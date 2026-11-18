@@ -1,0 +1,847 @@
+"""
+Tests for the AWS Lambda MicroVMs (entrypoint-as-host) sandbox launcher.
+
+The launcher talks to AWS only through a lazily-created ``lambda-microvms`` boto3
+client, so the SDK-driven tests inject a small recording fake in place of that
+client (no real AWS, no boto3 needed). The pure request-builder
+(:func:`build_run_microvm_kwargs`) and the TTL / idle-policy helpers are tested
+directly, since they carry the launch wiring and need no client at all.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+from collections.abc import Callable
+from typing import Any
+
+import click
+import pytest
+
+from omnigent.host.identity import (
+    HOST_ID_ENV_VAR,
+    HOST_NAME_ENV_VAR,
+    HOST_TOKEN_ENV_VAR,
+)
+from omnigent.onboarding.sandboxes.base import SandboxGoneError
+from omnigent.onboarding.sandboxes.lambda_microvm import (
+    DEBUG_INGRESS_CONNECTORS_ENV_VAR,
+    EGRESS_CONNECTORS_ENV_VAR,
+    IMAGE_IDENTIFIER_ENV_VAR,
+    IMAGE_VERSION_ENV_VAR,
+    MAX_IDLE_ENV_VAR,
+    MAX_LIFETIME_ENV_VAR,
+    LambdaMicroVMSandboxLauncher,
+    build_idle_policy,
+    build_run_microvm_kwargs,
+    managed_token_ttl_s,
+    resolve_max_lifetime_s,
+    run_microvm_client_token,
+)
+from omnigent.onboarding.sandboxes.types import RepoWorkspace
+
+_RUN_KW = {
+    "image_identifier": "arn:aws:lambda:us-east-1:123456789012:microvm-image:omnigent-host",
+    "execution_role_arn": "arn:aws:iam::123456789012:role/omnigent-microvm-exec",
+    "host_id": "host_abcdef",
+    "host_name": "managed-abcdef",
+    "server_url": "https://srv.example.com",
+    "token": "launch-token-xyz",
+    "env_literals": {"ANTHROPIC_API_KEY": "sk-test"},
+}
+
+
+# ── pure builder / helper tests (no boto3) ──────────────────
+
+
+def test_build_run_microvm_kwargs_injects_identity_token_and_server() -> None:
+    """Identity, launch token, and server URL ride the /run hook payload.
+
+    RunMicrovm has no per-launch environmentVariables parameter, so the
+    per-launch identity travels in runHookPayload (a JSON string the platform
+    delivers as the /run hook body).
+    """
+    kwargs = build_run_microvm_kwargs(**_RUN_KW)
+    assert "environmentVariables" not in kwargs
+    env = json.loads(kwargs["runHookPayload"])
+    assert env[HOST_ID_ENV_VAR] == "host_abcdef"
+    assert env[HOST_NAME_ENV_VAR] == "managed-abcdef"
+    assert env[HOST_TOKEN_ENV_VAR] == "launch-token-xyz"
+    assert env["OMNIGENT_SERVER"] == "https://srv.example.com"
+    assert env["IS_SANDBOX"] == "1"
+    # Harness credential passthrough is merged into the same payload.
+    assert env["ANTHROPIC_API_KEY"] == "sk-test"
+
+
+def test_build_run_microvm_kwargs_sets_image_role_and_idle_policy() -> None:
+    """The request names the image + execution role and carries an idle policy."""
+    kwargs = build_run_microvm_kwargs(**_RUN_KW)
+    assert kwargs["imageIdentifier"] == _RUN_KW["image_identifier"]
+    assert kwargs["executionRoleArn"] == "arn:aws:iam::123456789012:role/omnigent-microvm-exec"
+    assert kwargs["idlePolicy"]["autoResumeEnabled"] is True
+    assert kwargs["maximumDurationInSeconds"] == resolve_max_lifetime_s()
+    # No version requested → the key is omitted (account's latest is used).
+    assert "imageVersion" not in kwargs
+
+
+def test_build_run_microvm_kwargs_includes_version_when_set() -> None:
+    """A pinned image version is threaded into the request."""
+    kwargs = build_run_microvm_kwargs(**_RUN_KW, image_version="2.1")
+    assert kwargs["imageVersion"] == "2.1"
+
+
+@pytest.mark.parametrize("lifetime", [None, 60, 600, 3600, 7200, 28800])
+def test_run_request_uses_full_lifetime_before_idle_suspend(
+    monkeypatch: pytest.MonkeyPatch, lifetime: int | None
+) -> None:
+    monkeypatch.delenv(MAX_IDLE_ENV_VAR, raising=False)
+    monkeypatch.delenv(MAX_LIFETIME_ENV_VAR, raising=False)
+    if lifetime is not None:
+        monkeypatch.setenv(MAX_LIFETIME_ENV_VAR, str(lifetime))
+    expected = 28800 if lifetime is None else lifetime
+    request = build_run_microvm_kwargs(**_RUN_KW)
+    assert request["maximumDurationInSeconds"] == expected
+    assert request["idlePolicy"] == {
+        "maxIdleDurationSeconds": expected,
+        "suspendedDurationSeconds": expected,
+        "autoResumeEnabled": True,
+    }
+
+
+def test_build_run_microvm_kwargs_counts_escaped_non_ascii() -> None:
+    """Non-ASCII is escaped in the JSON payload, and the cap counts the escapes."""
+    # 700 x "é" is 700 characters of input but 4,200 once escaped as \u00e9.
+    oversized = {**_RUN_KW, "env_literals": {"NOTE": "é" * 700}}
+    with pytest.raises(click.ClickException, match="runHookPayload"):
+        build_run_microvm_kwargs(**oversized)
+
+
+def test_build_run_microvm_kwargs_payload_cap_is_4096_characters() -> None:
+    """The service rejects a 4,097-character runHookPayload, so 4,096 is the cap."""
+    base = build_run_microvm_kwargs(**{**_RUN_KW, "env_literals": {"PAD": ""}})
+    pad = 4_096 - len(base["runHookPayload"])
+    at_cap = build_run_microvm_kwargs(**{**_RUN_KW, "env_literals": {"PAD": "x" * pad}})
+    assert len(at_cap["runHookPayload"]) == 4_096
+    with pytest.raises(click.ClickException, match="4097 characters"):
+        build_run_microvm_kwargs(**{**_RUN_KW, "env_literals": {"PAD": "x" * (pad + 1)}})
+
+
+def test_build_run_microvm_kwargs_derives_client_token_from_launch_token() -> None:
+    """The clientToken is stable for one launch and new for the next.
+
+    Each launch arms a fresh launch token, so a digest of it identifies the
+    launch generation; a repeated RunMicrovm with the same token and
+    parameters returns the VM it already created.
+    """
+    kwargs = build_run_microvm_kwargs(**_RUN_KW)
+    client_token = kwargs["clientToken"]
+    assert client_token == build_run_microvm_kwargs(**_RUN_KW)["clientToken"]
+    assert client_token == run_microvm_client_token(_RUN_KW["token"])
+    assert 1 <= len(client_token) <= 128
+    assert client_token != build_run_microvm_kwargs(**{**_RUN_KW, "token": "next"})["clientToken"]
+    # CloudTrail records the clientToken: it must be neither the token nor the
+    # digest the host store keeps.
+    assert _RUN_KW["token"] not in client_token
+    assert client_token != hashlib.sha256(_RUN_KW["token"].encode()).hexdigest()
+
+
+@pytest.mark.parametrize(
+    ("bad", "message"),
+    [
+        ("soon", "number of seconds"),
+        ("0", "positive, finite"),
+        ("-1", "positive, finite"),
+        ("-3600", "positive, finite"),
+        ("inf", "positive, finite"),
+        ("nan", "positive, finite"),
+        ("0.5", "at least 60"),
+        ("1", "at least 60"),
+        ("30", "at least 60"),
+        ("59", "at least 60"),
+        ("59.9", "at least 60"),
+        ("28801", "exceeds"),
+    ],
+)
+def test_max_lifetime_env_rejects_invalid_values(
+    monkeypatch: pytest.MonkeyPatch, bad: str, message: str
+) -> None:
+    monkeypatch.setenv(MAX_LIFETIME_ENV_VAR, bad)
+    with pytest.raises(click.ClickException, match=message):
+        resolve_max_lifetime_s()
+
+
+def test_max_idle_env_overrides_the_idle_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Operators explicitly opt into earlier suspension."""
+    monkeypatch.setenv(MAX_IDLE_ENV_VAR, "3600")
+    assert build_idle_policy()["maxIdleDurationSeconds"] == 3600
+
+
+@pytest.mark.parametrize("bad", ["59", "0", "soon", str(8 * 60 * 60 + 1)])
+def test_max_idle_env_rejects_values_outside_sixty_to_lifetime(
+    monkeypatch: pytest.MonkeyPatch, bad: str
+) -> None:
+    """The idle window must be at least 60 s (the RunMicrovm floor) and no
+    longer than the VM's own lifetime."""
+    monkeypatch.setenv(MAX_IDLE_ENV_VAR, bad)
+    with pytest.raises(click.ClickException, match="OMNIGENT_LAMBDA_MICROVM_MAX_IDLE_S"):
+        build_idle_policy()
+
+
+def test_managed_token_ttl_exceeds_lifetime() -> None:
+    """The launch-token TTL always outlives the sandbox so it can reconnect."""
+    assert managed_token_ttl_s() > resolve_max_lifetime_s()
+
+
+# ── SDK-driven lifecycle tests (recording fake client) ──────
+
+
+class _FakeMicroVMClient:
+    """Recording stand-in for the ``lambda-microvms`` boto3 client."""
+
+    def __init__(self, *, run_id: str = "microvm-0001") -> None:
+        self._run_id = run_id
+        self.run_calls: list[dict[str, Any]] = []
+        self.resumed: list[str] = []
+        self.terminated: list[str] = []
+        # When set, terminate_microvm raises this to simulate an AWS error.
+        self.terminate_error: Exception | None = None
+        # When set, resume_microvm raises this to simulate an AWS error.
+        self.resume_error: Exception | None = None
+        # Raised by successive run_microvm calls, one per call, before any
+        # call returns the VM.
+        self.run_errors: list[Exception] = []
+
+    def run_microvm(self, **kwargs: Any) -> dict[str, str]:
+        self.run_calls.append(kwargs)
+        if self.run_errors:
+            raise self.run_errors.pop(0)
+        return {"microvmId": self._run_id}
+
+    def resume_microvm(self, *, microvmIdentifier: str) -> dict[str, str]:
+        if self.resume_error is not None:
+            raise self.resume_error
+        self.resumed.append(microvmIdentifier)
+        return {}
+
+    def terminate_microvm(self, *, microvmIdentifier: str) -> dict[str, str]:
+        if self.terminate_error is not None:
+            raise self.terminate_error
+        self.terminated.append(microvmIdentifier)
+        return {}
+
+
+def _launcher_with_fake(
+    monkeypatch: pytest.MonkeyPatch, client: _FakeMicroVMClient, **kwargs: Any
+) -> LambdaMicroVMSandboxLauncher:
+    """Build a launcher whose ``_get_client`` returns the recording fake."""
+    launcher = LambdaMicroVMSandboxLauncher(
+        image_identifier="omnigent-host",
+        execution_role_arn="arn:aws:iam::123456789012:role/omnigent-microvm-exec",
+        **kwargs,
+    )
+    monkeypatch.setattr(launcher, "_get_client", lambda: client)
+    return launcher
+
+
+def test_provision_reserves_name_without_calling_aws(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Entrypoint-as-host: provision only reserves the name; no MicroVM is run."""
+    client = _FakeMicroVMClient()
+    launcher = _launcher_with_fake(monkeypatch, client)
+    assert launcher.provision("managed-abc") == "managed-abc"
+    assert client.run_calls == []
+
+
+def test_start_host_runs_microvm_and_returns_workspace_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """start_host runs the MicroVM and returns the in-sandbox workspace path.
+
+    NOT the provider's microvmId: the managed-launch framework persists this
+    return value only as the session workspace (never a new sandbox id), and
+    host.launch_runner validates it with Path(...).is_dir() inside the guest —
+    so returning the opaque microvm_id here breaks every runner launch with
+    "workspace path does not exist".
+    """
+    client = _FakeMicroVMClient(run_id="microvm-run-42")
+    launcher = _launcher_with_fake(monkeypatch, client)
+    assert launcher.started_sandbox_id is None
+    workspace = launcher.start_host(
+        "managed-abc",
+        token="tok",
+        host_id="host_x",
+        host_name="managed-x",
+        server_url="https://srv.example.com",
+    )
+    assert workspace == "/root/workspace"
+    assert len(client.run_calls) == 1
+    call = client.run_calls[0]
+    assert call["imageIdentifier"] == "omnigent-host"
+    assert json.loads(call["runHookPayload"])[HOST_TOKEN_ENV_VAR] == "tok"
+    # run_microvm's returned microvmId is not the return value (see docstring
+    # above) — it is surfaced on started_sandbox_id for the framework to persist
+    # as the host row's sandbox_id, so terminate/resume key off the real id.
+    assert launcher.started_sandbox_id == "microvm-run-42"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("..", "repo"),
+        (".", "repo"),
+        ("-rf", "repo"),
+        ("../../etc", "etc"),
+        ("nested/path/proj", "proj"),
+        ("normal-name", "normal-name"),
+    ],
+)
+def test_start_host_workspace_matches_entrypoint_sanitization(
+    monkeypatch: pytest.MonkeyPatch, raw: str, expected: str
+) -> None:
+    """The returned workspace path applies the SAME repo-name sanitization as
+    start_host.sh — a divergent path fails Path(...).is_dir() inside the guest
+    and no runner ever launches."""
+    client = _FakeMicroVMClient()
+    launcher = _launcher_with_fake(monkeypatch, client)
+    workspace = launcher.start_host(
+        "managed-abc",
+        token="tok",
+        host_id="host_x",
+        host_name="managed-x",
+        server_url="https://srv.example.com",
+        repos=[RepoWorkspace(url="https://github.com/org/repo.git", branch=None, repo_name=raw)],
+    )
+    assert workspace == f"/root/workspace/{expected}"
+
+
+# A one-provider gateway config of the shape deployments use.
+_GATEWAY_HOST_CONFIG: dict[str, object] = {
+    "providers": {
+        "litellm": {
+            "kind": "gateway",
+            "default": ["pi"],
+            "openai": {
+                "base_url": "http://litellm.litellm.svc.cluster.local/v1",
+                "api_key_ref": "env:LITELLM_API_KEY",
+                "wire_api": "chat",
+            },
+        }
+    }
+}
+
+
+def _start_with_fake(
+    monkeypatch: pytest.MonkeyPatch,
+    client: _FakeMicroVMClient,
+    *,
+    launcher: LambdaMicroVMSandboxLauncher | None = None,
+    **kwargs: Any,
+) -> LambdaMicroVMSandboxLauncher:
+    """Run start_host against *client* with a fixed identity."""
+    launcher = launcher or _launcher_with_fake(monkeypatch, client)
+    launcher.start_host(
+        "managed-abc",
+        token="tok",
+        host_id="host_x",
+        host_name="managed-x",
+        server_url="https://srv.example.com",
+        **kwargs,
+    )
+    return launcher
+
+
+def test_start_host_threads_host_config_as_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """host_config rides the /run payload as JSON, not as the rendered script.
+
+    There is no exec transport to install the config from the server side, so
+    the config travels as OMNIGENT_HOST_CONFIG_JSON and start_host.sh renders
+    the shared marker-aware write command from the image's omnigent.
+    """
+    client = _FakeMicroVMClient()
+    _start_with_fake(monkeypatch, client, host_config=_GATEWAY_HOST_CONFIG)
+    env = json.loads(client.run_calls[0]["runHookPayload"])
+    assert json.loads(env["OMNIGENT_HOST_CONFIG_JSON"]) == _GATEWAY_HOST_CONFIG
+    assert "OMNIGENT_HOST_CONFIG_CMD" not in env
+    assert len(client.run_calls[0]["runHookPayload"]) < 1_000
+
+
+def test_start_host_omits_host_config_when_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No host_config → no OMNIGENT_HOST_CONFIG_JSON in the payload."""
+    client = _FakeMicroVMClient()
+    _start_with_fake(monkeypatch, client)
+    env = json.loads(client.run_calls[0]["runHookPayload"])
+    assert "OMNIGENT_HOST_CONFIG_JSON" not in env
+
+
+def _read_timeout() -> Exception:
+    from botocore.exceptions import ReadTimeoutError
+
+    return ReadTimeoutError(endpoint_url="https://lambda-microvms.us-east-1.amazonaws.com")
+
+
+def _client_error(code: str, status: int) -> Exception:
+    from botocore.exceptions import ClientError
+
+    return ClientError(
+        {"Error": {"Code": code, "Message": code}, "ResponseMetadata": {"HTTPStatusCode": status}},
+        "RunMicrovm",
+    )
+
+
+@pytest.mark.parametrize(
+    "first_error",
+    [_read_timeout, lambda: _client_error("InternalServerException", 500)],
+    ids=["read-timeout", "5xx"],
+)
+def test_start_host_asks_again_when_the_run_gave_no_answer(
+    monkeypatch: pytest.MonkeyPatch, first_error: Callable[[], Exception]
+) -> None:
+    """An unanswered RunMicrovm is repeated with the same clientToken.
+
+    AWS may have created the VM before the call failed. The repeat returns that
+    VM's id, so started_sandbox_id is set and the failure cleanup terminates
+    the VM that runs rather than the reserved name.
+    """
+    client = _FakeMicroVMClient(run_id="microvm-recovered")
+    client.run_errors = [first_error()]
+    launcher = _start_with_fake(monkeypatch, client)
+    assert len(client.run_calls) == 2
+    assert client.run_calls[0] == client.run_calls[1]
+    assert client.run_calls[0]["clientToken"] == run_microvm_client_token("tok")
+    assert launcher.started_sandbox_id == "microvm-recovered"
+
+
+def test_start_host_does_not_repeat_a_refused_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 4xx means AWS refused the request and created nothing."""
+    client = _FakeMicroVMClient()
+    client.run_errors = [_client_error("ValidationException", 400)]
+    with pytest.raises(click.ClickException, match="ValidationException"):
+        _start_with_fake(monkeypatch, client)
+    assert len(client.run_calls) == 1
+
+
+def test_start_host_gives_up_after_the_second_unanswered_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The repeat runs once, so a dead endpoint fails the launch promptly."""
+    client = _FakeMicroVMClient()
+    client.run_errors = [_read_timeout(), _read_timeout()]
+    launcher = _launcher_with_fake(monkeypatch, client)
+    with pytest.raises(click.ClickException, match="run failed"):
+        launcher.start_host(
+            "managed-abc",
+            token="tok",
+            host_id="host_x",
+            host_name="managed-x",
+            server_url="https://srv.example.com",
+        )
+    assert len(client.run_calls) == 2
+    assert launcher.started_sandbox_id is None
+
+
+def test_start_host_threads_repo_env_when_requested(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A repo workspace is passed to the image entrypoint via the /run payload."""
+    client = _FakeMicroVMClient()
+    launcher = _launcher_with_fake(monkeypatch, client)
+    launcher.start_host(
+        "managed-abc",
+        token="tok",
+        host_id="host_x",
+        host_name="managed-x",
+        server_url="https://srv.example.com",
+        repos=[
+            RepoWorkspace(url="https://github.com/org/repo.git", branch="main", repo_name="repo")
+        ],
+    )
+    env = json.loads(client.run_calls[0]["runHookPayload"])
+    assert env["OMNIGENT_REPO_URL"] == "https://github.com/org/repo.git"
+    assert env["OMNIGENT_REPO_BRANCH"] == "main"
+    assert env["OMNIGENT_REPO_NAME"] == "repo"
+
+
+def test_start_host_rejects_more_than_one_repo(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The /run payload carries one clone; a second repo fails before any VM runs."""
+    client = _FakeMicroVMClient()
+    launcher = _launcher_with_fake(monkeypatch, client)
+    with pytest.raises(click.ClickException, match="one repository"):
+        launcher.start_host(
+            "managed-abc",
+            token="tok",
+            host_id="host_x",
+            host_name="managed-x",
+            server_url="https://srv.example.com",
+            repos=[
+                RepoWorkspace(url="https://github.com/org/a.git", branch=None, repo_name="a"),
+                RepoWorkspace(url="https://github.com/org/b.git", branch=None, repo_name="b"),
+            ],
+        )
+    assert client.run_calls == []
+
+
+def test_resume_calls_resume_microvm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """resume thaws the suspended MicroVM under the same id."""
+    client = _FakeMicroVMClient()
+    launcher = _launcher_with_fake(monkeypatch, client)
+    launcher.resume("microvm-run-42")
+    assert client.resumed == ["microvm-run-42"]
+
+
+def test_resume_treats_already_running_conflict_as_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ConflictException (VM already RUNNING) is idempotent success.
+
+    resume-microvm requires the SUSPENDED state and conflicts on a running VM.
+    The wake path resumes with force=True when persisted liveness may be stale,
+    so a redundant resume against a live VM is a normal event — it must not
+    become a 502.
+    """
+    from botocore.exceptions import ClientError
+
+    client = _FakeMicroVMClient()
+    client.resume_error = ClientError(
+        {"Error": {"Code": "ConflictException", "Message": "MicroVM is not suspended"}},
+        "ResumeMicrovm",
+    )
+    launcher = _launcher_with_fake(monkeypatch, client)
+    # Does not raise.
+    launcher.resume("microvm-already-running")
+
+
+def test_resume_raises_on_real_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An AWS error that is neither a conflict nor a gone VM surfaces as a
+    plain ClickException, so the wake path reports it and keeps the VM."""
+    from botocore.exceptions import ClientError
+
+    client = _FakeMicroVMClient()
+    client.resume_error = ClientError(
+        {"Error": {"Code": "AccessDeniedException", "Message": "denied"}},
+        "ResumeMicrovm",
+    )
+    launcher = _launcher_with_fake(monkeypatch, client)
+    with pytest.raises(click.ClickException) as excinfo:
+        launcher.resume("microvm-denied")
+    assert not isinstance(excinfo.value, SandboxGoneError)
+
+
+@pytest.mark.parametrize(
+    ("code", "message"),
+    [
+        ("ResourceNotFoundException", "gone"),
+        (
+            "ValidationException",
+            "The MicroVM microvm-x has been terminated and its state cannot be changed.",
+        ),
+    ],
+)
+def test_resume_reports_a_terminated_vm_as_gone(
+    monkeypatch: pytest.MonkeyPatch, code: str, message: str
+) -> None:
+    """A VM past its lifetime or suspended window raises SandboxGoneError, so
+    the wake path launches a fresh sandbox instead of retrying a dead one."""
+    from botocore.exceptions import ClientError
+
+    client = _FakeMicroVMClient()
+    client.resume_error = ClientError(
+        {"Error": {"Code": code, "Message": message}}, "ResumeMicrovm"
+    )
+    launcher = _launcher_with_fake(monkeypatch, client)
+    with pytest.raises(SandboxGoneError):
+        launcher.resume("microvm-x")
+
+
+def test_resume_keeps_other_validation_errors_retryable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only the terminated-VM ValidationException means gone."""
+    from botocore.exceptions import ClientError
+
+    client = _FakeMicroVMClient()
+    client.resume_error = ClientError(
+        {"Error": {"Code": "ValidationException", "Message": "bad identifier"}},
+        "ResumeMicrovm",
+    )
+    launcher = _launcher_with_fake(monkeypatch, client)
+    with pytest.raises(click.ClickException) as excinfo:
+        launcher.resume("microvm-x")
+    assert not isinstance(excinfo.value, SandboxGoneError)
+
+
+def test_capabilities_declare_a_host_preserving_resume() -> None:
+    """The launcher advertises an in-place resume that keeps the running host
+    and its token, so the wake path neither rotates the token nor restarts the
+    host (that would race a second host against the thawed one)."""
+    caps = LambdaMicroVMSandboxLauncher().capabilities
+    assert caps.managed_launch is True
+    assert caps.resume_stopped is True
+    assert caps.resume_preserves_host is True
+    assert caps.cli_bootstrap is False
+    assert caps.local_port_forward is False
+
+
+def test_terminate_calls_terminate_microvm(monkeypatch: pytest.MonkeyPatch) -> None:
+    """terminate releases the MicroVM's compute."""
+    client = _FakeMicroVMClient()
+    launcher = _launcher_with_fake(monkeypatch, client)
+    launcher.terminate("microvm-run-42")
+    assert client.terminated == ["microvm-run-42"]
+
+
+def test_terminate_is_idempotent_on_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A MicroVM already gone (ResourceNotFoundException) is idempotent success."""
+    from botocore.exceptions import ClientError
+
+    client = _FakeMicroVMClient()
+    client.terminate_error = ClientError(
+        {"Error": {"Code": "ResourceNotFoundException", "Message": "gone"}},
+        "TerminateMicrovm",
+    )
+    launcher = _launcher_with_fake(monkeypatch, client)
+    # Does not raise.
+    launcher.terminate("microvm-already-gone")
+
+
+def test_terminate_is_idempotent_on_already_terminated(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A VM AWS still lists as terminated is idempotent success too."""
+    from botocore.exceptions import ClientError
+
+    client = _FakeMicroVMClient()
+    client.terminate_error = ClientError(
+        {
+            "Error": {
+                "Code": "ValidationException",
+                "Message": (
+                    "The MicroVM microvm-x has been terminated and its state cannot be changed."
+                ),
+            }
+        },
+        "TerminateMicrovm",
+    )
+    launcher = _launcher_with_fake(monkeypatch, client)
+    launcher.terminate("microvm-x")
+
+
+def test_terminate_raises_on_real_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-not-found AWS error surfaces as a ClickException."""
+    from botocore.exceptions import ClientError
+
+    client = _FakeMicroVMClient()
+    client.terminate_error = ClientError(
+        {"Error": {"Code": "AccessDeniedException", "Message": "nope"}},
+        "TerminateMicrovm",
+    )
+    launcher = _launcher_with_fake(monkeypatch, client)
+    with pytest.raises(click.ClickException):
+        launcher.terminate("microvm-run-42")
+
+
+def test_no_exec_transport() -> None:
+    """Entrypoint-as-host: the launcher inherits SandboxHostLauncher directly
+    (like Kubernetes) and carries NO exec transport — there is no run()."""
+    launcher = LambdaMicroVMSandboxLauncher(
+        image_identifier="omnigent-host",
+        execution_role_arn="arn:aws:iam::123456789012:role/x",
+    )
+    assert not hasattr(launcher, "run")
+
+
+# ── config resolution (no client) ──────────────────────────
+
+
+def test_prepare_requires_image_identifier(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Preflight fails loud when no MicroVM image is configured."""
+    monkeypatch.delenv(IMAGE_IDENTIFIER_ENV_VAR, raising=False)
+    # boto3 present in the test env; the missing-image check is what should fire.
+    launcher = LambdaMicroVMSandboxLauncher(
+        execution_role_arn="arn:aws:iam::123456789012:role/x",
+    )
+    with pytest.raises(click.ClickException, match="image"):
+        launcher.prepare()
+
+
+def test_sandbox_env_passthrough_reads_server_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Configured env NAMES resolve to the server process's values."""
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-live")
+    launcher = LambdaMicroVMSandboxLauncher(
+        image_identifier="omnigent-host",
+        execution_role_arn="arn:aws:iam::123456789012:role/x",
+        env=["OPENAI_API_KEY"],
+    )
+    assert launcher._resolve_sandbox_env() == {"OPENAI_API_KEY": "sk-live"}
+
+
+def test_sandbox_env_passthrough_fails_loud_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A configured env NAME that is unset in the server env fails loud."""
+    monkeypatch.delenv("MISSING_KEY", raising=False)
+    launcher = LambdaMicroVMSandboxLauncher(
+        image_identifier="omnigent-host",
+        execution_role_arn="arn:aws:iam::123456789012:role/x",
+        env=["MISSING_KEY"],
+    )
+    with pytest.raises(click.ClickException, match="MISSING_KEY"):
+        launcher._resolve_sandbox_env()
+
+
+@pytest.mark.parametrize(
+    "reserved",
+    ["OMNIGENT_SERVER", "IS_SANDBOX", HOST_ID_ENV_VAR, HOST_NAME_ENV_VAR, HOST_TOKEN_ENV_VAR],
+)
+def test_sandbox_env_passthrough_rejects_reserved_identity_names(
+    monkeypatch: pytest.MonkeyPatch, reserved: str
+) -> None:
+    """A passthrough naming a reserved identity key fails loud — it would
+    otherwise clobber the per-launch identity in the /run payload."""
+    monkeypatch.setenv(reserved, "attacker-controlled")
+    launcher = LambdaMicroVMSandboxLauncher(
+        image_identifier="omnigent-host",
+        execution_role_arn="arn:aws:iam::123456789012:role/x",
+        env=[reserved],
+    )
+    with pytest.raises(click.ClickException, match="reserved"):
+        launcher._resolve_sandbox_env()
+
+
+def test_build_run_microvm_kwargs_identity_wins_over_passthrough() -> None:
+    """Even if a passthrough value for a reserved key reaches the builder, the
+    launch identity wins in the payload (merge-order backstop to the rejection)."""
+    kw = {
+        **_RUN_KW,
+        "env_literals": {"OMNIGENT_SERVER": "https://evil.example", "IS_SANDBOX": "0"},
+    }
+    kwargs = build_run_microvm_kwargs(**kw)
+    payload = json.loads(kwargs["runHookPayload"])
+    assert payload["OMNIGENT_SERVER"] == _RUN_KW["server_url"]
+    assert payload["IS_SANDBOX"] == "1"
+    assert payload[HOST_TOKEN_ENV_VAR] == _RUN_KW["token"]
+
+
+def test_build_run_microvm_kwargs_attaches_egress_connectors() -> None:
+    """VPC egress connectors, when provided, ride the run request so the host
+    reaches a private server over the customer VPC instead of the internet."""
+    arns = ["arn:aws:lambda:us-east-1:123456789012:network-connector:vpc-egress"]
+    kwargs = build_run_microvm_kwargs(**_RUN_KW, egress_network_connectors=arns)
+    assert kwargs["egressNetworkConnectors"] == arns
+    # Omitted by default (account-default public egress).
+    assert "egressNetworkConnectors" not in build_run_microvm_kwargs(**_RUN_KW)
+
+
+_EGRESS_ARN = "arn:aws:lambda:us-east-1:123456789012:network-connector:vpc-egress"
+
+
+def test_start_host_sends_the_configured_egress_connectors_and_image_version(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The config's connectors and image version reach RunMicrovm, ahead of the env.
+
+    The egress connector is the private VPC path: without it the host dials the
+    server over public egress and never reaches a private one.
+    """
+    monkeypatch.setenv(EGRESS_CONNECTORS_ENV_VAR, "arn:from-env")
+    monkeypatch.setenv(IMAGE_VERSION_ENV_VAR, "9")
+    client = _FakeMicroVMClient()
+    launcher = _launcher_with_fake(
+        monkeypatch, client, image_version="3", egress_network_connectors=[_EGRESS_ARN]
+    )
+
+    _start_with_fake(monkeypatch, client, launcher=launcher)
+    assert len(client.run_calls) == 1
+    call = client.run_calls[0]
+
+    assert call["egressNetworkConnectors"] == [_EGRESS_ARN]
+    assert call["imageVersion"] == "3"
+
+
+def test_start_host_reads_egress_connectors_and_image_version_from_the_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no config, the env vars supply both, and blank entries are dropped."""
+    monkeypatch.setenv(EGRESS_CONNECTORS_ENV_VAR, f" {_EGRESS_ARN} , ")
+    monkeypatch.setenv(IMAGE_VERSION_ENV_VAR, "4")
+    client = _FakeMicroVMClient()
+    launcher = _launcher_with_fake(monkeypatch, client)
+
+    _start_with_fake(monkeypatch, client, launcher=launcher)
+    assert len(client.run_calls) == 1
+    call = client.run_calls[0]
+
+    assert call["egressNetworkConnectors"] == [_EGRESS_ARN]
+    assert call["imageVersion"] == "4"
+
+
+def test_start_host_without_egress_or_version_uses_the_account_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Unset everywhere, the request leaves both out: public egress, latest image."""
+    monkeypatch.delenv(EGRESS_CONNECTORS_ENV_VAR, raising=False)
+    monkeypatch.delenv(IMAGE_VERSION_ENV_VAR, raising=False)
+    client = _FakeMicroVMClient()
+    launcher = _launcher_with_fake(monkeypatch, client)
+
+    _start_with_fake(monkeypatch, client, launcher=launcher)
+    assert len(client.run_calls) == 1
+    call = client.run_calls[0]
+
+    assert "egressNetworkConnectors" not in call
+    assert "imageVersion" not in call
+
+
+def test_debug_ingress_attaches_parsed_arns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A real DEBUG_INGRESS value attaches the parsed connector ARNs."""
+    monkeypatch.setenv(
+        DEBUG_INGRESS_CONNECTORS_ENV_VAR,
+        "arn:aws:lambda:us-east-1:123456789012:network-connector:shell , arn:...:nc2",
+    )
+    kwargs = build_run_microvm_kwargs(**_RUN_KW)
+    assert kwargs["ingressNetworkConnectors"] == [
+        "arn:aws:lambda:us-east-1:123456789012:network-connector:shell",
+        "arn:...:nc2",
+    ]
+
+
+@pytest.mark.parametrize("blank", [",", " ", ", ,", ""])
+def test_debug_ingress_separators_only_omits_key(
+    monkeypatch: pytest.MonkeyPatch, blank: str
+) -> None:
+    """A DEBUG_INGRESS value of only separators/whitespace is truthy but parses
+    to [] — the key must be OMITTED (an explicit empty ingressNetworkConnectors
+    is rejected by the run-microvm API), not sent as an empty list."""
+    monkeypatch.setenv(DEBUG_INGRESS_CONNECTORS_ENV_VAR, blank)
+    kwargs = build_run_microvm_kwargs(**_RUN_KW)
+    assert "ingressNetworkConnectors" not in kwargs
+
+
+# ── SDK availability (real botocore, no network) ────────────
+
+
+def test_installed_botocore_ships_lambda_microvms_service_model() -> None:
+    """The locked botocore carries the ``lambda-microvms`` service model.
+
+    The extra's floor (boto3/botocore >= 1.43.35, the service's GA release)
+    exists precisely so ``boto3.client("lambda-microvms")`` can resolve; this
+    guards the pin against a future lockfile downgrade that would pass the
+    import probe and fail at client construction.
+    """
+    botocore = pytest.importorskip("botocore")
+    del botocore  # presence probe; the session below does the real check
+    import botocore.session
+
+    assert "lambda-microvms" in botocore.session.get_session().get_available_services()
+
+
+def test_ensure_sdk_rejects_botocore_without_service_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """_ensure_sdk fails loud (with an upgrade hint) on a pre-GA botocore."""
+    pytest.importorskip("botocore")
+    import botocore.session
+
+    from omnigent.onboarding.sandboxes import lambda_microvm as mod
+
+    class _OldSession:
+        def get_available_services(self) -> list[str]:
+            return ["s3", "lambda"]  # no lambda-microvms
+
+    monkeypatch.setattr(botocore.session, "get_session", lambda: _OldSession())
+    with pytest.raises(click.ClickException, match=r"1\.43\.35"):
+        mod._ensure_sdk()

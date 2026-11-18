@@ -101,6 +101,16 @@ def test_file_and_unfile_session_single_user(db_uri: str) -> None:
     listed = client.get("/v1/sessions?project=Work")
     assert [s["id"] for s in listed.json()["data"]] == [conv.id]
 
+    # Archived folders resolve first-class membership and exclude live sessions.
+    archived = client.patch(f"/v1/sessions/{conv.id}", json={"archived": True})
+    assert archived.status_code == 200
+    archived_list = client.get("/v1/sessions?project=Work&visibility=archived")
+    assert archived_list.status_code == 200
+    assert [row["id"] for row in archived_list.json()["data"]] == [conv.id]
+    assert archived_list.json()["data"][0]["project_id"] == project["id"]
+    assert client.get("/v1/sessions?project=Work&visibility=mine").json()["data"] == []
+    assert client.patch(f"/v1/sessions/{conv.id}", json={"archived": False}).status_code == 200
+
     # Unfile it.
     resp = client.patch(f"/v1/sessions/{conv.id}", json={"project_id": ""})
     assert resp.status_code == 200

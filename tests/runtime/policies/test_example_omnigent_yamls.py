@@ -325,7 +325,7 @@ async def test_risk_score_web_searches_accrue_and_gate_send(
 # NOTE: the label-in-result scoring path (``sensitive_labels``) is intentionally
 # NOT exercised from this example YAML. There is no portable, cross-MCP
 # classification field to depend on (the field the demo previously used,
-# ``label_classification``, is specific to the Databricks-internal Google MCP),
+# ``label_classification``, is specific to a deployment-specific Google MCP),
 # so the shipped example leaves ``sensitive_labels`` commented out and drives the
 # threshold via ``tool_points`` alone. The label-scoring mechanism itself is
 # fully covered at the unit level in tests/policies/builtins/test_risk_score.py.

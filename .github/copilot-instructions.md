@@ -70,3 +70,16 @@ the smallest suitable test.
   no flow change, type-only changes, dependency bumps, or refactors with no
   observable behaviour change.
 - A trivial, empty, or unrelated test does not count as coverage.
+
+## Committing and Formatting
+
+The `pre-commit` hooks are the local gate and CI runs the same checks. They
+run on `git commit` and `git push` only once installed; `just ensure` (or
+`just hooks`) installs them, once per clone.
+
+- Never use `--no-verify`. Treat a hook failure as something to fix.
+- Files written through shell heredocs or scripts are unformatted until a hook
+  or `just lint` touches them. Before pushing web changes, run
+  `cd web && pnpm exec prettier --check .` and act on its exit code.
+- If a PR's CI fails on `prettier --check` or a pre-commit hook, flag that the
+  author should run `just lint-all` locally rather than fix files one at a time.

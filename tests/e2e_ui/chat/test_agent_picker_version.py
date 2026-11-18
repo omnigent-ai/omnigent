@@ -20,7 +20,6 @@ the test pins the picker's resolution without provisioning real agents.
 
 from __future__ import annotations
 
-import asyncio
 import json
 import re
 
@@ -28,6 +27,7 @@ from playwright.async_api import Route, async_playwright, expect
 
 from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
 from tests._helpers.picker_routes import OWN_AGENTS
+from tests._helpers.polling import poll_until_async
 from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
 
 _HOST_ID = "host_e2e"
@@ -208,19 +208,9 @@ async def _drive(base_url: str, created_session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").fill("which version are you?")
             await page.get_by_test_id("new-chat-landing-submit").click()
 
-            await _wait_until(lambda: len(create_requests) == 1)
+            await poll_until_async(lambda: len(create_requests) == 1)
             assert create_requests[0].get("agent_id") == _UPLOAD_ID, (
                 f"picker bound the wrong version: {create_requests[0]}"
             )
         finally:
             await browser.close()
-
-
-async def _wait_until(predicate, *, timeout_s: float = 15.0) -> None:
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout_s
-    while loop.time() < deadline:
-        if predicate():
-            return
-        await asyncio.sleep(0.05)
-    raise AssertionError(f"condition not met within {timeout_s:.0f}s")

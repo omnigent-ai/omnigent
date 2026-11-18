@@ -11,7 +11,9 @@ from playwright.sync_api import Page, expect
 
 from tests.e2e_ui.conftest import _server_state, configure_mock_llm
 
-_TURNS = 80
+# Two items per turn: more than the initial window plus one older page, so
+# scrolling back lands at least two pages.
+_TURNS = 200
 _NEWEST_REPLY = f"reply number {_TURNS - 1}"
 _VIEWPORT = {"width": 1280, "height": 480}
 _TAG_SCROLLER = """
@@ -194,6 +196,49 @@ def test_scrolling_back_through_history_never_moves_the_offset(
         56, round(reading["trackHeight"] * reading["clientHeight"] / reading["scrollHeight"])
     )
     assert abs(heights[-1] - expected) <= 2, (heights[-1], expected, reading)
+
+
+def test_thumb_dragged_past_the_end_waits_for_the_pointer_to_return(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """Pointer travel past the track's end is owed back before the thumb moves again."""
+    base_url, session_id = seeded_session
+    _seed_turns(session_id)
+    page.set_viewport_size(_VIEWPORT)
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_text(_NEWEST_REPLY).first).to_be_visible(timeout=30_000)
+    assert page.evaluate(_TAG_SCROLLER), "transcript did not overflow; seed more turns"
+    page.wait_for_timeout(500)
+    thumb = page.get_by_test_id("transcript-scrollbar-thumb")
+    scroller = page.locator("[data-pw-scroller]")
+
+    def scroll_top() -> float:
+        return scroller.evaluate("(el) => el.scrollTop")
+
+    def thumb_top() -> float:
+        box = thumb.bounding_box()
+        assert box is not None
+        return box["y"]
+
+    # Grab the thumb at the bottom and pull the pointer 120px below the track.
+    box = thumb.bounding_box()
+    assert box is not None
+    x, grab_y = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
+    resting_thumb = thumb_top()
+    page.mouse.move(x, grab_y)
+    page.mouse.down()
+    page.mouse.move(x, grab_y + 120, steps=6)
+    bottom = scroll_top()
+    # Most of the way back, the thumb has not left the bottom.
+    page.mouse.move(x, grab_y + 20, steps=5)
+    assert scroll_top() == bottom
+    assert abs(thumb_top() - resting_thumb) <= 1
+    # Past the grab point the thumb follows again.
+    page.mouse.move(x, grab_y - 10, steps=3)
+    assert scroll_top() < bottom
+    assert thumb_top() < resting_thumb
+    page.mouse.up()
 
 
 # --- Tool-heavy transcripts: the view holds while pages land and stops with the reader ---
@@ -526,7 +571,8 @@ _STREAM_PROMPT = "Tell me a long story, streamed."
 # few seconds and the view has to keep up rather than jump once.
 _STREAM_CHUNK_DELAY_S = 0.03
 
-# Measure the newest text, not the scroll extent (which includes footer spacing).
+# Sample the newest text's visibility and the distance from the scroll end in each
+# frame as it paints: after layout and the transcript's own observers.
 _TRACK_NEWEST_TEXT = """
 () => {
   const el = document.querySelector('[data-pw-scroller]');
@@ -551,9 +597,14 @@ _TRACK_NEWEST_TEXT = """
       Math.max(0, line.bottom - viewport.bottom, viewport.top - line.top),
       el.scrollHeight,
       section.textContent.length,
+      Math.round(el.scrollHeight - el.clientHeight - el.scrollTop),
     ]);
   };
-  const tick = () => { setTimeout(sample, 0); requestAnimationFrame(tick); };
+  const tick = () => {
+    const observer = new ResizeObserver(() => { sample(); observer.disconnect(); });
+    observer.observe(el);
+    requestAnimationFrame(tick);
+  };
   requestAnimationFrame(tick);
 }
 """
@@ -605,15 +656,78 @@ def test_streaming_reply_keeps_newest_text_visible(
 
     # The final line is visible even if footer spacing extends below the viewport.
     assert samples[-1][1] <= 2, samples[-1]
-    # And followed the reply as it grew.
+    # And followed the reply in every frame: growth never painted before the
+    # scroll that follows it, which drops the transcript's end by a line.
     growing = [s for s in samples if s[2] > height_before]
     assert growing, samples[:3]
-    # A resize may precede its scroll correction by one frame. Count only
-    # intervals bounded by two clipped-text samples; a delayed first sample
-    # does not establish how long the view has been behind.
-    behind_ms = 0
-    longest_behind_ms = 0
-    for (t0, d0, _h0, _n0), (t1, d1, _h1, _n1) in pairwise(growing):
-        behind_ms = behind_ms + (t1 - t0) if d0 > 8 and d1 > 8 else 0
-        longest_behind_ms = max(longest_behind_ms, behind_ms)
-    assert longest_behind_ms <= 100, (longest_behind_ms, [s for s in growing if s[1] > 8][:20])
+    behind = [s for s in growing if s[4] > 2]
+    assert behind == [], (len(behind), len(growing), behind[:20])
+
+
+# --- Pinned at the bottom: a reply's completion keeps the reader at the end ---
+
+_CODE_PROMPT = "Explain the code, streamed."
+_CODE_REPLY_DONE = "code reply complete marker"
+_END_SLACK_PX = 24
+# Resolves once the distance has held for 20 frames; fails if it never does within 600.
+_SETTLED_DISTANCE_FROM_END_JS = """
+() => new Promise((resolve, reject) => {
+  const el = document.querySelector('[data-pw-scroller]');
+  let last = null;
+  let still = 0;
+  let frames = 0;
+  const tick = () => {
+    const distance = el.scrollHeight - el.clientHeight - el.scrollTop;
+    still = distance === last ? still + 1 : 0;
+    last = distance;
+    frames += 1;
+    if (still >= 20) resolve(distance);
+    else if (frames >= 600) reject(new Error(`distance never settled; last ${distance}px`));
+    else requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+})
+"""
+
+
+def _code_reply() -> str:
+    """A Python block and a TypeScript block, sized like a long code answer."""
+    python = "\n".join(f"    value_{n} = compute({n}, factor={n * 3})" for n in range(33))
+    typescript = "\n".join(f"  const v{n} = await fetchThing({n});" for n in range(14))
+    return (
+        "Here is the implementation and its client.\n\n"
+        f"```python\ndef run():\n{python}\n    return value_0\n```\n\n"
+        f"```ts\nexport async function load() {{\n{typescript}\n}}\n```\n\n{_CODE_REPLY_DONE}"
+    )
+
+
+def test_code_reply_completion_keeps_reader_at_bottom(
+    page: Page,
+    seeded_session: tuple[str, str],
+    mock_llm_server_url: str,
+) -> None:
+    """The reader at the end of a streamed reply is still at the end after it completes."""
+    base_url, session_id = seeded_session
+    _seed_turns(session_id)
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": _code_reply(), "stream": True, "chunk_delay": 0.02}],
+        key="turn-end-follow",
+        match=_CODE_PROMPT,
+    )
+
+    page.set_viewport_size(_VIEWPORT)
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_text(_NEWEST_REPLY).first).to_be_visible(timeout=30_000)
+    assert page.evaluate(_TAG_SCROLLER), "transcript did not overflow; seed more turns"
+    page.wait_for_timeout(500)
+
+    composer = page.get_by_label("Message the agent")
+    expect(composer).to_be_visible(timeout=30_000)
+    composer.fill(_CODE_PROMPT)
+    page.get_by_role("button", name="Send", exact=True).click()
+    expect(page.get_by_text(_CODE_REPLY_DONE).first).to_be_visible(timeout=60_000)
+    expect(page.get_by_test_id("working-indicator")).to_have_count(0, timeout=60_000)
+
+    distance = page.evaluate(_SETTLED_DISTANCE_FROM_END_JS)
+    assert distance <= _END_SLACK_PX, f"reader left {distance}px above the end"

@@ -22,7 +22,7 @@ import asyncio
 from pathlib import Path
 
 import respx
-from fakes import FakeOmnigentServer, RecordingSlackClient
+from fakes import FakeOmnigentServer, RecordingSlackClient, resolve_test_auth
 from omnigent_slack.models import UserConfig
 from omnigent_slack.omnigent import OmnigentClientPool
 from omnigent_slack.service import _MANAGED_SANDBOX_NOT_READY_TEXT, SlackOmnigentService
@@ -88,7 +88,7 @@ async def test_managed_still_provisioning_surfaces_curated_notice(tmp_path: Path
 
     store = await _store(tmp_path)
     await _configure_managed_user(store, "T1", "U1")
-    pool = OmnigentClientPool()
+    pool = OmnigentClientPool(auth_resolver=resolve_test_auth)
     service = SlackOmnigentService(store=store, pool=pool, setup=_NoopSetup(), server_url=_SERVER)
     client = RecordingSlackClient()
 

@@ -50,7 +50,6 @@ import json
 import os
 import secrets
 import signal
-import socket
 import subprocess
 import sys
 import tarfile
@@ -60,6 +59,8 @@ from pathlib import Path
 
 import httpx
 import pytest
+
+from tests._helpers.live_server import find_free_port
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -121,12 +122,6 @@ _HEALTH_TIMEOUT_S = 90.0
 _client = httpx.Client(trust_env=False, timeout=30.0)
 
 
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
 def _bundle(files: dict[str, str]) -> bytes:
     """Gzip a mapping of arcname -> YAML text as a session bundle."""
     buf = io.BytesIO()
@@ -152,7 +147,7 @@ def spec_probe_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]
     for path in (artifacts, config_home, home_dir):
         path.mkdir(parents=True, exist_ok=True)
 
-    port = _free_port()
+    port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     env = {
         **os.environ,

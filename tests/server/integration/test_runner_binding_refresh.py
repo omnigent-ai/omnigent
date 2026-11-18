@@ -26,7 +26,7 @@ async def test_binding_change_does_not_hide_offline_runner(
     original_runner_id: str | None,
     replacement_runner_id: str | None,
 ) -> None:
-    """Re-address a concurrent rebind once; a stable offline binding still fails."""
+    """Re-address a concurrent rebind once; a stable offline binding is never hidden."""
     agent = await create_test_agent(client)
     created = await client.post(
         "/v1/sessions",
@@ -67,6 +67,13 @@ async def test_binding_change_does_not_hide_offline_runner(
         assert not [item for item in items if item["type"] in {"message", "error"}], items
         response = await client.post(f"/v1/sessions/{session_id}/events", json=body)
 
+    if replacement_runner_id is not None:
+        # A host-less runner that stays bound can't be relaunched: refused, nothing recorded.
+        assert response.status_code == 503, response.text
+        assert response.json()["error"]["code"] == "runner_unavailable", response.text
+        items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
+        assert not [item for item in items if item["type"] in {"message", "error"}], items
+        return
     assert response.status_code == 202, response.text
     items = (await client.get(f"/v1/sessions/{session_id}/items")).json()["data"]
     assert len([item for item in items if item["type"] == "message"]) == 1, items

@@ -11,11 +11,12 @@ on the run's terminal :class:`cursor_sdk.RunResult`.
 
 Policy enforcement covers three phases: PHASE_LLM_REQUEST (pre-send),
 PHASE_LLM_RESPONSE (post-response), and PHASE_TOOL_CALL (native tools).
-Cursor's native tools execute inside the Cursor process so they cannot be
-pre-blocked, but when a non-bridged tool call is observed the executor
-evaluates PHASE_TOOL_CALL and cancels the run on DENY.  Bridged Omnigent
-tools (MCP-wrapped) are already gated server-side via the dispatch bridge
-and are skipped to avoid double evaluation.
+On Linux and macOS, Cursor's preToolUse hook sends each native tool call to
+this process before it runs; the hook lives in a private home that Cursor's
+sandbox keeps the tools out of. Elsewhere Cursor has no filesystem
+isolation, so the hook stays in the workspace and the executor also cancels
+the run when it observes a denied call. Bridged Omnigent tools (MCP-wrapped)
+are gated by the dispatch bridge and are skipped to avoid double evaluation.
 
 Crucially, Omnigent's spec-declared tools (``sys_session_send`` et al.) are
 bridged into Cursor **in-process** via the SDK's ``custom_tools``: each
@@ -46,7 +47,14 @@ import contextlib
 import json
 import logging
 import os
+import shlex
+import shutil
+import socket
+import stat
+import struct
+import subprocess
 import sys
+import tempfile
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -135,6 +143,52 @@ _TOOL_CALL_TIMEOUT_S = 1800.0
 # to the web-UI approval card — mirrors the server-side ``ask_timeout`` default
 # and the ``read_timeout`` used by ``cursor_policy_hook.py``.
 _HOOK_APPROVAL_TIMEOUT_S = 86400
+_POLICY_REQUEST_MAX_BYTES = 1024 * 1024
+# macOS ``getsockopt`` names for a Unix socket peer; the socket module has none.
+_DARWIN_SOL_LOCAL = 0
+_DARWIN_LOCAL_PEERCRED = 0x001
+_DARWIN_LOCAL_PEERPID = 0x002
+
+
+def _policy_gate_supported() -> bool:
+    """Whether Cursor's sandbox can keep native tools out of the policy home.
+
+    Cursor isolates the filesystem on Linux and macOS. On other platforms it
+    does not, so the hook stays in the workspace as before.
+    """
+    return sys.platform in ("linux", "darwin")
+
+
+def _policy_hook_runtime_paths() -> list[Path]:
+    """The interpreter that runs the policy hook and every directory it imports from."""
+    interpreter = Path(sys.executable).resolve(strict=True)
+    listed = subprocess.run(
+        [str(interpreter), "-I", "-c", "import json, sys; print(json.dumps(sys.path))"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+        env={"PATH": "/usr/local/bin:/usr/bin:/bin", "LANG": "C.UTF-8"},
+    )
+    return [interpreter, *(Path(entry).resolve() for entry in json.loads(listed.stdout) if entry)]
+
+
+def _darwin_peer_is_unsandboxed(peer_socket: socket.socket) -> bool:
+    """Whether a macOS Unix-socket peer runs as this user outside any sandbox."""
+    import ctypes
+
+    credentials = peer_socket.getsockopt(_DARWIN_SOL_LOCAL, _DARWIN_LOCAL_PEERCRED, 76)
+    _version, peer_uid = struct.unpack_from("II", credentials)
+    (peer_pid,) = struct.unpack(
+        "i", peer_socket.getsockopt(_DARWIN_SOL_LOCAL, _DARWIN_LOCAL_PEERPID, 4)
+    )
+    if peer_pid <= 0 or peer_uid != os.getuid():
+        return False
+    sandbox_check = ctypes.CDLL("/usr/lib/libSystem.B.dylib").sandbox_check
+    sandbox_check.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int]
+    sandbox_check.restype = ctypes.c_int
+    # 0 means the process has no sandbox profile; anything else is not trusted.
+    return sandbox_check(peer_pid, None, 0) == 0
 
 
 def _resolve_model(model: str | None) -> str:
@@ -180,7 +234,7 @@ async def _resolve_model_against_catalog(
         listing = list_models(api_key=api_key)
         raw = await listing if isinstance(listing, Awaitable) else listing
         catalog: list[object] = list(raw) if isinstance(raw, Iterable) else []
-    except Exception:  # noqa: BLE001 — any listing failure degrades to backend-side validation
+    except Exception:  # any listing failure degrades to backend-side validation
         logger.warning(
             "CursorExecutor: model listing failed; dispatching %r unverified.",
             requested,
@@ -575,6 +629,33 @@ async def _bridge_spawn_in_cwd(cwd: str) -> AsyncIterator[None]:
 
 
 @dataclass
+class _CursorPolicyGate:
+    home: Path
+    server: asyncio.AbstractServer
+    home_identity: tuple[int, int]
+    # Connections still being answered, e.g. waiting on a user's approval.
+    handlers: set[asyncio.Task[None]] = field(default_factory=set)
+
+    async def close(self) -> None:
+        self.server.close()
+        # A handler can wait a day for an approval; cancel it so closing returns.
+        pending = list(self.handlers)
+        for handler in pending:
+            handler.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        await self.server.wait_closed()
+        try:
+            current = self.home.lstat()
+        except FileNotFoundError:
+            return
+        if (
+            stat.S_ISDIR(current.st_mode)
+            and (current.st_dev, current.st_ino) == self.home_identity
+        ):
+            shutil.rmtree(self.home)
+
+
+@dataclass
 class _CursorSessionState:
     """Per-Omnigent-conversation SDK session state."""
 
@@ -586,6 +667,7 @@ class _CursorSessionState:
     tools_fingerprint: str | None = None
     has_sent_prompt: bool = False
     hooks_file: Path | None = field(default=None, repr=False)
+    policy_gate: _CursorPolicyGate | None = None
 
 
 class CursorExecutor(Executor):
@@ -724,6 +806,34 @@ class CursorExecutor(Executor):
 
         return {"block": False, "reason": ""}
 
+    async def _gate_native_tool(self, name: str, args: _JsonObject) -> _PolicyGate:
+        """Resolve policy and user approval before Cursor runs a native tool; fails closed.
+
+        The server resolves an ASK verdict before it answers, so an ASK that
+        reaches here is denied and never prompts.
+        """
+        evaluator = self._policy_evaluator
+        if evaluator is None:
+            return {"block": True, "reason": "policy evaluator unavailable"}
+        verdict = await evaluator("PHASE_TOOL_CALL", {"name": name, "arguments": args})
+        action = getattr(verdict, "action", None)
+        if action not in {"POLICY_ACTION_ALLOW", "POLICY_ACTION_UNSPECIFIED"}:
+            return {
+                "block": True,
+                "reason": getattr(verdict, "reason", "") or "blocked by policy",
+            }
+
+        if self._permission_mode in ("auto", "bypassPermissions"):
+            return {"block": False, "reason": ""}
+
+        handler = self._elicitation_handler
+        if handler is None:
+            return {"block": True, "reason": "approval handler unavailable"}
+        logger.info("surfacing elicitation for native cursor tool %s", name)
+        if await handler(name, args):
+            return {"block": False, "reason": ""}
+        return {"block": True, "reason": "turn denied via web-UI elicitation"}
+
     # -- custom-tool bridge -------------------------------------------------
 
     def _make_custom_tools(
@@ -796,6 +906,305 @@ class CursorExecutor(Executor):
 
     # -- session lifecycle --------------------------------------------------
 
+    @staticmethod
+    def _trusted_policy_peer(writer: asyncio.StreamWriter) -> bool:
+        """Accept hook processes, not native tools running in Cursor's sandbox."""
+        peer_socket = writer.get_extra_info("socket")
+        if peer_socket is None:
+            return False
+        if sys.platform == "darwin":
+            return _darwin_peer_is_unsandboxed(peer_socket)
+        if sys.platform == "linux":
+            credentials = peer_socket.getsockopt(
+                socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
+            )
+            peer_pid, peer_uid, _ = struct.unpack("3i", credentials)
+            if peer_pid <= 0 or peer_uid != os.getuid():
+                return False
+            peer_namespace = os.stat(f"/proc/{peer_pid}/ns/mnt")
+            own_namespace = os.stat("/proc/self/ns/mnt")
+            return (peer_namespace.st_dev, peer_namespace.st_ino) == (
+                own_namespace.st_dev,
+                own_namespace.st_ino,
+            )
+        return False
+
+    async def _handle_policy_gate_connection(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        response: dict[str, str] = {
+            "permission": "deny",
+            "agent_message": "Cursor policy gate unavailable",
+        }
+        try:
+            await self._answer_policy_request(reader, writer, response)
+        finally:
+            # Also on cancellation, so the hook sees the stream end and denies.
+            writer.close()
+            with contextlib.suppress(ConnectionError, OSError):
+                await writer.wait_closed()
+
+    async def _answer_policy_request(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        response: dict[str, str],
+    ) -> None:
+        try:
+            if not self._trusted_policy_peer(writer):
+                raise PermissionError("Cursor policy request from sandboxed process")
+            raw = await asyncio.wait_for(reader.readline(), timeout=30)
+            if not raw.endswith(b"\n") or len(raw) > _POLICY_REQUEST_MAX_BYTES:
+                raise ValueError("invalid Cursor policy request length")
+            request = json.loads(raw)
+            if not isinstance(request, dict):
+                raise ValueError("invalid Cursor policy request")
+            name = request.get("name")
+            arguments = request.get("arguments")
+            if not isinstance(name, str) or not name or not isinstance(arguments, dict):
+                raise ValueError("invalid Cursor tool call")
+            gate = await self._gate_native_tool(name, arguments)
+            if not gate["block"]:
+                response = {"permission": "allow"}
+            else:
+                response = {
+                    "permission": "deny",
+                    "agent_message": f"Tool {name!r} denied: {gate['reason'][:4000]}",
+                }
+        except PermissionError as exc:
+            logger.warning("Cursor pre-tool policy gate rejected client: %s", exc)
+        except Exception:  # a broken policy channel must block the tool
+            logger.exception("Cursor pre-tool policy gate failed")
+        with contextlib.suppress(ConnectionError, OSError):
+            writer.write((json.dumps(response) + "\n").encode("utf-8"))
+            await writer.drain()
+
+    async def _start_policy_gate(self, cwd: str) -> _CursorPolicyGate:
+        if not _policy_gate_supported():
+            raise RuntimeError("Cursor SDK policy gate requires Linux or macOS sandbox isolation")
+        workspace = Path(cwd).resolve(strict=True)
+        home_root = Path.home().resolve(strict=True)
+        home_stat = home_root.stat()
+        if (
+            not stat.S_ISDIR(home_stat.st_mode)
+            or home_stat.st_uid != os.getuid()
+            or home_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+            or home_root.is_relative_to(workspace)
+        ):
+            raise RuntimeError("Cursor SDK needs an owner-only home outside the workspace")
+
+        private_home = Path(tempfile.mkdtemp(prefix=".omnigent-cursor-", dir=home_root))
+        private_stat = private_home.lstat()
+        server: asyncio.AbstractServer | None = None
+        try:
+            hook_source = (
+                Path(__file__).with_name("cursor_policy_gate_hook.py").resolve(strict=True)
+            )
+            interpreter = Path(sys.executable).resolve(strict=True)
+            # Cursor's tools write the workspace, so nothing the hook runs may be in it.
+            if hook_source.is_relative_to(workspace) or any(
+                path.is_relative_to(workspace) or workspace.is_relative_to(path)
+                for path in _policy_hook_runtime_paths()
+            ):
+                raise RuntimeError("Cursor policy hook code must be outside the workspace")
+            hook_script = private_home / "cursor_policy_gate_hook.py"
+            shutil.copyfile(hook_source, hook_script)
+            hook_script.chmod(0o500)
+
+            socket_path = private_home / "policy.sock"
+            handlers: set[asyncio.Task[None]] = set()
+
+            async def serve(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+                task = asyncio.current_task()
+                assert task is not None
+                handlers.add(task)
+                try:
+                    await self._handle_policy_gate_connection(reader, writer)
+                finally:
+                    handlers.discard(task)
+
+            # A socket address is limited to about 100 bytes, which a long home
+            # exceeds. Bind by name from inside the directory instead.
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                async with _bridge_spawn_cwd_lock():
+                    previous_cwd = os.getcwd()
+                    os.chdir(private_home)
+                    try:
+                        listener.bind(socket_path.name)
+                    finally:
+                        os.chdir(previous_cwd)
+                socket_path.chmod(0o600)
+                server = await asyncio.start_unix_server(
+                    serve, sock=listener, limit=_POLICY_REQUEST_MAX_BYTES + 1
+                )
+            except BaseException:
+                listener.close()
+                raise
+            config_dir = private_home / ".cursor"
+            config_dir.mkdir(mode=0o700)
+            config = {
+                "version": 1,
+                "hooks": {
+                    "preToolUse": [
+                        {
+                            "command": shlex.join(
+                                [
+                                    str(interpreter),
+                                    "-I",
+                                    str(hook_script),
+                                    str(socket_path),
+                                ]
+                            ),
+                            "timeout": _HOOK_APPROVAL_TIMEOUT_S,
+                            "failClosed": True,
+                        }
+                    ]
+                },
+            }
+            config_file = config_dir / "hooks.json"
+            config_file.write_text(json.dumps(config), encoding="utf-8")
+            config_file.chmod(0o400)
+            return _CursorPolicyGate(
+                home=private_home,
+                server=server,
+                home_identity=(private_stat.st_dev, private_stat.st_ino),
+                handlers=handlers,
+            )
+        except BaseException:
+            if server is not None:
+                server.close()
+                await server.wait_closed()
+            shutil.rmtree(private_home)
+            raise
+
+    @staticmethod
+    def _bridge_command(private_home: Path, cwd: str) -> list[str]:
+        from cursor_sdk._vendor import resolve_bridge_path  # type: ignore[import-not-found]
+
+        bridge_name = resolve_bridge_path()
+        bridge_path = Path(bridge_name)
+        if not bridge_path.is_absolute():
+            resolved = shutil.which(bridge_name)
+            if resolved is None:
+                raise RuntimeError("Cursor SDK bridge not found")
+            bridge_path = Path(resolved)
+        bridge_path = bridge_path.resolve(strict=True)
+        if bridge_path.is_relative_to(Path(cwd).resolve(strict=True)):
+            raise RuntimeError("Cursor SDK bridge must be outside the workspace")
+        if not Path("/usr/bin/env").is_file():
+            raise RuntimeError("Cursor SDK requires /usr/bin/env for an isolated bridge")
+        return [
+            "/usr/bin/env",
+            "-i",
+            f"HOME={private_home}",
+            "PATH=/usr/local/bin:/usr/bin:/bin",
+            "LANG=C.UTF-8",
+            str(bridge_path),
+        ]
+
+    def _check_bridged_tool_isolation(self, tools: list[ToolSpec], cwd: str) -> None:
+        if any(str(tool.get("name", "")).startswith("sys_terminal_") for tool in tools):
+            raise RuntimeError("Cursor SDK terminal tools need a verified sandbox boundary")
+        if not any(str(tool.get("name", "")).startswith("sys_os_") for tool in tools):
+            return
+        if self._os_env_spec is None:
+            raise RuntimeError("Cursor SDK OS tools require an isolated OS environment")
+        from .sandbox import resolve_sandbox
+
+        os_env_cwd = Path(self._os_env_spec.cwd or cwd).resolve(strict=True)
+        sandbox = resolve_sandbox(self._os_env_spec, os_env_cwd)
+        if not sandbox.active:
+            raise RuntimeError("Cursor SDK OS tools require an active sandbox")
+        # A directory can be granted through ``write_files`` as well.
+        grants = [*sandbox.write_roots, *sandbox.write_files]
+        home_root = Path.home().resolve(strict=True)
+        if any(home_root.is_relative_to(grant) for grant in grants):
+            raise RuntimeError("Cursor SDK OS tools cannot write the policy home")
+        # The hook is only as trustworthy as the interpreter and modules it loads.
+        for path in _policy_hook_runtime_paths():
+            if any(path.is_relative_to(grant) or grant.is_relative_to(path) for grant in grants):
+                raise RuntimeError("Cursor SDK OS tools cannot write the policy hook's Python")
+
+    async def _ensure_isolated_session(
+        self,
+        state: _CursorSessionState,
+        model: str,
+        tools: list[ToolSpec],
+    ) -> None:
+        """Launch the local bridge and create the SDK agent if not already live.
+
+        On any bring-up failure the partially-created client is closed before
+        propagating, so a bad ``CURSOR_API_KEY`` / launch error can't orphan a
+        bridge subprocess.
+
+        Policy hooks and state live in a private home outside the workspace.
+        Cursor's sandbox prevents native tools from changing that home, and
+        the hook forwards to this process without a bearer in a file or env.
+        """
+        if state.agent is not None:
+            return
+        if not self._api_key:
+            raise RuntimeError("Cursor SDK requires a Cursor API key")
+        cwd = os.path.abspath(self._cwd or os.getcwd())
+        self._check_bridged_tool_isolation(tools, cwd)
+        try:
+            from cursor_sdk import AsyncAgent, AsyncClient, LocalAgentOptions
+        except ImportError as exc:
+            from omnigent.onboarding.cursor_auth import CURSOR_EXTRA
+            from omnigent.onboarding.extra_install import extra_install_display
+
+            raise ImportError(
+                "CursorExecutor requires the 'cursor-sdk' package. "
+                f"Install it with: {extra_install_display(CURSOR_EXTRA)}"
+            ) from exc
+
+        loop = asyncio.get_running_loop()
+        gate = await self._start_policy_gate(cwd)
+
+        # Spawn the bridge with the process cwd pointing at the workspace so
+        # Cursor's shell tools execute there, not in the runner daemon's
+        # directory (the SDK spawns the bridge without a cwd=). See
+        # _bridge_spawn_in_cwd.
+        try:
+            bridge_command = self._bridge_command(gate.home, cwd)
+            async with _bridge_spawn_in_cwd(cwd):
+                client = await AsyncClient.launch_bridge(
+                    command=bridge_command,
+                    workspace=cwd,
+                    state_root=str(gate.home / "state"),
+                )
+        except BaseException:
+            await gate.close()
+            raise
+        try:
+            model = await _resolve_model_against_catalog(client, model, self._api_key)
+            local_kwargs: _JsonObject = {
+                "cwd": cwd,
+                "custom_tools": self._make_custom_tools(tools, loop) or None,
+                # No SDK approval channel is wired: attempts to leave the
+                # workspace sandbox must be rejected by Cursor itself.
+                "sandbox_options": {"enabled": True},
+                "auto_review": False,
+                "setting_sources": ["user"],
+            }
+            local = LocalAgentOptions(**local_kwargs)
+            agent = await AsyncAgent.create(
+                client=client,
+                model=model,
+                api_key=self._api_key,
+                name=self._agent_name,
+                local=local,
+            )
+        except BaseException:
+            await _safe_close(client)
+            await gate.close()
+            raise
+        state.client = client
+        state.agent = agent
+        state.model = model
+        state.policy_gate = gate
+
     async def _ensure_session(
         self,
         state: _CursorSessionState,
@@ -813,8 +1222,14 @@ class CursorExecutor(Executor):
         PHASE_TOOL_CALL policies are enforced on ALL Cursor native tools --
         including those that execute silently without emitting ``tool_call``
         SDK messages.
+
+        Where Cursor isolates the filesystem, :meth:`_ensure_isolated_session`
+        keeps the hook in a private home instead.
         """
         if state.agent is not None:
+            return
+        if _policy_gate_supported():
+            await self._ensure_isolated_session(state, model, tools)
             return
         try:
             from cursor_sdk import AsyncAgent, AsyncClient, LocalAgentOptions
@@ -998,8 +1413,14 @@ class CursorExecutor(Executor):
                             # the elicitation handler is wired — the
                             # latter alone (no server connection) still
                             # surfaces an approval card natively.
-                            if not event.metadata.get("is_bridged") and (
-                                policy_eval is not None or self._elicitation_handler is not None
+                            # The policy home's hook already gated the call.
+                            if (
+                                state.policy_gate is None
+                                and not event.metadata.get("is_bridged")
+                                and (
+                                    policy_eval is not None
+                                    or self._elicitation_handler is not None
+                                )
                             ):
                                 gate = await self._evaluate_native_tool_policy(
                                     event.name, event.args if isinstance(event.args, dict) else {}
@@ -1091,6 +1512,9 @@ class CursorExecutor(Executor):
         if state.client is not None:
             await _safe_close(state.client)
             state.client = None
+        if state.policy_gate is not None:
+            await state.policy_gate.close()
+            state.policy_gate = None
         # Best-effort cleanup of hooks.json and the wrapper script.
         if state.hooks_file is not None:
             try:

@@ -214,6 +214,23 @@ def test_normalize_status_payload_extracts_record() -> None:
     assert normalize_status_payload({"model": "claude-opus-4-8"}) is None
 
 
+@pytest.mark.parametrize(
+    ("version", "kept"),
+    [("2.1.299", True), ("", False), (2.1, False), ("9" * 33, False)],
+)
+def test_normalize_status_payload_keeps_a_short_claude_code_version(
+    version: object, kept: bool
+) -> None:
+    """The statusLine's Claude Code version is kept for delivery diagnostics."""
+    from omnigent.harnesses.claude_native.status import normalize_status_payload
+
+    record = normalize_status_payload(
+        {"context_window": {"context_window_size": 200_000}, "version": version}
+    )
+    assert record is not None
+    assert record.get("claude_code_version") == (version if kept else None)
+
+
 def test_sync_raw_status_context_normalizes_and_retries(tmp_path: Path) -> None:
     """The forwarder-side sync normalizes raw captures and tolerates junk.
 

@@ -250,19 +250,24 @@ class TestModelFamilyMismatch:
 @pytest.mark.parametrize(
     ("model", "expected"),
     [
-        # Bare canonical vendor ids gain the gateway prefix mechanically.
-        ("claude-opus-4-8", "databricks-claude-opus-4-8"),
-        ("claude-sonnet-4-6", "databricks-claude-sonnet-4-6"),
-        ("gpt-5-4", "databricks-gpt-5-4"),
-        ("gpt-5.4-mini", "databricks-gpt-5.4-mini"),
+        # Bare canonical vendor ids gain the Unity Catalog prefix mechanically.
+        ("claude-opus-4-8", "system.ai.claude-opus-4-8"),
+        ("claude-sonnet-4-6", "system.ai.claude-sonnet-4-6"),
+        ("gpt-5-4", "system.ai.gpt-5-4"),
+        ("gpt-5.4-mini", "system.ai.gpt-5.4-mini"),
         # The codex-compatible families localize the same way: they are
         # dispatchable, so a caller can name a bare one, and leaving them out
         # persisted the bare id verbatim onto a gateway-backed child.
-        ("glm-5-2", "databricks-glm-5-2"),
-        ("kimi-k2.6", "databricks-kimi-k2.6"),
-        # Already gateway-local: no double prefix.
-        ("databricks-claude-opus-4-8", "databricks-claude-opus-4-8"),
-        ("databricks-glm-5-2", "databricks-glm-5-2"),
+        ("glm-5-2", "system.ai.glm-5-2"),
+        ("kimi-k2.6", "system.ai.kimi-k2.6"),
+        # Legacy and current gateway spellings canonicalize to Unity Catalog.
+        ("databricks-claude-opus-4-8", "system.ai.claude-opus-4-8"),
+        ("databricks-glm-5-2", "system.ai.glm-5-2"),
+        (
+            "databricks-meta-llama-3.3-70b-instruct",
+            "system.ai.meta-llama-3.3-70b-instruct",
+        ),
+        ("system.ai.gpt-5-4", "system.ai.gpt-5-4"),
         # Non-mechanical shapes pass through to the fail-loud path:
         # vendor-prefixed, slash-routed, alias-bracketed, other-family.
         ("us.anthropic.claude-sonnet-4-6", "us.anthropic.claude-sonnet-4-6"),
@@ -289,6 +294,7 @@ def test_normalize_localizes_canonical_ids_for_gateway_children(model: str, expe
         # Gateway-local ids lose the prefix for vendor-direct children.
         ("databricks-claude-opus-4-8", "claude-opus-4-8"),
         ("databricks-gpt-5-4", "gpt-5-4"),
+        ("system.ai.gpt-5-4", "gpt-5-4"),
         # The stripped remainder must itself be a mechanical claude/gpt
         # id — other families have no canonical vendor counterpart.
         ("databricks-meta-llama-3.3-70b-instruct", "databricks-meta-llama-3.3-70b-instruct"),
@@ -350,8 +356,8 @@ def test_normalize_passes_through_for_unmapped_provider_kinds(
 )
 def test_canonical_model_spelling(model: str, expected: str) -> None:
     """
-    The canonicalizer strips exactly the mechanical ``databricks-``
-    prefix and nothing else.
+    The canonicalizer strips exactly the mechanical Databricks model prefix
+    and nothing else.
 
     This is the single spelling-equivalence rule shared by dispatch
     normalization and cost-tier ranking; an over-eager strip here would
@@ -384,7 +390,7 @@ def test_family_tokens_survive_normalization_in_both_directions(harness: str, mo
     localized id round-trips back to a compatible id when stripped.
     """
     localized = normalize_model_for_provider(model, "databricks")
-    assert localized == f"databricks-{model}"
+    assert localized == f"system.ai.{model}"
     # Compatible before AND after localization.
     assert model_family_mismatch(harness, model) is None
     assert model_family_mismatch(harness, localized) is None

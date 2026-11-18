@@ -29,8 +29,8 @@ the per-surface mechanics, and captioning. Use the CUJ ID as the facet and
   (`OMNIGENT_RUNNER_ID` is set), strip the inherited runner variables as the
   guide describes, and retry before reporting a blocker.
 
-Never commit recordings; they ride in the PR Demo section and the CI artifact
-bundle.
+Never commit recordings; upload them to the PR as described in
+`feature-publish`.
 
 ## When a recording can't be made
 

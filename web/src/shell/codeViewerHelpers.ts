@@ -51,6 +51,66 @@ export const MONACO_SPLIT_BREAKPOINT = 900;
  */
 export const SPLIT_DIFF_MIN_WIDTH = 920;
 
+export const MAX_RICH_MARKDOWN_BYTES = 256 * 1024;
+
+export const MAX_PREVIEW_MARKDOWN_BYTES = 1024 * 1024;
+
+/** Large Markdown skips the rich editor, whose load and resize cost grow with the document. */
+export function isMarkdownTooLargeForRichView(lang: string, content: string): boolean {
+  return (
+    lang === "markdown" && new TextEncoder().encode(content).byteLength > MAX_RICH_MARKDOWN_BYTES
+  );
+}
+
+/** Very large Markdown opens straight in source; the rendered preview still parses it all. */
+export function isMarkdownTooLargeForPreview(lang: string, content: string): boolean {
+  return (
+    lang === "markdown" && new TextEncoder().encode(content).byteLength > MAX_PREVIEW_MARKDOWN_BYTES
+  );
+}
+
+interface HastNode {
+  type: string;
+  children?: readonly HastNode[];
+}
+
+/** True when a rehype tree holds raw HTML that rehype-raw must parse. */
+export function hasRawHtmlNode(node: HastNode): boolean {
+  return node.type === "raw" || (node.children?.some(hasRawHtmlNode) ?? false);
+}
+
+export type PreviewableViewMode = "editor" | "preview" | "source";
+
+/**
+ * Resolve the surface a file opens on. Large Markdown opens in Preview and edits
+ * in source; HTML and notebooks have no rich editor, so "editor" means Preview.
+ */
+export function resolveFileViewMode({
+  isPreviewable,
+  lang,
+  largeMarkdown,
+  largeMarkdownVisitMode,
+  deepLinkedComment,
+  preference,
+}: {
+  isPreviewable: boolean;
+  lang: string;
+  largeMarkdown: boolean;
+  /** Preview/Source picked during this visit to a large Markdown file. */
+  largeMarkdownVisitMode?: "preview" | "source";
+  /** A ?comment= link targets this file and needs a surface that shows anchors. */
+  deepLinkedComment: boolean;
+  preference: PreviewableViewMode;
+}): PreviewableViewMode {
+  if (!isPreviewable) return "source";
+  if (lang === "markdown" && largeMarkdown) {
+    if (largeMarkdownVisitMode) return largeMarkdownVisitMode;
+    return deepLinkedComment || preference === "source" ? "source" : "preview";
+  }
+  if (lang === "markdown") return deepLinkedComment ? "editor" : preference;
+  return preference === "editor" ? "preview" : preference;
+}
+
 // ---------------------------------------------------------------------------
 // File-type helpers
 // ---------------------------------------------------------------------------
@@ -260,94 +320,96 @@ export function modelViewerTheme(resolved: ResolvedThemeMode): ModelViewerTheme 
   return MODEL_VIEWER_THEMES[resolved];
 }
 
+/** The Shiki language for each file extension the viewer highlights. */
+export const LANGUAGE_BY_EXTENSION: Readonly<Record<string, BundledLanguage>> = {
+  js: "javascript",
+  jsx: "jsx",
+  ts: "typescript",
+  tsx: "tsx",
+  py: "python",
+  rs: "rust",
+  go: "go",
+  java: "java",
+  scala: "scala",
+  sc: "scala",
+  kt: "kotlin",
+  kts: "kotlin",
+  groovy: "groovy",
+  gradle: "groovy",
+  clj: "clojure",
+  cljs: "clojure",
+  cljc: "clojure",
+  ex: "elixir",
+  exs: "elixir",
+  erl: "erlang",
+  hrl: "erlang",
+  hs: "haskell",
+  ml: "ocaml",
+  mli: "ocaml",
+  rb: "ruby",
+  php: "php",
+  swift: "swift",
+  dart: "dart",
+  lua: "lua",
+  pl: "perl",
+  pm: "perl",
+  r: "r",
+  jl: "julia",
+  cs: "csharp",
+  c: "c",
+  cpp: "cpp",
+  cc: "cpp",
+  cxx: "cpp",
+  h: "c",
+  hpp: "cpp",
+  hh: "cpp",
+  m: "objective-c",
+  mm: "objective-c",
+  css: "css",
+  scss: "scss",
+  less: "less",
+  html: "html",
+  htm: "html",
+  xml: "xml",
+  svg: "xml",
+  vue: "vue",
+  svelte: "svelte",
+  astro: "astro",
+  json: "json",
+  jsonc: "json",
+  yaml: "yaml",
+  yml: "yaml",
+  toml: "toml",
+  ini: "ini",
+  cfg: "ini",
+  md: "markdown",
+  markdown: "markdown",
+  tex: "latex",
+  sh: "bash",
+  bash: "bash",
+  zsh: "bash",
+  ps1: "powershell",
+  bat: "bat",
+  cmd: "bat",
+  sql: "sql",
+  graphql: "graphql",
+  gql: "graphql",
+  proto: "proto",
+  dockerfile: "dockerfile",
+  diff: "diff",
+  patch: "diff",
+  csv: "csv",
+  cmake: "cmake",
+};
+
 export function detectLang(path: string): BundledLanguage | "text" {
   const ext = path.split(".").pop()?.toLowerCase() ?? "";
-  const map: Record<string, BundledLanguage> = {
-    js: "javascript",
-    jsx: "jsx",
-    ts: "typescript",
-    tsx: "tsx",
-    py: "python",
-    rs: "rust",
-    go: "go",
-    java: "java",
-    scala: "scala",
-    sc: "scala",
-    kt: "kotlin",
-    kts: "kotlin",
-    groovy: "groovy",
-    gradle: "groovy",
-    clj: "clojure",
-    cljs: "clojure",
-    cljc: "clojure",
-    ex: "elixir",
-    exs: "elixir",
-    erl: "erlang",
-    hrl: "erlang",
-    hs: "haskell",
-    ml: "ocaml",
-    mli: "ocaml",
-    rb: "ruby",
-    php: "php",
-    swift: "swift",
-    dart: "dart",
-    lua: "lua",
-    pl: "perl",
-    pm: "perl",
-    r: "r",
-    jl: "julia",
-    cs: "csharp",
-    c: "c",
-    cpp: "cpp",
-    cc: "cpp",
-    cxx: "cpp",
-    h: "c",
-    hpp: "cpp",
-    hh: "cpp",
-    m: "objective-c",
-    mm: "objective-c",
-    css: "css",
-    scss: "scss",
-    less: "less",
-    html: "html",
-    htm: "html",
-    xml: "xml",
-    svg: "xml",
-    vue: "vue",
-    svelte: "svelte",
-    astro: "astro",
-    json: "json",
-    jsonc: "json",
-    yaml: "yaml",
-    yml: "yaml",
-    toml: "toml",
-    ini: "ini",
-    cfg: "ini",
-    md: "markdown",
-    markdown: "markdown",
-    tex: "latex",
-    sh: "bash",
-    bash: "bash",
-    zsh: "bash",
-    ps1: "powershell",
-    bat: "bat",
-    cmd: "bat",
-    sql: "sql",
-    graphql: "graphql",
-    gql: "graphql",
-    proto: "proto",
-    dockerfile: "dockerfile",
-    diff: "diff",
-    patch: "diff",
-    csv: "csv",
-    cmake: "cmake",
-  };
   // Files commonly identified by name rather than extension.
   const base = path.split(/[/\\]/).pop()?.toLowerCase() ?? "";
   if (base === "dockerfile") return "dockerfile";
   if (base === "makefile") return "make";
   if (base === "cmakelists.txt") return "cmake";
-  return map[ext] ?? "text";
+  return LANGUAGE_BY_EXTENSION[ext] ?? "text";
 }
 
 // ---------------------------------------------------------------------------
@@ -525,7 +587,7 @@ function scriptEnd(html: string, from: number): number {
  * anything still open at end of input swallows the rest, as in the parser. The
  * scan only moves forward because artifact text is processed on the host page.
  */
-function startTagEnd(html: string, tag: "head" | "html"): number {
+export function startTagEnd(html: string, tag: "head" | "html"): number {
   for (let i = html.indexOf("<"); i !== -1; i = html.indexOf("<", i)) {
     if (html.startsWith("<!--", i)) {
       // An empty comment may close abruptly (`<!-->`, `<!--->`); otherwise `-->` or `--!>` ends it.

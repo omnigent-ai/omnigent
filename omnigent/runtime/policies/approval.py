@@ -160,7 +160,7 @@ async def _await_elicitation(
         if result.set_labels:
             policy_engine.apply_label_writes(result.set_labels)
         if result.state_updates:
-            policy_engine.apply_state_updates(result.state_updates)
+            policy_engine.apply_state_updates(result.state_updates, approved=True)
     return approved
 
 

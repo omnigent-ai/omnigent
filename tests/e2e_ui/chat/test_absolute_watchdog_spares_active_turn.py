@@ -53,7 +53,8 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-from tests._helpers.session import bundle_files, post_session_bundle
+from tests._helpers.operator_agents import post_operator_session
+from tests._helpers.session import bundle_files
 from tests.e2e_ui.conftest import configure_mock_llm, set_fallback_mock_llm
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -210,7 +211,7 @@ def watchdog_session(
     name = f"watchdog_probe_{uuid.uuid4().hex[:8]}"
     model = f"watchdog-probe-{uuid.uuid4().hex[:8]}"
 
-    create_resp = post_session_bundle(
+    create_resp = post_operator_session(
         httpx.post, f"{live_server}/v1/sessions", _agent_bundle(name, model, str(ws)), timeout=30.0
     )
     create_resp.raise_for_status()

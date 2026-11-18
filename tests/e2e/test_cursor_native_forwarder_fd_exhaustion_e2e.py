@@ -54,7 +54,6 @@ import json
 import logging
 import os
 import resource
-import socket
 import sqlite3
 import subprocess
 import sys
@@ -68,6 +67,7 @@ import httpx
 import pytest
 import yaml
 
+from tests._helpers.live_server import find_free_port
 from tests._helpers.session import bundle_files, post_session_bundle
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -87,15 +87,6 @@ _RECOVERY_REPLY = "post-exhaustion recovery sentinel"
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _find_free_port() -> int:
-    """Return an ephemeral TCP port the OS considers free right now."""
-    s = socket.socket()
-    s.bind(("", 0))
-    port: int = s.getsockname()[1]
-    s.close()
-    return port
 
 
 def _build_minimal_agent_bundle() -> bytes:
@@ -208,7 +199,7 @@ async def _wait_for_mirrored_texts(
 @pytest.fixture(scope="module")
 def emfile_server() -> Iterator[str]:
     """Start a minimal Omnigent server subprocess; yield its base URL."""
-    port = _find_free_port()
+    port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     tmp_root = Path(tempfile.mkdtemp(prefix="cursor-fwd-emfile-e2e-"))
     db_path = tmp_root / "ap.db"

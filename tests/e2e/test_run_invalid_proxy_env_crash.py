@@ -11,9 +11,9 @@ environment and raises ``httpx.InvalidURL: Invalid port: ':'``. Because
 ``except (httpx.HTTPError, ValueError)`` guard misses it and the launch dies
 on the crash-handler screen instead of starting the session.
 
-This test spawns the real CLI as a subprocess with an isolated ``$HOME`` and
-the poison ``NO_PROXY`` value, and asserts the launch never reaches the
-crash handler. The launch is allowed to fail for unrelated environmental
+This test spawns the real CLI against a private local server, with an isolated
+``$HOME`` and the poison ``NO_PROXY`` value. The launch must never reach the
+crash handler. The launch is allowed to fail gracefully for environmental
 reasons (no model credentials) or to still be mid-bring-up at the timeout —
 it must simply never crash with the ``InvalidURL`` traceback.
 
@@ -27,9 +27,13 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
+import httpx
 import pytest
+
+from tests._helpers.live_server import isolated_local_server
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -94,7 +98,7 @@ _POST_PROBE_MARKERS = (
 @pytest.fixture
 def isolated_home(tmp_path: Path) -> Path:
     """An empty ``$HOME`` so the launch sees a fresh, credential-less machine."""
-    home = tmp_path / "home"
+    home = tmp_path / "server" / "server-home"
     (home / ".omnigent").mkdir(parents=True)
     return home
 
@@ -121,12 +125,17 @@ def _launch_env(home: Path) -> dict[str, str]:
     :returns: Environment for the ``omnigent run`` subprocess.
     """
     env = os.environ.copy()
+    harness_tmp_parent = env.get("OMNIGENT_HARNESS_TMP_PARENT")
     for key in _ENV_TO_CLEAR:
         env.pop(key, None)
     for key in [k for k in env if k.startswith(_ENV_PREFIXES_TO_CLEAR)]:
         env.pop(key, None)
+    if harness_tmp_parent is not None:
+        env["OMNIGENT_HARNESS_TMP_PARENT"] = harness_tmp_parent
     env["HOME"] = str(home)
     env["OMNIGENT_DATA_DIR"] = str(home / ".omnigent")
+    env["OMNIGENT_AUTH_PROVIDER"] = "header"
+    env["OMNIGENT_LOCAL_SINGLE_USER"] = "1"
     env["NO_PROXY"] = _POISON_NO_PROXY
     env["no_proxy"] = _POISON_NO_PROXY
     env["TERM"] = "dumb"
@@ -141,10 +150,28 @@ def _launch_env(home: Path) -> dict[str, str]:
     return env
 
 
+@pytest.fixture
+def server_url(tmp_path: Path, isolated_home: Path) -> Iterator[str]:
+    # A private port keeps other CLI tests' default-port cleanup from stopping us.
+    # Register it so plain `run` retains the local accounts-probe path.
+    bootstrap = (
+        "import sys\n"
+        "from omnigent.host.local_server import register_local_server\n"
+        "from omnigent.cli import main\n"
+        "register_local_server(int(sys.argv[sys.argv.index('--port') + 1]))\n"
+        "main()\n"
+    )
+    with isolated_local_server(
+        tmp_path / "server", bootstrap=bootstrap, base_env=_launch_env(isolated_home)
+    ) as base_url:
+        yield base_url
+
+
 @pytest.mark.timeout(_RUN_TIMEOUT_S + 90)
 def test_run_with_invalid_proxy_env_does_not_crash(
     isolated_home: Path,
     agent_yaml: Path,
+    server_url: str,
 ) -> None:
     """A malformed proxy env value must not crash the launch with InvalidURL.
 
@@ -186,10 +213,18 @@ def test_run_with_invalid_proxy_env_does_not_crash(
             output = proc.communicate()[0] or ""
             timed_out = True
     finally:
-        # The launch boots a local server/daemon before the crash point —
-        # stop it so nothing leaks across tests.
+        # Stop only our host; the fixture owns the server process.
         subprocess.run(
-            [sys.executable, "-m", "omnigent.cli", "stop"],
+            [
+                sys.executable,
+                "-m",
+                "omnigent.cli",
+                "host",
+                "stop",
+                "--server",
+                "",
+                "--force",
+            ],
             env=env,
             cwd=str(isolated_home),
             capture_output=True,
@@ -216,3 +251,5 @@ def test_run_with_invalid_proxy_env_does_not_crash(
         f"site) — none of {_POST_PROBE_MARKERS} appeared in the launch output "
         f"(timed_out={timed_out}).\n--- CLI output ---\n{output}"
     )
+    # The CLI must reuse our server, and host cleanup must leave it alive.
+    assert httpx.get(f"{server_url}/health", trust_env=False, timeout=5).status_code == 200

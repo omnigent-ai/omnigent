@@ -17,8 +17,9 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { Editor } from "@tiptap/core";
 import { Markdown } from "@tiptap/markdown";
-import { TaskItem, TaskList } from "@tiptap/extension-list";
+import { TaskItem } from "@tiptap/extension-list";
 import { StarterKit } from "@tiptap/starter-kit";
+import { BoundedTaskList } from "./tiptapBoundedTokenizers";
 
 let editor: Editor | null = null;
 let host: HTMLElement | null = null;
@@ -39,7 +40,7 @@ function makeEditor(markdown: string): Editor {
     element: host,
     extensions: [
       StarterKit.configure({ link: false, blockquote: false }),
-      TaskList,
+      BoundedTaskList,
       TaskItem.configure({ nested: true }),
       Markdown,
     ],

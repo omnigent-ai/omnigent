@@ -106,7 +106,7 @@ def _generate_ca(cert_path: Path, key_path: Path) -> None:
         ]
     )
 
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     cert = (
         x509.CertificateBuilder()
         .subject_name(subject)
@@ -162,7 +162,7 @@ def _is_expired(cert_path: Path) -> bool:
     try:
         data = cert_path.read_bytes()
         cert = x509.load_pem_x509_certificate(data)
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = datetime.datetime.now(datetime.UTC)
         return now >= cert.not_valid_after_utc
     except Exception:  # noqa: BLE001 — invalid/missing CA cert regenerates
         return True

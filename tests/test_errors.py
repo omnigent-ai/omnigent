@@ -18,6 +18,7 @@ from omnigent.errors import (
     ErrorPhase,
     OmnigentError,
     StaleCursorError,
+    WrongReplicaError,
     category_for_code,
     classify_exception,
     impact_for_code,
@@ -84,6 +85,7 @@ def test_omnigent_error_with_harness_violation_code_returns_500() -> None:
         (ErrorCode.CONFLICT, 409),
         (ErrorCode.INTERNAL_ERROR, 500),
         (ErrorCode.HARNESS_PROTOCOL_VIOLATION, 500),
+        (ErrorCode.HOST_OFFLINE, 503),
         (ErrorCode.UPSTREAM_CANCELLED, 499),
         (ErrorCode.UPSTREAM_PERMISSION_DENIED, 403),
         (ErrorCode.STALE_CURSOR, 400),
@@ -123,6 +125,7 @@ def test_every_error_code_has_a_concrete_category() -> None:
         (ErrorCode.HARNESS_PROTOCOL_VIOLATION, ErrorCategory.SERVER),
         (ErrorCode.WRONG_REPLICA, ErrorCategory.SERVER),
         (ErrorCode.RUNNER_UNAVAILABLE, ErrorCategory.CONFIG),
+        (ErrorCode.HOST_OFFLINE, ErrorCategory.USER),
         (ErrorCode.HARNESS_NOT_CONFIGURED, ErrorCategory.CONFIG),
         (ErrorCode.RUNNER_CAPABILITY_MISMATCH, ErrorCategory.CONFIG),
         (ErrorCode.NOT_FOUND, ErrorCategory.USER),
@@ -200,6 +203,7 @@ def test_every_error_code_has_an_impact() -> None:
         (ErrorCode.UNAUTHORIZED, ErrorImpact.BLOCKING),
         # Transient: self-healing, no lost progress.
         (ErrorCode.RUNNER_UNAVAILABLE, ErrorImpact.TRANSIENT),
+        (ErrorCode.HOST_OFFLINE, ErrorImpact.TRANSIENT),
         (ErrorCode.WRONG_REPLICA, ErrorImpact.TRANSIENT),
         (ErrorCode.UPSTREAM_CANCELLED, ErrorImpact.TRANSIENT),
         # Benign: a rejected request that leaves the session healthy.
@@ -480,6 +484,22 @@ def test_stale_cursor_error_carries_cursor_and_maps_to_400() -> None:
     assert err.http_status == 400
     assert err.cursor_id == "conv_gone"
     assert "conv_gone" in err.message
+
+
+@pytest.mark.parametrize(
+    "host_id",
+    [
+        "0123456789abcdef0123456789abcdef",
+        "host_0123456789abcdef0123456789abcdef",
+        "01234567-89ab-cdef-0123-456789abcdef",
+    ],
+)
+def test_wrong_replica_error_names_the_bare_host_id(host_id: str) -> None:
+    """The host dials with its bare id, and ingress routes on the literal key."""
+    err = WrongReplicaError("host 'laptop' is on another replica", host_id=host_id)
+    assert err.code == ErrorCode.WRONG_REPLICA
+    assert err.http_status == 400
+    assert err.host_id == "0123456789abcdef0123456789abcdef"
 
 
 def test_restart_on_stale_cursor_restarts_then_returns() -> None:

@@ -424,16 +424,16 @@ async def test_wedge_retry_waits_for_executor_close(monkeypatch: pytest.MonkeyPa
 async def test_cleanup_cannot_enable_unsafe_retry(
     monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
-    from omnigent.runtime.harnesses import _executor_adapter, _scaffold
+    from omnigent.runtime.harnesses import _scaffold
 
     monkeypatch.setattr(_scaffold, "_TURN_IDLE_TIMEOUT_S", 0.1)
     monkeypatch.setattr(
         _scaffold, "_TURN_ABSOLUTE_TIMEOUT_S", 0.4 if failure in {"budget", "absolute"} else 10
     )
     monkeypatch.setattr(
-        _executor_adapter,
-        "INTERRUPT_TIMEOUT_S",
-        0.5 if failure in {"budget", "absolute"} else 0.05,
+        _FakeExecutor,
+        "close_timeout",
+        lambda self: 0.5 if failure in {"budget", "absolute"} else 0.05,
     )
     ctx = _ctx("cleanup_failed")
 
@@ -850,7 +850,7 @@ async def test_safe_interrupt_reaps_even_when_interrupt_hangs(
     import omnigent.runtime.harnesses._executor_adapter as _adapter_mod
 
     monkeypatch.setattr(_adapter_mod, "_INTERRUPT_SLICE_S", 0.05)
-    monkeypatch.setattr(_adapter_mod, "INTERRUPT_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(_FakeExecutor, "close_timeout", lambda self: 0.2)
 
     executor = _HangInterruptExecutor()
     adapter = ExecutorAdapter(executor_factory=lambda: executor)
@@ -916,7 +916,7 @@ async def test_safe_interrupt_hang_is_not_an_error(
     import omnigent.runtime.harnesses._executor_adapter as _adapter_mod
 
     monkeypatch.setattr(_adapter_mod, "_INTERRUPT_SLICE_S", 0.05)
-    monkeypatch.setattr(_adapter_mod, "INTERRUPT_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(_FakeExecutor, "close_timeout", lambda self: 0.2)
 
     executor = _HangInterruptExecutor()
     adapter = ExecutorAdapter(executor_factory=lambda: executor)

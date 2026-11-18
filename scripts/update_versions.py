@@ -52,10 +52,10 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
-import tomllib
 from packaging.version import InvalidVersion, Version
 
 # scripts/update_versions.py -> repo root is one level up.

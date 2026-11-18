@@ -57,7 +57,7 @@ from __future__ import annotations
 import json
 import time
 import zipfile
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from omnigent_client import OmnigentClient
@@ -288,7 +288,7 @@ async def write_session_log(
 
     payload: dict[str, object] = {
         "version": _LOG_SCHEMA_VERSION,
-        "written_at": datetime.now(timezone.utc).isoformat(),
+        "written_at": datetime.now(UTC).isoformat(),
         "format": _LOG_FORMAT,
         "agent_name": agent_name,
         "conversation": root_node,
@@ -450,7 +450,7 @@ def write_session_log_from_store(
 
     payload: dict[str, object] = {
         "version": _LOG_SCHEMA_VERSION,
-        "written_at": datetime.now(timezone.utc).isoformat(),
+        "written_at": datetime.now(UTC).isoformat(),
         "format": _LOG_FORMAT,
         "agent_name": agent_name,
         "conversation": root_node,

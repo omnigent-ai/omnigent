@@ -4,6 +4,7 @@ import android.widget.Button
 import android.widget.EditText
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -11,6 +12,7 @@ import org.robolectric.Robolectric
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
 import org.robolectric.annotation.Config
+import org.robolectric.shadows.ShadowAlertDialog
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [35])
@@ -28,6 +30,25 @@ class UserConnectRequestsTest {
         assertTrue(UserConnectRequests.consume(token))
         // A restored activity is relaunched with the same intent: not a fresh tap.
         assertFalse(UserConnectRequests.consume(token))
+    }
+
+    @Test
+    fun `about shows the installed build version without connecting`() {
+        val activity = Robolectric.buildActivity(ConnectActivity::class.java).setup().get()
+
+        activity.findViewById<Button>(R.id.about).performClick()
+
+        val dialog = ShadowAlertDialog.getLatestAlertDialog()
+        assertTrue(dialog.isShowing)
+        assertEquals(
+            activity.getString(
+                R.string.about_version,
+                BuildConfig.VERSION_NAME,
+                BuildConfig.VERSION_CODE,
+            ),
+            dialog.findViewById<android.widget.TextView>(android.R.id.message)?.text,
+        )
+        assertNull(shadowOf(activity).nextStartedActivity)
     }
 
     @Test

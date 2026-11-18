@@ -98,6 +98,7 @@ def build_subagent_recovery(
             child_session_id=conv_id,
             agent=agent,
             title=snapshot.sub_agent_name or "",
+            wrapper_label=snapshot.wrapper_label,
         )
 
     async def _parent_is_nested_subagent(entry: _SubagentWorkEntry) -> bool:
@@ -215,7 +216,7 @@ def build_subagent_recovery(
             await task
         except asyncio.CancelledError:
             pass
-        except Exception:  # noqa: BLE001 - recovery failure must not block session deletion
+        except Exception:  # recovery failure must not block session deletion
             _logger.warning(
                 "Sub-agent recovery failed while deleting session %s",
                 parent_id,

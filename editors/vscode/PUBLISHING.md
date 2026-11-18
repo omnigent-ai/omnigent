@@ -10,7 +10,7 @@ The work splits into two halves:
 
 - **This repo** builds a SHA256-verified `.vsix` and attaches it to a GitHub
 release. No marketplace tokens live here.
-- **A Databricks-internal secure-release repo** downloads that `.vsix`, verifies
+- **A separate secure-release repo** downloads that `.vsix`, verifies
 the checksum, scans it, and publishes to the VS Code Marketplace and Open VSX.
 It holds the tokens and the approval gate.
 

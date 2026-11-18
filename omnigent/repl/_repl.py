@@ -16,9 +16,11 @@ import pathlib
 import re
 import sys
 import tempfile
-from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable
+import time
+from collections.abc import AsyncGenerator, Awaitable, Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Protocol, TextIO, TypeAlias
+from datetime import UTC
+from typing import TYPE_CHECKING, Any, Protocol, TextIO, TypeAlias
 
 from omnigent_client import (
     BlockContext,
@@ -36,6 +38,7 @@ from omnigent_client import (
     ToolGroup,
     ToolHandler,
     ToolResultBlock,
+    child_summary_busy,
     format_tool_args_brief,
 )
 from omnigent_ui_sdk import (
@@ -50,6 +53,7 @@ from omnigent_ui_sdk import (
     save_user_config,
     update_user_config,
 )
+from omnigent_ui_sdk.terminal import StreamLive
 
 # ``FormattedItem`` is the SDK formatter's per-method return type
 # (``Rich.RenderableType | StreamingText | StreamReplace``). The
@@ -69,7 +73,15 @@ from rich.console import RenderableType
 from rich.markup import escape
 from rich.text import Text
 
+from omnigent.cli_diagnostics import printable
 from omnigent.cli_invocation import cli_invocation
+from omnigent.harness_aliases import canonicalize_harness
+from omnigent.remote_launch import (
+    REMOTE_LAUNCH_MESSAGE,
+    no_online_runner_message,
+    resolve_remote_launch_host,
+)
+from omnigent.session_host import set_session_host
 from omnigent.spec.types import SkillSpec
 
 if TYPE_CHECKING:
@@ -78,6 +90,10 @@ if TYPE_CHECKING:
     from omnigent.server.schemas import SessionStatusEvent
 
 _log = logging.getLogger(__name__)
+
+# The session stream has no replay, so the REPL waits for the server's
+# subscription heartbeat before posting; the cap covers servers without one.
+_STREAM_READY_TIMEOUT_S: float = 5.0
 
 
 def _is_recoverable_sse_transport_error(exc: BaseException) -> bool:
@@ -223,6 +239,14 @@ _LIST_ITEMS_PAGE_SIZE = 100
 # Full re-walks allowed when a page cursor's item is deleted mid-enumeration
 # before the overlay settles for whatever it managed to fetch.
 _LIST_ITEMS_MAX_RESTARTS = 3
+# How long the Ctrl+O overview reuses earlier pages before walking every page
+# again, so an edit to an older item still shows up.
+_OVERVIEW_FULL_REFRESH_SECONDS = 30.0
+
+# Turn-completion backstop: the stream normally ends a turn, so the snapshot is
+# checked after the first second and then less often.
+_TURN_BACKSTOP_FIRST_SECONDS = 1.0
+_TURN_BACKSTOP_MAX_SECONDS = 5.0
 
 # Sub-agent tree (state badge + ``↓`` menu). The depth cap mirrors web's
 # ``MAX_TREE_DEPTH`` so the CLI tree matches the web Agents rail; the poll
@@ -230,6 +254,14 @@ _LIST_ITEMS_MAX_RESTARTS = 3
 # session's direct children) while sub-agents are active.
 _MAX_SUBAGENT_TREE_DEPTH = 3
 _SUBAGENT_POLL_SECONDS = 2.0
+# The poll doubles its wait after each fetch that changed nothing (or failed),
+# up to this cap, and snaps back to _SUBAGENT_POLL_SECONDS on any change, any
+# child-session event, or user input.
+_SUBAGENT_POLL_MAX_SECONDS = 10.0
+# Fetches skip the children of subtrees that have settled. While the poll runs
+# (see _should_discover_subagents), a periodic full walk still catches a
+# settled grandchild that resumed without an event the REPL can see.
+_SUBAGENT_FULL_SWEEP_SECONDS = 60.0
 
 
 def _load_startup_theme() -> TerminalTheme:
@@ -758,6 +790,29 @@ def _parse_approval_input(text: str) -> _ApprovalVerdict:
     return _ApprovalVerdict.REFUSE
 
 
+# How another client's verdict settles the ASK this REPL is prompting for,
+# paired with the transcript line that reports it.
+_RESOLVED_ELSEWHERE: dict[str, tuple[_ApprovalVerdict, str]] = {
+    "accept": (_ApprovalVerdict.APPROVE_ONCE, "approved elsewhere"),
+    "decline": (_ApprovalVerdict.REFUSE, "declined elsewhere"),
+    "cancel": (_ApprovalVerdict.REFUSE, "cancelled elsewhere"),
+}
+
+
+def _resolved_elsewhere_verdict(action: str | None) -> _ApprovalVerdict:
+    """Verdict for an external resolution; anything but ``accept`` refuses."""
+    return _RESOLVED_ELSEWHERE.get(action or "", (_ApprovalVerdict.REFUSE, ""))[0]
+
+
+def _resolved_elsewhere_label(action: str | None, reason: str | None) -> str:
+    """Transcript line for an ASK another client settled, e.g. ``"declined elsewhere"``."""
+    if action in _RESOLVED_ELSEWHERE:
+        return _RESOLVED_ELSEWHERE[action][1]
+    if reason == "unanswered":
+        return "expired unanswered · refused"
+    return "resolved elsewhere · no verdict recorded · refused"
+
+
 class _ApprovalState:
     """
     Per-REPL holder for pending approvals and the session
@@ -792,6 +847,9 @@ class _ApprovalState:
         # ctx fields.
         self._current_policy: str | None = None
         self._current_phase: str | None = None
+        # Server id of the current ASK, so a resolved event from another
+        # client only settles the prompt when it is for this elicitation.
+        self._current_elicitation_id: str | None = None
         # When True, the current approval is URL-mode-only and
         # keyboard input (y/a/n) should be rejected.
         self._url_mode: bool = False
@@ -842,7 +900,12 @@ class _ApprovalState:
         self._always.add((policy_name, phase))
 
     def begin(
-        self, policy_name: str, phase: str, *, url_mode: bool = False
+        self,
+        policy_name: str,
+        phase: str,
+        *,
+        elicitation_id: str | None = None,
+        url_mode: bool = False,
     ) -> asyncio.Future[bool]:
         """
         Start a new approval — create the future the hook awaits.
@@ -850,7 +913,9 @@ class _ApprovalState:
         Records the identity of the ASK so
         :meth:`resolve_verdict` can cache an "always" decision
         against the right ``(policy_name, phase)`` pair
-        without the caller having to re-pass them.
+        without the caller having to re-pass them, and so
+        :meth:`resolve_elsewhere` can tell this elicitation's
+        resolved event apart from any other's.
 
         If a previous approval's future is still open (the user
         never answered before a new ASK arrived), refuse the
@@ -861,6 +926,9 @@ class _ApprovalState:
         :param policy_name: Deciding policy's name from the
             :class:`ElicitationRequestCtx`.
         :param phase: Phase string from the ctx.
+        :param elicitation_id: Server-assigned id of this ASK,
+            e.g. ``"elicit_abc123"``. ``None`` when unknown; the
+            prompt then only settles through keyboard input.
         :returns: The future to await. Resolves to ``True`` on
             approve (one or always) and ``False`` on refuse.
         """
@@ -868,6 +936,7 @@ class _ApprovalState:
             self._future.set_result(False)
         self._current_policy = policy_name
         self._current_phase = phase
+        self._current_elicitation_id = elicitation_id or None
         self._url_mode = url_mode
         self._future = asyncio.get_running_loop().create_future()
         return self._future
@@ -899,7 +968,29 @@ class _ApprovalState:
         self._future = None
         self._current_policy = None
         self._current_phase = None
+        self._current_elicitation_id = None
         return True
+
+    def resolve_elsewhere(self, elicitation_id: str, action: str | None) -> bool:
+        """
+        Settle the pending approval from another client's resolution of
+        the same elicitation.
+
+        The server publishes ``elicitation_resolved`` for every elicitation
+        in the session, so only an event carrying this ASK's id may release
+        the gate. ``accept`` approves once; a decline, cancel, or
+        verdict-less clear refuses fail-closed.
+
+        :param elicitation_id: Id carried by the resolved event.
+        :param action: MCP verdict carried by the event, or ``None``.
+        :returns: ``True`` iff the pending approval was for this
+            elicitation and has now been resolved.
+        """
+        if not self.pending or not elicitation_id:
+            return False
+        if elicitation_id != self._current_elicitation_id:
+            return False
+        return self.resolve_verdict(_resolved_elsewhere_verdict(action))
 
     def cancel(self) -> None:
         """
@@ -915,6 +1006,7 @@ class _ApprovalState:
         self._future = None
         self._current_policy = None
         self._current_phase = None
+        self._current_elicitation_id = None
 
 
 class _FieldInputState:
@@ -1116,7 +1208,12 @@ def _make_elicitation_prompt(
                     f"n = refuse[/{fmt.accent}]",
                 ),
             )
-        future = state.begin(ctx.policy_name, ctx.phase, url_mode=bool(_is_external_url))
+        future = state.begin(
+            ctx.policy_name,
+            ctx.phase,
+            elicitation_id=ctx.elicitation_id,
+            url_mode=bool(_is_external_url),
+        )
         return await future
 
     return _on_elicitation_request
@@ -1299,6 +1396,7 @@ class _SessionsChatReplAdapter:
         field_input_state: _FieldInputState | None = None,
         host: TerminalHost | None = None,
         fmt: RichBlockFormatter | None = None,
+        registered_agent: RegisteredAgent | None = None,
     ) -> None:
         """
         Wire the adapter; do NOT issue any HTTP calls.
@@ -1345,9 +1443,11 @@ class _SessionsChatReplAdapter:
             field values interactively via the main input loop.
         :param host: Terminal output channel for rendering field prompts.
         :param fmt: Formatter for styling field prompts.
+        :param registered_agent: Catalog identity selected for a new remote session.
         """
         self._client = client
         self._agent_id: str | None = None
+        self._registered_agent = registered_agent
         self._agent_name = agent_name
         self._tool_callables = tool_callables
         self._hooks = hooks or StreamHooks()
@@ -1388,6 +1488,8 @@ class _SessionsChatReplAdapter:
         # Set by run_repl() to the rendering callback.
         self._on_event: Callable[[object], None] | None = None
         self._stream_task: asyncio.Task[None] | None = None
+        # Set once the current stream subscription registers or its attempt ends.
+        self._stream_ready = asyncio.Event()
         self._recover_task: asyncio.Task[None] | None = None
         self._recover_lock = asyncio.Lock()
         self._bind_lock = asyncio.Lock()
@@ -1656,6 +1758,8 @@ class _SessionsChatReplAdapter:
             attributes.
         :returns: None.
         """
+        if self._session_id is not None:
+            set_session_host(self._session_id, getattr(session, "host_id", None))
         self._agent_id = session.agent_id
         # The agent name changes when the session is switched in place
         # to a different agent (web UI "Switch agent"). Don't clobber
@@ -1714,10 +1818,7 @@ class _SessionsChatReplAdapter:
                 self._hydrate_from_session_snapshot(session)
             await self._bind_runner_if_needed()
             if self._stream_task is None:
-                self._stream_task = asyncio.create_task(
-                    self._stream_pump(),
-                    name=f"sessions-adapter-stream-{self._session_id}",
-                )
+                await self._start_stream_pump()
             if self._runner_recover is not None and self._recover_task is None:
                 self._recover_task = asyncio.create_task(
                     self._runner_recover_watch(),
@@ -1731,11 +1832,11 @@ class _SessionsChatReplAdapter:
         """
         Create a session bound to an agent already registered server-side.
 
-        The remote-URL path: there is no local bundle to upload, so
-        resolve the picked name to its id and use the JSON create route.
-        A remote client also has no runner of its own, so adopt one the
-        server already has online — otherwise the first turn fails the
-        runner-binding precondition.
+        The remote-URL path: there is no local bundle to upload, so use
+        the selected catalog identity or resolve the name for direct callers.
+        Adopt a matching online runner, or ask the server to launch one
+        on this machine's connected host. Host-launched runners arrive
+        bound to the session and remain owned by the host lifecycle.
 
         :param pending_debug: Whether to emit adapter debug lines.
         :returns: None.
@@ -1746,22 +1847,35 @@ class _SessionsChatReplAdapter:
                 file=sys.stderr,
                 flush=True,
             )
-        # Skip the name lookup only when nothing needs it: we already know
-        # the id, and a bound runner means we don't need the harness either.
-        agent: RegisteredAgent | None = None
-        if self._agent_id is None or self._runner_id is None:
-            agent = await self._client.sessions.resolve_agent(self._agent_name)
-        agent_id = self._agent_id or (agent.id if agent is not None else None)
-        if agent_id is None:
-            raise RuntimeError(f"Could not resolve an agent id for {self._agent_name!r}")
+        # /new keeps the session's identity, including unnamed uploaded agents.
+        if self._agent_id is not None:
+            agent = RegisteredAgent(id=self._agent_id, harness=self._harness)
+            if self._runner_id is None and not agent.harness:
+                raise RuntimeError(
+                    "The previous session does not report its harness, so a compatible "
+                    "runner cannot be selected. Start a new session with --agent <name>."
+                )
+        else:
+            agent = self._registered_agent
+        if agent is None:
+            try:
+                agent = await self._client.sessions.resolve_agent(self._agent_name)
+            except LookupError as exc:
+                # The REPL renders this message; keep server-supplied names inert.
+                raise LookupError(printable(str(exc))) from exc
+        launch_host_id: str | None = None
         if self._runner_id is None:
-            from omnigent.harness_aliases import canonicalize_harness
-
             self._runner_id = await self._client.sessions.resolve_online_runner(
-                harness=agent.harness if agent is not None else None,
+                harness=agent.harness,
                 canonicalize=lambda name: canonicalize_harness(name) or name,
             )
-            if pending_debug:
+            if self._runner_id is None:
+                launch_host_id = await resolve_remote_launch_host(
+                    self._client.sessions, harness=agent.harness
+                )
+                if launch_host_id is None:
+                    raise RuntimeError(no_online_runner_message())
+            if pending_debug and self._runner_id is not None:
                 print(
                     f"[sessions-adapter] adopted server runner {self._runner_id!r}",
                     file=sys.stderr,
@@ -1770,13 +1884,23 @@ class _SessionsChatReplAdapter:
         # Snapshot the pre-create /model pick before hydration clobbers
         # it; applied after create since create has no such field.
         pending_model_override = self._model_override
-        session = await self._client.sessions.create_from_agent_id(
-            agent_id,
-            reasoning_effort=self._reasoning_effort,
-            workspace=os.getcwd(),
-        )
+        progress_host = self._host if launch_host_id is not None else None
+        if progress_host is not None:
+            progress_host.output(StreamLive(Text(REMOTE_LAUNCH_MESSAGE)))
+        try:
+            session = await self._client.sessions.create_from_agent_id(
+                agent.id,
+                reasoning_effort=self._reasoning_effort,
+                workspace=os.getcwd(),
+                host_id=launch_host_id,
+            )
+        finally:
+            if progress_host is not None:
+                progress_host.clear_streamed_text()
         self._session_id = session.id
         self._hydrate_from_session_snapshot(session)
+        if launch_host_id is not None:
+            set_session_host(session.id, launch_host_id)
         await self._apply_pending_model_override(pending_model_override, session)
         if pending_debug:
             print(
@@ -1831,7 +1955,7 @@ class _SessionsChatReplAdapter:
         """
         Apply a pre-session ``/model`` pick to a freshly created session.
 
-        Neither create route carries a ``model_override`` field, so a
+        The adapter's create request does not carry the pending pick, so a
         ``/model`` typed before the first turn has to be PATCHed after
         create for the first event to pick it up via
         ``conv.model_override``. ``silent`` skips the tmux ``/model``
@@ -1901,11 +2025,7 @@ class _SessionsChatReplAdapter:
                 if self._session_bundle is None:
                     # Remote target: we tried to adopt one of the server's
                     # online runners at create time and found none.
-                    raise RuntimeError(
-                        "This server has no online runner to run the turn. Start one "
-                        f"against it with `{cli_invocation()} host --server <url>` (or run the "
-                        f"agent locally with `{cli_invocation()} run <agent.yaml>`), then retry."
-                    )
+                    raise RuntimeError(no_online_runner_message())
                 raise RuntimeError(
                     "Sessions API dispatch requires a registered runner id. "
                     f"Start through `{cli_invocation()} run <agent>` or pass --server so the CLI "
@@ -2129,7 +2249,7 @@ class _SessionsChatReplAdapter:
         self._hydrate_from_session_snapshot(session)
         await self._bind_runner_if_needed()
 
-        self._stream_task = asyncio.create_task(self._stream_pump())
+        await self._start_stream_pump()
         return new_session_id
 
     async def view_session(
@@ -2178,7 +2298,7 @@ class _SessionsChatReplAdapter:
             self._stream_task = None
         session = await self._client.sessions.get(new_session_id)
         self._hydrate_from_session_snapshot(session)
-        self._stream_task = asyncio.create_task(self._stream_pump())
+        await self._start_stream_pump()
         return new_session_id
 
     async def aclose(self) -> None:
@@ -2205,6 +2325,28 @@ class _SessionsChatReplAdapter:
                 return_exceptions=True,
             )
             self._pending_local_tasks.clear()
+
+    async def _start_stream_pump(self) -> None:
+        """Start the persistent stream and wait until the server has registered it.
+
+        Events published before registration are never delivered, which would
+        lose e.g. the approval prompt for the message posted right after this.
+        """
+        self._stream_ready.clear()
+        self._stream_task = asyncio.create_task(
+            self._stream_pump(),
+            name=f"sessions-adapter-stream-{self._session_id}",
+        )
+        ready = asyncio.ensure_future(self._stream_ready.wait())
+        try:
+            # A pump that exits early will never register; stop waiting on it.
+            await asyncio.wait(
+                {ready, self._stream_task},
+                timeout=_STREAM_READY_TIMEOUT_S,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            ready.cancel()
 
     async def _stream_pump(self) -> None:
         """Subscribe to ``/v1/sessions/{id}/stream`` indefinitely.
@@ -2238,6 +2380,7 @@ class _SessionsChatReplAdapter:
                         flush=True,
                     )
                 async for event in self._client.sessions.stream(self._session_id):
+                    self._stream_ready.set()
                     if isinstance(event, _StatusEv) and event.status in (
                         "idle",
                         "waiting",
@@ -2249,11 +2392,14 @@ class _SessionsChatReplAdapter:
                     if self._on_event is not None:
                         self._on_event(event)
                 # Clean close (server sent [DONE]). Reopen.
+                self._stream_ready.set()
                 await asyncio.sleep(backoff)
                 backoff = 0.5
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 — reconnect on any error
+                # A failed attempt will not register; don't hold up the post.
+                self._stream_ready.set()
                 # Recoverable transport errors (peer closed mid-chunk,
                 # read timeout, transient network error) are normal
                 # background noise — the session continues server-side
@@ -2296,6 +2442,34 @@ class _SessionsChatReplAdapter:
                     )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, max_backoff)
+
+    async def _wait_for_turn_done(self, session_id: str) -> None:
+        """Wait for the in-flight turn, checking the snapshot as a backstop.
+
+        The stream pump sets ``_turn_done`` on the terminal status event. If the
+        subscription missed it, the snapshot's status settles the turn: checked
+        after the first second, then with a growing interval, since a missed
+        event is caught by the early checks and later ones only cost requests.
+
+        :param session_id: Session whose turn is in flight.
+        """
+        interval = _TURN_BACKSTOP_FIRST_SECONDS
+        while not self._turn_done.is_set():
+            try:
+                # Event.wait() is cancellation-safe (its finally block removes
+                # the waiter from Event._waiters), so no asyncio.shield() is
+                # needed — shield leaks orphaned Tasks on each timeout iteration.
+                await asyncio.wait_for(self._turn_done.wait(), timeout=interval)
+            except TimeoutError:
+                snap = await self._client.sessions.get(
+                    session_id,
+                    include_items=False,
+                    include_liveness=False,
+                    include_usage=False,
+                )
+                if snap.status in ("idle", "failed"):
+                    self._turn_done.set()
+                interval = min(interval * 2, _TURN_BACKSTOP_MAX_SECONDS)
 
     async def send(
         self,
@@ -2390,21 +2564,7 @@ class _SessionsChatReplAdapter:
             # flush streaming body chunks eagerly, so the pump's
             # SSE subscription may not be active when the workflow
             # publishes its terminal event (no-replay pub-sub).
-            # We poll the snapshot every second as a backstop.
-            while not self._turn_done.is_set():
-                try:
-                    # Event.wait() is cancellation-safe (its finally block
-                    # removes the waiter from Event._waiters), so no
-                    # asyncio.shield() is needed — shield leaks orphaned
-                    # Tasks on each timeout iteration.
-                    await asyncio.wait_for(
-                        self._turn_done.wait(),
-                        timeout=1.0,
-                    )
-                except asyncio.TimeoutError:
-                    snap = await self._client.sessions.get(session_id)
-                    if snap.status in ("idle", "failed"):
-                        self._turn_done.set()
+            await self._wait_for_turn_done(session_id)
             # Yield a terminal event so callers iterating send()
             # observe completion. Rendering already happened via
             # _on_event.
@@ -2475,16 +2635,7 @@ class _SessionsChatReplAdapter:
                     flush=True,
                 )
             await self._client.sessions.post_event(session_id, event_payload)
-            while not self._turn_done.is_set():
-                try:
-                    await asyncio.wait_for(
-                        self._turn_done.wait(),
-                        timeout=1.0,
-                    )
-                except asyncio.TimeoutError:
-                    snap = await self._client.sessions.get(session_id)
-                    if snap.status in ("idle", "failed"):
-                        self._turn_done.set()
+            await self._wait_for_turn_done(session_id)
             from omnigent_client._events import ResponseCompleted
             from omnigent_client._types import Response as SDKResponse
 
@@ -3188,11 +3339,13 @@ async def run_repl(
     agent_description: str | None = None,
     used_families: list[str] | None = None,
     attach_only: bool = False,
+    registered_agent: RegisteredAgent | None = None,
 ) -> str | None:
     """The entire REPL — using the framework.
 
     :param client: Connected OmnigentClient.
     :param agent_name: Agent name (used for API calls).
+    :param registered_agent: Catalog identity selected for a new remote session.
     :param tool_handler: Optional client-side tool handler.
     :param initial_message: If set, auto-send this message on startup
         (e.g. a greeting prompt for onboarding).
@@ -3363,6 +3516,7 @@ async def run_repl(
     session = _SessionsChatReplAdapter(
         client=client,
         agent_name=agent_name,
+        registered_agent=registered_agent,
         tool_callables=tool_callables,
         hooks=hooks,
         session_id=resume_conversation_id,
@@ -3456,6 +3610,13 @@ async def run_repl(
         _refresh_task = asyncio.create_task(_refresh_session_metadata(session, client, host, fmt))
         _background_event_tasks.add(_refresh_task)
         _refresh_task.add_done_callback(_background_event_tasks.discard)
+
+    # Wakes the sub-agent poll early and resets its backoff. Set by child-session
+    # stream events and by user input; ``subagent_force_expand`` collects parents
+    # whose children an event says changed, so the next fetch re-reads them even
+    # if their subtree had settled.
+    subagent_poll_wake = asyncio.Event()
+    subagent_force_expand: set[str] = set()
 
     def _render_session_event(event: object) -> None:
         """Push-based renderer for all session stream events.
@@ -3626,22 +3787,17 @@ async def run_repl(
                 _maybe_log_tape_entry(tape_entry)
             return
 
-        # When an elicitation is resolved externally (via the standalone
-        # approval page), the server publishes ``elicitation_resolved``.
-        # Wake the parked ``_ApprovalState`` future so the REPL unblocks.
-        # The ``elicitation_resolved`` event doesn't carry the verdict
-        # (accept/decline), but ``_handle_elicitation`` will POST a
-        # redundant resolve that the server silently ignores (already
-        # resolved). We approve here so the REPL unblocks; the actual
-        # outcome is whatever the user chose on the page.
+        # ``elicitation_resolved`` fans out for every elicitation in the
+        # session, from any client; release the parked approval only for the
+        # ASK this REPL is prompting for, with the verdict the event carries.
         from omnigent.server.schemas import ElicitationResolvedEvent
 
         if isinstance(event, ElicitationResolvedEvent):
-            if approval_state.pending:
-                approval_state.resolve_verdict(_ApprovalVerdict.APPROVE_ONCE)
+            if approval_state.resolve_elsewhere(event.elicitation_id, event.action):
+                label = _resolved_elsewhere_label(event.action, event.reason)
                 host.output(
                     Text.from_markup(
-                        f"   [{fmt.muted}]› resolved via approval page[/{fmt.muted}]",
+                        f"   [{fmt.muted}]› {label}[/{fmt.muted}]",
                     ),
                 )
             if tape_entry is not None:
@@ -3657,6 +3813,12 @@ async def run_repl(
             active_conversation_id=session.session_id,
             host=host,
         ):
+            # A relayed event about a deeper level names its parent as the
+            # carrier: re-read that parent's children on the woken fetch.
+            carrier = getattr(event, "conversation_id", None)
+            if isinstance(carrier, str) and carrier != session.session_id:
+                subagent_force_expand.add(carrier)
+            subagent_poll_wake.set()
             if tape_entry is not None:
                 _event_tape.update_translation(tape_entry, event)  # type: ignore[union-attr]
                 _maybe_log_tape_entry(tape_entry)
@@ -4067,6 +4229,9 @@ async def run_repl(
 
     async def on_input(text: str, attachments: list[PendingAttachment] | None = None) -> None:
         nonlocal conversation_id, is_streaming
+        # Input can restart a settled sub-agent (e.g. chatting with a finished
+        # child), so refresh the tree at the fast cadence again.
+        subagent_poll_wake.set()
 
         # Pending schema field input: consume this line as the
         # current field's value before any other routing.
@@ -4303,6 +4468,10 @@ async def run_repl(
     # Warp) and prompt-toolkit binds it cleanly.
     from omnigent_ui_sdk import Overlay
 
+    # Items the Ctrl+O overview already fetched, per conversation, so each
+    # refresh tick re-reads only the newest page instead of the whole history.
+    overview_items_cache: dict[str, _OverviewItems] = {}
+
     async def _overview_builder(target: OverlayTarget | None) -> RenderableType:
         from omnigent.cli_diagnostics import current_cli_log_path
 
@@ -4310,6 +4479,7 @@ async def run_repl(
             return Text.from_markup("[dim]No debug target available.[/dim]")
         return await _build_debug_overview(
             target,
+            items_cache=overview_items_cache,
             client=client,
             session=session,
             agent_name=agent_name,
@@ -4405,14 +4575,28 @@ async def run_repl(
         if not observing_child and session.session_id is not None:
             subagent_root[0] = session.session_id
 
-    async def _refresh_subagents() -> None:
+    async def _refresh_subagents(*, expand_all: bool) -> str | None:
         root_id = subagent_root[0]
         if root_id is None:
-            return
+            return None
+        # Re-read the ancestors of a sub-agent the user is viewing, so its own
+        # row stays fresh even when the branch above it has settled.
+        viewed = session.session_id if session.session_id != root_id else None
+        force = set(subagent_force_expand) | {root_id}
+        if viewed is not None:
+            force |= host.subagent_ancestors(viewed)
+        subagent_force_expand.clear()
         # Capture the generation BEFORE the fetch so a clear-during-poll
         # (``/switch`` / ``/new`` / ``/clear`` re-rooting mid-fetch) makes the
         # resulting seed a no-op instead of resurrecting cleared nodes.
-        await _refresh_subagent_tree(client, host, root_id, generation=host.subagent_generation)
+        return await _refresh_subagent_tree(
+            client,
+            host,
+            root_id,
+            generation=host.subagent_generation,
+            expand_all=expand_all,
+            force_expand=force,
+        )
 
     async def _subagent_poll_loop() -> None:
         # Periodically re-fetch the tree so nested (grandchild) levels + live
@@ -4428,6 +4612,16 @@ async def run_repl(
         # sub-agent's status no longer changes, so polling retained-but-terminal
         # nodes forever is pure waste; a child that later resumes re-arms the
         # poll via the active stream's ``session.child_session.updated``.
+        #
+        # Each fetch skips settled subtrees, and the wait between fetches backs
+        # off while nothing changes; see _SUBAGENT_POLL_MAX_SECONDS.
+        delay = _SUBAGENT_POLL_SECONDS
+        # Keyed by full_sweep: a full walk returns rows a partial fetch skips, so
+        # only fetches of the same kind are comparable.
+        last_fingerprint: dict[bool, str] = {}
+        last_full_sweep = 0.0
+        last_fetch = 0.0
+        loop = asyncio.get_running_loop()
         while True:
             try:
                 _sync_subagent_root()
@@ -4441,13 +4635,41 @@ async def run_repl(
                     observing_subagent=observing_subagent,
                     last_polled_root=polled_root[0],
                 ):
-                    await _refresh_subagents()
+                    root_changed = polled_root[0] != root_id
+                    last_fetch = loop.time()
+                    full_sweep = (
+                        root_changed
+                        or loop.time() - last_full_sweep >= _SUBAGENT_FULL_SWEEP_SECONDS
+                    )
+                    fingerprint = await _refresh_subagents(expand_all=full_sweep)
                     polled_root[0] = root_id
+                    if full_sweep and fingerprint is not None:
+                        last_full_sweep = loop.time()
+                    changed = fingerprint is not None and (
+                        root_changed
+                        or fingerprint != last_fingerprint.get(full_sweep, fingerprint)
+                    )
+                    delay = _next_subagent_poll_delay(delay, changed=changed)
+                    if root_changed:
+                        last_fingerprint.clear()
+                    if fingerprint is not None:
+                        last_fingerprint[full_sweep] = fingerprint
+                else:
+                    delay = _SUBAGENT_POLL_SECONDS
             except asyncio.CancelledError:
                 raise
             except Exception:  # noqa: BLE001 — best-effort background poll; never crash the REPL
+                delay = _next_subagent_poll_delay(delay, changed=False)
+            try:
+                await asyncio.wait_for(subagent_poll_wake.wait(), timeout=delay)
+            except TimeoutError:
                 pass
-            await asyncio.sleep(_SUBAGENT_POLL_SECONDS)
+            else:
+                # A wake resets the backoff but never fetches more often than
+                # the base cadence, so a burst of events costs one fetch.
+                delay = _SUBAGENT_POLL_SECONDS
+                await asyncio.sleep(max(0.0, last_fetch + _SUBAGENT_POLL_SECONDS - loop.time()))
+            subagent_poll_wake.clear()
 
     async def _open_subagent_by_id(target_id: str) -> None:
         # Invoked by the host when the user picks a row in the inline ↓ menu
@@ -4507,7 +4729,8 @@ async def run_repl(
                     f"  [{fmt.muted}]read-only (closed sub-agent) — ← back to main[/{fmt.muted}]"
                 )
             )
-        await _refresh_subagents()
+        await _refresh_subagents(expand_all=True)
+        subagent_poll_wake.set()
 
     host.on_subagent_select = _open_subagent_by_id
     # Let the host see the active session id so Left-arrow can return to the
@@ -5502,7 +5725,7 @@ async def _cmd_switch(
     host: TerminalHost,
     fmt: RichBlockFormatter,
 ) -> None:
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     from rich.table import Table
     from rich.text import Text
@@ -5522,7 +5745,7 @@ async def _cmd_switch(
             table.add_column("Created", style="dim")
             for i, s in enumerate(sessions_list, 1):
                 when = (
-                    datetime.fromtimestamp(s.created_at, tz=timezone.utc)
+                    datetime.fromtimestamp(s.created_at, tz=UTC)
                     .astimezone()
                     .strftime("%b %d %H:%M")
                 )
@@ -6297,7 +6520,7 @@ def _build_github_issue_url(
     from urllib.parse import quote
 
     session_line = f"`{session_id}`" if session_id else "not started"
-    timestamp = datetime.datetime.now(tz=datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    timestamp = datetime.datetime.now(tz=datetime.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     what_happened = description if description else "<!-- Describe what went wrong -->"
 
     info_lines = [
@@ -6525,6 +6748,90 @@ async def _list_all_conversation_items(
     return all_items
 
 
+@dataclass
+class _OverviewItems:
+    """One conversation's items as last fetched for the Ctrl+O overview."""
+
+    items: list[dict[str, object]]
+    fetched_full_at: float
+
+
+async def _list_overview_items(
+    client: OmnigentClient,
+    conv_id: str,
+    cache: dict[str, _OverviewItems],
+) -> list[dict[str, object]]:
+    """
+    Return *conv_id*'s items for the overview, re-reading only the newest page.
+
+    The overview refreshes every second while open. Walking every page each
+    tick costs one request per 100 items, so after a full walk later ticks
+    keep all but the newest page and re-read from there: one request for a
+    long conversation, and the newest page (where items still change, e.g. a
+    tool call gaining its output) stays fresh. A full walk runs again every
+    :data:`_OVERVIEW_FULL_REFRESH_SECONDS`, or when a cursor goes stale.
+
+    :param client: Agent-plane HTTP client.
+    :param conv_id: Session to enumerate, e.g. ``"conv_abc123"``.
+    :param cache: Per-conversation cache owned by the overview, updated in place.
+    :returns: All items in chronological order.
+    """
+    now = time.monotonic()
+    entry = cache.get(conv_id)
+    # Keep all but the newest page-minus-one items, so re-reading the tail of an
+    # unchanged conversation returns a short page and stops after one request.
+    settled = 0 if entry is None else len(entry.items) - _LIST_ITEMS_PAGE_SIZE + 1
+    anchor = entry.items[settled - 1].get("id") if entry is not None and settled > 0 else None
+    if (
+        entry is None
+        or not isinstance(anchor, str)
+        or now - entry.fetched_full_at >= _OVERVIEW_FULL_REFRESH_SECONDS
+    ):
+        items = await _list_all_conversation_items(client, conv_id)
+        cache[conv_id] = _OverviewItems(items=items, fetched_full_at=now)
+        return items
+    tail: list[dict[str, object]] = []
+    after: str = anchor
+    while True:
+        try:
+            raw_page = await client.sessions.list_items(
+                conv_id,
+                limit=_LIST_ITEMS_PAGE_SIZE,
+                after=after,
+                order="asc",
+            )
+        except StaleCursorError:
+            # An item before the cursor was deleted; rebuild from the start.
+            items = await _list_all_conversation_items(client, conv_id)
+            cache[conv_id] = _OverviewItems(items=items, fetched_full_at=now)
+            return items
+        except Exception:  # noqa: BLE001 — overlay builder: keep showing the last fetch
+            return entry.items
+        page: list[dict[str, object]] = raw_page.data
+        tail.extend(page)
+        last_id = page[-1].get("id") if page and isinstance(page[-1], dict) else None
+        if len(page) < _LIST_ITEMS_PAGE_SIZE or not isinstance(last_id, str):
+            break
+        after = last_id
+    entry.items = entry.items[:settled] + tail
+    return entry.items
+
+
+def _next_subagent_poll_delay(delay: float, *, changed: bool) -> float:
+    """Return the wait before the next sub-agent tree fetch.
+
+    Back to the base cadence after a fetch that saw a change; otherwise (no
+    change, or a failed fetch) double the wait up to the cap.
+
+    :param delay: The wait used before the fetch that just ran.
+    :param changed: Whether that fetch saw a different tree.
+    :returns: Seconds to wait before the next fetch.
+    """
+    if changed:
+        return _SUBAGENT_POLL_SECONDS
+    return min(delay * 2, _SUBAGENT_POLL_MAX_SECONDS)
+
+
 def _should_discover_subagents(
     root_id: str | None,
     *,
@@ -6623,7 +6930,9 @@ async def _refresh_subagent_tree(
     *,
     max_depth: int = _MAX_SUBAGENT_TREE_DEPTH,
     generation: int | None = None,
-) -> None:
+    expand_all: bool = True,
+    force_expand: Collection[str] = (),
+) -> str | None:
     """Recursively fetch the sub-agent tree under *root_id* and push it into
     the host registry.
 
@@ -6639,14 +6948,39 @@ async def _refresh_subagent_tree(
         the fetch began. Passed through to :meth:`TerminalHost.seed_subagent_tree`
         so a snapshot whose tree was cleared (``/switch`` / ``/new`` / ``/clear``)
         mid-fetch is dropped instead of resurrecting the cleared nodes.
+    :param expand_all: ``False`` skips the children of rows whose known subtree
+        has settled (:meth:`TerminalHost.subagent_subtree_settled`), unless the
+        row is busy or listed in *force_expand*. The skipped subtrees keep their
+        last-seen rows.
+    :param force_expand: Session ids whose children are fetched regardless, e.g.
+        the ancestors of a sub-agent the user is viewing.
+    :returns: A fingerprint of the fetched rows, equal across fetches that saw
+        no change, or ``None`` when the fetch failed.
     """
+    forced = set(force_expand)
+    unexpanded: set[str] = set()
+
+    def _expand(row: Mapping[str, Any]) -> bool:
+        sid = row.get("id")
+        if not isinstance(sid, str):
+            return False
+        if expand_all or sid in forced or child_summary_busy(row):
+            return True
+        if host.subagent_subtree_settled(sid):
+            unexpanded.add(sid)
+            return False
+        return True
+
     try:
         # Recursion + parent_id tagging now live in the shared SDK helper so the
         # CLI tree and the SDK rollup (subtree_busy) walk identical data.
-        nodes = await client.sessions.child_sessions_tree(root_id, max_depth=max_depth)
+        nodes = await client.sessions.child_sessions_tree(
+            root_id, max_depth=max_depth, expand=_expand
+        )
     except Exception:  # noqa: BLE001 — best-effort poll: a failed fetch leaves the prior tree in place rather than crashing the REPL
-        return
-    host.seed_subagent_tree(root_id, nodes, generation=generation)
+        return None
+    host.seed_subagent_tree(root_id, nodes, generation=generation, unexpanded=unexpanded)
+    return json.dumps(nodes, sort_keys=True, default=str)
 
 
 async def _collect_overview_targets(
@@ -7567,6 +7901,7 @@ async def _build_debug_overview(
     runner_log_path: pathlib.Path | None = None,
     event_log_path: pathlib.Path | None = None,
     cli_log_path: pathlib.Path | None = None,
+    items_cache: dict[str, _OverviewItems] | None = None,
 ) -> RenderableType:
     """
     Assemble the Ctrl+O debug overview for the REPL.
@@ -7745,15 +8080,23 @@ async def _build_debug_overview(
     items: list[dict[str, object]] = []
     items_error: str | None = None
     try:
-        snap = await client.sessions.get(conv_id)
+        # Only labels are read from the snapshot; the items come from the
+        # paginated walk below.
+        snap = await client.sessions.get(
+            conv_id,
+            include_items=False,
+            include_liveness=False,
+            include_live_status=False,
+            include_usage=False,
+        )
         labels = snap.labels
     except Exception as exc:  # noqa: BLE001 — overlay content builder
         labels_error = f"{type(exc).__name__}: {exc}"
     try:
-        items = await _list_all_conversation_items(
-            client,
-            conv_id,
-        )
+        if items_cache is None:
+            items = await _list_all_conversation_items(client, conv_id)
+        else:
+            items = await _list_overview_items(client, conv_id, items_cache)
     except Exception as exc:  # noqa: BLE001 — overlay content builder
         items_error = f"{type(exc).__name__}: {exc}"
     if items_error is not None:
@@ -8816,7 +9159,7 @@ async def _run_bang_command(
     timed_out = False
     try:
         out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=_BANG_TIMEOUT_S)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         timed_out = True
         proc.kill()
         out_b, err_b = await proc.communicate()

@@ -84,12 +84,12 @@ export async function getAgentConfig(
 
 export async function patchAgentConfig(
   id: string,
-  etag: string,
+  etag: string | null,
   patch: AgentConfigPatch,
 ): Promise<AgentConfigRevision> {
   const res = await authenticatedFetch(`/v1/agents/${encodeURIComponent(id)}`, {
     method: "PATCH",
-    headers: { "Content-Type": "application/json", "If-Match": etag },
+    headers: { "Content-Type": "application/json", ...(etag ? { "If-Match": etag } : {}) },
     body: JSON.stringify(patch),
   });
   if (!res.ok) throw await apiErrorFromResponse(res);

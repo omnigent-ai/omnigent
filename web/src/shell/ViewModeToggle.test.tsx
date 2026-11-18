@@ -128,6 +128,20 @@ describe("ViewModeToggle", () => {
     expect(terminalSegment()).toHaveAttribute("aria-pressed", "false");
   });
 
+  it("uses the dark segmented-control surface tokens", () => {
+    renderToggle(makeCtx({ view: "chat" }));
+    expect(screen.getByTestId("view-mode-toggle")).toHaveClass(
+      "bg-muted",
+      "dark:bg-[var(--segmented-trough-bg)]",
+    );
+    expect(chatSegment()).toHaveClass(
+      "bg-background",
+      "dark:border-transparent",
+      "dark:bg-[var(--segmented-active-bg)]",
+    );
+    expect(terminalSegment()).toHaveClass("dark:bg-[var(--segmented-inactive-bg)]");
+  });
+
   it("presses only the active segment in the terminal view", () => {
     renderToggle(makeCtx({ view: "terminal" }));
     expect(terminalSegment()).toHaveAttribute("aria-pressed", "true");
@@ -156,9 +170,13 @@ describe("ViewModeToggle", () => {
     fireEvent.pointerMove(chatSegment().parentElement!, { pointerType: "mouse" });
     const tooltip = await screen.findByRole("tooltip");
     expect(tooltip).toHaveTextContent("Chat view");
-    expect(
-      Array.from(tooltip.querySelectorAll('[data-slot="kbd"]'), (key) => key.textContent),
-    ).toEqual([MOD_KEY, ALT_KEY, "\\"]);
+    expect(tooltip).toHaveClass("menu-surface", "bg-popover", "text-popover-foreground");
+    expect(tooltip).not.toHaveClass("bg-neutral-900", "text-white");
+    const keys = Array.from(tooltip.querySelectorAll<HTMLElement>('[data-slot="kbd"]'));
+    expect(keys.map((key) => key.textContent)).toEqual([MOD_KEY, ALT_KEY, "\\"]);
+    for (const key of keys) {
+      expect(key).toHaveClass("bg-muted", "text-muted-foreground");
+    }
   });
 
   it("keeps the Terminal segment usable and shows a spinner while the terminal is coming up", () => {

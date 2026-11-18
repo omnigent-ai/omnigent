@@ -22,6 +22,8 @@ Uses the shared ``client`` fixture from ``tests/server/conftest.py``
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+
 import httpx
 import pytest
 
@@ -30,6 +32,24 @@ from tests.server.helpers import create_test_agent
 from tests.server.helpers import policy_tool_call_request as _tool_call_request
 
 pytestmark = pytest.mark.asyncio
+
+
+POLICY_REGISTRY = [
+    {
+        "handler": "omnigent.policies.function.make_fixed_action_callable",
+        "kind": "factory",
+    }
+]
+
+
+@pytest.fixture(autouse=True)
+def _register_test_policy_handlers() -> Iterator[None]:
+    from omnigent.policies.registry import load_registry
+
+    # HTTP uploads accept custom policies only when the server registers them.
+    load_registry([__name__])
+    yield
+    load_registry()
 
 
 _MAKE_FIXED = "omnigent.policies.function.make_fixed_action_callable"

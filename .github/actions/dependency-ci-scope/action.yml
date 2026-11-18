@@ -1,0 +1,48 @@
+name: Dependency CI scope
+description: Select affected consumers for isolated dependency changes, otherwise run full CI.
+outputs:
+  dependency:
+    description: Use focused dependency tests on this PR.
+    value: ${{ steps.scope.outputs.dependency }}
+  python_matrix:
+    description: Selected Python test groups.
+    value: ${{ steps.scope.outputs.python_matrix }}
+  database:
+    description: Run the full database backend matrix.
+    value: ${{ steps.scope.outputs.database }}
+  integration:
+    description: Run the server and harness integration journeys.
+    value: ${{ steps.scope.outputs.integration }}
+  windows:
+    description: Run Windows Python checks.
+    value: ${{ steps.scope.outputs.windows }}
+  ios:
+    description: Validate the iOS Bundler dependency environment.
+    value: ${{ steps.scope.outputs.ios }}
+  docker:
+    description: Run container builds for these changes.
+    value: ${{ steps.scope.outputs.docker }}
+  web:
+    description: Run JavaScript workspace checks.
+    value: ${{ steps.scope.outputs.web }}
+  backend:
+    description: Run Python and harness integration tests.
+    value: ${{ steps.scope.outputs.backend }}
+  e2e:
+    description: Run server E2E journeys.
+    value: ${{ steps.scope.outputs.e2e }}
+  omnidev:
+    description: Build and test the Rust development supervisor.
+    value: ${{ steps.scope.outputs.omnidev }}
+  sidecar:
+    description: Build and run Codex parity tests.
+    value: ${{ steps.scope.outputs.sidecar }}
+  ui:
+    description: Run full, dependency smoke, sidecar, or none of the UI E2E suite.
+    value: ${{ steps.scope.outputs.ui }}
+runs:
+  using: composite
+  steps:
+    - id: scope
+      shell: bash
+      run: python3 .github/scripts/ci/dependency_scope.py

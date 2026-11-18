@@ -46,10 +46,12 @@ vi.mock("./ForkSessionDialog", () => ({
     sourceWorkspace?: string | null;
     sourceHostId?: string | null;
     sourceGitBranch?: string | null;
+    visible: boolean;
     onClose: () => void;
   }) => (
     <div
       data-testid="fork-session-form-stub"
+      data-visible={String(props.visible)}
       data-source-session-id={props.sourceSessionId}
       data-source-title={props.sourceTitle ?? ""}
       data-source-workspace={props.sourceWorkspace ?? ""}
@@ -351,6 +353,20 @@ describe("<ReconnectSessionDialog />", () => {
     expect(screen.queryByText(/Clone the session to continue/)).not.toBeInTheDocument();
   });
 
+  it("offers Clone for a sandbox session while keeping Switch host disabled", () => {
+    vi.mocked(useSessionActionRestrictions).mockReturnValue({
+      forkDisabledReason: undefined,
+      switchHostDisabledReason: "Switching hosts is not supported for this sandbox session yet.",
+    });
+    renderDialog({ state: "host_offline", isOwner: true });
+
+    expect(screen.getByTestId("reconnect-session-switch-host")).toBeDisabled();
+    expect(screen.getByTestId("reconnect-session-tab-clone")).not.toBeDisabled();
+    switchToTab("reconnect-session-tab-clone");
+    expect(clonePanelState()).toBe("active");
+    expect(screen.queryByTestId("switch-host-dialog-stub")).not.toBeInTheDocument();
+  });
+
   it("keeps a non-owner on Clone while loading, then selects Reconnect when unsupported", () => {
     vi.mocked(useSessionActionRestrictions).mockReturnValue({
       forkDisabledReason: SESSION_ACTIONS_LOADING,
@@ -462,6 +478,15 @@ describe("<ReconnectSessionDialog />", () => {
     expect(form).toHaveAttribute("data-source-workspace", "/Users/me/repo");
     expect(form).toHaveAttribute("data-source-host-id", "host_1");
     expect(form).toHaveAttribute("data-source-git-branch", "main");
+  });
+
+  it("shows the force-mounted fork form only while the Clone tab is active", () => {
+    renderDialog();
+    expect(screen.getByTestId("fork-session-form-stub")).toHaveAttribute("data-visible", "false");
+    switchToTab("reconnect-session-tab-clone");
+    expect(screen.getByTestId("fork-session-form-stub")).toHaveAttribute("data-visible", "true");
+    switchToTab("reconnect-session-tab-reconnect");
+    expect(screen.getByTestId("fork-session-form-stub")).toHaveAttribute("data-visible", "false");
   });
 
   it("the fork form's onClose closes the dialog", () => {

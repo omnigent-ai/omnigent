@@ -1,9 +1,8 @@
-// Onboarding: "Where do you work today?", shown after picking a preset server
-// from the landing. Pick the runner (a remote environment when offered, else
-// this laptop), then install/open.
+// Onboarding "Where do you work today?": pick a runner (remote or this laptop), then
+// install/open; a new user without the CLI may instead "Just join" or install it first.
 
 import { useState } from "react";
-import { Cloud, Laptop } from "lucide-react";
+import { Cloud, Laptop, LogIn } from "lucide-react";
 import { Card } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 import type { ConnectProgress } from "@/pages/onboarding/ServerSelectorV2";
@@ -17,6 +16,9 @@ import {
 
 export type Runner = "remote" | "local";
 
+const RADIO_CLASS =
+  "size-[13px] shrink-0 appearance-none rounded-full border border-foreground text-foreground checked:bg-[radial-gradient(circle_at_center,currentColor_0_3px,transparent_3.5px)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2";
+
 export function RunnerStep({
   remoteAvailable,
   installed,
@@ -25,6 +27,7 @@ export function RunnerStep({
   onCancelConnect,
   onBack,
   onInstall,
+  onJustJoin,
 }: {
   /** Offer the remote environment, and pick it by default. */
   remoteAvailable: boolean;
@@ -37,12 +40,19 @@ export function RunnerStep({
   onCancelConnect?: () => void;
   onBack: () => void;
   onInstall: (runner: Runner) => void;
+  /** Offer "Just join" (picked by default), which opens the server without a runner. */
+  onJustJoin?: () => void;
 }) {
-  const [runner, setRunner] = useState<Runner>(remoteAvailable ? "remote" : "local");
+  const [runner, setRunner] = useState<Runner | "join">(() => {
+    if (onJustJoin) return "join";
+    return remoteAvailable ? "remote" : "local";
+  });
 
   return (
     <div className="flex h-full flex-col px-2 pb-1 pt-3">
-      <OnboardingHeading>Where do you work today?</OnboardingHeading>
+      <OnboardingHeading>
+        {onJustJoin ? "How do you want to join?" : "Where do you work today?"}
+      </OnboardingHeading>
 
       {remoteAvailable && (
         <label htmlFor="runner-remote">
@@ -58,12 +68,40 @@ export function RunnerStep({
               name="runner"
               checked={runner === "remote"}
               onChange={() => setRunner("remote")}
-              className="size-[13px] shrink-0 appearance-none rounded-full border border-foreground text-foreground checked:bg-[radial-gradient(circle_at_center,currentColor_0_3px,transparent_3.5px)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+              className={RADIO_CLASS}
             />
             <span className="flex items-center justify-center gap-1">
               <Cloud className="size-4" aria-hidden />
               Arca
             </span>
+          </Card>
+        </label>
+      )}
+      {onJustJoin && (
+        <label htmlFor="runner-join">
+          <Card
+            className={cn(
+              "cursor-pointer flex-row pl-4 items-center",
+              runner === "join" ? "shadow-sm" : "shadow-none",
+            )}
+          >
+            <input
+              id="runner-join"
+              type="radio"
+              name="runner"
+              checked={runner === "join"}
+              onChange={() => setRunner("join")}
+              className={RADIO_CLASS}
+            />
+            <div className="flex flex-col">
+              <span className="flex items-center justify-start gap-1">
+                <LogIn className="size-4" aria-hidden />
+                Just join
+              </span>
+              <span className="text-center text-sm text-muted-foreground">
+                Open the server without installing anything.
+              </span>
+            </div>
           </Card>
         </label>
       )}
@@ -81,12 +119,12 @@ export function RunnerStep({
             name="runner"
             checked={runner === "local"}
             onChange={() => setRunner("local")}
-            className="size-[13px] shrink-0 appearance-none rounded-full border border-foreground text-foreground checked:bg-[radial-gradient(circle_at_center,currentColor_0_3px,transparent_3.5px)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2"
+            className={RADIO_CLASS}
           />
           <div className="flex flex-col">
             <span className="flex items-center justify-start gap-1">
               <Laptop className="size-4" aria-hidden />
-              My laptop
+              {onJustJoin ? "Install CLI first" : "My laptop"}
             </span>
 
             <span className="text-center text-sm text-muted-foreground">
@@ -96,10 +134,14 @@ export function RunnerStep({
         </Card>
       </label>
 
-      <p className="mx-auto mt-4 max-w-sm flex-1 text-center text-base text-muted-foreground">
-        Automatically carry over your existing setup. Share sessions with your teammates. Use from
-        any device. Keep sessions running in the cloud.
-      </p>
+      {onJustJoin ? (
+        <div className="flex-1" />
+      ) : (
+        <p className="mx-auto mt-4 max-w-sm flex-1 text-center text-base text-muted-foreground">
+          Automatically carry over your existing setup. Share sessions with your teammates. Use from
+          any device. Keep sessions running in the cloud.
+        </p>
+      )}
 
       {error && (
         <div role="alert" className="text-base text-destructive">
@@ -113,9 +155,9 @@ export function RunnerStep({
       <OnboardingRail>
         <OnboardingBackButton onClick={onBack} disabled={connection !== null} />
         <InstallActionButton
-          installed={installed}
+          installed={runner === "join" || installed}
           loading={connection !== null}
-          onClick={() => onInstall(runner)}
+          onClick={() => (runner === "join" ? onJustJoin?.() : onInstall(runner))}
         />
       </OnboardingRail>
     </div>

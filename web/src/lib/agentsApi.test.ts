@@ -73,6 +73,13 @@ describe("configuration API", () => {
   it("preserves missing revision information and exposes conflicts", async () => {
     mockFetch.mockResolvedValue(new Response("{}"));
     expect((await getAgentConfig("a")).etag).toBeNull();
+    mockFetch.mockResolvedValue(new Response("{}"));
+    expect((await patchAgentConfig("a", null, { description: "Updated" })).etag).toBeNull();
+    expect(mockFetch).toHaveBeenLastCalledWith("/v1/agents/a", {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: '{"description":"Updated"}',
+    });
     mockFetch.mockResolvedValue(
       new Response('{"error":{"code":"precondition_failed","message":"Reload"}}', { status: 412 }),
     );

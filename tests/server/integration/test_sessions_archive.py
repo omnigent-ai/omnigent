@@ -13,21 +13,27 @@ pipeline without subprocesses.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import dataclasses
 import gzip
 import io
 import tarfile
+import types
+from collections.abc import AsyncIterator
 from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
+from fastapi import FastAPI
 
+from omnigent.server.routes import _host_launch
 from omnigent.server.routes import sessions as _sessions_facade
 from omnigent.server.routes._sessions import common as _sessions_common
 from omnigent.server.routes._sessions import orchestration as _sessions_orchestration
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from omnigent.stores.host_store import HostStore
 from tests.server.helpers import create_test_session
 
 pytestmark = pytest.mark.asyncio
@@ -249,9 +255,12 @@ async def test_archive_idle_parent_stops_running_child(
         _sessions_common._session_status_cache.pop(child.id, None)
 
 
+@pytest.mark.parametrize("cleanup_status", [200, 503, "stalled-headers", "stalled-body"])
 async def test_archive_tears_down_host_spawned_runner(
     client: httpx.AsyncClient,
     db_uri: str,
+    cleanup_status: int | str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     Archiving a host-spawned session tears down its dedicated runner.
@@ -273,21 +282,67 @@ async def test_archive_tears_down_host_spawned_runner(
     conv_store.set_runner_id(session_id, "b1b2c3d4e5f61234567890abcdef0123")
 
     mock_teardown = AsyncMock(return_value=True)
+    requests: list[httpx.Request] = []
+    canceled = asyncio.Event()
+
+    async def stall() -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            canceled.set()
+
+    class StalledBody(httpx.AsyncByteStream):
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            await stall()
+            yield b""
+
+    async def handle_cleanup(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if cleanup_status == "stalled-headers":
+            await stall()
+        if cleanup_status == "stalled-body":
+            return httpx.Response(200, stream=StalledBody())
+        return httpx.Response(int(cleanup_status))
+
+    runner_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handle_cleanup), base_url="http://runner"
+    )
     _sessions_common._session_status_cache[session_id] = "running"
     try:
         with (
+            patch.object(_sessions_orchestration, "_ARCHIVE_SESSION_TEARDOWN_TIMEOUT_S", 0.05),
             patch.object(
                 _sessions_orchestration, "_stop_session_via_runner", AsyncMock(return_value=True)
             ),
             patch.object(_sessions_facade, "_stop_session_host_runner", mock_teardown),
+            patch.object(
+                _sessions_facade, "_get_runner_client", AsyncMock(return_value=runner_client)
+            ),
         ):
             resp = await client.patch(
                 f"/v1/sessions/{session_id}",
                 json={"archived": True},
             )
-            await _drain_detached_stops()
+            await asyncio.wait_for(_drain_detached_stops(), timeout=5.0)
         assert resp.status_code == 200
         assert resp.json()["archived"] is True
+        assert [(request.method, request.url.path) for request in requests] == [
+            ("DELETE", f"/v1/sessions/{session_id}")
+        ]
+        failures = [
+            record
+            for record in caplog.records
+            if "Archive runner-session teardown failed" in record.message
+        ]
+        if isinstance(cleanup_status, str):
+            assert canceled.is_set()
+            assert len(failures) == 1
+            assert failures[0].exc_info is not None
+            assert isinstance(failures[0].exc_info[1], TimeoutError)
+        elif cleanup_status == 503:
+            assert len(failures) == 1
+        else:
+            assert not failures
         mock_teardown.assert_awaited_once()
         assert mock_teardown.await_args is not None
         assert mock_teardown.await_args.args[:3] == (
@@ -295,6 +350,73 @@ async def test_archive_tears_down_host_spawned_runner(
             "a1b2c3d4e5f61234567890abcdef0123",
             "b1b2c3d4e5f61234567890abcdef0123",
         )
+    finally:
+        await runner_client.aclose()
+        _sessions_common._session_status_cache.pop(session_id, None)
+        _sessions_common._intentional_stop_sessions.pop(session_id, None)
+
+
+_SHARDED_HOST_ID = "c1b2c3d4e5f61234567890abcdef0123"
+
+
+@pytest.mark.parametrize(
+    ("host_state", "status"),
+    [("on_other_replica", 400), ("on_this_replica", 200), ("offline", 200)],
+)
+async def test_sharded_archive_requires_the_host_replica(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    host_state: str,
+    status: int,
+) -> None:
+    """
+    A sharded archive commits only on the replica that can stop the runner.
+
+    The teardown reaches the host-launched runner over the host's tunnel. On a
+    replica without it, committing ``archived`` would hide a session whose
+    runner keeps running, so a live host elsewhere gets ``wrong_replica``
+    (the client re-addresses with the slice key) and the session is untouched.
+    An offline host has no runner to stop, so its archive still succeeds.
+    """
+    session = await create_test_session(client, name=f"archive-sharded-{host_state}")
+    session_id = session["id"]
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.set_host_id(session_id, _SHARDED_HOST_ID, workspace="/tmp/archive-ws")
+    conv_store.set_runner_id(session_id, "d1b2c3d4e5f61234567890abcdef0123")
+    host_store = HostStore(db_uri)
+    host_store.upsert_on_connect(_SHARDED_HOST_ID, "archive-host", "local")
+    if host_state == "offline":
+        host_store.set_offline(_SHARDED_HOST_ID)
+    monkeypatch.setattr(app.state, "host_store", host_store)
+    monkeypatch.setattr(_host_launch, "_host_sharded", True)
+    tunnel = types.SimpleNamespace(hello=types.SimpleNamespace(version="test"))
+    local_tunnel = (
+        patch.object(app.state.host_registry, "get", lambda _host_id: tunnel)
+        if host_state == "on_this_replica"
+        else contextlib.nullcontext()
+    )
+
+    mock_teardown = AsyncMock(return_value=True)
+    try:
+        with (
+            local_tunnel,
+            patch.object(
+                _sessions_orchestration, "_stop_session_via_runner", AsyncMock(return_value=True)
+            ),
+            patch.object(_sessions_facade, "_stop_session_host_runner", mock_teardown),
+        ):
+            resp = await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
+            await _drain_detached_stops()
+        assert resp.status_code == status, resp.text
+        archived = (await client.get(f"/v1/sessions/{session_id}")).json()["archived"]
+        if status == 400:
+            assert resp.json()["error"]["code"] == "wrong_replica"
+            assert archived is False
+            mock_teardown.assert_not_awaited()
+        else:
+            assert archived is True
     finally:
         _sessions_common._session_status_cache.pop(session_id, None)
         _sessions_common._intentional_stop_sessions.pop(session_id, None)
@@ -446,11 +568,13 @@ async def test_undo_within_grace_keeps_runner_alive(
     session_id = session["id"]
 
     mock_stop = AsyncMock(return_value=True)
+    resolve_runner = AsyncMock()
     _sessions_common._session_status_cache[session_id] = "running"
     try:
         with (
             patch.object(_sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 30.0),
             patch.object(_sessions_orchestration, "_stop_session_via_runner", mock_stop),
+            patch.object(_sessions_facade, "_get_runner_client", resolve_runner),
         ):
             await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
             assert session_id in _sessions_orchestration._pending_archive_stops
@@ -460,6 +584,7 @@ async def test_undo_within_grace_keeps_runner_alive(
             assert session_id not in _sessions_orchestration._pending_archive_stops
             await _drain_detached_stops()
         mock_stop.assert_not_awaited()
+        resolve_runner.assert_not_awaited()
     finally:
         _sessions_common._session_status_cache.pop(session_id, None)
 
@@ -715,3 +840,22 @@ async def test_agent_contents_404_for_nonexistent_session(
     """GET /v1/sessions/{id}/agent/contents returns 404 for a missing session."""
     resp = await client.get("/v1/sessions/conv_nonexistent/agent/contents")
     assert resp.status_code == 404
+
+
+async def test_archive_passes_the_servers_sandbox_config_to_the_teardown(
+    app, client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The archive teardown gets the deployment config that decides a sandbox stop."""
+    session = await create_test_session(client, name="archive-sandbox-stop")
+    sandbox_config, host_store = object(), object()
+    monkeypatch.setattr(app.state, "sandbox_config", sandbox_config, raising=False)
+    monkeypatch.setattr(app.state, "host_store", host_store, raising=False)
+    stop_sandbox = AsyncMock(return_value=False)
+    with patch.object(_sessions_orchestration, "stop_archived_session_sandbox", stop_sandbox):
+        resp = await client.patch(f"/v1/sessions/{session['id']}", json={"archived": True})
+        await _drain_detached_stops()
+    assert resp.status_code == 200, resp.text
+    (call,) = stop_sandbox.await_args_list
+    conv, passed_host_store, _conversations, passed_config = call.args
+    assert conv.id == session["id"] and conv.archived is True
+    assert passed_host_store is host_store and passed_config is sandbox_config

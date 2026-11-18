@@ -192,9 +192,19 @@ def test_executor_factory_databricks_kimi_defaults_to_chat_completions(
         ("databricks/databricks-claude-sonnet-4-6", False),
         ("databricks-meta-llama-3.3-70b-instruct", False),
         ("databricks-kimi-k2-6", False),
+        # Unity Catalog spellings of the same models get the same default;
+        # model-override normalization rewrites legacy ids to this form.
+        ("system.ai.claude-sonnet-4-6", False),
+        ("databricks/system.ai.claude-sonnet-4-6", False),
+        ("system.ai.meta-llama-3-3-70b-instruct", False),
+        ("system.ai.kimi-k2-6", False),
+        # Unity Catalog model-service ids follow the same rule.
+        ("system.ai.gemini-3-8-flash", False),
+        ("system.ai.gpt-6-astra", True),
         # Databricks GPT models keep the Responses-API default.
         ("databricks-gpt-5-4-mini", True),
         ("databricks/databricks-gpt-5-5", True),
+        ("system.ai.gpt-5-5", True),
         # Non-Databricks ids keep the existing Responses default (the rule is
         # scoped to gateway-hosted models).
         ("gpt-5.5", True),

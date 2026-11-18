@@ -100,7 +100,7 @@ class ControllableMockTool:
         # ... start the workflow that will invoke the tool ...
         await call_1.call_event.wait()  # tool entered
         # perform concurrent action while tool is blocked ...
-        call_1.release()                # let the tool finish
+        call_1.release()  # let the tool finish
 
     Returns the result as a string (matches the runner's wire
     contract). For non-string return shapes use ``result=`` with

@@ -79,9 +79,11 @@ steps below are validated end-to-end:
 ## Release features
 
 In the Omnigent service's **Variables** tab, set `OMNIGENT_FEATURES` to a
-comma-separated enabled set such as `usage_page`. Railway redeploys the service
-automatically. Remove the key from the value to roll back, then reload the web
-app. See [`designs/FEATURE_FLAGS.md`](../../designs/FEATURE_FLAGS.md) for known
+comma-separated overrides such as `usage_page`: names enable, `-name` disables,
+and empty uses defaults. Railway redeploys the service automatically. Add
+`-feature_name` to roll back, then reload the web app. Runner overrides such as
+`-claude_osc_status` also need to be set on separately running hosts; restart
+their host/runners and launch fresh terminals. See [`designs/FEATURE_FLAGS.md`](../../designs/FEATURE_FLAGS.md) for known
 keys.
 
 ## Use your own IdP instead (OIDC)

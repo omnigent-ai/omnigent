@@ -600,26 +600,34 @@ def test_build_policy_llm_client_constructs_from_config() -> None:
     assert result._request_timeout == 60
 
 
-def test_build_policy_llm_client_normalizes_databricks_prefix() -> None:
+@pytest.mark.parametrize(
+    ("primary", "fallback"),
+    [
+        ("databricks-claude-sonnet-4", "databricks-claude-3-5-haiku"),
+        ("system.ai.claude-sonnet-4", "system.ai.claude-3-5-haiku"),
+    ],
+)
+def test_build_policy_llm_client_normalizes_databricks_prefix(primary: str, fallback: str) -> None:
     """
-    Bare ``databricks-`` model names get the ``databricks/``
-    provider prefix, on both the primary model and every fallback.
+    Bare Databricks model names (``databricks-`` and Unity Catalog
+    ``system.ai.``) get the ``databricks/`` provider prefix, on both
+    the primary model and every fallback.
 
-    What breaks if this fails: hosted fallback calls route to
+    What breaks if this fails: hosted judge calls route to
     ``/responses`` on the Databricks gateway and 400 (the exact
     bug the primary-model fixup already guards against).
     """
     llm_config = LLMConfig(
-        model="databricks-claude-sonnet-4",
-        fallback_models=["databricks-claude-3-5-haiku", "openai/gpt-4o-mini"],
+        model=primary,
+        fallback_models=[fallback, "openai/gpt-4o-mini"],
     )
     result = _build_policy_llm_client(llm_config, None)
 
     assert result is not None
-    assert result._model == "databricks/databricks-claude-sonnet-4"
+    assert result._model == f"databricks/{primary}"
     # Fallbacks get the same fixup; already-prefixed ids pass through.
     assert result._fallback_models == [
-        "databricks/databricks-claude-3-5-haiku",
+        f"databricks/{fallback}",
         "openai/gpt-4o-mini",
     ]
 

@@ -9,6 +9,7 @@ Each tool set is a module in this package that exports:
 Usage::
 
     from omnigent.client_tools import get_tool_set
+
     tool_set = get_tool_set("coding")
     schemas = tool_set.TOOLS
     result = tool_set.execute_tool("Read", {"file_path": "/tmp/foo.py"})

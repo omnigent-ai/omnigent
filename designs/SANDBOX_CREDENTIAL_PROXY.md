@@ -132,7 +132,7 @@ os_env:
       # git_https: nothing enters the sandbox — git fires its request and
       # the proxy injects Basic auth for the bound host.
       - type: git_https
-        target: github.com/databricks-eng/agent-framework.git
+        target: github.com/example-org/agent-framework.git
         source: {env: OA_TEST_GITHUB_PAT}
       # https_bearer with no `env`: swap-on-access. curl/python send no
       # Authorization header; the proxy attaches Bearer <real>.
@@ -197,8 +197,8 @@ os_env:
       - "* pypi.org/**"
     credential_proxy:
       - type: databricks_cli
-        profiles: [dbc-adb7b1a3-9097, oss]
-        default: dbc-adb7b1a3-9097
+        profiles: [dbc-87654321-dcba, oss]
+        default: dbc-87654321-dcba
 ```
 
 ## Internal model

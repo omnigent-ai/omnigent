@@ -3,7 +3,7 @@ import {
   extractAssistantText,
   extractErrorText,
   fetchLastAssistantText,
-  latestOutputPreview,
+  latestOutput,
   previewText,
 } from "./lastAssistantText";
 
@@ -64,8 +64,9 @@ describe("extractErrorText", () => {
   });
 });
 
-describe("latestOutputPreview", () => {
-  const reply = (text: string) => ({
+describe("latestOutput", () => {
+  const reply = (text: string, id?: string) => ({
+    ...(id === undefined ? {} : { id }),
     type: "message",
     role: "assistant",
     content: [{ type: "output_text", text }],
@@ -78,16 +79,46 @@ describe("latestOutputPreview", () => {
       reply("Second answer."),
       { type: "function_call_output", output: "tool result" },
     ];
-    expect(latestOutputPreview(items)).toBe("Second answer.");
+    expect(latestOutput(items)?.preview).toBe("Second answer.");
   });
 
   it("surfaces a failed turn's error when it is newer than the last reply", () => {
     const items = [reply("Earlier answer."), { type: "error", message: "Model overloaded" }];
-    expect(latestOutputPreview(items)).toBe("Model overloaded");
+    expect(latestOutput(items)?.preview).toBe("Model overloaded");
   });
 
   it("returns undefined when nothing carries output text", () => {
-    expect(latestOutputPreview([{ type: "function_call", name: "edit" }])).toBeUndefined();
+    expect(latestOutput([{ type: "function_call", name: "edit" }])).toBeUndefined();
+  });
+
+  it("keys the output by its item id", () => {
+    // WHY: two answers with the same text are still different replies.
+    const items = [reply("Done.", "item_1"), reply("Done.", "item_2")];
+    expect(latestOutput(items)).toEqual({ key: "item_2", preview: "Done." });
+  });
+
+  it("keys an error item by its id too", () => {
+    const items = [reply("Done.", "item_1"), { id: "item_err", type: "error", message: "boom" }];
+    expect(latestOutput(items)).toEqual({ key: "item_err", preview: "boom" });
+  });
+
+  it("falls back to the full text when the item has no id", () => {
+    // The key is the untruncated text, so two long replies sharing a prefix differ.
+    const long = `${"a".repeat(30)} first`;
+    expect(latestOutput([reply(long)])?.key).toBe(long);
+  });
+
+  it("returns the untrimmed text only when the preview cut some of it", () => {
+    const capped = `${"a".repeat(30)} first`;
+    expect(latestOutput([reply(capped)], 10)).toEqual({
+      key: capped,
+      preview: "aaaaaaaaa…",
+      fullText: capped,
+    });
+    const manyLines = "one\ntwo\nthree\nfour";
+    expect(latestOutput([reply(manyLines)])?.fullText).toBe(manyLines);
+    // Blank lines between paragraphs are dropped from the preview but lose no text.
+    expect(latestOutput([reply("one\n\ntwo")])).toEqual({ key: "one\n\ntwo", preview: "one\ntwo" });
   });
 });
 

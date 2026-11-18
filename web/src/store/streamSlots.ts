@@ -3,7 +3,7 @@
 // The cap this enforces is shared across every same-origin tab, because the
 // resource it protects — the browser's connection pool (~6 per origin on
 // HTTP/1.1, one multiplexed connection on HTTP/2) — is shared across tabs. A
-// per-tab cap can't see the other tabs, so two tabs at cap 3 each open 6 SSE
+// per-tab cap can't see the other tabs, so two tabs at cap 4 each open 8 SSE
 // streams and deadlock every other fetch. `navigator.locks` is the coordination
 // primitive: a lock's holders are visible across all same-origin agents, and a
 // lock auto-releases when its tab closes or crashes, so a dead tab never strands

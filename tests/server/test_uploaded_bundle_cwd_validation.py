@@ -95,7 +95,7 @@ class UploadedBundleCwdValidationTest(unittest.TestCase):
                     spec = validate_agent_bundle(_bundle_with_cwd(location, valid_cwd))
                     self.assertEqual(spec.name, "root")
 
-    def test_trusted_local_bundle_allows_absolute_cwd(self) -> None:
+    def test_direct_trusted_caller_allows_absolute_cwd(self) -> None:
         for location in _LOCATIONS:
             with self.subTest(location=location):
                 spec = validate_agent_bundle(

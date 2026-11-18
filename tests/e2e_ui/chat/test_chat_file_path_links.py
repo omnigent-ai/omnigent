@@ -45,7 +45,8 @@ import httpx
 import pytest
 from playwright.sync_api import Browser, Page, expect
 
-from tests._helpers.session import bind_session_runner, post_session_bundle
+from tests._helpers.operator_agents import post_operator_session
+from tests._helpers.session import bind_session_runner
 
 _ROOT_FILE = "README.md"
 _README_CONTENT = "# Readme\n\nWorkspace-root file for the e2e link test.\n"
@@ -112,7 +113,7 @@ def linkify_session(
     ws = Path(tempfile.mkdtemp(prefix="omnigent-e2e-ui-links-", dir=Path.home()))
     (ws / _ROOT_FILE).write_text(_README_CONTENT)
 
-    create_resp = post_session_bundle(
+    create_resp = post_operator_session(
         httpx.post, f"{live_server}/v1/sessions", _agent_bundle(str(ws)), timeout=30.0
     )
     create_resp.raise_for_status()
@@ -238,7 +239,7 @@ def test_chat_link_opens_file_beyond_first_large_directory_page(
     target = large / "zzzz-target.md"
     target.write_text("# File beyond the first page\n")
 
-    create_resp = post_session_bundle(
+    create_resp = post_operator_session(
         httpx.post, f"{live_server}/v1/sessions", _agent_bundle(str(tmp_path)), timeout=30.0
     )
     create_resp.raise_for_status()
@@ -263,6 +264,57 @@ def test_chat_link_opens_file_beyond_first_large_directory_page(
         expect(page.get_by_test_id("file-viewer").last).to_contain_text(
             "File beyond the first page"
         )
+    finally:
+        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+
+
+def test_chat_link_to_folder_browses_it_in_files_tree(
+    request: pytest.FixtureRequest,
+    live_server: str,
+    runner_id: str,
+    tmp_path: Path,
+) -> None:
+    """A chat link to an existing folder opens it in the Files tree, not a "wasn't found" toast."""
+    folder = tmp_path / "experimental" / "data" / "mobile-touch-targets"
+    folder.mkdir(parents=True)
+    (folder / "touch-targets.md").write_text("# Touch targets\n")
+
+    create_resp = post_operator_session(
+        httpx.post, f"{live_server}/v1/sessions", _agent_bundle(str(tmp_path)), timeout=30.0
+    )
+    create_resp.raise_for_status()
+    session_id = create_resp.json()["session_id"]
+    try:
+        bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
+        env_resp = httpx.get(
+            f"{live_server}/v1/sessions/{session_id}/resources/environments/default",
+            timeout=10.0,
+        )
+        env_resp.raise_for_status()
+        root = env_resp.json()["metadata"]["root"]
+        link_target = f"{root}/experimental/data/mobile-touch-targets"
+        event_resp = httpx.post(
+            f"{live_server}/v1/sessions/{session_id}/events",
+            json={
+                "type": "external_assistant_message",
+                "data": {
+                    "agent": _AGENT_NAME,
+                    "text": f"Results are in [mobile-touch-targets]({link_target}).",
+                },
+            },
+            timeout=10.0,
+        )
+        event_resp.raise_for_status()
+
+        page: Page = request.getfixturevalue("page")
+        page.goto(f"{live_server}/c/{session_id}")
+        link = page.get_by_role("button", name="mobile-touch-targets", exact=True)
+        expect(link).to_be_visible(timeout=30_000)
+        link.click()
+
+        rail = page.get_by_role("complementary", name="Workspace")
+        expect(rail.get_by_text("touch-targets.md")).to_be_visible(timeout=30_000)
+        expect(page.get_by_text("wasn't found")).to_have_count(0)
     finally:
         httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
 

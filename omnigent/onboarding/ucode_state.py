@@ -118,6 +118,9 @@ def _parse_agent_state(raw: object) -> UcodeAgentState:
     auth_raw = raw.get("auth")
     env_raw = raw.get("env")
     refresh_raw = raw.get("auth_refresh_interval_ms")
+    if refresh_raw is None and isinstance(auth_raw, dict):
+        # ucode writes Codex's cadence inside its ``auth`` table.
+        refresh_raw = auth_raw.get("refresh_interval_ms")
     return UcodeAgentState(
         model=raw.get("model") if isinstance(raw.get("model"), str) else None,
         base_url=raw.get("base_url") if isinstance(raw.get("base_url"), str) else None,
@@ -129,7 +132,9 @@ def _parse_agent_state(raw: object) -> UcodeAgentState:
         auth_command=(
             raw.get("auth_command") if isinstance(raw.get("auth_command"), str) else None
         ),
-        auth_refresh_interval_ms=refresh_raw if isinstance(refresh_raw, int) else None,
+        auth_refresh_interval_ms=(
+            refresh_raw if type(refresh_raw) is int and refresh_raw > 0 else None
+        ),
         auth=dict(auth_raw) if isinstance(auth_raw, dict) else {},
         env={str(key): str(value) for key, value in env_raw.items()}
         if isinstance(env_raw, dict)

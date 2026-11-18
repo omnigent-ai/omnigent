@@ -38,8 +38,7 @@ _start_egress_proxy_locked`` for the matching parent-side change.
 Lifecycle::
 
     # Inside the sandboxed helper process, after activate_sandbox():
-    start_relay(relay_port=37145,
-                unix_socket_path="/tmp/scratch/.egress.sock")
+    start_relay(relay_port=37145, unix_socket_path="/tmp/scratch/.egress.sock")
     # relay runs in a background daemon thread until process exit
 """
 

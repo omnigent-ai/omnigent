@@ -16,16 +16,13 @@ How it differs from the transcript forwarder it supersedes:
   snapshot), so the driver de-dups *within the run* by ``(trajectory_id,
   step_index)`` identity and posts only steps it has not yet seen.
 
-* **No durable cursor.** The transcript forwarder persisted a ``forwarded_steps``
-  resume cursor to bridge state so a restart did not re-mirror the whole file.
-  This driver keeps an *in-memory* seen-set only; the durable cursor (and its
-  JSONL) is retired in the Task 12 cutover. A restart re-reads from the start —
-  acceptable because the reader is recreated per session by the Task 11 runner,
-  not crash-restarted mid-conversation, and the mapper's USER_INPUT-skip plus the
-  server's own item handling bound the blast radius.
+* **Replay is idempotent.** A restart re-reads the full trajectory. Each
+  conversation item carries a stable ``source_id`` derived from its cascade,
+  step identity and item type, so the server's durable item deduplication
+  preserves messages and tool pairs without a separate local cursor.
 
 * **The mapper carries the item logic.** :func:`map_step_to_events` is the pure,
-  no-delta, skip-USER_INPUT mapping layer (Task 4). It deliberately does NOT emit
+  no-delta mapping layer. It deliberately does NOT emit
   status edges — that was always the stateful parser's job. This driver is now
   that stateful layer: it replicates the transcript parser's RUNNING/IDLE
   transition emission (a turn opens on a USER_INPUT step and closes on an
@@ -39,7 +36,11 @@ Discovery mirrors the forwarder's discipline — *poll until ready, never guess*
    ``agy_conv_*`` placeholder until the real id is discovered and persisted. The
    reader polls :func:`read_bridge_state` until ``conversation_id`` is present and
    is NOT a placeholder; that real id is the cascade id (agy uses one UUID for
-   both the conversation and the cascade).
+   both the conversation and the cascade). When the cold-start missed its
+   deadline and the placeholder is all there is, the loop also runs the
+   placeholder-recovery scan (:func:`_recover_placeholder_cascade`) that adopts
+   the TUI-minted cascade a typed turn creates, so discovery cannot deadlock on
+   a placeholder nothing else will ever replace.
 2. **RPC port.** The reader enumerates candidate agy connect-RPC ports
    (:func:`_candidate_agy_rpc_ports`) and binds the one that confirms it hosts the
    cascade id (:func:`_conversation_matches`). It keeps polling until a port
@@ -55,10 +56,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
+import json
 import logging
+import time
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -67,17 +72,22 @@ from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.antigravity_native.bridge import (
     ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
     AntigravityNativeBridgeState,
+    agy_conversation_db,
     is_placeholder_conversation_id,
     read_bridge_state,
+    read_tmux_info,
+    update_conversation_id,
     write_bridge_state,
 )
 from omnigent.harnesses.antigravity_native.rpc import (
     AntigravityRpcError,
+    ColdStartPortLog,
     _candidate_agy_rpc_ports,
     _conversation_matches,
     get_all_cascade_trajectories,
     get_available_models,
     get_trajectory_steps,
+    resolve_cold_start_agy_rpc_port,
     stream_agent_state_updates,
 )
 
@@ -85,6 +95,7 @@ from omnigent.harnesses.antigravity_native.rpc import (
 # (relocated from the retired transcript forwarder). The reader reuses the SAME
 # event shape so the mapped events post identically.
 from omnigent.harnesses.antigravity_native.steps import (
+    _AGENT_NAME,
     OutboundEvent,
     PendingInteraction,
     _execution_discriminator,
@@ -98,6 +109,11 @@ from omnigent.harnesses.antigravity_native.steps import (
 )
 from omnigent.harnesses.claude_native.bridge import url_component
 from omnigent.native._native_post_delivery import post_session_event_with_retry
+from omnigent.native._native_supersession import (
+    clear_replacement_create_body,
+    post_clear_supersession,
+    unfiled_clear_replacement_body,
+)
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 
 _logger = logging.getLogger(__name__)
@@ -131,6 +147,11 @@ _SUBAGENT_QUIESCENT_POLLS_MAX = 480
 # this off the hot path — far slower than the per-turn poll cadence so it does not
 # hammer the loopback RPC.
 _DEFAULT_ROTATION_INTERVAL_S = 3.0
+
+# Seconds between placeholder-recovery scans while discovery is parked on the
+# launcher placeholder. Coarse like the rotation interval: each scan does a
+# pane-scoped port resolve plus a ``GetAllCascadeTrajectories`` fetch.
+_PLACEHOLDER_RECOVERY_INTERVAL_S = 3.0
 
 # Backoff between connect-stream re-entries in :func:`_stream_loop`. In steady
 # state the re-opened stream blocks awaiting frames, so this delay is paid only
@@ -413,7 +434,7 @@ def _parse_activity_timestamp(value: object) -> datetime | None:
         parsed = datetime.fromisoformat(normalized)
     except ValueError:
         return None
-    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 def _summary_activity(summary: dict[str, object]) -> datetime | None:
@@ -464,7 +485,9 @@ def _summary_is_child_trajectory(cascade_id: str, summary: dict[str, object]) ->
     root — so the type alone cannot tell them apart (live-verified, agy 1.1.9).
     The distinction lives in ``trajectoryMetadata``, where a child carries a
     ``parentConversationId`` and a ``rootConversationId`` pointing at its PARENT,
-    while a root's ``rootConversationId`` is its own id::
+    while a root's ``rootConversationId`` is its own id:
+
+    .. code-block:: text
 
         root:  {"rootConversationId": "<self>"}
         child: {"parentConversationId": "<parent>", "rootConversationId": "<parent>",
@@ -490,6 +513,13 @@ def _summary_is_child_trajectory(cascade_id: str, summary: dict[str, object]) ->
         return True
     root = metadata.get("rootConversationId")
     return isinstance(root, str) and bool(root) and root != cascade_id
+
+
+def _is_root_cascade(cascade_id: str, summary: dict[str, object]) -> bool:
+    """Return whether a trajectory summary is a root cascade rather than a subagent child."""
+    if summary.get("trajectoryType") != _TRAJECTORY_TYPE_CASCADE:
+        return False
+    return not _summary_is_child_trajectory(cascade_id, summary)
 
 
 def _detect_rotated_cascade(summaries: dict[str, object], bound_cascade_id: str) -> str | None:
@@ -542,12 +572,8 @@ def _detect_rotated_cascade(summaries: dict[str, object], bound_cascade_id: str)
     best_id: str | None = None
     best_activity: datetime | None = None
     for cascade_id, summary in summaries.items():
-        if not isinstance(summary, dict):
-            continue
-        if summary.get("trajectoryType") != _TRAJECTORY_TYPE_CASCADE:
-            continue  # never rotate to a non-cascade trajectory
-        if _summary_is_child_trajectory(cascade_id, summary):
-            continue  # a subagent works FOR the bound cascade; it is not a new one
+        if not isinstance(summary, dict) or not _is_root_cascade(cascade_id, summary):
+            continue  # never rotate to a non-cascade trajectory or a subagent child
         if cascade_id == bound_cascade_id:
             continue
         activity = _summary_activity(summary)
@@ -568,6 +594,42 @@ def _detect_rotated_cascade(summaries: dict[str, object], bound_cascade_id: str)
     if bound_activity is None or best_activity > bound_activity:
         return best_id
     return None
+
+
+def _typed_root_cascade(summaries: dict[str, object]) -> str | None:
+    """
+    Return the most recently typed-into root cascade id, or ``None``.
+
+    Root filters match rotation; requiring ``lastUserInputTime`` excludes the
+    headless cold-start phantom and bare ``/clear`` mints (never typed into).
+    Only UUID-shaped ids qualify: the id is later used as a file name and a
+    ``--conversation`` argument, so a malformed key from the RPC is never adopted.
+
+    :param summaries: ``trajectorySummaries`` from ``GetAllCascadeTrajectories``.
+    :returns: The typed-into root cascade id, or ``None`` when none exists yet.
+    """
+    best_id: str | None = None
+    best_input: datetime | None = None
+    for cascade_id, summary in summaries.items():
+        if not isinstance(summary, dict) or not _is_cascade_uuid(cascade_id):
+            continue
+        if not _is_root_cascade(cascade_id, summary):
+            continue
+        typed = _parse_activity_timestamp(summary.get("lastUserInputTime"))
+        if typed is None:
+            continue
+        if best_input is None or typed > best_input:
+            best_id, best_input = cascade_id, typed
+    return best_id
+
+
+def _is_cascade_uuid(cascade_id: str) -> bool:
+    """Return whether *cascade_id* parses as a UUID (agy mints UUIDs for cascades)."""
+    try:
+        uuid.UUID(cascade_id)
+    except ValueError:
+        return False
+    return True
 
 
 async def _sleep(seconds: float) -> None:
@@ -793,11 +855,109 @@ def _resolve_rpc_port(cascade_id: str) -> int | None:
     return None
 
 
+@dataclass
+class _RecoveryScanLog:
+    """Per-discovery throttling for recovery-scan warnings that would repeat every round."""
+
+    port_log: ColdStartPortLog = field(default_factory=ColdStartPortLog)
+    foreign_misses: dict[str, int] = field(default_factory=dict)
+
+
+def _recover_placeholder_cascade(
+    bridge_dir: Path, *, scan_log: _RecoveryScanLog | None = None
+) -> str | None:
+    """
+    Adopt agy's TUI-minted cascade while bridge state still holds the placeholder.
+
+    Nothing else replaces a stale placeholder: discovery rejects it and the
+    rotation detector starts only after discovery binds. Safety mirrors the
+    cold-start — pane-scoped port (no local pane, no scan), typed-into root
+    cascades only, and the cascade's conversation db must exist under this
+    session's own Gemini dir (a foreign agy writes to its own).
+
+    :param bridge_dir: Native Antigravity bridge directory.
+    :param scan_log: Throttling state shared by one discovery run: the resolver's
+        restricted-``/proc`` fallback is reported at WARNING once, and a cascade
+        missing from this session's Gemini dir at WARNING on its second miss (the
+        first is usually agy's write lag), DEBUG otherwise. A fresh log when ``None``.
+    :returns: The adopted cascade id (persisted), or ``None`` this round.
+    """
+    log = scan_log if scan_log is not None else _RecoveryScanLog()
+    state = read_bridge_state(bridge_dir)
+    if state is None or not is_placeholder_conversation_id(state.conversation_id):
+        return None
+    info = read_tmux_info(bridge_dir)
+    if info is None:
+        return None
+    socket_path = Path(info["socket_path"])
+    if not socket_path.exists():
+        # A socket that is not on this host cannot scope the scan (and its pane
+        # cannot have delivered a web turn from here); skip this round.
+        return None
+    port = resolve_cold_start_agy_rpc_port(socket_path, info["tmux_target"], log=log.port_log)
+    if port is None:
+        return None
+    try:
+        body = get_all_cascade_trajectories(port)
+    except (httpx.HTTPError, ValueError) as exc:
+        _logger.debug(
+            "agy placeholder recovery: GetAllCascadeTrajectories failed; retrying "
+            "next round: port=%s error=%r",
+            port,
+            exc,
+        )
+        return None
+    summaries = body.get("trajectorySummaries")
+    if not isinstance(summaries, dict):
+        return None
+    cascade_id = _typed_root_cascade(summaries)
+    if cascade_id is None:
+        return None
+    if not agy_conversation_db(bridge_dir, cascade_id).is_file():
+        # agy writes the db shortly after listing the cascade, so the first miss is
+        # usually that lag; a repeat miss means a foreign agy and is reported once.
+        misses = log.foreign_misses.get(cascade_id, 0)
+        _logger.log(
+            logging.WARNING if misses == 1 else logging.DEBUG,
+            "agy placeholder recovery: typed cascade %s on port %s is not (yet) in this "
+            "session's Gemini dir (a foreign agy, or agy has not written it yet); "
+            "refusing to adopt.",
+            cascade_id,
+            port,
+        )
+        log.foreign_misses[cascade_id] = misses + 1
+        return None
+    # The scan took seconds: a cold-start may have bound a real id, or a recreated
+    # terminal reseeded the placeholder. Write only over the state this scan read.
+    try:
+        adopted = update_conversation_id(bridge_dir, cascade_id, expected_state=state)
+    except OSError as exc:
+        # A transient write failure must not end discovery; the next round retries.
+        _logger.warning(
+            "agy placeholder recovery: could not persist cascade %s; retrying next "
+            "round: bridge_dir=%s error=%r",
+            cascade_id,
+            bridge_dir,
+            exc,
+        )
+        return None
+    if not adopted:
+        return None
+    _logger.info(
+        "agy reader adopted the TUI-minted cascade past a stale placeholder "
+        "(cold-start never bound a real id): bridge_dir=%s cascade=%s",
+        bridge_dir,
+        cascade_id,
+    )
+    return cascade_id
+
+
 async def _discover(
     bridge_dir: Path,
     *,
     poll_interval_s: float,
     stop: StopPredicate,
+    on_adopted: Callable[[str], Awaitable[None]] | None = None,
 ) -> tuple[str, int] | None:
     """
     Resolve ``(cascade_id, port)``, polling until ready or asked to stop.
@@ -806,6 +966,11 @@ async def _discover(
     from bridge state (past the launcher placeholder), then the connect-RPC port
     that confirms ownership of that cascade. Discovery work (file read + blocking
     httpx TLS probes) runs in a worker thread so the event loop stays responsive.
+
+    While the placeholder persists, the loop retries the recovery scan
+    (:func:`_recover_placeholder_cascade`) every
+    :data:`_PLACEHOLDER_RECOVERY_INTERVAL_S` and awaits ``on_adopted`` as soon as
+    an adoption is persisted, before the port resolves.
 
     Readiness is checked BEFORE ``stop`` each round, so a discovery that resolves
     immediately consumes none of the caller's poll budget — ``stop`` is a
@@ -816,11 +981,23 @@ async def _discover(
     :param poll_interval_s: Seconds to wait between discovery polls.
     :param stop: Predicate consulted only when a round did NOT resolve; when it
         returns ``True`` the discovery loop gives up (the runner owns restart).
+    :param on_adopted: Awaited once with the cascade id the recovery scan adopted;
+        the caller records it as the session's external id, since no
+        rotation-based first adoption will run for it.
     :returns: ``(cascade_id, port)`` once both resolve, or ``None`` if ``stop``
         fired before discovery completed.
     """
+    scan_log = _RecoveryScanLog()
+    next_recovery_at = 0.0
     while True:
         cascade_id = await asyncio.to_thread(_resolve_cascade_id, bridge_dir)
+        if cascade_id is None and time.monotonic() >= next_recovery_at:
+            next_recovery_at = time.monotonic() + _PLACEHOLDER_RECOVERY_INTERVAL_S
+            cascade_id = await asyncio.to_thread(
+                _recover_placeholder_cascade, bridge_dir, scan_log=scan_log
+            )
+            if cascade_id is not None and on_adopted is not None:
+                await on_adopted(cascade_id)
         if cascade_id is not None:
             port = await asyncio.to_thread(_resolve_rpc_port, cascade_id)
             if port is not None:
@@ -959,8 +1136,7 @@ async def supervise_reader(
     for every step it has not seen before this run:
 
     * maps the step to conversation-item events (:func:`map_step_to_events`) and
-      POSTs each one (USER_INPUT maps to ``[]`` so it posts nothing — the user
-      turn is already persisted by the direct ``POST /events`` hook);
+      POSTs each one, including user turns, with a stable source identity;
     * emits an ``external_session_status`` RUNNING edge when a user turn opens and
       an IDLE edge when an assistant-text step closes it, each only on a real
       transition (deduped via an in-memory turn-active flag);
@@ -969,8 +1145,9 @@ async def supervise_reader(
       bridge drives the elicitation + answer).
 
     De-dup is by ``(trajectory_id, step_index)`` identity in an in-memory
-    seen-set (no durable cursor — retired in Task 12), so re-reading the same
-    snapshot posts nothing. Tool-call ids are derived from each step's own
+    seen-set, so re-reading the same snapshot posts nothing within a run. Across
+    restarts, the server deduplicates items by their stable source ids.
+    Tool-call ids are derived from each step's own
     ``(trajectory, step)`` identity by the mapper, so a re-read or a fallback to
     a different RPC re-derives the same id rather than re-keying the pair.
 
@@ -1020,7 +1197,14 @@ async def supervise_reader(
     """
     should_stop: StopPredicate = stop if stop is not None else (lambda: False)
 
-    discovered = await _discover(bridge_dir, poll_interval_s=poll_interval_s, stop=should_stop)
+    async def _record_adopted(adopted_cascade_id: str) -> None:
+        # Placeholder recovery binds the TUI-minted conversation directly, so no
+        # rotation-based first adoption will record it for --resume.
+        await _record_external_session_id(client, session_id, adopted_cascade_id)
+
+    discovered = await _discover(
+        bridge_dir, poll_interval_s=poll_interval_s, stop=should_stop, on_adopted=_record_adopted
+    )
     if discovered is None:
         return None
     cascade_id, port = discovered
@@ -1895,8 +2079,7 @@ def _is_settled(step: dict[str, object]) -> bool:
     A step is settled when re-emitting it can produce nothing new, so recording
     its identity in ``seen`` will not drop later content:
 
-    * a USER_INPUT step (always terminal; maps to ``[]`` permanently — the user
-      turn is persisted by the direct ``POST /events``);
+    * a USER_INPUT step (always terminal; maps to one user message);
     * any step whose ``status`` is terminal — DONE (the mapper emits its content)
       or ERROR (the command failed before producing output, so none is coming).
 
@@ -2290,6 +2473,10 @@ async def _emit_step(
         await _post_event(client, session_id, _status_event(_STATUS_RUNNING))
 
     for event in map_step_to_events(step, conversation_id=cascade_id):
+        # The server deduplicates replayed items across reader/process restarts.
+        # Include item type so a tool call and its result remain separate items.
+        identity = json.dumps([cascade_id, _step_key(step), event.data["item_type"]])
+        event.data["source_id"] = "agy:" + hashlib.sha256(identity.encode()).hexdigest()
         await _post_event(client, session_id, event)
 
     if _is_turn_close_step(step) and turn_active:
@@ -3071,7 +3258,7 @@ async def _rotate_session_for_cascade(
     new cascade on the SAME process:
 
     1. GET the old session snapshot (``agent_id`` / ``runner_id`` / ``labels``).
-    2. POST ``/v1/sessions`` with the old ``agent_id`` + inherited ``labels`` — the
+    2. POST ``/v1/sessions`` with the old ``agent_id``, title, project + inherited ``labels`` — the
        labels carry agy's bridge-id (:data:`ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY`),
        so the NEW session resolves to the SAME ``bridge_dir`` the reader uses (agy's
        bridge_dir is keyed off the launcher's bridge-id, NOT the session id — so we
@@ -3089,6 +3276,8 @@ async def _rotate_session_for_cascade(
        conversation id (the reader re-reads this on rebind to bind the new cascade).
     6. PATCH the old session's ``runner_id`` to ``""`` to release it (best-effort;
        a failure is logged, not raised — the new session is already live).
+    7. POST the shared ``/clear`` supersession notice to the OLD conversation
+       (best-effort), so its web view stops spinning and follows the new chat.
 
     Best-effort: ANY failure (snapshot, create, bind, transfer, state write) is
     logged at WARNING and yields ``None``, and the caller keeps serving the OLD
@@ -3125,10 +3314,10 @@ async def _rotate_session_for_cascade(
         if ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY not in labels:
             labels[ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY] = old_session_id
 
-        create_resp = await client.post(
-            "/v1/sessions",
-            json={"agent_id": agent_id, "labels": labels},
-        )
+        create_body = clear_replacement_create_body(old, agent_id=agent_id, labels=labels)
+        create_resp = await client.post("/v1/sessions", json=create_body)
+        if (unfiled_body := unfiled_clear_replacement_body(create_body, create_resp)) is not None:
+            create_resp = await client.post("/v1/sessions", json=unfiled_body)
         create_resp.raise_for_status()
         created = create_resp.json()
         new_session_id = created.get("id") if isinstance(created, dict) else None
@@ -3195,6 +3384,13 @@ async def _rotate_session_for_cascade(
             new_session_id,
             exc_info=True,
         )
+
+    await post_clear_supersession(
+        client,
+        old_session_id=old_session_id,
+        new_session_id=new_session_id,
+        agent_name=_AGENT_NAME,
+    )
 
     _logger.info(
         "agy reader rotated Omnigent session after /clear: old_session=%s new_session=%s "

@@ -192,6 +192,7 @@ def cross_harness_rig(
         "OMNIGENT_RUNNER_WORKSPACE": str(workspace),
         "OMNIGENT_SKIP_ONBOARD": "1",
         "OMNIGENT_NO_UPDATE_CHECK": "1",
+        "OMNIGENT_DISABLE_CATALOG_LOOKUP": "1",
         "OMNIGENT_SKIP_WEB_UI": "true",
         "OMNIGENT_CODEX_PATH": str(shutil.which("codex")),
         "OMNIGENT_CLAUDE_PATH": str(shutil.which("claude")),
@@ -373,7 +374,7 @@ def test_codex_parent_answers_real_claude_child_elicitation(
     tmp_path: Path,
 ) -> None:
     """A different parent harness preserves the child's prompt and native answer."""
-    client, workspace, runner_id, mock_url = cross_harness_rig
+    client, _workspace, runner_id, mock_url = cross_harness_rig
     name = f"cross-harness-parent-{uuid.uuid4().hex[:8]}"
     parent = {
         "spec_version": 1,
@@ -388,7 +389,7 @@ def test_codex_parent_answers_real_claude_child_elicitation(
         "async": True,
         "os_env": {
             "type": "caller_process",
-            "cwd": str(workspace),
+            "cwd": ".",
             "sandbox": {"type": "none"},
         },
         "tools": {"agents": ["claude_code"]},

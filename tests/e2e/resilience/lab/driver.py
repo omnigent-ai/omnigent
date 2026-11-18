@@ -134,10 +134,23 @@ class SessionDriver:
         reply = {"text": text, "stream": True, "chunk_delay": seconds / (words + 5)}
         self._script(turn, [reply] * (1 + retries))
         self.send(turn)
+        self._wait_model_call(turn)
+        return turn
+
+    def start_unanswered_turn(self) -> Turn:
+        """Start a text turn whose first model call never gets a response byte.
+
+        A retry of that call gets the reply. Returns once the first call is open
+        and the session shows ``running``.
+        """
+        turn = self._turn()
+        self._script(turn, [{"text": turn.reply, "block": True}, {"text": turn.reply}])
+        self.send(turn)
+        self._wait_model_call(turn)
         wait_for(
-            lambda: True if self.model_calls(turn) else None,
+            lambda: self.lab.snapshot(self.session_id).get("status") == "running" or None,
             timeout=_TURN_TIMEOUT_S,
-            what=f"the model call for {turn.marker}",
+            what=f"the running status for {turn.marker}",
         )
         return turn
 
@@ -260,6 +273,13 @@ class SessionDriver:
                 sandbox_permissions="require_escalated", justification=f"task {marker}"
             )
         return {"call_id": call_id, "name": "exec_command", "arguments": json.dumps(arguments)}
+
+    def _wait_model_call(self, turn: Turn) -> None:
+        wait_for(
+            lambda: True if self.model_calls(turn) else None,
+            timeout=_TURN_TIMEOUT_S,
+            what=f"the model call for {turn.marker}",
+        )
 
     def _script(self, turn: Turn, responses: list[dict[str, Any]]) -> None:
         self.lab.script_turn(turn.marker, responses, harness=self.harness)

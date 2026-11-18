@@ -221,6 +221,12 @@ def test_detect_adoptable_credentials_only_env_key_families(
 ) -> None:
     """Detection surfaces only env-var key creds for the UI-auth families."""
 
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_readiness._databricks_credential_source",
+        lambda: None,
+    )
+    monkeypatch.setattr(ha.shutil, "which", lambda _command: None)
+
     class _P:
         def __init__(self, family: str, kind: str, source: str) -> None:
             self.family = family
@@ -243,7 +249,46 @@ def test_detect_adoptable_credentials_only_env_key_families(
 def test_detect_adoptable_credentials_never_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     """A detection failure yields an empty list, not an exception."""
     monkeypatch.setattr(
+        "omnigent.onboarding.harness_readiness._databricks_credential_source",
+        lambda: None,
+    )
+    monkeypatch.setattr(ha.shutil, "which", lambda _command: None)
+    monkeypatch.setattr(
         "omnigent.onboarding.ambient.detect_providers",
         lambda: (_ for _ in ()).throw(RuntimeError("boom")),
     )
     assert ha.detect_adoptable_credentials() == []
+
+
+def test_detect_adoptable_credentials_reports_databricks_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A configured workspace is advertised without exposing credential material."""
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_readiness._databricks_credential_source",
+        lambda: "Databricks profile engineering",
+    )
+    monkeypatch.setattr(ha.shutil, "which", lambda _command: "/usr/bin/isaac")
+    monkeypatch.setattr("omnigent.onboarding.ambient.detect_providers", list)
+
+    assert ha.detect_adoptable_credentials() == [
+        ha.DetectedCredential("databricks", "Databricks profile engineering", None)
+    ]
+
+
+def test_detect_adoptable_credentials_reports_isaac_cli(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The isaac CLI is a non-secret detection fallback without a profile."""
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_readiness._databricks_credential_source",
+        lambda: None,
+    )
+    monkeypatch.setattr(ha.shutil, "which", lambda command: f"/usr/bin/{command}")
+    monkeypatch.setattr("omnigent.onboarding.ambient.detect_providers", list)
+
+    detected = ha.detect_adoptable_credentials()
+
+    assert detected == [ha.DetectedCredential("databricks", "isaac CLI", None)]
+    result = ha.adopt_env_credential(family=detected[0].family, env_var="")
+    assert result.stored is False

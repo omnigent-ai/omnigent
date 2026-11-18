@@ -16,7 +16,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from threading import Barrier, Event
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 import pytest
@@ -731,3 +731,74 @@ def test_tracked_pr_does_not_wait_for_discovery_and_later_includes_its_result(
         recovered = pr_resource.pr_info(repo, session_id="slow-discovery")
         assert {pr["url"] for pr in recovered["prs"]} == {selected, MR}
         assert not recovered.get("discovery_warnings")
+
+
+def test_a_checkout_outside_the_workspace_infers_its_pushed_branch_pr(
+    facet: FakeGitLabFacet, repo: str
+) -> None:
+    """A worktree the agent pushed from gets the same branch inference as the workspace."""
+    facet.branch_pr = MR
+
+    def git(*argv: str) -> None:
+        subprocess.run(
+            ["git", "-c", "user.name=T", "-c", "user.email=t@t", *argv], cwd=repo, check=True
+        )
+
+    git("commit", "-q", "--allow-empty", "-m", "change")
+    pr_resource.infer_checkout_pr("session", repo)
+    assert facet.calls == []  # nothing pushed yet, so no PR to look up
+    git("update-ref", "refs/remotes/origin/topic", "HEAD")  # what a push leaves behind
+    pr_resource.infer_checkout_pr("session", repo)
+    pr_resource.infer_checkout_pr("session", repo)
+    assert facet.calls == ["workspace_info", "on_inferred_pr"]
+    [entry] = SessionPrRegistry("session").list()
+    assert (entry.url, entry.relationship, entry.source) == (MR, "inferred", "branch")
+
+
+@pytest.mark.parametrize("relationship", ["attached", "worked_on"])
+def test_checkout_inference_keeps_an_existing_association(
+    facet: FakeGitLabFacet, repo: str, relationship: Literal["attached", "worked_on"]
+) -> None:
+    facet.branch_pr = MR
+    SessionPrRegistry("session").record(
+        [PullRequestRef.from_url(MR)], relationship=relationship, source="test"
+    )
+    subprocess.run(
+        [
+            "git",
+            "-c",
+            "user.name=T",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-q",
+            "--allow-empty",
+            "-m",
+            "c",
+        ],
+        cwd=repo,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "update-ref", "refs/remotes/origin/topic", "HEAD"], cwd=repo, check=True
+    )
+    pr_resource.infer_checkout_pr("session", repo)
+    [entry] = SessionPrRegistry("session").list()
+    assert entry.relationship == relationship
+
+
+def test_a_provider_with_only_the_commit_methods_keeps_its_commit_history() -> None:
+    """Through head is a separate facet, so a provider without it still lists commits."""
+    from omnigent.runner.git_providers import CommitCompareFacet, CommitsFacet
+
+    class CommitsOnly:
+        def commits(self, root: str, reference: object, *, head_sha: str) -> dict[str, object]:
+            return {"object": "list", "data": [], "has_more": False}
+
+        def commit_diff(
+            self, root: str, reference: object, *, commit_sha: str
+        ) -> dict[str, object]:
+            return {"object": "session.github.pr_diff", "patch": ""}
+
+    assert isinstance(CommitsOnly(), CommitsFacet)
+    assert not isinstance(CommitsOnly(), CommitCompareFacet)

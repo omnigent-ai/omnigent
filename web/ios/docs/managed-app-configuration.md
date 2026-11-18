@@ -2,7 +2,7 @@
 
 Administrators can preset the server URLs the Omnigent iOS app offers, so people
 in an organization pick their server from a list instead of typing it. They can
-also enable Databricks-internal features for managed installs.
+also enable managed features for managed installs.
 
 This page is the configuration specification. Apple's guidance is to publish it
 where administrators can reach it, so treat the keys and error codes below as a
@@ -23,7 +23,7 @@ is used, because it is validated with feedback to the administrator (see
 [Errors](#errors)).
 
 An unmanaged install, or a managed install with no configuration, behaves exactly
-as before: no preset servers, the person types a URL, and Databricks-internal
+as before: no preset servers, the person types a URL, and managed
 features are disabled.
 
 ## Keys
@@ -64,7 +64,7 @@ declarative configuration is applied as soon as the device receives it; a classi
 configuration is picked up the next time the app becomes active, so a change made
 while someone is using the app appears when they next return to it.
 
-## Databricks-internal features
+## Managed features
 
 Set `databricksInternalFeaturesEnabled` to a **boolean** `true` in either delivery
 channel. This is the same key as the Electron app's managed preference; it is not
@@ -80,11 +80,15 @@ When enabled, a connection failure with `NSURLErrorCannotFindHost` or
 
 > Couldn’t reach the server. Check your device’s compliance status in Jamf.
 
-This applies to any server the user connects to in this install. It is a
-troubleshooting hint, not a check of the device's JAMF compliance status. Other
-errors (including timeouts, offline, connection refusal, and TLS failures) keep
-their original messages. When disabled, DNS failures also keep their original
-messages.
+This applies to any server the user connects to in this install, including
+Databricks workspace sign-in (the token and session requests and the workspace
+page load). It is a troubleshooting hint, not a check of the device's JAMF
+compliance status. Other errors (including timeouts, offline, connection refusal,
+and TLS failures) keep their original messages. When disabled, DNS failures also
+keep their original messages. On workspace sign-in, those messages read "Could
+not reach Databricks. Please try again." followed by the error domain and code,
+for example `(NSURLErrorDomain -1001)` for a timeout, and the app logs the same
+code.
 
 Missing or malformed flags (including strings such as `"true"` and integers such
 as `1`) disable the feature without discarding valid preset servers. A declarative

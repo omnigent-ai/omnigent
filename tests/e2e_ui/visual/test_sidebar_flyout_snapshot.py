@@ -20,7 +20,7 @@ timers still fire), so a plain ``hover`` opens it without advancing a fake clock
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from playwright.sync_api import Page, expect
@@ -148,7 +148,7 @@ def test_pinned_project_flyout_matches_baseline(
 
     # Pin the clock so the row's relative-time pill renders a constant string;
     # only Date.now is frozen, so the flyout's openDelay timer still fires.
-    page.clock.set_fixed_time(datetime.fromtimestamp(_NOW_S, tz=timezone.utc))
+    page.clock.set_fixed_time(datetime.fromtimestamp(_NOW_S, tz=UTC))
 
     # Silence the session-updates socket so no live patch churns the row.
     page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)

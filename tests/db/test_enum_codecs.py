@@ -41,6 +41,14 @@ _CODECS = [
         ec.encode_scheduled_task_run_status,
         ec.decode_scheduled_task_run_status,
     ),
+    (
+        ec.SCHEDULED_TASK_SESSION_MODE,
+        ec.encode_scheduled_task_session_mode,
+        ec.decode_scheduled_task_session_mode,
+    ),
+    (ec.JOURNAL_ENTRY_KIND, ec.encode_journal_entry_kind, ec.decode_journal_entry_kind),
+    (ec.INBOX_ITEM_STATUS, ec.encode_inbox_item_status, ec.decode_inbox_item_status),
+    (ec.MEMORY_ACTOR_TYPE, ec.encode_memory_actor_type, ec.decode_memory_actor_type),
 ]
 
 
@@ -116,15 +124,35 @@ def test_shipped_codes_are_stable() -> None:
         "active": 1,
         "paused": 2,
         "deleted": 3,
+        "completed": 4,
     }
     assert ec.SCHEDULED_TASK_EXECUTION_TARGET == {
         "connected_host": 1,
         "managed_sandbox": 2,
     }
+    assert ec.SCHEDULED_TASK_SESSION_MODE == {"new": 1, "continue": 2}
+    assert ec.INBOX_ITEM_STATUS == {"unread": 1, "read": 2, "done": 3, "dismissed": 4}
+    assert ec.MEMORY_ACTOR_TYPE == {"user": 1}
     assert ec.SCHEDULED_TASK_RUN_STATUS == {
         "scheduled": 1,
         "running": 2,
         "succeeded": 3,
         "failed": 4,
         "skipped": 5,
+        "starting": 6,
     }
+    assert ec.JOURNAL_ENTRY_KIND == {
+        "status": 1,
+        "note": 2,
+        "dispatch": 3,
+        "dispatch_result": 4,
+        "plan": 5,
+        "plan_status": 6,
+    }
+
+
+def test_journal_entry_kinds_match_the_entity_kinds() -> None:
+    """Every journal kind has a code, and every code names a journal kind."""
+    from omnigent.entities.session_journal import JOURNAL_KINDS
+
+    assert set(ec.JOURNAL_ENTRY_KIND) == set(JOURNAL_KINDS)

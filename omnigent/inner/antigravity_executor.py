@@ -1089,12 +1089,12 @@ class AntigravityExecutor(Executor):
         if closer is not None:
             try:
                 await closer(None, None, None)
-            except Exception:  # noqa: BLE001 — agent teardown is best-effort
+            except Exception:  # agent teardown is best-effort
                 logger.debug("Antigravity agent close failed", exc_info=True)
             return
         aclose = getattr(agent, "aclose", None)
         if aclose is not None:
             try:
                 await aclose()
-            except Exception:  # noqa: BLE001 — agent teardown is best-effort
+            except Exception:  # agent teardown is best-effort
                 logger.debug("Antigravity agent aclose failed", exc_info=True)

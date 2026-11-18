@@ -218,6 +218,7 @@ def test_cursor_install_command_falls_back_to_pip(monkeypatch: pytest.MonkeyPatc
     cmd = cursor_install_command()
     assert cmd == [
         extra_install.sys.executable,
+        "-P",
         "-m",
         "pip",
         "install",
@@ -266,7 +267,9 @@ def test_install_cursor_sdk_runs_command_then_rechecks(
     monkeypatch.setattr(cursor_auth, "cursor_sdk_installed", lambda: state["installed"])
 
     assert install_cursor_sdk() is True
-    assert calls == [[extra_install.sys.executable, "-m", "pip", "install", "omnigent[cursor]"]]
+    assert calls == [
+        [extra_install.sys.executable, "-P", "-m", "pip", "install", "omnigent[cursor]"]
+    ]
 
 
 def test_install_cursor_sdk_false_on_spawn_failure(monkeypatch: pytest.MonkeyPatch) -> None:

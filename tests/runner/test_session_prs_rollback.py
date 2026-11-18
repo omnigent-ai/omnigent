@@ -12,6 +12,7 @@ import pytest
 from filelock import FileLock
 
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry, SessionPullRequest
+from tests.budgets import budget
 
 GITHUB = "https://github.com/example/repo/pull/1"
 FOREIGN = "https://forge.example.com/team/repo/requests/2"
@@ -170,7 +171,15 @@ def test_corrupt_companion_is_not_overwritten(tmp_path: Path, references) -> Non
     assert store.path.read_bytes() == original
 
 
-def test_concurrent_writers_preserve_both_providers(tmp_path: Path, references) -> None:
+def test_concurrent_writers_preserve_both_providers(
+    tmp_path: Path, references, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Allow serialized durable writes to finish even on a busy CI filesystem.
+    monkeypatch.setattr(
+        "omnigent.runner.session_prs.FileLock",
+        lambda path, **_kwargs: FileLock(path, timeout=budget(10)),
+    )
+
     def record(reference):
         SessionPrRegistry("mixed", root=tmp_path).record(
             [reference],

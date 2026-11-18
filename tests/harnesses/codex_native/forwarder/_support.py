@@ -3,12 +3,82 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import httpx
 
+from omnigent.harnesses.codex_native import forwarder as fwd
 from omnigent.harnesses.codex_native.bridge import (
+    CodexNativeBridgeState,
     codex_home_for_bridge_dir,
+    write_bridge_state,
 )
+
+
+def _seed_active_turn(bridge_dir: Path, turn_id: str) -> None:
+    """
+    Seed bridge state so a terminal turn edge clears the active turn.
+
+    ``_terminal_turn_status_edge`` only produces an edge when the terminal
+    event clears the recorded active turn id; without this seed it returns
+    ``None`` as "stale".
+
+    :param bridge_dir: Native Codex bridge directory (the test ``tmp_path``).
+    :param turn_id: Active Codex turn id to record, e.g. ``"turn_123"``.
+    :returns: None.
+    """
+    write_bridge_state(
+        bridge_dir,
+        CodexNativeBridgeState(
+            session_id="conv_x",
+            socket_path=str(bridge_dir / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(bridge_dir / "codex-home"),
+            active_turn_id=turn_id,
+        ),
+    )
+
+
+_Tokens = tuple[int, int, int]
+
+
+def _usage_event(
+    thread_id: str, total: _Tokens, last: _Tokens, turn_id: str | None = None
+) -> dict:
+    """Build a ``thread/tokenUsage/updated`` notification from ``(input, cached, output)``."""
+
+    def breakdown(tokens: _Tokens) -> dict[str, int]:
+        return {
+            "inputTokens": tokens[0],
+            "cachedInputTokens": tokens[1],
+            "outputTokens": tokens[2],
+        }
+
+    return {
+        "method": "thread/tokenUsage/updated",
+        "params": {
+            "threadId": thread_id,
+            "turnId": turn_id or f"turn_{thread_id}",
+            "tokenUsage": {
+                "total": breakdown(total),
+                "last": breakdown(last),
+                "modelContextWindow": 258400,
+            },
+        },
+    }
+
+
+def _posted_cumulative_tokens(posts: list[tuple[str, dict]], session_id: str) -> list[_Tokens]:
+    """Return the cumulative ``(input, cached, output)`` usage posted to one session."""
+    return [
+        (
+            body["data"]["cumulative_input_tokens"],
+            body["data"]["cumulative_cache_read_input_tokens"],
+            body["data"]["cumulative_output_tokens"],
+        )
+        for url, body in posts
+        if url == f"/v1/sessions/{session_id}/events" and body["type"] == "external_session_usage"
+    ]
 
 
 class _RecordingClient:
@@ -65,3 +135,109 @@ def _write_session_config(tmp_path: Path, body: str) -> None:
     home = codex_home_for_bridge_dir(tmp_path)
     home.mkdir(parents=True, exist_ok=True)
     (home / "config.toml").write_text(body)
+
+
+async def _deliver_to_parent(
+    client: _RecordingClient,
+    bridge_dir: Path,
+    state: fwd._CodexForwarderState,
+    event: dict[str, Any],
+    *,
+    codex_client: Any = None,
+) -> None:
+    """
+    Deliver one Codex notification to the parent session ``conv_x``.
+
+    :param client: Recording HTTP client standing in for the Omnigent server.
+    :param bridge_dir: Native Codex bridge directory (the test ``tmp_path``).
+    :param state: Forwarder state for the connection under test.
+    :param event: Codex notification envelope for thread ``thread_123``.
+    :param codex_client: App-server stub for requests the event triggers, e.g.
+        a terminal listing after a turn ends. ``None`` when none is needed.
+    :returns: None.
+    """
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=bridge_dir,
+        event=event,
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_123",
+        codex_client=codex_client,
+        forwarder_state=state,
+    )
+
+
+def _status_post(data: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """
+    Return the recorded post for one ``external_session_status`` edge.
+
+    :param data: Expected status data, e.g. ``{"status": "idle"}``.
+    :returns: ``(url, json)`` as recorded by :class:`_RecordingClient`.
+    """
+    return ("/v1/sessions/conv_x/events", {"type": "external_session_status", "data": data})
+
+
+def _background_work_post(
+    running: bool | None, tasks: list[dict[str, Any]] | None = None
+) -> tuple[str, dict[str, Any]]:
+    """
+    Return the recorded post for one ``external_background_work`` event.
+
+    :param running: Flag value, e.g. ``True``; ``None`` when the post omits it.
+    :param tasks: Composer rows the post lists, e.g. from :func:`_terminal_tasks`;
+        ``None`` when the post carries no list.
+    :returns: ``(url, json)`` as recorded by :class:`_RecordingClient`.
+    """
+    data: dict[str, Any] = {}
+    if running is not None:
+        data["running"] = running
+    if tasks is not None:
+        data["background_task_count"] = len(tasks)
+        data["background_tasks"] = tasks
+    return ("/v1/sessions/conv_x/events", {"type": "external_background_work", "data": data})
+
+
+def _terminal_tasks(*commands: str) -> list[dict[str, Any]]:
+    """
+    Return the composer rows for terminals listed by ``_terminal_listing``.
+
+    :param commands: Command of each running terminal, e.g. ``"npm run dev"``.
+    :returns: One row per terminal, e.g. ``[{"id": "proc_0", "command": "npm run dev"}]``.
+    """
+    return [{"id": f"proc_{index}", "command": command} for index, command in enumerate(commands)]
+
+
+def _turn_started(turn_id: str) -> dict[str, Any]:
+    """
+    Build a Codex ``turn/started`` envelope for the parent thread.
+
+    :param turn_id: Turn that began, e.g. ``"turn_2"``.
+    :returns: Notification envelope dict.
+    """
+    return {
+        "method": "turn/started",
+        "params": {"threadId": "thread_123", "turn": {"id": turn_id, "items": []}},
+    }
+
+
+def _turn_completed(turn_id: str, status: str) -> dict[str, Any]:
+    """
+    Build a Codex ``turn/completed`` envelope for the parent thread.
+
+    :param turn_id: Turn that ended, e.g. ``"turn_1"``.
+    :param status: Turn status, e.g. ``"completed"`` or ``"failed"``.
+    :returns: Notification envelope dict.
+    """
+    return {
+        "method": "turn/completed",
+        "params": {
+            "threadId": "thread_123",
+            "turn": {
+                "id": turn_id,
+                "status": status,
+                "items": [{"type": "agentMessage", "id": "item_1", "text": "done"}],
+            },
+        },
+    }

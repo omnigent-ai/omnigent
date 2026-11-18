@@ -691,6 +691,32 @@ async def test_repl_state_cancel_refuses_closed() -> None:
     assert state.pending is False
 
 
+@pytest.mark.asyncio
+async def test_repl_hook_settles_only_its_own_elicitation_from_elsewhere() -> None:
+    """
+    The hook registers the ctx's elicitation id: a resolved event for another
+    elicitation leaves the gate pending; one for this id applies its verdict.
+    """
+    repl_mod = _load_repl_module()
+    state = repl_mod._ApprovalState()
+    prompt_fn = repl_mod._make_elicitation_prompt(_FakeHost(), _FakeFmt(), state)
+    ctx = _make_ctx(
+        elicitation_id="c4",
+        message="",
+        policy_name="p",
+        phase="request",
+        content_preview="",
+        response_id="r4",
+    )
+    task = asyncio.create_task(prompt_fn(ctx))
+    await asyncio.sleep(0)
+
+    assert state.resolve_elsewhere("c-earlier", "accept") is False
+    assert state.pending is True
+    assert state.resolve_elsewhere("c4", "decline") is True
+    assert await task is False
+
+
 def test_repl_state_replaces_stale_future() -> None:
     """
     If a second elicitation arrives while a prior one is still

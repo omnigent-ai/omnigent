@@ -18,8 +18,7 @@ Default view inside the sandbox:
   ``/etc/ld.so.cache``, ``/etc/ld.so.conf``,
   ``/etc/ld.so.conf.d``, ``/etc/ssl``, ``/etc/ca-certificates``,
   ``/etc/pki``) bound read-only via ``--ro-bind-try``.
-- Fresh ``/proc`` (bind-mounted from the host on outer sandboxes that
-  forbid a fresh procfs mount, e.g. Lakebox — see
+- Fresh ``/proc`` (or a bind from vetted outer sandboxes; see
   :func:`_should_bind_host_proc`), ``/dev``, and ``/tmp``.
 - Cwd bind-mounted read-only by default; explicit
   ``write_paths: ["."]`` flips it to read-write. Top-level
@@ -66,8 +65,10 @@ import errno
 import logging
 import os
 import shutil
+import stat
 import sys
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 from ._cwd_scan import MaskedEntry, MaskKind, merge_scan_roots, scan_cwd_mask_entries
@@ -83,8 +84,10 @@ from ._seccomp import (
 )
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .sandbox import (
+    HOST_SANDBOX_BACKEND_ENV,
     SandboxBackend,
     SandboxPolicy,
+    _check_relative_grant_containment,
     register_backend,
 )
 
@@ -185,36 +188,12 @@ _ALLOWED_SOCKET_FAMILIES = (
 # Nested-sandbox /proc handling
 # ---------------------------------------------------------------------------
 
-# Outer sandbox backends whose microVM/container permits binding the
-# existing ``/proc`` but forbids mounting a FRESH procfs under
-# ``--unshare-pid`` (masked ``/proc`` overmounts make ``mount proc``
-# return EPERM). On these backends the bwrap wrap binds the host
-# ``/proc`` instead of emitting ``--proc /proc``.
-#
-# Why an explicit allow-list rather than a "fresh-proc mount failed, retry
-# with a bind" fallback: binding the existing ``/proc`` is a security
-# DOWNGRADE. It exposes the outer process list plus the world-readable
-# per-process files (``cmdline`` / ``comm`` / ``stat`` / ``status``) to the
-# sandboxed helper. It does NOT expose the ptrace-gated files (``environ``
-# / ``mem`` / ``maps`` / ``fd``): the retained user namespace keeps those
-# blocked even for same-uid targets and even as namespaced root, and
-# ``--unshare-pid`` still contains signalling. That leak is acceptable on a
-# single-tenant dev microVM (Lakebox) but not on an arbitrary host, so the
-# downgrade is only taken for vetted backends. Add entries here as more
-# backends are verified safe.
-_PROC_BIND_HOST_BACKENDS: frozenset[str] = frozenset({"lakebox"})
+# Vetted outer sandboxes; see _should_bind_host_proc for isolation requirements.
+_PROC_BIND_HOST_BACKENDS: frozenset[str] = frozenset({"lakebox", "phoenix-kubernetes"})
 
-# Env var an outer launcher may set to name the host's outer sandbox
-# backend (e.g. ``lakebox``). Authoritative when present; otherwise the
-# backend is autodetected (see ``_detect_host_sandbox_backend``). Note it
-# must survive ``SandboxPolicy.spawn_env_allowlist`` pruning to be visible
-# on the re-exec launcher path — the marker autodetect below is the
-# prune-proof fallback that lakebox relies on today.
-_HOST_SANDBOX_BACKEND_ENV = "OMNIGENT_HOST_SANDBOX_BACKEND"
-
-# Marker directory the Databricks Lakebox runtime seeds inside every
+# Marker directory the Lakebox runtime seeds inside every
 # microVM. Used to autodetect lakebox when the launcher hasn't declared the
-# backend via ``_HOST_SANDBOX_BACKEND_ENV``.
+# backend via :data:`HOST_SANDBOX_BACKEND_ENV`.
 _LAKEBOX_MARKER = Path("/run/lakebox")
 
 
@@ -231,7 +210,7 @@ def _detect_host_sandbox_backend() -> str | None:
     :returns: Lower-cased backend name (e.g. ``"lakebox"``), or ``None``
         when the host is not running under a recognised outer sandbox.
     """
-    declared = os.environ.get(_HOST_SANDBOX_BACKEND_ENV)
+    declared = os.environ.get(HOST_SANDBOX_BACKEND_ENV)
     if declared and declared.strip():
         return declared.strip().lower()
     try:
@@ -251,9 +230,15 @@ def _should_bind_host_proc() -> bool:
     mounting a fresh procfs.
 
     ``True`` only when the host runs under an outer sandbox backend in
-    :data:`_PROC_BIND_HOST_BACKENDS` (lakebox today). On every other host
+    :data:`_PROC_BIND_HOST_BACKENDS`. On every other host
     the fresh-proc mount is kept, so ordinary hosts — and their fail-closed
     behaviour when a fresh procfs mount is denied — are unchanged.
+
+    Binding outer ``/proc`` exposes its world-readable process metadata.
+    The user namespace still blocks ptrace-gated files, and ``--unshare-pid``
+    contains signalling, but callers must still provide an isolated,
+    single-tenant outer PID namespace. Phoenix must disable ``hostPID`` and
+    ``shareProcessNamespace``.
 
     :returns: ``True`` to emit ``--bind /proc /proc``; ``False`` to emit
         ``--proc /proc``.
@@ -331,18 +316,18 @@ class BwrapSandboxBackend(SandboxBackend):
 
         read_roots: list[Path] | None = None
         if sandbox_spec.read_paths is not None:
-            read_roots = [_resolve_root(cwd, root) for root in sandbox_spec.read_paths]
+            read_roots = [_resolve_grant(cwd, root) for root in sandbox_spec.read_paths]
 
         # Bwrap-specific default: cwd is RO unless the spec opts in.
         # Empty default honors the "no surprise writes" contract from
         # the design plan — agents that need an editable project tree
         # opt in via ``write_paths: ["."]``.
         write_grants = [
-            (_resolve_root(cwd, grant.path), grant.copy_on_write)
+            (_resolve_grant(cwd, grant.path), grant.copy_on_write)
             for grant in sandbox_spec.write_path_specs
         ]
         write_roots = [path for path, _ in write_grants]
-        write_files = [_resolve_root(cwd, path) for path in sandbox_spec.write_files or []]
+        write_files = [_resolve_grant(cwd, path) for path in sandbox_spec.write_files or []]
         copy_on_write_roots = sorted({path for path, disposable in write_grants if disposable})
         for root in copy_on_write_roots:
             if not root.is_dir():
@@ -363,6 +348,11 @@ class BwrapSandboxBackend(SandboxBackend):
             if sandbox_spec.cwd_allow_hidden is not None
             else list(_DEFAULT_CWD_ALLOW_HIDDEN)
         )
+        if ".git" in cwd_allow_hidden or "*" in cwd_allow_hidden:
+            _LOGGER.warning(
+                "linux_bwrap: cwd_allow_hidden grants the agent access to .git "
+                "in sandbox roots; audit whether the agent actually needs it."
+            )
 
         mask_paths = (
             [_resolve_root(cwd, path) for path in sandbox_spec.mask_paths]
@@ -390,6 +380,48 @@ class BwrapSandboxBackend(SandboxBackend):
             ),
             credential_proxy=sandbox_spec.credential_proxy,
             git_ssh=sandbox_spec.git_ssh,
+            tcp_egress=sandbox_spec.tcp_egress,
+        )
+
+    def launch_fingerprint(
+        self,
+        argv: list[str],
+        policy: SandboxPolicy,
+        cwd: Path,
+        chdir: Path | None = None,
+    ) -> object:
+        """Return mask and bind identities, including regular-file mask change times.
+
+        A mount stays on the entry it covered, so a masked entry, granted
+        root or intervening mask ancestor replaced on the host must force
+        a relaunch. Framework scratch roots are per-launch and excluded.
+        """
+        del chdir
+        cwd_resolved = cwd.resolve(strict=False)
+        masks = _dotfile_and_symlink_mask_args(
+            cwd_resolved,
+            policy.cwd_allow_hidden if policy.cwd_allow_hidden is not None else [],
+            policy,
+            argv=argv,
+        )
+        masks += _socket_mask_args(policy)
+        skip = set(policy.mask_scan_skip_roots or [])
+        granted = [
+            cwd_resolved,
+            *(policy.read_roots or []),
+            *(root for root in policy.write_roots if root not in skip),
+            *policy.write_files,
+            *_default_readonly_bind_sources(),
+        ]
+        roots = [_path_identity(root, follow_symlinks=True) for root in granted]
+        interpreter_binds = _ensure_executable_visible(argv, cwd_resolved)
+        interpreter_binds += _interpreter_reexpose_after_mask(argv, _tmpfs_mask_dirs(masks))
+        return (
+            masks,
+            _mount_target_identities(masks, granted),
+            roots,
+            interpreter_binds,
+            _mount_target_identities(interpreter_binds, granted),
         )
 
     def wrap_launcher_argv(
@@ -444,28 +476,19 @@ class BwrapSandboxBackend(SandboxBackend):
         ``SandboxPolicy.spawn_env_allowlist`` prune in
         :func:`omnigent.inner.sandbox.run_launcher`.
         """
+        policy = self.prepare_launcher_policy(policy)
+        if policy.tcp_egress and policy.tcp_egress_socket_path is None:
+            raise ValueError("tcp_egress requires its parent broker before sandbox launch")
         cwd_resolved = cwd.resolve(strict=False)
         chdir_target = chdir.resolve(strict=False) if chdir is not None else cwd_resolved
         bwrap_args: list[str] = ["bwrap"]
 
-        for path in _DEFAULT_RO_DIRS:
-            bwrap_args += ["--ro-bind-try", path, path]
-        for path in _DEFAULT_ETC_FILES:
-            bwrap_args += ["--ro-bind-try", path, path]
-        for path in _DEFAULT_ETC_DIRS:
+        for path in _default_readonly_bind_sources():
             bwrap_args += ["--ro-bind-try", path, path]
 
-        # /proc, /dev (filtered by bwrap to a safe minimal device set),
-        # and a private /tmp so the agent's writes there don't pollute
-        # the host.
-        #
-        # ``--proc`` mounts a FRESH procfs tied to the new PID namespace so
-        # the helper sees only its own processes. Some nested outer
-        # sandboxes (Lakebox) forbid that mount under ``--unshare-pid``
-        # (masked ``/proc`` overmounts -> ``mount proc: EPERM``), so there
-        # we bind the host ``/proc`` instead. See ``_should_bind_host_proc``
-        # for the gate and the security trade-off.
-        if _should_bind_host_proc():
+        # Fresh procfs by default; bind outer /proc where nested sandboxes deny
+        # the mount. Bwrap supplies a minimal /dev and private /tmp.
+        if policy.bind_host_proc:
             bwrap_args += ["--bind", "/proc", "/proc"]
         else:
             bwrap_args += ["--proc", "/proc"]
@@ -511,44 +534,11 @@ class BwrapSandboxBackend(SandboxBackend):
             str(cwd_resolved),
         ]
 
-        # Additional write roots — typically the per-helper scratch
-        # tmpdir. We skip cwd here because it was bound above.
-        #
-        # ``--bind-try`` silently skips a missing source, so a write_paths
-        # root that doesn't exist yet on the host would otherwise bind to
-        # nothing and leave the grant with no effect — the agent finds out
-        # only much later, as a bare "Read-only file system" error on its
-        # first write. Since the policy layer has already approved this
-        # root as a write grant, create it up front so the bind (and the
-        # grant) actually does what it says. If creation fails (e.g. an
-        # unwritable parent), keep the old skip-the-bind behavior but warn
-        # loudly instead of failing the whole sandbox wrap: some merged-in
-        # write roots (harness-internal dirs) are optional, and a hard
-        # error here would degrade the helper to running unsandboxed paths.
+        # Additional write roots; cwd was bound above.
+        self.prepare_launcher_filesystem(policy, cwd_resolved)
         for root in policy.write_roots:
             if _is_same_path(root, cwd_resolved):
                 continue
-            if not root.exists():
-                try:
-                    root.mkdir(parents=True, exist_ok=True)
-                    created_mode = root.stat().st_mode & 0o777
-                except OSError as exc:
-                    _LOGGER.warning(
-                        "linux_bwrap: write_paths root %s does not exist on "
-                        "the host and could not be created (%s); the write "
-                        "grant for this path will have no effect",
-                        root,
-                        exc,
-                    )
-                else:
-                    _LOGGER.warning(
-                        "linux_bwrap: write_paths root %s did not exist on "
-                        "the host, created it (permissions %s) so the "
-                        "granted write access takes effect instead of "
-                        "silently binding to nothing",
-                        root,
-                        oct(created_mode),
-                    )
             bwrap_args += ["--bind-try", str(root), str(root)]
 
         # Per-file write grants. ``--bind-try`` with a file source
@@ -612,8 +602,7 @@ class BwrapSandboxBackend(SandboxBackend):
         # mask only exists inside the helper's mount namespace. Emitted
         # AFTER the write-root binds so it is the last mount and wins
         # (same deny-wins ordering as the dotfile mask above).
-        for sock in policy.deny_unix_socket_paths or []:
-            bwrap_args += ["--bind-try", "/dev/null", str(sock)]
+        bwrap_args.extend(_socket_mask_args(policy))
 
         # Set $TMPDIR (and friends) to the first write_root that lives
         # under the system temp dir — the parent's
@@ -632,6 +621,7 @@ class BwrapSandboxBackend(SandboxBackend):
             not policy.allow_network
             or policy.egress_relay_port is not None
             or policy.git_ssh_socket_path is not None
+            or policy.tcp_egress_socket_path is not None
         ):
             bwrap_args.append("--unshare-net")
 
@@ -669,6 +659,39 @@ class BwrapSandboxBackend(SandboxBackend):
 
             return wrap_shared_namespace(bwrap_args, policy)
         return bwrap_args
+
+    def prepare_launcher_policy(self, policy: SandboxPolicy) -> SandboxPolicy:
+        """Resolve the proc mount on the machine building the bwrap argv."""
+        if policy.bind_host_proc is not None:
+            return policy
+        return replace(policy, bind_host_proc=_should_bind_host_proc())
+
+    def prepare_launcher_filesystem(self, policy: SandboxPolicy, cwd: Path) -> None:
+        """Create missing approved write roots so their bind identities are stable."""
+        for root in policy.write_roots:
+            if _is_same_path(root, cwd):
+                continue
+            if not root.exists():
+                try:
+                    root.mkdir(parents=True, exist_ok=True)
+                    created_mode = root.stat().st_mode & 0o777
+                except OSError as exc:
+                    _LOGGER.warning(
+                        "linux_bwrap: write_paths root %s does not exist on "
+                        "the host and could not be created (%s); the write "
+                        "grant for this path will have no effect",
+                        root,
+                        exc,
+                    )
+                else:
+                    _LOGGER.warning(
+                        "linux_bwrap: write_paths root %s did not exist on "
+                        "the host, created it (permissions %s) so the "
+                        "granted write access takes effect instead of "
+                        "silently binding to nothing",
+                        root,
+                        oct(created_mode),
+                    )
 
     def activate(self, policy: SandboxPolicy) -> None:
         """
@@ -894,6 +917,19 @@ def _resolve_root(cwd: Path, root: str) -> Path:
     return path.resolve(strict=False)
 
 
+def _resolve_grant(cwd: Path, root: str) -> Path:
+    """
+    Resolve a read or write grant against *cwd* and reject a relative
+    grant whose target leaves *cwd* through a symlink.
+
+    Mask paths use :func:`_resolve_root` directly: a mask only denies
+    access, so a symlink there must not block the launch.
+    """
+    resolved = _resolve_root(cwd, root)
+    _check_relative_grant_containment(cwd, root)
+    return resolved
+
+
 def _is_same_path(a: Path, b: Path) -> bool:
     """
     Return whether two paths reference the same filesystem location
@@ -1021,6 +1057,74 @@ def _interpreter_chain_binds(argv: Sequence[str], covered_prefixes: list[Path]) 
             current = Path(os.path.normpath(str(current.parent / link)))
 
     return extra
+
+
+_BIND_FLAGS = frozenset(
+    {"--bind", "--bind-try", "--ro-bind", "--ro-bind-try", "--dev-bind", "--dev-bind-try"}
+)
+
+
+def _default_readonly_bind_sources() -> tuple[str, ...]:
+    """Share the persistent default mounts between launch and reuse validation."""
+    return (*_DEFAULT_RO_DIRS, *_DEFAULT_ETC_FILES, *_DEFAULT_ETC_DIRS)
+
+
+def _socket_mask_args(policy: SandboxPolicy) -> list[str]:
+    """Return explicit socket masks shared by launch and fingerprint calculation."""
+    return [
+        arg
+        for path in policy.deny_unix_socket_paths or []
+        for arg in ("--bind-try", "/dev/null", str(path))
+    ]
+
+
+def _mount_target_identities(
+    argv: Sequence[str], bound_roots: Sequence[str | Path]
+) -> list[tuple[int, int, int | None] | None]:
+    """Return mount identities and destination ancestors up to their bound root.
+
+    Destinations are not followed (a mask covers the entry itself); bind
+    sources are, since bwrap mounts what a symlinked source points at.
+    """
+    targets: list[tuple[str, bool]] = []
+    for i, token in enumerate(argv[:-1]):
+        if token == "--tmpfs":
+            targets.append((argv[i + 1], False))
+        elif token in _BIND_FLAGS and i + 2 < len(argv):
+            targets += [(argv[i + 1], True), (argv[i + 2], False)]
+    identities = [
+        _path_identity(target, follow_symlinks=follow, track_file_changes=not follow)
+        for target, follow in targets
+    ]
+    roots = {Path(root) for root in bound_roots}
+    ancestors: dict[Path, None] = {}
+    for target, follow in targets:
+        path = Path(target)
+        if follow or path in roots:
+            continue
+        for index, parent in enumerate(path.parents):
+            if parent in roots:
+                ancestors.update(dict.fromkeys(path.parents[: index + 1]))
+                break
+    # A symlink ancestor and its referent can each be replaced independently.
+    identities.extend(
+        _path_identity(parent, follow_symlinks=follow)
+        for parent in ancestors
+        for follow in (False, True)
+    )
+    return identities
+
+
+def _path_identity(
+    path: str | Path, *, follow_symlinks: bool, track_file_changes: bool = False
+) -> tuple[int, int, int | None] | None:
+    """Track entry identity and optional regular-file mask changes, or missing paths."""
+    try:
+        info = os.stat(path, follow_symlinks=follow_symlinks)
+    except OSError:
+        return None
+    changed = info.st_ctime_ns if track_file_changes and stat.S_ISREG(info.st_mode) else None
+    return info.st_dev, info.st_ino, changed
 
 
 def _tmpfs_mask_dirs(mask_args: Sequence[str]) -> list[Path]:

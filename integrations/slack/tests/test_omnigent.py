@@ -129,6 +129,18 @@ def test_extract_assistant_text_from_stream_item() -> None:
 
 
 @respx.mock
+async def test_client_identifies_as_slack_bot() -> None:
+    route = respx.get("http://omnigent.test/v1/me").mock(return_value=httpx.Response(200, json={}))
+    client = OmnigentClient("http://omnigent.test")
+    try:
+        await client._client.get("/v1/me")
+    finally:
+        await client.aclose()
+
+    assert route.calls.last.request.headers["User-Agent"].startswith("omnigent-slack/")
+
+
+@respx.mock
 async def test_client_create_and_submit_request_shapes() -> None:
     create = respx.post("http://omnigent.test/v1/sessions").mock(
         return_value=httpx.Response(201, json={"id": "conv_1"})

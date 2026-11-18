@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, call
@@ -494,4 +495,44 @@ async def test_resume_effort_update_times_out_and_closes_client(
     with pytest.raises(TimeoutError):
         task.result()
     assert read_codex_config_effort(tmp_path) == "medium"
+    client.close.assert_awaited_once()
+
+
+@pytest.mark.parametrize("rejected", [False, True])
+async def test_plan_mode_keeps_codex_preset_and_closes_client(
+    monkeypatch: pytest.MonkeyPatch, rejected: bool
+) -> None:
+    client = AsyncMock(spec=app_server.CodexAppServerClient)
+    if rejected:
+        client.request.side_effect = RuntimeError("thread not loaded")
+    resolve_effort = AsyncMock(return_value="low")
+    monkeypatch.setattr(app_server, "client_for_transport", lambda *args, **kwargs: client)
+    monkeypatch.setattr(app_server, "resolve_codex_effort_for_model", resolve_effort)
+
+    with (
+        pytest.raises(RuntimeError, match="thread not loaded")
+        if rejected
+        else contextlib.nullcontext()
+    ):
+        await app_server.apply_codex_thread_collaboration_mode(
+            "ws://127.0.0.1:1", "thread_new", "plan", model="gpt-5.4", effort="minimal"
+        )
+
+    resolve_effort.assert_awaited_once_with(
+        client, "minimal", "gpt-5.4", transport="ws://127.0.0.1:1"
+    )
+    client.request.assert_awaited_once_with(
+        "thread/settings/update",
+        {
+            "threadId": "thread_new",
+            "collaborationMode": {
+                "mode": "plan",
+                "settings": {
+                    "model": "gpt-5.4",
+                    "reasoning_effort": "low",
+                    "developer_instructions": None,
+                },
+            },
+        },
+    )
     client.close.assert_awaited_once()

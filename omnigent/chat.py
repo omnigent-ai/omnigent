@@ -18,7 +18,8 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Awaitable, Callable, Generator
+import urllib.parse
+from collections.abc import AsyncGenerator, Awaitable, Callable, Generator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias
@@ -27,8 +28,12 @@ import click
 import httpx
 import yaml
 from omnigent_client import (
+    AgentCatalogEntry as _AgentChoice,
+)
+from omnigent_client import (
     OmnigentClient,
     RegisteredAgent,
+    RegisteredAgentCatalog,
     SessionToolCallInfo,
     ToolCallable,
     ToolCallInfo,
@@ -38,13 +43,21 @@ from omnigent_client import (
     OmnigentError as ClientOmnigentError,
 )
 from omnigent_client._http import is_loopback_url
+from omnigent_client._sessions import Session as SessionSnapshot
 from rich.console import Console
 
+from omnigent._runner_startup import runner_startup_progress
 from omnigent._wrapper_labels import (
     CLAUDE_NATIVE_WRAPPER_VALUE as _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE,
 )
 from omnigent._wrapper_labels import (
     WRAPPER_LABEL_KEY as _CLAUDE_NATIVE_WRAPPER_LABEL_KEY,
+)
+from omnigent.cli_auth import open_sdk_client
+from omnigent.cli_diagnostics import (
+    SUPPRESS_RECOVERY_HINT_ATTR,
+    printable,
+    suppresses_recovery_hint,
 )
 from omnigent.cli_invocation import cli_invocation
 from omnigent.conversation_browser import (
@@ -55,7 +68,9 @@ from omnigent.errors import OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.inner import _proc
 from omnigent.inner.databricks_executor import (
+    _forget_remembered_profile,
     _read_databrickscfg,
+    _remember_profile,
     _ReusedDatabricksTokenSource,
 )
 from omnigent.models.model_catalog import resolve_catalog_model
@@ -69,13 +84,17 @@ from omnigent.process_logging import (
     open_process_log_file,
     process_log_dir_reference,
 )
+from omnigent.remote_launch import REMOTE_LAUNCH_MESSAGE
+from omnigent.session_host import set_session_host
 from omnigent.spec import load as load_spec
 from omnigent.spec._omnigent_compat import OMNIGENT_EXECUTOR_TYPE
 from omnigent.spec.parser import discover_host_skills
 from omnigent.spec.types import AgentSpec, SkillSpec
+from omnigent.util.server_url import display_server_url
 
 if TYPE_CHECKING:
     from omnigent._runner_startup import RunnerStartupProgress
+    from omnigent.inner.databricks_executor import _DatabricksBearerAuth
 
 console = Console()
 
@@ -126,6 +145,10 @@ _PER_TURN_TIMEOUT_S = 120.0
 # Overall budget for following one headless ``-p`` session to idle
 # (first-turn recovery and the extra-turns loop share it).
 _LOOP_TIMEOUT_S = 1800.0  # 30 min total
+# Snapshot statuses that keep a headless ``-p`` run going. The server reports any
+# ``waiting`` (an async orchestrator's, or a claude-native turn's background-agent
+# hold) as ``running``; ``waiting`` is here in case a snapshot ever carries it raw.
+_HEADLESS_UNFINISHED_STATUSES = frozenset({"running", "launching", "waiting"})
 
 # Optional bearer token for remote omnigent servers that sit
 # behind an auth proxy (for example Databricks Apps). When set, the
@@ -315,6 +338,7 @@ def run_chat(
     debug_events: bool = False,
     resume_parts: list[str] | None = None,
     auto_open_conversation: bool = False,
+    agent_name: str | None = None,
 ) -> None:
     """
     Main entry point for ``omnigent run`` (and the ``attach`` client).
@@ -391,6 +415,9 @@ def run_chat(
         resume hint on exit.
     :param auto_open_conversation: When ``True``, open the
         browser conversation URL when the session id becomes known.
+    :param agent_name: CLI ``--agent`` — the registered agent a server URL
+        target starts its session with, e.g. ``"scribe"``. ``None``
+        discovers one from the server. Remote URL targets only.
     """
     # Client-side tools are a CLI/TUI convenience (e.g. shell access
     # for coding agents). They don't affect agent behavior — the spec
@@ -408,6 +435,7 @@ def run_chat(
             "--server is for binding a local agent YAML to a server. "
             "Pass a YAML path as the target (got a URL)."
         )
+    _require_url_target_for_agent(target, agent_name)
 
     if _is_url(target):
         if any(
@@ -429,6 +457,13 @@ def run_chat(
                 "The remote server owns its own persistence and conversation lookup. "
                 "Pass --resume <id> with a remote URL to attach to a specific conversation."
             )
+        # An explicit --agent is checked against the server's registered agents
+        # up front, so a typo is a clean error rather than a failed session.
+        selected_agent = (
+            _require_registered_agent(target.rstrip("/"), agent_name)
+            if agent_name is not None
+            else None
+        )
         # Discover host-scope skills from cwd so ``/skill-name`` slash
         # commands work even when connecting to a remote server with no
         # local agent spec.
@@ -439,6 +474,8 @@ def run_chat(
             initial_message=prompt,
             resume_conversation_id=resume_conversation_id,
             fork_session_id=fork_session_id,
+            agent_name=selected_agent.name if selected_agent is not None else None,
+            registered_agent=selected_agent,
             debug_events=debug_events,
             resume_parts=resume_parts,
             skills=host_skills or None,
@@ -504,6 +541,7 @@ def run_prompt(
     prompt: str,
     system_prompt: str | None = None,
     ephemeral: bool = False,
+    agent_name: str | None = None,
 ) -> None:
     """Run one prompt headlessly and print only the assistant text.
 
@@ -521,6 +559,9 @@ def run_prompt(
     :param system_prompt: CLI ``--system-prompt`` override for local targets.
     :param ephemeral: When ``True``, use a fresh per-run local
         server database and artifact directory.
+    :param agent_name: Registered agent to run on a server URL target,
+        e.g. ``"scribe"``. ``None`` discovers one; with several registered
+        agents the headless run fails and asks for it.
     """
     tool_handler = _load_tool_handler(client_tools) if client_tools else None
     overrides = ChatOverrides(
@@ -528,6 +569,7 @@ def run_prompt(
         model=model,
         system_prompt=system_prompt,
     )
+    _require_url_target_for_agent(target, agent_name)
 
     if _is_url(target):
         if any(
@@ -538,12 +580,17 @@ def run_prompt(
                 "agent paths. The remote server controls its own agent registrations."
             )
         base_url = target.rstrip("/")
-        agent_name = _pick_agent(base_url, quiet=True)
+        selected_agent = (
+            _require_registered_agent(base_url, agent_name)
+            if agent_name is not None
+            else _pick_agent(base_url, quiet=True)
+        )
         _run_headless_prompt(
             base_url,
-            agent_name,
+            selected_agent.name,
             tool_handler,
             prompt=prompt,
+            registered_agent=selected_agent,
         )
         return
 
@@ -596,8 +643,6 @@ def run_attach(
     # snapshot gives the agent name + harness for an honest banner.
     info = _attach_session_info(base_url=base_url, conversation_id=conversation_id)
     if not info.runner_online:
-        from omnigent.util.server_url import display_server_url
-
         raise click.ClickException(
             f"Session {conversation_id} has no online runner on "
             f"{display_server_url(base_url)} — its "
@@ -644,46 +689,6 @@ def _is_url(target: str) -> bool:
 # Server URL client helpers
 # ---------------------------------------------------------------------------
 
-# Client-side ``session_id → host_id`` tracking, for routing a session's
-# tunnel-bound traffic to the right server replica when the server runs
-# multiple.
-#
-# A host's control tunnel and its runners' tunnels register on a single
-# replica, so the turn / resource / stream calls for a session running on that
-# host must name the host or they can reach a different replica than the runner
-# tunnel they need. The host_id is the routing key; it's populated when the CLI
-# learns a session's host (session GETs, daemon launch) and read once when a
-# client for that session is built — callers pass the session_id they already
-# have to ``_server_auth`` rather than the auth re-deriving it per request. This
-# is the Python peer of the web UI's ``sessionHost.ts``. (The host_id is
-# translated into the routing header inside ``cli_auth.databricks_request_headers``;
-# OSS only ever threads a host_id.)
-_session_hosts: dict[str, str] = {}
-
-
-def set_session_host(session_id: str, host_id: str | None) -> None:
-    """Record (or clear) the host a session is bound to.
-
-    A ``None``/empty host clears any stale mapping so a session that loses its
-    host binding stops routing to the old replica.
-
-    :param session_id: Session id, e.g. ``"conv_abc123"``.
-    :param host_id: The bound host id, e.g. ``"host_abc123"``, or ``None``.
-    """
-    if host_id:
-        _session_hosts[session_id] = host_id
-    else:
-        _session_hosts.pop(session_id, None)
-
-
-def get_session_host(session_id: str) -> str | None:
-    """Return a session's bound host id, or ``None`` when unknown.
-
-    :param session_id: Session id, e.g. ``"conv_abc123"``.
-    :returns: The host id, or ``None`` (session not seen yet, or hostless).
-    """
-    return _session_hosts.get(session_id)
-
 
 def _remote_headers(
     server_url: str | None = None,
@@ -702,7 +707,7 @@ def _remote_headers(
          (populated by ``omnigent login <apps-url>``) — mints a
          fresh workspace OAuth token via the SDK
       4. ambient Databricks CLI / ``~/.databrickscfg`` credentials
-         (the SDK's default resolution; no profile is threaded)
+         (only when no workspace pairing is stored for the server)
 
     This lets ``omnigent run --server <apps-url>`` work against
     Databricks Apps after a one-time ``omnigent login <apps-url>``,
@@ -723,9 +728,15 @@ def _remote_headers(
     # source per branch), then merge the workspace-routing header.
     headers: dict[str, str] = {}
     token = os.environ.get(_REMOTE_AUTH_TOKEN_ENV)
+    from omnigent.util.proxy_bearer import read_proxy_bearer
+
     if token and (token := token.strip()):
         # 1. Explicit env-var token.
         headers["Authorization"] = f"Bearer {token}"
+    elif server_url and (proxy_bearer := read_proxy_bearer(server_url)):
+        # 1b. A managed sandbox host behind an authenticating front door: the
+        # launcher-refreshed proxy bearer (see omnigent.util.proxy_bearer).
+        headers["Authorization"] = f"Bearer {proxy_bearer}"
     elif server_url:
         from omnigent.cli_auth import load_token
 
@@ -739,10 +750,13 @@ def _remote_headers(
             if record_token:
                 headers["Authorization"] = f"Bearer {record_token}"
     if "Authorization" not in headers:
-        # 4. Ambient ~/.databrickscfg credentials.
-        creds = _read_databrickscfg(None)
-        if creds is not None and creds.token:
-            headers["Authorization"] = f"Bearer {creds.token}"
+        from omnigent.cli_auth import load_databricks_workspace_host
+
+        # A saved workspace stays authoritative when its credentials cannot mint.
+        if not server_url or load_databricks_workspace_host(server_url) is None:
+            creds = _read_databrickscfg(None)
+            if creds is not None and creds.token:
+                headers["Authorization"] = f"Bearer {creds.token}"
     # Workspace routing: when a ?o= selector was recorded at login, name the
     # workspace or the request routes to the account. Merged onto the result
     # because these ad-hoc requests carry no httpx Auth. ``host_id`` pins a
@@ -756,8 +770,75 @@ def _remote_headers(
     return headers
 
 
-# Reuse the SDK's in-memory token cache for each server.
+# One token source per server, shared by every client in the process, so a
+# launch walks ~/.databrickscfg once instead of once per client.
 _databricks_auth_cache: dict[str, _ReusedDatabricksTokenSource] = {}
+
+
+def _shared_token_source(server_url: str | None) -> _ReusedDatabricksTokenSource:
+    """Return this process's Databricks token source for *server_url*.
+
+    :param server_url: The remote server URL, e.g.
+        ``"https://myapp-123.aws.databricksapps.com"``, or ``None`` for
+        ambient credentials, which get an unshared source.
+    :returns: The shared source, created on first use.
+    """
+    if server_url is None:
+        return _ReusedDatabricksTokenSource()
+    key = server_url.rstrip("/")
+    source = _databricks_auth_cache.get(key)
+    if source is None:
+        source = _databricks_auth_cache[key] = _ReusedDatabricksTokenSource(server_url)
+    return source
+
+
+def _remember_accepted_credential(server_url: str, authorization: str | None) -> None:
+    """Remember the profile behind *authorization* once the server accepted it.
+
+    Only a bearer minted by the shared source counts; an env-var or OIDC
+    token says nothing about which profile works.
+
+    :param server_url: The remote server URL the token was accepted by.
+    :param authorization: The ``Authorization`` header the server accepted.
+    """
+    from omnigent.cli_auth import load_databricks_workspace_host
+
+    source = _databricks_auth_cache.get(server_url.rstrip("/"))
+    if source is None or source.profile_name is None or authorization is None:
+        return
+    if authorization != f"Bearer {source.current_token()}":
+        return
+    workspace_host = load_databricks_workspace_host(server_url)
+    if workspace_host is not None:
+        _remember_profile(workspace_host, source.profile_name)
+
+
+def _forget_refused_credential(server_url: str) -> None:
+    """Forget the credential the server just refused for *server_url*.
+
+    The next client resolves again, and the profile walk goes back to its
+    default order instead of preferring the refused profile.
+
+    :param server_url: The remote server URL that refused the credential.
+    """
+    from omnigent.cli_auth import load_databricks_workspace_host
+
+    _databricks_auth_cache.pop(server_url.rstrip("/"), None)
+    workspace_host = load_databricks_workspace_host(server_url)
+    if workspace_host is not None:
+        _forget_remembered_profile(workspace_host)
+
+
+def _adopt_verified_credential(server_url: str, auth: _DatabricksBearerAuth) -> None:
+    """Serve later clients of *server_url* from *auth*, whose token the server accepted.
+
+    A recovery resolves credentials outside the shared source; without this the
+    next client would walk ``~/.databrickscfg`` and mint again.
+
+    :param server_url: The remote server URL that accepted the token.
+    :param auth: The resolved auth that minted the accepted token.
+    """
+    _shared_token_source(server_url).adopt(auth)
 
 
 def _stored_databricks_record_token(server_url: str) -> str | None:
@@ -776,14 +857,9 @@ def _stored_databricks_record_token(server_url: str) -> str | None:
     """
     from omnigent.cli_auth import load_databricks_workspace_host
 
-    workspace_host = load_databricks_workspace_host(server_url)
-    if workspace_host is None:
+    if load_databricks_workspace_host(server_url) is None:
         return None
-    source = _databricks_auth_cache.get(server_url)
-    if source is None:
-        source = _ReusedDatabricksTokenSource(host=workspace_host)
-        _databricks_auth_cache[server_url] = source
-    return source.current_token()
+    return _shared_token_source(server_url).current_token()
 
 
 class _DatabricksTokenAuth(httpx.Auth):
@@ -799,41 +875,19 @@ class _DatabricksTokenAuth(httpx.Auth):
          Databricks CLI near expiry (not on every request).
     """
 
-    def __init__(
-        self,
-        server_url: str | None = None,
-        *,
-        session_id: str | None = None,
-    ) -> None:
+    def __init__(self, server_url: str | None = None) -> None:
         """
         :param server_url: Remote server URL for looking up stored
             OIDC tokens, e.g. ``"http://localhost:6767"``.
-        :param session_id: The single session this client drives; its
-            requests are pinned to that session's host replica. ``None``
-            for a hostless / local client.
         """
         self._server_url = server_url
-        self._session_id = session_id
         raw = os.environ.get(_REMOTE_AUTH_TOKEN_ENV)
         self._static_token = raw.strip() if raw else None
         # Lazily-resolved, then reused, SDK auth (one Config → one token
         # cache). Resolving per request rebuilt Config and shelled out to
         # the Databricks CLI (~0.5s) every time — a heavy tax on the
         # long-lived transcript-forwarder client that posts reply items.
-        self._sdk_token_source = _ReusedDatabricksTokenSource(server_url)
-
-    def pin_session(self, session_id: str | None) -> None:
-        """Repoint this auth at a different session's host.
-
-        ``auth_flow`` reads ``get_session_host(self._session_id)`` per request,
-        so changing the pinned session id changes which host replica the slice
-        key routes to — without rebuilding the client. Used when a client
-        outlives the session it was built for (e.g. a ``--fork`` in the REPL
-        resumes under a new conversation id on a new host).
-
-        :param session_id: The session id to pin to, or ``None`` to unpin.
-        """
-        self._session_id = session_id
+        self._sdk_token_source = _shared_token_source(server_url)
 
     def _sdk_token(self) -> str | None:
         """
@@ -865,19 +919,38 @@ class _DatabricksTokenAuth(httpx.Auth):
         :param request: The outgoing httpx request.
         :yields: The request with auth header set.
         """
-        # Workspace routing (empty when none recorded); independent of the
-        # credential branch below. On a host-sharded deployment, also pin the
-        # turn/resource/stream traffic for this client's session to the replica
-        # holding its runner tunnel — the slice key is the session's host_id,
-        # from the session→host map. An unsharded server has no sharding layer,
-        # so no key.
+        self._apply_headers(request)
+        yield request
+
+    def sync_auth_flow(
+        self, request: httpx.Request
+    ) -> Generator[httpx.Request, httpx.Response, None]:
+        """Authenticate *request*, re-sending it unkeyed once after a ``wrong_replica`` miss."""
+        self._apply_headers(request)
+        response = yield request
+        if _keyed_wrong_replica_candidate(request, response):
+            response.read()
+            if _is_wrong_replica(response):
+                yield _unkeyed(request)
+
+    async def async_auth_flow(
+        self, request: httpx.Request
+    ) -> AsyncGenerator[httpx.Request, httpx.Response]:
+        """Async twin of :meth:`sync_auth_flow`."""
+        self._apply_headers(request)
+        response = yield request
+        if _keyed_wrong_replica_candidate(request, response):
+            await response.aread()
+            if _is_wrong_replica(response):
+                yield _unkeyed(request)
+
+    def _apply_headers(self, request: httpx.Request) -> None:
+        """Set the routing and ``Authorization`` headers on *request*."""
         if self._server_url:
             from omnigent.cli_auth import databricks_request_headers
 
-            session_host = get_session_host(self._session_id) if self._session_id else None
-            request.headers.update(
-                databricks_request_headers(self._server_url, host_id=session_host)
-            )
+            # The default key; a session routing transport re-keys session requests.
+            request.headers.update(databricks_request_headers(self._server_url))
         if self._static_token:
             request.headers["Authorization"] = f"Bearer {self._static_token}"
         else:
@@ -894,7 +967,35 @@ class _DatabricksTokenAuth(httpx.Auth):
                 token = self._sdk_token()
                 if token:
                     request.headers["Authorization"] = f"Bearer {token}"
-        yield request
+
+
+def _keyed_wrong_replica_candidate(request: httpx.Request, response: httpx.Response) -> bool:
+    # Only a 400 can be wrong_replica; reading other bodies would buffer streams.
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, UNKEYED_REQUEST_EXTENSION
+
+    return (
+        response.status_code == 400
+        and OMNIGENT_SLICE_KEY_HEADER in request.headers
+        and not request.extensions.get(UNKEYED_REQUEST_EXTENSION)
+    )
+
+
+def _is_wrong_replica(response: httpx.Response) -> bool:
+    from omnigent.runner.session_requests import is_wrong_replica
+
+    return is_wrong_replica(response)
+
+
+def _unkeyed(request: httpx.Request) -> httpx.Request:
+    """*request* re-addressed without a slice key, reaching the default replica.
+
+    A host whose tunnels connected without a key is only reachable there.
+    """
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, UNKEYED_REQUEST_EXTENSION
+
+    request.headers.pop(OMNIGENT_SLICE_KEY_HEADER, None)
+    request.extensions[UNKEYED_REQUEST_EXTENSION] = True
+    return request
 
 
 def _server_headers(
@@ -913,17 +1014,16 @@ def _server_headers(
         already threaded the value here; runner affinity is now
         persisted through ``PATCH /v1/sessions/{id}``, not a
         request header.
-    :returns: Static headers for ``httpx`` / ``OmnigentClient``.
+    :returns: Static headers for ``httpx`` / ``OmnigentClient``: the client
+        identity ``User-Agent``, so an unauthenticated CLI isn't reported as the SDK.
     """
+    from omnigent.telemetry.request_headers import client_identity_headers
+
     del runner_id
-    return {}
+    return client_identity_headers()
 
 
-def _server_auth(
-    server_url: str | None = None,
-    *,
-    session_id: str | None,
-) -> httpx.Auth | None:
+def _server_auth(server_url: str | None = None) -> httpx.Auth | None:
     """
     Build an httpx Auth for a remote Omnigent server client.
 
@@ -935,29 +1035,21 @@ def _server_auth(
 
     :param server_url: Optional remote server URL for looking up
         stored OIDC tokens.
-    :param session_id: The single session this client drives, e.g.
-        ``"conv_abc123"``. When set, the auth pins every request to the
-        replica holding that session's runner tunnel (its host, looked up
-        in the session→host map). Required-keyword with no default so every
-        caller consciously decides: pass the session when known so its
-        traffic co-locates, or ``None`` before a session exists / for a
-        host-less client (the slice key then falls back to the runner-env
-        or CLI-own-host id inside ``databricks_request_headers``).
     :returns: Auth instance, or ``None``.
     """
     raw = os.environ.get(_REMOTE_AUTH_TOKEN_ENV)
     if raw and raw.strip():
-        return _DatabricksTokenAuth(server_url=server_url, session_id=session_id)
+        return _DatabricksTokenAuth(server_url=server_url)
     # Check stored `omnigent login` records: a session JWT or a
     # Databricks Apps pointer record.
     if server_url:
         from omnigent.cli_auth import load_databricks_workspace_host, load_token
 
         if load_token(server_url) or load_databricks_workspace_host(server_url):
-            return _DatabricksTokenAuth(server_url=server_url, session_id=session_id)
+            return _DatabricksTokenAuth(server_url=server_url)
     creds = _read_databrickscfg(None)
     if creds is not None and creds.token:
-        return _DatabricksTokenAuth(server_url=server_url, session_id=session_id)
+        return _DatabricksTokenAuth(server_url=server_url)
     return None
 
 
@@ -969,6 +1061,7 @@ def _chat_with_server(
     resume_conversation_id: str | None = None,
     fork_session_id: str | None = None,
     agent_name: str | None = None,
+    registered_agent: RegisteredAgent | None = None,
     runner_id: str | None = None,
     runner_recover: Callable[[], str] | None = None,
     log: bool = False,
@@ -1006,6 +1099,7 @@ def _chat_with_server(
         entering the REPL. The REPL opens attached to the fork.
     :param agent_name: Optional already-selected agent name,
         e.g. ``"hello_world"``.
+    :param registered_agent: Catalog identity selected for a new remote session.
     :param runner_id: Optional preferred runner id to send on
         requests, e.g. ``"runner_0123456789abcdef"``.
     :param runner_recover: Optional callback that restarts a local
@@ -1072,7 +1166,40 @@ def _chat_with_server(
     ):
         return
 
-    selected_agent = agent_name or _pick_agent(base_url)
+    source_session_id = resume_conversation_id or fork_session_id
+    if agent_name is None and source_session_id is not None:
+        # A resumed session already has its agent; asking would risk picking
+        # another one and adopting a runner for the wrong harness. A failed
+        # lookup surfaces as a discovery error naming the session.
+        snapshot = _discovery_get(
+            base_url,
+            f"/v1/sessions/{urllib.parse.quote(source_session_id, safe='')}",
+            {},
+            what=f"Session {source_session_id} lookup",
+        )
+        host_id = snapshot.get("host_id")
+        set_session_host(source_session_id, host_id if isinstance(host_id, str) else None)
+        session_agent = snapshot.get("agent_name")
+        agent_name = session_agent if isinstance(session_agent, str) and session_agent else None
+        if agent_name is None and fork_session_id is not None:
+            # Display only: the fork copies its source agent without a name lookup.
+            agent_name = "agent"
+        if agent_name is None and initial_message is not None:
+            # --agent is rejected with --resume, so the generic "pass --agent"
+            # advice would be a dead end here.
+            raise _server_setup_error(
+                f"Session {resume_conversation_id} on {display_server_url(base_url)} does not "
+                "report its agent (an older server?), so this headless resume cannot choose "
+                f"one. Resume it interactively (`{cli_invocation()} run --server <url> --resume "
+                f"{resume_conversation_id}`) or start a new session with --agent <name>."
+            )
+    # A headless one-shot cannot answer the agent menu, so it fails with the
+    # candidates instead.
+    if agent_name is None:
+        selected = _pick_agent(base_url, interactive=initial_message is None)
+        agent_name = selected.name
+        if resume_conversation_id is None and fork_session_id is None:
+            registered_agent = selected
 
     # Bring-up is done — clear the spinner the instant before we produce
     # terminal output (the one-shot reply or the REPL's first paint), so it
@@ -1083,7 +1210,8 @@ def _chat_with_server(
     if initial_message is not None:
         _run_one_shot(
             base_url=base_url,
-            agent_name=selected_agent,
+            agent_name=agent_name,
+            registered_agent=registered_agent,
             tool_handler=tool_handler,
             prompt=initial_message,
             runner_id=runner_id,
@@ -1096,8 +1224,9 @@ def _chat_with_server(
 
     _run_repl(
         base_url,
-        selected_agent,
+        agent_name,
         tool_handler,
+        registered_agent=registered_agent,
         initial_message=initial_message,
         resume_conversation_id=resume_conversation_id,
         fork_session_id=fork_session_id,
@@ -1387,26 +1516,43 @@ def _attach_session_info(
     )
 
 
-def _pick_agent(base_url: str, *, quiet: bool = False) -> str:
-    """
-    Discover agent names from existing sessions and let the user pick.
+def _require_url_target_for_agent(target: str, agent_name: str | None) -> None:
+    """``--agent`` names a server-registered agent; a local AGENT path already is the agent."""
+    if agent_name is not None and not _is_url(target):
+        raise click.ClickException(
+            "--agent names an agent registered on a server; it only applies to "
+            "`run --server <url>` without an AGENT path."
+        )
 
-    If only one agent name is found, selects it automatically.
-    Falls back to requiring the user to specify ``--agent`` if no
-    sessions exist yet.
+
+def _discovery_error(
+    base_url: str, path: str, detail: str, *, what: str = "Agent discovery"
+) -> click.ClickException:
+    """Build the CLI error for a server listing or lookup the client cannot use."""
+    return _server_setup_error(
+        f"{what} failed: GET {path} on {display_server_url(base_url)} {detail}."
+    )
+
+
+def _discovery_get(
+    base_url: str, path: str, params: dict[str, Any], *, what: str = "Agent discovery"
+) -> dict[str, Any]:
+    """
+    Fetch one agent-discovery listing or lookup from the server as JSON.
 
     :param base_url: Server base URL.
-    :param quiet: When ``True``, suppress interactive prompts and
-        auto-select the first available agent.
-    :returns: The chosen agent name.
-    :raises click.ClickException: If the server is unreachable, no
-        sessions exist, or no agent name can be discovered.
+    :param path: Route, e.g. ``"/v1/agents"``.
+    :param params: Query parameters for the request.
+    :param what: Short name of the lookup for error messages.
+    :returns: The decoded JSON object.
+    :raises click.ClickException: If the server is unreachable, answers with an
+        HTTP error, or returns something other than a JSON object.
     """
     try:
         resp = _server_get(
-            f"{base_url}/v1/sessions",
+            f"{base_url}{path}",
             headers=_remote_headers(server_url=base_url, host_id=None),
-            params={"limit": 100, "visibility": "all"},
+            params=params,
             timeout=10.0,
         )
     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ProxyError, httpx.InvalidURL) as exc:
@@ -1414,44 +1560,160 @@ def _pick_agent(base_url: str, *, quiet: bool = False) -> str:
         # or a proxy environment httpx cannot parse is an environment problem,
         # not a crash. Same guard as the daemon path
         # (_prepare_chat_session_via_daemon).
-        raise click.ClickException(_unreachable_server_message(base_url)) from exc
-    resp.raise_for_status()
-    sessions = resp.json()["data"]
+        raise _server_setup_error(_unreachable_server_message(base_url)) from exc
+    except httpx.TransportError as exc:
+        # The connection was made but the response never fully arrived.
+        raise _discovery_error(
+            base_url, path, f"failed before a response arrived ({type(exc).__name__})", what=what
+        ) from exc
+    try:
+        resp.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        detail = f"returned HTTP {status}"
+        if status == 401:
+            detail += (
+                f". Sign in with `{cli_invocation()} login {display_server_url(base_url)}`, "
+                "then retry"
+            )
+        elif status == 403:
+            detail += (
+                ". Check that you are using the intended account and ask the server "
+                "administrator to grant access"
+            )
+        raise _discovery_error(base_url, path, detail, what=what) from exc
+    try:
+        body = resp.json()
+    except ValueError as exc:
+        raise _discovery_error(base_url, path, "returned a non-JSON body", what=what) from exc
+    if not isinstance(body, dict):
+        raise _discovery_error(base_url, path, "returned an unexpected body shape", what=what)
+    return body
 
-    # Collect unique agent names from sessions.
-    names: list[str] = []
-    seen: set[str] = set()
-    for s in sessions:
-        name = s.get("agent_name")
-        if name and name not in seen:
-            names.append(name)
-            seen.add(name)
 
+#: Most agent names an error message spells out before summarizing the rest.
+_MAX_LISTED_AGENTS = 20
+
+
+def _format_agent_names(names: list[str]) -> str:
+    """Comma-join agent names for an error message, summarizing a long registry."""
+    shown = ", ".join(printable(name) for name in names[:_MAX_LISTED_AGENTS])
+    hidden = len(names) - _MAX_LISTED_AGENTS
+    return f"{shown} (and {hidden} more)" if hidden > 0 else shown
+
+
+def _registered_agents(base_url: str, *, stop_at: str | None = None) -> list[_AgentChoice]:
+    """Read the SDK catalog policy through the CLI's authenticated sync transport."""
+    catalog = RegisteredAgentCatalog(stop_at=stop_at)
+    while not catalog.done:
+        try:
+            page = _discovery_get(base_url, "/v1/agents", catalog.params)
+        except click.ClickException as exc:
+            cause = exc.__cause__
+            if isinstance(cause, httpx.HTTPStatusError) and catalog.skip_unavailable_scope(
+                cause.response.status_code
+            ):
+                break
+            raise
+        try:
+            catalog.add_page(page)
+        except ClientOmnigentError as exc:
+            raise _discovery_error(base_url, "/v1/agents", str(exc)) from exc
+    return list(catalog.entries.values())
+
+
+def _server_setup_error(message: str) -> click.ClickException:
+    """A CLI error about the server's agents or runners; `omnigent stop` cannot fix these."""
+    from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
+
+    exc = click.ClickException(message)
+    setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
+    return exc
+
+
+def _no_registered_agents_message(base_url: str) -> str:
+    """Build the error for a server that has no registered agents at all."""
+    return (
+        f"No agents are registered on {display_server_url(base_url)}. Install one with "
+        f"`{cli_invocation()} agent add <path> --server <url>`, or register one when starting "
+        f"the server (`{cli_invocation()} server --agent <path>`), then retry."
+    )
+
+
+def _require_registered_agent(base_url: str, agent_name: str) -> _AgentChoice:
+    """
+    Check that *agent_name* (``--agent``) is registered on the server.
+
+    :param base_url: Server base URL.
+    :param agent_name: Agent name the user asked for, e.g. ``"scribe"``.
+    :returns: The matching catalog entry, including its id and harness.
+    :raises click.ClickException: If the server is unreachable or no
+        registered agent has that name.
+    """
+    agents = _registered_agents(base_url, stop_at=agent_name)
+    for agent in agents:
+        if agent.name == agent_name:
+            return agent
+    names = [agent.name for agent in agents]
     if not names:
-        raise click.ClickException(
-            "No sessions found on the server. Start a session first "
-            "or specify the agent with --agent."
+        raise _server_setup_error(_no_registered_agents_message(base_url))
+
+    raise _server_setup_error(
+        f"Agent {printable(repr(agent_name))} is not registered on "
+        f"{display_server_url(base_url)}. "
+        f"Registered agents: {_format_agent_names(names)}."
+    )
+
+
+def _pick_agent(base_url: str, *, quiet: bool = False, interactive: bool = True) -> _AgentChoice:
+    """
+    Choose the registered agent a new ``--server`` session should use.
+
+    Only registered server and user agents are candidates for a new session.
+    Session-scoped uploads from conversation history are not catalog entries.
+    A single candidate is selected automatically; several are offered as a
+    menu, or rejected with the list when no prompt is allowed.
+
+    :param base_url: Server base URL.
+    :param quiet: When ``True``, suppress the ``Agent:`` echo and never prompt.
+    :param interactive: When ``False`` (headless ``-p``), fail with the
+        candidate list instead of prompting when several agents qualify.
+    :returns: The selected catalog entry, including its id and harness.
+    :raises click.ClickException: If the server is unreachable, no agent is
+        registered, or several qualify and no prompt is allowed.
+    """
+    agents = _registered_agents(base_url)
+    if not agents:
+        raise _server_setup_error(_no_registered_agents_message(base_url))
+
+    if len(agents) == 1:
+        if not quiet:
+            click.echo(f"\n  Agent: {printable(agents[0].name)}")
+        return agents[0]
+
+    if quiet or not interactive:
+        names = _format_agent_names([agent.name for agent in agents])
+        raise _server_setup_error(
+            f"Several agents are available on {display_server_url(base_url)}; pass "
+            f"--agent <name> to choose one: {names}."
         )
 
-    if len(names) == 1:
-        if not quiet:
-            click.echo(f"\n  Agent: {names[0]}")
-        return names[0]
-
     click.echo("\n  Available agents:\n")
-    for i, name in enumerate(names, 1):
-        click.echo(f"    {i}. {name}")
+    for index, agent in enumerate(agents, 1):
+        details = f"{agent.source}, {printable(agent.harness or 'unknown harness')}"
+        click.echo(f"    {index}. {printable(agent.name)} ({details})")
 
     while True:
         raw = str(click.prompt("\n  Agent", default="1"))
         try:
             choice = int(raw)
-            if 1 <= choice <= len(names):
-                return names[choice - 1]
+            if 1 <= choice <= len(agents):
+                return agents[choice - 1]
         except ValueError:
-            if raw.strip() in seen:
-                return raw.strip()
-        click.echo(f"  Enter a number between 1 and {len(names)}.")
+            for agent in agents:
+                if raw.strip() == agent.name:
+                    return agent
+        click.echo(f"  Enter a number between 1 and {len(agents)}.")
 
 
 # ---------------------------------------------------------------------------
@@ -1565,7 +1827,6 @@ def _unreachable_server_message(base_url: str) -> str:
             f"It may have stopped — run `{cli_invocation()} stop`, then try again. "
             f"Server logs are under {process_log_dir_reference('server')}."
         )
-    from omnigent.util.server_url import display_server_url
 
     return (
         f"Could not connect to the Omnigent server at {display_server_url(base_url)}. "
@@ -1646,8 +1907,6 @@ async def _prepare_chat_session_via_daemon(
     :raises click.ClickException: If the server is unreachable, or session
         create/fork or runner launch fails.
     """
-    from omnigent_client import OmnigentClient
-
     from omnigent._runner_startup import (
         STARTUP_PHASE_CONNECTING,
         STARTUP_PHASE_LAUNCHING_AGENT,
@@ -1666,7 +1925,7 @@ async def _prepare_chat_session_via_daemon(
         :returns: The session id and whether it was created just now.
         :raises click.ClickException: If the server rejects the create/fork.
         """
-        async with OmnigentClient(base_url=base_url, headers=headers, auth=auth) as sdk:
+        async with open_sdk_client(base_url, headers=headers, auth=auth) as sdk:
             try:
                 if fork_session_id is not None:
                     fork_result = await sdk.sessions.fork(fork_session_id)
@@ -1751,7 +2010,7 @@ def _stop_headless_session(*, base_url: str, session_id: str) -> None:
     # Teardown must never turn a completed run into a failed one.
     try:
         _stop_session_on_server(base_url=base_url, session_id=session_id)
-    except Exception:  # noqa: BLE001 — best-effort cleanup
+    except Exception:  # best-effort cleanup
         logger.debug("could not stop session %s after one-shot run", session_id, exc_info=True)
 
 
@@ -1841,7 +2100,7 @@ def _chat_via_daemon(
             _await_accounts_first_run_setup(base_url, progress=progress)
 
             headers = _remote_headers(server_url=base_url, host_id=None)
-            auth = _server_auth(server_url=base_url, session_id=None)
+            auth = _server_auth(server_url=base_url)
             host_id = load_or_create_host_identity().host_id
             workspace = str(Path.cwd().resolve())
 
@@ -2188,7 +2447,6 @@ def _chat_local(
                 resume_latest=resume_latest,
                 resume_picker=resume_picker,
             )
-            bundle_bytes = _bundle_agent(spec_path)
             _chat_with_server(
                 base_url,
                 tool_handler,
@@ -2199,7 +2457,6 @@ def _chat_local(
                 fork_session_id=fork_session_id,
                 log=log,
                 agent_yaml=spec_path,
-                session_bundle=bundle_bytes,
                 ephemeral=ephemeral,
                 debug_events=debug_events,
                 server_log_path=server.log_path,
@@ -2257,7 +2514,6 @@ def _run_local_headless_prompt(
                 tool_handler,
                 prompt=prompt,
                 runner_id=server.runner_id,
-                session_bundle=_bundle_agent(spec_path),
             )
         finally:
             _stop_local_server(server)
@@ -2274,12 +2530,14 @@ def _run_headless_prompt(
     runner_id: str | None = None,
     session_bundle: bytes | None = None,
     session_bundle_filename: str = "agent.tar.gz",
+    registered_agent: RegisteredAgent | None = None,
 ) -> None:
     """
     POST one prompt through the SDK and print the final assistant text.
 
-    Uses the sessions API: create the session, bind the runner,
-    send one message, print text, and return.
+    Uses the sessions API: create or resume the session, get it a runner
+    (adopt one, or have a host launch it), send one message, print text,
+    and return.
 
     :param base_url: Server base URL, e.g.
         ``"http://127.0.0.1:8123"``.
@@ -2292,6 +2550,7 @@ def _run_headless_prompt(
     :param session_bundle: Optional gzipped agent bundle bytes.
     :param session_bundle_filename: Multipart filename, e.g.
         ``"agent.tar.gz"``.
+    :param registered_agent: Catalog identity selected before opening the SDK client.
     :raises SystemExit: Exits with code 1 after printing the server
         error text when the stream emits ``response.error`` or
         returns ``ResponseFailed`` without output text.
@@ -2299,10 +2558,10 @@ def _run_headless_prompt(
     """
 
     async def _main() -> None:
-        async with OmnigentClient(
-            base_url=base_url,
+        async with open_sdk_client(
+            base_url,
             headers=_server_headers(runner_id=runner_id),
-            auth=_server_auth(server_url=base_url, session_id=None),
+            auth=_server_auth(server_url=base_url),
         ) as client:
             # Both a local bundle and a remote registered agent go through
             # the sessions API; _query_sessions_once picks the create route
@@ -2315,6 +2574,7 @@ def _run_headless_prompt(
                 session_bundle=session_bundle,
                 session_bundle_filename=session_bundle_filename,
                 runner_id=runner_id,
+                registered_agent=registered_agent,
             )
             if result_text:
                 print(result_text)
@@ -2331,6 +2591,14 @@ def _run_headless_prompt(
         raise SystemExit(1) from exc
 
 
+async def _resolve_remote_agent(client: OmnigentClient, agent_name: str) -> RegisteredAgent:
+    """Resolve a server or user agent by name; a miss is a clean CLI error."""
+    try:
+        return await client.sessions.resolve_agent(agent_name)
+    except LookupError as exc:
+        raise _server_setup_error(printable(str(exc))) from exc
+
+
 async def _query_sessions_once(
     *,
     client: OmnigentClient,
@@ -2342,9 +2610,10 @@ async def _query_sessions_once(
     runner_id: str | None,
     resume_conversation_id: str | None = None,
     on_session_ready: Callable[[str], None] | None = None,
+    registered_agent: RegisteredAgent | None = None,
 ) -> str | None:
     """
-    Create, bind, and query a sessions-API session for headless ``-p``.
+    Create or resume a sessions-API session, get it a runner, and query it for ``-p``.
 
     :param client: Connected SDK client.
     :param agent_name: Agent display name, e.g. ``"hello_world"``.
@@ -2364,46 +2633,89 @@ async def _query_sessions_once(
         ``"conv_abc123"``. ``None`` creates a fresh session.
     :param on_session_ready: Optional callback invoked after the
         session has been created/resumed and bound to the runner.
+    :param registered_agent: Selected catalog identity; avoids another name lookup.
     :returns: Final assistant text, or ``None`` when no text was
         emitted.
+    :raises click.ClickException: If the remote server has no online
+        runner to adopt and no connected host to launch one on.
     :raises RuntimeError: If no runner id was supplied.
     """
-    from omnigent_client import SessionsChat
+    from omnigent.remote_launch import (
+        LaunchHostError,
+        no_online_runner_message,
+        resolve_remote_launch_host,
+    )
 
     # Remote target: no local bundle means no local runner either, so
-    # adopt one the server already has online before the dispatch
-    # precondition is checked.
-    agent: RegisteredAgent | None = None
+    # adopt one the server already has online, or have a host launch one,
+    # before the dispatch precondition is checked.
+    agent = registered_agent if resume_conversation_id is None and session_bundle is None else None
+    resumed: SessionSnapshot | None = None
+    launch_host_id: str | None = None
     if runner_id is None and session_bundle is None:
-        agent = await client.sessions.resolve_agent(agent_name)
+        if resume_conversation_id is not None:
+            # Resumed sessions may use unnamed uploads; take the harness from the session.
+            resumed = await client.sessions.get(resume_conversation_id)
+            set_session_host(resume_conversation_id, getattr(resumed, "host_id", None))
+            harness = resumed.harness if isinstance(resumed.harness, str) else None
+            if harness is not None and not harness.strip():
+                harness = None
+            if harness is None:
+                lookup_error = _server_setup_error(
+                    f"Cannot determine the harness of session "
+                    f"{printable(resume_conversation_id)}; refusing to adopt an arbitrary runner."
+                )
+                try:
+                    if resumed.agent_name:
+                        harness = (await client.sessions.resolve_agent(resumed.agent_name)).harness
+                except (LookupError, ClientOmnigentError) as exc:
+                    raise lookup_error from exc
+                if not isinstance(harness, str) or not harness.strip():
+                    raise lookup_error
+        else:
+            agent = agent or await _resolve_remote_agent(client, agent_name)
+            harness = agent.harness
         runner_id = await client.sessions.resolve_online_runner(
-            harness=agent.harness,
+            harness=harness,
             canonicalize=lambda name: canonicalize_harness(name) or name,
         )
-        if runner_id is None:
-            raise RuntimeError(
-                "This server has no online runner to run the turn. Start one against "
-                f"it with `{cli_invocation()} host --server <url>` (or run the agent locally "
-                f"with `{cli_invocation()} run <agent.yaml>`), then retry."
+        if runner_id is None and agent is not None:
+            # No runner yet: have the server launch one on this machine's host.
+            try:
+                launch_host_id = await resolve_remote_launch_host(
+                    client.sessions, harness=agent.harness
+                )
+            except LaunchHostError as exc:
+                raise _server_setup_error(str(exc)) from exc
+        if runner_id is None and launch_host_id is None:
+            raise _server_setup_error(no_online_runner_message())
+    tool_callables = _sessions_tool_callables(tool_handler, agent_name)
+    if launch_host_id is not None and agent is not None:
+        # The server launches and binds the host's runner itself.
+        with runner_startup_progress(initial_message=REMOTE_LAUNCH_MESSAGE):
+            bound = await client.sessions.create_from_agent_id(
+                agent.id,
+                workspace=os.getcwd(),
+                host_id=launch_host_id,
             )
-    if runner_id is None:
+        set_session_host(bound.id, launch_host_id)
+    elif runner_id is None:
         raise RuntimeError(
             "Sessions API headless prompt requires a registered runner id. "
             f"Start through `{cli_invocation()} run <agent>` or pass --server so the CLI "
             "can launch and bind a runner."
         )
-    tool_callables = _sessions_tool_callables(tool_handler, agent_name)
-    if resume_conversation_id is not None:
-        bound = await client.sessions.get(resume_conversation_id)
+    elif resume_conversation_id is not None:
+        bound = resumed or await client.sessions.get(resume_conversation_id)
         await client.sessions.bind_runner(resume_conversation_id, runner_id=runner_id)
     else:
         # Record CLI cwd so the Web UI can show "ran locally in
-        # <workspace>" for one-shot sessions. CLI sessions don't set
-        # host_id; this column is purely informational.
+        # <workspace>" for one-shot sessions; an adopted runner's session
+        # has no host_id, so the column is purely informational here.
         if session_bundle is None:
             # Remote target: the agent is registered server-side, so
             # bind by id rather than uploading a bundle we don't have.
-            agent = agent or await client.sessions.resolve_agent(agent_name)
+            agent = agent or await _resolve_remote_agent(client, agent_name)
             created = await client.sessions.create_from_agent_id(
                 agent.id,
                 workspace=os.getcwd(),
@@ -2415,9 +2727,59 @@ async def _query_sessions_once(
                 workspace=os.getcwd(),
             )
         bound = await client.sessions.bind_runner(created.id, runner_id=runner_id)
-    if on_session_ready is not None:
-        on_session_ready(bound.id)
+        set_session_host(bound.id, getattr(bound, "host_id", None))
+    del agent_name
+    try:
+        if on_session_ready is not None:
+            on_session_ready(bound.id)
+        return await _run_bound_turn(
+            client=client, bound=bound, prompt=prompt, tool_callables=tool_callables
+        )
+    finally:
+        # Stop the runner this run caused a host to launch.
+        if launch_host_id is not None:
+            await _stop_launched_session(client, bound.id)
+
+
+async def _stop_launched_session(client: OmnigentClient, session_id: str) -> None:
+    """Stop the runner a one-shot had a host launch; best-effort."""
+    # Teardown must never turn a completed run into a failed one.
+    try:
+        await client.sessions.post_event(session_id, {"type": "stop_session", "data": {}})
+    except Exception:  # best-effort cleanup
+        logger.debug("could not stop session %s after one-shot run", session_id, exc_info=True)
+
+
+async def _run_bound_turn(
+    *,
+    client: OmnigentClient,
+    bound: SessionSnapshot,
+    prompt: str,
+    tool_callables: dict[str, ToolCallable] | None,
+) -> str | None:
+    """Send one prompt on a bound session and return the final assistant text."""
+    from omnigent_client import SessionsChat, StreamHooks
+    from omnigent_client._tool_handler import ResponseEndCtx
+
     session_files = client.files.for_session(bound.id)
+    # ``SessionsChat.query`` ends quietly on ``response.failed`` and returns
+    # whatever text streamed before it, so a turn that failed after emitting an
+    # error as text (the Claude CLI's "apiKeyHelper script is failing") would
+    # print as a reply and exit 0. Record the turn's own failure to raise it.
+    turn_failures: list[ClientOmnigentError] = []
+
+    def _note_failed_turn(ctx: ResponseEndCtx) -> None:
+        if ctx.status != "failed":
+            return
+        error = ctx.response.error
+        failure = ClientOmnigentError(
+            error.message if error is not None and error.message else "turn failed",
+            code=error.code if error is not None else None,
+        )
+        # The runner ran the turn, so `omnigent stop` cannot fix this failure.
+        setattr(failure, SUPPRESS_RECOVERY_HINT_ATTR, True)
+        turn_failures.append(failure)
+
     chat = SessionsChat(
         namespace=client.sessions,
         files_uploader=session_files.upload,
@@ -2425,8 +2787,8 @@ async def _query_sessions_once(
         session=bound,
         tool_callables=tool_callables,
         agent_tools_getter=client._fetch_agent_tools,
+        hooks=StreamHooks(on_response_end=_note_failed_turn),
     )
-    del agent_name
     # A transport-level runner disconnect publishes ``session.status:
     # failed`` for every session pinned to that runner (server
     # ``_on_runner_disconnect``), even when the turn already completed
@@ -2484,7 +2846,7 @@ async def _query_sessions_once(
             async with asyncio.timeout(_LOOP_TIMEOUT_S):
                 while True:
                     await chat.refresh()
-                    if chat.status not in ("running", "launching"):
+                    if chat.status not in _HEADLESS_UNFINISHED_STATUSES:
                         break
                     await chat.await_turn(timeout=_PER_TURN_TIMEOUT_S)
         reconciled = await _persisted_turn_text(client, bound.id)
@@ -2496,6 +2858,10 @@ async def _query_sessions_once(
             "(subscribe-after-post race: the terminal event was lost and "
             "the runner appears not to have completed either)."
         ) from None
+    if turn_failures:
+        # Not reconciled: the transcript can hold the failed turn's error text
+        # as a completed assistant item, which would read as a reply.
+        raise turn_failures[0]
     all_text_parts: list[str] = []
     if result.text:
         all_text_parts.append(result.text)
@@ -2553,7 +2919,7 @@ async def _query_sessions_once(
         # relay cache holds "waiting" (sub-agents still running); "idle" means
         # truly done (single-turn agent, or synthesis completed in the probe).
         await chat.refresh()
-        if chat.status not in ("running", "launching"):
+        if chat.status not in _HEADLESS_UNFINISHED_STATUSES:
             return
         # Async orchestrator confirmed. Loop, refreshing after each turn.
         for _ in range(_MAX_EXTRA_TURNS):
@@ -2561,7 +2927,7 @@ async def _query_sessions_once(
             if extra.text:
                 all_text_parts.append(extra.text)
             await chat.refresh()
-            if chat.status not in ("running", "launching"):
+            if chat.status not in _HEADLESS_UNFINISHED_STATUSES:
                 return  # Idle: synthesis done or all sub-agents complete.
         logger.warning(
             "headless -p hit the %d-turn guard for session %s; "
@@ -2573,7 +2939,7 @@ async def _query_sessions_once(
     try:
         async with asyncio.timeout(_LOOP_TIMEOUT_S):
             await _drain_extra_turns()
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning(
             "headless -p timed out after %.0fs waiting for session %s to complete",
             _LOOP_TIMEOUT_S,
@@ -2584,7 +2950,7 @@ async def _query_sessions_once(
         return "\n\n".join(p for p in all_text_parts if p)
     # An auto-woken turn can finish between live-stream subscriptions.
     # Recheck its durable output once the session has stopped running.
-    if chat.status not in ("running", "launching"):
+    if chat.status not in _HEADLESS_UNFINISHED_STATUSES:
         reconciled = await _persisted_turn_text(client, bound.id)
         if reconciled is not None:
             logger.info("Recovered headless output from completed session %s", bound.id)
@@ -2866,7 +3232,7 @@ def _assert_resume_conversation_exists(
     """
 
     async def _lookup() -> None:
-        async with OmnigentClient(base_url=base_url, headers=headers) as client:
+        async with open_sdk_client(base_url, headers=headers) as client:
             await client.sessions.get(conversation_id)
 
     try:
@@ -2909,7 +3275,7 @@ def _run_picker(
     from omnigent.repl._resume_picker import pick_conversation_from_sdk
 
     async def _lookup() -> str | None:
-        async with OmnigentClient(base_url=base_url, headers=headers) as client:
+        async with open_sdk_client(base_url, headers=headers) as client:
             # Multipart ``omnigent run <yaml>`` uploads now create a
             # fresh session-scoped agent for every session so users who
             # choose the same YAML ``name:`` never share a bundle. Resume
@@ -2957,7 +3323,7 @@ def _resolve_latest_conversation_id(
     """
 
     async def _lookup() -> str | None:
-        async with OmnigentClient(base_url=base_url, headers=headers) as client:
+        async with open_sdk_client(base_url, headers=headers) as client:
             return await _resolve_latest_conversation_id_async(
                 client=client,
                 agent_name=agent_name,
@@ -3055,6 +3421,15 @@ def _materialize_override_bundle(source: Path, overrides: ChatOverrides) -> Path
             raise click.ClickException(
                 f"{source}: expected YAML mapping at top level, got {type(raw).__name__}"
             )
+        if source.is_file() and isinstance(raw.get("instructions"), str):
+            from omnigent.inner.loader import _resolve_instructions
+
+            instructions = _resolve_instructions(raw["instructions"], source.parent)
+            if instructions is not None and instructions != raw["instructions"]:
+                # A newline marks one-line file contents as inline text on reload.
+                if instructions and "\n" not in instructions:
+                    instructions += "\n"
+                raw["instructions"] = instructions
         _apply_overrides_to_raw(raw, overrides)
         target.write_text(yaml.safe_dump(raw, default_flow_style=False), encoding="utf-8")
         materialized = target if source.is_file() else target.parent
@@ -3704,6 +4079,7 @@ def _start_local_server(
             server_proc: subprocess.Popen[bytes] = subprocess.Popen(
                 [
                     sys.executable,
+                    "-P",
                     "-m",
                     "omnigent.cli",
                     "server",
@@ -3962,6 +4338,7 @@ def _run_repl(
     auto_open_conversation: bool = False,
     attach_only: bool = False,
     attach_harness: str | None = None,
+    registered_agent: RegisteredAgent | None = None,
 ) -> None:
     """
     Open the REPL connected to the server.
@@ -4026,6 +4403,7 @@ def _run_repl(
         ``None`` (default) means no skill commands are registered.
     :param auto_open_conversation: When ``True``, open the
         browser conversation URL when the session id becomes known.
+    :param registered_agent: Catalog identity selected for a new remote session.
     """
     from omnigent.repl import run_repl
     from omnigent.repl._session_log import DEFAULT_LOG_DIR
@@ -4096,13 +4474,10 @@ def _run_repl(
         if attach_harness is not None:
             launch_harness = attach_harness
 
-        # Named so a --fork below can repoint it: the auth pins the slice key
-        # to whichever session it names, and a fork lands under a new id.
-        server_auth = _server_auth(server_url=base_url, session_id=resume_conversation_id)
-        async with OmnigentClient(
-            base_url=base_url,
+        async with open_sdk_client(
+            base_url,
             headers=_server_headers(runner_id=runner_id),
-            auth=server_auth,
+            auth=_server_auth(server_url=base_url),
         ) as client:
             # When --fork is set, call the fork endpoint before
             # entering the REPL so the user lands in the fork.
@@ -4113,17 +4488,13 @@ def _run_repl(
                 except Exception as exc:
                     raise click.ClickException(f"Fork failed: {exc}") from exc
                 effective_resume_id = fork_result["id"]
-                # The fork is a fresh session on (possibly) a different host.
-                # Record its host and repoint the auth from the source session
-                # to the fork, so this client's requests route to the fork's
-                # replica instead of the source's for the rest of the REPL.
+                # The fork is a fresh session on (possibly) a different host;
+                # recording it routes this client's fork requests there.
                 fork_host = fork_result.get("host_id")
                 set_session_host(
                     effective_resume_id,
                     fork_host if isinstance(fork_host, str) and fork_host else None,
                 )
-                if isinstance(server_auth, _DatabricksTokenAuth):
-                    server_auth.pin_session(effective_resume_id)
                 click.echo(
                     f"Conversation forked. To return to the previous "
                     f"conversation, run --resume {fork_session_id}",
@@ -4151,6 +4522,7 @@ def _run_repl(
                 agent_description=agent_description,
                 used_families=used_families,
                 attach_only=attach_only,
+                registered_agent=registered_agent,
                 on_session_start=(
                     lambda session_id: _on_session_known(
                         base_url=base_url,
@@ -4175,6 +4547,7 @@ def _run_one_shot(
     session_bundle_filename: str = "agent.tar.gz",
     resume_conversation_id: str | None = None,
     auto_open_conversation: bool = False,
+    registered_agent: RegisteredAgent | None = None,
 ) -> None:
     """
     Send a single prompt to a remote server and print the final text.
@@ -4195,15 +4568,16 @@ def _run_one_shot(
         ``"conv_abc123"``. ``None`` creates a fresh session.
     :param auto_open_conversation: When ``True``, open the
         browser conversation URL after the session is created or resumed.
+    :param registered_agent: Catalog identity selected for a new remote session.
     :returns: None.
     """
 
     async def _main() -> None:
         """Run the one-shot SDK query inside an async client context."""
-        async with OmnigentClient(
-            base_url=base_url,
+        async with open_sdk_client(
+            base_url,
             headers=_server_headers(runner_id=runner_id),
-            auth=_server_auth(server_url=base_url, session_id=resume_conversation_id),
+            auth=_server_auth(server_url=base_url),
         ) as client:
             # Both a local bundle and a remote registered agent go through
             # the sessions API; _query_sessions_once picks the create route
@@ -4217,6 +4591,7 @@ def _run_one_shot(
                 session_bundle_filename=session_bundle_filename,
                 runner_id=runner_id,
                 resume_conversation_id=resume_conversation_id,
+                registered_agent=registered_agent,
                 on_session_ready=(
                     lambda session_id: _on_session_known(
                         base_url=base_url,
@@ -4238,7 +4613,10 @@ def _run_one_shot(
         # raises as an OmnigentError. Surface its message as a clean
         # CLI error instead of an opaque traceback so ``-p`` users see
         # why the turn produced no output.
-        raise click.ClickException(str(exc)) from exc
+        error = click.ClickException(str(exc))
+        if suppresses_recovery_hint(exc):
+            setattr(error, SUPPRESS_RECOVERY_HINT_ATTR, True)
+        raise error from exc
 
 
 # ---------------------------------------------------------------------------

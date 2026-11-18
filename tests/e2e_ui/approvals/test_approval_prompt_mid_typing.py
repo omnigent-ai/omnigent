@@ -26,11 +26,12 @@ prompt from silently ejecting the typist's focus.
 from __future__ import annotations
 
 import threading
-import time
 
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
+
+from tests._helpers.polling import poll_until
 
 _APPROVAL_CARD = '[data-testid="approval-card"]'
 _COMPOSER = 'textarea[aria-label="Message the agent"]'
@@ -82,16 +83,6 @@ def _active_element_descriptor(page: Page) -> str:
             return `${el.tagName}:${label}`;
         }"""
     )
-
-
-def _wait_for(predicate, *, timeout_s: float = 30.0, interval_s: float = 0.5) -> None:
-    """Poll *predicate* until truthy or the deadline passes."""
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(interval_s)
-    raise AssertionError("condition not met within timeout")
 
 
 @pytest.mark.timeout(120)
@@ -148,7 +139,7 @@ def test_send_chord_right_after_prompt_appears_does_not_approve(
     hook_thread.join(timeout=30)
     if "error" in holder:
         raise AssertionError(f"hook thread failed: {holder['error']}") from holder["error"]
-    _wait_for(lambda: not _pending_elicitations(base_url, session_id))
+    poll_until(lambda: not _pending_elicitations(base_url, session_id))
 
 
 @pytest.mark.timeout(120)
@@ -193,4 +184,4 @@ def test_prompt_does_not_silently_eject_focus_mid_typing(
     hook_thread.join(timeout=30)
     if "error" in holder:
         raise AssertionError(f"hook thread failed: {holder['error']}") from holder["error"]
-    _wait_for(lambda: not _pending_elicitations(base_url, session_id))
+    poll_until(lambda: not _pending_elicitations(base_url, session_id))

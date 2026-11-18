@@ -15,7 +15,9 @@ from the transcript. Keeping HTTP out of this hook is what makes live
 streaming smooth — see ``CLAUDE_NATIVE_LIVE_TEXT_STREAMING`` design notes
 and :mod:`omnigent.harnesses.claude_native.forwarder`.
 
-Observed ``MessageDisplay`` payload (this Claude build)::
+Observed ``MessageDisplay`` payload (this Claude build):
+
+.. code-block:: text
 
     {
       "hook_event_name": "MessageDisplay",

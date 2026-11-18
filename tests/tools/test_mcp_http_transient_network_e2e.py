@@ -39,6 +39,7 @@ import pytest
 
 from omnigent.spec.types import MCPServerConfig, RetryPolicy
 from omnigent.tools.mcp import McpServerConnection
+from tests._helpers.live_server import find_free_port
 
 _ECHO_HTTP_SERVER = str(Path(__file__).parent / "fixtures" / "echo_http_mcp_server.py")
 
@@ -67,15 +68,6 @@ _SLOW_TOOL_S = 2.0
 # Plenty for a loopback POST to reach the server and start executing,
 # and well under _SLOW_TOOL_S so the response is still pending.
 _MID_CALL_FAULT_DELAY_S = 0.5
-
-
-def _free_port() -> int:
-    """Reserve an ephemeral localhost port and return it."""
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
 
 
 def _wait_for_listen(port: int, timeout_s: float = 30.0) -> None:
@@ -234,7 +226,7 @@ def flaky_http_mcp(_no_env_proxy: None) -> Iterator[tuple[MCPServerConfig, _Blip
     at the proxy's listen port, and the test triggers the outage via
     ``proxy.blip(seconds)``.
     """
-    server_port = _free_port()
+    server_port = find_free_port()
     server = subprocess.Popen(
         [sys.executable, _ECHO_HTTP_SERVER, str(server_port)],
         stdout=subprocess.DEVNULL,

@@ -63,8 +63,10 @@ def route_client(db_uri: str) -> Iterator[tuple[TestClient, str]]:
         yield client, conv.id
 
 
+@pytest.mark.parametrize("evaluation_error", [False, True], ids=["deny", "evaluation-error"])
 def test_input_policy_deny_persists_item_readable_from_items_api(
     route_client: tuple[TestClient, str],
+    evaluation_error: bool,
 ) -> None:
     """Synchronous INPUT DENY both streams and persists the deny sentinel."""
     client, session_id = route_client
@@ -73,12 +75,20 @@ def test_input_policy_deny_persists_item_readable_from_items_api(
         name="test-agent",
         guardrails=GuardrailsSpec(policies=[]),
     )
+    private_message = "private-policy-store-connection-details"
+    reason = (
+        "Denied by policy (policy evaluation error: RuntimeError)."
+        if evaluation_error
+        else "Request contains BLOCK_THIS_TOKEN"
+    )
     deny_result = PolicyResult(
         action=PolicyAction.DENY,
-        reason="Request contains BLOCK_THIS_TOKEN",
+        reason=reason,
     )
 
     async def _eval(_ctx: Any) -> PolicyResult:
+        if evaluation_error:
+            raise RuntimeError(private_message)
         return deny_result
 
     with (
@@ -111,13 +121,13 @@ def test_input_policy_deny_persists_item_readable_from_items_api(
     assert resp.json() == {
         "queued": False,
         "denied": True,
-        "reason": "Request contains BLOCK_THIS_TOKEN",
+        "reason": reason,
     }
     mock_stream.publish.assert_any_call(
         session_id,
         {
             "type": "response.output_text.delta",
-            "delta": "[Denied by policy: Request contains BLOCK_THIS_TOKEN]",
+            "delta": f"[Denied by policy: {reason}]",
             "message_id": ANY,
             "index": 0,
         },
@@ -133,6 +143,9 @@ def test_input_policy_deny_persists_item_readable_from_items_api(
     assert persisted["content"] == [
         {
             "type": "output_text",
-            "text": "[Denied by policy: Request contains BLOCK_THIS_TOKEN]",
+            "text": f"[Denied by policy: {reason}]",
         }
     ]
+    assert private_message not in resp.text
+    assert private_message not in items_resp.text
+    assert private_message not in str(mock_stream.publish.call_args_list)

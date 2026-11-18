@@ -33,8 +33,10 @@ const harnesses = [];
 // produces independent closure state (activeResponseId, pendingInterruptUntil,
 // latestContext, ...).
 function makeHarness({ captureEvents = false, existingTools = [] } = {}) {
-  const inboxDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-native-inbox-"));
-  const configPath = path.join(inboxDir, "config.json");
+  const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-native-inbox-"));
+  const inboxDir = path.join(fixtureRoot, "inbox");
+  fs.mkdirSync(inboxDir);
+  const configPath = path.join(fixtureRoot, "config.json");
   // A serverUrl + sessionId make postEvent attempt a real fetch; with a mock
   // global fetch that lets a test capture the posted event bodies. Without
   // them postEvent fails closed (the interrupt tests rely on that).
@@ -76,7 +78,7 @@ function makeHarness({ captureEvents = false, existingTools = [] } = {}) {
   const mod = require(EXT_PATH);
   mod(pi);
 
-  const h = { pi, handlers, inboxDir, postedEvents, registeredTools };
+  const h = { pi, handlers, fixtureRoot, configPath, inboxDir, postedEvents, registeredTools };
   harnesses.push(h);
   return h;
 }
@@ -435,6 +437,9 @@ async function testRunningIdleShareResponseId() {
   const ctx = makeCtx({ idle: false });
 
   await h.handlers.agent_start({}, ctx);
+  await h.handlers.message_end({
+    message: { role: "assistant", stopReason: "stop", content: [] },
+  }, ctx);
   await h.handlers.agent_end({ messages: [] }, ctx);
 
   const edges = statusEdges(h.postedEvents);
@@ -459,6 +464,9 @@ async function testRunningIdleShareResponseId() {
 
   // A second turn mints a fresh id, still paired across its own running/idle.
   await h.handlers.agent_start({}, ctx);
+  await h.handlers.message_end({
+    message: { role: "assistant", stopReason: "stop", content: [] },
+  }, ctx);
   await h.handlers.agent_end({ messages: [] }, ctx);
   const edges2 = statusEdges(h.postedEvents);
   const running2 = edges2.filter((e) => e.status === "running");
@@ -471,6 +479,163 @@ async function testRunningIdleShareResponseId() {
       running2[1].responseId !== running2[0].responseId,
     `turn1=${running2[0].responseId} turn2=${running2[1].responseId}`,
   );
+}
+
+async function uiSession(mode = "tui", missing = []) {
+  const h = makeHarness({ captureEvents: true });
+  const originalCalls = [];
+  const ui = {};
+  for (const [method, result] of Object.entries({
+    confirm: true, select: "Allow", input: "typed", editor: "edited",
+    notify: undefined, setStatus: undefined, setTitle: undefined,
+  })) {
+    ui[method] = function (...args) {
+      assert(`${method}: fallback retains UI receiver`, this === ui);
+      originalCalls.push({ method, args });
+      return result;
+    };
+  }
+  for (const method of missing) delete ui[method];
+  const ctx = { mode, ui };
+  await h.handlers.session_start({}, ctx);
+  originalCalls.length = 0;
+  return { ...h, ctx, originalCalls };
+}
+
+function dialogFetch(respond) {
+  global.fetch = async (url, opts) => String(url).includes("pi-extension-ui")
+    ? respond(opts) : { ok: true, status: 204 };
+}
+
+function dialogResponse(value) {
+  return { ok: true, status: 200, text: async () => JSON.stringify(value) };
+}
+
+async function testTuiWrapParksConfirmWithoutCallingOriginal() {
+  const { ctx, originalCalls } = await uiSession();
+  dialogFetch((opts) => {
+    const body = JSON.parse(opts.body);
+    assert("confirm carries its correlation ID and request", body.elicitation_id &&
+      body.request.method === "confirm" && body.request.title === "Clear?");
+    return dialogResponse({ confirmed: true });
+  });
+  assert("confirm returns the server answer", await ctx.ui.confirm("Clear?", "Lost.") === true);
+  assert("original TUI dialog is bypassed", !originalCalls.some((call) => call.method === "confirm"));
+  ctx.ui.notify("hello");
+  ctx.ui.setStatus("test", "ready");
+  assert("notifications remain local", originalCalls.some((call) => call.method === "notify") && originalCalls.some((call) => call.method === "setStatus"));
+}
+
+async function testUnsupportedDialogsFallBackToTui() {
+  for (const status of [404, 405, 403]) {
+    const { ctx, originalCalls } = await uiSession();
+    dialogFetch(() => ({ ok: false, status }));
+    const opts = { timeout: 2000 };
+    for (const [method, args, expected] of [
+      ["confirm", ["Continue?", "Details", opts], true],
+      ["select", ["Choice?", ["Allow", "Block"], opts], "Allow"],
+      ["input", ["Name?", "placeholder", opts], "typed"],
+      ["editor", ["Notes", "prefill", opts], "edited"],
+    ]) {
+      const actual = await ctx.ui[method](...args);
+      assert(`${status}: ${method} result`, actual === (status === 403 ? (method === "confirm" ? false : undefined) : expected));
+      if (status !== 403) {
+        const call = originalCalls.at(-1);
+        assert(`${method}: preserves arguments`, call.method === method && call.args.every((arg, index) => arg === args[index]));
+      }
+    }
+    assert(`${status}: only unsupported endpoints use TUI`, originalCalls.length === (status === 403 ? 0 : 4));
+  }
+}
+
+async function testDialogCancellationDoesNotRepark() {
+  for (const [response, expectedCalls] of [
+    [dialogResponse({ cancelled: true }), 1],
+    [{ ok: true, status: 200, text: async () => "" }, 3],
+  ]) {
+    const { ctx } = await uiSession();
+    let calls = 0;
+    dialogFetch(() => { calls += 1; return response; });
+    assert("unanswered input returns undefined", await ctx.ui.input("Name?", "", { timeout: 6000 }) === undefined);
+    assert("cancel stops and empty responses are bounded", calls === expectedCalls);
+  }
+}
+
+async function testTuiWrapReparksSameElicitationId() {
+  const { ctx, configPath } = await uiSession();
+  const ids = [], headers = [];
+  const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+  const setToken = (token) => fs.writeFileSync(configPath, JSON.stringify({ ...config, authHeaders: { authorization: token } }));
+  setToken("first-token");
+  dialogFetch((opts) => {
+    const body = JSON.parse(opts.body);
+    ids.push(body.elicitation_id);
+    headers.push(opts.headers.authorization);
+    assert("caller timeout reaches the server", body.request.timeout === 6000);
+    if (ids.length === 1) {
+      setToken("rotated-token");
+      return { ok: true, status: 200, text: async () => "" };
+    }
+    return dialogResponse({ value: "Allow" });
+  });
+  const started = Date.now();
+  assert("select returns chosen label", await ctx.ui.select("Choice?", ["Allow", "Block"], { timeout: 6000 }) === "Allow");
+  assert("empty responses back off", Date.now() - started >= 900);
+  assert("re-park preserves its ID", ids.length === 2 && ids[0] === ids[1]);
+  assert("re-park refreshes the bearer", JSON.stringify(headers) === JSON.stringify(["first-token", "rotated-token"]));
+}
+
+async function testPartialUiStillInitializes() {
+  const { ctx, registeredTools } = await uiSession("tui", ["editor"]);
+  assert("missing editor stays absent", ctx.ui.editor === undefined);
+  assert("startup registers task tool", !!registeredTools.manage_todo_list);
+  dialogFetch(() => dialogResponse({ confirmed: true }));
+  assert("remaining UI still works", await ctx.ui.confirm("Continue?", "") === true);
+}
+
+async function testActiveDialogCancellation() {
+  for (const phase of ["already-aborted", "headers", "body", "backoff", "timeout"]) {
+    const { ctx } = await uiSession();
+    const controller = new AbortController();
+    let requestStarted;
+    const started = new Promise((resolve) => { requestStarted = resolve; });
+    dialogFetch((opts) => {
+      const wait = () => new Promise((_, reject) => {
+        opts.signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+        requestStarted();
+      });
+      if (phase === "headers" || phase === "timeout") return wait();
+      if (phase === "body") return { ok: true, status: 200, text: wait };
+      setTimeout(requestStarted, 10);
+      return { ok: false, status: 503 };
+    });
+    if (phase === "already-aborted") controller.abort();
+    const pending = ctx.ui.confirm("Continue?", "Test only", {
+      ...(phase !== "timeout" ? { signal: controller.signal } : {}),
+      timeout: phase === "timeout" ? 50 : 2000,
+    });
+    if (phase !== "already-aborted" && phase !== "timeout") {
+      await started;
+      controller.abort();
+    }
+    let timer;
+    try {
+      const value = await Promise.race([
+        pending,
+        new Promise((resolve) => { timer = setTimeout(() => resolve("still-waiting"), 500); }),
+      ]);
+      assert(`${phase}: abort releases the caller`, value === false, String(value));
+    } finally {
+      clearTimeout(timer);
+    }
+    dialogFetch(() => dialogResponse({ confirmed: true }));
+    assert(`${phase}: a later dialog works`, await ctx.ui.confirm("Again?", "Test only") === true);
+  }
+}
+
+async function testRpcModeDoesNotWrapUi() {
+  const { ctx, originalCalls } = await uiSession("rpc");
+  assert("RPC mode keeps its original UI", await ctx.ui.confirm("Clear?", "Lost.") === true && originalCalls.some((call) => call.method === "confirm"));
 }
 
 async function testSessionStartupDoesNotCompleteATurn() {
@@ -542,6 +707,9 @@ async function testQueuedPromptDuringStartupStaysRunningUntilAgentEnd() {
       JSON.stringify(beforeEnd),
     );
 
+    await h.handlers.message_end({
+      message: { role: "assistant", stopReason: "stop", content: [] },
+    }, ctx);
     await h.handlers.agent_end({ messages: [] }, ctx);
     const afterEnd = statusEdges(h.postedEvents);
     assert(
@@ -573,11 +741,18 @@ async function testQueuedPromptDuringStartupStaysRunningUntilAgentEnd() {
     await testAgentLoopInterruptFallbackNoIsIdleBeforeTurnStart();
     await testMidTurnInterruptFallbackNoIsIdle();
     await testAgentStartClearsStaleWindow();
+    await testTuiWrapParksConfirmWithoutCallingOriginal();
+    await testUnsupportedDialogsFallBackToTui();
+    await testDialogCancellationDoesNotRepark();
+    await testTuiWrapReparksSameElicitationId();
+    await testPartialUiStillInitializes();
+    await testActiveDialogCancellation();
+    await testRpcModeDoesNotWrapUi();
   } finally {
     for (const h of harnesses) {
       if (h.pi.__omnigentInboxPoller) clearInterval(h.pi.__omnigentInboxPoller);
       try {
-        fs.rmSync(h.inboxDir, { recursive: true, force: true });
+        fs.rmSync(h.fixtureRoot, { recursive: true, force: true });
       } catch (_err) {}
     }
   }

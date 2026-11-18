@@ -26,6 +26,7 @@ from omnigent.server.mcp_registry import (
 from omnigent.server.routes.connections_base import ConnectionError
 from omnigent.server.routes.mcp_registry import create_mcp_registry_router
 from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
+from tests.budgets import budget
 from tests.server.test_credential_store import _FakeCipher
 
 
@@ -216,6 +217,25 @@ def test_invalid_operator_configuration_fails_early(override):
 def test_invalid_public_callback_url_is_rejected(url):
     with pytest.raises(ValidationError, match="public_url"):
         McpRegistryConfig(public_url=url, services=[])
+
+
+def test_env_catalog_uses_the_credential_cipher(db_uri, tmp_path, monkeypatch):
+    from omnigent.server import mcp_registry
+
+    monkeypatch.delenv("OMNIGENT_MCP_REGISTRY", raising=False)
+    assert mcp_registry.build_mcp_registry_from_env(db_uri) is None
+
+    catalog = tmp_path / "mcp-registry.yaml"
+    catalog.write_text(json.dumps({"services": [service().model_dump()]}))
+    monkeypatch.setenv("OMNIGENT_MCP_REGISTRY", str(catalog))
+    monkeypatch.setattr(mcp_registry, "build_secret_cipher", lambda: None)
+    with pytest.raises(ValueError, match="cipher"):
+        mcp_registry.build_mcp_registry_from_env(db_uri)
+
+    monkeypatch.setattr(mcp_registry, "build_secret_cipher", _FakeCipher)
+    registry = mcp_registry.build_mcp_registry_from_env(db_uri)
+    assert isinstance(registry.store, CredentialStore)
+    assert list(registry.services) == ["tracker"]
 
 
 @pytest.mark.asyncio
@@ -584,7 +604,7 @@ async def test_oauth_connect_keeps_event_loop_responsive(oauth_app, monkeypatch)
 
     def blocked_upsert(*args, **kwargs):
         loop.call_soon_threadsafe(entered.set)
-        assert release.wait(5), "OAuth begin blocked the event loop"
+        assert release.wait(budget(5)), "OAuth begin blocked the event loop"
 
     monkeypatch.setattr(oauth_app.state.mcp_registry.store, "upsert", blocked_upsert)
     async with httpx.AsyncClient(
@@ -594,13 +614,15 @@ async def test_oauth_connect_keeps_event_loop_responsive(oauth_app, monkeypatch)
     ) as browser:
         pending = asyncio.create_task(browser.get("/v1/connections/mcp-tracker/connect"))
         try:
-            await asyncio.wait_for(entered.wait(), timeout=5)
-            catalog = await asyncio.wait_for(browser.get("/v1/mcp-registry/services"), timeout=1)
+            await asyncio.wait_for(entered.wait(), timeout=budget(5))
+            catalog = await asyncio.wait_for(
+                browser.get("/v1/mcp-registry/services"), timeout=budget(1)
+            )
             assert catalog.status_code == 200
             assert not pending.done()
         finally:
             release.set()
-            response = await asyncio.wait_for(pending, timeout=5)
+            response = await asyncio.wait_for(pending, timeout=budget(5))
     assert response.status_code == 302
     assert response.headers["location"].startswith("https://auth.example.test/authorize?")
 

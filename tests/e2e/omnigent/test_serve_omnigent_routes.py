@@ -14,7 +14,6 @@ HTTP routes -- no LLM calls are made, so mock credentials suffice.
 from __future__ import annotations
 
 import signal
-import socket
 import subprocess
 import time
 from collections.abc import Generator
@@ -25,6 +24,7 @@ from typing import Any
 import httpx
 import pytest
 
+from tests._helpers.live_server import find_free_port
 from tests.e2e.omnigent._snapshot import compare_snapshot
 
 _YAML_RELPATH = ("tests", "resources", "examples", "hello_world.yaml")
@@ -106,13 +106,6 @@ def _wait_for_health(
     )
 
 
-def _find_free_port() -> int:
-    """Return a free TCP port on localhost."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 def _gather_omnigent_observations(port: int) -> dict[str, Any]:
     """Capture structural observations proving the server is omnigent."""
     with httpx.Client(
@@ -151,7 +144,7 @@ def test_serve_omnigent_routes_to_omnigent(
     ``omnigent server --agent <yaml>`` boots an omnigent server
     with the YAML pre-registered. No LLM calls are made.
     """
-    port = _find_free_port()
+    port = find_free_port()
     yaml_path = omnigent_repo_root.joinpath(*_YAML_RELPATH)
     with _omnigent_serve_omnigent(
         omnigent_python=omnigent_python,

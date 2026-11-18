@@ -246,11 +246,15 @@ def test_callback_redirects_to_root_for_hostile_cookie(
     too, not only at ingest.
     """
     state = "csrf-state-token"
-    # Mock the two external-IdP boundaries: token exchange + email.
+    # Mock the two external-IdP boundaries: token exchange + id_token validation.
     # Rebind on the auth module's own namespace (contained, auto-undone)
     # rather than walking through the global httpx module.
     monkeypatch.setattr(auth_module.httpx, "AsyncClient", _FakeAsyncClient)
-    monkeypatch.setattr(auth_module, "_resolve_oidc_email", lambda token_json, config: "u@x.com")
+    monkeypatch.setattr(
+        auth_module,
+        "_validate_id_token",
+        lambda token_json, config: {"email": "u@x.com", "email_verified": True},
+    )
 
     oidc_client.cookies.set(_STATE_COOKIE, _mint_state_cookie(state=state, return_to=malicious))
     resp = oidc_client.get(
@@ -277,7 +281,11 @@ def test_callback_preserves_safe_cookie_return_to(
     """A same-origin ``return_to`` in the cookie is honored at callback."""
     state = "csrf-state-token"
     monkeypatch.setattr(auth_module.httpx, "AsyncClient", _FakeAsyncClient)
-    monkeypatch.setattr(auth_module, "_resolve_oidc_email", lambda token_json, config: "u@x.com")
+    monkeypatch.setattr(
+        auth_module,
+        "_validate_id_token",
+        lambda token_json, config: {"email": "u@x.com", "email_verified": True},
+    )
 
     oidc_client.cookies.set(
         _STATE_COOKIE, _mint_state_cookie(state=state, return_to="/sessions/abc?tab=files")

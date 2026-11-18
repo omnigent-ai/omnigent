@@ -13,7 +13,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import socket
 import subprocess
 import sys
 import uuid
@@ -25,6 +24,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from omnigent.onboarding.sandboxes.bootstrap import DEFAULT_WHEELS_TGZ
+from tests._helpers.live_server import find_free_port
 
 pexpect = pytest.importorskip("pexpect")
 grpc = pytest.importorskip("grpc")
@@ -45,12 +45,6 @@ _GATEWAY_NAME = "local"
 _GATEWAY_MAX_MESSAGE_BYTES = 1 << 20
 _REMOTE_WHEELS_TGZ = "/tmp/oa-wheels.tgz"
 _CREATE_TIMEOUT_S = 480
-
-
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 @dataclass
@@ -150,7 +144,7 @@ class _FakeGateway(openshell_pb2_grpc.OpenShellServicer):
             cwd=self._localize(request.workdir) if request.workdir else self.sandbox_root,
             env=env,
             capture_output=True,
-            timeout=request.timeout_seconds or None,
+            timeout=request.execution_timeout.seconds or None,
             check=False,
         )
 
@@ -217,7 +211,7 @@ def _run_sandbox_create(config_home: Path) -> tuple[int | None, str]:
             "--provider",
             "openshell",
             "--server",
-            f"http://127.0.0.1:{_free_port()}",
+            f"http://127.0.0.1:{find_free_port()}",
         ],
         cwd=str(_REPO_ROOT),
         env=env,
@@ -248,6 +242,11 @@ def test_sandbox_create_ships_wheel_bundle_within_gateway_message_cap(
         f"the wheels were built. CLI output:\n{output}"
     )
     assert exit_status == 0, f"`sandbox create` exited {exit_status}. CLI output:\n{output}"
+    # Every exec addresses the created sandbox by name within its workspace.
+    (sandbox_name,) = gateway._sandboxes
+    assert {(r.sandbox, r.workspace_scope.workspace) for r in gateway.exec_requests} == {
+        (sandbox_name, _WORKSPACE)
+    }
 
     uploaded = gateway.sandbox_root / _REMOTE_WHEELS_TGZ.lstrip("/")
     assert uploaded.is_file(), f"wheel bundle never landed at {uploaded}. CLI output:\n{output}"

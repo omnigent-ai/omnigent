@@ -330,7 +330,7 @@ def test_real_pi_child_startup_cannot_complete_or_timeout_running_work(
         prompt="Reply briefly; wait for the worker.",
         mock_llm_base_url=f"{model_url}/v1",
         extra_config={
-            "os_env": {"type": "caller_process", "cwd": str(workspace)},
+            "os_env": {"type": "caller_process", "cwd": "."},
             "tools": {
                 "worker": {
                     "type": "agent",
@@ -339,7 +339,7 @@ def test_real_pi_child_startup_cannot_complete_or_timeout_running_work(
                     "prompt": "Run the requested task.",
                     "os_env": {
                         "type": "caller_process",
-                        "cwd": str(workspace),
+                        "cwd": ".",
                         "sandbox": {"type": "none"},
                     },
                 }

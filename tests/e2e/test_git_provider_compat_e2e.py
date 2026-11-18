@@ -164,9 +164,7 @@ def test_github_resources_survive_mixed_versions_and_parked_runner(
         _wait_for_host_online(http_client, daemon.host_id)
         agent_dir = _write_smoke_agent_yaml(tmp_path)
         with (agent_dir / "host-e2e-agent.yaml").open("a") as spec:
-            spec.write(
-                f"os_env:\n  type: caller_process\n  cwd: {tmp_path}\n  sandbox:\n    type: none\n"
-            )
+            spec.write("os_env:\n  type: caller_process\n  cwd: .\n  sandbox:\n    type: none\n")
         agent = upload_agent(http_client, agent_dir)
         response = http_client.post(
             "/v1/sessions", json={"agent_id": lookup_agent_id(http_client, agent)}

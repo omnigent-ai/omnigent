@@ -11,7 +11,6 @@ import json
 import os
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import threading
@@ -22,6 +21,7 @@ import httpx
 import pytest
 import yaml
 
+from tests._helpers.live_server import find_free_port
 from tests._helpers.session import bundle_files, post_session_bundle
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -48,13 +48,6 @@ _TOKEN_TTL_S = 12
 _EXPIRY_WAIT_S = _TOKEN_TTL_S + 6
 
 _TOKEN_REFRESH_FAILURE = "Databricks token refresh returned no token"
-
-
-def _find_free_port() -> int:
-    """Reserve an ephemeral loopback port."""
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 def _localhost_env(extra: dict[str, str] | None = None) -> dict[str, str]:
@@ -127,7 +120,7 @@ def _point_stable_symlink(brew: Path, version: str) -> None:
 
 def _start_server(tmp_path: Path) -> tuple[subprocess.Popen[bytes], str]:
     """Start a real server on loopback."""
-    port = _find_free_port()
+    port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     log = (tmp_path / "server.log").open("w")
     proc = subprocess.Popen(

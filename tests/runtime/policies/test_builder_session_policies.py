@@ -11,13 +11,20 @@ Also covers DB-stored default policies (``session_id IS NULL``) and the
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Iterator
+from typing import Any
+
+import cachetools
 import pytest
 
 from omnigent.entities import Policy as StoredPolicy
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.policies.function import FunctionPolicy
+from omnigent.policies.registry import load_registry
 from omnigent.runtime.policies.builder import (
     _DEFAULT_POLICY_SPECS_CACHE,
+    _DEFAULT_POLICY_SPECS_KEY,
     _SESSION_POLICY_SPECS_CACHE,
     _load_default_policy_specs,
     _load_session_policy_specs,
@@ -25,6 +32,7 @@ from omnigent.runtime.policies.builder import (
     build_policy_engine,
     invalidate_default_policy_specs_cache,
     invalidate_session_policy_specs_cache,
+    policy_specs_cache_age,
 )
 from omnigent.spec.types import (
     AgentSpec,
@@ -36,6 +44,29 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
+
+# Handlers attached by these fixtures. They are declared in this module's
+# POLICY_REGISTRY and loaded through the real registry, so attachment and
+# runtime validation both accept them.
+POLICY_REGISTRY = [
+    {"handler": handler}
+    for handler in (
+        "myorg.policies.allow_all",
+        "myorg.policies.deny_all",
+        "myorg.policies.rate_limit",
+        "myorg.policies.simple_check",
+        "tests.resources.examples._shared.tool_functions.block_division",
+        "tests.resources.examples._shared.tool_functions.block_long_sleep",
+    )
+]
+
+
+@pytest.fixture(autouse=True)
+def _register_fixture_policy_handlers() -> Iterator[None]:
+    load_registry(extra_modules=[__name__])
+    yield
+    load_registry()
+
 
 # ── _stored_policy_to_spec ──────────────────────────────────────────────────
 
@@ -66,6 +97,24 @@ def test_stored_python_policy_to_spec() -> None:
     assert spec.function is not None
     assert spec.function.path == "myorg.policies.rate_limit"
     assert spec.function.arguments == {"limit": 10}
+
+
+def test_stored_python_policy_with_unregistered_handler_is_rejected() -> None:
+    """A stored python policy naming an unregistered handler is never converted."""
+    stored = StoredPolicy(
+        id="5e1c0f3b9a7d4c2e8b6f1a0d9c3e7b25",
+        name="unregistered",
+        session_id="0099dc8be6d82871e2e450424d46d1b7",
+        scope="session",
+        created_at=1000,
+        type="python",
+        handler="example_org.policies.unregistered_gate",
+        factory_params=None,
+    )
+
+    with pytest.raises(OmnigentError, match="not a registered policy handler") as excinfo:
+        _stored_policy_to_spec(stored)
+    assert excinfo.value.code == ErrorCode.INVALID_INPUT
 
 
 def test_stored_python_policy_without_factory_params() -> None:
@@ -185,6 +234,54 @@ def test_invalidate_session_policy_specs_cache(db_uri: str) -> None:
     assert len(second) == 2
 
 
+class _CorruptedTTLCache(cachetools.TTLCache[Any, Any]):
+    """TTLCache whose expiry links are broken, as after unlocked writes."""
+
+    def __init__(self) -> None:
+        super().__init__(maxsize=64, ttl=30)
+
+    def expire(self, time: Any = None) -> Any:
+        raise KeyError((0, "conv_corrupted"))
+
+
+def test_corrupted_session_cache_falls_back_to_db_and_resets(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A raising session-policy cache never fails the engine build.
+
+    The DB specs are still enforced, a warning is logged, and the
+    corrupted backing is replaced so later builds cache normally again.
+
+    :param db_uri: Per-test SQLite URI from the root conftest.
+    """
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.create_conversation()
+    policy_store = SqlAlchemyPolicyStore(db_uri)
+    policy_store.create(
+        policy_id="3f0c2b8e6a9d4e1f8b7a6c5d4e3f2a1b",
+        session_id=conv.id,
+        name="survives_corruption",
+        type="python",
+        handler="tests.resources.examples._shared.tool_functions.block_long_sleep",
+    )
+    corrupted = _CorruptedTTLCache()
+    monkeypatch.setattr(_SESSION_POLICY_SPECS_CACHE, "_backing", corrupted)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.db.workspace_cache"):
+        engine = build_policy_engine(
+            spec=_make_minimal_spec(),
+            conversation_id=conv.id,
+            conversation_store=conv_store,
+            policy_store=policy_store,
+        )
+
+    assert engine.policies[0].spec.name == "survives_corruption"
+    assert "Resetting workspace-scoped cache" in caplog.text
+    assert _SESSION_POLICY_SPECS_CACHE._backing is not corrupted
+    first = _load_session_policy_specs(conv.id, policy_store)
+    assert _load_session_policy_specs(conv.id, policy_store) is first
+
+
 def test_load_session_policy_specs_filters_disabled(db_uri: str) -> None:
     """Disabled policies are excluded from the loaded specs.
 
@@ -302,9 +399,11 @@ def test_build_engine_no_store_returns_noop(db_uri: str) -> None:
         policy_store=None,
     )
 
-    # No user-declared policies, but ask_on_add_policy is always present.
-    assert len(engine.policies) == 2
-    assert engine.policies[0].spec.name == "__ask_on_add_policy"
+    # No user-declared policies, but the mandatory approval guards are always present.
+    assert [p.spec.name for p in engine.policies] == [
+        "__ask_on_add_policy",
+        "__ask_on_scheduled_task_change",
+    ]
 
 
 def test_build_engine_ordering_session_agent_admin(db_uri: str) -> None:
@@ -655,6 +754,36 @@ def test_load_default_policy_specs_skips_url_type(db_uri: str) -> None:
     assert specs[0].name == "python_default"
 
 
+def test_load_default_policy_specs_skips_unregistered_handler(db_uri: str) -> None:
+    """A default row whose handler is no longer registered is skipped, not raised.
+
+    Engine construction runs for every session, so one stale default row must not
+    break it.
+
+    :param db_uri: Per-test SQLite URI from the root conftest.
+    """
+    store = SqlAlchemyPolicyStore(db_uri)
+    store.create_default(
+        policy_id="3c9f1e7a0b2d4f86a1c5e9d7b3f0a2e4",
+        name="stale_default",
+        type="python",
+        handler="example_org.policies.removed_gate",
+        enabled=True,
+    )
+    store.create_default(
+        policy_id="7d2a6b4e9c1f48a0b5d3e8f2a6c9b1d7",
+        name="python_default",
+        type="python",
+        handler="myorg.policies.allow_all",
+        enabled=True,
+    )
+    _DEFAULT_POLICY_SPECS_CACHE.clear()
+
+    specs = _load_default_policy_specs(store)
+
+    assert [spec.name for spec in specs] == ["python_default"]
+
+
 def test_load_default_policy_specs_filters_disabled(db_uri: str) -> None:
     """Disabled default policies are excluded from the loaded specs.
 
@@ -833,3 +962,30 @@ def test_build_engine_ordering_session_agent_db_default_admin(db_uri: str) -> No
         "__ask_on_add_policy",
         "__ask_on_scheduled_task_change",
     ]
+
+
+def test_policy_specs_cache_age_tracks_the_older_store_read(db_uri: str) -> None:
+    """A no-policy answer is as old as the older of the two lists behind it.
+
+    A list no longer cached counts as a full TTL old, and without a store
+    there is nothing to go stale.
+
+    :param db_uri: Per-test SQLite URI from the root conftest.
+    """
+    store = SqlAlchemyPolicyStore(db_uri)
+    session_id = "0f4a9f8e7d6c5b4a39281706f5e4d3c2"
+    _DEFAULT_POLICY_SPECS_CACHE.clear()
+    _SESSION_POLICY_SPECS_CACHE.clear()
+    assert policy_specs_cache_age(session_id, None) == 0.0
+    assert policy_specs_cache_age(session_id, store) == 30.0
+
+    _load_default_policy_specs(store)
+    _load_session_policy_specs(session_id, store)
+    assert policy_specs_cache_age(session_id, store) < 1.0
+
+    specs, loaded_at = _SESSION_POLICY_SPECS_CACHE[session_id]
+    _SESSION_POLICY_SPECS_CACHE[session_id] = (specs, loaded_at - 20.0)
+    assert 20.0 <= policy_specs_cache_age(session_id, store) < 21.0
+    assert _DEFAULT_POLICY_SPECS_KEY in _DEFAULT_POLICY_SPECS_CACHE
+    _DEFAULT_POLICY_SPECS_CACHE.clear()
+    _SESSION_POLICY_SPECS_CACHE.clear()

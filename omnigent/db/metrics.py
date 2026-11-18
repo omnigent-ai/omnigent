@@ -74,5 +74,5 @@ def record_transaction_retry(operation: str, outcome: RetryOutcome) -> None:
         return
     try:
         _default_metrics().record_transaction_retry(operation, outcome)
-    except Exception:  # noqa: BLE001 - metrics must not disrupt database work.
+    except Exception:  # metrics must not disrupt database work.
         _logger.debug("failed to record database retry metric", exc_info=True)

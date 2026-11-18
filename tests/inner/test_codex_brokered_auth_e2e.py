@@ -72,7 +72,7 @@ async def test_real_codex_seatbelt_signer_turn_and_cleanup(
     try:
         try:
             await asyncio.wait_for(_collect_turn(), timeout=30)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             state = executor._session_states.get("brokered-e2e")
             stderr = (
                 state.app_session._recent_stderr

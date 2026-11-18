@@ -8,10 +8,15 @@ behave as expected.
 from __future__ import annotations
 
 import hashlib
+import random
+import string
 import time
 
 import pytest
-from sqlalchemy.exc import IntegrityError, OperationalError
+import sqlalchemy as sa
+from sqlalchemy import make_url
+from sqlalchemy.dialects import mysql, sqlite
+from sqlalchemy.exc import IntegrityError, OperationalError, StatementError
 
 from omnigent.db.db_models import (
     SqlAccountToken,
@@ -27,6 +32,7 @@ from omnigent.db.db_models import (
     SqlSessionPermission,
     SqlUser,
     SqlUserDailyCost,
+    SqlWorkflow,
 )
 from omnigent.db.enum_codecs import (
     encode_account_token_kind,
@@ -93,6 +99,12 @@ def _make_metadata(
         id=id,
         kind=encode_conversation_kind(kind),
     )
+
+
+def _incompressible_text(length: int) -> str:
+    """Seeded high-entropy text, which zstd cannot shrink much."""
+    rng = random.Random(42)
+    return "".join(rng.choices(string.ascii_letters + string.digits, k=length))
 
 
 def _make_item(
@@ -394,6 +406,45 @@ class TestSqlConversation:
             assert loaded_conv is not None
             assert loaded_conv.archived is False
 
+    @pytest.mark.parametrize("column", ["session_state", "session_usage", "terminal_launch_args"])
+    def test_metadata_blob_columns_cap_stored_size_only_on_mysql(self, column: str) -> None:
+        """MySQL BLOB holds 65,535 bytes; other dialects store larger values."""
+        column_type = SqlConversationMetadata.__table__.c[column].type
+        assert column_type.compile(dialect=mysql.dialect()) == "BLOB"
+        value = _incompressible_text(100_000)
+        with pytest.raises(ValueError, match="size limit"):
+            column_type.dialect_impl(mysql.dialect()).process_bind_param(value, None)
+        uncapped = column_type.dialect_impl(sqlite.dialect())
+        stored = uncapped.process_bind_param(value, None)
+        assert uncapped.process_result_value(stored, None) == value
+
+    def test_metadata_blob_columns_store_values_over_mysql_limit(self, db_uri: str) -> None:
+        engine = get_or_create_engine(db_uri)
+        managed = make_managed_session_maker(engine)
+        value = _incompressible_text(100_000)
+        meta = _make_metadata()
+        meta.session_state = value
+        meta.session_usage = value
+        meta.terminal_launch_args = value
+
+        if make_url(db_uri).get_backend_name() == "mysql":
+            # Rejected while binding parameters, before MySQL sees the statement.
+            with pytest.raises(StatementError) as raised, managed() as session:
+                session.add(meta)
+            assert isinstance(raised.value.orig, ValueError)
+            return
+
+        with managed() as session:
+            session.add(meta)
+        with managed() as session:
+            loaded = session.get(SqlConversationMetadata, (0, "a9930027fd3e2e979e65844f7af7bf88"))
+            assert loaded is not None
+            assert (loaded.session_state, loaded.session_usage, loaded.terminal_launch_args) == (
+                value,
+                value,
+                value,
+            )
+
     def test_metadata_check_constraint_rejects_invalid_kind(self, db_uri: str) -> None:
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
@@ -692,6 +743,40 @@ class TestSqlSessionPermission:
 
 
 class TestSqlComment:
+    def test_anchor_writes_enforce_stored_byte_limit(self) -> None:
+        assert "anchor_metadata" in sa.inspect(SqlComment).columns
+        table = SqlComment.__table__
+        assert table.c.anchor_metadata.type.max_stored_bytes == 1_024
+        anchor = '{"pr_url":"https://example.com/repo/pull/1","side":"LEFT","line":9}'
+        engine = sa.create_engine("sqlite://")
+        try:
+            table.create(engine)
+            with engine.begin() as connection:
+                connection.execute(
+                    table.insert().values(
+                        id="cccccccccccccccccccccccccccccc01",
+                        conversation_id="a9930027fd3e2e979e65844f7af7bf88",
+                        path="main.py",
+                        start_index=0,
+                        end_index=0,
+                        body="Review",
+                        status=encode_comment_status("draft"),
+                        created_at=0,
+                        updated_at=0,
+                        anchor_metadata=anchor,
+                    )
+                )
+                assert (
+                    connection.execute(sa.select(table.c.anchor_metadata)).scalar_one() == anchor
+                )
+            oversized_anchor = "".join(random.Random(0).choices(string.ascii_letters, k=2_048))
+            with pytest.raises(StatementError, match="size limit"), engine.begin() as connection:
+                connection.execute(
+                    table.update().values(anchor_metadata=oversized_anchor),
+                )
+        finally:
+            engine.dispose()
+
     def test_persist_and_read(self, db_uri: str) -> None:
         engine = get_or_create_engine(db_uri)
         managed = make_managed_session_maker(engine)
@@ -960,3 +1045,42 @@ class TestSqlUserDailyCost:
         with managed() as session:
             rows = session.query(SqlUserDailyCost).filter_by(user_id="u1").all()
             assert len(rows) == 2
+
+
+# ── SqlWorkflow ───────────────────────────────────────
+
+
+class TestSqlWorkflow:
+    @pytest.mark.parametrize(("column_name", "limit"), [("description", 2000), ("plan", 16_383)])
+    def test_user_content_writes_enforce_the_column_stored_limit(
+        self, column_name: str, limit: int
+    ) -> None:
+        table = SqlWorkflow.__table__
+        assert table.c[column_name].type.max_bytes == limit
+        plan = b'{"steps":[{"id":"build","name":"Build","goal":null,"depends_on":[]}]}'
+        engine = sa.create_engine("sqlite://")
+        try:
+            table.create(engine)
+            with engine.begin() as connection:
+                connection.execute(
+                    table.insert().values(
+                        workspace_id=0,
+                        id="0123456789abcdef0123456789abcdef",
+                        user_id="alice@example.com",
+                        name="nightly-build",
+                        description=b"Build and test main every night.",
+                        plan=plan,
+                        created_at=1_762_534_860,
+                        updated_at=1_762_534_860,
+                    )
+                )
+                assert connection.execute(sa.select(table.c.plan)).scalar_one() == plan
+            # The column bounds the encoded bytes, including any encryption envelope.
+            oversized = b"x" * (limit + 1)
+            with (
+                pytest.raises(StatementError, match="stored value exceeds"),
+                engine.begin() as connection,
+            ):
+                connection.execute(table.update().values({column_name: oversized}))
+        finally:
+            engine.dispose()

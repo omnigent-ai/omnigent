@@ -1,23 +1,18 @@
 "use strict";
 
 /**
- * Arca host connection (Databricks-internal).
+ * Arca host connection.
  *
- * Arca is Databricks' internal sandbox CLI: each user has one EC2 dev
- * instance, `arca ssh <args...>` passes the args through to ssh against it
- * (starting the instance first when needed). Connecting that instance as an
- * Omnigent host means running, over `arca ssh`:
+ * Connecting an Arca instance as an Omnigent host means running, over
+ * `arca ssh`:
  *
  *   isaac omni host --server <url> --background --non-interactive
  *
- * (`isaac` is the Databricks-internal launcher that provides the `omni` CLI
- * on Arca instances.)
- *
  * The remote daemon then opens the ordinary outbound host tunnel using the
- * Arca box's own Omnigent OAuth grant; generic Arca sign-in is not sufficient.
- * `--background` exits 0 only once the daemon registered with the server,
- * and `--non-interactive` fails loud instead of dangling on a browser
- * login — both are what make the exit code a trustworthy signal here.
+ * instance's own Omnigent OAuth grant; generic Arca sign-in is not sufficient.
+ * `--background` exits 0 only once the daemon registered with the server, and
+ * `--non-interactive` fails instead of waiting on a browser login, so the exit
+ * code is a reliable signal.
  *
  * This module is main-process-free: the binary probe and process spawn are
  * injected so everything is unit-testable without Electron or a real arca.
@@ -37,6 +32,10 @@ const { readArcaIdentity, IDENTITY_START, IDENTITY_END } = require("./arcaIdenti
 const CONNECT_TIMEOUT_MS = 5 * 60 * 1000;
 const STATUS_TIMEOUT_MS = 60_000;
 const EXTEND_TIMEOUT_MS = 120_000;
+/** A dbcert refresh waits for the user to finish its browser sign-in. */
+const DBCERT_REFRESH_TIMEOUT_MS = 5 * 60 * 1000;
+const DBCERT_STATUS_TIMEOUT_MS = 10_000;
+const DBCERT_ARCA_SYNC_TIMEOUT_MS = 60_000;
 const ARCA_EXTEND_MODES = Object.freeze(["overnight", "workweek"]);
 const ARCA_AUTH_RE = /arca (auth )?login|certificate.*expired|permission denied \(publickey/i;
 const MAX_CLI_OUTPUT_BYTES = 256 * 1024;
@@ -160,10 +159,9 @@ function buildArcaArgs(serverUrl, login = false) {
   }
   return [
     "ssh",
-    // Ordinary arca ssh inherits -R 19222 from ~/.ssh/config. Arca Companion
-    // concurrently reclaims that reserved listener with `fuser -k`, which can
-    // kill this session during cold start even after the remote command
-    // succeeded. This headless launch needs no forwards, so opt out entirely.
+    // A headless launch needs no port forwards. Clear the reserved -R 19222
+    // from ~/.ssh/config so a listener reclaimed during cold start can't kill
+    // the session after the remote command succeeds.
     "-o",
     "ClearAllForwardings=yes",
     "isaac",
@@ -216,7 +214,14 @@ function buildLoginArgs(serverUrl) {
  * Arca, or `arca login` on this machine).
  *
  * @param {{ code: number | null, stdout: string, stderr: string, timedOut?: boolean }} run
- * @returns {{ ok: false, error: string, errorKind: ArcaErrorKind, authError?: boolean }}
+ * @returns {{
+ *   ok: false,
+ *   error: string,
+ *   errorMessage?: string,
+ *   errorAction?: string,
+ *   errorKind: ArcaErrorKind,
+ *   authError?: boolean,
+ * }}
  */
 function describeConnectFailure(run) {
   const output = `${run.stderr}\n${run.stdout}`;
@@ -227,10 +232,12 @@ function describeConnectFailure(run) {
       error:
         "Connecting to Arca timed out. The instance may still be starting — " +
         "check `arca status` and try again.",
+      errorMessage: "Connecting to Arca timed out. The instance may still be starting.",
+      errorAction: "Check `arca status` and try again.",
     };
   }
-  // `omni host --non-interactive` fails loud with a sign-in hint when the
-  // Arca box's Databricks credentials can't mint a server token.
+  // `omni host --non-interactive` fails with a sign-in hint when the instance's
+  // credentials can't mint a server token.
   if (/OMNIGENT_AUTH_REQUIRED|not signed in|authentication failed \(HTTP 401\)/i.test(output)) {
     return {
       ok: false,
@@ -239,6 +246,9 @@ function describeConnectFailure(run) {
       error:
         "The Arca instance isn't signed in to this server. Run " +
         "`arca ssh` and sign in with `isaac omni login <server-url>`, then try again.",
+      errorMessage: "The Arca instance isn't signed in to this server.",
+      errorAction:
+        "Run `arca ssh` and sign in with `isaac omni login <server-url>`, then try again.",
     };
   }
   // The remote shell couldn't find isaac (or isaac couldn't find omni) on the
@@ -250,6 +260,9 @@ function describeConnectFailure(run) {
       error:
         "`isaac omni` isn't available on the Arca instance. " +
         "Check the isaac setup there (`arca ssh`, then `isaac omni --help`) and try again.",
+      errorMessage: "`isaac omni` isn't available on the Arca instance.",
+      errorAction:
+        "Check the isaac setup there (`arca ssh`, then `isaac omni --help`) and try again.",
     };
   }
   // This machine's arca credentials are missing or expired, so ssh never
@@ -260,6 +273,8 @@ function describeConnectFailure(run) {
       errorKind: "arca-auth",
       error:
         "Your arca sign-in on this machine has expired. Run `arca login` in a terminal, then try again.",
+      errorMessage: "Your arca sign-in on this machine has expired.",
+      errorAction: "Run `arca login` in a terminal, then try again.",
     };
   }
   if (/error connecting to arca/i.test(output)) {
@@ -269,6 +284,8 @@ function describeConnectFailure(run) {
       error:
         "Couldn't reach the Arca instance. Try `arca stop && arca start` in a terminal, " +
         "then connect again.",
+      errorMessage: "Couldn't reach the Arca instance.",
+      errorAction: "Try `arca stop && arca start` in a terminal, then connect again.",
     };
   }
   const detail = run.stderr.trim() || run.stdout.trim();
@@ -380,7 +397,7 @@ function parseArcaStatus(stdout) {
  * Run a headless Arca command and capture both output streams.
  * @param {string} arcaPath
  * @param {string[]} args
- * @param {{ spawn?: typeof spawn, timeoutMs: number, killGraceMs?: number, maxOutputBytes?: number }} options
+ * @param {{ spawn?: typeof spawn, timeoutMs: number, killGraceMs?: number, maxOutputBytes?: number, env?: NodeJS.ProcessEnv }} options
  * @returns {Promise<{ code: number | null, stdout: string, stderr: string, timedOut?: boolean, spawnError?: Error }>}
  */
 function runArca(arcaPath, args, options) {
@@ -390,6 +407,7 @@ function runArca(arcaPath, args, options) {
       child = (options.spawn || spawn)(arcaPath, args, {
         stdio: ["ignore", "pipe", "pipe"],
         detached: true,
+        ...(options.env ? { env: options.env } : {}),
       });
     } catch (error) {
       resolve({ code: null, stdout: "", stderr: "", spawnError: error });
@@ -821,10 +839,134 @@ function connectArcaHost(serverUrl, deps = {}) {
   return startArcaConnect(serverUrl, deps).promise;
 }
 
+/**
+ * Well-known install locations for dbcert.
+ *
+ * @returns {string[]}
+ */
+function dbcertCandidatePaths() {
+  return [
+    "/usr/local/bin/dbcert",
+    "/opt/homebrew/bin/dbcert",
+    path.join(os.homedir(), ".local", "bin", "dbcert"),
+  ];
+}
+
+/**
+ * Locate dbcert the way {@link resolveArcaPathAsync} locates arca.
+ *
+ * @param {{ isExecutableFile?: (p: string) => boolean }} [deps]
+ * @returns {Promise<string | null>}
+ */
+function resolveDbcertPathAsync(deps = {}) {
+  return new Promise((resolve) => {
+    execFile("/bin/sh", ["-c", "command -v dbcert"], { encoding: "utf8" }, (error, stdout) => {
+      const onPath = error ? null : String(stdout).trim() || null;
+      resolve(
+        resolveArcaPath({ ...deps, whichArca: () => onPath, candidatePaths: dbcertCandidatePaths }),
+      );
+    });
+  });
+}
+
+/**
+ * Renew this machine's dbcert with `dbcert --force`, which signs in through
+ * the browser. Unless skipped, dbcert also syncs the primary Arca instance.
+ * `--force` mints a new certificate even while the current one is valid.
+ *
+ * @param {{ resolveDbcertPath?: () => string | null | Promise<string | null>, spawn?: typeof spawn, timeoutMs?: number, killGraceMs?: number, skipArcaSync?: boolean }} [deps]
+ * @returns {Promise<{ ok: true } | { ok: false, error: string }>}
+ */
+async function runDbcertRefresh(deps = {}) {
+  return runDbcertCommand(
+    ["--force", "--caller-name", "omnigent", "--update-kubeconfig=false"],
+    "sign-in",
+    deps,
+  );
+}
+
+async function runDbcertArcaSync(deps = {}) {
+  return runDbcertCommand(["sync-arca"], "Arca sync", {
+    ...deps,
+    timeoutMs: deps.timeoutMs ?? DBCERT_ARCA_SYNC_TIMEOUT_MS,
+  });
+}
+
+async function runDbcertCommand(args, action, deps) {
+  try {
+    const dbcertPath = await (deps.resolveDbcertPath || resolveDbcertPathAsync)();
+    if (!dbcertPath) return { ok: false, error: "dbcert was not found on this machine." };
+    const run = await runArca(dbcertPath, args, {
+      spawn: deps.spawn,
+      timeoutMs: deps.timeoutMs ?? DBCERT_REFRESH_TIMEOUT_MS,
+      killGraceMs: deps.killGraceMs,
+      maxOutputBytes: MAX_CLI_OUTPUT_BYTES,
+      ...(deps.skipArcaSync ? { env: { ...process.env, DBCERT_SKIP_ARCA_SYNC: "1" } } : {}),
+    });
+    if (run.spawnError)
+      return { ok: false, error: `Couldn't run dbcert: ${run.spawnError.message}` };
+    if (run.timedOut) return { ok: false, error: `The dbcert ${action} timed out.` };
+    if (run.code !== 0) {
+      const output = run.stderr.trim() || run.stdout.trim();
+      return {
+        ok: false,
+        error: output ? lastLine(output) : `dbcert exited with code ${run.code}.`,
+      };
+    }
+    return { ok: true };
+  } catch (error) {
+    return { ok: false, error: `Couldn't run dbcert: ${error.message}` };
+  }
+}
+
+/** Check both SSH and X.509 credentials without starting an interactive login. */
+async function readDbcertStatus(dbcertPath, deps) {
+  const run = await runArca(dbcertPath, ["status"], {
+    spawn: deps.spawn,
+    timeoutMs: deps.timeoutMs ?? DBCERT_STATUS_TIMEOUT_MS,
+    killGraceMs: deps.killGraceMs,
+    maxOutputBytes: 0,
+  });
+  if (run.spawnError || run.code === null || run.timedOut) {
+    return {
+      ok: false,
+      error: "Couldn't check your laptop's dbcert. Try again, or check dbcert in Arca Companion.",
+    };
+  }
+  if (run.code !== 0 && run.code !== 1) {
+    return { ok: false, error: `Couldn't check your laptop's dbcert (exit ${run.code}).` };
+  }
+  return { ok: true, valid: run.code === 0 };
+}
+
+/**
+ * Check local credentials before provisioning an Arclet without starting sign-in.
+ * @param {Parameters<typeof runDbcertRefresh>[0]} [deps]
+ * @returns {Promise<{ ok: true, valid: boolean } | { ok: false, error: string }>}
+ */
+async function checkDbcert(deps = {}) {
+  try {
+    const dbcertPath = await (deps.resolveDbcertPath || resolveDbcertPathAsync)();
+    if (!dbcertPath) {
+      return {
+        ok: false,
+        error: "dbcert is not installed on this laptop. Install dbcert, then try again.",
+      };
+    }
+    return await readDbcertStatus(dbcertPath, deps);
+  } catch {
+    return { ok: false, error: "Couldn't check your laptop's dbcert. Try again." };
+  }
+}
+
 module.exports = {
   ARCA_EXTEND_MODES,
   STATUS_TIMEOUT_MS,
   EXTEND_TIMEOUT_MS,
+  DBCERT_REFRESH_TIMEOUT_MS,
+  runDbcertRefresh,
+  runDbcertArcaSync,
+  checkDbcert,
   parseArcaStatus,
   readArcaStatus,
   runArcaExtend,
@@ -834,8 +976,10 @@ module.exports = {
   connectArcaHost,
   describeConnectFailure,
   isExecutableFile,
+  lastLine,
   resolveArcaPath,
   resolveArcaPathAsync,
+  SAFE_URL_RE,
   startArcaConnect,
   startArcaLogin,
 };

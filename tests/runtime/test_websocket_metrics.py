@@ -81,6 +81,11 @@ class _Closed(Exception):
     [
         (None, {"local_shutdown": True}, "local_shutdown"),
         (_Closed(1006), {"resumed_from_suspend": True}, "suspend_resume"),
+        (
+            _Closed(1001, "scheduled tunnel renewal"),
+            {"scheduled_renewal": True},
+            "scheduled_renewal",
+        ),
         (_Closed(4003, "server reassigned; reconnecting"), {}, "server_rehome"),
         (_Closed(1012, "service restart"), {}, "server_restart"),
         (_Closed(4003, "ping timeout"), {}, "ping_timeout"),
@@ -144,6 +149,18 @@ def test_records_normalized_disconnect_and_close_code() -> None:
                 "websocket.close.code": 4003,
             },
         )
+    ]
+
+
+def test_records_scheduled_renewal_reason() -> None:
+    """A planned renewal is counted as such, not as a peer close."""
+    meter = _Meter()
+    metrics = ClientWebSocketMetrics(meter)
+
+    metrics.record_disconnected("runner", None, scheduled_renewal=True)
+
+    assert meter.counters[DISCONNECTIONS_METRIC_NAME].records == [
+        _Record(1, {"tunnel.kind": "runner", "disconnect.reason": "scheduled_renewal"})
     ]
 
 

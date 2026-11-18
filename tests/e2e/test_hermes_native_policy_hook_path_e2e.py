@@ -37,7 +37,6 @@ import json
 import os
 import re
 import shutil
-import socket
 import sqlite3
 import subprocess
 import threading
@@ -48,6 +47,7 @@ from pathlib import Path
 import pytest
 
 from omnigent.harnesses.hermes_native.bridge import write_policy_hook_config
+from tests._helpers.live_server import find_free_port
 
 from .conftest import configure_mock_llm
 
@@ -73,12 +73,6 @@ class _AllowPolicyHandler(BaseHTTPRequestHandler):
 
     def log_message(self, *_args: object) -> None:  # silence access logs
         pass
-
-
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 def _hook_script_path_from_wrapper(wrapper: Path) -> str:
@@ -143,7 +137,7 @@ def test_hermes_native_policy_hook_path_lets_the_tool_run(
     )
 
     # Local policy endpoint the hook posts to; ALLOW so a reachable hook proceeds.
-    policy_port = _free_port()
+    policy_port = find_free_port()
     policy = ThreadingHTTPServer(("127.0.0.1", policy_port), _AllowPolicyHandler)
     threading.Thread(target=policy.serve_forever, daemon=True).start()
     policy_url = f"http://127.0.0.1:{policy_port}"

@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { HostFilesystemEntry } from "./useHostFilesystem";
 import {
   buildHostFilesystemUrl,
+  cloneHostRepository,
   createHostDirectory,
   shouldRetryHostFilesystem,
   useHostFilesystem,
@@ -280,5 +281,89 @@ describe("createHostDirectory", () => {
     await expect(createHostDirectory("host_abc", "/Users/me/dup")).rejects.toThrow(
       "directory already exists",
     );
+  });
+});
+
+// cloneHostRepository: POSTs the clone route and surfaces the server's detail on failure.
+
+describe("cloneHostRepository", () => {
+  const fetchMock = vi.fn();
+
+  beforeEach(() => {
+    fetchMock.mockReset();
+    vi.stubGlobal("fetch", fetchMock);
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("POSTs the url, branch and destination and returns the checkout path", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ object: "repository", path: "/Users/me/app" }), {
+        status: 200,
+      }),
+    );
+
+    const path = await cloneHostRepository("host_abc", {
+      url: "https://git.example.com/team/app.git",
+      branch: "main",
+      path: "~/app",
+    });
+
+    expect(path).toBe("/Users/me/app");
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/v1/hosts/host_abc/repositories/clone");
+    expect(init?.method).toBe("POST");
+    expect(JSON.parse(init?.body as string)).toEqual({
+      url: "https://git.example.com/team/app.git",
+      branch: "main",
+      path: "~/app",
+    });
+  });
+
+  it("sends a null branch for the remote default", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ object: "repository", path: "/Users/me/app" }), {
+        status: 200,
+      }),
+    );
+
+    await cloneHostRepository("host_abc", {
+      url: "https://git.example.com/team/app.git",
+      path: "~/app",
+    });
+
+    expect(JSON.parse(fetchMock.mock.calls[0][1]?.body as string)).toEqual({
+      url: "https://git.example.com/team/app.git",
+      branch: null,
+      path: "~/app",
+    });
+  });
+
+  it("throws the server's detail message on a non-OK response", async () => {
+    fetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ detail: "host clone failed: /Users/me/app already exists" }), {
+        status: 409,
+      }),
+    );
+
+    await expect(
+      cloneHostRepository("host_abc", {
+        url: "https://git.example.com/team/app.git",
+        path: "/Users/me/app",
+      }),
+    ).rejects.toThrow("host clone failed: /Users/me/app already exists");
+  });
+
+  it("falls back to the status when the response has no detail", async () => {
+    fetchMock.mockResolvedValue(new Response("", { status: 502 }));
+
+    await expect(
+      cloneHostRepository("host_abc", {
+        url: "https://git.example.com/team/app.git",
+        path: "~/app",
+      }),
+    ).rejects.toThrow("clone repository failed: HTTP 502");
   });
 });

@@ -34,7 +34,6 @@ from __future__ import annotations
 
 import json
 import os
-import socket
 import stat
 import subprocess
 import tempfile
@@ -49,6 +48,7 @@ import httpx
 import pytest
 import yaml
 
+from tests._helpers.live_server import find_free_port
 from tests._helpers.session import bundle_files, post_session_bundle
 
 # Worktree root: tests/e2e/<this file> -> parents[2]. Threaded onto every
@@ -116,12 +116,6 @@ def _subprocess_env(home: Path | None = None) -> dict[str, str]:
         # Pin the data dir under this role's HOME to match its identity.
         env["OMNIGENT_DATA_DIR"] = str(home / ".omnigent")
     return env
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 
 def _client() -> httpx.Client:
@@ -194,7 +188,7 @@ class _CrossHostEnv:
 
 
 def _boot_server(root: Path) -> tuple[subprocess.Popen, str]:
-    port = _free_port()
+    port = find_free_port()
     url = f"http://127.0.0.1:{port}"
     (root / "server").mkdir(parents=True, exist_ok=True)
     log = open(root / "server" / "server.log", "w")  # noqa: SIM115 — Popen lifetime

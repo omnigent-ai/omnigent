@@ -34,6 +34,7 @@ import uuid
 import httpx
 import pytest
 
+from tests._helpers.polling import poll_until
 from tests.e2e.conftest import (
     configure_mock_llm,
     create_runner_bound_session,
@@ -50,6 +51,7 @@ pytestmark = pytest.mark.timeout(300, method="signal")
 # (omnigent/runner/tool_dispatch.py). Its presence in the nudge's tool
 # output is exactly the reported uninterruptibility.
 _REFUSAL_MARKER = "already has a launching or running turn"
+_DISPATCH_ACK = "Dispatched coder on merge-task."
 
 
 def _send_tool_call(call_id: str, agent: str, title: str, args: str) -> dict:
@@ -171,7 +173,7 @@ def test_parent_nudge_lands_on_child_with_stuck_running_turn(
                     )
                 ]
             },
-            {"text": "Dispatched coder on merge-task."},
+            {"text": _DISPATCH_ACK},
             {
                 "tool_calls": [
                     _send_tool_call(
@@ -221,15 +223,19 @@ def test_parent_nudge_lands_on_child_with_stuck_running_turn(
                 "Check the agent / mock-LLM wiring."
             )
 
-        # Wait for the parent's dispatch turn to end (idle or waiting) so the
-        # nudge is a fresh turn rather than a mid-turn steer.
-        deadline = time.monotonic() + 60.0
-        while time.monotonic() < deadline:
-            resp = http_client.get(f"/v1/sessions/{session_id}")
-            resp.raise_for_status()
-            if resp.json().get("status") in ("idle", "waiting"):
-                break
-            time.sleep(1.0)
+        # The parent's waiting status maps to running while its child is live.
+        # Its final reply is persisted when the dispatch response completes.
+        poll_until(
+            lambda: any(
+                item.get("type") == "message"
+                and item.get("role") == "assistant"
+                and item.get("status") == "completed"
+                and any(block.get("text") == _DISPATCH_ACK for block in item.get("content", []))
+                for item in _conversation_items(http_client, session_id)
+            ),
+            timeout_s=60.0,
+        )
+        assert _gate_pending(mock_llm_server_url), "child finished before the parent's nudge"
 
         # Turn 2 — the parent relays the steering nudge to the child whose
         # turn is still running (gate still held).

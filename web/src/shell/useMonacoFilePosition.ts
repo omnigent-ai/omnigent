@@ -34,7 +34,21 @@ export function useMonacoFilePosition({
       });
       // Moving the cursor expands collapsed diff context containing the target.
       editor.setPosition(target);
-      editor.revealPositionInCenter(target, 1 /* ScrollType.Immediate */);
+      if (position.endLine) {
+        const endLine = model.validatePosition({ lineNumber: position.endLine, column: 1 });
+        const rangeHeight =
+          editor.getBottomForLineNumber(endLine.lineNumber) -
+          editor.getTopForLineNumber(target.lineNumber);
+        // A range taller than the viewport is revealed from its first line.
+        if (rangeHeight <= height)
+          editor.revealRangeInCenter(
+            citedRange(target.lineNumber, endLine.lineNumber),
+            1 /* ScrollType.Immediate */,
+          );
+        else editor.revealLineNearTop(target.lineNumber, 1 /* ScrollType.Immediate */);
+      } else {
+        editor.revealPositionInCenter(target, 1 /* ScrollType.Immediate */);
+      }
     };
     const layout = editor.onDidLayoutChange(center);
     let frame: number | undefined;
@@ -57,4 +71,32 @@ export function useMonacoFilePosition({
     center();
     return stop;
   }, [editorRef, mounted, position, cancelScrollRestoreRef, diffEditorRef]);
+
+  // A cited range stays highlighted while it is the viewer's position, even
+  // after the reader scrolls away from it.
+  useEffect(() => {
+    const editor = editorRef.current;
+    if (!mounted || !editor || !position?.endLine) return;
+    const decorations = [
+      {
+        range: citedRange(position.line, position.endLine),
+        options: { isWholeLine: true, className: CITED_LINES_CLASS_NAME },
+      },
+    ];
+    const highlight = editor.createDecorationsCollection(decorations);
+    // Replacing the whole value (an external file reload) drops model decorations.
+    const reload = editor.onDidChangeModelContent((event) => {
+      if (event.isFlush) highlight.set(decorations);
+    });
+    return () => {
+      reload.dispose();
+      highlight.clear();
+    };
+  }, [editorRef, mounted, position]);
+}
+
+const CITED_LINES_CLASS_NAME = "oa-cited-lines";
+
+function citedRange(startLine: number, endLine: number) {
+  return { startLineNumber: startLine, startColumn: 1, endLineNumber: endLine, endColumn: 1 };
 }

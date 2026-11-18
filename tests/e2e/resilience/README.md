@@ -29,6 +29,9 @@ uv run --no-sync pytest tests/e2e/resilience -v
 OMNIGENT_E2E_RESILIENCE_FULL=1 uv run --no-sync pytest tests/e2e/resilience/scenarios -n 2  # 60 s/120 s outages
 ```
 
+The default run still includes S4's 120 s unanswered model call, which must
+outlast Claude Code's request timeout.
+
 To poke at the UI by hand, start a lab with a fault console:
 
 ```sh
@@ -61,8 +64,8 @@ They are built from four pieces:
   run, or of every run with `OMNIGENT_RESILIENCE_KEEP=1`.
 
 `scenarios/_contract.py` holds the shared phases (idle, tool running, tool
-ending during the outage, approval pending) and the checks every scenario
-records once its fault clears.
+ending during the outage, approval pending, model call unanswered) and the
+checks every scenario records once its fault clears.
 
 Rows that break the contract today are pinned to their finding in one of two
 ways. A row that breaks several checks is marked `xfail(strict=True)`. When a
@@ -122,6 +125,13 @@ lab's isolated home. That noise is local, and CI does not have it.
 
 Faults return a handle. Use it as a context manager or call `.clear()`. Every
 connection, fault and process action is appended to `<lab root>/events.jsonl`.
+
+On Linux, a bound, non-listening socket reserves each proxy's port against
+ephemeral allocation and ordinary binds until the proxy stops. Closing the
+listener for `refuse()` still gives clients a real connection refusal. Another
+socket explicitly using `SO_REUSEADDR` can still share the port during refusal.
+macOS keeps the existing close/rebind behavior: a bound, non-listening socket
+there would make clients time out instead of refusing.
 
 `LabConfig(front="ingress")`, the default, makes a stopped server answer `502`
 like the Databricks Apps front door. `front="direct"` refuses connections, as

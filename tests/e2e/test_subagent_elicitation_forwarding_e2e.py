@@ -35,7 +35,6 @@ import contextlib
 import json
 import os
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
@@ -46,6 +45,8 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
+
+from tests._helpers.live_server import find_free_port
 
 _REPO = Path(__file__).resolve().parents[2]
 _PROFILE = "oss"
@@ -224,13 +225,6 @@ def _clean_env(profile: str = _PROFILE) -> dict[str, str]:
     return env
 
 
-def _free_port() -> int:
-    """:returns: An ephemeral localhost port the OS just confirmed free."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 def _get(base: str, path: str, token: str | None) -> dict:
     """
     GET a JSON object from the local server.
@@ -377,7 +371,7 @@ def local_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
     :raises RuntimeError: If the server never passes health.
     """
     workdir = tmp_path_factory.mktemp("subagent_elicit_e2e")
-    port = _free_port()
+    port = find_free_port()
     base = f"http://127.0.0.1:{port}"
     log = open(workdir / "server.log", "w")  # noqa: SIM115 — lives for the Popen lifetime
     proc = subprocess.Popen(

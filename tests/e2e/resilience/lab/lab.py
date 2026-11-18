@@ -29,7 +29,6 @@ import re
 import secrets
 import shutil
 import signal
-import socket
 import sys
 import tempfile
 import time
@@ -43,6 +42,7 @@ import httpx
 import psutil
 import yaml
 
+from tests._helpers.live_server import reserve_port
 from tests.e2e.resilience.lab.events import EventLog
 from tests.e2e.resilience.lab.model import MockModel
 from tests.e2e.resilience.lab.processes import (
@@ -159,16 +159,10 @@ def wait_for(predicate: Callable[[], T | None], *, timeout: float, what: str) ->
         value = predicate()
         if value is not None:
             return value
-        if time.monotonic() >= deadline:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
             raise TimeoutError(f"timed out after {timeout}s waiting for {what}")
-        time.sleep(_POLL_S)
-
-
-@contextlib.contextmanager
-def _reserve_port() -> Iterator[socket.socket]:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        yield sock
+        time.sleep(min(_POLL_S, remaining))
 
 
 def _write_yaml(path: Path, value: dict[str, Any]) -> None:
@@ -208,8 +202,8 @@ class Lab:
         self.client: httpx.Client | None = None
         self.observer: httpx.Client | None = None
         with contextlib.ExitStack() as ports:
-            self._server_port_reservation = ports.enter_context(_reserve_port())
-            self._model_port_reservation = ports.enter_context(_reserve_port())
+            self._server_port_reservation = ports.enter_context(reserve_port())
+            self._model_port_reservation = ports.enter_context(reserve_port())
             self._server_port = int(self._server_port_reservation.getsockname()[1])
             self._model_port = int(self._model_port_reservation.getsockname()[1])
             self._port_reservations = ports.pop_all()
@@ -502,7 +496,14 @@ class Lab:
         return self.root / "t"
 
     def _client(self, base_url: str, *, timeout: float = 30.0) -> httpx.Client:
-        client = httpx.Client(base_url=base_url, timeout=timeout, trust_env=False)
+        # Retire pooled sockets before Uvicorn's five-second idle close, whose
+        # FIN can reach a client later through a proxy.
+        client = httpx.Client(
+            base_url=base_url,
+            timeout=timeout,
+            limits=httpx.Limits(keepalive_expiry=1.0),
+            trust_env=False,
+        )
         self._clients.append(client)
         return client
 
@@ -748,19 +749,31 @@ class Lab:
         self._host = self._spawn("host", argv, env)
         assert self.observer is not None
         observer, host = self.observer, self._host
+        deadline = time.monotonic() + _STARTUP_TIMEOUT_S
+        timeout_detail = (
+            f"timed out after {_STARTUP_TIMEOUT_S}s waiting for the host daemon to answer an RPC"
+        )
 
-        def _online() -> bool | None:
+        def _ready() -> bool | None:
             if not host.running:
                 raise RuntimeError(f"host daemon exited:\n{host.log_tail()}")
-            response = observer.get("/v1/hosts")
-            if response.status_code != 200:
-                return None
-            for row in response.json().get("hosts", []):
-                if row.get("host_id") == self.host_id and row.get("status") == "online":
-                    return True
-            return None
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(timeout_detail)
+            # The online DB row is committed before the tunnel enters the registry.
+            try:
+                response = observer.get(
+                    f"/v1/hosts/{self.host_id}/filesystem",
+                    params={"limit": 1},
+                    timeout=min(2.0, remaining),
+                )
+            except httpx.HTTPError:
+                response = None
+            if time.monotonic() >= deadline:
+                raise TimeoutError(timeout_detail)
+            return True if response is not None and response.status_code == 200 else None
 
-        wait_for(_online, timeout=_STARTUP_TIMEOUT_S, what="the host daemon to register")
+        wait_for(_ready, timeout=_STARTUP_TIMEOUT_S, what="the host daemon to answer an RPC")
 
     def _start_runner(self) -> None:
         from omnigent.runner.identity import token_bound_runner_id

@@ -1,38 +1,15 @@
-// Global command palette (⌘K). Two command groups, Sessions first:
-//
-//   • Sessions — fuzzy session switching from the SAME server-search source the
-//     sidebar uses (`useConversations(query)` → `GET /v1/sessions?search_query=`),
-//     debounced. Not a static first page: a user with hundreds of sessions must
-//     find any of them, which client-side filtering over one page cannot do.
-//     Listed first: the palette doubles as the sidebar's "Search" entry point,
-//     so finding a session is the primary task; the static actions sit below.
-//     Capped to a few recent sessions while the query is empty (see
-//     IDLE_SESSION_LIMIT) so Actions stays visible without scrolling; typing
-//     lifts the cap.
-//   • Actions — static app commands (new chat, navigate, toggle panels).
-//     Filtered client-side against the live query.
-//
-// cmdk's own filtering is disabled (`shouldFilter={false}`): the server filters
-// sessions, and we filter the (tiny, static) action list ourselves so both
-// groups react to the same input.
+// ⌘K palette: Sessions (recent, or title matches), In messages (content matches), Actions.
+// Sessions are searched server-side (one loaded page can't find older ones), so
+// cmdk filtering is off and the static actions are filtered here.
 
 import type React from "react";
-import { defaultFilter } from "cmdk";
-import { useEffect, useMemo, useState } from "react";
-import {
-  CalendarClockIcon,
-  InboxIcon,
-  type LucideIcon,
-  PanelLeftIcon,
-  PanelRightIcon,
-  SettingsIcon,
-  SquarePenIcon,
-  XIcon,
-} from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { ChevronRightIcon, CornerDownRightIcon, FolderIcon, XIcon } from "lucide-react";
 import { useNavigate } from "@/lib/routing";
-import { useConversations } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { cn } from "@/lib/utils";
+import { Badge } from "@/components/ui/badge";
+import { CompactShortcutKeys } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
 import {
@@ -43,7 +20,8 @@ import {
   CommandItem,
   CommandList,
 } from "@/components/ui/command";
-import { conversationDisplayLabel, getConversationAgentType } from "./sidebarNav";
+import { type ActionCommand, filterAppCommands, useAppCommands } from "./appCommands";
+import { type PaletteSession, usePaletteSessionSearch } from "./usePaletteSessionSearch";
 
 export interface CommandPaletteProps {
   sessionsOnly?: boolean;
@@ -53,20 +31,9 @@ export interface CommandPaletteProps {
   onToggleLeftSidebar: () => void;
   /** Flip the right (Workspace) sidebar — owned by AppShell. */
   onToggleRightSidebar: () => void;
+  /** False on grid routes, where ⌘⌥] belongs to the grid's own workspace. */
+  rightSidebarShortcutEnabled?: boolean;
 }
-
-interface ActionCommand {
-  id: string;
-  label: string;
-  /** Mirrors the icon on the equivalent button elsewhere in the UI. */
-  icon: LucideIcon;
-  /** Extra terms the client-side filter matches against (beyond the label). */
-  keywords: string[];
-  run: () => void;
-}
-
-/** Debounce matches the sidebar search (300ms) so keystrokes don't each fetch. */
-const SEARCH_DEBOUNCE_MS = 300;
 
 /** Split `text` on case-insensitive occurrences of `query`, bolding the matches
     so a search hit is visible in the title / content snippet. Returns the raw
@@ -96,11 +63,8 @@ function HighlightedText({ text, query }: { text: string; query: string }): Reac
   });
 }
 
-/** How many recent sessions to show before the user types, so the Actions
-    group stays visible without scrolling. Typing lifts the cap. */
-const IDLE_SESSION_LIMIT = 5;
-const SESSION_SEARCH_PAGE_BATCH = 10;
-const SESSION_SEARCH_RESULT_LIMIT = 50;
+/** Keys that move cmdk's selection; see `userMovedSelection`. */
+const SELECTION_KEYS = new Set(["ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"]);
 
 export function CommandPalette({
   sessionsOnly = false,
@@ -108,147 +72,59 @@ export function CommandPalette({
   onOpenChange,
   onToggleLeftSidebar,
   onToggleRightSidebar,
+  rightSidebarShortcutEnabled = true,
 }: CommandPaletteProps) {
   const navigate = useNavigate();
   const isMobile = useIsMobileViewport();
-  const [query, setQuery] = useState("");
-  const [debouncedQuery, setDebouncedQuery] = useState("");
-  const [pageLimit, setPageLimit] = useState(SESSION_SEARCH_PAGE_BATCH);
-
-  // Reset the query when the palette closes so it reopens clean.
-  useEffect(() => {
-    if (!open) {
-      setQuery("");
-      setDebouncedQuery("");
-      setPageLimit(SESSION_SEARCH_PAGE_BATCH);
-    }
-  }, [open]);
-
-  useEffect(() => {
-    const timer = setTimeout(() => setDebouncedQuery(query), SEARCH_DEBOUNCE_MS);
-    return () => clearTimeout(timer);
-  }, [query]);
+  const {
+    query,
+    setQuery,
+    debouncedQuery,
+    searching,
+    sessions,
+    visibleSessions,
+    contentSessions,
+    titleSearch,
+    contentSearch,
+    isFetching,
+    loadError,
+    loadMoreError,
+    searchFetching,
+    retrying,
+    retryLoad,
+    olderSessionsAvailable,
+    searchOlderSessions,
+    rememberSearchRow,
+  } = usePaletteSessionSearch({ open, sessionsOnly });
 
   const close = (): void => onOpenChange(false);
 
-  const actions = useMemo<ActionCommand[]>(
-    () => [
-      {
-        id: "new-chat",
-        label: "New chat",
-        icon: SquarePenIcon,
-        keywords: ["compose", "start", "new session"],
-        run: () => navigate("/"),
-      },
-      {
-        id: "go-inbox",
-        label: "Go to Inbox",
-        icon: InboxIcon,
-        keywords: ["notifications", "comments", "needs response"],
-        run: () => navigate("/inbox"),
-      },
-      {
-        id: "go-tasks",
-        label: "Go to Automations",
-        icon: CalendarClockIcon,
-        keywords: ["scheduled", "recurring", "cron", "automation", "schedule"],
-        run: () => navigate("/tasks"),
-      },
-      {
-        id: "go-settings",
-        label: "Go to Settings",
-        icon: SettingsIcon,
-        keywords: ["preferences", "configuration", "account"],
-        run: () => navigate("/settings"),
-      },
-      {
-        id: "toggle-left-sidebar",
-        label: "Toggle conversations sidebar",
-        icon: PanelLeftIcon,
-        keywords: ["panel", "left", "sessions list"],
-        run: onToggleLeftSidebar,
-      },
-      {
-        id: "toggle-right-sidebar",
-        label: "Toggle workspace sidebar",
-        icon: PanelRightIcon,
-        keywords: ["panel", "right", "files", "terminal"],
-        run: onToggleRightSidebar,
-      },
-    ],
-    [navigate, onToggleLeftSidebar, onToggleRightSidebar],
+  const actions = useAppCommands({
+    onToggleLeftSidebar,
+    onToggleRightSidebar,
+    rightSidebarShortcutEnabled,
+  });
+
+  const filteredActions = useMemo(
+    () => (sessionsOnly ? [] : filterAppCommands(actions, query)),
+    [actions, query, sessionsOnly],
   );
 
-  const filteredActions = useMemo(() => {
-    const q = query.trim().toLowerCase();
-    if (sessionsOnly) return [];
-    if (q === "") return actions;
-    return actions.filter(
-      (a) =>
-        a.label.toLowerCase().includes(q) || a.keywords.some((k) => k.toLowerCase().includes(q)),
-    );
-  }, [actions, query, sessionsOnly]);
-
-  const { data, isFetching, isError, refetch, hasNextPage, fetchNextPage, isFetchNextPageError } =
-    useConversations(sessionsOnly ? "" : debouncedQuery, false, { enabled: open });
-  const loadedPages = data?.pages.length ?? 0;
+  // The two search groups resolve independently, so a title match can render
+  // above an already-highlighted content match. Keep the top row selected
+  // until the user moves the selection for this query.
+  const firstItemValue =
+    visibleSessions[0]?.id ??
+    contentSessions[0]?.id ??
+    (filteredActions[0] ? `action:${filteredActions[0].id}` : "");
+  const [selectedValue, setSelectedValue] = useState("");
+  const userMovedSelection = useRef(false);
   useEffect(() => {
-    if (
-      open &&
-      sessionsOnly &&
-      hasNextPage &&
-      loadedPages < pageLimit &&
-      !isFetching &&
-      !isError &&
-      !isFetchNextPageError
-    ) {
-      void fetchNextPage();
-    }
-  }, [
-    open,
-    sessionsOnly,
-    hasNextPage,
-    loadedPages,
-    pageLimit,
-    isFetching,
-    isError,
-    isFetchNextPageError,
-    fetchNextPage,
-  ]);
-
-  const sessions = useMemo(() => {
-    const seen = new Set<string>();
-    const out: { id: string; label: string; agent: string; snippet: string | null }[] = [];
-    for (const page of data?.pages ?? []) {
-      for (const c of page.data) {
-        if (c.archived) continue;
-        if (seen.has(c.id)) continue;
-        seen.add(c.id);
-        out.push({
-          id: c.id,
-          label: conversationDisplayLabel(c),
-          agent: getConversationAgentType(c),
-          // Present only when the match was in chat content (not the title);
-          // the server omits it otherwise. Shown as a dimmed second line.
-          snippet: c.search_snippet ?? null,
-        });
-      }
-    }
-    // With no query the palette shows the full session page, which pushes the
-    // Actions group below the fold. Cap the idle list to the few most-recent
-    // sessions so both groups fit without scrolling; once the user types, show
-    // every match (finding a specific session is then the point).
-    if (sessionsOnly) {
-      if (!query.trim()) return out;
-      return out
-        .map((session) => ({ ...session, score: defaultFilter(session.label, query.trim()) }))
-        .filter((session) => session.score > 0)
-        .sort((first, second) => second.score - first.score);
-    }
-    return debouncedQuery ? out : out.slice(0, IDLE_SESSION_LIMIT);
-  }, [data, debouncedQuery, query, sessionsOnly]);
-  const visibleSessions = sessionsOnly ? sessions.slice(0, SESSION_SEARCH_RESULT_LIMIT) : sessions;
-  const loadError = isError || isFetchNextPageError;
+    userMovedSelection.current = false;
+  }, [open, debouncedQuery]);
+  useEffect(() => {
+    if (!userMovedSelection.current) setSelectedValue(firstItemValue);
+  }, [firstItemValue, open, debouncedQuery]);
 
   const paletteLabel = sessionsOnly ? "Switch session" : "Command palette";
   const placeholder = sessionsOnly
@@ -261,22 +137,101 @@ export function CommandPalette({
   };
 
   const goToSession = (id: string): void => {
+    rememberSearchRow(id);
     close();
     navigate(`/c/${id}`);
   };
+
+  const renderSession = (s: PaletteSession): React.ReactNode => (
+    // pl-6 indents the label to line up with the icon-prefixed Action rows
+    // below (their 16px icon + 8px gap), so the groups read as one column.
+    <CommandItem
+      key={s.id}
+      value={s.id}
+      onSelect={() => goToSession(s.id)}
+      className="items-start pl-6"
+    >
+      <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+        <span className="truncate text-left">
+          <HighlightedText text={s.label} query={sessionsOnly ? query : debouncedQuery} />
+        </span>
+        {(s.project || s.parent) && (
+          <span className="flex min-w-0 items-center gap-1 text-xs text-muted-foreground">
+            {s.project && (
+              <>
+                <FolderIcon aria-hidden="true" className="size-3 shrink-0" />
+                <span className="truncate" title={s.project}>
+                  <span className="sr-only">Project: </span>
+                  {s.project}
+                </span>
+              </>
+            )}
+            {s.project && s.parent && (
+              <ChevronRightIcon aria-hidden="true" className="size-3 shrink-0" />
+            )}
+            {s.parent && (
+              <>
+                <CornerDownRightIcon aria-hidden="true" className="size-3 shrink-0" />
+                <span className="truncate" title={s.parent}>
+                  <span className="sr-only">Nested under: </span>
+                  {s.parent}
+                </span>
+              </>
+            )}
+          </span>
+        )}
+        {s.snippet && (
+          // Where the match was found in the chat body — the session is often
+          // unidentifiable from the title alone.
+          <span className="truncate text-left text-muted-foreground text-sm">
+            <HighlightedText text={s.snippet} query={debouncedQuery} />
+          </span>
+        )}
+      </div>
+      {s.archived && (
+        <Badge variant="outline" className="ml-2 text-muted-foreground">
+          Archived
+        </Badge>
+      )}
+      <span className="ml-2 shrink-0 text-sm text-muted-foreground">{s.agent}</span>
+    </CommandItem>
+  );
+
+  const renderShowMore = (
+    scope: "title" | "content",
+    group: typeof titleSearch,
+    rows: readonly PaletteSession[],
+  ): React.ReactNode =>
+    group.hasNextPage &&
+    !group.isFetchNextPageError && (
+      <CommandItem
+        value={`more:${scope}`}
+        disabled={group.isFetchingNextPage}
+        onSelect={() => {
+          // This row vanishes after the last page, so park the selection on
+          // the group's last row; the next ArrowDown reaches the new rows.
+          userMovedSelection.current = true;
+          const lastRow = rows.at(-1);
+          if (lastRow) setSelectedValue(lastRow.id);
+          void group.fetchNextPage();
+        }}
+        className="pl-6 text-muted-foreground"
+      >
+        {group.isFetchingNextPage ? "Loading…" : "Show more"}
+      </CommandItem>
+    );
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent
         aria-describedby={undefined}
-        // Mobile: a top-anchored full-screen sheet sized to the keyboard-aware
-        // visible viewport (--omnigent-viewport-height), so the input and results
-        // sit above the soft keyboard instead of a centered card whose lower half
-        // hides behind it. Desktop keeps the centered command palette.
+        // Mobile: a top-anchored full-screen sheet sized to --omnigent-viewport-height,
+        // so the input and results sit above the soft keyboard. sm:max-w-full
+        // overrides DialogContent's sm:max-w-sm between 640px and md.
         className={cn(
           "overflow-hidden p-0",
           isMobile
-            ? "inset-x-0 top-0 h-full max-h-full w-full max-w-full translate-x-0 translate-y-0 gap-0 rounded-none border-0 shadow-none"
+            ? "inset-x-0 top-0 h-full max-h-full w-full max-w-full translate-x-0 translate-y-0 gap-0 rounded-none border-0 shadow-none sm:max-w-full"
             : "top-1/4 translate-y-0 rounded-xl sm:max-w-2xl",
         )}
         style={
@@ -285,10 +240,10 @@ export function CommandPalette({
                 top: 0,
                 height: "var(--omnigent-viewport-height, 100dvh)",
                 maxHeight: "var(--omnigent-viewport-height, 100dvh)",
-                // Pad both insets: safe-top clears the notch, safe-bottom keeps
-                // the last row above the home indicator when the keyboard is
-                // closed (the visible-viewport height then spans the home bar).
-                paddingTop: "var(--omnigent-safe-top, 0px)",
+                // Pad both insets: the macOS title bar or safe-top clears the window
+                // controls or notch; safe-bottom keeps the last row above the home
+                // indicator when the keyboard is closed (the viewport then spans it).
+                paddingTop: "var(--mac-titlebar-height, var(--omnigent-safe-top, 0px))",
                 paddingBottom: "var(--omnigent-safe-bottom, 0px)",
               }
             : undefined
@@ -300,7 +255,16 @@ export function CommandPalette({
             (see file header). vimBindings=false: keep Ctrl+K/J from doubling as
             list-nav on Win/Linux, where Ctrl+K is also the opener. */}
         {/* Command's base class is `size-full`, so it already fills the sheet. */}
-        <Command shouldFilter={false} vimBindings={false} label={paletteLabel}>
+        <Command
+          shouldFilter={false}
+          vimBindings={false}
+          label={paletteLabel}
+          value={selectedValue}
+          onValueChange={setSelectedValue}
+          onKeyDown={(event) => {
+            if (SELECTION_KEYS.has(event.key)) userMovedSelection.current = true;
+          }}
+        >
           {isMobile ? (
             // Search field and an explicit close button share a top row; the
             // full-screen sheet has no ⌘K/Esc affordance the way the desktop
@@ -332,11 +296,19 @@ export function CommandPalette({
               data-testid="command-palette-input"
             />
           )}
-          <CommandList className={isMobile ? "max-h-none flex-1" : undefined}>
+          <CommandList
+            className={isMobile ? "max-h-none flex-1" : undefined}
+            // Hovering a row selects it in cmdk, which counts as the user's pick.
+            onPointerMove={(event) => {
+              if ((event.target as Element).closest("[cmdk-item]")) {
+                userMovedSelection.current = true;
+              }
+            }}
+          >
             {(loadError || (sessionsOnly && isFetching)) && (
               <p role="status" className="px-3 py-2 text-xs text-muted-foreground">
                 {loadError
-                  ? isFetchNextPageError
+                  ? loadMoreError
                     ? "Couldn't load more sessions."
                     : "Couldn't load sessions."
                   : "Loading sessions…"}
@@ -344,8 +316,8 @@ export function CommandPalette({
                   <button
                     type="button"
                     className="ml-2 underline"
-                    disabled={isFetching}
-                    onClick={() => void (isFetchNextPageError ? fetchNextPage() : refetch())}
+                    disabled={retrying}
+                    onClick={retryLoad}
                   >
                     Retry
                   </button>
@@ -353,40 +325,18 @@ export function CommandPalette({
               </p>
             )}
             {!loadError && !(sessionsOnly && isFetching) && (
-              <CommandEmpty>
-                {isFetching && debouncedQuery ? "Searching…" : "No results found"}
-              </CommandEmpty>
+              <CommandEmpty>{searchFetching ? "Searching…" : "No results found"}</CommandEmpty>
             )}
             {sessions.length > 0 && (
               <CommandGroup heading="Sessions">
-                {visibleSessions.map((s) => (
-                  // pl-6 indents the label to line up with the icon-prefixed
-                  // Action rows below (their 16px icon + 8px gap), so the two
-                  // groups read as one aligned column.
-                  <CommandItem
-                    key={s.id}
-                    value={s.id}
-                    onSelect={() => goToSession(s.id)}
-                    className="items-start pl-6"
-                  >
-                    <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-                      <span className="truncate text-left">
-                        <HighlightedText
-                          text={s.label}
-                          query={sessionsOnly ? query : debouncedQuery}
-                        />
-                      </span>
-                      {s.snippet && (
-                        // Where the match was found in the chat body — the
-                        // session is often unidentifiable from the title alone.
-                        <span className="truncate text-left text-muted-foreground text-sm">
-                          <HighlightedText text={s.snippet} query={debouncedQuery} />
-                        </span>
-                      )}
-                    </div>
-                    <span className="ml-2 shrink-0 text-sm text-muted-foreground">{s.agent}</span>
-                  </CommandItem>
-                ))}
+                {visibleSessions.map(renderSession)}
+                {searching && renderShowMore("title", titleSearch, visibleSessions)}
+              </CommandGroup>
+            )}
+            {contentSessions.length > 0 && (
+              <CommandGroup heading="In messages">
+                {contentSessions.map(renderSession)}
+                {renderShowMore("content", contentSearch, contentSessions)}
               </CommandGroup>
             )}
             {sessionsOnly && sessions.length > visibleSessions.length && (
@@ -395,12 +345,12 @@ export function CommandPalette({
                 your search.
               </p>
             )}
-            {sessionsOnly && hasNextPage && loadedPages >= pageLimit && !loadError && (
+            {sessionsOnly && olderSessionsAvailable && !loadError && (
               <Button
                 variant="ghost"
                 className="w-full"
                 disabled={isFetching}
-                onClick={() => setPageLimit(loadedPages + SESSION_SEARCH_PAGE_BATCH)}
+                onClick={searchOlderSessions}
               >
                 Search older sessions
               </Button>
@@ -413,6 +363,7 @@ export function CommandPalette({
                     <CommandItem key={a.id} value={`action:${a.id}`} onSelect={() => runAction(a)}>
                       <Icon />
                       <span className="flex-1 truncate text-left">{a.label}</span>
+                      {a.shortcut && <CompactShortcutKeys keys={a.shortcut} />}
                     </CommandItem>
                   );
                 })}

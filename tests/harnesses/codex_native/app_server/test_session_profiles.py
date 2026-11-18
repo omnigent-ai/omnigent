@@ -29,6 +29,8 @@ from tests.harnesses.codex_native.app_server._support import (
 )
 
 _ROUTED_TOOL_APPROVALS = {
+    "sys_scheduled_task_create": {"approval_mode": "approve"},
+    "sys_scheduled_task_update": {"approval_mode": "approve"},
     "sys_session_rename": {"approval_mode": "approve"},
     "sys_session_create": {"approval_mode": "approve"},
     "sys_agent_list": {"approval_mode": "approve"},
@@ -51,7 +53,7 @@ def test_the_framework_tool_approvals_are_scoped_to_the_session_class() -> None:
 # codex-native session boots on. A plain session must be indistinguishable from
 # a pre-Smart-Routing one: codex's bundled model catalog (no ``codex debug
 # models`` probe), no ``spawn_agent`` routing gate in hooks.json, and only the
-# one framework tool approval.
+# framework tool approvals.
 #
 # Every Smart Routing session — pinned harness or auto — adds the extended
 # catalog, the spawn gate and the routed-spawn approvals, because on this arm
@@ -272,6 +274,9 @@ async def test_native_codex_materializes_provider_auth_for_app_server_and_tui(
     assert 'model_provider="omnigent_provider"' in remote_argv
     assert 'approval_policy="never"' in app_server_argv
     assert 'sandbox_mode="danger-full-access"' in app_server_argv
+    # Every override precedes the subcommand, joining a wrapper's top-level -c group.
+    subcommand = app_server_argv.index("app-server")
+    assert all(i < subcommand for i, arg in enumerate(app_server_argv) if arg == "-c")
 
     config_path = codex_home / "config.toml"
     config = tomllib.loads(config_path.read_text(encoding="utf-8"))

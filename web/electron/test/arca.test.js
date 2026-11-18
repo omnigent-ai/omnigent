@@ -8,9 +8,12 @@ const {
   buildLoginArgs,
   connectArcaHost,
   describeConnectFailure,
+  checkDbcert,
   readArcaStatus,
   resolveArcaPath,
   runArcaExtend,
+  runDbcertRefresh,
+  runDbcertArcaSync,
   startArcaConnect,
   startArcaLogin,
 } = require("../src/arca");
@@ -144,6 +147,152 @@ describe("arca extend command", () => {
   });
 });
 
+describe("dbcert refresh", () => {
+  const dbcertDeps = (outputs) => ({
+    ...commandDeps(outputs),
+    resolveDbcertPath: () => "/bin/dbcert",
+  });
+
+  it("renews for Omnigent without updating kubeconfig", async () => {
+    const deps = dbcertDeps([{ stdout: "All credentials successfully written" }]);
+    assert.deepEqual(await runDbcertRefresh(deps), { ok: true });
+    assert.deepEqual(deps.calls, [
+      ["--force", "--caller-name", "omnigent", "--update-kubeconfig=false"],
+    ]);
+  });
+
+  it("syncs existing credentials with a shorter non-interactive timeout", async (context) => {
+    const timeouts = [];
+    const schedule = global.setTimeout;
+    context.mock.method(global, "setTimeout", (callback, delay, ...args) => {
+      timeouts.push(delay);
+      return schedule(callback, delay, ...args);
+    });
+    const deps = dbcertDeps([{ code: 0 }]);
+    assert.deepEqual(await runDbcertArcaSync(deps), { ok: true });
+    assert.deepEqual(deps.calls, [["sync-arca"]]);
+    assert.equal(timeouts[0], 60_000);
+  });
+
+  for (const skipArcaSync of [false, true]) {
+    it(`sets local-only renewal environment only when requested (${skipArcaSync})`, async () => {
+      const deps = dbcertDeps([{ code: 0 }]);
+      const inheritedSkip = process.env.DBCERT_SKIP_ARCA_SYNC;
+      let environment;
+      const result = await runDbcertRefresh({
+        ...deps,
+        skipArcaSync,
+        spawn: (binary, args, options) => {
+          environment = options.env;
+          return deps.spawn(binary, args);
+        },
+      });
+      assert.deepEqual(result, { ok: true });
+      assert.deepEqual(
+        environment,
+        skipArcaSync ? { ...process.env, DBCERT_SKIP_ARCA_SYNC: "1" } : undefined,
+      );
+      assert.equal(process.env.DBCERT_SKIP_ARCA_SYNC, inheritedSkip);
+    });
+  }
+
+  it("reports the last line dbcert printed when it fails", async () => {
+    const deps = dbcertDeps([{ code: 1, stderr: "Opening browser\nlogin was canceled\n" }]);
+    assert.deepEqual(await runDbcertRefresh(deps), { ok: false, error: "login was canceled" });
+  });
+
+  it("reports a missing dbcert without spawning", async () => {
+    const deps = { ...dbcertDeps([]), resolveDbcertPath: () => null };
+    assert.match((await runDbcertRefresh(deps)).error, /not found/);
+    assert.deepEqual(deps.calls, []);
+  });
+
+  for (const [action, runCommand] of [
+    ["sign-in", runDbcertRefresh],
+    ["Arca sync", runDbcertArcaSync],
+  ]) {
+    it(`ends an abandoned ${action}`, async () => {
+      const child = fakeConnectChild();
+      const keepAlive = setTimeout(() => {}, 1000);
+      try {
+        const result = await runCommand({
+          resolveDbcertPath: () => "/bin/dbcert",
+          spawn: () => child,
+          timeoutMs: 5,
+          killGraceMs: 5,
+        });
+        assert.deepEqual(result, { ok: false, error: `The dbcert ${action} timed out.` });
+        assert.deepEqual(child.signals, ["SIGTERM", "SIGKILL"]);
+      } finally {
+        clearTimeout(keepAlive);
+      }
+    });
+  }
+});
+
+describe("Arclet dbcert preflight", () => {
+  const depsFor = (outputs) => ({
+    ...commandDeps(outputs),
+    resolveDbcertPath: () => "/bin/dbcert",
+  });
+
+  it("leaves a valid certificate alone", async () => {
+    const deps = depsFor([{ code: 0 }]);
+    assert.deepEqual(await checkDbcert(deps), { ok: true, valid: true });
+    assert.deepEqual(deps.calls, [["status"]]);
+  });
+
+  it("reports missing or expired credentials without starting sign-in", async () => {
+    const deps = depsFor([{ code: 1 }]);
+    assert.deepEqual(await checkDbcert(deps), { ok: true, valid: false });
+    assert.deepEqual(deps.calls, [["status"]]);
+  });
+
+  for (const exitCode of [2, 127]) {
+    it(`reports status exit ${exitCode} as a check failure, not invalid credentials`, async () => {
+      const deps = depsFor([{ code: exitCode }]);
+      assert.deepEqual(await checkDbcert(deps), {
+        ok: false,
+        error: `Couldn't check your laptop's dbcert (exit ${exitCode}).`,
+      });
+      assert.deepEqual(deps.calls, [["status"]]);
+    });
+  }
+
+  it("reports a missing CLI without attempting sign-in", async () => {
+    const deps = { ...depsFor([]), resolveDbcertPath: () => null };
+    const result = await checkDbcert(deps);
+    assert.equal(result.ok, false);
+    assert.match(result.error, /Install dbcert/);
+    assert.deepEqual(deps.calls, []);
+  });
+
+  it("does not turn a stuck status check into an interactive renewal", async () => {
+    const child = fakeConnectChild();
+    const deps = depsFor([]);
+    const result = await checkDbcert({
+      ...deps,
+      spawn: () => child,
+      timeoutMs: 5,
+      killGraceMs: 5,
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /Couldn't check/);
+    assert.deepEqual(child.signals, ["SIGTERM", "SIGKILL"]);
+  });
+
+  it("does not renew if the status process cannot start", async () => {
+    const result = await checkDbcert({
+      ...depsFor([]),
+      spawn: () => {
+        throw new Error("spawn EACCES");
+      },
+    });
+    assert.equal(result.ok, false);
+    assert.match(result.error, /Couldn't check/);
+  });
+});
+
 describe("arca binary resolution", () => {
   it("prefers PATH, then falls back to well-known locations", () => {
     assert.equal(
@@ -174,7 +323,7 @@ describe("arca binary resolution", () => {
 });
 
 describe("arca connect command", () => {
-  it("binds remote login and noninteractive startup to the same SPOG workspace", () => {
+  it("binds remote login and noninteractive startup to the same workspace", () => {
     const server = "https://account.databricks.com/omnigent?o=123&test=value";
     const args = buildLoginArgs(server);
     assert.deepEqual(args, [
@@ -239,10 +388,13 @@ describe("arca connect failures", () => {
     }
   });
   it("maps a timeout, sign-in, missing-CLI, and unreachable instance", () => {
-    assert.match(
-      describeConnectFailure({ code: null, stdout: "", stderr: "", timedOut: true }).error,
-      /timed out/i,
+    const timeout = describeConnectFailure({ code: null, stdout: "", stderr: "", timedOut: true });
+    assert.match(timeout.error, /timed out/i);
+    assert.equal(
+      timeout.errorMessage,
+      "Connecting to Arca timed out. The instance may still be starting.",
     );
+    assert.equal(timeout.errorAction, "Check `arca status` and try again.");
 
     const auth = describeConnectFailure({
       code: 1,
@@ -251,11 +403,22 @@ describe("arca connect failures", () => {
     });
     assert.equal(auth.authError, true);
     assert.match(auth.error, /isaac omni login/);
+    assert.equal(auth.errorMessage, "The Arca instance isn't signed in to this server.");
+    assert.equal(
+      auth.errorAction,
+      "Run `arca ssh` and sign in with `isaac omni login <server-url>`, then try again.",
+    );
 
-    assert.match(
-      describeConnectFailure({ code: 127, stdout: "", stderr: "bash: isaac: command not found" })
-        .error,
-      /isn't available on the Arca instance/,
+    const missingCli = describeConnectFailure({
+      code: 127,
+      stdout: "",
+      stderr: "bash: isaac: command not found",
+    });
+    assert.match(missingCli.error, /isn't available on the Arca instance/);
+    assert.equal(missingCli.errorMessage, "`isaac omni` isn't available on the Arca instance.");
+    assert.equal(
+      missingCli.errorAction,
+      "Check the isaac setup there (`arca ssh`, then `isaac omni --help`) and try again.",
     );
     assert.match(
       describeConnectFailure({ code: 1, stdout: "", stderr: "isaac: omni: command not found" })
@@ -263,13 +426,16 @@ describe("arca connect failures", () => {
       /isn't available on the Arca instance/,
     );
 
-    assert.match(
-      describeConnectFailure({
-        code: 1,
-        stdout: "",
-        stderr: "Error connecting to arca. The instance may be stopped or unreachable.",
-      }).error,
-      /arca stop && arca start/,
+    const unreachable = describeConnectFailure({
+      code: 1,
+      stdout: "",
+      stderr: "Error connecting to arca. The instance may be stopped or unreachable.",
+    });
+    assert.match(unreachable.error, /arca stop && arca start/);
+    assert.equal(unreachable.errorMessage, "Couldn't reach the Arca instance.");
+    assert.equal(
+      unreachable.errorAction,
+      "Try `arca stop && arca start` in a terminal, then connect again.",
     );
   });
 

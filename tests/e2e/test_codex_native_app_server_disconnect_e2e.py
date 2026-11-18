@@ -23,7 +23,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-import socket
 from collections.abc import AsyncIterator, Awaitable, Callable
 
 import pytest
@@ -31,6 +30,7 @@ from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
 from omnigent.harnesses.codex_native.app_server import CodexAppServerClient
+from tests._helpers.live_server import find_free_port
 
 #: Seconds within which an RPC must settle once its connection is gone.
 #: Generous against CI jitter, tiny against the reported indefinite hang.
@@ -39,13 +39,6 @@ _DISCONNECT_DEADLINE = 5.0
 _TURN_PARAMS = {"input": "hello"}
 
 _Responder = Callable[[ServerConnection, dict], Awaitable[None]]
-
-
-def _free_port() -> int:
-    """Reserve an ephemeral loopback port for the fake app-server."""
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 @contextlib.asynccontextmanager
@@ -77,7 +70,7 @@ async def _connected_client(
                     received.append(message)
                     await respond(ws, message)
 
-    port = _free_port()
+    port = find_free_port()
     async with serve(handler, "127.0.0.1", port):
         client = CodexAppServerClient(ws_url=f"ws://127.0.0.1:{port}")
         await client.connect()
