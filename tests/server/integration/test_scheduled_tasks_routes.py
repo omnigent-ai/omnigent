@@ -42,6 +42,10 @@ from omnigent.server.scheduled.dispatch_scheduler import (
     PersistentTaskScheduler,
     ScheduledTaskDispatchHooks,
 )
+from omnigent.server.scheduled.workflow_automations import (
+    CONTINUED_SESSION_MESSAGE,
+    TASK_SESSION_MESSAGE,
+)
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -58,7 +62,9 @@ from tests.server.helpers import FakeSandboxLauncher
 pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures("frozen_recurrence_clock")]
 
 
-def _sandbox_deployment(*, manages_profiles: bool = False) -> ManagedSandboxDeployment:
+def _sandbox_deployment(
+    *, manages_profiles: bool = False, mcp_selection: object | None = None
+) -> ManagedSandboxDeployment:
     launcher = FakeSandboxLauncher()
     launcher.manages_profiles = manages_profiles
     return ManagedSandboxDeployment.single(
@@ -68,6 +74,7 @@ def _sandbox_deployment(*, manages_profiles: bool = False) -> ManagedSandboxDepl
             token_ttl_s=100,
             launcher_factory=lambda: launcher,
             manages_profiles=manages_profiles,
+            mcp_selection=mcp_selection,  # type: ignore[arg-type]
         )
     )
 
@@ -102,7 +109,6 @@ def _build_app(
     projects: bool = True,
     automations: bool | Callable[[], bool] | None = None,
     automations_feature: bool = True,
-    session_mcp_selection: object | None = None,
     workflows: bool = False,
 ) -> FastAPI:
     from omnigent.server.auth import UnifiedAuthProvider
@@ -140,7 +146,6 @@ def _build_app(
             if persistent
             else None
         ),
-        session_mcp_selection=session_mcp_selection,
     )
 
 
@@ -1202,55 +1207,149 @@ async def test_mcp_services_the_owner_cannot_use_are_rejected(
     assert kept.json()["mcp_services"] == ["github"]
 
 
-async def test_mcp_services_use_the_deployment_selection(
-    runtime_init: None, db_uri: str, tmp_path: Path, mock_llm: ControllableMockClient
+class _ProviderSelection:
+    """A sandbox provider that records its own system.ai.* services, accepting any."""
+
+    def __init__(self) -> None:
+        self.checked: list[tuple[tuple[str, ...], str | None]] = []
+
+    def validate(self, request, services, *, spec, user_id):
+        self.checked.append((tuple(services), user_id))
+        return tuple(services)
+
+    def session_labels(self, services):
+        return {}
+
+    def selected_services(self, labels):
+        return ()
+
+
+def _sandbox_body(**overrides: object) -> dict[str, object]:
+    body = _create_body(execution_target="managed_sandbox", **overrides)
+    del body["host_id"], body["workspace"]
+    return body
+
+
+async def test_mcp_services_use_the_selection_of_where_the_task_runs(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
-    checked: list[tuple[tuple[str, ...], str | None]] = []
-
-    class _Selection:
-        def validate(self, request, services, *, spec, user_id):
-            checked.append((tuple(services), user_id))
-            return tuple(services)
-
-        def session_labels(self, services):
-            return {}
-
-        def selected_services(self, labels):
-            return ()
-
-    app = _build_app(db_uri, tmp_path, session_mcp_selection=_Selection())
     _make_user(db_uri)
-    _register_host(app, "4b653f6031f35d168cc0b37caa1306d1", "alice@example.com")
-    async with _serve(app, mock_llm, tmp_path) as client:
-        created = await client.post(
-            "/v1/scheduled-tasks",
-            json=_create_body(mcp_services=["system.ai.github"]),
-            headers=_headers(),
-        )
-        info = await client.get("/v1/info")
-    assert created.status_code == 200, created.text
-    assert created.json()["mcp_services"] == ["system.ai.github"]
-    assert checked == [(("system.ai.github",), "alice@example.com")]
+    selection = _ProviderSelection()
+    auth_app.state.sandbox_config = _sandbox_deployment(mcp_selection=selection)
+
+    in_sandbox = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_sandbox_body(mcp_services=["system.ai.github"]),
+        headers=_headers(),
+    )
+    assert in_sandbox.status_code == 200, in_sandbox.text
+    assert in_sandbox.json()["mcp_services"] == ["system.ai.github"]
+    assert selection.checked == [(("system.ai.github",), "alice@example.com")]
+
+    # A connected host uses the registry, which this server doesn't run.
+    on_host = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(mcp_services=["system.ai.github"]),
+        headers=_headers(),
+    )
+    assert on_host.status_code == 400, on_host.text
+    assert "Invalid MCP service id" in on_host.text
+    assert len(selection.checked) == 1
+
+    # Moving the task onto a host re-checks the services it keeps there.
+    task_url = f"/v1/scheduled-tasks/{in_sandbox.json()['id']}"
+    moved = await auth_client.patch(
+        task_url,
+        json={
+            "execution_target": "connected_host",
+            "host_id": "4b653f6031f35d168cc0b37caa1306d1",
+            "workspace": "/repo",
+        },
+        headers=_headers(),
+    )
+    assert moved.status_code == 400, moved.text
+    assert "Invalid MCP service id" in moved.text
+    kept = await auth_client.get(task_url, headers=_headers())
+    assert kept.json()["execution_target"] == "managed_sandbox"
+    assert kept.json()["mcp_services"] == ["system.ai.github"]
+
+    info = await auth_client.get("/v1/info")
     assert info.json()["scheduled_task_mcp_services"] is True
 
 
-async def test_mcp_services_that_do_not_fit_the_column_are_rejected(
-    auth_app: FastAPI, auth_client: httpx.AsyncClient
+class _RejectAll(_ProviderSelection):
+    def validate(self, request, services, *, spec, user_id):
+        from omnigent.errors import ErrorCode, OmnigentError
+
+        raise OmnigentError("not offered here", code=ErrorCode.INVALID_INPUT)
+
+
+@pytest.mark.parametrize("edit", ["unchanged-services", "new-agent", "new-session-each-run"])
+async def test_a_continuing_sandbox_task_is_checked_against_the_sandbox_it_keeps(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str, edit: str
 ) -> None:
-    class _AcceptAll:
-        def validate(self, request, services, *, spec, user_id):
-            return tuple(services)
+    import dataclasses
 
-        def session_labels(self, services):
-            return {}
+    from omnigent.server.scheduled.schedule import continued_sandbox_host_id
+    from omnigent.stores.host_store import HostStore
 
-        def selected_services(self, labels):
-            return ()
+    _make_user(db_uri)
+    older = _ProviderSelection()
+    older_provider = dataclasses.replace(
+        _sandbox_deployment().default, provider="older", mcp_selection=older
+    )
+    auth_app.state.sandbox_config = ManagedSandboxDeployment(configs=(older_provider,))
+    created = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_sandbox_body(session_mode="continue", mcp_services=["system.ai.github"]),
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    task_id = created.json()["id"]
+    task = SqlAlchemyScheduledTaskStore(db_uri).get(task_id)
+    assert task is not None
+    # The task's sandbox runs on "older"; the default has since moved to a provider
+    # that doesn't offer these services.
+    HostStore(db_uri).reserve_sandbox_host(
+        host_id=continued_sandbox_host_id(task_id, task.workspace_id),
+        name="automation-sandbox",
+        user_id="alice@example.com",
+        provider="older",
+    )
+    newer_provider = dataclasses.replace(
+        _sandbox_deployment().default, provider="newer", mcp_selection=_RejectAll()
+    )
+    auth_app.state.sandbox_config = ManagedSandboxDeployment(
+        configs=(newer_provider, older_provider)
+    )
 
-    auth_app.state.session_mcp_selection = _AcceptAll()
+    # Resending the services, or changing the agent, revalidates the ones the task keeps.
+    patch = {
+        "unchanged-services": {"mcp_services": ["system.ai.github"]},
+        "new-agent": {"agent_id": builtin_agent_id(CODEX_NATIVE_AGENT_NAME)},
+        "new-session-each-run": {"session_mode": "new"},
+    }[edit]
+    task_url = f"/v1/scheduled-tasks/{task_id}"
+    updated = await auth_client.patch(task_url, json=patch, headers=_headers())
+    if edit == "new-session-each-run":
+        # Each run would start a new sandbox on the default, which doesn't offer them.
+        assert updated.status_code == 400, updated.text
+        kept = (await auth_client.get(task_url, headers=_headers())).json()
+        assert (kept["session_mode"], kept["mcp_services"]) == ("continue", ["system.ai.github"])
+        return
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["mcp_services"] == ["system.ai.github"]
+    assert len(older.checked) == 2
+
+
+async def test_mcp_services_that_do_not_fit_the_column_are_rejected(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri)
+    auth_app.state.sandbox_config = _sandbox_deployment(mcp_selection=_ProviderSelection())
     long_names = [f"system.ai.{'x' * 100}{i:02d}" for i in range(40)]
     rejected = await auth_client.post(
-        "/v1/scheduled-tasks", json=_create_body(mcp_services=long_names), headers=_headers()
+        "/v1/scheduled-tasks", json=_sandbox_body(mcp_services=long_names), headers=_headers()
     )
     assert rejected.status_code == 400, rejected.text
     assert "Too many MCP services" in rejected.text
@@ -3951,6 +4050,144 @@ async def test_a_task_that_starts_from_a_session_can_switch_agents_but_not_conti
     assert cleared.json()["source_session_id"] == created["source_session_id"]
 
 
+_WORKFLOW_PROMPT = (
+    '/workflow Run the saved workflow "Triage" (ID 0123456789abcdef0123456789abcdef).'
+)
+
+
+async def test_a_workflow_automation_starts_each_run_in_a_new_session(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    refused = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(prompt=_WORKFLOW_PROMPT, session_mode="continue"),
+        headers=_headers(),
+    )
+    assert refused.status_code == 400, refused.text
+    assert refused.json()["error"]["message"] == CONTINUED_SESSION_MESSAGE
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(prompt=_WORKFLOW_PROMPT), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    continuing = await auth_client.patch(
+        f"/v1/scheduled-tasks/{created.json()['id']}",
+        json={"session_mode": "continue"},
+        headers=_headers(),
+    )
+    assert continuing.status_code == 400, continuing.text
+
+    plain = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(session_mode="continue"), headers=_headers()
+    )
+    plain_url = f"/v1/scheduled-tasks/{plain.json()['id']}"
+    to_workflow = await auth_client.patch(
+        plain_url, json={"prompt": _WORKFLOW_PROMPT}, headers=_headers()
+    )
+    assert to_workflow.status_code == 400, to_workflow.text
+    switched = await auth_client.patch(
+        plain_url, json={"prompt": _WORKFLOW_PROMPT, "session_mode": "new"}, headers=_headers()
+    )
+    assert switched.status_code == 200, switched.text
+    assert switched.json()["session_mode"] == "new"
+
+
+async def test_a_workflow_trigger_starts_a_session_for_each_match(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    prompts = json.loads(
+        (
+            Path(__file__).parents[1] / "scheduled" / "fixtures" / "workflow_trigger_prompts.json"
+        ).read_text()
+    )
+    for session_mode in ("continue", "new"):
+        refused = await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(prompt=prompts["jira_task_session"], session_mode=session_mode),
+            headers=_headers(),
+        )
+        assert refused.status_code == 400, refused.text
+        assert refused.json()["error"]["message"] == TASK_SESSION_MESSAGE
+    # The polling session continues; each match gets its own session.
+    created = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(prompt=prompts["jira_per_match"], session_mode="continue"),
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+
+
+async def test_a_workflow_automation_saved_continuing_a_session_runs_until_edited(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    """Pausing, renaming or rescheduling it keeps its session; changing what it runs doesn't."""
+    task = SqlAlchemyScheduledTaskStore(db_uri).create(
+        scheduled_task_id=uuid.uuid4().hex,
+        user_id="alice@example.com",
+        **_create_body(prompt=_WORKFLOW_PROMPT, session_mode="continue"),
+    )
+    url = f"/v1/scheduled-tasks/{task.id}"
+    for change in (
+        {"state": "paused"},
+        # The agent tool resends the prompt with every update.
+        {"name": "renamed", "prompt": _WORKFLOW_PROMPT},
+        {"rrule": "FREQ=DAILY;BYHOUR=9"},
+    ):
+        kept = await auth_client.patch(url, json=change, headers=_headers())
+        assert kept.status_code == 200, kept.text
+        assert kept.json()["session_mode"] == "continue"
+    edited_prompt = f"{_WORKFLOW_PROMPT}\n\nOnly bugs"
+    for change in ({"prompt": edited_prompt}, {"session_id": _owned_session(db_uri)}):
+        refused = await auth_client.patch(url, json=change, headers=_headers())
+        assert refused.status_code == 400, refused.text
+        assert refused.json()["error"]["message"] == CONTINUED_SESSION_MESSAGE
+    switched = await auth_client.patch(
+        url, json={"prompt": edited_prompt, "session_mode": "new"}, headers=_headers()
+    )
+    assert switched.status_code == 200, switched.text
+    assert (switched.json()["prompt"], switched.json()["session_mode"]) == (edited_prompt, "new")
+
+
+async def test_concurrent_edits_cant_combine_a_workflow_with_a_continued_session(
+    auth_client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Each edit passes on its own snapshot; the locked row refuses the one that lands second."""
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    url = f"/v1/scheduled-tasks/{created.json()['id']}"
+    check = scheduled_tasks_routes._workflow_reuse_problem
+    checked = asyncio.Barrier(2)
+    workflow_saved = asyncio.Event()
+
+    async def check_together(prompt: str, session_mode: str) -> str | None:
+        problem = await check(prompt, session_mode)
+        await checked.wait()
+        if session_mode == "continue":
+            await workflow_saved.wait()
+        return problem
+
+    async def add_workflow() -> httpx.Response:
+        try:
+            return await auth_client.patch(
+                url, json={"prompt": _WORKFLOW_PROMPT}, headers=_headers()
+            )
+        finally:
+            workflow_saved.set()
+
+    monkeypatch.setattr(scheduled_tasks_routes, "_workflow_reuse_problem", check_together)
+    async with asyncio.timeout(10):
+        added, continued = await asyncio.gather(
+            add_workflow(),
+            auth_client.patch(url, json={"session_mode": "continue"}, headers=_headers()),
+        )
+    assert added.status_code == 200, added.text
+    assert continued.status_code == 400, continued.text
+    assert continued.json()["error"]["message"] == CONTINUED_SESSION_MESSAGE
+    saved = (await auth_client.get(url, headers=_headers())).json()
+    assert (saved["prompt"], saved["session_mode"]) == (_WORKFLOW_PROMPT, "new")
+
+
 async def test_the_copy_carries_history_for_its_own_agent_not_the_tasks(
     auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -4929,6 +5166,93 @@ async def test_grant_stores_the_canonical_id_and_tolerates_a_name_lookup_failure
     listed = await auth_client.get(_permissions_url(task_id), headers=_headers())
     assert listed.status_code == 200, listed.text
     assert [p["display_name"] for p in listed.json()["permissions"]] == ["bob@example.com"]
+
+
+@_SHARING
+@pytest.mark.parametrize("refusal", ["invalid_input", "forbidden", "unavailable"])
+async def test_revoke_removes_the_grant_under_the_spelling_the_store_holds(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch, refusal: str
+) -> None:
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ
+    from omnigent.server.routes import scheduled_task_permissions
+
+    refused: set[str] = set()
+
+    def canonical(
+        self: SqlAlchemyPermissionStore, grants: list[tuple[str, int]]
+    ) -> list[tuple[str, int]]:
+        if any(user_id.lower() in refused for user_id, _ in grants):
+            if refusal == "unavailable":
+                raise RuntimeError("directory unavailable")
+            code = ErrorCode.INVALID_INPUT if refusal == "invalid_input" else ErrorCode.FORBIDDEN
+            raise OmnigentError("No such principal", code=code)
+        return [(user_id.lower(), level) for user_id, level in grants]
+
+    monkeypatch.setattr(SqlAlchemyPermissionStore, "validate_grants", canonical)
+    session_id = _owned_session(db_uri)
+    task_id = await _create_task(auth_client, session_mode="continue", session_id=session_id)
+    for user in ("Bob@Example.com", "Erin@Example.com"):
+        assert (await _share(auth_client, task_id, user)).status_code == 200
+    # A grant held under a spelling the store no longer produces, as after a rename.
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("Carol@Example.com")
+    permissions.grant_for_scheduled_task("Carol@Example.com", task_id, LEVEL_READ)
+    permissions.grant("Carol@Example.com", session_id, LEVEL_READ)
+    audited: list[dict[str, object]] = []
+    monkeypatch.setattr(
+        scheduled_task_permissions, "add_audit_attrs", lambda **attrs: audited.append(attrs)
+    )
+
+    # A spelling that holds no grant is canonicalized.
+    revoked = await auth_client.delete(
+        _permissions_url(task_id, "BOB@example.com"), headers=_headers()
+    )
+    assert revoked.status_code == 204, revoked.text
+    assert audited[-1] == {"target_user_id": "bob@example.com"}
+    # The listed spelling is used as given.
+    revoked = await auth_client.delete(
+        _permissions_url(task_id, "Carol@Example.com"), headers=_headers()
+    )
+    assert revoked.status_code == 204, revoked.text
+    assert _task_grantees(db_uri, task_id) == ["erin@example.com"]
+    erin = {"alice@example.com": LEVEL_OWNER, "erin@example.com": LEVEL_READ}
+    assert _session_grants(db_uri, session_id) == erin
+
+    # A spelling the directory refuses, or can't look up, is used as given.
+    refused.add("erin@example.com")
+    revoked = await auth_client.delete(
+        _permissions_url(task_id, "ERIN@example.com"), headers=_headers()
+    )
+    assert revoked.status_code == 204, revoked.text
+    assert _task_grantees(db_uri, task_id) == ["erin@example.com"]
+    # So a grantee it now refuses is still removed by their listed ID.
+    revoked = await auth_client.delete(
+        _permissions_url(task_id, "erin@example.com"), headers=_headers()
+    )
+
+    assert revoked.status_code == 204, revoked.text
+    assert _task_grantees(db_uri, task_id) == []
+    assert _session_grants(db_uri, session_id) == {"alice@example.com": LEVEL_OWNER}
+
+
+@_SHARING
+async def test_grant_refuses_the_stores_public_grantees(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A store whose General access is a built-in group, which a sync never revokes.
+    monkeypatch.setattr(
+        SqlAlchemyPermissionStore, "public_grantees", lambda self: frozenset({"users"})
+    )
+    task_id = await _create_task(auth_client)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    users = {user.id for user in permissions.list_users()}
+
+    refused = await _share(auth_client, task_id, "users")
+
+    assert refused.status_code == 400, refused.text
+    assert _task_grantees(db_uri, task_id) == []
+    assert {user.id for user in permissions.list_users()} == users
 
 
 @_SHARING

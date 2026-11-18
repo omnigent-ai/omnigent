@@ -42,6 +42,8 @@ export interface Suggestion {
   /** Rich content drawn on the card, in order. */
   media: SuggestionMediaBlock[];
   sourceSessionId: string;
+  /** Agent of the posting session; Omni Advisor's items carry its agent id. */
+  agentId: string;
   status: SuggestionStatus;
   resolution: SuggestionResolution;
   createdAt: number;
@@ -56,6 +58,7 @@ interface SuggestionWire {
   actions?: SuggestionAction[];
   media?: unknown;
   source_session_id: string;
+  agent_id?: string;
   status: SuggestionStatus;
   resolution?: SuggestionResolution;
   created_at: number;
@@ -105,6 +108,7 @@ export function suggestionFromWire(wire: SuggestionWire): Suggestion {
         )
       : [],
     sourceSessionId: wire.source_session_id,
+    agentId: wire.agent_id ?? "",
     status: wire.status,
     resolution: wire.resolution ?? "none",
     createdAt: wire.created_at,

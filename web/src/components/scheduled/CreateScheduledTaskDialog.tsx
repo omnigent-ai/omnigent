@@ -65,6 +65,7 @@ import {
 } from "@/components/scheduled/WorkflowField";
 import { type SavedWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
+import { parseSavedWorkflowRun } from "@/lib/savedWorkflowRun";
 import { parseSavedWorkflowMessage, savedWorkflowMessage } from "@/lib/workflow";
 import {
   TriggerWorkerHarnessField,
@@ -78,11 +79,14 @@ import {
   encodeTriggerPrompt,
   hasTriggerHeader,
   isTriggerPrompt,
+  promptMayRunSavedWorkflow,
   readTriggerWorkerPlacement,
   readTriggerMessageMaxChars,
   readTriggerWorkerSettings,
   renderTriggerConfigPrompt,
+  renderTriggerPrompt,
   splitTriggerPrompt,
+  syncTriggerWorkflowId,
   TRIGGER_SOURCES,
   stripTriggerHeader,
   TRIGGER_TEMPLATES,
@@ -92,6 +96,7 @@ import {
   triggerMcpService,
   triggerServiceName,
   triggerWorkerSettingsOf,
+  updateTriggerWorkerPlacement,
   updateTriggerWorkerSettings,
   type TriggerConfig,
   type TriggerFields,
@@ -551,7 +556,8 @@ export function CreateScheduledTaskDialog({
   // Id of the existing project picked, captured at pick time so a later rename
   // can't redirect the save; null for a newly typed name.
   const [pickedProjectId, setPickedProjectId] = useState<string | null>(null);
-  const [sessionMode, setSessionMode] = useState<ScheduledTaskSessionMode>("new");
+  // The choice in Session continuity; a workflow can override it (see `sessionMode`).
+  const [pickedSessionMode, setSessionMode] = useState<ScheduledTaskSessionMode>("new");
   const [startNewSession, setStartNewSession] = useState(false);
   const [mcpServices, setMcpServices] = useState<string[]>([]);
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
@@ -559,18 +565,6 @@ export function CreateScheduledTaskDialog({
   const executionTarget: ScheduledTaskExecutionTarget = sandboxMode
     ? "managed_sandbox"
     : "connected_host";
-  // Agent, host, execution-target and repository changes clear the binding.
-  // Host directory edits stay locked: a symlink may resolve to the same directory.
-  const reusesExistingSession =
-    sessionMode === "continue" &&
-    editingTask !== null &&
-    editingTask.sessionId !== null &&
-    !startNewSession &&
-    !agentChanged &&
-    executionTarget === editingTask.executionTarget &&
-    (!sandboxMode || sandboxWorkspace === savedWorkspace) &&
-    baseBranch === (editingTask.baseBranch ?? null) &&
-    (hostId === "" || hostId === editingTask.hostId);
   // An active trigger template replaces the Prompt field; the saved prompt is
   // rendered from its fields. An edit shows the saved prompt unless the user
   // switches the trigger to another integration.
@@ -581,7 +575,8 @@ export function CreateScheduledTaskDialog({
     emptyTriggerFields("jira"),
   );
   // Like the model and effort overrides, this choice outlives switching trigger types.
-  const [triggerTaskSessionMode, setTriggerTaskSessionMode] =
+  // A workflow can override it (see `triggerTaskSessionMode`).
+  const [pickedTriggerTaskSessionMode, setTriggerTaskSessionMode] =
     useState<TriggerTaskSessionMode>("new");
   // Kept while a trigger edit watches another source, so switching back restores the saved trigger.
   const [sourceSwitch, setSourceSwitch] = useState<{
@@ -837,7 +832,8 @@ export function CreateScheduledTaskDialog({
       setSwitchedWorkerSettings(settings);
       return;
     }
-    const updated = updateTriggerWorkerSettings(effectivePrompt, settings);
+    // Edit the authored prompt, so a later revert of the target restores its placement.
+    const updated = updateTriggerWorkerSettings(syncedFreeTextPrompt, settings);
     if (updated === null) return;
     const parts = splitTriggerPrompt(updated);
     // A chosen workflow leaves the hidden draft out of the prompt, so keep the draft as typed.
@@ -853,13 +849,23 @@ export function CreateScheduledTaskDialog({
         ? switchedWorkerSettings
         : readTriggerWorkerSettings(combineTriggerPrompt(prompt, systemPrompt));
   }
-  let workerPlacement: WorkerPlacement | null = null;
+  // Moving the poller between a sandbox and a connected host moves its workers with it.
+  const targetWorkerPlacement: WorkerPlacement | null =
+    editingTask !== null && executionTarget !== editingTask.executionTarget
+      ? sandboxMode
+        ? "managed"
+        : "same_host"
+      : null;
+  // The placement as saved or edited; state keeps it, and only the target override changes it.
+  let authoredWorkerPlacement: WorkerPlacement | null = null;
   if (editingWorkerSettings) {
-    workerPlacement =
+    authoredWorkerPlacement =
       trigger !== null
         ? switchedWorkerPlacement
         : readTriggerWorkerPlacement(combineTriggerPrompt(prompt, systemPrompt));
   }
+  const workerPlacement =
+    authoredWorkerPlacement === null ? null : (targetWorkerPlacement ?? authoredWorkerPlacement);
   const workerSandboxMode = workerPlacement === "managed" || sandboxMode;
   const workerAgent = agents?.find(
     (agent) =>
@@ -1075,11 +1081,6 @@ export function CreateScheduledTaskDialog({
       : (trigger ?? sourceSwitch?.source ?? editingTriggerSource);
   // The polling session's state tracks the saved source's items, so a switch always resets it.
   const triggerSourceSwitched = sourceSwitch !== null;
-  const scheduleInvalid =
-    scheduleUnsupported ||
-    unsupportedByScheduler ||
-    validateSchedule(schedule, { allowPastEnd, sessionMode, subhourSupported, executionTarget }) !==
-      null;
   const workflowPrefix = skillInvocationPrefix(harnessSettings.harness);
   // With a workflow, text typed before choosing it stays hidden and out of each run.
   const keepsWorkflowDetails = workflowChoice !== null && workflowChoice.id === detailsWorkflowId;
@@ -1116,18 +1117,81 @@ export function CreateScheduledTaskDialog({
     ...triggerFields,
     instructions: withWorkflow(triggerFields.instructions),
   };
+  // Whether each match's session can start as a run of the trigger's saved workflow.
+  const workflowIdSupported =
+    workflowsEnabled && info !== "loading" && info.session_create_workflow_id === true;
+  // The prompt when no trigger form is open: as typed, or an older trigger's instructions
+  // inside its saved template text, whose creation call follows the workflow they run.
+  const syncedFreeTextPrompt = syncTriggerWorkflowId(
+    combineTriggerPrompt(withWorkflow(prompt), systemPrompt),
+    workflowIdSupported,
+  );
+  const freeTextPrompt =
+    targetWorkerPlacement === null
+      ? syncedFreeTextPrompt
+      : updateTriggerWorkerPlacement(syncedFreeTextPrompt, targetWorkerPlacement);
+  const triggerComplete =
+    trigger !== null &&
+    triggerFieldsComplete(promptTriggerFields, trigger, messageBudget.instructionsMaxChars);
+  // Each run of a saved workflow gets its own new session, whether the workflow was
+  // picked or its message typed. Text is read as the server reads it; for a trigger, that
+  // is the prompt it would save with one task session, which its instructions can keep
+  // from splitting.
+  let runsSavedWorkflow: boolean;
+  if (trigger === null) {
+    runsSavedWorkflow = promptMayRunSavedWorkflow(freeTextPrompt);
+  } else if (triggerComplete) {
+    runsSavedWorkflow = promptMayRunSavedWorkflow(
+      renderTriggerPrompt(trigger, promptTriggerFields, {
+        placement: "same_host",
+        sessionLink,
+        taskSessionMode: "continue",
+      }),
+    );
+  } else {
+    runsSavedWorkflow = parseSavedWorkflowRun(promptTriggerFields.instructions) !== null;
+  }
+  // A trigger keeps its one polling session; only its matches start new ones.
+  const workflowNeedsNewSessions =
+    runsSavedWorkflow && trigger === null && !isTriggerPrompt(freeTextPrompt);
+  const sessionMode: ScheduledTaskSessionMode = workflowNeedsNewSessions
+    ? "new"
+    : pickedSessionMode;
+  const triggerTaskSessionMode: TriggerTaskSessionMode = runsSavedWorkflow
+    ? "new"
+    : pickedTriggerTaskSessionMode;
+  // A trigger edited as its prompt can't be rendered again, so it keeps its task session.
+  const workflowKeepsTaskSession =
+    trigger === null && runsSavedWorkflow && isTaskSessionTriggerPrompt(freeTextPrompt);
+  // Agent, host, execution-target and repository changes clear the binding.
+  // Host directory edits stay locked: a symlink may resolve to the same directory.
+  const reusesExistingSession =
+    sessionMode === "continue" &&
+    editingTask !== null &&
+    editingTask.sessionId !== null &&
+    !startNewSession &&
+    !agentChanged &&
+    executionTarget === editingTask.executionTarget &&
+    (!sandboxMode || sandboxWorkspace === savedWorkspace) &&
+    baseBranch === (editingTask.baseBranch ?? null) &&
+    (hostId === "" || hostId === editingTask.hostId);
+  const scheduleInvalid =
+    scheduleUnsupported ||
+    unsupportedByScheduler ||
+    validateSchedule(schedule, { allowPastEnd, sessionMode, subhourSupported, executionTarget }) !==
+      null;
   const triggerPromptContext = {
     sessionLink,
     pollingIntervalMinutes:
       schedule.preset === "custom" && schedule.customFreq === "minutely" ? schedule.interval : 60,
     taskSessionTitle: name,
     messageMaxChars: messageBudget.messageMaxChars,
+    workflowIdSupported,
   };
   // An edit keeps the saved workers; a new trigger's workers run where the manager
   // runs (beside it on a connected host, or each in its own sandbox).
   const renderedTriggerConfig: TriggerConfig | null =
-    trigger !== null &&
-    triggerFieldsComplete(promptTriggerFields, trigger, messageBudget.instructionsMaxChars)
+    trigger !== null && triggerComplete
       ? {
           source: trigger,
           ...promptTriggerFields,
@@ -1150,10 +1214,7 @@ export function CreateScheduledTaskDialog({
   } else if (renderedTriggerConfig !== null) {
     renderedTriggerPrompt = renderTriggerConfigPrompt(renderedTriggerConfig, triggerPromptContext);
   }
-  const effectivePrompt =
-    trigger !== null
-      ? renderedTriggerPrompt
-      : combineTriggerPrompt(withWorkflow(prompt), systemPrompt);
+  const effectivePrompt = trigger !== null ? renderedTriggerPrompt : freeTextPrompt;
   const triggerMode =
     trigger !== null ||
     (sessionMode === "continue" && (editingTemplateTrigger || isTriggerPrompt(effectivePrompt)));
@@ -1430,6 +1491,7 @@ export function CreateScheduledTaskDialog({
     (isEdit || sandboxMode || hostId !== "") &&
     !workspaceWithoutHost &&
     !scheduleInvalid &&
+    !workflowKeepsTaskSession &&
     !pollingBlockedReason &&
     !(workerSettings !== null && workerHarnessSettings.blockedReason) &&
     mcpBlockedReason === null &&
@@ -1462,7 +1524,7 @@ export function CreateScheduledTaskDialog({
       triggerFields,
       schedule,
       timezone,
-      sessionMode,
+      sessionMode: pickedSessionMode,
     };
     const previousDefaultName =
       triggerType === "schedule" ? (initialName ?? "") : TRIGGER_TEMPLATES[triggerType].name;
@@ -1531,7 +1593,9 @@ export function CreateScheduledTaskDialog({
     }
     // Fall back to the saved workers if the prompt editor's creation call no longer parses.
     setSwitchedWorkerSettings(workerSettings ?? savedWorkerSettings);
-    setSwitchedWorkerPlacement(workerSettings !== null ? workerPlacement : savedWorkerPlacement);
+    setSwitchedWorkerPlacement(
+      workerSettings !== null ? authoredWorkerPlacement : savedWorkerPlacement,
+    );
     if (next === editingTriggerSource) {
       setStartNewSession(saved.savedStartNewSession);
       setSourceSwitch(null);
@@ -1995,6 +2059,16 @@ export function CreateScheduledTaskDialog({
                       </div>
                     )}
                   </div>
+                  {workflowKeepsTaskSession && (
+                    <p
+                      role="alert"
+                      className="text-sm text-warning sm:col-span-6"
+                      data-testid="task-workflow-task-session-note"
+                    >
+                      A workflow runs in a new session for each match, but this automation sends
+                      every match to one task session. Remove the workflow to save it.
+                    </p>
+                  )}
                   {hiddenTriggerScheduleNeedsReplacement && (
                     <div
                       className="flex items-center justify-between gap-3 rounded-lg bg-muted/50 px-3 py-2 text-ui"
@@ -2197,7 +2271,10 @@ export function CreateScheduledTaskDialog({
                                     <DropdownMenuRadioItem value="new">
                                       New session for each match
                                     </DropdownMenuRadioItem>
-                                    <DropdownMenuRadioItem value="continue">
+                                    <DropdownMenuRadioItem
+                                      value="continue"
+                                      disabled={runsSavedWorkflow}
+                                    >
                                       One task session for all matches
                                     </DropdownMenuRadioItem>
                                   </DropdownMenuRadioGroup>
@@ -2242,7 +2319,10 @@ export function CreateScheduledTaskDialog({
                                         <DropdownMenuRadioItem value="new">
                                           New session each run
                                         </DropdownMenuRadioItem>
-                                        <DropdownMenuRadioItem value="continue">
+                                        <DropdownMenuRadioItem
+                                          value="continue"
+                                          disabled={workflowNeedsNewSessions}
+                                        >
                                           Continue one session
                                         </DropdownMenuRadioItem>
                                       </DropdownMenuRadioGroup>

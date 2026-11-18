@@ -21,7 +21,7 @@ import {
   type SuggestionUpdateResult,
 } from "@/lib/proactiveInbox";
 import { useRebasePath } from "@/lib/routing";
-import { useProactiveAgentSettings } from "./useProactiveAgentSettings";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useViewerId } from "./useViewerId";
 
 type Pages = InfiniteData<SuggestionPage, string | null>;
@@ -116,7 +116,7 @@ function cachedStatus(
 }
 
 /**
- * Agent-posted suggestions for the Inbox, when the proactive agent is on for the viewer.
+ * Agent-posted suggestions for the Inbox, when the server offers agent Inbox items.
  *
  * Updates show at once and stay overlaid on every fetched page until their
  * PATCH settles; the server's reply, with the viewer's unread total after the
@@ -130,7 +130,7 @@ export function useProactiveInbox(
   identityReady: boolean,
   statuses: readonly SuggestionStatus[] = OPEN_SUGGESTION_STATUSES,
 ) {
-  const { settings } = useProactiveAgentSettings();
+  const info = useServerInfo();
   const viewerId = useViewerId();
   const rebasePath = useRebasePath();
   const queryClient = useQueryClient();
@@ -141,7 +141,7 @@ export function useProactiveInbox(
     viewerId,
   ];
   const scopeKeyText = JSON.stringify(scopeKey);
-  const enabled = identityReady && settings?.enabled === true;
+  const enabled = identityReady && info !== "loading" && info.inbox_items_available === true;
   const query = useInfiniteQuery({
     queryKey: [...scopeKey, [...statuses]],
     queryFn: ({ pageParam }) => listSuggestions(pageParam, statuses),

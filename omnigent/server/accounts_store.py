@@ -270,7 +270,8 @@ class SqlAlchemyAccountStore:
         :returns: The created :class:`Account`.
         :raises ValueError: If a user with this id already exists.
         :raises OmnigentError: ``CONFLICT`` while a deleted account's automation
-            grants or workflows under this name remain; retrying can succeed.
+            grants, workflows or Inbox items under this name remain; retrying
+            can succeed.
         """
         now = int(time.time())
         # Finish any held-grant cleanup a deletion left, so the name inherits nothing.
@@ -278,6 +279,7 @@ class SqlAlchemyAccountStore:
             self._session_immediate, user_id, batch_size=self._cleanup_batch_size
         )
         self._delete_deleted_workflows(user_id)
+        self._delete_deleted_inbox_items(user_id)
 
         def write(session: Session) -> Account:
             existing = lock_account(session, user_id)
@@ -291,6 +293,11 @@ class SqlAlchemyAccountStore:
             if existing is not None and self._owned_workflow_ids(session, user_id, limit=1):
                 raise OmnigentError(
                     "A deleted account's workflows are still being removed. Try again.",
+                    code=ErrorCode.CONFLICT,
+                )
+            if existing is not None and self._owned_inbox_item_ids(session, user_id, limit=1):
+                raise OmnigentError(
+                    "A deleted account's Inbox items are still being removed. Try again.",
                     code=ErrorCode.CONFLICT,
                 )
             row = existing or SqlUser(id=user_id)
@@ -495,14 +502,15 @@ class SqlAlchemyAccountStore:
         In the same transaction as the tombstone this also removes
         the user's ``session_permissions`` rows, marks their scheduled
         tasks ``deleted`` (so the scheduler never fires them again),
-        deletes their Inbox items, revokes their device/refresh grants (so no further access tokens
+        revokes their device/refresh grants (so no further access tokens
         can be minted), and deletes or tombstones their hosts (so an
         unattended run has nowhere to land). Because everything shares
         one transaction, a partial failure rolls back the whole delete
         rather than leaving authority behind. After it commits, the
-        scheduled task grants the user held, those on their tasks, and saved
-        workflows are deleted in bounded batches. Re-registration finishes any
-        interrupted workflow cleanup before reusing the username.
+        scheduled task grants the user held, those on their tasks, saved
+        workflows and Inbox items are deleted in bounded batches.
+        Re-registration finishes any interrupted workflow or Inbox cleanup
+        before reusing the username.
 
         The admin-invariant check and the delete run in the same locked
         transaction (see :meth:`_locked_admin_ids`), so this is atomic
@@ -545,13 +553,6 @@ class SqlAlchemyAccountStore:
                     SqlPreference.user_id == user_id,
                 )
             )
-            # A later account with the same username must not see these.
-            session.execute(
-                delete(SqlInboxItem).where(
-                    SqlInboxItem.workspace_id == current_workspace_id(),
-                    SqlInboxItem.user_id == user_id,
-                )
-            )
             target.deleted_at = int(time.time())
             target.password_hash = None
             target.is_admin = False
@@ -570,6 +571,10 @@ class SqlAlchemyAccountStore:
                 self._delete_deleted_workflows(user_id)
             except Exception:
                 _logger.exception("Workflow cleanup deferred for a deleted account")
+            try:
+                self._delete_deleted_inbox_items(user_id)
+            except Exception:
+                _logger.exception("Inbox cleanup deferred for a deleted account")
         return deleted
 
     def _owned_workflow_ids(self, session: Session, user_id: str, *, limit: int) -> list[str]:
@@ -607,6 +612,50 @@ class SqlAlchemyAccountStore:
         while (
             run_write_transaction(
                 self._session_immediate, "delete_deleted_account_workflow_batch", delete_batch
+            )
+            == self._cleanup_batch_size
+        ):
+            pass
+
+    def _owned_inbox_item_ids(self, session: Session, user_id: str, *, limit: int) -> list[str]:
+        """Read a bounded page through the owner's ``ix_inbox_items_user_created`` index."""
+        return list(
+            session.scalars(
+                select(SqlInboxItem.id)
+                .where(
+                    SqlInboxItem.workspace_id == current_workspace_id(),
+                    SqlInboxItem.user_id == user_id,
+                )
+                .order_by(SqlInboxItem.created_at, SqlInboxItem.id)
+                .limit(limit)
+                .with_hint(SqlInboxItem, "FORCE INDEX (ix_inbox_items_user_created)", "mysql")
+            )
+        )
+
+    def _delete_deleted_inbox_items(self, user_id: str) -> None:
+        """Delete a tombstoned account's Inbox items, one bounded batch per transaction.
+
+        Each batch re-checks the tombstone under the account lock, so cleanup
+        that runs late never deletes a re-registered account's new items.
+        """
+
+        def delete_batch(session: Session) -> int:
+            account = lock_account(session, user_id)
+            if account is None or account.deleted_at is None:
+                return 0
+            ids = self._owned_inbox_item_ids(session, user_id, limit=self._cleanup_batch_size)
+            if ids:
+                session.execute(
+                    delete(SqlInboxItem).where(
+                        SqlInboxItem.workspace_id == current_workspace_id(),
+                        SqlInboxItem.id.in_(sorted(ids)),
+                    )
+                )
+            return len(ids)
+
+        while (
+            run_write_transaction(
+                self._session_immediate, "delete_deleted_account_inbox_batch", delete_batch
             )
             == self._cleanup_batch_size
         ):

@@ -11,11 +11,13 @@ import {
   emptyTriggerFields,
   jiraAssignee,
   parseGithubReviewer,
+  promptMayRunSavedWorkflow,
   isTaskSessionTriggerPrompt,
   hasTriggerHeader,
   isTriggerPrompt,
   triggerPromptSource,
   readTriggerMessageMaxChars,
+  readTriggerWorkerPlacement,
   readTriggerWorkerSettings,
   LEGACY_MAX_INSTRUCTIONS_CHARS,
   MAX_INSTRUCTIONS_CHARS,
@@ -26,12 +28,14 @@ import {
   splitTriggerPrompt,
   stripScopePrefix,
   splitJqlOrderBy,
+  syncTriggerWorkflowId,
   triggerConditionFields,
   triggerEventDescription,
   stripTriggerHeader,
   triggerFieldsComplete,
   triggerMessageBudget,
   triggerScopeOperators,
+  updateTriggerWorkerPlacement,
   updateTriggerWorkerSettings,
   withTriggerEvent,
   TRIGGER_SOURCES,
@@ -83,6 +87,108 @@ describe("saved trigger prompts", () => {
     );
     expect(readTriggerWorkerSettings(prompt)?.permissionMode).toBe("approve-for-me");
     expect(renderTriggerPrompt("jira", fields(), CTX)).not.toContain("permission_mode");
+  });
+
+  const WORKFLOW_ID = "0123456789abcdef0123456789abcdef";
+  const WORKFLOW_RUN = `/workflow Run the saved workflow "Triage" (ID ${WORKFLOW_ID}).\n\nOnly bugs`;
+
+  it.each(TRIGGER_SOURCES)(
+    "starts each %s match's session as a run of the saved workflow its instructions run",
+    (source) => {
+      const prompt = renderTriggerPrompt(source, fields({ instructions: WORKFLOW_RUN }), {
+        ...CTX,
+        model: "old",
+        workflowIdSupported: true,
+      });
+      expect(prompt).toContain(`, workflow_id "${WORKFLOW_ID}", model "old"`);
+      // The session's first message still opens with the instructions, which run the workflow skill.
+      expect(prompt).toContain("The message starts with the instructions below");
+      expect(splitTriggerPrompt(prompt).userPrompt).toBe(WORKFLOW_RUN);
+      expect(readTriggerWorkerSettings(prompt)).toEqual({ ...AGENT_DEFAULT_WORKERS, model: "old" });
+      expect(readTriggerWorkerPlacement(prompt)).toBe("same_host");
+      expect(readTriggerMessageMaxChars(prompt)).toBe(32000);
+      // Changing the worker settings keeps the workflow.
+      expect(updateTriggerWorkerSettings(prompt, { ...AGENT_DEFAULT_WORKERS, model: "new" })).toBe(
+        prompt.replace('model "old"', 'model "new"'),
+      );
+      // Moving the workers keeps the workflow and the other settings.
+      const managed = updateTriggerWorkerPlacement(prompt, "managed");
+      expect(managed).toBe(prompt.replace('placement "same_host"', 'placement "managed"'));
+      expect(readTriggerWorkerPlacement(managed)).toBe("managed");
+      expect(updateTriggerWorkerPlacement(managed, "same_host")).toBe(prompt);
+      expect(updateTriggerWorkerPlacement(prompt, "same_host")).toBe(prompt);
+    },
+  );
+
+  it("starts workers as workflow runs only for their own sessions, on a server that can", () => {
+    const runsWorkflow = fields({ instructions: WORKFLOW_RUN });
+    const supported = { ...CTX, workflowIdSupported: true };
+    expect(renderTriggerPrompt("jira", runsWorkflow, CTX)).not.toContain("workflow_id");
+    expect(renderTriggerPrompt("jira", fields(), supported)).not.toContain("workflow_id");
+    expect(
+      renderTriggerPrompt("jira", runsWorkflow, { ...supported, taskSessionMode: "continue" }),
+    ).not.toContain("workflow_id");
+  });
+
+  it("reads a prompt's saved workflow as the server does, even when it won't split", () => {
+    const unsplittable = `${WORKFLOW_RUN}\n\nInstructions for each session:\nfirst.`;
+    const render = (instructions: string) =>
+      renderTriggerPrompt("jira", fields({ instructions }), CTX);
+    expect(promptMayRunSavedWorkflow(render(WORKFLOW_RUN))).toBe(true);
+    expect(splitTriggerPrompt(render(unsplittable)).systemPrompt).toBeNull();
+    expect(promptMayRunSavedWorkflow(render(unsplittable))).toBe(true);
+    expect(
+      promptMayRunSavedWorkflow(render(unsplittable.replace(WORKFLOW_RUN, "Triage it."))),
+    ).toBe(false);
+    expect(promptMayRunSavedWorkflow(WORKFLOW_RUN)).toBe(true);
+    expect(promptMayRunSavedWorkflow("Summarize overnight activity")).toBe(false);
+  });
+
+  it("keeps a prompt's creation call on the workflow its instructions now run", () => {
+    const supported = { ...CTX, workflowIdSupported: true };
+    const otherRun = WORKFLOW_RUN.replace(WORKFLOW_ID, "f".repeat(32));
+    const saved = renderTriggerPrompt("jira", fields({ instructions: WORKFLOW_RUN }), supported);
+    const withInstructions = (instructions: string) =>
+      combineTriggerPrompt(instructions, splitTriggerPrompt(saved).systemPrompt);
+    expect(syncTriggerWorkflowId(saved, true)).toBe(saved);
+    // Another workflow, or none, takes over the call, as a fresh render would.
+    expect(syncTriggerWorkflowId(withInstructions(otherRun), true)).toBe(
+      renderTriggerPrompt("jira", fields({ instructions: otherRun }), supported),
+    );
+    expect(syncTriggerWorkflowId(withInstructions("Investigate the ticket."), true)).toBe(
+      renderTriggerPrompt("jira", fields(), supported),
+    );
+    // A server that can't take workflow_id gets none.
+    expect(syncTriggerWorkflowId(saved, false)).toBe(
+      renderTriggerPrompt("jira", fields({ instructions: WORKFLOW_RUN }), CTX),
+    );
+    // A task session never starts as a run, and a call written by hand stays as written.
+    const taskSession = renderTriggerPrompt("jira", fields({ instructions: WORKFLOW_RUN }), {
+      ...supported,
+      taskSessionMode: "continue",
+    });
+    expect(syncTriggerWorkflowId(taskSession, true)).toBe(taskSession);
+    expect(syncTriggerWorkflowId("A handwritten automation.", true)).toBe(
+      "A handwritten automation.",
+    );
+    // Instructions that repeat the heading keep a prompt from splitting; the call still
+    // follows the workflow they open with.
+    const unsplittable = (instructions: string) =>
+      renderTriggerPrompt(
+        "jira",
+        fields({ instructions: `${instructions}\n\nInstructions for each session:\nfirst.` }),
+        supported,
+      );
+    const seeded = unsplittable(WORKFLOW_RUN);
+    expect(splitTriggerPrompt(seeded).systemPrompt).toBeNull();
+    expect(seeded).toContain(`workflow_id "${WORKFLOW_ID}"`);
+    expect(syncTriggerWorkflowId(seeded, true)).toBe(seeded);
+    expect(syncTriggerWorkflowId(seeded.replace(WORKFLOW_RUN, otherRun), true)).toBe(
+      unsplittable(otherRun),
+    );
+    expect(
+      syncTriggerWorkflowId(seeded.replace(WORKFLOW_RUN, "Investigate the ticket."), true),
+    ).toBe(unsplittable("Investigate the ticket."));
   });
 
   it.each(SOURCE_MODES)(
@@ -1144,6 +1250,71 @@ describe("trigger header", () => {
     expect(prompt).toContain('"Team" = "Backend"');
   });
 
+  it("round-trips a workflow trigger, and one saved before its workers started as runs", () => {
+    const workflowId = "a".repeat(32);
+    const saved = config("jira", {
+      instructions: `/workflow Run the saved workflow "Triage" (ID ${workflowId}).`,
+    });
+    const prompt = encodeTriggerPrompt(saved, { ...CTX, workflowIdSupported: true });
+    expect(prompt).toContain(`workflow_id "${workflowId}"`);
+    expect(decodeTriggerPrompt(prompt)).toEqual(saved);
+    const older = encodeTriggerPrompt(saved, CTX);
+    expect(older).not.toContain("workflow_id");
+    expect(decodeTriggerPrompt(older)).toEqual(saved);
+  });
+
+  it("still saves workflow trigger prompts in the layout the server reads", async () => {
+    // tests/server/scheduled/test_workflow_automations.py checks that the server reads
+    // these layouts as the form does. Only the parts it reads are kept, so this changes
+    // only with them: then update this snapshot with `vitest -u` and run those tests.
+    const layout = (saved: string) => {
+      const prompt = stripTriggerHeader(saved);
+      const mode = isTaskSessionTriggerPrompt(prompt) ? "the task session" : "each session";
+      const instructions = `\n\nInstructions for ${mode}:\n`;
+      const posting = `\n\nPosting instructions for ${mode}:\n`;
+      const opening =
+        /^This automation watches \S+ and starts one Omnigent session(?:, its task session,)?/.exec(
+          prompt,
+        )![0];
+      // The generated steps come before the instructions; after a posting heading, the
+      // server needs only that the heading is there.
+      const rest = prompt.slice(prompt.indexOf(instructions));
+      const postingAt = rest.lastIndexOf(posting);
+      return `${opening} ...${postingAt < 0 ? rest : `${rest.slice(0, postingAt + posting.length)}...`}`;
+    };
+    const scopes: Record<TriggerConfig["source"], string> = {
+      jira: "ES",
+      slack: "triage",
+      github: "example/project",
+      linear: "ENG",
+      pagerduty: "Checkout",
+    };
+    const save = (source: TriggerConfig["source"], taskSession: boolean, details = "Only bugs") =>
+      encodeTriggerPrompt(
+        {
+          ...emptyTriggerFields(source),
+          source,
+          scope: scopes[source],
+          instructions: `/workflow Run the saved workflow "Triage" (ID 0123456789abcdef0123456789abcdef).\n\n${details}`,
+          ...(taskSession ? { taskSessionMode: "continue" as const } : {}),
+          worker: WORKER,
+        },
+        { ...CTX, workflowIdSupported: true },
+      );
+    const prompts: Record<string, string> = {};
+    for (const source of TRIGGER_SOURCES) {
+      prompts[`${source}_task_session`] = layout(save(source, true));
+      prompts[`${source}_per_match`] = layout(save(source, false));
+    }
+    // Instructions that repeat the heading keep the saved prompt from splitting.
+    prompts.jira_task_session_unsplittable = layout(
+      save("jira", true, "Read the notes under\n\nInstructions for the task session:\nfirst."),
+    );
+    await expect(`${JSON.stringify(prompts, null, 2)}\n`).toMatchFileSnapshot(
+      "../../../../tests/server/scheduled/fixtures/workflow_trigger_prompts.json",
+    );
+  });
+
   it("reads a header saved without the newer optional settings", () => {
     // Headers written before worker permissions existed have no permissionMode key.
     const saved = encodeTriggerPrompt(config("slack"), CTX);
@@ -1340,6 +1511,20 @@ describe("renderTriggerPrompt", () => {
     },
   );
 
+  it.each(SOURCE_MODES)(
+    "loads a $source manager's tools in one search in $taskSessionMode mode",
+    ({ source, taskSessionMode }) => {
+      const prompt = renderTriggerPrompt(source, fields(), { ...CTX, taskSessionMode });
+
+      // One search, not one per tool, when the manager's tools load on demand.
+      expect(prompt).toContain(
+        "Each run:\n1. If your tools load on demand, load every tool this run needs in one tool search before your first call, naming them all:",
+      );
+      // The creation call stays the only sys_session_create the saved-prompt parser reads.
+      expect(readTriggerWorkerSettings(prompt)).not.toBeNull();
+    },
+  );
+
   it("signs what it posts and stops when it can't reach the service", () => {
     const prompt = renderTriggerPrompt("jira", fields(), CTX);
 
@@ -1388,7 +1573,7 @@ describe("renderTriggerPrompt", () => {
     // The window opens 5 minutes before the previous run's end, for slow indexing;
     // the form discloses that an item created in that overlap can still count.
     expect(prompt).toContain(
-      "Note the current UTC time; it ends this run's window. Then search from 5 minutes before the check time, because new items can take a few minutes to appear.",
+      "Note the current UTC time: the \"Run time:\" line near the end of this message gives it, so don't check the clock unless that line is missing. It ends this run's window. Then search from 5 minutes before the check time, because new items can take a few minutes to appear.",
     );
     expect(prompt).toContain(
       'End with "Checked through: <time>" in ISO 8601 UTC: the time you noted before searching if you read every result and handled every match; otherwise the time the last ticket you handled (started or skipped) before you stopped was created, or the previous check time if you handled none',
@@ -1401,8 +1586,13 @@ describe("renderTriggerPrompt", () => {
     expect(prompt).toContain(
       'Skip any ticket you already started a session for, or that is on a "Delivery pending:" line. Check the sessions your earlier replies in this session say you started first.',
     );
+    // Only a run that read everything saw nothing after its checkpoint. A failed run can
+    // repeat an older checkpoint after an interrupted run left an unrecorded worker.
     expect(prompt).toContain(
-      "For results not listed there, call sys_session_list once with include_archived true, following next_cursor through every page, and look for sessions whose created_by_session_id is your session ID",
+      'If the last message you wrote before this run\'s message is a reply with no "Delivery pending:" entries whose "Checked through:" time equals the "Run time:" of the message it answered, that run read and handled every result, so a result created after that time can\'t have a session yet: start it without the check below. A reply that ends earlier, such as after a failed or partial run, doesn\'t count, even if it repeats an older check time.',
+    );
+    expect(prompt).toContain(
+      "For other results not listed there, call sys_session_list once with include_archived true, and created_by_this_session true when the tool offers it, following next_cursor through every page, and look for sessions whose created_by_session_id is your session ID",
     );
     // Older runners silently ignore include_archived; their rows lack the archived field.
     expect(prompt).toContain(
@@ -1451,7 +1641,7 @@ describe("renderTriggerPrompt", () => {
       'If it returns a conversation_id with status created_initial_message_failed, the session exists but its task wasn\'t delivered: don\'t create another or resend now; list it as "<title> <conversation_id>" on a "Delivery pending:" line and go on.',
     );
     expect(prompt).toContain(
-      "2. For each pending delivery, find its session: by its conversation_id, or, for an unconfirmed start listed without one, by its title among the sessions you created (sys_session_list with include_archived true, following next_cursor through every page).",
+      "2. For each pending delivery, find its session: by its conversation_id, or, for an unconfirmed start listed without one, by its title among the sessions you created (sys_session_list with include_archived true, and created_by_this_session true when the tool offers it, following next_cursor through every page).",
     );
     // An unconfirmed start that never happened is fetched again by key, since the
     // checkpoint may have moved past its creation time while it was pending.
@@ -1901,7 +2091,7 @@ describe("one task session for every match", () => {
     );
     // The same lookup runs before a first start and before a replacement.
     expect(prompt).toContain(
-      `So before you start a task session, and to resolve an unconfirmed start, call sys_session_list once with include_archived true, following next_cursor through every page, and look for sessions whose created_by_session_id is your session ID and whose title is ${TITLE}. One that isn't archived and wasn't known as a task session before this run (named on a "Task session:" line, returned by your own earlier calls, or named after "replacing" on a pending entry) is your task session.`,
+      `So before you start a task session, and to resolve an unconfirmed start, call sys_session_list once with include_archived true, and created_by_this_session true when the tool offers it, following next_cursor through every page, and look for sessions whose created_by_session_id is your session ID and whose title is ${TITLE}. One that isn't archived and wasn't known as a task session before this run (named on a "Task session:" line, returned by your own earlier calls, or named after "replacing" on a pending entry) is your task session.`,
     );
     expect(prompt).toContain(
       "If you have no task session, look for one as in step 2. If you find one, the run that started it may already have sent it this ticket: check its latest items for the title before sending. If there is none, start one",

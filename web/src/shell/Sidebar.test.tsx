@@ -2237,7 +2237,7 @@ describe("Sidebar sections", () => {
       expect(placeholder.closest("a")).toHaveAttribute("href", `/?sibling=${source.id}`);
       expect(await screen.findByText("conv_peer")).toBeInTheDocument();
       const rowNode = placeholder.closest("li");
-      expect(rowNode).toHaveClass("ml-9");
+      expect(rowNode).toHaveClass("ml-6");
       if (scope.endsWith("backfill")) {
         const fetch = vi.spyOn(identity, "authenticatedFetch").mockResolvedValue(
           new Response(

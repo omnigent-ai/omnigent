@@ -24,6 +24,7 @@ function settings(overrides: Partial<ProactiveAgentSettings> = {}): ProactiveAge
     user_enabled: true,
     enabled: true,
     can_manage_workspace: false,
+    agent_id: "agent_advisor",
     ...overrides,
   };
 }

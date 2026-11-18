@@ -6,8 +6,8 @@ Several low-cardinality closed-set columns (``conversations.kind``,
 ``hosts.status``, ``agents.kind``, ``scheduled_tasks.state``,
 ``scheduled_tasks.execution_target``,
 ``scheduled_task_runs.status``, ``session_journal_entries.kind``,
-``inbox_items.status``) are stored as integer codes rather than their string
-names — smaller rows and a tighter ``CHECK`` than a free ``VARCHAR``.
+``inbox_items.status``, ``memories.actor_type``) are stored as integer codes
+rather than their string names — smaller rows and a tighter ``CHECK`` than a free ``VARCHAR``.
 The string names remain the
 contract for entities, the HTTP API, the web client, and the SDKs; the
 integer form never leaves the store row↔entity boundary. These codecs are
@@ -155,6 +155,12 @@ INBOX_ITEM_STATUS: dict[str, int] = {
     "read": 2,
     "done": 3,
     "dismissed": 4,
+}
+
+# Whose memory a ``memories`` row is. The column's CHECK lists these codes, so a
+# new type also needs a migration.
+MEMORY_ACTOR_TYPE: dict[str, int] = {
+    "user": 1,
 }
 
 
@@ -408,3 +414,13 @@ def encode_inbox_item_status(name: str) -> int:
 def decode_inbox_item_status(code: int) -> str:
     """Decode an ``inbox_items.status`` int code to its name."""
     return _decode(INBOX_ITEM_STATUS, code, field="inbox_items.status")
+
+
+def encode_memory_actor_type(name: str) -> int:
+    """Encode a ``memories.actor_type`` name to its int code."""
+    return _encode(MEMORY_ACTOR_TYPE, name, field="memories.actor_type")
+
+
+def decode_memory_actor_type(code: int) -> str:
+    """Decode a ``memories.actor_type`` int code to its name."""
+    return _decode(MEMORY_ACTOR_TYPE, code, field="memories.actor_type")

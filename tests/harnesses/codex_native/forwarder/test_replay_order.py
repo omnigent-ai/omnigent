@@ -1010,3 +1010,318 @@ async def test_replayed_turn_failure_keeps_its_detail_over_a_later_goal_limit(
     assert [status["status"] for status in statuses] == ["failed"]
     assert statuses[0].get("reauth_required") is True
     assert "Your access token expired." in statuses[0]["output"]
+
+
+@pytest.mark.asyncio
+async def test_recovered_running_waits_for_replay_that_ended_the_turn(tmp_path: Path) -> None:
+    """A live item's recovered running cannot land after resume replay ended its turn."""
+
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_x",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_1",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_1",
+        ),
+    )
+    client = _RecordingClient()
+    lock_entered = asyncio.Event()
+    release_lock = asyncio.Event()
+
+    async def replay_ends_turn() -> None:
+        async with fwd._conversation_item_delivery_scope("conv_x"):
+            lock_entered.set()
+            await release_lock.wait()
+            await fwd._post_resume_turn_status(
+                client,  # type: ignore[arg-type]
+                session_id="conv_x",
+                bridge_dir=tmp_path,
+                thread_id="thread_1",
+                turns=[{"id": "turn_1", "status": "completed"}],
+                replay_from_turn_id="turn_1",
+            )
+
+    locks_token = fwd._conversation_item_locks.set({})
+    try:
+        replay = asyncio.create_task(replay_ends_turn())
+        await asyncio.wait_for(lock_entered.wait(), timeout=5.0)
+        recovered = asyncio.create_task(
+            fwd._post_missed_turn_start(
+                client,  # type: ignore[arg-type]
+                session_id="conv_x",
+                bridge_dir=tmp_path,
+                thread_id="thread_1",
+                event={
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread_1",
+                        "turnId": "turn_1",
+                        "item": {"type": "agentMessage", "id": "item_1", "text": "Done."},
+                    },
+                },
+                forwarder_state=fwd._CodexForwarderState(),
+            )
+        )
+        await asyncio.sleep(0)
+        release_lock.set()
+        await replay
+        await asyncio.wait_for(recovered, timeout=5.0)
+    finally:
+        fwd._conversation_item_locks.reset(locks_token)
+
+    statuses = [
+        body["data"]["status"]
+        for _, body in client.posts
+        if body["type"] == "external_session_status"
+    ]
+    assert statuses == ["idle"]
+    assert read_bridge_state(tmp_path).active_turn_id is None  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("overlapping", [False, True])
+@pytest.mark.parametrize("live_first", [False, True])
+async def test_live_item_does_not_republish_running_that_resume_reported(
+    tmp_path: Path, overlapping: bool, live_first: bool
+) -> None:
+    """Live recovery and resume publish running once, whichever owns delivery first."""
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_x",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_1",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_1",
+        ),
+    )
+    post_entered = asyncio.Event()
+    release_post = asyncio.Event()
+    competing_started = asyncio.Event()
+    publication_attempts = 0
+
+    class PendingStatusClient(_RecordingClient):
+        async def post(
+            self, url: str, *, json: dict[str, Any], timeout: float | None = None
+        ) -> httpx.Response:
+            nonlocal publication_attempts
+            if json["type"] == "external_session_status" and json["data"]["status"] == "running":
+                publication_attempts += 1
+                if overlapping and publication_attempts == 1:
+                    post_entered.set()
+                    await release_post.wait()
+            return await super().post(url, json=json, timeout=timeout)
+
+    client = PendingStatusClient()
+    state = fwd._CodexForwarderState()
+    live_item = {
+        "method": "item/completed",
+        "params": {
+            "threadId": "thread_1",
+            "turnId": "turn_1",
+            "item": {"type": "agentMessage", "id": "item_1", "text": "Working."},
+        },
+    }
+
+    async def replay() -> None:
+        async with fwd._conversation_item_delivery_scope("conv_x"):
+            await fwd._post_resume_turn_status(
+                client,  # type: ignore[arg-type]
+                session_id="conv_x",
+                bridge_dir=tmp_path,
+                thread_id="thread_1",
+                turns=[{"id": "turn_1", "status": "inProgress", "items": []}],
+                forwarder_state=state,
+            )
+
+    async def live() -> None:
+        await fwd._post_missed_turn_start(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            thread_id="thread_1",
+            event=live_item,
+            forwarder_state=state,
+        )
+
+    publishers: list[asyncio.Task[None]] = []
+    locks_token = fwd._conversation_item_locks.set({})
+    try:
+        first, second = (live, replay) if live_first else (replay, live)
+        if not overlapping:
+            await first()
+            await second()
+        else:
+            publishing = asyncio.create_task(first())
+            publishers.append(publishing)
+            await asyncio.wait_for(post_entered.wait(), timeout=5.0)
+            assert state.running_reported_turn_id is None
+            assert client.posts == []
+
+            async def compete() -> None:
+                competing_started.set()
+                await second()
+
+            waiting = asyncio.create_task(compete())
+            publishers.append(waiting)
+            await asyncio.wait_for(competing_started.wait(), timeout=5.0)
+            assert not waiting.done()
+            assert publication_attempts == 1
+            release_post.set()
+            await asyncio.wait_for(publishing, timeout=5.0)
+            await asyncio.wait_for(waiting, timeout=5.0)
+    finally:
+        release_post.set()
+        for publisher in publishers:
+            publisher.cancel()
+        await asyncio.gather(*publishers, return_exceptions=True)
+        fwd._conversation_item_locks.reset(locks_token)
+
+    statuses = [
+        body["data"]["status"]
+        for _, body in client.posts
+        if body["type"] == "external_session_status"
+    ]
+    assert statuses == ["running"]
+    assert publication_attempts == 1
+
+
+def _fail_first_running_publish(monkeypatch: pytest.MonkeyPatch, mode: str) -> list[str]:
+    """Fail the first running-status publish using the requested mode."""
+    real_post_session_event = fwd._post_session_event
+    outcomes: list[str] = []
+
+    async def flaky(client, session_id, *, event_type, data, **kwargs):  # type: ignore[no-untyped-def]
+        is_running = event_type == "external_session_status" and data.get("status") == "running"
+        if is_running and not outcomes:
+            outcomes.append(mode)
+            if mode == "raised":
+                raise RuntimeError("credential resolution failed")
+            if mode == "cancelled":
+                raise asyncio.CancelledError()
+            if mode == "missing":
+                return None
+            return httpx.Response(500, json={"error": "server unavailable"})
+        if is_running:
+            outcomes.append("accepted")
+        return await real_post_session_event(
+            client, session_id, event_type=event_type, data=data, **kwargs
+        )
+
+    monkeypatch.setattr(fwd, "_post_session_event", flaky)
+    return outcomes
+
+
+def _running_statuses(client: _RecordingClient) -> list[str]:
+    """Return the statuses of the external session status posts the server accepted."""
+    return [
+        body["data"]["status"]
+        for _, body in client.posts
+        if body["type"] == "external_session_status"
+    ]
+
+
+def _live_item(item_id: str) -> dict:
+    """Return a live ``item/completed`` notification for the active turn of ``thread_1``."""
+    return {
+        "method": "item/completed",
+        "params": {
+            "threadId": "thread_1",
+            "turnId": "turn_1",
+            "item": {"type": "agentMessage", "id": item_id, "text": "Working."},
+        },
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("initial_source", "mode"),
+    [
+        pytest.param("live", "rejected", id="rejected"),
+        pytest.param("live", "raised", id="raised"),
+        pytest.param("live", "cancelled", id="cancelled"),
+        pytest.param("live", "missing", id="missing"),
+        pytest.param("resume", "rejected", id="resume"),
+        pytest.param("observed-start", "rejected", id="observed-start"),
+    ],
+)
+async def test_failed_running_publish_is_retried_by_the_next_live_item(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, initial_source: str, mode: str
+) -> None:
+    """A failed live, resume or observed-start running publish permits one live recovery."""
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_x",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_1",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=None if initial_source == "observed-start" else "turn_1",
+        ),
+    )
+    outcomes = _fail_first_running_publish(monkeypatch, mode)
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState()
+    locks_token = fwd._conversation_item_locks.set({})
+    try:
+        if mode == "cancelled":
+            failure = pytest.raises(asyncio.CancelledError)
+        elif mode == "raised":
+            failure = pytest.raises(RuntimeError, match="credential resolution failed")
+        else:
+            failure = contextlib.nullcontext()
+        with failure:
+            if initial_source == "live":
+                await fwd._post_missed_turn_start(
+                    client,  # type: ignore[arg-type]
+                    session_id="conv_x",
+                    bridge_dir=tmp_path,
+                    thread_id="thread_1",
+                    event=_live_item("item_1"),
+                    forwarder_state=state,
+                )
+            elif initial_source == "resume":
+                await fwd._post_resume_turn_status(
+                    client,  # type: ignore[arg-type]
+                    session_id="conv_x",
+                    bridge_dir=tmp_path,
+                    thread_id="thread_1",
+                    turns=[{"id": "turn_1", "status": "inProgress", "items": []}],
+                    forwarder_state=state,
+                )
+            else:
+                await fwd._handle_event(
+                    client,  # type: ignore[arg-type]
+                    session_id="conv_x",
+                    bridge_dir=tmp_path,
+                    event={
+                        "method": "turn/started",
+                        "params": {
+                            "threadId": "thread_1",
+                            "turn": {"id": "turn_1", "status": "inProgress"},
+                        },
+                    },
+                    usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+                    elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+                    expected_thread_id="thread_1",
+                    forwarder_state=state,
+                )
+        assert outcomes == [mode]
+        assert _running_statuses(client) == []
+        assert state.running_reported_turn_id is None
+        await fwd._post_missed_turn_start(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            thread_id="thread_1",
+            event=_live_item("item_2" if initial_source == "live" else "item_1"),
+            forwarder_state=state,
+        )
+    finally:
+        fwd._conversation_item_locks.reset(locks_token)
+
+    assert outcomes == [mode, "accepted"]
+    assert _running_statuses(client) == ["running"]
+    assert state.running_reported_turn_id == "turn_1"

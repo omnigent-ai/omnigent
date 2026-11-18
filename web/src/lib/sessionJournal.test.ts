@@ -9,6 +9,7 @@ import {
   finishedTaskCount,
   isPlanComplete,
   isRestart,
+  latestStatusText,
   mergeJournalEntries,
   nativeTaskProgress,
   pausedLabel,
@@ -41,6 +42,38 @@ function status(position: number, step: string, value: string, fields: Partial<J
     ...fields,
   });
 }
+
+describe("latestStatusText", () => {
+  it("is the words of the status written last, whichever step it is on", () => {
+    const entries = [
+      status(4, "explore", "done", { content: { status: "done", text: "Found it" } }),
+      status(9, "fix", "failed", { content: { status: "failed", text: "CI is down" } }),
+      status(6, "test", "done", { content: { status: "done", text: "Tests pass" } }),
+    ];
+    expect(latestStatusText(entries)).toEqual({ status: "failed", text: "CI is down" });
+  });
+
+  it("skips a status with no words, such as started, and anything that isn't a status", () => {
+    const entries = [
+      status(2, "explore", "done", { content: { status: "done", text: " Found it " } }),
+      status(5, "fix", "started", { content: { status: "started", text: null } }),
+      status(7, "test", "done", { content: { status: "done", text: "  " } }),
+      journalEntry(8, { kind: "note", content: { body: "A note" } }),
+      status(9, "ship", "done", { content: { status: "paused", text: "Unknown status" } }),
+    ];
+    expect(latestStatusText(entries)).toEqual({ status: "done", text: "Found it" });
+    expect(latestStatusText([entries[1]!, entries[3]!])).toBeNull();
+    expect(latestStatusText([])).toBeNull();
+  });
+
+  it("counts a started status that has words", () => {
+    const entries = [
+      status(2, "explore", "done", { content: { status: "done", text: "Found it" } }),
+      status(5, "fix", "started", { content: { status: "started", text: "Retrying the build" } }),
+    ];
+    expect(latestStatusText(entries)).toEqual({ status: "started", text: "Retrying the build" });
+  });
+});
 
 describe("mergeJournalEntries", () => {
   it("orders by position and keeps one copy of each entry", () => {

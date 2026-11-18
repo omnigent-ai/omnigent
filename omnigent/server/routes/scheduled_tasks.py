@@ -82,8 +82,16 @@ from omnigent.server.scheduled.rrule import (
 )
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.server.scheduled.run_sharing import delete_task_grants
+from omnigent.server.scheduled.schedule import continued_sandbox_host_id
 from omnigent.server.scheduled.telemetry import log_task_created
-from omnigent.server.session_mcp_selection import MAX_SESSION_MCP_SERVICES, session_mcp_selection
+from omnigent.server.scheduled.workflow_automations import workflow_session_reuse_error
+from omnigent.server.session_mcp_selection import (
+    MAX_SESSION_MCP_SERVICES,
+    SessionMcpSelection,
+    mcp_selection_for,
+    run_sandbox,
+    session_mcp_services,
+)
 from omnigent.server.workflows import require_workflows
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
@@ -152,7 +160,8 @@ class CreateScheduledTaskRequest(BaseModel):
     mcp_services: list[str] = Field(default_factory=list, max_length=MAX_SESSION_MCP_SERVICES)
     max_cost_usd: float | None = Field(default=None, gt=0)
     # "continue" sends every run's prompt into one session: ``session_id`` when
-    # given, else the session the first run creates.
+    # given, else the session the first run creates. A prompt that runs a saved
+    # workflow needs "new" (see ``workflow_session_reuse_error``).
     session_mode: Literal["new", "continue"] = "new"
     session_id: str | None = Field(default=None, min_length=1)
     # Unpinned connected-host tasks resolve an online host and its home at fire time.
@@ -423,6 +432,39 @@ def _validate_timezone_or_400(timezone: str) -> None:
         ) from exc
 
 
+async def _workflow_reuse_problem(prompt: str, session_mode: str) -> str | None:
+    """Why an automation that runs a saved workflow can't reuse a session, if it would.
+
+    Runs in a thread: reading a prompt edited outside the form can take a pass over all of it.
+    """
+    return await asyncio.to_thread(workflow_session_reuse_error, prompt, session_mode)
+
+
+def _refuse_workflow_reuse(problem: str | None) -> None:
+    if problem is not None:
+        raise OmnigentError(problem, code=ErrorCode.INVALID_INPUT)
+
+
+def _workflow_reuse_change(
+    task: ScheduledTask, requested: dict[str, Any]
+) -> tuple[str, str] | None:
+    """The prompt and session mode an update leaves *task* with, if it changes them or
+    the session; None otherwise.
+
+    An automation saved before workflows needed new sessions keeps running until an
+    update changes what it runs or the session it uses.
+    """
+    prompt = task.prompt if requested.get("prompt") is None else requested["prompt"]
+    session_mode = requested.get("session_mode", task.session_mode)
+    if (
+        prompt == task.prompt
+        and session_mode == task.session_mode
+        and requested.get("session_id", task.session_id) == task.session_id
+    ):
+        return None
+    return prompt, session_mode
+
+
 _AGENT_AUTOMATION_ACTION = "Agent automation changes"
 
 
@@ -653,10 +695,32 @@ def create_scheduled_tasks_router(
             return {}
         return await asyncio.to_thread(display_names_or_ids, permission_store, owners)
 
+    async def _task_mcp_selection(
+        request: Request, execution_target: str, host_id: str | None
+    ) -> SessionMcpSelection:
+        """The selection a task's next run uses: its sandbox's provider's, or the registry's.
+
+        *host_id* is the existing sandbox the next run joins, if any, as for a fire.
+        """
+        state = request.app.state
+        sandbox = await asyncio.to_thread(
+            run_sandbox,
+            getattr(state, "sandbox_config", None),
+            getattr(state, "host_store", None),
+            execution_target,
+            host_id,
+        )
+        return mcp_selection_for(sandbox)
+
     async def _validated_mcp_services(
-        request: Request, services: list[str], agent: Agent, owner: str
+        request: Request,
+        services: list[str],
+        agent: Agent,
+        owner: str,
+        execution_target: str,
+        host_id: str | None = None,
     ) -> tuple[str, ...]:
-        """Check *services* with the deployment's session MCP selection."""
+        """Check *services* with the selection of where the task's next run lands."""
         if not services:
             return ()
         spec = None
@@ -673,7 +737,7 @@ def create_scheduled_tasks_router(
             except (KeyError, AttributeError, ValueError, ImportError, OSError):
                 # The fire path reports an unloadable agent; skip only the spec check.
                 spec = None
-        selection = session_mcp_selection(request.app.state)
+        selection = await _task_mcp_selection(request, execution_target, host_id)
         validated = await asyncio.to_thread(
             selection.validate, request, services, spec=spec, user_id=owner
         )
@@ -714,7 +778,9 @@ def create_scheduled_tasks_router(
         """
         if not services:
             return
-        running = session_mcp_selection(request.app.state).selected_services(session.labels)
+        running = session_mcp_services(
+            getattr(request.app.state, "sandbox_config", None), session.labels
+        )
         if set(services) != set(running):
             raise OmnigentError(
                 "The picked session runs different MCP services. Select the ones it "
@@ -1005,6 +1071,7 @@ def create_scheduled_tasks_router(
             permission_store=permission_store,
         )
         _reject_proactive_agent(body.agent_id)
+        _refuse_workflow_reuse(await _workflow_reuse_problem(body.prompt, body.session_mode))
         await _validate_rrule_or_400(
             body.rrule,
             body.session_mode,
@@ -1039,7 +1106,9 @@ def create_scheduled_tasks_router(
             source: Conversation | None = None
             source_up_to = ""
             carry = False
-            mcp_services = await _validated_mcp_services(request, body.mcp_services, agent, owner)
+            mcp_services = await _validated_mcp_services(
+                request, body.mcp_services, agent, owner, body.execution_target
+            )
             if body.session_id is not None:
                 # A picked session keeps the agent it runs, so the task takes no copy.
                 bound = agent
@@ -1605,6 +1674,18 @@ def create_scheduled_tasks_router(
         if fields.get("mcp_services") is None:
             fields.pop("mcp_services", None)
         target_session_mode = fields.get("session_mode", existing.session_mode)
+        # The caller's own changes, before the ones derived below.
+        requested_session = {
+            name: fields[name]
+            for name in ("prompt", "session_mode", "session_id")
+            if name in fields
+        }
+        # Checked on this snapshot, then again on the locked row for a concurrent edit.
+        workflow_checks: dict[tuple[str, str], str | None] = {}
+        snapshot_change = _workflow_reuse_change(existing, requested_session)
+        if snapshot_change is not None:
+            workflow_checks[snapshot_change] = await _workflow_reuse_problem(*snapshot_change)
+            _refuse_workflow_reuse(workflow_checks[snapshot_change])
         target_execution = fields.get("execution_target") or existing.execution_target
         if body.rrule is not None or {"session_mode", "execution_target"}.intersection(fields):
             await _validate_rrule_or_400(
@@ -1657,8 +1738,17 @@ def create_scheduled_tasks_router(
                     agent=agent,
                     agent_cache=agent_cache,
                 )
-        if "mcp_services" in fields or (agent_changed and existing.mcp_services):
-            # A rebound agent must still accept the services the task keeps.
+        if "mcp_services" in fields or (
+            existing.mcp_services
+            and (
+                agent_changed
+                or target_execution != existing.execution_target
+                or fields.get("session_mode", existing.session_mode) != existing.session_mode
+            )
+        ):
+            # A rebound agent, or a change of where the next run lands (a sandbox
+            # in place of a host, or a new sandbox in place of the one a continuing
+            # task keeps), must still accept the services the task keeps.
             mcp_agent = await validate_session_agent(
                 user_id=owner_id,
                 agent_id=target_agent_id,
@@ -1666,11 +1756,20 @@ def create_scheduled_tasks_router(
                 permission_store=permission_store,
                 conversation_store=conversation_store,
             )
+            # A continuing sandbox task's next run joins the sandbox it already has.
+            continues_in_sandbox = (
+                target_execution == "managed_sandbox"
+                and fields.get("session_mode", existing.session_mode) == "continue"
+            )
             fields["mcp_services"] = await _validated_mcp_services(
                 request,
                 list(fields.get("mcp_services", existing.mcp_services)),
                 mcp_agent,
                 owner,
+                target_execution,
+                continued_sandbox_host_id(existing.id, existing.workspace_id)
+                if continues_in_sandbox
+                else None,
             )
         switching_to_managed = target_execution == "managed_sandbox"
         if not switching_to_managed and "workspace" in fields and fields["workspace"] is None:
@@ -1774,6 +1873,19 @@ def create_scheduled_tasks_router(
             await _require_mode_fits_session(request, continuing)
         project_owner = _project_owner(owner)
         cancellation: asyncio.CancelledError | None = None
+        # Rechecked under the task's lock, so a grant made meanwhile counts.
+        shared_target_guard = agent_shared_target_guard(request, fields, permission_store)
+
+        def guard(locked: ScheduledTask) -> None:
+            if shared_target_guard is not None:
+                shared_target_guard(locked)
+            # Another update may have changed the prompt or session mode since the snapshot.
+            locked_change = _workflow_reuse_change(locked, requested_session)
+            if locked_change is not None:
+                if locked_change not in workflow_checks:
+                    workflow_checks[locked_change] = workflow_session_reuse_error(*locked_change)
+                _refuse_workflow_reuse(workflow_checks[locked_change])
+
         try:
             # On the derived fields, so a session the update clears counts as a change.
             await require_agent_keeps_shared_target(request, fields, existing, permission_store)
@@ -1785,8 +1897,7 @@ def create_scheduled_tasks_router(
                     store.update,
                     scheduled_task_id,
                     expected_schedule=existing,
-                    # Rechecked under the task's lock, so a grant made meanwhile counts.
-                    guard=agent_shared_target_guard(request, fields, permission_store),
+                    guard=guard,
                     **fields,
                 )
             )

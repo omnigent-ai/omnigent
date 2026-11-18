@@ -456,6 +456,8 @@ export interface ArcaConnectResult extends HostActionResult {
 export interface WorkspaceSocketRequest {
   /** The session's host; the shell reaches it over SSH when this desktop connected it that way. */
   hostId: string;
+  /** An SSH alias the shell may verify and record for `hostId` when it has none. */
+  sshTarget?: string;
   /** The socket the server named for the session's host, on the host's machine. */
   socketPath: string;
   /** The call's path, e.g. `/omnigent.api.workspace.v1alpha1.WorkspaceService/ReadFile`. */
