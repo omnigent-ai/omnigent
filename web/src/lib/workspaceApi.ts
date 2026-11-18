@@ -54,7 +54,12 @@ const GRANT_TIMEOUT_MS = 10_000;
 // A route that failed for a session is skipped for this long, then tried again.
 const ROUTE_RETRY_MS = 5 * 60_000;
 // Answers about the request itself, not failures of the route that carried it.
-const ANSWER_CODES = new Set([Code.NotFound, Code.InvalidArgument]);
+const ANSWER_CODES: ReadonlySet<Code> = new Set([Code.NotFound, Code.InvalidArgument]);
+// Also answers for reads refused on the file's current state, e.g. a moved base.
+const FILE_STATE_ANSWER_CODES: ReadonlySet<Code> = new Set([
+  ...ANSWER_CODES,
+  Code.FailedPrecondition,
+]);
 // The host is briefly away, e.g. reconnecting: try the next route, keep this one.
 const TRANSIENT_CODES = new Set([Code.Unavailable]);
 // Every host with the workspace API serves these, so they need no capability check.
@@ -75,6 +80,12 @@ const capabilities = new Map<string, CapabilitiesEntry>();
 const unsupportedUntil = new Map<string, number>();
 
 /** A failed direct route is retried as soon as a read brings an SSH alias it didn't have. */
+/**
+ * A method's answer the client can't use, e.g. a stream cut short: the route
+ * skips that method for a while and keeps serving the rest.
+ */
+class UnusableAnswerError extends Error {}
+
 function routeKey(route: Route, sessionId: string, sshTarget?: string | null): string {
   return route === "direct" ? `direct:${sessionId}:${sshTarget ?? ""}` : `${route}:${sessionId}`;
 }
@@ -202,6 +213,7 @@ async function callOn<T>(
   call: (client: WorkspaceClient) => Promise<T>,
   signal?: AbortSignal,
   sshTarget?: string | null,
+  answerCodes: ReadonlySet<Code> = ANSWER_CODES,
 ): Promise<T> {
   if (route === "server") return call(serverClient(sessionId));
   const send = workspaceSocketBridge();
@@ -214,7 +226,7 @@ async function callOn<T>(
     // The host accepted the token if it answered about the request or method.
     const answered =
       error instanceof ConnectError &&
-      (ANSWER_CODES.has(error.code) || error.code === Code.Unimplemented);
+      (answerCodes.has(error.code) || error.code === Code.Unimplemented);
     // Drop only the grant this read used; a parallel read may have renewed it.
     if (!answered && !signal?.aborted && grants.get(sessionId)?.pending === pending) {
       grants.delete(sessionId);
@@ -349,6 +361,17 @@ async function listDirectory(
   return { data, hasMore: pageToken !== "" };
 }
 
+interface CallOptions {
+  signal?: AbortSignal;
+  sshTarget?: string | null;
+  /** Optional features of `method` the call relies on, e.g. "search_files.substring". */
+  features?: readonly string[];
+  /** Codes that answer the request rather than fail the route. */
+  answerCodes?: ReadonlySet<Code>;
+  /** Throw an answer to the caller, for methods REST can't answer instead. */
+  throwAnswers?: boolean;
+}
+
 /**
  * Call the workspace API on the first route that works, or return null so the
  * caller uses REST.
@@ -356,17 +379,22 @@ async function listDirectory(
  * Tries the host's local socket first (desktop shell only, with a short-lived
  * token the server grants the session's owner), then the server. A route that
  * fails is skipped for the session for a while. A route whose host doesn't
- * serve `method` is skipped for that method only, so an older host keeps
- * serving the rest. An error answer also returns null, since REST reports it
- * in the shape callers expect.
+ * serve `method`, or gives an answer the client can't use, is skipped for that
+ * method only, so the host keeps serving the rest. An error answer also
+ * returns null, since REST reports it in the shape callers expect, unless
+ * `throwAnswers` is set.
  */
 async function viaWorkspaceApi<T>(
   sessionId: string,
   method: Method,
   call: (client: WorkspaceClient) => Promise<T>,
-  signal?: AbortSignal,
-  sshTarget?: string | null,
-  features: readonly string[] = [],
+  {
+    signal,
+    sshTarget,
+    features = [],
+    answerCodes = ANSWER_CODES,
+    throwAnswers = false,
+  }: CallOptions = {},
 ): Promise<T | null> {
   const checked = !BASELINE_METHODS.has(method) || features.length > 0;
   // Each route's attempt must finish before the next is tried.
@@ -381,11 +409,18 @@ async function viaWorkspaceApi<T>(
         const required = [capabilityName(method), ...features];
         if (!required.every((name) => served.has(name))) continue;
       }
-      return await callOn(route, sessionId, call, signal, sshTarget);
+      return await callOn(route, sessionId, call, signal, sshTarget, answerCodes);
     } catch (error) {
       signal?.throwIfAborted();
+      if (error instanceof UnusableAnswerError) {
+        unsupportedUntil.set(unsupportedKey, Date.now() + ROUTE_RETRY_MS);
+        continue;
+      }
       const code = error instanceof ConnectError ? error.code : null;
-      if (code !== null && ANSWER_CODES.has(code)) return null;
+      if (code !== null && answerCodes.has(code)) {
+        if (throwAnswers) throw error;
+        return null;
+      }
       if (code !== null && TRANSIENT_CODES.has(code)) continue;
       // A restarted host refuses the old token; the next read gets a new one.
       if (route === "direct" && code === Code.Unauthenticated) {
@@ -427,7 +462,7 @@ export function listDirectoryViaWorkspaceApi(
     sessionId,
     "listDirectory",
     (client) => listDirectory(client, path, maxEntries, signal),
-    signal,
+    { signal },
   );
 }
 
@@ -453,8 +488,7 @@ export async function readFileViaWorkspaceApi(
     sessionId,
     "readFile",
     (client) => collectFile(path, client.readFile({ path }, { signal })),
-    signal,
-    sshTarget,
+    { signal, sshTarget },
   );
 }
 
@@ -531,9 +565,7 @@ export function searchFilesViaWorkspaceApi(
         truncated: response.indexIncomplete || response.untrackedUnavailable,
       };
     },
-    signal,
-    null,
-    ["search_files.substring"],
+    { signal, features: ["search_files.substring"] },
   );
 }
 
@@ -592,15 +624,17 @@ export function searchTextViaWorkspaceApi(
         }
       }
       // A stream cut short would pass for a complete answer.
-      if (!done) throw new ConnectError("The content search ended early", Code.Unavailable);
+      if (!done) throw new UnusableAnswerError("The content search ended early");
       return result;
     },
-    signal,
+    { signal },
   );
 }
 
 // Git comparisons. Each returns null when no route serves the method, so the
-// caller can say the comparison is unavailable.
+// caller can say the comparison is unavailable. REST can't answer instead, so a
+// request the host rejects throws its ConnectError, whose message says why.
+const GIT_OPTIONS = { throwAnswers: true } as const;
 
 /** Resolve a comparison's base and head commits. */
 export function resolveWorkingCopyBaseViaWorkspaceApi(
@@ -613,10 +647,10 @@ export function resolveWorkingCopyBaseViaWorkspaceApi(
     "resolveWorkingCopyBase",
     async (client) => {
       const response = await client.resolveWorkingCopyBase({ comparison }, { signal });
-      if (!response.base) throw new ConnectError("The workspace API sent no base", Code.Internal);
+      if (!response.base) throw new UnusableAnswerError("The workspace API sent no base");
       return response.base;
     },
-    signal,
+    { ...GIT_OPTIONS, signal },
   );
 }
 
@@ -630,7 +664,7 @@ export function listWorkingCopyChangesViaWorkspaceApi(
     sessionId,
     "listWorkingCopyChanges",
     (client) => client.listWorkingCopyChanges({ comparison }, { signal }),
-    signal,
+    { ...GIT_OPTIONS, signal },
   );
 }
 
@@ -638,6 +672,8 @@ export function listWorkingCopyChangesViaWorkspaceApi(
  * Read a file's content at a commit, in the REST file payload's shape.
  *
  * :param file: The commit, path and blob, e.g. a ChangedFile's ``base_object``.
+ * :raises ConnectError: FailedPrecondition when the path no longer has that
+ *     blob, e.g. the base moved since the changes were listed.
  */
 export function readBaseFileViaWorkspaceApi(
   sessionId: string,
@@ -648,11 +684,15 @@ export function readBaseFileViaWorkspaceApi(
     sessionId,
     "readBaseFile",
     (client) => collectFile(file.path, client.readBaseFile(file, { signal })),
-    signal,
+    { ...GIT_OPTIONS, signal, answerCodes: FILE_STATE_ANSWER_CODES },
   );
 }
 
-/** Read a symlink's own text, without following it. */
+/**
+ * Read a symlink's own text, without following it.
+ *
+ * :raises ConnectError: FailedPrecondition when the path isn't a symlink.
+ */
 export function readLinkTextViaWorkspaceApi(
   sessionId: string,
   path: string,
@@ -662,7 +702,7 @@ export function readLinkTextViaWorkspaceApi(
     sessionId,
     "readLinkText",
     async (client) => (await client.readLinkText({ path }, { signal })).target,
-    signal,
+    { ...GIT_OPTIONS, signal, answerCodes: FILE_STATE_ANSWER_CODES },
   );
 }
 
@@ -675,7 +715,7 @@ export function listRepositoryRefsViaWorkspaceApi(
     sessionId,
     "listRepositoryRefs",
     (client) => client.listRepositoryRefs({}, { signal }),
-    signal,
+    { ...GIT_OPTIONS, signal },
   );
 }
 
@@ -689,7 +729,7 @@ export function listBranchCommitsViaWorkspaceApi(
     sessionId,
     "listBranchCommits",
     (client) => client.listBranchCommits({ baseRevision }, { signal }),
-    signal,
+    { ...GIT_OPTIONS, signal },
   );
 }
 
@@ -702,6 +742,6 @@ export function resolveRepositoryContextViaWorkspaceApi(
     sessionId,
     "resolveRepositoryContext",
     (client) => client.resolveRepositoryContext({}, { signal }),
-    signal,
+    { ...GIT_OPTIONS, signal },
   );
 }

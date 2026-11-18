@@ -32,9 +32,12 @@ has them. Before any other method (file and content search, Git comparisons)
 the page asks the route's host with `GetCapabilities`, once per route every
 five minutes, shared by concurrent calls and never cancelled by one of them.
 A method or feature the host doesn't list goes straight to REST, or reads as
-unavailable where REST has no equivalent. An `unimplemented` answer skips only
-that method on that route for five minutes. Either way the route keeps serving
-what the host has, so an older host still reads files.
+unavailable where REST has no equivalent. An `unimplemented` answer, or one the
+page can't use (a content search that ends early), skips only that method on
+that route for five minutes. Either way the route keeps serving what the host
+has, so an older host still reads files. Git comparisons have no REST
+equivalent, so a request the host refuses, such as an unknown revision, fails
+with the host's message instead.
 
 Go to File and Content search try the workspace API first and fall back to
 their REST routes. Content search is only asked for while the server's
