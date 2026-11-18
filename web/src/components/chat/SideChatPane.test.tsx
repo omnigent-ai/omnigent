@@ -91,6 +91,7 @@ const mentionListing = vi.hoisted(() => ({
   searchHits: [] as unknown[],
   declaredHarnesses: new Set<string>(["claude-sdk"]),
   workspaceQueries: [] as { owner?: string; enabled?: boolean }[],
+  environmentQueries: [] as { owner?: string; enabled?: boolean }[],
   directoryQueries: [] as { owner?: string; dirPath: string | null }[],
   searchQueries: [] as { owner?: string; query: string }[],
   childOwners: [] as unknown[],
@@ -109,9 +110,10 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
       isLoading: options?.enabled !== false && mentionListing.rootLoading,
     };
   },
-  useWorkspaceEnvironment: (_owner?: string, options?: { enabled?: boolean }) => ({
-    isLoading: options?.enabled === true && mentionListing.environmentLoading,
-  }),
+  useWorkspaceEnvironment: (owner?: string, options?: { enabled?: boolean }) => {
+    mentionListing.environmentQueries.push({ owner, enabled: options?.enabled });
+    return { isLoading: options?.enabled === true && mentionListing.environmentLoading };
+  },
   useWorkspaceDirectory: (owner: string | undefined, dirPath: string | null) => {
     mentionListing.directoryQueries.push({ owner, dirPath });
     return { data: undefined, isLoading: false };
@@ -2930,6 +2932,7 @@ describe("grid cell @-mention picker", () => {
     mentionListing.searchHits = [fixSession];
     mentionListing.declaredHarnesses = new Set(["claude-sdk"]);
     mentionListing.workspaceQueries = [];
+    mentionListing.environmentQueries = [];
     mentionListing.environmentLoading = false;
     mentionListing.directoryQueries = [];
     mentionListing.searchQueries = [];
@@ -3022,6 +3025,32 @@ describe("grid cell @-mention picker", () => {
     expect(input()).toHaveValue("@");
     expect(send).not.toHaveBeenCalled();
   });
+
+  it.each([
+    ["open", false],
+    ["loading", true],
+  ])(
+    "Mod+Enter with the picker %s neither sends the draft nor steers the queue",
+    (_state, loading) => {
+      writeAlwaysSteer(false);
+      conversationRegistry.acquire(childId).setState({ sessionStatus: "running" });
+      mountCell();
+      typeText("queued first");
+      fireEvent.keyDown(input(), { key: "Enter" });
+      expect(useChatStore.getState().queuedMessages).toEqual([
+        expect.objectContaining({ text: "queued first", conversationId: childId }),
+      ]);
+
+      mentionListing.rootLoading = loading;
+      typeText("@");
+      expect(screen.getByTestId("file-mention-menu")).toBeInTheDocument();
+      fireEvent.keyDown(input(), { key: "Enter", ctrlKey: true });
+
+      expect(input()).toHaveValue("@");
+      expect(send).not.toHaveBeenCalled();
+      expect(useChatStore.getState().queuedMessages).toHaveLength(1);
+    },
+  );
 
   it("Enter does not send while the workspace environment is still resolving, then submits once it settles", () => {
     mentionListing.environmentLoading = true;
@@ -3160,6 +3189,12 @@ describe("grid cell @-mention picker", () => {
       });
       expect(
         mentionListing.workspaceQueries.every(
+          (query) => query.owner === undefined && query.enabled === false,
+        ),
+      ).toBe(true);
+      expect(mentionListing.environmentQueries.length).toBeGreaterThan(0);
+      expect(
+        mentionListing.environmentQueries.every(
           (query) => query.owner === undefined && query.enabled === false,
         ),
       ).toBe(true);
