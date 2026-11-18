@@ -233,6 +233,26 @@ class HostSessionRecoverer:
         if self.store.supports_session_recovery:
             _stop_recovery(self.store, conv, only_pending=only_pending)
 
+    def admit_turn(self, session_id: str, recovery_id: str) -> bool:
+        """Revalidate durable authorization after runner setup, before starting work."""
+        if not deployment_gate_enabled(self.deployment_gate, "host_session_recovery"):
+            return False
+        recovery = self.store.get_session_recovery(session_id)
+        if (
+            recovery is None
+            or recovery.phase != "dispatching"
+            or recovery.attempt_id != recovery_id
+            or recovery.launch_runner_id != recovery.runner_id
+            or recovery.retry_at <= now_epoch()
+            or now_epoch() - recovery.interrupted_at > RECOVERY_MAX_AGE_S
+        ):
+            return False
+        # A callback may reach another replica; the durable dispatch carries
+        # admission from the replica holding the authenticated host connection.
+        if self.hosts.get(recovery.host_id) is not None and not self.enabled(recovery.host_id):
+            return False
+        return self.store.admit_session_recovery(session_id, recovery)
+
     def schedule_retirement(self, connection: HostConnection) -> None:
         """Keep opt-out bookkeeping independent of normal host connection handling."""
 

@@ -2957,6 +2957,45 @@ class SqlAlchemyConversationStore(ConversationStore):
             self._conv_session_immediate, "replace_session_recovery", write
         )
 
+    def admit_session_recovery(self, conversation_id: str, expected: SessionRecovery) -> bool:
+        """Order turn admission against binding changes and accepted input."""
+        if expected.phase != "dispatching":
+            return False
+
+        def check_binding(meta_session: Session) -> bool:
+            meta = meta_session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), conversation_id),
+                with_for_update=True,
+            )
+            if (
+                meta is None
+                or meta.host_id != expected.host_id
+                or meta.runner_id != expected.runner_id
+                or meta.pending_elicitation_count
+                or meta.live_status == encode_session_live_status("waiting")
+            ):
+                return False
+
+            def check_input(session: Session) -> bool:
+                self._lock_conversation(session, conversation_id)
+                row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
+                return (
+                    row is not None
+                    and not row.archived
+                    and _read_session_recovery(session, conversation_id) == expected
+                )
+
+            if self._conv_engine is self._engine:
+                return check_input(meta_session)
+            return run_write_transaction(
+                self._conv_session_immediate, "admit_session_recovery_input", check_input
+            )
+
+        return run_write_transaction(
+            self._session_immediate, "admit_session_recovery", check_binding
+        )
+
     def list_host_conversation_ids(
         self,
         host_id: str,

@@ -489,11 +489,13 @@ async def test_explicit_recovery_deduplicates_history_heuristic(
     "before_initialization", [False, True], ids=["during-init", "before-init"]
 )
 @pytest.mark.parametrize("native", [False, True], ids=["sdk", "native"])
+@pytest.mark.parametrize("pause", ["history", "admission"])
 async def test_stop_fences_delayed_recovery_initialization(
     monkeypatch: pytest.MonkeyPatch,
     event_type: str,
     before_initialization: bool,
     native: bool,
+    pause: str,
 ) -> None:
     from unittest.mock import AsyncMock
 
@@ -507,14 +509,28 @@ async def test_stop_fences_delayed_recovery_initialization(
     class PausedHistoryServer(_HistoryServerClient):
         async def get(self, url: str, **kwargs: Any) -> Any:
             response = await super().get(url, **kwargs)
-            if url.endswith(f"/{SESSION_ID}/items") and not release.is_set():
+            if (
+                pause == "history"
+                and url.endswith(f"/{SESSION_ID}/items")
+                and not release.is_set()
+            ):
                 entered.set()
                 await release.wait()
             return response
 
+        async def post(self, url: str, **kwargs: Any) -> Any:
+            if url.endswith("/recovery/admit"):
+                if pause == "admission" and not release.is_set():
+                    entered.set()
+                    await release.wait()
+                return self._Resp({"admitted": True})
+            return await super().post(url, **kwargs)
+
     app, _pm, harness = _build_sdk_app(PausedHistoryServer())
     payload = _session_init_payload(suppress_recovery_turn=False)
-    payload["session_init"].update(resume_interrupted_turn=True, recovery_id="stopped-task")
+    payload["session_init"].update(
+        resume_interrupted_turn=True, recovery_id="stopped-task", require_recovery_admission=True
+    )
     if native:
         payload["session_init"]["snapshot"]["harness_override"] = "cursor-native"
         monkeypatch.setattr(runner_app, "_launch_native_terminal", AsyncMock(return_value=True))
@@ -569,7 +585,8 @@ async def test_stop_fences_delayed_recovery_initialization(
 
 
 @pytest.mark.asyncio
-async def test_newer_turn_finishing_during_initialization_supersedes_recovery() -> None:
+@pytest.mark.parametrize("pause", ["history", "admission"])
+async def test_newer_turn_finishing_during_initialization_supersedes_recovery(pause: str) -> None:
     """A completed newer turn must not be followed by a stale recovery prompt."""
     from omnigent.runner.app import _session_histories_ref
 
@@ -578,14 +595,30 @@ async def test_newer_turn_finishing_during_initialization_supersedes_recovery() 
     class PausedHistoryServer(_HistoryServerClient):
         async def get(self, url: str, **kwargs: Any) -> Any:
             response = await super().get(url, **kwargs)
-            if url.endswith(f"/{SESSION_ID}/items") and not entered.is_set():
+            if (
+                pause == "history"
+                and url.endswith(f"/{SESSION_ID}/items")
+                and not entered.is_set()
+            ):
                 entered.set()
                 await release.wait()
             return response
 
+        async def post(self, url: str, **kwargs: Any) -> Any:
+            if url.endswith("/recovery/admit"):
+                if pause == "admission" and not entered.is_set():
+                    entered.set()
+                    await release.wait()
+                return self._Resp({"admitted": True})
+            return await super().post(url, **kwargs)
+
     app, _pm, harness = _build_sdk_app(PausedHistoryServer())
     payload = _session_init_payload(suppress_recovery_turn=False)
-    payload["session_init"].update(resume_interrupted_turn=True, recovery_id="interrupted-task")
+    payload["session_init"].update(
+        resume_interrupted_turn=True,
+        recovery_id="interrupted-task",
+        require_recovery_admission=True,
+    )
     async with _runner_client(app) as client:
         recovery = asyncio.create_task(client.post("/v1/sessions", json=payload))
         await asyncio.wait_for(entered.wait(), timeout=5)

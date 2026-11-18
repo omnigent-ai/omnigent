@@ -18,6 +18,7 @@ import httpx
 from fastapi import (
     APIRouter,
     HTTPException,
+    Query,
     Request,
 )
 from fastapi.responses import StreamingResponse
@@ -1066,6 +1067,22 @@ def register_events_routes(
                 "session is not bound to this runner", code=ErrorCode.FORBIDDEN
             )
         return user_id, conv
+
+    @event_router.post("/sessions/{session_id}/recovery/admit", include_in_schema=False)
+    async def admit_recovery_turn(
+        request: Request,
+        session_id: str,
+        recovery_id: str = Query(min_length=1, max_length=128),
+    ) -> dict[str, bool]:
+        _, conv = await _authorized_conversation(request, session_id, external_transcript=True)
+        reporting_runner = _reporting_runner_id(request)
+        if reporting_runner is not None and reporting_runner != conv.runner_id:
+            raise OmnigentError("session is not bound to this runner", code=ErrorCode.FORBIDDEN)
+        recoverer = getattr(request.app.state, "host_session_recoverer", None)
+        admitted = recoverer is not None and await asyncio.to_thread(
+            recoverer.admit_turn, session_id, recovery_id
+        )
+        return {"admitted": admitted}
 
     @event_router.post(
         "/sessions/{session_id}/events",

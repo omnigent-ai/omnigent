@@ -136,6 +136,52 @@ def user_input(
     )
 
 
+@pytest.mark.parametrize(
+    "changed",
+    [
+        None,
+        "remote_replica",
+        "missing",
+        "phase",
+        "attempt",
+        "deadline",
+        "age",
+        "deployment",
+        "host",
+    ],
+)
+def test_turn_admission_rechecks_durable_attempt_and_policy(
+    recovery: Any, changed: str | None
+) -> None:
+    intent = replace(
+        recovery.store.get_session_recovery(recovery.conv.id),
+        phase="dispatching",
+        attempt_id="attempt",
+        launch_runner_id="old",
+        retry_at=1100,
+    )
+    if changed == "phase":
+        intent = replace(intent, phase="stopped")
+    elif changed == "deadline":
+        intent = replace(intent, retry_at=1000)
+    elif changed == "age":
+        recovery.clock[0] += RECOVERY_MAX_AGE_S + 1
+        intent = replace(intent, retry_at=recovery.clock[0] + 100)
+    previous = recovery.store.get_session_recovery(recovery.conv.id)
+    assert recovery.store.replace_session_recovery(
+        recovery.conv.id, previous, None if changed == "missing" else intent
+    )
+    if changed == "deployment":
+        recovery.service.deployment_gate = False
+    elif changed == "host":
+        recovery.connection.hello.recover_interrupted_sessions = False
+    elif changed == "remote_replica":
+        recovery.service.hosts.get = Mock(return_value=None)
+    assert recovery.service.admit_turn(
+        recovery.conv.id, "other-attempt" if changed == "attempt" else "attempt"
+    ) is (changed in {None, "remote_replica"})
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("custom_prompt", [None, "Check the task checkpoint before continuing."])
 async def test_host_recovery_claim_is_shared_between_replicas(

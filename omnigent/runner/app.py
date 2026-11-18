@@ -3714,12 +3714,16 @@ def create_runner_app(
         forward_in_flight = _ingest_next_seq.get(session_id, 0) != _ingest_now_serving.get(
             session_id, 0
         )
-        execution_seen = (
-            initially_active
-            or forward_in_flight
-            or _turn_bind_epoch.get(session_id) != initial_turn_epoch
-            or resource_registry.session_activity_epoch(session_id) != initial_native_activity
-        )
+
+        def execution_observed() -> bool:
+            return (
+                initially_active
+                or _ingest_next_seq.get(session_id, 0) != _ingest_now_serving.get(session_id, 0)
+                or _turn_bind_epoch.get(session_id) != initial_turn_epoch
+                or resource_registry.session_activity_epoch(session_id) != initial_native_activity
+            )
+
+        execution_seen = execution_observed()
         recovery_turn = "none"
         if history and not execution_seen and session_id not in _active_turns:
             _session_histories[session_id] = history
@@ -3767,10 +3771,27 @@ def create_runner_app(
         if recovery_id is not None and recovery_id not in _recovery_turn_ids.get(
             session_id, set()
         ):
+            admitted = True
+            if (
+                init_context.envelope is not None
+                and init_context.envelope.require_recovery_admission
+            ):
+                admission = await server_client.post(
+                    f"/v1/sessions/{session_id}/recovery/admit",
+                    params={"recovery_id": recovery_id},
+                    timeout=10.0,
+                )
+                admission.raise_for_status()
+                admitted = admission.json().get("admitted") is True
+                execution_seen = execution_observed()
+                forward_in_flight = _ingest_next_seq.get(session_id, 0) != _ingest_now_serving.get(
+                    session_id, 0
+                )
             # Active execution, including a newer message, takes precedence over
             # automatic continuation. Initialization alone cannot consume it.
             if (
-                not execution_seen
+                admitted
+                and not execution_seen
                 and session_id not in _recovery_blocked_sessions
                 and session_id not in _active_turns
                 and not resource_registry.session_turn_is_active(session_id)

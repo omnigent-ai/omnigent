@@ -880,6 +880,62 @@ def test_get_conversation_takes_one_checkout_per_engine(
     )
 
 
+@pytest.mark.parametrize("single_database", [False, True])
+@pytest.mark.parametrize(
+    "superseded", [None, "input", "stop", "runner", "host", "approval", "archive"]
+)
+def test_recovery_admission_checks_input_and_binding(
+    store: SqlAlchemyConversationStore,
+    omnigent_db: Path,
+    single_database: bool,
+    superseded: str | None,
+) -> None:
+    from dataclasses import replace
+
+    from omnigent.db.db_models import workspace_scope
+    from omnigent.entities import MessageData, NewConversationItem
+    from omnigent.session_recovery import SessionRecovery
+
+    if single_database:
+        store = SqlAlchemyConversationStore(f"sqlite:///{omnigent_db}")
+    conv = store.create_conversation(host_id="a" * 32, runner_id="runner", workspace="/restored")
+    intent = SessionRecovery(
+        conv.host_id,
+        conv.runner_id,
+        100,
+        phase="dispatching",
+        attempt_id="attempt",
+        launch_runner_id=conv.runner_id,
+    )
+    assert store.replace_session_recovery(conv.id, None, intent)
+    if superseded == "input":
+        store.append(
+            conv.id,
+            [
+                NewConversationItem(
+                    response_id="user",
+                    type="message",
+                    data=MessageData(
+                        role="user", content=[{"type": "input_text", "text": "New work"}]
+                    ),
+                )
+            ],
+        )
+    elif superseded == "stop":
+        assert store.replace_session_recovery(conv.id, intent, replace(intent, phase="stopped"))
+    elif superseded == "runner":
+        store.replace_runner_id(conv.id, "replacement")
+    elif superseded == "host":
+        store.set_host_id(conv.id, "b" * 32, workspace="/restored")
+    elif superseded == "approval":
+        store.set_pending_elicitation_count(conv.id, 1)
+    elif superseded == "archive":
+        store.update_conversation(conv.id, archived=True)
+    with workspace_scope(42):
+        assert not store.admit_session_recovery(conv.id, intent)
+    assert store.admit_session_recovery(conv.id, intent) is (superseded is None)
+
+
 @pytest.mark.parametrize("legacy_counter", [False, True])
 def test_recovery_state_shares_input_transaction_and_workspace_scope(
     store: SqlAlchemyConversationStore, conv_db: Path, legacy_counter: bool

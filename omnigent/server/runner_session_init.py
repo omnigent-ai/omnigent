@@ -268,6 +268,7 @@ class RunnerSessionInitializer:
                 resume_interrupted_turn=resume_interrupted_turn,
                 recovery_id=recovery_id,
                 recovery_prompt=recovery_prompt,
+                require_recovery_admission=trigger == "host_recovery",
             )
 
             async def post_session_init() -> httpx.Response:

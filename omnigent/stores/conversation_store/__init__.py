@@ -583,6 +583,11 @@ class ConversationStore(ABC):
 
     supports_session_recovery = False
 
+    def admit_session_recovery(self, conversation_id: str, expected: SessionRecovery) -> bool:
+        """Order turn admission against new input and the current host/runner binding."""
+        del conversation_id, expected
+        return False
+
     def get_session_recovery(self, conversation_id: str) -> SessionRecovery | None:
         """Read private recovery intent; unsupported stores do not opt in."""
         del conversation_id
