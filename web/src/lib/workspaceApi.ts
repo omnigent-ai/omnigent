@@ -245,9 +245,10 @@ function routeCapabilities(
       route,
       sessionId,
       async (client) => {
-        const signal = AbortSignal.timeout(CAPABILITIES_TIMEOUT_MS);
+        const controller = new AbortController();
+        const deadline = setTimeout(() => controller.abort(), CAPABILITIES_TIMEOUT_MS);
         try {
-          const response = await client.getCapabilities({}, { signal });
+          const response = await client.getCapabilities({}, { signal: controller.signal });
           return new Set(response.capabilities);
         } catch (error) {
           // A host without the capability query serves only the baseline methods.
@@ -255,6 +256,8 @@ function routeCapabilities(
             return new Set<string>();
           }
           throw error;
+        } finally {
+          clearTimeout(deadline);
         }
       },
       undefined,
