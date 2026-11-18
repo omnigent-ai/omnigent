@@ -48,6 +48,24 @@ const STEPS: WorkflowStep[] = [
   { id: "fix", name: "Fix the test", goal: "The suite passes", depends_on: ["explore"] },
 ];
 
+// One unbroken token, as a command or path in a step's goal is.
+const LONG_PATH = "//services/payments/third_party/sync/source:unit_suite_with_a_long_name";
+
+/**
+ * jsdom has no layout, so check what keeps a card's text inside it: the card wraps long
+ * tokens and fits the room beside its step. A `break-words` inside would let a long token
+ * set its line's width past the card again.
+ */
+function expectTextWrapsInside(card: HTMLElement) {
+  expect(card).toHaveClass(
+    "wrap-anywhere",
+    "max-w-[min(18rem,var(--radix-hover-card-content-available-width))]",
+    "max-h-(--radix-hover-card-content-available-height)",
+    "overflow-y-auto",
+  );
+  expect(card.querySelector(".break-words")).toBeNull();
+}
+
 /**
  * Radix can leave a hover card's open timer pending when focus opens the card
  * after a pointer enter. jsdom tears the window down before that timer fires,
@@ -121,6 +139,24 @@ describe("WorkflowStepsGraph", () => {
     expect(card).toHaveTextContent("Fix the test");
     expect(card).toHaveTextContent("The suite passes");
   });
+
+  it("wraps a long path in a step's box and in its card, which zooming doesn't scale", async () => {
+    const goal = `\`${LONG_PATH}\` passes`;
+    render(
+      <WorkflowStepsGraph
+        steps={[{ id: "check", name: "Run the suite", goal, depends_on: [] }]}
+        title="Triage flaky tests"
+      />,
+    );
+    const node = screen.getByTestId("workflow-step-node");
+    expect(within(node).getByText(goal).parentElement).toHaveClass("wrap-anywhere");
+    await userEvent.hover(node);
+    const card = await screen.findByTestId("workflow-step-card");
+    expect(card).toHaveTextContent(goal);
+    // The graph zooms by scaling what's inside it; the card opens outside it.
+    expect(screen.getByTestId("react-flow")).not.toContainElement(card);
+    expectTextWrapsInside(card);
+  });
 });
 
 describe("WorkflowGraphOverlay", () => {
@@ -185,6 +221,7 @@ describe("WorkflowGraphOverlay", () => {
     expect(within(card).getByRole("img", { name: "Failed" })).toBeInTheDocument();
     expect(card).toHaveTextContent("The upload test still fails");
     expect(card).toHaveTextContent("Goal: The suite passes");
+    expectTextWrapsInside(card);
   });
 
   it("offers each step's action in its ⋯ menu, and an open menu takes the first Escape", async () => {
