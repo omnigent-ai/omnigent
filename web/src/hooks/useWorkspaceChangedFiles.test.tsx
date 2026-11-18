@@ -4,6 +4,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useEffect } from "react";
 import type { ReactNode } from "react";
 
+vi.mock(import("@/lib/workspaceApi"), async (original) => ({
+  ...(await original()),
+  listDirectoryViaWorkspaceApi: vi.fn(async () => null),
+}));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionRunnerOnline: vi.fn(),
   useSessionHostOnline: vi.fn(),
@@ -43,6 +47,7 @@ import {
 import { goToFileSearchState, goToFileStatusMessage } from "@/shell/goToFileSearchStatus";
 
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { listDirectoryViaWorkspaceApi } from "@/lib/workspaceApi";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { conversationRegistry } from "@/store/conversationRegistry";
 
@@ -268,10 +273,10 @@ afterEach(() => {
 });
 
 describe("useWorkspaceChangedFiles gating", () => {
-  it("preserves optional repository identity and workspace-relative paths", async () => {
+  it("preserves optional repository identity, untracked lines and relative paths", async () => {
     onlineMock.mockReturnValue(true);
     const entries = [
-      { path: "api/app.py", name: "app.py", repository_root: "api" },
+      { path: "api/app.py", name: "app.py", repository_root: "api", untracked_lines: 4 },
       { path: "notes.md", name: "notes.md" },
     ].map((entry) => ({ ...entry, status: "modified", bytes: 12, modified_at: null }));
     fetchMock
@@ -281,6 +286,8 @@ describe("useWorkspaceChangedFiles gating", () => {
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(result.current.data?.data).toMatchObject(entries);
     expect(result.current.data?.data[1].repository_root).toBeUndefined();
+    // Runners that predate untracked line counts omit the field.
+    expect(result.current.data?.data[1].untracked_lines).toBeNull();
   });
 
   it("does not fetch when the runner is offline and the host is also down", async () => {
@@ -731,6 +738,32 @@ describe("useWorkspaceDirectory gating", () => {
     );
   });
 
+  it("lists through the workspace API when it answers, with no REST request", async () => {
+    onlineMock.mockReturnValue(true);
+    vi.mocked(listDirectoryViaWorkspaceApi).mockResolvedValueOnce({
+      data: [
+        {
+          id: "src/inner/a.ts",
+          name: "a.ts",
+          path: "src/inner/a.ts",
+          type: "file",
+          bytes: 3,
+          modified_at: 1,
+        },
+      ],
+      hasMore: false,
+    });
+
+    const { result } = renderHook(() => useWorkspaceDirectory("conv_api", "src/inner"), {
+      wrapper: Wrap,
+    });
+
+    await waitFor(() => expect(result.current.data).toBeDefined());
+    expect(result.current.data?.map((file) => file.path)).toEqual(["src/inner/a.ts"]);
+    expect(listDirectoryViaWorkspaceApi).toHaveBeenCalledWith("conv_api", "src/inner", 1000);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it("does not fetch when path is null (pre-existing gate)", async () => {
     onlineMock.mockReturnValue(true);
 
@@ -1117,6 +1150,14 @@ function dirEntry(path: string, type: "file" | "directory" = "file") {
   };
 }
 
+/** A listing the workspace API answers with, in its REST-shaped entries. */
+function apiListing(paths: string[], hasMore = false) {
+  return {
+    data: paths.map((path) => ({ ...dirEntry(path), name: path.split("/").pop() ?? path })),
+    hasMore,
+  };
+}
+
 function FileExistsProbe({
   id,
   path,
@@ -1158,6 +1199,25 @@ function FileExistenceProbe({
 describe("useWorkspaceFileExists", () => {
   beforeEach(() => {
     onlineMock.mockReturnValue(true);
+  });
+
+  it("checks the parent through the workspace API, leaving a miss open when it has more", async () => {
+    vi.mocked(listDirectoryViaWorkspaceApi).mockResolvedValueOnce(
+      apiListing(["docs/target.md"], true),
+    );
+    const found: { exists: boolean; settled: boolean }[] = [];
+    const missing: { exists: boolean; settled: boolean }[] = [];
+    render(
+      <Wrap>
+        <FileExistenceProbe id="conv_api" path="docs/target.md" onResult={(r) => found.push(r)} />
+        <FileExistenceProbe id="conv_api" path="docs/unseen.md" onResult={(r) => missing.push(r)} />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(found.at(-1)).toEqual({ exists: true, settled: true }));
+    expect(missing.at(-1)).toEqual({ exists: false, settled: false });
+    expect(listDirectoryViaWorkspaceApi).toHaveBeenCalledWith("conv_api", "docs", 10_000);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("lists the parent directory and reports an existing file as present", async () => {
@@ -1788,6 +1848,24 @@ describe("browse-location listings normalize to paths relative to the location",
     expect(onPaths).toHaveBeenLastCalledWith(["summary.md", "q3.csv"]);
   });
 
+  it("strips the echoed prefix from a workspace API listing too", async () => {
+    fetchMock.mockResolvedValueOnce(environmentResponse());
+    vi.mocked(listDirectoryViaWorkspaceApi).mockResolvedValueOnce(
+      apiListing(["reports/summary.md", "reports/q3.csv"]),
+    );
+    const onPaths = vi.fn();
+
+    render(
+      <Wrap>
+        <AllFilesPathsProbe id="conv_rel_api" location="reports" onPaths={onPaths} />
+      </Wrap>,
+    );
+    await waitFor(() => expect(onPaths).toHaveBeenCalled());
+
+    expect(onPaths).toHaveBeenLastCalledWith(["summary.md", "q3.csv"]);
+    expect(listDirectoryViaWorkspaceApi).toHaveBeenCalledWith("conv_rel_api", "reports", 1000);
+  });
+
   it("leaves an absolute location's already-bare paths alone", async () => {
     fetchMock
       .mockResolvedValueOnce(environmentResponse())
@@ -1802,6 +1880,7 @@ describe("browse-location listings normalize to paths relative to the location",
     await waitFor(() => expect(onPaths).toHaveBeenCalled());
 
     expect(onPaths).toHaveBeenLastCalledWith(["summary.md"]);
+    expect(listDirectoryViaWorkspaceApi).not.toHaveBeenCalled();
   });
 
   it.each([

@@ -230,6 +230,7 @@ from omnigent.stores.host_store import Host, HostStore, host_is_live
 
 if TYPE_CHECKING:
     from omnigent.onboarding.sandboxes import SandboxHostLauncher
+    from omnigent.server.session_mcp_selection import SessionMcpSelection
     from omnigent.stores.agent_store import AgentStore
     from omnigent.stores.conversation_store import Conversation, ConversationStore
 
@@ -809,6 +810,11 @@ class ManagedSandboxConfig:
         provider's launcher makes the final call through
         :meth:`~omnigent.onboarding.sandboxes.base.SandboxLifecycle.stop_when_archived`
         (see :func:`stop_archived_session_sandbox`).
+    :param mcp_selection: How sessions the server creates in this provider's
+        sandboxes record their owner's MCP services, for a provider that
+        configures MCP servers inside the sandbox rather than through the
+        server's registry. ``None`` uses the registry, as on a connected host.
+        See :mod:`omnigent.server.session_mcp_selection`.
     """
 
     server_url: str
@@ -829,6 +835,7 @@ class ManagedSandboxConfig:
     manages_profiles: bool = False
     default_profile_id: str | None = None
     stop_on_archive: bool = False
+    mcp_selection: SessionMcpSelection | None = None
 
 
 class NoReachableModels(Exception):
@@ -5235,8 +5242,8 @@ async def stop_archived_session_sandbox(
     The provider's ``stop_on_archive`` setting, passed through the launcher's
     ``stop_when_archived`` hook, decides. Only the sandbox of a session bound to
     it directly, and used by no other session (see
-    :func:`_sandbox_has_other_users`), is stopped; scheduled task runs are
-    skipped. Any failure before the stop leaves the sandbox running.
+    :func:`_sandbox_has_other_users`), is stopped; the scheduler's own sessions
+    and retained host are skipped. Any failure before the stop leaves it running.
 
     Nothing holds new work off while the provider stops the sandbox: a session
     unarchived and messaged during that call can start a runner the stop then
@@ -5250,13 +5257,26 @@ async def stop_archived_session_sandbox(
         hosts are not configured.
     :returns: ``True`` when the provider stopped the sandbox.
     """
-    from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
+    from omnigent.db.db_models import current_workspace_id
+    from omnigent.server.scheduled.schedule import continued_sandbox_host_id
+    from omnigent.stores.conversation_store import (
+        CREATED_BY_SESSION_LABEL_KEY,
+        SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+    )
 
     if config is None or conv.host_id is None:
         return False
-    if conv.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY):
-        return False
     try:
+        task_id = conv.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY)
+        if task_id:
+            # Workers inherit provenance but can own independent sandboxes.
+            is_worker = bool(
+                conv.parent_conversation_id or conv.labels.get(CREATED_BY_SESSION_LABEL_KEY)
+            )
+            if not is_worker or conv.host_id == continued_sandbox_host_id(
+                task_id, current_workspace_id()
+            ):
+                return False
         host = await asyncio.to_thread(host_store.get_host, conv.host_id)
         if host is None or host.sandbox_id is None:
             return False

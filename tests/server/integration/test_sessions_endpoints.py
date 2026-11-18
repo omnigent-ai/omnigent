@@ -2897,6 +2897,9 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
             # No renderer subscribes to the session stream in this test,
             # so the turn is stamped headless (browser tools stripped).
             "browser_renderer_available": False,
+            # The advanced browser tools switch was off at creation.
+            "browser_agent_tools": False,
+            "browser_trusted_input": False,
             # The forwarded message is the meta item; its store id lets the
             # runner dedup it on a cold-cache history reload.
             "persisted_item_id": meta["id"],
@@ -10126,12 +10129,22 @@ async def test_post_external_session_todos_publishes_session_todos(
     assert resp.status_code == 202, resp.text
     assert resp.json() == {"queued": False}
 
-    # Exactly one session.todos event must be published; no extra events.
-    assert [ev["type"] for _, ev in published] == ["session.todos"]
-    assert published[0][0] == session["id"]
+    # One chat marker each for the task that completed and the one that
+    # started, then exactly one session.todos event.
+    assert [ev["type"] for _, ev in published] == [
+        "response.output_item.done",
+        "response.output_item.done",
+        "session.todos",
+    ]
+    markers = [ev["item"]["resource"] for _, ev in published[:2]]
+    assert [(m["name"], m["status"]) for m in markers] == [
+        ("Write tests", "done"),
+        ("Fix the bug", "started"),
+    ]
+    assert {session_id for session_id, _ in published} == {session["id"]}
     # The full todos list is forwarded verbatim to subscribers.
-    assert published[0][1]["todos"] == todos
-    assert published[0][1]["conversation_id"] == session["id"]
+    assert published[2][1]["todos"] == todos
+    assert published[2][1]["conversation_id"] == session["id"]
 
 
 async def test_post_external_session_todos_updates_snapshot(
@@ -11327,6 +11340,7 @@ async def test_codex_side_chat_message_drives_parent_thread_without_child_init(
     )
     assert child_response.status_code == 202, child_response.text
     child_id = child_response.json()["child_session_id"]
+    SqlAlchemyConversationStore(db_uri).replace_runner_id(parent["id"], "native-runner")
     SqlAlchemyConversationStore(db_uri).replace_runner_id(child_id, "native-runner")
     forwarded: list[tuple[str, dict[str, Any]]] = []
 
@@ -13116,8 +13130,10 @@ async def test_external_codex_subagent_start_mints_child_session(
     )
 
 
+@pytest.mark.parametrize("parent_item_id", ["parent-before", ""])
 async def test_external_codex_subagent_start_is_idempotent_and_upserts_labels(
     client: httpx.AsyncClient,
+    parent_item_id: str,
 ) -> None:
     """
     Re-registering the same Codex child thread returns the existing child
@@ -13164,11 +13180,19 @@ async def test_external_codex_subagent_start_is_idempotent_and_upserts_labels(
                 "parent_thread_id": "thread_parent",
                 "agent_nickname": "Euclid",
                 "agent_role": "explorer",
+                "parent_item_id": parent_item_id,
             },
         },
     )
     assert second.status_code == 202, second.text
     child_id_second = second.json()["child_session_id"]
+    replay = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={"type": "external_codex_subagent_start", "data": {"thread_id": "thread_child_beta"}},
+    )
+    assert replay.status_code == 202, replay.text
+    child = (await client.get(f"/v1/sessions/{child_id_second}")).json()
+    assert child["labels"]["omnigent.codex_native.side_chat_parent_item_id"] == parent_item_id
 
     # Must return the same child id — no duplicate row minted.
     assert child_id_first == child_id_second, (

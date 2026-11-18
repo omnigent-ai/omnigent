@@ -2,6 +2,8 @@ import json
 from typing import Any
 
 _MAX_TODOS, _MAX_TEXT_LENGTH, _MAX_SERIALIZED_BYTES = 100, 4096, 256 * 1024
+# A harness's own ID for a to-do, e.g. Claude's task ID, so a renamed task stays the same task.
+_MAX_ID_LENGTH = 128
 
 
 def validate_session_todos(value: object) -> list[dict[str, Any]]:
@@ -24,7 +26,11 @@ def validate_session_todos(value: object) -> list[dict[str, Any]]:
         if len(content) > _MAX_TEXT_LENGTH or len(active_form) > _MAX_TEXT_LENGTH:
             raise ValueError(f"session todo text exceeds {_MAX_TEXT_LENGTH} characters")
         status = todo["status"]
-        normalized.append({"content": content, "status": status, "activeForm": active_form})
+        entry = {"content": content, "status": status, "activeForm": active_form}
+        todo_id = todo.get("id")
+        if isinstance(todo_id, str) and 0 < len(todo_id) <= _MAX_ID_LENGTH:
+            entry["id"] = todo_id
+        normalized.append(entry)
 
     size = len(json.dumps(normalized, ensure_ascii=False, separators=(",", ":")).encode())
     if size > _MAX_SERIALIZED_BYTES:

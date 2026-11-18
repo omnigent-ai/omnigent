@@ -132,6 +132,38 @@ def fetched_state(info: Mapping[str, Any]) -> FetchedState | None:
     )
 
 
+def listed_states(entries: object) -> list[FetchedState]:
+    """Read the states a host looked up for listed PRs while it refreshed their titles.
+
+    Hosts that look up only titles leave ``state`` out of the entries, so this is empty.
+
+    :param entries: The ``prs`` of a ``session.github.info`` payload.
+    """
+    if not isinstance(entries, list):
+        return []
+    states: list[FetchedState] = []
+    for entry in entries[:_MAX_REPORTED_PRS]:
+        if not isinstance(entry, dict):
+            continue
+        url, number, state, title = (
+            entry.get("url"),
+            entry.get("number"),
+            entry.get("state"),
+            entry.get("title"),
+        )
+        if isinstance(url, str) and isinstance(number, int) and isinstance(state, str):
+            states.append(
+                FetchedState(
+                    url=url,
+                    number=number,
+                    state=state,
+                    is_draft=entry.get("is_draft") is True,
+                    title=title if isinstance(title, str) else None,
+                )
+            )
+    return states
+
+
 def ingest_info(
     store: SessionPullRequestStore,
     session_id: str,
@@ -139,7 +171,7 @@ def ingest_info(
     *,
     requested_at: float,
 ) -> SessionPullRequests | None:
-    """Merge a host payload's PRs and the selected PR's state into the store.
+    """Merge a host payload's PRs and the states it fetched into the store.
 
     :param store: The server's PR store.
     :param session_id: The session the payload describes.
@@ -151,7 +183,11 @@ def ingest_info(
     return store.apply_report(
         session_id,
         parse_reports(info.get("prs")),
-        fetched=fetched_state(info),
+        # The selected PR's full read wins over its listed entry from the same response.
+        fetched=[
+            *listed_states(info.get("prs")),
+            *([selected] if (selected := fetched_state(info)) is not None else []),
+        ],
         requested_at=requested_at,
         complete=info.get("tracking_available") is True and isinstance(info.get("prs"), list),
     )
@@ -269,6 +305,59 @@ def needs_refresh(summary: SessionSummary, *, now: float) -> bool:
         return False
     checked = primary.state_checked_at
     return checked is None or now - checked >= FRESHNESS_S
+
+
+def has_stale_state(stored: SessionPullRequests, *, now: float) -> bool:
+    """Whether any of a session's PRs is open, or of unknown state, as of :data:`FRESHNESS_S` ago.
+
+    Unlike :func:`needs_refresh`, which looks only at the first PR, this covers
+    every PR, for surfaces that show them all.
+    """
+    if not stored.synced:
+        return True
+    return any(
+        entry.state in (None, "OPEN")
+        and (entry.state_checked_at is None or now - entry.state_checked_at >= FRESHNESS_S)
+        for entry in stored.entries
+    )
+
+
+def run_pull_requests(
+    run_id: str, stored: SessionPullRequests, *, created_session: bool
+) -> list[StoredPullRequest]:
+    """Pick the PRs one automation run created or worked on from its session's PRs.
+
+    A run gets the PRs the server first stored while the session's turn belonged
+    to it (:attr:`StoredPullRequest.run_id`), however long its agent worked
+    after the prompt was delivered. PRs first seen outside any run, such as from
+    chat between runs, belong to none. PRs with no recorded run, ones the user
+    linked or stored before runs were recorded, go to the run that created the
+    session. Branch-inferred PRs are left out, since being checked out on a
+    branch is not work on its PR, unless one is the run's only PR: that is most
+    likely the run's own branch.
+
+    :param run_id: The run.
+    :param stored: Its session's PRs.
+    :param created_session: Whether the run created the session.
+    :returns: The run's PRs, created ones first, then in the order they were first seen.
+    """
+    picked = [
+        entry
+        for entry in stored.entries
+        if entry.run_id == run_id or (not entry.run_recorded and created_session)
+    ]
+    explicit = [entry for entry in picked if entry.relationship != "inferred"]
+    if not explicit and len(picked) == 1:
+        explicit = picked
+    return sorted(
+        explicit, key=lambda entry: (entry.relationship != "created", entry.first_seen_at)
+    )
+
+
+def request_refresh(session_id: str) -> None:
+    """Refresh a session's stored PRs in the background, at most once per :data:`FRESHNESS_S`."""
+    if _installed is not None:
+        _installed.request(session_id)
 
 
 class PullRequestRefresher:

@@ -124,6 +124,16 @@ describe("formatToolTitle", () => {
     });
   });
 
+  it("formats sys_reminder_set with its time", () => {
+    expect(
+      formatToolTitle("sys_reminder_set", { message: "x", at: "2026-11-12T15:00:00-08:00" }),
+    ).toEqual({ verb: "Set reminder:", body: "2026-11-12T15:00:00-08:00" });
+    expect(formatToolTitle("sys_reminder_set", { message: "x", delay_seconds: 2700 })).toEqual({
+      verb: "Set reminder:",
+      body: "in 2700s",
+    });
+  });
+
   it("formats terminal tools with `<terminal>:<session>` identity", () => {
     const args = { terminal: "tmux", session: "dev" };
     expect(formatToolTitle("sys_terminal_launch", args)).toEqual({

@@ -86,7 +86,8 @@ class SearchConversationsTool(Tool):
         :param arguments: JSON with ``"query"`` and optional
             ``"limit"`` keys, e.g.
             ``'{"query": "database config", "limit": 5}'``.
-        :param ctx: Server-side execution context (unused).
+        :param ctx: Server-side execution context with the authenticated
+            turn actor.
         :returns: JSON string with search results.
         """
         args, error = parse_json_object_arguments(arguments)
@@ -102,10 +103,13 @@ class SearchConversationsTool(Tool):
             return json.dumps({"error": "limit must be a positive integer"})
         limit = min(limit, _MAX_SEARCH_RESULTS)
 
+        if not ctx.caller_user_id:
+            return json.dumps({"error": "conversation search requires an authenticated caller"})
+
         from omnigent.runtime import get_conversation_store
 
         conv_store = get_conversation_store()
-        items = conv_store.search(query, limit=limit)
+        items = conv_store.search(query, limit=limit, accessible_by=ctx.caller_user_id)
 
         if not items:
             return json.dumps({"results": [], "message": "No matching conversations found."})

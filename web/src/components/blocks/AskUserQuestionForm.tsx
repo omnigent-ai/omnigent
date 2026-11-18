@@ -12,7 +12,6 @@ import { ENTER_KEY } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { CompactShortcutKeys } from "@/components/ui/kbd";
 import { isDraftingTarget } from "@/hooks/useApproveHotkey";
-import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import type { ClaudeQuestion } from "@/lib/askUserQuestion";
 import {
@@ -134,9 +133,8 @@ export function AskUserQuestionForm({
   // follows the question instead of dropping to the page.
   const focusQuestionOnMoveRef = useRef(false);
   const isMobileViewport = useIsMobileViewport();
-  const isCoarsePointer = useIsCoarsePointer();
-  // Touch and narrow viewports keep Enter as the newline key, as the composer does.
-  const preventsKeyboardSubmit = isMobileViewport || isCoarsePointer;
+  // The mobile layout keeps Enter as the newline key, as the composer does.
+  const preventsKeyboardSubmit = isMobileViewport;
   const showKeyHints = !preventsKeyboardSubmit;
   // The window listener is registered once and calls the latest handler through this ref.
   const handleKeyRef = useRef<(event: KeyboardEvent) => void>(() => {});

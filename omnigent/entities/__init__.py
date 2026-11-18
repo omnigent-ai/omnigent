@@ -30,6 +30,7 @@ from omnigent.entities.databricks_connection import DatabricksConnection
 from omnigent.entities.device_grant import DeviceGrant
 from omnigent.entities.file import StoredFile
 from omnigent.entities.github_connection import GithubConnection
+from omnigent.entities.inbox_item import InboxItem
 from omnigent.entities.pagination import PagedList
 from omnigent.entities.permission import (
     ResolvedAccess,
@@ -66,6 +67,7 @@ __all__ = [
     "FunctionCallData",
     "FunctionCallOutputData",
     "GithubConnection",
+    "InboxItem",
     "ItemData",
     "LoadedAgent",
     "MessageData",

@@ -140,7 +140,7 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
         "relative flex w-full flex-col rounded-2xl md:min-h-[105px]",
         appearance === "glass"
           ? "isolate rounded-[20px] border-0 bg-transparent"
-          : "composer-reference-surface border transition-shadow duration-150 has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]",
+          : "composer-reference-surface border transition-shadow duration-150 hover:shadow-[var(--composer-shadow)] has-[textarea:focus]:shadow-[var(--composer-shadow)]",
         className,
       )}
       {...props}

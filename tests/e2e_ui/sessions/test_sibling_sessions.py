@@ -160,8 +160,17 @@ async def _drive(rig: ManagedReplicas) -> None:
                         .get_by_text("Research the API", exact=True)
                         .bounding_box()
                     )
+                    representative_box, sibling_box = [
+                        await page.locator(
+                            f'li[data-sidebar-session-id="{row_id}"]'
+                        ).bounding_box()
+                        for row_id in (source_id, sibling_id)
+                    ]
                     assert representative_label and sibling_label
-                    assert sibling_label["x"] >= representative_label["x"] + 16
+                    assert representative_box and sibling_box
+                    # The nested row steps in; its title lines up with the representative's.
+                    assert sibling_box["x"] >= representative_box["x"] + 16
+                    assert sibling_label["x"] == representative_label["x"]
                     await page.screenshot(path=str(evidence / "siblings-two-sandboxes.png"))
                     representative = page.locator(f'li[data-sidebar-session-id="{source_id}"]')
                     await page.mouse.move(1200, 900)
@@ -347,7 +356,7 @@ async def _drive(rig: ManagedReplicas) -> None:
                     # Pinning an expanded folder's family removes every row from that folder.
                     project_header = page.get_by_role("button", name="Sibling demo", exact=True)
                     if await project_header.get_attribute("aria-expanded") == "false":
-                        await project_header.click()
+                        await project_header.locator("[data-section-toggle]").first.click()
                     project_section = project_header.locator("xpath=ancestor::section[1]")
                     member_selector = f'li[data-sidebar-session-id="{fresh_id}"]'
                     member_row = project_section.locator(member_selector)
@@ -447,7 +456,7 @@ async def _drive(rig: ManagedReplicas) -> None:
                         await phone.get_by_role("button", name="Open sidebar", exact=True).click()
                         project = phone.get_by_role("button", name="Sibling demo", exact=True)
                         if await project.get_attribute("aria-expanded") == "false":
-                            await project.click()
+                            await project.locator("[data-section-toggle]").first.click()
                         row = phone.locator(f'li[data-sidebar-session-id="{fresh_id}"]').first
                         await row.scroll_into_view_if_needed()
                         box = await row.bounding_box()

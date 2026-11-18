@@ -286,7 +286,9 @@ fallback.
 
 Before deploying the server, make client builds containing the PKCE update
 available through your CLI, mobile, and Slack distribution channels, and
-announce that older clients must upgrade to sign in again. Test both an old
+announce that older clients must upgrade to sign in again. Confirm the live
+App Store and Play Store builds contain the PKCE client, not just the version
+number in the repository: mobile builds are released by hand and can lag main. Test both an old
 and an updated client against a staging server with your actual identity
 provider. The old client must show the upgrade page without signing in; the
 updated client must complete fresh sign-in and browser approval. Preserve

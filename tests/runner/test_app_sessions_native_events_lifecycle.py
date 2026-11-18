@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import sys
@@ -22,7 +23,10 @@ from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_conversation_id,
 )
 from omnigent.harnesses.codex_native import bridge as codex_native_bridge
-from omnigent.harnesses.codex_native.side_chat import SideChatEffortUnavailable
+from omnigent.harnesses.codex_native.side_chat import (
+    SideChatEffortUnavailable,
+    SideChatValidationError,
+)
 from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
 from omnigent.harnesses.cursor_native import main as cursor_native
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
@@ -2759,6 +2763,91 @@ async def test_events_interrupt_codex_side_chat_leaves_parent_turn_running(
     )
     parent_state = codex_native_bridge.read_bridge_state(bridge_dir)
     assert parent_state is not None and parent_state.active_turn_id == "turn_parent"
+    assert pm.cancelled == []
+    assert pm.released == []
+    assert conv_id not in app.state.interrupted_sessions
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("child_id", "failure", "status"),
+    [
+        ("conv_side", None, 200),
+        (None, None, 400),
+        ("", None, 400),
+        (12, None, 400),
+        ("conv_side", SideChatValidationError("Internal validation detail"), 400),
+        ("conv_side", json.JSONDecodeError("Internal parser detail", "invalid", 0), 503),
+        ("conv_side", RuntimeError("The forwarder is unavailable."), 503),
+        ("conv_side", httpx.ConnectError("Connection lost"), 503),
+    ],
+    ids=[
+        "resumed",
+        "missing-id",
+        "empty-id",
+        "invalid-id",
+        "wrong-child",
+        "invalid-history",
+        "unavailable",
+        "disconnected",
+    ],
+)
+async def test_events_resume_codex_side_chat_leaves_parent_turn_running(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    child_id: str | int | None,
+    failure: Exception | None,
+    status: int,
+) -> None:
+    from omnigent.harnesses.codex_native import side_chat
+
+    conv_id = "acbeddbbce38421b921a7abbe82f7176"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
+    bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=conv_id,
+            socket_path="ws://127.0.0.1:43210",
+            thread_id="thread_parent",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_parent",
+        ),
+    )
+    resume = AsyncMock(side_effect=failure)
+    monkeypatch.setattr(side_chat, "resume_side_chat", resume)
+    app, pm = await _build_app_for_spec(_harness_spec("codex-native"))
+    async with _runner_client(app) as client:
+        created = await client.post(
+            "/v1/sessions", json={"session_id": conv_id, "agent_id": "agent_side"}
+        )
+        assert created.status_code == 201, created.text
+        spawns_before = list(pm.get_client_calls)
+        response = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "codex_side_chat_resume", "codex_side_session_id": child_id},
+        )
+
+    assert response.status_code == status, response.text
+    if status == 200:
+        assert response.json() == {"resumed": True}
+    elif isinstance(failure, SideChatValidationError):
+        assert response.json() == {
+            "error": "invalid_request",
+            "detail": "This session is not a side chat of the active Codex parent.",
+        }
+    elif status == 503:
+        assert response.json() == {
+            "error": "codex_side_chat_unavailable",
+            "detail": "The Codex side chat could not be resumed; try again.",
+        }
+    if isinstance(child_id, str) and child_id:
+        resume.assert_awaited_once_with(bridge_dir, child_id)
+    else:
+        resume.assert_not_awaited()
+    parent_state = codex_native_bridge.read_bridge_state(bridge_dir)
+    assert parent_state is not None and parent_state.active_turn_id == "turn_parent"
+    assert pm.get_client_calls == spawns_before
     assert pm.cancelled == []
     assert pm.released == []
     assert conv_id not in app.state.interrupted_sessions

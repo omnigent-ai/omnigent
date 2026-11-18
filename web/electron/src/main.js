@@ -78,6 +78,7 @@ const { registerServerAwayWatch, AWAY_BANNER_DELAY_MS } = require("./away_banner
 const { createReturnBanner } = require("./return_banner");
 const { createReconnectOverlay } = require("./reconnect_overlay");
 const { createBrowserViewRegistry } = require("./browserViewRegistry");
+const { registerBrowserTabsIpc } = require("./browserTabs");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { goBack, goForward, registerBrowserIpc } = require("./browserIpc");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
@@ -132,6 +133,10 @@ const {
   sanitizeDesktopCommandState,
 } = require("./desktopCommands");
 const omnigentCli = require("./omnigent_cli");
+const { workspaceSocketRequest } = require("./workspaceSocket");
+const { createWorkspaceSshForwards } = require("./workspaceSshForwards");
+const { createSshHostStore } = require("./sshHosts");
+const { createSshTargetChecks } = require("./sshTargets");
 
 const serverManager = require("./server_manager");
 const { diagnostics } = require("./diagnostics");
@@ -161,14 +166,13 @@ function serverSelectorV2EnvForced() {
   return process.env.OMNIGENT_SERVER_SELECTOR_V2 === "1";
 }
 
-/** V2 defaults on for macOS users with managed features enabled. */
+/** V2 defaults on for macOS users. */
 function serverSelectorV2Enabled() {
   // If enforced by the environment variable, enable.
   if (serverSelectorV2EnvForced()) {
     return true;
   }
   const savedPreference = loadSettings().server_selector_v2 ?? null;
-  const isDatabricksManaged = databricksInternalFeaturesEnabled();
 
   // Respect the user's preference.
   if (savedPreference !== null) {
@@ -176,17 +180,7 @@ function serverSelectorV2Enabled() {
   }
 
   // Enable on macOS only.
-  if (process.platform !== "darwin") {
-    return false;
-  }
-
-  // Enable on managed devices.
-  if (isDatabricksManaged) {
-    return true;
-  }
-
-  // Otherwise, disable.
-  return false;
+  return process.platform === "darwin";
 }
 
 /** Which setup page to load — the server selector when enabled. */
@@ -354,6 +348,30 @@ function databricksInternalFeaturesEnabled() {
  * while one is in flight re-focuses the console and shares its outcome.
  */
 const arcaIdentities = createArcaIdentityStore();
+// Hosts this desktop connected over SSH, and the connections that reach their workspace sockets.
+const sshHosts = createSshHostStore(() => path.join(app.getPath("userData"), "ssh-hosts.json"));
+const workspaceSshForwards = createWorkspaceSshForwards();
+const sshTargetChecks = createSshTargetChecks({ record: sshHosts.record });
+
+/**
+ * Ask, in a dialog the page can't draw over, before SSH runs with a destination
+ * the page suggested. Null when there is no window to ask in.
+ */
+async function approveSshTarget(win, serverUrl, alias) {
+  if (!win || win.isDestroyed()) return null;
+  const { response } = await dialog.showMessageBox(win, {
+    type: "question",
+    buttons: ["Not now", "Allow"],
+    defaultId: 0,
+    cancelId: 0,
+    message: `Read this session's files over SSH from "${alias}"?`,
+    detail:
+      `${new URL(serverUrl).host} says this session's host runs on the SSH destination "${alias}". ` +
+      "Omnigent would connect with your SSH config and keys, check that the host is there, and read files from it directly instead of through the server.\n\n" +
+      `Allow only if you recognize "${alias}".`,
+  });
+  return response === 1;
+}
 
 function startArcaHostConnect(serverUrl, deps) {
   const finish = arcaIdentities.begin(serverUrl);
@@ -3145,7 +3163,11 @@ function newWindow() {
   const current = win?.webContents.getURL();
   // Cloning an ephemeral (multi-server) window keeps the clone
   // ephemeral, so Change Server… from it still won't touch saved settings.
-  createWindow(current, { ephemeral: win ? windows.get(win)?.ephemeral === true : false });
+  // The clone's server is its source's, not its /c/<id> URL (browserTabs.js keys tabs by it).
+  createWindow(current, {
+    ephemeral: win ? windows.get(win)?.ephemeral === true : false,
+    serverUrl: (win && windows.get(win)?.serverUrl) || undefined,
+  });
 }
 
 /**
@@ -4693,6 +4715,17 @@ function registerIpc() {
     return { remote: internal && arca.resolveArcaPath() !== null, bundledCli: internal };
   });
 
+  // In-flight onboarding runner connects, per setup window, so Cancel can stop one.
+  const runnerConnects = new Map();
+  ipcMain.handle("omnigent:cancel-runner-connect", (event) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("cancel-runner-connect is only available to the setup page");
+    }
+    const controller = runnerConnects.get(event.sender);
+    controller?.abort();
+    return controller !== undefined;
+  });
+
   // Setup page → connect the runner picked in onboarding to `url`, streaming
   // output, before the window opens the server. The Install click on this
   // bundled page is the user's consent, so no enrollment dialog here.
@@ -4702,10 +4735,33 @@ function registerIpc() {
     }
     if (runner !== "local" && runner !== "remote") throw new TypeError("unknown runner");
     if (typeof url !== "string") throw new TypeError("connect-runner requires a URL string");
-    const target = await resolveConnectTarget(url);
-    // Resolving can probe the network; don't start anything for a closed window.
-    if (event.sender.isDestroyed()) return { ok: false, canceled: true };
+    // One attempt per window; Cancel, a newer attempt, or closing the window aborts it.
+    runnerConnects.get(event.sender)?.abort();
+    const controller = new AbortController();
+    runnerConnects.set(event.sender, controller);
+    const abortOnClose = () => controller.abort();
+    event.sender.once("destroyed", abortOnClose);
+    try {
+      return await connectRunnerAttempt(event, url, runner, controller.signal);
+    } finally {
+      event.sender.removeListener("destroyed", abortOnClose);
+      if (runnerConnects.get(event.sender) === controller) runnerConnects.delete(event.sender);
+    }
+  });
+
+  async function connectRunnerAttempt(event, url, runner, signal) {
+    const canceled = { ok: false, canceled: true };
+    let target;
+    try {
+      target = await resolveConnectTarget(url, { signal });
+    } catch (error) {
+      if (signal.aborted) return canceled;
+      throw error;
+    }
+    // Resolving can probe the network; don't start anything for a stopped attempt.
+    if (signal.aborted || event.sender.isDestroyed()) return canceled;
     const log = (line) => {
+      if (signal.aborted) return;
       try {
         event.sender.send("omnigent:runner-connect-log", { line });
       } catch {
@@ -4717,6 +4773,7 @@ function registerIpc() {
         return { ok: false, error: "A remote environment isn't available for this server." };
       }
       const result = await connectOnboardingArca(target, log, event.sender);
+      if (signal.aborted) return canceled;
       if (result.ok) rememberOnboardingRunner(target, runner);
       return result;
     }
@@ -4733,7 +4790,9 @@ function registerIpc() {
     log("Signing in to the server if needed…");
     const auth = await serverManager.ensureServerAuth(cliCommand, target, {
       onLogin: () => log("If a browser window opens, finish signing in there."),
+      signal,
     });
+    if (auth.canceled || signal.aborted) return canceled;
     if (!auth.ok) {
       return {
         ok: false,
@@ -4746,12 +4805,14 @@ function registerIpc() {
     log("Signed in. Connecting this laptop to the server…");
     const result = await serverManager.ensureHostConnected(cliCommand, target);
     broadcastHostStatus();
+    // The host connect itself can't be stopped, but a stopped attempt isn't recorded.
+    if (signal.aborted) return canceled;
     if (result.ok) {
       log("Connected this laptop.");
       rememberOnboardingRunner(target, runner);
     }
     return { ok: result.ok, error: result.error };
-  });
+  }
 
   ipcMain.handle("omnigent:copy-setup-text", (event, text) => {
     if (!isSetupPageSender(event)) {
@@ -5378,6 +5439,27 @@ function registerIpc() {
     };
   });
 
+  // SPA → a workspace API call on a session host's local socket. The socket and
+  // call shape are checked in workspaceSocket.js; the host checks the token.
+  ipcMain.handle("omnigent:workspace-socket-request", (event, request) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("workspace-socket-request is only available to a connected server page");
+    }
+    const serverUrl = senderServerUrl(event);
+    return workspaceSocketRequest(request, {
+      sshDestination: (hostId) => (serverUrl ? sshHosts.destination(serverUrl, hostId) : null),
+      verifySshTarget: serverUrl
+        ? (hostId, alias, proves) =>
+            sshTargetChecks.verify(serverUrl, hostId, alias, {
+              approve: () =>
+                approveSshTarget(BrowserWindow.fromWebContents(event.sender), serverUrl, alias),
+              proves,
+            })
+        : undefined,
+      forwards: workspaceSshForwards,
+    });
+  });
+
   // SPA → connect a machine over SSH as a host. Requires the window's pinned origin
   // and revalidates the destination before the shell-owned console asks consent.
   ipcMain.handle("omnigent:ssh-connect", async (event, destination) => {
@@ -5408,7 +5490,20 @@ function registerIpc() {
         error: `${target} can't reach a server on this computer (${new URL(serverUrl).host}). Connect this window to a server ${target} can reach, or, if ${target} runs this server itself, run "omnigent host" there.`,
       };
     }
-    return sshConnectFlow.run(BrowserWindow.fromWebContents(event.sender), serverUrl, target);
+    const result = await sshConnectFlow.run(
+      BrowserWindow.fromWebContents(event.sender),
+      serverUrl,
+      target,
+    );
+    // Lets the file viewer read this host's workspace over SSH.
+    if (result?.ok && result.identity) {
+      try {
+        sshHosts.record(serverUrl, result.identity.hostId, target);
+      } catch (error) {
+        console.warn("[omnigent] couldn't record the SSH host:", error);
+      }
+    }
+    return result;
   });
 
   // SPA → connect the user's Arca instance to the window's server as a host,
@@ -5551,11 +5646,37 @@ function registerIpc() {
 
   // Embedded browser pane — the `omnigent:browser-*` surface lives in
   // browserIpc.js; the trust gate + per-window registry lookup are injected.
+  // Every window's view of each session's browser tabs, and the
+  // routing of a tab's calls to the one window with its page
+  // (browserTabs.js).
+  const windowShowsServer = (win) => {
+    const origin = windows.get(win)?.origin;
+    return !!origin && originOf(win.webContents.getURL()) === origin;
+  };
+  const browserTabs = registerBrowserTabsIpc({
+    ipcMain,
+    isPinnedOriginSender,
+    windows: () => windows,
+    windowForEvent: (event) => BrowserWindow.fromWebContents(event.sender),
+    // A window that navigated to a foreign page keeps its pinned origin.
+    showsServer: windowShowsServer,
+    // Tabs belong to a server, so two servers on one origin share none.
+    serverOf: (state) =>
+      (state.serverUrl && normalizeSavedServerUrl(state.serverUrl).replace(/\/+$/, "")) ||
+      state.origin,
+  });
   registerBrowserIpc({
     ipcMain,
     isPinnedOriginSender,
     getRegistryForEvent: browserRegistryForSender,
     getWindowForEvent: (event) => BrowserWindow.fromWebContents(event.sender),
+    showsServerForEvent: (event) => {
+      const win = BrowserWindow.fromWebContents(event.sender);
+      return !!win && windowShowsServer(win);
+    },
+    routeViewForEvent: browserTabs.route, // a tab's one page, in its window
+    whileOpeningView: browserTabs.whileOpening,
+    refuseCloseForEvent: browserTabs.refuseClose,
     getAgentContextForEvent: (event, opts) => {
       const win = BrowserWindow.fromWebContents(event.sender);
       const sourceHostId = typeof opts?.sourceHostId === "string" ? opts.sourceHostId : null;
@@ -6189,7 +6310,10 @@ if (!gotLock) {
     });
   });
 
-  app.on("will-quit", () => globalShortcut.unregisterAll());
+  app.on("will-quit", () => {
+    globalShortcut.unregisterAll();
+    workspaceSshForwards.closeAll();
+  });
   app.on("window-all-closed", () => {
     // macOS apps typically stay alive until Cmd-Q.
     if (process.platform !== "darwin") app.quit();
@@ -6224,6 +6348,8 @@ if (!gotLock) {
   app.on("quit", clearQuitForceExitTimer);
   app.on("before-quit", (event) => {
     quitConfirmation.quitStarted();
+    // Forced exits below skip will-quit, so SSH connections are torn down here first.
+    workspaceSshForwards.closeAll();
     if (quitCleanupDone) return;
     // A second quit (e.g. Cmd-Q again during the SIGKILL grace window) must not
     // re-enter shutdown() concurrently — just keep deferring until the first

@@ -1,11 +1,9 @@
 import { useEffect } from "react";
 
 import { isMacPlatform } from "@/lib/hotkeys";
-import { type Chord, chordMatches } from "@/lib/shortcuts/chord";
 import { supportsDesktopCommands } from "@/lib/nativeBridge";
 import { useNavigate } from "@/lib/routing";
-
-const SETTINGS_CHORD: Chord = { mod: true, alt: true, code: "Comma" };
+import { matchesShortcut } from "@/lib/shortcuts/registry";
 
 /**
  * True for Cmd+Alt+, on Apple platforms or Ctrl+Alt+, elsewhere. Never in the
@@ -16,7 +14,7 @@ export function isSettingsHotkey(
   isMac = isMacPlatform(),
   desktopMenu = supportsDesktopCommands(),
 ): boolean {
-  return !desktopMenu && chordMatches(SETTINGS_CHORD, event, isMac);
+  return matchesShortcut(event, "settings.open", { mac: isMac, desktopMenu });
 }
 
 /** Navigate to Settings from anywhere in the app. */
