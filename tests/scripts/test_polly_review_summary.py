@@ -545,6 +545,21 @@ def test_split_review_rejects_nonprogress_on_escaped_pipe_whitespace() -> None:
                 "boundary-summary-attributes",
                 "boundary-summary-fitting",
                 "short-boundary-summary",
+                "code-span-details-prose",
+                "code-span-summary-prose",
+                "code-span-details-rationale",
+                "code-span-summary-rationale",
+                "code-span-matched-runs",
+                "code-span-even-backslashes",
+                "code-span-cut-guard",
+                "short-code-span-tags",
+                "code-span-unmatched",
+                "code-span-escaped-opener",
+                "code-span-real-tag",
+                "code-span-raw-html",
+                "code-span-html-attribute",
+                "code-span-link-title",
+                "code-span-cross-line-ambiguity",
             )
         ],
     ],
@@ -621,6 +636,21 @@ def test_split_review_rejects_nonprogress_on_escaped_pipe_whitespace() -> None:
         "boundary-summary-attributes",
         "boundary-summary-fitting",
         "short-boundary-summary",
+        "code-span-details-prose",
+        "code-span-summary-prose",
+        "code-span-details-rationale",
+        "code-span-summary-rationale",
+        "code-span-matched-runs",
+        "code-span-even-backslashes",
+        "code-span-cut-guard",
+        "short-code-span-tags",
+        "code-span-unmatched",
+        "code-span-escaped-opener",
+        "code-span-real-tag",
+        "code-span-raw-html",
+        "code-span-html-attribute",
+        "code-span-link-title",
+        "code-span-cross-line-ambiguity",
     ],
 )
 def test_long_review_parts_preserve_all_assessments_and_markdown_context(
@@ -640,7 +670,15 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     if table_variant and table_variant.startswith(
-        ("container-", "short-container-", "fenced-container-", "boundary-", "short-boundary-")
+        (
+            "container-",
+            "short-container-",
+            "fenced-container-",
+            "boundary-",
+            "short-boundary-",
+            "code-span-",
+            "short-code-span-",
+        )
     ):
         from html.parser import HTMLParser
 
@@ -649,7 +687,47 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         short = table_variant.startswith("short-")
         variant = table_variant.removeprefix("short-")
         table_rows = []
-        if variant.startswith("boundary-table-"):
+        assessment_review = _REVIEW
+        code_span_refusal = variant in {
+            "code-span-unmatched",
+            "code-span-escaped-opener",
+            "code-span-real-tag",
+            "code-span-raw-html",
+            "code-span-html-attribute",
+            "code-span-link-title",
+            "code-span-cross-line-ambiguity",
+        }
+        if variant.startswith("code-span-"):
+            literal = {
+                "code-span-details-prose": "`<details>` / `</details>`",
+                "code-span-summary-prose": "`<summary>` / `</summary>`",
+                "code-span-details-rationale": "`<details>` / `</details>`",
+                "code-span-summary-rationale": "`<summary>` / `</summary>`",
+                "code-span-matched-runs": "`` `<details>` and <summary> ``",
+                "code-span-even-backslashes": r"\\`<details>`",
+                "code-span-cut-guard": "`" + "x" * 130 + "<details> <summary>" + "y" * 130 + "`",
+                "code-span-tags": "`<details>` and `<summary>`",
+                "code-span-unmatched": "`<details>",
+                "code-span-escaped-opener": r"\`<details>`",
+                "code-span-real-tag": "`<summary>` and <details>",
+                "code-span-raw-html": "",
+                "code-span-html-attribute": '<span title="use `"> <details> literal? ` </span>',
+                "code-span-link-title": '[link](https://x.test "use `") <details> literal? `',
+                "code-span-cross-line-ambiguity": "`` earlier line\nNow `` <details> literal? ``",
+            }[variant]
+            lead = "Ordinary finding é🙂.\n" * (1 if short else 4500) + "\n"
+            if variant.endswith("rationale"):
+                assessment_review = _REVIEW.replace("Guards the regression.", literal)
+            elif variant == "code-span-raw-html":
+                lead = (
+                    "<details><summary>Use `<summary>` tags</summary>\n\n"
+                    "Body\n\n</details>\n\n" + lead
+                )
+            elif variant == "code-span-cut-guard":
+                lead = "x" * 59400 + " uses " + literal + " tags.\n\n" + lead
+            else:
+                lead = "Wrap output in " + literal + " tags.\n\n" + lead
+        elif variant.startswith("boundary-table-"):
             header, delimiter = "Finding | Reason", "--- | ---"
             if variant in {
                 "boundary-table-delimiter-no-leading",
@@ -731,7 +809,8 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         if variant == "container-bounded-blockquote":
             lead += "Ordinary finding outside the quote.\n" * 4000
         review = lead + _HELPERS["compose_review"](
-            _REVIEW, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+            assessment_review,
+            {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]},
         )
         parser = MarkdownIt("commonmark").enable("table")
 
@@ -798,9 +877,22 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         review_path, receipt, posts = _prepare_publication(
             tmp_path, monkeypatch, head_sha="a" * 40, run_url="https://example.test/run"
         )
+        if code_span_refusal:
+            assert any(
+                "<details>" in token.content
+                for block in parser.parse(lead)
+                for token in ([block] if block.type == "html_block" else block.children or [])
+                if token.type in {"html_block", "html_inline"}
+            ), "An ambiguous backtick must not hide an independently parsed real tag"
+            with pytest.raises(ValueError, match=r"Polly review noncanonical (details|summary)"):
+                _published_comments(review, review_path, receipt)
+            assert not posts and not receipt.exists()
+            assert sorted(path.name for path in tmp_path.iterdir()) == ["review.md"]
+            return
         try:
             comments = _published_comments(review, review_path, receipt)
         except ValueError as error:
+            assert not variant.startswith("code-span-"), str(error)
             assert not short and variant not in {
                 "container-bounded-blockquote",
                 "fenced-container-literal",
@@ -872,8 +964,32 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
                 and tokens[index - 1].type == "td_open"
                 and token.content.startswith("case")
             ] == [f"case{index}" for index in range(len(table_rows))]
-        row = next(line for line in _REVIEW.splitlines() if line.startswith("| tests/"))
+        row = next(line for line in assessment_review.splitlines() if line.startswith("| tests/"))
         assert sum(comment.count(row) for comment in comments) == 1
+        if variant.startswith("code-span-"):
+
+            def literal_tags(tokens: list) -> list[str]:
+                return [
+                    child.content
+                    for token in tokens
+                    for child in token.children or []
+                    if child.type == "code_inline"
+                    and re.search(r"</?(details|summary)", child.content)
+                ]
+
+            expected_literals = literal_tags(original)
+            assert expected_literals
+            assert [
+                item for tokens in rendered for item in literal_tags(tokens)
+            ] == expected_literals
+            if not short:
+                fragments = [
+                    comment.split("part 1 appears.\n\n", 1)[1].rsplit("\n\n---\n", 1)[0]
+                    for comment in comments
+                ]
+                assert "".join(fragments) == review
+                if variant == "code-span-cut-guard":
+                    assert len(fragments[0]) == review.index(literal)
         if variant == "container-bounded-blockquote":
             assert (
                 sum(comment.count("Ordinary finding outside the quote.\n") for comment in comments)
@@ -2142,7 +2258,9 @@ def test_multipart_publication_is_retryable_and_completes_only_after_primary(
         "        print('a' * 40)\n"
         "    else:\n"
         "        assert arguments[1:3] == ['repos/test/repo/issues/1/comments', '--paginate']\n"
-        "        comments = [dict(user=dict(type='Bot'), html_url=f'https://example.test/{i}', "
+        "        controls = directory / 'controls.json'\n"
+        "        comments = json.loads(controls.read_text()) if controls.exists() else []\n"
+        "        comments += [dict(user=dict(type='Bot'), html_url=f'https://example.test/{i}', "
         "body=body) for i, body in enumerate(bodies)]\n"
         "        subprocess.run(['jq', '-r', arguments[arguments.index('--jq') + 1]], "
         "input=json.dumps(comments), text=True, check=True)\n"
@@ -2186,6 +2304,31 @@ def test_multipart_publication_is_retryable_and_completes_only_after_primary(
         return "duplicate=true" in output.read_text()
 
     primary_header = "<!-- polly-review-bot -->\n<!-- polly-reviewed-sha: " + "a" * 40 + " -->\n"
+    controls = tmp_path / "controls.json"
+    lookalikes = [
+        {
+            "user": {"type": "User"},
+            "html_url": "https://example.test/human",
+            "body": primary_header + "Human-authored metadata lookalike.",
+        },
+        {
+            "user": {"type": "Bot"},
+            "html_url": "https://example.test/unrelated-bot",
+            "body": "Unrelated bot quoting an example:\n```text\n" + primary_header + "```\n",
+        },
+    ]
+    controls.write_text(json.dumps(lookalikes))
+    assert not already_reviewed()
+    assert not (tmp_path / "skip.md").exists()
+    skip_notice = {
+        "user": {"type": "Bot"},
+        "html_url": "https://example.test/existing-skip",
+        "body": "<!-- polly-skipped-sha: " + "a" * 40 + " -->\nExisting skip notice.\n",
+    }
+    controls.write_text(json.dumps([*lookalikes, skip_notice]))
+    assert already_reviewed()
+    assert not (tmp_path / "skip.md").exists(), "Existing notice must not post another skip"
+    controls.write_text(json.dumps(lookalikes))
     command = [sys.executable, str(_SCRIPT), "publish", str(review), str(receipt)]
     result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=10)
     calls = json.loads((tmp_path / "calls.json").read_text())

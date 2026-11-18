@@ -318,6 +318,40 @@ def split_review(
     return parts
 
 
+def _disclosure_code_spans(line: str) -> list[tuple[int, int]]:
+    """Locate complete same-line backtick spans without rescanning unmatched tails."""
+    runs = list(re.finditer(r"`+", line))
+    following: dict[int, int] = {}
+    pairs: dict[int, tuple[int, int]] = {}
+    for index in range(len(runs) - 1, -1, -1):
+        run = runs[index]
+        start = slash_start = run.start()
+        while slash_start and line[slash_start - 1] == "\\":
+            slash_start -= 1
+        # An escaped first backtick leaves the rest of a run available to open code.
+        start += (start - slash_start) % 2
+        width = run.end() - start
+        if width and width in following:
+            pairs[index] = (slash_start, following[width])
+        following[len(run[0])] = index
+    spans = []
+    index = 0
+    previous_end = 0
+    while index < len(runs):
+        if index in pairs:
+            start, closer = pairs[index]
+            # Raw HTML and link syntax may consume backticks before inline parsing.
+            preceding = line[previous_end:start]
+            if "<" in preceding or "]" in preceding:
+                break
+            spans.append((start, runs[closer].end()))
+            previous_end = runs[closer].end()
+            index = closer + 1
+        else:
+            break
+    return spans
+
+
 def _markdown_context(
     text: str,
     *,
@@ -335,6 +369,7 @@ def _markdown_context(
     fences outside active fences, and keeps ordinary list/quote blocks indivisible.
     Tables require leading pipes; disclosure summaries must be canonical single-line
     headers that fit indivisibly. Other forms fail closed before multipart publication.
+    Unambiguous same-line disclosure code spans stay literal and indivisible.
     Inline-code formatting across fragments is not balanced.
     """
     details = 0
@@ -348,6 +383,7 @@ def _markdown_context(
     offset = previous_start = 0
     container_start = None
     container_blank = False
+    inline_ambiguous = False
     container_marker = re.compile(r">|[-+*](?=[ \t\r]|$)|[0-9]{1,9}[.)](?=[ \t\r]|$)")
     literal_marker = re.compile(r">+|[-+*#_]+|[0-9]{1,9}[.)](?=[ \t\r]|$)")
     disclosure_tag = re.compile(r"</?details(?=[ \t\f\r/>]|$)", re.IGNORECASE)
@@ -357,6 +393,28 @@ def _markdown_context(
         if protected_spans is None:
             return
         protected_spans.append((start, end, kind))
+
+    def visible_tags(
+        pattern: re.Pattern[str],
+        line: str,
+        line_start: int,
+        literal_spans: list[tuple[int, int]],
+    ) -> list[re.Match[str]]:
+        visible = []
+        literal_index = 0
+        for tag in pattern.finditer(line):
+            while (
+                literal_index < len(literal_spans)
+                and literal_spans[literal_index][1] <= tag.start()
+            ):
+                literal_index += 1
+            if literal_index < len(literal_spans):
+                start, end = literal_spans[literal_index]
+                if start <= tag.start() < end:
+                    protect_span(line_start + start, line_start + end, "inline disclosure code")
+                    continue
+            visible.append(tag)
+        return visible
 
     def protect_literals(line: str, line_start: int, active_fence: str = "") -> None:
         pattern = (
@@ -387,6 +445,7 @@ def _markdown_context(
             if re.fullmatch(rf" {{0,3}}{re.escape(fence[0])}{{{len(fence)},}}[ \t]*\r?", line):
                 protect_span(line_start, min(offset, len(text)), "fence delimiter")
                 fence = ""
+                inline_ambiguous = False
             elif protected_spans is not None:
                 protect_literals(line, line_start, fence)
             continue
@@ -439,6 +498,7 @@ def _markdown_context(
                     "Polly review container fences are not supported in multipart comments."
                 )
             fence, fence_line = opening[1], line
+            inline_ambiguous = False
             protect_span(line_start, min(offset, len(text)), "fence delimiter")
             table_header = ""
             assessment_table = False
@@ -472,7 +532,21 @@ def _markdown_context(
                             "literal indentation",
                         )
             protect_literals(line, line_start)
-            tags = list(disclosure_tag.finditer(line))
+            if not line.strip(" \t\r") or (table_header and line.lstrip().startswith("|")):
+                inline_ambiguous = False
+            code_spans = (
+                _disclosure_code_spans(line)
+                if "`" in line and not line.lstrip().startswith("<")
+                else []
+            )
+            literal_spans = [] if inline_ambiguous else code_spans
+            cursor = 0
+            for start, end in code_spans:
+                inline_ambiguous |= "`" in line[cursor:start]
+                cursor = end
+            inline_ambiguous |= "`" in line[cursor:]
+
+            tags = visible_tags(disclosure_tag, line, line_start, literal_spans)
             if tags and (
                 not line.lstrip().startswith(("<details>", "</details>"))
                 or any(
@@ -484,7 +558,7 @@ def _markdown_context(
                 raise ValueError(
                     "Polly review noncanonical details are not supported in multipart comments."
                 )
-            summaries = list(summary_tag.finditer(line))
+            summaries = visible_tags(summary_tag, line, line_start, literal_spans)
             if summaries and (
                 [tag[0] for tag in summaries] != ["<summary", "</summary"]
                 or not line.lstrip().startswith(("<details>", "<summary>"))
