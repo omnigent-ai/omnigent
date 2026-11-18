@@ -965,6 +965,9 @@ it("keeps each cell's picker inert for a read-only viewer and while its session 
   fixture.livenessKind = "host_offline";
   view.rerender(twoCellGrid());
   expect(cellModelTrigger("second")).toHaveAttribute("aria-disabled", "true");
+  fireEvent.keyDown(cellModelTrigger("second"), { key: "ArrowDown" });
+  expect(screen.queryByTestId("composer-agent-edit")).not.toBeInTheDocument();
+  expect(updateSession).not.toHaveBeenCalled();
   view.unmount();
 });
 
