@@ -7,6 +7,7 @@ import type { ReactNode } from "react";
 vi.mock(import("@/lib/workspaceApi"), async (original) => ({
   ...(await original()),
   listDirectoryViaWorkspaceApi: vi.fn(async () => null),
+  searchFilesViaWorkspaceApi: vi.fn(async () => null),
 }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
   useSessionRunnerOnline: vi.fn(),
@@ -47,7 +48,7 @@ import {
 import { goToFileSearchState, goToFileStatusMessage } from "@/shell/goToFileSearchStatus";
 
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
-import { listDirectoryViaWorkspaceApi } from "@/lib/workspaceApi";
+import { listDirectoryViaWorkspaceApi, searchFilesViaWorkspaceApi } from "@/lib/workspaceApi";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { conversationRegistry } from "@/store/conversationRegistry";
 
@@ -811,6 +812,66 @@ describe("useWorkspaceFileSearch gating", () => {
     expect(fetchMock.mock.calls[0][0]).toBe(
       "/v1/sessions/conv_live/resources/environments/default/search?limit=500&q=main&include=*.ts&exclude=**%2Fnode_modules",
     );
+  });
+});
+
+describe("useWorkspaceFileSearch through the workspace API", () => {
+  function SearchPathsProbe({ location }: { location: string }) {
+    const { data } = useWorkspaceFileSearch("conv_live", " main ", " *.ts ", "", {}, location);
+    return (
+      <>
+        <output data-testid="paths">{data?.files.map((file) => file.path).join(",")}</output>
+        <output data-testid="truncated">{String(data?.truncated)}</output>
+      </>
+    );
+  }
+
+  it("uses the API's answer, relative to the searched folder, without REST", async () => {
+    onlineMock.mockReturnValue(true);
+    vi.mocked(searchFilesViaWorkspaceApi).mockResolvedValueOnce({
+      data: [
+        {
+          id: "a/main.ts",
+          name: "main.ts",
+          path: "a/main.ts",
+          type: "file",
+          bytes: 1,
+          modified_at: 1,
+        },
+      ],
+      hasMore: false,
+      truncated: true,
+    });
+
+    render(
+      <Wrap>
+        <SearchPathsProbe location="src" />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("paths")).toHaveTextContent("a/main.ts"));
+    expect(screen.getByTestId("truncated")).toHaveTextContent("true");
+    expect(searchFilesViaWorkspaceApi).toHaveBeenCalledWith(
+      "conv_live",
+      "main",
+      { path: "src", include: "*.ts", exclude: "", limit: 500 },
+      expect.any(AbortSignal),
+    );
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("searches a folder outside the workspace through REST only", async () => {
+    onlineMock.mockReturnValue(true);
+    fetchMock.mockResolvedValue(jsonResponse({ object: "list", data: [], has_more: false }));
+
+    render(
+      <Wrap>
+        <SearchPathsProbe location="/etc" />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    expect(searchFilesViaWorkspaceApi).not.toHaveBeenCalled();
   });
 });
 
