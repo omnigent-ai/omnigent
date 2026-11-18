@@ -99,10 +99,12 @@ class GhCalls:
 @pytest.fixture(autouse=True)
 def _github(monkeypatch: pytest.MonkeyPatch) -> None:
     github_pr_state._CACHE.clear()
+    pr_resource._SUMMARY_READ_AT.clear()
     monkeypatch.setattr(github_resource, "_in_sandbox", lambda *_: True)
     monkeypatch.setattr(github_resource, "_pr_token", lambda *_: None)
     yield
     github_pr_state._CACHE.clear()
+    pr_resource._SUMMARY_READ_AT.clear()
 
 
 def _read(monkeypatch: pytest.MonkeyPatch, gh: GhCalls, url: str = URL) -> dict[str, Any] | None:
@@ -355,7 +357,7 @@ def test_a_summary_reads_every_tracked_pr_and_the_server_stores_them(
     ]
 
 
-def test_a_summary_past_the_request_deadline_reads_only_the_selected_pr(
+def test_a_summary_past_the_request_deadline_reads_no_pr(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     other = "https://github.com/example/repo/pull/43"
@@ -370,8 +372,65 @@ def test_a_summary_past_the_request_deadline_reads_only_the_selected_pr(
     with pr_resource.server_tracking(True, URL):
         info = pr_resource.pr_info("/workspace", session_id=SESSION, summary=True)
 
-    assert read == [URL]
+    assert read == []
+    assert info["pr"] is None
     assert info["pr_states"] == []
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+@pytest.mark.parametrize("seconds_per_read", [1.0, 3.0, 9.0])
+def test_summaries_cut_by_the_budget_read_every_tracked_pr_in_turn(
+    monkeypatch: pytest.MonkeyPatch, seconds_per_read: float
+) -> None:
+    urls = [f"https://github.com/example/repo/pull/{number}" for number in range(42, 46)]
+    entries = [_tracked(url) for url in urls]
+    _track(monkeypatch, entries)
+    monkeypatch.setattr(pr_resource, "_selected_pr", lambda *_: entries[0])
+    clock = _Clock()
+    monkeypatch.setattr(pr_resource, "time", clock)
+    read: list[str] = []
+
+    def reference_state(_: str, reference: PullRequestRef) -> dict[str, Any]:
+        read.append(reference.url)
+        clock.now += seconds_per_read
+        return {"number": reference.number, "url": reference.url, "title": "T", "state": "OPEN"}
+
+    monkeypatch.setattr(github_pr_state, "reference_state", reference_state)
+    for _ in urls:
+        with pr_resource.server_tracking(True, urls[0]):
+            pr_resource.pr_info("/workspace", session_id=SESSION, summary=True)
+        clock.now += 300.0
+
+    assert set(read) == set(urls)
+
+
+def test_a_summary_bounds_each_github_call_by_its_request_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entries = [_tracked(URL), _tracked("https://github.com/example/repo/pull/43")]
+    _track(monkeypatch, entries)
+    monkeypatch.setattr(pr_resource, "_selected_pr", lambda *_: entries[0])
+    clock = _Clock()
+    monkeypatch.setattr(pr_resource, "time", clock)
+    monkeypatch.setattr(github_resource, "time", clock)
+
+    def slow_run(argv: list[str], *, cwd: str, timeout: float, env: Any) -> tuple[int, str, str]:
+        # A response that takes six seconds unless the call's timeout is shorter.
+        clock.now += min(6.0, timeout)
+        return _response_200()
+
+    monkeypatch.setattr(github_resource, "_run", slow_run)
+    with pr_resource.server_tracking(True, URL):
+        pr_resource.pr_info("/workspace", session_id=SESSION, summary=True)
+
+    assert clock.now <= pr_resource._PR_TITLE_REQUEST_SECONDS
 
 
 def test_a_session_also_tracking_another_provider_gets_the_full_read(

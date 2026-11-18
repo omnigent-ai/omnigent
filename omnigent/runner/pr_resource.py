@@ -317,6 +317,12 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
         }
 
 
+# When a summary last read each PR (monotonic), so budget-cut summaries rotate.
+_SUMMARY_READ_AT: OrderedDict[str, float] = OrderedDict()
+_SUMMARY_READ_LIMIT = 256
+_SUMMARY_READ_LOCK = Lock()
+
+
 def _summary_info(
     root: str,
     reference: PullRequestRef,
@@ -326,22 +332,37 @@ def _summary_info(
     """The tracked GitHub PRs' states alone, for the server's lists.
 
     Carries no ``prs`` or ``tracking_available``, so the server keeps its tracked
-    list as is. ``pr`` is ``None`` when GitHub could not say, and the server then
-    keeps the state it has; ``pr_states`` holds the other PRs GitHub could read.
+    list as is. ``pr`` is ``None`` when GitHub could not say or the request budget
+    ran out first, and the server then keeps the state it has; ``pr_states`` holds
+    the other PRs read. Every read ends by ``request_deadline``.
     """
     # github_pr_state imports github_resource, which imports this module at load time.
-    from omnigent.runner import github_pr_state
+    from omnigent.runner import github_pr_state, github_resource
 
-    selected = github_pr_state.reference_state(root, reference)
+    tracked = {entry.url: entry for entry in entries}
+    tracked.setdefault(reference.url, reference)
+    with _SUMMARY_READ_LOCK:
+        # The longest-unread PR goes first, so the budget never skips the same ones.
+        order = sorted(
+            tracked.values(),
+            key=lambda pr: (_SUMMARY_READ_AT.get(pr.url, -1.0), pr.url != reference.url),
+        )
+    selected: dict[str, Any] | None = None
     states: list[dict[str, Any]] = []
-    for entry in entries:
-        if entry.url == reference.url:
-            continue
-        if time.monotonic() >= request_deadline:
-            break  # The rest keep their stored states until the next refresh.
-        state = github_pr_state.reference_state(root, entry)
-        if state is not None:
-            states.append(state)
+    with github_resource._gh_deadline_scope(request_deadline):
+        for entry in order:
+            if time.monotonic() >= request_deadline:
+                break  # The rest keep their stored states until the next refresh.
+            with _SUMMARY_READ_LOCK:
+                _SUMMARY_READ_AT.pop(entry.url, None)
+                _SUMMARY_READ_AT[entry.url] = time.monotonic()
+                while len(_SUMMARY_READ_AT) > _SUMMARY_READ_LIMIT:
+                    _SUMMARY_READ_AT.popitem(last=False)
+            state = github_pr_state.reference_state(root, entry)
+            if entry.url == reference.url:
+                selected = state
+            elif state is not None:
+                states.append(state)
     return {
         "object": "session.github.info",
         "available": True,
