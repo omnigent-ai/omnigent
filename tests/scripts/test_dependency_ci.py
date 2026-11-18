@@ -688,7 +688,8 @@ def test_workflows_connect_selection_to_jobs():
     assert "--reruns 0" in cli_test["run"]
     assert "test_real_cli_bash_tool_round_trip_and_inline_skill_finish" in cli_test["run"]
     assert "test_each_cli_execution_path_inherits_the_sandbox" in cli_test["run"]
-    assert "len(cases) != 16 or skipped" in cli_test["run"]
+    assert "test_bound_host_proc_does_not_expose_synthetic_parent" in cli_test["run"]
+    assert "len(cases) != 17 or skipped" in cli_test["run"]
     for name in ("pytest", "stores-postgres", "stores-cockroachdb", "stores-mysql"):
         assert jobs[name]["needs"] == "scope"
         output = "backend" if name == "pytest" else "database"

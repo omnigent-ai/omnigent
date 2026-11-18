@@ -276,7 +276,7 @@ jobs:
           mkdir -p artifacts
           uv run --no-sync pytest -q -rs --reruns 0 --timeout=180 \
             tests/inner/test_claude_worker_containment.py \
-            -k 'test_real_cli_bash_tool_round_trip_and_inline_skill_finish or test_sdk_real_cli_bash_policy_runs_before_execution or test_each_cli_execution_path_inherits_the_sandbox' \
+            -k 'test_real_cli_bash_tool_round_trip_and_inline_skill_finish or test_sdk_real_cli_bash_policy_runs_before_execution or test_each_cli_execution_path_inherits_the_sandbox or test_bound_host_proc_does_not_expose_synthetic_parent' \
             --junitxml=artifacts/claude-containment.xml
           python - <<'PYTHON'
           from pathlib import Path
@@ -285,9 +285,9 @@ jobs:
           root = ElementTree.parse(Path("artifacts/claude-containment.xml")).getroot()
           cases = root.findall(".//testcase")
           skipped = root.findall(".//skipped")
-          if len(cases) != 16 or skipped:
+          if len(cases) != 17 or skipped:
               raise SystemExit(
-                  f"Expected 16 real Claude CLI cases with no skips; "
+                  f"Expected 17 Claude containment cases with no skips; "
                   f"got {len(cases)} cases and {len(skipped)} skips"
               )
           PYTHON
