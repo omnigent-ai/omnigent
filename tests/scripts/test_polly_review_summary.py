@@ -560,6 +560,18 @@ def test_split_review_rejects_nonprogress_on_escaped_pipe_whitespace() -> None:
                 "code-span-html-attribute",
                 "code-span-link-title",
                 "code-span-cross-line-ambiguity",
+                *[
+                    f"code-span-{context}-{tag}-{placement}"
+                    for context in ("comparison", "completed-link", "completed-reference")
+                    for tag in ("details", "summary")
+                    for placement in ("prose", "rationale")
+                ],
+                "code-span-comparison-cut-guard",
+                "code-span-completed-link-cut-guard",
+                "code-span-html-attribute-quoted-close",
+                "code-span-link-title-quoted-close",
+                "short-code-span-comparison-tags",
+                "short-code-span-completed-link-tags",
             )
         ],
     ],
@@ -651,6 +663,18 @@ def test_split_review_rejects_nonprogress_on_escaped_pipe_whitespace() -> None:
         "code-span-html-attribute",
         "code-span-link-title",
         "code-span-cross-line-ambiguity",
+        *[
+            f"code-span-{context}-{tag}-{placement}"
+            for context in ("comparison", "completed-link", "completed-reference")
+            for tag in ("details", "summary")
+            for placement in ("prose", "rationale")
+        ],
+        "code-span-comparison-cut-guard",
+        "code-span-completed-link-cut-guard",
+        "code-span-html-attribute-quoted-close",
+        "code-span-link-title-quoted-close",
+        "short-code-span-comparison-tags",
+        "short-code-span-completed-link-tags",
     ],
 )
 def test_long_review_parts_preserve_all_assessments_and_markdown_context(
@@ -696,9 +720,16 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
             "code-span-html-attribute",
             "code-span-link-title",
             "code-span-cross-line-ambiguity",
+            "code-span-html-attribute-quoted-close",
+            "code-span-link-title-quoted-close",
         }
         if variant.startswith("code-span-"):
-            literal = {
+            literal_context = re.fullmatch(
+                r"code-span-(comparison|completed-link|completed-reference)-"
+                r"(details|summary)-(prose|rationale)",
+                variant,
+            )
+            literals = {
                 "code-span-details-prose": "`<details>` / `</details>`",
                 "code-span-summary-prose": "`<summary>` / `</summary>`",
                 "code-span-details-rationale": "`<details>` / `</details>`",
@@ -714,8 +745,39 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
                 "code-span-html-attribute": '<span title="use `"> <details> literal? ` </span>',
                 "code-span-link-title": '[link](https://x.test "use `") <details> literal? `',
                 "code-span-cross-line-ambiguity": "`` earlier line\nNow `` <details> literal? ``",
-            }[variant]
+                "code-span-comparison-cut-guard": "`"
+                + "x" * 130
+                + "<details> <summary>"
+                + "y" * 130
+                + "`",
+                "code-span-completed-link-cut-guard": "`"
+                + "x" * 130
+                + "<details> <summary>"
+                + "y" * 130
+                + "`",
+                "code-span-html-attribute-quoted-close": (
+                    '<span title="use > `"> <details> literal? ` </span>'
+                ),
+                "code-span-link-title-quoted-close": (
+                    '[link](https://x.test "use ) `") <details> literal? `'
+                ),
+                "code-span-comparison-tags": "Use x < 3 and `<details>` / `<summary>` tags.",
+                "code-span-completed-link-tags": (
+                    "Use a [link](https://example.test/) and `<details>` / `<summary>` tags."
+                ),
+            }
+            if literal_context:
+                prefix = {
+                    "comparison": "Use x < 3 and ",
+                    "completed-link": "Use a [link](https://example.test/) and ",
+                    "completed-reference": "Use a [link][docs] and ",
+                }[literal_context[1]]
+                literal = prefix + f"`<{literal_context[2]}>` tags."
+            else:
+                literal = literals[variant]
             lead = "Ordinary finding é🙂.\n" * (1 if short else 4500) + "\n"
+            if literal_context and literal_context[1] == "completed-reference":
+                lead = "[docs]: https://example.test/\n\n" + lead
             if variant.endswith("rationale"):
                 assessment_review = _REVIEW.replace("Guards the regression.", literal).replace(
                     "::test_empty", "::test_empty[param]"
@@ -725,8 +787,19 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
                     "<details><summary>Use `<summary>` tags</summary>\n\n"
                     "Body\n\n</details>\n\n" + lead
                 )
-            elif variant == "code-span-cut-guard":
-                lead = "x" * 59400 + " uses " + literal + " tags.\n\n" + lead
+            elif variant in {
+                "code-span-cut-guard",
+                "code-span-comparison-cut-guard",
+                "code-span-completed-link-cut-guard",
+            }:
+                prefix = {
+                    "code-span-cut-guard": " uses ",
+                    "code-span-comparison-cut-guard": " uses x < 3 and ",
+                    "code-span-completed-link-cut-guard": (
+                        " uses a [link](https://example.test/) and "
+                    ),
+                }[variant]
+                lead = "x" * 59400 + prefix + literal + " tags.\n\n" + lead
             else:
                 lead = "Wrap output in " + literal + " tags.\n\n" + lead
         elif variant.startswith("boundary-table-"):
@@ -865,6 +938,18 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
                     self.depth -= 1
 
         original = parser.parse(review)
+        if variant.startswith("code-span-") and literal_context:
+            literal_tokens = [
+                child
+                for block in parser.parse(literal + "\n\n[docs]: https://example.test/\n")
+                for child in block.children or []
+            ]
+            assert [token.content for token in literal_tokens if token.type == "code_inline"] == [
+                f"<{literal_context[2]}>"
+            ]
+            assert not any(token.type == "html_inline" for token in literal_tokens)
+            if literal_context[1].startswith("completed-"):
+                assert any(token.type == "link_open" for token in literal_tokens)
         expected = containers(original)
         assert bool(expected) == ("blockquote" in variant or "continuation" in variant)
         optional_table = (
@@ -990,7 +1075,11 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
                     for comment in comments
                 ]
                 assert "".join(fragments) == review
-                if variant == "code-span-cut-guard":
+                if variant in {
+                    "code-span-cut-guard",
+                    "code-span-comparison-cut-guard",
+                    "code-span-completed-link-cut-guard",
+                }:
                     assert len(fragments[0]) == review.index(literal)
         if variant == "container-bounded-blockquote":
             assert (

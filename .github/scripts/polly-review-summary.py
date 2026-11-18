@@ -342,7 +342,46 @@ def _disclosure_code_spans(line: str) -> list[tuple[int, int]]:
             start, closer = pairs[index]
             # Raw HTML and link syntax may consume backticks before inline parsing.
             preceding = line[previous_end:start]
-            if "<" in preceding or "](" in preceding or "][" in preceding:
+            contexts: list[str] = []
+            quote = ""
+            for token in re.finditer(
+                r"\\.|<!--|-->|<!\[CDATA\[|\]\]>|<\?|\?>|<(?=\S|$)|\]\(|\]\[|[()\[\]>\"']",
+                preceding,
+            ):
+                symbol = token[0]
+                if symbol.startswith("\\"):
+                    continue
+                if quote:
+                    if symbol == quote:
+                        quote = ""
+                elif contexts and contexts[-1] in {"-->", "]]>", "?>"}:
+                    if symbol == contexts[-1]:
+                        contexts.pop()
+                elif contexts and contexts[-1] == ">":
+                    if symbol in {'"', "'"}:
+                        quote = symbol
+                    elif symbol == ">":
+                        contexts.pop()
+                elif contexts and contexts[-1] == "]":
+                    if symbol == "]":
+                        contexts.pop()
+                elif symbol.startswith("<"):
+                    contexts.append(
+                        {"<!--": "-->", "<![CDATA[": "]]>", "<?": "?>"}.get(symbol, ">")
+                    )
+                elif contexts and contexts[-1] == ")":
+                    if symbol in {"(", "]("}:
+                        contexts.append(")")
+                    elif symbol == ")":
+                        contexts.pop()
+                    elif symbol in {'"', "'"} and preceding[token.start() - 1 : token.start()] in {
+                        " ",
+                        "\t",
+                    }:
+                        quote = symbol
+                elif symbol in {"](", "]["}:
+                    contexts.append(")" if symbol == "](" else "]")
+            if contexts or quote:
                 break
             spans.append((start, runs[closer].end()))
             previous_end = runs[closer].end()
