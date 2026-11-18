@@ -490,6 +490,40 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
             "".join(cells[4].removeprefix(" ").removesuffix(" ") for cells in fragments)
             == rationale
         )
+        if table_variant == "large-identity":
+            later_rationale = "Retains the later independent identity."
+            later_row = original.replace("test_empty", "test_later").replace(
+                "Empty input", "Different input" + "c" * 40000
+            )
+            later_row = later_row.replace("Guards the regression.", later_rationale)
+            later_review = _HELPERS["compose_review"](
+                _REVIEW.replace(original, later_row),
+                {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]},
+            )
+            later_comments = _HELPERS["review_comments"](later_review, **metadata)
+            assert len(later_comments) == 1
+            assert len(later_comments[0].encode("utf-8")) < 60000
+            (tmp_path / "later-single-comment.md").write_text(later_comments[0], encoding="utf-8")
+            comments = published_comments(composed.replace(row, row + "\n" + later_row))
+            assert sum(comment.count(later_row) for comment in comments) == 1
+            for expected_row, expected_rationale in [
+                (row, rationale),
+                (later_row, later_rationale),
+            ]:
+                expected = _HELPERS["split_table_row"](expected_row.strip().strip("|"))
+                fragments = []
+                for comment in comments:
+                    for line in comment.split("\n"):
+                        if line.startswith("|" + expected[0] + "|"):
+                            assert header + "\n" + delimiter in comment
+                            fragments.append(_HELPERS["split_table_row"](line.strip().strip("|")))
+                assert fragments
+                assert all(len(cells) == 5 and cells[:4] == expected[:4] for cells in fragments)
+                assert all(all(cell.strip() for cell in cells) for cells in fragments)
+                assert (
+                    "".join(cells[4].removeprefix(" ").removesuffix(" ") for cells in fragments)
+                    == expected_rationale
+                )
         return
 
     if final_table_newline is not None:

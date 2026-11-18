@@ -267,8 +267,10 @@ def compose_review(review: str, stats: dict) -> str:
     )
 
 
-def split_review(review: str, byte_limit: int, *, in_table_row: bool = False) -> list[str]:
-    """Partition without dropping text, preferring complete Markdown lines."""
+def split_review(
+    review: str, byte_limit: int, *, in_table_row: bool = False, split_once: bool = False
+) -> list[str]:
+    """Partition without dropping text; optionally leave the tail unsplit."""
     if byte_limit < 4:
         raise ValueError("Comment wrappers leave no room for review content.")
     parts = []
@@ -307,6 +309,8 @@ def split_review(review: str, byte_limit: int, *, in_table_row: bool = False) ->
             raise ValueError("Polly review split cannot make progress within comment capacity.")
         parts.append(review[:end])
         review = review[end:]
+        if split_once:
+            break
     parts.append(review)
     return parts
 
@@ -440,6 +444,7 @@ def review_comments(review: str, *, head_sha: str, run_id: str, run_url: str) ->
                     "".join(chunks[part - 1 :]),
                     len(chunk.encode("utf-8")) - overflow,
                     in_table_row=prefix.endswith("| "),
+                    split_once=True,
                 )
                 break
             comments.append(comment)
