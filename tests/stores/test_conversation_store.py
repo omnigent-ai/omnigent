@@ -10428,10 +10428,12 @@ async def test_sibling_family_lifecycle(tmp_path, split_database, user_id, monke
     assert store.get_conversation(replacement.id).project_id is None
     assert all(member.project_id == project_id for member in store.get_session_family(later.id))
     candidate = store.create_conversation()
-    with pytest.raises(OmnigentError, match="another family"):
-        store.add_new_sibling(replacement.id, candidate.id, user_id=user_id)
-    assert store.get_conversation(replacement.id).family_id is None
-    assert store.get_conversation(candidate.id).family_id is None
+    store.add_new_sibling(replacement.id, candidate.id, user_id=user_id)
+    assert (
+        store.get_conversation(candidate.id).family_id
+        == store.get_conversation(replacement.id).family_id
+    )
+    assert store.get_conversation(candidate.id).family_id != source.id
 
     another = store.create_conversation()
     another_sibling = store.create_conversation(labels={"omni_project": "Other project"})
@@ -10570,7 +10572,7 @@ def test_failed_family_membership_preserves_source_pin(
 @pytest.mark.parametrize("store_name", ["conversation_store", "split_db_conversation_store"])
 def test_move_one_session_between_nests(request, store_name, monkeypatch):
     from omnigent.errors import OmnigentError
-    from omnigent.stores.conversation_store import family_pinned_label_key
+    from omnigent.stores.conversation_store import family_pinned_label_key, pinned_label_key
 
     store = request.getfixturevalue(store_name)
     clock = [100]
@@ -10594,14 +10596,20 @@ def test_move_one_session_between_nests(request, store_name, monkeypatch):
         moved.root_conversation_id,
     )
     assert store.get_session_family(moved.id)[0].id == head.id
+    store.set_family_pin(head.id, "234", user_id="owner")
+    store.set_conversation_project(head.id, "d" * 32)
+    assert store.get_conversation(moved.id).project_id == "d" * 32
+    assert store.get_conversation(moved.id).labels[family_pinned_label_key("owner")] == "234"
     other = store.create_conversation()
     store.set_session_nest(moved.id, other.id, user_id="owner")
     assert {row.id for row in store.get_session_family(head.id)} == {head.id, peer.id}
     assert family_pinned_label_key("owner") not in store.get_conversation(moved.id).labels
     store.set_session_nest(other.id, None, user_id="owner")
     assert store.get_conversation(other.id).family_id is None
+    store.set_labels(other.id, {pinned_label_key("owner"): "345"})
     fresh = store.create_conversation()
-    store.set_session_nest(fresh.id, other.id, user_id="owner")
+    store.add_new_sibling(other.id, fresh.id, user_id="owner")
+    assert store.get_conversation(fresh.id).labels[family_pinned_label_key("owner")] == "345"
     assert store.get_conversation(fresh.id).family_id != store.get_conversation(moved.id).family_id
     child = store.create_conversation(parent_conversation_id=head.id)
     with pytest.raises(OmnigentError):

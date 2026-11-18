@@ -2063,8 +2063,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             raise ConversationNotFoundError(source_id)
         family_id = source.family_id or source.id
         target = self.get_conversation(session_id) if move_existing else None
-        if move_existing and source.family_id is None:
-            with self._session("move_session_nest") as session:
+        if source.family_id is None:
+            with self._session("prepare_sibling_membership") as session:
                 if self._family_member_ids(session, family_id):
                     family_id = uuid.uuid4().hex
         pin_key = pinned_label_key(user_id)
@@ -2207,7 +2207,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         labels_session,
                         members if initialize_labels else [session_id],
                         label_source_id=family_id
-                        if initialize_labels and not move_existing
+                        if initialize_labels and family_id in members
                         else source_id,
                         promote_pin=initialize_labels,
                         project_id=source_meta.project_id,
@@ -2300,8 +2300,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             .order_by(
                 SqlConversation.archived,
-                SqlConversation.created_at,
                 case((SqlConversation.id == family_id, 0), else_=1),
+                SqlConversation.created_at,
                 SqlConversation.id,
             )
             .limit(1)

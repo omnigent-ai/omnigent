@@ -3024,6 +3024,21 @@ describe("useMoveToNest", () => {
       const queryClient = new QueryClient();
       const key = ["conversations", "", false];
       queryClient.setQueryData(key, infinitePage([row]));
+      queryClient.setQueryData(
+        ["projects"],
+        [
+          { id: "project", name: "Initial project" },
+          { id: "confirmed", name: "Confirmed project" },
+        ],
+      );
+      const folderKey = ["project-sessions", "Initial project", "created_at", false];
+      queryClient.setQueryData(folderKey, infinitePage([]));
+      let settle!: () => void;
+      vi.spyOn(queryClient, "invalidateQueries").mockReturnValue(
+        new Promise<void>((done) => {
+          settle = done;
+        }),
+      );
       const wrapper = ({ children }: { children: ReactNode }) =>
         createElement(QueryClientProvider, { client: queryClient }, children);
       const { result } = renderHook(() => useMoveToNest(), { wrapper });
@@ -3036,32 +3051,51 @@ describe("useMoveToNest", () => {
         queryClient.getQueryData<ConversationsInfiniteData>(key)?.pages[0].data[0],
       ).toMatchObject(updated);
       expect(withMoveTombstone(row)).toMatchObject(updated);
-      resolve(mockResponse(updated));
+      if (!detach)
+        expect(
+          queryClient.getQueryData<ConversationsInfiniteData>(folderKey)?.pages[0].data[0],
+        ).toMatchObject({ id: row.id, family: updated.family, project_id: updated.project_id });
+      const confirmed = { ...updated, project_id: "confirmed" };
+      resolve(mockResponse(confirmed));
+      await waitFor(() => expect(withMoveTombstone(row)).toMatchObject(confirmed));
+      settle();
       await waitFor(() => expect(result.current.isSuccess).toBe(true));
       expect(withMoveTombstone(row)).toEqual(row);
     },
   );
 
-  it("restores the row if the server rejects the move", async () => {
-    const row = conversation({
-      id: "moved",
-      family: { id: "nest", representative_id: "head", pinned: false },
-    });
-    fetchMock.mockResolvedValue(
-      mockResponse({ detail: "Move rejected" }, { ok: false, status: 409 }),
-    );
-    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
-    const key = ["conversations", "", false];
-    const original = infinitePage([row]);
-    queryClient.setQueryData(key, original);
-    const wrapper = ({ children }: { children: ReactNode }) =>
-      createElement(QueryClientProvider, { client: queryClient }, children);
-    const { result } = renderHook(() => useMoveToNest(), { wrapper });
-    result.current.mutate({ id: row.id, destination: null });
-    await waitFor(() => expect(result.current.isError).toBe(true));
-    expect(queryClient.getQueryData(key)).toEqual(original);
-    expect(withMoveTombstone(row)).toEqual(row);
-  });
+  it.each([false, true])(
+    "restores a rejected move without reviving a removed open row (removed=%s)",
+    async (removed) => {
+      const row = conversation({
+        id: "moved",
+        family: { id: "nest", representative_id: "head", pinned: false },
+      });
+      let rejectMove!: (response: Response) => void;
+      fetchMock.mockReturnValue(
+        new Promise<Response>((resolve) => {
+          rejectMove = resolve;
+        }),
+      );
+      const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+      const key = ["conversations", "", false];
+      const original = infinitePage([row]);
+      queryClient.setQueryData(key, original);
+      const backfillKey = ["conversation-backfill", row.id];
+      queryClient.setQueryData(backfillKey, row);
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      const { result } = renderHook(() => useMoveToNest(), { wrapper });
+      result.current.mutate({ id: row.id, destination: null });
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+      if (removed) queryClient.setQueryData(backfillKey, null);
+      rejectMove(mockResponse({ detail: "Move rejected" }, { ok: false, status: 409 }));
+      await waitFor(() => expect(result.current.isError).toBe(true));
+      expect(queryClient.getQueryData(key)).toEqual(original);
+      expect(withMoveTombstone(row)).toEqual(row);
+      expect(queryClient.getQueryData(backfillKey)).toEqual(removed ? null : row);
+    },
+  );
 });
 
 describe("useMoveToProject", () => {

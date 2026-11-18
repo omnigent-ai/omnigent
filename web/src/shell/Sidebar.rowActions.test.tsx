@@ -66,6 +66,7 @@ const mocks = vi.hoisted(() => {
     projectIcons: {} as Record<string, string | null | undefined>,
     moveToProject: { mutate: vi.fn() },
     moveToNest: { mutate: vi.fn(), isPending: false },
+    searchRows: [] as Conversation[],
     leave: { mutate: vi.fn(), isPending: false },
     // The signed-in viewer. Rows with no `owner` read as owned by them; a row
     // owned by someone else is the shared case Leave applies to.
@@ -127,6 +128,18 @@ vi.mock("@/hooks/useConversations", async () => {
     }),
     useMoveToProject: () => mocks.moveToProject,
     useMoveToNest: () => mocks.moveToNest,
+    useSessionSearch: (query: string) => ({
+      data: {
+        pages: [
+          {
+            data: mocks.searchRows.filter((row) =>
+              row.title?.toLowerCase().includes(query.toLowerCase()),
+            ),
+          },
+        ],
+      },
+      isFetching: false,
+    }),
   };
 });
 
@@ -299,6 +312,7 @@ beforeEach(() => {
   mocks.rename.isError = false;
   mocks.moveToProject.mutate.mockReset();
   mocks.moveToNest.mutate.mockReset();
+  mocks.searchRows = [];
   mocks.leave.mutate.mockReset();
   mocks.projects = [];
   mocks.projectIcons = {};
@@ -1155,8 +1169,22 @@ describe("two-step move menu", () => {
     fireEvent.change(search, { target: { value: "missing" } });
     expect(screen.queryByRole("menuitem", { name: "Destination nest" })).toBeNull();
     fireEvent.change(search, { target: { value: "Destination" } });
-    fireEvent.click(screen.getByRole("menuitem", { name: "Destination nest" }));
-    expect(mocks.moveToNest.mutate).toHaveBeenCalledWith({ id: CONV.id, destination });
+    expect(screen.getByRole("menuitem", { name: "Destination nest" })).toBeInTheDocument();
+    const remote = {
+      ...destination,
+      id: "remote",
+      title: "Member session",
+      family: {
+        ...destination.family,
+        id: "remote",
+        representative_id: "remote",
+        representative_title: "Remote nest",
+      },
+    };
+    mocks.searchRows = [remote];
+    fireEvent.change(search, { target: { value: "Member" } });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Remote nest" }));
+    expect(mocks.moveToNest.mutate).toHaveBeenCalledWith({ id: CONV.id, destination: remote });
     view.unmount();
     renderSidebar(undefined, serverInfo({ sibling_sessions: true, session_nest_moves: true }));
     fireEvent.pointerDown(

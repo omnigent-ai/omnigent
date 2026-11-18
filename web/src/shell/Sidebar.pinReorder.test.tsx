@@ -16,15 +16,21 @@ const mocks = vi.hoisted(() => ({
   pinFn: vi.fn(),
   reorderPins: vi.fn(),
   moveNest: vi.fn(),
+  moveProject: vi.fn(),
+  projects: [] as { id: string; name: string }[],
+  projectRows: [] as ReturnType<typeof conv>[],
 }));
 
 vi.mock("@/hooks/useConversations", async () => {
-  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
+  const { conversationHooksMock, conversationPage: projectPage } =
+    await import("@/test/sidebarMockHelpers");
   const { useMutation } = await import("@tanstack/react-query");
   const { PIN_WRITE_MUTATION_KEY } = await import("@/lib/sessionListCache");
   return {
     ...conversationHooksMock(),
-    useProjects: vi.fn(() => ({ data: [] })),
+    useProjects: () => ({ data: mocks.projects }),
+    useProjectSessions: () => projectPage(mocks.projectRows),
+    useMoveToProject: () => ({ mutate: mocks.moveProject }),
     usePinnedConversations: () => ({
       data: { conversations: mocks.pinned, filterHonored: mocks.filterHonored },
       isSuccess: true,
@@ -102,6 +108,8 @@ async function dropOnto(
 }
 
 beforeEach(() => {
+  mocks.projects = [];
+  mocks.projectRows = [];
   mocks.filterHonored = true;
   mocks.pinned = [
     conv("conv_a", { labels: { "omnigent.pinned": "1000" } }),
@@ -138,13 +146,16 @@ it("joins a nest by dropping on its center and detaches through a floating targe
   );
   const rowRect = vi.mocked(Element.prototype.getBoundingClientRect).getMockImplementation()!;
   vi.mocked(Element.prototype.getBoundingClientRect).mockImplementation(function (this: Element) {
-    if (this.matches('[data-testid="detach-nest-target"]'))
-      return rowRect.call(document.querySelector('li[data-sidebar-session-id="conv_d"]')!);
+    if (this.matches('[data-testid="detach-nest-target"]')) return new DOMRect(0, 500, 100, 30);
+    if (this.matches('[data-testid="sidebar-ungroup-drop-zone"]'))
+      return new DOMRect(110, 500, 100, 30);
     return rowRect.call(this);
   });
-  renderSidebar({
+  const view = renderSidebar({
     info: { ...FALLBACK_SERVER_INFO, sibling_sessions: true, session_nest_moves: true },
   });
+  await dropOnto("conv_c", "conv_d", { expectTarget: false, offsetY: ROW_HEIGHT / 2 - 2 });
+  expect(mocks.moveNest).not.toHaveBeenCalled();
   await dropOnto("conv_c", "conv_d", { expectTarget: false });
   expect(mocks.moveNest).toHaveBeenCalledWith({ id: "conv_c", destination });
   const member = document.querySelector('li[data-sidebar-session-id="conv_member"]')!;
@@ -153,9 +164,10 @@ it("joins a nest by dropping on its center and detaches through a floating targe
   fireEvent.mouseDown(member, { button: 0, ...start });
   fireEvent.mouseMove(document, { clientX: start.clientX, clientY: start.clientY - 10 });
   const target = await screen.findByTestId("detach-nest-target");
-  expect(target).toHaveStyle({ position: "fixed" });
+  expect(target.parentElement).toHaveClass("absolute", "top-full");
+  expect(document.querySelector("nav")).not.toContainElement(target);
   expect([...document.querySelectorAll("li[data-sidebar-session-id]")]).toEqual(rowsBefore);
-  const drop = rowCenter("conv_d");
+  const drop = { clientX: 50, clientY: 515 };
   await act(async () => {
     fireEvent.mouseMove(document, drop);
   });
@@ -163,6 +175,30 @@ it("joins a nest by dropping on its center and detaches through a floating targe
     fireEvent.mouseUp(document, drop);
   });
   expect(mocks.moveNest).toHaveBeenLastCalledWith({ id: "conv_member", destination: null });
+  view.unmount();
+  mocks.projects = [{ id: "project", name: "Demo" }];
+  mocks.projectRows = [
+    conv("conv_d", { family, project_id: "project" }),
+    conv("conv_member", { family, project_id: "project" }),
+  ];
+  vi.mocked(useConversations).mockReturnValue(conversationPage([]));
+  renderSidebar({
+    info: { ...FALLBACK_SERVER_INFO, sibling_sessions: true, session_nest_moves: true },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Demo" }));
+  const head = document.querySelector('li[data-sidebar-session-id="conv_d"]')!;
+  const headStart = rowCenter("conv_d");
+  fireEvent.mouseDown(head, { button: 0, ...headStart });
+  fireEvent.mouseMove(document, { clientX: headStart.clientX, clientY: headStart.clientY - 10 });
+  expect(await screen.findByTestId("detach-nest-target")).toBeInTheDocument();
+  expect(screen.getByTestId("sidebar-ungroup-drop-zone")).toBeInTheDocument();
+  await act(async () => {
+    fireEvent.mouseMove(document, { clientX: 150, clientY: 515 });
+  });
+  await act(async () => {
+    fireEvent.mouseUp(document, { clientX: 150, clientY: 515 });
+  });
+  expect(mocks.moveProject).toHaveBeenLastCalledWith({ id: "conv_d", project: "" });
 });
 
 describe("dropping an unpinned session onto a pinned row", () => {

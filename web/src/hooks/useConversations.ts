@@ -2548,16 +2548,24 @@ export function useMoveToNest() {
       );
       const backfill = queryClient.getQueryData<Conversation | null>(["conversation-backfill", id]);
       const pins = queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY);
-      const globallyVisible = queries.some(
-        ([key, data]) =>
-          key[0] === "conversations" &&
-          data?.pages.some((page) => page.data.some((c) => c.id === id)),
-      );
-      const targetLoaded = queries.some(
-        ([key, data]) => key[0] === "project-sessions" && key[1] === project && data,
-      );
       for (const [key, data] of queries) {
         const inProject = key[0] === "project-sessions";
+        const scope = inProject ? parseProjectSessionsQueryKey(key) : null;
+        const globallyVisible = queries.some(
+          ([windowKey, window]) =>
+            windowKey[0] === "conversations" &&
+            (windowKey[5] ?? "updated_at") === scope?.sortBy &&
+            scope?.archived === (row.archived === true) &&
+            window?.pages.some((page) => page.data.some((item) => item.id === id)),
+        );
+        const targetLoaded = queries.some(
+          ([targetKey, target]) =>
+            targetKey[0] === "project-sessions" &&
+            targetKey[1] === project &&
+            target &&
+            parseProjectSessionsQueryKey(targetKey).sortBy === scope?.sortBy &&
+            parseProjectSessionsQueryKey(targetKey).archived === scope?.archived,
+        );
         if (inProject && key[1] !== project && !globallyVisible && !targetLoaded) continue;
         const filters = inProject
           ? filtersFromProjectQueryKey(key)
@@ -2581,11 +2589,20 @@ export function useMoveToNest() {
       if (!previous) return;
       unmarkSessionMoving(id, previous.move);
       for (const [key, data] of previous.queries) if (data) queryClient.setQueryData(key, data);
-      queryClient.setQueryData(["conversation-backfill", id], previous.backfill);
+      restoreOpenSessionRow(queryClient, id, previous.backfill);
       queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, previous.pins);
     },
     onSuccess: (updated, _variables, previous) => {
-      if (previous) previous.move.family = updated.family ?? null;
+      if (!previous) return;
+      previous.move.family = updated.family ?? null;
+      previous.move.projectId = updated.project_id ?? null;
+      previous.move.projectLabel = updated.labels?.[PROJECT_LABEL_KEY] || undefined;
+      previous.move.project =
+        queryClient
+          .getQueryData<ProjectSummary[]>(["projects"])
+          ?.find((project) => project.id === updated.project_id)?.name ??
+        previous.move.projectLabel ??
+        null;
     },
     onSettled: async (_data, _error, { id }, previous) => {
       await Promise.all(

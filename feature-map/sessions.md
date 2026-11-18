@@ -363,13 +363,18 @@ then continue from Chat or Terminal.
 
 **Sidebar row:** hover a row and open its menu, or right-click the row. Both
 offer pin, fork, rename, mark as unread or read, create automation (when
-automations are on), add to project (or move session), archive or unarchive,
+automations are on), Move session, archive or unarchive,
 and delete. Create automation opens the New automation dialog for the session;
 saving files its copy in the automation's project and opens the automation. The
 dialog and the automation's page link the session it starts from under Starts
 from. Deleting a session an automation runs from asks to Delete both, and leaves
 the automation's page for the automations list. With automations off for the
 caller, the session is deleted alone and its automation pauses at its next run.
+
+**Move session:** choose **Projects** or **Nests**, each with its own search.
+Nests also offers **Remove from nest**. Drag onto a nest row's center to join;
+row edges retain pin/custom ordering. Removal targets appear over the sidebar
+footer, keeping session rows in place and available as drop targets.
 
 **Project folder:** right-click its header or open its three-dot menu, then
 choose Rename project. Start typing as soon as the dialog opens. Delete project
@@ -885,6 +890,10 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_header_move_to_project.py::test_header_folder_tag_moves_session_into_existing_project`.
   Repeat from the header menu's Add to project by hand and expect the row to
   regroup under that project.
+- **`siblings`, moving existing sessions:** use an owned active session and nest.
+  Drag into the nest, then onto **Remove from nest** in the footer. Repeat through
+  the sidebar kebab and right-click **Move session → Nests**, search by a nest or
+  member title, and reload to confirm membership. **Projects** retains its own search.
 - **Right-click menu:**
   `tests/e2e_ui/sessions/test_sidebar_context_menu.py::test_right_click_opens_session_actions_menu`
 - **`project-rename`, project header right-click and three-dot menus:**

@@ -2969,6 +2969,21 @@ function ConversationList({
     }
     moveToNest.mutate({ id, destination });
   });
+  const canJoinNests = serverInfo !== "loading" && serverInfo.sibling_sessions === true;
+  const nestMoveValue = useMemo(
+    () =>
+      nestMovesSupported
+        ? {
+            destinations: allConversations.filter(
+              (row) => row.family && !row.archived && isOwnedByViewer(row, viewerId),
+            ),
+            move: moveNest,
+            canJoin: canJoinNests,
+            saving: moveToNest.isPending,
+          }
+        : null,
+    [nestMovesSupported, allConversations, viewerId, moveNest, canJoinNests, moveToNest.isPending],
+  );
   // The session currently being dragged (id + source project + pinned state), or
   // null. Set on drag start, cleared on end/cancel; drives the DragOverlay
   // preview and which drop zones light up (ungroup only for a filed session, pin
@@ -2978,6 +2993,8 @@ function ConversationList({
     label: string;
     project: string | null;
     isPinned: boolean;
+    canDetachNest: boolean;
+    canMoveProject: boolean;
   } | null>(null);
   // Mouse: a small drag threshold so a plain click still navigates / opens the
   // kebab. Touch: a press-and-hold delay so scrolling the list isn't hijacked
@@ -3023,12 +3040,21 @@ function ConversationList({
       return;
     }
     const data = event.active.data.current as
-      { label?: string; project?: string | null; isPinned?: boolean } | undefined;
+      | {
+          label?: string;
+          project?: string | null;
+          isPinned?: boolean;
+          canDetachNest?: boolean;
+          canMoveProject?: boolean;
+        }
+      | undefined;
     setActiveDrag({
       id: String(event.active.id),
       label: data?.label ?? String(event.active.id),
       project: data?.project ?? null,
       isPinned: data?.isPinned ?? false,
+      canDetachNest: data?.canDetachNest === true,
+      canMoveProject: data?.canMoveProject === true,
     });
   }, []);
   const handleDragEnd = useCallback(
@@ -3475,6 +3501,13 @@ function ConversationList({
   // Section structure comes from the muted micro-headers + whitespace
   // alone (Linear-style) — no icons or counts in the headers, no divider
   // rules between groups.
+  const removalTargetContainer = scrollContainerRef.current?.parentElement;
+  const showProjectRemoval =
+    !showShared &&
+    !grouped &&
+    activeDrag?.canMoveProject &&
+    activeDrag.project !== null &&
+    sections.sessions.length === 0;
   return (
     <SidebarRowDataProvider
       projectNamesById={projectNamesById}
@@ -3486,18 +3519,7 @@ function ConversationList({
       serverInfo={serverInfo}
       onActivate={activateRow}
       onReorder={reorderSessions}
-      nestMoves={
-        nestMovesSupported
-          ? {
-              destinations: allConversations.filter(
-                (row) => row.family && !row.archived && isOwnedByViewer(row, viewerId),
-              ),
-              move: moveNest,
-              canJoin: serverInfo.sibling_sessions === true,
-              saving: moveToNest.isPending,
-            }
-          : null
-      }
+      nestMoves={nestMoveValue}
     >
       <DndContext
         sensors={sensors}
@@ -3540,13 +3562,16 @@ function ConversationList({
               );
             });
             if (nest) return [nest];
+            const targets = collisions.filter(
+              (hit) => hit.data?.droppableContainer.data.current?.type !== "session-nest",
+            );
             // A row reorders; elsewhere, e.g. over another project's row, its folder files it.
-            const row = collisions.find(
+            const row = targets.find(
               (hit) => hit.data?.droppableContainer.data.current?.type === "session-order",
             );
             if (row) return [row];
             // Over a pinned row, note which half the pointer is in: a new pin lands on that side.
-            const [first, ...rest] = collisions;
+            const [first, ...rest] = targets;
             const rect = first && args.droppableRects.get(first.id);
             if (
               first?.data?.droppableContainer.data.current?.type === "pin-order" &&
@@ -3556,7 +3581,7 @@ function ConversationList({
               const below = args.pointerCoordinates.y > rect.top + rect.height / 2;
               return [{ ...first, data: { ...first.data, below } }, ...rest];
             }
-            return collisions;
+            return targets;
           }
           // Restrict project drops to the project list inside the sidebar.
           if (args.pointerCoordinates) {
@@ -3595,17 +3620,14 @@ function ConversationList({
         }}
       >
         {activeDrag && <GridDropTargets sessionId={activeDrag.id} />}
-        {activeDrag &&
-          ((nestMovesSupported &&
-            allConversations.find((row) => row.id === activeDrag.id)?.family) ||
-            (!showShared && !grouped && activeDrag.project && sections.sessions.length === 0)) && (
-            <UngroupDropZone
-              nest={
-                nestMovesSupported &&
-                !!allConversations.find((row) => row.id === activeDrag.id)?.family
-              }
-              rect={scrollContainerRef.current?.getBoundingClientRect()}
-            />
+        {(activeDrag?.canDetachNest || showProjectRemoval) &&
+          removalTargetContainer &&
+          createPortal(
+            <div className="absolute inset-x-0 top-full z-[60] flex h-12 gap-1 px-1">
+              {activeDrag?.canDetachNest && <UngroupDropZone nest />}
+              {showProjectRemoval && <UngroupDropZone nest={false} />}
+            </div>,
+            removalTargetContainer,
           )}
         <RowEditHoldContext.Provider value={reportRowEditing}>
           <PinSavingContext.Provider value={pinWriting}>
@@ -3990,32 +4012,24 @@ function PinDropZone({ active, children }: { active: boolean; children: ReactNod
   );
 }
 
-/** Float above the list so showing the removal target never shifts session rows. */
-function UngroupDropZone({ nest, rect }: { nest: boolean; rect?: DOMRect }) {
+/** The footer overlay keeps removal targets clear of session rows. */
+function UngroupDropZone({ nest }: { nest: boolean }) {
   const { setNodeRef, isOver } = useDroppable({
     id: nest ? "detach-nest" : "__ungroup__",
     data: { type: nest ? "detach-nest" : "ungroup" },
   });
-  return createPortal(
+  return (
     <div
       ref={setNodeRef}
       data-testid={nest ? "detach-nest-target" : "sidebar-ungroup-drop-zone"}
-      style={{
-        position: "fixed",
-        left: rect?.left,
-        top: rect?.top,
-        width: rect?.width,
-        zIndex: 60,
-      }}
       className={cn(
-        "flex items-center gap-1.5 rounded-md border border-dashed border-border bg-popover px-2 py-1.5 text-muted-foreground text-sm shadow-sm transition-colors",
+        "flex min-w-0 flex-1 items-center gap-1.5 rounded-md border border-dashed border-border bg-popover px-2 py-1 text-muted-foreground text-sm shadow-sm transition-colors",
         isOver && cn(DROP_TARGET_HIGHLIGHT, "text-foreground"),
       )}
     >
       <FolderMinusIcon className="size-3.5 shrink-0" />
-      {nest ? "Remove from nest" : "Drop here to remove from project"}
-    </div>,
-    getEmbedRoot() ?? document.body,
+      {nest ? "Remove from nest" : "Remove from project"}
+    </div>
   );
 }
 
@@ -7546,7 +7560,12 @@ function NestPickerMenu({
     row.family?.representative_title ?? conversationDisplayLabel(row);
   const destinations = [
     ...new Map(
-      [...nests.destinations, ...(result.data?.pages.flatMap((p) => p.data) ?? [])]
+      [
+        ...nests.destinations.filter((row) =>
+          label(row).toLowerCase().includes(search.trim().toLowerCase()),
+        ),
+        ...(query === search.trim() ? (result.data?.pages.flatMap((p) => p.data) ?? []) : []),
+      ]
         .filter(
           (row) =>
             nests.canJoin &&
@@ -7554,8 +7573,7 @@ function NestPickerMenu({
             row.family.id !== conversation.family?.id &&
             row.id !== conversation.id &&
             !row.archived &&
-            isOwnedByViewer(row, viewerId) &&
-            label(row).toLowerCase().includes(search.trim().toLowerCase()),
+            isOwnedByViewer(row, viewerId),
         )
         .map((row) => [row.family!.id, row]),
     ).values(),
@@ -7589,7 +7607,7 @@ function NestPickerMenu({
             {label(row)}
           </C.Item>
         ))}
-        {!destinations.length && !result.isFetching && (
+        {!destinations.length && !result.isFetching && query === search.trim() && (
           <p className="px-2 py-1 text-sm text-muted-foreground">No other nests</p>
         )}
         {result.isFetching && <p className="px-2 py-1 text-sm text-muted-foreground">Searching…</p>}
