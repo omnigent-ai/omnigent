@@ -770,6 +770,47 @@ async def test_owner_identity_reaps_each_sandbox_as_its_own_owner() -> None:
     assert current["bob"].terminated == ["bob:sb-b"]
 
 
+async def test_reaper_binds_each_candidates_owner_for_bind_owner_launchers() -> None:
+    now = 4_000_000
+    terminated: list[str] = []
+
+    class _BoundOwnerLauncher:
+        provider = "databricks"
+
+        def __init__(self) -> None:
+            self.owner: str | None = None
+
+        def bind_owner(self, owner: str) -> None:
+            self.owner = owner
+
+        @contextlib.contextmanager
+        def reaper_identity(self, workspace_id: int) -> Iterator[None]:
+            yield
+
+        def terminate(self, sandbox_id: str) -> None:
+            terminated.append(f"{self.owner}:{sandbox_id}")
+
+    deployment = ManagedSandboxDeployment(
+        configs=(
+            ManagedSandboxConfig(
+                server_url="https://s.example.com",
+                launcher_factory=_BoundOwnerLauncher,  # type: ignore[arg-type]
+                token_ttl_s=3600,
+                provider="databricks",
+            ),
+        ),
+        reaper=ManagedSandboxReaperConfig(enabled=True, terminate_after_offline_days=1),
+    )
+    reaper = ManagedSandboxReaper(
+        host_store=_alice_and_bob_stale_hosts(now),  # type: ignore[arg-type]
+        sandbox_config=deployment,
+    )
+
+    assert await reaper.sweep_once(now=now) == 2
+
+    assert sorted(terminated) == ["alice:sb-a", "bob:sb-b"]
+
+
 async def test_disconnected_owner_stays_pending_while_other_owners_are_reaped(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

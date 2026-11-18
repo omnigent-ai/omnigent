@@ -9,7 +9,7 @@ from contextlib import suppress
 
 from omnigent.db.db_models import workspace_scope
 from omnigent.db.utils import now_epoch
-from omnigent.onboarding.sandboxes.base import OwnerCredentialMissingError
+from omnigent.onboarding.sandboxes.base import OwnerCredentialMissingError, SandboxHostLauncher
 from omnigent.server.managed_hosts import (
     ManagedSandboxDeployment,
     _launcher_for_teardown,
@@ -206,9 +206,12 @@ class ManagedSandboxReaper:
                 return 0
 
             reaped = 0
-            # An owner-identity launcher acts as one user; each candidate host
-            # may belong to a different owner, so bind per candidate.
-            per_owner = getattr(launcher, "owner_credential_provider", None) is not None
+            # A launcher bound to its owner (credential or bind_owner) acts as one
+            # user; candidates may differ in owner, so rebuild per candidate.
+            bound_hook = getattr(type(launcher), "bind_owner", None)
+            per_owner = getattr(launcher, "owner_credential_provider", None) is not None or (
+                bound_hook is not None and bound_hook is not SandboxHostLauncher.bind_owner
+            )
             with launcher.reaper_identity(workspace_id):
                 for candidate in candidates:
                     try:
