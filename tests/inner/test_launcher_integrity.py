@@ -638,6 +638,108 @@ def test_editable_finder_uses_bundled_template_without_setuptools(tmp_path: Path
         sb._trusted_pth_import_roots(pth, line)
 
 
+def test_setuptools_68_editable_finder_is_accepted_as_data(tmp_path: Path) -> None:
+    site_dir = tmp_path / "site-packages"
+    site_dir.mkdir()
+    finder = site_dir / "__editable___sample_finder.py"
+    # Generated finder from Setuptools 68.1.2, with only the install data substituted.
+    source = """import sys
+from importlib.machinery import ModuleSpec, PathFinder
+from importlib.machinery import all_suffixes as module_suffixes
+from importlib.util import spec_from_file_location
+from itertools import chain
+from pathlib import Path
+
+MAPPING = {mapping!r}
+NAMESPACES = {namespaces!r}
+PATH_PLACEHOLDER = {name!r} + ".__path_hook__"
+
+
+class _EditableFinder:  # MetaPathFinder
+    @classmethod
+    def find_spec(cls, fullname, path=None, target=None):
+        # Top-level packages and modules (we know these exist in the FS)
+        if fullname in MAPPING:
+            pkg_path = MAPPING[fullname]
+            return cls._find_spec(fullname, Path(pkg_path))
+
+        # Handle immediate children modules (required for namespaces to work)
+        # To avoid problems with case sensitivity in the file system we delegate
+        # to the importlib.machinery implementation.
+        parent, _, child = fullname.rpartition(".")
+        if parent and parent in MAPPING:
+            return PathFinder.find_spec(fullname, path=[MAPPING[parent]])
+
+        # Other levels of nesting should be handled automatically by importlib
+        # using the parent path.
+        return None
+
+    @classmethod
+    def _find_spec(cls, fullname, candidate_path):
+        init = candidate_path / "__init__.py"
+        candidates = (candidate_path.with_suffix(x) for x in module_suffixes())
+        for candidate in chain([init], candidates):
+            if candidate.exists():
+                return spec_from_file_location(fullname, candidate)
+
+
+class _EditableNamespaceFinder:  # PathEntryFinder
+    @classmethod
+    def _path_hook(cls, path):
+        if path == PATH_PLACEHOLDER:
+            return cls
+        raise ImportError
+
+    @classmethod
+    def _paths(cls, fullname):
+        # Ensure __path__ is not empty for the spec to be considered a namespace.
+        return NAMESPACES[fullname] or MAPPING.get(fullname) or [PATH_PLACEHOLDER]
+
+    @classmethod
+    def find_spec(cls, fullname, target=None):
+        if fullname in NAMESPACES:
+            spec = ModuleSpec(fullname, None, is_package=True)
+            spec.submodule_search_locations = cls._paths(fullname)
+            return spec
+        return None
+
+    @classmethod
+    def find_module(cls, fullname):
+        return None
+
+
+def install():
+    if not any(finder == _EditableFinder for finder in sys.meta_path):
+        sys.meta_path.append(_EditableFinder)
+
+    if not NAMESPACES:
+        return
+
+    if not any(hook == _EditableNamespaceFinder._path_hook for hook in sys.path_hooks):
+        # PathEntryFinder is needed to create NamespaceSpec without private APIS
+        sys.path_hooks.append(_EditableNamespaceFinder._path_hook)
+    if PATH_PLACEHOLDER not in sys.path:
+        sys.path.append(PATH_PLACEHOLDER)  # Used just to trigger the path hook
+""".format(
+        name="__editable__.sample.finder",
+        mapping={"sample": str(tmp_path / "package")},
+        namespaces={"sample.assets": [str(tmp_path / "assets")]},
+    )
+    finder.write_text(source)
+    pth = site_dir / "__editable__.sample.pth"
+    line = "import __editable___sample_finder; __editable___sample_finder.install()"
+    assert sb._trusted_pth_import_roots(pth, line) == {
+        tmp_path / "package",
+        tmp_path / "assets",
+    }
+
+    marker = tmp_path / "modified-finder-ran"
+    finder.write_text(source + f"\nPath({str(marker)!r}).touch()\n")
+    with pytest.raises(OSError, match=r"unsupported \.pth editable finder"):
+        sb._trusted_pth_import_roots(pth, line)
+    assert not marker.exists()
+
+
 @pytest.mark.skipif(os.name == "nt", reason="POSIX disposable venv")
 def test_isolated_pth_roots_are_read_again_after_change(tmp_path: Path) -> None:
     runtime = tmp_path / "runtime"

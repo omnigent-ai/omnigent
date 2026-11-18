@@ -160,6 +160,168 @@ def install():
     if PATH_PLACEHOLDER not in sys.path:
         sys.path.append(PATH_PLACEHOLDER)  # Used just to trigger the path hook
 """
+# Setuptools 68.1.2 emits this older finder body. Compare the whole AST so
+# only mapping data and the finder name can vary across installations.
+_SETUPTOOLS_EDITABLE_FINDER_TEMPLATE_68_1_2 = """import sys
+from importlib.machinery import ModuleSpec, PathFinder
+from importlib.machinery import all_suffixes as module_suffixes
+from importlib.util import spec_from_file_location
+from itertools import chain
+from pathlib import Path
+
+MAPPING = {mapping!r}
+NAMESPACES = {namespaces!r}
+PATH_PLACEHOLDER = {name!r} + ".__path_hook__"
+
+
+class _EditableFinder:  # MetaPathFinder
+    @classmethod
+    def find_spec(cls, fullname, path=None, target=None):
+        # Top-level packages and modules (we know these exist in the FS)
+        if fullname in MAPPING:
+            pkg_path = MAPPING[fullname]
+            return cls._find_spec(fullname, Path(pkg_path))
+
+        # Handle immediate children modules (required for namespaces to work)
+        # To avoid problems with case sensitivity in the file system we delegate
+        # to the importlib.machinery implementation.
+        parent, _, child = fullname.rpartition(".")
+        if parent and parent in MAPPING:
+            return PathFinder.find_spec(fullname, path=[MAPPING[parent]])
+
+        # Other levels of nesting should be handled automatically by importlib
+        # using the parent path.
+        return None
+
+    @classmethod
+    def _find_spec(cls, fullname, candidate_path):
+        init = candidate_path / "__init__.py"
+        candidates = (candidate_path.with_suffix(x) for x in module_suffixes())
+        for candidate in chain([init], candidates):
+            if candidate.exists():
+                return spec_from_file_location(fullname, candidate)
+
+
+class _EditableNamespaceFinder:  # PathEntryFinder
+    @classmethod
+    def _path_hook(cls, path):
+        if path == PATH_PLACEHOLDER:
+            return cls
+        raise ImportError
+
+    @classmethod
+    def _paths(cls, fullname):
+        # Ensure __path__ is not empty for the spec to be considered a namespace.
+        return NAMESPACES[fullname] or MAPPING.get(fullname) or [PATH_PLACEHOLDER]
+
+    @classmethod
+    def find_spec(cls, fullname, target=None):
+        if fullname in NAMESPACES:
+            spec = ModuleSpec(fullname, None, is_package=True)
+            spec.submodule_search_locations = cls._paths(fullname)
+            return spec
+        return None
+
+    @classmethod
+    def find_module(cls, fullname):
+        return None
+
+
+def install():
+    if not any(finder == _EditableFinder for finder in sys.meta_path):
+        sys.meta_path.append(_EditableFinder)
+
+    if not NAMESPACES:
+        return
+
+    if not any(hook == _EditableNamespaceFinder._path_hook for hook in sys.path_hooks):
+        # PathEntryFinder is needed to create NamespaceSpec without private APIS
+        sys.path_hooks.append(_EditableNamespaceFinder._path_hook)
+    if PATH_PLACEHOLDER not in sys.path:
+        sys.path.append(PATH_PLACEHOLDER)  # Used just to trigger the path hook
+"""
+# Earlier releases change only these fixed finder bodies. Keep the variants
+# explicit so an edited finder cannot pass by changing arbitrary AST nodes.
+_SETUPTOOLS_EDITABLE_FINDER_TEMPLATE_68_0 = _SETUPTOOLS_EDITABLE_FINDER_TEMPLATE_68_1_2.replace(
+    "from importlib.machinery import ModuleSpec, PathFinder",
+    "from importlib.machinery import ModuleSpec",
+).replace(
+    """        # Top-level packages and modules (we know these exist in the FS)
+        if fullname in MAPPING:
+            pkg_path = MAPPING[fullname]
+            return cls._find_spec(fullname, Path(pkg_path))
+
+        # Handle immediate children modules (required for namespaces to work)
+        # To avoid problems with case sensitivity in the file system we delegate
+        # to the importlib.machinery implementation.
+        parent, _, child = fullname.rpartition(".")
+        if parent and parent in MAPPING:
+            return PathFinder.find_spec(fullname, path=[MAPPING[parent]])
+
+        # Other levels of nesting should be handled automatically by importlib
+        # using the parent path.
+""",
+    """        for pkg, pkg_path in reversed(list(MAPPING.items())):
+            if fullname == pkg or fullname.startswith(f"{{pkg}}."):
+                rest = fullname.replace(pkg, "", 1).strip(".").split(".")
+                return cls._find_spec(fullname, Path(pkg_path, *rest))
+
+""",
+)
+_SETUPTOOLS_EDITABLE_FINDER_TEMPLATE_68_1_0 = _SETUPTOOLS_EDITABLE_FINDER_TEMPLATE_68_1_2.replace(
+    """        # Handle immediate children modules (required for namespaces to work)
+        # To avoid problems with case sensitivity in the file system we delegate
+        # to the importlib.machinery implementation.
+        parent, _, child = fullname.rpartition(".")
+        if parent and parent in MAPPING:
+            return PathFinder.find_spec(fullname, path=[MAPPING[parent]])
+
+        # Other levels of nesting should be handled automatically by importlib
+        # using the parent path.
+""",
+    """        # Nested modules (apparently required for namespaces to work)
+        for pkg, pkg_path in reversed(list(MAPPING.items())):
+            if fullname.startswith(f"{{pkg}}."):
+                return cls._find_nested_spec(fullname, pkg, pkg_path)
+
+""",
+).replace(
+    "\n\nclass _EditableNamespaceFinder:",
+    """
+    @classmethod
+    def _find_nested_spec(cls, fullname, parent, parent_path):
+        '''
+        To avoid problems with case sensitivity in the file system we delegate to the
+        importlib.machinery implementation.
+        '''
+        rest = fullname.replace(parent, "", 1).strip(".")
+        nested = PathFinder.find_spec(rest, path=[parent_path])
+        return nested and spec_from_file_location(
+            fullname,
+            nested.origin,
+            submodule_search_locations=nested.submodule_search_locations
+        )
+
+
+class _EditableNamespaceFinder:""",
+)
+_SETUPTOOLS_EDITABLE_FINDER_TEMPLATE_68_2 = _SETUPTOOLS_EDITABLE_FINDER_TEMPLATE_68_1_2.replace(
+    "def find_spec(cls, fullname, path=None, target=None):\n",
+    "def find_spec(cls, fullname, path=None, target=None):\n        extra_path = []\n\n",
+    1,
+).replace(
+    "return PathFinder.find_spec(fullname, path=[MAPPING[parent]])",
+    "return PathFinder.find_spec(fullname, path=[MAPPING[parent], *extra_path])",
+)
+_SETUPTOOLS_EDITABLE_FINDER_TEMPLATE_70 = _SETUPTOOLS_EDITABLE_FINDER_TEMPLATE.replace(
+    "def find_spec(cls, fullname: str, path=None, target=None) -> ModuleSpec | None:",
+    "def find_spec(cls, fullname: str, _path=None, _target=None) -> ModuleSpec | None:",
+    1,
+).replace(
+    "def find_spec(cls, fullname: str, target=None) -> ModuleSpec | None:",
+    "def find_spec(cls, fullname: str, _target=None) -> ModuleSpec | None:",
+    1,
+)
 _STARTUP_HOOK_ENV_VARS = ("COVERAGE_PROCESS_START", "COVERAGE_PROCESS_CONFIG")
 _MAX_TRUSTED_RUNTIME_ENTRIES = 250_000
 
@@ -1685,12 +1847,24 @@ def _trusted_pth_import_roots(pth: Path, line: str) -> set[Path]:
             raise ValueError("missing editable finder roots")
         if not isinstance(finder_name, str):
             raise ValueError("missing editable finder name")
-        template = _SETUPTOOLS_EDITABLE_FINDER_TEMPLATE
-        expected = ast.parse(
-            template.format(name=finder_name, mapping=mapping, namespaces=namespaces)
+        templates = (
+            _SETUPTOOLS_EDITABLE_FINDER_TEMPLATE,
+            _SETUPTOOLS_EDITABLE_FINDER_TEMPLATE_70,
+            _SETUPTOOLS_EDITABLE_FINDER_TEMPLATE_68_2,
+            _SETUPTOOLS_EDITABLE_FINDER_TEMPLATE_68_1_2,
+            _SETUPTOOLS_EDITABLE_FINDER_TEMPLATE_68_1_0,
+            _SETUPTOOLS_EDITABLE_FINDER_TEMPLATE_68_0,
         )
-        if ast.dump(source, include_attributes=False) != ast.dump(
-            expected, include_attributes=False
+        actual = ast.dump(source, include_attributes=False)
+        if not any(
+            actual
+            == ast.dump(
+                ast.parse(
+                    template.format(name=finder_name, mapping=mapping, namespaces=namespaces)
+                ),
+                include_attributes=False,
+            )
+            for template in templates
         ):
             raise ValueError("editable finder implementation differs from its installed template")
         values = [*mapping.values(), *(path for group in namespaces.values() for path in group)]
