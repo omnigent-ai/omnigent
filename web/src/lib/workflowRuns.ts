@@ -22,6 +22,8 @@ export interface WorkflowRun {
   sessionStatus: "idle" | "running" | "failed";
   /** Work that outlives the parent turn, such as background shells or an active goal. */
   backgroundWorkRunning?: boolean;
+  /** The session's sandbox is still launching, so the run is starting; absent on older servers. */
+  sandboxLaunching?: boolean;
   archived: boolean;
   /** The run's latest steps, counted by their current status. */
   progress: {
@@ -58,9 +60,17 @@ export interface WorkflowRunStarter {
   title: string;
 }
 
-/** The session's turn, delegated work, or work left running between turns. */
+/** The run is starting: its session waits on a sandbox that is still launching. */
+export function isWorkflowRunLaunching(run: WorkflowRun): boolean {
+  return run.isCurrent && run.sandboxLaunching === true;
+}
+
+/** The session's turn, delegated work, work left running between turns, or its sandbox launch. */
 export function isWorkflowRunWorking(run: WorkflowRun): boolean {
-  return run.isCurrent && (run.sessionStatus === "running" || run.backgroundWorkRunning === true);
+  return (
+    isWorkflowRunLaunching(run) ||
+    (run.isCurrent && (run.sessionStatus === "running" || run.backgroundWorkRunning === true))
+  );
 }
 
 /** Where each of the run's steps stands, as the Tasks tab works it out. */
