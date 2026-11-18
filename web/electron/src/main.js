@@ -119,6 +119,7 @@ const {
   IP_ACL_BLOCKED,
 } = require("./databricks-auth");
 const { decideWindowOpen, stripCrossOriginOpenerHeaders, WEB_SCHEMES } = require("./popupPolicy");
+const { browserUrlFor } = require("./openInBrowser");
 const {
   SETTINGS_PATH,
   focusedConnectedWindow,
@@ -3152,6 +3153,12 @@ function isFindBarSender(event) {
   return url.protocol === "file:" && url.pathname === FIND_PAGE_URL.pathname;
 }
 
+/** Open the window's current server page in the default browser. */
+function openInBrowser(win) {
+  const url = browserUrlFor(win?.webContents.getURL(), pinnedOrigin(win));
+  if (url) void shell.openExternal(url);
+}
+
 /**
  * Open a new window cloning the focused window's current URL when it's a
  * loaded server page, so "New Window" lands on the same place (and the user
@@ -3883,6 +3890,12 @@ function buildMenu() {
         click: () => reloadFocused(),
       },
       { role: "forceReload" },
+      {
+        id: "open_in_browser",
+        label: "Open in Browser",
+        accelerator: "CmdOrCtrl+Alt+B",
+        click: () => openInBrowser(activeWindow()),
+      },
       { type: "separator" },
       { role: "resetZoom" },
       { role: "zoomIn" },

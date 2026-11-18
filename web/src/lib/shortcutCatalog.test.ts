@@ -46,6 +46,13 @@ describe("shortcutGroupsFor", () => {
     );
   });
 
+  it("lists Open in browser only in the desktop app", () => {
+    expect(labelsIn(BROWSER_TAB, "View")).not.toContain("Open in browser");
+    expect(labelsIn({ ...BROWSER_TAB, native: true, electron: true }, "View")).toContain(
+      "Open in browser",
+    );
+  });
+
   it("hides send and desktop-only rows where Enter inserts a newline", () => {
     const touch = labelsIn({ ...BROWSER_TAB, preventsKeyboardSubmit: true }, "In chats");
     expect(touch).not.toContain("Send message");

@@ -5,6 +5,8 @@ import { MemoryRouter } from "react-router-dom";
 import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 
+import type * as NativeBridge from "@/lib/nativeBridge";
+
 import { SidebarHeaderActions } from "./SidebarHeaderActions";
 
 const historyNavigation = vi.hoisted(() => ({
@@ -16,8 +18,15 @@ vi.mock("@/hooks/useHistoryNavigation", () => ({
   useHistoryNavigationAvailability: () => historyNavigation.availability,
 }));
 
+const desktopShell = vi.hoisted(() => ({ electron: false }));
+vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
+  ...(await importOriginal<typeof NativeBridge>()),
+  isElectronShell: () => desktopShell.electron,
+}));
+
 afterEach(() => {
   cleanup();
+  desktopShell.electron = false;
   historyNavigation.request.mockReset();
   historyNavigation.availability = { canGoBack: true, canGoForward: true };
 });
@@ -169,5 +178,43 @@ describe("SidebarHeaderActions shortcut hints", () => {
     expect(screen.queryByLabelText("Search")).toBeNull();
     expect(screen.getByLabelText("Settings")).toBeInTheDocument();
     expect(screen.getByLabelText("Close sidebar")).toBeInTheDocument();
+  });
+});
+
+describe("SidebarHeaderActions open in browser", () => {
+  function renderActions() {
+    render(
+      <MemoryRouter>
+        <TooltipProvider delayDuration={0}>
+          <SidebarHeaderActions expanded onToggle={vi.fn()} />
+        </TooltipProvider>
+      </MemoryRouter>,
+    );
+  }
+
+  it("is only offered in the desktop shell", () => {
+    renderActions();
+    expect(screen.queryByLabelText("Open in browser")).not.toBeInTheDocument();
+  });
+
+  it("opens the current page in a new browser window", async () => {
+    desktopShell.electron = true;
+    const open = vi.spyOn(window, "open").mockReturnValue(null);
+    renderActions();
+    const trigger = screen.getByLabelText("Open in browser");
+    expect(trigger).toHaveAttribute(
+      "aria-keyshortcuts",
+      MOD_KEY === "⌘" ? "Meta+Alt+B" : "Control+Alt+B",
+    );
+    fireEvent.click(trigger);
+    expect(open).toHaveBeenCalledWith(window.location.href, "_blank", "noopener,noreferrer");
+    fireEvent.focus(trigger);
+    expect(
+      Array.from(
+        (await screen.findByRole("tooltip")).querySelectorAll('[data-slot="kbd"]'),
+        (key) => key.textContent,
+      ),
+    ).toEqual([MOD_KEY, ALT_KEY, "B"]);
+    open.mockRestore();
   });
 });
