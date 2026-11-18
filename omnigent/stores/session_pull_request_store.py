@@ -107,15 +107,18 @@ class StoredPullRequest(PullRequestReport):
     :ivar state: ``"OPEN"``, ``"CLOSED"`` or ``"MERGED"``, or ``None`` until fetched.
     :ivar is_draft: Whether the PR was a draft at that fetch.
     :ivar state_checked_at: Epoch seconds of that fetch's request, or ``None``.
-    :ivar run_id: The scheduled-task run the session was attributed to when the
-        server first stored the PR, or ``None`` outside a run, for a PR the user
-        linked, and for PRs stored before runs were recorded.
+    :ivar run_id: The scheduled-task run whose turn the session was in when the
+        server first stored the PR, or ``None``.
+    :ivar run_recorded: Whether the server recorded ``run_id`` when it first stored
+        the PR, so ``None`` there means the PR was first seen outside any run.
+        False for a PR the user linked and for PRs stored before runs were recorded.
     """
 
     state: str | None = None
     is_draft: bool = False
     state_checked_at: float | None = None
     run_id: str | None = None
+    run_recorded: bool = False
 
 
 @dataclass(frozen=True)
@@ -192,6 +195,9 @@ class _Document:
     prs: tuple[StoredPullRequest, ...] = ()
     # Oldest first.
     unlinked: tuple[_Unlink, ...] = ()
+    # The run whose turn a person interrupted by writing to the session; PRs first
+    # seen after that are not the run's, even while its label stays on the session.
+    ended_run_id: str | None = None
 
 
 _DOCUMENT = TypeAdapter(_Document)
@@ -269,9 +275,13 @@ def _display_order(prs: Iterable[StoredPullRequest]) -> tuple[StoredPullRequest,
     return tuple(sorted(prs, key=key))
 
 
-def _new_entry(report: PullRequestReport, run_id: str | None = None) -> StoredPullRequest:
+def _new_entry(
+    report: PullRequestReport, run_id: str | None = None, *, run_recorded: bool = False
+) -> StoredPullRequest:
     return StoredPullRequest(
-        **{**asdict(report), "title": _clean_title(report.title)}, run_id=run_id
+        **{**asdict(report), "title": _clean_title(report.title)},
+        run_id=run_id,
+        run_recorded=run_recorded,
     )
 
 
@@ -306,11 +316,13 @@ def _add(
     entries: dict[str, StoredPullRequest],
     report: PullRequestReport,
     run_id: str | None = None,
+    *,
+    run_recorded: bool = False,
 ) -> bool:
     """Add a new member if the session has room for it; ``entries`` is updated in place."""
     if len(entries) >= MAX_PRS_PER_SESSION:
         return False
-    candidate = {**entries, report.url: _new_entry(report, run_id)}
+    candidate = {**entries, report.url: _new_entry(report, run_id, run_recorded=run_recorded)}
     membership = _membership(replace(document, prs=_display_order(candidate.values())))
     if not _fits(membership, _MAX_MEMBERSHIP_BYTES):
         return False
@@ -324,13 +336,20 @@ def _merge_reports(
     requested_at: float | None,
     run_id: str | None = None,
 ) -> _Document:
-    """Merge reports; a newly added PR keeps ``run_id``, the run it was first seen in."""
+    """Merge reports; a newly added PR records ``run_id``, the run it was first seen in.
+
+    A run whose turn a person interrupted (``document.ended_run_id``) records none.
+    """
+    if run_id is not None and run_id == document.ended_run_id:
+        run_id = None
     unlinked = {unlink.url for unlink in document.unlinked}
     entries = {pr.url: pr for pr in document.prs}
     for report in reports:
         if report.url in entries:
             entries[report.url] = _merge(entries[report.url], report, requested_at)
-        elif report.url not in unlinked and not _add(document, entries, report, run_id):
+        elif report.url not in unlinked and not _add(
+            document, entries, report, run_id, run_recorded=True
+        ):
             _logger.debug("A session's pull request list is full; ignoring a reported PR")
     return replace(document, prs=_display_order(entries.values()))
 
@@ -625,6 +644,46 @@ class SessionPullRequestStore:
         with self._session("get_session_current_run") as session:
             value = session.execute(stmt.limit(1)).scalar_one_or_none()
         return value if isinstance(value, str) and value else None
+
+    def end_run_turn(self, conversation_id: str, run_id: str) -> None:
+        """Record that a person wrote to the session during ``run_id``'s turn.
+
+        PRs first stored after this record no run until another run starts. Writes
+        at most once per run.
+
+        :param conversation_id: The session, e.g. ``"conv_abc123"``.
+        :param run_id: The run the session's label names.
+        :raises UnreadablePullRequestsError: The stored document cannot be read.
+        """
+        self._update(
+            "end_session_pull_request_run_turn",
+            conversation_id,
+            lambda document: replace(document, ended_run_id=run_id),
+        )
+
+    def initial_run_ids(self, conversation_ids: Sequence[str]) -> dict[str, str]:
+        """Return the run that created each session, for the sessions a run created.
+
+        Reads only the initial-run label, at most one row per session.
+
+        :param conversation_ids: Sessions to look up; an empty list reads nothing.
+        """
+        if not conversation_ids:
+            return {}
+        from omnigent.stores.conversation_store import SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY
+
+        stmt = select(SqlConversationLabel.conversation_id, SqlConversationLabel.value).where(
+            SqlConversationLabel.workspace_id == current_workspace_id(),
+            SqlConversationLabel.conversation_id.in_(list(dict.fromkeys(conversation_ids))),
+            SqlConversationLabel.key == SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+        )
+        with self._session("list_session_initial_runs") as session:
+            rows = session.execute(stmt).all()
+        return {
+            conversation_id: value
+            for conversation_id, value in rows
+            if isinstance(value, str) and value
+        }
 
     def check_room(self, conversation_id: str, url: str) -> None:
         """Fail before a host links a PR the session has no room for.

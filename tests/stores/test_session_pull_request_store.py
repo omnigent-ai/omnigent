@@ -396,12 +396,49 @@ def test_a_pr_keeps_the_run_its_session_served_when_the_server_first_stored_it(
     store.attach(SESSION, _report(D))
     stored = store.read(SESSION)
     assert stored is not None
-    assert {entry.url: entry.run_id for entry in stored.entries} == {
-        A: first_run,
-        B: second_run,
-        C: None,
-        D: None,
+    assert {entry.url: (entry.run_id, entry.run_recorded) for entry in stored.entries} == {
+        A: (first_run, True),
+        B: (second_run, True),
+        # First seen outside any run, unlike a PR the user linked.
+        C: (None, True),
+        D: (None, False),
     }
     # Another session's run doesn't leak in.
     store.apply_report(OTHER, [_report(A)])
     assert store.read(OTHER).entries[0].run_id is None  # type: ignore[union-attr]
+
+
+def test_a_persons_message_ends_the_runs_pr_attribution_until_another_run(
+    store: SessionPullRequestStore, conversations: SqlAlchemyConversationStore
+) -> None:
+    """For a session the automation created, whose run label stays for its journal."""
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
+
+    C = "https://github.com/example/three/pull/3"
+    run, next_run = "a" * 32, "b" * 32
+    conversations.set_labels(SESSION, {SCHEDULED_TASK_RUN_LABEL_KEY: run})
+    store.apply_report(SESSION, [_report(A)])
+    store.end_run_turn(SESSION, run)
+    store.apply_report(SESSION, [_report(B)])
+    conversations.set_labels(SESSION, {SCHEDULED_TASK_RUN_LABEL_KEY: next_run})
+    store.apply_report(SESSION, [_report(C)])
+    stored = store.read(SESSION)
+    assert stored is not None
+    assert {entry.url: entry.run_id for entry in stored.entries} == {A: run, B: None, C: next_run}
+
+
+def test_initial_run_ids_read_only_the_sessions_a_run_created(
+    store: SessionPullRequestStore, conversations: SqlAlchemyConversationStore
+) -> None:
+    from omnigent.stores.conversation_store import (
+        SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+        SCHEDULED_TASK_RUN_LABEL_KEY,
+    )
+
+    conversations.set_labels(
+        SESSION,
+        {SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY: "a" * 32, SCHEDULED_TASK_RUN_LABEL_KEY: "b" * 32},
+    )
+    conversations.set_labels(OTHER, {SCHEDULED_TASK_RUN_LABEL_KEY: "c" * 32})
+    assert store.initial_run_ids([SESSION, OTHER, MISSING]) == {SESSION: "a" * 32}
+    assert store.initial_run_ids([]) == {}

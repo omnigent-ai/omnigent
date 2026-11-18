@@ -5923,7 +5923,7 @@ def _in_groups(monkeypatch: pytest.MonkeyPatch, groups: dict[str, list[str]]) ->
 
 def _read_urls(task_id: str) -> list[str]:
     url = f"/v1/scheduled-tasks/{task_id}"
-    return [url, f"{url}/runs", f"{url}/run-steps"]
+    return [url, f"{url}/runs", f"{url}/run-steps", f"{url}/run-pull-requests"]
 
 
 @pytest_asyncio.fixture()
@@ -5997,7 +5997,7 @@ async def test_recipients_read_an_automation_its_runs_and_their_steps(
         return {user_id: user_id.split("@")[0].title() for user_id in user_ids}
 
     monkeypatch.setattr(SqlAlchemyPermissionStore, "display_names", display_names)
-    owned, owned_runs, owned_steps = [
+    owned, owned_runs, owned_steps, _ = [
         (await client.get(url, headers=_headers())).json() for url in _read_urls(task_id)
     ]
     assert (owned["viewer_role"], owned["owner_display_name"]) == ("owner", None)
@@ -6028,8 +6028,8 @@ async def test_recipients_read_an_automation_its_runs_and_their_steps(
             )
             patched.setattr(SessionJournalStore, "run_start_plans", refuse_session_read)
             responses = [await client.get(url, headers=recipient) for url in _read_urls(task_id)]
-        assert [r.status_code for r in responses] == [200, 200, 200], responses[-1].text
-        task, runs, steps = (r.json() for r in responses)
+        assert [r.status_code for r in responses] == [200] * 4, responses[-1].text
+        task, runs, steps, run_prs = (r.json() for r in responses)
         assert task == {**owned, "viewer_role": "viewer", "owner_display_name": "Alice"}
         assert runs == {
             "runs": [{**run, **without_session} for run in owned_runs["runs"]],
@@ -6037,6 +6037,7 @@ async def test_recipients_read_an_automation_its_runs_and_their_steps(
         }
         assert [run["id"] for run in runs["runs"]] == [run_id, failed_id, skipped_id]
         assert steps == {"runs": [], "next_cursor": None}
+        assert run_prs == {"runs": [], "refresh_pending": False, "next_cursor": None}
     pending_elicitations.resolve(shared_session, elicitation_id)
 
     # Someone it isn't shared with sees what a missing automation shows.
@@ -6052,7 +6053,7 @@ async def test_recipients_read_an_automation_its_runs_and_their_steps(
     assert revoked.status_code == 204, revoked.text
     assert [(await client.get(url, headers=_BOB)).status_code for url in _read_urls(task_id)] == [
         404
-    ] * 3
+    ] * 4
     assert (await client.delete(_read_urls(task_id)[0], headers=_headers())).status_code == 200
     assert (await client.get(_read_urls(task_id)[0], headers=_CAROL)).status_code == 404
 
@@ -6103,10 +6104,22 @@ async def test_each_run_lists_the_prs_it_created_or_worked_on(
         conversations.set_labels(session, {SCHEDULED_TASK_RUN_LABEL_KEY: run_id})
 
     newest, later, earlier = uuid.uuid4().hex, uuid.uuid4().hex, uuid.uuid4().hex
-    # The newest run started a session of its own, which already had a PR stored
-    # before runs were recorded.
+    # The newest run started a session of its own, where the user linked a PR.
     own = _owned_session(db_uri)
-    legacy = link(own, 1, "created")
+    legacy = f"https://github.com/example/repo/pull/{1}"
+    prs.attach(
+        own,
+        PullRequestReport(
+            url=legacy,
+            provider="github",
+            host="github.com",
+            repository="example/repo",
+            number=1,
+            relationship="attached",
+            first_seen_at=1.0,
+            last_seen_at=1.0,
+        ),
+    )
     conversations.set_labels(own, {SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY: newest})
     serve(own, newest)
     inferred = link(own, 2, "inferred")
@@ -6197,6 +6210,90 @@ async def test_each_run_lists_the_prs_it_created_or_worked_on(
     )
 
 
+async def test_a_persons_message_ends_a_runs_pr_attribution_in_a_session_it_created(
+    workflows_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Chat in an automation's own session adds no PR to its run, though the label stays."""
+    from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.server.auth import LEVEL_OWNER
+    from omnigent.server.routes._sessions.helpers import _publish_status
+    from omnigent.stores.conversation_store import (
+        SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+        SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+        SCHEDULED_TASK_RUN_LABEL_KEY,
+    )
+    from omnigent.stores.session_pull_request_store import (
+        PullRequestReport,
+        SessionPullRequestStore,
+    )
+    from tests.server.integration.test_sessions_harness_override import _stub_late_runner_bind
+
+    client = workflows_client
+    task_id = await _create_task(client)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    run_id, next_run_id = uuid.uuid4().hex, uuid.uuid4().hex
+    session = conversations.create_conversation().id
+    SqlAlchemyPermissionStore(db_uri).grant("alice@example.com", session, LEVEL_OWNER)
+    conversations.set_labels(
+        session,
+        {
+            SCHEDULED_TASK_ORIGIN_LABEL_KEY: task_id,
+            SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY: run_id,
+            SCHEDULED_TASK_RUN_LABEL_KEY: run_id,
+        },
+    )
+    conversations.set_runner_id(session, token_bound_runner_id("run-prs-test-runner"))
+    for run, start in ((run_id, 1000), (next_run_id, 2000)):
+        _seed_run(db_uri, task_id, run, scheduled_at=start, conversation_id=session)
+    prs = SessionPullRequestStore(db_uri)
+
+    def link(number: int) -> str:
+        url = f"https://github.com/example/repo/pull/{number}"
+        prs.apply_report(
+            session,
+            [
+                PullRequestReport(
+                    url=url,
+                    provider="github",
+                    host="github.com",
+                    repository="example/repo",
+                    number=number,
+                    relationship="created",
+                    first_seen_at=1.0,
+                    last_seen_at=1.0,
+                )
+            ],
+            complete=True,
+        )
+        return url
+
+    worked = link(1)
+    _publish_status(session, "idle")
+    _stub_late_runner_bind(monkeypatch)
+    human = await client.post(
+        f"/v1/sessions/{session}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "text", "text": "Open another PR"}]},
+        },
+        headers=_headers(),
+    )
+    assert human.status_code == 202, human.text
+    # The journal still attributes the session to the run.
+    assert conversations.get_conversation(session).labels[SCHEDULED_TASK_RUN_LABEL_KEY] == run_id
+    link(2)
+    conversations.set_labels(session, {SCHEDULED_TASK_RUN_LABEL_KEY: next_run_id})
+    later = link(3)
+
+    body = (
+        await client.get(f"/v1/scheduled-tasks/{task_id}/run-pull-requests", headers=_headers())
+    ).json()
+    assert {run["run_id"]: [pr["url"] for pr in run["pull_requests"]] for run in body["runs"]} == {
+        next_run_id: [later],
+        run_id: [worked],
+    }
+
+
 async def test_a_shared_reminder_is_not_shown_to_recipients(
     workflows_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -6285,7 +6382,7 @@ async def test_agents_get_no_access_through_a_recipient(
         (await auth_client.get(url, headers=agent)).status_code for url in _read_urls(task_id)
     ]
     # Run steps need workflows, which this server leaves off.
-    assert statuses == [404, 404, 404]
+    assert statuses == [404] * 4
     assert (await auth_client.get(_read_urls(task_id)[0], headers=_BOB)).status_code == 200
     listed = await auth_client.get("/v1/scheduled-tasks/shared", headers=agent)
     assert listed.status_code == 403, listed.text

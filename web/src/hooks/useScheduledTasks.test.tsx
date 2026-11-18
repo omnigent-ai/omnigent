@@ -713,6 +713,65 @@ describe("useScheduledTaskRunPullRequests", () => {
     }
   });
 
+  it("keeps each page's PRs with their runs when pages answer out of order", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    try {
+      const { wrapper } = makeWrapper();
+      const many = Array.from({ length: 21 }, (_, index) => ({
+        ...SUCCEEDED_RUN,
+        id: `run_${index}`,
+      }));
+      let answerFirst: (page: api.ScheduledTaskRunPullRequestsPage) => void = () => {};
+      vi.mocked(api.listScheduledTaskRunPullRequests).mockImplementation((_id, { after }) =>
+        after === undefined
+          ? new Promise((resolve) => {
+              answerFirst = resolve;
+            })
+          : Promise.resolve({
+              runs: [{ runId: "run_20", pullRequests: [pullRequest("CLOSED")] }],
+              refreshPending: false,
+            }),
+      );
+      const { result } = renderHook(() => useScheduledTaskRunPullRequests("st_1", many, true), {
+        wrapper,
+      });
+      await tick(0);
+      expect(api.listScheduledTaskRunPullRequests).toHaveBeenCalledWith("st_1", {
+        limit: 20,
+        after: "run_19",
+      });
+      expect(result.current.get("run_20")?.pullRequests[0]?.state).toBe("CLOSED");
+      answerFirst({
+        runs: [{ runId: "run_0", pullRequests: [pullRequest("MERGED")] }],
+        refreshPending: false,
+      });
+      await tick(0);
+      expect(result.current.get("run_0")?.pullRequests[0]?.state).toBe("MERGED");
+      expect(result.current.get("run_20")?.pullRequests[0]?.state).toBe("CLOSED");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the PRs it has when asking again fails", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: false });
+    try {
+      const { wrapper } = makeWrapper();
+      vi.mocked(api.listScheduledTaskRunPullRequests)
+        .mockResolvedValueOnce(page(["OPEN"]))
+        .mockRejectedValue(new Error("server unavailable"));
+      const { result } = renderHook(() => useScheduledTaskRunPullRequests("st_1", runs, true), {
+        wrapper,
+      });
+      await tick(0);
+      await tick(60_000);
+      expect(api.listScheduledTaskRunPullRequests).toHaveBeenCalledTimes(2);
+      expect(result.current.get("run_1")?.pullRequests[0]?.state).toBe("OPEN");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("asks for nothing while disabled", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: false });
     try {

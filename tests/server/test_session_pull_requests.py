@@ -349,10 +349,11 @@ D = "https://github.com/example/four/pull/4"
 
 def test_a_run_gets_the_prs_first_stored_during_its_turn_created_first() -> None:
     """However long after delivery its agent opened them, and none from other runs."""
+    recorded = {"run_recorded": True}
     entries = (
-        _stored(A, relationship="worked_on", first_seen_at=500.0, run_id="run"),
-        _stored(B, relationship="created", first_seen_at=9_000.0, run_id="run"),
-        _stored(C, run_id="other"),
+        _stored(A, relationship="worked_on", first_seen_at=500.0, run_id="run", **recorded),
+        _stored(B, relationship="created", first_seen_at=9_000.0, run_id="run", **recorded),
+        _stored(C, run_id="other", **recorded),
         _stored(D, relationship="attached"),
     )
     assert _picked("run", *entries) == [B, A]
@@ -362,12 +363,19 @@ def test_a_run_gets_the_prs_first_stored_during_its_turn_created_first() -> None
 def test_unrecorded_prs_go_to_the_run_that_created_the_session() -> None:
     """User links and PRs stored before runs were recorded carry no run."""
     entries = (
-        _stored(A, run_id=None),
+        _stored(A),
         _stored(B, relationship="attached"),
-        _stored(C, run_id="run"),
+        _stored(C, run_id="run", run_recorded=True),
     )
     assert _picked("run", *entries, created_session=True) == [A, C, B]
     assert _picked("run", *entries) == [C]
+
+
+def test_a_pr_first_seen_outside_any_run_belongs_to_none() -> None:
+    """Chat between runs, even in the session a run created."""
+    chat = _stored(A, run_recorded=True)
+    assert _picked("run", chat, created_session=True) == []
+    assert _picked("run", chat) == []
 
 
 def test_a_branch_inferred_pr_shows_only_as_a_runs_lone_pr() -> None:

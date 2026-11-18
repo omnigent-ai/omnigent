@@ -21160,7 +21160,7 @@
     },
     "/v1/scheduled-tasks/{scheduled_task_id}/run-pull-requests": {
       "get": {
-        "description": "The pull requests each of one page of a scheduled task's runs created or worked on.\n\nPages and authorizes like `GET /scheduled-tasks/{id}/runs`, most recent\nfirst, and reads only what the server stores, so it answers while hosts\nare offline. `omnigent.server.session_pull_requests.run_pull_requests`\ndecides which of a session's PRs belong to a run. Each PR carries the state\nits host last fetched, with `state_checked_at`. `refresh_pending` says a\nbackground refresh of a listed session started, so a later read may show\nmore. The response is `{\"runs\": [{\"run_id\", \"pull_requests\": [...]}], \"refresh_pending\", \"next_cursor\"}`, listing only runs with PRs. PRs are\nsession content, so someone it is shared with always gets no runs.",
+        "description": "List stored PRs for a page of runs; shared viewers receive no session content.",
         "operationId": "list_scheduled_task_run_pull_requests_v1_scheduled_tasks__scheduled_task_id__run_pull_requests_get",
         "parameters": [
           {

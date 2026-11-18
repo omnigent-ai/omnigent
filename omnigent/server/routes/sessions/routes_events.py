@@ -1380,18 +1380,21 @@ def register_events_routes(
             )
         start_fire_stage("input_validation", session_id=session_id)
         peer_message = body.type == "session_message"
-        interactive_run_id = (
-            conv.labels.get(SCHEDULED_TASK_RUN_LABEL_KEY)
-            if isinstance(request, Request)
+        # A person writing to the session, not an agent, workflow or runner.
+        human_input = (
+            isinstance(request, Request)
             and not peer_message
             and body.workflow_run_id is None
             and not request.headers.get(ORCHESTRATION_SOURCE_HEADER)
             and not request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER)
-            and not conv.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY)
             and (
                 (body.type == "message" and body.data.get("role", "user") == "user")
                 or body.type == _SLASH_COMMAND_TYPE
             )
+        )
+        interactive_run_id = (
+            conv.labels.get(SCHEDULED_TASK_RUN_LABEL_KEY)
+            if human_input and not conv.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY)
             else None
         )
         if peer_message:
@@ -3765,6 +3768,23 @@ def register_events_routes(
         if refreshed_conv is None:
             raise _session_not_found()
         conv = refreshed_conv
+        # A person's message ends the run's PR attribution, even in a session the
+        # automation created, whose run label the journal still needs. A prompt
+        # still being dispatched belongs to its run.
+        turn_run_id = conv.labels.get(SCHEDULED_TASK_RUN_LABEL_KEY) if human_input else None
+        if (
+            turn_run_id
+            and pull_request_store is not None
+            and SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX + turn_run_id not in conv.labels
+        ):
+            try:
+                await asyncio.to_thread(pull_request_store.end_run_turn, session_id, turn_run_id)
+            except Exception:  # PR attribution must not block the message.
+                _logger.warning(
+                    "Could not end a run's pull request attribution",
+                    exc_info=True,
+                    extra={"session_id": session_id},
+                )
         # A human's next turn ends attribution from an earlier continuation.
         # Leave a newer fire or a prompt still being dispatched untouched.
         pending_run_finished = False

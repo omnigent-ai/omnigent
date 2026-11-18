@@ -329,11 +329,12 @@ def run_pull_requests(
 
     A run gets the PRs the server first stored while the session's turn belonged
     to it (:attr:`StoredPullRequest.run_id`), however long its agent worked
-    after the prompt was delivered and never ones from chat between runs. PRs
-    stored before runs were recorded, and PRs the user linked, carry no run;
-    they go to the run that created the session. Branch-inferred PRs are left
-    out, since being checked out on a branch is not work on its PR, unless one
-    is the run's only PR: that is most likely the run's own branch.
+    after the prompt was delivered. PRs first seen outside any run, such as from
+    chat between runs, belong to none. PRs with no recorded run, ones the user
+    linked or stored before runs were recorded, go to the run that created the
+    session. Branch-inferred PRs are left out, since being checked out on a
+    branch is not work on its PR, unless one is the run's only PR: that is most
+    likely the run's own branch.
 
     :param run_id: The run.
     :param stored: Its session's PRs.
@@ -343,7 +344,7 @@ def run_pull_requests(
     picked = [
         entry
         for entry in stored.entries
-        if entry.run_id == run_id or (entry.run_id is None and created_session)
+        if entry.run_id == run_id or (not entry.run_recorded and created_session)
     ]
     explicit = [entry for entry in picked if entry.relationship != "inferred"]
     if not explicit and len(picked) == 1:

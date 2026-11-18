@@ -89,10 +89,7 @@ from omnigent.server.session_mcp_selection import MAX_SESSION_MCP_SERVICES, sess
 from omnigent.server.workflows import require_workflows
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
-from omnigent.stores.conversation_store import (
-    SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
-    SCHEDULED_TASK_RUN_LABEL_KEY,
-)
+from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
 from omnigent.stores.permission_store import MAX_SHARED_SCHEDULED_TASKS_PAGE_SIZE
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import (
@@ -1566,18 +1563,7 @@ def create_scheduled_tasks_router(
         limit: int = Query(default=20, ge=1, le=50),
         after: str | None = Query(default=None),
     ) -> dict[str, Any]:
-        """The pull requests each of one page of a scheduled task's runs created or worked on.
-
-        Pages and authorizes like ``GET /scheduled-tasks/{id}/runs``, most recent
-        first, and reads only what the server stores, so it answers while hosts
-        are offline. :func:`omnigent.server.session_pull_requests.run_pull_requests`
-        decides which of a session's PRs belong to a run. Each PR carries the state
-        its host last fetched, with ``state_checked_at``. ``refresh_pending`` says a
-        background refresh of a listed session started, so a later read may show
-        more. The response is ``{"runs": [{"run_id", "pull_requests": [...]}],
-        "refresh_pending", "next_cursor"}``, listing only runs with PRs. PRs are
-        session content, so someone it is shared with always gets no runs.
-        """
+        """List stored PRs for a page of runs; shared viewers receive no session content."""
         from omnigent.server import session_pull_requests as server_prs
 
         _, role = await _require_readable(request, scheduled_task_id)
@@ -1590,9 +1576,9 @@ def create_scheduled_tasks_router(
         if pull_request_store is None or not served:
             return {**empty, "next_cursor": next_cursor}
         conversation_ids = list(dict.fromkeys(run.conversation_id or "" for run in served))
-        stored, sessions = await asyncio.gather(
+        stored, initial_runs = await asyncio.gather(
             asyncio.to_thread(pull_request_store.read_many, conversation_ids),
-            asyncio.to_thread(conversation_store.get_conversations, conversation_ids),
+            asyncio.to_thread(pull_request_store.initial_run_ids, conversation_ids),
         )
         now = time.time()
         refresh_pending = False
@@ -1606,12 +1592,9 @@ def create_scheduled_tasks_router(
             prs = stored.get(conversation_id)
             if prs is None:
                 continue
-            session = sessions.get(conversation_id)
-            created_session = (
-                session is not None
-                and session.labels.get(SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY) == run.id
+            picked = server_prs.run_pull_requests(
+                run.id, prs, created_session=initial_runs.get(conversation_id) == run.id
             )
-            picked = server_prs.run_pull_requests(run.id, prs, created_session=created_session)
             if picked:
                 rows.append(
                     {
