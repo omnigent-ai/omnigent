@@ -84,7 +84,9 @@ def runtime_layout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNam
         ),
     )
     monkeypatch.setattr(sb, "site", SimpleNamespace(getsitepackages=lambda: [str(packages)]))
-    monkeypatch.setattr(sb, "_isolated_launcher_import_roots", lambda _: (stdlib, packages))
+    monkeypatch.setattr(
+        sb, "_isolated_launcher_import_roots", lambda _, *, sandbox: (stdlib, packages)
+    )
     monkeypatch.setattr(sb, "__file__", str(framework / "omnigent" / "inner" / "sandbox.py"))
     monkeypatch.setattr(
         sb,
@@ -358,7 +360,9 @@ def test_launcher_rejects_nested_runtime_symlink_hops(
     monkeypatch.setattr(
         sb,
         "_isolated_launcher_import_roots",
-        lambda _interpreter: pytest.fail("startup probe ran before symlink validation"),
+        lambda _interpreter, *, sandbox: pytest.fail(
+            "startup probe ran before symlink validation"
+        ),
     )
     policy = _policy()
     policy.write_roots = [workspace]

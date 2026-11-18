@@ -88,7 +88,7 @@ def test_auth_runtime_rejects_writable_hardlink_alias(
     assert (trusted.stat().st_dev, trusted.stat().st_ino) == original_identity
 
     monkeypatch.setattr(sandbox, "_validate_launcher_runtime", lambda _policy: None)
-    monkeypatch.setattr(sandbox, "_isolated_launcher_import_roots", lambda _python: ())
+    monkeypatch.setattr(sandbox, "_isolated_launcher_import_roots", lambda _python, *, sandbox: ())
     policy = SandboxPolicy("linux_bwrap", True, None, [workspace], [], False)
     with pytest.raises(ValueError, match="outside sandbox-writable paths"):
         _validate_auth_runtime(pinned, policy)
@@ -140,7 +140,7 @@ def test_auth_runtime_rejects_copied_interpreter_base_stdlib_alias_before_probe(
     unrelated = base_bin.parent / "lib" / "ssl" / "private"
     unrelated.mkdir(parents=True)
     unrelated.chmod(0)
-    monkeypatch.setattr(sandbox, "_isolated_launcher_import_roots", lambda _python: ())
+    monkeypatch.setattr(sandbox, "_isolated_launcher_import_roots", lambda _python, *, sandbox: ())
     try:
         _validate_auth_runtime(pinned, policy)
     finally:
