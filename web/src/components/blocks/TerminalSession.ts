@@ -835,7 +835,10 @@ export class TerminalSession {
       "mousedown",
       (event) => {
         const mode = this.term.modes.mouseTrackingMode;
-        this.linkPressOpens = terminalLinkClickOpens(event, mode, this.lastPointerType);
+        // Under mouse tracking, right and middle presses belong to the program and never open.
+        this.linkPressOpens =
+          mode === "none" ||
+          (event.button === 0 && terminalLinkClickOpens(event, mode, this.lastPointerType));
         if (!this.linkHovered || mode === "none" || !this.linkPressOpens) return;
         event.preventDefault();
         event.stopPropagation();

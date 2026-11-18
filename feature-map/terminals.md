@@ -18,6 +18,10 @@ reattach when the session moves to another host.
 - `user-shell`: open a shell, type into it, and close it.
 - `scrollback`: scroll back with the mouse wheel (including programs that track
   the mouse), by touch on phones, and by keyboard.
+- `links`: clicking a URL or OSC 8 link opens it in a new tab. While a program
+  tracks the mouse (fullscreen Claude Code, vim with mouse), plain clicks go to
+  the program and ⌘-click (macOS) or Ctrl-click opens the link without reaching
+  it. Touch and pen taps always open.
 - `reconnect`: after the terminal connection drops, the terminal shows that it
   is reconnecting and then reattaches without user action.
 - `host-switch-reattach`: after "Switch host…", both the terminal strip and the

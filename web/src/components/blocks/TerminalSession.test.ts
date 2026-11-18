@@ -886,7 +886,7 @@ describe("TerminalSession", () => {
       session.dispose();
     });
 
-    it("decides opening from the press when the modifier changes before release", async () => {
+    it("decides opening from the primary press when the modifier changes before release", async () => {
       const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
       const { session } = makeSession();
       const term = termOf(session);
@@ -905,6 +905,13 @@ describe("TerminalSession", () => {
       screen.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
       activate(term, { ctrlKey: true });
       expect(reported).toHaveBeenCalledOnce();
+      expect(openSpy).toHaveBeenCalledOnce();
+
+      screen.dispatchEvent(
+        new MouseEvent("mousedown", { bubbles: true, button: 2, ctrlKey: true }),
+      );
+      activate(term, { button: 2, ctrlKey: true });
+      expect(reported).toHaveBeenCalledTimes(2);
       expect(openSpy).toHaveBeenCalledOnce();
       session.dispose();
     });

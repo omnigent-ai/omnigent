@@ -1,10 +1,8 @@
 """UI journeys: opening links that real Claude Code prints in its Terminal view.
 
-The mock LLM answers with a URL that wraps across two pane rows, and the browser
-⌘/Ctrl-clicks it. In fullscreen mode Claude tracks the mouse, so a plain click must
-reach Claude and open nothing. Claude Code only uses fullscreen under tmux control
-mode when ``CLAUDE_CODE_NO_FLICKER=1`` reaches it, so that journey needs the variable;
-the shell link tests cover the same gesture with a mouse-tracking program.
+Fullscreen Claude Code tracks the mouse, so plain clicks go to it and ⌘/Ctrl-click
+opens links. Under tmux control mode it only goes fullscreen when
+``CLAUDE_CODE_NO_FLICKER=1`` reaches it, so that journey is opt-in.
 """
 
 from __future__ import annotations
