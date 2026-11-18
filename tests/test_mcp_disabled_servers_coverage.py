@@ -59,10 +59,11 @@ def test_every_supported_executor_has_exactly_one_launch_hook():
         ("missing-envelope", "parsed"),
         ("nonobject-envelope", "parsed"),
         ("nondict-servers", "parsed"),
+        ("claude", "not_applicable"),
     ],
 )
 def test_native_failure_metadata_is_bounded_and_excludes_private_values(
-    tmp_path, file_state, expected_state
+    tmp_path, monkeypatch, file_state, expected_state
 ):
     from tests.e2e.test_mcp_disabled_servers import _mcp_failure_metadata
 
@@ -147,7 +148,14 @@ def test_native_failure_metadata_is_bounded_and_excludes_private_values(
     }
     requests = [{"tools": [known, unknown, *([unknown] * 100)], "input": private}] * 10
 
-    metadata = _mcp_failure_metadata(requests, home, "session")
+    harness = "claude" if file_state == "claude" else "codex"
+    with monkeypatch.context() as scoped:
+        if harness == "claude":
+            bridge_open = MagicMock(side_effect=AssertionError("unexpected Codex bridge read"))
+            scoped.setattr("tests.e2e.test_mcp_disabled_servers.os.open", bridge_open)
+        metadata = _mcp_failure_metadata(requests, home, "session", harness)
+    if harness == "claude":
+        bridge_open.assert_not_called()
 
     assert private not in json.dumps(metadata)
     assert metadata["requests_omitted"] == 2
@@ -292,4 +300,13 @@ def test_native_failure_traceback_and_junit_exclude_request_bodies(tmp_path, mon
             captured.traceback[-1].name == "test_disabled_server_absent_from_real_native_session"
         )
         assert captured.value.__cause__ is None and captured.value.__context__ is None
+    if outcome == "timeout":
+        metadata_path = tmp_path / "mcp-failure-metadata.json"
+        assert metadata_path.is_file()
+        metadata_text = metadata_path.read_text()
+        metadata = json.loads(metadata_text)
+        assert metadata["requests_omitted"] == 0
+        assert metadata["requests"][0]["tools"]["entries"][0]["name"]["known"] == "mcp__on_fixture"
+        assert captured.value.__notes__ == [f"MCP controls never advertised: {metadata}"]
+        assert "-".join(("private", "request", "sentinel")) not in metadata_text
     client.delete.assert_called_once_with("/v1/sessions/session")

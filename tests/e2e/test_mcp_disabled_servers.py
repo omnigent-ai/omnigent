@@ -37,8 +37,8 @@ from tests.e2e.conftest import configure_mock_llm, get_mock_requests
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def _mcp_failure_metadata(requests: list[dict], home: Path, session_id: str) -> dict:
-    """Project bounded structural evidence without provider or bridge contents."""
+def _mcp_failure_metadata(requests: list[dict], home: Path, session_id: str, harness: str) -> dict:
+    """Project bounded requests and applicable Codex bridge evidence without contents."""
     servers = ("off_fixture", "on_fixture", "omnigent")
     controls = ("sys_session_get_info", "sys_session_create", "sys_terminal_list")
     known_names = (*servers, *controls, *(f"mcp__{name}" for name in servers))
@@ -110,6 +110,8 @@ def _mcp_failure_metadata(requests: list[dict], home: Path, session_id: str) -> 
     )
 
     def record(filename: str) -> tuple[str, object]:
+        if harness != "codex":
+            return "not_applicable", None
         path = bridge / filename
         try:
             if any(
@@ -319,7 +321,7 @@ def test_disabled_server_absent_from_real_native_session(
                     poll_until(mcp_controls_advertised, timeout_s=120)
                 except AssertionError as exc:
                     try:
-                        metadata = _mcp_failure_metadata(requests, host.home, session_id)
+                        metadata = _mcp_failure_metadata(requests, host.home, session_id, harness)
                         with contextlib.suppress(OSError):
                             (tmp_path / "mcp-failure-metadata.json").write_text(
                                 json.dumps(metadata)
