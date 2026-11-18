@@ -22,6 +22,7 @@ from playwright.sync_api import Page, expect
 
 from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.conftest import _build_hello_world_bundle
+from tests.e2e_ui.sessions._sidebar_helpers import open_project_picker
 
 
 def _seed_session(base_url: str, *, title: str) -> str:
@@ -63,11 +64,7 @@ def test_move_session_into_project_regroups_sidebar_row(
 
         # Context menu → "Move session" flyout → pick the seeded project.
         row.click(button="right")
-        submenu = page.get_by_test_id("move-to-project")
-        expect(submenu).to_be_visible()
-        submenu.hover()
-        if submenu.inner_text() == "Move session":
-            page.get_by_role("menuitem", name="Project", exact=True).hover()
+        open_project_picker(page)
         target = page.get_by_role("menuitem", name=project_name)
         expect(target).to_be_visible()
         target.click()

@@ -30,7 +30,7 @@ import pytest
 from playwright.sync_api import Browser, Locator, Page, expect
 
 from tests.e2e_ui.conftest import seed_committed_turn
-from tests.e2e_ui.sessions._sidebar_helpers import enable_grouping_ui
+from tests.e2e_ui.sessions._sidebar_helpers import enable_grouping_ui, open_project_picker
 
 
 def _set_title(base_url: str, session_id: str, title: str) -> None:
@@ -76,7 +76,7 @@ def _move_to_new_project(page: Page, row: Locator, name: str) -> None:
     row.hover()
     row.get_by_test_id("conversation-actions").click()
     # Open the submenu flyout, then pick the just-created project by name.
-    page.get_by_test_id("move-to-project").click()
+    open_project_picker(page)
     page.get_by_role("menuitem", name=name, exact=True).click()
 
 
@@ -257,7 +257,7 @@ def test_remove_session_from_project(
     )
     project_row.hover()
     project_row.get_by_test_id("conversation-actions").click()
-    page.get_by_test_id("move-to-project").click()
+    open_project_picker(page)
     # The kebab item names the project it removes from ("Remove from <name>").
     # It unfiles immediately — no confirmation, since a first-class project
     # persists when emptied (nothing is deleted).

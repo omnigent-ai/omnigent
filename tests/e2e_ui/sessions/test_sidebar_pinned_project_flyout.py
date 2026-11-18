@@ -23,6 +23,8 @@ import uuid
 import httpx
 from playwright.sync_api import Locator, Page, expect
 
+from tests.e2e_ui.sessions._sidebar_helpers import open_project_picker
+
 
 def _set_title(base_url: str, session_id: str, title: str) -> None:
     """Give a session a unique title via ``PATCH /v1/sessions/{id}`` so its row
@@ -65,7 +67,7 @@ def _move_to_new_project(page: Page, row: Locator, name: str) -> None:
     _create_project(page, name)
     row.hover()
     row.get_by_test_id("conversation-actions").click()
-    page.get_by_test_id("move-to-project").click()
+    open_project_picker(page)
     page.get_by_role("menuitem", name=name, exact=True).click()
 
 

@@ -1,7 +1,16 @@
 """Shared session and sidebar setup for browser journeys through the real server."""
 
 import httpx
-from playwright.sync_api import Page, Route
+from playwright.sync_api import Page, Route, expect
+
+
+def open_project_picker(page: Page) -> None:
+    """Open the desktop project picker, including the destination-type step when present."""
+    page.get_by_test_id("move-to-project").hover()
+    project_step = page.get_by_role("menuitem", name="Project", exact=True)
+    expect(project_step.or_(page.get_by_placeholder("Search or create project"))).to_be_visible()
+    if project_step.is_visible():
+        project_step.hover()
 
 
 def wait_for_sidebar_collapse(page: Page) -> None:
