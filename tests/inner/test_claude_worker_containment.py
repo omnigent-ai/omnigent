@@ -1011,6 +1011,15 @@ def test_real_cli_bash_tool_round_trip_and_inline_skill_finish(
         assert result.returncode == 0, (result.stdout, result.stderr)
         assert json.loads(result.stdout)["result"] == "CLI_E2E_OK"
         assert (workspace / "skill-marker").read_text() == "SKILL_OK"
+        assert (workspace / "tool-marker").is_file(), (
+            result.stdout,
+            result.stderr,
+            [
+                [tool.get("name") for tool in request["body"].get("tools", [])]
+                for request in requests
+            ],
+            replies,
+        )
         assert (workspace / "tool-marker").read_text() == "TOOL_OK"
         assert (workspace / "private-leak").read_text() == ""
         assert (workspace / "credential-leak").read_text() == ""
@@ -1578,6 +1587,11 @@ def test_each_cli_execution_path_inherits_the_sandbox(
         extra_args = ["--plugin-dir", str(plugin)]
     target_cli = real_claude_cli
     if execution_path == "api-key-helper":
+        # The forwarding script execs a second path after launcher validation.
+        real_worker_spec.sandbox.read_paths = [
+            str(Path(real_claude_cli).parent),
+            str(Path(real_claude_cli).resolve().parent),
+        ]
         # Unset after the launcher restores its safe environment snapshot.
         forwarding_cli = Path(real_worker_spec.cwd) / "helper-claude"
         forwarding_cli.write_text(
