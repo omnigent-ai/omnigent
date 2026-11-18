@@ -69,8 +69,15 @@ New:
 | `@codemirror/search` | Find and replace. |
 | `@codemirror/autocomplete` | Closing brackets as you type; no completion. |
 | `@pierre/trees` | The Files tree and the file tree beside a diff review, from the same library as `@pierre/diffs`. |
-| `unified`, `remark-parse`, `remark-rehype`, `hast-util-to-html`, `fast-myers-diff` | Rendered Markdown diffs: parse both sides and diff the rendered blocks. |
-| `hast-util-to-jsx-runtime` | Renders a Markdown diff as React elements. |
-| `@types/hast` (dev) | Types for the Markdown syntax trees. |
 | `gemoji` | `:shortcode:` emoji in pull request comments, as GitHub shows them. |
 | `@tanstack/query-persist-client-core` | Keeps the pull request list's cache across restarts, so the list shows at once. |
+
+Already installed as dependencies of other packages, at the same versions, and
+now declared because the sidebar imports them directly:
+
+| Package | Why |
+| --- | --- |
+| `unified`, `remark-parse`, `remark-rehype`, `hast-util-to-html` | Rendered Markdown diffs: parse both sides and render the changed blocks. |
+| `diff` | Diffs the two sides' blocks of a Markdown diff. |
+| `hast-util-to-jsx-runtime` | Renders a Markdown diff as React elements. |
+| `@types/hast` (dev) | Types for the Markdown syntax trees. |
