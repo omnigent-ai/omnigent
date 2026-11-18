@@ -17,6 +17,7 @@ import {
   createSession,
   createSideChat,
   exportSessionTranscript,
+  transcriptOmitsOutputs,
   fetchRewindPrompts,
   fetchSessionItemsPage,
   fetchSessionRepositoryBranches,
@@ -1820,8 +1821,9 @@ describe("fetchRewindPrompts", () => {
   });
 });
 
-describe("exportSessionTranscript", () => {
+describe("exportSessionTranscript on a server without the export route", () => {
   it("writes session_meta first, then every item in ascending order", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 404 }));
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({ id: "sess_1", object: "conversation", title: "Planning" }),
     );
@@ -1840,10 +1842,11 @@ describe("exportSessionTranscript", () => {
 
     const jsonl = await exportSessionTranscript("sess_1");
 
-    expect(fetchMock.mock.calls[0]![0]).toBe(
+    expect(fetchMock.mock.calls[0]![0]).toBe("/v1/sessions/sess_1/export?format=jsonl");
+    expect(fetchMock.mock.calls[1]![0]).toBe(
       "/v1/sessions/sess_1?include_items=false&include_liveness=false",
     );
-    expect(fetchMock.mock.calls[1]![0]).toBe("/v1/sessions/sess_1/items?limit=500&order=asc");
+    expect(fetchMock.mock.calls[2]![0]).toBe("/v1/sessions/sess_1/items?limit=500&order=asc");
 
     expect(jsonl.endsWith("\n")).toBe(true);
     const records = jsonl
@@ -1856,6 +1859,7 @@ describe("exportSessionTranscript", () => {
   });
 
   it("pages forward with after=<last_id> until has_more is false", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 404 }));
     fetchMock.mockResolvedValueOnce(mockJsonResponse({ id: "sess_1" }));
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
@@ -1876,8 +1880,8 @@ describe("exportSessionTranscript", () => {
 
     const jsonl = await exportSessionTranscript("sess_1");
 
-    expect(fetchMock).toHaveBeenCalledTimes(3);
-    expect(fetchMock.mock.calls[2]![0]).toBe(
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    expect(fetchMock.mock.calls[3]![0]).toBe(
       "/v1/sessions/sess_1/items?limit=500&order=asc&after=msg_1",
     );
     const ids = jsonl
@@ -1886,6 +1890,36 @@ describe("exportSessionTranscript", () => {
       .slice(1)
       .map((line) => (JSON.parse(line) as { id: string }).id);
     expect(ids).toEqual(["msg_1", "msg_2"]);
+  });
+});
+
+describe("server-built transcript export", () => {
+  it("downloads the server's JSONL as is", async () => {
+    const body = '{"record_type":"session_meta","id":"sess_1","outputs_omitted":true}\n';
+    fetchMock.mockResolvedValueOnce(new Response(body, { status: 200 }));
+
+    const jsonl = await exportSessionTranscript("sess_1");
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]![0]).toBe("/v1/sessions/sess_1/export?format=jsonl");
+    expect(jsonl).toBe(body);
+    expect(transcriptOmitsOutputs(jsonl)).toBe(true);
+  });
+
+  it("fails on a refusal other than 404 instead of building the file itself", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({ error: { message: "Forbidden" } }, { ok: false, status: 403 }),
+    );
+    await expect(exportSessionTranscript("sess_1")).rejects.toThrow();
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['{"record_type":"session_meta","outputs_omitted":false}\n{"x":1}\n', false],
+    ['{"record_type":"session_meta"}', false],
+    ["not json", false],
+  ])("reads outputs_omitted from the first line of %j", (jsonl, omitted) => {
+    expect(transcriptOmitsOutputs(jsonl)).toBe(omitted);
   });
 });
 

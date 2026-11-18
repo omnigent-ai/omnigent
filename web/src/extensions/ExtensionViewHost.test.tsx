@@ -14,6 +14,8 @@ vi.mock("./rpc/host", () => ({
   buildExtensionDocument: buildDocumentMock,
 }));
 
+import { DEFAULT_DATA_CONTROLS, FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { ExtensionViewHost } from "./ExtensionViewHost";
 
 const page: ExtensionPage = {
@@ -425,5 +427,23 @@ describe("ExtensionViewHost", () => {
     render(<ExtensionViewHost extension={extension} page={page} refresh={refresh} />);
 
     expect(await screen.findByRole("alert")).toHaveTextContent("bundle missing");
+  });
+});
+
+describe("ExtensionViewHost under the server's policy", () => {
+  it("explains why the page can't run instead of loading it", () => {
+    render(
+      <CapabilitiesProvider
+        info={{
+          ...FALLBACK_SERVER_INFO,
+          data_controls: { ...DEFAULT_DATA_CONTROLS, contentSecurityPolicy: "enforce" },
+        }}
+      >
+        <ExtensionViewHost extension={extension} page={page} refresh={refresh} />
+      </CapabilitiesProvider>,
+    );
+
+    expect(screen.getByRole("alert")).toHaveTextContent("Dashboard is unavailable");
+    expect(loadBundleMock).not.toHaveBeenCalled();
   });
 });

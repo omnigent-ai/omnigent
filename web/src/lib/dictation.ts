@@ -14,7 +14,9 @@
 // Vite dev proxy keep working. Identity rides the ingress/dev proxy on the
 // handshake, as with those sockets.
 
+import { dataControls, getCachedServerInfo } from "@/lib/capabilities";
 import { resolveWebSocketUrl } from "@/lib/host";
+import WORKLET_SOURCE from "./pcm16Worklet.js?raw";
 
 /**
  * Build the `ws(s)://` URL for the dictation stream.
@@ -102,63 +104,19 @@ const WS_CLOSE_TRY_AGAIN_LATER = 1013;
 
 const TARGET_RATE = 16_000;
 
-// AudioWorklet processor, inlined as a Blob module so no separate asset has
-// to survive the Vite build. Linear-interpolation downsample from the
-// context capture rate to 16 kHz, Float32 → Int16, posted in 100 ms chunks.
-// (When the context already runs at 16 kHz — we ask for that — the step is
-// 1 and the loop degenerates to a plain format conversion.)
-//
-// Any message on the port means "flush": the partially-filled chunk is
-// posted, then a null marker — so stop() can capture trailing speech that
-// hasn't crossed the 100 ms boundary before tearing the graph down.
-const WORKLET_SOURCE = `
-const TARGET_RATE = ${TARGET_RATE};
-const CHUNK_SAMPLES = TARGET_RATE / 10; // 100 ms per posted chunk
-class Pcm16Downsampler extends AudioWorkletProcessor {
-  constructor() {
-    super();
-    this.step = sampleRate / TARGET_RATE;
-    this.pos = 0; // fractional read position, carried across blocks
-    this.pending = new Int16Array(CHUNK_SAMPLES);
-    this.filled = 0;
-    this.port.onmessage = () => {
-      if (this.filled > 0) {
-        const out = this.pending.slice(0, this.filled);
-        this.filled = 0;
-        this.port.postMessage(out, [out.buffer]);
-      }
-      this.port.postMessage(null);
-    };
-  }
-  process(inputs) {
-    const channel = inputs[0] && inputs[0][0];
-    if (!channel || channel.length === 0) return true;
-    let pos = this.pos;
-    while (pos < channel.length) {
-      const i = Math.floor(pos);
-      const s0 = channel[i];
-      const s1 = i + 1 < channel.length ? channel[i + 1] : s0;
-      const sample = s0 + (s1 - s0) * (pos - i);
-      const clamped = Math.max(-1, Math.min(1, sample));
-      this.pending[this.filled++] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
-      if (this.filled === CHUNK_SAMPLES) {
-        const out = this.pending;
-        this.pending = new Int16Array(CHUNK_SAMPLES);
-        this.filled = 0;
-        this.port.postMessage(out, [out.buffer]);
-      }
-      pos += this.step;
-    }
-    this.pos = pos - channel.length;
-    return true;
-  }
-}
-registerProcessor("omnigent-pcm16-downsampler", Pcm16Downsampler);
-`;
+// The AudioWorklet processor. Its source is loaded as a Blob module so no
+// separate asset has to load from the embed's host. Under the server's
+// Content-Security-Policy a blob: script is refused, so the built file is
+// used instead.
+const WORKLET_ASSET_URL = new URL("./pcm16Worklet.js?no-inline", import.meta.url).href;
 
 let cachedWorkletUrl: string | null = null;
 
-function workletUrl(): string {
+/** Where the dictation worklet loads from: a Blob, or the built file under a policy. */
+export function workletUrl(): string {
+  if (dataControls(getCachedServerInfo() ?? "loading").contentSecurityPolicy !== "off") {
+    return WORKLET_ASSET_URL;
+  }
   if (cachedWorkletUrl === null) {
     cachedWorkletUrl = URL.createObjectURL(
       new Blob([WORKLET_SOURCE], { type: "application/javascript" }),

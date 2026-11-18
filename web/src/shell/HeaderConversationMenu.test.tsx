@@ -38,6 +38,7 @@ const mocks = vi.hoisted(() => ({
   exportTranscript: vi.fn(),
   triggerDownload: vi.fn(),
   toastError: vi.fn(),
+  toastInfo: vi.fn(),
 }));
 
 vi.mock("@/components/scheduled/CreateAutomationFromSessionDialog", () => ({
@@ -92,7 +93,12 @@ vi.mock("@/hooks/useFileContent", async (importOriginal) => {
 
 // `toast` is callable too: archiving shows the Undo pill via `toast(...)`.
 vi.mock("sonner", () => ({
-  toast: Object.assign(vi.fn(), { error: mocks.toastError, custom: vi.fn(), dismiss: vi.fn() }),
+  toast: Object.assign(vi.fn(), {
+    error: mocks.toastError,
+    info: mocks.toastInfo,
+    custom: vi.fn(),
+    dismiss: vi.fn(),
+  }),
 }));
 
 const CONVERSATION: Conversation = {
@@ -353,6 +359,22 @@ describe("HeaderConversationMenu", () => {
     expect(filename).toBe("conv-1.jsonl");
     expect(await blob.text()).toBe(jsonl);
     expect(mocks.toastError).not.toHaveBeenCalled();
+    expect(mocks.toastInfo).not.toHaveBeenCalled();
+  });
+
+  it("says when the server left tool outputs out of the export", async () => {
+    mocks.exportTranscript.mockResolvedValueOnce(
+      '{"record_type":"session_meta","id":"conv-1","outputs_omitted":true}\n',
+    );
+    renderMenu();
+    openMenu();
+
+    fireEvent.click(screen.getByRole("menuitem", { name: "Export" }));
+
+    await waitFor(() => expect(mocks.triggerDownload).toHaveBeenCalledTimes(1));
+    expect(mocks.toastInfo).toHaveBeenCalledWith(
+      "Tool outputs were left out, as this server's settings require.",
+    );
   });
 
   it("surfaces an export failure as a toast and downloads nothing", async () => {

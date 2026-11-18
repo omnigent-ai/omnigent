@@ -51,6 +51,10 @@ import "./pdfViewer.css";
 // lifetime. It bypasses pdf.js's fake-worker fallback, so a restrictive worker
 // CSP or a non-Worker environment (jsdom) throws on import — importing tests
 // must mock this module (CodeViewer.test.tsx already mocks ./PdfViewer).
+// pdf.js otherwise probes `new Function` for faster glyph drawing, which a
+// Content-Security-Policy without 'unsafe-eval' reports. Stable for react-pdf.
+const PDF_DOCUMENT_OPTIONS = { isEvalSupported: false } as const;
+
 // The app's pdfjs-dist must match react-pdf's; Dependabot skips it (.github/dependabot.yml).
 pdfjs.GlobalWorkerOptions.workerPort = new Worker(
   new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url),
@@ -356,6 +360,7 @@ export function PdfViewer({
         {pdfFile && (
           <Document
             file={pdfFile}
+            options={PDF_DOCUMENT_OPTIONS}
             onLoadSuccess={(doc) => setNumPages(doc.numPages)}
             onLoadError={() => setErrored(true)}
             loading={centered("Loading PDF…")}

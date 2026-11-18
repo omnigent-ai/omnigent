@@ -4,7 +4,7 @@
 
 import type { FileDiffMetadata } from "@pierre/diffs";
 import { useCallback, useMemo, useSyncExternalStore } from "react";
-import { z } from "zod";
+import { z } from "@/lib/zod";
 import type { PullRequestAssociation } from "@/hooks/usePullRequests";
 import { useViewerId } from "@/hooks/useViewerId";
 import { getOmnigentServerIdentity } from "./host";

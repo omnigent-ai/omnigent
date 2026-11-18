@@ -15,6 +15,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MessageSquarePlusIcon } from "lucide-react";
 import type { Comment } from "@/hooks/useComments";
 import { useCanEdit } from "@/hooks/usePermissions";
+import { dataControls } from "@/lib/capabilities";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useIsEmbedded } from "@/lib/embedded";
 import { getEmbedRoot, getOmnigentHtmlPreviewFrame } from "@/lib/host";
 import { randomUUID } from "@/lib/randomUUID";
@@ -104,9 +106,11 @@ export function HtmlCommentViewer({
   const canEdit = useCanEdit(conversationId);
   const isEmbedded = useIsEmbedded();
   const HtmlPreviewFrame = getOmnigentHtmlPreviewFrame();
-  // Only the default srcdoc frame inherits the host CSP. Isolated host frames
-  // use the inline bridge to avoid cross-origin requests back to the host.
-  const loadBridgeExternally = isEmbedded && !HtmlPreviewFrame;
+  // Only the default srcdoc frame inherits the host CSP (the embed's, or the
+  // server's opt-in policy). Isolated host frames use the inline bridge to
+  // avoid cross-origin requests back to the host.
+  const underPolicy = dataControls(useServerInfo()).contentSecurityPolicy !== "off";
+  const loadBridgeExternally = (isEmbedded || underPolicy) && !HtmlPreviewFrame;
 
   // A fresh nonce + srcDoc per content load. The nonce key remounts either frame,
   // re-running the bridge and clearing stale highlights; the frame reopens at the

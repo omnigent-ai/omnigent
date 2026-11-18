@@ -1,6 +1,6 @@
 import { isAdminViewEnabled } from "@/lib/adminView";
 import { modelOptionSchema } from "./modelCatalogCache";
-import { z } from "zod";
+import { z } from "@/lib/zod";
 import { readRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { readLastAgentId } from "./agentPreferences";
 import { readDefaultBaseBranch } from "./baseBranchPreferences";

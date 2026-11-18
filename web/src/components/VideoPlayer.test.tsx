@@ -8,6 +8,8 @@ import {
 } from "@testing-library/react";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { DEFAULT_DATA_CONTROLS, FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { VideoPlayer } from "./VideoPlayer";
 import { parseVideoChapters } from "@/lib/videoChapters";
 
@@ -422,5 +424,36 @@ describe("VideoPlayer", () => {
     const closingSignal = fetchBlob.mock.calls[1][2]!;
     unmount();
     expect(closingSignal.aborted).toBe(true);
+  });
+});
+
+describe("VideoPlayer with downloads off", () => {
+  const downloadsOff = {
+    ...FALLBACK_SERVER_INFO,
+    data_controls: { ...DEFAULT_DATA_CONTROLS, allowDownloads: false },
+  };
+
+  it("offers neither Play nor Download for a workspace recording", () => {
+    render(
+      <CapabilitiesProvider info={downloadsOff}>
+        <VideoPlayer {...props} />
+      </CapabilitiesProvider>,
+    );
+
+    expect(screen.getByRole("status")).toHaveTextContent("This server doesn't allow downloads");
+    expect(screen.queryByRole("button", { name: /Play video/ })).toBeNull();
+    expect(screen.queryByRole("button", { name: /Download/ })).toBeNull();
+    expect(fetchBlob).not.toHaveBeenCalled();
+  });
+
+  it("still plays a remote recording", () => {
+    render(
+      <CapabilitiesProvider info={downloadsOff}>
+        <VideoPlayer src="https://media.example.test/demo.mp4" title="Remote demo" />
+      </CapabilitiesProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Play video: Remote demo" }));
+    expect(screen.getByLabelText("Remote demo").tagName).toBe("VIDEO");
   });
 });

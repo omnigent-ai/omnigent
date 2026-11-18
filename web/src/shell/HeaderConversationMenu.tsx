@@ -57,7 +57,7 @@ import { useIsMutating, useQueryClient } from "@tanstack/react-query";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isIndentedSibling, isSessionPinned } from "@/lib/sessionFamilies";
 import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
-import { exportSessionTranscript } from "@/lib/sessionsApi";
+import { exportSessionTranscript, transcriptOmitsOutputs } from "@/lib/sessionsApi";
 import { triggerBrowserDownload } from "@/hooks/useFileContent";
 import {
   type Conversation,
@@ -268,6 +268,9 @@ export function HeaderConversationMenu({
         new Blob([jsonl], { type: "application/jsonl" }),
         `${conversation.id}.jsonl`,
       );
+      if (transcriptOmitsOutputs(jsonl)) {
+        toast.info("Tool outputs were left out, as this server's settings require.");
+      }
     } catch {
       toast.error("Export failed");
     }

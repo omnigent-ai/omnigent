@@ -3,17 +3,22 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+import json
+from collections.abc import AsyncIterator, Awaitable, Callable
+from typing import Any
 
 from fastapi import (
     APIRouter,
     Query,
     Request,
 )
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import StreamingResponse
 
 from omnigent.entities import Conversation
 from omnigent.entities.conversation import ITEM_TYPE_TO_DATA_CLS
 from omnigent.errors import StaleCursorError
+from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -28,6 +33,7 @@ from omnigent.server.auth import (
     LEVEL_READ,
     AuthProvider,
 )
+from omnigent.server.data_controls import app_data_controls, omit_item_outputs
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
@@ -47,10 +53,11 @@ from omnigent.server.routes._sessions.common import (
     get_server_runner_router,
     set_server_runner_router,
 )
-from omnigent.server.routes._sessions.helpers import SessionLiveness
+from omnigent.server.routes._sessions.helpers import SessionLiveness, _attachment_disposition
 from omnigent.server.routes._sessions.orchestration import (
     _agent_costs,
     _child_session_summaries_from_conversations,
+    _get_session_snapshot,
     _settle_orphaned_running_rows,
 )
 from omnigent.server.schemas import (
@@ -74,6 +81,8 @@ _MAX_DESCENDANT_DEPTH = 10
 _SPAWN_TREE_READ_CAP = 2000
 # The item types ``GET /sessions/{id}/items`` can filter by.
 _ITEM_TYPE_PATTERN = f"^({'|'.join(ITEM_TYPE_TO_DATA_CLS)})$"
+#: Items a session export reads per store page.
+_EXPORT_PAGE_SIZE = 500
 
 
 def _is_settle_candidate(conv: Conversation) -> bool:
@@ -96,6 +105,7 @@ def register_items_routes(
     *,
     conversation_store: ConversationStore,
     agent_store: AgentStore,
+    agent_cache: AgentCache | None = None,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
     liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None = None,
@@ -229,6 +239,109 @@ def register_items_routes(
             first_id=page.first_id,
             last_id=page.last_id,
             has_more=page.has_more,
+        )
+
+    # ── GET /sessions/{session_id}/export ────────────────────────
+
+    @router.get(
+        "/sessions/{session_id}/export",
+        response_model=None,
+        response_class=StreamingResponse,
+        responses={
+            200: {
+                "description": (
+                    "The session as JSONL: a `session_meta` line, then one `item` "
+                    "line per item in order."
+                ),
+                "content": {"application/jsonl": {"schema": {"type": "string"}}},
+            }
+        },
+    )
+    async def export_session(
+        request: Request,
+        session_id: str,
+        export_format: str = Query(
+            alias="format",
+            pattern="^jsonl$",
+            description='The export format; only `"jsonl"` today.',
+        ),
+        outputs: bool = Query(
+            default=True,
+            description=(
+                "Whether tool outputs are included. A deployment with "
+                "`data_controls.include_outputs: never` leaves them out regardless."
+            ),
+        ),
+    ) -> StreamingResponse:
+        """
+        Download a session as the JSONL transcript ``omnigent session import`` reads.
+
+        The first line is the session snapshot ``GET /sessions/{id}`` returns,
+        with ``"record_type": "session_meta"`` and ``outputs_omitted``; each
+        further line is one item from ``GET /sessions/{id}/items``. When
+        outputs are left out, tool outputs are replaced with a placeholder.
+
+        :param session_id: Session to export, e.g. ``"conv_abc123"``.
+        :param export_format: ``"jsonl"``.
+        :param outputs: Whether tool outputs are wanted.
+        :returns: The transcript as a ``.jsonl`` attachment.
+        :raises OmnigentError: 403 without READ; 404 when no session exists.
+        """
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        conversation = access.conversation or await asyncio.to_thread(
+            conversation_store.get_conversation, session_id
+        )
+        if conversation is None:
+            raise _session_not_found()
+        include_outputs = app_data_controls(request.app.state).export_includes_outputs(outputs)
+        snapshot = await _get_session_snapshot(
+            conversation_store,
+            session_id,
+            access.level,
+            agent_store,
+            agent_cache,
+            conversation=conversation,
+            include_items=False,
+            include_live_status=False,
+            viewer_id=user_id,
+            request=request,
+        )
+        meta: dict[str, Any] = {
+            "record_type": "session_meta",
+            **jsonable_encoder(snapshot),
+            "outputs_omitted": not include_outputs,
+        }
+
+        async def lines() -> AsyncIterator[bytes]:
+            yield (json.dumps(meta) + "\n").encode()
+            after: str | None = None
+            while True:
+                page = await asyncio.to_thread(
+                    conversation_store.list_items,
+                    session_id,
+                    limit=_EXPORT_PAGE_SIZE,
+                    after=after,
+                    order="asc",
+                )
+                for item in page.data:
+                    record = item.to_api_dict()
+                    if not include_outputs:
+                        record = omit_item_outputs(record)
+                    yield (json.dumps({"record_type": "item", **record}) + "\n").encode()
+                if not page.has_more or page.last_id is None:
+                    return
+                after = page.last_id
+
+        return StreamingResponse(
+            lines(),
+            media_type="application/jsonl",
+            headers={
+                "Content-Disposition": _attachment_disposition(f"{session_id}.{export_format}"),
+                "Cache-Control": "no-store",
+            },
         )
 
     # ── GET /sessions/{session_id}/agent_costs ───────────────────
