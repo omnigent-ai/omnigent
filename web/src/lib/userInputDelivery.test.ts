@@ -41,7 +41,10 @@ describe("snapshotRefusesSend", () => {
     const otherError = { code: "harness_crashed", message: "Crashed.", item_id: "item_1" };
     expect(snapshotRefusesSend(snapshot("failed", otherError), "item_1")).toBe(false);
     expect(snapshotRefusesSend(snapshot("failed", null), "item_1")).toBe(false);
-    expect(snapshotRefusesSend(snapshot("failed", undefined), "item_1")).toBe(false);
+    // No `lastTaskError` field at all, which `snapshot()` would default to null.
+    expect(snapshotRefusesSend({ id: "conv_1", status: "failed" } as Session, "item_1")).toBe(
+      false,
+    );
   });
 });
 
