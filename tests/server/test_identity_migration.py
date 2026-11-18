@@ -22,6 +22,7 @@ from omnigent.cli import cli
 from omnigent.db.db_models import (
     SqlAccountToken,
     SqlComment,
+    SqlCommentReply,
     SqlHost,
     SqlPolicy,
 )
@@ -160,9 +161,27 @@ def test_remap_repoints_comments_policies_tokens_hosts(db_uri: str) -> None:
         )
         s.commit()
 
+    from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
+
+    reply = SqlAlchemyCommentStore(db_uri).add_reply(
+        "747618b4b2dd94383e50ddf180ceddc3",
+        "8af356d908005a65f872c246158c6293",
+        "Answer",
+        created_by="alice",
+    )
+    assert reply is not None
     remap_identities(engine, {"alice": "alice@example.com"}, dry_run=False)
+    migrated = SqlAlchemyCommentStore(db_uri).get(reply.comment_id, reply.conversation_id)
+    assert migrated is not None and migrated.last_reply is not None
+    assert migrated.last_reply.created_by == "alice@example.com"
 
     with Session(engine) as s:
+        assert (
+            s.get(
+                SqlCommentReply, (0, reply.conversation_id, reply.comment_id, reply.id)
+            ).created_by
+            == "alice@example.com"
+        )
         assert (
             s.get(
                 SqlComment,

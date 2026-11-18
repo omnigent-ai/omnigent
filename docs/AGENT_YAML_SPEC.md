@@ -1182,7 +1182,7 @@ byte-bounded provider counts every advertised tool against its limit.
 tool_groups:
   browser: false          # browser_navigate / _snapshot / _click / _type / _screenshot
   scheduled_tasks: false  # sys_scheduled_task_create / _list / _update / _delete, sys_reminder_set
-  comments: false         # list_comments / update_comment
+  comments: false         # list_comments / update_comment / reply_to_comment
   policies: false         # sys_add_policy / sys_policy_registry
   agent_discovery: false  # sys_agent_get / sys_agent_download / sys_agent_list
   journal: false          # sys_journal_read / _write_plan / _write_status / _write_note, sys_workflow_request_input / _save / _load / _list

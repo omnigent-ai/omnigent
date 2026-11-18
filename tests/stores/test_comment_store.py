@@ -189,7 +189,9 @@ def test_comment_pages_use_session_primary_key(store: SqlAlchemyCommentStore) ->
     assert cursor == comments[3].id
     assert store.list_page(conversation_id, limit=2, after_id=cursor) == (comments[4:], None)
     assert store.list_page(conversation_id, after_id=comments[-1].id) == ([], None)
+    # Summary columns are read on the bounded parent page, without thread scans.
     assert len(queries) == 1
+    assert "comment_replies" not in queries[0][0]
     statement, parameters = queries[0]
     with store._engine.connect() as connection:
         assert len(connection.exec_driver_sql(statement, parameters).all()) == 3
@@ -925,3 +927,207 @@ def test_pr_anchor_persists_through_comment_lifecycle(store: SqlAlchemyCommentSt
     deleted = store.delete(comment.id, session_id)
     assert deleted is not None
     assert deleted.anchor_metadata == anchor
+
+
+def test_reply_pagination_cap_and_fingerprint(store: SqlAlchemyCommentStore) -> None:
+    """Replies preserve a stable cursor, obey the cap and invalidate comments."""
+    from omnigent.db.db_models import SqlCommentReply
+    from omnigent.stores.comment_store import MAX_REPLIES_PER_COMMENT, CommentReplyLimitError
+
+    conversation_id = "1" * 32
+    parent = store.add(conversation_id, "file.py", "Why?", 0, 1)
+    before = store.get_comments_fingerprints([conversation_id])[conversation_id]
+    replies = [
+        store.add_reply(parent.id, conversation_id, f"Reply {index}")
+        for index in range(MAX_REPLIES_PER_COMMENT)
+    ]
+    assert all(reply is not None for reply in replies)
+    summary = store.get(parent.id, conversation_id)
+    assert summary is not None and summary.reply_count == 200
+    assert summary.last_reply is not None
+    assert summary.last_reply.created_at == replies[-1].created_at
+    assert summary.last_reply.author_kind == "user"
+    # Force timestamp ties to exercise the ID tie-break in the actual storage query.
+    with store._session("seed_reply_timestamps") as session:
+        session.query(SqlCommentReply).filter_by(
+            workspace_id=0, conversation_id=conversation_id
+        ).update({"created_at": 7})
+    expected = sorted(
+        (reply for reply in replies if reply is not None), key=lambda reply: reply.id
+    )
+    page, cursor = store.list_replies(parent.id, conversation_id, limit=100)
+    assert [reply.id for reply in page] == [reply.id for reply in expected[:100]]
+    assert cursor == (7, page[-1].id)
+    tail, cursor = store.list_replies(
+        parent.id, conversation_id, limit=100, after_created_at=cursor[0], after_id=cursor[1]
+    )
+    assert [reply.id for reply in tail] == [reply.id for reply in expected[100:]]
+    assert cursor is None
+    descending, cursor = store.list_replies(parent.id, conversation_id, order="desc", limit=100)
+    assert [reply.id for reply in descending] == [reply.id for reply in reversed(expected[100:])]
+    assert cursor is not None
+    tail, cursor = store.list_replies(
+        parent.id,
+        conversation_id,
+        order="desc",
+        limit=100,
+        after_created_at=cursor[0],
+        after_id=cursor[1],
+    )
+    assert [reply.id for reply in tail] == [reply.id for reply in reversed(expected[:100])]
+    assert cursor is None
+    assert [reply.id for reply in store.recent_replies(parent.id, conversation_id)] == [
+        reply.id for reply in expected[-20:]
+    ]
+    with pytest.raises(CommentReplyLimitError):
+        store.add_reply(parent.id, conversation_id, "One too many")
+    after_add = store.get_comments_fingerprints([conversation_id])[conversation_id]
+    assert after_add.count == before.count
+    assert after_add.last_updated_at > before.last_updated_at
+    assert store.delete_reply(parent.id, conversation_id, page[0].id)
+    assert not store.delete_reply(parent.id, conversation_id, page[0].id)
+    after_delete = store.get_comments_fingerprints([conversation_id])[conversation_id]
+    assert after_delete.last_updated_at > after_add.last_updated_at
+    assert store.list_for_conversation(conversation_id)[0].reply_count == 199
+
+
+@pytest.mark.parametrize("body", ["", " \n", "é" * 6001], ids=["empty", "blank", "oversized"])
+def test_reply_body_bounds(store: SqlAlchemyCommentStore, body: str) -> None:
+    from omnigent.stores.comment_store import validate_reply_body
+
+    with pytest.raises(ValueError, match="12,000"):
+        validate_reply_body(body)
+    assert store.list_replies("1" * 32, "2" * 32) == ([], None)
+
+
+def test_reply_scoping_and_cleanup(store: SqlAlchemyCommentStore) -> None:
+    """Comment and bounded conversation cleanup leave other tenants intact."""
+    conversation_id = "2" * 32
+    first = store.add(conversation_id, "a.py", "First", 0, 1)
+    second = store.add(conversation_id, "b.py", "Second", 0, 1)
+    reply = store.add_reply(first.id, conversation_id, "Answer", author_kind="agent")
+    assert reply is not None and reply.author_kind == "agent" and reply.created_by is None
+    assert store.get_reply(first.id, "3" * 32, reply.id) is None
+    assert store.add_reply(first.id, "3" * 32, "Wrong session") is None
+    assert not store.delete_reply(second.id, conversation_id, reply.id)
+    with workspace_scope(7):
+        assert store.get_reply(first.id, conversation_id, reply.id) is None
+        tenant_parent = store.add(conversation_id, "c.py", "Tenant", 0, 1)
+        tenant_reply = store.add_reply(tenant_parent.id, conversation_id, "Keep")
+    store.delete(first.id, conversation_id)
+    assert store.list_replies(first.id, conversation_id) == ([], None)
+    # More than a cleanup page exercises continuation without a separate fixture.
+    for index in range(105):
+        store.add_reply(second.id, conversation_id, f"Answer {index}")
+    store.remove_conversation(conversation_id)
+    assert store.list_replies(second.id, conversation_id) == ([], None)
+    with workspace_scope(7):
+        assert tenant_reply is not None
+        assert store.get_reply(tenant_parent.id, conversation_id, tenant_reply.id) == tenant_reply
+
+
+def test_reply_body_limits_include_cipher_envelope(monkeypatch: pytest.MonkeyPatch) -> None:
+    from omnigent.stores.comment_store import validate_reply_body
+
+    class ExpandingCipher:
+        def encrypt(self, plaintext: bytes) -> tuple[dict[str, str], bytes]:
+            return {"algorithm": "example"}, plaintext + b"x" * 16_383
+
+    validate_reply_body("a" * 12_000)
+    monkeypatch.setattr("omnigent.db.envelope._cipher", ExpandingCipher())
+    with pytest.raises(ValueError, match=r"12,000.*encrypted storage limit"):
+        validate_reply_body("A short message")
+
+
+def test_reply_summary_tracks_latest_delete_and_edits(store: SqlAlchemyCommentStore) -> None:
+    """All comment return paths carry the current metadata without decoding replies."""
+    conversation_id = "4" * 32
+    parent = store.add(conversation_id, "a.py", "Question", 0, 1)
+    first = store.add_reply(parent.id, conversation_id, "First", created_by="a@example.test")
+    latest = store.add_reply(parent.id, conversation_id, "Latest", author_kind="agent")
+    assert first is not None and latest is not None
+    updated = store.update_comment(parent.id, conversation_id, status="addressed")
+    assert updated is not None and updated.reply_count == 2
+    assert updated.last_reply is not None and updated.last_reply.author_kind == "agent"
+    assert store.delete_reply(parent.id, conversation_id, latest.id)
+    remaining = store.get(parent.id, conversation_id)
+    assert remaining is not None and remaining.reply_count == 1
+    assert remaining.last_reply is not None
+    assert remaining.last_reply.created_by == "a@example.test"
+    assert remaining.last_reply.created_at == first.created_at
+    assert store.delete_reply(parent.id, conversation_id, first.id)
+    empty = store.list_for_conversation(conversation_id)[0]
+    assert empty.reply_count == 0 and empty.last_reply is None
+
+
+def test_edit_clock_read_after_interleaved_reply(
+    store: SqlAlchemyCommentStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A delayed edit cannot restore the fingerprint from before a reply cycle."""
+    import omnigent.stores.comment_store.sqlalchemy_store as module
+
+    conversation_id = "5" * 32
+    parent = store.add(conversation_id, "a.py", "Question", 0, 1)
+    original = module.run_write_transaction
+    clock_reads = []
+    monkeypatch.setattr(module, "now_epoch_us", lambda: clock_reads.append(True) or 1)
+
+    def interleave(session_maker, operation, write):
+        if operation == "update_comment":
+            assert clock_reads == [], "Edit read the clock before acquiring the write transaction"
+            reply = store.add_reply(parent.id, conversation_id, "Temporary")
+            assert reply is not None
+            store.delete_reply(parent.id, conversation_id, reply.id)
+        return original(session_maker, operation, write)
+
+    monkeypatch.setattr(module, "run_write_transaction", interleave)
+    updated = store.update_comment(parent.id, conversation_id, body="Edited")
+    assert updated is not None
+    assert updated.updated_at == parent.updated_at + 3
+    assert (
+        store.get_comments_fingerprints([conversation_id])[conversation_id].last_updated_at
+        == updated.updated_at
+    )
+
+
+def test_conversation_cleanup_closes_reply_writers_first(
+    store: SqlAlchemyCommentStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reply attempted as cleanup starts cannot survive the drain."""
+    import omnigent.stores.comment_store.sqlalchemy_store as module
+
+    conversation_id = "6" * 32
+    parent = store.add(conversation_id, "a.py", "Question", 0, 1)
+    store.add_reply(parent.id, conversation_id, "Existing")
+    drain = module.delete_conversation_replies
+
+    def interleave(session_maker, conversation):
+        assert store.add_reply(parent.id, conversation, "Too late") is None
+        drain(session_maker, conversation)
+
+    monkeypatch.setattr(module, "delete_conversation_replies", interleave)
+    store.remove_conversation(conversation_id)
+    assert store.list_replies(parent.id, conversation_id) == ([], None)
+
+
+def test_reply_cleanup_stops_when_delete_makes_no_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A concurrent drain can remove selected rows before this batch deletes them."""
+    from unittest.mock import Mock
+
+    import omnigent.stores.comment_store.sqlalchemy_store as module
+
+    session = Mock()
+    selected = Mock()
+    selected.all.return_value = [("1" * 32, "2" * 32)] * module.MAX_COMMENT_PAGE_SIZE
+    session.execute.side_effect = [selected, Mock(rowcount=0)]
+    transactions = []
+
+    def run_batch(session_maker, operation, write):
+        transactions.append(operation)
+        return write(session)
+
+    monkeypatch.setattr(module, "run_write_transaction", run_batch)
+    module.delete_conversation_replies(Mock(), "3" * 32)
+    assert transactions == ["remove_reply_batch"]

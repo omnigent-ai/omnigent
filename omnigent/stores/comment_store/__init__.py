@@ -3,12 +3,18 @@
 import json
 from abc import ABC, abstractmethod
 from dataclasses import asdict
+from typing import Literal
 
 from omnigent.db.compression import encode
 from omnigent.entities import Comment, CommentsFingerprint
-from omnigent.entities.comment import COMMENT_ANCHOR_MAX_STORED_BYTES, PullRequestCommentAnchor
+from omnigent.entities.comment import (
+    COMMENT_ANCHOR_MAX_STORED_BYTES,
+    CommentReply,
+    PullRequestCommentAnchor,
+)
 
 MAX_COMMENT_PAGE_SIZE = 100
+AGENT_COMMENT_REPLY_WINDOW = 20
 
 
 def serialize_comment_anchor(anchor: PullRequestCommentAnchor | None) -> str | None:
@@ -199,3 +205,84 @@ class CommentStore(ABC):
             e.g. ``"conv_abc123"``.
         """
         ...
+
+    @abstractmethod
+    def add_reply(
+        self,
+        comment_id: str,
+        conversation_id: str,
+        body: str,
+        *,
+        author_kind: str = "user",
+        created_by: str | None = None,
+    ) -> CommentReply | None:
+        """Append atomically under the parent lock; None means no parent."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def get_reply(
+        self, comment_id: str, conversation_id: str, reply_id: str
+    ) -> CommentReply | None:
+        """Read a reply scoped to its conversation and parent comment."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def list_replies(
+        self,
+        comment_id: str,
+        conversation_id: str,
+        *,
+        limit: int = 50,
+        after_created_at: int | None = None,
+        after_id: str | None = None,
+        order: Literal["asc", "desc"] = "asc",
+    ) -> tuple[list[CommentReply], tuple[int, str] | None]:
+        """Return ordered messages and an exclusive (epoch µs, ID) cursor."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def recent_replies(
+        self,
+        comment_id: str,
+        conversation_id: str,
+        *,
+        limit: int = AGENT_COMMENT_REPLY_WINDOW,
+    ) -> list[CommentReply]:
+        """Return the latest bounded messages in oldest-first order for agent context."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def delete_reply(
+        self,
+        comment_id: str,
+        conversation_id: str,
+        reply_id: str,
+    ) -> bool:
+        """Delete a reply and advance its parent's fingerprint atomically."""
+        raise NotImplementedError
+
+
+MAX_REPLIES_PER_COMMENT = 200
+# 12,000 UTF-8 bytes leaves 4,383 bytes for compression/encryption framing.
+# Cipher plugins have no overhead bound, so validate the actual envelope too.
+MAX_REPLY_BODY_BYTES = 12_000
+
+
+class CommentReplyLimitError(ValueError):
+    """A comment thread has reached its reply cap."""
+
+
+def validate_reply_body(body: str) -> None:
+    """Reject empty/oversized plaintext and encryption envelopes before writing."""
+    from omnigent.db.db_models import COMMENT_REPLY_BODY_MAX_STORED_BYTES
+    from omnigent.db.envelope import seal_text
+
+    if not body.strip() or len(body.encode("utf-8")) > MAX_REPLY_BODY_BYTES:
+        raise ValueError(
+            f"Reply body must contain 1–{MAX_REPLY_BODY_BYTES:,} UTF-8 bytes of nonblank text"
+        )
+    if len(seal_text(body)) > COMMENT_REPLY_BODY_MAX_STORED_BYTES:
+        raise ValueError(
+            f"Reply body (maximum {MAX_REPLY_BODY_BYTES:,} UTF-8 bytes) "
+            "exceeds the encrypted storage limit"
+        )

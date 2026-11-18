@@ -409,6 +409,8 @@ class ServerInfoResponse(BaseModel):
     admin_view: bool = False
     # Session comments accept and preserve immutable PR coordinates.
     comment_anchor_metadata: bool = True
+    # File-comment threads and user/agent replies are available.
+    comment_replies: bool = True
     # Absent on older servers, which clients treat as the default extensions.
     filesystem_attachments: FilesystemAttachmentsInfo | None = None
     # Scheduled tasks accept ``project_id``; older servers reject it.

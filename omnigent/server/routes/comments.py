@@ -8,16 +8,17 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import asdict
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, field_validator, model_validator
 
 from omnigent.db.enum_codecs import COMMENT_STATUS
 from omnigent.entities import Comment
-from omnigent.entities.comment import PullRequestCommentAnchor
+from omnigent.entities.comment import CommentReply, PullRequestCommentAnchor
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider
+from omnigent.server.routes._agent_origin import require_agent_origin
 from omnigent.server.routes._auth_helpers import (
     attribution_user,
     get_user_id,
@@ -26,14 +27,20 @@ from omnigent.server.routes._auth_helpers import (
 from omnigent.server.routes._errors import session_not_found
 from omnigent.stores import ConversationStore
 from omnigent.stores.comment_store import (
+    AGENT_COMMENT_REPLY_WINDOW,
     MAX_COMMENT_PAGE_SIZE,
+    CommentReplyLimitError,
     CommentStore,
     serialize_comment_anchor,
 )
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.util.uuid import normalize_uuid
 
 
-def _format_message(comments: list[Comment]) -> str:
+def _format_message(
+    comments: list[Comment],
+    replies: dict[str, list[CommentReply]] | None = None,
+) -> str:
     """Format a list of comments into a human-readable message for the agent.
 
     Groups comments by file path (alphabetical) and sorts within each group
@@ -56,6 +63,21 @@ def _format_message(comments: list[Comment]) -> str:
         for c in sorted(by_path[path], key=lambda c: c.start_index):
             anchor = f'"{c.anchor_content.strip()}" ' if c.anchor_content else ""
             lines.append(f"• {anchor}(offset {c.start_index}–{c.end_index}): {c.body}")
+            thread = (replies or {}).get(c.id, [])
+            if thread:
+                lines.append(
+                    f"  Answer in-thread with reply_to_comment(comment_id={c.id!r}, body=...)."
+                )
+                omitted = c.reply_count - len(thread)
+                if omitted > 0:
+                    lines.append(f"  ({omitted} earlier replies omitted; call list_comments)")
+                for reply in thread:
+                    label = "Agent" if reply.author_kind == "agent" else "User"
+                    if reply.created_by is not None:
+                        label += f" ({reply.created_by})"
+                    reply_lines = reply.body.splitlines()
+                    lines.append(f"  {label}: {reply_lines[0]}")
+                    lines.extend(f"    {line}" for line in reply_lines[1:])
 
     return "\n".join(lines)
 
@@ -68,6 +90,26 @@ class CommentPage(BaseModel):
 
     comments: list[Comment]
     next_cursor: str | None
+
+
+class ReplyCursor(BaseModel):
+    """Exclusive keyset position, in epoch microseconds and reply ID."""
+
+    created_at: int
+    id: str
+
+
+class CommentReplyPage(BaseModel):
+    """Reply page in the requested order."""
+
+    replies: list[CommentReply]
+    next_cursor: ReplyCursor | None
+
+
+class AddCommentReplyRequest(BaseModel):
+    """A reply's plaintext body, validated by the store's byte bounds."""
+
+    body: str
 
 
 class AddCommentRequest(BaseModel):
@@ -375,9 +417,143 @@ def create_comments_router(
         await _require_session_access(user_id, session_id, LEVEL_EDIT)
         if permission_store is not None:
             await _require_comment_author(user_id, comment_id, session_id)
-        deleted = store.delete(comment_id, session_id)
+        deleted = await asyncio.to_thread(store.delete, comment_id, session_id)
         if deleted is None:
             raise OmnigentError("Comment not found", code=ErrorCode.NOT_FOUND)
+        return {"deleted": True}
+
+    async def _require_parent(comment_id: str, session_id: str) -> None:
+        """Keep unknown and cross-session thread lookups indistinguishable."""
+        if await asyncio.to_thread(store.get, comment_id, session_id) is None:
+            raise OmnigentError("Comment not found", code=ErrorCode.NOT_FOUND)
+
+    @router.get("/sessions/{session_id}/comments/{comment_id}/replies")
+    async def list_comment_replies(
+        request: Request,
+        session_id: str,
+        comment_id: str,
+        after_created_at: int | None = Query(None, ge=0),
+        after_id: str | None = Query(None, pattern=r"^[0-9a-f]{32}$"),
+        limit: int = Query(50, ge=1, le=100),
+        order: Literal["asc", "desc"] = Query("asc"),
+    ) -> CommentReplyPage:
+        """Read a thread page (oldest-first by default) with LEVEL_READ access."""
+        await _require_session_access(get_user_id(request, auth_provider), session_id, LEVEL_READ)
+        await _require_parent(comment_id, session_id)
+        try:
+            replies, cursor = await asyncio.to_thread(
+                store.list_replies,
+                comment_id,
+                session_id,
+                limit=limit,
+                after_created_at=after_created_at,
+                after_id=after_id,
+                order=order,
+            )
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+        return CommentReplyPage(
+            replies=replies,
+            next_cursor=ReplyCursor(created_at=cursor[0], id=cursor[1]) if cursor else None,
+        )
+
+    async def _append_reply(
+        user_id: str | None,
+        session_id: str,
+        comment_id: str,
+        body: AddCommentReplyRequest,
+        *,
+        agent: bool = False,
+    ) -> CommentReply:
+        """Append after the caller has authorized its writer transport."""
+        try:
+            reply = await asyncio.to_thread(
+                store.add_reply,
+                comment_id,
+                session_id,
+                body.body,
+                author_kind="agent" if agent else "user",
+                created_by=None if agent else attribution_user(user_id),
+            )
+        except CommentReplyLimitError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.CONFLICT) from exc
+        except ValueError as exc:
+            raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+        if reply is None:
+            raise OmnigentError("Comment not found", code=ErrorCode.NOT_FOUND)
+        return reply
+
+    @router.post("/sessions/{session_id}/comments/{comment_id}/replies")
+    async def add_comment_reply(
+        request: Request,
+        session_id: str,
+        comment_id: str,
+        body: AddCommentReplyRequest,
+    ) -> CommentReply:
+        """Append a user reply with LEVEL_EDIT access; a full thread returns 409."""
+        user_id = get_user_id(request, auth_provider)
+        await _require_session_access(user_id, session_id, LEVEL_EDIT)
+        return await _append_reply(user_id, session_id, comment_id, body)
+
+    @router.post("/sessions/{session_id}/comments/{comment_id}/replies/agent")
+    async def add_agent_comment_reply(
+        request: Request,
+        session_id: str,
+        comment_id: str,
+        body: AddCommentReplyRequest,
+    ) -> CommentReply:
+        """Runner tool transport: require a verified runner bound to this session.
+
+        Runner callbacks carry their human owner's credentials and source binding.
+        Any editor may delete these unattributed replies, matching comments.
+        """
+        if conversation_store is None:
+            raise OmnigentError("Agent replies require a source session", code=ErrorCode.FORBIDDEN)
+        user_id = get_user_id(request, auth_provider)
+        await _require_session_access(user_id, session_id, LEVEL_EDIT)
+        source = await asyncio.to_thread(
+            require_agent_origin,
+            request,
+            action="Agent replies",
+            owner=user_id or "local",
+            auth_provider=auth_provider,
+            conversation_store=conversation_store,
+            permission_store=permission_store,
+            required=True,
+        )
+        if source != (normalize_uuid(session_id) or session_id):
+            raise OmnigentError(
+                "Agents may reply only in their source session", code=ErrorCode.FORBIDDEN
+            )
+        return await _append_reply(user_id, session_id, comment_id, body, agent=True)
+
+    @router.delete("/sessions/{session_id}/comments/{comment_id}/replies/{reply_id}")
+    async def delete_comment_reply(
+        request: Request,
+        session_id: str,
+        comment_id: str,
+        reply_id: str,
+    ) -> dict[str, bool]:
+        """Delete one's reply with LEVEL_EDIT; unattributed replies allow any editor.
+
+        This mirrors comment deletion, including agent replies with created_by=None.
+        """
+        user_id = get_user_id(request, auth_provider)
+        await _require_session_access(user_id, session_id, LEVEL_EDIT)
+        await _require_parent(comment_id, session_id)
+        reply = await asyncio.to_thread(store.get_reply, comment_id, session_id, reply_id)
+        if reply is None:
+            raise OmnigentError("Reply not found", code=ErrorCode.NOT_FOUND)
+        if (
+            permission_store is not None
+            and reply.created_by is not None
+            and reply.created_by != user_id
+        ):
+            raise OmnigentError(
+                "Only the reply author can delete this reply", code=ErrorCode.FORBIDDEN
+            )
+        if not await asyncio.to_thread(store.delete_reply, comment_id, session_id, reply_id):
+            raise OmnigentError("Reply not found", code=ErrorCode.NOT_FOUND)
         return {"deleted": True}
 
     @router.post("/sessions/{session_id}/comments/send")
@@ -430,7 +606,16 @@ def create_comments_router(
 
         to_send = await asyncio.to_thread(_fetch_and_mark)
 
-        formatted = _format_message(to_send)
+        threads = await asyncio.to_thread(
+            lambda: {
+                comment.id: store.recent_replies(
+                    comment.id, session_id, limit=AGENT_COMMENT_REPLY_WINDOW
+                )
+                for comment in to_send
+                if comment.reply_count > 0
+            }
+        )
+        formatted = _format_message(to_send, threads)
         return {
             "formatted_message": formatted,
             "sent_comment_ids": [c.id for c in to_send],

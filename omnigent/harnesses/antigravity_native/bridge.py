@@ -376,6 +376,7 @@ _MCP_SERVER_NAME = "omnigent"
 # prompt blocking the call before Omnigent ever sees it.
 _AGY_ENABLED_TOOLS = [
     "list_comments",
+    "reply_to_comment",
     "sys_add_policy",
     "sys_agent_download",
     "sys_agent_get",

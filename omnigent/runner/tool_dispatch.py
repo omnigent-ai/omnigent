@@ -77,6 +77,7 @@ from omnigent.runner.journal_tools import (
 from omnigent.runner.session_requests import remember_session_host
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.spec.types import MEMORY_TOOL_NAMES
+from omnigent.stores.comment_store import AGENT_COMMENT_REPLY_WINDOW
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.browser_agent_tools import ADVANCED_BROWSER_TOOL_NAMES
@@ -97,6 +98,7 @@ from omnigent.tools.builtins.os_env import (
     SysOsShellTool,
     SysOsWriteTool,
 )
+from omnigent.tools.builtins.reply_to_comment import ReplyToCommentTool
 from omnigent.tools.builtins.scheduled_tasks import (
     reminder_name,
     reminder_prompt,
@@ -453,6 +455,7 @@ _COMMENT_TOOLS = frozenset(
     {
         ListCommentsTool.name(),
         UpdateCommentTool.name(),
+        ReplyToCommentTool.name(),
     }
 )
 
@@ -686,6 +689,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
         for _cls in (
             ListCommentsTool,
             UpdateCommentTool,
+            ReplyToCommentTool,
             SysSessionListTool,
             SysSessionGetHistoryTool,
             SysSessionGetInfoTool,
@@ -5031,7 +5035,53 @@ async def _execute_comment_tool(
         status_filter = _optional_string(args.get("status"))
         if status_filter is not None:
             all_comments = [c for c in all_comments if c.get("status") == status_filter]
+        for comment in all_comments:
+            # Older servers omit reply_count and have no thread endpoint.
+            if not comment.get("reply_count"):
+                comment["replies"] = []
+                continue
+            comment_id = _optional_string(comment.get("id"))
+            if comment_id is None:
+                continue
+            comment["replies"] = []
+            try:
+                response = await server_client.get(
+                    f"{base}/{_route_identifier(comment_id, 'Comment')}/replies",
+                    params={"order": "desc", "limit": AGENT_COMMENT_REPLY_WINDOW},
+                    timeout=30.0,
+                )
+                if response.status_code != 200:
+                    comment["replies_note"] = (
+                        f"Thread unavailable (HTTP {response.status_code}); retry list_comments."
+                    )
+                    continue
+                comment["replies"] = [
+                    {key: reply[key] for key in ("author_kind", "body", "created_at")}
+                    for reply in reversed(response.json()["replies"])
+                ]
+            except Exception as exc:  # noqa: BLE001
+                comment["replies_note"] = f"Thread unavailable: {exc}; retry list_comments."
         return json.dumps({"comments": all_comments})
+
+    if tool_name == ReplyToCommentTool.name():
+        comment_id = _optional_string(args.get("comment_id"))
+        body = _optional_string(args.get("body"))
+        if not comment_id or body is None:
+            return json.dumps({"error": "comment_id and body are required"})
+        try:
+            response = await server_client.post(
+                f"{base}/{_route_identifier(comment_id, 'Comment')}/replies/agent",
+                json={"body": body},
+                headers={ORCHESTRATION_SOURCE_HEADER: conversation_id},
+                timeout=30.0,
+            )
+            if response.status_code != 200:
+                return json.dumps(
+                    {"error": f"reply_to_comment returned {response.status_code}: {response.text}"}
+                )
+            return json.dumps({"reply": response.json()})
+        except Exception as exc:  # noqa: BLE001
+            return json.dumps({"error": f"reply_to_comment failed: {exc}"})
 
     # update_comment
     comment_id = _optional_string(args.get("comment_id"))

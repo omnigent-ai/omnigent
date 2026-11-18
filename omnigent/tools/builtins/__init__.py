@@ -63,6 +63,7 @@ from omnigent.tools.builtins.nimble_research import NimbleResearchTool
 from omnigent.tools.builtins.read_skill_file import (
     ReadSkillFileTool,
 )
+from omnigent.tools.builtins.reply_to_comment import ReplyToCommentTool
 from omnigent.tools.builtins.scheduled_tasks import (
     SysReminderSetTool,
     SysScheduledTaskCreateTool,
@@ -108,6 +109,7 @@ __all__ = [
     "NimbleExtractTool",
     "NimbleResearchTool",
     "ReadSkillFileTool",
+    "ReplyToCommentTool",
     "SysAdviseModelsTool",
     "SysAgentDownloadTool",
     "SysAgentGetTool",
@@ -308,6 +310,7 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "web_fetch": None,
     "list_comments": None,
     "update_comment": None,
+    "reply_to_comment": None,
     # ``sys_list_models`` is auto-registered by
     # ``ToolManager._register_sub_agent_tools`` with the dispatch grant
     # and intercepted by name in the runner's tool dispatch — reserved

@@ -58,6 +58,7 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         # list and update review comments without the spec opting in.
         "list_comments",
         "update_comment",
+        "reply_to_comment",
         # Read-only session discovery tools are registered for every
         # agent (a user-added agent that declares no sub-agents still
         # needs to list/peek/get-info on its session-mates); the
@@ -1753,7 +1754,7 @@ _TOOL_GROUP_MEMBERS: dict[str, frozenset[str]] = {
             "sys_reminder_set",
         }
     ),
-    "comments": frozenset({"list_comments", "update_comment"}),
+    "comments": frozenset({"list_comments", "update_comment", "reply_to_comment"}),
     "policies": frozenset({"sys_add_policy", "sys_policy_registry"}),
     "agent_discovery": frozenset({"sys_agent_get", "sys_agent_download", "sys_agent_list"}),
     "projects": frozenset(
@@ -1791,13 +1792,13 @@ def test_tool_groups_false_drops_only_that_group(group: str) -> None:
 
 def test_tool_groups_all_false_keeps_the_load_bearing_tools() -> None:
     """
-    With every group off, the 20 gated tools are gone but the session
+    With every group off, the 22 gated tools are gone but the session
     reads, ``sys_session_rename`` and ``sys_cancel_task`` stay: multi-agent
     participation and async handles depend on them, so they have no key.
     """
     names = _tool_names(_grouped_spec(**dict.fromkeys(_TOOL_GROUP_MEMBERS, False)))
     gated = frozenset().union(*_TOOL_GROUP_MEMBERS.values())
-    assert len(gated) == 21
+    assert len(gated) == 22
     assert not (gated & names)
     assert {
         "sys_session_list",

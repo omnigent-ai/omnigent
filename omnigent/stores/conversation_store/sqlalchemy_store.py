@@ -106,6 +106,7 @@ from omnigent.session_recovery import (
     SessionRecovery,
     reject_recovery_labels,
 )
+from omnigent.stores.comment_store.sqlalchemy_store import delete_conversation_replies
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
     _INSTANCE_SCOPED_LABEL_KEYS,
@@ -7739,6 +7740,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                 "delete_conversation_metadata",
                 lambda session, batch=batch_ids: delete_metadata(session, batch),
             )
+        for deleted_id in subtree_ids:
+            delete_conversation_replies(self._session_immediate, deleted_id)
         self._delete_session_journals(subtree_ids)
 
         return True

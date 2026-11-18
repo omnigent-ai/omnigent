@@ -37,7 +37,7 @@ def _registered(spec: AgentSpec) -> set[str]:
 def _gated() -> frozenset[str]:
     """Tools the six groups control, derived from registration itself."""
     gated = frozenset(_registered(_spec(ToolGroupsConfig())) - _registered(_spec(_ALL_OFF)))
-    assert len(gated) == 32, sorted(gated)
+    assert len(gated) == 33, sorted(gated)
     return gated
 
 
@@ -71,3 +71,12 @@ def test_dispatch_refuses_a_disabled_group_tool() -> None:
         assert _ungranted_tool_reason(name, default_spec) is None, name
         reason = _ungranted_tool_reason(name, trimmed_spec)
         assert reason is not None and "not enabled for this agent" in reason, name
+
+
+def test_native_comment_allowlists_cover_relay_tools() -> None:
+    from omnigent.harnesses.antigravity_native.bridge import _AGY_ENABLED_TOOLS
+    from omnigent.harnesses.cursor_native.bridge import _CURSOR_AUTO_APPROVE_TOOLS
+    from omnigent.runner.tool_dispatch import _COMMENT_TOOLS
+
+    assert set(_CURSOR_AUTO_APPROVE_TOOLS) >= _COMMENT_TOOLS
+    assert set(_AGY_ENABLED_TOOLS) >= _COMMENT_TOOLS

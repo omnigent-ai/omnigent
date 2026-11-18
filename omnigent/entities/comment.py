@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import dataclasses
+from typing import Literal
 
 COMMENT_ANCHOR_MAX_STORED_BYTES = 1_024
+CommentReplyAuthorKind = Literal["user", "agent"]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -35,6 +37,15 @@ class PullRequestCommentAnchor:
                 or any(character not in "0123456789abcdef" for character in revision)
             ):
                 raise ValueError("review revisions must be hexadecimal commit IDs")
+
+
+@dataclasses.dataclass(frozen=True)
+class CommentReplySummary:
+    """Latest reply metadata for a collapsed comment, with no plaintext body."""
+
+    author_kind: CommentReplyAuthorKind
+    created_by: str | None
+    created_at: int
 
 
 @dataclasses.dataclass
@@ -85,6 +96,8 @@ class Comment:
     anchor_content: str | None = None
     created_by: str | None = None
     anchor_metadata: PullRequestCommentAnchor | None = None
+    reply_count: int = 0
+    last_reply: CommentReplySummary | None = None
 
 
 @dataclasses.dataclass
@@ -106,3 +119,16 @@ class CommentsFingerprint:
 
     count: int
     last_updated_at: int
+
+
+@dataclasses.dataclass(frozen=True)
+class CommentReply:
+    """One user or agent message in a comment thread; created_at is epoch µs."""
+
+    id: str
+    comment_id: str
+    conversation_id: str
+    author_kind: CommentReplyAuthorKind
+    body: str
+    created_by: str | None
+    created_at: int
