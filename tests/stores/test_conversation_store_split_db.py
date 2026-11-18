@@ -878,3 +878,462 @@ def test_get_conversation_takes_one_checkout_per_engine(
         "runner_split",
         "a6bfc420101272fcd5906a9eff904dfd",
     )
+
+
+@pytest.mark.parametrize("single_database", [False, True])
+@pytest.mark.parametrize(
+    "superseded",
+    [
+        None,
+        "input",
+        "skill",
+        "authored-meta",
+        "synthetic-meta",
+        "command",
+        "stop",
+        "runner",
+        "host",
+        "approval",
+        "archive",
+    ],
+)
+def test_recovery_admission_checks_input_and_binding(
+    store: SqlAlchemyConversationStore,
+    omnigent_db: Path,
+    single_database: bool,
+    superseded: str | None,
+) -> None:
+    from dataclasses import replace
+
+    from omnigent.db.db_models import workspace_scope
+    from omnigent.entities import MessageData, NewConversationItem, SlashCommandData
+    from omnigent.session_recovery import SessionRecovery
+
+    if single_database:
+        store = SqlAlchemyConversationStore(f"sqlite:///{omnigent_db}")
+    conv = store.create_conversation(host_id="a" * 32, runner_id="runner", workspace="/restored")
+    intent = SessionRecovery(
+        conv.host_id,
+        conv.runner_id,
+        100,
+        phase="dispatching",
+        attempt_id="attempt",
+        launch_runner_id=conv.runner_id,
+    )
+    assert store.replace_session_recovery(conv.id, None, intent)
+    if superseded in {"input", "authored-meta", "synthetic-meta"}:
+        store.append(
+            conv.id,
+            [
+                NewConversationItem(
+                    response_id="user",
+                    type="message",
+                    data=MessageData(
+                        role="user",
+                        content=[{"type": "input_text", "text": "New work"}],
+                        is_meta=superseded != "input",
+                        user_authored=superseded == "authored-meta",
+                    ),
+                )
+            ],
+        )
+    elif superseded in {"skill", "command"}:
+        store.append(
+            conv.id,
+            [
+                NewConversationItem(
+                    response_id="user",
+                    type="slash_command",
+                    data=SlashCommandData(
+                        agent="test", kind=superseded, name="inspect", arguments=""
+                    ),
+                )
+            ],
+        )
+    elif superseded == "stop":
+        assert store.replace_session_recovery(conv.id, intent, replace(intent, phase="stopped"))
+    elif superseded == "runner":
+        store.replace_runner_id(conv.id, "replacement")
+    elif superseded == "host":
+        store.set_host_id(conv.id, "b" * 32, workspace="/restored")
+    elif superseded == "approval":
+        store.set_pending_elicitation_count(conv.id, 1)
+    elif superseded == "archive":
+        store.update_conversation(conv.id, archived=True)
+    with workspace_scope(42):
+        assert not store.admit_session_recovery(conv.id, intent)
+    assert store.admit_session_recovery(conv.id, intent) is (
+        superseded in {None, "synthetic-meta", "command"}
+    )
+
+
+@pytest.mark.parametrize("legacy_counter", [False, True])
+def test_recovery_state_shares_input_transaction_and_workspace_scope(
+    store: SqlAlchemyConversationStore, conv_db: Path, legacy_counter: bool
+) -> None:
+    from dataclasses import fields
+
+    from sqlalchemy import event
+
+    from omnigent.db.db_models import workspace_scope
+    from omnigent.entities import MessageData, NewConversationItem
+    from omnigent.session_recovery import SessionRecovery
+
+    conv = store.create_conversation(
+        host_id="a" * 32,
+        runner_id="old",
+        workspace="/restored",
+        labels={f"custom.{index}": "value" for index in range(100)},
+    )
+    intent = SessionRecovery("a" * 32, "old", 100)
+    if legacy_counter:
+        from omnigent.db.db_models import SqlConversation
+
+        with store._conv_session("seed_legacy_counter") as session:
+            session.get(SqlConversation, (0, conv.id)).next_position = None
+    snapshot = store.get_conversation(conv.id)
+    tables = _tables(conv_db)
+    assert store.replace_session_recovery(conv.id, None, intent, expected_conversation=snapshot)
+    assert _tables(conv_db) == tables
+    assert "session_recovery" not in tables
+    assert _count(conv_db, "conversation_labels") > 0
+    with workspace_scope(42):
+        assert store.get_session_recovery(conv.id) is None
+        assert not store.replace_session_recovery(conv.id, None, intent)
+    statements: list[tuple[str, Any]] = []
+
+    def capture(_conn, _cursor, statement, parameters, _context, _many):
+        if "FROM conversation_labels" in statement:
+            statements.append((statement, parameters))
+
+    event.listen(store._conv_engine, "before_cursor_execute", capture)
+    try:
+        store.append(
+            conv.id,
+            [
+                NewConversationItem(
+                    response_id="user",
+                    type="message",
+                    data=MessageData(
+                        role="user", content=[{"type": "input_text", "text": "new work"}]
+                    ),
+                )
+            ],
+        )
+    finally:
+        event.remove(store._conv_engine, "before_cursor_execute", capture)
+    assert len(statements) == 2  # Recovery read and cancellation delete.
+    with store._conv_engine.connect() as connection:
+        for statement, parameters in statements:
+            plan = " ".join(
+                str(row[-1])
+                for row in connection.exec_driver_sql(
+                    "EXPLAIN QUERY PLAN " + statement, parameters
+                )
+            )
+            assert "(workspace_id=? AND conversation_id=? AND key=?)" in plan, plan
+            assert len(parameters) == 2 + len(fields(SessionRecovery))
+    assert store.get_session_recovery(conv.id) is None
+    assert not store.replace_session_recovery(
+        conv.id, None, intent, expected_conversation=snapshot
+    )
+    assert not store.replace_session_recovery(conv.id, intent, None)
+    assert store.replace_session_recovery(conv.id, None, intent)
+    asyncio.run(store.delete_conversation(conv.id))
+    assert _count(conv_db, "conversation_labels") == 0
+
+
+@pytest.mark.parametrize(
+    "code", [None, "runner_disconnected", "runner_interrupted", "session_recovery_failed", ""]
+)
+def test_session_interruption_time_uses_error_label_timestamp_and_workspace_scope(
+    store: SqlAlchemyConversationStore, code: str | None
+) -> None:
+    from sqlalchemy import event
+
+    from omnigent.db.db_models import workspace_scope
+
+    conv = store.create_conversation()
+    if code is not None:
+        store.set_labels(conv.id, {"omnigent.last_task_error_code": code}, updated_at=100)
+    store.set_labels(conv.id, {"unrelated": "newer"}, updated_at=200)
+    statements: list[tuple[str, Any]] = []
+
+    def capture(_conn, _cursor, statement, parameters, _context, _many):
+        if statement.lstrip().startswith("SELECT"):
+            statements.append((statement, parameters))
+
+    event.listen(store._conv_engine, "before_cursor_execute", capture)
+    try:
+        assert store.get_session_interruption_time(conv.id) == (
+            100 if code in {"runner_disconnected", "runner_interrupted"} else None
+        )
+    finally:
+        event.remove(store._conv_engine, "before_cursor_execute", capture)
+    assert len(statements) == 1
+    statement, parameters = statements[0]
+    assert len(parameters) == 3
+    with store._conv_engine.connect() as connection:
+        plan = " ".join(
+            str(row[-1])
+            for row in connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters)
+        )
+    assert "(workspace_id=? AND conversation_id=? AND key=?)" in plan, plan
+    with workspace_scope(42):
+        assert store.get_session_interruption_time(conv.id) is None
+        other = store.create_conversation(conversation_id=conv.id)
+        store.set_labels(
+            other.id, {"omnigent.last_task_error_code": "runner_interrupted"}, updated_at=300
+        )
+        assert store.get_session_interruption_time(conv.id) == 300
+    assert store.get_session_interruption_time(conv.id) == (
+        100 if code in {"runner_disconnected", "runner_interrupted"} else None
+    )
+    assert store.get_session_interruption_time("0" * 32) is None
+
+
+def test_recovery_labels_are_private_and_cannot_be_overwritten_or_forked(
+    store: SqlAlchemyConversationStore, conv_db: Path
+) -> None:
+    from dataclasses import replace
+
+    from omnigent.errors import OmnigentError
+    from omnigent.session_recovery import RECOVERY_LABEL_PREFIX, SessionRecovery
+
+    conv = store.create_conversation(labels={"team": "platform"})
+    intent = SessionRecovery(
+        "a" * 64, "b" * 64, 100, attempt_id="c" * 64, attempts=3, launch_runner_id="replacement"
+    )
+    assert store.replace_session_recovery(conv.id, None, intent)
+    with sqlite3.connect(conv_db) as connection:
+        connection.execute(
+            "INSERT INTO conversation_labels "
+            "(workspace_id, conversation_id, key, value, updated_at) "
+            "VALUES (0, ?, ?, 'private', 100)",
+            (bytes.fromhex(conv.id), RECOVERY_LABEL_PREFIX + "future"),
+        )
+    assert store.get_session_recovery(conv.id) == intent
+    assert store.get_conversation(conv.id).labels == {"team": "platform"}
+    assert store.list_conversations().data[0].labels == {"team": "platform"}
+    fork = store.fork_conversation(conv.id)
+    assert store.get_session_recovery(fork.id) is None
+
+    for key in (RECOVERY_LABEL_PREFIX + "attempts", (RECOVERY_LABEL_PREFIX + "attempts").upper()):
+        with pytest.raises(OmnigentError, match="server-internal"):
+            store.create_conversation(labels={key: "0"})
+        with pytest.raises(OmnigentError, match="server-internal"):
+            store.set_labels(conv.id, {"team": "forged", key: "0"})
+        with pytest.raises(OmnigentError, match="server-internal"):
+            store.delete_label(conv.id, key)
+    with pytest.raises(ValueError, match="storage limit"):
+        store.replace_session_recovery(conv.id, intent, replace(intent, runner_id="x" * 256))
+    assert store.get_session_recovery(conv.id) == intent
+    assert store.get_conversation(conv.id).labels == {"team": "platform"}
+    assert max(map(len, _col(conv_db, "conversation_labels", "value"))) <= 256
+    assert store.replace_session_recovery(conv.id, intent, None)
+    assert store.get_session_recovery(conv.id) is None
+    assert RECOVERY_LABEL_PREFIX + "future" in _col(conv_db, "conversation_labels", "key")
+    assert store.get_conversation(conv.id).labels == {"team": "platform"}
+
+
+@pytest.mark.parametrize(
+    ("phase", "attempt_id", "user_authored", "expected_meta"),
+    [
+        (None, None, False, False),
+        ("pending", "attempt", False, False),
+        ("launching", "attempt", False, False),
+        ("dispatching", None, False, False),
+        ("dispatching", "attempt", False, True),
+        ("submitted", "attempt", False, True),
+        ("stopped", "attempt", False, True),
+        ("failed", "attempt", False, True),
+        ("dispatching", "attempt", True, False),
+    ],
+)
+@pytest.mark.parametrize("custom_prompt", [False, True])
+def test_recovery_notice_requires_a_dispatched_attempt(
+    store: SqlAlchemyConversationStore,
+    phase: Any,
+    attempt_id: str | None,
+    user_authored: bool,
+    expected_meta: bool,
+    custom_prompt: bool,
+) -> None:
+    from omnigent.entities import MessageData, NewConversationItem
+    from omnigent.session_recovery import RECOVERY_NOTICE, RECOVERY_PROMPT, SessionRecovery
+
+    conv = store.create_conversation()
+    state = (
+        SessionRecovery("a" * 32, "runner", 100, phase=phase, attempts=1, attempt_id=attempt_id)
+        if phase is not None
+        else None
+    )
+    if state is not None:
+        assert store.replace_session_recovery(conv.id, None, state)
+    notice = (
+        f"{RECOVERY_NOTICE}\nContinue from the checkpoint." if custom_prompt else RECOVERY_PROMPT
+    )
+    item = NewConversationItem(
+        response_id="native",
+        type="message",
+        data=MessageData(
+            role="user",
+            user_authored=user_authored,
+            content=[{"type": "input_text", "text": notice}],
+        ),
+    )
+    [persisted] = store.append(conv.id, [item])
+    assert persisted.data.is_meta is expected_meta
+    assert item.data.is_meta is False
+    assert store.list_items(conv.id).data == [persisted]
+    assert store.get_session_recovery(conv.id) == (state if expected_meta else None)
+
+
+@pytest.mark.parametrize("input_first", [False, True])
+def test_input_in_the_same_batch_supersedes_later_native_recovery_echoes(
+    store: SqlAlchemyConversationStore, input_first: bool
+) -> None:
+    from omnigent.entities import MessageData, NewConversationItem
+    from omnigent.session_recovery import RECOVERY_PROMPT, SessionRecovery
+
+    conv = store.create_conversation()
+    state = SessionRecovery(
+        "a" * 32, "runner", 100, phase="dispatching", attempts=1, attempt_id="attempt"
+    )
+    assert store.replace_session_recovery(conv.id, None, state)
+    texts = ["New task", RECOVERY_PROMPT] if input_first else [RECOVERY_PROMPT, "New task"]
+    persisted = store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                response_id="native",
+                type="message",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": text}]),
+            )
+            for text in texts
+        ],
+    )
+    assert [item.data.is_meta for item in persisted] == (
+        [False, False] if input_first else [True, False]
+    )
+    assert store.get_session_recovery(conv.id) is None
+
+
+@pytest.mark.parametrize("value", ["legacy text", '"pending"'])
+def test_legacy_recovery_labels_do_not_block_new_input(
+    store: SqlAlchemyConversationStore, conv_db: Path, value: str
+) -> None:
+    from omnigent.entities import MessageData, NewConversationItem
+
+    conv = store.create_conversation()
+    with sqlite3.connect(conv_db) as connection:
+        connection.execute(
+            "INSERT INTO conversation_labels "
+            "(workspace_id, conversation_id, key, value, updated_at) VALUES (0, ?, ?, ?, 100)",
+            (bytes.fromhex(conv.id), "omnigent.recovery.phase", value),
+        )
+    assert store.get_session_recovery(conv.id) is None
+    [item] = store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                response_id="user",
+                type="message",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "new work"}]
+                ),
+            )
+        ],
+    )
+    assert store.list_items(conv.id).data == [item]
+
+
+def test_failed_input_does_not_cancel_recovery(
+    store: SqlAlchemyConversationStore, conv_db: Path
+) -> None:
+    from sqlalchemy.exc import IntegrityError
+
+    from omnigent.entities import MessageData, NewConversationItem
+    from omnigent.session_recovery import SessionRecovery
+
+    conv = store.create_conversation()
+    intent = SessionRecovery("a" * 32, "old", 100)
+    assert store.replace_session_recovery(conv.id, None, intent)
+    with sqlite3.connect(conv_db) as connection:
+        connection.execute(
+            "CREATE TRIGGER refuse_input BEFORE INSERT ON conversation_items "
+            "BEGIN SELECT RAISE(ABORT, 'input refused'); END"
+        )
+    with pytest.raises(IntegrityError, match="input refused"):
+        store.append(
+            conv.id,
+            [
+                NewConversationItem(
+                    response_id="user",
+                    type="message",
+                    data=MessageData(
+                        role="user", content=[{"type": "input_text", "text": "new work"}]
+                    ),
+                )
+            ],
+        )
+    assert store.get_session_recovery(conv.id) == intent
+
+
+def test_turn_completion_fences_recovery_in_the_input_database(
+    store: SqlAlchemyConversationStore,
+) -> None:
+    from omnigent.entities import MessageData, NewConversationItem
+    from omnigent.server.host_session_recovery import _record_interruption, record_turn
+
+    conv = store.create_conversation(host_id="a" * 32, workspace="/workspace", runner_id="runner")
+    store.set_session_live_status(conv.id, "running")
+    record_turn(store, conv.id, "runner", "first", finished=False)
+    snapshot = store.get_conversation(conv.id)
+    record_turn(store, conv.id, "runner", "first", finished=True)
+    _record_interruption(store, snapshot, interrupted_at=100)
+    assert store.get_session_recovery(conv.id).phase == "stopped"
+    store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                response_id="user",
+                type="message",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "New task"}]
+                ),
+            )
+        ],
+    )
+    record_turn(store, conv.id, "runner", "second", finished=False)
+    record_turn(store, conv.id, "runner", "first", finished=True)
+    assert store.get_session_recovery(conv.id).response_id == "second"
+    assert store.get_session_recovery(conv.id).phase == "active"
+
+
+@pytest.mark.parametrize("user_authored", [False, True])
+def test_interruption_notice_preserves_stop_fence(
+    store: SqlAlchemyConversationStore, user_authored: bool
+) -> None:
+    from omnigent.entities import MessageData, NewConversationItem
+    from omnigent.inner.executor import INTERRUPTION_MARKER_TEXT
+    from omnigent.session_recovery import SessionRecovery
+
+    conv = store.create_conversation(host_id="a" * 32, workspace="/workspace", runner_id="runner")
+    state = SessionRecovery("a" * 32, "runner", 100, phase="stopped", response_id="turn")
+    assert store.replace_session_recovery(conv.id, None, state)
+    store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="cancel",
+                data=MessageData(
+                    role="user",
+                    user_authored=user_authored,
+                    content=[{"type": "input_text", "text": INTERRUPTION_MARKER_TEXT}],
+                ),
+            )
+        ],
+    )
+    assert store.get_session_recovery(conv.id) == (None if user_authored else state)

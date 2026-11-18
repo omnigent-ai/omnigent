@@ -18,6 +18,7 @@ import httpx
 from fastapi import (
     APIRouter,
     HTTPException,
+    Query,
     Request,
 )
 from fastapi.responses import StreamingResponse
@@ -42,6 +43,7 @@ from omnigent.entities.conversation import (
     parse_item_data,
 )
 from omnigent.errors import ErrorCode, OmnigentError, WrongReplicaError
+from omnigent.harness_aliases import is_native_harness
 from omnigent.harness_plugins import NativeCodingAgent
 from omnigent.harnesses.codex_native.shell_input import shell_command_from_input
 from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
@@ -1173,6 +1175,22 @@ def register_events_routes(
             )
         return user_id, conv
 
+    @event_router.post("/sessions/{session_id}/recovery/admit", include_in_schema=False)
+    async def admit_recovery_turn(
+        request: Request,
+        session_id: str,
+        recovery_id: str = Query(min_length=1, max_length=128),
+    ) -> dict[str, bool]:
+        _, conv = await _authorized_conversation(request, session_id, external_transcript=True)
+        reporting_runner = _reporting_runner_id(request)
+        if reporting_runner is not None and reporting_runner != conv.runner_id:
+            raise OmnigentError("session is not bound to this runner", code=ErrorCode.FORBIDDEN)
+        recoverer = getattr(request.app.state, "host_session_recoverer", None)
+        admitted = recoverer is not None and await asyncio.to_thread(
+            recoverer.admit_turn, session_id, recovery_id
+        )
+        return {"admitted": admitted}
+
     @event_router.post(
         "/sessions/{session_id}/events",
         # Internal event ingestion — hidden from the public API reference.
@@ -1816,6 +1834,9 @@ def register_events_routes(
                 user_id=user_id,
                 permission_store=permission_store,
             )
+            recoverer = getattr(request.app.state, "host_session_recoverer", None)
+            if recoverer is not None:
+                await asyncio.to_thread(recoverer.stop_recovery, conv, only_pending=True)
             if startup is not None and await startup.retry(session_id):
                 if conv.host_id is not None:
                     startup.host_changed(request.app, conv.host_id)
@@ -2164,6 +2185,9 @@ def register_events_routes(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
             )
         if body.type in (_INTERRUPT_TYPE, _STOP_SESSION_TYPE):
+            recoverer = getattr(request.app.state, "host_session_recoverer", None)
+            if recoverer is not None:
+                await asyncio.to_thread(recoverer.stop_recovery, conv)
             startup = getattr(request.app.state, "startup_inputs", None)
             if startup is not None:
                 await startup.cancel(session_id)
@@ -2336,6 +2360,9 @@ def register_events_routes(
                     stop_conv.runner_id,
                     stop_host_registry,
                     conversation_store,
+                    host_session_recoverer=getattr(
+                        request.app.state, "host_session_recoverer", None
+                    ),
                 )
                 if not host_stopped:
                     host_conn = (
@@ -2414,6 +2441,9 @@ def register_events_routes(
                         session_id,
                         conversation_store,
                         int(time.time()) - RUNNER_LIVENESS_TTL_S,
+                        host_session_recoverer=getattr(
+                            request.app.state, "host_session_recoverer", None
+                        ),
                     )
             # Stop is non-sticky: no persistent marker is written. The
             # runner tunnel dropping above flips ``runner_online`` to false
@@ -2923,6 +2953,34 @@ def register_events_routes(
             # A confirmed turn completion after a failure means a later turn
             # succeeded, so the earlier failure must not outlive it.
             turn_completed = status == "idle" and data.get("turn_completed") is True
+            recoverer = getattr(request.app.state, "host_session_recoverer", None)
+            recovery_terminal = turn_completed
+            if recoverer is not None and status == "idle":
+                harness = await asyncio.to_thread(
+                    _native_pane_harness, conv, agent_store=agent_store, agent_cache=agent_cache
+                )
+                recovery_terminal = turn_completed or (
+                    is_native_harness(harness)
+                    and native_subagent_terminal_status(
+                        status,
+                        harness=harness,
+                        turn_outcome=data.get("turn_outcome"),
+                        turn_completed=data.get("turn_completed"),
+                    )
+                    is not None
+                )
+            if recoverer is not None and (
+                status in {"running", "failed", "waiting"} or recovery_terminal
+            ):
+                await asyncio.to_thread(
+                    recoverer.record_turn,
+                    session_id,
+                    conv.runner_id,
+                    response_id,
+                    finished=status in {"failed", "waiting"}
+                    or recovery_terminal
+                    or bool(blocked_on),
+                )
             recovered_from_failure = (
                 turn_completed and _session_status_cache.get(session_id) == "failed"
             )

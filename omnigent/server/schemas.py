@@ -3437,7 +3437,8 @@ class WorkflowStep(BaseModel):
     :param id: Stable step ID, e.g. ``"build"``: lowercase letters, digits,
         ``-`` and ``_``, starting with a letter or digit; at most 64 characters.
     :param name: One line of at most 80 characters, e.g. ``"Build"``.
-    :param goal: What the step achieves, at most 300 characters, or ``None``.
+    :param goal: The step's description in Markdown, e.g. what it reads, does and
+        produces, or ``None``.
     :param depends_on: IDs of the steps that must be done before it.
     """
 
@@ -3478,7 +3479,8 @@ class WorkflowObject(WorkflowSummary):
     :param steps: The workflow's graph.
     :param planning_session_id: The conversation for proposing revisions, separate from runs.
     :param description_source: The planning conversation's journal entry for the proposal
-        the description was saved from, until the description is written otherwise.
+        the description was saved from or kept over, until the description is written
+        otherwise.
     """
 
     steps: list[WorkflowStep]
@@ -3553,6 +3555,8 @@ class WorkflowRun(BaseModel):
     :param session_status: The session's status, ``"idle"``, ``"running"`` or
         ``"failed"``, including active direct sub-agents.
     :param background_work_running: Whether background work outlives the session's turn.
+    :param sandbox_launching: Whether the session's sandbox is still launching, so
+        the run is starting; ``False`` once it is up and for a failed launch.
     :param archived: Whether the session is archived.
     :param progress: Where the run's steps stand.
     :param steps: The latest plan's steps within this invocation.
@@ -3584,6 +3588,7 @@ class WorkflowRun(BaseModel):
     is_current: bool = False
     session_status: Literal["idle", "running", "failed"]
     background_work_running: bool = False
+    sandbox_launching: bool = False
     archived: bool = False
     progress: WorkflowRunProgress
     steps: list[WorkflowStep] = Field(default_factory=list)
@@ -3641,7 +3646,8 @@ class UpdateWorkflowRequest(BaseModel):
     :param expected_description: Apply ``description`` only while the stored
         description is still this text, so one written meanwhile stays.
     :param description_source: The journal entry ID of the planning-chat proposal
-        ``description`` comes from; a description written without one clears it.
+        ``description`` was saved from or kept over; a description written without one
+        clears it.
     :param steps: New steps, replacing the old ones.
     :param planning_session_id: The private owned session for iterating on the plan.
     """

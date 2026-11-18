@@ -9,7 +9,7 @@ export interface WorkflowStep {
   id: string;
   /** A few words, e.g. `"Explore the failing tests"`. */
   name: string;
-  /** What done means for the step, or `null`. */
+  /** The step's description in Markdown, e.g. what it reads, does and produces, or `null`. */
   goal: string | null;
   /** The IDs of the steps it waits for. */
   depends_on: string[];

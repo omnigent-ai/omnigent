@@ -6,6 +6,7 @@ import random
 import string
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import httpx
@@ -18,6 +19,9 @@ from omnigent.entities.session_journal import JournalEntryTooLargeError
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.server.auth import LEVEL_READ
 from omnigent.server.feature_flags import resolve_feature_flags
+from omnigent.server.routes._sessions.common import _session_sandbox_status_cache
+from omnigent.server.schemas import SandboxStatus
+from omnigent.server.startup_inputs import STARTUP_LABEL
 from omnigent.stores.conversation_store import (
     CREATED_BY_SESSION_LABEL_KEY,
     SCHEDULED_TASK_RUN_LABEL_KEY,
@@ -804,3 +808,55 @@ async def test_each_family_lists_the_runs_below_it_up_to_its_own_cap(
     assert {
         run["session_id"]: run["descendant_run_count"] for run in listed["data"]
     } == dict.fromkeys(roots, 2)
+
+
+async def test_a_run_whose_session_waits_on_its_sandbox_is_launching(
+    client: httpx.AsyncClient, db_uri: str
+) -> None:
+    stack = await _save_workflow(client, "Land a stack")
+    ready = await _save_workflow(client, "Ready a PR")
+    conversations = SqlAlchemyConversationStore(db_uri)
+    root = _session(db_uri, title="Land stack")
+    await _run(client, root, stack, "land")
+    worker = _session(db_uri, title="Ready #1", labels={CREATED_BY_SESSION_LABEL_KEY: root})
+    conversations.add_new_sibling(root, worker, user_id=ALICE)
+    await _run(client, worker, ready, "ready-1")
+
+    async def runs(workflow: dict[str, str]) -> list[dict[str, Any]]:
+        listed = await client.get(f"/v1/workflows/{workflow['id']}/runs", headers=_headers())
+        assert listed.status_code == 200, listed.text
+        return listed.json()["data"]
+
+    async def worker_run() -> dict[str, Any]:
+        (run,) = await runs(ready)
+        return run
+
+    assert (await worker_run())["sandbox_launching"] is False
+    # Every replica reads the startup label a sandbox launch keeps on its session.
+    conversations.set_labels(worker, {STARTUP_LABEL: "pending"})
+    launching = await worker_run()
+    assert launching["sandbox_launching"] is True and launching["session_status"] == "idle"
+    (root_run,) = await runs(stack)
+    assert root_run["descendant_runs_active"] is True
+    try:
+        # The launching replica's stage comes first, so its failure ends the launch.
+        _session_sandbox_status_cache[worker] = SandboxStatus(stage="failed", error="no capacity")
+        assert (await worker_run())["sandbox_launching"] is False
+        _session_sandbox_status_cache[worker] = SandboxStatus(stage="provisioning")
+        conversations.set_labels(worker, {STARTUP_LABEL: "failed"})
+        assert (await worker_run())["sandbox_launching"] is True
+    finally:
+        _session_sandbox_status_cache.pop(worker, None)
+    # A launch that failed elsewhere, or a session whose sandbox is up, isn't launching.
+    assert (await worker_run())["sandbox_launching"] is False
+    conversations.delete_label(worker, STARTUP_LABEL)
+    assert (await worker_run())["sandbox_launching"] is False
+    (root_run,) = await runs(stack)
+    assert root_run["descendant_runs_active"] is False
+
+    # Only the session's current run reads its launch.
+    conversations.set_labels(worker, {STARTUP_LABEL: "pending"})
+    await _run(client, worker, ready, "ready-2")
+    current, earlier = await runs(ready)
+    assert current["is_current"] and current["sandbox_launching"] is True
+    assert earlier["sandbox_launching"] is False
