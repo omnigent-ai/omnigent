@@ -11,7 +11,9 @@
 // the sort, so a refresh (or a brand-new conversation) starts from the last
 // choice instead of the hardcoded default.
 
+import { useSyncExternalStore } from "react";
 import { type ChangedSort, isValidSort } from "@/lib/changedSort";
+import { createStoredChoicePreference } from "./storedChoicePreference";
 
 export interface FilesPanelPreferences {
   /** Sort order for the changed-files flat list. */
@@ -61,4 +63,64 @@ export function writeFilesPanelPreferences(prefs: FilesPanelPreferences): void {
   } catch {
     // localStorage quota or access errors shouldn't break the app.
   }
+}
+
+// Own key, so every mounted Files panel (shell, Grid panes, other windows) follows a toggle live.
+export const FILES_PANEL_SHOW_HIDDEN_STORAGE_KEY = "omnigent:files-panel-show-hidden";
+
+/** Hidden (dot-prefixed) files are shown until the user hides them. */
+export const DEFAULT_FILES_PANEL_SHOW_HIDDEN = true;
+
+const showHiddenPreference = createStoredChoicePreference(
+  FILES_PANEL_SHOW_HIDDEN_STORAGE_KEY,
+  ["true", "false"],
+  DEFAULT_FILES_PANEL_SHOW_HIDDEN ? "true" : "false",
+);
+
+// A choice storage refused (quota, privacy mode) still applies on this page.
+let unsavedShowHidden: boolean | undefined;
+const unsavedShowHiddenListeners = new Set<() => void>();
+
+function subscribeUnsavedShowHidden(listener: () => void): () => void {
+  unsavedShowHiddenListeners.add(listener);
+  return () => unsavedShowHiddenListeners.delete(listener);
+}
+
+// A change to this key from another window replaces this page's unsaved choice.
+if (typeof window !== "undefined") {
+  window.addEventListener("storage", (event) => {
+    if (unsavedShowHidden === undefined) return;
+    if (event.key !== null && event.key !== FILES_PANEL_SHOW_HIDDEN_STORAGE_KEY) return;
+    try {
+      if (event.storageArea !== null && event.storageArea !== window.localStorage) return;
+    } catch {
+      // Unreadable storage: drop the unsaved choice and re-read, as the stored preference does.
+    }
+    unsavedShowHidden = undefined;
+    for (const listener of unsavedShowHiddenListeners) listener();
+  });
+}
+
+/** Read whether the Files panel shows hidden files; storage errors mean the default. */
+export function readFilesPanelShowHidden(): boolean {
+  return unsavedShowHidden ?? showHiddenPreference.read() === "true";
+}
+
+/** Persist the hidden-files choice and update every Files panel on screen. */
+export function writeFilesPanelShowHidden(showHidden: boolean): void {
+  showHiddenPreference.write(showHidden ? "true" : "false");
+  const saved = (showHiddenPreference.read() === "true") === showHidden;
+  unsavedShowHidden = saved ? undefined : showHidden;
+  for (const listener of unsavedShowHiddenListeners) listener();
+}
+
+/** Live hidden-files choice, including changes made in other windows. */
+export function useFilesPanelShowHidden(): boolean {
+  const stored = showHiddenPreference.use() === "true";
+  const unsaved = useSyncExternalStore(
+    subscribeUnsavedShowHidden,
+    () => unsavedShowHidden,
+    () => undefined,
+  );
+  return unsaved ?? stored;
 }

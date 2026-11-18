@@ -29,6 +29,10 @@ import {
   useWorkspaceEnvironment,
   useWorkspaceFileSearch,
 } from "@/hooks/useWorkspaceChangedFiles";
+import {
+  readFilesTreeBrowseLocation,
+  writeFilesTreeBrowseLocation,
+} from "@/lib/filesPanelTreeState";
 import { cn } from "@/lib/utils";
 import { BrowseLocationBar } from "./BrowseLocationBar";
 import { CopyPathButton } from "./CopyPathButton";
@@ -241,17 +245,14 @@ function SearchFilterInput({
 // ---------------------------------------------------------------------------
 
 /**
- * Browse location per conversation, surviving unmount/remount within a JS
- * session (e.g. a session switch, or the mobile drawer closing). Same pattern
- * as FolderTree's expandedPathsCache. Keyed by conversation, so a session
- * switch still lands on that session's own last location (or its root).
+ * Browse location is stored per conversation, so a remount, session switch or
+ * reload lands on that session's own last location (or its root).
  */
-const browseLocationCache = new Map<string, string>();
 const folderRevealListeners = new Set<(conversationId: string, absolutePath: string) => void>();
 
 /** Point a session's Files tree at a folder: live if mounted, else on its next mount. */
 export function revealFolderInFilesPanel(conversationId: string, absolutePath: string): void {
-  browseLocationCache.set(conversationId, absolutePath);
+  writeFilesTreeBrowseLocation(conversationId, absolutePath);
   folderRevealListeners.forEach((listener) => listener(conversationId, absolutePath));
 }
 
@@ -327,9 +328,9 @@ export function FilesPanel({
   // workspace chip uses.
   const { session } = useSession(conversationId);
   // Absolute path currently browsed. Null tracks the workspace root. Seeded
-  // from the per-conversation cache so the location survives a remount.
-  const [browseLocation, setBrowseLocation] = useState<string | null>(
-    () => (conversationId && browseLocationCache.get(conversationId)) || null,
+  // from the per-conversation store so the location survives a remount.
+  const [browseLocation, setBrowseLocation] = useState<string | null>(() =>
+    conversationId ? readFilesTreeBrowseLocation(conversationId) : null,
   );
   const [browseError, setBrowseError] = useState<string | null>(null);
   // On an in-place conversation switch (no remount), land on the NEW
@@ -339,7 +340,7 @@ export function FilesPanel({
   useEffect(() => {
     if (browseForRef.current === conversationId) return;
     browseForRef.current = conversationId;
-    setBrowseLocation((conversationId && browseLocationCache.get(conversationId)) || null);
+    setBrowseLocation(conversationId ? readFilesTreeBrowseLocation(conversationId) : null);
     setBrowseError(null);
   }, [conversationId]);
   const workingDir = browseLocation ?? workspaceRoot;
@@ -355,10 +356,7 @@ export function FilesPanel({
     (absolutePath: string) => {
       setBrowseError(null);
       const next = absolutePath === workspaceRoot ? null : absolutePath;
-      if (conversationId) {
-        if (next === null) browseLocationCache.delete(conversationId);
-        else browseLocationCache.set(conversationId, next);
-      }
+      if (conversationId) writeFilesTreeBrowseLocation(conversationId, next);
       setBrowseLocation(next);
     },
     [workspaceRoot, conversationId],

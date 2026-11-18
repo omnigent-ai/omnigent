@@ -38,11 +38,13 @@ import {
   ROW_META_SLOT_CLASS,
   ROW_STATUS_SLOT_CLASS,
 } from "./fileStatusUtils";
+import { readFilesTreeExpandedPaths, writeFilesTreeExpandedPaths } from "@/lib/filesPanelTreeState";
 import { FolderTree } from "./FolderTree";
 
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
+  localStorage.clear();
 });
 beforeEach(() => copyTextMock.mockClear());
 
@@ -446,6 +448,8 @@ describe("FolderTree directory search results", () => {
     // The ancestor was auto-expanded (its lazy child rendered); the target
     // itself stays collapsed, like clicking a folder in the tree.
     expect(subRow).toHaveAttribute("aria-expanded", "false");
+    // The reveal counts as the user's expansion, so a reload reopens it.
+    expect(readFilesTreeExpandedPaths("conv_reveal", "")).toEqual(["src"]);
   });
 
   it("flashes a deep revealed folder once its ancestors' lazy levels resolve", async () => {
@@ -602,6 +606,48 @@ describe("FolderTree nested lazy loading", () => {
     unmount();
     renderTree({ files: [dir("src")], conversationId });
     expect(await screen.findByText("leaf.ts")).toBeInTheDocument();
+  });
+});
+
+describe("FolderTree expansion across reloads", () => {
+  beforeEach(() => {
+    lazyChildren.clear();
+    lazyErrors.clear();
+  });
+
+  it("saves the folders the user opens and closes, per browsed location", () => {
+    vi.useFakeTimers();
+    lazyChildren.set("guides", [file("guides/intro.md")]);
+    renderTree({
+      files: [dir("guides"), file("notes/todo.md")],
+      conversationId: "conv_save_expansion",
+      browseLocation: "docs",
+    });
+
+    // The default-expanded folder is shown but not saved, so the defaults stay in charge.
+    expect(screen.getByText("todo.md")).toBeInTheDocument();
+    expect(readFilesTreeExpandedPaths("conv_save_expansion", "docs")).toBeUndefined();
+
+    fireEvent.click(screen.getByRole("button", { name: "guides/" }));
+    expect(readFilesTreeExpandedPaths("conv_save_expansion", "docs")).toEqual(["notes", "guides"]);
+    expect(readFilesTreeExpandedPaths("conv_save_expansion", "")).toBeUndefined();
+
+    // Collapsing is saved once its exit animation removes the folder's rows.
+    fireEvent.click(screen.getByRole("button", { name: "guides/" }));
+    act(() => vi.runOnlyPendingTimers());
+    expect(readFilesTreeExpandedPaths("conv_save_expansion", "docs")).toEqual(["notes"]);
+  });
+
+  it("reopens a reloaded session with its saved folders expanded", async () => {
+    // Nothing of this conversation is in memory, as after a page reload.
+    writeFilesTreeExpandedPaths("conv_reloaded_tree", "", ["src", "src/deep"]);
+    lazyChildren.set("src", [dir("src/deep")]);
+    lazyChildren.set("src/deep", [file("src/deep/leaf.ts")]);
+
+    renderTree({ files: [dir("src"), dir("docs")], conversationId: "conv_reloaded_tree" });
+
+    expect(await screen.findByText("leaf.ts")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "docs/" })).toHaveAttribute("aria-expanded", "false");
   });
 });
 
