@@ -3598,7 +3598,7 @@ function ConversationList({
         {activeDrag &&
           ((nestMovesSupported &&
             allConversations.find((row) => row.id === activeDrag.id)?.family) ||
-            (activeDrag.project && sections.sessions.length === 0)) && (
+            (!showShared && !grouped && activeDrag.project && sections.sessions.length === 0)) && (
             <UngroupDropZone
               nest={
                 nestMovesSupported &&
@@ -4008,7 +4008,7 @@ function UngroupDropZone({ nest, rect }: { nest: boolean; rect?: DOMRect }) {
         zIndex: 60,
       }}
       className={cn(
-        "flex items-center gap-1.5 rounded-md border border-dashed border-border px-2 py-1.5 text-muted-foreground text-sm transition-colors",
+        "flex items-center gap-1.5 rounded-md border border-dashed border-border bg-popover px-2 py-1.5 text-muted-foreground text-sm shadow-sm transition-colors",
         isOver && cn(DROP_TARGET_HIGHLIGHT, "text-foreground"),
       )}
     >
