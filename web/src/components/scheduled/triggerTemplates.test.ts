@@ -1525,6 +1525,27 @@ describe("renderTriggerPrompt", () => {
     },
   );
 
+  it.each(SOURCE_MODES)(
+    "names sys_session_get_info in the first tool search, in $taskSessionMode mode",
+    ({ source, taskSessionMode }) => {
+      const blank = renderTriggerPrompt(source, fields(), { ...CTX, taskSessionMode });
+      const pinned = renderTriggerPrompt(source, fields(), {
+        ...CTX,
+        agentId: "ag_worker",
+        taskSessionMode,
+      });
+
+      // A blank worker agent is learned from this search, not a later get_info call.
+      for (const prompt of [blank, pinned]) {
+        expect(prompt).toContain(
+          "each sys_session tool the steps below use, and sys_session_get_info, which returns your session and agent IDs.",
+        );
+      }
+      expect(readTriggerWorkerSettings(blank)?.agentId).toBeNull();
+      expect(readTriggerWorkerSettings(pinned)?.agentId).toBe("ag_worker");
+    },
+  );
+
   it("signs what it posts and stops when it can't reach the service", () => {
     const prompt = renderTriggerPrompt("jira", fields(), CTX);
 
