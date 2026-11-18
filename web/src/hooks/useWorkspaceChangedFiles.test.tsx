@@ -828,12 +828,13 @@ describe("useWorkspaceFileSearch through the workspace API", () => {
 
   it("uses the API's answer, relative to the searched folder, without REST", async () => {
     onlineMock.mockReturnValue(true);
+    // src/src/util.ts in the workspace: a nested folder named like the searched one.
     vi.mocked(searchFilesViaWorkspaceApi).mockResolvedValueOnce({
       data: [
         {
-          id: "a/main.ts",
-          name: "main.ts",
-          path: "a/main.ts",
+          id: "src/util.ts",
+          name: "util.ts",
+          path: "src/util.ts",
           type: "file",
           bytes: 1,
           modified_at: 1,
@@ -849,7 +850,7 @@ describe("useWorkspaceFileSearch through the workspace API", () => {
       </Wrap>,
     );
 
-    await waitFor(() => expect(screen.getByTestId("paths")).toHaveTextContent("a/main.ts"));
+    await waitFor(() => expect(screen.getByTestId("paths").textContent).toBe("src/util.ts"));
     expect(screen.getByTestId("truncated")).toHaveTextContent("true");
     expect(searchFilesViaWorkspaceApi).toHaveBeenCalledWith(
       "conv_live",
@@ -886,7 +887,8 @@ describe("useWorkspaceFileSearch through the workspace API", () => {
       </Wrap>,
     );
 
-    await waitFor(() => expect(screen.getByTestId("paths")).toHaveTextContent("b.ts"));
+    // REST echoes the searched folder, which the hook strips.
+    await waitFor(() => expect(screen.getByTestId("paths").textContent).toBe("b.ts"));
     expect(searchFilesViaWorkspaceApi).toHaveBeenCalledTimes(1);
     expect(fetchMock).toHaveBeenCalledWith(
       expect.stringContaining("/search/src?"),
