@@ -956,6 +956,7 @@ describe("HarnessFixDialog", () => {
     const email = screen.getByRole("textbox", { name: "Account to sign in with" });
     expect(email).toHaveValue("");
     expect(email).toHaveAttribute("placeholder", "name@example.com");
+    expect(email).toHaveAccessibleName("Account to sign in with");
     await user.type(email, "new@example.com");
     await user.click(screen.getByRole("button", { name: "Sign out and switch" }));
 

@@ -751,11 +751,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
               <Button
                 {...parts.control("authenticate", {
                   ...NO_TOOLTIP,
-                  name: credentialDecisionPending
-                    ? { alternative: "checking" }
-                    : mode === "install"
-                      ? { alternative: "install" }
-                      : undefined,
+                  name: authenticateName(credentialDecisionPending, mode),
                   outside: {},
                 })}
                 disabled={credentialDecisionPending}
@@ -1427,4 +1423,10 @@ function dialogTitle(
   }
   if (mode === "update") return `Update ${harnessLabel}`;
   return mode === "install" ? `Install ${harnessLabel}` : `Reconfigure ${harnessLabel}`;
+}
+
+/** The Authenticate button's name while it checks the credential, or when it installs instead. */
+function authenticateName(checking: boolean, mode: string) {
+  if (checking) return { alternative: "checking" } as const;
+  return mode === "install" ? ({ alternative: "install" } as const) : undefined;
 }
