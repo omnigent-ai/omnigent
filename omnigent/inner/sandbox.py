@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import ast
 import base64
+import errno
 import importlib.util
 import json
 import logging
 import os
+import re
 import shlex
 import shutil
 import site
@@ -19,7 +22,6 @@ from abc import ABC, abstractmethod
 from collections.abc import Mapping, MutableMapping, Sequence
 from contextlib import suppress
 from dataclasses import dataclass, replace
-from functools import lru_cache
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -68,6 +70,10 @@ HOST_SANDBOX_BACKEND_ENV = "OMNIGENT_HOST_SANDBOX_BACKEND"
 # work ``activate_sandbox`` does. ``none`` is a no-op backend so it
 # doesn't need a wrap.
 _SPAWN_WRAP_BACKENDS = frozenset({"linux_bwrap", "darwin_seatbelt"})
+
+_EDITABLE_PTH_IMPORT = re.compile(r"import (__editable__[A-Za-z0-9_]+_finder); \1\.install\(\)\Z")
+_STARTUP_HOOK_ENV_VARS = ("COVERAGE_PROCESS_START", "COVERAGE_PROCESS_CONFIG")
+_MAX_TRUSTED_RUNTIME_ENTRIES = 250_000
 
 
 def _json_string_list(values: Sequence[object]) -> list[JsonValue]:
@@ -1247,7 +1253,12 @@ def run_launcher(
     # Before any wrap / exec so neither the re-exec'd launcher nor the target
     # can see env vars the spawner didn't deliberately pass.
     _prune_environ_to_spawn_allowlist(sandbox)
+    if sandbox.active and sandbox.backend_type in _SPAWN_WRAP_BACKENDS:
+        for name in _STARTUP_HOOK_ENV_VARS:
+            os.environ.pop(name, None)
     if env_overrides is not None:
+        if sandbox.active and sandbox.backend_type in _SPAWN_WRAP_BACKENDS:
+            _reject_startup_hook_overrides(env_overrides)
         os.environ.update(env_overrides)
         if sandbox.spawn_env_allowlist is not None:
             # Re-exec inherits sanitized values; only their names enter the policy.
@@ -1472,26 +1483,20 @@ def _launcher_path_variants(path: Path) -> set[Path]:
     raise OSError(f"Cannot validate sandbox launcher symlink chain: {path}")
 
 
-@lru_cache(maxsize=32)
 def _isolated_launcher_import_roots(interpreter: str) -> tuple[Path, ...]:
-    """Snapshot startup imports before any contained process can modify them."""
+    """Read isolated startup paths without executing site or its .pth hooks."""
     program = """
-import json, os, sys
-paths = []
-for path in sys.path:
-    if os.path.isabs(path):
-        paths.append(path)
-    else:
-        finder = sys.path_importer_cache.get(path)
-        if not (isinstance(finder, type)
-                and finder.__module__.startswith('__editable__')
-                and finder.__name__ == '_EditableNamespaceFinder'):
-            raise ValueError('unsupported relative isolated startup import root')
-print(json.dumps(paths))
+import json, site, sys
+print(json.dumps({
+    'paths': sys.path,
+    'base_sites': site.getsitepackages([sys.base_prefix]),
+    'venv_sites': site.getsitepackages([sys.argv[1]]),
+}))
 """
     try:
+        venv = Path(interpreter).absolute().parent.parent
         completed = subprocess.run(
-            [interpreter, "-I", "-c", program],
+            [interpreter, "-I", "-S", "-c", program, str(venv)],
             cwd=os.path.abspath(os.sep),
             env={"PATH": os.defpath},
             capture_output=True,
@@ -1499,16 +1504,134 @@ print(json.dumps(paths))
             check=True,
             timeout=10,
         )
-        paths = json.loads(completed.stdout)
+        metadata = json.loads(completed.stdout)
+        paths = metadata["paths"]
         if (
             not isinstance(paths, list)
             or not paths
             or any(not isinstance(path, str) or not Path(path).is_absolute() for path in paths)
         ):
             raise ValueError("invalid isolated startup import roots")
-        return tuple(Path(path) for path in paths)
-    except (OSError, ValueError, subprocess.SubprocessError):
+        config = next(
+            (
+                candidate
+                for candidate in (
+                    Path(interpreter).absolute().parent / "pyvenv.cfg",
+                    venv / "pyvenv.cfg",
+                )
+                if candidate.is_file()
+            ),
+            None,
+        )
+        in_venv = config is not None
+        include_system = True
+        if config is not None:
+            for line in config.read_text(encoding="utf-8").splitlines():
+                key, _, value = line.partition("=")
+                if key.strip().lower() == "include-system-site-packages":
+                    include_system = value.strip().lower() == "true"
+        site_paths = metadata["venv_sites"] if in_venv else []
+        if include_system:
+            site_paths += metadata["base_sites"]
+        roots = {Path(path) for path in [*paths, *site_paths]}
+        for site_path in site_paths:
+            site_dir = Path(site_path)
+            if not site_dir.is_dir():
+                continue
+            for pth in sorted(site_dir.glob("*.pth")):
+                for line in pth.read_text(encoding="utf-8").splitlines():
+                    if not line or line.startswith("#"):
+                        continue
+                    if line.startswith(("import ", "import\t")):
+                        roots.update(_trusted_pth_import_roots(pth, line))
+                        continue
+                    roots.add(site_dir / line.strip())
+        return tuple(sorted(roots))
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+        if isinstance(exc, OSError) and "unsupported .pth" in str(exc):
+            raise
         raise OSError("Cannot validate sandbox launcher isolated startup imports") from None
+
+
+def _trusted_pth_import_roots(pth: Path, line: str) -> set[Path]:
+    """Accept only startup hooks whose import roots can be inspected as data."""
+    if pth.name == "distutils-precedence.pth" and line == (
+        "import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'local') "
+        "== 'local'; enabled and __import__('_distutils_hack').add_shim(); "
+    ):
+        return set()
+    if pth.name == "a1_coverage.pth" and line == (
+        'import sys; exec(\'import os\\n\\nif os.getenv("COVERAGE_PROCESS_START") or '
+        'os.getenv("COVERAGE_PROCESS_CONFIG"):\\n try:\\n  import coverage\\n '
+        'except:\\n  pass\\n else:\\n  coverage.process_startup(slug="pth")\')'
+    ):
+        return set()
+    match = _EDITABLE_PTH_IMPORT.fullmatch(line)
+    if match is None:
+        raise OSError(f"Cannot validate sandbox launcher: unsupported .pth startup form in {pth}")
+    finder = pth.parent / f"{match.group(1)}.py"
+    try:
+        source = ast.parse(finder.read_text(encoding="utf-8"))
+        mapping: object = None
+        namespaces: object = None
+        finder_name: str | None = None
+        for statement in source.body:
+            if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                targets = (
+                    statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+                )
+                for target in targets:
+                    if isinstance(target, ast.Name) and target.id in ("MAPPING", "NAMESPACES"):
+                        if statement.value is None:
+                            raise ValueError("missing editable finder assignment")
+                        value = ast.literal_eval(statement.value)
+                        if target.id == "MAPPING":
+                            mapping = value
+                        else:
+                            namespaces = value
+                    if isinstance(target, ast.Name) and target.id == "PATH_PLACEHOLDER":
+                        value = statement.value
+                        if isinstance(value, ast.BinOp) and isinstance(value.op, ast.Add):
+                            finder_name = ast.literal_eval(value.left)
+        if not isinstance(mapping, dict) or not isinstance(namespaces, dict):
+            raise ValueError("missing editable finder roots")
+        if not isinstance(finder_name, str):
+            raise ValueError("missing editable finder name")
+        template_path = pth.parent / "setuptools" / "command" / "editable_wheel.py"
+        template_tree = ast.parse(template_path.read_text(encoding="utf-8"))
+        template = next(
+            ast.literal_eval(statement.value)
+            for statement in template_tree.body
+            if isinstance(statement, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "_FINDER_TEMPLATE"
+                for target in statement.targets
+            )
+        )
+        if not isinstance(template, str):
+            raise ValueError("invalid editable finder template")
+        expected = ast.parse(
+            template.format(name=finder_name, mapping=mapping, namespaces=namespaces)
+        )
+        if ast.dump(source, include_attributes=False) != ast.dump(
+            expected, include_attributes=False
+        ):
+            raise ValueError("editable finder implementation differs from its installed template")
+        values = [*mapping.values(), *(path for group in namespaces.values() for path in group)]
+        if any(not isinstance(path, str) or not Path(path).is_absolute() for path in values):
+            raise ValueError("invalid editable finder root")
+        return {Path(path) for path in values}
+    except (OSError, SyntaxError, ValueError, TypeError, StopIteration, KeyError) as exc:
+        raise OSError(
+            f"Cannot validate sandbox launcher: unsupported .pth editable finder {finder}"
+        ) from exc
+
+
+def _reject_startup_hook_overrides(overrides: Mapping[str, str]) -> None:
+    if any(overrides.get(name) for name in _STARTUP_HOOK_ENV_VARS):
+        raise OSError(
+            "Cannot build sandbox exec launcher: coverage startup environment is unsupported"
+        )
 
 
 def _validate_launcher_write_grants(
@@ -1529,6 +1652,63 @@ def _validate_launcher_write_grants(
                     )
 
 
+def _validate_trusted_hardlink_aliases(
+    sandbox: SandboxPolicy, entries: set[Path], trees: set[Path]
+) -> None:
+    """Reject trusted inodes that a worker could change through any hard link."""
+    visited_directories: set[tuple[int, int]] = set()
+    pending = [(path, False) for path in entries] + [(path, True) for path in trees]
+    entries_seen = 0
+    while pending:
+        entries_seen += 1
+        if entries_seen > _MAX_TRUSTED_RUNTIME_ENTRIES:
+            raise OSError("Cannot validate trusted runtime: too many entries")
+        path, recursive = pending.pop()
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise OSError(f"Cannot validate trusted runtime inode: {path}") from exc
+        if path.is_symlink():
+            resolved = path.resolve(strict=True)
+            _validate_launcher_write_grants(
+                sandbox,
+                set() if stat.S_ISDIR(info.st_mode) else {resolved},
+                {resolved} if stat.S_ISDIR(info.st_mode) else set(),
+            )
+        if stat.S_ISDIR(info.st_mode):
+            identity = (info.st_dev, info.st_ino)
+            if not recursive or identity in visited_directories:
+                continue
+            visited_directories.add(identity)
+            try:
+                with os.scandir(path) as children:
+                    for child in children:
+                        pending.append((Path(child.path), True))
+                        if len(pending) + entries_seen > _MAX_TRUSTED_RUNTIME_ENTRIES:
+                            raise OSError("Cannot validate trusted runtime: too many entries")
+            except OSError as exc:
+                raise OSError(f"Cannot validate trusted runtime inode: {path}") from exc
+        elif stat.S_ISREG(info.st_mode) and info.st_nlink > 1:
+            if (
+                sys.platform == "darwin"
+                or info.st_uid == os.geteuid()
+                or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+                or os.access(path, os.W_OK)
+            ):
+                raise OSError("Cannot validate trusted runtime: mutable hard-link alias")
+            if sys.platform == "linux":
+                try:
+                    acl = os.getxattr(path, "system.posix_acl_access")
+                except OSError as exc:
+                    if exc.errno != errno.ENODATA:
+                        raise OSError(f"Cannot validate trusted runtime ACL: {path}") from exc
+                else:
+                    if acl:
+                        raise OSError("Cannot validate trusted runtime: mutable hard-link alias")
+
+
 def _validate_launcher_runtime(sandbox: SandboxPolicy) -> None:
     """Reject writes to code or startup configuration used before containment."""
     if not sandbox.active or sandbox.backend_type not in _SPAWN_WRAP_BACKENDS:
@@ -1542,6 +1722,7 @@ def _validate_launcher_runtime(sandbox: SandboxPolicy) -> None:
         Path(sys.exec_prefix),
         Path(sys.base_exec_prefix),
     }
+    entries.add(_project_root())
     trees = {Path(__file__).absolute().parents[2], _project_root()}
     for prefix in list(entries):
         entries.add(prefix / "pyvenv.cfg")
@@ -1566,6 +1747,7 @@ def _validate_launcher_runtime(sandbox: SandboxPolicy) -> None:
     trusted_trees = {variant for path in trees for variant in _launcher_path_variants(path)}
     # Reject mutable interpreter/site files before running the startup probe.
     _validate_launcher_write_grants(sandbox, trusted_entries, trusted_trees)
+    _validate_trusted_hardlink_aliases(sandbox, trusted_entries, trusted_trees)
     # The parent may add workspaces to sys.path. Only isolated startup roots,
     # including .pth additions, are imported by the launcher before containment.
     isolated_trees = {
@@ -1574,6 +1756,7 @@ def _validate_launcher_runtime(sandbox: SandboxPolicy) -> None:
         for variant in _launcher_path_variants(path)
     }
     _validate_launcher_write_grants(sandbox, set(), isolated_trees)
+    _validate_trusted_hardlink_aliases(sandbox, set(), isolated_trees)
 
 
 def create_exec_launcher(
@@ -1602,6 +1785,8 @@ def create_exec_launcher(
     """
     if sandbox.tcp_egress and sandbox.tcp_egress_socket_path is None:
         raise ValueError("tcp_egress requires its parent broker before creating a launcher")
+    if sandbox.active and sandbox.backend_type in _SPAWN_WRAP_BACKENDS and env_overrides:
+        _reject_startup_hook_overrides(env_overrides)
     launcher_dir = Path(tempfile.gettempdir()).resolve(strict=False)
     if sandbox.active:
         for root in [*sandbox.write_roots, *sandbox.write_files]:
@@ -1642,8 +1827,13 @@ def create_exec_launcher(
             else:
                 # A native shell shebang also supports Python wrapper scripts
                 # and interpreter paths containing spaces.
+                startup_env = (
+                    "unset COVERAGE_PROCESS_START COVERAGE_PROCESS_CONFIG\n"
+                    if sandbox.active and sandbox.backend_type in _SPAWN_WRAP_BACKENDS
+                    else ""
+                )
                 script = (
-                    f"#!/bin/sh\nexec {shlex.quote(interpreter)} -I -c "
+                    f"#!/bin/sh\n{startup_env}exec {shlex.quote(interpreter)} -I -c "
                     f'{shlex.quote(inline)} "$@"\n'
                 )
             if env_overrides is not None:

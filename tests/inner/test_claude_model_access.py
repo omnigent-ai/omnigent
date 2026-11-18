@@ -1309,6 +1309,48 @@ def test_auth_runtime_writes_are_rejected_before_refresh(
     assert not marker.exists()
 
 
+@pytest.mark.parametrize("target", ["helper", "startup-import"])
+def test_profile_auth_rejects_workspace_hardlink_to_trusted_code(
+    auth_runtime: tuple[Path, Path, Path], target: str
+) -> None:
+    _, module, workspace = auth_runtime
+    trusted = workspace.parent / "trusted-bin" / "profile-auth" if target == "helper" else module
+    if target == "helper":
+        trusted.chmod(0o700)
+    access = _profile_auth_access()
+    original_identity = (trusted.stat().st_dev, trusted.stat().st_ino)
+    alias = workspace / "editable.py"
+    os.link(trusted, alias)
+    alias.write_text("print('modified in place')\n")
+    assert (trusted.stat().st_dev, trusted.stat().st_ino) == original_identity
+
+    policy = SandboxPolicy("linux_bwrap", True, [workspace], [workspace], [], False)
+    with pytest.raises(ValueError, match=r"auth executable and runtime.*outside sandbox-writable"):
+        access.protect_sources(policy, workspace)
+
+
+def test_profile_auth_rejects_hardlinked_pth_before_startup_probe(
+    auth_runtime: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    _, module, workspace = auth_runtime
+    startup = module.parent / "startup.pth"
+    startup.write_text("# clean startup\n")
+    alias = workspace / "editable.pth"
+    os.link(startup, alias)
+    marker = tmp_path / "startup-ran"
+    alias.write_text(f"import pathlib; pathlib.Path({str(marker)!r}).touch()\n")
+    access = _profile_auth_access()
+    policy = SandboxPolicy("linux_bwrap", True, [workspace], [workspace], [], False)
+
+    with pytest.raises(
+        ValueError, match=r"auth executable and runtime.*outside sandbox-writable"
+    ) as error:
+        access.protect_sources(policy, workspace)
+    assert error.value.__cause__ is not None
+    assert "hard-link alias" in str(error.value.__cause__)
+    assert not marker.exists(), "the isolated startup probe must not run poisoned .pth code"
+
+
 def test_profile_auth_protects_pth_imports_without_rerunning_startup_hooks(
     auth_runtime: tuple[Path, Path, Path], tmp_path: Path
 ) -> None:

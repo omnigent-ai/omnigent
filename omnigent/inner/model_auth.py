@@ -171,6 +171,91 @@ def _pin_auth_python_runtime(executable: _TrustedExecutable) -> _TrustedExecutab
     return replace(executable, interpreter=interpreter, interpreter_identity=target.identity)
 
 
+def _auth_base_runtime_trees(interpreter: Path) -> set[Path]:
+    """Locate the base stdlib from venv metadata before starting Python."""
+    from .sandbox import _launcher_path_variants
+
+    configs: list[Path] = []
+    for path in (interpreter.parent / "pyvenv.cfg", interpreter.parent.parent / "pyvenv.cfg"):
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            continue
+        configs.append(path)
+    if len(configs) > 1:
+        raise OSError("Cannot determine authentication Python base runtime")
+
+    homes: set[Path] = set()
+    version: str | None = None
+    if configs:
+        config = configs[0]
+        for variant in _launcher_path_variants(config):
+            _validate_provenance_chain(variant)
+        if not config.is_file():
+            raise OSError("Cannot read authentication Python venv configuration")
+        values: dict[str, str] = {}
+        try:
+            lines = config.read_text(encoding="utf-8").splitlines()
+        except UnicodeError as exc:
+            raise OSError("Cannot read authentication Python venv configuration") from exc
+        for line in lines:
+            key, separator, value = line.partition("=")
+            key = key.strip().lower()
+            if key not in ("home", "version", "version_info", "executable"):
+                continue
+            if not separator or key in values or not value.strip():
+                raise OSError("Ambiguous authentication Python venv configuration")
+            values[key] = value.strip()
+        home = Path(values.get("home", ""))
+        if not home.is_absolute() or not home.is_dir():
+            raise OSError("Cannot determine authentication Python base runtime")
+        homes.add(home)
+        executable_value = values.get("executable")
+        if executable_value is not None:
+            base_executable = Path(executable_value)
+            if not base_executable.is_absolute() or not base_executable.is_file():
+                raise OSError("Cannot determine authentication Python base runtime")
+            for variant in _launcher_path_variants(base_executable):
+                _validate_provenance_chain(variant)
+            homes.add(base_executable.parent)
+            homes.add(base_executable.resolve(strict=True).parent)
+        versions: set[str] = set()
+        for key in ("version", "version_info"):
+            if (value := values.get(key)) is None:
+                continue
+            match = re.match(r"(\d+\.\d+)(?:\.|\Z)", value)
+            if match is None:
+                raise OSError("Cannot determine authentication Python base runtime")
+            versions.add(match.group(1))
+        if len(versions) > 1:
+            raise OSError("Cannot determine authentication Python base runtime")
+        version = versions.pop() if versions else None
+    else:
+        homes.add(interpreter.resolve(strict=True).parent)
+
+    prefixes: set[Path] = set()
+    for home in homes:
+        for variant in _launcher_path_variants(home):
+            _validate_provenance_chain(variant)
+            prefixes.add(variant.parent)
+
+    trees = {
+        prefix / library for prefix in prefixes for library in ("lib", "lib64", "Lib", "DLLs")
+    }
+    stdlibs: set[Path] = set()
+    for tree in trees:
+        if not tree.is_dir():
+            continue
+        candidates = [tree / f"python{version}"] if version is not None else tree.glob("python*")
+        stdlibs.update(candidate for candidate in candidates if candidate.is_dir())
+    if not any(
+        (stdlib / "site.py").is_file() and (stdlib / "json" / "__init__.py").is_file()
+        for stdlib in stdlibs
+    ):
+        raise OSError("Cannot determine authentication Python base stdlib")
+    return trees
+
+
 def _validate_auth_runtime(executable: _TrustedExecutable, policy: SandboxPolicy) -> None:
     """Reject grants that can replace helper code or either Python startup runtime."""
     from .sandbox import (
@@ -178,6 +263,7 @@ def _validate_auth_runtime(executable: _TrustedExecutable, policy: SandboxPolicy
         _launcher_path_variants,
         _validate_launcher_runtime,
         _validate_launcher_write_grants,
+        _validate_trusted_hardlink_aliases,
     )
 
     entries = _launcher_path_variants(executable.path)
@@ -193,14 +279,20 @@ def _validate_auth_runtime(executable: _TrustedExecutable, policy: SandboxPolicy
     trees = {variant for path in trees for variant in _launcher_path_variants(path)}
     try:
         _validate_launcher_write_grants(policy, entries, trees)
+        _validate_trusted_hardlink_aliases(policy, entries, trees)
+        base_trees = {
+            variant
+            for path in _auth_base_runtime_trees(executable.interpreter)
+            for variant in _launcher_path_variants(path)
+        }
+        _validate_launcher_write_grants(policy, set(), base_trees)
+        _validate_trusted_hardlink_aliases(policy, set(), base_trees)
         # The liveness supervisor also starts Python in the trusted parent.
         _validate_launcher_runtime(policy)
         roots = _isolated_launcher_import_roots(str(executable.interpreter))
-        _validate_launcher_write_grants(
-            policy,
-            set(),
-            {variant for root in roots for variant in _launcher_path_variants(root)},
-        )
+        import_trees = {variant for root in roots for variant in _launcher_path_variants(root)}
+        _validate_launcher_write_grants(policy, set(), import_trees)
+        _validate_trusted_hardlink_aliases(policy, set(), import_trees)
     except OSError as exc:
         raise ValueError(
             "model auth executable and runtime must stay outside sandbox-writable paths"

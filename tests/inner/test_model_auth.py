@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import stat
 from pathlib import Path
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -14,12 +15,15 @@ from omnigent.inner._proc import process_alive
 from omnigent.inner.model_auth import (
     PROVIDER_AUTH_REQUIRED,
     ProviderAuthRequired,
+    _auth_base_runtime_trees,
     _pin_auth_python_runtime,
     _profile_token_argv,
     _resolve_auth_executable,
     _TrustedExecutable,
+    _validate_auth_runtime,
     mint_profile_token,
 )
+from omnigent.inner.sandbox import SandboxPolicy
 
 _HOST = "https://workspace.cloud.databricks.com"
 _PROFILE = "agent-profile"
@@ -61,6 +65,114 @@ def test_pinned_interpreter_keeps_original_invocation_path(
     assert pinned.interpreter != binary
     info = binary.stat()
     assert pinned.interpreter_identity == (info.st_dev, info.st_ino)
+
+
+@pytest.mark.parametrize("target", ["helper", "interpreter"])
+def test_auth_runtime_rejects_writable_hardlink_alias(
+    trusted_python_helper: tuple[_TrustedExecutable, Path, Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+) -> None:
+    from omnigent.inner import sandbox
+
+    executable, _, _, binary = trusted_python_helper
+    pinned = _pin_auth_python_runtime(executable)
+    trusted = pinned.path if target == "helper" else binary
+    original_identity = (trusted.stat().st_dev, trusted.stat().st_ino)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    alias = workspace / "editable"
+    os.link(trusted, alias)
+    alias.write_bytes(b"modified in place")
+    assert (trusted.stat().st_dev, trusted.stat().st_ino) == original_identity
+
+    monkeypatch.setattr(sandbox, "_validate_launcher_runtime", lambda _policy: None)
+    monkeypatch.setattr(sandbox, "_isolated_launcher_import_roots", lambda _python: ())
+    policy = SandboxPolicy("linux_bwrap", True, None, [workspace], [], False)
+    with pytest.raises(ValueError, match="outside sandbox-writable paths"):
+        _validate_auth_runtime(pinned, policy)
+
+
+def test_auth_runtime_rejects_copied_interpreter_base_stdlib_alias_before_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.inner import sandbox
+
+    base_bin = tmp_path / "base" / "bin"
+    base_bin.mkdir(parents=True)
+    base_python = base_bin / "python"
+    base_python.write_bytes(b"\x7fELF-disposable-runtime")
+    base_python.chmod(0o700)
+    stdlib = base_bin.parent / "lib" / "python3.12"
+    (stdlib / "json").mkdir(parents=True)
+    (stdlib / "json" / "__init__.py").write_text("# disposable stdlib\n")
+    site = stdlib / "site.py"
+    site.write_text("# disposable stdlib\n")
+    runtime = tmp_path / "auth-venv"
+    (runtime / "bin").mkdir(parents=True)
+    interpreter = runtime / "bin" / "python"
+    shutil.copy2(base_python, interpreter)
+    (runtime / "pyvenv.cfg").write_text(f"home = {base_bin}\nversion = 3.12.0\n")
+    helper = tmp_path / "profile-auth"
+    helper.write_text(f"#!{interpreter}\nprint('unused')\n")
+    helper.chmod(0o700)
+    info = helper.stat()
+    pinned = _pin_auth_python_runtime(_TrustedExecutable(helper, (info.st_dev, info.st_ino)))
+    assert not interpreter.is_symlink()
+    assert interpreter.stat().st_ino != base_python.stat().st_ino
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    alias = workspace / "editable.py"
+    os.link(site, alias)
+    alias.write_text("# worker can change base site import\n")
+    probe = Mock(side_effect=AssertionError("auth interpreter probe ran"))
+    monkeypatch.setattr(sandbox, "_validate_launcher_runtime", lambda _policy: None)
+    monkeypatch.setattr(sandbox, "_isolated_launcher_import_roots", probe)
+
+    policy = SandboxPolicy("linux_bwrap", True, None, [workspace], [], False)
+    with pytest.raises(ValueError, match="outside sandbox-writable paths"):
+        _validate_auth_runtime(pinned, policy)
+    probe.assert_not_called()
+
+
+def test_auth_base_runtime_accepts_venv_without_optional_version(tmp_path: Path) -> None:
+    base_bin = tmp_path / "base" / "bin"
+    base_bin.mkdir(parents=True)
+    stdlib = base_bin.parent / "lib" / "python3.12"
+    (stdlib / "json").mkdir(parents=True)
+    (stdlib / "json" / "__init__.py").write_text("# disposable stdlib\n")
+    (stdlib / "site.py").write_text("# disposable stdlib\n")
+    interpreter = tmp_path / "runtime" / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_bytes(b"\x7fELF-disposable-runtime")
+    (interpreter.parent.parent / "pyvenv.cfg").write_text(f"home = {base_bin}\n")
+
+    assert base_bin.parent / "lib" in _auth_base_runtime_trees(interpreter)
+
+
+@pytest.mark.parametrize(
+    "config_text",
+    ["version = 3.12.0\n", "home = relative/bin\nversion = 3.12.0\n"],
+)
+def test_auth_runtime_rejects_indeterminate_venv_home_before_probe(
+    trusted_python_helper: tuple[_TrustedExecutable, Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    config_text: str,
+) -> None:
+    from omnigent.inner import sandbox
+
+    executable, interpreter, _, _ = trusted_python_helper
+    (interpreter.parent.parent / "pyvenv.cfg").write_text(config_text)
+    probe = Mock(side_effect=AssertionError("auth interpreter probe ran"))
+    monkeypatch.setattr(sandbox, "_validate_launcher_runtime", lambda _policy: None)
+    monkeypatch.setattr(sandbox, "_isolated_launcher_import_roots", probe)
+
+    policy = SandboxPolicy("linux_bwrap", True, None, [], [], False)
+    with pytest.raises(ValueError, match="outside sandbox-writable paths"):
+        _validate_auth_runtime(_pin_auth_python_runtime(executable), policy)
+    probe.assert_not_called()
 
 
 @pytest.mark.parametrize("stage", ["pin", "mint"])

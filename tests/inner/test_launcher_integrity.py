@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shlex
+import shutil
 import stat
 import subprocess
 import sys
@@ -47,6 +49,7 @@ def runtime_layout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNam
         sb,
         "sys",
         SimpleNamespace(
+            platform=sys.platform,
             executable=str(interpreter),
             prefix=str(runtime),
             exec_prefix=str(runtime),
@@ -171,6 +174,245 @@ def test_launcher_rejects_alias_and_intermediate_interpreter_hops(
 
 
 @pytest.mark.parametrize("grant_kind", ["write_roots", "write_files"])
+def test_launcher_rejects_writable_hardlink_to_startup_import(
+    runtime_layout: SimpleNamespace, tmp_path: Path, grant_kind: str
+) -> None:
+    startup = runtime_layout.packages / "startup_module.py"
+    startup.parent.mkdir(parents=True)
+    startup.write_text("value = 'trusted'\n")
+    original_identity = (startup.stat().st_dev, startup.stat().st_ino)
+    workspace = tmp_path / "contained"
+    workspace.mkdir()
+    alias = workspace / "editable.py"
+    os.link(startup, alias)
+    alias.write_text("value = 'modified'\n")
+    assert (startup.stat().st_dev, startup.stat().st_ino) == original_identity
+
+    policy = _policy()
+    setattr(policy, grant_kind, [workspace if grant_kind == "write_roots" else alias])
+    with pytest.raises(OSError, match="hard-link alias"):
+        sb.create_exec_launcher("/bin/true", policy)
+
+
+def test_launcher_allows_unrelated_hardlinks(
+    runtime_layout: SimpleNamespace, tmp_path: Path
+) -> None:
+    startup = runtime_layout.packages / "startup_module.py"
+    startup.parent.mkdir(parents=True)
+    startup.write_text("value = 'trusted'\n")
+    unrelated = tmp_path / "unrelated.py"
+    unrelated.write_text("value = 'workspace'\n")
+    workspace = tmp_path / "contained"
+    workspace.mkdir()
+    os.link(unrelated, workspace / "editable.py")
+
+    policy = _policy()
+    policy.write_roots = [workspace]
+    Path(sb.create_exec_launcher("/bin/true", policy)).unlink()
+
+
+def test_launcher_rejects_root_level_import_alias(
+    runtime_layout: SimpleNamespace, tmp_path: Path
+) -> None:
+    root = runtime_layout.framework
+    root.mkdir(parents=True, exist_ok=True)
+    shadow = root / "uuid.py"
+    shadow.write_text("value = 'trusted'\n")
+    workspace = tmp_path / "contained"
+    workspace.mkdir()
+    os.link(shadow, workspace / "editable.py")
+    policy = _policy()
+    policy.write_roots = [workspace]
+    with pytest.raises(OSError, match="hard-link alias"):
+        sb.create_exec_launcher("/bin/true", policy)
+
+
+def test_launcher_rejects_hardlink_moved_out_of_workspace_during_scan(
+    runtime_layout: SimpleNamespace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trusted = runtime_layout.packages / "startup.py"
+    trusted.parent.mkdir(parents=True)
+    trusted.write_text("value = 'trusted'\n")
+    workspace = tmp_path / "grant"
+    workspace.mkdir()
+    alias = workspace / "editable.py"
+    os.link(trusted, alias)
+    hidden = tmp_path / "moved.py"
+    original_scandir = os.scandir
+
+    def move_on_trusted_scan(path: str | os.PathLike[str]):
+        if Path(path) == runtime_layout.packages:
+            alias.rename(hidden)
+        return original_scandir(path)
+
+    monkeypatch.setattr(sb.os, "scandir", move_on_trusted_scan)
+    policy = _policy()
+    policy.write_roots = [workspace]
+    with pytest.raises(OSError, match="hard-link alias"):
+        sb._validate_trusted_hardlink_aliases(policy, set(), {runtime_layout.packages})
+    assert hidden.exists(), "the alias moved before the trusted file was checked"
+    assert not alias.exists()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux root-owned package compatibility")
+def test_root_owned_readonly_package_hardlinks_are_allowed(
+    runtime_layout: SimpleNamespace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trusted = runtime_layout.packages / "module.py"
+    trusted.parent.mkdir(parents=True)
+    trusted.write_text("value = 'trusted'\n")
+    os.link(trusted, tmp_path / "cache-copy.py")
+    original_stat = Path.stat
+    original_access = os.access
+    info = trusted.stat()
+    trusted_identity = (info.st_dev, info.st_ino)
+
+    def is_trusted_inode(path: Path | str) -> bool:
+        try:
+            info = original_stat(Path(path))
+        except FileNotFoundError:
+            return False
+        return (info.st_dev, info.st_ino) == trusted_identity
+
+    def root_owned_stat(path: Path, *args: object, **kwargs: object) -> os.stat_result:
+        info = original_stat(path, *args, **kwargs)
+        if (info.st_dev, info.st_ino) == trusted_identity:
+            fields = list(info)
+            fields[4] = 0
+            return os.stat_result(fields)
+        return info
+
+    monkeypatch.setattr(Path, "stat", root_owned_stat)
+    monkeypatch.setattr(
+        os,
+        "access",
+        lambda path, mode: False if is_trusted_inode(path) else original_access(path, mode),
+    )
+    policy = _policy()
+    policy.write_roots = [tmp_path / "grant"]
+    Path(sb.create_exec_launcher("/bin/true", policy)).unlink()
+
+    trusted.chmod(0o664)
+    with pytest.raises(OSError, match="hard-link alias"):
+        sb.create_exec_launcher("/bin/true", policy)
+
+
+def test_trusted_inode_scan_follows_directory_symlinks_without_loop(tmp_path: Path) -> None:
+    trusted_dir = tmp_path / "trusted"
+    trusted_dir.mkdir()
+    trusted = trusted_dir / "trusted.py"
+    trusted.write_text("value = 'trusted'\n")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    external = tmp_path / "external"
+    external.mkdir()
+    (trusted_dir / "external").symlink_to(external, target_is_directory=True)
+    (external / "cycle").symlink_to(trusted_dir, target_is_directory=True)
+    policy = _policy()
+    policy.write_roots = [workspace]
+    sb._validate_trusted_hardlink_aliases(policy, set(), {trusted_dir})
+
+    os.link(trusted, external / "editable.py")
+    with pytest.raises(OSError, match="hard-link alias"):
+        sb._validate_trusted_hardlink_aliases(policy, set(), {trusted_dir})
+
+
+def test_trusted_inode_scan_fails_closed_on_large_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for number in range(4):
+        (tmp_path / f"file-{number}.py").write_text("value = 'trusted'\n")
+    monkeypatch.setattr(sb, "_MAX_TRUSTED_RUNTIME_ENTRIES", 3)
+
+    with pytest.raises(OSError, match="Cannot validate trusted runtime"):
+        sb._validate_trusted_hardlink_aliases(_policy(), set(), {tmp_path})
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS Seatbelt")
+def test_seatbelt_denies_new_hardlink_from_readonly_source(tmp_path: Path) -> None:
+    from omnigent.inner.seatbelt_sandbox import _build_profile
+
+    sandbox_exec = Path("/usr/bin/sandbox-exec")
+    if not sandbox_exec.exists():
+        pytest.skip("sandbox-exec is unavailable")
+    trusted = tmp_path / "trusted"
+    trusted.mkdir()
+    source = trusted / "startup.py"
+    source.write_text("value = 'trusted'\n")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    alias = workspace / "editable.py"
+    policy = _policy("darwin_seatbelt")
+    policy.read_roots = [trusted]
+    policy.write_roots = [workspace]
+    profile = _build_profile(policy, workspace)
+    copied = workspace / "copy.py"
+    subprocess.run(
+        [str(sandbox_exec), "-p", profile, "/bin/cp", str(source), str(copied)],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    )
+    assert copied.read_text() == source.read_text()
+
+    result = subprocess.run(
+        [str(sandbox_exec), "-p", profile, "/bin/ln", str(source), str(alias)],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert result.returncode != 0
+    assert result.stderr.startswith("ln: ")
+    assert "Operation not permitted" in result.stderr
+    assert not alias.exists()
+    os.link(source, alias)
+    assert alias.exists(), "the filesystem itself must permit the link"
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="requires Linux bubblewrap")
+def test_bwrap_denies_new_hardlink_from_readonly_source(tmp_path: Path) -> None:
+    from omnigent.inner.bwrap_sandbox import BwrapSandboxBackend
+
+    if shutil.which("bwrap") is None:
+        pytest.skip("bubblewrap is unavailable")
+    trusted = tmp_path / "trusted"
+    trusted.mkdir()
+    source = trusted / "startup.py"
+    source.write_text("value = 'trusted'\n")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    alias = workspace / "editable.py"
+    policy = _policy()
+    policy.read_roots = [trusted]
+    policy.write_roots = [workspace]
+    copied = workspace / "copy.py"
+    copy_argv = BwrapSandboxBackend().wrap_launcher_argv(
+        ["/bin/cp", str(source), str(copied)], policy, workspace
+    )
+    subprocess.run(
+        copy_argv, cwd=workspace, capture_output=True, text=True, check=True, timeout=10
+    )
+    assert copied.read_text() == source.read_text()
+    code = (
+        "import os, sys\n"
+        "try:\n"
+        "    os.link(sys.argv[1], sys.argv[2])\n"
+        "except OSError as error:\n"
+        "    print(error.errno)\n"
+    )
+    argv = BwrapSandboxBackend().wrap_launcher_argv(
+        [sys.executable, "-I", "-c", code, str(source), str(alias)], policy, workspace
+    )
+    result = subprocess.run(argv, cwd=workspace, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(errno.EXDEV)
+    assert not alias.exists()
+    os.link(source, alias)
+    assert alias.exists(), "the filesystem itself must permit the link"
+
+
+@pytest.mark.parametrize("grant_kind", ["write_roots", "write_files"])
 def test_launcher_allows_child_workspace_under_system_prefix(
     runtime_layout: SimpleNamespace, grant_kind: str
 ) -> None:
@@ -226,7 +468,7 @@ def test_isolated_pth_import_root_remains_protected(
     external.mkdir()
     (packages / "external.pth").write_text(str(external) + "\n")
     assert str(external) not in sys.path
-    # Snapshot while the installation is trusted, before any worker can run.
+    # Read startup roots without running .pth hooks.
     roots = sb._isolated_launcher_import_roots(str(interpreter))
     assert external in roots
     marker = tmp_path / "startup-ran"
@@ -244,7 +486,201 @@ def test_isolated_pth_import_root_remains_protected(
         setattr(policy, grant_kind, [grant])
         with pytest.raises(OSError, match="trusted launcher runtime"):
             sb.create_exec_launcher("/bin/true", policy)
-    assert not marker.exists(), "cached startup roots must not re-execute modified hooks"
+    assert not marker.exists(), "startup root checks must not execute sitecustomize"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX disposable venv")
+def test_external_pth_import_is_rejected_before_startup_code_runs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = tmp_path / "runtime"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(runtime)
+    interpreter = runtime / "bin/python"
+    packages = (
+        runtime
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+    )
+    external = tmp_path / "external"
+    external.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    marker = tmp_path / "external-import-ran"
+    module = external / "_distutils_hack.py"
+    module.write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).touch()\ndef add_shim(): pass\n"
+    )
+    os.link(module, workspace / "editable.py")
+    (packages / "a_external.pth").write_text(str(external) + "\n")
+    (packages / "distutils-precedence.pth").write_text(
+        "import os; var = 'SETUPTOOLS_USE_DISTUTILS'; enabled = os.environ.get(var, 'local') "
+        "== 'local'; enabled and __import__('_distutils_hack').add_shim(); \n"
+    )
+    monkeypatch.setattr(sys, "executable", str(interpreter))
+    policy = _policy()
+    policy.write_roots = [workspace]
+
+    with pytest.raises(OSError, match="hard-link alias"):
+        sb.create_exec_launcher("/bin/true", policy)
+    assert not marker.exists(), "validation must not execute .pth imports"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX disposable venv")
+def test_unsupported_pth_startup_form_fails_closed(tmp_path: Path) -> None:
+    runtime = tmp_path / "runtime"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(runtime)
+    interpreter = runtime / "bin/python"
+    packages = (
+        runtime
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+    )
+    marker = tmp_path / "startup-ran"
+    (packages / "dynamic.pth").write_text(
+        f"import pathlib; pathlib.Path({str(marker)!r}).touch()\n"
+    )
+
+    with pytest.raises(OSError, match=r"unsupported \.pth startup form"):
+        sb._isolated_launcher_import_roots(str(interpreter))
+    assert not marker.exists()
+
+
+@pytest.mark.parametrize("config_location", ["adjacent", "venv-root"])
+def test_isolated_pth_roots_follow_cpython_venv_config_layout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config_location: str
+) -> None:
+    runtime = tmp_path / "runtime"
+    interpreter = runtime / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.touch()
+    base_site = tmp_path / "base-site"
+    base_site.mkdir()
+    venv_site = tmp_path / "venv-site"
+    venv_site.mkdir()
+    external = tmp_path / "external-imports"
+    external.mkdir()
+    (base_site / "external.pth").write_text(str(external) + "\n")
+    if config_location == "adjacent":
+        (runtime / "pyvenv.cfg").write_text("include-system-site-packages = false\n")
+        (interpreter.parent / "pyvenv.cfg").write_text("include-system-site-packages = true\n")
+    else:
+        (runtime / "pyvenv.cfg").write_text("home = /trusted/bin\n")
+
+    metadata = {
+        "paths": [str(tmp_path / "stdlib")],
+        "base_sites": [str(base_site)],
+        "venv_sites": [str(venv_site)],
+    }
+    monkeypatch.setattr(
+        sb.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(stdout=json.dumps(metadata)),
+    )
+
+    roots = sb._isolated_launcher_import_roots(str(interpreter))
+    assert external in roots
+    assert base_site in roots
+    assert venv_site in roots
+
+
+def test_editable_finder_must_match_installed_template(tmp_path: Path) -> None:
+    site_dir = tmp_path / "site-packages"
+    template_path = site_dir / "setuptools" / "command" / "editable_wheel.py"
+    template_path.parent.mkdir(parents=True)
+    template = (
+        "MAPPING = {mapping!r}\n"
+        "NAMESPACES = {namespaces!r}\n"
+        "PATH_PLACEHOLDER = {name!r} + '.__path_hook__'\n"
+        "def install():\n    pass\n"
+    )
+    template_path.write_text(f"_FINDER_TEMPLATE = {template!r}\n")
+    finder = site_dir / "__editable___sample_finder.py"
+    finder.write_text(
+        template.format(name="__editable__.sample.finder", mapping={}, namespaces={})
+    )
+    pth = site_dir / "__editable__.sample.pth"
+    line = "import __editable___sample_finder; __editable___sample_finder.install()"
+    assert sb._trusted_pth_import_roots(pth, line) == set()
+
+    finder.write_text(finder.read_text() + "import pathlib; pathlib.Path('/tmp/marker').touch()\n")
+    with pytest.raises(OSError, match=r"unsupported \.pth editable finder"):
+        sb._trusted_pth_import_roots(pth, line)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX disposable venv")
+def test_isolated_pth_roots_are_read_again_after_change(tmp_path: Path) -> None:
+    runtime = tmp_path / "runtime"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(runtime)
+    interpreter = runtime / "bin/python"
+    packages = (
+        runtime
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+    )
+    startup = packages / "external.pth"
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    startup.write_text(str(first) + "\n")
+    assert first in sb._isolated_launcher_import_roots(str(interpreter))
+    startup.write_text(str(second) + "\n")
+    roots = sb._isolated_launcher_import_roots(str(interpreter))
+    assert second in roots
+    assert first not in roots
+
+
+@pytest.mark.parametrize("name", ["COVERAGE_PROCESS_START", "COVERAGE_PROCESS_CONFIG"])
+def test_launcher_rejects_staged_coverage_startup(
+    runtime_layout: SimpleNamespace, name: str
+) -> None:
+    with pytest.raises(OSError, match="coverage startup environment"):
+        sb.create_exec_launcher("/bin/true", _policy(), env_overrides={name: "config"})
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX launcher shell")
+def test_wrapped_launcher_clears_inherited_coverage_before_python_startup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    runtime = tmp_path / "runtime"
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(runtime)
+    interpreter = runtime / "bin/python"
+    packages = (
+        runtime
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+    )
+    marker = tmp_path / "coverage-ran"
+    (packages / "coverage.py").write_text(
+        f"from pathlib import Path\nPath({str(marker)!r}).touch()\n"
+    )
+    (packages / "a1_coverage.pth").write_text(
+        'import sys; exec(\'import os\\n\\nif os.getenv("COVERAGE_PROCESS_START") or '
+        'os.getenv("COVERAGE_PROCESS_CONFIG"):\\n try:\\n  import coverage\\n '
+        'except:\\n  pass\\n else:\\n  coverage.process_startup(slug="pth")\')\n'
+    )
+    monkeypatch.setattr(sys, "executable", str(interpreter))
+    monkeypatch.setattr(sb, "_launcher_inline_source", lambda *_args, **_kwargs: "print('ok')")
+    path = Path(sb.create_exec_launcher("/bin/true", _policy()))
+    try:
+        result = subprocess.run(
+            [str(path)],
+            env={
+                "PATH": os.defpath,
+                "COVERAGE_PROCESS_START": str(tmp_path / "coverage-config"),
+                "COVERAGE_PROCESS_CONFIG": str(tmp_path / "coverage-config"),
+            },
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        assert result.returncode == 0, result.stderr
+        assert result.stdout.strip() == "ok"
+        assert not marker.exists()
+    finally:
+        path.unlink()
 
 
 def test_isolated_import_snapshot_failure_is_closed(
@@ -336,6 +772,15 @@ def test_disposable_runtime_startup_poison_is_rejected(
         with pytest.raises(OSError, match="trusted launcher runtime"):
             sb.create_exec_launcher("/bin/true", policy)
     assert not marker.exists()
+
+    alias_dir = tmp_path / "contained"
+    alias_dir.mkdir()
+    os.link(startup, alias_dir / "editable.py")
+    policy.write_roots = [alias_dir]
+    policy.write_files = []
+    with pytest.raises(OSError, match="hard-link alias"):
+        sb.create_exec_launcher("/bin/true", policy)
+    assert not marker.exists(), "the isolated startup probe must not run poisoned .pth code"
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX fake CLI")
