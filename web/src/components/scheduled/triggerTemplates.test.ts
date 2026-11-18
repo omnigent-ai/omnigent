@@ -35,6 +35,7 @@ import {
   triggerFieldsComplete,
   triggerMessageBudget,
   triggerScopeOperators,
+  updateTriggerWorkerPlacement,
   updateTriggerWorkerSettings,
   withTriggerEvent,
   TRIGGER_SOURCES,
@@ -110,6 +111,12 @@ describe("saved trigger prompts", () => {
       expect(updateTriggerWorkerSettings(prompt, { ...AGENT_DEFAULT_WORKERS, model: "new" })).toBe(
         prompt.replace('model "old"', 'model "new"'),
       );
+      // Moving the workers keeps the workflow and the other settings.
+      const managed = updateTriggerWorkerPlacement(prompt, "managed");
+      expect(managed).toBe(prompt.replace('placement "same_host"', 'placement "managed"'));
+      expect(readTriggerWorkerPlacement(managed)).toBe("managed");
+      expect(updateTriggerWorkerPlacement(managed, "same_host")).toBe(prompt);
+      expect(updateTriggerWorkerPlacement(prompt, "same_host")).toBe(prompt);
     },
   );
 

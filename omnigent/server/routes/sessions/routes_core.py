@@ -1700,7 +1700,7 @@ def register_core_routes(
             created_by_scheduled_task_id=(
                 source.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY) if source is not None else None
             ),
-            created_by_labels=source.labels if source is not None else None,
+            created_by=source,
             launched_by_scheduled_task_id=(
                 launching_task.id if launching_task is not None else None
             ),

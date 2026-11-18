@@ -125,25 +125,20 @@ export function readOnlyReasonForSessionLabels(
   activeSession: LabelSource,
   activeConv: LabelSource,
 ): string | null {
+  const wrapper =
+    activeSession?.labels?.["omnigent.wrapper"] ?? activeConv?.labels?.["omnigent.wrapper"];
   const closed =
     activeSession?.labels?.["omnigent.closed"] ?? activeConv?.labels?.["omnigent.closed"];
   if (closed === "true") {
-    // A codex /side child is sealed (server-computed) once its ephemeral fork's
-    // runner is gone; give it a side-chat-specific reason rather than the
-    // generic sub-agent one so the user understands it's read-only for good.
-    // "Side chat" is the nickname the server stamps on a /side fork.
-    const wrapperLabel =
-      activeSession?.labels?.["omnigent.wrapper"] ?? activeConv?.labels?.["omnigent.wrapper"];
     const nickname =
       activeSession?.labels?.["omnigent.codex_native.agent_nickname"] ??
       activeConv?.labels?.["omnigent.codex_native.agent_nickname"];
-    if (wrapperLabel === "codex-native-ui-subagent" && nickname === "Side chat") {
-      return "This side chat has ended and can't receive new messages";
+    const resumeSupported =
+      (activeSession ?? activeConv)?.labels?.["omnigent.codex_native.side_chat_resume"] === "true";
+    if (wrapper !== "codex-native-ui-subagent" || nickname !== "Side chat" || !resumeSupported) {
+      return "This sub-agent session is closed";
     }
-    return "This sub-agent session is closed";
   }
-  const wrapper =
-    activeSession?.labels?.["omnigent.wrapper"] ?? activeConv?.labels?.["omnigent.wrapper"];
   if (wrapper === "claude-code-native-ui-subagent") {
     return "Claude Code sub-agents are read-only";
   }

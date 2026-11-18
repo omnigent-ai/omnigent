@@ -481,7 +481,9 @@ def test_cursor_native_cli_exposes_omnigent_mcp_tools(
         assert tools.returncode == 0, tools.stdout
         assert "sys_session_list" in tools.stdout
         assert "sys_session_send" in tools.stdout
-        assert "sys_os_read" in tools.stdout
+        assert "list_comments" in tools.stdout
+        # Cursor's own file and shell tools cover the workspace; the relay offers none.
+        assert "sys_os_read" not in tools.stdout
     finally:
         handle.terminate()
 

@@ -118,10 +118,15 @@ def codex_budget_rig(
         yield client, workspace, stack.runner_id, mock_url
 
 
-def _snapshot(client: httpx.Client, session_id: str) -> dict[str, Any]:
+def _snapshot(
+    client: httpx.Client, session_id: str, *, evidence: dict[str, Any] | None = None
+) -> dict[str, Any]:
     response = client.get(f"/v1/sessions/{session_id}")
     response.raise_for_status()
-    return response.json()
+    snapshot = response.json()
+    if evidence is not None:
+        evidence.update(_budget_state_summary(snapshot))
+    return snapshot
 
 
 def _wait_for(probe: Callable[[], Any], *, description: str, deadline: float) -> Any:
@@ -149,9 +154,85 @@ def _shell_response(call_id: str, command: str, **options: Any) -> dict[str, Any
     }
 
 
-def _work_requests(mock_url: str, model: str) -> list[dict[str, Any]]:
+def _budget_state_summary(state: dict[str, Any]) -> dict[str, Any]:
+    """Keep only fixed state labels and bounded elicitation counts."""
+    statuses = {
+        "idle",
+        "launching",
+        "running",
+        "waiting",
+        "queued",
+        "in_progress",
+        "completed",
+        "failed",
+        "cancelled",
+    }
+    summary: dict[str, Any] = {}
+    for key in ("status", "current_task_status"):
+        value = state.get(key)
+        summary[key] = value if isinstance(value, str) and value in statuses else "other"
+    busy = state.get("busy")
+    summary["busy"] = busy if isinstance(busy, bool) else "other"
+    pending = state.get("pending_elicitations")
+    count = len(pending) if isinstance(pending, list) else state.get("pending_elicitations_count")
+    summary["pending_elicitations_count"] = (
+        count if type(count) is int and 0 <= count <= 999_999 else "unavailable"
+    )
+    return summary
+
+
+def _budget_request_evidence(requests: list[dict[str, Any]], states: dict[str, Any]) -> str:
+    """Bound request structure to four requests, four items each and 4096 ASCII bytes."""
+    labels = {
+        "role": {"system", "developer", "user", "assistant", "tool"},
+        "type": {
+            "message",
+            "function_call",
+            "function_call_output",
+            "reasoning",
+            "item_reference",
+        },
+        "name": {"sys_session_send", "mcp__omnigent.sys_session_send", "exec_command"},
+    }
+    summary: dict[str, Any] = {
+        "request_count": len(requests),
+        "requests_omitted": max(0, len(requests) - 4),
+        "parent_at_cost_check": _budget_state_summary(states.get("parent", {})),
+        "child_at_discovery": _budget_state_summary(states.get("child", {})),
+        "requests": [],
+    }
+    for request_index in range(max(0, len(requests) - 4), len(requests)):
+        items = requests[request_index].get("input")
+        detail: dict[str, Any] = {
+            "request_index": request_index,
+            "item_count": "other",
+            "items": [],
+        }
+        if isinstance(items, list):
+            detail["item_count"] = len(items)
+            detail["items_omitted"] = max(0, len(items) - 4)
+            for item_index in range(max(0, len(items) - 4), len(items)):
+                item = items[item_index]
+                entry: dict[str, Any] = {"item_index": item_index}
+                for key, allowed in labels.items():
+                    value = item.get(key) if isinstance(item, dict) else None
+                    entry[key] = value if isinstance(value, str) and value in allowed else "other"
+                detail["items"].append(entry)
+        summary["requests"].append(detail)
+    encoded = json.dumps(summary, ensure_ascii=True, separators=(",", ":"))
+    if len(encoded) > 4096:
+        encoded = json.dumps({"request_count": len(requests), "structure_omitted": True})
+    return encoded
+
+
+def _work_requests(
+    mock_url: str, model: str, *, evidence: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
     """Exclude the CLI's auxiliary title-generation requests from turn counts."""
-    return [body for body in get_mock_requests(mock_url, key=model) if body.get("tools")]
+    requests = [body for body in get_mock_requests(mock_url, key=model) if body.get("tools")]
+    if evidence is not None:
+        evidence["detail"] = _budget_request_evidence(requests, evidence)
+    return requests
 
 
 def test_codex_child_enforces_root_cost_budget_without_parent_activity(
@@ -256,10 +337,14 @@ def test_codex_child_enforces_root_cost_budget_without_parent_activity(
         )
         response.raise_for_status()
 
+        evidence: dict[str, Any] = {"parent": {}, "child": {}}
+
         def find_child() -> str | None:
             response = client.get(f"/v1/sessions/{parent_id}/child_sessions")
             response.raise_for_status()
             rows = response.json()["data"]
+            if rows:
+                evidence["child"] = _budget_state_summary(rows[0])
             return rows[0]["id"] if rows else None
 
         child_id = _wait_for(find_child, description="native child dispatch", deadline=deadline)
@@ -274,9 +359,11 @@ def test_codex_child_enforces_root_cost_budget_without_parent_activity(
             deadline=deadline,
         )
         assert (workspace / "under-budget.txt").read_text() == "allowed"
-        assert (_snapshot(client, parent_id).get("total_cost_usd") or 0) < 100
-        parent_requests = len(_work_requests(mock_url, _PARENT_MODEL))
-        assert parent_requests == 2
+        assert (
+            _snapshot(client, parent_id, evidence=evidence["parent"]).get("total_cost_usd") or 0
+        ) < 100
+        parent_requests = len(_work_requests(mock_url, _PARENT_MODEL, evidence=evidence))
+        assert parent_requests == 2, evidence["detail"]
         release_mock_gate(mock_url)
         _wait_for(
             lambda: len(_work_requests(mock_url, _CHILD_MODEL)) == 3,
