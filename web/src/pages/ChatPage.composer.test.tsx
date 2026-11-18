@@ -6973,6 +6973,60 @@ describe("Composer side-chat entry points", () => {
     vi.restoreAllMocks();
   });
 
+  it.each(["success", "failure"])(
+    "ignores repeated /side submissions until creation settles (%s)",
+    async (outcome) => {
+      let finishCreation!: () => void;
+      const creation = new Promise<{ childSessionId: string }>((resolve, reject) => {
+        finishCreation = () => {
+          if (outcome === "success") resolve({ childSessionId: "conv_side" });
+          else reject(new Error("offline"));
+        };
+      });
+      const createSideChat = vi
+        .spyOn(sessionsApi, "createSideChat")
+        .mockReturnValueOnce(creation)
+        .mockResolvedValue({ childSessionId: "conv_next" });
+      const error = vi.spyOn(toast, "error");
+      renderWithTooltips(<Composer {...composerProps()} />);
+      fireEvent.change(textarea(), { target: { value: "/side question" } });
+
+      act(() => {
+        fireEvent.keyDown(textarea(), { key: "Enter" });
+        fireEvent.keyDown(textarea(), { key: "Enter" });
+        fireEvent.click(screen.getByRole("button", { name: "Send" }));
+      });
+
+      expect(createSideChat).toHaveBeenCalledExactlyOnceWith("conv_test");
+      expect(textarea()).toHaveValue("/side question");
+      expect(useChatStore.getState().sideChatToOpen).toBeNull();
+      await act(async () => finishCreation());
+
+      if (outcome === "success") {
+        expect(textarea()).toHaveValue("");
+        expect(useChatStore.getState().sideChatToOpen).toEqual({
+          childId: "conv_side",
+          parentId: "conv_test",
+        });
+        fireEvent.change(textarea(), { target: { value: "/side another question" } });
+      } else {
+        expect(textarea()).toHaveValue("/side question");
+        expect(useChatStore.getState().sideChatToOpen).toBeNull();
+        expect(error).toHaveBeenCalledWith("Couldn't start a side chat for this session.");
+      }
+
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      await waitFor(() =>
+        expect(useChatStore.getState().sideChatToOpen).toEqual({
+          childId: "conv_next",
+          parentId: "conv_test",
+        }),
+      );
+      expect(createSideChat).toHaveBeenCalledTimes(2);
+      expect(textarea()).toHaveValue("");
+    },
+  );
+
   // An admin has owner level, but only the root session's owner starts side chats.
   it.each([
     [true, true],
