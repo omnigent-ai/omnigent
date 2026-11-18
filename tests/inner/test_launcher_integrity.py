@@ -193,11 +193,16 @@ def test_launcher_rejects_alias_and_intermediate_interpreter_hops(
         sb.create_exec_launcher("/bin/true", policy)
 
 
+@pytest.mark.parametrize("trusted_source", ["package", "framework"])
 @pytest.mark.parametrize("grant_kind", ["write_roots", "write_files"])
 def test_launcher_rejects_writable_hardlink_to_startup_import(
-    runtime_layout: SimpleNamespace, tmp_path: Path, grant_kind: str
+    runtime_layout: SimpleNamespace, tmp_path: Path, trusted_source: str, grant_kind: str
 ) -> None:
-    startup = runtime_layout.packages / "startup_module.py"
+    startup = (
+        runtime_layout.packages / "startup_module.py"
+        if trusted_source == "package"
+        else runtime_layout.framework / "uuid.py"
+    )
     startup.parent.mkdir(parents=True)
     startup.write_text("value = 'trusted'\n")
     original_identity = (startup.stat().st_dev, startup.stat().st_ino)
@@ -229,22 +234,6 @@ def test_launcher_allows_unrelated_hardlinks(
     policy = _policy()
     policy.write_roots = [workspace]
     Path(sb.create_exec_launcher("/bin/true", policy)).unlink()
-
-
-def test_launcher_rejects_root_level_import_alias(
-    runtime_layout: SimpleNamespace, tmp_path: Path
-) -> None:
-    root = runtime_layout.framework
-    root.mkdir(parents=True, exist_ok=True)
-    shadow = root / "uuid.py"
-    shadow.write_text("value = 'trusted'\n")
-    workspace = tmp_path / "contained"
-    workspace.mkdir()
-    os.link(shadow, workspace / "editable.py")
-    policy = _policy()
-    policy.write_roots = [workspace]
-    with pytest.raises(OSError, match="hard-link alias"):
-        sb.create_exec_launcher("/bin/true", policy)
 
 
 def test_launcher_rejects_hardlink_moved_out_of_workspace_during_scan(

@@ -21,17 +21,15 @@ from omnigent.inner.terminal import TerminalInstance
 from omnigent.runtime import workflow
 from omnigent.spec import load
 from omnigent.spec.types import AgentSpec, ApiKeyAuth, ExecutorSpec
+from tests._helpers.providers import isolate_provider_resolution
 
 
 @pytest.fixture
 def isolated_auth(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     home = tmp_path / "parent-home"
     home.mkdir()
-    config_home = home / ".omnigent"
-    config_home.mkdir()
     monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
-    monkeypatch.delenv("OMNIGENT_INFERENCE_CONFIG", raising=False)
+    config_home = isolate_provider_resolution(monkeypatch, home / ".omnigent")
     monkeypatch.setenv("CUSTOM_CLAUDE_CREDENTIAL", "parent-only-custom-key")
     monkeypatch.setenv("OMNIGENT_CUSTOM_CLAUDE_CREDENTIAL", "parent-only-alias-key")
     monkeypatch.setenv("UNRELATED_ENV", "keep-me")

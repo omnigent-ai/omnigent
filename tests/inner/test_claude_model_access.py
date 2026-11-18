@@ -1376,6 +1376,24 @@ def test_host_oauth_file_is_reread_without_exposing_refresh_token(
     assert "parent-only-refresh" not in json.dumps(env)
     assert "renewed" not in json.dumps(env)
 
+    fixed_time = time.time()
+    monkeypatch.setattr("omnigent.inner.claude_model_access.time.time", lambda: fixed_time)
+    source.write_text(
+        json.dumps(
+            {
+                "claudeAiOauth": {
+                    "accessToken": "expired-parent-token",
+                    "refreshToken": "parent-only-refresh",
+                    "expiresAt": (fixed_time - 1) * 1000,
+                }
+            }
+        )
+    )
+    with pytest.raises(ClaudeAuthRequired, match="authentication is unavailable") as error:
+        access.credential()
+    assert "expired-parent-token" not in str(error.value)
+    assert "parent-only-refresh" not in str(error.value)
+
 
 def test_databricks_auth_pins_the_trusted_executable_before_worker_start(
     auth_runtime: tuple[Path, Path, Path], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
