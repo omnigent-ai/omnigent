@@ -12,6 +12,7 @@ import os
 import shutil
 import stat
 import sys
+import traceback
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -100,7 +101,9 @@ def _mcp_failure_metadata(requests: list[dict], home: Path, session_id: str) -> 
             "ordinal": index,
             "tools": project(request.get("tools") if isinstance(request, dict) else request),
         }
-        for index, request in enumerate(requests[-8:], start=max(0, len(requests) - 8))
+        for index, request in reversed(
+            tuple(enumerate(requests[-8:], start=max(0, len(requests) - 8)))
+        )
     ]
     bridge = (
         home / ".omnigent" / "codex-native" / hashlib.sha256(session_id.encode()).hexdigest()[:32]
@@ -309,12 +312,35 @@ def test_disabled_server_absent_from_real_native_session(
                 )
 
             try:
-                poll_until(mcp_controls_advertised, timeout_s=120)
-            except AssertionError as exc:
-                metadata = _mcp_failure_metadata(requests, host.home, session_id)
-                with contextlib.suppress(OSError):
-                    (tmp_path / "mcp-failure-metadata.json").write_text(json.dumps(metadata))
-                raise AssertionError(f"MCP controls never advertised: {metadata}") from exc
+                try:
+                    poll_until(mcp_controls_advertised, timeout_s=120)
+                except AssertionError as exc:
+                    try:
+                        metadata = _mcp_failure_metadata(requests, host.home, session_id)
+                        with contextlib.suppress(OSError):
+                            (tmp_path / "mcp-failure-metadata.json").write_text(
+                                json.dumps(metadata)
+                            )
+                        exc.add_note(f"MCP controls never advertised: {metadata}")
+                    except Exception:
+                        exc.add_note("MCP failure metadata unavailable")
+                    raise
+            except BaseException as exc:
+                pending = [exc]
+                seen: set[int] = set()
+                while pending:
+                    error = pending.pop()
+                    if id(error) in seen:
+                        continue
+                    seen.add(id(error))
+                    traceback.clear_frames(error.__traceback__)
+                    pending.extend(
+                        item for item in (error.__cause__, error.__context__) if item is not None
+                    )
+                raise
+            finally:
+                # Pytest renders locals after both polling and later assertion failures.
+                requests = []
             assert any("on_fixture" in name for name in tools), tools
             assert not any("off_fixture" in name for name in tools), tools
             assert any("omnigent" in name for name in tools), sorted(tools)
