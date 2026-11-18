@@ -51,7 +51,9 @@ export const usePlanStops = create<PlanStopsState>(() => ({ requests: {}, settle
 const RECENT_KEPT = 8;
 
 let nextRequestId = 1;
-const watcherCounts = new Map<string, number>();
+let nextObserverId = 1;
+/** Per session, each surface watching it and whether that surface sees it working. */
+const observers = new Map<string, Map<number, boolean>>();
 /** Per session with a Stop to place, the items recent native receipts named, by pending input. */
 const receiptItems = new Map<string, Map<string, string>>();
 /** Per session, pending inputs of Stops a later request ended before their items were known. */
@@ -290,15 +292,25 @@ export function supersedePlanStop(sessionId: string | null): () => void {
 }
 
 /**
- * The session stopped working: its sent Stop, if any, is done, and so is the
- * stop message the transcript last shows, so a later wake isn't stopping.
+ * Every surface watching the session sees it stopped: its sent Stop, if any,
+ * is done, and so is the stop message the transcript last shows, so a later
+ * wake isn't stopping. Surfaces count work differently, e.g. the Tasks tab
+ * counts busy sub-agents, so a Stop settles only once none sees work.
  */
-export function settlePlanStop(sessionId: string, request: PlanStopRequest | undefined): void {
-  if (request?.sent && currentRequest(sessionId)?.id === request.id) {
+function settleIfStopped(sessionId: string): void {
+  const watching = observers.get(sessionId);
+  if (!watching || [...watching.values()].some(Boolean)) return;
+  const request = currentRequest(sessionId);
+  if (request?.sent) {
     retireOwnStopMessage(sessionId, request);
     endPlanStop(sessionId, request);
   }
   retireStopMessage(sessionId, transcriptStopIdentities(sessionId, true));
+}
+
+/** A new surface's ID for {@link watchPlanStop} and {@link reportPlanStopActivity}. */
+export function newPlanStopObserver(): number {
+  return nextObserverId++;
 }
 
 /**
@@ -308,15 +320,31 @@ export function settlePlanStop(sessionId: string, request: PlanStopRequest | und
  *
  * @returns Stops watching.
  */
-export function watchPlanStop(sessionId: string): () => void {
-  watcherCounts.set(sessionId, (watcherCounts.get(sessionId) ?? 0) + 1);
+export function watchPlanStop(sessionId: string, observer: number): () => void {
+  const watching = observers.get(sessionId) ?? new Map<number, boolean>();
+  // A surface sees the session working until it says otherwise.
+  watching.set(observer, true);
+  observers.set(sessionId, watching);
   return () => {
-    const remaining = (watcherCounts.get(sessionId) ?? 1) - 1;
-    if (remaining > 0) {
-      watcherCounts.set(sessionId, remaining);
+    const current = observers.get(sessionId);
+    if (!current?.delete(observer)) return;
+    if (current.size > 0) {
+      settleIfStopped(sessionId);
       return;
     }
-    watcherCounts.delete(sessionId);
+    observers.delete(sessionId);
     replaceRequest(sessionId, currentRequest(sessionId), undefined);
   };
+}
+
+/** Whether *observer*, a surface watching *sessionId*, sees the session working. */
+export function reportPlanStopActivity(
+  sessionId: string,
+  observer: number,
+  working: boolean,
+): void {
+  const watching = observers.get(sessionId);
+  if (!watching?.has(observer)) return;
+  watching.set(observer, working);
+  if (!working) settleIfStopped(sessionId);
 }

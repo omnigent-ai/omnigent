@@ -1,11 +1,12 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 
 import { useConversationEntryValue } from "@/hooks/useConversationEntryState";
 import {
   endPlanStop,
   hasRequestAfter,
   isOpenStopLatest,
-  settlePlanStop,
+  newPlanStopObserver,
+  reportPlanStopActivity,
   usePlanStops,
   watchPlanStop,
 } from "@/store/planStops";
@@ -22,6 +23,7 @@ const NO_SETTLED_STOPS: readonly string[] = [];
  * @param sessionWorking - Whether the session works, as the surface's own controls read it.
  */
 export function usePlanStopping(sessionId: string | null, sessionWorking: boolean): boolean {
+  const [observer] = useState(newPlanStopObserver);
   const request = usePlanStops((state) =>
     sessionId === null ? undefined : state.requests[sessionId],
   );
@@ -36,12 +38,16 @@ export function usePlanStopping(sessionId: string | null, sessionWorking: boolea
     sessionId,
     (state) => stopItem !== undefined && hasRequestAfter(state.blocks, stopItem),
   );
-  useEffect(() => (sessionId === null ? undefined : watchPlanStop(sessionId)), [sessionId]);
+  useEffect(
+    () => (sessionId === null ? undefined : watchPlanStop(sessionId, observer)),
+    [sessionId, observer],
+  );
   useEffect(() => {
     if (sessionId === null) return;
     if (request && followed) endPlanStop(sessionId, request);
-    if (!sessionWorking) settlePlanStop(sessionId, request);
-  }, [sessionId, sessionWorking, request, followed, stopIsLatest]);
+    // Re-reported as a Stop or a stop message appears, so one that arrives while idle settles.
+    reportPlanStopActivity(sessionId, observer, sessionWorking);
+  }, [sessionId, observer, sessionWorking, request, followed, stopIsLatest]);
   const stopRequested = request !== undefined && !followed;
   if (stopRequested && !request.sent) return true;
   return sessionWorking && (stopRequested || stopIsLatest);

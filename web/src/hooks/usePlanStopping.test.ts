@@ -314,6 +314,39 @@ describe("usePlanStopping", () => {
     expect(result.current).toBe(true);
   });
 
+  it("settles only once every surface watching the session sees it stopped", async () => {
+    // The Tasks tab counts a busy sub-agent; a run row reads only the session's own activity.
+    const tasksTab = renderStopping(true);
+    const runRow = renderStopping(true);
+    await sendStop().take({ itemId: "stop" });
+    runRow.rerender({ working: false });
+    expect(tasksTab.result.current).toBe(true);
+    expect(usePlanStops.getState().requests[SESSION]).toMatchObject({ sent: true });
+
+    tasksTab.rerender({ working: false });
+    expect(usePlanStops.getState().requests[SESSION]).toBeUndefined();
+    expect(usePlanStops.getState().settledStops[SESSION]).toContain("stop");
+  });
+
+  it("keeps a native Stop A retired and Stop B open as their replies cross", async () => {
+    const entry = transcript();
+    const { result } = renderStopping(true);
+    const stopA = sendStop();
+    await sendFollowUp()();
+    const stopB = sendStop();
+    await stopB.take({ itemId: "stop_b" });
+    // A's delivery answers with only a pending input, then its receipt names the item.
+    await stopA.take({ pendingId: "pending_a" });
+    act(() => notePlanStopReceipt(SESSION, "pending_a", "stop_a"));
+    expect(usePlanStops.getState().settledStops[SESSION]).toContain("stop_a");
+    expect(usePlanStops.getState().requests[SESSION]).toMatchObject({ itemId: "stop_b" });
+
+    act(() => entry.setState({ blocks: [stopMessage("stop_a")] }));
+    expect(result.current).toBe(true);
+    act(() => entry.setState({ blocks: [stopMessage("stop_a"), stopMessage("stop_b")] }));
+    expect(result.current).toBe(true);
+  });
+
   it("drops the Stop once no surface watches the session, which can't see it stop", async () => {
     const first = renderStopping(true);
     const second = renderStopping(true);

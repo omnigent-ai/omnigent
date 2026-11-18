@@ -1750,14 +1750,12 @@ describe("runs of a saved workflow", () => {
   });
 
   // Runs show their plans only while the server offers workflows.
-  const renderWithWorkflows = () =>
-    render(
-      <CapabilitiesProvider
-        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { workflows: true } }}
-      >
-        {pageTree()}
-      </CapabilitiesProvider>,
-    );
+  const pageWithWorkflows = () => (
+    <CapabilitiesProvider info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { workflows: true } }}>
+      {pageTree()}
+    </CapabilitiesProvider>
+  );
+  const renderWithWorkflows = () => render(pageWithWorkflows());
 
   it.each([false, true])("shows each run's tasks and graph (trigger header=%s)", (header) => {
     const prompt = header
@@ -1924,14 +1922,7 @@ describe("runs of a saved workflow", () => {
       fetchMessage.mockRestore();
       usePlanStops.setState({ requests: {}, settledStops: {} });
     });
-    const renderWorkflowPage = () => (
-      <CapabilitiesProvider
-        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { workflows: true } }}
-      >
-        {pageTree()}
-      </CapabilitiesProvider>
-    );
-    const { rerender } = render(renderWorkflowPage());
+    const { rerender } = renderWithWorkflows();
     const row = screen.getByTestId("task-detail-run");
     fireEvent.click(within(row).getByRole("button", { name: "Stop" }));
     expect(within(row).getByTestId("plan-stopping")).toBeDisabled();
@@ -1943,7 +1934,7 @@ describe("runs of a saved workflow", () => {
     expect(within(row).getByTestId("plan-stopping")).toBeInTheDocument();
 
     setRuns([{ ...runningRun, conversationStatus: "idle" }]);
-    rerender(renderWorkflowPage());
+    rerender(pageWithWorkflows());
     expect(within(row).queryByTestId("plan-stopping")).toBeNull();
     expect(within(row).getByRole("button", { name: "Continue the plan" })).toBeInTheDocument();
   });
