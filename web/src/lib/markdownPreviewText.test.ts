@@ -56,6 +56,7 @@ describe("markdownPreviewText", () => {
         "Multiply 2 * 3 in my_file_name.py, not \\*this\\*, but _this_, *that* and ~~those~~.",
       ),
     ).toBe("Multiply 2 * 3 in my_file_name.py, not *this*, but this, that and those.");
+    expect(markdownPreviewText("**a**, **b** _c_ `d` `e`")).toBe("a, b c d e");
   });
 
   it("keeps placeholders such as <date> as written", () => {

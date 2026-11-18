@@ -16,8 +16,11 @@ const TABLE_ROW_LINE = /^[ \t]*\|(.*)\|[ \t]*$/;
 // item's marker and its task box.
 const BLOCK_MARKERS =
   /^[ \t]*(?:>[ \t]?)*[ \t]*(?:#{1,6}(?=[ \t]|$)|(?:[-*+]|\d{1,9}[.)])(?=[ \t]|$)(?:[ \t]+\[[ xX]\](?=[ \t]|$))?)?/;
+// The rules below capture the character before a delimiter instead of looking
+// behind, which older Safari can't parse.
+
 // A code span: a run of backticks, its code, then a run of as many.
-const CODE_SPAN = /(?<!`)(`+)(?!`)(.*?[^`])\1(?!`)/g;
+const CODE_SPAN = /(^|[^`])(`+)(?!`)(.*?[^`])\2(?!`)/g;
 // Code spans wait behind placeholders while the rules below run, so their
 // characters stay as written. Agents don't write private-use characters.
 const PLACEHOLDER = String.fromCharCode(0xe000);
@@ -33,9 +36,9 @@ const INLINE_RULES: readonly (readonly [RegExp, string])[] = [
   [/<((?:https?|mailto):[^\s<>]+)>/g, "$1"],
   // Strong, emphasis and strikethrough keep their text. Delimiters inside a
   // word, such as snake_case, stay.
-  [/(?<![\\*_\w])(\*\*|__)(?=\S)(.*?\S)\1(?![*_\w])/g, "$2"],
-  [/(?<![\\*_\w])([*_])(?=[^\s*_])(.*?[^\s\\])\1(?![*_\w])/g, "$2"],
-  [/(?<![\\~])~~(?=\S)(.*?\S)~~(?!~)/g, "$1"],
+  [/(^|[^\\*_\w])(\*\*|__)(?=\S)(.*?\S)\2(?![*_\w])/g, "$1$3"],
+  [/(^|[^\\*_\w])([*_])(?=[^\s*_])(.*?[^\s\\])\2(?![*_\w])/g, "$1$3"],
+  [/(^|[^\\~])~~(?=\S)(.*?\S)~~(?!~)/g, "$1$2"],
   // An escaped character shows as itself.
   [/\\([\\`*_{}[\]()#+.!|<>~-])/g, "$1"],
 ];
@@ -43,9 +46,9 @@ const INLINE_RULES: readonly (readonly [RegExp, string])[] = [
 /** One line's inline Markdown as plain text. */
 function inlinePlainText(line: string): string {
   const codes: string[] = [];
-  let text = line.replace(CODE_SPAN, (_span, _ticks: string, code: string) => {
+  let text = line.replace(CODE_SPAN, (_span, before: string, _ticks: string, code: string) => {
     codes.push(code);
-    return `${PLACEHOLDER}${codes.length - 1}${PLACEHOLDER}`;
+    return `${before}${PLACEHOLDER}${codes.length - 1}${PLACEHOLDER}`;
   });
   for (const [pattern, replacement] of INLINE_RULES) text = text.replace(pattern, replacement);
   return text.replace(PLACEHOLDER_PATTERN, (_placeholder, index: string) => codes[Number(index)]);
