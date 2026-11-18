@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { MatchClass, type MatchStrategy, foldText, matchField, mergeRanges } from "./match";
+import {
+  MAX_FUZZY_STARTS,
+  MatchClass,
+  type MatchStrategy,
+  foldText,
+  matchField,
+  mergeRanges,
+} from "./match";
 
 function match(query: string, text: string, matching?: MatchStrategy) {
   return matchField(foldText(query).values, foldText(text), 0, matching);
@@ -28,8 +35,8 @@ describe("matchField", () => {
   });
 
   it("returns null when characters are missing or out of order", () => {
-    expect(classOf("xyz", "Open settings")).toBeUndefined();
-    expect(classOf("tsop", "Open settings")).toBeUndefined();
+    expect(match("xyz", "Open settings")).toBeNull();
+    expect(match("tsop", "Open settings")).toBeNull();
   });
 
   it("returns null for an empty query, an empty field, or a query longer than the field", () => {
@@ -56,10 +63,12 @@ describe("matchField", () => {
 
   it("folds case and diacritics while reporting source ranges", () => {
     expect(match("cafe", "Le Café")?.ranges).toEqual([{ start: 3, end: 7 }]);
+    expect(match("ος", "ΟΣ")?.ranges).toEqual([{ start: 0, end: 2 }]);
+    expect(match("ΟΣ", "ος")?.ranges).toEqual([{ start: 0, end: 2 }]);
   });
 
   it("keeps a decomposed accent with its letter", () => {
-    expect(match("cafe", "Le Café noir")?.ranges).toEqual([{ start: 3, end: 8 }]);
+    expect(match("cafe", "Le Cafe\u0301 noir")?.ranges).toEqual([{ start: 3, end: 8 }]);
   });
 
   it("maps ranges past astral characters to UTF-16 offsets", () => {
@@ -112,10 +121,12 @@ describe("matchField", () => {
   });
 
   it("still tries the last start when there are more starts than the scan bound", () => {
-    const text = `${"a-x-".repeat(20)}ab-c`;
+    const repeats = MAX_FUZZY_STARTS + 4;
+    const offset = repeats * 4;
+    const text = `${"a-x-".repeat(repeats)}ab-c`;
     expect(match("abc", text)?.ranges).toEqual([
-      { start: 80, end: 82 },
-      { start: 83, end: 84 },
+      { start: offset, end: offset + 2 },
+      { start: offset + 3, end: offset + 4 },
     ]);
   });
 });

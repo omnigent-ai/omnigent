@@ -46,11 +46,12 @@ export interface FoldedText {
 
 const COMBINING_MARKS = /\p{M}/gu;
 const WORD_CHARACTER = /[\p{L}\p{N}]/u;
-const MAX_FUZZY_STARTS = 16;
+export const MAX_FUZZY_STARTS = 16;
 
+// Final sigma folds to plain sigma, so "ς" and "Σ" compare equal in either direction.
 function foldCharacter(character: string): string {
   const folded = character.normalize("NFD").replace(COMBINING_MARKS, "").toLowerCase();
-  return folded.length > 0 ? folded : character;
+  return (folded.length > 0 ? folded : character).replace("ς", "σ");
 }
 
 const COMBINING_MARK = /^\p{M}$/u;
@@ -217,10 +218,7 @@ function subsequenceMatch(query: readonly string[], target: FoldedText): Subsequ
     const match = scanFromEachStart(query, target, filenameStart, values.length);
     if (match) {
       const filenameLength = values.length - filenameStart;
-      const score =
-        query.length === filenameLength
-          ? match.score / 4
-          : (match.score / 2) * (2 - query.length / filenameLength);
+      const score = (match.score / 2) * (2 - query.length / filenameLength);
       return { score, offsets: match.offsets };
     }
   }
