@@ -484,6 +484,91 @@ async def test_explicit_recovery_deduplicates_history_heuristic(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("event_type", ["interrupt", "stop_session"])
+@pytest.mark.parametrize(
+    "before_initialization", [False, True], ids=["during-init", "before-init"]
+)
+@pytest.mark.parametrize("native", [False, True], ids=["sdk", "native"])
+async def test_stop_fences_delayed_recovery_initialization(
+    monkeypatch: pytest.MonkeyPatch,
+    event_type: str,
+    before_initialization: bool,
+    native: bool,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    from starlette.responses import Response
+
+    from omnigent.runner import app as runner_app
+    from omnigent.runner.native.interrupt import NativeInterruptRunner
+
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class PausedHistoryServer(_HistoryServerClient):
+        async def get(self, url: str, **kwargs: Any) -> Any:
+            response = await super().get(url, **kwargs)
+            if url.endswith(f"/{SESSION_ID}/items") and not release.is_set():
+                entered.set()
+                await release.wait()
+            return response
+
+    app, _pm, harness = _build_sdk_app(PausedHistoryServer())
+    payload = _session_init_payload(suppress_recovery_turn=False)
+    payload["session_init"].update(resume_interrupted_turn=True, recovery_id="stopped-task")
+    if native:
+        payload["session_init"]["snapshot"]["harness_override"] = "cursor-native"
+        monkeypatch.setattr(runner_app, "_launch_native_terminal", AsyncMock(return_value=True))
+        monkeypatch.setattr(runner_app, "_resolve_native_spawn_env", AsyncMock(return_value={}))
+        monkeypatch.setattr(
+            NativeInterruptRunner, "interrupt", AsyncMock(return_value=Response(status_code=204))
+        )
+        monkeypatch.setattr(
+            NativeInterruptRunner, "stop", AsyncMock(return_value=Response(status_code=204))
+        )
+    async with _runner_client(app) as client:
+
+        async def stop() -> None:
+            result = await client.post(
+                f"/v1/sessions/{SESSION_ID}/events", json={"type": event_type}
+            )
+            assert result.status_code == 204, result.text
+
+        if before_initialization:
+            await stop()
+        recovery = asyncio.create_task(client.post("/v1/sessions", json=payload))
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=5)
+            if not before_initialization:
+                await stop()
+        finally:
+            release.set()
+        result = await asyncio.wait_for(recovery, timeout=5)
+        assert result.status_code == 201, result.text
+        assert result.json()["recovery_turn"] == "none"
+        assert SESSION_ID not in app.state.active_turns
+        assert not harness.posted_bodies
+        # An explicit message still works; neither retries nor new recovery ids
+        # may revive the stopped work on this runner session.
+        result = await client.post(
+            f"/v1/sessions/{SESSION_ID}/events",
+            params={"stream": "true"},
+            json={
+                "type": "message",
+                "agent_id": AGENT_ID,
+                "content": [{"type": "input_text", "text": "New work"}],
+            },
+        )
+        assert result.status_code == 200, result.text
+        assert len(harness.posted_bodies) == 1
+        for recovery_id in ("stopped-task", "delayed-retry"):
+            payload["session_init"]["recovery_id"] = recovery_id
+            result = await client.post("/v1/sessions", json=payload)
+            assert result.status_code == 201
+            assert result.json()["recovery_turn"] == "none"
+        assert len(harness.posted_bodies) == 1
+
+
+@pytest.mark.asyncio
 async def test_newer_turn_finishing_during_initialization_supersedes_recovery() -> None:
     """A completed newer turn must not be followed by a stale recovery prompt."""
     from omnigent.runner.app import _session_histories_ref

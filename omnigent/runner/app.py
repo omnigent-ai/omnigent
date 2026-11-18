@@ -1472,6 +1472,7 @@ def create_runner_app(
         tuple[str, str, str | None, str | None], asyncio.Task[JSONResponse]
     ] = {}
     _recovery_turn_ids: dict[str, set[str]] = {}
+    _recovery_blocked_sessions: set[str] = set()
     _session_init_envelopes: dict[str, tuple[float, RunnerSessionInitEnvelope]] = {}
     # session_id → canonical reasoning effort, seeded from the session-init
     # snapshot and updated by ``effort_change``. In-process harnesses learn the
@@ -3770,6 +3771,7 @@ def create_runner_app(
             # automatic continuation. Initialization alone cannot consume it.
             if (
                 not execution_seen
+                and session_id not in _recovery_blocked_sessions
                 and session_id not in _active_turns
                 and not resource_registry.session_turn_is_active(session_id)
             ):
@@ -4105,6 +4107,7 @@ def create_runner_app(
         # Clear all desync/turn state so a recreated same-id session starts clean.
         _turn_bind_epoch.pop(session_id, None)
         _recovery_turn_ids.pop(session_id, None)
+        _recovery_blocked_sessions.discard(session_id)
         _desync_terminalized.pop(session_id, None)
         _desynced_sessions.discard(session_id)
         _required_terminal_exit_errors.pop(session_id, None)
@@ -8155,6 +8158,8 @@ def create_runner_app(
                     _cond.notify_all()
 
         if body_type == "interrupt":
+            # Stop fences even recovery initialization that has not arrived yet.
+            _recovery_blocked_sessions.add(conversation_id)
             _cancel_claude_prompt_waiter(conversation_id)
             _harness = _session_harness_name(conversation_id)
             resource_registry.note_terminal_control_request(conversation_id, "interrupt")
@@ -8319,6 +8324,7 @@ def create_runner_app(
             return Response(status_code=204)
 
         if body_type == "stop_session":
+            _recovery_blocked_sessions.add(conversation_id)
             resource_registry.note_terminal_control_request(conversation_id, "stop_session")
             _cancel_claude_prompt_waiter(conversation_id)
             _harness = _session_harness_name(conversation_id)

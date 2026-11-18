@@ -780,7 +780,7 @@ def test_embedded_default_is_off_and_server_prompt_is_generic(recovery: Any) -> 
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("disabled", ["deployment", "host", "connection"])
+@pytest.mark.parametrize("disabled", ["deployment", "host", "connection", "stop", "input"])
 async def test_policy_is_rechecked_after_dispatch_claim(recovery: Any, disabled: str) -> None:
     claim = recovery.store.replace_session_recovery
 
@@ -791,6 +791,10 @@ async def test_policy_is_rechecked_after_dispatch_claim(recovery: Any, disabled:
                 recovery.service.deployment_gate = False
             elif disabled == "host":
                 recovery.connection.hello.recover_interrupted_sessions = False
+            elif disabled == "stop":
+                recovery.service.stop_recovery(recovery.store.get_conversation(recovery.conv.id))
+            elif disabled == "input":
+                user_input(recovery.store, recovery.conv.id)
             else:
                 recovery.service.hosts.get = Mock(return_value=None)
         return result
@@ -798,4 +802,8 @@ async def test_policy_is_rechecked_after_dispatch_claim(recovery: Any, disabled:
     recovery.store.replace_session_recovery = disable_after_claim
     await recovery.service.recover(recovery.connection, [])
     recovery.initializer.initialize.assert_not_awaited()
-    assert recovery.store.get_session_recovery(recovery.conv.id).phase == "stopped"
+    state = recovery.store.get_session_recovery(recovery.conv.id)
+    if disabled == "input":
+        assert state is None
+    else:
+        assert state.phase == "stopped"

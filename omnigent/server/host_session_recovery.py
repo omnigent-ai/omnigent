@@ -521,6 +521,7 @@ class HostSessionRecoverer:
         if (
             not await asyncio.to_thread(self.enabled, connection.host_id)
             or self.hosts.get(connection.host_id) is not connection
+            or await asyncio.to_thread(self.store.get_session_recovery, conv.id) != dispatch
         ):
             await asyncio.to_thread(
                 self.store.replace_session_recovery,
