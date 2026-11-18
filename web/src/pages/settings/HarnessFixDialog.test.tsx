@@ -1615,7 +1615,7 @@ describe("HarnessFixDialog", () => {
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: "Use an API key or gateway URL instead" }));
     await user.type(screen.getByPlaceholderText("Paste an API key"), "secret");
-    await user.click(screen.getAllByRole("button", { name: "Save" })[0]);
+    await user.click(screen.getAllByRole("button", { name: /^Save/ })[0]);
 
     await waitFor(() =>
       expect(props.onFixed).toHaveBeenCalledWith({
@@ -1651,7 +1651,7 @@ describe("HarnessFixDialog", () => {
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: "Use an API key or gateway URL instead" }));
     await user.type(screen.getByPlaceholderText("Paste an API key"), "secret");
-    await user.click(screen.getAllByRole("button", { name: "Save" })[0]);
+    await user.click(screen.getAllByRole("button", { name: /^Save/ })[0]);
 
     expect(
       await screen.findByRole("heading", { name: "Set up tmux on Local laptop" }),
@@ -1741,5 +1741,32 @@ describe("HarnessFixDialog as a Settings overlay", () => {
       .getAllByRole("button", { name: "Close" })
       .find((button) => button.textContent === "Close");
     expect(footerClose).toHaveAttribute("data-settings-dialog-action", "Close");
+  });
+});
+
+describe("HarnessFixDialog's credential step as a Settings overlay", () => {
+  it("names the credential form's controls through the control that opened the dialog", async () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <SettingsOverlayOwner
+          entry={harnessFixOwner("codex-native", "fixAction")}
+          opener="fixAction"
+        >
+          <HarnessFixDialog {...baseProps} mode="reconfigure" />
+        </SettingsOverlayOwner>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Use an API key or gateway URL instead" }),
+    );
+
+    expect(screen.getByLabelText("API key")).toHaveAttribute(
+      "data-settings-control",
+      "harness-codex-native-detail:apiKey",
+    );
   });
 });
