@@ -29,6 +29,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
 
 _REGISTERED_HANDLER = "omnigent.policies.builtins.safety.ask_on_os_tools"
@@ -57,6 +58,31 @@ def policy_app_with_auth(runtime_init: None, db_uri: str, tmp_path: Path) -> Fas
         ),
         comment_store=SqlAlchemyCommentStore(db_uri),
         policy_store=SqlAlchemyPolicyStore(db_uri),
+        auth_provider=_FixedAuthProvider(),
+    )
+
+
+class _DenyListingPermissionStore(SqlAlchemyPermissionStore):
+    """Permission store that denies listing default policies to every caller."""
+
+    def can_list_default_policies(self, user_id: str | None) -> bool:
+        return False
+
+
+def _app_with_permission_store(
+    db_uri: str, tmp_path: Path, permission_store: SqlAlchemyPermissionStore
+) -> FastAPI:
+    """Policy-enabled app whose list gate consults ``permission_store``."""
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    return create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        comment_store=SqlAlchemyCommentStore(db_uri),
+        policy_store=SqlAlchemyPolicyStore(db_uri),
+        permission_store=permission_store,
         auth_provider=_FixedAuthProvider(),
     )
 
@@ -142,6 +168,28 @@ async def test_create_policy_unregistered_python_handler(policy_client: httpx.As
 
 
 # ── GET /v1/policies ─────────────────────────────────────────────────
+
+
+async def test_list_default_policies_forbidden_when_permission_store_denies(
+    runtime_init: None, db_uri: str, tmp_path: Path
+) -> None:
+    """A permission store that denies listing makes GET /v1/policies return 403."""
+    app = _app_with_permission_store(db_uri, tmp_path, _DenyListingPermissionStore(db_uri))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/v1/policies")
+    assert resp.status_code == 403
+
+
+async def test_list_default_policies_allowed_by_default_permission_store(
+    runtime_init: None, db_uri: str, tmp_path: Path
+) -> None:
+    """The default permission-store hook allows listing, so the route returns 200."""
+    app = _app_with_permission_store(db_uri, tmp_path, SqlAlchemyPermissionStore(db_uri))
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/v1/policies")
+    assert resp.status_code == 200
 
 
 async def test_list_default_policies_empty(policy_client: httpx.AsyncClient) -> None:

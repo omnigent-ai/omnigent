@@ -6,6 +6,7 @@
 
 const { describe, it, mock, afterEach } = require("node:test");
 const assert = require("node:assert/strict");
+const { execFileSync } = require("child_process");
 const fs = require("fs");
 const http = require("http");
 const os = require("os");
@@ -91,6 +92,53 @@ describe("runCli", () => {
       assert.deepEqual(res.failure, { kind: "timed-out", exitCode: 7 });
     },
   );
+
+  it("kills the child when its signal aborts", { timeout: 10000 }, async () => {
+    const readyFile = path.join(os.tmpdir(), `runcli-ready-${process.pid}-${Date.now()}`);
+    const controller = new AbortController();
+    const pending = runCli(
+      nodeScript(
+        'require("fs").writeFileSync(process.argv[1], String(process.pid)); setTimeout(() => {}, 60000);',
+      ),
+      [readyFile],
+      { signal: controller.signal },
+    );
+    try {
+      await new Promise((resolve, reject) => {
+        const deadline = Date.now() + 5000;
+        const timer = setInterval(() => {
+          if (fs.existsSync(readyFile)) {
+            clearInterval(timer);
+            resolve();
+          } else if (Date.now() > deadline) {
+            clearInterval(timer);
+            reject(new Error("the child never started"));
+          }
+        }, 25);
+      });
+      const started = Date.now();
+      controller.abort();
+      const res = await pending;
+      assert.notEqual(res.code, 0);
+      const pid = Number(fs.readFileSync(readyFile, "utf8"));
+      // An unreaped zombie still answers signal 0, so ask `ps` for the process state.
+      const state = (() => {
+        try {
+          return execFileSync("ps", ["-o", "stat=", "-p", String(pid)])
+            .toString()
+            .trim();
+        } catch {
+          return "";
+        }
+      })();
+      assert.ok(state === "" || state.startsWith("Z"), `the child is still running (${state})`);
+      assert.ok(Date.now() - started < 5000, "the abort ended the run before its 60s sleep");
+    } finally {
+      // A child that never reported ready must not outlive a failed test.
+      controller.abort();
+      fs.rmSync(readyFile, { force: true });
+    }
+  });
 
   it("does not mistake execFile's maxBuffer kill for a timeout", async () => {
     // 2 MiB of stdout overflows execFile's default 1 MiB maxBuffer.
@@ -520,6 +568,21 @@ describe("probeServerAuth — /v1/me auth gate", () => {
     // Plain unauthenticated.
     mock.method(globalThis, "fetch", async () => ({ status: 401 }));
     assert.deepEqual(await probeServerAuth(url), { authed: false, reachable: true });
+  });
+
+  it("ends early, reporting unreachable, when its signal aborts", { timeout: 3000 }, async () => {
+    mock.method(fs, "readFileSync", () => "{}");
+    mock.method(globalThis, "fetch", (_target, init) => {
+      return new Promise((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(new Error("aborted")));
+      });
+    });
+    const controller = new AbortController();
+
+    const pending = probeServerAuth("https://app.example.com", { signal: controller.signal });
+    controller.abort();
+
+    assert.deepEqual(await pending, { authed: false, reachable: false });
   });
 
   it("returns unreachable (never authed) when fetch throws", async () => {

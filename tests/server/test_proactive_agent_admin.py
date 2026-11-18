@@ -121,6 +121,37 @@ async def test_run_now_starts_named_users_tasks_and_reports_the_rest(
     assert off.json()["skipped"] == [{"user_id": "local", "reason": "turned_off"}]
 
 
+async def test_run_now_finds_the_local_users_task_under_a_local_auth_provider(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A local single-user provider owns the task as the reserved local name, not ``None``."""
+    from omnigent.server.auth import UnifiedAuthProvider
+
+    monkeypatch.setenv("OMNIGENT_LOCAL_SINGLE_USER", "1")
+    app = _app(
+        db_uri,
+        tmp_path,
+        enabled=True,
+        auth_provider=UnifiedAuthProvider(source="header", local_single_user=True),
+    )
+    app.state.seed_builtin_agents()
+    app.state.scheduled_task_scheduler = SimpleNamespace(
+        run_now=AsyncMock(return_value=SimpleNamespace(id="run-1"))
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await _create_session(client)
+        assert app.state.scheduled_task_store.get(proactive_task_id("local")) is not None
+
+        resp = await client.post("/v1/proactive-agent/runs", json={"users": ["local"]})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["started"] == [
+        {"user_id": "local", "task_id": proactive_task_id("local"), "run_id": "run-1"}
+    ]
+
+
 async def test_run_now_for_everyone(client: httpx.AsyncClient) -> None:
     app: Any = client.app  # type: ignore[attr-defined]
     await _create_session(client)

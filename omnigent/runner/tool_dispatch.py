@@ -76,6 +76,7 @@ from omnigent.runner.journal_tools import (
 )
 from omnigent.runner.session_requests import remember_session_host
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
+from omnigent.spec.types import MEMORY_TOOL_NAMES
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.browser_agent_tools import ADVANCED_BROWSER_TOOL_NAMES
@@ -488,6 +489,21 @@ _JOURNAL_TOOLS = JOURNAL_TOOL_NAMES
 # only for agents that opt into ``tool_groups.user_inbox``.
 _USER_INBOX_TOOLS = frozenset({"sys_user_inbox_post", "sys_user_inbox_list"})
 
+# Priority 5l.3: Long-term memory — proxied to the server's /v1/memory routes, which
+# decide whose memory it is. Proxy them only for memory-enabled specs; otherwise
+# an agent's own tool may use these names.
+_MEMORY_TOOLS = MEMORY_TOOL_NAMES
+
+
+def _memory_tool_on(agent_spec: object, tool_name: str) -> bool:
+    """Whether *tool_name* is one of *agent_spec*'s memory tools, so the name means memory."""
+    if not getattr(getattr(agent_spec, "tool_groups", None), "memory", False):
+        return False
+    return tool_name != "memory_search" or bool(
+        getattr(agent_spec, "memory_search_available", True)
+    )
+
+
 # Priority 5m: Embedded-browser tools.
 # Runner dispatch POSTs a blocking action request to the server, which parks a
 # Future + publishes ``browser.action_request`` on the session stream; the
@@ -522,10 +538,9 @@ _BROWSER_TIMEOUT_ERROR = (
 # free: the relay only advertises names that ``ToolManager(spec)``
 # actually registered, and terminal tools register only when the spec
 # declares a non-empty ``terminals:`` block.
-# ``sys_os_*`` is intentionally excluded: the
-# bridge exposes static ``sys_os_*`` tools and the relay overrides them
-# unconditionally for policy enforcement (independent of the spec's
-# ``os_env`` gate), so the native relay assembles them separately.
+# ``sys_os_*`` is intentionally excluded: every native harness has its own
+# shell and file tools, and a relayed copy would be a second route to the
+# workspace that a same-uid caller holding the relay token could use.
 _NATIVE_RELAY_BUILTIN_TOOLS = (
     {SysSessionMessageTool.name()}
     | _COMMENT_TOOLS
@@ -544,6 +559,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _SCHEDULED_TASK_TOOLS
     | _JOURNAL_TOOLS
     | _USER_INBOX_TOOLS
+    | _MEMORY_TOOLS
     | _TERMINAL_TOOLS
     # ``browser_*`` must ride the native relay: the Omnigent desktop app
     # runs native (claude/codex/pi) sessions, which ignore ``request.tools``
@@ -606,9 +622,8 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
     Returns the same tool set the claude-native / codex-native relay advertises
     and that pi-native registers via ``pi.registerTool``: the spec-gated builtin
     surface (``_NATIVE_RELAY_BUILTIN_TOOLS`` — comment, session read/write,
-    agent-discovery, policy, and terminal families) plus the ``sys_os_*`` tools,
-    relayed unconditionally so they override any harness-static versions and get
-    centralized policy enforcement on the Omnigent server.
+    agent-discovery, policy, and terminal families). It never includes
+    ``sys_os_*``: native harnesses use their own shell and file tools.
 
     Each entry is a flat ``{"name", "description", "parameters"}`` dict (the
     ``"function"`` sub-dict of an OpenAI tool schema), which is exactly what
@@ -656,7 +671,14 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
 
         for schema in ToolManager(spec, os_env_schema_only=True).get_tool_schemas():
             function = _string_object_dict(schema.get("function"))
-            if function is not None and function.get("name") in _NATIVE_RELAY_BUILTIN_TOOLS:
+            if function is None:
+                continue
+            name = function.get("name")
+            if (
+                isinstance(name, str)
+                and name in _NATIVE_RELAY_BUILTIN_TOOLS
+                and (name not in _MEMORY_TOOLS or _memory_tool_on(spec, name))
+            ):
                 _append(function)
     else:
         from omnigent.tools.builtins.policy import SysAddPolicyTool, SysPolicyRegistryTool
@@ -689,14 +711,6 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
             if function is not None:
                 _append(function)
 
-    # Relay OS tools unconditionally for centralized policy enforcement.
-    # Their schemas are static and need no OS environment or working directory.
-    for tool_cls in OS_ENV_TOOL_TYPES:
-        tool_schema = _string_object_dict(tool_cls.get_schema())
-        function = _string_object_dict(tool_schema.get("function")) if tool_schema else None
-        if function is not None:
-            _append(function)
-
     return schemas
 
 
@@ -719,6 +733,8 @@ _RUNNER_STATUS_CONCURRENCY = 8
 _SESSION_LIST_DEFAULT_VISIBILITY = "mine"
 # Newest sessions ``sys_session_list`` returns when the agent passes no ``limit``.
 _SESSION_LIST_DEFAULT_LIMIT = 50
+# Most sessions one ``created_by_this_session`` call scans before it returns a cursor.
+_CREATED_SESSIONS_SCAN_LIMIT = 5 * _AGENT_LIST_PAGE_LIMIT
 _SESSION_LIST_VISIBILITIES = ("mine", "shared", "all")
 
 _DISCOVERY_LIST_MAX_LIMIT = 100
@@ -988,6 +1004,7 @@ _ALL_LOCAL_TOOLS = (
     | _SCHEDULED_TASK_TOOLS
     | _JOURNAL_TOOLS
     | _USER_INBOX_TOOLS
+    | _MEMORY_TOOLS
 )
 _PLACEHOLDER_CWDS = (None, "", ".", "./")
 
@@ -1023,14 +1040,20 @@ def get_arguments(event: _JsonObject) -> str:
     return arguments if isinstance(arguments, str) else "{}"
 
 
-def should_dispatch_locally(tool_name: str) -> bool:
+def should_dispatch_locally(tool_name: str, agent_spec: object = None) -> bool:
     """Return True if this tool should be dispatched by the runner locally.
 
     Used by BOTH the runner's proxy_stream (to decide whether to
     dispatch) AND the server-side executor (to skip its own dispatch
     for tools the runner already handled). The executor imports this
     function directly — Phase 5 of RUNNER_TOOL_DISPATCH.md.
+
+    :param tool_name: The tool the model called.
+    :param agent_spec: The session's spec, if known. The memory tool names
+        count only when it has memory on.
     """
+    if tool_name in _MEMORY_TOOLS:
+        return _memory_tool_on(agent_spec, tool_name)
     return tool_name in _ALL_LOCAL_TOOLS
 
 
@@ -1066,11 +1089,12 @@ def _effective_harness_name(agent_spec: AgentSpec, effective_harness: str | None
 def _granted_tool_names(agent_spec: AgentSpec, harness: str | None = None) -> frozenset[str]:
     """Return the non-MCP tool surface advertised for *agent_spec* on *harness*.
 
-    Mirrors advertisement: the names ``ToolManager`` registers, spec-local
-    tools by declared name (no workdir load needed), and ``sys_os_*`` when the
-    session runs a native harness, whose relay advertises them unconditionally
-    (see :func:`build_native_relay_tool_schemas`). MCP tools are runner-owned
-    and resolved by the MCP manager, never by this set.
+    Mirrors advertisement: the names ``ToolManager`` registers and spec-local
+    tools by declared name (no workdir load needed). A native harness gets no
+    ``sys_os_*`` even when the spec declares ``os_env``, matching its relay (see
+    :func:`build_native_relay_tool_schemas`), so ``sys_call_async`` or
+    ``execute_tool`` can't reach a shell the relay withholds. MCP tools are
+    runner-owned and resolved by the MCP manager, never by this set.
 
     :param agent_spec: The session's resolved agent spec.
     :param harness: Canonical harness the session runs, from
@@ -1090,7 +1114,7 @@ def _granted_tool_names(agent_spec: AgentSpec, harness: str | None = None) -> fr
         manager.shutdown()
     names.update(info.name for info in agent_spec.local_tools)
     if is_native_harness(harness):
-        names.update(_OS_ENV_TOOLS)
+        names.difference_update(_OS_ENV_TOOLS)
     granted = frozenset(names)
     if len(_granted_tool_names_cache) >= _GRANTED_TOOL_NAMES_CACHE_MAX:
         _granted_tool_names_cache.clear()
@@ -1158,6 +1182,7 @@ async def _execute_local_python_tool(
     agent_id: str | None,
     runner_workspace: Path | None,
     local_tool_workdir: Path | None,
+    caller_user_id: str | None,
 ) -> str:
     if agent_spec is None:
         return f"Error: {tool_name} not in local dispatch table (no agent spec)"
@@ -1168,6 +1193,7 @@ async def _execute_local_python_tool(
             agent_id=agent_id or agent_spec.name or "runner-agent",
             workspace=runner_workspace,
             conversation_id=conversation_id,
+            caller_user_id=caller_user_id,
         )
         return await asyncio.to_thread(manager.call_tool, tool_name, args, ctx)
     except Exception as exc:
@@ -5718,6 +5744,135 @@ async def _execute_user_inbox_tool(
         return json.dumps({"error": f"{tool_name} failed: {exc}"})
 
 
+# Servers (or tool calls) known to expose ``/v1/memory``, so a turn pays for the
+# ``/v1/info`` probe once per connection rather than once per tool call.
+_memory_capable_clients: weakref.WeakSet[httpx.AsyncClient] = weakref.WeakSet()
+_MEMORY_UNAVAILABLE = (
+    "long-term memory is not available on this server (it is disabled or too old); "
+    "continue without it"
+)
+
+
+async def _server_has_memory(server_client: httpx.AsyncClient) -> bool:
+    """
+    Whether the server advertises ``memory`` in ``/v1/info``.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: ``True`` when ``/v1/memory`` is mounted and enabled.
+    """
+    if server_client in _memory_capable_clients:
+        return True
+    info = await server_client.get("/v1/info", timeout=30.0)
+    if info.status_code >= 400 or info.json().get("memory") is not True:
+        return False
+    _memory_capable_clients.add(server_client)
+    return True
+
+
+async def _execute_memory_tool(
+    tool_name: str,
+    arguments: str,
+    *,
+    server_client: httpx.AsyncClient | None,
+    conversation_id: str | None = None,
+) -> str:
+    """
+    Runner-local handler for the ``memory_*`` family.
+
+    Proxies the Omnigent server's ``/v1/memory`` REST endpoints over
+    ``server_client``. The calling session rides in the orchestration-source
+    header so the server can check it is the owner's, private, and bound to this
+    runner; the owner of the memory is derived there, never from the arguments.
+
+    :param tool_name: One of the ``memory_*`` names.
+    :param arguments: JSON-encoded arguments string from the LLM.
+    :param server_client: HTTP client pointed at the Omnigent server; ``None``
+        returns an error string.
+    :param conversation_id: Session whose tool call is being dispatched.
+    :returns: Tool output JSON string.
+    """
+    if server_client is None:
+        return json.dumps({"error": f"{tool_name} requires server access"})
+    try:
+        args: _JsonObject = json.loads(arguments) if arguments.strip() else {}
+    except json.JSONDecodeError:
+        return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
+    if not isinstance(args, dict):
+        return json.dumps({"error": f"{tool_name}: arguments must be an object"})
+    headers = {ORCHESTRATION_SOURCE_HEADER: conversation_id} if conversation_id else None
+    raw_path = args.get("path")
+    if tool_name in ("memory_get", "memory_write", "memory_delete") and not isinstance(
+        raw_path, str
+    ):
+        return json.dumps({"error": f"{tool_name} requires a string 'path'"})
+    path = raw_path if isinstance(raw_path, str) else ""
+    try:
+        if not await _server_has_memory(server_client):
+            return json.dumps({"error": _MEMORY_UNAVAILABLE})
+        if tool_name == "memory_search":
+            payload = {k: args[k] for k in ("query", "path_prefix", "limit") if k in args}
+            resp = await server_client.post(
+                "/v1/memory/search", json=payload, headers=headers, timeout=30.0
+            )
+        elif tool_name == "memory_get":
+            resp = await server_client.get(
+                "/v1/memory/entry", params={"path": path}, headers=headers, timeout=30.0
+            )
+        elif tool_name == "memory_list":
+            params: dict[str, str] = {}
+            for arg, param in (("path_prefix", "prefix"), ("page_token", "page_token")):
+                value = args.get(arg)
+                if isinstance(value, str):
+                    params[param] = value
+            resp = await server_client.get(
+                "/v1/memory/entries", params=params or None, headers=headers, timeout=30.0
+            )
+        elif tool_name == "memory_write":
+            payload = {k: args[k] for k in ("path", "content", "description") if k in args}
+            resp = await server_client.put(
+                "/v1/memory/entry", json=payload, headers=headers, timeout=30.0
+            )
+        elif tool_name == "memory_delete":
+            resp = await server_client.delete(
+                "/v1/memory/entry", params={"path": path}, headers=headers, timeout=30.0
+            )
+        else:  # pragma: no cover — routing guarantees a known name
+            return json.dumps({"error": f"unknown memory tool {tool_name!r}"})
+    except Exception as exc:  # noqa: BLE001
+        return json.dumps({"error": f"{tool_name} failed: {exc}"})
+
+    if resp.status_code >= 400:
+        return json.dumps(
+            {"error": f"server returned {resp.status_code}", "details": resp.text[:500]}
+        )
+    return json.dumps(_with_memory_dates(resp.json()))
+
+
+def _with_memory_dates(value: object) -> object:
+    """
+    Show a memory result's Unix timestamps as UTC dates, e.g. ``"2026-11-15"``.
+
+    A date tells the model how old a memory is; an epoch number does not.
+
+    :param value: A decoded ``/v1/memory`` response.
+    :returns: The same structure with ``created_at`` and ``updated_at`` as dates.
+    """
+    if isinstance(value, list):
+        return [_with_memory_dates(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    converted: dict[str, object] = {}
+    for key, item in value.items():
+        if key in ("created_at", "updated_at") and type(item) is int and item >= 0:
+            try:
+                converted[key] = datetime.fromtimestamp(item, UTC).strftime("%Y-%m-%d")
+            except (OverflowError, OSError, ValueError):
+                converted[key] = item
+        else:
+            converted[key] = _with_memory_dates(item)
+    return converted
+
+
 @dataclass
 class _ParsedTitle:
     """
@@ -5931,11 +6086,14 @@ async def _execute_session_query_tool(
                     )
                 }
             )
+        created_by_this_session = args.get("created_by_this_session") is True
         window = _discovery_list_window(
             args,
             tool_name,
             ("sessions",),
-            _session_list_filters(agent_name, include_archived, visibility, project),
+            _session_list_filters(
+                agent_name, include_archived, visibility, project, created_by_this_session
+            ),
         )
         if isinstance(window, str):
             return window
@@ -5947,6 +6105,7 @@ async def _execute_session_query_tool(
             include_archived=include_archived,
             visibility=visibility,
             project=project,
+            created_by_this_session=created_by_this_session,
             limit=limit,
             cursor_state=cursor_state,
             continued=continued,
@@ -6894,6 +7053,7 @@ def _session_list_filters(
     include_archived: bool,
     visibility: str = _SESSION_LIST_DEFAULT_VISIBILITY,
     project: str | None = None,
+    created_by_this_session: bool = False,
 ) -> _JsonObject:
     """
     The ``sys_session_list`` filters a continuation cursor is bound to.
@@ -6905,6 +7065,7 @@ def _session_list_filters(
     :param agent_name: The caller's ``agent_name`` argument, e.g. ``"researcher"``.
     :param include_archived: Whether archived sessions are listed.
     :param visibility: Which sessions the global view covers, e.g. ``"mine"``.
+    :param created_by_this_session: Whether only the caller's workers are listed.
     :returns: The filter mapping, e.g. ``{"agent_name": None}``.
     """
     filters: _JsonObject = {
@@ -6916,6 +7077,8 @@ def _session_list_filters(
         filters["visibility"] = visibility
     if project is not None:
         filters["project"] = project
+    if created_by_this_session:
+        filters["created_by_this_session"] = True
     return filters
 
 
@@ -6927,6 +7090,7 @@ async def _session_list_via_rest(
     include_archived: bool = False,
     visibility: str = _SESSION_LIST_DEFAULT_VISIBILITY,
     project: str | None = None,
+    created_by_this_session: bool = False,
     limit: int | None,
     cursor_state: dict[str, _DiscoveryState],
     continued: bool,
@@ -6951,6 +7115,8 @@ async def _session_list_via_rest(
     :param include_archived: Also list archived sessions in the global view.
     :param visibility: ``"mine"``, ``"shared"`` or ``"all"`` — the server's
         ownership filter for the global view.
+    :param created_by_this_session: List only sessions the caller started, and
+        skip the ``sub_agents`` view.
     :param limit: Optional maximum rows returned from the global sessions view;
         :data:`_SESSION_LIST_DEFAULT_LIMIT` when omitted.
     :param cursor_state: Opaque continuation position for the global sessions view.
@@ -6958,32 +7124,109 @@ async def _session_list_via_rest(
         :data:`_SESSION_LIST_DEFAULT_LIMIT` sessions exist, otherwise a bounded
         page with continuation metadata.
     """
-    sub_agents = await _collect_sub_agents(conversation_id, server_client)
-    sessions_page = (
-        _DiscoveryPage([], False)
-        if cursor_state["sessions"][0] == _DISCOVERY_END
-        else await _collect_global_sessions(
+    page_limit = limit or _SESSION_LIST_DEFAULT_LIMIT
+    # Finding this session's workers doesn't need its named children.
+    sub_agents = (
+        []
+        if created_by_this_session
+        else await _collect_sub_agents(conversation_id, server_client)
+    )
+    if cursor_state["sessions"][0] == _DISCOVERY_END:
+        sessions_page = _DiscoveryPage([], False)
+    elif created_by_this_session:
+        sessions_page = await _collect_created_sessions(
+            conversation_id,
             server_client,
             agent_name,
             include_archived=include_archived,
             visibility=visibility,
             project=project,
             after=cursor_state["sessions"][1],
-            limit=limit or _SESSION_LIST_DEFAULT_LIMIT,
+            limit=page_limit,
         )
-    )
+    else:
+        sessions_page = await _collect_global_sessions(
+            server_client,
+            agent_name,
+            include_archived=include_archived,
+            visibility=visibility,
+            project=project,
+            after=cursor_state["sessions"][1],
+            limit=page_limit,
+        )
     result = _bounded_discovery_result(
         {"sub_agents": cast(list[_JsonObject], sub_agents), "sessions": sessions_page.rows},
         limit=limit,
         cursor_state=cursor_state,
         continued=continued,
         tool_name="sys_session_list",
-        filters=_session_list_filters(agent_name, include_archived, visibility, project),
+        filters=_session_list_filters(
+            agent_name, include_archived, visibility, project, created_by_this_session
+        ),
         source_pages={"sessions": sessions_page},
         page_sections=("sessions",),
         default_limit=_SESSION_LIST_DEFAULT_LIMIT,
     )
     return await _fill_returned_runner_online(result, server_client)
+
+
+async def _collect_created_sessions(
+    conversation_id: str,
+    server_client: httpx.AsyncClient,
+    agent_name: object,
+    *,
+    include_archived: bool,
+    visibility: str,
+    project: str | None,
+    after: str | None,
+    limit: int,
+) -> _DiscoveryPage:
+    """
+    The global session view narrowed to sessions *conversation_id* started.
+
+    Pages ``GET /v1/sessions`` in large source pages here, so a trigger manager
+    makes one call instead of following a cursor through every session it owns.
+    Stops after more than ``limit`` matches, at the end of the listing, or once
+    :data:`_CREATED_SESSIONS_SCAN_LIMIT` rows were scanned.
+
+    :param conversation_id: The caller; rows whose ``created_by_session_id`` is
+        this id are kept, e.g. ``"conv_manager"``.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param agent_name: Optional agent-name filter, as for the global view.
+    :param include_archived: Also list archived sessions.
+    :param visibility: The server's ownership filter, e.g. ``"mine"``.
+    :param project: Optional project-name filter.
+    :param after: Server cursor to resume from, if any.
+    :param limit: Rows the caller asked for; one extra match proves more remain.
+    :returns: The matching rows and the source continuation state.
+    """
+    matches: list[_JsonObject] = []
+    scanned = 0
+    while True:
+        page = await _collect_global_sessions(
+            server_client,
+            agent_name,
+            include_archived=include_archived,
+            visibility=visibility,
+            project=project,
+            after=after,
+            limit=_AGENT_LIST_PAGE_LIMIT,
+        )
+        if page.failed:
+            # A failed read can't prove a worker is absent, so never report "none".
+            return _DiscoveryPage(matches, True, after, failed=not matches)
+        matches += [
+            row for row in page.rows if row.get("created_by_session_id") == conversation_id
+        ]
+        scanned += _AGENT_LIST_PAGE_LIMIT
+        if (
+            not page.has_more
+            or page.next_after is None
+            or len(matches) > limit
+            or scanned >= _CREATED_SESSIONS_SCAN_LIMIT
+        ):
+            return _DiscoveryPage(matches, page.has_more, page.next_after)
+        after = page.next_after
 
 
 async def _fill_returned_runner_online(result: str, server_client: httpx.AsyncClient) -> str:
@@ -7785,6 +8028,7 @@ async def execute_tool(
     effective_harness: str | None = None,
     wake_on_async_result: AsyncResultWake | None = None,
     call_id: str | None = None,
+    caller_user_id: str | None = None,
 ) -> str:
     """
     Execute a tool and return the output string.
@@ -8102,6 +8346,13 @@ async def execute_tool(
                 server_client=server_client,
                 conversation_id=conversation_id,
             )
+        elif tool_name in _MEMORY_TOOLS and _memory_tool_on(agent_spec, tool_name):
+            output = await _execute_memory_tool(
+                tool_name,
+                arguments,
+                server_client=server_client,
+                conversation_id=conversation_id,
+            )
         elif tool_name in _BROWSER_TOOLS:
             output = await _execute_browser_tool(
                 tool_name,
@@ -8123,6 +8374,7 @@ async def execute_tool(
                     if local_tool_workdir is _UNSET_LOCAL_TOOL_WORKDIR
                     else cast(Path | None, local_tool_workdir)
                 ),
+                caller_user_id=caller_user_id,
             )
         elif _is_uc_function_tool(tool_name, agent_spec):
             output = await _execute_uc_function_tool(tool_name, args, agent_spec=agent_spec)
@@ -8230,6 +8482,7 @@ async def dispatch_tool_locally(
     filesystem_registry: FilesystemRegistry | None = None,
     effective_harness: str | None = None,
     wake_on_async_result: AsyncResultWake | None = None,
+    caller_user_id: str | None = None,
 ) -> str:
     """Execute a tool once and POST its result to the harness.
 
@@ -8284,6 +8537,7 @@ async def dispatch_tool_locally(
         effective_harness=effective_harness,
         wake_on_async_result=wake_on_async_result,
         call_id=call_id,
+        caller_user_id=caller_user_id,
     )
 
     # A file-mutating tool just ran — nudge the web to refetch the

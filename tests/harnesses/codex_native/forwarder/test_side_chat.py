@@ -79,3 +79,31 @@ async def test_side_chat_turn_status_settles_without_touching_parent(
     )
     parent_state = read_bridge_state(bridge_dir)
     assert parent_state is not None and parent_state.active_turn_id == "turn_parent"
+
+
+@pytest.mark.asyncio
+async def test_resumed_side_chat_does_not_rotate_parent(tmp_path: Path) -> None:
+    client = _RecordingClient()
+    state = fwd._CodexForwarderState(parent_session_id="conv_parent")
+    state.note_child_thread("thread_side", "conv_side")
+    target = fwd._ForwarderTarget(
+        session_id="conv_parent",
+        thread_id="thread_parent",
+        delta_coalescer=fwd._OutputTextDeltaCoalescer(client, "conv_parent"),
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_parent"),
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+    )
+    rotated = await fwd._maybe_rotate_session_on_thread_started(
+        ap_client=client,
+        target=target,
+        bridge_dir=tmp_path,
+        app_server_url="ws://127.0.0.1:1234",
+        event={
+            "method": "thread/started",
+            "params": {"thread": {"id": "thread_side", "ephemeral": False}},
+        },
+        forwarder_state=state,
+    )
+    assert rotated is False
+    assert target.session_id == "conv_parent" and target.thread_id == "thread_parent"
+    assert client.posts == []

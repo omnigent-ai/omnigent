@@ -31,7 +31,11 @@ from omnigent.server.auth import (
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
-from omnigent.stores.permission_store import MAX_GRANTS_PAGE_SIZE, PermissionStore
+from omnigent.stores.permission_store import (
+    MAX_GRANTS_PAGE_SIZE,
+    MAX_SHARED_SCHEDULED_TASKS_PAGE_SIZE,
+    PermissionStore,
+)
 from omnigent.stores.permission_store import sqlalchemy_store as permission_module
 from omnigent.stores.permission_store.sqlalchemy_store import (
     SqlAlchemyPermissionStore,
@@ -1591,6 +1595,79 @@ def test_resolve_scheduled_task_access_returns_highest_principal_level(
     assert store.resolve_scheduled_task_access(["editors"], other_task_id) is None
 
 
+def test_tasks_shared_with_a_caller_page_once_each_across_principals(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """Pages walk task IDs past the cursor; a task granted to two principals lists once."""
+    task_ids = sorted(_create_scheduled_task(db_uri) for _ in range(5))
+    other_task_id = _create_scheduled_task(db_uri)
+    for user_id in ("alice@example.com", "team", "bob@example.com"):
+        _ensure_user(store, user_id)
+    for task_id in task_ids[:3]:
+        store.grant_for_scheduled_task("alice@example.com", task_id, LEVEL_READ)
+    for task_id in task_ids[2:]:
+        store.grant_for_scheduled_task("team", task_id, LEVEL_READ)
+    store.grant_for_scheduled_task("bob@example.com", other_task_id, LEVEL_READ)
+
+    principals = ["team", "alice@example.com", "team"]
+    pages: list[list[str]] = []
+    cursors: list[str | None] = []
+    cursor = None
+    while True:
+        page, cursor = store.list_scheduled_tasks_shared_with(
+            principals, limit=2, after_scheduled_task_id=cursor
+        )
+        pages.append(page)
+        cursors.append(cursor)
+        if cursor is None:
+            break
+    assert pages == [task_ids[:2], task_ids[2:4], task_ids[4:]]
+    assert cursors == [task_ids[1], task_ids[3], None]
+    assert store.list_scheduled_tasks_shared_with(["alice@example.com"], limit=3) == (
+        task_ids[:3],
+        None,
+    )
+    assert store.list_scheduled_tasks_shared_with(["carol@example.com"]) == ([], None)
+    assert store.list_scheduled_tasks_shared_with([]) == ([], None)
+    for limit in (0, MAX_SHARED_SCHEDULED_TASKS_PAGE_SIZE + 1):
+        with pytest.raises(OmnigentError) as caught:
+            store.list_scheduled_tasks_shared_with(principals, limit=limit)
+        assert caught.value.code == ErrorCode.INVALID_INPUT
+
+
+def test_tasks_shared_with_a_caller_skip_deleted_tasks_without_stalling(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """A deleted or purged task's leftover grant is skipped, and the cursor moves past it."""
+    tasks = SqlAlchemyScheduledTaskStore(db_uri)
+    deleted, purged, live = sorted(_create_scheduled_task(db_uri) for _ in range(3))
+    _ensure_user(store, "alice@example.com")
+    for task_id in (deleted, purged, live):
+        store.grant_for_scheduled_task("alice@example.com", task_id, LEVEL_READ)
+    assert tasks.update(deleted, state="deleted")
+    assert tasks.delete(purged)
+
+    first = store.list_scheduled_tasks_shared_with(["alice@example.com"], limit=2)
+    assert first == ([], purged)
+    assert store.list_scheduled_tasks_shared_with(
+        ["alice@example.com"], limit=2, after_scheduled_task_id=first[1]
+    ) == ([live], None)
+
+
+def test_tasks_shared_with_a_caller_are_scoped_to_the_workspace(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    with workspace_scope(101):
+        task_id = _create_scheduled_task(db_uri)
+        _ensure_user(store, "alice@example.com")
+        store.grant_for_scheduled_task("alice@example.com", task_id, LEVEL_READ)
+
+    with workspace_scope(102):
+        assert store.list_scheduled_tasks_shared_with(["alice@example.com"]) == ([], None)
+    with workspace_scope(101):
+        assert store.list_scheduled_tasks_shared_with(["alice@example.com"]) == ([task_id], None)
+
+
 def test_delete_for_scheduled_task_removes_only_that_tasks_grants(
     store: SqlAlchemyPermissionStore, db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1723,6 +1800,14 @@ def test_scheduled_task_grants_are_scoped_to_the_workspace(
         assert store.resolve_scheduled_task_access(["alice@example.com"], task_id) == 1
 
 
+def _minimal_store(**methods: object) -> PermissionStore:
+    """A store implementing only the abstract methods, as no-ops unless given in *methods*."""
+    stubs: dict[str, object] = {
+        name: lambda self, *args, **kwargs: None for name in PermissionStore.__abstractmethods__
+    }
+    return type("MinimalPermissionStore", (PermissionStore,), {**stubs, **methods})("unused://")
+
+
 def test_store_without_scheduled_task_grants_keeps_safe_defaults() -> None:
     """A subclass without scheduled task grants still instantiates and holds or grants none."""
     scheduled_task_methods = {
@@ -1731,14 +1816,11 @@ def test_store_without_scheduled_task_grants_keeps_safe_defaults() -> None:
         "list_for_scheduled_task",
         "resolve_scheduled_task_access",
         "delete_for_scheduled_task",
+        "caller_principals",
+        "list_scheduled_tasks_shared_with",
     }
     assert not scheduled_task_methods & PermissionStore.__abstractmethods__
-    minimal_store_class = type(
-        "MinimalPermissionStore",
-        (PermissionStore,),
-        {name: lambda self, *args, **kwargs: None for name in PermissionStore.__abstractmethods__},
-    )
-    minimal = minimal_store_class("unused://")
+    minimal = _minimal_store()
 
     assert minimal.supports_scheduled_task_grants is False
     with pytest.raises(OmnigentError) as caught:
@@ -1748,3 +1830,61 @@ def test_store_without_scheduled_task_grants_keeps_safe_defaults() -> None:
     assert minimal.list_for_scheduled_task("task") == ([], None)
     assert minimal.resolve_scheduled_task_access(["alice@example.com"], "task") is None
     assert minimal.delete_for_scheduled_task("task") == 0
+    # The caller alone, and no automation shared with them.
+    assert minimal.caller_principals("alice@example.com") == ["alice@example.com"]
+    assert minimal.list_scheduled_tasks_shared_with(["alice@example.com"]) == ([], None)
+
+
+def test_direct_session_reads_default_to_the_stores_reads() -> None:
+    """A store whose reads are already direct needs no overrides; ``__public__`` stays public."""
+    grant = SessionPermission("alice@example.com", "conv", LEVEL_READ)
+    reads: list[tuple[object, ...]] = []
+
+    def get(self: PermissionStore, user_id: str, conversation_id: str) -> SessionPermission:
+        reads.append(("get", user_id, conversation_id))
+        return grant
+
+    def list_for_session(
+        self: PermissionStore, conversation_id: str, *, limit: int, after_user_id: str | None
+    ) -> tuple[list[SessionPermission], str | None]:
+        reads.append(("list", conversation_id, limit, after_user_id))
+        return [grant], "alice@example.com"
+
+    store = _minimal_store(get=get, list_for_session=list_for_session)
+
+    assert store.get_direct("alice@example.com", "conv") is grant
+    assert store.list_direct_for_session("conv", limit=5, after_user_id="aaron@example.com") == (
+        [grant],
+        "alice@example.com",
+    )
+    assert store.list_direct_for_session("conv", limit=5) == ([grant], "alice@example.com")
+    assert reads == [
+        ("get", "alice@example.com", "conv"),
+        ("list", "conv", 5, "aaron@example.com"),
+        ("list", "conv", 5, None),
+    ]
+    assert store.public_grantees() == frozenset({RESERVED_USER_PUBLIC})
+
+
+def test_conditional_write_defaults_check_only_the_sessions_own_grant() -> None:
+    """Access through a group or admin rights neither blocks a grant nor is revoked."""
+    effective = SessionPermission("alice@example.com", "conv", LEVEL_READ)
+    writes: list[tuple[str, ...]] = []
+
+    def grant(self: PermissionStore, user_id: str, conversation_id: str, level: int) -> None:
+        writes.append(("grant", user_id, conversation_id))
+
+    def revoke(self: PermissionStore, user_id: str, conversation_id: str) -> bool:
+        writes.append(("revoke", user_id, conversation_id))
+        return True
+
+    store = _minimal_store(
+        get=lambda self, user_id, conversation_id: effective,
+        get_direct=lambda self, user_id, conversation_id: None,
+        grant=grant,
+        revoke=revoke,
+    )
+
+    assert store.grant_if_absent("alice@example.com", "conv", LEVEL_READ) is True
+    assert store.revoke_if_level("alice@example.com", "conv", LEVEL_READ) is False
+    assert writes == [("grant", "alice@example.com", "conv")]

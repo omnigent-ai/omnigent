@@ -24,7 +24,7 @@ import {
   resolveThisMachineHostId,
   SANDBOX_REPO_LABEL_KEY,
 } from "./NewChatDialog";
-import { useDesktopHostId } from "./RevealInFileManager";
+import { useDesktopHostId } from "@/lib/desktopHostId";
 import { getConversationAgentType } from "./sidebarNav";
 
 /** Where a session runs: local machine, a sandbox provider, or the host's name (id while unresolved). */

@@ -101,11 +101,13 @@ def host_ownership_key(workspace_id: int, host_id: str | None) -> str:
     return host_id if host_id is not None else str(workspace_id)
 
 
+# The services trigger templates watch, as their prompts name them.
+TRIGGER_SERVICE_NAMES = ("Jira", "Slack", "GitHub", "Linear", "PagerDuty")
 # A task doesn't record its template, so, like the web form (``isTriggerPrompt`` in
 # web/src/components/scheduled/triggerTemplates.ts), recognize the opening sentence.
 _TRIGGER_PROMPT_OPENINGS = tuple(
     f"This automation watches {source} and starts one Omnigent session"
-    for source in ("Jira", "Slack", "GitHub", "Linear", "PagerDuty")
+    for source in TRIGGER_SERVICE_NAMES
 )
 # The trigger form saves its state as the prompt's first line; the model never sees it.
 # Keep in sync with TRIGGER_HEADER_PATTERN in web/src/components/scheduled/triggerTemplates.ts.
@@ -116,6 +118,11 @@ def strip_trigger_header(prompt: str) -> str:
     """Return ``prompt`` without the trigger form's header line, if it has one."""
     match = _TRIGGER_HEADER.match(prompt)
     return prompt[match.end() :] if match else prompt
+
+
+def is_trigger_prompt(prompt: str) -> bool:
+    """Whether ``prompt`` was rendered from a trigger template, by its opening sentence."""
+    return strip_trigger_header(prompt).startswith(_TRIGGER_PROMPT_OPENINGS)
 
 
 def fits_reminder(task: ScheduledTask) -> bool:
@@ -131,4 +138,4 @@ def is_trigger_automation(task: ScheduledTask) -> bool:
     """Whether a task was set up from a trigger template and polls for new items."""
     if task.session_mode != "continue":
         return False
-    return strip_trigger_header(task.prompt).startswith(_TRIGGER_PROMPT_OPENINGS)
+    return is_trigger_prompt(task.prompt)

@@ -21,6 +21,7 @@ import {
   listPermissions,
   revokePermission,
   revokeSharePermission,
+  sharedAutomationsListed,
   workspaceSharingBlocked,
 } from "./permissionsApi";
 
@@ -410,6 +411,27 @@ describe("canShareAutomation", () => {
     ["a server still loading", "loading" as const, owner, false],
   ])("answers for %s", (_label, info, viewerId, expected) => {
     expect(canShareAutomation(info, viewerId, owner)).toBe(expected);
+  });
+});
+
+describe("sharedAutomationsListed", () => {
+  const listed = {
+    ...FALLBACK_SERVER_INFO,
+    scheduled_task_sharing: true,
+    scheduled_task_shared_with_me: true,
+  };
+  it.each([
+    ["a multi-user server that lists them", listed, true],
+    ["a single-user server", { ...listed, single_user: true }, false],
+    [
+      "an older server that shares automations but cannot list them",
+      { ...FALLBACK_SERVER_INFO, scheduled_task_sharing: true },
+      false,
+    ],
+    ["a server without automation sharing", FALLBACK_SERVER_INFO, false],
+    ["a server still loading", "loading" as const, false],
+  ])("answers for %s", (_label, info, expected) => {
+    expect(sharedAutomationsListed(info)).toBe(expected);
   });
 });
 

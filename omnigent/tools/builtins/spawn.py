@@ -544,7 +544,8 @@ class SysSessionListTool(Tool):
             "the sessions you own (visibility 'mine', the default), each "
             "with status, runner connectivity and "
             "created_by_session_id (creation origin for independent workers). "
-            "Match that field to your session ID to find workers you created. "
+            "Match that field to your session ID to find workers you created, or "
+            "pass created_by_this_session true to list only those. "
             "Pass visibility 'shared' for sessions other users shared with you, "
             "or 'all' for both; those rows carry owner, so check it before "
             "treating a session as yours. "
@@ -605,6 +606,15 @@ class SysSessionListTool(Tool):
                                 "Optional: also list archived sessions in the "
                                 "global 'sessions' view; each row then carries "
                                 "'archived'. Defaults to false."
+                            ),
+                        },
+                        "created_by_this_session": {
+                            "type": "boolean",
+                            "description": (
+                                "Optional: list only sessions this session started "
+                                "(created_by_session_id is your session ID) in the "
+                                "global 'sessions' view, in one call where possible; "
+                                "sub_agents is then empty. Defaults to false."
                             ),
                         },
                         "limit": {

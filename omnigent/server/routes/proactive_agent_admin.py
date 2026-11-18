@@ -171,10 +171,7 @@ def create_proactive_agent_admin_router(
                     'Use "*" alone to run for every user', code=ErrorCode.INVALID_INPUT
                 )
             targets = [
-                (
-                    user_id,
-                    await asyncio.to_thread(find_proactive_task, tasks_store, _owner(user_id)),
-                )
+                (user_id, await asyncio.to_thread(_find_task, tasks_store, user_id))
                 for user_id in dict.fromkeys(user.strip() for user in body.users if user.strip())
             ]
         for user_id, task in targets:
@@ -195,9 +192,17 @@ def create_proactive_agent_admin_router(
     return router
 
 
-def _owner(user_id: str) -> str | None:
-    """Single-user mode stores its tasks without an owner."""
-    return None if user_id == RESERVED_USER_LOCAL else user_id
+def _find_task(store: Any, user_id: str) -> ScheduledTask | None:
+    """Return *user_id*'s live proactive task.
+
+    The local user's task is owned by ``None`` on a server without an auth
+    provider, and by the reserved local name under a local single-user
+    provider, so both are tried for that name.
+    """
+    task = find_proactive_task(store, user_id)
+    if task is None and user_id == RESERVED_USER_LOCAL:
+        task = find_proactive_task(store, None)
+    return task
 
 
 def _display_user(user_id: str | None) -> str:

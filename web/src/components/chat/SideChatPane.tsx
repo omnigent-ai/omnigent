@@ -10,6 +10,7 @@ import {
   useState,
   type ClipboardEvent,
   type KeyboardEvent,
+  type ReactNode,
 } from "react";
 import { MessagesSquareIcon, TriangleAlertIcon } from "lucide-react";
 import { toast } from "sonner";
@@ -84,6 +85,7 @@ import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import { isNativeTerminalSession } from "@/lib/nativeCodingAgents";
 import { sideChatSettingsMutationKey, usesNativeSideChatFork } from "@/lib/sideChat";
 import { parentIdFromLabels } from "@/lib/sessionHost";
+import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
 import {
   appendReplyQuote,
   removeReplyQuote,
@@ -173,11 +175,12 @@ export function SideChatPane({
   fullSession = false,
   evenComposerPadding = false,
   transcriptTopInset,
+  gridComposer,
 }: {
   childId: string;
   selectionParentId?: string;
   onStart?: (text: string) => Promise<void>;
-  /** A dead, restored Codex side chat: show the transcript without a composer. */
+  /** Show the transcript without a composer when the viewer cannot edit. */
   readOnly?: boolean;
   /** Display an existing session with its complete history and scoped composer. */
   fullSession?: boolean;
@@ -185,17 +188,21 @@ export function SideChatPane({
   evenComposerPadding?: boolean;
   /** Extra room above the transcript, as a CSS length, for a header laid over it. */
   transcriptTopInset?: string;
+  /** A grid cell's composer: one row tall, with the cell session's controls. */
+  gridComposer?: { leading?: ReactNode; trailing?: ReactNode };
 }) {
   const pending = isPendingSideChat(childId);
   const starting = useChatStore((s) => s.sideChatComposers[childId]?.starting ?? false);
-  // The server seals a side chat whose fork died with its runner.
   const {
     session,
     isLoading: sessionLoading,
     error: sessionError,
   } = useSession(pending ? null : childId);
   const { session: draftSource } = useSession(pending ? (selectionParentId ?? null) : null);
-  const readOnly = restoredReadOnly || session?.labels?.["omnigent.closed"] === "true";
+  const readOnly =
+    restoredReadOnly ||
+    (session?.labels?.["omnigent.closed"] === "true" &&
+      readOnlyReasonForSessionLabels(session, null) !== null);
   useLayoutEffect(() => {
     if (!selectionParentId || readOnly || starting) return;
     const target = { childId, parentId: selectionParentId };
@@ -535,6 +542,7 @@ export function SideChatPane({
                 starting={starting}
                 onStart={onStart ? startSideChat : undefined}
                 onSend={followSentMessage}
+                gridComposer={gridComposer}
               />
             )}
           </div>
@@ -565,6 +573,7 @@ function SideChatComposer({
   starting,
   onStart,
   onSend,
+  gridComposer,
 }: {
   fullSession: boolean;
   childId: string;
@@ -580,6 +589,7 @@ function SideChatComposer({
   onStart?: (text: string) => Promise<void>;
   /** Called when a live tab sends or queues a follow-up. */
   onSend: () => void;
+  gridComposer?: { leading?: ReactNode; trailing?: ReactNode };
 }) {
   const send = useChatStore((s) => s.send);
   const sendSlashCommand = useChatStore((s) => s.sendSlashCommand);
@@ -751,7 +761,7 @@ function SideChatComposer({
     textareaRef.current = tailTextareaRef.current;
     if (quote !== undefined || composer?.quotes?.length) tailTextareaRef.current?.focus();
   }, [quote, composer?.quotes?.length]);
-  // Re-read the labels so a side chat the server just sealed turns read-only.
+  // Refresh lifecycle labels after a send or recovery attempt.
   const refreshLabels = useCallback(
     () => void queryClient.invalidateQueries({ queryKey: ["session", childId] }),
     [queryClient, childId],
@@ -1106,6 +1116,7 @@ function SideChatComposer({
           // Menu rows preventDefault on mousedown so selecting one keeps focus.
           onBlur: () => setInputFocused(false),
           placeholder: fullSession ? "Reply to this session..." : "Ask a side question...",
+          rows: gridComposer ? 1 : undefined,
           disabled: !ready,
           "data-testid": "side-chat-input",
           onKeyDown: handleKeyDown,
@@ -1158,14 +1169,17 @@ function SideChatComposer({
         }}
         actions={{
           leading: pending ? null : (
-            <ComposerAddMenu
-              disabled={agentId === null}
-              onAttach={() => fileInputRef.current?.click()}
-              showGoal={false}
-              showPlan={false}
-              planActive={false}
-              testIdPrefix="side-chat"
-            />
+            <>
+              <ComposerAddMenu
+                disabled={agentId === null}
+                onAttach={() => fileInputRef.current?.click()}
+                showGoal={false}
+                showPlan={false}
+                planActive={false}
+                testIdPrefix="side-chat"
+              />
+              {gridComposer?.leading}
+            </>
           ),
           trailing: (
             <>
@@ -1188,6 +1202,7 @@ function SideChatComposer({
                   }
                 />
               )}
+              {gridComposer?.trailing}
               <ComposerMicButton
                 className="size-8 md:size-7"
                 disabled={!ready}

@@ -66,6 +66,21 @@ describe("ServerSelectStep", () => {
     expect(screen.queryByText(/Self-chosen/)).not.toBeInTheDocument();
   });
 
+  it("restoring a selection doesn't also pre-fill the failed URL into the input", () => {
+    render(
+      <ServerSelectStep
+        {...baseProps}
+        error="Could not load http://dead.example.com/"
+        initialUrl="http://dead.example.com/"
+        recentServers={["https://team.example.com/"]}
+        initialSelected="https://team.example.com/"
+        onConnect={vi.fn()}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /add server/i }));
+    expect(screen.getByLabelText("Server URL")).toHaveValue("");
+  });
+
   it("with recents, starts on the list (no input) and 'Add server' opens the add view", () => {
     render(
       <ServerSelectStep

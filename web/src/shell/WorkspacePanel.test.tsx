@@ -928,6 +928,22 @@ describe("WorkspacePanel shell tabs", () => {
     expect(screen.getByTestId("content-search-stub").parentElement).toHaveClass("hidden");
   });
 
+  it("shows a selected shell over an open file, and the file while its terminal is missing", async () => {
+    useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
+    const { rerender } = renderWorkspace({
+      rightRailTab: "files",
+      selectedFilePath: "src/App.tsx",
+      selectedTerminalKey: termKey,
+      openTerminals: [termKey],
+    });
+    expect(await screen.findByTestId("terminal-view-stub")).toHaveTextContent("terminal_zsh_s1");
+    expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
+
+    rerender({ openTerminals: [] });
+    expect(screen.queryByTestId("terminal-view-stub")).toBeNull();
+    expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("src/App.tsx");
+  });
+
   it("keeps the Files tab panel mounted but hidden behind the active shell", async () => {
     useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
     const { rerender } = renderWorkspace({ rightRailTab: "files", openTerminals: [termKey] });
@@ -1616,6 +1632,49 @@ describe("WorkspacePanel restored side chats", () => {
   });
 });
 
+describe("WorkspacePanel side chat start", () => {
+  it("points a pending tab at the server-forked child and seeds its question", async () => {
+    const previousHarness = useChatStore.getState().sessionHarness;
+    useChatStore.setState({
+      sessionHarness: "openai-agents",
+      sideChatComposers: { "pending:one": { text: "question", files: [] } },
+      sideChatDrafts: {},
+    });
+    const create = vi
+      .spyOn(sessionsApi, "createSideChat")
+      .mockResolvedValueOnce({ childSessionId: "conv_fork" } as Awaited<
+        ReturnType<typeof sessionsApi.createSideChat>
+      >);
+    try {
+      writeSessionWorkspaceState("conv_ws", {
+        openSideChats: ["pending:one"],
+        selectedSideChatId: "pending:one",
+      });
+      renderWorkspace({ rightRailTab: "sidechat" });
+
+      fireEvent.click(screen.getByRole("button", { name: "Start side chat" }));
+
+      await waitFor(() =>
+        expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_fork"),
+      );
+      expect(create).toHaveBeenCalledWith("conv_ws", undefined);
+      expect(useChatStore.getState().sideChatComposers["pending:one"]).toBeUndefined();
+      expect(useChatStore.getState().sideChatDrafts.conv_fork).toBe("question");
+      expect(readSessionWorkspaceState("conv_ws")).toMatchObject({
+        openSideChats: ["conv_fork"],
+        selectedSideChatId: "conv_fork",
+      });
+    } finally {
+      create.mockRestore();
+      useChatStore.setState({
+        sessionHarness: previousHarness,
+        sideChatComposers: {},
+        sideChatDrafts: {},
+      });
+    }
+  });
+});
+
 describe("WorkspacePanel mobile side chats", () => {
   const openTabs = () =>
     writeSessionWorkspaceState("conv_ws", {
@@ -1902,6 +1961,25 @@ describe("WorkspacePanel sub-agent tabs", () => {
 
     expect(screen.getByTestId("side-chat-pane-stub")).toHaveAttribute("data-read-only", "true");
     expect(screen.getByTestId("subagent-tab-read-only")).toHaveTextContent(reason);
+  });
+
+  it("allows a closed Codex side chat to resume in a sub-agent tab", () => {
+    writeSessionWorkspaceState("conv_ws", {
+      openSubagentTabs: [SUBAGENT_TAB],
+      selectedSideChatId: SUBAGENT_TAB,
+    });
+    renderWorkspace({
+      rightRailTab: "sidechat",
+      queryClient: clientWithSubagent("Side chat", {
+        "omnigent.closed": "true",
+        "omnigent.wrapper": "codex-native-ui-subagent",
+        "omnigent.codex_native.agent_nickname": "Side chat",
+        "omnigent.codex_native.side_chat_resume": "true",
+      }),
+    });
+
+    expect(screen.getByTestId("side-chat-pane-stub")).toHaveAttribute("data-read-only", "false");
+    expect(screen.queryByTestId("subagent-tab-read-only")).toBeNull();
   });
 
   it("selects a session's open side-chat tab instead of adding a sub-agent tab for it", () => {
