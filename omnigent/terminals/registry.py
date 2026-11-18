@@ -336,6 +336,8 @@ class TerminalRegistry:
             # Only SDK-owned terminals inherit implicit process containment.
             environment_spec.sandbox = _default_sandbox_for_platform()
             spec = replace(spec, os_env=environment_spec)
+            # The effective environment already contains the cwd override.
+            cwd_override = None
         parent_environment = None
         if environment_spec.sandbox is not None and any(
             p.copy_on_write for p in environment_spec.sandbox.write_path_specs

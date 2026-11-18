@@ -373,20 +373,34 @@ async def test_rest_terminal_omitted_sandbox_uses_platform_default_and_model_acc
 ) -> None:
     workspace = tmp_path / "workspace"
     spec = _agent(workspace, harness="codex")
+    child = workspace / "child"
+    (child / "child").mkdir(parents=True)
     env_spec = OSEnvSpec(type="caller_process", cwd=str(workspace))
     if inherited:
         spec.os_env = env_spec
+        spec.terminals["shell"].allow_cwd_override = True
     else:
-        spec.terminals = {"shell": TerminalEnvSpec(command="bash", os_env=env_spec)}
+        spec.terminals = {
+            "shell": TerminalEnvSpec(command="bash", os_env=env_spec, allow_cwd_override=True)
+        }
     effective = terminal_mod.build_terminal_os_env_spec(
         spec.terminals["shell"], parent_os_env_spec=spec.os_env
     )
     assert effective.sandbox is None
     assert env_spec.sandbox is None
     async with _runner(spec, bundle, override="claude-sdk") as (client, terminals, _):
+        resolved_cwds: list[Path] = []
+        original_resolver = terminals.model_access_resolver
+        assert original_resolver is not None
+
+        async def record_resolver(session_id: str, cwd: Path):
+            resolved_cwds.append(cwd)
+            return await original_resolver(session_id, cwd)
+
+        terminals.model_access_resolver = record_resolver
         response = await client.post(
             "/v1/sessions/conv_test/resources/terminals",
-            json={"terminal": "shell", "session_key": "main"},
+            json={"terminal": "shell", "session_key": "main", "cwd": "child"},
         )
         assert response.status_code == 200, response.text
         instance = terminals.get("conv_test", "shell", "main")
@@ -394,6 +408,8 @@ async def test_rest_terminal_omitted_sandbox_uses_platform_default_and_model_acc
         assert instance.sandbox_policy is not None and instance.sandbox_policy.active
         assert bundle in instance.sandbox_policy.credential_source_paths
         assert instance.model_access.credential() == "parent-provider-secret"
+        assert resolved_cwds == [child]
+        assert Path(instance.launch_cwd) == child
         assert len(processes.launched) == 1
 
 
