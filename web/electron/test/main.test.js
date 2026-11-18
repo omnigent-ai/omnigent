@@ -427,6 +427,13 @@ function loadNavigationHarness({
     ),
     clipboard: { writeText: (text) => clipboardWriteText(text) },
     dialog: {},
+    globalShortcut: {
+      register: (accelerator) => {
+        (calls.globalShortcuts ??= []).push(["register", accelerator]);
+        return true;
+      },
+      unregister: (accelerator) => (calls.globalShortcuts ??= []).push(["unregister", accelerator]),
+    },
     ipcMain: { handle: (name, fn) => ipc.set(name, fn), on: (name, fn) => ipc.set(name, fn) },
     nativeImage: { createFromPath: () => ({ isEmpty: () => true }) },
     nativeTheme: { shouldUseDarkColors: false, on: () => {} },
@@ -835,6 +842,7 @@ describe("Arca extend IPC", () => {
         arcaPreviewRecovery: true,
         // Managed-feature fixtures simulate macOS on every test host.
         chromeCookieImport: true,
+        floatingComposer: true,
       },
     );
     assert.deepEqual(await extend(event, "overnight"), { ok: true, shutdownAt: null });
@@ -3700,6 +3708,74 @@ describe("CLI deep-link handoff", () => {
   }
 });
 
+describe("floating panel wiring", () => {
+  const chord = "CommandOrControl+Shift+Space";
+  const announce = (h, version, url = h.webContents.getURL()) =>
+    h.ipc.get("omnigent:floating-composer:announce")(
+      { sender: h.webContents, senderFrame: { url } },
+      version,
+    );
+
+  it("holds ⇧⌘Space only while a main window's page supports the panel", (t) => {
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    announce(h, 2);
+    announce(h, 1, "https://evil.example/");
+    assert.equal(h.calls.globalShortcuts, undefined);
+    announce(h, 1);
+    assert.deepEqual(h.calls.globalShortcuts, [["register", chord]]);
+    // A same-document navigation keeps it; a new document has to announce again.
+    h.webContents.emitWith("did-start-navigation", { isMainFrame: true, isSameDocument: true });
+    h.webContents.emitWith("did-start-navigation", { isMainFrame: true, isSameDocument: false });
+    assert.deepEqual(h.calls.globalShortcuts, [
+      ["register", chord],
+      ["unregister", chord],
+    ]);
+    // Holding the default chord writes nothing to settings.json.
+    const saved = fs.existsSync(h.settingsPath) ? fs.readFileSync(h.settingsPath, "utf8") : "";
+    assert.doesNotMatch(saved, /floating_composer/);
+  });
+
+  it("holds nothing off macOS, and says the panel isn't available there", (t) => {
+    const h = loadNavigationHarness({ platform: "linux" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    announce(h, 1);
+    assert.equal(h.calls.globalShortcuts, undefined);
+    const event = { sender: h.webContents, senderFrame: { url: h.webContents.getURL() } };
+    assert.equal(h.ipc.get("omnigent:get-desktop-features")(event).floatingComposer, false);
+  });
+
+  it("Find does nothing while a panel has focus, instead of searching the window behind", (t) => {
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    const panel = { isDestroyed: () => false, getParentWindow: () => null };
+    h.api.windows.set(panel, { origin: "https://host.example", role: "panel" });
+    h.api.buildMenu();
+    const find = h.calls.appMenu.getMenuItemById("find");
+    h.electron.BrowserWindow.getFocusedWindow = () => panel;
+    find.click();
+    assert.equal(h.findBars.length, 0);
+    h.electron.BrowserWindow.getFocusedWindow = () => h.win;
+    find.click();
+    assert.equal(h.findBars.length, 1);
+  });
+
+  it("opens a page in a main window only when the panel asks", async (t) => {
+    const h = loadNavigationHarness();
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const open = h.ipc.get("omnigent:floating-composer:open-in-main-window");
+    const event = { sender: h.webContents, senderFrame: { url: h.webContents.getURL() } };
+    assert.deepEqual({ ...(await open(event, "/c/abc")) }, { ok: false, error: "not-composer" });
+    assert.equal(
+      h.calls.progress.some(({ channel }) => channel === "omnigent:open-path"),
+      false,
+    );
+  });
+});
+
 describe("deep links with a panel open", () => {
   it("open in the server's main window, not a focused panel of that server", async (t) => {
     const h = loadNavigationHarness({
@@ -4725,6 +4801,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
         arcaPreviewRecovery: true,
         // Managed-feature fixtures simulate macOS on every test host.
         chromeCookieImport: true,
+        floatingComposer: true,
       },
     );
   });

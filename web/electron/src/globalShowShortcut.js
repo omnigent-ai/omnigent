@@ -117,8 +117,11 @@ function acceleratorFromInput(input, isMac) {
  *   isMac: boolean,
  *   claimedElsewhere?: (accelerator: string) => boolean,
  *   outranked?: (accelerator: string) => boolean,
+ *   active?: () => boolean,
  * }} deps `claimedElsewhere` says whether another of the shell's shortcuts uses a chord;
  *   `outranked` whether one that uses it comes first, so this one must not register it.
+ *   While `active` is false the shortcut holds no chord and keeps none from the others;
+ *   call `apply()` when it changes.
  */
 function createGlobalShowShortcut({
   id = "show",
@@ -129,6 +132,7 @@ function createGlobalShowShortcut({
   isMac,
   claimedElsewhere = () => false,
   outranked = () => false,
+  active = () => true,
 }) {
   if (!Object.hasOwn(GLOBAL_SHORTCUTS, id)) throw new Error(`Unknown global shortcut: ${id}`);
   const definition = GLOBAL_SHORTCUTS[id];
@@ -161,7 +165,7 @@ function createGlobalShowShortcut({
   function uses(accelerator) {
     if (sameChord(registeredAccelerator, accelerator)) return true;
     const setting = saved();
-    return setting.enabled && sameChord(setting.accelerator, accelerator);
+    return active() && setting.enabled && sameChord(setting.accelerator, accelerator);
   }
 
   /** Whether the user saved this shortcut on, rather than it running on its default. */
@@ -205,7 +209,7 @@ function createGlobalShowShortcut({
   function apply() {
     unregister();
     const { enabled, accelerator } = saved();
-    if (!enabled) launchError = null;
+    if (!enabled || !active()) launchError = null;
     else if (outranked(accelerator)) launchError = CLAIMED_ERROR;
     else launchError = register(accelerator) ? null : NOT_WORKING_ERROR;
   }
@@ -248,8 +252,9 @@ function createGlobalShowShortcut({
       return { ok: false, error: SAVE_ERROR };
     }
     if (previous !== null && (!sameChord(previous, accelerator) || !on)) unregister();
-    // An equivalent spelling keeps the registration it already has.
-    if (on && candidate) registeredAccelerator = accelerator;
+    // An equivalent spelling keeps the registration it already has. While inactive the chord
+    // was only tried, and `apply()` registers it once the shortcut is active.
+    if (on && candidate && active()) registeredAccelerator = accelerator;
     else if (candidate) globalShortcut.unregister(accelerator);
     launchError = null;
     return { ok: true, setting };
@@ -344,10 +349,13 @@ function createGlobalShowShortcut({
  *
  * @param {Omit<
  *   Parameters<typeof createGlobalShowShortcut>[0],
- *   "id" | "show" | "claimedElsewhere" | "outranked"
- * > & { presses: Partial<Record<keyof typeof GLOBAL_SHORTCUTS, () => void>> }} deps
+ *   "id" | "show" | "claimedElsewhere" | "outranked" | "active"
+ * > & {
+ *   presses: Partial<Record<keyof typeof GLOBAL_SHORTCUTS, () => void>>,
+ *   active?: Partial<Record<keyof typeof GLOBAL_SHORTCUTS, () => boolean>>,
+ * }} deps
  */
-function createGlobalShortcuts({ presses, ...deps }) {
+function createGlobalShortcuts({ presses, active = {}, ...deps }) {
   const ids = Object.keys(GLOBAL_SHORTCUTS).filter((id) => presses[id]);
   /** @type {Record<string, ReturnType<typeof createGlobalShowShortcut>>} */
   const shortcuts = {};
@@ -361,6 +369,7 @@ function createGlobalShortcuts({ presses, ...deps }) {
       ...deps,
       id,
       show: presses[id],
+      active: active[id],
       // Another shortcut's chord is off limits, unless this one already holds it ahead of them.
       claimedElsewhere: (accelerator) =>
         others(id).some(

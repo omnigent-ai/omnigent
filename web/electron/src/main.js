@@ -129,6 +129,20 @@ const {
 const { createQuitConfirmation } = require("./quitConfirmation");
 const { acceleratorLabel, createGlobalShortcuts } = require("./globalShowShortcut");
 const {
+  FLOATING_COMPOSER_PATH,
+  FRAME_SETTINGS_KEY,
+  createFloatingComposerController,
+  fadeInFloatingComposer,
+  floatingComposerAppPagePath,
+  floatingComposerSessionPath,
+  floatingComposerWindowOptions,
+} = require("./floating_composer_window");
+const {
+  createFloatingComposerSupport,
+  floatingComposerTarget,
+  mainWindowsByRecency,
+} = require("./floating_composer_support");
+const {
   registerDesktopCommandStateReset,
   sanitizeDesktopCommandState,
 } = require("./desktopCommands");
@@ -1769,8 +1783,12 @@ const quitConfirmation = createQuitConfirmation({
   quit: () => app.quit(),
 });
 
+// Main-window documents that can render the floating New Agent panel (see registerIpc).
+const floatingComposerSupport = createFloatingComposerSupport();
+
 // "Show Omnigent from anywhere" (opt-in). macOS needs app-level activation to
-// come forward from another app.
+// come forward from another app. The floating panel's ⇧⌘Space is held only while a
+// page on macOS can render the panel.
 const globalShortcuts = createGlobalShortcuts({
   globalShortcut,
   loadSettings,
@@ -1787,9 +1805,106 @@ const globalShortcuts = createGlobalShortcuts({
       win.focus();
       if (process.platform === "darwin") app.focus({ steal: true });
     },
+    floatingComposer: () => openFloatingComposerFromShortcut(),
+  },
+  active: {
+    floatingComposer: () => process.platform === "darwin" && floatingComposerSupport.any(),
   },
 });
 const globalShowShortcut = globalShortcuts.show;
+
+/** Main windows, most recently focused first; a closed one drops out on the next focus. */
+let mainWindowFocusOrder = [];
+/** @type {ReturnType<typeof createFloatingComposerController> | null} */
+let floatingComposerController = null;
+// Set as the app starts quitting, so a panel's close stops hiding it and lets it go.
+let appQuitting = false;
+
+/** The floating panels' controller, built on first use. */
+function floatingComposer() {
+  floatingComposerController ??= createFloatingComposerController({
+    createPanel: (serverUrl) => {
+      const panel = createWindow(undefined, {
+        role: "panel",
+        serverUrl,
+        path: FLOATING_COMPOSER_PATH,
+        windowOptions: floatingComposerWindowOptions(),
+      });
+      // A link the page didn't route itself must not turn the panel into an app window.
+      panel.webContents.on("did-navigate-in-page", (_event, _url, isMainFrame) => {
+        if (isMainFrame === false || floatingComposerPanelIsCurrent(panel, serverUrl)) return;
+        floatingComposerController?.closePanels((candidate) => candidate === serverUrl);
+      });
+      return panel;
+    },
+    screen,
+    loadFrames: () => loadSettings()[FRAME_SETTINGS_KEY] ?? {},
+    saveFrames: (frames) => {
+      const settings = loadSettings();
+      settings[FRAME_SETTINGS_KEY] = frames;
+      saveSettings(settings);
+    },
+    isCurrent: floatingComposerPanelIsCurrent,
+    quitting: () => appQuitting,
+    present: (panel, show) =>
+      fadeInFloatingComposer(panel, show, {
+        reduceMotion: systemPreferences.getAnimationSettings?.().prefersReducedMotion === true,
+      }),
+  });
+  return floatingComposerController;
+}
+
+/** Whether a panel still shows the panel page of `serverUrl`, or is still loading it. */
+function floatingComposerPanelIsCurrent(panel, serverUrl) {
+  if (panel.isDestroyed() || windows.get(panel)?.serverUrl !== serverUrl) return false;
+  const url = panel.webContents.getURL();
+  if (url === "") return true;
+  try {
+    return new URL(url).pathname.endsWith(FLOATING_COMPOSER_PATH);
+  } catch {
+    return false;
+  }
+}
+
+/** Whether `win`'s current document announced support for its own server. */
+function floatingComposerSupported(win, serverUrl) {
+  return !win.isDestroyed() && floatingComposerSupport.supports(win.webContents.id, serverUrl);
+}
+
+/** The server ⇧⌘Space opens the panel for, or null when it can't open. */
+function floatingComposerServerUrl() {
+  return floatingComposerTarget({
+    focused: BrowserWindow.getFocusedWindow(),
+    panelServerUrl: (win) => floatingComposerController?.serverUrlFor(win) ?? null,
+    mainWindowsByRecency: mainWindowsByRecency(mainWindowFocusOrder, mainWindows()),
+    serverUrlOf: (win) => windows.get(win)?.serverUrl ?? null,
+    supported: floatingComposerSupported,
+  });
+}
+
+/** ⇧⌘Space: the panel for the most recent server, else Omnigent comes forward. */
+function openFloatingComposerFromShortcut() {
+  const serverUrl = floatingComposerServerUrl();
+  if (serverUrl !== null) {
+    floatingComposer().show(serverUrl);
+    return;
+  }
+  const win = activeWindow();
+  if (!win) {
+    createWindow();
+  } else {
+    if (win.isMinimized()) win.restore();
+    win.focus();
+  }
+  app.focus({ steal: true });
+}
+
+/** Re-applies ⇧⌘Space after the pages that support the panel changed. */
+function applyFloatingComposerShortcut() {
+  globalShortcuts.floatingComposer.apply();
+  // A chord it let go of may be the one the other shortcut couldn't take.
+  if (globalShowShortcut.current().error) globalShowShortcut.apply();
+}
 
 // Shell-owned About window: available from the native application menu even
 // while the parent is on setup or an external sign-in page.
@@ -3155,6 +3270,8 @@ function findConversationId(url) {
  */
 function findTargetForShortcut() {
   const focused = BrowserWindow.getFocusedWindow();
+  // A panel has no find, and the main window behind it isn't what the user is looking at.
+  if (windows.has(focused) && !isMainWindow(focused)) return null;
   if (focused && !windows.has(focused)) {
     const parent = focused.getParentWindow();
     if (parent && windows.has(parent)) return parent;
@@ -3273,6 +3390,8 @@ function canSignOutOfServer(win) {
 async function signOutOfServer(win) {
   const origin = pinnedOrigin(win);
   if (!origin || !canSignOutOfServer(win)) return false;
+  // The server's floating panel goes too; the next open builds one for whoever signs in.
+  floatingComposerController?.closePanels((serverUrl) => originOf(serverUrl) === origin);
   if (usesOidcBrowserAuth(win)) return getOidcAuth().signOutWindow(win);
   const existing = databricksSignOuts.get(origin);
   if (existing) return existing;
@@ -5077,6 +5196,80 @@ function registerIpc() {
     return true;
   });
 
+  // A main window's document can render the floating panel for its server, until it's replaced.
+  ipcMain.on("omnigent:floating-composer:announce", (event, version) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!isPinnedOriginSender(event) || !isMainWindow(win) || version !== 1) return;
+    const serverUrl = windows.get(win)?.serverUrl;
+    if (!serverUrl) return;
+    const contents = win.webContents;
+    const hadSupport = floatingComposerSupport.any();
+    if (!floatingComposerSupport.announce(contents.id, serverUrl)) return;
+    const revoke = () => {
+      contents.removeListener("did-start-navigation", onNavigation);
+      contents.removeListener("destroyed", revoke);
+      floatingComposerSupport.revoke(contents.id);
+      if (!floatingComposerSupport.any()) applyFloatingComposerShortcut();
+    };
+    const onNavigation = (details, _url, isInPlace, isMainFrame) => {
+      const mainFrame = details?.isMainFrame ?? isMainFrame;
+      const sameDocument = details?.isSameDocument ?? isInPlace;
+      if (mainFrame && !sameDocument) revoke();
+    };
+    contents.on("did-start-navigation", onNavigation);
+    contents.on("destroyed", revoke);
+    if (!hadSupport) applyFloatingComposerShortcut();
+  });
+
+  // From the panel: hide it, keeping its draft.
+  ipcMain.on("omnigent:floating-composer:dismiss", (event) => {
+    const panel = BrowserWindow.fromWebContents(event.sender);
+    if (!isPinnedOriginSender(event) || !floatingComposerController?.isPanel(panel)) return;
+    floatingComposerController.hide(panel);
+  });
+
+  // From the panel: while its native file picker is open, focusing a main window keeps it up.
+  ipcMain.on("omnigent:floating-composer:file-picker", (event, state) => {
+    const panel = BrowserWindow.fromWebContents(event.sender);
+    if (!isPinnedOriginSender(event) || !floatingComposerController?.isPanel(panel)) return;
+    if (state === "open") floatingComposerController.filePickerOpened(panel);
+    else floatingComposerController.filePickerClosed(panel);
+  });
+
+  // From the panel: a session it launched, or an app page it links to, in a main window of
+  // its server. The panel then hides.
+  ipcMain.handle("omnigent:floating-composer:open-in-main-window", (event, routePath) => {
+    const panel = BrowserWindow.fromWebContents(event.sender);
+    if (!isPinnedOriginSender(event) || !floatingComposerController?.isPanel(panel)) {
+      return { ok: false, error: "not-composer" };
+    }
+    const sessionPath = floatingComposerSessionPath(routePath);
+    const openPath = sessionPath ?? floatingComposerAppPagePath(routePath);
+    if (openPath === null) return { ok: false, error: "bad-path" };
+    // Bound by main when it built the panel; never taken from the page.
+    const serverUrl = floatingComposerController.serverUrlFor(panel);
+    const target = mainWindowsByRecency(mainWindowFocusOrder, mainWindows()).find(
+      (win) => windows.get(win)?.serverUrl === serverUrl,
+    );
+    // A window still connecting would drop the route when its page loads; the panel stays.
+    if (target && connectionAttempts.get(target)?.pending === true) {
+      return { ok: false, error: "window-loading" };
+    }
+    if (target) {
+      sendOpenPath(target, openPath);
+      // A linked page comes forward; a launched session waits behind the app the user is in.
+      if (sessionPath === null) {
+        target.focus();
+        app.focus({ steal: true });
+      }
+    } else {
+      createWindow(undefined, { serverUrl, path: openPath });
+    }
+    // After a launch the next open starts at the default placement again.
+    floatingComposerController.hide(panel, { resetFrame: sessionPath !== null });
+    return { ok: true };
+  });
+
   // Dock/taskbar badge. Each window's SPA reports ITS unread count; the
   // app-wide badge shown is the sum across windows (see updateBadge), so two
   // windows on different servers don't clobber each other's counts.
@@ -5479,6 +5672,8 @@ function registerIpc() {
       // Importing local Chrome cookies is wired for macOS only (Keychain-decrypted
       // v10 values); the SPA hides the toolbar button everywhere else.
       chromeCookieImport: process.platform === "darwin",
+      // The floating New Agent panel is a macOS panel window.
+      floatingComposer: process.platform === "darwin",
     };
   });
 
@@ -6343,7 +6538,17 @@ if (!gotLock) {
     updater.init();
     // The menu reflects the focused window: Sign Out of Server, and the
     // commands (and Pin/Archive labels) its SPA reported.
-    app.on("browser-window-focus", () => buildMenu());
+    app.on("browser-window-focus", (_event, focused) => {
+      if (isMainWindow(focused)) {
+        mainWindowFocusOrder = [
+          focused,
+          ...mainWindowFocusOrder.filter((win) => win !== focused && !win.isDestroyed()),
+        ];
+        // Clicking an Omnigent window hides the floating panel, keeping its draft.
+        floatingComposerController?.mainWindowFocused();
+      }
+      buildMenu();
+    });
 
     app.on("activate", () => {
       // macOS: re-create the window when the dock icon is clicked and none
@@ -6393,6 +6598,7 @@ if (!gotLock) {
   };
   app.on("quit", clearQuitForceExitTimer);
   app.on("before-quit", (event) => {
+    appQuitting = true;
     quitConfirmation.quitStarted();
     // Forced exits below skip will-quit, so SSH connections are torn down here first.
     workspaceSshForwards.closeAll();
