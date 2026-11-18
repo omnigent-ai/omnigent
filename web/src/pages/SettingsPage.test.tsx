@@ -1822,6 +1822,29 @@ describe("SettingsPage", () => {
     expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
   });
 
+  it("renders the Account rows and the password dialog from their Settings catalog entries", async () => {
+    renderPage("/settings/account");
+    await screen.findByRole("button", { name: "Sign out" });
+    expect(document.querySelector('[data-settings-item="account-sign-out"]')).not.toBeNull();
+    expect(
+      document.querySelector('[data-settings-control="account-password:change"]'),
+    ).not.toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Change password" }));
+    expect(screen.getByPlaceholderText("Current password")).toHaveAccessibleName(
+      "Current password",
+    );
+    expect(screen.getByPlaceholderText("New password")).toHaveAccessibleName("New password");
+    expect(screen.getByPlaceholderText("Confirm new password")).toHaveAccessibleName(
+      "Confirm new password",
+    );
+    expect(
+      document.querySelector('[data-settings-control="account-password:currentPassword"]'),
+    ).not.toBeNull();
+    expect(
+      document.querySelector('[data-settings-control="account-password:submit"]'),
+    ).not.toBeNull();
+  });
+
   it("lists archived sessions and unarchives on click", () => {
     mocks.conversations = [
       conv("conv_active"),
