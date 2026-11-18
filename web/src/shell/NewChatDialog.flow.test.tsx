@@ -64,6 +64,7 @@ import { writeLastHostChoice } from "@/lib/hostPreferences";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { ComposerPresentationContext, type ComposerPresentation } from "./composerPresentation";
 
 // The landing screen drives the real Web-start flow end to end: the host and
 // first agent auto-select, the working directory seeds from the host's most-
@@ -273,6 +274,7 @@ function setAgents(agents: AvailableAgent[]): void {
 function renderLanding(
   cachedSessionIds: string[] = [],
   infoOverrides: Partial<ServerInfo> = {},
+  presentation: ComposerPresentation = { kind: "page" },
 ): QueryClient {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
@@ -317,7 +319,9 @@ function renderLanding(
     return (
       <QueryClientProvider client={client}>
         <CapabilitiesProvider info={info}>
-          <TooltipProvider>{children}</TooltipProvider>
+          <ComposerPresentationContext.Provider value={presentation}>
+            <TooltipProvider>{children}</TooltipProvider>
+          </ComposerPresentationContext.Provider>
         </CapabilitiesProvider>
       </QueryClientProvider>
     );
@@ -449,6 +453,165 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   localStorage.clear();
+});
+
+describe("NewChatLandingScreen in the floating panel", () => {
+  function floatingPanel() {
+    return {
+      kind: "floating" as const,
+      launch: vi.fn(),
+      onFilePicker: vi.fn(),
+      openAppPage: vi.fn(),
+    };
+  }
+
+  /** The desktop shell names this Mac's host, as it does in the panel. */
+  function inDesktopShell(hostId: string): void {
+    const shell = window as unknown as { omnigentDesktop?: unknown };
+    shell.omnigentDesktop = {
+      kind: "electron",
+      getHostIdentity: async () => ({ cliInstalled: true, hostId }),
+    };
+    onTestFinished(() => {
+      delete shell.omnigentDesktop;
+    });
+  }
+
+  it("hands a host create to the panel instead of opening a temp chat or navigating", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const panel = floatingPanel();
+
+    renderLanding([], {}, panel);
+    expect(screen.getByTestId("new-chat-landing").dataset.presentation).toBe("floating");
+    await waitForWorkspaceSeed();
+    typeMessage("inspect the repo");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+    await waitFor(() =>
+      expect(panel.launch).toHaveBeenCalledWith({
+        sessionId: "conv_new",
+        text: "inspect the repo",
+        skill: null,
+        files: [],
+        inputAccepted: false,
+      }),
+    );
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toMatchObject({ host_id: "host_1" });
+    expect(beginLocalConversationMock).not.toHaveBeenCalled();
+    expect(setPendingInitialPromptMock).not.toHaveBeenCalled();
+    expect(navigateMock).not.toHaveBeenCalled();
+  });
+
+  it.each([true, undefined])(
+    "says whether a sandbox create took the first message (durable input %s)",
+    async (durable) => {
+      vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ id: "conv_sandbox" }),
+      } as unknown as Response);
+      const panel = floatingPanel();
+
+      renderLanding([], { managed_sandboxes_enabled: true, durable_initial_input: durable }, panel);
+      typeMessage("start a sandbox");
+      await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+
+      await waitFor(() =>
+        expect(panel.launch).toHaveBeenCalledWith(
+          expect.objectContaining({ sessionId: "conv_sandbox", inputAccepted: durable === true }),
+        ),
+      );
+      const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+      expect(JSON.parse(init.body as string).host_type).toBe("managed");
+      expect(navigateMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("offers only this Mac's host, and doesn't start on a remembered other host", async () => {
+    inDesktopShell("host_1");
+    setHosts([host(), host({ host_id: "host_2", name: "build-box" })]);
+    writeLastHostChoice("host_2");
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const panel = floatingPanel();
+
+    renderLanding([], {}, panel);
+    await waitForWorkspaceSeed();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    expect(screen.getByTestId("new-chat-landing-host-host_1")).toBeInTheDocument();
+    expect(screen.queryByTestId("new-chat-landing-host-host_2")).toBeNull();
+    fireEvent.keyDown(document, { key: "Escape" });
+
+    typeMessage("inspect the repo");
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(panel.launch).toHaveBeenCalled());
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toMatchObject({ host_id: "host_1" });
+  });
+
+  it("starts nowhere until the desktop shell names this Mac's host", async () => {
+    let answer!: (identity: { cliInstalled: boolean; hostId: string }) => void;
+    const shell = window as unknown as { omnigentDesktop?: unknown };
+    shell.omnigentDesktop = {
+      kind: "electron",
+      getHostIdentity: () =>
+        new Promise((resolve) => {
+          answer = resolve;
+        }),
+    };
+    onTestFinished(() => {
+      delete shell.omnigentDesktop;
+    });
+
+    renderLanding([], {}, floatingPanel());
+    typeMessage("inspect the repo");
+    await waitFor(() => expect(answer).toBeDefined());
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+
+    await act(async () => answer({ cliInstalled: true, hostId: "host_1" }));
+    await waitForWorkspaceSeed();
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+  });
+
+  it("sends with ⌘↵ and keeps plain ↵ for a new line", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const panel = floatingPanel();
+
+    renderLanding([], {}, panel);
+    await waitForWorkspaceSeed();
+    typeMessage("inspect the repo");
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "Enter" });
+    expect(authenticatedFetch).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), {
+      key: "Enter",
+      metaKey: true,
+    });
+    await waitFor(() => expect(panel.launch).toHaveBeenCalled());
+  });
+
+  it("tells the panel when the native file picker closes", async () => {
+    const panel = floatingPanel();
+
+    renderLanding([], {}, panel);
+    const input = screen.getByTestId("new-chat-landing-file-input");
+    fireEvent(input, new Event("cancel"));
+    expect(panel.onFilePicker).toHaveBeenLastCalledWith("closed");
+    panel.onFilePicker.mockClear();
+    fireEvent.change(input, {
+      target: { files: [new File(["notes"], "notes.txt", { type: "text/plain" })] },
+    });
+    expect(panel.onFilePicker).toHaveBeenCalledWith("closed");
+  });
 });
 
 describe("NewChatLandingScreen create flow", () => {
