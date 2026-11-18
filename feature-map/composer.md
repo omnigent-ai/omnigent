@@ -592,7 +592,9 @@ composer, which changes only that session (Smart Routing too, where eligible).
 Shift+Tab in the cell's composer steps that session's mode too; side chats and
 subagent tabs keep Shift+Tab for focus. Switch the host from the cell's host menu
 when you can edit the session. The model picker is inert for a viewer who can't
-edit the session and while the session is unreachable.
+edit the session and while the session is unreachable. A cell whose managed
+sandbox is still launching lists no models until its host is bound, unlike the
+full-screen composer, which previews the sandbox's catalog.
 
 ## Driving it with the repro environment
 

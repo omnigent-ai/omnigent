@@ -19,6 +19,7 @@ import { SessionHarnessPicker } from "@/components/composer/SessionHarnessPicker
 import {
   composerHarnessLabel,
   modelResetSupported,
+  useSessionField,
   useSessionPickerInputs,
 } from "@/components/composer/sessionPickerInputs";
 import { ComposerPermissionPicker } from "@/components/composer/ComposerControls";
@@ -654,9 +655,12 @@ function GridSessionHarnessPicker({
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
   const brainHarnessLabels = useBrainHarnessLabels();
-  // shortcut: no sandbox launch-preview fallback, so a launching sandbox lists no
-  // models until its host is bound; pass ChatPage's launchPreviewOptions if that matters.
+  // A launching sandbox lists no models until its host is bound; ChatPage previews them.
   const inputs = useSessionPickerInputs(sessionId, session);
+  // Sub-agent head and harness override live on the cell's entry, as on the full-screen composer.
+  const subAgentName = useSessionField(sessionId, (state) => state.subAgentName);
+  const sessionHarness = useSessionField(sessionId, (state) => state.sessionHarness);
+  const agentName = subAgentName ?? session.agentName;
   const wrapper = session.labels?.["omnigent.wrapper"] ?? null;
   return (
     <SessionHarnessPicker
@@ -665,11 +669,11 @@ function GridSessionHarnessPicker({
       busy={busy}
       busyRef={busyRef}
       setBusy={setBusy}
-      agentName={session.agentName}
+      agentName={agentName}
       harnessLabel={composerHarnessLabel(
         inputs.modelPickerKind,
-        session.agentName,
-        session.harness ?? null,
+        agentName,
+        sessionHarness ?? session.harness ?? null,
         brainHarnessLabels,
         wrapper,
       )}

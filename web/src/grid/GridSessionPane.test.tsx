@@ -941,6 +941,7 @@ it("writes a cell's model pick to its own session, and leaves the other cell's p
   await waitFor(() =>
     expect(updateSession).toHaveBeenCalledWith("first", { modelOverride: "opus" }),
   );
+  expect(cellModelTrigger("first")).toBeDisabled();
   openCellModelList("second");
   fireEvent.click(screen.getByTestId("composer-agent-model-sonnet"));
   await waitFor(() =>
