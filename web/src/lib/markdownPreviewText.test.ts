@@ -54,6 +54,10 @@ describe("markdownPreviewText", () => {
     );
     // An escaped backtick is a backtick, not code.
     expect(markdownPreviewText("Type \\`not code\\` here")).toBe("Type `not code` here");
+    // Code, like emphasis, can go on across a paragraph's lines.
+    expect(markdownPreviewText("Keep `a\n*b*` as code, **all\nof it**")).toBe(
+      "Keep a *b* as code, all of it",
+    );
   });
 
   it("shows a link's label and an image's alt text, without block markers", () => {

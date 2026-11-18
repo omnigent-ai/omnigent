@@ -46,11 +46,11 @@ const INLINE_RULES: readonly (readonly [RegExp, string])[] = [
   [/\\([\\`*_{}[\]()#+.!|<>~-])/g, "$1"],
 ];
 
-/** One line's inline Markdown as plain text. */
-function inlinePlainText(line: string): string {
+/** A block's inline Markdown as plain text. */
+function inlinePlainText(source: string): string {
   const codes: string[] = [];
   // The source's own placeholder characters go first, so none reads as a placeholder.
-  let text = line
+  let text = source
     .replaceAll(PLACEHOLDER, "")
     .replace(CODE_SPAN, (_span, before: string, _ticks: string, code: string) => {
       codes.push(code);
@@ -71,8 +71,9 @@ function inlinePlainText(line: string): string {
  * @returns e.g. `"Inputs: the pull request · Fix the tests · Push"`; empty when no text remains.
  */
 export function markdownPreviewText(markdown: string): string {
-  // Each line's text, and whether it starts a block rather than continuing one.
-  const lines: { text: string; startsBlock: boolean }[] = [];
+  // Each block's text: a code line, a table row, or the source of a paragraph,
+  // list item or heading, whose inline Markdown can span its lines.
+  const blocks: { text: string; inline: boolean }[] = [];
   let fence: string | null = null;
   // Whether the line before ended its block: a blank line, heading, table row, rule or code.
   let blockEnded = true;
@@ -87,7 +88,7 @@ export function markdownPreviewText(markdown: string): string {
         fenceLine[1].length >= fence.length &&
         fenceLine[2].trim() === "";
       if (closes) fence = null;
-      else lines.push({ text: line, startsBlock: true });
+      else blocks.push({ text: line, inline: false });
       blockEnded = true;
     } else if (fenceLine) {
       fence = fenceLine[1];
@@ -99,29 +100,28 @@ export function markdownPreviewText(markdown: string): string {
       const cells = (row[1].match(TABLE_CELL) ?? []).map((cell) =>
         inlinePlainText(cell.replaceAll("\\|", "|")).trim(),
       );
-      lines.push({ text: cells.filter(Boolean).join(" · "), startsBlock: true });
+      blocks.push({ text: cells.filter(Boolean).join(" · "), inline: false });
       blockEnded = true;
     } else {
       const unquoted = line.replace(QUOTE_MARKERS, "");
       const marker = BLOCK_MARKER.exec(unquoted)?.[0] ?? "";
-      lines.push({
-        text: inlinePlainText(unquoted.slice(marker.length)),
-        startsBlock: blockEnded || marker !== "",
-      });
-      // A heading takes one line; a paragraph or list item goes on to the next.
+      const content = unquoted.slice(marker.length);
+      const last = blocks.at(-1);
+      // A line without a marker goes on with the paragraph or list item before it.
+      if (!blockEnded && marker === "" && last?.inline) last.text += ` ${content}`;
+      else blocks.push({ text: content, inline: true });
+      // A heading takes one line.
       blockEnded = marker.trimStart().startsWith("#");
     }
   }
   let text = "";
-  let startsBlock = false;
-  for (const line of lines) {
-    // A block whose first line has no text still starts before the next line.
-    startsBlock ||= line.startsBlock;
-    const plain = line.text.replace(/\s+/g, " ").trim();
+  for (const block of blocks) {
+    const plain = (block.inline ? inlinePlainText(block.text) : block.text)
+      .replace(/\s+/g, " ")
+      .trim();
     if (!plain) continue;
     if (!text) text = plain;
-    else text += `${startsBlock && !ENDS_WITH_PUNCTUATION.test(text) ? " · " : " "}${plain}`;
-    startsBlock = false;
+    else text += `${ENDS_WITH_PUNCTUATION.test(text) ? " " : " · "}${plain}`;
   }
   return text;
 }
