@@ -13,7 +13,7 @@ import type { WorkspaceChangedFile } from "@/hooks/useWorkspaceChangedFiles";
 import { copyText } from "@/lib/clipboard";
 import { toast } from "sonner";
 import { cn } from "@/lib/utils";
-import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { isAbsoluteComposerPath } from "@/lib/composerContext";
 import { Button } from "@/components/ui/button";
 import {
@@ -87,7 +87,7 @@ export function FileRowActions({ children, ...props }: FileRowActionsProps) {
   const panelFocusRef = useContext(FilesPanelFocusContext);
   const [contextOpen, setContextOpen] = useState(false);
   const [dropdownOpen, setDropdownOpen] = useState(false);
-  const isCoarsePointer = useIsCoarsePointer();
+  const isMobileViewport = useIsMobileViewport();
   const isDeleted = props.isDeleted ?? props.lastKnown ?? false;
   const revealTarget = useRevealTarget(isDeleted ? null : props.revealPath);
   const actionLabel = `More actions for ${props.actionName ?? props.name}`;
@@ -189,7 +189,7 @@ export function FileRowActions({ children, ...props }: FileRowActionsProps) {
           onClick={(event) => event.stopPropagation()}
           className={cn(
             "size-[18px] shrink-0 rounded p-0.5 text-muted-foreground transition-opacity hover:bg-muted hover:text-foreground",
-            isCoarsePointer || contextOpen
+            isMobileViewport || contextOpen
               ? "opacity-100"
               : "opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100 data-[state=open]:opacity-100",
             "pointer-coarse:size-6",
