@@ -50,6 +50,11 @@ const MODIFIER_ALIASES = new Map([
   ["meta", "super"],
 ]);
 const MODIFIER_ORDER = ["control", "alt", "altgr", "shift", "command", "super"];
+/** Key names Electron accepts in two spellings. */
+const KEY_ALIASES = new Map([
+  ["return", "enter"],
+  ["esc", "escape"],
+]);
 
 /**
  * One spelling for every way to write a chord, so `CommandOrControl+Shift+Space` and the
@@ -61,7 +66,8 @@ const MODIFIER_ORDER = ["control", "alt", "altgr", "shift", "command", "super"];
  */
 function chordKey(accelerator, isMac) {
   const parts = accelerator.split("+").map((part) => part.trim().toLowerCase());
-  const key = parts.pop();
+  const typed = parts.pop();
+  const key = KEY_ALIASES.get(typed) ?? typed;
   const modifiers = new Set(
     parts.map((part) => {
       const name = MODIFIER_ALIASES.get(part) ?? part;

@@ -396,27 +396,57 @@ describe("recording a chord", () => {
 
 describe("createGlobalShortcuts", () => {
   /**
+   * How macOS Electron tells chords apart, written independently of chordKey so a bug there
+   * can't hide behind the fake: one name per modifier and key alias, in any order and case.
+   */
+  const MAC_NAMES = {
+    commandorcontrol: "cmd",
+    cmdorctrl: "cmd",
+    command: "cmd",
+    cmd: "cmd",
+    super: "cmd",
+    meta: "cmd",
+    control: "ctrl",
+    ctrl: "ctrl",
+    alt: "alt",
+    option: "alt",
+    return: "enter",
+    esc: "escape",
+  };
+  const electronChord = (accelerator) =>
+    accelerator
+      .toLowerCase()
+      .split("+")
+      .map((part) => MAC_NAMES[part] ?? part)
+      .sort()
+      .join("+");
+
+  /**
    * Both shortcuts over one settings store and a fake GlobalShortcut that, like Electron,
-   * refuses a chord already registered in any spelling.
+   * refuses a chord already registered in any spelling. `pressed` counts each action.
    */
   function shortcuts(settings = {}) {
     let stored = structuredClone(settings);
     const live = new Map();
+    const pressed = { show: 0, floatingComposer: 0 };
     const built = createGlobalShortcuts({
       globalShortcut: {
-        register: (accelerator) => {
-          if (live.has(chordKey(accelerator, true))) return false;
-          live.set(chordKey(accelerator, true), accelerator);
+        register: (accelerator, press) => {
+          if (live.has(electronChord(accelerator))) return false;
+          live.set(electronChord(accelerator), { accelerator, press });
           return true;
         },
-        unregister: (accelerator) => live.delete(chordKey(accelerator, true)),
+        unregister: (accelerator) => live.delete(electronChord(accelerator)),
       },
       loadSettings: () => structuredClone(stored),
       saveSettings: (next) => {
         stored = structuredClone(next);
       },
       isMac: true,
-      presses: { show: () => {}, floatingComposer: () => {} },
+      presses: {
+        show: () => (pressed.show += 1),
+        floatingComposer: () => (pressed.floatingComposer += 1),
+      },
     });
     return {
       ...built,
@@ -424,9 +454,24 @@ describe("createGlobalShortcuts", () => {
       rewrite: (next) => {
         stored = structuredClone(next);
       },
-      registered: () => [...live.values()],
+      registered: () => [...live.values()].map(({ accelerator }) => accelerator),
+      press: (accelerator) => live.get(electronChord(accelerator)).press(),
+      pressed,
     };
   }
+
+  it("runs each shortcut's own action when its chord is pressed", async () => {
+    const s = shortcuts();
+    assert.equal(
+      (await s.show.set({ enabled: true, accelerator: "Alt+Space" }, async () => true)).ok,
+      true,
+    );
+    s.floatingComposer.apply();
+    s.press("Alt+Space");
+    assert.deepEqual(s.pressed, { show: 1, floatingComposer: 0 });
+    s.press("CommandOrControl+Shift+Space");
+    assert.deepEqual(s.pressed, { show: 1, floatingComposer: 1 });
+  });
 
   it("keeps each shortcut under its own settings key", () => {
     const keys = Object.values(GLOBAL_SHORTCUTS).map((definition) => definition.settingKey);
@@ -578,6 +623,8 @@ describe("chordKey", () => {
     assert.equal(chordKey("Super+Shift+Space", true), "shift+command+space");
     assert.equal(chordKey("CmdOrCtrl+Option+K", false), "control+alt+k");
     assert.equal(chordKey("Ctrl+Alt+K", false), "control+alt+k");
+    assert.equal(chordKey("Alt+Return", true), chordKey("Option+Enter", true));
+    assert.equal(chordKey("Shift+Esc", true), chordKey("Shift+Escape", true));
     assert.notEqual(chordKey("Super+K", false), chordKey("Control+K", false));
   });
 });
