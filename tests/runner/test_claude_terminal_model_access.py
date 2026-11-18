@@ -133,6 +133,7 @@ async def _runner(
     *,
     override: str | None = None,
     omit_harness: bool = False,
+    omit_spec_resolver: bool = False,
 ) -> AsyncIterator[tuple[httpx.AsyncClient, TerminalRegistry, SessionResourceRegistry]]:
     async def snapshot(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/v1/sessions/conv_test"
@@ -154,7 +155,7 @@ async def _runner(
             resource_registry=resources,
             terminal_registry=terminals,
             server_client=server,
-            spec_resolver=resolve,
+            spec_resolver=None if omit_spec_resolver else resolve,
         )
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://runner.example.test"
@@ -365,6 +366,37 @@ async def test_rest_terminal_effective_harness_controls_model_access(
         assert response.status_code == 200, response.text
         assert len(processes.launched) == 1
         assert (processes.launched[0].model_access is not None) == (override != "codex")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["claude-sdk", "codex-native"])
+async def test_unresolved_session_spec_blocks_sdk_terminal_only(
+    tmp_path: Path,
+    processes: _TerminalProcesses,
+    bundle: Path,
+    harness: str,
+) -> None:
+    spec = _agent(tmp_path / "workspace", harness=harness)
+    async with _runner(spec, bundle, omit_spec_resolver=True) as (_, terminals, _):
+        if harness == "claude-sdk":
+            with pytest.raises(
+                RuntimeError, match="Claude SDK terminals require a resolved session spec"
+            ):
+                await terminals.launch(
+                    "conv_test",
+                    "shell",
+                    "main",
+                    spec.terminals["shell"],
+                    parent_os_env=spec.os_env,
+                )
+            assert not processes.created
+            assert not processes.launched
+        else:
+            instance = await terminals.launch(
+                "conv_test", "shell", "main", spec.terminals["shell"], parent_os_env=spec.os_env
+            )
+            assert instance.model_access is None
+            assert processes.launched == [instance]
 
 
 @pytest.mark.asyncio

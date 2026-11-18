@@ -8861,20 +8861,22 @@ def create_runner_app(
         return _unwrap_spec_entry(entry)
 
     async def _terminal_model_access(session_id: str, cwd: Path) -> ClaudeModelAccess | None:
+        from omnigent.harness_aliases import is_claude_sdk_harness_name
         from omnigent.runtime.workflow import claude_terminal_model_access
 
         entry = await _resolve_session_spec_entry(session_id)
         spec = _unwrap_spec_entry(entry)
-        return (
-            await asyncio.to_thread(
-                claude_terminal_model_access,
-                spec,
-                bundle_dir=_resolved_spec_workdir(entry),
-                effective_harness=_session_harness_name(session_id),
-                cwd=cwd,
-            )
-            if spec is not None
-            else None
+        if spec is None:
+            snapshot = await _session_snapshot(session_id)
+            if not snapshot.ok or is_claude_sdk_harness_name(_session_harness_name(session_id)):
+                raise RuntimeError("Claude SDK terminals require a resolved session spec")
+            return None
+        return await asyncio.to_thread(
+            claude_terminal_model_access,
+            spec,
+            bundle_dir=_resolved_spec_workdir(entry),
+            effective_harness=_session_harness_name(session_id),
+            cwd=cwd,
         )
 
     if terminal_registry is not None:

@@ -910,6 +910,50 @@ async def test_relay_stream_survives_signer_total_and_idle_limits(
     assert output.endswith(b"\r\n\r\nhelloworld")
 
 
+async def test_relay_cuts_silent_upstream_after_response_headers(tmp_path: Path) -> None:
+    # A provider that sends headers but no body must not hold a relay socket forever.
+    relay = _response_relay(tmp_path, response_idle_timeout_seconds=0.02)
+    upstream = asyncio.StreamReader()
+    upstream.feed_data(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n")
+    output = bytearray()
+    downstream = SimpleNamespace(write=output.extend, drain=AsyncMock())
+
+    result = await asyncio.wait_for(
+        relay._relay_response_observing_status(upstream, downstream), timeout=1
+    )
+
+    assert result == (len(output), 200, False)
+
+
+async def test_relay_cuts_endless_chunk_stream_at_total_deadline(tmp_path: Path) -> None:
+    # Regular chunks can defeat an idle timer, so the total deadline also applies.
+    relay = _response_relay(
+        tmp_path, response_idle_timeout_seconds=0.5, response_total_timeout_seconds=0.1
+    )
+    upstream = asyncio.StreamReader()
+    upstream.feed_data(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx\r\n")
+    output = bytearray()
+    downstream = SimpleNamespace(write=output.extend, drain=AsyncMock())
+
+    async def send_chunks() -> None:
+        while True:
+            await asyncio.sleep(0.01)
+            upstream.feed_data(b"1\r\nx\r\n")
+
+    sender = asyncio.create_task(send_chunks())
+    try:
+        result = await asyncio.wait_for(
+            relay._relay_response_observing_status(upstream, downstream), timeout=1
+        )
+    finally:
+        sender.cancel()
+        await asyncio.gather(sender, return_exceptions=True)
+
+    assert result[1:] == (200, False)
+    assert result[0] > 0
+    assert b"x" in output
+
+
 async def test_relay_honors_explicit_short_header_deadline(tmp_path: Path) -> None:
     relay = _response_relay(tmp_path, response_header_timeout_seconds=0.01)
     output = bytearray()

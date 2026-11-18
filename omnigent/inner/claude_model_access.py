@@ -81,6 +81,8 @@ _BETA = re.compile(r"[a-z0-9][a-z0-9.-]{0,100}(?:,[a-z0-9][a-z0-9.-]{0,100})*\Z"
 # Match the Messages API request limit so attachments the provider accepts still pass.
 _MAX_REQUEST_BODY_BYTES = 32 * 1024 * 1024
 _DEFAULT_RESPONSE_HEADER_TIMEOUT_SECONDS = 150.0
+_DEFAULT_RESPONSE_IDLE_TIMEOUT_SECONDS = 5 * 60.0
+_DEFAULT_RESPONSE_TOTAL_TIMEOUT_SECONDS = 60 * 60.0
 _RESPONSE_WRITE_TIMEOUT_SECONDS = 60.0
 _T = TypeVar("_T")
 
@@ -307,8 +309,8 @@ class ClaudeModelAccess:
     auth_executable: _TrustedExecutable | None = field(default=None, repr=False)
     source_env_names: frozenset[str] = frozenset()
     response_header_timeout_seconds: float | None = _DEFAULT_RESPONSE_HEADER_TIMEOUT_SECONDS
-    response_idle_timeout_seconds: float | None = None
-    response_total_timeout_seconds: float | None = None
+    response_idle_timeout_seconds: float | None = _DEFAULT_RESPONSE_IDLE_TIMEOUT_SECONDS
+    response_total_timeout_seconds: float | None = _DEFAULT_RESPONSE_TOTAL_TIMEOUT_SECONDS
     _attribution_headers: tuple[tuple[str, str], ...] = field(init=False, default=(), repr=False)
     _credential_resolver: _CredentialResolver = field(init=False, repr=False, compare=False)
 
