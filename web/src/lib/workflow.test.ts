@@ -167,6 +167,8 @@ describe("editWorkflowPlanPrompt", () => {
     expect(prompt).toContain("Read the saved plan and use it as the starting point");
     expect(prompt).toContain("wait for my answer before proposing or publishing changes");
     expect(prompt).toContain("Preserve steps I haven't asked to change");
+    expect(prompt).toContain("Set description on every plan you publish");
+    expect(prompt).toContain("Save plan stores it as the workflow description");
     expect(prompt).not.toContain("Draft a useful first proposal now");
   });
 
@@ -242,14 +244,14 @@ describe("runSavedWorkflowPrompt", () => {
 
   it("asks the workflow skill to run the saved workflow by ID", () => {
     expect(runSavedWorkflowPrompt(workflow)).toBe(
-      'Use the workflow skill to run the saved workflow "Triage flaky tests" (ID 0123456789abcdef0123456789abcdef).',
+      'Use the workflow skill to run the saved workflow "Triage flaky tests" (ID 0123456789abcdef0123456789abcdef).\n\nIf the session journal already contains this workflow\'s plan, continue that run without writing a second starting plan.',
     );
     expect(runSavedWorkflowPrompt(workflow, "  \n")).toBe(runSavedWorkflowPrompt(workflow));
   });
 
   it("adds the run's additional instructions as their own paragraph", () => {
     expect(runSavedWorkflowPrompt(workflow, "  Only the upload tests.\n")).toBe(
-      'Use the workflow skill to run the saved workflow "Triage flaky tests" (ID 0123456789abcdef0123456789abcdef).\n\nOnly the upload tests.',
+      `${runSavedWorkflowPrompt(workflow)}\n\nOnly the upload tests.`,
     );
   });
 });

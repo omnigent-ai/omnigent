@@ -1,4 +1,14 @@
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  renderHook,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react";
+import { useSharedSessionDraft } from "@/grid/sharedSessionDraft";
 import { createPortal } from "react-dom";
 import { StrictMode } from "react";
 import userEvent from "@testing-library/user-event";
@@ -12,11 +22,14 @@ import { writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import * as filesApi from "@/lib/filesApi";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { SESSION_MENTION_HINT } from "@/lib/composerMentions";
+import type { Comment } from "@/hooks/useComments";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
+import { clearSessionDrafts, getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 import * as sessionsApi from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
 import type * as ChatStoreModule from "@/store/chatStore";
-import { useChatStore, type ChatState } from "@/store/chatStore";
+import { gridCellComposerKey, useChatStore, type ChatState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { SideChatPane } from "./SideChatPane";
@@ -77,6 +90,26 @@ const renderPane = (ui: ReactNode) =>
       <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
     ),
   });
+
+/** The child's sent user message, as the transcript shows it for "Edit and resend". */
+function seedSentMessage(text = "Why did this build fail?") {
+  conversationRegistry.acquire(childId).setState({
+    sessionStatus: "idle",
+    blocks: itemsToBlocks([
+      {
+        id: "sent",
+        response_id: "turn",
+        type: "message",
+        role: "user",
+        status: "completed",
+        content: [
+          { type: "input_file", file_id: "file_log", filename: "build.log" },
+          { type: "input_text", text },
+        ],
+      },
+    ]),
+  });
+}
 
 beforeEach(() => {
   mockSession.labels = {};
@@ -142,25 +175,6 @@ describe("undelivered startup messages", () => {
 });
 
 describe("editing a sent side-chat message", () => {
-  function seedSentMessage(text = "Why did this build fail?") {
-    conversationRegistry.acquire(childId).setState({
-      sessionStatus: "idle",
-      blocks: itemsToBlocks([
-        {
-          id: "sent",
-          response_id: "turn",
-          type: "message",
-          role: "user",
-          status: "completed",
-          content: [
-            { type: "input_file", file_id: "file_log", filename: "build.log" },
-            { type: "input_text", text },
-          ],
-        },
-      ]),
-    });
-  }
-
   it("copies the message's text and @-mention into this side chat's composer", async () => {
     // The side-chat composer has no mention picker, so the mention returns as the
     // marker it was sent with.
@@ -591,6 +605,30 @@ describe("side chat opened from a + button", () => {
     act(() => conversationRegistry.acquire(childId).setState({ boundAgentId: "agent_side" }));
     expect(screen.getByTestId("side-chat-input")).toBeEnabled();
     expect(screen.getByTestId("other-field")).toHaveFocus();
+  });
+
+  it("continues a restored draft from its end when the input takes focus", () => {
+    conversationRegistry.acquire(childId).setState({ boundAgentId: null, sessionStatus: "idle" });
+    const draft = "Add a step that opens the upgrade PRs";
+    useChatStore.setState({
+      sideChatComposers: { [childId]: { text: draft, files: [], autoFocus: true } },
+    });
+    renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId<HTMLTextAreaElement>("side-chat-input");
+    // Browsers can leave a restored value's caret before its first word.
+    input.setSelectionRange(0, 0);
+
+    act(() => conversationRegistry.acquire(childId).setState({ boundAgentId: "agent_side" }));
+
+    expect(input).toHaveFocus();
+    expect(input.selectionStart).toBe(draft.length);
+    expect(input.selectionEnd).toBe(draft.length);
+
+    // Asked again while it already has focus, the input keeps the user's caret.
+    input.setSelectionRange(3, 3);
+    act(() => useChatStore.getState().requestSideChatFocus(childId));
+    expect(input).toHaveFocus();
+    expect(input.selectionStart).toBe(3);
   });
 
   it("leaves a text input that already had focus before the pane mounted alone", () => {
@@ -1463,6 +1501,362 @@ describe("unsent composer state survives the pane moving", () => {
       expect(useChatStore.getState().sideChatComposers["other-pane"].text).toBe("keep me");
     },
   );
+
+  it("is one row tall only in a grid cell", () => {
+    const view = renderPane(<SideChatPane childId={childId} fullSession />);
+    expect(screen.getByTestId("side-chat-input")).not.toHaveAttribute("rows");
+    view.unmount();
+    renderPane(<SideChatPane childId={childId} fullSession gridComposer={{}} />);
+    expect(screen.getByTestId("side-chat-input")).toHaveAttribute("rows", "1");
+  });
+
+  it("gives Shift+Tab to a grid cell's permission cycle, and leaves a side chat's to the browser", () => {
+    const cyclePermissionMode = vi.fn(() => true);
+    const view = renderPane(
+      <SideChatPane childId={childId} fullSession gridComposer={{ cyclePermissionMode }} />,
+    );
+    const shiftTabInit = { key: "Tab", shiftKey: true };
+    expect(fireEvent.keyDown(screen.getByTestId("side-chat-input"), shiftTabInit)).toBe(false);
+    expect(cyclePermissionMode).toHaveBeenCalledOnce();
+    view.unmount();
+
+    cyclePermissionMode.mockReturnValueOnce(false);
+    const cell = renderPane(
+      <SideChatPane childId={childId} fullSession gridComposer={{ cyclePermissionMode }} />,
+    );
+    expect(fireEvent.keyDown(screen.getByTestId("side-chat-input"), shiftTabInit)).toBe(true);
+    cell.unmount();
+
+    renderPane(<SideChatPane childId={childId} />);
+    expect(fireEvent.keyDown(screen.getByTestId("side-chat-input"), shiftTabInit)).toBe(true);
+    expect(cyclePermissionMode).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe("grid cell composer shares its session's draft", () => {
+  const fileTag = { path: "src/app.ts", isDir: false, token: "@src/app.ts" };
+  const sessionTag = { id: "sess_fix", title: "Fix CI", isSubagent: false, token: "@Fix CI" };
+  const reviewComment = {
+    id: "review",
+    conversation_id: childId,
+    path: "src/app.ts",
+    body: "Rename this",
+    status: "draft",
+    start_index: 0,
+    end_index: 0,
+    created_at: 1,
+    updated_at: 1,
+    created_by: null,
+    anchor_content: null,
+    anchor_metadata: {
+      pr_url: "https://github.example.com/acme/app/pull/1",
+      side: "RIGHT",
+      line: 4,
+      head_sha: "a".repeat(40),
+      base_sha: "b".repeat(40),
+    },
+  } as Comment;
+
+  beforeEach(() => {
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+  });
+  afterEach(() => clearSessionDrafts());
+
+  /** The cell's composer entry and its session draft, as the grid's bridge keeps them. */
+  function seedCell(
+    text: string,
+    shared: Parameters<typeof setSessionDraft>[1] = { text, files: [] },
+  ) {
+    useChatStore.setState({
+      sideChatComposers: { [gridCellComposerKey(childId)]: { text, files: [] } },
+    });
+    setSessionDraft(childId, shared);
+  }
+
+  const gridCell = () =>
+    renderPane(<SideChatPane childId={childId} fullSession gridComposer={{}} />);
+
+  /** A cell mounted over its session draft alone, so the bridge does the seeding. */
+  function bridgedCell(sharedDraft: Parameters<typeof setSessionDraft>[1]) {
+    setSessionDraft(childId, sharedDraft);
+    const bridge = renderHook(() => useSharedSessionDraft(childId));
+    gridCell();
+    return bridge;
+  }
+
+  it("sends a tagged file and session as their markers, with the session hint", () => {
+    const text = "Compare @src/app.ts with @Fix CI";
+    const bridge = bridgedCell({
+      text,
+      files: [],
+      mentions: { files: [fileTag], sessions: [sessionTag] },
+    });
+
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+
+    expect(send).toHaveBeenCalledExactlyOnceWith(
+      `Compare [Attached file: src/app.ts] with [Session: "Fix CI" id=sess_fix subagent=no]\n\n${SESSION_MENTION_HINT}`,
+      "agent_side",
+      undefined,
+      { pinnedConversationId: childId },
+    );
+    // The bridge mirrors the cleared composer, so the shared draft empties too.
+    expect(getSessionDraft(childId)).toBeUndefined();
+    bridge.unmount();
+    // Remounting the cell starts empty: nothing from the sent draft comes back.
+    renderHook(() => useSharedSessionDraft(childId));
+    expect(useChatStore.getState().sideChatComposers[gridCellComposerKey(childId)]).toBeUndefined();
+  });
+
+  it("sends a tagged skill command as an ordinary message, not as a local command", () => {
+    conversationRegistry
+      .acquire(childId)
+      .setState({ sessionHarness: "claude-sdk", sessionStatus: "idle" });
+    skillsFixture.current = {
+      skills: [{ name: "review", description: "Review" }],
+      skillsStatus: null,
+    };
+    const text = "/review @Fix CI";
+    seedCell(text, { text, files: [], mentions: { files: [], sessions: [sessionTag] } });
+    gridCell();
+
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+
+    expect(sendSlashCommand).not.toHaveBeenCalled();
+    expect(send).toHaveBeenCalledExactlyOnceWith(
+      `/review [Session: "Fix CI" id=sess_fix subagent=no]\n\n${SESSION_MENTION_HINT}`,
+      "agent_side",
+      undefined,
+      { pinnedConversationId: childId },
+    );
+  });
+
+  it("runs an untagged skill command locally", () => {
+    conversationRegistry
+      .acquire(childId)
+      .setState({ sessionHarness: "claude-sdk", sessionStatus: "idle" });
+    skillsFixture.current = {
+      skills: [{ name: "review", description: "Review" }],
+      skillsStatus: null,
+    };
+    seedCell("/review", { text: "/review", files: [] });
+    gridCell();
+
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+
+    expect(send).not.toHaveBeenCalled();
+    expect(sendSlashCommand).toHaveBeenCalledExactlyOnceWith("review", "", "agent_side", {
+      pinnedConversationId: childId,
+    });
+  });
+
+  it("sends a cell's review comments with its instructions, then clears them", () => {
+    const bridge = bridgedCell({
+      text: "Address this",
+      files: [],
+      reviewComments: [reviewComment],
+    });
+
+    expect(
+      screen.getByRole("button", { name: "Open local review comment src/app.ts:4 (new)" }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+
+    const message = send.mock.calls[0]![0];
+    expect(message).toMatch(/^Address this\n\n```local-review-comment\n\{/);
+    expect(message).toContain('"body": "Rename this"');
+    expect(getSessionDraft(childId)).toBeUndefined();
+    bridge.unmount();
+    renderHook(() => useSharedSessionDraft(childId));
+    expect(useChatStore.getState().sideChatComposers[gridCellComposerKey(childId)]).toBeUndefined();
+  });
+
+  /** Fails a grid send of `sent` and mounts the cell, which restores it. */
+  function failedGridSend(sent: string) {
+    const entry = conversationRegistry.acquire(childId);
+    entry.setState({
+      sessionStatus: "idle",
+      abortController: new AbortController(),
+      failedSendDraft: { conversationId: childId, text: sent, files: [], stableId: "retry-stable" },
+    });
+    renderHook(() => useSharedSessionDraft(childId));
+    gridCell();
+    return entry;
+  }
+
+  it("clears a restored grid draft once its send is delivered, if the user left it as restored", async () => {
+    const sent = `Compare [Session: "Fix CI" id=sess_fix subagent=no]\n\n${SESSION_MENTION_HINT}`;
+    const entry = failedGridSend(sent);
+    expect(screen.getByTestId("side-chat-input")).toHaveValue("Compare @Fix CI");
+
+    act(() =>
+      entry.setState({
+        restoredSendDraft: { ...entry.getState().restoredSendDraft!, delivered: true },
+      }),
+    );
+
+    await waitFor(() => expect(screen.getByTestId("side-chat-input")).toHaveValue(""));
+  });
+
+  it("keeps a restored grid draft the user edited after the failed send", () => {
+    const sent = `Compare [Session: "Fix CI" id=sess_fix subagent=no]\n\n${SESSION_MENTION_HINT}`;
+    const entry = failedGridSend(sent);
+    fireEvent.change(screen.getByTestId("side-chat-input"), {
+      target: { value: "Compare @Fix CI, then more" },
+    });
+
+    act(() =>
+      entry.setState({
+        restoredSendDraft: { ...entry.getState().restoredSendDraft!, delivered: true },
+      }),
+    );
+
+    expect(screen.getByTestId("side-chat-input")).toHaveValue("Compare @Fix CI, then more");
+  });
+
+  it("sends a review comment on its own with the instruction to address it", () => {
+    seedCell("", { text: "", files: [], reviewComments: [reviewComment] });
+    gridCell();
+
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+
+    expect(send.mock.calls[0]![0]).toMatch(
+      /^Please address these local review comments:\n\n```local-review-comment\n/,
+    );
+  });
+
+  it("sends a quote card with its reply draft, as the full-screen composer does", () => {
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "Intro", text: "Quoted line" }],
+      text: "Reply",
+    };
+    setSessionDraft(childId, {
+      text: serializeReplyDraft(replyDraft),
+      files: [],
+      replyDraft,
+    });
+    useChatStore.setState({
+      sideChatComposers: {
+        [gridCellComposerKey(childId)]: {
+          text: "Reply",
+          files: [],
+          quotes: [{ id: "q", before: "Intro", text: "Quoted line" }],
+        },
+      },
+    });
+    gridCell();
+
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+
+    expect(send).toHaveBeenCalledExactlyOnceWith(
+      serializeReplyDraft(replyDraft),
+      "agent_side",
+      undefined,
+      { pinnedConversationId: childId, replyDraft },
+    );
+  });
+
+  it("edits a sent message with its session tag back as a token and resends it unchanged", async () => {
+    const sent = `Summarize [Session: "Fix CI" id=sess_fix subagent=no]\n\n${SESSION_MENTION_HINT}`;
+    seedSentMessage(sent);
+    seedCell("Old draft");
+    gridCell();
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit and resend" }));
+    fireEvent.click(
+      within(await screen.findByRole("dialog", { name: "Replace your draft?" })).getByRole(
+        "button",
+        { name: "Replace draft" },
+      ),
+    );
+
+    await waitFor(() =>
+      expect(screen.getByTestId("side-chat-input")).toHaveValue("Summarize @Fix CI"),
+    );
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    expect(send).toHaveBeenCalledExactlyOnceWith(sent, "agent_side", undefined, {
+      pinnedConversationId: childId,
+    });
+  });
+
+  it("drops the cell's stale tags when an edited message replaces its draft", async () => {
+    // The replaced draft tagged "@Fix CI"; the recalled message has that text as plain words.
+    seedSentMessage("Ping @Fix CI");
+    seedCell("Old draft", {
+      text: "Old draft",
+      files: [],
+      mentions: { files: [], sessions: [sessionTag] },
+    });
+    gridCell();
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit and resend" }));
+    fireEvent.click(
+      within(await screen.findByRole("dialog", { name: "Replace your draft?" })).getByRole(
+        "button",
+        { name: "Replace draft" },
+      ),
+    );
+
+    await waitFor(() => expect(screen.getByTestId("side-chat-input")).toHaveValue("Ping @Fix CI"));
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    expect(send).toHaveBeenCalledExactlyOnceWith("Ping @Fix CI", "agent_side", undefined, {
+      pinnedConversationId: childId,
+    });
+  });
+
+  it("restores a failed grid send with its session tag as a token, and resends it unchanged", () => {
+    const sent = `Compare [Session: "Fix CI" id=sess_fix subagent=no]\n\n${SESSION_MENTION_HINT}`;
+    failedGridSend(sent);
+
+    expect(screen.getByTestId("side-chat-input")).toHaveValue("Compare @Fix CI");
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    expect(send).toHaveBeenCalledExactlyOnceWith(sent, "agent_side", undefined, {
+      pinnedConversationId: childId,
+    });
+  });
+
+  it("sends a built-in command with a review comment as a message, not a menu pick on Enter", () => {
+    conversationRegistry
+      .acquire(childId)
+      .setState({ sessionHarness: "claude-sdk", sessionStatus: "idle" });
+    seedCell("", { text: "", files: [], reviewComments: [reviewComment] });
+    gridCell();
+    const input = screen.getByTestId("side-chat-input");
+
+    fireEvent.focus(input);
+    fireEvent.change(input, { target: { value: "/help" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(screen.queryByTestId("side-chat-command-notice")).toBeNull();
+    expect(send).toHaveBeenCalledExactlyOnceWith(
+      expect.stringMatching(/^\/help\n\n```local-review-comment\n/),
+      "agent_side",
+      undefined,
+      { pinnedConversationId: childId },
+    );
+  });
+
+  it("leaves a side chat alone when its session has a shared draft", () => {
+    setSessionDraft(childId, {
+      text: "shared @Fix CI",
+      files: [],
+      mentions: { files: [], sessions: [sessionTag] },
+      reviewComments: [reviewComment],
+    });
+    renderPane(<SideChatPane childId={childId} />);
+
+    expect(screen.queryByRole("button", { name: /Open local review comment/ })).toBeNull();
+    fireEvent.change(screen.getByTestId("side-chat-input"), {
+      target: { value: "ask about it" },
+    });
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+
+    expect(send).toHaveBeenCalledExactlyOnceWith("ask about it", "agent_side", undefined, {
+      pinnedConversationId: childId,
+    });
+    expect(getSessionDraft(childId)?.reviewComments).toEqual([reviewComment]);
+  });
 });
 
 describe("history a side chat copied from its parent", () => {
@@ -1628,9 +2022,16 @@ describe("history a side chat copied from its parent", () => {
   });
 });
 
-describe("side chat sealed by the server", () => {
-  it("is read-only once the server marks the child closed", () => {
-    mockSession.labels = { "omnigent.closed": "true" };
+describe("side chat closed by the server", () => {
+  it.each<Record<string, string>>([
+    { "omnigent.closed": "true" },
+    {
+      "omnigent.closed": "true",
+      "omnigent.wrapper": "codex-native-ui-subagent",
+      "omnigent.codex_native.agent_nickname": "Side chat",
+    },
+  ])("is read-only when closed without recovery support (%j)", (labels) => {
+    mockSession.labels = labels;
     renderPane(<SideChatPane childId={childId} />);
 
     expect(
@@ -1638,6 +2039,38 @@ describe("side chat sealed by the server", () => {
     ).toBeInTheDocument();
     expect(screen.queryByTestId("side-chat-input")).toBeNull();
     expect(sessionsApi.stopSession).not.toHaveBeenCalled();
+  });
+
+  it("sends another message to a closed Codex side chat", async () => {
+    mockSession.labels = {
+      "omnigent.closed": "true",
+      "omnigent.wrapper": "codex-native-ui-subagent",
+      "omnigent.codex_native.agent_nickname": "Side chat",
+      "omnigent.codex_native.side_chat_resume": "true",
+    };
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+    renderPane(<SideChatPane childId={childId} />);
+
+    fireEvent.change(screen.getByTestId("side-chat-input"), { target: { value: "Continue" } });
+    fireEvent.keyDown(screen.getByTestId("side-chat-input"), { key: "Enter" });
+
+    await waitFor(() =>
+      expect(send).toHaveBeenCalledWith("Continue", "agent_side", undefined, {
+        pinnedConversationId: childId,
+      }),
+    );
+  });
+
+  it("preserves read-only access for a closed Codex side chat", () => {
+    mockSession.labels = {
+      "omnigent.closed": "true",
+      "omnigent.wrapper": "codex-native-ui-subagent",
+      "omnigent.codex_native.agent_nickname": "Side chat",
+      "omnigent.codex_native.side_chat_resume": "true",
+    };
+    renderPane(<SideChatPane childId={childId} readOnly />);
+
+    expect(screen.queryByTestId("side-chat-input")).toBeNull();
   });
 
   it("re-reads the child's labels after the opening /side send settles", async () => {

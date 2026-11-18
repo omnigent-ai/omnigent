@@ -80,7 +80,9 @@ _CLI_UPGRADE_TICKET = "upgrade-required"
 _CLI_UPGRADE_MESSAGE = (
     "Upgrade Omnigent to sign in: this server requires a newer login client. "
     "For the CLI, run `omni upgrade`, then retry `omnigent login`. "
-    "For mobile, update the app. For Slack, ask your administrator to update the integration."
+    "For mobile, install the newest app version, or ask your administrator if the app store "
+    "has no compatible build yet. "
+    "For Slack, ask your administrator to update the integration."
 )
 _CLI_LOGIN_MAX_BODY_BYTES = 4096
 _CLI_BROWSER_HEADERS = {
@@ -1206,15 +1208,15 @@ def _cli_consent_html(
     if upgrade_required:
         body = (
             "<h1>Update Omnigent to sign in</h1>"
-            "<p>This server has a security update that requires a newer version "
-            "of the app you used to start sign-in. This login attempt did not "
-            "grant access.</p>"
+            "<p>This server requires a newer sign-in client than the one you used. "
+            "This login attempt did not grant access.</p>"
             "<ul><li><b>CLI:</b> Run <code>omni upgrade</code>, then run your "
             "<code>omnigent login</code> command again. If the upgrade command "
             "is unavailable, update using your original installer.</li>"
-            "<li><b>iOS or Android:</b> Update the Omnigent app through your "
-            "app store or your organization's distribution channel, then "
-            "start sign-in again.</li>"
+            "<li><b>iOS or Android:</b> Install the newest Omnigent app from your "
+            "app store or your organization's distribution channel, then start "
+            "sign-in again. If no newer version is offered, a compatible build may "
+            "not be released yet.</li>"
             "<li><b>Slack:</b> Ask your administrator to update the Omnigent "
             "Slack integration, then restart setup in Slack.</li></ul>"
             "<p>If no compatible update is available, contact your server "

@@ -323,6 +323,75 @@ async def test_stop_session_cancels_inprocess_turn() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("event_type", ["interrupt", "stop_session"])
+async def test_cancel_relays_terminal_the_harness_sends_after_acknowledging(
+    event_type: str,
+) -> None:
+    """A turn's own ``response.cancelled`` relays before the cancel floor fires.
+
+    The in-process harness acknowledges an interrupt once its executor stops and
+    streams the terminal, which carries the turn's usage, just afterwards.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+
+    usage = {"input_tokens": 50, "output_tokens": 25, "total_tokens": 75}
+    gate = asyncio.Event()
+    app, _pm, harness = _build_interrupt_app(
+        gate,
+        sse_frames=[
+            _sse({"type": "response.created", "response": {"id": "resp_stop"}}),
+            _sse(
+                {
+                    "type": "response.cancelled",
+                    "response": {"id": "resp_stop", "status": "cancelled", "usage": usage},
+                }
+            ),
+        ],
+    )
+    acknowledge = harness.post
+
+    async def acknowledge_then_finish(
+        url: str, *, json: dict[str, Any], timeout: Any = None
+    ) -> Any:
+        response = await acknowledge(url, json=json, timeout=timeout)
+        if json.get("type") == "interrupt":
+            asyncio.get_running_loop().call_later(0.05, gate.set)
+        return response
+
+    harness.post = acknowledge_then_finish  # type: ignore[method-assign]
+
+    async with _runner_client(app) as client:
+        conv_id = f"terminal-relay-{event_type}"
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_int_test"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "do something"}],
+                "harness": "openai-agents",
+            },
+        )
+        assert resp.status_code == 202
+        await asyncio.wait_for(harness.post_seen.wait(), timeout=5.0)
+
+        cancel_resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": event_type},
+        )
+        assert cancel_resp.status_code == 204, cancel_resp.text
+        published = _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+
+    terminals = [event for event in published if event.get("type") == "response.cancelled"]
+    assert [event["response"].get("usage") for event in terminals] == [usage]
+
+
+@pytest.mark.asyncio
 async def test_interrupt_during_setup_phase_recovers_stuck_turn() -> None:
     """Interrupt during the setup phase finalizes the turn — the session isn't stuck.
 

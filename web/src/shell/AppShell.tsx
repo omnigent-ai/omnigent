@@ -44,6 +44,7 @@ import { useIsEmbedded } from "@/lib/embedded";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
+import { useToggleUnreadHotkey } from "@/hooks/useToggleUnreadHotkey";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
@@ -96,7 +97,9 @@ import {
 } from "@/hooks/useChildSessions";
 import { useDebugMode } from "@/hooks/useDebugMode";
 import { useBrowserAgentRelay } from "@/hooks/useBrowserAgentRelay";
-import { AGENT_BROWSER_TAB_ID, browserViewOwnerId, openBrowserTab } from "@/hooks/useBrowserTabs";
+import { browserViewOwnerId, openBrowserTab } from "@/hooks/useBrowserTabs";
+import { agentBrowserTabId } from "@/components/BrowserPane/agentTools/agentTabs";
+import { useRevealBrowserOnAgentTabs } from "@/components/BrowserPane/agentTools/useRevealBrowserOnAgentTabs";
 import { resyncBrowserSuppression } from "@/hooks/useSuppressBrowserView";
 import {
   isAgentTerminalKey,
@@ -118,7 +121,7 @@ import {
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled, isSingleUserMode } from "@/lib/capabilities";
+import { isFeatureEnabled, isSingleUserMode, SHARING_OFF_REASON } from "@/lib/capabilities";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { holdsInitialDraft, isTempConvId, useChatStore } from "@/store/chatStore";
 import { useSessionTasksActions } from "@/store/sessionTasksActions";
@@ -166,7 +169,12 @@ import { resolveDefaultShell } from "./preferredShell";
 import { WorkspacePanel } from "./WorkspacePanel";
 import { SessionRail } from "./SessionRail";
 import { TasksTabOnOpen } from "./TasksTabOnOpen";
-import { SessionCostButton, SessionOverview, useIsWideViewport } from "./SessionOverview";
+import {
+  SessionCostButton,
+  SessionOverview,
+  useDockedOverviewOpen,
+  useIsWideViewport,
+} from "./SessionOverview";
 import type { RightRailTab } from "./railTabs";
 
 /**
@@ -911,6 +919,7 @@ function AppShellImpl() {
     openSessionRow,
     permissionLevel,
   ]);
+  useToggleUnreadHotkey(activeConv);
   // Header action gating, hoisted so the desktop buttons and the mobile
   // three-dot menu render the exact same set (they can't drift apart).
   // Stop session is not a header action — it lives in the sidebar row's
@@ -939,7 +948,7 @@ function AppShellImpl() {
     ? undefined
     : isCurrentServerLocal()
       ? "Sharing is unavailable from a local server."
-      : "Sharing has been disabled for this Omnigent server.";
+      : SHARING_OFF_REASON;
   // Any viewer can fork a shared session, sub-agents included — forking a
   // child is how it gets promoted to a top-level session of its own. Gated on
   // knowing which the session is (sidebar row or loaded snapshot) so the
@@ -2252,13 +2261,19 @@ function AppShellImpl() {
     const unsubscribeLink = onInAppLinkOpen(surfaceBrowserTab);
     const unsubscribeAction = onBrowserActionRequest((evt, sourceConversationId) => {
       if (evt.action !== "navigate" || !sourceConversationId) return;
-      surfaceBrowserTab(sourceConversationId, AGENT_BROWSER_TAB_ID);
+      // The agent navigates its current tab (browser_tabs).
+      surfaceBrowserTab(sourceConversationId, agentBrowserTabId(sourceConversationId));
     });
     return () => {
       unsubscribeLink();
       unsubscribeAction();
     };
   }, [conversationId, handleRightRailTabChange, setRightPanelOpenAnimated]);
+  // An agent opening or selecting a tab (browser_tabs) surfaces the pane.
+  useRevealBrowserOnAgentTabs(conversationId, () => {
+    handleRightRailTabChange("browser");
+    setRightPanelOpenAnimated(true);
+  });
 
   // Mobile FAB → "Side chats" opens the session's side chats as a full-screen
   // drawer (the desktop rail shows them as soft tabs). Also used when a side
@@ -2975,7 +2990,7 @@ function AppShellImpl() {
     !filesPanelOpen,
   );
   // WIP(session_overview): docks beside chat when a wide window leaves the right side
-  // free; otherwise the header cost opens it over chat.
+  // free; otherwise it opens as a popover from the header cost.
   const sessionOverviewEnabled =
     serverConversationId !== undefined && isFeatureEnabled(serverInfo, "session_overview");
   const wideViewport = useIsWideViewport();
@@ -2986,17 +3001,21 @@ function AppShellImpl() {
     !executionLogsOpen &&
     !filesPanelOpen &&
     !canvasMode;
-  const [sessionOverviewDockedOpen, setSessionOverviewDockedOpen] = useState(true);
+  const [sessionOverviewDockedOpen, setSessionOverviewDockedOpen] = useDockedOverviewOpen();
   const [sessionOverviewOverlayOpen, setSessionOverviewOverlayOpen] = useState(false);
   const sessionOverviewOpen =
     sessionOverviewEnabled &&
     (sessionOverviewDocked ? sessionOverviewDockedOpen : sessionOverviewOverlayOpen);
-  const toggleSessionOverview = useCallback(() => {
-    const setOpen = sessionOverviewDocked
-      ? setSessionOverviewDockedOpen
-      : setSessionOverviewOverlayOpen;
-    setOpen((open) => !open);
-  }, [sessionOverviewDocked]);
+  const setSessionOverviewOpen = sessionOverviewDocked
+    ? setSessionOverviewDockedOpen
+    : setSessionOverviewOverlayOpen;
+  // One card for both placements; only one of them mounts it at a time.
+  const sessionOverviewCard = (
+    <SessionOverview
+      onClose={() => setSessionOverviewOpen(false)}
+      changesSessionId={showFilesPanel ? serverConversationId : undefined}
+    />
+  );
   useEffect(() => {
     if (!workspacePanelVisible || !focusWorkspaceTabsOnOpenRef.current) return;
     focusWorkspaceTabsOnOpenRef.current = false;
@@ -3135,9 +3154,12 @@ function AppShellImpl() {
                     sessionOverviewControl={
                       sessionOverviewEnabled && (
                         <SessionCostButton
-                          expanded={sessionOverviewOpen}
-                          onToggle={toggleSessionOverview}
-                        />
+                          docked={sessionOverviewDocked}
+                          open={sessionOverviewOpen}
+                          onOpenChange={setSessionOverviewOpen}
+                        >
+                          {sessionOverviewCard}
+                        </SessionCostButton>
                       )
                     }
                     // Real docked state — deliberately NOT `|| sidebarPeek`. Peek
@@ -3233,17 +3255,6 @@ function AppShellImpl() {
                       </ShellCommandContext.Provider>
                     </RenderErrorBoundary>
                   </SubagentPanelOpenerContext.Provider>
-                  {sessionOverviewOpen && !sessionOverviewDocked && (
-                    <aside
-                      aria-label="Session overview"
-                      className="absolute right-2 top-12 z-20 w-64 max-md:hidden"
-                    >
-                      <SessionOverview
-                        onClose={toggleSessionOverview}
-                        changesSessionId={showFilesPanel ? serverConversationId : undefined}
-                      />
-                    </aside>
-                  )}
                 </GridSessionMain>
 
                 {sessionOverviewOpen && sessionOverviewDocked && (
@@ -3251,10 +3262,7 @@ function AppShellImpl() {
                     aria-label="Session overview"
                     className="flex w-64 shrink-0 flex-col overflow-y-auto px-2 pb-3 pt-12"
                   >
-                    <SessionOverview
-                      onClose={toggleSessionOverview}
-                      changesSessionId={showFilesPanel ? serverConversationId : undefined}
-                    />
+                    {sessionOverviewCard}
                   </aside>
                 )}
 

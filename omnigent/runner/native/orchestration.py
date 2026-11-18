@@ -89,6 +89,7 @@ from omnigent.native.native_dispatch import resolve_hook
 from omnigent.pi_prompt import pi_prompt_args
 from omnigent.process_logging import process_log_reference
 from omnigent.runner.identity import runner_mcp_disabled_servers_active_harnesses
+from omnigent.runner.memory_guidance import memory_startup_guidance
 from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
     CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -2927,11 +2928,15 @@ async def _auto_create_pi_terminal(
             build_native_relay_tool_schemas,
             filter_workflow_tool_schemas,
         )
+        from omnigent.tools.browser_agent_tools import filter_native_relay_browser_tools
 
         spec_for_tools = _unwrap_resolved_spec(agent_spec)
-        pi_tools = filter_workflow_tool_schemas(
+        relay_tools = filter_workflow_tool_schemas(
             build_native_relay_tool_schemas(spec_for_tools),
             enabled=await server_workflows_enabled(server_client),
+        )
+        pi_tools = await filter_native_relay_browser_tools(
+            relay_tools, session_id=session_id, server_client=server_client
         )
     except Exception:  # tool registration is additive
         _logger.warning(
@@ -2980,7 +2985,9 @@ async def _auto_create_pi_terminal(
         system_prompt_mode = pi_spec.executor.config.get("system_prompt_mode", "append")
         if system_prompt_mode == "replace" and raw_author_instructions(pi_spec) is None:
             raise ValueError("system_prompt_mode='replace' requires non-empty instructions")
-    startup_instructions = _native_startup_instructions_from_spec(agent_spec)
+    startup_instructions = await _native_startup_instructions(
+        agent_spec, server_client, session_id, workspace=workspace
+    )
     instructions_path = write_agent_instructions(bridge_dir, startup_instructions)
     provider_args: list[str] = []
     pi_env_unset = pi_native_env_unset(os.environ)
@@ -5870,13 +5877,8 @@ async def _auto_create_codex_terminal(
         from omnigent.inner.hook_scripts.subagent_router import smart_routing_spawn_note
 
         _codex_routing_note = smart_routing_spawn_note("codex-native")
-    _codex_developer_instructions = "\n\n".join(
-        x
-        for x in [
-            _native_startup_instructions_from_spec(agent_spec),
-            _codex_routing_note,
-        ]
-        if x
+    _codex_developer_instructions = await _native_startup_instructions(
+        agent_spec, server_client, session_id, _codex_routing_note, workspace=workspace
     )
     # SDK initialization can block on DNS/auth before model discovery times out.
     # Keep it off the runner loop so heartbeats and other sessions can progress.
@@ -7862,6 +7864,79 @@ def _native_startup_instructions_from_spec(
     return build_native_startup_instructions(spec)
 
 
+async def _native_startup_instructions(
+    agent_spec: AgentSpec | ResolvedSpec | None,
+    server_client: httpx.AsyncClient | None,
+    session_id: str,
+    *launch_notes: str | None,
+    workspace: str | Path | None = None,
+) -> str:
+    """
+    Compose a native harness's startup instructions, including long-term memory.
+
+    Joins :func:`_native_startup_instructions_from_spec`, any launch notes (e.g.
+    the routed spawn note), and the memory guidance, skipping empty parts.
+
+    :param agent_spec: The session's agent spec, or ``None``.
+    :param server_client: The runner's client for the Omnigent server, used to
+        fetch the memory index.
+    :param session_id: The session being launched.
+    :param launch_notes: Additional framework notes, in order; ``None`` skipped.
+    :param workspace: The session's working directory, which names its project
+        in the memory guidance.
+    :returns: The joined text.
+    """
+    parts = [
+        _native_startup_instructions_from_spec(agent_spec),
+        *launch_notes,
+        await memory_startup_guidance(server_client, session_id, agent_spec, workspace=workspace),
+    ]
+    return "\n\n".join(part for part in parts if part)
+
+
+# Claude Code's own setting for its machine-local auto memory.
+_CLAUDE_AUTO_MEMORY_OFF_ENV = "CLAUDE_CODE_DISABLE_AUTO_MEMORY"
+# A slow server must not delay the launch.
+_CLAUDE_AUTO_MEMORY_CHECK_SECONDS = 5.0
+
+
+async def _claude_auto_memory_env(
+    agent_spec: AgentSpec | ResolvedSpec | None, server_client: httpx.AsyncClient | None
+) -> dict[str, str]:
+    """
+    Turn Claude Code's own auto memory off when the session has Omnigent memory.
+
+    Two memory systems would keep separate, possibly conflicting notes, and
+    Claude Code's stays on the host, so a sandboxed session would lose it. It is
+    turned off only when the agent has the memory tools and the server confirms
+    memory is on, so a session never loses both. A value already set in the
+    runner's environment is kept.
+
+    :param agent_spec: The session's agent spec, or ``None``.
+    :param server_client: The runner's client for the Omnigent server.
+    :returns: ``{"CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1"}`` when Omnigent memory
+        is on, otherwise ``{}``.
+    """
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    if (
+        spec is None
+        or not spec.tool_groups.memory
+        or server_client is None
+        or _CLAUDE_AUTO_MEMORY_OFF_ENV in os.environ
+    ):
+        return {}
+    from omnigent.runner.tool_dispatch import _server_has_memory
+
+    try:
+        has_memory = await asyncio.wait_for(
+            _server_has_memory(server_client), timeout=_CLAUDE_AUTO_MEMORY_CHECK_SECONDS
+        )
+    except Exception:
+        _logger.debug("memory availability unknown; leaving Claude auto memory on", exc_info=True)
+        return {}
+    return {_CLAUDE_AUTO_MEMORY_OFF_ENV: "1"} if has_memory else {}
+
+
 def _cursor_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> str | None:
     """
     Read the cursor-agent model id to launch the native TUI with, from a spec.
@@ -9256,6 +9331,7 @@ async def _auto_create_claude_terminal(
         validate_claude_hook_interpreter_compatibility,
     )
     from omnigent.harnesses.claude_native.forwarder import reset_transcript_forward_state
+    from omnigent.inner.bundle_skills import claude_agents_skill_overlay
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 
     workspace = str(
@@ -9337,16 +9413,14 @@ async def _auto_create_claude_terminal(
     )
 
     _pre_wipe_claude_sid = _read_csid_pre_wipe(_bridge_dir_for_bridge_id(bridge_id))
-    # Resolved once here and reused below (env_spec) so the bridge's own
-    # sys_os_* tools and the terminal process see the same sandbox — the
-    # agent's declared os_env.sandbox, already overridden by any
-    # enforce_sandbox/force_sandbox policy verdict upstream.
+    # The agent's declared os_env.sandbox, already overridden by any
+    # enforce_sandbox/force_sandbox policy verdict upstream; the terminal
+    # process runs under it (env_spec below).
     agent_os_env = _agent_os_env_from_spec(agent_spec)
     bridge_dir = prepare_bridge_dir(
         session_id,
         bridge_id=bridge_id,
         workspace=Path(workspace),
-        sandbox=(agent_os_env.sandbox if agent_os_env is not None else None),
     )
     # Cancel any surviving forwarder BEFORE wiping its cursor/seen state, else it
     # re-posts with fresh dedup state alongside the forwarder spawned below.
@@ -9941,14 +10015,16 @@ async def _auto_create_claude_terminal(
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
         model_overrides=claude_config.model_overrides if claude_config is not None else None,
         subagent_router_dir=subagent_router_dir,
-        append_system_prompt="\n\n".join(
-            x for x in [_native_startup_instructions_from_spec(agent_spec), routed_spawn_note] if x
+        append_system_prompt=await _native_startup_instructions(
+            agent_spec, server_client, session_id, routed_spawn_note, workspace=workspace
         ),
         allowed_tools=routed_spawn_tools,
         # The route-turn hook is registered only when this session can
         # actually route; otherwise every submit would pay its round trip.
         turn_routing=_claude_turn_router is not None,
     )
+    skill_overlay = claude_agents_skill_overlay(bridge_dir)
+    trusted_added_dirs = (skill_overlay,) if str(skill_overlay) in claude_args else ()
 
     # Apply the per-harness startup command/args override from config
     # (``harness.claude-native.{command,args}`` in ~/.omnigent/config.yaml) so a
@@ -9977,13 +10053,12 @@ async def _auto_create_claude_terminal(
         validate_claude_hook_interpreter_compatibility(resolved_claude)
 
     claude_terminal_env_unset = _claude_terminal_env_unset(claude_config)
+    claude_auto_memory_env = await _claude_auto_memory_env(agent_spec, server_client)
 
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
     # and ``parent_os_env`` below, launch_terminal falls back to
     # _default_sandbox_for_platform (linux_bwrap), overriding the YAML config.
-    # ``agent_os_env`` was already resolved above for ``prepare_bridge_dir``,
-    # so the terminal process and the bridge's sys_os_* tools agree.
     env_spec = TerminalEnvSpec(
         os_env=OSEnvSpec(
             type="caller_process",
@@ -10001,6 +10076,7 @@ async def _auto_create_claude_terminal(
                 client_surface=resource_registry.client_surface(session_id),
             ),
             **claude_terminal_relay_env(bridge_dir),
+            **claude_auto_memory_env,
         },
         # Names to strip (see ``_claude_terminal_env_unset``). Dropping
         # ``DATABRICKS_CONFIG_PROFILE`` matters because Claude's MCP servers
@@ -10026,6 +10102,7 @@ async def _auto_create_claude_terminal(
         ensure_claude_workspace_trusted(
             _claude_terminal_launch_cwd(env_spec, agent_os_env),
             env=_claude_terminal_launch_env(env_spec),
+            added_dirs=trusted_added_dirs,
         )
     except BaseException as seed_error:
         # No forwarder owns the routers yet, so release the ones this launch started.
