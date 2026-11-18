@@ -890,6 +890,27 @@ def _check_capacity_and_work_limits(
         assert not posts
         assert not receipt.exists()
         assert not list(tmp_path.glob("comment*.md"))
+        if table_variant == "part-limit":
+            raw_ceiling = _HELPERS["COMMENT_BYTE_LIMIT"] * limit
+            assert len(composed.encode("utf-8")) < raw_ceiling
+            initial_oversized = "é" * (raw_ceiling // 2 + 1) + "\n\n" + composed
+            assert len(initial_oversized.encode("utf-8")) > raw_ceiling
+
+            def unexpected_context(*args, **kwargs):
+                pytest.fail("Initial raw-byte refusal must precede Markdown context rendering")
+
+            with monkeypatch.context() as context:
+                context.setitem(
+                    _HELPERS["review_comments"].__globals__,
+                    "_markdown_context",
+                    unexpected_context,
+                )
+                with pytest.raises(
+                    ValueError, match=r"^Polly review exceeds the publication part limit\.$"
+                ):
+                    _published_comments(initial_oversized, review_path, receipt)
+            assert not posts and not receipt.exists()
+            assert sorted(path.name for path in tmp_path.iterdir()) == ["review.md"]
     return
 
 
@@ -1187,6 +1208,10 @@ def test_multipart_inline_destinations_keep_rendered_meaning(
         "quoted-definition",
         "list-definition",
         "midline-definition",
+        "code-span-completed-reference-details-prose",
+        "code-span-completed-reference-details-rationale",
+        "code-span-completed-reference-summary-prose",
+        "code-span-completed-reference-summary-rationale",
         "short",
         "fenced-literal",
         "inline-control",
@@ -1195,6 +1220,10 @@ def test_multipart_inline_destinations_keep_rendered_meaning(
 def test_multipart_reference_dependencies_are_refused(
     form: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    if form.startswith("code-span-completed-reference-"):
+        _check_review_context(form, tmp_path, monkeypatch)
+        return
+
     from markdown_it import MarkdownIt
 
     parser = MarkdownIt("commonmark").enable("table")
@@ -1381,10 +1410,6 @@ def test_multipart_reference_dependencies_are_refused(
         "code-span-completed-link-details-rationale",
         "code-span-completed-link-summary-prose",
         "code-span-completed-link-summary-rationale",
-        "code-span-completed-reference-details-prose",
-        "code-span-completed-reference-details-rationale",
-        "code-span-completed-reference-summary-prose",
-        "code-span-completed-reference-summary-rationale",
         "code-span-comparison-cut-guard",
         "code-span-completed-link-cut-guard",
         "code-span-html-attribute-quoted-close",
@@ -2121,6 +2146,16 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         ("html-declaration", "closing-tail-whitespace"),
         ("html-pre", "closing-tail-short"),
         ("html-comment", "closing-tail-short"),
+        ("indented-disclosure", "outside-open"),
+        ("tab-disclosure", "outside-open"),
+        ("indented-disclosure", "inside-close"),
+        ("tab-disclosure", "inside-close"),
+        ("indented-disclosure", "outside-summary"),
+        ("tab-disclosure", "inside-summary"),
+        ("indented-disclosure", "short-outside-open"),
+        ("tab-disclosure", "short-inside-close"),
+        ("indented-disclosure", "fenced-literal"),
+        ("tab-disclosure", "raw-literal"),
     ],
     ids=lambda value: value,
 )
@@ -2137,12 +2172,54 @@ def test_multipart_keeps_literal_blocks_and_paragraph_dependencies_indivisible(
     )
     parser = MarkdownIt("commonmark").enable("table")
 
+    class FooterContext(HTMLParser):
+        footers = 0
+        raw_depth = 0
+        details_depth = 0
+        details_openings = 0
+
+        def handle_starttag(self, tag: str, attrs: list) -> None:
+            if tag in {"pre", "textarea", "code"}:
+                self.raw_depth += 1
+            elif tag == "details":
+                self.details_depth += 1
+                self.details_openings += 1
+            elif tag == "sub":
+                assert self.raw_depth == 0, "Footer is inside literal HTML or code"
+                assert self.details_depth == 0, "Footer is inside a disclosure"
+                self.footers += 1
+
+        def handle_endtag(self, tag: str) -> None:
+            if tag in {"pre", "textarea", "code"}:
+                self.raw_depth -= 1
+            elif tag == "details":
+                assert self.details_depth > 0, "A comment has an unmatched disclosure closer"
+                self.details_depth -= 1
+
     calibration = _HELPERS["review_comments"]("x" * 130000 + "\n\n" + composed, **metadata)
     capacity = len(_multipart_content(calibration[0]))
     assert _HELPERS["COMMENT_BYTE_LIMIT"] == 60000
     amount = 130000 if form == "oversized" else 100
     prefix = ""
-    if kind.startswith("html-"):
+    indented_disclosure = kind in {"indented-disclosure", "tab-disclosure"}
+    literal_control = form in {"fenced-literal", "raw-literal"}
+    if indented_disclosure:
+        indentation = "\t" if kind == "tab-disclosure" else "    "
+        literal = (
+            "</details>"
+            if "close" in form
+            else "<summary>Literal summary</summary>"
+            if "summary" in form
+            else "<details>"
+        )
+        block = indentation + literal + "\n\n"
+        if form == "fenced-literal":
+            block = "```text\n" + block + "```\n\n"
+        elif form == "raw-literal":
+            block = "<!--\n" + block + "-->\n\n"
+        if "inside" in form:
+            prefix = "<details>\n<summary>Real disclosure</summary>\n\n"
+    elif kind.startswith("html-"):
         opener, closer = {
             "html-comment": ("<!--", "-->"),
             "html-pre": ("<pre>", "</pre>"),
@@ -2203,8 +2280,10 @@ def test_multipart_keeps_literal_blocks_and_paragraph_dependencies_indivisible(
         block = block.removesuffix("\n")
         prefix = "p" * (capacity - len(earlier + block) - 2) + "\n\n" + earlier
         assert len(prefix + block) == capacity
-    short = form in {"short", "closing-tail-short"}
+    short = form in {"short", "closing-tail-short"} or form.startswith("short-")
     tail = "After.\n\n" + ("" if short else "z" * 70000 + "\n\n")
+    if indented_disclosure and "inside" in form:
+        tail += "</details>\n\n"
     if form in {
         "closing-tail-context",
         "closing-tail-cdata",
@@ -2218,7 +2297,22 @@ def test_multipart_keeps_literal_blocks_and_paragraph_dependencies_indivisible(
     original = parser.parse(review)
     expected_tables = 0 if form == "unclosed" else 2 if form == "table-boundary" else 1
     assert sum(token.type == "table_open" for token in original) == expected_tables
-    if kind.startswith("paragraph-"):
+    if indented_disclosure:
+        original_context = FooterContext()
+        original_context.feed(parser.render(review))
+        original_context.close()
+        assert original_context.details_depth == original_context.raw_depth == 0
+        composed_context = FooterContext()
+        composed_context.feed(parser.render(composed))
+        composed_context.close()
+        assert original_context.details_openings == (
+            composed_context.details_openings + int("inside" in form)
+        )
+        if not literal_control:
+            assert [token.content for token in original if token.type == "code_block"] == [
+                literal + "\n"
+            ], "The disclosure-looking tag must independently parse as literal code"
+    elif kind.startswith("paragraph-"):
         assert any(
             token.type == "inline"
             and "Paragraph first line" in token.content
@@ -2249,8 +2343,36 @@ def test_multipart_keeps_literal_blocks_and_paragraph_dependencies_indivisible(
         assert not posts and not receipt.exists()
         assert sorted(path.name for path in tmp_path.iterdir()) == ["review.md"]
         return
-    comments = _HELPERS["review_comments"](review, **metadata)
+    if indented_disclosure:
+        review_path, receipt, posts = _prepare_publication(
+            tmp_path, monkeypatch, head_sha=metadata["head_sha"], run_url=metadata["run_url"]
+        )
+        message = "Polly review indented disclosure tags are not supported in multipart comments."
+        try:
+            comments = _published_comments(review, review_path, receipt)
+        except ValueError as error:
+            assert not short and not literal_control
+            assert str(error) == message
+            assert not posts and not receipt.exists()
+            assert sorted(path.name for path in tmp_path.iterdir()) == ["review.md"]
+            with pytest.raises(ValueError, match=re.escape(message)):
+                _HELPERS["_markdown_context"](review, continuing=False)
+            return
+        assert posts == [*comments[1:], comments[0]]
+        assert receipt.read_text() == metadata["head_sha"] + "\n"
+    else:
+        comments = _HELPERS["review_comments"](review, **metadata)
     assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
+    if not short or indented_disclosure:
+        for comment in comments:
+            context = FooterContext()
+            context.feed(parser.render(comment))
+            context.close()
+            assert context.footers == 1, "Footer is hidden inside an HTML comment"
+            assert context.raw_depth == 0
+            assert context.details_depth == 0, "A comment leaves a disclosure open"
+    if indented_disclosure and not short and not literal_control:
+        pytest.fail("Indented disclosure tags must refuse before multipart publication")
     if short:
         assert len(comments) == 1
         assert comments[0].split("Polly AI Review\n\n", 1)[1].rsplit("\n---\n", 1)[0] == review
@@ -2280,7 +2402,17 @@ def test_multipart_keeps_literal_blocks_and_paragraph_dependencies_indivisible(
     assert sum(comment.count("<!-- polly-reviewed-sha:") for comment in comments) == 1
     row = next(line for line in _REVIEW.splitlines() if line.startswith("| tests/"))
     assert sum(comment.count(row) for comment in comments) == 1
-    if kind.startswith("paragraph-"):
+    if indented_disclosure:
+        for token_type in ("fence", "code_block", "html_block"):
+            expected = [token.content for token in original if token.type == token_type]
+            actual = [
+                token.content
+                for fragment in fragments
+                for token in parser.parse(fragment)
+                if token.type == token_type
+            ]
+            assert actual == expected
+    elif kind.startswith("paragraph-"):
         assert not any(
             token.type in {"code_block", "fence"} for tokens in rendered for token in tokens
         )
@@ -2332,28 +2464,6 @@ def test_multipart_keeps_literal_blocks_and_paragraph_dependencies_indivisible(
             if token.type == "inline" and tokens[index - 1].type == "th_open"
         ].count("Earlier") == 1, "A raw block must not carry a prior table header forward"
     assert sum(block.rstrip("\n") in fragment for fragment in fragments) == 1
-
-    class FooterContext(HTMLParser):
-        footers = 0
-        raw_depth = 0
-
-        def handle_starttag(self, tag: str, attrs: list) -> None:
-            if tag in {"pre", "textarea", "code"}:
-                self.raw_depth += 1
-            elif tag == "sub":
-                assert self.raw_depth == 0, "Footer is inside literal HTML or code"
-                self.footers += 1
-
-        def handle_endtag(self, tag: str) -> None:
-            if tag in {"pre", "textarea", "code"}:
-                self.raw_depth -= 1
-
-    for comment in comments:
-        context = FooterContext()
-        context.feed(parser.render(comment))
-        context.close()
-        assert context.footers == 1, "Footer is hidden inside an HTML comment"
-        assert context.raw_depth == 0
 
 
 @pytest.mark.parametrize(

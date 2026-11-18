@@ -420,6 +420,7 @@ def _markdown_context(
     Reference-definition-like lines outside fenced/raw blocks fail closed in multipart.
     Destination-bearing words and inline-link blocks remain indivisible at cuts.
     Ambiguous inline-code contexts with destinations fail closed.
+    Indented disclosure-tag lines outside fenced/raw blocks fail closed in multipart.
     Inline-code formatting across fragments is not balanced.
     """
     details = 0
@@ -748,6 +749,12 @@ def _markdown_context(
                     "Polly review ambiguous inline destinations are not supported "
                     "in multipart comments."
                 )
+        if re.match(r"(?: {4}| {0,3}\t)", line) and line.lstrip().startswith(
+            ("<details>", "</details>", "<summary>")
+        ):
+            raise ValueError(
+                "Polly review indented disclosure tags are not supported in multipart comments."
+            )
         if line.lstrip().startswith(("<details>", "</details>", "<summary>")):
             for tag in re.findall(r"</?details>|</?summary>", line):
                 if tag == "<details>":
