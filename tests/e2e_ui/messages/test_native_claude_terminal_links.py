@@ -23,7 +23,7 @@ from tests.e2e_ui.conftest import (
 
 from ..shells.test_terminal_session_links import (
     expect_terminal_link_hovered,
-    record_terminal_mouse_presses,
+    record_terminal_mouse_reports,
 )
 from .test_native_claude_render_parity import (
     _CLAUDE_MOCK_MODEL,
@@ -197,7 +197,7 @@ def test_fullscreen_claude_keeps_plain_clicks_and_command_click_opens(
     base_url, session_id = native_claude_mock_session
     page: Page = request.getfixturevalue("page")
     opened = _serve_link_destination(page)
-    presses = record_terminal_mouse_presses(page)
+    reports = record_terminal_mouse_reports(page)
     _open_claude_terminal(page, base_url, session_id)
 
     url, rows = _ask_for_long_link(page, base_url, session_id, mock_llm_server_url)
@@ -207,16 +207,16 @@ def test_fullscreen_claude_keeps_plain_clicks_and_command_click_opens(
     point = _cell_point(page, base_url, session_id, first_cell)
 
     _hover(page, point)
-    presses.clear()
+    reports.clear()
     page.mouse.click(*point)
     page.wait_for_timeout(2_000)  # custom-lint: disable=sleep-then-assert -- no tab may open
     assert opened == []
     assert len(page.context.pages) == 1
-    assert presses and all(code & 3 == 0 for code in presses)
+    assert reports and all(code & 3 == 0 for code in reports)
 
-    presses.clear()
+    reports.clear()
     _command_click_opens(page, point, url)
     _command_click_opens(page, _cell_point(page, base_url, session_id, wrapped_cell), url)
     page.wait_for_timeout(1_000)  # custom-lint: disable=sleep-then-assert -- no extra tab or press
     assert opened == [url, url]
-    assert presses == []
+    assert reports == []

@@ -33,8 +33,8 @@ _WRAPPED_URL = (
     f"https://{_WRAPPED_URL_HOST}/explore/connections/seg-path/seg-path/pagerduty-mcp?o=1#end"
 )
 _TRACKED_URL = f"https://{_WRAPPED_URL_HOST}/docs/mouse-tracking"
-# SGR mouse report: ESC [ < button ; column ; row, then M for a press.
-_SGR_PRESS = re.compile(r"\x1b\[<(\d+);\d+;\d+M")
+# SGR mouse report: ESC [ < button ; column ; row, then M for a press or m for a release.
+_SGR_BUTTON_REPORT = re.compile(r"\x1b\[<(\d+);\d+;\d+[Mm]")
 _SGR_MOTION_BIT = 32
 
 
@@ -112,15 +112,15 @@ def _record_pane_sizes(page: Page) -> list[list[tuple[int, int]]]:
     return panes
 
 
-def record_terminal_mouse_presses(page: Page) -> list[int]:
-    """Collect the button codes of SGR mouse presses the page sends to terminal sockets."""
-    presses: list[int] = []
+def record_terminal_mouse_reports(page: Page) -> list[int]:
+    """Collect the button codes of SGR mouse reports the page sends to terminal sockets."""
+    reports: list[int] = []
 
     def _on_frame(payload: str | bytes) -> None:
         text = payload.decode("latin-1") if isinstance(payload, bytes) else payload
-        presses.extend(
+        reports.extend(
             int(match.group(1))
-            for match in _SGR_PRESS.finditer(text)
+            for match in _SGR_BUTTON_REPORT.finditer(text)
             if not int(match.group(1)) & _SGR_MOTION_BIT
         )
 
@@ -129,7 +129,7 @@ def record_terminal_mouse_presses(page: Page) -> list[int]:
             socket.on("framesent", _on_frame)
 
     page.on("websocket", _on_socket)
-    return presses
+    return reports
 
 
 def _echo_destination(route: Route) -> None:
@@ -225,7 +225,7 @@ def test_mouse_tracking_program_keeps_plain_clicks_and_command_click_opens_the_l
     base_url, session_id = terminal_session
     page: Page = request.getfixturevalue("page")
     page.context.route(f"https://{_WRAPPED_URL_HOST}/**", _echo_destination)
-    presses = record_terminal_mouse_presses(page)
+    reports = record_terminal_mouse_reports(page)
 
     page.goto(f"{base_url}/c/{session_id}")
     _open_new_shell(page)
@@ -234,7 +234,7 @@ def test_mouse_tracking_program_keeps_plain_clicks_and_command_click_opens_the_l
     page.mouse.move(*point)
     expect_terminal_link_hovered(page)
 
-    presses.clear()
+    reports.clear()
     try:
         with page.expect_popup(timeout=2_000):
             page.mouse.click(*point)
@@ -242,11 +242,11 @@ def test_mouse_tracking_program_keeps_plain_clicks_and_command_click_opens_the_l
         pass
     else:
         raise AssertionError("a plain click opened the link while the program tracks the mouse")
-    assert presses and all(code & 3 == 0 for code in presses), (
-        f"the plain click never reached the program as a left-button press: {presses}"
+    assert reports and all(code & 3 == 0 for code in reports), (
+        f"the plain click never reached the program as a left-button press: {reports}"
     )
 
-    presses.clear()
+    reports.clear()
     page.mouse.move(*point)
     expect_terminal_link_hovered(page)
     with page.expect_popup(timeout=5_000) as popup_info:
@@ -259,4 +259,4 @@ def test_mouse_tracking_program_keeps_plain_clicks_and_command_click_opens_the_l
     ).to_be_visible()
     assert popup.url == _TRACKED_URL
     page.wait_for_timeout(500)  # custom-lint: disable=sleep-then-assert -- no late press
-    assert presses == [], f"the command-click also reached the program: {presses}"
+    assert reports == [], f"the command-click also reached the program: {reports}"
