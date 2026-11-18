@@ -92,12 +92,21 @@ def test_reconstructs_only_model_headers(header: str, client_header: str) -> Non
 
 
 @pytest.mark.parametrize("gateway", [True, False])
+@pytest.mark.parametrize(
+    ("base_url", "coding_agent_mode"),
+    [
+        ("https://gateway.example.test/anthropic", None),
+        ("https://docs.databricks.com/anthropic", "true"),
+    ],
+)
 def test_gateway_attribution_comes_from_parent_metadata(
-    monkeypatch: pytest.MonkeyPatch, gateway: bool
+    monkeypatch: pytest.MonkeyPatch,
+    gateway: bool,
+    base_url: str,
+    coding_agent_mode: str | None,
 ) -> None:
     from omnigent.inner import claude_model_access as module
 
-    base_url = "https://gateway.example.test/anthropic"
     monkeypatch.setattr(module, "is_databricks_ai_gateway_url", lambda _: gateway)
     via_ug = Mock(return_value=True)
     monkeypatch.setattr(module, "is_ug_route", via_ug)
@@ -118,7 +127,7 @@ def test_gateway_attribution_comes_from_parent_metadata(
             ("x-databricks-use-coding-agent-mode", "false"),
         ],
     )
-    assert request.header("x-databricks-use-coding-agent-mode") is None
+    assert request.header("x-databricks-use-coding-agent-mode") == coding_agent_mode
     assert request.header("Databricks-Custom-Coding-Agent") == ("claude-code" if gateway else None)
     assert request.header("Databricks-Custom-Client-Surfaces") == (
         "omnigent-desktop, ug" if gateway else None
@@ -1268,6 +1277,30 @@ def test_databricks_auth_pins_the_trusted_executable_before_worker_start(
     policy = SandboxPolicy("linux_bwrap", True, [tmp_path], [tmp_path], [], False)
     with pytest.raises(ValueError, match=r"auth executable.*outside sandbox-writable"):
         access.protect_sources(policy, tmp_path)
+
+
+def test_databricks_auth_requires_trusted_python_helper_before_worker_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.inner import claude_model_access as module
+
+    monkeypatch.setattr(
+        module,
+        "_resolve_auth_executable",
+        Mock(side_effect=FileNotFoundError("trusted profile helper is unavailable")),
+    )
+    mint = AsyncMock()
+    monkeypatch.setattr(module, "mint_profile_token", mint)
+
+    with pytest.raises(FileNotFoundError, match="trusted profile helper is unavailable"):
+        resolve_claude_model_access(
+            {
+                HELPER_ENV: "profile-token helper",
+                "ANTHROPIC_BASE_URL": "https://model.test/gateway",
+            },
+            databricks_profile="selected-profile",
+        )
+    mint.assert_not_awaited()
 
 
 @pytest.fixture

@@ -552,8 +552,10 @@ and Bedrock/Vertex/Foundry transports fail closed. This automatic integration is
 specific to `claude-sdk`; it does not change `claude-native` launches or other
 harnesses' model-authentication policy.
 
-The trusted profile-token helper requires an absolute Python interpreter shebang; its
-interpreter and installed modules must stay outside sandbox write grants.
+Profile authentication requires the trusted Python profile-token helper on the parent's `PATH`; a profile
+configured only through the Databricks CLI cannot start a sandboxed Claude worker.
+The helper requires an absolute Python interpreter shebang, and its interpreter
+and installed modules must stay outside sandbox write grants.
 The parent retains any `DATABRICKS_CONFIG_FILE` selection. Managed Claude policy
 remains in force, but managed configuration containing model credentials or
 `apiKeyHelper` is rejected before it becomes readable by the CLI. Store model

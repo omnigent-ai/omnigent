@@ -833,6 +833,7 @@ def test_isolated_import_snapshot_failure_is_closed(
         sb._isolated_launcher_import_roots(str(tmp_path / "uncached-interpreter"))
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX file permission check")
 def test_launcher_snapshot_rejects_group_or_world_readable_file() -> None:
     path = sb.create_exec_launcher(
         "/bin/true", _policy("none", active=False), env_overrides={"TOKEN": "placeholder"}
