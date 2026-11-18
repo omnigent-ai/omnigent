@@ -720,7 +720,7 @@ function loadNavigationHarness({
   const source =
     fs.readFileSync(mainPath, "utf8") +
     "\nmodule.exports.sshHosts = sshHosts;" +
-    "\nmodule.exports.panelTestApi = { activeWindow, mainWindows, enqueueDeepLink };" +
+    "\nmodule.exports.panelTestApi = { activeWindow, mainWindows, enqueueDeepLink, floatingComposer, loadSetupPage };" +
     "\nmodule.exports.testApi = { handleDeepLink, buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, setBlockedHintDelayMs: (ms) => { blockedHintDelayMs = ms; }, blockedHintDelayMs: () => blockedHintDelayMs, setServerResponseTimeoutMs: (ms) => { serverResponseTimeoutMs = ms; }, serverResponseTimeoutMs: () => serverResponseTimeoutMs, cancelReconnect };";
   const module = { exports: {} };
   const sandbox = {
@@ -3710,6 +3710,7 @@ describe("CLI deep-link handoff", () => {
 
 describe("floating panel wiring", () => {
   const chord = "CommandOrControl+Shift+Space";
+  const serverUrl = "https://host.example/ml/omnigents";
   const announce = (h, version, url = h.webContents.getURL()) =>
     h.ipc.get("omnigent:floating-composer:announce")(
       { sender: h.webContents, senderFrame: { url } },
@@ -3725,9 +3726,10 @@ describe("floating panel wiring", () => {
     assert.equal(h.calls.globalShortcuts, undefined);
     announce(h, 1);
     assert.deepEqual(h.calls.globalShortcuts, [["register", chord]]);
-    // A same-document navigation keeps it; a new document has to announce again.
-    h.webContents.emitWith("did-start-navigation", { isMainFrame: true, isSameDocument: true });
-    h.webContents.emitWith("did-start-navigation", { isMainFrame: true, isSameDocument: false });
+    // An in-page route change keeps it; a new document has to announce again once it commits.
+    h.webContents.emitWith("did-navigate-in-page", {}, `${serverUrl}/c/abc`, true);
+    assert.equal(h.calls.globalShortcuts.length, 1);
+    h.webContents.emitWith("did-navigate", {}, `${serverUrl}/`);
     assert.deepEqual(h.calls.globalShortcuts, [
       ["register", chord],
       ["unregister", chord],
@@ -3735,6 +3737,18 @@ describe("floating panel wiring", () => {
     // Holding the default chord writes nothing to settings.json.
     const saved = fs.existsSync(h.settingsPath) ? fs.readFileSync(h.settingsPath, "utf8") : "";
     assert.doesNotMatch(saved, /floating_composer/);
+  });
+
+  it("lets go of ⇧⌘Space when the supporting page's renderer goes away", (t) => {
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    announce(h, 1);
+    h.webContents.emitWith("render-process-gone", {}, { reason: "crashed" });
+    assert.deepEqual(h.calls.globalShortcuts, [
+      ["register", chord],
+      ["unregister", chord],
+    ]);
   });
 
   it("holds nothing off macOS, and says the panel isn't available there", (t) => {
@@ -3773,6 +3787,149 @@ describe("floating panel wiring", () => {
       h.calls.progress.some(({ channel }) => channel === "omnigent:open-path"),
       false,
     );
+  });
+
+  /**
+   * Turns the harness window into its server's panel, opened as ⇧⌘Space would, next to a
+   * separate main window of the same server whose page is at `mainUrl`.
+   */
+  function withPanel(h, { mainUrl = `${serverUrl}/`, minimized = false } = {}) {
+    const panel = { visible: false, destroyed: false };
+    Object.assign(h.win, {
+      setAlwaysOnTop() {},
+      setVisibleOnAllWorkspaces() {},
+      setBounds() {},
+      getBounds: () => ({ x: 0, y: 0, width: 620, height: 360 }),
+      setOpacity() {},
+      moveTop() {},
+      showInactive: () => (panel.visible = true),
+      isVisible: () => panel.visible,
+      hide: () => (panel.visible = false),
+      isDestroyed: () => panel.destroyed,
+      destroy() {
+        panel.destroyed = true;
+        h.emitWindow("closed");
+      },
+    });
+    Object.assign(h.webContents, { isCrashed: () => false, focus() {} });
+    const display = { id: 1, workArea: { x: 0, y: 0, width: 1440, height: 900 } };
+    Object.assign(h.electron.screen, {
+      getAllDisplays: () => [display],
+      getCursorScreenPoint: () => ({ x: 10, y: 10 }),
+      getDisplayNearestPoint: () => display,
+    });
+    h.electron.systemPreferences.getAnimationSettings = () => ({ prefersReducedMotion: true });
+    h.api.floatingComposer().show(serverUrl);
+    const main = {
+      sent: [],
+      focused: 0,
+      restored: 0,
+      isDestroyed: () => false,
+      isMinimized: () => minimized,
+      getPosition: () => [200, 200],
+      restore: () => (main.restored += 1),
+      focus: () => (main.focused += 1),
+      webContents: Object.assign(new EventEmitter(), {
+        id: 9,
+        getURL: () => mainUrl,
+        send: (channel, data) => main.sent.push([channel, data]),
+      }),
+    };
+    h.api.windows.set(main, { origin: "https://host.example", serverUrl, role: "main" });
+    const fromWebContents = h.electron.BrowserWindow.fromWebContents;
+    h.electron.BrowserWindow.fromWebContents = (sender) =>
+      sender === main.webContents ? main : fromWebContents(sender);
+    return { panel, main };
+  }
+  const fromPanel = (h) => ({
+    sender: h.webContents,
+    senderFrame: { url: h.webContents.getURL() },
+  });
+
+  for (const [routePath, comesForward] of [
+    ["/c/abc", false],
+    ["/settings/import", true],
+  ]) {
+    it(`opens ${routePath} in its server's main window, then hides the panel`, async (t) => {
+      const h = loadNavigationHarness({ platform: "darwin" });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      const { panel, main } = withPanel(h, { minimized: true });
+      assert.equal(panel.visible, true);
+      const open = h.ipc.get("omnigent:floating-composer:open-in-main-window");
+      assert.deepEqual({ ...(await open(fromPanel(h), routePath)) }, { ok: true });
+      assert.deepEqual(main.sent, [["omnigent:open-path", routePath]]);
+      // A linked page comes forward, restored; a launched session waits behind the app in front.
+      assert.equal(main.focused, comesForward ? 1 : 0);
+      assert.equal(main.restored, comesForward ? 1 : 0);
+      assert.equal(panel.visible, false);
+    });
+  }
+
+  it("keeps the panel up for a path it may not open", async (t) => {
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const { panel, main } = withPanel(h);
+    const open = h.ipc.get("omnigent:floating-composer:open-in-main-window");
+    assert.deepEqual(
+      { ...(await open(fromPanel(h), "/settings/account")) },
+      { ok: false, error: "bad-path" },
+    );
+    assert.deepEqual(main.sent, []);
+    assert.equal(panel.visible, true);
+  });
+
+  it("opens a new window when the server's main window isn't showing its app", async (t) => {
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const { main } = withPanel(h, { mainUrl: "https://login.example/sso" });
+    const built = h.calls.windowOptions.length;
+    const open = h.ipc.get("omnigent:floating-composer:open-in-main-window");
+    assert.deepEqual({ ...(await open(fromPanel(h), "/c/abc")) }, { ok: true });
+    assert.deepEqual(main.sent, []);
+    assert.equal(h.calls.windowOptions.length, built + 1);
+  });
+
+  it("hides the panel when its page dismisses it", (t) => {
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const { panel } = withPanel(h);
+    h.ipc.get("omnigent:floating-composer:dismiss")(fromPanel(h));
+    assert.equal(panel.visible, false);
+    assert.equal(panel.destroyed, false);
+  });
+
+  it("closes the panel when a supporting window lands on its server's sign-in page", (t) => {
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const { panel, main } = withPanel(h);
+    h.ipc.get("omnigent:floating-composer:announce")(
+      { sender: main.webContents, senderFrame: { url: `${serverUrl}/` } },
+      1,
+    );
+    // A reload keeps the panel and its draft; signing out doesn't.
+    main.webContents.emit("did-navigate", {}, `${serverUrl}/`);
+    assert.equal(panel.destroyed, false);
+    h.ipc.get("omnigent:floating-composer:announce")(
+      { sender: main.webContents, senderFrame: { url: `${serverUrl}/` } },
+      1,
+    );
+    main.webContents.emit("did-navigate", {}, `${serverUrl}/login`);
+    assert.equal(panel.destroyed, true);
+  });
+
+  it("closes a panel instead of showing it the setup page", async (t) => {
+    const h = loadNavigationHarness({ platform: "darwin" });
+    t.after(h.cleanup);
+    const { panel } = withPanel(h);
+    const loads = h.calls.loadFile.length;
+    await h.api.loadSetupPage(h.win);
+    assert.equal(panel.destroyed, true);
+    assert.equal(h.calls.loadFile.length, loads);
   });
 });
 

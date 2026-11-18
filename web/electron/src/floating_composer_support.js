@@ -80,8 +80,47 @@ function mainWindowsByRecency(focusOrder, allMainWindows) {
   return [...ordered, ...allMainWindows.filter((win) => !ordered.includes(win))];
 }
 
+/**
+ * Whether `url` is a page of the server at `serverUrl`: the same origin, and at or under its
+ * mount path, so another server mounted on the same origin doesn't count.
+ *
+ * @param {string} url
+ * @param {string} serverUrl
+ * @returns {boolean}
+ */
+function isPageOfServer(url, serverUrl) {
+  try {
+    const page = new URL(url);
+    const server = new URL(serverUrl);
+    if (page.origin !== server.origin) return false;
+    const mount = server.pathname.replace(/\/+$/, "");
+    return mount === "" || page.pathname === mount || page.pathname.startsWith(`${mount}/`);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Whether `url` is the sign-in page of the server mounted at `serverUrl`: accounts `/login`
+ * or `/register`, or an OIDC `/auth/…` route, under the mount.
+ *
+ * @param {string} url
+ * @param {string | null} serverUrl
+ */
+function isServerSignInPage(url, serverUrl) {
+  if (!serverUrl || !isPageOfServer(url, serverUrl)) return false;
+  try {
+    const mount = new URL(serverUrl).pathname.replace(/\/+$/, "");
+    const route = new URL(url).pathname.slice(mount.length) || "/";
+    return route === "/login" || route === "/register" || route.startsWith("/auth/");
+  } catch {
+    return false;
+  }
+}
+
 module.exports = {
   createFloatingComposerSupport,
   floatingComposerTarget,
+  isServerSignInPage,
   mainWindowsByRecency,
 };

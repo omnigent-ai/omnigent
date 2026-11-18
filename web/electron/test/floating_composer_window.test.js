@@ -18,7 +18,9 @@ class FakePanel extends EventEmitter {
     this.destroyed = false;
     this.calls = [];
     this.bounds = { x: 0, y: 0, width: 620, height: 360 };
-    this.webContents = { focus: () => this.calls.push("webContents.focus") };
+    this.webContents = Object.assign(new EventEmitter(), {
+      focus: () => this.calls.push("webContents.focus"),
+    });
   }
   isDestroyed() {
     return this.destroyed;
@@ -128,13 +130,22 @@ test("shows the panel on the pointer's display without activating the app", () =
   assert.equal(panel.bounds.x >= external.workArea.x, true);
 });
 
-test("showing again while the panel is visible but unfocused focuses it", () => {
-  const { controller, created } = setup();
+test("a hidden panel comes on screen through present; showing a visible one focuses it", () => {
+  const presented = [];
+  const { controller, created } = setup({
+    present: (panel, show) => {
+      presented.push(panel);
+      show();
+    },
+  });
   controller.show("https://a.example");
   const [panel] = created;
+  assert.deepEqual(presented, [panel]);
+  assert.ok(panel.calls.includes("showInactive"));
   panel.calls.length = 0;
   assert.equal(controller.show("https://a.example"), "focused");
   assert.deepEqual(panel.calls, ["moveTop", "focus", "webContents.focus"]);
+  assert.equal(presented.length, 1);
   assert.equal(panel.visible, true, "a second press never closes the panel");
 });
 
@@ -177,6 +188,21 @@ test("an open file picker keeps the panel up when focus moves", () => {
   assert.equal(panel.visible, false);
 });
 
+for (const [event, what] of [
+  ["did-navigate", "reloaded"],
+  ["render-process-gone", "lost its renderer"],
+]) {
+  test(`a picker its page left open stops keeping the panel up once the page ${what}`, () => {
+    const { controller, created } = setup();
+    controller.show("https://a.example");
+    const [panel] = created;
+    controller.filePickerOpened(panel);
+    panel.webContents.emit(event);
+    controller.mainWindowFocused();
+    assert.equal(panel.visible, false);
+  });
+}
+
 test("hide keeps the panel for its draft and remembers where it was", () => {
   const { controller, created, frames } = setup();
   controller.show("https://a.example");
@@ -203,7 +229,8 @@ test("closing the panel hides it, keeping its draft, unless the app is quitting"
   assert.equal(controller.isPanel(panel), false);
 });
 
-test("hiding after a launch resets the frame, even with a move still waiting to save", async () => {
+test("hiding after a launch resets the frame, even with a move still waiting to save", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   const { controller, created, frames } = setup();
   controller.show("https://a.example");
   const [panel] = created;
@@ -212,9 +239,7 @@ test("hiding after a launch resets the frame, even with a move still waiting to 
   controller.show("https://a.example");
   panel.emit("resized");
   controller.hide(panel, { resetFrame: true });
-  await new Promise((resolve) => {
-    setTimeout(resolve, 300);
-  });
+  t.mock.timers.tick(300);
   assert.equal(frames()["https://a.example"], undefined);
 });
 
@@ -351,17 +376,19 @@ test("a panel destroyed mid-fade stops fading", () => {
   assert.equal(clock.pending(), 0);
 });
 
-test("a hidden panel comes on screen through present; a visible one is only focused", () => {
-  const presented = [];
-  const { controller, created } = setup({
-    present: (panel, show) => {
-      presented.push(panel);
-      show();
-    },
-  });
-  controller.show("https://a.example");
-  assert.equal(presented.length, 1);
-  assert.ok(created[0].calls.includes("showInactive"));
-  controller.show("https://a.example");
-  assert.equal(presented.length, 1);
+test("reopening mid-fade stops the earlier fade, so the opacity never goes backwards", () => {
+  const panel = fadingPanel();
+  const clock = manualClock();
+  const options = { reduceMotion: false, durationMs: 120, ...clock };
+  fadeInFloatingComposer(panel, () => {}, options);
+  clock.advance(60);
+  fadeInFloatingComposer(panel, () => {}, options);
+  const restartedAt = panel.opacities.length - 1;
+  for (let step = 0; step < 30 && clock.pending() > 0; step += 1) clock.advance(10);
+  const second = panel.opacities.slice(restartedAt);
+  assert.equal(second[0], 0);
+  for (let index = 1; index < second.length; index += 1) {
+    assert.ok(second[index] >= second[index - 1], `opacity fell: ${second.join(", ")}`);
+  }
+  assert.equal(panel.opacities.at(-1), 1);
 });

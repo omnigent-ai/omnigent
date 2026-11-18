@@ -43,6 +43,8 @@ function floatingComposerAppPagePath(pagePath) {
 
 /** How long the panel takes to fade in when it opens; closing is instant. */
 const FLOATING_COMPOSER_FADE_MS = 120;
+/** Each panel's current fade, so reopening mid-fade stops the one before. */
+const fades = new WeakMap();
 
 /**
  * Show `panel` by calling `show`, fading it in over `durationMs` unless the user reduces
@@ -67,10 +69,12 @@ function fadeInFloatingComposer(panel, show, options) {
   const now = options.now ?? Date.now;
   const setTimer = options.setTimer ?? ((callback, ms) => setTimeout(callback, ms));
   const started = now();
+  const fade = {};
+  fades.set(panel, fade);
   panel.setOpacity(0);
   show();
   const step = () => {
-    if (panel.isDestroyed()) return;
+    if (panel.isDestroyed() || fades.get(panel) !== fade) return;
     const progress = Math.min(1, (now() - started) / durationMs);
     panel.setOpacity(progress >= 1 ? 1 : 1 - (1 - progress) ** 3);
     if (progress < 1) setTimer(step, 8);
@@ -118,7 +122,10 @@ function floatingComposerWindowOptions() {
 function createFloatingComposerController(deps) {
   /** @type {Map<string, import("electron").BrowserWindow>} */
   const panels = new Map();
-  /** Panels whose native file picker is open; a main-window focus then must not hide them. */
+  /**
+   * Panels whose document has its native file picker open; a main-window focus then must not
+   * hide them. The state belongs to that document and ends with it.
+   */
   const pickerOpen = new Set();
   /** Each panel's pending debounced frame save. */
   const saveTimers = new Map();
@@ -184,6 +191,9 @@ function createFloatingComposerController(deps) {
     };
     panel.on("moved", scheduleSave);
     panel.on("resized", scheduleSave);
+    // A new document, or a renderer that went away, can't still have the picker open.
+    panel.webContents.on("did-navigate", () => pickerOpen.delete(panel));
+    panel.webContents.on("render-process-gone", () => pickerOpen.delete(panel));
     // ⌘W hides the panel like Escape, keeping its draft; only quitting closes it.
     panel.on("close", (event) => {
       if (deps.quitting()) return;
@@ -200,8 +210,7 @@ function createFloatingComposerController(deps) {
   }
 
   function targetFrame(serverUrl) {
-    // shortcut: the panel always opens on the pointer's display; give other entry points
-    // (a menu item, ⌘K) their own placement when they land.
+    // Opened by the global shortcut, so it follows the pointer to the display the user is on.
     const pointerDisplay = deps.screen.getDisplayNearestPoint(deps.screen.getCursorScreenPoint());
     return placeFloatingComposer({
       savedFrame: deps.loadFrames()[serverUrl],

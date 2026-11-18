@@ -140,6 +140,7 @@ const {
 const {
   createFloatingComposerSupport,
   floatingComposerTarget,
+  isServerSignInPage,
   mainWindowsByRecency,
 } = require("./floating_composer_support");
 const {
@@ -277,6 +278,11 @@ function loadSetupPage(win, search = "") {
   const devUrl = serverSelectorV2DevUrl();
   const run = () => {
     if (win.isDestroyed()) return Promise.resolve();
+    // A panel never shows setup: it closes, and the next open builds it again.
+    if (windows.has(win) && !isMainWindow(win)) {
+      win.destroy();
+      return Promise.resolve();
+    }
     if (devUrl)
       return win.loadURL(effectiveSearch ? `${devUrl}?${effectiveSearch}` : devUrl).catch(loadFile);
     return loadFile();
@@ -1856,7 +1862,8 @@ function floatingComposer() {
 
 /** Whether a panel still shows the panel page of `serverUrl`, or is still loading it. */
 function floatingComposerPanelIsCurrent(panel, serverUrl) {
-  if (panel.isDestroyed() || windows.get(panel)?.serverUrl !== serverUrl) return false;
+  if (panel.isDestroyed() || panel.webContents.isCrashed()) return false;
+  if (windows.get(panel)?.serverUrl !== serverUrl) return false;
   const url = panel.webContents.getURL();
   if (url === "") return true;
   try {
@@ -1889,13 +1896,10 @@ function openFloatingComposerFromShortcut() {
     floatingComposer().show(serverUrl);
     return;
   }
-  const win = activeWindow();
-  if (!win) {
-    createWindow();
-  } else {
-    if (win.isMinimized()) win.restore();
-    win.focus();
-  }
+  // The window the panel would have opened over, by the same recency.
+  const win = mainWindowsByRecency(mainWindowFocusOrder, mainWindows())[0];
+  if (win) focusAndRestore(win);
+  else createWindow();
   app.focus({ steal: true });
 }
 
@@ -5206,17 +5210,22 @@ function registerIpc() {
     const hadSupport = floatingComposerSupport.any();
     if (!floatingComposerSupport.announce(contents.id, serverUrl)) return;
     const revoke = () => {
-      contents.removeListener("did-start-navigation", onNavigation);
+      contents.removeListener("did-navigate", onNavigate);
+      contents.removeListener("render-process-gone", revoke);
       contents.removeListener("destroyed", revoke);
       floatingComposerSupport.revoke(contents.id);
       if (!floatingComposerSupport.any()) applyFloatingComposerShortcut();
     };
-    const onNavigation = (details, _url, isInPlace, isMainFrame) => {
-      const mainFrame = details?.isMainFrame ?? isMainFrame;
-      const sameDocument = details?.isSameDocument ?? isInPlace;
-      if (mainFrame && !sameDocument) revoke();
+    // Support ends with this document: when another one commits, or its renderer goes away.
+    const onNavigate = (_event, url) => {
+      revoke();
+      // A sign-out lands on the sign-in page; the panel holds the signed-out account's draft.
+      if (isServerSignInPage(url, serverUrl)) {
+        floatingComposerController?.closePanels((candidate) => candidate === serverUrl);
+      }
     };
-    contents.on("did-start-navigation", onNavigation);
+    contents.on("did-navigate", onNavigate);
+    contents.on("render-process-gone", revoke);
     contents.on("destroyed", revoke);
     if (!hadSupport) applyFloatingComposerShortcut();
   });
@@ -5255,11 +5264,12 @@ function registerIpc() {
     if (target && connectionAttempts.get(target)?.pending === true) {
       return { ok: false, error: "window-loading" };
     }
-    if (target) {
+    // Only a window showing its server's app hears the route, not one on setup or sign-in.
+    if (target && originOf(target.webContents.getURL()) === originOf(serverUrl)) {
       sendOpenPath(target, openPath);
       // A linked page comes forward; a launched session waits behind the app the user is in.
       if (sessionPath === null) {
-        target.focus();
+        focusAndRestore(target);
         app.focus({ steal: true });
       }
     } else {
