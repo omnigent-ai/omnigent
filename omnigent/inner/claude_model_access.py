@@ -61,6 +61,7 @@ _SECRET_ENV = frozenset(
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
         "ANTHROPIC_CUSTOM_HEADERS",
+        "AWS_BEARER_TOKEN_BEDROCK",
         "CLAUDE_CODE_OAUTH_TOKEN",
         "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
         "CLAUDE_CODE_API_KEY_FILE_DESCRIPTOR",
@@ -68,6 +69,11 @@ _SECRET_ENV = frozenset(
     }
 )
 _BYPASS_ENV = frozenset({"ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"})
+_ALTERNATE_TRANSPORT_FLAGS = (
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+)
 _BETA = re.compile(r"[a-z0-9][a-z0-9.-]{0,100}(?:,[a-z0-9][a-z0-9.-]{0,100})*\Z")
 # Match the Messages API request limit so attachments the provider accepts still pass.
 _MAX_REQUEST_BODY_BYTES = 32 * 1024 * 1024
@@ -112,9 +118,17 @@ def _managed_config_object_validator(
             if key == "env":
                 if not isinstance(value, dict):
                     raise ValueError("managed env must be an object")
-                if forbidden.intersection(value) or any(
-                    not isinstance(name, str) or _is_claude_credential_env_name(name)
-                    for name in value
+                if (
+                    forbidden.intersection(value)
+                    or any(
+                        not isinstance(name, str) or _is_claude_credential_env_name(name)
+                        for name in value
+                    )
+                    or any(
+                        name.removeprefix("OMNIGENT_") in _ALTERNATE_TRANSPORT_FLAGS
+                        and setting not in (None, "", "0", "false")
+                        for name, setting in value.items()
+                    )
                 ):
                     raise ValueError("managed credentials must remain parent-owned")
         return dict(pairs)
@@ -741,7 +755,7 @@ def resolve_claude_model_access(
     databricks_profile: str | None = None,
 ) -> ClaudeModelAccess:
     """Resolve credentials in the trusted parent, before starting any worker."""
-    for flag in ("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY"):
+    for flag in _ALTERNATE_TRANSPORT_FLAGS:
         if env.get(flag) not in (None, "", "0", "false"):
             raise ValueError("sandboxed Claude model relay requires an Anthropic-compatible API")
     base_url = env.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com"

@@ -92,8 +92,22 @@ def test_benign_managed_policy_is_preserved(managed_dir: Path) -> None:
         {"apiKeyHelper": "printf parent-only-key"},
         {"env": {"CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR": "0"}},
         {"env": {"OMNIGENT_CLAUDE_API_KEY_HELPER": "printf parent-only-key"}},
+        {"env": {"AWS_BEARER_TOKEN_BEDROCK": "parent-only-key"}},
+        {"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}},
+        {"env": {"CLAUDE_CODE_USE_VERTEX": "true"}},
+        {"env": {"CLAUDE_CODE_USE_FOUNDRY": "1"}},
     ],
-    ids=["api-key", "source-env", "helper", "token-fd", "helper-env"],
+    ids=[
+        "api-key",
+        "source-env",
+        "helper",
+        "token-fd",
+        "helper-env",
+        "bedrock-bearer",
+        "bedrock-flag",
+        "vertex-flag",
+        "foundry-flag",
+    ],
 )
 def test_managed_auth_is_rejected_in_every_file(
     managed_dir: Path, relative_path: str, payload: dict[str, object]
