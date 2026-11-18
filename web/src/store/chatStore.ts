@@ -1483,8 +1483,8 @@ export interface ChatActions {
   /** Drain the queued composer attachments (called by the composer). */
   clearPendingComposerAttachments: () => void;
   /** Stamp {@link ChatState.runnerLaunchedAt} now — call right after a
-   *  successful `launchRunner` for the open session. */
-  markRunnerLaunched: () => void;
+   *  successful `launchRunner`, for `sessionId` or the open session when omitted. */
+  markRunnerLaunched: (sessionId?: string) => void;
   /**
    * Compact the active session's context. Posts a ``compact`` event to the
    * server, which summarises the conversation history in-place. No-ops when
@@ -3745,7 +3745,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
-  markRunnerLaunched: () => setActive({ runnerLaunchedAt: Date.now() }),
+  markRunnerLaunched: (sessionId) =>
+    (sessionId === undefined ? setActive : setterFor(sessionId))({ runnerLaunchedAt: Date.now() }),
 
   compact: async () => {
     const { conversationId } = get();

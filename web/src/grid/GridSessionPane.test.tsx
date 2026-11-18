@@ -60,6 +60,9 @@ const fixture = vi.hoisted(() => ({
   renderError: new Error("Grid surface render failed"),
   // Set while a cell's viewer holds unsaved edits and is asking to discard them.
   discardEdits: null as (() => void) | null,
+  // Sessions the viewer can't edit, and each session's sandbox launch.
+  readOnlySessions: [] as string[],
+  launches: {} as Record<string, { stage: string; error: null }>,
 }));
 vi.mock("@/lib/sessionsApi", async (original) => ({
   ...(await original<typeof SessionsApi>()),
@@ -67,10 +70,20 @@ vi.mock("@/lib/sessionsApi", async (original) => ({
   updateSession: vi.fn(async () => ({ labels: {} })),
 }));
 vi.mock("@/components/HostBadge", () => ({
-  HostBadge: ({ sessionId, readOnly }: { sessionId: string; readOnly?: boolean }) => (
+  HostBadge: ({
+    sessionId,
+    readOnly,
+    launch,
+  }: {
+    sessionId: string;
+    readOnly?: boolean;
+    launch?: { stage: string } | null;
+  }) => (
     <span>
       Host for {sessionId}
       {readOnly && " (status only)"}
+      {launch && ` (launch ${launch.stage})`}
+      {launch === undefined && " (launch omitted)"}
     </span>
   ),
 }));
@@ -117,11 +130,14 @@ vi.mock("@/hooks/useSession", () => ({
     queryFn: async () => ({ id, title: id }),
   }),
 }));
-vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: () => true }));
+vi.mock("@/hooks/usePermissions", () => ({
+  useCanEdit: (id: string) => !fixture.readOnlySessions.includes(id),
+}));
 vi.mock("@/hooks/useConversationEntryState", () => ({
-  useConversationEntryState: () => ({
+  useConversationEntryState: (id: string) => ({
     terminalPending: fixture.terminalPending,
     claudePermissionMode: "default",
+    sandboxStatus: fixture.launches[id] ?? null,
   }),
 }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
@@ -259,6 +275,8 @@ afterEach(() => {
   fixture.failedChat = "";
   fixture.failedTerminal = "";
   fixture.discardEdits = null;
+  fixture.readOnlySessions = [];
+  fixture.launches = {};
   vi.restoreAllMocks();
 });
 
@@ -280,8 +298,8 @@ it("shows each cell's session controls and targets that session's permission mod
   // Named from the cells' snapshots; neither session is on a loaded sidebar page.
   await waitFor(() => expect(document.title).toBe("first + second"));
   const second = within(screen.getByRole("region", { name: "second" }));
-  // Host and harness are read-only here; switch hosts and models full screen.
-  expect(second.getByText("Host for second (status only)")).toBeInTheDocument();
+  // The harness is read-only here; models are switched full screen.
+  expect(second.getByText("Host for second")).toBeInTheDocument();
   expect(second.getByTestId("grid-harness-status")).toHaveAccessibleName("Claude Code");
   fireEvent.pointerDown(second.getByRole("button", { name: "Permission mode: Manual" }), {
     button: 0,
@@ -309,6 +327,18 @@ it("shows each cell's session controls and targets that session's permission mod
   expect(second.getByRole("button", { name: "Permission mode: Manual" })).toBeDisabled();
   view.unmount();
   expect(document.title).toBe("Single session");
+});
+
+it("gives each cell its own host-switch access and launch progress", () => {
+  fixture.readOnlySessions = ["first"];
+  fixture.launches = { second: { stage: "provisioning", error: null } };
+  render(twoCellGrid());
+  // The active cell's name gains an " (active)" suffix, hence the prefix match.
+  const first = within(screen.getByRole("region", { name: /^first/ }));
+  const second = within(screen.getByRole("region", { name: "second" }));
+  // A cell with no launch passes null, so its badge never shows the open session's.
+  expect(first.getByText("Host for first (status only)")).toBeInTheDocument();
+  expect(second.getByText("Host for second (launch provisioning)")).toBeInTheDocument();
 });
 
 it("opens agent-requested files only in the active workspace and respects navigation guards", () => {

@@ -456,8 +456,12 @@ export function GridSessionPane({
                   gridComposer={{
                     leading: session && (
                       <>
-                        {/* Status only; switching hosts stays in the full-screen view. */}
-                        <HostBadge sessionId={sessionId} appearance="composer" readOnly />
+                        <HostBadge
+                          sessionId={sessionId}
+                          appearance="composer"
+                          readOnly={!canEdit}
+                          launch={state.sandboxStatus}
+                        />
                         <GridPermissionPicker permission={permission} />
                       </>
                     ),
