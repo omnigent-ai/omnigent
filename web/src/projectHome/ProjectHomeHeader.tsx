@@ -25,7 +25,6 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useNavigate } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { MobileHeaderButton } from "@/shell/MobileHeaderButton";
-import { MOBILE_GLASS_SURFACE } from "@/shell/mobileGlass";
 import { SessionMenuHeader } from "@/shell/SessionMenuHeader";
 import { useProjectFolderMenu } from "@/shell/Sidebar";
 import { projectHomePath } from "./projectHomeNavigation";
@@ -149,12 +148,9 @@ function ProjectHomeActions({ projectName }: { projectName: string }) {
         </DropdownMenuTrigger>
         <DropdownMenuContent
           align={isMobile ? "end" : "start"}
+          mobileSurface="solid"
           collisionPadding={isMobile ? 16 : undefined}
-          className={cn(
-            "min-w-40",
-            MOBILE_GLASS_SURFACE,
-            isMobile && "w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)]",
-          )}
+          className={cn("min-w-40", isMobile && "w-[calc(100vw-2rem)] max-w-[calc(100vw-2rem)]")}
           onCloseAutoFocus={actions.onCloseAutoFocus}
         >
           {isMobile && <SessionMenuHeader title={projectName} />}
