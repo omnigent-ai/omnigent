@@ -102,7 +102,12 @@ const arrived = new Set<string>();
 /** Learn the pending-input id `request` would have, for hearing that it arrived. */
 function notePendingId(request: Pick<DesignRequest, "id" | "conversationId">): void {
   void nativePendingId(request.conversationId, request.id).then(
-    (pendingId) => pendingIds.set(pendingId, request.id),
+    (pendingId) => {
+      // Not if it was dropped meanwhile.
+      if (useDesignOutbox.getState().requests.some((item) => item.id === request.id)) {
+        pendingIds.set(pendingId, request.id);
+      }
+    },
     () => {},
   );
 }
@@ -221,17 +226,20 @@ async function send(request: DesignRequest, agentId: string): Promise<void> {
     update(request.id, { status: "denied", slow: false, error: DENIED });
   } else if (failure !== null && !arrived.has(request.id)) {
     // Refused: it never reached the agent. Otherwise it may have (an unanswered POST).
-    const error = !refused
-      ? `Couldn't tell whether this reached the agent (${failure}). ${LOOK}`
-      : HOST_OFFLINE.test(failure)
-        ? HOST_OFFLINE_ERROR
-        : `Couldn't send: ${failure}`;
+    const error = failureMessage(failure, refused);
     const delivery = refused ? "refused" : "unknown";
     update(request.id, { status: "failed", slow: false, error, delivery });
   } else {
     markSent(request);
   }
   schedule();
+}
+
+/** Why a send failed, for the user: refused (it never reached the agent), or maybe arrived. */
+function failureMessage(failure: string, refused: boolean): string {
+  if (!refused) return `Couldn't tell whether this reached the agent (${failure}). ${LOOK}`;
+  if (HOST_OFFLINE.test(failure)) return HOST_OFFLINE_ERROR;
+  return `Couldn't send: ${failure}`;
 }
 
 function markSent(request: DesignRequest): void {
@@ -320,6 +328,10 @@ export function forget(id: string): void {
   if (held && held.status !== "sending") {
     running.get(id)?.abort();
     arrived.delete(id);
+    attempts.delete(id);
+    for (const [pendingId, requestId] of pendingIds) {
+      if (requestId === id) pendingIds.delete(pendingId);
+    }
   }
   useDesignOutbox.setState((state) => ({
     requests: state.requests.filter((request) => request.id !== id || request.status === "sending"),
@@ -438,7 +450,6 @@ function unsaved(): boolean {
     .requests.some((request) => savedAs.get(request.id) !== savedForm(request));
 }
 
-// The timer to try restoring again.
 let restoreTimer: ReturnType<typeof setTimeout> | null = null;
 let restoreRetryMs = RESTORE_RETRY_MS;
 
@@ -495,15 +506,18 @@ export async function restoreSavedDesignRequests(): Promise<void> {
       files: savedFilesOf(record),
       // Another page may have sent it since: it says to look in the chat first.
       delivery: record.refused ? ("refused" as const) : ("unknown" as const),
-      ...(record.status === "waiting"
-        ? { status: "failed" as const, error: RESTORED_WAITING }
-        : record.status === "sending"
-          ? { status: "failed" as const, error: RESTORED_SENDING }
-          : { status: record.status, error: record.error }),
+      ...restoredStatus(record),
     }));
   if (restored.length === 0) return;
   for (const request of restored) notePendingId(request);
   useDesignOutbox.setState((state) => ({ requests: [...restored, ...state.requests] }));
+}
+
+/** A restored request's status: one saved waiting or sending is failed, for the user to retry. */
+function restoredStatus(record: SavedRequest): Pick<DesignRequest, "status" | "error"> {
+  if (record.status === "waiting") return { status: "failed", error: RESTORED_WAITING };
+  if (record.status === "sending") return { status: "failed", error: RESTORED_SENDING };
+  return { status: record.status, error: record.error };
 }
 
 if (typeof window !== "undefined") {
@@ -517,6 +531,11 @@ if (typeof window !== "undefined") {
 /** Test hook: resolves once every save so far has finished. */
 export function designOutboxSaved(): Promise<void> {
   return writes;
+}
+
+/** Test hook: whether the outbox still keeps `id`'s attempt or pending-input id. */
+export function designOutboxTracks(id: string): boolean {
+  return attempts.has(id) || [...pendingIds.values()].includes(id);
 }
 
 /** Test hook: an empty outbox and no per-session waits. */

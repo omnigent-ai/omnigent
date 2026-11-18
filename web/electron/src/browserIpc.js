@@ -801,7 +801,6 @@ function registerBrowserIpc({
     }
   });
 
-  // Annotate and Draw on a view (designTools.js).
   registerDesignToolsIpc({ ipcMain, gateRegistry });
 
   // ── Design mode (point-and-prompt) ───────────────────────────────────────

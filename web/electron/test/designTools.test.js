@@ -4,8 +4,6 @@
 
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
-const fs = require("node:fs");
-const path = require("node:path");
 const { afterEach, beforeEach, describe, it } = require("node:test");
 const { JSDOM } = require("jsdom");
 
@@ -16,7 +14,9 @@ const {
   FRAME_PREFIX,
   createDesignTools,
   registerDesignToolsIpc,
+  sharedDesignTools,
 } = require("../src/designTools");
+const { registerBrowserIpc } = require("../src/browserIpc");
 const { createBrowserViewRegistry } = require("../src/browserViewRegistry");
 const { createBrowserViewBoundsController } = require("../src/browserViewBounds");
 
@@ -176,15 +176,16 @@ function fakeViews() {
 }
 
 /** A tool open on a page in a window, from the window's own app renderer. */
-function openTool({ zoom, opTimeoutMs, zoomCheckMs, above = [] } = {}) {
+function openTool({
+  zoom,
+  opTimeoutMs,
+  zoomCheckMs,
+  above = [],
+  views = fakeViews(),
+  tools = createDesignTools({ WebContentsView: views.WebContentsView, opTimeoutMs, zoomCheckMs }),
+} = {}) {
   const page = fakePage({ zoom });
   const host = fakeHost(page.view, ...above);
-  const views = fakeViews();
-  const tools = createDesignTools({
-    WebContentsView: views.WebContentsView,
-    opTimeoutMs,
-    zoomCheckMs,
-  });
   const sent = [];
   const app = {
     send: (channel, payload) => sent.push({ channel, ...payload }),
@@ -314,6 +315,29 @@ describe("design tools: the overlay", () => {
     await eventually(() => overlay.bounds.height === 600);
   });
 
+  it("measures the page one at a time, and drops a measurement that outlived its opening", async () => {
+    const t = openTool();
+    const overlay = t.open();
+    await tick();
+    const measured = () => t.webContents.codes.filter((code) => code.includes("innerHeight"));
+    Object.defineProperty(t.window, "innerWidth", { value: 400, configurable: true });
+    Object.defineProperty(t.window, "innerHeight", { value: 200, configurable: true });
+    t.webContents.isDevToolsOpened = () => true;
+    const release = t.webContents.holdNext();
+    t.webContents.emit("devtools-opened");
+    t.webContents.emit("devtools-opened");
+    t.webContents.emit("devtools-opened");
+    await tick();
+    assert.equal(measured().length, 1, "one measurement in flight");
+    t.tools.stop(t.entry, t.session);
+    // Were its overlay still there, an ended opening's late answer wouldn't move it.
+    overlay.webContents.destroyed = false;
+    release();
+    await tick();
+    await tick();
+    assert.deepEqual(overlay.bounds, { x: 100, y: 50, width: 800, height: 600 });
+  });
+
   it("forwards the recent-session shortcut from the overlay, as from the page", () => {
     const t = openTool();
     const forwarded = [];
@@ -335,21 +359,35 @@ describe("design tools: the overlay", () => {
     assert.equal(t.tools.overlayFocused(undefined), false);
   });
 
-  it("is asked by main's and the renderer's focused-view checks", () => {
-    const source = (file) => fs.readFileSync(path.join(__dirname, "../src", file), "utf8");
-    const main = source("main.js");
-    const body = main.slice(main.indexOf("function focusedBrowserViewId("));
-    assert.match(
-      body.slice(0, body.indexOf("\n}\n")),
-      /sharedDesignTools\(\)\.overlayFocused\(entry\)/,
-    );
-    // A click into the overlay is not the page losing focus.
-    const ipc = source("browserIpc.js");
-    const handler = ipc.slice(ipc.indexOf('ipcMain.handle("omnigent:browser-focused-view"'));
-    assert.match(
-      handler.slice(0, handler.indexOf("\n  });\n")),
-      /sharedDesignTools\(\)\.overlayFocused\(entry\)/,
-    );
+  it("names its page as the focused view while its overlay holds the keys", (t) => {
+    // Main's own design tools, made with this test's views.
+    const views = fakeViews();
+    const Module = require("node:module");
+    const load = Module["_load"];
+    Module["_load"] = function (request, ...rest) {
+      if (request === "electron") return { WebContentsView: views.WebContentsView };
+      return load.call(this, request, ...rest);
+    };
+    t.after(() => {
+      Module["_load"] = load;
+    });
+    const tool = openTool({ views, tools: sharedDesignTools() });
+    const overlay = tool.open();
+    t.after(() => tool.tools.stop(tool.entry, tool.session));
+    tool.webContents.isFocused = () => false;
+    const handlers = new Map();
+    registerBrowserIpc({
+      ipcMain: { handle: (channel, fn) => handlers.set(channel, fn), on: () => {} },
+      isPinnedOriginSender: () => true,
+      getRegistryForEvent: () => ({
+        activeConversationId: () => "view-1",
+        get: (id) => (id === "view-1" ? tool.entry : undefined),
+      }),
+    });
+    const focusedView = () => handlers.get("omnigent:browser-focused-view")({ sender: {} });
+    assert.equal(focusedView(), "view-1");
+    overlay.webContents.focusedNow = false;
+    assert.equal(focusedView(), null);
   });
 
   it("closes with its opening, and hands its keys to the page", () => {
@@ -664,6 +702,29 @@ describe("design tools: capture", () => {
     assert.deepEqual(answer.viewport, { width: 400, height: 300 });
     assert.deepEqual(t.webContents.captured, { x: 20, y: 40, width: 780, height: 60 });
     assert.deepEqual(t.webContents.codes, [], "nothing to hide in the page first");
+  });
+
+  it("crops a rect off the top or left to what's left of it", async () => {
+    const t = openTool();
+    t.open();
+    await t.ask("capture", { rect: { x: -10, y: -5, width: 50, height: 30 } });
+    assert.deepEqual(t.webContents.captured, { x: 0, y: 0, width: 40, height: 25 });
+  });
+
+  it("refuses a rect with nothing of it in the viewport", async () => {
+    const t = openTool();
+    t.open();
+    const nothing = { ok: false, error: "nothing to capture there" };
+    for (const rect of [
+      { x: 800, y: 20, width: 50, height: 30 },
+      { x: 10, y: 600, width: 50, height: 30 },
+      { x: -60, y: 20, width: 50, height: 30 },
+      { x: 10, y: -30, width: 50, height: 30 },
+    ]) {
+      // oxlint-disable-next-line no-await-in-loop -- one capture at a time
+      assert.deepEqual(await t.ask("capture", { rect }), nothing, JSON.stringify(rect));
+    }
+    assert.equal(t.webContents.captured, undefined, "nothing was captured");
   });
 
   it("refuses a capture the page zoomed during, whether it was measuring or painting", async () => {

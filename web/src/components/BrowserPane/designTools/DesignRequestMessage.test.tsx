@@ -1,15 +1,14 @@
 import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { DesignRequestBody } from "./LazyDesignRequestMessage";
 import { NO_SCREENSHOT_NOTE } from "./parseDesignRequest";
 
 describe("DesignRequestBody", () => {
   it("shows the request and its subject while the card's chunk loads", async () => {
-    render(
-      <DesignRequestBody
-        request={{ kind: "element", request: "Make it red", element: "p#blurb" }}
-      />,
-    );
+    // A fresh module, whose card hasn't loaded for an earlier test.
+    vi.resetModules();
+    const { DesignRequestBody: FreshBody } = await import("./LazyDesignRequestMessage");
+    render(<FreshBody request={{ kind: "element", request: "Make it red", element: "p#blurb" }} />);
     expect(screen.getByText("Make it red")).toBeInTheDocument();
     expect(screen.getByText("p#blurb")).toBeInTheDocument();
     expect(screen.queryByTestId("design-request")).toBeNull();
@@ -22,7 +21,8 @@ describe("DesignRequestBody", () => {
         request={{ kind: "element", request: "Make it red", element: "p#blurb", elementText: "Hi" }}
       />,
     );
-    expect(await screen.findByText('p#blurb "Hi"')).toBeInTheDocument();
+    await screen.findByTestId("design-request");
+    expect(screen.getByText('p#blurb "Hi"')).toBeInTheDocument();
     expect(screen.getByText("Make it red")).toBeInTheDocument();
   });
 
@@ -32,7 +32,8 @@ describe("DesignRequestBody", () => {
         request={{ kind: "drawing", request: "Bigger heading", page: "localhost:5173" }}
       />,
     );
-    expect(await screen.findByText("Drawing on localhost:5173")).toBeInTheDocument();
+    await screen.findByTestId("design-request");
+    expect(screen.getByText("Drawing on localhost:5173")).toBeInTheDocument();
     expect(screen.getByText("Bigger heading")).toBeInTheDocument();
   });
 

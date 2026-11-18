@@ -102,6 +102,17 @@ describe("DesignOverlay", () => {
     await expect(overlay.request("scroll")).rejects.toThrow("isn't open");
   });
 
+  it("says a capture of an element off the page's screen needs it scrolled to", async () => {
+    const { bridge, next } = heldBridge();
+    const overlay = new DesignOverlay(bridge, "view_1", frames().open);
+    overlay.start(true);
+    const shot = overlay.capture({ x: 900, y: 10, width: 50, height: 20 });
+    const refused = expect(shot).rejects.toThrow("The element isn't on screen.");
+    (await next("start")).answer({ ok: true, session: "s1", frame: "f1" });
+    (await next("capture")).answer({ ok: false, error: "nothing to capture there" });
+    await refused;
+  });
+
   it("stops main's opening when its window can't open, and says why", async () => {
     const { bridge, next } = heldBridge();
     const overlay = new DesignOverlay(bridge, "view_1", () => null);

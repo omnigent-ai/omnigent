@@ -31,7 +31,9 @@ import {
   restoreSavedDesignRequests,
   useDesignOutbox,
 } from "./designOutbox";
+import { noteSavedDesignRequests } from "./designOutboxPresence";
 import {
+  deleteRequest,
   resetDesignOutboxStorage,
   saveRequest,
   thisServer,
@@ -214,6 +216,26 @@ describe("design outbox storage", () => {
     await designOutboxSaved();
     expect(await savedIds()).toEqual([other]);
     expect(unloadAsks()).toBe(false);
+  });
+
+  it("leaves the saved hint on when another tab saves while a delete counts what's left", async () => {
+    let otherTab: Promise<void> | undefined;
+    const count = IDBObjectStore.prototype.count;
+    vi.spyOn(IDBObjectStore.prototype, "count").mockImplementationOnce(function (
+      this: IDBObjectStore,
+      ...args
+    ) {
+      const counting = count.apply(this, args);
+      // Another tab saves one as this count runs, and notes it once that commits.
+      otherTab = putRecord(record({ id: "theirs", page: "other_tab" })).then(() =>
+        noteSavedDesignRequests(true),
+      );
+      return counting;
+    });
+    await deleteRequest("gone");
+    await otherTab;
+    expect(await savedIds()).toEqual(["theirs"]);
+    expect(localStorage.getItem("omnigent.designOutbox.saved")).toBe("1");
   });
 
   it("asks before leaving while a sent request's saved copy isn't deleted yet", async () => {

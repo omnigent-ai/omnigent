@@ -23,6 +23,8 @@ const NOT_OPEN = "The design tool isn't open on this page.";
 const NO_OVERLAY = "the tool's overlay didn't open";
 // Main's answer for a point or capture measured at the overlay's old zoom.
 const ZOOM_CHANGED = "the page's zoom changed";
+// Main's answer for a capture rect wholly outside the page's viewport.
+const OFF_SCREEN = "nothing to capture there";
 
 type Opener = (frame: string) => Window | null;
 
@@ -231,6 +233,9 @@ export class DesignOverlay {
       }
       if (error instanceof Error && error.message === ZOOM_CHANGED) {
         throw new Error("The page's zoom changed while it was captured. Send again.");
+      }
+      if (error instanceof Error && error.message === OFF_SCREEN) {
+        throw new Error("The element isn't on screen. Scroll to it and send again.");
       }
       throw error;
     });

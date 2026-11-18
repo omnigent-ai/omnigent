@@ -22,6 +22,7 @@ import {
   SLOW_SEND_MS,
   STALLED_SEND_MS,
   TURN_START_MS,
+  designOutboxTracks,
   forget,
   queueDesignRequest,
   resetDesignOutbox,
@@ -286,6 +287,19 @@ describe("design outbox", () => {
     runnerTook(await nativePendingId(SESSION, id));
     expect(statusOf(id)).toBe("sent");
     expect(send).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps nothing of a request once it's dropped", async () => {
+    send.mockImplementationOnce(async (_t, _a, _f, opts) => opts?.onError?.("Network down"));
+    const id = queueDesignRequest({ tabId: TAB, label: "Annotate", text: "Dropped" });
+    await flush();
+    await nativePendingId(SESSION, id);
+    await flush();
+    expect(statusOf(id)).toBe("failed");
+    expect(designOutboxTracks(id)).toBe(true);
+    forget(id);
+    expect(statusOf(id)).toBeUndefined();
+    expect(designOutboxTracks(id)).toBe(false);
   });
 
   it("stops a send it stopped waiting on once the request is removed, before it posts", async () => {

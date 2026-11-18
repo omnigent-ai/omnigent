@@ -21,6 +21,7 @@ vi.mock("@/components/BrowserPane/designTools/LazyDesktopDesignTools", () => ({
 
 afterEach(() => {
   cleanup();
+  vi.unstubAllGlobals();
   delete (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop;
 });
 
@@ -41,10 +42,13 @@ describe("BrowserPane's design tools", () => {
       browserSetActive: vi.fn().mockResolvedValue({ ok: true }),
       browserResize: vi.fn().mockResolvedValue({ ok: true }),
     };
-    (globalThis as unknown as { ResizeObserver: unknown }).ResizeObserver = class {
-      observe() {}
-      disconnect() {}
-    };
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        observe() {}
+        disconnect() {}
+      },
+    );
     render(<BrowserPane conversationId="conv_url" />);
     const tools = await screen.findByLabelText("Tools' page");
     await act(async () => {});

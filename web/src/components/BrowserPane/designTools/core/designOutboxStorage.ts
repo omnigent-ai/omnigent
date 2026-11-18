@@ -1,7 +1,6 @@
-// The outbox's unsent design requests, kept in IndexedDB so a reload or crash doesn't lose
-// them. Each names its server, its user and its browser tab: a tab takes back its own, and
-// another tab's only once Web Locks show that tab is gone (adopting under one lock across
-// windows).
+// The outbox's unsent design requests in IndexedDB, so a reload or crash doesn't lose them.
+// Each names its server, user and browser tab: a tab takes back its own, and another tab's
+// only once Web Locks show that tab is gone (adopting under one lock across windows).
 import { getBasePath } from "@/lib/basePath";
 import type { DesignRequest, DesignRequestStatus } from "./designOutbox";
 import { DESIGN_OUTBOX_DATABASE, noteSavedDesignRequests } from "./designOutboxPresence";
@@ -117,13 +116,6 @@ async function openTabs(): Promise<Set<string>> {
   );
 }
 
-function done<T>(request: IDBRequest<T>): Promise<T> {
-  return new Promise((resolve, reject) => {
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error ?? new Error("IndexedDB request failed"));
-  });
-}
-
 /** Resolves once `transaction` commits; rejects if it fails or aborts (a full disk, say). */
 function committed(transaction: IDBTransaction): Promise<void> {
   return new Promise((resolve, reject) => {
@@ -153,8 +145,15 @@ async function store(mode: IDBTransactionMode): Promise<IDBObjectStore> {
   return (await database()).transaction(STORE, mode).objectStore(STORE);
 }
 
+/**
+ * Note whether any are saved, in the count's own transaction: another tab's save can't
+ * commit between the count and the note, so a stale "none" can't overwrite its "some".
+ */
 async function noteCount(): Promise<void> {
-  noteSavedDesignRequests((await done((await store("readonly")).count())) > 0);
+  const objects = await store("readonly");
+  const counting = objects.count();
+  counting.onsuccess = () => noteSavedDesignRequests(counting.result > 0);
+  await committed(objects.transaction);
 }
 
 async function bytesOf(file: File): Promise<ArrayBuffer> {

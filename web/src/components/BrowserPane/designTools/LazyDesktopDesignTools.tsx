@@ -3,10 +3,15 @@ import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { desktopDesignTools } from "./desktopBridge";
 import type { DesktopDesignToolsProps } from "./DesktopDesignTools";
 
-// The tools' chunk couldn't load (this document's lifetime): the pane offers design mode
-// in their place, as an older shell does.
+// The tools' chunk couldn't load, or they failed (this document's lifetime): the pane
+// offers design mode in their place, as an older shell does.
 let loadFailed = false;
 const loadListeners = new Set<() => void>();
+
+function markFailed(): void {
+  loadFailed = true;
+  for (const listener of [...loadListeners]) listener();
+}
 
 /** Whether this desktop shell has the design tools and they can load (else, design mode). */
 export function hasDesktopDesignTools(): boolean {
@@ -27,8 +32,7 @@ const Tools = lazy<ComponentType<DesktopDesignToolsProps>>(() =>
   import("./DesktopDesignTools")
     .then((module) => ({ default: module.DesktopDesignTools }))
     .catch(() => {
-      loadFailed = true;
-      for (const listener of [...loadListeners]) listener();
+      markFailed();
       return { default: () => null };
     }),
 );
@@ -37,7 +41,7 @@ const Tools = lazy<ComponentType<DesktopDesignToolsProps>>(() =>
 export function DesktopDesignTools(props: DesktopDesignToolsProps) {
   if (!hasDesktopDesignTools()) return null;
   return (
-    <RenderErrorBoundary name="the design tools" fallback={null}>
+    <RenderErrorBoundary name="the design tools" fallback={null} onError={markFailed}>
       <Suspense fallback={null}>
         <Tools {...props} />
       </Suspense>

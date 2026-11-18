@@ -1,20 +1,6 @@
 import { renderHook, render, screen, waitFor } from "@testing-library/react";
 import { Component, createRef, type ReactNode } from "react";
-import { afterEach, expect, it, vi } from "vitest";
-
-// The tools' chunk can't load (a deploy replaced it, the network dropped).
-vi.mock("./DesktopDesignTools", () => ({
-  get DesktopDesignTools() {
-    throw new TypeError(
-      "Failed to fetch dynamically imported module: /assets/DesktopDesignTools.js",
-    );
-  },
-}));
-import {
-  DesktopDesignTools,
-  hasDesktopDesignTools,
-  useHasDesktopDesignTools,
-} from "./LazyDesktopDesignTools";
+import { afterEach, beforeEach, expect, it, vi } from "vitest";
 
 /** The app's boundary above: what reaches it would replace the app. */
 class AppBoundary extends Component<{ children: ReactNode }, { failed: boolean }> {
@@ -27,15 +13,35 @@ class AppBoundary extends Component<{ children: ReactNode }, { failed: boolean }
   }
 }
 
-afterEach(() => {
-  delete (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop;
-});
+/** The tools' chunk can't load (a deploy replaced it, the network dropped). */
+function chunkFails() {
+  vi.doMock("./DesktopDesignTools", () => ({
+    get DesktopDesignTools() {
+      throw new TypeError(
+        "Failed to fetch dynamically imported module: /assets/DesktopDesignTools.js",
+      );
+    },
+  }));
+}
 
-it("leaves the app as it is when the tools' chunk can't load", async () => {
+// Each test loads the module afresh, so none sees another's failed load.
+beforeEach(() => {
+  vi.resetModules();
   (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop = {
     browserDesignTools: vi.fn(),
     onBrowserDesignToolsEvent: vi.fn(() => () => {}),
   };
+});
+
+afterEach(() => {
+  vi.doUnmock("./DesktopDesignTools");
+  vi.restoreAllMocks();
+  delete (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop;
+});
+
+it("leaves the app as it is when the tools' chunk can't load", async () => {
+  chunkFails();
+  const { DesktopDesignTools } = await import("./LazyDesktopDesignTools");
   render(
     <AppBoundary>
       <p>Chat</p>
@@ -50,13 +56,32 @@ it("leaves the app as it is when the tools' chunk can't load", async () => {
 });
 
 it("says the tools are missing once their chunk can't load, so the pane offers design mode", async () => {
-  (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop = {
-    browserDesignTools: vi.fn(),
-    onBrowserDesignToolsEvent: vi.fn(() => () => {}),
-  };
-  // Loaded already (the test above), or loading now.
+  chunkFails();
+  const { DesktopDesignTools, hasDesktopDesignTools, useHasDesktopDesignTools } =
+    await import("./LazyDesktopDesignTools");
   const has = renderHook(() => useHasDesktopDesignTools());
+  expect(has.result.current).toBe(true);
   render(<DesktopDesignTools viewId="conv_1" hasView url="" container={createRef()} />);
   await waitFor(() => expect(has.result.current).toBe(false));
   expect(hasDesktopDesignTools()).toBe(false);
+});
+
+it("says the tools are missing once they fail after loading, so the pane offers design mode", async () => {
+  vi.spyOn(console, "error").mockImplementation(() => {});
+  vi.doMock("./DesktopDesignTools", () => ({
+    DesktopDesignTools: () => {
+      throw new Error("The tools broke");
+    },
+  }));
+  const { DesktopDesignTools, useHasDesktopDesignTools } = await import("./LazyDesktopDesignTools");
+  const has = renderHook(() => useHasDesktopDesignTools());
+  expect(has.result.current).toBe(true);
+  render(
+    <AppBoundary>
+      <p>Chat</p>
+      <DesktopDesignTools viewId="conv_1" hasView url="" container={createRef()} />
+    </AppBoundary>,
+  );
+  await waitFor(() => expect(has.result.current).toBe(false));
+  expect(screen.queryByText("The app failed")).toBeNull();
 });

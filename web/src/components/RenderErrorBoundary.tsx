@@ -8,6 +8,8 @@ interface Props {
   resetKey?: string;
   /** Shown instead of the alert; `null` hides a part whose absence is fine. */
   fallback?: ReactNode;
+  /** Told of a render failure it contained. */
+  onError?: (error: Error) => void;
 }
 
 interface State {
@@ -31,6 +33,7 @@ export class RenderErrorBoundary extends Component<Props, State> {
 
   override componentDidCatch(error: Error, info: ErrorInfo) {
     console.error(`Rendering ${this.props.name} failed`, error, info.componentStack);
+    this.props.onError?.(error);
   }
 
   override render() {

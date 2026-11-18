@@ -16,6 +16,7 @@ const FRAME_PREFIX = "omnigent-design-tools:";
 const NOT_OPEN = "the design tool isn't open on this page";
 const ZOOM_CHANGED = "the page's zoom changed";
 const NO_ANSWER = "the page didn't answer";
+const OFF_SCREEN = "nothing to capture there";
 // How long a page operation may take to answer.
 const OP_TIMEOUT_MS = 5000;
 // How often an open tool checks that its overlay is still at the page's zoom (nothing
@@ -38,6 +39,7 @@ const NOTICE_GAP = 4;
  * @property {{ width: number, height: number } | null} area  The page's part of its view
  *           while DevTools are docked there, in its CSS pixels; else null.
  * @property {boolean} claimed  Its overlay was asked for (it can be only once).
+ * @property {boolean} [measuring]  Its page area is being measured.
  * @property {() => void} detach
  * @property {(reason: string) => void} ended  End it, telling the app why.
  */
@@ -136,13 +138,15 @@ function watchOwner(owner, onGone) {
   return { detach, gone: () => gone };
 }
 
-/** `rect` inside the viewport (a crop past its edge would fail), or null for the whole page. */
+/** The part of `rect` inside the viewport (a crop past its edge would fail), or null if none. */
 function clampRect(rect, viewport) {
-  if (!rect || !(viewport.width > 0 && viewport.height > 0)) return rect;
-  const right = Math.min(viewport.width, rect.x + rect.width);
-  const bottom = Math.min(viewport.height, rect.y + rect.height);
-  if (right - rect.x < 1 || bottom - rect.y < 1) return rect;
-  return { x: rect.x, y: rect.y, width: right - rect.x, height: bottom - rect.y };
+  const x = Math.max(0, rect.x);
+  const y = Math.max(0, rect.y);
+  const fits = viewport.width > 0 && viewport.height > 0;
+  const right = fits ? Math.min(viewport.width, rect.x + rect.width) : rect.x + rect.width;
+  const bottom = fits ? Math.min(viewport.height, rect.y + rect.height) : rect.y + rect.height;
+  if (right - x < 1 || bottom - y < 1) return null;
+  return { x, y, width: right - x, height: bottom - y };
 }
 
 /** A CSS-pixel rect from the app, or null. */
@@ -150,7 +154,7 @@ function asRect(value) {
   if (!value || typeof value !== "object") return null;
   const { x, y, width, height } = /** @type {Record<string, unknown>} */ (value);
   if (![x, y, width, height].every(isFiniteNumber) || width <= 0 || height <= 0) return null;
-  return { x: Math.max(0, x), y: Math.max(0, y), width, height };
+  return { x, y, width, height };
 }
 
 /** A notice's size from the app (page CSS pixels), or null. */
@@ -212,11 +216,18 @@ function createDesignTools({
 
   /** Measure `session`'s page area again, and lay the overlay over it if it moved. */
   async function remeasure(session) {
-    const area = await pageArea(session.entry.view.webContents);
-    const before = session.area;
-    if (area?.width === before?.width && area?.height === before?.height) return;
-    session.area = area;
-    fit(session);
+    if (session.measuring) return;
+    session.measuring = true;
+    try {
+      const area = await pageArea(session.entry.view.webContents);
+      if (sessions.get(session.id) !== session) return;
+      const before = session.area;
+      if (area?.width === before?.width && area?.height === before?.height) return;
+      session.area = area;
+      fit(session);
+    } finally {
+      session.measuring = false;
+    }
   }
 
   // ── The overlay ──────────────────────────────────────────
@@ -514,7 +525,7 @@ function createDesignTools({
         const { x, y, dx, dy } = args;
         if (![x, y, dx, dy].every(isFiniteNumber)) return invalid();
         const zoom = zoomOf(entry);
-        // Its modifier keys too: Ctrl+wheel is a zoom, not a scroll.
+        // Ctrl+wheel zooms.
         const modifiers = asModifiers(args.modifiers);
         webContents.sendInputEvent({
           type: "mouseWheel",
@@ -544,7 +555,9 @@ function createDesignTools({
       width: bounds.width / zoom,
       height: bounds.height / zoom,
     };
-    const rect = clampRect(asRect(args.rect), viewport);
+    const wanted = asRect(args.rect);
+    const rect = wanted && clampRect(wanted, viewport);
+    if (wanted && !rect) return { ok: false, error: OFF_SCREEN };
     const image = await withTimeout(
       page.webContents.capturePage(
         rect

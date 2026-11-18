@@ -3,18 +3,23 @@ import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import type { DesignOutboxStripProps } from "./DesignOutboxStrip";
 import { useHasDesignRequests } from "./core/designOutboxPresence";
 
-/** After the strip's chunk fails to load, how long before the strip tries it again. */
+/** After the strip's chunk first fails to load, how long before the strip tries it again. */
 export const STRIP_RETRY_MS = 5_000;
+/** The longest wait between tries: each failed one doubles it, and a load resets it. */
+export const STRIP_RETRY_MAX_MS = 5 * 60_000;
+let retryMs = STRIP_RETRY_MS;
 
 type LoadedProps = DesignOutboxStripProps & { onUnavailable: () => void };
 
-/** In place of a strip whose chunk can't load: nothing, until it's time to try again. */
-function Unavailable({ onUnavailable }: LoadedProps) {
-  useEffect(() => {
-    const timer = setTimeout(onUnavailable, STRIP_RETRY_MS);
-    return () => clearTimeout(timer);
-  }, [onUnavailable]);
-  return null;
+/** In place of a strip whose chunk can't load: nothing, and after `waitMs`, another try. */
+function unavailable(waitMs: number): ComponentType<LoadedProps> {
+  return function Unavailable({ onUnavailable }: LoadedProps) {
+    useEffect(() => {
+      const timer = setTimeout(onUnavailable, waitMs);
+      return () => clearTimeout(timer);
+    }, [onUnavailable]);
+    return null;
+  };
 }
 
 // Loads with the design tools' outbox, and only once the session has requests to show. A
@@ -23,8 +28,16 @@ function Unavailable({ onUnavailable }: LoadedProps) {
 function loadStrip() {
   return lazy<ComponentType<LoadedProps>>(() =>
     import("./DesignOutboxStrip")
-      .then((module) => ({ default: module.DesignOutboxStrip }))
-      .catch(() => ({ default: Unavailable })),
+      .then((module) => {
+        const loaded = module.DesignOutboxStrip;
+        retryMs = STRIP_RETRY_MS;
+        return { default: loaded };
+      })
+      .catch(() => {
+        const waitMs = retryMs;
+        retryMs = Math.min(retryMs * 2, STRIP_RETRY_MAX_MS);
+        return { default: unavailable(waitMs) };
+      }),
   );
 }
 let Strip = loadStrip();
