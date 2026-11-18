@@ -837,6 +837,20 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         ("~~~", "~" * 10000, "inline-prose"),
         ("~~~", "~~~ ~~~", "overlap"),
         ("~~~", "~~~", "leading-run"),
+        ("", "`" * 130000, "outside-oversized-run"),
+        ("", "~" * 130000, "outside-oversized-run"),
+        ("", "```", "outside-short"),
+        ("", "~~~", "outside-short"),
+        ("", "```", "outside-whitespace"),
+        ("", "~~~", "outside-whitespace"),
+        ("", "`" * 10000, "outside-short"),
+        ("", "~" * 10000, "outside-short"),
+        ("", "``` ```", "outside-short"),
+        ("", "~~~ ~~~", "outside-short"),
+        ("", "```", "outside-oversized-guard"),
+        ("", "~~~", "outside-oversized-guard"),
+        ("", "```", "outside-oversized-header"),
+        ("", "~~~", "outside-oversized-header"),
     ],
     ids=[
         "backticks",
@@ -851,11 +865,138 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         "inline-prose-tildes",
         "overlap-tildes",
         "leading-run-tildes",
+        "outside-oversized-backticks",
+        "outside-oversized-tildes",
+        "outside-short-backticks",
+        "outside-short-tildes",
+        "outside-whitespace-backticks",
+        "outside-whitespace-tildes",
+        "outside-long-backticks",
+        "outside-long-tildes",
+        "outside-overlap-backticks",
+        "outside-overlap-tildes",
+        "outside-oversized-guard-backticks",
+        "outside-oversized-guard-tildes",
+        "outside-header-overlap-backticks",
+        "outside-header-overlap-tildes",
     ],
 )
 def test_fence_continuations_preserve_literal_content_and_footer_context(
-    fence: str, literal: str, shape: str
+    fence: str,
+    literal: str,
+    shape: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    if shape.startswith("outside-"):
+        from markdown_it import MarkdownIt
+
+        def content_of(comment: str) -> str:
+            _, marker, content = comment.partition("part 1 appears.\n\n")
+            assert marker
+            content, separator, footer = content.rpartition("\n\n---\n")
+            assert separator and footer.startswith("<sub>Automated review by Polly")
+            return content
+
+        metadata = {
+            "head_sha": "a" * 40,
+            "run_id": "10-1",
+            "run_url": "https://example.test/run",
+        }
+        composed = _HELPERS["compose_review"](
+            _REVIEW, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+        )
+        if shape == "outside-oversized-run":
+            prose = "Before.\n\nx" + literal + "a\n\nAfter.\n"
+        elif shape == "outside-oversized-guard":
+            prose = "Before.\n\nx" + " " * 130000 + literal + "info\n\nAfter.\n"
+        elif shape == "outside-oversized-header":
+            prose = (
+                "| x"
+                + literal
+                + " | "
+                + "h" * 70000
+                + literal
+                + " |\n| --- | --- |\n| item | note |\n\nAfter.\n"
+            )
+        else:
+            calibration = _HELPERS["review_comments"]("x" * 130000 + "\n\n" + composed, **metadata)
+            boundary = len(content_of(calibration[0]))
+            spaces = 200 if shape == "outside-whitespace" else 0
+            prose = (
+                "x" * (boundary - spaces)
+                + " " * spaces
+                + literal
+                + "info\n\n"
+                + "y" * 70000
+                + "\n\nAfter.\n"
+            )
+        review = prose + "\n" + composed
+        parser = MarkdownIt("commonmark").enable("table")
+        original = parser.parse(review)
+        assert not any(token.type == "fence" for token in original)
+        review_path, receipt = tmp_path / "review.md", tmp_path / "receipt.txt"
+        review_path.write_text(review, encoding="utf-8")
+        receipt.write_text("stale receipt\n")
+        for name, value in {
+            "HEAD_SHA": metadata["head_sha"],
+            "GITHUB_RUN_ID": "10",
+            "GITHUB_RUN_ATTEMPT": "1",
+            "RUN_URL": metadata["run_url"],
+            "PR_NUMBER": "1",
+            "REPO": "test/repo",
+        }.items():
+            monkeypatch.setenv(name, value)
+        posts = []
+        monkeypatch.setattr(
+            subprocess, "run", lambda argv, **kwargs: posts.append(Path(argv[-1]).read_text())
+        )
+        try:
+            _HELPERS["publish_review"](review_path, receipt)
+        except ValueError as error:
+            assert shape.startswith("outside-oversized-")
+            kind = "table header" if shape == "outside-oversized-header" else "literal fence run"
+            assert str(error) == f"Polly review {kind} cannot fit within comment capacity."
+            assert not posts
+            assert not receipt.exists()
+            assert not list(tmp_path.glob("comment*.md"))
+            return
+        paths = [
+            tmp_path / "comment.md",
+            *sorted(
+                tmp_path.glob("comment-part-*.md"),
+                key=lambda path: int(path.stem.rsplit("-", 1)[1]),
+            ),
+        ]
+        comments = [path.read_text(encoding="utf-8") for path in paths]
+        assert 1 < len(comments) <= _HELPERS["MAX_REVIEW_PARTS"]
+        assert posts == [*comments[1:], comments[0]]
+        assert receipt.read_text() == metadata["head_sha"] + "\n"
+        assert _HELPERS["COMMENT_BYTE_LIMIT"] == 60000
+        assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
+        table_count = 0
+        for comment in comments:
+            tokens = parser.parse(comment)
+            for token in tokens:
+                if token.type in {"fence", "code_block"}:
+                    assert "<sub>Automated review by Polly" not in token.content, (
+                        "Publication footer is inside independently rendered code"
+                    )
+                    assert "tests/test_parser.py::test_empty" not in token.content, (
+                        "Assessment is inside independently rendered code"
+                    )
+            assert not any(token.type == "fence" for token in tokens), (
+                "Literal prose became an opening fence"
+            )
+            table_count += sum(token.type == "table_open" for token in tokens)
+        assert not shape.startswith("outside-oversized-")
+        assert table_count == sum(token.type == "table_open" for token in original) == 1
+        assert "".join(content_of(comment) for comment in comments) == review
+        row = next(line for line in _REVIEW.splitlines() if line.startswith("| tests/"))
+        assert sum(comment.count(row) for comment in comments) == 1
+        assert sum(comment.count("After.") for comment in comments) == 1
+        assert sum(comment.count("<!-- polly-reviewed-sha:") for comment in comments) == 1
+        return
     if shape == "leading-run":
         code = literal + " " * 58000 + "a" + "\n" + "y" * 70000 + "\n"
     else:

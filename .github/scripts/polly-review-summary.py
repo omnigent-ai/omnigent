@@ -331,6 +331,7 @@ def _markdown_context(
     Only canonical assessment rows require every field to be populated.
     Disclosure balancing supports lowercase <details>/</details> without attributes
     at the first nonblank position; <summary> may share an opening line.
+    Inline-code formatting across fragments is not balanced.
     """
     details = 0
     fence = ""
@@ -343,11 +344,32 @@ def _markdown_context(
     def protect_span(start: int, end: int, kind: str) -> None:
         if protected_spans is None:
             return
-        if protected_spans and start < protected_spans[-1][1]:
-            prior_start, prior_end, prior_kind = protected_spans[-1]
-            protected_spans[-1] = (prior_start, max(prior_end, end), prior_kind)
-        else:
-            protected_spans.append((start, end, kind))
+        while protected_spans and start < protected_spans[-1][1]:
+            prior_start, prior_end, _ = protected_spans.pop()
+            start, end = min(start, prior_start), max(end, prior_end)
+        protected_spans.append((start, end, kind))
+
+    def protect_literals(line: str, line_start: int, active_fence: str = "") -> None:
+        pattern = (
+            rf" {{0,3}}({re.escape(active_fence[0])}{{{len(active_fence)},}})"
+            if active_fence
+            else r"(`{3,}|~{3,})"
+        )
+        for literal in re.finditer(pattern, line):
+            start = max(0, literal.start() - 1)
+            end = literal.end(1)
+            if active_fence:
+                if re.fullmatch(r" {0,3}", line[start : literal.start(1)]):
+                    following = re.search(r"\S", line[end:])
+                    end += following.end() if following else len(line) - end
+            else:
+                # Opening fences allow trailing info, so retain the left non-opening context.
+                start = literal.start(1)
+                while start and line[start - 1] in " \t":
+                    start -= 1
+                if start:
+                    start -= 1
+            protect_span(line_start + start, line_start + end, "literal fence run")
 
     for line in text.removesuffix("\n").split("\n"):
         line_start = offset
@@ -357,16 +379,7 @@ def _markdown_context(
                 protect_span(line_start, min(offset, len(text)), "fence delimiter")
                 fence = ""
             elif protected_spans is not None:
-                for literal in re.finditer(
-                    rf" {{0,3}}({re.escape(fence[0])}{{{len(fence)},}})", line
-                ):
-                    start = max(0, literal.start() - 1)
-                    end = literal.end(1)
-                    # A run needs a left guard, or nonspace text after it, to stay literal.
-                    if re.fullmatch(r" {0,3}", line[start : literal.start(1)]):
-                        following = re.search(r"\S", line[end:])
-                        end += following.end() if following else len(line) - end
-                    protect_span(line_start + start, line_start + end, "literal fence run")
+                protect_literals(line, line_start, fence)
             continue
         opening = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
         if opening:
@@ -375,6 +388,8 @@ def _markdown_context(
             table_header = ""
             assessment_table = False
             continue
+        if protected_spans is not None:
+            protect_literals(line, line_start)
         if line.lstrip().startswith(("<details>", "</details>")):
             for tag in re.findall(r"</?details>", line):
                 details = max(0, details + (1 if tag == "<details>" else -1))
