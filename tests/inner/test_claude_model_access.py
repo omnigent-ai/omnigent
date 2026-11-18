@@ -347,10 +347,11 @@ def test_worker_gets_only_placeholder_and_private_state(tmp_path: Path) -> None:
 
 
 def test_replaced_static_credential_scrubs_current_value(tmp_path: Path) -> None:
+    resolve = Mock(side_effect=AssertionError("static credential must not be resolved"))
     access = ClaudeModelAccess(
-        "https://model.test", "authorization", lambda: "old-key", static_credential_value="old-key"
+        "https://model.test", "authorization", resolve, static_credential_value="old-key"
     )
-    replacement = replace(access, credential=lambda: "new-key", static_credential_value="new-key")
+    replacement = replace(access, credential=resolve, static_credential_value="new-key")
     access._adopt_credential(replacement)
     env = {"MODEL_ALIAS": "Bearer new-key", "UNRELATED_ENV": "keep-me"}
     access.worker_environment(env, tmp_path)
@@ -1382,9 +1383,11 @@ def test_host_oauth_file_is_reread_without_exposing_refresh_token(
     monkeypatch.chdir(workspace)
     _write_oauth(source, "renewed")
     assert access.credential() == "renewed"
-    env: dict[str, str] = {}
+    env = {"MODEL_ALIAS": "Bearer renewed", "UNRELATED_ENV": "keep-me"}
     access.worker_environment(env, tmp_path / "worker")
     assert env["CLAUDE_CODE_OAUTH_TOKEN"] == access.placeholder
+    assert "MODEL_ALIAS" not in env
+    assert env["UNRELATED_ENV"] == "keep-me"
     assert "parent-only-refresh" not in json.dumps(env)
     assert "renewed" not in json.dumps(env)
 
@@ -1405,6 +1408,8 @@ def test_host_oauth_file_is_reread_without_exposing_refresh_token(
         access.credential()
     assert "expired-parent-token" not in str(error.value)
     assert "parent-only-refresh" not in str(error.value)
+    with pytest.raises(ClaudeAuthRequired, match="authentication is unavailable"):
+        access.worker_environment({"MODEL_ALIAS": "expired-parent-token"}, tmp_path / "worker")
 
 
 def test_databricks_auth_pins_the_trusted_executable_before_worker_start(
@@ -1425,7 +1430,9 @@ def test_databricks_auth_pins_the_trusted_executable_before_worker_start(
         {HELPER_ENV: "trusted-generated-auth", "ANTHROPIC_BASE_URL": "https://model.test/gateway"},
         databricks_profile="selected-profile",
     )
-    assert access.credential() == "parent-bearer"
+    env = {"MODEL_ALIAS": "Bearer parent-bearer"}
+    assert access.worker_environment(env, tmp_path / "worker") == "parent-bearer"
+    assert "MODEL_ALIAS" not in env
     assert access.auth_executable is not None
     assert access.auth_executable.path == executable.path
     assert access.auth_executable.interpreter == interpreter

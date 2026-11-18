@@ -434,9 +434,20 @@ class ClaudeModelAccess:
             )
         return policy
 
-    def worker_environment(self, env: MutableMapping[str, str], home: Path) -> None:
+    def worker_environment(
+        self, env: MutableMapping[str, str], home: Path, *, credential_value: str | None = None
+    ) -> str:
         """Install only a session placeholder and isolated Claude state."""
-        static_secret = self._credential_resolver.static_secret()
+        secret = credential_value
+        if secret is None:
+            secret = self._credential_resolver.static_secret()
+        if secret is None:
+            try:
+                secret = self.credential()
+            except Exception:  # noqa: BLE001 — resolver errors may include credentials
+                raise ClaudeAuthRequired() from None
+        if not isinstance(secret, str) or not secret:
+            raise ClaudeAuthRequired()
         for key in (*_SECRET_ENV, *self.source_env_names):
             for name in env_names_with_omnigent_prefix(key):
                 env.pop(name, None)
@@ -446,7 +457,7 @@ class ClaudeModelAccess:
             if (
                 _is_claude_credential_env_name(key)
                 or key.removeprefix("OMNIGENT_").startswith(("HARNESS_", "DATABRICKS_"))
-                or (bool(static_secret) and static_secret in value)
+                or secret in value
             ):
                 env.pop(key)
         env["HOME"] = str(home)
@@ -455,6 +466,7 @@ class ClaudeModelAccess:
         # A Bearer placeholder also works with apiKeyHelper-style gateways.
         env["CLAUDE_CODE_OAUTH_TOKEN" if self.oauth else "ANTHROPIC_AUTH_TOKEN"] = self.placeholder
         env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+        return secret
 
     def reconstruct(
         self,

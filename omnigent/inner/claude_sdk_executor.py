@@ -2172,8 +2172,10 @@ def prepare_claude_cli_path(
             if model_access is not None:
                 home = runtime_tmpdir / "home"
                 (home / ".claude").mkdir(parents=True)
-                model_access.worker_environment(staged_env, home)
-                model_access.worker_environment(allowed_env, home)
+                credential_value = model_access.worker_environment(staged_env, home)
+                model_access.worker_environment(
+                    allowed_env, home, credential_value=credential_value
+                )
         if egress_rules or model_access is not None:
             assert runtime_tmpdir is not None
             from .credential_proxy import prepare_credential_proxy_runtime
