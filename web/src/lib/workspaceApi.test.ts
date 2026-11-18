@@ -540,6 +540,7 @@ describe("searchFilesViaWorkspaceApi", () => {
         path: "src",
         include: ["*.{ts,tsx}", "lib/**"],
         exclude: [],
+        includeIgnored: true,
       }),
     ]);
     // Paths are relative to the searched directory, as REST reports them.
@@ -614,6 +615,24 @@ describe("searchFilesViaWorkspaceApi", () => {
     );
     expect(methods).toEqual(["GetCapabilities", "SearchFiles", "ReadFile"]);
     expect(grantRequests()).toBe(1);
+  });
+
+  it("leaves the search to REST while the host's file list is still being built", async () => {
+    enable("workspace_api_server_access");
+    const refreshing = create(SearchFilesResponseSchema, { refreshing: true });
+    serveMethods({
+      GetCapabilities: () =>
+        new Response(capabilitiesBody("ReadFile", ...SEARCH_FILES), { headers: PROTO_HEADERS }),
+      SearchFiles: () =>
+        new Response(toBinary(SearchFilesResponseSchema, refreshing), { headers: PROTO_HEADERS }),
+      ReadFile: () => new Response(textFile(), { headers: CONNECT_HEADERS }),
+    });
+
+    expect(await searchFilesViaWorkspaceApi("s-refreshing", "main", SEARCH_OPTIONS)).toBeNull();
+    // An unsettled list isn't a failure: the route keeps serving.
+    expect((await readFileViaWorkspaceApi("s-refreshing", "notes.md"))?.content).toBe("héllo");
+    expect(await searchFilesViaWorkspaceApi("s-refreshing", "main", SEARCH_OPTIONS)).toBeNull();
+    expect(methodCalls("SearchFiles")).toHaveLength(2);
   });
 
   it("lets one caller cancel while another uses the shared capability check", async () => {
