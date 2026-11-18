@@ -391,7 +391,7 @@ def test_project_menu_is_visible_without_hover(
 
         for expanded in [True, False]:
             if header.get_attribute("aria-expanded") != str(expanded).lower():
-                header.click()
+                header.locator("[data-section-toggle]").first.click()
                 touch.mouse.move(viewport["width"] - 1, 0)
             expect(kebab).to_be_visible()
             assert kebab.evaluate("""element => {
