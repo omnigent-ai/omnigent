@@ -56,6 +56,9 @@ const NODE_TINT: Record<StepState, string> = {
 // The states a run's legend explains, in the order work moves through them.
 const LEGEND: readonly StepState[] = ["waiting", "running", "needs_input", "done", "failed"];
 
+/** How long a step's hover card waits before it opens. */
+export const HOVER_CARD_OPEN_DELAY_MS = 300;
+
 // A node's ⋯ button; React Flow leaves a press on it alone rather than panning.
 const NODE_MENU_BUTTON =
   "nodrag nopan -my-0.5 -mr-1.5 shrink-0 cursor-pointer rounded-md p-0.5 text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50";
@@ -92,7 +95,7 @@ function StepNode({ id, data }: NodeProps<Node<StepNodeData>>) {
       <HoverCard
         open={cardOpen && !menuOpen}
         onOpenChange={setCardOpen}
-        openDelay={300}
+        openDelay={HOVER_CARD_OPEN_DELAY_MS}
         closeDelay={100}
       >
         <HoverCardTrigger asChild>

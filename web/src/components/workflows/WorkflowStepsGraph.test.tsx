@@ -7,7 +7,11 @@ import type { JournalEntry, StepProgress } from "@/lib/sessionJournal";
 import type { WorkflowStep } from "@/lib/workflowGraphLayout";
 import { taskMenuAction } from "@/shell/TasksPanel";
 
-import { WorkflowGraphOverlay, WorkflowStepsGraph } from "./WorkflowStepsGraph";
+import {
+  HOVER_CARD_OPEN_DELAY_MS,
+  WorkflowGraphOverlay,
+  WorkflowStepsGraph,
+} from "./WorkflowStepsGraph";
 
 // React Flow runs out of memory in jsdom; this stand-in draws each node with its type.
 vi.mock("@xyflow/react", () => ({
@@ -44,9 +48,6 @@ const STEPS: WorkflowStep[] = [
   { id: "fix", name: "Fix the test", goal: "The suite passes", depends_on: ["explore"] },
 ];
 
-// The hover card's open delay (WorkflowStepsGraph's HoverCard) is 300ms.
-const HOVER_CARD_OPEN_DELAY_MS = 300;
-
 /**
  * Radix can leave a hover card's open timer pending when focus opens the card
  * after a pointer enter. jsdom tears the window down before that timer fires,
@@ -59,6 +60,12 @@ async function settleHoverCards() {
     });
   });
 }
+
+// Runs after every test, before unmounting, so pending hover-card timers fire while mounted.
+afterEach(async () => {
+  await settleHoverCards();
+  cleanup();
+});
 
 /** A step's newest status, as the run's journal records it. */
 function statusEntry(step: string, status: string, text: string): JournalEntry {
@@ -86,11 +93,6 @@ function progress(...states: StepProgress["state"][]): StepProgress[] {
 }
 
 describe("WorkflowStepsGraph", () => {
-  afterEach(async () => {
-    await settleHoverCards();
-    cleanup();
-  });
-
   it("numbers the workflow's steps, and opens them full screen", () => {
     render(<WorkflowStepsGraph steps={STEPS} title="Triage flaky tests" />);
     const nodes = screen.getAllByTestId("workflow-step-node");
@@ -122,11 +124,6 @@ describe("WorkflowStepsGraph", () => {
 });
 
 describe("WorkflowGraphOverlay", () => {
-  afterEach(async () => {
-    await settleHoverCards();
-    cleanup();
-  });
-
   it("shows where each of a run's steps stands, with a legend", () => {
     const onClose = vi.fn();
     render(
