@@ -363,6 +363,7 @@ def test_split_review_rejects_nonprogress_on_escaped_pipe_whitespace() -> None:
             None,
             "unsafe-fence-whitespace-tildes",
         ),
+        (None, 0, "", False, "run", None, None, False, False, None, None, "nested-list"),
     ],
     ids=[
         "many-rows",
@@ -401,6 +402,7 @@ def test_split_review_rejects_nonprogress_on_escaped_pipe_whitespace() -> None:
         "unsafe-inline-run-tildes",
         "unsafe-fence-whitespace-backticks",
         "unsafe-fence-whitespace-tildes",
+        "nested-list",
     ],
 )
 def test_long_review_parts_preserve_all_assessments_and_markdown_context(
@@ -419,6 +421,62 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    if table_variant == "nested-list":
+        from markdown_it import MarkdownIt
+
+        findings = "## Findings\n\n" + "".join(
+            f"- Finding {index}\n    - nested {index} " + "z" * 200 + "\n" for index in range(400)
+        )
+        review = (
+            findings
+            + "\n"
+            + _HELPERS["compose_review"](
+                _REVIEW, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+            )
+        )
+        parser = MarkdownIt("commonmark").enable("table")
+        original = parser.parse(review)
+        expected = [
+            item
+            for index in range(400)
+            for item in [(f"Finding {index}", 3), (f"nested {index} " + "z" * 200, 5)]
+        ]
+        assert [
+            (token.content, token.level)
+            for token in original
+            if token.type == "inline" and token.content.startswith(("Finding ", "nested "))
+        ] == expected
+        assert not any(token.type in {"code_block", "fence"} for token in original)
+        assert sum(token.type == "table_open" for token in original) == 1
+        assert _HELPERS["COMMENT_BYTE_LIMIT"] == 60000
+        assert len(review.encode("utf-8")) > 60000
+        review_path, receipt, posts = _prepare_publication(
+            tmp_path, monkeypatch, head_sha="a" * 40, run_url="https://example.test/run"
+        )
+        try:
+            comments = _published_comments(review, review_path, receipt)
+        except ValueError as error:
+            assert (
+                str(error) == "Polly review nested lists are not supported in multipart comments."
+            )
+            assert not posts and not receipt.exists()
+            assert sorted(path.name for path in tmp_path.iterdir()) == ["review.md"]
+            return
+        assert posts == [*comments[1:], comments[0]]
+        assert receipt.read_text() == "a" * 40 + "\n"
+        assert 1 < len(comments) <= _HELPERS["MAX_REVIEW_PARTS"]
+        assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
+        rendered = [token for comment in comments for token in parser.parse(comment)]
+        assert not any(token.type in {"code_block", "fence"} for token in rendered), (
+            "Nested-list child became independently rendered code"
+        )
+        assert [
+            (token.content, token.level)
+            for token in rendered
+            if token.type == "inline" and token.content.startswith(("Finding ", "nested "))
+        ] == expected
+        assert sum(token.type == "table_open" for token in rendered) == 1
+        return
     unrenderable_whitespace = any(
         isinstance(spec, str) and " " * _HELPERS["COMMENT_BYTE_LIMIT"] in spec
         for spec in rationale_specs or ()
@@ -909,6 +967,8 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         ("~~~", "  ", "container-continuation"),
         ("```", "    ", "container-continuation"),
         ("~~~", "    ", "container-continuation"),
+        ("```", "- ", "short-fenced-example"),
+        ("~~~", "- ", "short-fenced-example"),
     ],
     ids=[
         "backticks",
@@ -981,6 +1041,8 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         "container-continuation-list-tildes",
         "container-continuation-nested-backticks",
         "container-continuation-nested-tildes",
+        "short-fenced-example-backticks",
+        "short-fenced-example-tildes",
     ],
 )
 def test_fence_continuations_preserve_literal_content_and_footer_context(
@@ -990,6 +1052,59 @@ def test_fence_continuations_preserve_literal_content_and_footer_context(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    if shape == "short-fenced-example":
+        from markdown_it import MarkdownIt
+
+        example = (
+            literal
+            + fence
+            + "text\n"
+            + "".join(
+                "  " + line + "\n"
+                for line in [
+                    "| Test / case | Behavior protected | Layer | Needed? | Action / rationale |",
+                    "| --- | --- | --- | --- | --- |",
+                    "| example | | Unit | Keep | |",
+                ]
+            )
+            + "  "
+            + fence
+            + "\n\n"
+        )
+        review = _HELPERS["compose_review"](
+            example + _REVIEW,
+            {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]},
+        )
+        parser = MarkdownIt("commonmark").enable("table")
+        original = parser.parse(review)
+        assert len([token for token in original if token.type == "fence"]) == 1
+        assert "| example | | Unit | Keep | |" in next(
+            token.content for token in original if token.type == "fence"
+        )
+        assert sum(token.type == "table_open" for token in original) == 1
+        expected = (
+            "<!-- polly-review-bot -->\n<!-- polly-reviewed-sha: " + "a" * 40 + " -->\n"
+            "<!-- polly-review-run:10-1 -->\n"
+            '## <img src="https://raw.githubusercontent.com/omnigent-ai/omnigent/main/'
+            'docs/images/omnigent-logo.svg" alt="" height="20" valign="middle" /> '
+            "Polly AI Review\n\n"
+            + review
+            + "\n---\n<sub>Automated review by Polly · [workflow run](https://example.test/run)</sub>\n"
+        )
+        assert len(expected.encode("utf-8")) < _HELPERS["COMMENT_BYTE_LIMIT"] == 60000
+        review_path, receipt, posts = _prepare_publication(
+            tmp_path, monkeypatch, head_sha="a" * 40, run_url="https://example.test/run"
+        )
+        comments = _published_comments(review, review_path, receipt)
+        assert comments == posts == [expected]
+        assert receipt.read_text() == "a" * 40 + "\n"
+        assert not list(tmp_path.glob("comment-part-*.md"))
+        rendered = parser.parse(comments[0])
+        assert sum(token.type == "table_open" for token in rendered) == 1
+        assert [token.content for token in rendered if token.type == "fence"] == [
+            token.content for token in original if token.type == "fence"
+        ]
+        return
     if shape == "container-continuation":
         from markdown_it import MarkdownIt
 

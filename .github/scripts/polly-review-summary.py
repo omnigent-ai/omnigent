@@ -331,7 +331,8 @@ def _markdown_context(
     Only canonical assessment rows require every field to be populated.
     Disclosure balancing supports lowercase <details>/</details> without attributes
     at the first nonblank position; <summary> may share an opening line.
-    Multipart preflight rejects container-prefixed or indented fences outside active fences.
+    Multipart preflight rejects nested lists and container-prefixed or indented
+    fences outside active fences.
     Inline-code formatting across fragments is not balanced.
     """
     details = 0
@@ -339,6 +340,7 @@ def _markdown_context(
     fence_line = ""
     table_header = ""
     assessment_table = False
+    nested_list = False
     previous = ""
     offset = previous_start = 0
     container_marker = re.compile(r">|[-+*](?=[ \t])|[0-9]{1,9}[.)](?=[ \t])")
@@ -398,6 +400,10 @@ def _markdown_context(
                 raise ValueError(
                     "Polly review container fences are not supported in multipart comments."
                 )
+            indentation = len(line) - len(line.lstrip(" \t"))
+            if indentation:
+                marker = container_marker.match(line, indentation)
+                nested_list |= marker is not None and marker[0] != ">"
         opening = re.match(
             r"^[ \t]*(`{3,}|~{3,})" if protected_spans is not None else r"^ {0,3}(`{3,}|~{3,})",
             line,
@@ -446,6 +452,8 @@ def _markdown_context(
             assessment_table = False
         previous = line
         previous_start = line_start
+    if nested_list:
+        raise ValueError("Polly review nested lists are not supported in multipart comments.")
     prefix = "<details>\n<summary>Review continued</summary>\n\n" * details
     suffix = "\n\n</details>" * details
     if fence:
@@ -507,7 +515,7 @@ def review_comments(review: str, *, head_sha: str, run_id: str, run_url: str) ->
 
     single = wrap(review, 1, 1)
     if len(single.encode("utf-8")) <= COMMENT_BYTE_LIMIT:
-        return validated([single])
+        return [single]
     if len(review.encode("utf-8")) > COMMENT_BYTE_LIMIT * MAX_REVIEW_PARTS:
         raise ValueError("Polly review exceeds the publication part limit.")
     work_left = RENDER_WORK_BYTE_LIMIT
