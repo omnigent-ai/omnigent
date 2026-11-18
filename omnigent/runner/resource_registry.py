@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Literal, Protocol, TypedDict
 
 from cachetools import TTLCache
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.entities.pagination import PagedList
 from omnigent.entities.session_resources import (
@@ -68,10 +69,7 @@ class _ProgramStatusLaunchArgs(TypedDict, total=False):
     program_status_app: str
 
 
-_DEFAULT_WORKSPACE_ROOT = os.path.join(
-    os.environ.get("TMPDIR", "/tmp"),
-    "omnigent-sessions",
-)
+_DEFAULT_WORKSPACE_PARENT = os.environ.get("TMPDIR", None if IS_WINDOWS else "/tmp")
 
 CODEX_NATIVE_TERMINAL_ROLE = "codex-native"
 CLAUDE_NATIVE_TERMINAL_ROLE = "claude-native"
@@ -565,10 +563,12 @@ def _session_workspace(session_id: str) -> str:
     :returns: Absolute path to the session workspace directory.
     :raises ValueError: If the session id escapes the workspace root.
     """
-    root = os.environ.get(
-        "OMNIGENT_RUNNER_OS_ENV_ROOT",
-        _DEFAULT_WORKSPACE_ROOT,
-    )
+    root = os.environ.get("OMNIGENT_RUNNER_OS_ENV_ROOT")
+    if root is None:
+        workspace_parent = _DEFAULT_WORKSPACE_PARENT
+        if workspace_parent is None:
+            workspace_parent = tempfile.gettempdir()
+        root = os.path.join(workspace_parent, "omnigent-sessions")
     return os.path.join(_contained_session_dir(root, session_id), "workspace")
 
 
