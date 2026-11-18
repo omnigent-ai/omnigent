@@ -171,7 +171,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
     proposedSteps?.length && proposedDescription !== workflow.description
       ? proposedDescription
       : null;
-  const useNewDescription = newDescription !== null && acceptedDescription === newDescription;
+  const proposedChosen = newDescription !== null && acceptedDescription === newDescription;
   const stepSignature = (steps: typeof workflow.steps) =>
     JSON.stringify(
       steps.map(({ id, name, goal, depends_on }) => [id, name, goal ?? null, depends_on]),
@@ -271,8 +271,10 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
           workflowId={workflow.id}
           text={workflow.description}
           proposed={newDescription}
-          useProposed={useNewDescription}
-          onUseProposedChange={(use) => setAcceptedDescription(use ? newDescription : null)}
+          choice={proposedChosen ? "proposed" : "current"}
+          onChoiceChange={(choice) =>
+            setAcceptedDescription(choice === "proposed" ? newDescription : null)
+          }
         />
 
         <section className="mt-6">
@@ -295,7 +297,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
                   setPlannerOpen(showPlanner);
                   // Keeping the current description still records the proposal, so it isn't
                   // offered again. The server keeps a description another client saved since.
-                  const kept = newDescription !== null && !useNewDescription;
+                  const kept = newDescription !== null && !proposedChosen;
                   const description =
                     proposedDescription === null
                       ? {}
@@ -474,6 +476,8 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   );
 }
 
+type DescriptionChoice = "current" | "proposed";
+
 /**
  * The description, in a section like an automation's prompt: three lines and
  * an ellipsis, with a chevron to show the rest when there is more. Its pencil
@@ -484,16 +488,16 @@ function WorkflowDescription({
   workflowId,
   text,
   proposed,
-  useProposed,
-  onUseProposedChange,
+  choice,
+  onChoiceChange,
 }: {
   workflowId: string;
   text: string;
   /** A newer proposal's different description, or null. */
   proposed: string | null;
-  /** Whether Save plan applies *proposed*. */
-  useProposed: boolean;
-  onUseProposedChange: (useProposed: boolean) => void;
+  /** The description Save plan applies while *proposed* is offered. */
+  choice: DescriptionChoice;
+  onChoiceChange: (choice: DescriptionChoice) => void;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [clamped, setClamped] = useState(false);
@@ -545,7 +549,7 @@ function WorkflowDescription({
     if (!next) return;
     if (next === text) {
       // Back to the current wording, which a review then keeps.
-      if (reviewing) onUseProposedChange(false);
+      if (reviewing) onChoiceChange("current");
       close();
       return;
     }
@@ -558,7 +562,7 @@ function WorkflowDescription({
   };
   // The editor starts from the chosen description.
   const edit = () => {
-    const start = useProposed && proposed !== null ? proposed : text;
+    const start = choice === "proposed" && proposed !== null ? proposed : text;
     setDraftStart(start);
     setDraft(start);
   };
@@ -656,10 +660,10 @@ function WorkflowDescription({
           </div>
         </form>
       ) : reviewing ? (
-        <CardRadioGroup<"current" | "proposed">
+        <CardRadioGroup<DescriptionChoice>
           labelledBy={headingId}
-          value={useProposed ? "proposed" : "current"}
-          onSelect={(choice) => onUseProposedChange(choice === "proposed")}
+          value={choice}
+          onSelect={onChoiceChange}
           className="grid gap-3 sm:grid-cols-2"
           cardClassName="gap-1 p-3 text-left"
           items={[
@@ -667,7 +671,7 @@ function WorkflowDescription({
               value: "current",
               testId: "workflow-detail-keep-description",
               body: (
-                <DescriptionChoice
+                <DescriptionOption
                   label="Keep current"
                   text={text}
                   testId="workflow-detail-description"
@@ -678,7 +682,7 @@ function WorkflowDescription({
               value: "proposed",
               testId: "workflow-detail-use-proposed-description",
               body: (
-                <DescriptionChoice
+                <DescriptionOption
                   label="Use proposed"
                   text={proposed}
                   testId="workflow-detail-proposed-description"
@@ -704,7 +708,7 @@ function WorkflowDescription({
 }
 
 /** One description to choose from, inside its radio card. */
-function DescriptionChoice({
+function DescriptionOption({
   label,
   text,
   testId,
