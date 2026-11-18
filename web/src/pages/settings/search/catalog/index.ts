@@ -3,6 +3,7 @@
 
 import type { SettingsSectionId } from "@/shell/settingsNav";
 
+import { ARCHIVED_SETTINGS } from "./archived";
 import { CLI_SETTINGS } from "./cli";
 import { IMPORT_SETTINGS } from "./import";
 import type { SettingsEntry } from "./types";
@@ -23,7 +24,7 @@ export const SECTION_CATALOGS: Readonly<Record<SettingsSectionId, readonly Setti
   members: [],
   policies: [],
   sharing: [],
-  archived: [],
+  archived: ARCHIVED_SETTINGS,
   cli: CLI_SETTINGS,
   updates: UPDATES_SETTINGS,
 };
