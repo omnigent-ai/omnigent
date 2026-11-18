@@ -525,6 +525,8 @@ async def test_real_callback_child_cannot_read_secrets_or_use_direct_network(
         listener.bind(("127.0.0.1", 0))
         listener.listen()
         port = listener.getsockname()[1]
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
+            pass
         code = f"""
 import json, os, pathlib, socket, subprocess, sys
 child = '''import json, os; print(json.dumps(dict(os.environ)))'''

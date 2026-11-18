@@ -11,6 +11,7 @@ import sys
 import sysconfig
 import time
 import venv
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -760,13 +761,37 @@ async def test_oauth_reread_revalidates_aliases_and_file_type(
     assert "parent-only-refresh" not in str(error.value)
 
 
+async def _start_model_upstream(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider: Callable[[asyncio.StreamReader, asyncio.StreamWriter], Awaitable[None]],
+) -> tuple[Path, Path, Path, asyncio.Server]:
+    cert, key = ensure_ca(cache_dir=tmp_path)
+    bundle = ensure_ca_bundle(cert, cache_dir=tmp_path)
+    upstream = await asyncio.start_server(
+        provider, "127.0.0.1", 0, ssl=HostCertCache(cert, key).get_ssl_context("model.test")
+    )
+    upstream_port = upstream.sockets[0].getsockname()[1]
+    original_connect = asyncio.open_connection
+
+    async def connect(host, port, **kwargs):
+        assert host in ("127.0.0.1", "model.test")
+        return await original_connect(
+            "127.0.0.1", upstream_port if port == 443 else port, **kwargs
+        )
+
+    async def allow_destination(self, host, port):
+        return "127.0.0.1"
+
+    monkeypatch.setattr(asyncio, "open_connection", connect)
+    monkeypatch.setattr(EgressProxy, "_assert_destination_allowed", allow_destination)
+    return cert, key, bundle, upstream
+
+
 async def test_inference_works_without_rules_and_broad_rules_cannot_bypass_signing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Exercise CONNECT, TLS, signing, streaming, and rejection on real sockets."""
-    cert, key = ensure_ca(cache_dir=tmp_path)
-    bundle = ensure_ca_bundle(cert, cache_dir=tmp_path)
-    server_context = HostCertCache(cert, key).get_ssl_context("model.test")
     received: list[bytes] = []
 
     async def provider(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -787,21 +812,7 @@ async def test_inference_works_without_rules_and_broad_rules_cannot_bypass_signi
         writer.close()
         await writer.wait_closed()
 
-    upstream = await asyncio.start_server(provider, "127.0.0.1", 0, ssl=server_context)
-    upstream_port = upstream.sockets[0].getsockname()[1]
-    original_connect = asyncio.open_connection
-
-    async def connect(host, port, **kwargs):
-        assert host == "127.0.0.1" or host == "model.test"
-        return await original_connect(
-            "127.0.0.1", upstream_port if port == 443 else port, **kwargs
-        )
-
-    async def allow_destination(self, host, port):
-        return "127.0.0.1"
-
-    monkeypatch.setattr(asyncio, "open_connection", connect)
-    monkeypatch.setattr(EgressProxy, "_assert_destination_allowed", allow_destination)
+    cert, key, bundle, upstream = await _start_model_upstream(tmp_path, monkeypatch, provider)
     credentials = Mock(return_value="parent-only-key")
     access = ClaudeModelAccess("https://model.test/gateway", "x-api-key", credentials)
     relay = access.create_proxy([], cert, key, upstream_ca_bundle=bundle)
@@ -907,8 +918,6 @@ async def test_upstream_401_refreshes_credential_on_the_next_request(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A real upstream response must invalidate the relay's credential cache."""
-    cert, key = ensure_ca(cache_dir=tmp_path)
-    bundle = ensure_ca_bundle(cert, cache_dir=tmp_path)
     received: list[bytes] = []
 
     async def provider(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -926,23 +935,7 @@ async def test_upstream_401_refreshes_credential_on_the_next_request(
         writer.close()
         await writer.wait_closed()
 
-    upstream = await asyncio.start_server(
-        provider, "127.0.0.1", 0, ssl=HostCertCache(cert, key).get_ssl_context("model.test")
-    )
-    upstream_port = upstream.sockets[0].getsockname()[1]
-    original_connect = asyncio.open_connection
-
-    async def connect(host, port, **kwargs):
-        assert host in ("127.0.0.1", "model.test")
-        return await original_connect(
-            "127.0.0.1", upstream_port if port == 443 else port, **kwargs
-        )
-
-    async def allow_destination(self, host, port):
-        return "127.0.0.1"
-
-    monkeypatch.setattr(asyncio, "open_connection", connect)
-    monkeypatch.setattr(EgressProxy, "_assert_destination_allowed", allow_destination)
+    cert, key, bundle, upstream = await _start_model_upstream(tmp_path, monkeypatch, provider)
     credentials = Mock(side_effect=["first", "refreshed"])
     access = ClaudeModelAccess("https://model.test/gateway", "authorization", credentials)
     relay = access.create_proxy([], cert, key, upstream_ca_bundle=bundle)
