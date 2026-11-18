@@ -607,6 +607,7 @@ function CommentCard({
       {threadsEnabled && !c.anchor_metadata && (
         <CommentThread
           comment={c}
+          onSelect={onClick}
           selected={!!isSelected}
           canEdit={canEditReplies}
           canAddress={canAddressReplies}

@@ -168,7 +168,7 @@ export const ReadOnlyAddressedTab: Story = {
 
 const threadClient = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity } } });
 threadClient.setQueryData(
-  ["comments", "conversation-story", "replies", "thread-comment"],
+  ["comments", "conversation-story", "replies", "thread-comment", 1_718_440_200 * 1_000_000],
   [
     {
       id: "reply-1",

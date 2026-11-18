@@ -1075,7 +1075,11 @@ describe("FileViewer URL sync — comment param (write)", () => {
 describe("FileViewer addressed selection", () => {
   it("keeps the selected comment active while Address All moves it", () => {
     const mutate = vi.fn();
-    useOptionalCommentSenderMock.mockReturnValue({ mutate, isPending: false });
+    useOptionalCommentSenderMock.mockReturnValue({
+      mutate,
+      mutateAsync: vi.fn(),
+      isPending: false,
+    });
     const comment = makeComment("c1");
     useCommentsMock.mockReturnValue(makeCommentsQuery([comment]));
 
@@ -1111,7 +1115,11 @@ describe("FileViewer Address All", () => {
     ["only other files", [sentHere], ["c2"], 1],
   ])("sends drafts from %s in one message", (_label, fileComments, expectedIds, fileCount) => {
     const mutate = vi.fn();
-    useOptionalCommentSenderMock.mockReturnValue({ mutate, isPending: false });
+    useOptionalCommentSenderMock.mockReturnValue({
+      mutate,
+      mutateAsync: vi.fn(),
+      isPending: false,
+    });
     // The session-wide list may lag behind this file's list: c4 is still a draft there,
     // the new draft c1 is missing, and the deleted draft c5 remains.
     const staleSessionComments = [
@@ -1138,7 +1146,11 @@ describe("FileViewer Address All", () => {
 
   it("does not send or count local review comments on any path", () => {
     const mutate = vi.fn();
-    useOptionalCommentSenderMock.mockReturnValue({ mutate, isPending: false });
+    useOptionalCommentSenderMock.mockReturnValue({
+      mutate,
+      mutateAsync: vi.fn(),
+      isPending: false,
+    });
     const localHere = { ...localReview, id: "pr-here", path: "file1.py" };
     useCommentsMock.mockImplementation((_sessionId, path) =>
       makeCommentsQuery(path ? [localHere] : [localHere, localReview]),
@@ -1161,7 +1173,11 @@ describe("FileViewer Address All", () => {
     ["file", "failed", { data: undefined, isError: true }],
   ] as const)("sends nothing until the %s list loads (%s)", (unavailableList, _state, query) => {
     const mutate = vi.fn();
-    useOptionalCommentSenderMock.mockReturnValue({ mutate, isPending: false });
+    useOptionalCommentSenderMock.mockReturnValue({
+      mutate,
+      mutateAsync: vi.fn(),
+      isPending: false,
+    });
     const unavailableQuery = query as unknown as ReturnType<typeof useComments>;
     let loaded = false;
     useCommentsMock.mockImplementation((_sessionId, path) => {
@@ -1188,7 +1204,11 @@ describe("FileViewer Address All", () => {
     "keeps sending cached drafts when the %s list's refresh fails",
     (failedList) => {
       const mutate = vi.fn();
-      useOptionalCommentSenderMock.mockReturnValue({ mutate, isPending: false });
+      useOptionalCommentSenderMock.mockReturnValue({
+        mutate,
+        mutateAsync: vi.fn(),
+        isPending: false,
+      });
       useCommentsMock.mockImplementation((_sessionId, path) => {
         const data = path ? [makeComment("c1")] : [makeComment("c1"), otherDraft];
         const isError = (path ? "file" : "session") === failedList;

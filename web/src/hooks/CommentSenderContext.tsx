@@ -9,6 +9,7 @@ import { useSendCommentsToAgent } from "@/hooks/useComments";
 interface CommentSender {
   /** Fire the POST /comments/send mutation. */
   mutate: ReturnType<typeof useSendCommentsToAgent>["mutate"];
+  mutateAsync: ReturnType<typeof useSendCommentsToAgent>["mutateAsync"];
   /** True while a `mutate` call is in flight. */
   isPending: boolean;
 }
@@ -58,8 +59,12 @@ function AgentBoundSenderProvider({
 }) {
   const mutation = useSendCommentsToAgent(sessionId, agentId);
   const value = useMemo(
-    () => ({ mutate: mutation.mutate, isPending: mutation.isPending }),
-    [mutation.mutate, mutation.isPending],
+    () => ({
+      mutate: mutation.mutate,
+      mutateAsync: mutation.mutateAsync,
+      isPending: mutation.isPending,
+    }),
+    [mutation.mutate, mutation.mutateAsync, mutation.isPending],
   );
   return <CommentSenderContext.Provider value={value}>{children}</CommentSenderContext.Provider>;
 }

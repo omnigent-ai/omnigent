@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
-import { apiErrorFromResponse } from "@/lib/sessionsApi";
+import { ApiError, apiErrorFromResponse } from "@/lib/sessionsApi";
 
 export interface CommentReply {
   id: string;
@@ -27,9 +27,16 @@ async function replyResponse(response: Response) {
   return response.json();
 }
 
-export function useCommentReplies(sessionId: string, commentId: string, enabled = true) {
-  return useQuery({
-    queryKey: ["comments", sessionId, "replies", commentId],
+export function useCommentReplies(
+  sessionId: string,
+  commentId: string,
+  enabled = true,
+  updatedAt?: number,
+) {
+  return useQuery<CommentReply[]>({
+    // A parent fingerprint advance supersedes even an unfinished first read.
+    queryKey: ["comments", sessionId, "replies", commentId, updatedAt],
+    placeholderData: (previous) => previous,
     enabled,
     queryFn: async ({ signal }): Promise<CommentReply[]> => {
       const replies: CommentReply[] = [];
@@ -65,7 +72,13 @@ export function useAddCommentReply(sessionId: string, commentId: string) {
           body: JSON.stringify({ body }),
         }),
       ),
-    onSuccess: () => {
+    onSuccess: async (reply) => {
+      const queryKey = ["comments", sessionId, "replies", commentId];
+      await queryClient.cancelQueries({ queryKey });
+      queryClient.setQueriesData<CommentReply[]>({ queryKey }, (previous) => [
+        ...(previous ?? []).filter((item) => item.id !== reply.id),
+        reply,
+      ]);
       void queryClient.invalidateQueries({ queryKey: ["comments", sessionId] });
     },
   });
@@ -83,8 +96,21 @@ export function useDeleteCommentReply(sessionId: string, commentId: string) {
           },
         ),
       ),
-    onSuccess: () => {
+    onSuccess: async (_result, replyId) => {
+      const queryKey = ["comments", sessionId, "replies", commentId];
+      await queryClient.cancelQueries({ queryKey });
+      queryClient.setQueriesData<CommentReply[]>({ queryKey }, (previous) =>
+        (previous ?? []).filter((reply) => reply.id !== replyId),
+      );
       void queryClient.invalidateQueries({ queryKey: ["comments", sessionId] });
+    },
+    onError: async (error) => {
+      if (error instanceof ApiError && error.status === 404) {
+        await queryClient.cancelQueries({
+          queryKey: ["comments", sessionId, "replies", commentId],
+        });
+        void queryClient.invalidateQueries({ queryKey: ["comments", sessionId] });
+      }
     },
   });
 }
