@@ -623,12 +623,24 @@ def test_isolated_pth_roots_follow_cpython_venv_config_layout(
     assert venv_site in roots
 
 
-def test_editable_finder_uses_bundled_template_without_setuptools(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "template",
+    [
+        pytest.param(sb._SETUPTOOLS_EDITABLE_FINDER_TEMPLATE, id="current"),
+        pytest.param(sb._SETUPTOOLS_EDITABLE_FINDER_TEMPLATE_70, id="setuptools-70"),
+        pytest.param(sb._SETUPTOOLS_EDITABLE_FINDER_TEMPLATE_68_2, id="setuptools-68-2"),
+        pytest.param(sb._SETUPTOOLS_EDITABLE_FINDER_TEMPLATE_68_1_0, id="setuptools-68-1-0"),
+        pytest.param(sb._SETUPTOOLS_EDITABLE_FINDER_TEMPLATE_68_0, id="setuptools-68-0"),
+    ],
+)
+def test_editable_finder_uses_bundled_template_without_setuptools(
+    tmp_path: Path, template: str
+) -> None:
     site_dir = tmp_path / "site-packages"
     site_dir.mkdir()
     finder = site_dir / "__editable___sample_finder.py"
     finder.write_text(
-        sb._SETUPTOOLS_EDITABLE_FINDER_TEMPLATE.format(
+        template.format(
             name="__editable__.sample.finder",
             mapping={"sample": str(tmp_path / "package")},
             namespaces={"sample.assets": [str(tmp_path / "assets")]},
