@@ -17,7 +17,7 @@ import secrets
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import httpx
 from fastapi import (
@@ -481,6 +481,9 @@ from omnigent.util.session_lifecycle import (
 )
 from omnigent.util.tmux_compat import MIN_TMUX_VERSION_HINT
 
+if TYPE_CHECKING:
+    from omnigent.server.host_session_recovery import HostSessionRecoverer
+
 
 def _harness_elicitation_request_fingerprint(params: ElicitationRequestParams) -> str:
     """
@@ -874,6 +877,8 @@ async def _stop_host_runner_intentionally(
     runner_id: str,
     host_registry: Any,
     conversation_store: ConversationStore,
+    *,
+    host_session_recoverer: HostSessionRecoverer | None = None,
 ) -> bool:
     """Carry stop intent to the active sessions sharing the terminated runner.
 
@@ -937,6 +942,12 @@ async def _stop_host_runner_intentionally(
                     completed_stop_relays[related_id] = (handle, handle.running_event_count)
                 handle.intentional_stop_turn_ended = False
 
+        if host_session_recoverer is not None:
+            for related_id in stop_targets:
+                related = await asyncio.to_thread(conversation_store.get_conversation, related_id)
+                if related is not None:
+                    await asyncio.to_thread(host_session_recoverer.stop_recovery, related)
+
         acknowledged = False
         attempt = _HostRunnerStopAttempt()
         try:
@@ -994,6 +1005,7 @@ async def _archive_stop(
     delete_worktree: bool = False,
     host_store: HostStore | None = None,
     sandbox_config: ManagedSandboxDeployment | None = None,
+    host_session_recoverer: HostSessionRecoverer | None = None,
 ) -> None:
     """
     Stop an archived session and tear down its host-launched runner.
@@ -1098,6 +1110,7 @@ async def _archive_stop(
                     conv.runner_id,
                     host_registry,
                     conversation_store,
+                    host_session_recoverer=host_session_recoverer,
                 )
         except Exception:  # noqa: BLE001
             _logger.debug(
@@ -1192,6 +1205,7 @@ def _spawn_archive_stop(
     delete_worktree: bool = False,
     host_store: HostStore | None = None,
     sandbox_config: ManagedSandboxDeployment | None = None,
+    host_session_recoverer: HostSessionRecoverer | None = None,
     after_turn: bool = False,
 ) -> None:
     """
@@ -1250,6 +1264,7 @@ def _spawn_archive_stop(
             delete_worktree=delete_worktree,
             host_store=host_store,
             sandbox_config=sandbox_config,
+            host_session_recoverer=host_session_recoverer,
         )
 
     task = asyncio.create_task(_stop_after_grace())
@@ -4758,6 +4773,8 @@ async def _mark_runner_sessions_offline_impl(
     *,
     fail_idle_top_level: bool = False,
     disconnect_evidence: Mapping[str, str] | None = None,
+    host_session_recoverer: HostSessionRecoverer | None = None,
+    interrupted_at: int | None = None,
 ) -> None:
     """
     Fail the sessions a departed runner actually interrupted, with the cause.
@@ -4806,6 +4823,8 @@ async def _mark_runner_sessions_offline_impl(
             conversation_store,
             fail_idle_top_level=fail_idle_top_level,
             disconnect_evidence=disconnect_evidence,
+            host_session_recoverer=host_session_recoverer,
+            interrupted_at=interrupted_at,
             swept_at=swept_at,
         )
         if not pending:
@@ -4849,6 +4868,8 @@ async def _mark_runner_sessions_offline_once(
     fail_idle_top_level: bool,
     disconnect_evidence: Mapping[str, str] | None = None,
     swept_at: int,
+    host_session_recoverer: HostSessionRecoverer | None = None,
+    interrupted_at: int | None = None,
 ) -> list[Conversation]:
     """Reconcile each session once and return the ones blocked by metadata errors."""
     retry: list[Conversation] = []
@@ -4921,6 +4942,15 @@ async def _mark_runner_sessions_offline_once(
             error_code=error.code,
         ):
             continue
+        recovery = None
+        if host_session_recoverer is not None:
+            await asyncio.to_thread(
+                host_session_recoverer.record_interruption, conv, interrupted_at=interrupted_at
+            )
+            if await asyncio.to_thread(host_session_recoverer.enabled, conv.host_id):
+                recovery = await asyncio.to_thread(
+                    conversation_store.get_session_recovery, conv.id
+                )
         decision_status = _session_status_cache.get(conv.id)
         binding_unavailable = False
         try:
@@ -4957,6 +4987,13 @@ async def _mark_runner_sessions_offline_once(
                 conv.runner_id,
                 conv.id,
             )
+            continue
+        if (
+            recovery is not None
+            and recovery.host_id == conv.host_id
+            and recovery.runner_id == conv.runner_id
+            and recovery.phase in {"pending", "launching", "dispatching", "submitted"}
+        ):
             continue
         _publish_status(
             conv.id,
@@ -9502,6 +9539,7 @@ async def _settle_orphaned_running_rows(
     liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None,
     host_store: HostStore | None,
     may_settle: Callable[[Conversation], bool],
+    host_session_recoverer: HostSessionRecoverer | None = None,
 ) -> None:
     """
     Settle rows whose persisted ``running`` outlived their runner, before a read.
@@ -9560,6 +9598,7 @@ async def _settle_orphaned_running_rows(
             conv.id,
             conversation_store,
             now - RUNNER_LIVENESS_TTL_S,
+            host_session_recoverer=host_session_recoverer,
         )
 
 
@@ -10401,6 +10440,29 @@ async def _relay_runner_stream_once(
                             and evt_type not in _FENCE_EXEMPT_EVENT_TYPES
                         ):
                             continue
+
+                    turn_response = event.get("response")
+                    turn_response_id = (
+                        turn_response.get("id")
+                        if isinstance(turn_response, dict)
+                        else event.get("response_id")
+                    )
+                    terminal_turn = evt_type in _TERMINAL_RESPONSE_EVENT_TYPES
+                    status = event.get("status")
+                    blocked_turn = evt_type == "session.status" and (
+                        status in {"failed", "waiting"}
+                        or bool(event.get("blocked_on"))
+                        or (status == "idle" and event.get("turn_completed") is True)
+                    )
+                    if terminal_turn or blocked_turn or evt_type == "response.in_progress":
+                        await asyncio.to_thread(
+                            session_live_state.record_recovery_turn,
+                            conversation_store,
+                            session_id,
+                            runner_id,
+                            turn_response_id if isinstance(turn_response_id, str) else None,
+                            finished=terminal_turn or blocked_turn,
+                        )
 
                     if evt_type == "session.status":
                         status = event.get("status", "")

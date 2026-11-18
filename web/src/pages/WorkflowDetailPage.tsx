@@ -24,6 +24,7 @@ import { KeyboardShortcutTooltip } from "@/components/KeyboardShortcut";
 import { PageScroll } from "@/components/PageScroll";
 import { PermissionsModal } from "@/components/PermissionsModal";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
+import { CardRadioGroup } from "@/components/theme/CardRadioGroup";
 import { DeleteWorkflowDialog } from "@/components/workflows/DeleteWorkflowDialog";
 import { WorkflowAutomations } from "@/components/workflows/WorkflowAutomations";
 import { Button } from "@/components/ui/button";
@@ -95,6 +96,8 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const [plannerExpanded, setPlannerExpanded] = useState(false);
   // Non-zero while the open planning chat flashes; each press restarts it.
   const [plannerFlash, setPlannerFlash] = useState(0);
+  // The proposal whose description the user chose over the current one; each is reviewed anew.
+  const [acceptedProposalId, setAcceptedProposalId] = useState<string | null>(null);
   // Someone it is shared with only reads it, and its planning chat is its owner's.
   const isViewer = workflow?.viewer_role === "viewer";
   const showPlanner = !isViewer && (plannerOpen ?? workflow?.is_draft ?? false);
@@ -111,7 +114,8 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
     canReadProposal ? planningSession.id : undefined,
     canReadProposal,
   );
-  // The proposal the description was saved from; the server places one outside the loaded pages.
+  // The proposal the description was saved from or kept over; the server places one outside
+  // the loaded pages.
   const source = workflow?.description_source ?? undefined;
   const savedFrom = source ? journal.entries.find((entry) => entry.id === source) : undefined;
   const sourcePosition = useJournalEntryPosition(
@@ -169,22 +173,23 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const runList = runs.data?.pages.flatMap((page) => page.runs) ?? [];
   const proposal = canReadProposal ? currentPlan(journal.entries) : null;
   const proposedSteps = proposal ? planSteps(proposal) : null;
-  // A proposal replaces the description only if it's newer than where the description came
-  // from, so an edit made since stands: the proposal Save plan took it from, by journal order,
-  // or else the workflow's last write, in whole seconds, where a tie keeps the description.
-  // Where that proposal sits in this journal: null when it came from another planning chat,
-  // undefined until the server places it, which offers no description meanwhile.
+  // Where the description's source sits in this journal: null when it came from another
+  // planning chat, undefined until the server places it, which offers no description meanwhile.
   const sourceAt = savedFrom ? savedFrom.position : sourcePosition.data;
+  // Only a proposal newer than that source, or else than the workflow's last write in whole
+  // seconds (a tie keeps the description), offers its description, so an edit made since stands.
   const proposalIsNewer =
     proposal !== null &&
     (!source || sourceAt === null
       ? proposal.created_at > (workflow.updated_at ?? 0)
       : sourceAt !== undefined && proposal.position > sourceAt);
   const proposedDescription = proposalIsNewer ? planDescription(proposal) : null;
+  // A different description is only offered: Save plan keeps the current one unless accepted.
   const newDescription =
     proposedSteps?.length && proposedDescription !== workflow.description
       ? proposedDescription
       : null;
+  const proposedChosen = newDescription !== null && acceptedProposalId === proposal?.id;
   const stepSignature = (steps: typeof workflow.steps) =>
     JSON.stringify(
       steps.map(({ id, name, goal, depends_on }) => [id, name, goal ?? null, depends_on]),
@@ -345,7 +350,12 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
         </div>
         <WorkflowDescription
           workflowId={workflow.id}
-          text={newDescription ?? workflow.description}
+          text={workflow.description}
+          proposed={newDescription}
+          choice={proposedChosen ? "proposed" : "current"}
+          onChoiceChange={(choice) =>
+            setAcceptedProposalId(choice === "proposed" ? (proposal?.id ?? null) : null)
+          }
           readOnly={isViewer}
         />
 
@@ -367,13 +377,14 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
                 onClick={() => {
                   if (!proposal || !proposedSteps) return;
                   setPlannerOpen(showPlanner);
-                  // Even an unchanged description records the proposal it now comes from. The
-                  // server keeps a description another client changed after this page loaded it.
+                  // Keeping the current description still records the proposal, so it isn't
+                  // offered again. The server keeps a description another client saved since.
+                  const kept = newDescription !== null && !proposedChosen;
                   const description =
                     proposedDescription === null
                       ? {}
                       : {
-                          description: proposedDescription,
+                          description: kept ? workflow.description : proposedDescription,
                           expected_description: workflow.description,
                           description_source: proposal.id,
                         };
@@ -556,28 +567,43 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   );
 }
 
+type DescriptionChoice = "current" | "proposed";
+
 /**
  * The description, in a section like an automation's prompt: three lines and
  * an ellipsis, with a chevron to show the rest when there is more. Its pencil
- * edits it in place, like a pull request's description.
+ * edits it in place, like a pull request's description. A proposal that would
+ * change it is shown beside it, to keep the current one or use the proposal's.
  */
 function WorkflowDescription({
   workflowId,
   text,
+  proposed,
+  choice,
+  onChoiceChange,
   readOnly = false,
 }: {
   workflowId: string;
   text: string;
+  /** A newer proposal's different description, or null. */
+  proposed: string | null;
+  /** The description Save plan applies while *proposed* is offered. */
+  choice: DescriptionChoice;
+  onChoiceChange: (choice: DescriptionChoice) => void;
   /** For someone the workflow is shared with: no pencil. */
   readOnly?: boolean;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [clamped, setClamped] = useState(false);
-  // The text being edited; null while the description is shown.
+  // The text being edited, and the one the editor opened with; null while the description is shown.
   const [draft, setDraft] = useState<string | null>(null);
+  const [draftStart, setDraftStart] = useState("");
   const editing = draft !== null;
+  // Both descriptions show in full while one is chosen.
+  const reviewing = proposed !== null;
   const bodyRef = useRef<HTMLParagraphElement>(null);
   const editorRef = useRef<HTMLFormElement>(null);
+  const headingId = useId();
   const errorId = useId();
   const update = useSaveWorkflowDescription(workflowId);
 
@@ -591,7 +617,7 @@ function WorkflowDescription({
     const observer = new ResizeObserver(measure);
     observer.observe(body);
     return () => observer.disconnect();
-  }, [text, expanded, editing]);
+  }, [text, expanded, editing, reviewing]);
 
   // The editor opens ready to continue the text, with the caret after it.
   useEffect(() => {
@@ -615,23 +641,31 @@ function WorkflowDescription({
     const next = draft.trim();
     // The shortcut follows the Save button: a workflow needs a description.
     if (!next) return;
-    if (next === text) {
+    // Either offered wording, unedited, is a choice for Save plan rather than a write.
+    if (next === text || (reviewing && next === proposed)) {
+      if (reviewing) onChoiceChange(next === text ? "current" : "proposed");
       close();
       return;
     }
     update.mutate(next, { onSuccess: close });
   };
   const cancel = () => {
-    const changed = draft !== null && draft.trim() !== text;
+    const changed = draft !== null && draft.trim() !== draftStart.trim();
     if (changed && !window.confirm("Discard your description changes?")) return;
     close();
+  };
+  // The editor starts from the chosen description.
+  const edit = () => {
+    const start = choice === "proposed" && proposed !== null ? proposed : text;
+    setDraftStart(start);
+    setDraft(start);
   };
 
   return (
     <section className="mt-6">
       <div className="mb-2 flex items-center gap-1">
-        <h2 className="text-sm font-medium text-muted-foreground">
-          {!editing && (clamped || expanded) ? (
+        <h2 id={headingId} className="text-sm font-medium text-muted-foreground">
+          {!editing && !reviewing && (clamped || expanded) ? (
             <button
               type="button"
               aria-expanded={expanded}
@@ -656,7 +690,7 @@ function WorkflowDescription({
               size="icon-xs"
               aria-label="Edit description"
               className="-my-0.5 text-muted-foreground"
-              onClick={() => setDraft(text)}
+              onClick={edit}
             >
               <PencilIcon aria-hidden="true" className="size-3" />
             </Button>
@@ -719,6 +753,38 @@ function WorkflowDescription({
             </Button>
           </div>
         </form>
+      ) : reviewing ? (
+        <CardRadioGroup<DescriptionChoice>
+          labelledBy={headingId}
+          value={choice}
+          onSelect={onChoiceChange}
+          className="grid gap-3 sm:grid-cols-2"
+          cardClassName="gap-1 p-3 text-left"
+          items={[
+            {
+              value: "current",
+              testId: "workflow-detail-keep-description",
+              body: (
+                <DescriptionOption
+                  label="Keep current"
+                  text={text}
+                  testId="workflow-detail-description"
+                />
+              ),
+            },
+            {
+              value: "proposed",
+              testId: "workflow-detail-use-proposed-description",
+              body: (
+                <DescriptionOption
+                  label="Use proposed"
+                  text={proposed}
+                  testId="workflow-detail-proposed-description"
+                />
+              ),
+            },
+          ]}
+        />
       ) : (
         <p
           ref={bodyRef}
@@ -732,6 +798,27 @@ function WorkflowDescription({
         </p>
       )}
     </section>
+  );
+}
+
+/** One description to choose from, inside its radio card. */
+function DescriptionOption({
+  label,
+  text,
+  testId,
+}: {
+  label: string;
+  text: string;
+  testId: string;
+}) {
+  return (
+    <>
+      {/* Clear of the card's check mark. */}
+      <span className="pr-6 text-xs font-medium text-muted-foreground">{label}</span>
+      <span className="whitespace-pre-wrap text-sm text-foreground/90" data-testid={testId}>
+        {text}
+      </span>
+    </>
   );
 }
 

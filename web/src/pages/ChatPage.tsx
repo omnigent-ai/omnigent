@@ -70,7 +70,7 @@ import {
 } from "@/hooks/useNativeServerSwitcher";
 import { isIOSShell, onNativeSidebarDrag, setNativeServerSwitcherHidden } from "@/lib/nativeBridge";
 import { type Agent, useSessionAgent, useAgents } from "@/hooks/useAgents";
-import { useBrainHarnessLabels, useFileMentionHarnesses } from "@/lib/agentLabels";
+import { useFileMentionHarnesses } from "@/lib/agentLabels";
 import { useCanStartSideChat, usePermissions, useSessionOwner } from "@/hooks/usePermissions";
 import type { NativeModelOption, Session, SessionStatus, SkillSummary } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
@@ -325,11 +325,13 @@ import { ConnectionIndicator } from "./ChatIndicators";
 import { SessionHarnessPicker } from "@/components/composer/SessionHarnessPicker";
 import {
   capabilitySourceForSession,
-  composerHarnessLabel,
-  modelResetSupported,
   useSessionPickerInputs,
   type ServerInfoValue,
 } from "@/components/composer/sessionPickerInputs";
+import {
+  isComposerReadOnly,
+  useSessionHarnessPickerProps,
+} from "@/components/composer/useSessionHarnessPickerProps";
 import { nextTranscriptBottomPin, type TranscriptBottomPin } from "./transcriptBottomPin";
 import { Transcript } from "@/components/chat/Transcript";
 
@@ -2350,18 +2352,8 @@ function SubagentComposerTray({ label }: { label: string }) {
   );
 }
 
-/**
- * Whether the composer refuses input: a read-only grant or a structurally
- * non-interactive session. A temporary send block keeps the level-1 fallback
- * of a still-starting client-only conversation editable.
- */
-export function isComposerReadOnly(
-  permissionLevel: number | null,
-  readOnlyReason: string | null,
-  sendDisabledReason: string | null,
-): boolean {
-  return readOnlyReason !== null || (permissionLevel === 1 && sendDisabledReason === null);
-}
+// Re-exported for existing importers; the definition lives with the picker hook.
+export { isComposerReadOnly };
 
 /**
  * Pill above the composer tallying running background tasks (a dev server, a
@@ -2545,24 +2537,6 @@ function ComposerImpl(
   // Harness/agent identity shown in the status tray below the card, separate
   // from the composer's read-only model/effort label.
   const sessionHarness = useChatStore((s) => s.sessionHarness);
-  const nativeTerminalSession = useChatStore((s) => s.isNativeTerminalSession);
-  const subAgentName = useChatStore((s) => s.subAgentName);
-  const brainHarnessLabels = useBrainHarnessLabels();
-  const harnessLabel = composerHarnessLabel(
-    modelPickerKind,
-    // For a sub-agent (head) session, identify the head family being viewed
-    // (e.g. the GPT head → "Gpt") rather than the bundle orchestrator
-    // ("Debby") — the bundle is already named in the breadcrumb / Agents rail.
-    // A native sub-agent's name is vendor-side, not an Omnigent head, so the
-    // wrapper below outranks it.
-    subAgentName ??
-      agents?.find((a) => a.id === selectedAgentId)?.name ??
-      agents?.[0]?.name ??
-      null,
-    sessionHarness,
-    brainHarnessLabels,
-    wrapperLabel,
-  );
 
   // Preserve unsent text + file attachments per session so switching
   // tabs and coming back restores the draft. The shared draft store also lets
@@ -2678,6 +2652,29 @@ function ComposerImpl(
   const codexApprovalMode = useChatStore((s) => s.codexApprovalMode);
   const [configBusy, setConfigBusy] = useState(false);
   const configBusyRef = useRef(false);
+  // The active conversation's picker props; ChatPage's fallbacks arrive through the inputs.
+  const sessionHarnessPicker = useSessionHarnessPickerProps({
+    sessionId: undefined,
+    hostId: composerSession?.hostId,
+    inputs: {
+      costRoutingEligible,
+      modelPickerKind,
+      showModels,
+      effortLevels,
+      showEffort,
+      codexModelOptions,
+      modelLabelOptions,
+      modelsFromLaunchPreview: modelsFromLaunchPreview ?? false,
+      inferenceConfigured,
+      inferenceError,
+    },
+    agentName:
+      agents?.find((agent) => agent.id === selectedAgentId)?.name ?? agents?.[0]?.name ?? null,
+    wrapperLabel,
+    isNativeWrapper,
+    runnerOnline,
+    gates: { permissionLevel, readOnlyReason, sendDisabledReason, unreachable },
+  });
 
   // Ctrl+Shift+M opens the model picker, the keyboard equivalent of bare
   // "/model" (same nonce bump). Gated like the gear's model-open path: a picker
@@ -2974,11 +2971,7 @@ function ComposerImpl(
   // it each turn; native wrappers expose it only when they have a picker
   // path that the runner can propagate without blocking the vendor TUI.
   const showModel = !isNativeWrapper || showModels;
-  const supportsModelReset = modelResetSupported({
-    inferenceConfigured,
-    modelPickerKind,
-    isNativeWrapper,
-  });
+  const { supportsModelReset } = sessionHarnessPicker;
   // /compact is functional for native wrappers (claude-native,
   // codex-native), which inject the slash command into the terminal, and
   // for claude-sdk, whose runner sends /compact to the live SDK client to
@@ -4819,34 +4812,9 @@ function ComposerImpl(
                     busy={configBusy}
                     busyRef={configBusyRef}
                     setBusy={setConfigBusy}
-                    agentName={
-                      subAgentName ??
-                      agents?.find((agent) => agent.id === selectedAgentId)?.name ??
-                      agents?.[0]?.name ??
-                      null
-                    }
-                    harnessLabel={harnessLabel}
-                    showModels={showModels}
-                    showEffort={showEffort}
-                    effortLevels={effortLevels}
-                    modelPickerKind={modelPickerKind}
-                    supportsModelReset={supportsModelReset}
-                    codexModelOptions={codexModelOptions}
-                    inferenceConfigured={inferenceConfigured}
-                    inferenceError={inferenceError}
-                    modelsFromLaunchPreview={modelsFromLaunchPreview}
-                    modelLabelOptions={modelLabelOptions}
-                    modelLabelHostId={composerSession?.hostId}
-                    costRoutingEligible={costRoutingEligible}
-                    modelPickWakesSession={nativeTerminalSession && runnerOnline === false}
-                    // Config changes persist server-side and apply on the next
-                    // wake/turn (the runner forward is best-effort), so the gear
-                    // stays live wherever a message could be sent — including
-                    // asleep/starting/unknown. Only read-only viewers and sessions
-                    // no message can wake (unreachable) get an inert gear.
-                    disabled={isReadOnly || unreachable}
                     openNonce={pickerOpenNonce}
                     modelPickerShortcutEnabled={modelPickerHotkeyEnabled}
+                    {...sessionHarnessPicker}
                   />
                 </div>
               </MobileHeaderControlPortal>

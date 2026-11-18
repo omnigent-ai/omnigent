@@ -179,6 +179,11 @@ the header menu), and each place is a separate entry point.
   which the server still lists the session's host offline (usually because the
   host came back under a new ID), with **Switch host** to move the session.
   States: reconnecting (spinner), reconnect failed (retry), host offline.
+- `host-recovery`: individually opted-in hosts request continuation after their
+  local state is ready. Lost runners resume witnessed interrupted root tasks with
+  a hidden system-tagged prompt; Stop, newer input, approvals, and archive win.
+  Completed turns stay stopped. Automatic launch retries are bounded and survive
+  a server restart. Embedded deployments stay off until their deployment gate allows it.
 - `workspace-recovery`: a missing-workspace error offers **Continue in another
   directory…**. Choose an existing host directory, optionally with a new git
   worktree of it, to fork the conversation into a new session; the original
@@ -295,7 +300,7 @@ to preview, then drop. Split a remaining full-width or full-height pane again
 to reach three or four panes. Alternatively, use a row's menu or right-click
 menu → **Open in grid** and choose the pane and direction. Each pane has its own
 transcript and composer, whose action row shows the session's host, permission mode and
-harness; terminal-capable sessions have a Chat/Terminal switch in
+model/effort picker; terminal-capable sessions have a Chat/Terminal switch in
 each cell header. The shortcut ⌘/Ctrl+Alt+\ switches
 only the active cell. Choices survive reloads and follow the session into full
 screen; drafts and terminal connections survive view changes. A managed session
@@ -1153,6 +1158,20 @@ plain `uv run pytest`, which starts a private server for the test.
   `web/src/hooks/useSandboxAutoWake.test.ts` and
   `web/src/hooks/useSessionReconnect.test.ts`. None
   of them resume a live sandbox.
+- **`host-recovery`, host request, store ordering, and runner initialization:**
+  `tests/server/test_host_session_recovery.py`,
+  `tests/server/integration/test_host_tunnel_route.py::test_host_requests_recovery_without_blocking_tunnel`,
+  `tests/stores/test_conversation_store_split_db.py::test_recovery_state_shares_input_transaction_and_workspace_scope`,
+  `tests/host/test_connect.py::test_recovery_launch_requires_restored_workspace`,
+  `tests/runner/test_suppress_recovery_turn.py`.
+  Run with plain `uv run pytest`. The UI marker is covered by
+  `web/src/components/blocks/SystemMessage.test.tsx`.
+  Live proof uses an ordinary host or provider host with restored files and the
+  host opt-in enabled: restart it during an active task, then confirm completion
+  in the same chat without another message. Completed and stopped sessions must
+  receive neither a launch nor a continuation. Repeat with opt-in disabled.
+  Keep native harness and provider lifecycle evidence separate from these tests.
+
 - **`message-recovery`, native binding races (own environment):**
   `tests/e2e/test_native_runner_binding_races_e2e.py::test_native_send_rechecks_binding_after_runner_miss`
   drives real servers, runners, and Claude/Codex CLIs with a mock model. It

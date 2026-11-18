@@ -436,6 +436,10 @@ describe("TasksPanel", () => {
     expect(ready).toHaveTextContent("Task 2 of 3");
     expect(ready).toHaveTextContent("cache");
     expect(ready).toHaveTextContent("Ready to start");
+    // A long path or command wraps inside the card; a break-words inside would let it set
+    // its line's width past the card.
+    expect(ready).toHaveClass("wrap-anywhere");
+    expect(ready.querySelector(".break-words")).toBeNull();
     fireEvent.blur(segments[1]);
     fireEvent.focus(segments[2]);
     await waitFor(() =>
