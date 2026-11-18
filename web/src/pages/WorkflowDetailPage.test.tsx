@@ -817,11 +817,14 @@ describe("WorkflowDetailPage", () => {
       expect(proposed()).toBe("Fixes flaky tests.");
       const editor = () => screen.getByRole("textbox", { name: "Workflow description" });
 
-      // The editor starts from the chosen description, and the current wording typed back
-      // keeps the current one.
+      // The editor starts from the chosen description. Saved unedited, either offered wording
+      // stays a choice for Save plan instead of a write.
       fireEvent.click(screen.getByRole("radio", { name: /^Use proposed/ }));
       fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
       expect(editor()).toHaveValue("Fixes flaky tests.");
+      fireEvent.click(screen.getByRole("button", { name: "Save" }));
+      expect(screen.getByRole("radio", { name: /^Use proposed/ })).toBeChecked();
+      fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
       fireEvent.change(editor(), { target: { value: "Fixes one flaky test." } });
       fireEvent.click(screen.getByRole("button", { name: "Save" }));
       expect(screen.getByRole("radio", { name: /^Keep current/ })).toBeChecked();
@@ -891,8 +894,9 @@ describe("WorkflowDetailPage", () => {
 
     const reload = async () => {
       cleanup();
-      renderPage();
+      const view = renderPage();
       await screen.findByTestId("workflow-detail-title");
+      return view;
     };
 
     it("keeps the current description unless the proposal's is chosen, and records that", async () => {
@@ -934,19 +938,21 @@ describe("WorkflowDetailPage", () => {
       expect(screen.getByRole("status")).toHaveTextContent("Saved plan");
 
       // A newer proposal is offered, and its description saves once chosen.
-      journal.entries = [
-        saved,
-        declined,
-        {
-          ...declined,
-          id: "newer",
-          position: 3,
-          created_at: 350,
-          content: { steps: edited, description: "Finds and fixes flaky tests." },
-        },
-      ];
-      await reload();
+      const newer = {
+        ...declined,
+        id: "newer",
+        position: 3,
+        created_at: 350,
+        content: { steps: edited, description: "Finds and fixes flaky tests." },
+      };
+      journal.entries = [saved, declined, newer];
+      const view = await reload();
       expect(proposed()).toBe("Finds and fixes flaky tests.");
+      expect(screen.getByRole("radio", { name: /^Keep current/ })).toBeChecked();
+      fireEvent.click(screen.getByRole("radio", { name: /^Use proposed/ }));
+      // Each proposal is chosen afresh, even one repeating the chosen wording.
+      journal.entries = [saved, declined, newer, { ...newer, id: "newest", position: 4 }];
+      view.rerender(<WorkflowDetailPage />);
       expect(screen.getByRole("radio", { name: /^Keep current/ })).toBeChecked();
       fireEvent.click(screen.getByRole("radio", { name: /^Use proposed/ }));
       fireEvent.click(screen.getByRole("button", { name: "Save plan" }));
@@ -955,7 +961,7 @@ describe("WorkflowDetailPage", () => {
         steps: edited,
         description: "Finds and fixes flaky tests.",
         expected_description: "Fixes one flaky test.",
-        description_source: "newer",
+        description_source: "newest",
       });
       expect(screen.queryByRole("radiogroup")).toBeNull();
       expect(screen.getByRole("status")).toHaveTextContent("Saved plan");

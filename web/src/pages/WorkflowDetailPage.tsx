@@ -79,8 +79,8 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const [plannerExpanded, setPlannerExpanded] = useState(false);
   // Non-zero while the open planning chat flashes; each press restarts it.
   const [plannerFlash, setPlannerFlash] = useState(0);
-  // The proposed description the user chose over the current one; other wording is reviewed anew.
-  const [acceptedDescription, setAcceptedDescription] = useState<string | null>(null);
+  // The proposal whose description the user chose over the current one; each is reviewed anew.
+  const [acceptedProposalId, setAcceptedProposalId] = useState<string | null>(null);
   const showPlanner = plannerOpen ?? workflow?.is_draft ?? false;
   const isMobile = useIsMobileViewport();
   const { session: planningSession, error: planningSessionError } = useSession(
@@ -154,12 +154,11 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const runList = runs.data?.pages.flatMap((page) => page.runs) ?? [];
   const proposal = canReadProposal ? currentPlan(journal.entries) : null;
   const proposedSteps = proposal ? planSteps(proposal) : null;
-  // A proposal offers its description only if it's newer than where the description came
-  // from, so an edit made since stands: the proposal Save plan took it from or kept it over, by
-  // journal order, or else the workflow's last write, in whole seconds, where a tie keeps it.
-  // Where that proposal sits in this journal: null when it came from another planning chat,
-  // undefined until the server places it, which offers no description meanwhile.
+  // Where the description's source sits in this journal: null when it came from another
+  // planning chat, undefined until the server places it, which offers no description meanwhile.
   const sourceAt = savedFrom ? savedFrom.position : sourcePosition.data;
+  // Only a proposal newer than that source, or else than the workflow's last write in whole
+  // seconds (a tie keeps the description), offers its description, so an edit made since stands.
   const proposalIsNewer =
     proposal !== null &&
     (!source || sourceAt === null
@@ -171,7 +170,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
     proposedSteps?.length && proposedDescription !== workflow.description
       ? proposedDescription
       : null;
-  const proposedChosen = newDescription !== null && acceptedDescription === newDescription;
+  const proposedChosen = newDescription !== null && acceptedProposalId === proposal?.id;
   const stepSignature = (steps: typeof workflow.steps) =>
     JSON.stringify(
       steps.map(({ id, name, goal, depends_on }) => [id, name, goal ?? null, depends_on]),
@@ -273,7 +272,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
           proposed={newDescription}
           choice={proposedChosen ? "proposed" : "current"}
           onChoiceChange={(choice) =>
-            setAcceptedDescription(choice === "proposed" ? newDescription : null)
+            setAcceptedProposalId(choice === "proposed" ? (proposal?.id ?? null) : null)
           }
         />
 
@@ -547,16 +546,16 @@ function WorkflowDescription({
     const next = draft.trim();
     // The shortcut follows the Save button: a workflow needs a description.
     if (!next) return;
-    if (next === text) {
-      // Back to the current wording, which a review then keeps.
-      if (reviewing) onChoiceChange("current");
+    // Either offered wording, unedited, is a choice for Save plan rather than a write.
+    if (next === text || (reviewing && next === proposed)) {
+      if (reviewing) onChoiceChange(next === text ? "current" : "proposed");
       close();
       return;
     }
     update.mutate(next, { onSuccess: close });
   };
   const cancel = () => {
-    const changed = draft !== null && draft.trim() !== draftStart;
+    const changed = draft !== null && draft.trim() !== draftStart.trim();
     if (changed && !window.confirm("Discard your description changes?")) return;
     close();
   };
