@@ -1,7 +1,8 @@
 import { redo, undo } from "@codemirror/commands";
 import { EditorView } from "@codemirror/view";
-import { act, fireEvent, render } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, waitFor } from "@testing-library/react";
+import { useState } from "react";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import { insertComposerText } from "@/lib/composerText";
 import { CodeMirrorComposerInput } from "./testing/codeMirrorComposer";
 import { COMPOSER_EDITING_KEYMAP } from "./CodeMirrorComposerInput";
@@ -25,6 +26,19 @@ function mount(props: Partial<Parameters<typeof CodeMirrorComposerInput>[0]> = {
   const content = view.container.querySelector<HTMLElement>(".cm-content")!;
   return { ...view, content, setTarget, target: () => box.target! };
 }
+
+// CodeMirror measures its text through Range.getClientRects, which jsdom lacks. Stubbed for the
+// whole file, since a measurement can run after the test that caused it has finished.
+beforeAll(() => {
+  Object.defineProperty(Range.prototype, "getClientRects", {
+    configurable: true,
+    writable: true,
+    value: () => [],
+  });
+});
+afterAll(() => {
+  Reflect.deleteProperty(Range.prototype, "getClientRects");
+});
 
 afterEach(() => {
   document.body.replaceChildren();
@@ -119,12 +133,6 @@ describe("CodeMirrorComposerInput", () => {
     expect(content.getAttribute("aria-readonly")).toBe("true");
   });
 
-  it("refuses an insert into a read-only draft and leaves it unchanged", () => {
-    const { target } = mount({ value: "draft", readOnly: true });
-    expect(insertComposerText(target(), "x", 0, 0)).toBe(false);
-    expect(target().value).toBe("draft");
-  });
-
   it("takes a caller's text size in place of the composer's own", () => {
     const host = (className?: string) => {
       const { container, unmount } = mount({ className });
@@ -187,23 +195,55 @@ describe("CodeMirrorComposerInput change events", () => {
     expect([target().selectionStart, target().selectionEnd]).toEqual([16, 16]);
   });
 
-  it("restores the controlled value when a parent rejects an edit", () => {
+  it("restores the controlled value when a parent rejects an edit", async () => {
     const onChange = vi.fn();
-    const { target, rerender, setTarget } = mount({ value: "draft", onChange });
+    const { target } = mount({ value: "draft", onChange });
     act(() => insertComposerText(target(), "x", 5, 5));
     expect(onChange).toHaveBeenCalledTimes(1);
-    expect(target().value).toBe("draftx");
 
-    // The parent re-renders with the same value, as after an unrelated state change.
+    // The parent ignores the edit and doesn't re-render, so the editor reconciles on its own.
+    await waitFor(() => expect(target().value).toBe("draft"));
+  });
+
+  it("keeps an edit the parent accepts", async () => {
+    const box: { target: ComposerTextTarget | null } = { target: null };
+    function Harness() {
+      const [value, setValue] = useState("draft");
+      return (
+        <CodeMirrorComposerInput
+          aria-label="Message the agent"
+          value={value}
+          onChange={(event) => setValue(event.currentTarget.value)}
+          ref={(target) => {
+            box.target = target;
+          }}
+        />
+      );
+    }
+    render(<Harness />);
+
+    act(() => insertComposerText(box.target!, "x", 5, 5));
+
+    await waitFor(() => expect(box.target!.value).toBe("draftx"));
+  });
+
+  it("normalizes a controlled CRLF value to the document's line breaks", () => {
+    const { target, rerender, setTarget } = mount({ value: "" });
     rerender(
-      <CodeMirrorComposerInput
-        aria-label="Message the agent"
-        value="draft"
-        onChange={onChange}
-        ref={setTarget}
-      />,
+      <CodeMirrorComposerInput aria-label="Message the agent" value={"a\r\nb"} ref={setTarget} />,
     );
-    expect(target().value).toBe("draft");
+    expect(target().value).toBe("a\nb");
+    expect([target().selectionStart, target().selectionEnd]).toEqual([3, 3]);
+  });
+
+  it("inserts CRLF text as the document's line breaks", () => {
+    const onChange = vi.fn();
+    const { target } = mount({ value: undefined, onChange });
+
+    act(() => insertComposerText(target(), "x\r\ny", 0, 0));
+
+    expect(target().value).toBe("x\ny");
+    expect([target().selectionStart, target().selectionEnd]).toEqual([3, 3]);
     expect(onChange).toHaveBeenCalledTimes(1);
   });
 

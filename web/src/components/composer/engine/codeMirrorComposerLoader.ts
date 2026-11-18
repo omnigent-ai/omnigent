@@ -60,17 +60,17 @@ export function loadCodeMirrorComposer(): void {
     if (attempt === generation) settle(next);
   };
   settle({ status: "loading" });
-  importer().then(
-    (module) =>
+  importer()
+    .then((module) =>
       settleAttempt({
         status: "ready",
         Component: module.createCodeMirrorComposerInput(codeMirrorComposerEnvironment()),
       }),
-    (error: unknown) => {
+    )
+    .catch((error: unknown) => {
       console.warn("The CodeMirror composer couldn't load; using the standard input.", error);
       settleAttempt({ status: "failed", error });
-    },
-  );
+    });
 }
 
 /** Test seam: swap the module import and forget any earlier load. */

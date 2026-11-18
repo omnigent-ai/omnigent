@@ -78,6 +78,5 @@ export function insertPastedText(event: ComposerPasteEvent): boolean {
     return false;
   }
   event.preventDefault();
-  insertComposerText(event.currentTarget, text);
-  return true;
+  return insertComposerText(event.currentTarget, text);
 }

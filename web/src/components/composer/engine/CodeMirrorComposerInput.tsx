@@ -133,7 +133,12 @@ function attributes(
   ];
 }
 
-/** The smallest change that turns `current` into `next`, so the caret keeps its place. */
+/** Line breaks as the document stores them, so a value measures the same as its document. */
+function normalizeLineBreaks(text: string): string {
+  return text.replace(/\r\n?/g, "\n");
+}
+
+/** The smallest change turning `current` into `next`, so undo history and mapped positions stay stable. */
 function minimalChange(current: string, next: string) {
   let prefix = 0;
   const limit = Math.min(current.length, next.length);
@@ -198,9 +203,10 @@ function createSurface(view: EditorView): ComposerEditorSurface {
       // Shared composer edits (paste, ⌥↵, list continuation) never change a locked draft.
       if (view.state.readOnly) return false;
       const from = clamp(start);
+      const insert = normalizeLineBreaks(text);
       view.dispatch({
-        changes: { from, to: clamp(end), insert: text },
-        selection: { anchor: from + text.length },
+        changes: { from, to: clamp(end), insert },
+        selection: { anchor: from + insert.length },
         userEvent: "input",
         // Each programmatic insert is its own undo step, not joined to the typing around it.
         annotations: isolateHistory.of("full"),
@@ -222,6 +228,19 @@ export function createCodeMirrorComposerInput(environment: CodeMirrorComposerEnv
       );
     },
   );
+}
+
+/** Bring a controlled value in without echoing a change or adding an undo step. */
+function syncControlledValue(view: EditorView, value: string) {
+  const next = normalizeLineBreaks(value);
+  const current = view.state.doc.toString();
+  if (current === next) return;
+  view.dispatch({
+    changes: minimalChange(current, next),
+    // As a textarea's value setter does: a new value puts the caret at its end.
+    selection: EditorSelection.cursor(next.length),
+    annotations: [controlledUpdate.of(true), Transaction.addToHistory.of(false)],
+  });
 }
 
 function CodeMirrorComposer({
@@ -329,6 +348,13 @@ function CodeMirrorComposer({
                 (transaction) => transaction.isUserEvent("undo") || transaction.isUserEvent("redo"),
               );
               latest.current.onChange?.({ ...event(), fromHistory });
+              // A parent that rejects the edit may not re-render. Reconcile once the parent's
+              // update, if any, has committed, as a textarea does after an event.
+              queueMicrotask(() => {
+                const parentValue = latest.current.value;
+                if (parentValue !== undefined && viewRef.current)
+                  syncControlledValue(viewRef.current, parentValue);
+              });
             }
             if (update.docChanged || update.selectionSet) latest.current.onSelect?.(event());
             if (update.docChanged || update.geometryChanged) markOverflow(update.view);
@@ -361,19 +387,10 @@ function CodeMirrorComposer({
   // React re-attaches the surface when the forwarded ref changes, as for a textarea.
   useImperativeHandle(forwardedRef, () => surfaceRef.current!, []);
 
-  // Bring a controlled value in without echoing a change or adding an undo step. Runs on every
-  // render, so an edit the parent rejected reverts even when the value didn't change.
+  // Runs on every render, so an edit the parent rejected reverts even when the value didn't change.
   useLayoutEffect(() => {
     const view = viewRef.current;
-    if (!view || value === undefined) return;
-    const current = view.state.doc.toString();
-    if (current === value) return;
-    view.dispatch({
-      changes: minimalChange(current, value),
-      // As a textarea's value setter does: a new value puts the caret at its end.
-      selection: EditorSelection.cursor(value.length),
-      annotations: [controlledUpdate.of(true), Transaction.addToHistory.of(false)],
-    });
+    if (view && value !== undefined) syncControlledValue(view, value);
   });
 
   // One key for every prop that becomes an editor or content attribute.

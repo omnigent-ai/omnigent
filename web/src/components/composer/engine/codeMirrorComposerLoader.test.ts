@@ -54,6 +54,22 @@ describe("loading the CodeMirror composer", () => {
     expect(importer).toHaveBeenCalledTimes(2);
   });
 
+  it("settles failed when the editor can't be built", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    resetCodeMirrorComposerLoadForTests(() =>
+      Promise.resolve({
+        createCodeMirrorComposerInput: () => {
+          throw new Error("no editor");
+        },
+      }),
+    );
+
+    loadCodeMirrorComposer();
+
+    await vi.waitFor(() => expect(codeMirrorComposerLoad().status).toBe("failed"));
+    expect(warn).toHaveBeenCalledTimes(1);
+  });
+
   it("drops a load that finishes after a reset", async () => {
     let finishImport!: () => void;
     resetCodeMirrorComposerLoadForTests(
