@@ -15,9 +15,13 @@ export interface FakeComposerSurface extends ComposerEditorSurface {
 
 /**
  * A non-textarea composer surface for tests: a focusable, marked element whose
- * value and selection live in memory, as another editor engine's would.
+ * value and selection live in memory, as another editor engine's would. A locked
+ * surface refuses inserts, as a read-only draft does.
  */
-export function createFakeComposerSurface(initial = ""): FakeComposerSurface {
+export function createFakeComposerSurface(
+  initial = "",
+  { locked = false }: { locked?: boolean } = {},
+): FakeComposerSurface {
   const element = document.createElement("div");
   element.contentEditable = "true";
   element.tabIndex = 0;
@@ -45,7 +49,8 @@ export function createFakeComposerSurface(initial = ""): FakeComposerSurface {
     scrollTop: 0,
     scrollLeft: 0,
     setSelectionRange(start, end) {
-      selection = [start, end];
+      // As a textarea does: a start past the end collapses to the end.
+      selection = [Math.min(start, end), end];
     },
     focus(options) {
       element.focus(options);
@@ -54,6 +59,7 @@ export function createFakeComposerSurface(initial = ""): FakeComposerSurface {
       element.blur();
     },
     insertText(text, start, end) {
+      if (locked) return false;
       inserts.push({ text, start, end });
       surface.value = surface.value.slice(0, start) + text + surface.value.slice(end);
       selection = [start + text.length, start + text.length];

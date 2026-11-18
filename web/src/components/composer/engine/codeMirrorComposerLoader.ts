@@ -35,6 +35,8 @@ const defaultImporter: Importer = () => import("./codeMirrorComposerModule");
 let importer: Importer = defaultImporter;
 let current: CodeMirrorComposerLoad = { status: "idle" };
 const listeners = new Set<() => void>();
+// Bumped on reset, so a load that started earlier can't settle the fresh state.
+let generation = 0;
 
 function settle(next: CodeMirrorComposerLoad) {
   current = next;
@@ -53,22 +55,27 @@ export function subscribeCodeMirrorComposerLoad(listener: () => void): () => voi
 /** Start loading unless it is loading or loaded; a failed load starts again. */
 export function loadCodeMirrorComposer(): void {
   if (current.status === "loading" || current.status === "ready") return;
+  const attempt = generation;
+  const settleAttempt = (next: CodeMirrorComposerLoad) => {
+    if (attempt === generation) settle(next);
+  };
   settle({ status: "loading" });
   importer().then(
     (module) =>
-      settle({
+      settleAttempt({
         status: "ready",
         Component: module.createCodeMirrorComposerInput(codeMirrorComposerEnvironment()),
       }),
     (error: unknown) => {
       console.warn("The CodeMirror composer couldn't load; using the standard input.", error);
-      settle({ status: "failed", error });
+      settleAttempt({ status: "failed", error });
     },
   );
 }
 
 /** Test seam: swap the module import and forget any earlier load. */
 export function resetCodeMirrorComposerLoadForTests(nextImporter: Importer = defaultImporter) {
+  generation += 1;
   importer = nextImporter;
   current = { status: "idle" };
   listeners.clear();

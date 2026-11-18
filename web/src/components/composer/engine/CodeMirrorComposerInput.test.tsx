@@ -16,18 +16,14 @@ import {
 
 function mount(props: Partial<Parameters<typeof CodeMirrorComposerInput>[0]> = {}) {
   const box: { target: ComposerTextTarget | null } = { target: null };
+  const setTarget = (target: ComposerTextTarget | null) => {
+    box.target = target;
+  };
   const view = render(
-    <CodeMirrorComposerInput
-      aria-label="Message the agent"
-      value=""
-      {...props}
-      ref={(target) => {
-        box.target = target;
-      }}
-    />,
+    <CodeMirrorComposerInput aria-label="Message the agent" value="" {...props} ref={setTarget} />,
   );
   const content = view.container.querySelector<HTMLElement>(".cm-content")!;
-  return { ...view, content, target: () => box.target! };
+  return { ...view, content, setTarget, target: () => box.target! };
 }
 
 afterEach(() => {
@@ -45,9 +41,14 @@ describe("CodeMirrorComposerInput", () => {
   });
 
   it("resizes its scroller when the height changes", () => {
-    const { container, rerender } = mount({ heightMode: "compact" });
+    const { container, rerender, setTarget } = mount({ heightMode: "compact" });
     rerender(
-      <CodeMirrorComposerInput aria-label="Message the agent" value="" heightMode="unbounded" />,
+      <CodeMirrorComposerInput
+        aria-label="Message the agent"
+        value=""
+        heightMode="unbounded"
+        ref={setTarget}
+      />,
     );
     const scroller = getComputedStyle(container.querySelector(".cm-scroller")!);
     expect(scroller.maxHeight).toBe("none");
@@ -61,10 +62,10 @@ describe("CodeMirrorComposerInput", () => {
   });
 
   it("drops multi-line semantics when it is a combobox", () => {
-    const { content, rerender } = mount({ role: "combobox" });
+    const { content, rerender, setTarget } = mount({ role: "combobox" });
     expect(content.getAttribute("role")).toBe("combobox");
     expect(content.hasAttribute("aria-multiline")).toBe(false);
-    rerender(<CodeMirrorComposerInput aria-label="Message the agent" value="" />);
+    rerender(<CodeMirrorComposerInput aria-label="Message the agent" value="" ref={setTarget} />);
     expect(content.getAttribute("aria-multiline")).toBe("true");
   });
 
@@ -154,9 +155,14 @@ describe("CodeMirrorComposerInput change events", () => {
 
   it("takes a controlled value without reporting it or making it undoable", () => {
     const onChange = vi.fn();
-    const { content, target, rerender } = mount({ value: "a", onChange });
+    const { content, target, rerender, setTarget } = mount({ value: "a", onChange });
     rerender(
-      <CodeMirrorComposerInput aria-label="Message the agent" value="ab" onChange={onChange} />,
+      <CodeMirrorComposerInput
+        aria-label="Message the agent"
+        value="ab"
+        onChange={onChange}
+        ref={setTarget}
+      />,
     );
     expect(target().value).toBe("ab");
     expect(onChange).not.toHaveBeenCalled();
@@ -167,12 +173,73 @@ describe("CodeMirrorComposerInput change events", () => {
 
   it("puts the caret at the end of a longer value after a caret move past the old end", () => {
     // A caret set before the new value commits clamps to the old end, as a mention pick's does.
-    const { target, rerender } = mount({ value: "Check " });
+    const { target, rerender, setTarget } = mount({ value: "Check " });
     act(() => target().setSelectionRange(99, 99));
     expect(target().selectionStart).toBe("Check ".length);
 
-    rerender(<CodeMirrorComposerInput aria-label="Message the agent" value="Check @README.md" />);
+    rerender(
+      <CodeMirrorComposerInput
+        aria-label="Message the agent"
+        value="Check @README.md"
+        ref={setTarget}
+      />,
+    );
     expect([target().selectionStart, target().selectionEnd]).toEqual([16, 16]);
+  });
+
+  it("restores the controlled value when a parent rejects an edit", () => {
+    const onChange = vi.fn();
+    const { target, rerender, setTarget } = mount({ value: "draft", onChange });
+    act(() => insertComposerText(target(), "x", 5, 5));
+    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(target().value).toBe("draftx");
+
+    // The parent re-renders with the same value, as after an unrelated state change.
+    rerender(
+      <CodeMirrorComposerInput
+        aria-label="Message the agent"
+        value="draft"
+        onChange={onChange}
+        ref={setTarget}
+      />,
+    );
+    expect(target().value).toBe("draft");
+    expect(onChange).toHaveBeenCalledTimes(1);
+  });
+
+  it("gives each programmatic insert its own undo step", () => {
+    const { content, target } = mount();
+    act(() => insertComposerText(target(), "a", 0, 0));
+    act(() => insertComposerText(target(), "b", 1, 1));
+
+    act(() => void undo(EditorView.findFromDOM(content)!));
+    expect(target().value).toBe("a");
+  });
+
+  it("lets a change handler move the caret without re-entering an update", () => {
+    const onChange = vi.fn(() => target().setSelectionRange(0, 0));
+    const { target } = mount({ onChange });
+
+    act(() => insertComposerText(target(), "x", 0, 0));
+
+    expect(target().value).toBe("x");
+    expect([target().selectionStart, target().selectionEnd]).toEqual([0, 0]);
+  });
+});
+
+describe("CodeMirrorComposerInput ref", () => {
+  it("transfers the live surface when the forwarded ref changes", () => {
+    const first = vi.fn<(target: ComposerTextTarget | null) => void>();
+    const second = vi.fn<(target: ComposerTextTarget | null) => void>();
+    const { rerender } = render(
+      <CodeMirrorComposerInput aria-label="Message the agent" value="" ref={first} />,
+    );
+    const surface = first.mock.lastCall![0]!;
+
+    rerender(<CodeMirrorComposerInput aria-label="Message the agent" value="" ref={second} />);
+
+    expect(first).toHaveBeenLastCalledWith(null);
+    expect(second).toHaveBeenLastCalledWith(surface);
   });
 });
 

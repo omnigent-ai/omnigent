@@ -1,10 +1,6 @@
-// The CodeMirror composer input: a plain-text editor with a real scrollbar and the same
-// ComposerTextTarget semantics as the textarea, so shared composer logic works on it unchanged.
-//
-// This module is its own lazy chunk. It imports only CodeMirror, React and engine-local code;
-// what it needs from the app arrives as a CodeMirrorComposerEnvironment.
+// Plain-text CodeMirror adapter with injected composer services.
 
-import { history, historyKeymap, standardKeymap } from "@codemirror/commands";
+import { history, historyKeymap, isolateHistory, standardKeymap } from "@codemirror/commands";
 import {
   Annotation,
   Compartment,
@@ -20,7 +16,15 @@ import {
   placeholder as placeholderText,
   type KeyBinding,
 } from "@codemirror/view";
-import { forwardRef, useEffect, useLayoutEffect, useMemo, useRef, type Ref } from "react";
+import {
+  forwardRef,
+  useEffect,
+  useImperativeHandle,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  type Ref,
+} from "react";
 
 import { cn } from "@/lib/utils";
 
@@ -178,7 +182,9 @@ function createSurface(view: EditorView): ComposerEditorSurface {
       view.scrollDOM.scrollLeft = value;
     },
     setSelectionRange(start, end) {
-      view.dispatch({ selection: EditorSelection.single(clamp(start), clamp(end)) });
+      // As a textarea does: a start past the end collapses to the end.
+      const to = clamp(end);
+      view.dispatch({ selection: EditorSelection.single(Math.min(clamp(start), to), to) });
     },
     focus() {
       // Not contentDOM.focus(): the browser would put its caret at the start and the editor
@@ -195,7 +201,9 @@ function createSurface(view: EditorView): ComposerEditorSurface {
       view.dispatch({
         changes: { from, to: clamp(end), insert: text },
         selection: { anchor: from + text.length },
-        userEvent: "input.type",
+        userEvent: "input",
+        // Each programmatic insert is its own undo step, not joined to the typing around it.
+        annotations: isolateHistory.of("full"),
       });
       return true;
     },
@@ -203,11 +211,6 @@ function createSurface(view: EditorView): ComposerEditorSurface {
       view.dispatch({ effects: EditorView.scrollIntoView(view.state.selection.main.head) });
     },
   };
-}
-
-function assignRef<T>(ref: Ref<T> | undefined, value: T | null) {
-  if (typeof ref === "function") ref(value);
-  else if (ref) (ref as { current: T | null }).current = value;
 }
 
 /** The CodeMirror composer input for `environment`; the loader makes one per page. */
@@ -234,10 +237,8 @@ function CodeMirrorComposer({
   const viewRef = useRef<EditorView | null>(null);
   const surfaceRef = useRef<ComposerEditorSurface | null>(null);
   const latest = useRef(props);
-  const refTarget = useRef(forwardedRef);
   useLayoutEffect(() => {
     latest.current = props;
-    refTarget.current = forwardedRef;
   });
   const compartments = useMemo(
     () => ({
@@ -349,10 +350,7 @@ function CodeMirrorComposer({
     viewRef.current = view;
     surfaceRef.current = surface;
     const unregister = environment.registerSurface(surface);
-    const ref = refTarget.current;
-    assignRef(ref, surface);
     return () => {
-      assignRef(ref, null);
       unregister();
       view.scrollDOM.removeEventListener("scroll", onScroll);
       view.destroy();
@@ -360,8 +358,11 @@ function CodeMirrorComposer({
       surfaceRef.current = null;
     };
   }, [compartments, environment]);
+  // React re-attaches the surface when the forwarded ref changes, as for a textarea.
+  useImperativeHandle(forwardedRef, () => surfaceRef.current!, []);
 
-  // Bring a controlled value in without echoing a change or adding an undo step.
+  // Bring a controlled value in without echoing a change or adding an undo step. Runs on every
+  // render, so an edit the parent rejected reverts even when the value didn't change.
   useLayoutEffect(() => {
     const view = viewRef.current;
     if (!view || value === undefined) return;
@@ -373,7 +374,7 @@ function CodeMirrorComposer({
       selection: EditorSelection.cursor(value.length),
       annotations: [controlledUpdate.of(true), Transaction.addToHistory.of(false)],
     });
-  }, [value]);
+  });
 
   // One key for every prop that becomes an editor or content attribute.
   const attributeKey = JSON.stringify([

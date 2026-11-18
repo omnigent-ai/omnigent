@@ -22,7 +22,12 @@ interface Mounted {
   setValue: (value: string) => void;
 }
 
-function mountTextarea(initial: string): Mounted {
+interface MountOptions {
+  /** Mount read-only, as a locked draft is. */
+  locked?: boolean;
+}
+
+function mountTextarea(initial: string, { locked = false }: MountOptions = {}): Mounted {
   const onChange = vi.fn();
   const box: { set?: (value: string) => void; element?: HTMLTextAreaElement | null } = {};
   function Harness() {
@@ -33,6 +38,7 @@ function mountTextarea(initial: string): Mounted {
         ref={(element) => {
           box.element = element;
         }}
+        readOnly={locked}
         value={value}
         onChange={(event) => {
           onChange(event.currentTarget.value);
@@ -49,7 +55,7 @@ function mountTextarea(initial: string): Mounted {
   };
 }
 
-function mountCodeMirror(initial: string): Mounted {
+function mountCodeMirror(initial: string, { locked = false }: MountOptions = {}): Mounted {
   const onChange = vi.fn();
   const box: { set?: (value: string) => void; target?: ComposerTextTarget | null } = {};
   function Harness() {
@@ -60,6 +66,7 @@ function mountCodeMirror(initial: string): Mounted {
         ref={(target) => {
           box.target = target;
         }}
+        readOnly={locked}
         value={value}
         onChange={(event) => {
           onChange(event.currentTarget.value);
@@ -77,8 +84,8 @@ function mountCodeMirror(initial: string): Mounted {
 }
 
 /** A surface has no React change events, so its edits are counted as they land. */
-function mountFake(initial: string): Mounted {
-  const surface = createFakeComposerSurface(initial);
+function mountFake(initial: string, { locked = false }: MountOptions = {}): Mounted {
+  const surface = createFakeComposerSurface(initial, { locked });
   return {
     target: () => surface,
     changes: () => surface.inserts.length,
@@ -112,18 +119,17 @@ describe.each([
     expect(target().selectionStart).toBe("hello there".length);
   });
 
-  it("takes a controlled value without reporting it as a change", () => {
-    const { target, changes, setValue } = mount("draft");
-    setValue("");
-    expect(target().value).toBe("");
-    expect(changes()).toBe(0);
-  });
-
   it("moves the selection without taking focus", () => {
     const { target } = mount("one two three");
     act(() => target().setSelectionRange(4, 7));
     expect(isComposerTargetFocused(target())).toBe(false);
     expect([target().selectionStart, target().selectionEnd]).toEqual([4, 7]);
+  });
+
+  it("collapses reversed selection bounds to the end offset", () => {
+    const { target } = mount("abcdef");
+    act(() => target().setSelectionRange(5, 2));
+    expect([target().selectionStart, target().selectionEnd]).toEqual([2, 2]);
   });
 
   it("keeps its selection across blur and focus", () => {
@@ -138,11 +144,35 @@ describe.each([
   });
 });
 
+describe.each([
+  ["textarea", mountTextarea],
+  ["codemirror", mountCodeMirror],
+  ["fake", mountFake],
+])("ComposerTextTarget locked on the %s engine", (_engine, mount) => {
+  it("refuses an insert and keeps its draft, selection and change count", () => {
+    const { target, changes } = mount("draft", { locked: true });
+    act(() => target().setSelectionRange(1, 3));
+
+    expect(insertComposerText(target(), "x", 0, 0)).toBe(false);
+
+    expect(target().value).toBe("draft");
+    expect([target().selectionStart, target().selectionEnd]).toEqual([1, 3]);
+    expect(changes()).toBe(0);
+  });
+});
+
 // The fake surface has no controlled-value sync, so only the rendered engines take a value.
 describe.each([
   ["textarea", mountTextarea],
   ["codemirror", mountCodeMirror],
 ])("ComposerTextTarget controlled value on the %s engine", (_engine, mount) => {
+  it("takes a controlled value without reporting it as a change", () => {
+    const { target, changes, setValue } = mount("draft");
+    setValue("");
+    expect(target().value).toBe("");
+    expect(changes()).toBe(0);
+  });
+
   it("puts the caret at the end of a new value", () => {
     const { target, setValue } = mount("hello world");
     act(() => target().setSelectionRange(2, 2));

@@ -53,4 +53,23 @@ describe("loading the CodeMirror composer", () => {
     await vi.waitFor(() => expect(codeMirrorComposerLoad().status).toBe("ready"));
     expect(importer).toHaveBeenCalledTimes(2);
   });
+
+  it("drops a load that finishes after a reset", async () => {
+    let finishImport!: () => void;
+    resetCodeMirrorComposerLoadForTests(
+      () =>
+        new Promise((resolve) => {
+          finishImport = () => resolve(CodeMirrorComposerModule);
+        }),
+    );
+    loadCodeMirrorComposer();
+
+    resetCodeMirrorComposerLoadForTests();
+    finishImport();
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+
+    expect(codeMirrorComposerLoad().status).toBe("idle");
+  });
 });
