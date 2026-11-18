@@ -208,7 +208,8 @@ islo = ["islo>=0.3.5,<0.4"]
 # exec by sandbox name within a workspace.
 openshell = ["openshell>=0.1.0,<1"]
 # Workspace API server and client (omnigent/api/workspace/v1alpha1/workspace.proto)
-# for the desktop fast track; optional while it ships off. Pre-1.0: pin minor.
+# for the desktop fast track. `databricks` includes it; other installs opt in,
+# since pyqwest builds from source with Rust where it has no wheel. Pre-1.0: pin minor.
 workspace-api = ["connectrpc>=0.13,<0.14"]
 # On-demand Kubernetes runner Pod launcher (server-managed
 # `sandbox.provider: kubernetes`). The launcher module ships in the base
@@ -316,6 +317,8 @@ databricks = [
     # Databricks uses a Postgres control plane (Lakebase); reuse the single
     # psycopg pin from the `postgres` extra so the two never drift.
     "omnigent[postgres]",
+    # The desktop fast track's workspace API, with its pin kept in `workspace-api`.
+    "omnigent[workspace-api]",
     "pymysql>=1.1,<2",
     # Databricks-specific MCP servers. Not imported by core Omnigent
     # code, so it is opt-in here rather than a default dependency. Floored
@@ -472,6 +475,7 @@ include = ["omnigent*"]
 "omnigent.db" = ["alembic.ini"]
 "omnigent.db.migrations" = ["script.py.mako"]
 "omnigent.resources.examples" = ["*.yaml", "*.sh", "debby/**/*", "polly/**/*"]
+"omnigent.resources.proactive" = ["bundle/*"]
 "omnigent.resources.pi" = ["*.cjs"]
 "omnigent.resources.pi_native" = ["*.js", "*.cjs"]
 "omnigent.resources.pi_gateway" = ["*.js"]

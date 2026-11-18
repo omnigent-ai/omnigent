@@ -1,7 +1,8 @@
 """Built-in tools that write to and read the session owner's Inbox.
 
-Registered only when the agent spec sets ``tool_groups.user_inbox: true``.
-The runner forwards both to the server's ``/v1/inbox/items`` endpoints.
+Registered unless the agent spec sets ``tool_groups.user_inbox: false``, and
+kept by the runner only when the server offers the Inbox to the session's
+owner. The runner forwards both to the server's ``/v1/inbox/items`` endpoints.
 Not to be confused with ``sys_read_inbox``, which drains an agent's own
 queue of background-work results.
 
@@ -34,10 +35,15 @@ class SysUserInboxPostTool(Tool):
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
         return (
-            "Post one suggestion to the user's Inbox: a follow-up, a piece of information, "
-            "or a reminder. Call sys_user_inbox_list first and skip anything the user already "
-            "has. Reuse an existing item's topic when posting about the same thing. If the "
-            "server reports duplicate: true, the item already exists; do not post it again."
+            "Post one item to the user's Inbox, which they read after this conversation: a "
+            "follow-up, a piece of information, or a reminder. Unless your instructions say "
+            "otherwise, post only when the user asked you to remind or notify them later, or "
+            "when you find something they must act on after this session ends and would "
+            "otherwise miss. Do not post to report progress or a finished task, to repeat what "
+            "you already said here, or to ask a question you can ask in this conversation. "
+            "Call sys_user_inbox_list first and skip anything the user already has. Reuse an "
+            "existing item's topic when posting about the same thing. If the server reports "
+            "duplicate: true, the item already exists; do not post it again."
         )
 
     def get_schema(self) -> dict[str, Any]:

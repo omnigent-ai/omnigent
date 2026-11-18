@@ -7,15 +7,16 @@ list at Read, with the owner's authority:
 * A run that creates a session grants it to every grantee.
 * A continue-session automation manages its session's sharing once it is shared
   with anyone: each run, and each change to the automation's grants, syncs that
-  session to the list, revoking any grant not on it except the owner's and
-  ``__public__``.
+  session to the list, revoking any grant not on it except the owner's and public
+  access (:meth:`.PermissionStore.public_grantees`).
 * An independent or sibling session launched from a run's session tree, directly
   or through other launches, is granted as it is created to each grantee who still
   holds a grant on that tree's root. Child sessions need nothing: their access
   resolves through their root.
 
-Both grant lists are read a page at a time, never whole. A grant is revoked only
-once the automation's share table confirms its holder isn't a grantee, so a read
+Both grant lists are read a page at a time, never whole. Session grants are those set
+on the session itself, never access through groups or admin rights. A grant is revoked
+only once the automation's share table confirms its holder isn't a grantee, so a read
 that fails part way revokes nothing unchecked. Grantees are added by exact ID, as the
 session share route adds them. Older run sessions are never updated. Callers run
 these as the task's owner: the fire path inside its owner scopes, a route in the
@@ -35,7 +36,7 @@ from omnigent.db.account_authority import target_account_scope
 from omnigent.entities import Conversation, ScheduledTask
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.inner._subprocess_lifecycle import await_cleanup_task
-from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
+from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL
 from omnigent.server.routes._sessions.helpers import _announce_session_added
 from omnigent.server.session_sharing import require_sharing_mode_allows_grant
 from omnigent.server.sharing_settings import host_is_managed_sandbox
@@ -147,16 +148,16 @@ async def _revoke_unlisted_grants(
 ) -> None:
     """Revoke each of *session*'s grants whose holder isn't one of the automation's grantees.
 
-    Keeps Owner grants, the automation's owner and ``__public__``. Reads a page at a
-    time and checks each holder on its own, so a failed read stops the pass without
-    revoking anyone unchecked.
+    Keeps Owner grants, the automation's owner and the store's public grantees. Reads
+    the grants set on the session itself a page at a time and checks each holder on its
+    own, so a failed read stops the pass without revoking anyone unchecked.
     """
-    kept = {task.user_id or RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC}
+    kept = {task.user_id or RESERVED_USER_LOCAL, *permission_store.public_grantees()}
     cursor: str | None = None
     while True:
         try:
             page, cursor = await asyncio.to_thread(
-                permission_store.list_for_session,
+                permission_store.list_direct_for_session,
                 session.id,
                 limit=permission_store_module.MAX_GRANTS_PAGE_SIZE,
                 after_user_id=cursor,
@@ -231,8 +232,9 @@ async def _add_missing_grantees(
         for grant in page:
             grantee = grant.user_id
             try:
-                # Anyone with access holds at least Read, so there is nothing to add for them.
-                held = await asyncio.to_thread(permission_store.get, grantee, session.id)
+                # Their own grant is at least Read, so nothing to add. Access only through a
+                # group still gets a grant, so a later group change can't take it away.
+                held = await asyncio.to_thread(permission_store.get_direct, grantee, session.id)
             except Exception:
                 _logger.exception(
                     "automation %s: could not read %r's share of session %s; not sharing it",
@@ -274,7 +276,7 @@ def _holds_grant(
 ) -> bool:
     """Whether *user_id* holds a direct grant on *session_id*; ``False`` when unreadable."""
     try:
-        return permission_store.get(user_id, session_id) is not None
+        return permission_store.get_direct(user_id, session_id) is not None
     except Exception:
         _logger.exception(
             "automation %s: could not read %r's share of session %s; not sharing with them",
@@ -557,7 +559,7 @@ async def sync_continued_session(
     """Make a continue-session automation's session shared with exactly its grantees.
 
     Grants anyone missing as :func:`share_new_run_session` does, and revokes every
-    other grant except the owner's and ``__public__``. Revoked recipients get no
+    other grant except the owner's and public access. Revoked recipients get no
     push; their session lists drop the session on the next refresh. Never raises.
 
     :param task: The automation that continues *session*.
@@ -641,9 +643,9 @@ async def revoke_from_task_session(
     The route calls this before it deletes their automation grant, which stays as
     the record that this revoke is owed: no run would make it once the automation
     has no grants. It calls it again after the delete for a session recorded
-    meanwhile, putting the grant back if that fails. Leaves the owner's grant,
-    ``__public__`` and a session the automation's owner doesn't own alone, as the
-    sync does.
+    meanwhile, putting the grant back if that fails. Leaves the owner's grant, public
+    access, access not set on the session itself and a session the automation's owner
+    doesn't own alone, as the sync does.
 
     :param task: The automation the grantee is being removed from.
     :param user_id: The grantee, e.g. ``"alice@example.com"``.
@@ -656,7 +658,8 @@ async def revoke_from_task_session(
         not task.continues_session
         or permission_store is None
         or not permission_store.supports_scheduled_task_grants
-        or user_id in (owner, RESERVED_USER_PUBLIC)
+        or user_id == owner
+        or user_id in permission_store.public_grantees()
     ):
         return
     assert task.session_id is not None
@@ -665,7 +668,7 @@ async def revoke_from_task_session(
             permission_store.check_access, owner, task.session_id, LEVEL_OWNER
         ):
             return
-        grant = await asyncio.to_thread(permission_store.get, user_id, task.session_id)
+        grant = await asyncio.to_thread(permission_store.get_direct, user_id, task.session_id)
         if grant is not None and grant.level != LEVEL_OWNER:
             await asyncio.to_thread(permission_store.revoke, user_id, task.session_id)
     except Exception as exc:

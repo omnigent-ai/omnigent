@@ -972,12 +972,11 @@ install production desktop updates. `build:mac:release` retains
 cross-platform publishing and update-feed checklist, see [the desktop release
 runbook](RELEASING.md).
 
-macOS apps, including unpackaged development, default to V2 onboarding only when the managed preference
-`databricksInternalFeaturesEnabled` is `true`, for both new and existing profiles.
-Other users and Windows/Linux keep the legacy
-default. The setup-page switch still persists an explicit choice on every
-platform, and `OMNIGENT_SERVER_SELECTOR_V2=1` forces V2 regardless of the saved
-choice. A saved server still reconnects on launch.
+macOS apps, including unpackaged development, default to V2 onboarding for both
+new and existing profiles. Windows/Linux keep the legacy default. The setup-page
+switch still persists an explicit choice on every platform, and
+`OMNIGENT_SERVER_SELECTOR_V2=1` forces V2 regardless of the saved choice. A
+saved server still reconnects on launch.
 
 Unpackaged `pnpm start` / `just electron-dev` runs inside Electron's own macOS
 bundle, but reads local preferences from `ai.omnigent.desktop-dev` explicitly

@@ -20,6 +20,7 @@ import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge"
 import { sessionRoutingHostId, setSessionHost, setSessionParent } from "./sessionHost";
 import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitlesPreferences";
 import { browserAgentToolsRequestHeaders } from "@/components/BrowserPane/agentTools/preferences";
+import { timezoneRequestHeaders } from "./timezones";
 import { parseBackgroundTasks } from "./sse";
 import type {
   BackgroundTaskInfo,
@@ -681,6 +682,7 @@ export async function createSession(
       "Content-Type": "application/json",
       "X-Omnigent-Client": getClientSurface(),
       ...backgroundSessionTitlesRequestHeaders(),
+      ...timezoneRequestHeaders(),
     },
     body: JSON.stringify(body),
   });
@@ -948,6 +950,7 @@ export async function createBundledSession(
     headers: {
       "X-Omnigent-Client": getClientSurface(),
       ...backgroundSessionTitlesRequestHeaders(),
+      ...timezoneRequestHeaders(),
     },
     body: form,
   });
