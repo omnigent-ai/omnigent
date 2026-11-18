@@ -33,15 +33,17 @@ unchanged.
 The sidebar reads through the workspace API
 (`omnigent/api/workspace/v1alpha1/workspace.proto`), which the session's host
 answers. The desktop app reaches the host's socket directly, on the same
-machine or over SSH; other clients go through the server. Either way the host
-checks the server-issued token. `docs/workspace-fast-track.md` describes these
-routes and their flags.
+machine or over SSH, with a short-lived token the server issues; the host
+verifies it on every call. Other clients go through the server, which
+authorizes the call itself and tunnels it to the host without a token.
+`docs/workspace-fast-track.md` describes these routes and their flags.
 
 Being added:
 
 - A Rust workspace helper, shipped as the `omnigent-workspace-helper` binary
-  wheel through an omnigent extra. The host starts it on first use, stops it
-  when idle, and forwards workspace API calls to it.
+  wheel through an omnigent extra. The host starts it on first use and stops
+  it when idle. The host still authorizes each request, then forwards only an
+  allowlist of read-only calls to the helper.
 - Search, and the git calls the Diffs page needs, in the workspace API.
 
 Without the helper, file reads fall back to the host's Python reader, then to
