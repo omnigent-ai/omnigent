@@ -30,6 +30,7 @@ import {
   useFileViewer,
   useFileViewerConversationId,
   useFolderOpener,
+  useChangedPathsLoading,
   useIsChangedPath,
   useWorkspacePaths,
 } from "@/shell/FileViewerContext";
@@ -115,6 +116,7 @@ export function useFileReference(
   const openFile = useFileViewer();
   const openFolder = useFolderOpener();
   const isChangedPath = useIsChangedPath();
+  const changedPathsLoading = useChangedPathsLoading();
   const conversationId = useFileViewerConversationId();
   const { root, home } = useWorkspacePaths();
   const serveable = useWorkspaceServeable(conversationId);
@@ -184,7 +186,8 @@ export function useFileReference(
     queryKey: ["file-reference-search", conversationId, searchName],
     queryFn: ({ signal }) =>
       fetchWorkspaceFileSearch(conversationId!, searchName, "", "", "", signal),
-    enabled: searchable && !!searchName && !!conversationId,
+    // The changed-files list may still name the file, so wait for it before searching.
+    enabled: searchable && !!searchName && !!conversationId && !changedPathsLoading,
     // A cited file rarely moves mid-conversation; re-searching on every remount
     // (scrolling history) would rescan the workspace for each bare file name.
     staleTime: 5 * 60_000,

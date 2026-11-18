@@ -11,7 +11,7 @@
 // Both should instead open the FileViewer, exactly as an inline-code path does.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { mentionPillMarkdown } from "@/lib/mentionPills";
@@ -1024,5 +1024,36 @@ describe("a file written after an earlier mention", () => {
     fireEvent.click(await screen.findByRole("button", { name: "report.md" }));
     expect(openFile).toHaveBeenCalledWith("report.md");
     expect(toastMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("a link to a changed file while the changed-files list loads", () => {
+  it("waits for the list instead of searching the workspace", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const markdown = "[Line 100](src/citation_target.py:100)";
+    const tree = (viewer: typeof FILE_VIEWER_WITH_SESSION & { changedPathsLoading: boolean }) => (
+      <QueryClientProvider client={client}>
+        <FileViewerContext.Provider value={viewer}>
+          <FilePathAwareMessageResponse>{markdown}</FilePathAwareMessageResponse>
+        </FileViewerContext.Provider>
+      </QueryClientProvider>
+    );
+    // The listing of src/ answers first and doesn't contain the file.
+    fetchMock.mockResolvedValue(jsonResponse({ object: "list", data: [], has_more: false }));
+    const { rerender } = render(tree({ ...FILE_VIEWER_WITH_SESSION, changedPathsLoading: true }));
+    await waitFor(() =>
+      expect(client.getQueryState(["workspace-dir-listing", "conv_1", "src"])?.status).toBe(
+        "success",
+      ),
+    );
+    await act(async () => {});
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    changedPaths = ["src/citation_target.py"];
+    rerender(tree({ ...FILE_VIEWER_WITH_SESSION, changedPathsLoading: false }));
+
+    fireEvent.click(await screen.findByRole("button", { name: "Line 100" }));
+    expect(openFile).toHaveBeenCalledWith("src/citation_target.py", { line: 100 });
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes("/search?"))).toBe(false);
   });
 });

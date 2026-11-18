@@ -139,6 +139,7 @@ export function GridSessionPane({
     showFilesPanel: showFiles,
     changedCount,
     isChangedPath,
+    changedPathsLoading,
     terminals,
     agentTerminal,
     openTerminals,
@@ -346,6 +347,7 @@ export function GridSessionPane({
       workspaceHome: environment.data?.home ?? null,
       sessionHostId: session?.hostId,
       isChangedPath,
+      changedPathsLoading,
     }),
     [
       openFile,
@@ -359,6 +361,7 @@ export function GridSessionPane({
       environment.data,
       session?.hostId,
       isChangedPath,
+      changedPathsLoading,
     ],
   );
   const rightRailTab =
