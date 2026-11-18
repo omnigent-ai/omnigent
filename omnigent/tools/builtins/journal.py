@@ -23,6 +23,7 @@ from typing import Any
 from omnigent.entities.session_journal import (
     JOURNAL_KINDS,
     NOTE_BODY_MAX_BYTES,
+    PLAN_DESCRIPTION_MAX_CHARS,
     PLAN_MAX_STEPS,
     PLAN_NAME_MAX_CHARS,
     STEP_ID_MAX_CHARS,
@@ -168,6 +169,16 @@ class SysJournalWritePlanTool(Tool):
                         "from sys_workflow_load."
                     ),
                 },
+                "description": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": PLAN_DESCRIPTION_MAX_CHARS,
+                    "description": (
+                        "Only in a workflow page's planning chat: the workflow's description "
+                        "for this proposal, what it does and what a run needs. Save plan "
+                        "stores it with the steps."
+                    ),
+                },
             },
             ["name", "steps"],
         )
@@ -215,17 +226,23 @@ class SysJournalWriteStatusTool(Tool):
         return (
             "Record where a plan step stands; the newest status is the step's current one. "
             "'started' when you begin a step yourself, or resume it; 'done' when it achieved "
-            "its goal (only done lets later steps start); 'needs_input' when it waits for "
-            "the user: an approval, a decision, a go-ahead they asked for, or how to get "
-            "past something you can't clear yourself, such as CI being down. To ask them, "
+            "its goal (only done lets later steps start); 'needs_input' only for required data "
+            "or access unavailable after relevant lookups, a choice between unresolved "
+            "irreversible external effects, or an explicit human gate still unsatisfied. "
+            "Record the blocked operation, evidence, attempted lookups or recovery and exact "
+            "human action needed, and why no default or authorized alternative can finish it. "
+            "Cite approval requirements; reuse existing authorization and reversible defaults. "
+            "Pending CI, jobs and workers stay started while you monitor "
+            "or recover them; they do not need human input just because they are slow. To ask, "
             "call sys_workflow_request_input instead, which writes it for you; 'failed' when its "
             "own work failed. text says why in a few words, and is required except for "
             "started. Writing started on a done step reopens it. Every status needs "
             "every step this one depends on to be done first; otherwise the write fails "
             "with step_not_ready, naming them. A user stopping you isn't a failure: leave "
             "the step started. In an unattended automation or its workers, needs_input is "
-            "refused: decide within the user's authorization, or write failed with the "
-            "blocker and continue independent work."
+            "refused: resolve within the user's authorization. Write failed for a remaining "
+            "blocker only with the same evidence; continue independent work. Being unattended "
+            "or uncertain is not itself a failure."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -243,8 +260,8 @@ class SysJournalWriteStatusTool(Tool):
                 "text": {
                     "type": "string",
                     "description": (
-                        "Why, e.g. 'p95 430 ms', 'Approve the deploy to prod?' or "
-                        "'CI is down: retry later, or skip the check?'."
+                        "Why, e.g. 'p95 430 ms', 'Waiting for CI to finish' or "
+                        "'AGENTS.md requires owner approval before deploy'."
                     ),
                 },
             },
@@ -302,17 +319,27 @@ class SysWorkflowRequestInputTool(Tool):
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
         return (
-            "Ask the user about a task in your plan and wait for their answer: an approval, "
-            "a decision, or a way past something you can't clear yourself. Ask only about a "
+            "Ask only for required data or access still unavailable after relevant lookups, "
+            "a choice between unresolved irreversible external effects, or an explicit "
+            "human gate still unsatisfied under existing authorization. Follow the workflow "
+            "skill's 'Before asking or declaring a blocker' rules: record the blocked "
+            "operation, evidence, attempts and exact input or action needed, and why no default "
+            "or authorized alternative can finish it. Cite an approval requirement; do not "
+            "infer one because work is external or important. Choose "
+            "reversible defaults and monitor or recover pending work yourself. Ask only about a "
             "task whose dependencies are done (otherwise step_not_ready), and first finish "
             "the ready tasks that don't depend on the answer. It marks the task needs_input "
             "with your first question, puts the questions in the user's Inbox with your "
             "options as buttons (they can also write their own answer), and returns the "
             "answers. Then write the task's next status: started to resume it, done for an "
-            "approval given, failed for one refused. Ask everything you need in one call. "
+            "approval given, failed for one refused. If they haven't answered within a few "
+            "minutes it returns still_open: finish the work that doesn't depend on the answer, "
+            "then end your turn; their answer arrives later as a message. Ask everything you "
+            "need in one call. "
             "In an unattended automation or its workers, this tool and needs_input are "
-            "refused. Decide within the user's authorization and record the choice, or "
-            "write failed with the blocker and continue independent work."
+            "refused. Resolve within the user's authorization and record the choice. Write "
+            "failed for a remaining blocker only with the same evidence; continue independent "
+            "work. Being unattended or uncertain is not itself a failure."
         )
 
     def get_schema(self) -> dict[str, Any]:
@@ -386,10 +413,11 @@ class SysWorkflowSaveTool(Tool):
             "Save a reusable workflow for the user: from this session's plan, or one they "
             "describe. Load the save-workflow skill first and follow it. Make the steps generic: "
             "a detail that would differ next run (the repo, the PR, the module, a ticket, a "
-            "date) comes out of the steps, and the description says what a run needs "
-            "('Give it: …'). Use the name the user picked; if they gave none, suggest one and "
-            "save once they agree. A workflow drafted from a description waits for the user's "
-            "go-ahead: show the draft first, offering to save it now or try it once. Returns the "
+            "date) comes out of the steps, and the description says how to discover inputs, "
+            "their defaults and what a run still requires. Use the user's name or choose a "
+            "short descriptive one. A request to create or save authorizes saving without "
+            "another confirmation; respect explicit draft-only or review-first instructions. "
+            "Saving does not authorize executing the workflow. Returns the "
             "workflow's id and name, or name_taken when the user already has a workflow with "
             "that name."
         )
@@ -404,7 +432,7 @@ class SysWorkflowSaveTool(Tool):
                     "type": "string",
                     "minLength": 1,
                     "maxLength": WORKFLOW_NAME_MAX_CHARS,
-                    "description": "The name the user picked, e.g. 'Triage flaky tests'.",
+                    "description": "The workflow's name, e.g. 'Triage flaky tests'.",
                 },
                 "description": {
                     "type": "string",

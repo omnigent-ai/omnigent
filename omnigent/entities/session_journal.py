@@ -46,6 +46,8 @@ PLAN_MAX_RAW_BYTES = 32 * 1024
 # A plan's name says its goal in a few words, e.g. "Cut GET /orders p95 by 20%". A
 # saved workflow's name, which a run's plan takes, is stored in a VARCHAR(80) column.
 PLAN_NAME_MAX_CHARS = 80
+# A workflow planning chat's proposal carries the description Save plan stores with it.
+PLAN_DESCRIPTION_MAX_CHARS = 2000
 PLAN_SOURCES: tuple[str, ...] = ("agent", "workflow")
 # Names the write that appended an entry, e.g. "tool:<tool call ID>".
 IDEMPOTENCY_KEY_MAX_CHARS = 128
@@ -188,6 +190,23 @@ def _line(name: str, value: object, max_chars: int | None = None) -> str:
     return collapsed
 
 
+def normalize_description(description: object) -> str:
+    """Check a workflow's description and return it trimmed.
+
+    :param description: Non-empty text of at most :data:`PLAN_DESCRIPTION_MAX_CHARS`
+        characters; it may span lines.
+    :raises InvalidJournalEntryError: If it is empty, too long or not text.
+    """
+    text = _text("description", description).strip()
+    if not text:
+        raise InvalidJournalEntryError("description must not be empty")
+    if len(text) > PLAN_DESCRIPTION_MAX_CHARS:
+        raise InvalidJournalEntryError(
+            f"description must be at most {PLAN_DESCRIPTION_MAX_CHARS} characters"
+        )
+    return text
+
+
 def normalize_step_id(step: object) -> str:
     """Check a step ID and return it.
 
@@ -288,7 +307,9 @@ def _check_acyclic(steps: list[dict[str, Any]]) -> None:
         )
 
 
-def normalize_plan(steps: object, *, name: object, source: str = "agent") -> dict[str, Any]:
+def normalize_plan(
+    steps: object, *, name: object, source: str = "agent", description: object = None
+) -> dict[str, Any]:
     """Check a plan's name and graph and return its content, without its version.
 
     :param steps: The whole graph: a list of ``{"id", "name", "goal",
@@ -298,8 +319,12 @@ def normalize_plan(steps: object, *, name: object, source: str = "agent") -> dic
     :param name: The plan's goal in a few words, e.g. ``"Cut GET /orders p95
         by 20%"``: one line of at most :data:`PLAN_NAME_MAX_CHARS`.
     :param source: Who drew it, one of :data:`PLAN_SOURCES`.
-    :returns: ``{"name", "source", "steps"}``; the store adds ``version``.
-    :raises InvalidJournalEntryError: If the name, the graph or a step is invalid.
+    :param description: A workflow planning chat's proposed workflow description,
+        checked by :func:`normalize_description`; ``None`` for none.
+    :returns: ``{"name", "source", "steps"}``, plus ``description`` when given;
+        the store adds ``version``.
+    :raises InvalidJournalEntryError: If the name, the graph, a step or the
+        description is invalid.
     """
     if name is None:
         raise InvalidJournalEntryError("a plan needs a name: its goal in a few words")
@@ -325,7 +350,9 @@ def normalize_plan(steps: object, *, name: object, source: str = "agent") -> dic
                 f"step {step['id']!r} depends on steps not in the plan: {', '.join(missing)}"
             )
     _check_acyclic(normalized)
-    content = {"name": plan_name, "source": source, "steps": normalized}
+    content: dict[str, Any] = {"name": plan_name, "source": source, "steps": normalized}
+    if description is not None:
+        content["description"] = normalize_description(description)
     size = len(json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
     if size > PLAN_MAX_RAW_BYTES:
         raise JournalEntryTooLargeError("the plan", size, PLAN_MAX_RAW_BYTES)
@@ -350,13 +377,14 @@ def normalize_content(kind: str, content: Mapping[str, Any]) -> dict[str, Any]:
             raise InvalidJournalEntryError("a note has exactly one field, body")
         return normalize_note(content["body"])
     if kind == "plan":
-        unknown = set(content) - {"name", "source", "steps"}
+        unknown = set(content) - {"name", "source", "steps", "description"}
         if unknown:
             raise InvalidJournalEntryError(f"unknown plan fields: {', '.join(sorted(unknown))}")
         return normalize_plan(
             content.get("steps"),
             name=content.get("name"),
             source=content.get("source", "agent"),
+            description=content.get("description"),
         )
     if kind in JOURNAL_KINDS:
         raise InvalidJournalEntryError(f"{kind} entries can't be written yet")

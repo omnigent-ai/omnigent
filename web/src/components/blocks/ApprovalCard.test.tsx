@@ -302,7 +302,7 @@ describe("ApprovalCard — binary approve/reject", () => {
     expect(screen.getByRole("button", { name: /reject/i })).toBeDefined();
   });
 
-  it("submits Codex execpolicy amendments when the remember option is clicked", () => {
+  it("shows the exact Codex rule prefix and binds the remember choice to this request", () => {
     const submitSpy = vi.fn().mockResolvedValue(undefined);
     useChatStore.setState({ submitApproval: submitSpy } as Partial<
       ReturnType<typeof useChatStore.getState>
@@ -323,18 +323,46 @@ describe("ApprovalCard — binary approve/reject", () => {
           cwd: "/Users/example/project",
           reason: "Run the focused pytest suite.",
           execPolicyAmendment: [".venv/bin/python", "-m", "pytest"],
+          requestFingerprint: "displayed-request",
         }}
       />,
     );
 
-    const rememberButton = screen.getByRole("button", { name: /approve and remember/i });
-    expect(rememberButton.getAttribute("data-variant")).toBe("outline");
-
-    fireEvent.click(rememberButton);
-
-    expect(submitSpy).toHaveBeenCalledWith("elic_cmd_policy", "accept", {
-      execpolicy_amendment: [".venv/bin/python", "-m", "pytest"],
+    const remember = screen.getByRole("button", {
+      name: /approve and remember commands starting with/i,
     });
+    expect(within(remember).getByText('[".venv/bin/python","-m","pytest"]')).toBeVisible();
+    fireEvent.click(remember);
+    expect(submitSpy).toHaveBeenCalledWith("elic_cmd_policy", "accept", {
+      remember: true,
+      request_fingerprint: "displayed-request",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    expect(submitSpy).toHaveBeenLastCalledWith("elic_cmd_policy", "accept", undefined);
+  });
+
+  it("shows the remembered command prefix after approval", () => {
+    render(
+      <ApprovalCard
+        elicitationId="elic_cmd_policy"
+        message="Codex wants to run pytest"
+        phase="codex_command_approval"
+        policyName="codex_native_command_approval"
+        contentPreview=""
+        requestedSchema={{}}
+        status="responded"
+        response={{ action: "accept", content: { remember: true } }}
+        codexCommand={{
+          command: ".venv/bin/python -m pytest -q",
+          cwd: null,
+          reason: null,
+          execPolicyAmendment: [".venv/bin/python", "-m", "pytest"],
+        }}
+      />,
+    );
+
+    expect(screen.getByText("Approved and remembered")).toBeVisible();
+    expect(screen.getByText('[".venv/bin/python","-m","pytest"]')).toBeVisible();
   });
 });
 

@@ -23,7 +23,7 @@ from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, TypeAlias, TypedDict, cast
+from typing import TYPE_CHECKING, Any, TextIO, TypeAlias, TypedDict, cast
 from urllib.parse import urlparse, urlunparse
 
 from omnigent._platform import IS_WINDOWS, WINDOWS_ENV_PASSTHROUGH
@@ -791,7 +791,16 @@ class _HelperProcessClient:
         stderr = ""
         if self._proc.stderr is not None:
             try:
-                stderr = self._proc.stderr.read().strip()
+                # Descendants can keep stderr open after the launcher exits.
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    self._proc.wait(timeout=1)
+                stderr_fd = self._proc.stderr.fileno()
+                os.set_blocking(stderr_fd, False)
+                stderr = (
+                    os.read(stderr_fd, 64 * 1024)
+                    .decode(cast(TextIO, self._proc.stderr).encoding, errors="replace")
+                    .strip()
+                )
             except Exception:  # noqa: BLE001 — stderr read is best-effort for error detail
                 stderr = ""
         returncode = self._proc.poll()

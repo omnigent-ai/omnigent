@@ -1344,7 +1344,7 @@ def test_failed_edit_rows_show_their_error(
 def test_automation_context_is_hidden_from_transcript(
     page: Page, chat_session_contract: ChatSessionContract
 ) -> None:
-    from omnigent.server.scheduled.fire import UNATTENDED_RUN_NOTE
+    from omnigent.server.scheduled.fire import unattended_run_note
 
     chat = chat_session_contract
     chat.set_items(
@@ -1352,7 +1352,7 @@ def test_automation_context_is_hidden_from_transcript(
             message_item(
                 "automation-task",
                 "user",
-                f"Summarize **today's changes**.\n\n{UNATTENDED_RUN_NOTE}",
+                f"Summarize **today's changes**.\n\n{unattended_run_note(1_794_895_414)}",
                 response_id="automation-turn",
             )
         ]
@@ -1362,6 +1362,7 @@ def test_automation_context_is_hidden_from_transcript(
     expect(user).to_contain_text("Summarize today's changes.")
     expect(user).not_to_contain_text("no one is watching")
     expect(user).not_to_contain_text("omnigent-automation-context")
+    expect(user).not_to_contain_text("Run time:")
 
 
 @pytest.mark.parametrize("width", [1280, 390], ids=["desktop", "mobile"])

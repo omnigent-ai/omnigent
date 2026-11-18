@@ -1,7 +1,9 @@
 """Real native web turns survive an unlinked runner cwd with a live workspace.
 
 Only Anthropic responses are scripted. The server, runner, Claude CLI, tmux,
-hooks, MCP relay, and workspace file read all run normally.
+hooks, MCP relay, and workspace file read all run normally. The read uses
+Claude's own Read tool: the relay offers Claude no ``sys_os_*`` tools, because
+its own file tools already pass the policy hook.
 """
 
 from __future__ import annotations
@@ -74,17 +76,12 @@ class _Gateway:
             self.results = reads
         if self.read_path is None or reads:
             return anthropic_sse_text_response(self.reply, model=model)
-        searched = any(result.get("tool_use_id") == "toolu_cwd_search" for result in results)
         return anthropic_sse_tool_call_response(
             [
                 {
-                    "call_id": _READ_ID if searched else "toolu_cwd_search",
-                    "name": "mcp__omnigent__sys_os_read" if searched else "ToolSearch",
-                    "arguments": json.dumps(
-                        {"path": self.read_path}
-                        if searched
-                        else {"query": "select:mcp__omnigent__sys_os_read", "max_results": 1}
-                    ),
+                    "call_id": _READ_ID,
+                    "name": "Read",
+                    "arguments": json.dumps({"file_path": self.read_path}),
                 }
             ],
             model=model,
@@ -171,9 +168,7 @@ def test_claude_web_turn_survives_deleted_runner_cwd(
             }
         )
     )
-    (config_dir / "settings.json").write_text(
-        json.dumps({"permissions": {"allow": ["mcp__omnigent__sys_os_read"]}})
-    )
+    (config_dir / "settings.json").write_text(json.dumps({"permissions": {"allow": ["Read"]}}))
     token = secrets.token_urlsafe(32)
     runner_id = token_bound_runner_id(token)
     env = {
@@ -349,7 +344,7 @@ os_env:
             assert sentinel in json.dumps(results), results
             assert os.readlink(f"/proc/{runner.pid}/cwd").endswith(" (deleted)")
             assert os.readlink(f"/proc/{claude_pid}/cwd") == str(workspace)
-            print("Post-unlink web reply and real MCP sentinel read verified", flush=True)
+            print("Post-unlink web reply and workspace sentinel read verified", flush=True)
         finally:
             if tmux is not None:
                 screen = subprocess.run(

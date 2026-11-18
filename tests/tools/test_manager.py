@@ -27,6 +27,7 @@ from omnigent.spec.types import (
 )
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.tools.browser_agent_tools import ADVANCED_BROWSER_TOOL_NAMES
 from omnigent.tools.client_specified import ClientSideTool, ClientSideToolSpec
 from omnigent.tools.manager import _UCFunctionSchemaTool
 from omnigent.tools.mcp import clear_discovery_cache
@@ -105,6 +106,10 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_workflow_save",
         "sys_workflow_load",
         "sys_workflow_list",
+        # The owner-Inbox tools register on every agent too; the runner drops
+        # them unless the server offers the Inbox. Schema-only; runner-dispatched.
+        "sys_user_inbox_post",
+        "sys_user_inbox_list",
         # Embedded-browser tools are always auto-registered (framework-
         # owned) so any agent can drive the desktop app's browser without
         # the spec opting in. Schema-only; runner-dispatched.
@@ -113,7 +118,15 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "browser_click",
         "browser_type",
         "browser_screenshot",
+        # Long-term memory tools are always auto-registered unless the spec
+        # sets ``tool_groups.memory: false``. Runner-dispatched to ``/v1/memory``.
+        "memory_search",
+        "memory_get",
+        "memory_list",
+        "memory_write",
+        "memory_delete",
     }
+    | ADVANCED_BROWSER_TOOL_NAMES
 )
 
 

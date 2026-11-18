@@ -9,7 +9,7 @@ from collections.abc import Callable
 from functools import partial
 from typing import Any, cast
 
-from sqlalchemy import and_, asc, desc, func, or_, select, tuple_, update
+from sqlalchemy import and_, asc, desc, or_, select, tuple_, update
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.orm import Session
 from sqlalchemy.sql.elements import ColumnElement
@@ -339,10 +339,29 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 return None
             return _to_entity(row)
 
-    def list(self, *, owner_user_id: str | None = None) -> list[ScheduledTask]:
+    def get_many(self, scheduled_task_ids: builtins.list[str]) -> dict[str, ScheduledTask]:
+        """Return the tasks with these ids by primary key, in one read. See base class."""
+        if not scheduled_task_ids:
+            return {}
+        with self._session("select_tasks_by_ids") as session:
+            rows = session.scalars(
+                select(SqlScheduledTask).where(
+                    SqlScheduledTask.workspace_id == current_workspace_id(),
+                    SqlScheduledTask.id.in_(sorted(set(scheduled_task_ids))),
+                )
+            ).all()
+            return {row.id: _to_entity(row) for row in rows}
+
+    def list(
+        self,
+        *,
+        owner_user_id: str | None = None,
+        exclude_agent_ids: frozenset[str] = frozenset(),
+    ) -> list[ScheduledTask]:
         """List non-deleted scheduled tasks ordered by ``created_at ASC, id ASC``.
 
         When *owner_user_id* is given, only tasks owned by that user are returned.
+        Tasks bound to *exclude_agent_ids* are left out.
         """
         with self._session("list_tasks") as session:
             stmt = (
@@ -353,8 +372,31 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             )
             if owner_user_id is not None:
                 stmt = stmt.where(SqlScheduledTask.user_id == owner_user_id)
+            if exclude_agent_ids:
+                stmt = stmt.where(SqlScheduledTask.agent_id.not_in(sorted(exclude_agent_ids)))
             rows = session.execute(stmt).scalars().all()
             return [_to_entity(r) for r in rows]
+
+    def list_for_agent(
+        self, agent_id: str, *, after: str | None = None, limit: int = 100
+    ) -> tuple[builtins.list[ScheduledTask], str | None]:
+        """See base class. Seeks ``ix_scheduled_tasks_agent``."""
+        if not 1 <= limit <= 500:
+            raise ValueError("limit must be between 1 and 500")
+        stmt = select(SqlScheduledTask).where(
+            SqlScheduledTask.workspace_id == current_workspace_id(),
+            SqlScheduledTask.agent_id == agent_id,
+        )
+        if after is not None:
+            stmt = stmt.where(SqlScheduledTask.id > after)
+        stmt = stmt.order_by(asc(SqlScheduledTask.id)).limit(limit + 1)
+        with self._session("list_tasks_for_agent") as session:
+            rows = session.execute(stmt).scalars().all()
+        page = rows[:limit]
+        cursor = page[-1].id if len(rows) > limit else None
+        deleted = encode_scheduled_task_state("deleted")
+        # Deleted tasks are dropped after paging so each query examines at most limit + 1 rows.
+        return [_to_entity(row) for row in page if row.state != deleted], cursor
 
     def list_active(self) -> builtins.list[ScheduledTask]:
         """List active scheduled tasks ordered by ``created_at ASC, id ASC``."""
@@ -436,6 +478,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
         expected_schedule: ScheduledTask | None = None,
+        guard: Callable[[ScheduledTask], None] | None = None,
     ) -> ScheduledTask | None:
         """Update mutable fields.
 
@@ -450,7 +493,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         managed-sandbox execution). Passing ``rrule`` updates the recurring
         trigger and ``agent_id`` rebinds the task to a different agent
         (switching the harness future firings run); ``None`` leaves either
-        unchanged.
+        unchanged. ``guard`` runs on the locked row before any write; see the base class.
         """
         updated_at = now_epoch()
         checks_owner = state is not None and state != "deleted"
@@ -476,6 +519,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             )
             if row is None or row.state == encode_scheduled_task_state("deleted"):
                 return None
+            if guard is not None:
+                guard(_to_entity(row))
             if expected_schedule is not None:
                 current = _to_entity(row)
                 if any(
@@ -861,6 +906,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         check_generation: bool = False,
         after: tuple[int, str] | None = None,
         limit: int = 50,
+        exclude_agent_ids: frozenset[str] = frozenset(),
     ) -> tuple[builtins.list[AutomationFailure], tuple[int, str] | None]:
         """Bound discovery by the owner/task index, then read one indexed run/task."""
         if not 1 <= limit <= 100:
@@ -877,6 +923,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 SqlScheduledTask.workspace_id == current_workspace_id(),
                 SqlScheduledTask.user_id == owner_user_id,
             )
+            if exclude_agent_ids:
+                stmt = stmt.where(SqlScheduledTask.agent_id.not_in(sorted(exclude_agent_ids)))
             if after is not None:
                 stmt = stmt.where(
                     self._cursor_after(
@@ -1127,37 +1175,38 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
     ) -> dict[str, str]:
         """Return ``{task_id: latest_run_status}`` for the given tasks.
 
-        One windowed query: ``row_number()`` partitioned by ``scheduled_task_id``
-        and ordered ``scheduled_at DESC, id DESC`` (the same order as
-        :meth:`list_runs`) picks each task's single most-recent run, decoded to
-        its status name. Tasks with no runs are absent from the map. Both SQLite
-        (>= 3.25) and PostgreSQL support window functions, matching the
-        conversation store's ``row_number()`` usage.
+        One query selects each requested task in the current workspace with a
+        correlated ``LIMIT 1`` lookup of its newest run, ordered ``scheduled_at
+        DESC, id DESC`` like :meth:`list_runs`. That lookup seeks
+        ``ix_scheduled_task_runs_scheduled_task_id``, so each task reads one run
+        however long its history. Tasks with no runs are absent from the map.
         """
         if not scheduled_task_ids:
             return {}
-        with self._session("list_latest_run_status_for_tasks") as session:
-            ranked = (
-                select(
-                    SqlScheduledTaskRun.scheduled_task_id.label("task_id"),
-                    SqlScheduledTaskRun.status.label("status"),
-                    func.row_number()
-                    .over(
-                        partition_by=SqlScheduledTaskRun.scheduled_task_id,
-                        order_by=(
-                            desc(SqlScheduledTaskRun.scheduled_at),
-                            desc(SqlScheduledTaskRun.id),
-                        ),
-                    )
-                    .label("row_num"),
-                )
-                .where(SqlScheduledTaskRun.workspace_id == current_workspace_id())
-                .where(SqlScheduledTaskRun.scheduled_task_id.in_(scheduled_task_ids))
-                .subquery()
+        workspace_id = current_workspace_id()
+        latest_status = (
+            select(SqlScheduledTaskRun.status)
+            .where(
+                SqlScheduledTaskRun.workspace_id == workspace_id,
+                SqlScheduledTaskRun.scheduled_task_id == SqlScheduledTask.id,
             )
-            stmt = select(ranked.c.task_id, ranked.c.status).where(ranked.c.row_num == 1)
-            rows = session.execute(stmt).all()
-            return {task_id: decode_scheduled_task_run_status(status) for task_id, status in rows}
+            .order_by(desc(SqlScheduledTaskRun.scheduled_at), desc(SqlScheduledTaskRun.id))
+            .limit(1)
+            .correlate(SqlScheduledTask)
+            .scalar_subquery()
+        )
+        with self._session("list_latest_run_status_for_tasks") as session:
+            rows = session.execute(
+                select(SqlScheduledTask.id, latest_status).where(
+                    SqlScheduledTask.workspace_id == workspace_id,
+                    SqlScheduledTask.id.in_(scheduled_task_ids),
+                )
+            ).all()
+            return {
+                task_id: decode_scheduled_task_run_status(status)
+                for task_id, status in rows
+                if status is not None
+            }
 
     # ── Database scheduler ───────────────────────────────────────
 

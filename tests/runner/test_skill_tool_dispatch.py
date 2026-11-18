@@ -64,7 +64,7 @@ async def test_framework_skills_load_only_when_server_and_tool_group_enable_them
     ) as client:
         for name, heading in (
             ("workflow", "# Run a workflow"),
-            ("save-workflow", "# Save a workflow"),
+            ("save-workflow", "# Author a reusable workflow"),
         ):
             result = await execute_tool(
                 tool_name="load_skill",

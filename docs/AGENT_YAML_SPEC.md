@@ -136,6 +136,35 @@ executor:
     api_key: ${GEMINI_API_KEY}     # or ANTIGRAVITY_API_KEY
 ```
 
+### Codex tool switches
+
+With `harness: codex`, `web_search: false` turns off Codex's built-in web
+search and `disable_native_tools: true` turns off its native shell tools, so
+shell commands use Omnigent tools and policies. For a directory bundle using
+`config.yaml`, place them in `executor.config`:
+
+```yaml
+spec_version: 1
+name: codex-worker
+executor:
+  type: omnigent
+  config:
+    harness: codex
+    web_search: false
+    disable_native_tools: true
+```
+
+The switches accept YAML booleans; omitting either switch or setting it to YAML
+`null` leaves it unset and preserves operator restrictions. Boolean settings
+apply on every Codex route, including ChatGPT login, API-key providers and brokered
+gateways. They only restrict tools: `web_search: true` and
+`disable_native_tools: false` do not re-enable tools that the runner's operator
+turned off. Locked profiles still require `web_search: false` and
+`disable_native_tools: true`, and `broker_gateway` rejects `null`.
+
+Upgrade runners before relying on these restrictions on ordinary routes. Older
+runners ignore the spec's tool switches on those routes.
+
 ### Pi context files
 
 With `harness: pi` or `pi-native`, Pi automatically appends context files such
@@ -1158,17 +1187,36 @@ tool_groups:
   agent_discovery: false  # sys_agent_get / sys_agent_download / sys_agent_list
   journal: false          # sys_journal_read / _write_plan / _write_status / _write_note, sys_workflow_request_input / _save / _load / _list
   projects: false         # sys_project_* / sys_session_update
+  user_inbox: false       # sys_user_inbox_post / sys_user_inbox_list
+  memory: false           # memory_search / _get / _list / _write / _delete
 ```
 
 Every group defaults to `true`, so omitting the block changes nothing. Values
 must be booleans and group names must match exactly; a typo fails the load
 rather than silently leaving the group registered. The `journal` group also
 requires the server's `workflows` feature flag, which defaults off; enable it
-with `OMNIGENT_FEATURES=workflows` on the server. Disabling `browser` also
+with `OMNIGENT_FEATURES=workflows` on the server. The `user_inbox` group, which
+posts to and reads the session owner's Inbox, requires the server's `user_inbox`
+feature flag, which defaults on; turn it off with `OMNIGENT_FEATURES=-user_inbox`.
+Disabling `browser` also
 drops the embedded-browser guidance from the composed system prompt, and
 disabling `journal` also drops the `/workflow` and `/save-workflow` skills (see
 [Session journal](session-journal.md)). The block is read the same way from a
 `config.yaml` bundle and a single-file agent YAML.
+
+The `memory` group is the long-term memory tools. It applies only when the server
+has memory turned on (`OMNIGENT_FEATURES=memory`); otherwise no agent gets them,
+whatever the spec says. The tools persist across sessions, harnesses, models and
+forks, and belong to the signed-in user: the server decides whose memory it is,
+never the agent. They are refused in a session shared with anyone who can add
+input. Two kinds of spec get `memory: false` by default, and setting `memory: true`
+on them is an error:
+
+- Specs that still declare the deprecated `hindsight_*` builtins, with a warning.
+  Configure Hindsight as the server's memory backend instead with
+  `omnigent server --memory-backend hindsight`.
+- Specs with their own local tool or MCP server named like a memory tool, which
+  keep that tool. See [MEMORY.md](MEMORY.md).
 
 `agent_discovery: false` is rejected while `spawn: true` or the
 `scheduled_tasks` group is on: `sys_session_create` and

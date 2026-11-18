@@ -416,6 +416,33 @@ def test_get_missing_returns_none(store: SqlAlchemyScheduledTaskStore) -> None:
     assert store.get(_uid("st_nope")) is None
 
 
+def test_get_many_reads_the_workspaces_tasks_by_id(store: SqlAlchemyScheduledTaskStore) -> None:
+    """Deleted tasks come back with their state; unknown and other workspaces' ids don't."""
+
+    def create(seed: str) -> str:
+        return store.create(
+            scheduled_task_id=_uid(seed),
+            name=seed,
+            prompt="p",
+            rrule="FREQ=DAILY",
+            user_id="u",
+            agent_id=_uid("ag_1"),
+            timezone="UTC",
+        ).id
+
+    live, deleted = create("st_live"), create("st_deleted")
+    assert store.update(deleted, state="deleted")
+    with workspace_scope(7):
+        elsewhere = create("st_elsewhere")
+
+    found = store.get_many([live, deleted, live, elsewhere, _uid("st_nope")])
+    assert {task_id: task.state for task_id, task in found.items()} == {
+        live: "active",
+        deleted: "deleted",
+    }
+    assert store.get_many([]) == {}
+
+
 # ── list / list_active ────────────────────────────────────────────────────────
 
 
@@ -1071,6 +1098,32 @@ def test_update_from_a_stale_snapshot_conflicts_on_agent_or_mcp_changes(
     assert (saved.agent_id, saved.mcp_services) == (applied.agent_id, applied.mcp_services)
 
 
+def test_update_guard_sees_the_locked_task_and_a_refusal_saves_nothing(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = _session_task(store, "st_guard", workspace="/repo")
+    seen: list[Any] = []
+
+    def refuse(locked: Any) -> None:
+        seen.append(locked)
+        raise OmnigentError("refused", code=ErrorCode.FORBIDDEN)
+
+    with pytest.raises(OmnigentError, match="refused"):
+        store.update(task.id, name="renamed", workspace="/elsewhere", guard=refuse)
+
+    assert [(locked.id, locked.workspace) for locked in seen] == [(task.id, "/repo")]
+    saved = store.get(task.id)
+    assert saved is not None
+    assert (saved.name, saved.workspace, saved.updated_at) == (
+        task.name,
+        task.workspace,
+        task.updated_at,
+    )
+    # A guard that returns lets the update through.
+    applied = store.update(task.id, workspace="/elsewhere", guard=seen.append)
+    assert applied is not None and applied.workspace == "/elsewhere"
+
+
 def test_update_last_run_conversation_id_can_be_cleared_to_null(
     store: SqlAlchemyScheduledTaskStore,
 ) -> None:
@@ -1364,7 +1417,7 @@ def test_list_latest_run_status_for_tasks_returns_most_recent_status(
 ) -> None:
     """Returns each task's single most-recent run status by scheduled_at DESC.
 
-    Powers the Tasks-list completion badge in one windowed query. A task with a
+    Powers the Tasks-list completion badge in one query. A task with a
     terminal run followed by a newer run reports the NEWER run's status (so a
     run-now firing becomes the badge as soon as it is recorded).
     """
@@ -1491,6 +1544,82 @@ def test_list_latest_run_status_is_workspace_scoped(
         assert store.list_latest_run_status_for_tasks([_uid("lst_w11")]) == {
             _uid("lst_w11"): "succeeded"
         }
+
+
+def test_list_latest_run_status_work_stays_flat_as_run_history_grows(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Each task's lookup seeks its newest run on the history index, however many it has."""
+    from sqlalchemy import event, insert
+
+    from omnigent.db.db_models import SqlScheduledTaskRun
+    from omnigent.db.enum_codecs import encode_scheduled_task_run_status
+
+    task = _session_task(store, "lst_history")
+    store.create_run(
+        run_id=_uid("lst_history_latest"),
+        scheduled_task_id=task.id,
+        status="failed",
+        scheduled_at=10_000,
+    )
+
+    def measure() -> tuple[int, str]:
+        """The lookup's SQLite VM steps and query plan; ``(0, "")`` on other databases."""
+        queries = []
+
+        def capture(conn, cursor, statement, parameters, context, executemany):
+            if "scheduled_task_runs" in statement:
+                queries.append((statement, parameters))
+
+        event.listen(store._engine, "before_cursor_execute", capture)
+        try:
+            assert store.list_latest_run_status_for_tasks([task.id]) == {task.id: "failed"}
+        finally:
+            event.remove(store._engine, "before_cursor_execute", capture)
+        [(statement, parameters)] = queries
+        if store._engine.dialect.name != "sqlite":
+            return 0, ""
+        steps = 0
+
+        def count_step() -> int:
+            nonlocal steps
+            steps += 1
+            return 0
+
+        with store._engine.connect() as connection:
+            plan = str(
+                connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
+            )
+            # Warm up first, so loading the schema on a new connection is not counted.
+            connection.exec_driver_sql(statement, parameters).all()
+            driver = connection.connection.driver_connection
+            driver.set_progress_handler(count_step, 1)
+            try:
+                connection.exec_driver_sql(statement, parameters).all()
+            finally:
+                driver.set_progress_handler(None, 1)
+        return steps, plan
+
+    short_history_steps, _ = measure()
+    with store._engine.begin() as connection:
+        connection.execute(
+            insert(SqlScheduledTaskRun),
+            [
+                {
+                    "workspace_id": current_workspace_id(),
+                    "id": _uid(f"lst_history_{index}"),
+                    "scheduled_task_id": task.id,
+                    "status": encode_scheduled_task_run_status("succeeded"),
+                    "scheduled_at": index,
+                }
+                for index in range(500)
+            ],
+        )
+    long_history_steps, plan = measure()
+    assert long_history_steps == short_history_steps
+    if plan:
+        assert "ix_scheduled_task_runs_scheduled_task_id" in plan
+        assert "SCAN scheduled_task_runs" not in plan and "TEMP B-TREE" not in plan
 
 
 # ── has_active_run (workers of a live automation run) ─────────────────────────

@@ -158,6 +158,7 @@ function loadNavigationHarness({
   internalFeatures = false,
   cliPath = null,
   hostConnectResult = { ok: true },
+  sshConnectResult = { ok: true, shownInConsole: true },
   serverAuthResult = { ok: true },
   managedServerNames = {},
   // A createWorkspaceNetwork() to run the real session module against.
@@ -442,7 +443,7 @@ function loadNavigationHarness({
       createSshConnectFlow: () => ({
         run: async (_parentWin, sshServerUrl, destination) => {
           calls.sshConnects.push({ serverUrl: sshServerUrl, destination });
-          return { ok: true, shownInConsole: true };
+          return sshConnectResult;
         },
       }),
     },
@@ -674,8 +675,10 @@ function loadNavigationHarness({
     "./server_manager": {
       shutdown: async () => {},
       onChange: () => {},
-      ensureServerAuth: async () => serverAuthResult,
-      ensureHostConnected: async () => hostConnectResult,
+      ensureServerAuth: async (...args) =>
+        typeof serverAuthResult === "function" ? serverAuthResult(...args) : serverAuthResult,
+      ensureHostConnected: async (...args) =>
+        typeof hostConnectResult === "function" ? hostConnectResult(...args) : hostConnectResult,
       restartHost: async () => ({ ok: true }),
       disconnectHost: async () => ({ ok: true }),
       startLocalServer: async () => ({ ok: false }),
@@ -703,6 +706,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
+    "\nmodule.exports.sshHosts = sshHosts;" +
     "\nmodule.exports.testApi = { handleDeepLink, buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, setBlockedHintDelayMs: (ms) => { blockedHintDelayMs = ms; }, blockedHintDelayMs: () => blockedHintDelayMs, setServerResponseTimeoutMs: (ms) => { serverResponseTimeoutMs = ms; }, serverResponseTimeoutMs: () => serverResponseTimeoutMs, cancelReconnect };";
   const module = { exports: {} };
   const sandbox = {
@@ -719,7 +723,8 @@ function loadNavigationHarness({
     module,
     process: {
       ...process,
-      platform: platform ?? (internalFeatures ? "darwin" : process.platform),
+      // Pinned so the default selector page does not depend on the test machine.
+      platform: platform ?? (internalFeatures ? "darwin" : "linux"),
       env: { ...process.env, OMNIGENT_SERVER_SELECTOR_V2: "", ...env },
     },
     require: (specifier) => {
@@ -745,6 +750,7 @@ function loadNavigationHarness({
 
   return {
     api,
+    sshHosts: module.exports.sshHosts,
     calls,
     overlay,
     bannerCalls,
@@ -3173,13 +3179,13 @@ describe("server selector default", () => {
       { recent_servers: ["https://team.example.com/"] },
       true,
     ],
-    ["new public macOS install", {}, null, false],
-    ["existing public macOS install", {}, { recent_servers: ["https://team.example.com/"] }, false],
+    ["new public macOS install", {}, null, true],
+    ["existing public macOS install", {}, { recent_servers: ["https://team.example.com/"] }, true],
     [
       "managed server presets without managed features",
       { managedServers: ["https://team.example.com/"] },
       null,
-      false,
+      true,
     ],
     ["Linux install", { platform: "linux", internalFeatures: true }, null, false],
     ["Windows install", { platform: "win32", internalFeatures: true }, null, false],
@@ -3189,7 +3195,7 @@ describe("server selector default", () => {
       null,
       true,
     ],
-    ["unpackaged public macOS build", { isPackaged: false }, null, false],
+    ["unpackaged public macOS build", { isPackaged: false }, null, true],
     ["null selector preference", { internalFeatures: true }, { server_selector_v2: null }, true],
     [
       "explicit V2 preference outside the default rollout",
@@ -5003,13 +5009,15 @@ describe("onboarding runner IPC", () => {
   // A setup-page sender that can be closed mid-request.
   function setupSender() {
     let destroyed = false;
+    const events = new EventEmitter();
     return {
       send() {},
-      once() {},
-      removeListener() {},
+      once: (name, listener) => events.once(name, listener),
+      removeListener: (name, listener) => events.removeListener(name, listener),
       isDestroyed: () => destroyed,
       destroy: () => {
         destroyed = true;
+        events.emit("destroyed");
       },
     };
   }
@@ -5059,6 +5067,140 @@ describe("onboarding runner IPC", () => {
     assert.equal(result.errorMessage, "The omnigent CLI was not found.");
     assert.equal(result.errorAction, "Install it or set its path.");
     assert.equal(result.error, `${result.errorMessage} ${result.errorAction}`);
+  });
+
+  it("Cancel stops a pending laptop sign-in without connecting the host", async (t) => {
+    let signal;
+    let hostConnected = false;
+    const h = harness(t, {
+      cliPath: "/usr/local/bin/omnigent",
+      hostConnectResult: () => {
+        hostConnected = true;
+        return { ok: true };
+      },
+      serverAuthResult: (_cli, _url, options) => {
+        ({ signal } = options);
+        return new Promise((resolve) => {
+          signal.addEventListener("abort", () => resolve({ ok: false, canceled: true }));
+        });
+      },
+    });
+    const sender = setupSender();
+    const event = { sender, senderFrame: setupFrame(h) };
+    const connecting = h.ipc.get("omnigent:connect-runner")(event, server, "local");
+    await until(() => signal !== undefined, "sign-in started");
+
+    assert.equal(await h.ipc.get("omnigent:cancel-runner-connect")(event), true);
+
+    assert.deepEqual(plain(await connecting), { ok: false, canceled: true });
+    assert.equal(signal.aborted, true);
+    assert.equal(hostConnected, false);
+    // Nothing left to cancel once it has finished.
+    assert.equal(await h.ipc.get("omnigent:cancel-runner-connect")(event), false);
+    assert.throws(
+      () => h.ipc.get("omnigent:cancel-runner-connect")({ sender, senderFrame: { url: server } }),
+      /only available to the setup page/,
+    );
+  });
+
+  it("Cancel right after the request starts stops it before it signs in or connects the host", async (t) => {
+    let authCalls = 0;
+    let hostConnected = false;
+    const h = harness(t, {
+      cliPath: "/usr/local/bin/omnigent",
+      hostConnectResult: () => {
+        hostConnected = true;
+        return { ok: true };
+      },
+      serverAuthResult: () => {
+        authCalls += 1;
+        return { ok: true };
+      },
+    });
+    const event = { sender: setupSender(), senderFrame: setupFrame(h) };
+    const connecting = h.ipc.get("omnigent:connect-runner")(event, server, "local");
+
+    // Before the target resolves: the attempt is already registered.
+    assert.equal(h.ipc.get("omnigent:cancel-runner-connect")(event), true);
+
+    assert.deepEqual(plain(await connecting), { ok: false, canceled: true });
+    assert.equal(authCalls, 0);
+    assert.equal(hostConnected, false);
+  });
+
+  it("closing the window stops a pending sign-in without connecting the host", async (t) => {
+    let signal;
+    let hostConnected = false;
+    const h = harness(t, {
+      cliPath: "/usr/local/bin/omnigent",
+      hostConnectResult: () => {
+        hostConnected = true;
+        return { ok: true };
+      },
+      serverAuthResult: (_cli, _url, options) => {
+        ({ signal } = options);
+        return new Promise((resolve) => {
+          signal.addEventListener("abort", () => resolve({ ok: false, canceled: true }));
+        });
+      },
+    });
+    const sender = setupSender();
+    const connecting = h.ipc.get("omnigent:connect-runner")(
+      { sender, senderFrame: setupFrame(h) },
+      server,
+      "local",
+    );
+    await until(() => signal !== undefined, "sign-in started");
+
+    sender.destroy();
+
+    assert.deepEqual(plain(await connecting), { ok: false, canceled: true });
+    assert.equal(signal.aborted, true);
+    assert.equal(hostConnected, false);
+  });
+
+  it("a newer attempt stops the previous one from the same window", async (t) => {
+    const signals = [];
+    const h = harness(t, {
+      cliPath: "/usr/local/bin/omnigent",
+      serverAuthResult: (_cli, _url, options) => {
+        signals.push(options.signal);
+        if (signals.length > 1) return { ok: true };
+        return new Promise((resolve) => {
+          options.signal.addEventListener("abort", () => resolve({ ok: false, canceled: true }));
+        });
+      },
+    });
+    const event = { sender: setupSender(), senderFrame: setupFrame(h) };
+    const first = h.ipc.get("omnigent:connect-runner")(event, server, "local");
+    await until(() => signals.length === 1, "first sign-in started");
+
+    const second = await h.ipc.get("omnigent:connect-runner")(event, server, "local");
+
+    assert.deepEqual(plain(await first), { ok: false, canceled: true });
+    assert.equal(signals[0].aborted, true);
+    assert.equal(second.ok, true);
+  });
+
+  it("a cancel that lands during the host connect isn't recorded as a connected laptop", async (t) => {
+    let cancel;
+    const h = harness(t, {
+      cliPath: "/usr/local/bin/omnigent",
+      hostConnectResult: () => {
+        cancel();
+        return { ok: true };
+      },
+    });
+    const event = { sender: setupSender(), senderFrame: setupFrame(h) };
+    cancel = () => h.ipc.get("omnigent:cancel-runner-connect")(event);
+
+    const result = await h.ipc.get("omnigent:connect-runner")(event, server, "local");
+
+    assert.deepEqual(plain(result), { ok: false, canceled: true });
+    const saved = fs.existsSync(h.settingsPath)
+      ? JSON.parse(fs.readFileSync(h.settingsPath, "utf8"))
+      : {};
+    assert.equal(saved.onboarding_runner, undefined);
   });
 
   it("passes separate authentication message and action fields to the setup page", async (t) => {
@@ -5866,6 +6008,36 @@ describe("SSH connect IPC", () => {
     assert.deepEqual(h.calls.sshConnects, [{ serverUrl: server, destination: "devbox" }]);
   });
 
+  it("records the host a connect reached, for that server only", async (t) => {
+    const hostId = "0123456789abcdef0123456789abcdef";
+    const h = sshHarness(t, {
+      sshConnectResult: { ok: true, shownInConsole: true, identity: { hostId } },
+    });
+
+    assert.equal((await h.ipc.get("omnigent:ssh-connect")(fromServer(h), "devbox")).ok, true);
+
+    assert.equal(h.sshHosts.destination(server, hostId), "devbox");
+    assert.equal(h.sshHosts.destination("https://elsewhere.example/", hostId), null);
+  });
+
+  it("records nothing for a connect that failed", async (t) => {
+    const hostId = "0123456789abcdef0123456789abcdef";
+    const h = sshHarness(t, { sshConnectResult: { ok: false, error: "Permission denied" } });
+
+    await h.ipc.get("omnigent:ssh-connect")(fromServer(h), "devbox");
+
+    assert.equal(h.sshHosts.destination(server, hostId), null);
+  });
+
+  it("records nothing for a connect that reached no host identity", async (t) => {
+    const hostId = "0123456789abcdef0123456789abcdef";
+    const h = sshHarness(t, { sshConnectResult: { ok: true, shownInConsole: true } });
+
+    await h.ipc.get("omnigent:ssh-connect")(fromServer(h), "devbox");
+
+    assert.equal(h.sshHosts.destination(server, hostId), null);
+  });
+
   it("refuses on Windows before opening anything", async (t) => {
     const h = sshHarness(t, { platform: "win32" });
 
@@ -6033,5 +6205,18 @@ describe("Close menu item", () => {
     clickClose();
     assert.equal(sentCloses(), 1);
     assert.equal(closes, 1);
+  });
+});
+
+describe("New Window keeps its source's server (src/main.js)", () => {
+  it("gives a window cloned on a conversation the source's server, not the conversation's URL", (t) => {
+    const h = loadNavigationHarness();
+    t.after(h.cleanup);
+    h.api.createWindow("https://host.example/ml/omnigents");
+    h.setUrl("https://host.example/ml/omnigents/c/conv_1");
+    h.electron.BrowserWindow.getFocusedWindow = () => h.win;
+    h.api.buildMenu();
+    h.calls.appMenu.getMenuItemById("new_window").click();
+    assert.equal(h.api.windows.get(h.win).serverUrl, "https://host.example/ml/omnigents");
   });
 });

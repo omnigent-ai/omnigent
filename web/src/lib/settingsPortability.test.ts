@@ -1,5 +1,6 @@
 import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { CODE_BLOCK_WORD_WRAP_STORAGE_KEY, useCodeBlockWordWrap } from "./codeWrapPreferences";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
 import {
   FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
@@ -128,21 +129,22 @@ it.each([
 });
 
 describe.each([
-  ["composer shortcut", COMPOSER_SEND_SHORTCUT_STORAGE_KEY],
-  ["final-answer fold", FOLD_ASSISTANT_NARRATION_STORAGE_KEY],
-])("%s portability", (_label, storageKey) => {
+  ["composer shortcut", COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true"],
+  ["final-answer fold", FOLD_ASSISTANT_NARRATION_STORAGE_KEY, "true"],
+  ["code block word wrap", CODE_BLOCK_WORD_WRAP_STORAGE_KEY, "false"],
+])("%s portability", (_label, storageKey, storedValue) => {
   it("exports, imports, and clears the device-local preference", () => {
-    localStorage.setItem(storageKey, "true");
-    expect(collectSettings()?.settings[storageKey]).toBe("true");
+    localStorage.setItem(storageKey, storedValue);
+    expect(collectSettings()?.settings[storageKey]).toBe(storedValue);
 
     applyImportedSettings({ version: 1, settings: {} });
     expect(localStorage.getItem(storageKey)).toBeNull();
 
     applyImportedSettings({
       version: 1,
-      settings: { [storageKey]: "true" },
+      settings: { [storageKey]: storedValue },
     });
-    expect(localStorage.getItem(storageKey)).toBe("true");
+    expect(localStorage.getItem(storageKey)).toBe(storedValue);
   });
 });
 
@@ -157,6 +159,19 @@ it("updates a mounted final-answer fold reader on import", () => {
     });
   });
   expect(result.current).toBe(true);
+});
+
+it("updates mounted code blocks' word wrap on import", () => {
+  const { result } = renderHook(() => useCodeBlockWordWrap());
+  expect(result.current).toBe(true);
+
+  act(() => {
+    applyImportedSettings({
+      version: 1,
+      settings: { [CODE_BLOCK_WORD_WRAP_STORAGE_KEY]: "false" },
+    });
+  });
+  expect(result.current).toBe(false);
 });
 
 it("carries hidden picker entries through export and import and tells an open picker", () => {

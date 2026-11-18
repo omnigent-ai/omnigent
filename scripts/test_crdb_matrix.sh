@@ -14,7 +14,8 @@ for target in "23.2.28:26323" "24.3.20:26324" "25.2.10:26325" "25.4.5:26326"; do
   port="${target##*:}"
   echo "Testing CockroachDB ${version} on SQL port ${port}"
   OMNIGENT_TEST_DB_URI="cockroachdb+psycopg://root@localhost:${port}/defaultdb?sslmode=disable" \
-    uv run --extra all --extra cockroachdb pytest tests/stores tests/db \
+    OMNIGENT_TEST_CRDB_VERSION="${version}" \
+    uv run --extra all --extra cockroachdb --group test pytest tests/stores tests/db \
       -m "not databricks" \
       -n 4 \
       --dist=loadfile \

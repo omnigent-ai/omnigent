@@ -34,6 +34,7 @@ export const NEW_BROWSER_TAB_KEYS = [MOD_KEY, "T"] as const;
 export const CLOSE_KEYS = [MOD_KEY, "W"] as const;
 export const CLOSE_WINDOW_KEYS = [MOD_KEY, SHIFT_KEY, "W"] as const;
 export const PIN_SESSION_KEYS = [MOD_KEY, ALT_KEY, "P"] as const;
+export const TOGGLE_UNREAD_KEYS = [MOD_KEY, ALT_KEY, "U"] as const;
 export const ARCHIVE_SESSION_KEYS = [MOD_KEY, SHIFT_KEY, "A"] as const;
 export const FORK_SESSION_KEYS = [MOD_KEY, ALT_KEY, "F"] as const;
 export const QUIT_KEYS = [MOD_KEY, "Q"] as const;

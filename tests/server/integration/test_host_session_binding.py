@@ -2051,8 +2051,13 @@ async def test_move_cancelled_during_its_detach_restores_the_whole_binding(
     await asyncio.gather(move, return_exceptions=True)
 
     def rolled_back() -> bool:
+        # The rollback withdraws the startup before it releases the claim.
         current = env.conv_store.get_conversation(session_id)
-        return current is not None and current.labels.get(STARTUP_LABEL) == STARTUP_WITHDRAWN
+        return (
+            current is not None
+            and current.labels.get(STARTUP_LABEL) == STARTUP_WITHDRAWN
+            and current.runner_id is None
+        )
 
     await poll_until_async(rolled_back)
     conv = env.conv_store.get_conversation(session_id)

@@ -79,12 +79,12 @@ import {
   type NativeHarnessMode,
 } from "@/lib/nativeHarnessModes";
 import {
-  CLAUDE_NATIVE_EFFORTS,
   DescribedSelect,
   EFFORT_SELECT_NONE,
   MODEL_SELECT_DEFAULT,
   RoutingModelSelect,
   defaultModelLabel,
+  nativeEffortOptions,
   nativeModelLabel,
 } from "@/components/HarnessConfigControls";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
@@ -275,9 +275,9 @@ export interface ForkRunConfigValue {
  * `copy_model_settings` / `copy_terminal_launch_args` gates. The Run workflow
  * dialog passes no source, so every picker starts on its default there.
  *
- * Emission is opt-in per control: a field is sent ONLY when the user actually
- * changed that control (see `touched`). An untouched control omits its field,
- * so the fork request carries nothing for it and the server's own
+ * Emission is opt-in per control: a field is sent when the user changes that
+ * control; choosing a model also settles its effort. An untouched control omits
+ * its field, so the fork request carries nothing for it and the server's own
  * inherit / reset-by-family path decides — which is exactly the seeded meaning.
  * This is what keeps the section honest against the async model catalog: a
  * submit before the catalog resolves can't emit a spurious `model_override`.
@@ -347,9 +347,8 @@ export function ForkRunConfig({
   const modelOptions = useMemo(
     () =>
       (catalogOptions ?? []).map((option) => ({
-        id: option.id,
+        ...option,
         displayName: option.displayName ?? option.id,
-        isDefault: option.isDefault,
       })),
     [catalogOptions],
   );
@@ -372,19 +371,27 @@ export function ForkRunConfig({
         : null;
     return picked && modelOptions.some((m) => m.id === picked) ? picked : MODEL_SELECT_DEFAULT;
   }, [remembered, sameFamilyAsSource, sourceSession, modelOptions]);
+  const [model, setModel] = useState(seededModel);
+  const effortOptions = useMemo(
+    () =>
+      nativeEffortOptions(
+        targetHarness,
+        modelOptions,
+        model === MODEL_SELECT_DEFAULT ? null : model,
+      ) ?? [],
+    [targetHarness, modelOptions, model],
+  );
+  const showEffort = effortOptions.length > 0;
   const seededEffort = useMemo(() => {
     // Seed only an effort the picker can display; a source value outside the
-    // offered vocabulary (e.g. "minimal") falls back to Default rather than
-    // leaving the Select on an empty, unselectable value.
+    // selected model's vocabulary falls back to Default.
     const effort = remembered
       ? remembered.reasoningEffort
       : sameFamilyAsSource
         ? sourceSession?.reasoningEffort
         : null;
-    return effort && CLAUDE_NATIVE_EFFORTS.some((e) => e.value === effort)
-      ? effort
-      : EFFORT_SELECT_NONE;
-  }, [remembered, sameFamilyAsSource, sourceSession]);
+    return effort && effortOptions.some((e) => e.value === effort) ? effort : EFFORT_SELECT_NONE;
+  }, [remembered, sameFamilyAsSource, sourceSession, effortOptions]);
   const seededPermission = useMemo(() => {
     if (remembered) {
       // Only a mode the picker still offers.
@@ -443,13 +450,15 @@ export function ForkRunConfig({
     return match?.value ?? dflt;
   }, [remembered, isCodex, sameAgentAsSource, sourceSession, hasApproval, hasCursor, hasAgySkip]);
 
-  const [model, setModel] = useState(seededModel);
   const [effort, setEffort] = useState(seededEffort);
+  const selectedEffort = effortOptions.some((option) => option.value === effort)
+    ? effort
+    : EFFORT_SELECT_NONE;
   const [permission, setPermission] = useState(seededPermission);
   const [mode, setMode] = useState(seededModeValue);
 
-  // Which controls the user has actually changed. An UNTOUCHED control omits
-  // its field from the emitted config, so the fork request never carries it
+  // Which controls the user has chosen (a model pick also settles effort).
+  // An UNTOUCHED control omits its field, so the fork request never carries it
   // and the server's inherit / reset-by-family path decides — which is exactly
   // the seeded meaning (same-harness → inherit the source; switch → the
   // target's default). This is what makes the section safe against the async
@@ -466,8 +475,19 @@ export function ForkRunConfig({
     mode: false,
   });
   const changeModel = (v: string) => {
-    setTouched((t) => ({ ...t, model: true }));
+    const nextEfforts = nativeEffortOptions(
+      targetHarness,
+      modelOptions,
+      v === MODEL_SELECT_DEFAULT ? null : v,
+    );
+    // Settle effort too, so a clone cannot inherit an effort the new model rejects.
+    setTouched((t) => ({ ...t, model: true, effort: true }));
     setModel(v);
+    setEffort(
+      nextEfforts?.some((option) => option.value === selectedEffort)
+        ? selectedEffort
+        : EFFORT_SELECT_NONE,
+    );
   };
   const changeEffort = (v: string) => {
     setTouched((t) => ({ ...t, effort: true }));
@@ -507,10 +527,10 @@ export function ForkRunConfig({
     if (showModel && (touched.model || reportAll)) {
       value.modelOverride = model === MODEL_SELECT_DEFAULT ? "default" : model;
     }
+    if (touched.effort || (showEffort && reportAll)) {
+      value.reasoningEffort = selectedEffort === EFFORT_SELECT_NONE ? "default" : selectedEffort;
+    }
     if (hasPermission) {
-      if (touched.effort || reportAll) {
-        value.reasoningEffort = effort === EFFORT_SELECT_NONE ? "default" : effort;
-      }
       if (touched.permission || reportAll) {
         value.terminalLaunchArgs =
           permission === CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
@@ -535,13 +555,14 @@ export function ForkRunConfig({
     onChange(value);
   }, [
     showModel,
+    showEffort,
     hasPermission,
     hasApproval,
     hasCursor,
     hasAgySkip,
     isCodex,
     model,
-    effort,
+    selectedEffort,
     permission,
     mode,
     touched,
@@ -585,46 +606,46 @@ export function ForkRunConfig({
         </ForkConfigRow>
       )}
 
-      {hasPermission && (
-        <>
-          <ForkConfigRow label="Effort">
-            <Select
-              value={effort}
-              onValueChange={changeEffort}
-              componentId="fork_session.config.effort"
-              valueHasNoPii
+      {showEffort && (
+        <ForkConfigRow label="Effort">
+          <Select
+            value={selectedEffort}
+            onValueChange={changeEffort}
+            componentId="fork_session.config.effort"
+            valueHasNoPii
+          >
+            <SelectTrigger
+              className="w-full cursor-pointer text-sm"
+              data-testid="fork-session-config-effort"
+              aria-label="Reasoning effort"
             >
-              <SelectTrigger
-                className="w-full cursor-pointer text-sm"
-                data-testid="fork-session-config-effort"
-                aria-label="Reasoning effort"
-              >
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent position="popper" align="start" className={FORK_SELECT_ITEM_SM}>
-                <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
-                {CLAUDE_NATIVE_EFFORTS.map((e) => (
-                  <SelectItem key={e.value} value={e.value}>
-                    {e.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </ForkConfigRow>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent position="popper" align="start" className={FORK_SELECT_ITEM_SM}>
+              <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
+              {effortOptions.map((e) => (
+                <SelectItem key={e.value} value={e.value}>
+                  {e.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </ForkConfigRow>
+      )}
 
-          <ForkConfigRow label="Permissions">
-            <DescribedSelect
-              value={permission}
-              onValueChange={changePermission}
-              options={CLAUDE_NATIVE_PERMISSION_MODES}
-              testId="fork-session-config-permission"
-              ariaLabel="Permissions"
-              triggerClassName="text-sm"
-              contentClassName={FORK_SELECT_ITEM_SM}
-              componentId="fork_session.config.permission"
-            />
-          </ForkConfigRow>
-        </>
+      {hasPermission && (
+        <ForkConfigRow label="Permissions">
+          <DescribedSelect
+            value={permission}
+            onValueChange={changePermission}
+            options={CLAUDE_NATIVE_PERMISSION_MODES}
+            testId="fork-session-config-permission"
+            ariaLabel="Permissions"
+            triggerClassName="text-sm"
+            contentClassName={FORK_SELECT_ITEM_SM}
+            componentId="fork_session.config.permission"
+          />
+        </ForkConfigRow>
       )}
 
       {hasApproval && (

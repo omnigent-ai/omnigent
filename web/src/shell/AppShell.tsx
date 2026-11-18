@@ -44,6 +44,7 @@ import { useIsEmbedded } from "@/lib/embedded";
 import { AgentInfoContent, agentHasInfo } from "@/components/AgentInfo";
 import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
+import { useToggleUnreadHotkey } from "@/hooks/useToggleUnreadHotkey";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
@@ -96,7 +97,9 @@ import {
 } from "@/hooks/useChildSessions";
 import { useDebugMode } from "@/hooks/useDebugMode";
 import { useBrowserAgentRelay } from "@/hooks/useBrowserAgentRelay";
-import { AGENT_BROWSER_TAB_ID, browserViewOwnerId, openBrowserTab } from "@/hooks/useBrowserTabs";
+import { browserViewOwnerId, openBrowserTab } from "@/hooks/useBrowserTabs";
+import { agentBrowserTabId } from "@/components/BrowserPane/agentTools/agentTabs";
+import { useRevealBrowserOnAgentTabs } from "@/components/BrowserPane/agentTools/useRevealBrowserOnAgentTabs";
 import { resyncBrowserSuppression } from "@/hooks/useSuppressBrowserView";
 import {
   isAgentTerminalKey,
@@ -118,7 +121,7 @@ import {
   WRAPPER_LABEL_KEY,
 } from "@/lib/nativeCodingAgents";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled, isSingleUserMode } from "@/lib/capabilities";
+import { isFeatureEnabled, isSingleUserMode, SHARING_OFF_REASON } from "@/lib/capabilities";
 import { isCurrentServerLocal } from "@/lib/serverOrigin";
 import { holdsInitialDraft, isTempConvId, useChatStore } from "@/store/chatStore";
 import { useSessionTasksActions } from "@/store/sessionTasksActions";
@@ -911,6 +914,7 @@ function AppShellImpl() {
     openSessionRow,
     permissionLevel,
   ]);
+  useToggleUnreadHotkey(activeConv);
   // Header action gating, hoisted so the desktop buttons and the mobile
   // three-dot menu render the exact same set (they can't drift apart).
   // Stop session is not a header action — it lives in the sidebar row's
@@ -939,7 +943,7 @@ function AppShellImpl() {
     ? undefined
     : isCurrentServerLocal()
       ? "Sharing is unavailable from a local server."
-      : "Sharing has been disabled for this Omnigent server.";
+      : SHARING_OFF_REASON;
   // Any viewer can fork a shared session, sub-agents included — forking a
   // child is how it gets promoted to a top-level session of its own. Gated on
   // knowing which the session is (sidebar row or loaded snapshot) so the
@@ -2252,13 +2256,19 @@ function AppShellImpl() {
     const unsubscribeLink = onInAppLinkOpen(surfaceBrowserTab);
     const unsubscribeAction = onBrowserActionRequest((evt, sourceConversationId) => {
       if (evt.action !== "navigate" || !sourceConversationId) return;
-      surfaceBrowserTab(sourceConversationId, AGENT_BROWSER_TAB_ID);
+      // The agent navigates its current tab (browser_tabs).
+      surfaceBrowserTab(sourceConversationId, agentBrowserTabId(sourceConversationId));
     });
     return () => {
       unsubscribeLink();
       unsubscribeAction();
     };
   }, [conversationId, handleRightRailTabChange, setRightPanelOpenAnimated]);
+  // An agent opening or selecting a tab (browser_tabs) surfaces the pane.
+  useRevealBrowserOnAgentTabs(conversationId, () => {
+    handleRightRailTabChange("browser");
+    setRightPanelOpenAnimated(true);
+  });
 
   // Mobile FAB → "Side chats" opens the session's side chats as a full-screen
   // drawer (the desktop rail shows them as soft tabs). Also used when a side

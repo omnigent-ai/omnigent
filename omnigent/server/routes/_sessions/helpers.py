@@ -4456,6 +4456,11 @@ def _codex_subagent_labels_from_body(
         value = body.data.get(data_key)
         if isinstance(value, str) and value:
             labels[label_key] = value
+    parent_item_id = body.data.get("parent_item_id")
+    if isinstance(parent_item_id, str):
+        from omnigent.harnesses.codex_native.side_chat import PARENT_REFERENCE_ITEM_LABEL
+
+        labels[PARENT_REFERENCE_ITEM_LABEL] = parent_item_id
     return labels
 
 
@@ -5936,6 +5941,26 @@ def _publish_btw_sidechat(
         truncated=truncated,
     )
     session_stream.publish(session_id, event.model_dump())
+
+
+def _codex_side_chat_resume_supported(
+    parent: Conversation | None,
+    runner_router: RunnerRouter | None,
+    host_registry: HostRegistry | None,
+) -> bool:
+    """Prefer the connected parent runner's report over its host's build support."""
+    from omnigent.host.frames import CAP_CODEX_SIDE_CHAT_RESUME
+
+    if parent is None:
+        return False
+    if (
+        parent.runner_id is not None
+        and runner_router is not None
+        and runner_router.runner_is_online(parent.runner_id)
+    ):
+        return runner_router.runner_has_capability(parent.runner_id, CAP_CODEX_SIDE_CHAT_RESUME)
+    host = host_registry.get(parent.host_id) if host_registry and parent.host_id else None
+    return host is not None and CAP_CODEX_SIDE_CHAT_RESUME in host.hello.capabilities
 
 
 async def _runner_supports_side_chat_settings(
@@ -8533,6 +8558,8 @@ async def _dispatch_skill_slash_command_to_runner(
         conversation_store,
     )
 
+    from omnigent.tools.browser_agent_tools import browser_agent_tools_turn_flag
+
     runner_body: dict[str, Any] = {
         "type": "message",
         "role": "user",
@@ -8544,6 +8571,7 @@ async def _dispatch_skill_slash_command_to_runner(
         # Live-renderer hint: the runner drops ``browser_*`` schemas for
         # the turn when no renderer is subscribed to the session stream.
         "browser_renderer_available": session_stream.has_subscribers(session_id),
+        **browser_agent_tools_turn_flag(conv.labels),
         # The forwarded message carries ``meta_content`` — i.e. the
         # META item (persisted_items[1]), not the user-visible item.
         # Hand the runner that id so a cold-cache reload drops the
@@ -11239,7 +11267,9 @@ def _reject_reserved_cost_control_label_seed(labels: dict[str, str]) -> None:
         )
 
 
-def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
+def _reject_server_reserved_label_seed(
+    labels: dict[str, str] | None, *, at_creation: bool = False
+) -> None:
     """
     Reject a client-supplied label map that touches server-internal keys.
 
@@ -11248,6 +11278,9 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     critical metadata (e.g. the policy-evaluation actor identity).
 
     :param labels: The client-supplied label mapping, or ``None``.
+    :param at_creation: Whether a session is being created, when a continuation
+        (a native ``/clear`` replacement) may carry its predecessor's browser-tool
+        label.
     :raises OmnigentError: 400 when any reserved key is present.
     """
     if not labels:
@@ -11271,6 +11304,7 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
         FAMILY_PIN_LABEL_PREFIX,
         SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
         SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+        SCHEDULED_TASK_LAUNCH_LABEL_KEY,
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
         SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX,
         SCHEDULED_TASK_RUN_LABEL_KEY,
@@ -11293,6 +11327,8 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
         # Deleting a session also deletes the automation this label names.
         SCHEDULED_TASK_SOURCE_LABEL_KEY,
         SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
+        # Launches from a session carrying it are shared with that automation's grantees.
+        SCHEDULED_TASK_LAUNCH_LABEL_KEY,
         CREATED_BY_SESSION_LABEL_KEY,
     ):
         if key in labels:
@@ -11316,6 +11352,18 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     if _TURN_ACTOR_LABEL in labels:
         raise OmnigentError(
             f"label {_TURN_ACTOR_LABEL!r} is server-internal and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    # The browser-tool mode is fixed at creation: from the app's header, or the
+    # label a continuation copies from its source.
+    from omnigent.tools.browser_agent_tools import BROWSER_AGENT_TOOLS_CREATION_LABEL_KEYS
+
+    if not at_creation and (
+        reserved := sorted(BROWSER_AGENT_TOOLS_CREATION_LABEL_KEYS & labels.keys())
+    ):
+        raise OmnigentError(
+            f"label {reserved[0]!r} is set only when a session is created"
+            " and cannot be set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
     # The archive timestamp is stamped by the server on the archive transition
