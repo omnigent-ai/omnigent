@@ -74,6 +74,7 @@ def test_creation_telemetry_records_kind(task, caplog, kind):
         ((), ""),
         (("slack", "github"), "github,slack"),
         (("jira", "Private Name", "jira"), "jira,other"),
+        (("github\n",), "other"),
     ],
 )
 def test_creation_telemetry_records_mcp_services(task, caplog, services, expected):

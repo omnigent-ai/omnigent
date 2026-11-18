@@ -802,7 +802,7 @@ owner (`local` for auth-disabled servers); attributes are `task_id`,
 `task_workspace_id`, `creation_source` (`ui`, `agent`, or `api`), `template_id`,
 `kind` (`automation` or `reminder`), `target`, `session_mode`, and `mcp_services`
 (the sorted, comma-joined registry service IDs every run starts with; empty for
-none). `template_id` is `none` for agent and API creates, which have no
+none, and `other` for a value outside the registry ID format). `template_id` is `none` for agent and API creates, which have no
 template, and `unknown` for an unrecognized or missing UI template. Rejected creates emit no creation event. As with
 run logs, delivery is best-effort; reconcile current inventory against the store.
 

@@ -163,9 +163,8 @@ def startup_failure_stage(error_code: str | None) -> str | None:
 
 def _logged_mcp_services(services: tuple[str, ...]) -> str:
     """Comma-joined registry service IDs, sorted; anything not shaped like one is ``other``."""
-    return ",".join(
-        sorted({service if _MCP_SERVICE_ID.match(service) else "other" for service in services})
-    )
+    logged = {service if _MCP_SERVICE_ID.fullmatch(service) else "other" for service in services}
+    return ",".join(sorted(logged))
 
 
 def log_task_created(
