@@ -7,6 +7,10 @@
 // holds a non-default value.
 
 import { DELETE_WORKTREES_ON_ARCHIVE_STORAGE_KEY } from "./archiveWorktreePreferences";
+import {
+  CODE_BLOCK_WORD_WRAP_STORAGE_KEY,
+  notifyCodeBlockWordWrapChanged,
+} from "./codeWrapPreferences";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
 import {
   FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
@@ -46,6 +50,7 @@ const EXPORTABLE_KEYS = [
   "omnigent:code-font-size",
   "omnigent:code-font-family",
   "omnigent:code-font-weight",
+  CODE_BLOCK_WORD_WRAP_STORAGE_KEY,
   "omnigent:terminal-theme",
   "omnigent:ui-theme-palette",
   "omnigent:custom-theme",
@@ -185,6 +190,7 @@ export function applyImportedSettings(imported: ExportedSettings): number {
   notifyHiddenPickerAgentsChanged();
   notifyProjectFolderPaginationChanged();
   notifyFoldAssistantNarrationChanged();
+  notifyCodeBlockWordWrapChanged();
   notifyPeerSessionMessageDisplayChanged();
   notifySessionRowQuickActionsChanged();
   const nextPins = readPinnedWorkspaceTabs();

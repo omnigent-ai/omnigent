@@ -877,7 +877,8 @@ jobs:
           # one turn, prints the assistant response, and exits.
           # --no-session: ephemeral run, no persistent session state.
           review_status=0
-          timeout --signal=INT --kill-after=30s "$review_timeout" uv run omnigent run examples/polly/ \
+          OMNIGENT_HEADLESS_TIMEOUT_S="$review_timeout" \
+            timeout --signal=INT --kill-after=30s "$review_timeout" uv run omnigent run examples/polly/ \
             --harness "$OMNIGENT_POLLY_HARNESS" --model "$OMNIGENT_POLLY_MODEL" \
             -p "$prompt" \
             --no-session \

@@ -82,8 +82,10 @@ import { useSlashCompletion } from "@/hooks/useSlashCompletion";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import { isNativeTerminalSession } from "@/lib/nativeCodingAgents";
+import { isPermissionModeCycleKey } from "@/lib/permissionModeCycle";
 import { sideChatSettingsMutationKey, usesNativeSideChatFork } from "@/lib/sideChat";
 import { parentIdFromLabels } from "@/lib/sessionHost";
+import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
 import {
   appendReplyQuote,
   removeReplyQuote,
@@ -143,6 +145,14 @@ function writeInheritedBoundary(childId: string, ids: Set<string>): void {
   }
 }
 
+/** A grid cell's extra composer controls, and its Shift+Tab permission cycle. */
+interface GridComposerSlots {
+  leading?: ReactNode;
+  trailing?: ReactNode;
+  /** Steps the cell's permission mode; returns whether it took the key. */
+  cyclePermissionMode?: () => boolean;
+}
+
 // Accurate for every harness: a side chat is a fork that stays out of the main
 // thread. It is NOT reliably ephemeral — a non-Codex side chat is a persisted
 // fork (hidden from the sidebar), so the copy doesn't promise it disappears.
@@ -176,23 +186,25 @@ export function SideChatPane({
   childId: string;
   selectionParentId?: string;
   onStart?: (text: string) => Promise<void>;
-  /** A dead, restored Codex side chat: show the transcript without a composer. */
+  /** Show the transcript without a composer when the viewer cannot edit. */
   readOnly?: boolean;
   /** Display an existing session with its complete history and scoped composer. */
   fullSession?: boolean;
   /** A grid cell's composer: one row tall, with the cell session's controls. */
-  gridComposer?: { leading?: ReactNode; trailing?: ReactNode };
+  gridComposer?: GridComposerSlots;
 }) {
   const pending = isPendingSideChat(childId);
   const starting = useChatStore((s) => s.sideChatComposers[childId]?.starting ?? false);
-  // The server seals a side chat whose fork died with its runner.
   const {
     session,
     isLoading: sessionLoading,
     error: sessionError,
   } = useSession(pending ? null : childId);
   const { session: draftSource } = useSession(pending ? (selectionParentId ?? null) : null);
-  const readOnly = restoredReadOnly || session?.labels?.["omnigent.closed"] === "true";
+  const readOnly =
+    restoredReadOnly ||
+    (session?.labels?.["omnigent.closed"] === "true" &&
+      readOnlyReasonForSessionLabels(session, null) !== null);
   useLayoutEffect(() => {
     if (!selectionParentId || readOnly || starting) return;
     const target = { childId, parentId: selectionParentId };
@@ -576,7 +588,7 @@ function SideChatComposer({
   onStart?: (text: string) => Promise<void>;
   /** Called when a live tab sends or queues a follow-up. */
   onSend: () => void;
-  gridComposer?: { leading?: ReactNode; trailing?: ReactNode };
+  gridComposer?: GridComposerSlots;
 }) {
   const send = useChatStore((s) => s.send);
   const sendSlashCommand = useChatStore((s) => s.sendSlashCommand);
@@ -748,7 +760,7 @@ function SideChatComposer({
     textareaRef.current = tailTextareaRef.current;
     if (quote !== undefined || composer?.quotes?.length) tailTextareaRef.current?.focus();
   }, [quote, composer?.quotes?.length]);
-  // Re-read the labels so a side chat the server just sealed turns read-only.
+  // Refresh lifecycle labels after a send or recovery attempt.
   const refreshLabels = useCallback(
     () => void queryClient.invalidateQueries({ queryKey: ["session", childId] }),
     [queryClient, childId],
@@ -1019,6 +1031,11 @@ function SideChatComposer({
       return;
     }
     if (slashCompletion.handleKey(event, intent)) return;
+    // Only a grid cell has a permission chip; a side chat leaves Shift+Tab to the browser.
+    if (isPermissionModeCycleKey(event) && gridComposer?.cyclePermissionMode?.()) {
+      event.preventDefault();
+      return;
+    }
     // A grid pane is a whole session, so only side chats let Escape stop the turn.
     if (event.key === "Escape" && queues && busy) {
       event.preventDefault();

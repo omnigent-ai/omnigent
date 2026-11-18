@@ -1495,6 +1495,28 @@ describe("unsent composer state survives the pane moving", () => {
     renderPane(<SideChatPane childId={childId} fullSession gridComposer={{}} />);
     expect(screen.getByTestId("side-chat-input")).toHaveAttribute("rows", "1");
   });
+
+  it("gives Shift+Tab to a grid cell's permission cycle, and leaves a side chat's to the browser", () => {
+    const cyclePermissionMode = vi.fn(() => true);
+    const view = renderPane(
+      <SideChatPane childId={childId} fullSession gridComposer={{ cyclePermissionMode }} />,
+    );
+    const shiftTabInit = { key: "Tab", shiftKey: true };
+    expect(fireEvent.keyDown(screen.getByTestId("side-chat-input"), shiftTabInit)).toBe(false);
+    expect(cyclePermissionMode).toHaveBeenCalledOnce();
+    view.unmount();
+
+    cyclePermissionMode.mockReturnValueOnce(false);
+    const cell = renderPane(
+      <SideChatPane childId={childId} fullSession gridComposer={{ cyclePermissionMode }} />,
+    );
+    expect(fireEvent.keyDown(screen.getByTestId("side-chat-input"), shiftTabInit)).toBe(true);
+    cell.unmount();
+
+    renderPane(<SideChatPane childId={childId} />);
+    expect(fireEvent.keyDown(screen.getByTestId("side-chat-input"), shiftTabInit)).toBe(true);
+    expect(cyclePermissionMode).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe("history a side chat copied from its parent", () => {
@@ -1660,9 +1682,16 @@ describe("history a side chat copied from its parent", () => {
   });
 });
 
-describe("side chat sealed by the server", () => {
-  it("is read-only once the server marks the child closed", () => {
-    mockSession.labels = { "omnigent.closed": "true" };
+describe("side chat closed by the server", () => {
+  it.each<Record<string, string>>([
+    { "omnigent.closed": "true" },
+    {
+      "omnigent.closed": "true",
+      "omnigent.wrapper": "codex-native-ui-subagent",
+      "omnigent.codex_native.agent_nickname": "Side chat",
+    },
+  ])("is read-only when closed without recovery support (%j)", (labels) => {
+    mockSession.labels = labels;
     renderPane(<SideChatPane childId={childId} />);
 
     expect(
@@ -1670,6 +1699,38 @@ describe("side chat sealed by the server", () => {
     ).toBeInTheDocument();
     expect(screen.queryByTestId("side-chat-input")).toBeNull();
     expect(sessionsApi.stopSession).not.toHaveBeenCalled();
+  });
+
+  it("sends another message to a closed Codex side chat", async () => {
+    mockSession.labels = {
+      "omnigent.closed": "true",
+      "omnigent.wrapper": "codex-native-ui-subagent",
+      "omnigent.codex_native.agent_nickname": "Side chat",
+      "omnigent.codex_native.side_chat_resume": "true",
+    };
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+    renderPane(<SideChatPane childId={childId} />);
+
+    fireEvent.change(screen.getByTestId("side-chat-input"), { target: { value: "Continue" } });
+    fireEvent.keyDown(screen.getByTestId("side-chat-input"), { key: "Enter" });
+
+    await waitFor(() =>
+      expect(send).toHaveBeenCalledWith("Continue", "agent_side", undefined, {
+        pinnedConversationId: childId,
+      }),
+    );
+  });
+
+  it("preserves read-only access for a closed Codex side chat", () => {
+    mockSession.labels = {
+      "omnigent.closed": "true",
+      "omnigent.wrapper": "codex-native-ui-subagent",
+      "omnigent.codex_native.agent_nickname": "Side chat",
+      "omnigent.codex_native.side_chat_resume": "true",
+    };
+    renderPane(<SideChatPane childId={childId} readOnly />);
+
+    expect(screen.queryByTestId("side-chat-input")).toBeNull();
   });
 
   it("re-reads the child's labels after the opening /side send settles", async () => {

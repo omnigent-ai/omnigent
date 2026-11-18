@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 import os
 import secrets
 import shutil
@@ -142,8 +143,8 @@ _RECONCILE_ITEMS_LIMIT = 100
 # Module-level so tests can patch it.
 _PER_TURN_TIMEOUT_S = 120.0
 
-# Overall budget for following one headless ``-p`` session to idle
-# (first-turn recovery and the extra-turns loop share it).
+# Default budget for headless first-turn recovery and extra-turn waits.
+# Override per invocation with OMNIGENT_HEADLESS_TIMEOUT_S.
 _LOOP_TIMEOUT_S = 1800.0  # 30 min total
 # Snapshot statuses that keep a headless ``-p`` run going. The server reports any
 # ``waiting`` (an async orchestrator's, or a claude-native turn's background-agent
@@ -2750,6 +2751,19 @@ async def _stop_launched_session(client: OmnigentClient, session_id: str) -> Non
         logger.debug("could not stop session %s after one-shot run", session_id, exc_info=True)
 
 
+def _headless_timeout_s() -> float:
+    """Read the per-invocation budget without changing interactive or runtime limits."""
+    try:
+        timeout = float(os.environ.get("OMNIGENT_HEADLESS_TIMEOUT_S", str(_LOOP_TIMEOUT_S)))
+        if math.isfinite(timeout) and timeout > 0:
+            return timeout
+    except ValueError:
+        pass
+    raise click.ClickException(
+        "OMNIGENT_HEADLESS_TIMEOUT_S must be a positive finite number of seconds"
+    )
+
+
 async def _run_bound_turn(
     *,
     client: OmnigentClient,
@@ -2761,6 +2775,7 @@ async def _run_bound_turn(
     from omnigent_client import SessionsChat, StreamHooks
     from omnigent_client._tool_handler import ResponseEndCtx
 
+    loop_timeout_s = _headless_timeout_s()
     session_files = client.files.for_session(bound.id)
     # ``SessionsChat.query`` ends quietly on ``response.failed`` and returns
     # whatever text streamed before it, so a turn that failed after emitting an
@@ -2843,7 +2858,7 @@ async def _run_bound_turn(
         # An async orchestrator stays ``running`` until its sub-agents
         # and synthesis finish, so this also follows those to idle.
         with contextlib.suppress(TimeoutError):
-            async with asyncio.timeout(_LOOP_TIMEOUT_S):
+            async with asyncio.timeout(loop_timeout_s):
                 while True:
                     await chat.refresh()
                     if chat.status not in _HEADLESS_UNFINISHED_STATUSES:
@@ -2907,8 +2922,7 @@ async def _run_bound_turn(
     # even when await_turn times out (sub-agents still running), unlike the
     # last_turn_saw_waiting flag which would incorrectly exit on timeout.
     _STATUS_PROBE_TIMEOUT_S = 5.0  # brief window; status events arrive fast
-    # ``_PER_TURN_TIMEOUT_S`` / ``_LOOP_TIMEOUT_S`` are module-level;
-    # they also guard the first-turn query above.
+    # Recovery and draining use the same configured wait budget.
 
     async def _drain_extra_turns() -> None:
         # Probe: collect synthesis text or status events that arrive quickly.
@@ -2937,12 +2951,12 @@ async def _run_bound_turn(
         )
 
     try:
-        async with asyncio.timeout(_LOOP_TIMEOUT_S):
+        async with asyncio.timeout(loop_timeout_s):
             await _drain_extra_turns()
     except TimeoutError:
         logger.warning(
             "headless -p timed out after %.0fs waiting for session %s to complete",
-            _LOOP_TIMEOUT_S,
+            loop_timeout_s,
             bound.id,
         )
 

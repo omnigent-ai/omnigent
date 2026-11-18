@@ -2499,9 +2499,9 @@ class SessionResponse(BaseModel):
         them with a separate ``GET /v1/sessions/{id}`` using
         ``include_usage=true``, ``include_items=false``,
         ``include_liveness=false``, and ``refresh_state=false``.
-    :param native_usage_baseline: Pi's own cumulative token baseline, excluding
-        descendants. Available even when display usage aggregation is skipped;
-        ``None`` for other harnesses or older servers.
+    :param native_usage_baseline: Own cumulative token baseline for Pi and Codex
+        side chats, excluding descendants. Available even when display usage
+        aggregation is skipped; ``None`` for other harnesses or older servers.
     :param last_task_error: Error details from the most recently
         failed task. Only present when ``status == "failed"`` and
         the task stored an error. Lets clients display the failure

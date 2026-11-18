@@ -1148,6 +1148,8 @@ class ConversationStore(ABC):
         query: str,
         conversation_id: str | None = None,
         limit: int = 20,
+        *,
+        accessible_by: str,
     ) -> list[ConversationItem]:
         """
         Full-text search over conversation items.
@@ -1161,6 +1163,8 @@ class ConversationStore(ABC):
         :param conversation_id: Optional conversation to scope
             the search to, e.g. ``"conv_abc123"``.
         :param limit: Maximum number of results to return.
+        :param accessible_by: Authenticated user whose session permissions
+            restrict matches before the result limit.
         :returns: A list of matching :class:`ConversationItem`
             objects ranked by relevance.
         """
@@ -2123,6 +2127,10 @@ class ConversationStore(ABC):
 
     def get_profile_host_binding(self, conversation_id: str) -> ProfileHostBinding:
         """Read host metadata and canonical profile labels by their complete unique keys."""
+        raise NotImplementedError
+
+    def get_profile_labels(self, conversation_ids: list[str]) -> dict[str, dict[str, str]]:
+        """Read many sessions' canonical profile labels in one query; unlabeled ones are absent."""
         raise NotImplementedError
 
     def bind_profiled_host(

@@ -772,6 +772,9 @@ class _CodexForwarderState:
     # block. Reasoning is transient — it has no completed conversation item;
     # the block finalizes when the turn's assistant message arrives.
     reasoning_stream_item_id: str | None = None
+    # Latest turn whose ``running`` edge this connection published, so a turn
+    # whose ``turn/started`` was missed publishes it once from its first item.
+    running_reported_turn_id: str | None = None
     turn_diff_by_turn: dict[str, str] = field(default_factory=dict)
     # Whether model output has already settled the synthesized MCP startup
     # round. The round is seeded once per forwarder connection (never on
@@ -2842,6 +2845,12 @@ async def supervise_forwarder(
             codex_client=client,
             child_usage_baseline_dir=bridge_dir,
         )
+        side_chat.register_side_chat_forwarder(
+            bridge_dir,
+            codex_client=client,
+            ap_client=ap_client,
+            forwarder_state=forwarder_state,
+        )
         # Released when the live event stream shows the thread became
         # active (its first turn materializes the rollout). Lets the
         # subscribe task park instead of blind-polling ``thread/resume``
@@ -2923,6 +2932,19 @@ async def supervise_forwarder(
                         parent_thread_id=target.thread_id,
                         event=event,
                     )
+                    try:
+                        await _post_missed_turn_start(
+                            ap_client,
+                            session_id=target.session_id,
+                            bridge_dir=bridge_dir,
+                            thread_id=target.thread_id,
+                            event=event,
+                            forwarder_state=forwarder_state,
+                        )
+                    except Exception:
+                        _logger.warning(
+                            "Codex forwarder missed turn-start recovery failed", exc_info=True
+                        )
                     handle = functools.partial(
                         _handle_event,
                         ap_client,
@@ -2950,6 +2972,7 @@ async def supervise_forwarder(
             stream_error = exc
             raise
         finally:
+            side_chat.unregister_side_chat_forwarder(bridge_dir, client)
             # Stop producers before draining their output while the HTTP client is open.
             background_tasks = [subscribe_task, side_chat_task]
             if mcp_settle_timer is not None:
@@ -3046,6 +3069,8 @@ async def _drive_side_chat_requests(
                     try:
                         child_thread_id = await side_chat.open_side_chat_on_client(
                             codex_client,
+                            ap_client=ap_client,
+                            parent_session_id=target.session_id,
                             parent_thread_id=parent_thread_id,
                             question=request.question,
                             bridge_dir=bridge_dir,
@@ -3157,6 +3182,8 @@ async def _maybe_rotate_session_on_thread_started(
     """
     new_thread_id = _thread_id_from_started_event(event)
     if new_thread_id is None or new_thread_id == target.thread_id:
+        return False
+    if forwarder_state is not None and forwarder_state.session_for_child_thread(new_thread_id):
         return False
     # A Codex AgentControl child thread emits ``thread/started`` when it
     # begins. That event must not rotate the parent Omnigent session — the child
@@ -3779,10 +3806,21 @@ async def _post_resume_turn_status(
     ):
         # A failure posted for this turn, such as a stopped goal's, stays the last word.
         return
-    await _post_turn_status_edge(client, session_id, edge)
+    if (
+        edge is not None
+        and edge.status == "running"
+        and edge.turn_id is not None
+        and forwarder_state is not None
+        and forwarder_state.running_reported_turn_id == edge.turn_id
+    ):
+        return
+    published = await _post_turn_status_edge(client, session_id, edge)
     if edge is not None and edge.status == "failed" and forwarder_state is not None:
         # As for a live failed turn: a later goal failure must not replace its detail.
         forwarder_state.turn_failure_surfaced = True
+    if published and edge is not None and edge.status == "running" and forwarder_state is not None:
+        # The recovered first-item edge must not publish this turn's running again.
+        forwarder_state.running_reported_turn_id = edge.turn_id
 
 
 def _resume_turn_status_edge_for_latest_turn(
@@ -4931,7 +4969,13 @@ async def _handle_thread_goal_notification(
             # The turn's start was missed, so its boundary is recognized when it arrives.
             forwarder_state.goal_failure_awaits_turn = True
         forwarder_state.turn_failure_surfaced = True
-        await _post_status(client, session_id, "failed", output=failure_output)
+        await _post_status(
+            client,
+            session_id,
+            "failed",
+            response_id=_response_id(_params_with_turn_id({}, turn_id)) if turn_id else None,
+            output=failure_output,
+        )
         await forwarder_state.forget_posted_terminals()
 
 
@@ -5175,8 +5219,12 @@ async def _maybe_handle_turn_event(
         async with _conversation_item_delivery_scope(session_id):
             if delta_coalescer is not None:
                 await delta_coalescer.flush()
-            await _handle_turn_started(client, session_id, bridge_dir, params)
+            published = await _handle_turn_started(client, session_id, bridge_dir, params)
             if forwarder_state is not None and bridge_dir is not None:
+                if published:
+                    forwarder_state.running_reported_turn_id = _turn_id_from_payload(
+                        params.get("turn")
+                    ) or _turn_id_from_payload(params)
                 # A new turn opens a fresh reasoning block: the next reasoning
                 # delta must emit ``response.reasoning.started`` again.
                 forwarder_state.reasoning_stream_item_id = None
@@ -6826,7 +6874,7 @@ async def _handle_turn_started(
     session_id: str,
     bridge_dir: Path | None,
     params: _JsonObject,
-) -> None:
+) -> bool:
     """
     Forward a Codex terminal turn start event.
 
@@ -6834,10 +6882,64 @@ async def _handle_turn_started(
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param bridge_dir: Native Codex bridge directory.
     :param params: Codex ``turn/started`` params.
-    :returns: None.
+    :returns: ``True`` when the running edge was published and accepted.
     """
     edge = _turn_started_status_edge(bridge_dir, params)
-    await _post_turn_status_edge(client, session_id, edge)
+    return await _post_turn_status_edge(client, session_id, edge)
+
+
+async def _post_missed_turn_start(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    thread_id: str,
+    event: CodexMessage,
+    forwarder_state: _CodexForwarderState,
+) -> None:
+    """
+    Publish ``running`` for the active turn when its ``turn/started`` was missed.
+
+    A fresh thread's subscription lands after its first turn started, so the
+    turn's first live item (normally its ``userMessage``) is the earliest sign
+    this connection gets that Codex began it. Resume replay is excluded: it
+    publishes its own verdict from the resumed turn's status.
+    """
+    params = event.get("params")
+    if (
+        event.get("method") not in {"item/started", "item/completed"}
+        or not isinstance(params, dict)
+        or params.get("threadId") != thread_id
+    ):
+        return
+    turn_id = _turn_id_from_payload(params)
+    if turn_id is None or turn_id == forwarder_state.running_reported_turn_id:
+        return
+    # Resume replay may end this turn concurrently; its terminal edge must win.
+    async with _conversation_item_delivery_scope(session_id):
+        # Resume replay may have published this turn's running while this item waited.
+        if turn_id == forwarder_state.running_reported_turn_id:
+            return
+        state = read_bridge_state(bridge_dir)
+        if (
+            state is None
+            or state.active_turn_id != turn_id
+            or params.get("threadId") != state.thread_id
+        ):
+            return
+        # A failure already posted for the turn, such as a stopped goal's, stays its status.
+        if _turn_failure_already_posted(forwarder_state, turn_id):
+            forwarder_state.running_reported_turn_id = turn_id
+            return
+        # Only an accepted publish settles this turn's running; a failed one is retried by
+        # the next live item, rather than suppressing recovery for the rest of the turn.
+        published = await _post_turn_status_edge(
+            client,
+            session_id,
+            _CodexTurnStatusEdge(status="running", turn_id=turn_id, source="item:recovered"),
+        )
+        if published:
+            forwarder_state.running_reported_turn_id = turn_id
 
 
 def _turn_started_status_edge(
@@ -7577,6 +7679,8 @@ async def _register_child_session(
     nickname = item.get("agent_nickname")
     if isinstance(nickname, str) and nickname:
         data["agent_nickname"] = nickname
+    if isinstance(item.get("parent_item_id"), str):
+        data["parent_item_id"] = item["parent_item_id"]
     response = await _post_session_event(
         client,
         parent_session_id,
@@ -8139,7 +8243,11 @@ async def _handle_agent_message_delta(
             await _ensure_user_message_posted(client, session_id, params, forwarder_state)
             # A failure already posted for the turn, such as a stopped goal's, stays its status.
             if not _turn_failure_already_posted(forwarder_state, turn_id):
-                await _post_turn_status_edge(client, session_id, edge)
+                published = await _post_turn_status_edge(client, session_id, edge)
+                if published and forwarder_state is not None:
+                    forwarder_state.running_reported_turn_id = turn_id
+            elif forwarder_state is not None:
+                forwarder_state.running_reported_turn_id = turn_id
             _record_partial_text_delta(
                 forwarder_state,
                 turn_id=turn_id,
@@ -8208,7 +8316,11 @@ async def _handle_plan_delta(
             await _ensure_user_message_posted(client, session_id, params, forwarder_state)
             # A failure already posted for the turn, such as a stopped goal's, stays its status.
             if not _turn_failure_already_posted(forwarder_state, turn_id):
-                await _post_turn_status_edge(client, session_id, edge)
+                published = await _post_turn_status_edge(client, session_id, edge)
+                if published and forwarder_state is not None:
+                    forwarder_state.running_reported_turn_id = turn_id
+            elif forwarder_state is not None:
+                forwarder_state.running_reported_turn_id = turn_id
             _record_partial_text_delta(
                 forwarder_state,
                 turn_id=turn_id,
@@ -9094,7 +9206,7 @@ async def _post_status(
     reauth_required: bool = False,
     compaction_model: str | None = None,
     selected_model: str | None = None,
-) -> None:
+) -> bool:
     """
     Publish a native Codex status edge.
 
@@ -9112,7 +9224,7 @@ async def _post_status(
     :param compaction_model: Previous model a failed pre-turn compaction ran
         on, so the server can explain that switching models won't help.
     :param selected_model: The thread's selected model for that failure.
-    :returns: None.
+    :returns: ``True`` when the server accepted the edge.
     """
     data: _JsonObject = {"status": status}
     if response_id is not None:
@@ -9131,13 +9243,14 @@ async def _post_status(
         data=data,
     )
     _log_failed_session_event_post("external_session_status", response)
+    return response is not None and response.status_code < 400
 
 
 async def _post_turn_status_edge(
     client: httpx.AsyncClient,
     session_id: str,
     edge: _CodexTurnStatusEdge | None,
-) -> None:
+) -> bool:
     """
     Publish one Codex turn lifecycle edge if a valid edge was derived.
 
@@ -9150,10 +9263,10 @@ async def _post_turn_status_edge(
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param edge: Derived lifecycle edge, or ``None`` when no status should
         be published.
-    :returns: None.
+    :returns: ``True`` when the edge was published and the server accepted it.
     """
     if edge is None:
-        return
+        return False
     _logger.info(
         "Codex forwarder publishing turn status: source=%s turn_id=%s status=%s",
         edge.source,
@@ -9189,7 +9302,7 @@ async def _post_turn_status_edge(
         elif output == _CODEX_OUTPUT_LIMIT_ERROR:
             output = f"{output}\n\n{_CODEX_OUTPUT_LIMIT_HINT}"
     with _turn_status_publication_scope(session_id, edge, phase="status_post"):
-        await _post_status(
+        return await _post_status(
             client,
             session_id,
             edge.status,

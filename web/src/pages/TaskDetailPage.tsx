@@ -104,7 +104,12 @@ import {
 import { canShareAutomation } from "@/lib/permissionsApi";
 import { ScheduledTaskApiError } from "@/lib/scheduledTasksApi";
 import type { ScheduledTaskRun, ScheduledTaskRunSteps } from "@/lib/scheduledTasksApi";
-import { stepProgress } from "@/lib/sessionJournal";
+import {
+  latestStatusText,
+  stepProgress,
+  WAITING_FOR_YOU,
+  type StepStatus,
+} from "@/lib/sessionJournal";
 import { cn } from "@/lib/utils";
 
 const RUN_HIGHLIGHT_DURATION_MS = 3_000;
@@ -685,6 +690,11 @@ function TaskDetail({ taskId }: { taskId: string }) {
                 />
               )}
             <ConfigField label="Timezone" value={task.timezone} testId="task-detail-timezone" />
+            <ConfigField
+              label="Cost limit per run"
+              value={task.maxCostUsd == null ? "No limit" : formatSessionCostUsd(task.maxCostUsd)}
+              testId="task-detail-cost-limit"
+            />
           </dl>
           {task.sessionMode === "continue" && task.sessionId && (
             <p className="mt-3 text-xs text-muted-foreground">
@@ -854,6 +864,14 @@ function useRunUnread(run: ScheduledTaskRun): boolean {
  * Runs without a conversation (e.g. skipped) render as a plain, non-interactive
  * row: no hover highlight, no pointer, not focusable.
  */
+// Shown before a run's status text, since the words alone don't say how the work went.
+const STATUS_TEXT_LABELS: Record<StepStatus, string> = {
+  started: "Started: ",
+  done: "Done: ",
+  failed: "Failed: ",
+  needs_input: `${WAITING_FOR_YOU}: `,
+};
+
 function RunRow({
   run,
   now,
@@ -877,6 +895,8 @@ function RunRow({
     () => (steps ? stepProgress(steps.steps, steps.statuses, sessionWorking) : []),
     [steps, sessionWorking],
   );
+  // What the run's agent last wrote about its work, when the run wrote a plan.
+  const statusText = useMemo(() => (steps ? latestStatusText(steps.statuses) : null), [steps]);
   const sessionId = run.conversationId;
   const showTasks = progress.length > 0 && sessionId != null;
   const [graphOpen, setGraphOpen] = useState(false);
@@ -948,6 +968,22 @@ function RunRow({
               Session needs approval · Open to review
             </span>
           )}
+        {statusText && (
+          <span
+            className={cn(
+              "min-w-0 truncate text-xs",
+              statusText.status === "failed"
+                ? "text-amber-700 dark:text-amber-400"
+                : "text-muted-foreground",
+            )}
+            data-testid="run-status-text"
+            data-run-status={statusText.status}
+            title={statusText.text}
+          >
+            <span className="font-medium">{STATUS_TEXT_LABELS[statusText.status]}</span>
+            {statusText.text}
+          </span>
+        )}
         {failure && (
           <span className="text-xs text-muted-foreground" data-testid="run-failure">
             {failure.stage && (

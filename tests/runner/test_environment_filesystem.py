@@ -1664,7 +1664,7 @@ async def test_filesystem_changes_modified(
     resp = await client_with_registry.get(
         f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
     )
-    assert resp.status_code == 200
+    assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["object"] == "list"
     entries_by_path = {e["path"]: e for e in body["data"]}
@@ -2320,7 +2320,7 @@ async def test_content_search_limits_errors_and_hidden_files(
 
 @pytest.mark.parametrize("mode", ["missing", "timeout", "long-line"])
 def test_content_search_process_boundaries(tmp_path: Path, mode: str) -> None:
-    """Exercise the sandbox script with controlled executables and a short deadline."""
+    """Exercise the sandbox script with controlled executables and a bounded timeout."""
     from omnigent.runner.content_search import _SEARCH_SCRIPT
 
     if mode != "missing":
@@ -2335,15 +2335,17 @@ def test_content_search_process_boundaries(tmp_path: Path, mode: str) -> None:
     parameters = (
         "query = 'needle'\ncase_sensitive = False\nregex = False\nlimit = 2\nglob_args = []\n"
     )
-    # Record the owned child's PID before the shortened timer can kill it.
-    timer = (
-        "import threading\noriginal_timer = threading.Timer\n"
-        "def shortened_timer(seconds, callback):\n"
-        f"    with open({str(tmp_path / 'pid')!r}, 'w') as marker:\n"
-        "        marker.write(str(process.pid))\n"
-        "    return original_timer(0.2, callback)\n"
-        "threading.Timer = shortened_timer\n"
-    )
+    timer = ""
+    if mode == "timeout":
+        # Record the owned child's PID before the shortened timer can kill it.
+        timer = (
+            "import threading\noriginal_timer = threading.Timer\n"
+            "def shortened_timer(seconds, callback):\n"
+            f"    with open({str(tmp_path / 'pid')!r}, 'w') as marker:\n"
+            "        marker.write(str(process.pid))\n"
+            "    return original_timer(0.2, callback)\n"
+            "threading.Timer = shortened_timer\n"
+        )
     completed = subprocess.run(
         [sys.executable, "-I", "-c", parameters + timer + _SEARCH_SCRIPT],
         env={**os.environ, "PATH": str(tmp_path)},

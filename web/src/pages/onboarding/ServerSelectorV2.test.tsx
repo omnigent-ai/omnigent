@@ -1030,6 +1030,103 @@ describe("ServerSelectorV2", () => {
     expect(onConnectRunner).toHaveBeenCalledWith("https://team.example.com/", "local");
   });
 
+  it("Cancel during the install returns to the join choice, and a later finish does nothing", async () => {
+    let finishInstall: (v: { ok: boolean }) => void = () => {};
+    const onInstallCli = vi.fn(
+      () =>
+        new Promise<{ ok: boolean }>((resolve) => {
+          finishInstall = resolve;
+        }),
+    );
+    const onConnectRunner = vi.fn().mockResolvedValue({ ok: true });
+    const onConnect = vi.fn().mockResolvedValue({});
+    joinTypedServer({ installed: false, onInstallCli, onConnectRunner, onConnect });
+    fireEvent.click(await screen.findByRole("radio", { name: /install cli first/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+    await waitFor(() => expect(onInstallCli).toHaveBeenCalledOnce());
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await screen.findByRole("heading", { name: /how do you want to join/i });
+
+    await act(async () => finishInstall({ ok: true }));
+
+    expect(onConnectRunner).not.toHaveBeenCalled();
+    expect(onConnect).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])(
+    "Cancel during the laptop sign-in returns to the join choice (shell cancel resolves %s)",
+    async (shellStopped) => {
+      const onCancelRunnerConnect = vi.fn().mockResolvedValue(shellStopped);
+      const onConnectRunner = vi.fn(() => new Promise<{ ok: boolean }>(() => {}));
+      const onConnect = vi.fn().mockResolvedValue({});
+      joinTypedServer({
+        installed: false,
+        onInstallCli: vi.fn().mockResolvedValue({ ok: true }),
+        onConnectRunner,
+        onConnect,
+        onCancelRunnerConnect,
+      });
+      fireEvent.click(await screen.findByRole("radio", { name: /install cli first/i }));
+      fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+      await waitFor(() => expect(onConnectRunner).toHaveBeenCalledOnce());
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      await screen.findByRole("heading", { name: /how do you want to join/i });
+      expect(onCancelRunnerConnect).toHaveBeenCalledOnce();
+      expect(onConnect).not.toHaveBeenCalled();
+    },
+  );
+
+  it("a laptop connect that succeeds after Cancel doesn't open the server", async () => {
+    let finishRunner: (v: { ok: boolean }) => void = () => {};
+    const onConnectRunner = vi.fn(
+      () =>
+        new Promise<{ ok: boolean }>((resolve) => {
+          finishRunner = resolve;
+        }),
+    );
+    const onConnect = vi.fn().mockResolvedValue({});
+    joinTypedServer({
+      installed: false,
+      onInstallCli: vi.fn().mockResolvedValue({ ok: true }),
+      onConnectRunner,
+      onConnect,
+      onCancelRunnerConnect: vi.fn().mockResolvedValue(true),
+    });
+    fireEvent.click(await screen.findByRole("radio", { name: /install cli first/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+    await waitFor(() => expect(onConnectRunner).toHaveBeenCalledOnce());
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await screen.findByRole("heading", { name: /how do you want to join/i });
+
+    await act(async () => finishRunner({ ok: true }));
+
+    expect(onConnect).not.toHaveBeenCalled();
+    expect(screen.getByRole("heading", { name: /how do you want to join/i })).toBeInTheDocument();
+  });
+
+  it("a remote-environment connect offers no Cancel, since it can't be stopped from here", async () => {
+    await installFromRunnerStep(
+      {
+        installed: true,
+        getRunnerOptions: vi.fn().mockResolvedValue({ remote: true }),
+        onConnectRunner: vi.fn(() => new Promise<{ ok: boolean }>(() => {})),
+      },
+      undefined,
+      "Open Omnigent",
+    );
+    await screen.findByText(/connecting your remote environment/i);
+    expect(screen.queryByRole("button", { name: "Cancel" })).not.toBeInTheDocument();
+  });
+
+  it("starting the local server offers no Cancel, since it can't be stopped from here", async () => {
+    const onStartLocal = vi.fn(() => new Promise<{ ok: boolean }>(() => {}));
+    render(<ServerSelectorV2 setup={makeSetup({ installed: true, onStartLocal })} />);
+    fireEvent.click(screen.getByRole("button", { name: /get started locally/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^(start|open) omnigent$/i }));
+    await waitFor(() => expect(onStartLocal).toHaveBeenCalledOnce());
+    expect(screen.queryByRole("button", { name: "Cancel" })).not.toBeInTheDocument();
+  });
+
   it("a failed laptop connect after the install can retry or continue without a host", async () => {
     const onConnect = vi.fn().mockResolvedValue({});
     const onConnectRunner = vi.fn().mockResolvedValue({ ok: false, error: "no host" });
