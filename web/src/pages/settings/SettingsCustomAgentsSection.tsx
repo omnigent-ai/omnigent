@@ -27,6 +27,7 @@ import {
 } from "@/hooks/useCustomAgents";
 import { CustomAgentConfigForm } from "./CustomAgentConfigForm";
 import {
+  CUSTOM_AGENT_CREATE_ENTRY,
   CUSTOM_AGENT_DETAIL_ENTRY,
   CUSTOM_AGENTS_LIST_ENTRY,
 } from "@/pages/settings/search/catalog/customAgents";
@@ -100,11 +101,14 @@ export function SettingsCustomAgentsSection() {
   );
   if (agentId === "new") {
     return (
-      <div className="@container">
+      <SettingsItem entry={CUSTOM_AGENT_CREATE_ENTRY} className="@container">
         {back}
-        <h1 className="settings-page-title mb-6 text-2xl font-medium">Create custom agent</h1>
+        <h1 className="settings-page-title mb-6 text-2xl font-medium">
+          {CUSTOM_AGENT_CREATE_ENTRY.label}
+        </h1>
         <CreateAgentForm
-          submitLabel="Save agent"
+          settingsEntry={CUSTOM_AGENT_CREATE_ENTRY}
+          submitLabel={CUSTOM_AGENT_CREATE_ENTRY.parts.submit}
           notice="Reusing an installed agent's name replaces its configuration and updates its sessions. Use a new name to keep both agents."
           onCancel={() => navigate(BASE)}
           onCreate={async (input) => {
@@ -112,7 +116,7 @@ export function SettingsCustomAgentsSection() {
             navigate(agentPath(agent.id));
           }}
         />
-      </div>
+      </SettingsItem>
     );
   }
   if (detailId) {
