@@ -8,6 +8,7 @@ import { APPEARANCE_SETTINGS } from "./appearance";
 import { ARCHIVED_SETTINGS } from "./archived";
 import { CLI_SETTINGS } from "./cli";
 import { CUSTOM_AGENTS_SETTINGS } from "./customAgents";
+import { GENERAL_SETTINGS } from "./general";
 import { GIT_SETTINGS } from "./git";
 import { HARNESS_SETTINGS } from "./harnesses";
 import { IMPORT_SETTINGS } from "./import";
@@ -23,7 +24,7 @@ export const SECTION_CATALOGS: Readonly<Record<SettingsSectionId, readonly Setti
   appearance: APPEARANCE_SETTINGS,
   harnesses: HARNESS_SETTINGS,
   "custom-agents": CUSTOM_AGENTS_SETTINGS,
-  general: [],
+  general: GENERAL_SETTINGS,
   git: GIT_SETTINGS,
   integrations: INTEGRATION_SETTINGS,
   mcp: MCP_SETTINGS,
