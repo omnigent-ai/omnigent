@@ -54,12 +54,13 @@ const SHARED_WORKFLOWS_KEY = ["shared-workflows"];
  *
  * @param enabled - Whether to load them now.
  * @returns The workflows, each with `viewer_role` `"viewer"` and its owner's name;
- *   `isLoading`, `isError` and `pagination` as for {@link useSavedWorkflows}.
+ *   `isLoading`, `isError`, `refresh` and `pagination` as for {@link useSavedWorkflows}.
  */
 export function useSharedWorkflows({ enabled = true }: { enabled?: boolean } = {}): {
   workflows: readonly SavedWorkflow[];
   isLoading: boolean;
   isError: boolean;
+  refresh: () => void;
   pagination: WorkflowPagination;
 } {
   const serverInfo = useServerInfo();
@@ -83,10 +84,16 @@ export function useSharedWorkflows({ enabled = true }: { enabled?: boolean } = {
     () => query.data?.pages.flatMap((page) => page.data) ?? NO_WORKFLOWS,
     [query.data],
   );
+  const { refetch } = query;
+  // refetch() ignores `enabled`, so a server that doesn't share workflows is never asked.
+  const refresh = useCallback(() => {
+    if (enabled && supported) void refetch();
+  }, [enabled, supported, refetch]);
   return {
     workflows: supported ? workflows : NO_WORKFLOWS,
     isLoading: supported && query.isLoading,
     isError: supported && query.isError,
+    refresh,
     pagination: {
       hasMore: supported && query.hasNextPage,
       loadingMore: query.isFetchingNextPage,

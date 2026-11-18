@@ -65,6 +65,19 @@ describe("ComposerAddMenu's Run a workflow", () => {
     await waitFor(() => expect(onRunSavedWorkflow).toHaveBeenCalledWith(shared));
   });
 
+  it("opens the picker while more workflows can load, though none loaded yet show", async () => {
+    const loadMore = vi.fn();
+    const { onWorkflow } = renderMenu({
+      savedWorkflows: [],
+      workflowPagination: { hasMore: true, loadingMore: false, loadMore },
+    });
+    runAWorkflow();
+    expect(await screen.findByTestId("composer-workflow-picker")).toBeInTheDocument();
+    expect(onWorkflow).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByText("Load more workflows"));
+    expect(loadMore).toHaveBeenCalledOnce();
+  });
+
   it("lists the saved workflows to search and run", async () => {
     const loadMore = vi.fn();
     const { onRunSavedWorkflow, onWorkflow } = renderMenu({

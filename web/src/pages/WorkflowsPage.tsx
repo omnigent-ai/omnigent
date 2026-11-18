@@ -31,6 +31,7 @@ import { useAutomationsEnabled } from "@/hooks/useConversations";
 import { automationPagePath } from "@/lib/automationFromSession";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useNavigate } from "@/lib/routing";
+import { cn } from "@/lib/utils";
 import { useCloneWorkflow, useCreateWorkflowDraft } from "@/hooks/useWorkflow";
 
 export function WorkflowsPage() {
@@ -103,25 +104,24 @@ export function WorkflowsPage() {
       )}
 
       {isError ? (
-        <div
-          role="alert"
-          data-testid="workflows-load-error"
-          className="flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-ui"
-        >
-          <TriangleAlertIcon className="size-4 shrink-0 text-destructive" />
-          <span className="flex-1">Couldn’t load workflows.</span>
-          <Button variant="outline" size="sm" onClick={refresh} componentId="workflows.retry">
-            Retry
-          </Button>
-        </div>
+        <LoadError
+          message="Couldn’t load workflows."
+          onRetry={refresh}
+          testId="workflows-load-error"
+          componentId="workflows.retry"
+        />
       ) : isLoading ? (
         <div className="flex items-center gap-2 py-12 text-ui text-muted-foreground">
           <Loader2Icon className="size-4 animate-spin" />
           Loading workflows…
         </div>
-      ) : filtered.length === 0 && sharedFiltered.length === 0 ? (
-        <EmptyState hasAny={hasAnyWorkflows} />
-      ) : filtered.length === 0 ? null : (
+      ) : filtered.length === 0 ? (
+        // Wait for the shared list too, which may yet have workflows.
+        sharedFiltered.length === 0 &&
+        !shared.isLoading &&
+        !shared.isError &&
+        !shared.pagination.hasMore && <EmptyState hasAny={hasAnyWorkflows} />
+      ) : (
         <div className="flex flex-col gap-2" data-testid="workflows-list">
           {filtered.map((workflow) => (
             <WorkflowRow
@@ -156,32 +156,43 @@ export function WorkflowsPage() {
         </Button>
       )}
 
-      {!isLoading && !isError && sharedFiltered.length > 0 && (
-        <section className="mt-8" data-testid="workflows-shared">
-          <h2 className="mb-2 text-sm font-medium text-muted-foreground">Shared with you</h2>
-          <div className="flex flex-col gap-2">
-            {sharedFiltered.map((workflow) => (
-              <WorkflowRow
-                key={workflow.id}
-                workflow={workflow}
-                onRun={() => startSession({ kind: "run", workflow })}
-                onClone={clone}
-                cloning={cloneWorkflow.isPending}
-              />
-            ))}
-          </div>
-          {shared.pagination.hasMore && (
-            <Button
-              variant="outline"
-              className="mt-4"
-              disabled={shared.pagination.loadingMore}
-              onClick={shared.pagination.loadMore}
-              componentId="workflows.shared.load-more"
-            >
-              {shared.pagination.loadingMore ? "Loading…" : "Load more shared workflows"}
-            </Button>
-          )}
-        </section>
+      {shared.isError ? (
+        <LoadError
+          className="mt-8"
+          message="Couldn’t load the workflows shared with you."
+          onRetry={shared.refresh}
+          testId="workflows-shared-load-error"
+          componentId="workflows.shared.retry"
+        />
+      ) : (
+        // Shown while more can load, even when no loaded workflow matches.
+        (sharedFiltered.length > 0 || shared.pagination.hasMore) && (
+          <section className="mt-8" data-testid="workflows-shared">
+            <h2 className="mb-2 text-sm font-medium text-muted-foreground">Shared with you</h2>
+            <div className="flex flex-col gap-2">
+              {sharedFiltered.map((workflow) => (
+                <WorkflowRow
+                  key={workflow.id}
+                  workflow={workflow}
+                  onRun={() => startSession({ kind: "run", workflow })}
+                  onClone={clone}
+                  cloning={cloneWorkflow.isPending}
+                />
+              ))}
+            </div>
+            {shared.pagination.hasMore && (
+              <Button
+                variant="outline"
+                className="mt-4"
+                disabled={shared.pagination.loadingMore}
+                onClick={shared.pagination.loadMore}
+                componentId="workflows.shared.load-more"
+              >
+                {shared.pagination.loadingMore ? "Loading…" : "Load more shared workflows"}
+              </Button>
+            )}
+          </section>
+        )
       )}
 
       {deleteTarget && (
@@ -214,6 +225,38 @@ export function WorkflowsPage() {
         />
       )}
     </PageScroll>
+  );
+}
+
+/** A list that failed to load, and a Retry for it. */
+function LoadError({
+  message,
+  onRetry,
+  testId,
+  componentId,
+  className,
+}: {
+  message: string;
+  onRetry: () => void;
+  testId: string;
+  componentId: string;
+  className?: string;
+}) {
+  return (
+    <div
+      role="alert"
+      data-testid={testId}
+      className={cn(
+        "flex items-center gap-2 rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-ui",
+        className,
+      )}
+    >
+      <TriangleAlertIcon className="size-4 shrink-0 text-destructive" />
+      <span className="flex-1">{message}</span>
+      <Button variant="outline" size="sm" onClick={onRetry} componentId={componentId}>
+        Retry
+      </Button>
+    </div>
   );
 }
 
