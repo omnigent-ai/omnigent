@@ -11,6 +11,7 @@ import { useConversationRedirect } from "@/hooks/useConversationRedirect";
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation, isCanvasPathname } from "@/canvas/canvasNavigation";
 import { useSkills } from "@/hooks/useSkills";
+import { useDismissOnEscape } from "@/hooks/useDismissOnEscape";
 import {
   type ForwardedRef,
   type ChangeEvent,
@@ -2436,6 +2437,7 @@ function ComposerImpl(
   } = useReplyDraft();
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
   const [commandError, setCommandError] = useState<string | null>(null);
+  useDismissOnEscape(commandError !== null, () => setCommandError(null));
   const [planModeBusy, setPlanModeBusy] = useState(false);
   const [goalDialogOpen, setGoalDialogOpen] = useState(false);
   const [inputFocused, setInputFocused] = useState(false);
@@ -4298,6 +4300,12 @@ function ComposerImpl(
       submit();
       return;
     }
+    // Esc closes slash-command output before it can reach the turn.
+    if (e.key === "Escape" && commandError !== null) {
+      e.preventDefault();
+      setCommandError(null);
+      return;
+    }
     // Esc dismisses the /btw sidechat overlay if open
     if (e.key === "Escape" && btwSidechat) {
       e.preventDefault();
@@ -4707,8 +4715,11 @@ function ComposerImpl(
                 <ComposerFeedbackRow tone="error">{attachmentError}</ComposerFeedbackRow>
               )}
               <ComposerLocalReviewChips comments={localReviewComments} />
-              {/* Inline slash-command feedback: errors and /help output */}
-              {commandError !== null && <ComposerFeedbackRow>{commandError}</ComposerFeedbackRow>}
+              {/* Inline slash-command feedback: errors and /help output. It closes on
+                  Escape, so page-wide Escape shortcuts leave it the key. */}
+              {commandError !== null && (
+                <ComposerFeedbackRow data-escape-owner="">{commandError}</ComposerFeedbackRow>
+              )}
             </>
           ),
         }}

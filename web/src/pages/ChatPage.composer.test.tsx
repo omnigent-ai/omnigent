@@ -431,6 +431,35 @@ describe("Composer Escape interrupt", () => {
     expect(props.onStop).toHaveBeenCalledTimes(1);
   });
 
+  it("closes slash-command output before interrupting", () => {
+    const props = composerProps({ isWorking: true });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "/help " } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(screen.getByText(/\/help — Show available slash commands/)).toBeVisible();
+
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(screen.queryByText(/\/help — Show available slash commands./)).toBeNull();
+    expect(props.onStop).not.toHaveBeenCalled();
+    fireEvent.keyDown(textarea(), { key: "Escape" });
+    expect(props.onStop).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes slash-command output on Escape with focus outside the composer", () => {
+    const props = composerProps({ isWorking: true });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "/help " } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    // Page-wide Escape shortcuts (approval decline, question reject) defer to escape owners.
+    const help = screen.getByText(/\/help — Show available slash commands/);
+    expect(help.closest("[data-escape-owner]")).not.toBeNull();
+
+    textarea().blur();
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(screen.queryByText(/\/help — Show available slash commands./)).toBeNull();
+    expect(props.onStop).not.toHaveBeenCalled();
+  });
+
   it("leaves Escape to active IME composition", () => {
     const props = composerProps({ isWorking: true });
     render(<Composer {...props} />);
