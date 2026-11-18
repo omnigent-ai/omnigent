@@ -6,25 +6,13 @@ import { useResizableCommentsPanel } from "@/hooks/useResizableCommentsPanel";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { cn } from "@/lib/utils";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { CommentThread } from "./CommentThread";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
 import { displayAnchorContent } from "./pdfCommentHelpers";
 
-function avatarStyle(name: string): { backgroundColor: string; color: string } {
-  let hash = 0;
-  for (let i = 0; i < name.length; i++) hash = (hash * 31 + name.charCodeAt(i)) >>> 0;
-  return { backgroundColor: `hsl(${hash % 360} 60% 50%)`, color: "white" };
-}
-
-function formatCommentTime(createdAt: number, now: Date): string {
-  const date = new Date(createdAt * 1000);
-  const time = date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
-  if (date.toDateString() === now.toDateString()) return `${time} Today`;
-  const yesterday = new Date(now);
-  yesterday.setDate(now.getDate() - 1);
-  if (date.toDateString() === yesterday.toDateString()) return `${time} Yesterday`;
-  return `${date.toLocaleDateString(undefined, { month: "short", day: "numeric" })} ${time}`;
-}
+import { avatarStyle, formatCommentTime } from "./commentPresentation";
 
 // ---------------------------------------------------------------------------
 // CommentsPanel — right panel for adding and viewing comments. Resizable on
@@ -95,6 +83,8 @@ export function CommentsPanel({
   now,
 }: CommentsPanelProps) {
   const currentTime = now ?? new Date();
+  const serverInfo = useServerInfo();
+  const threadsEnabled = serverInfo !== "loading" && serverInfo.comment_replies === true;
   const [body, setBody] = useState("");
   const [tab, setTab] = useState<Tab>("open");
   const addCommentTextareaRef = useRef<HTMLTextAreaElement>(null);
@@ -339,6 +329,9 @@ export function CommentsPanel({
                     onDelete={canModify(c) ? () => onDeleteComment(c.id) : undefined}
                     onEdit={canModify(c) ? (newBody) => onEditComment(c.id, newBody) : undefined}
                     onCopyLink={onCopyCommentLink ? () => onCopyCommentLink(c.id) : undefined}
+                    threadsEnabled={threadsEnabled}
+                    canEditReplies={canEdit}
+                    canAddressReplies={canAddress}
                     now={currentTime}
                   />
                 );
@@ -362,6 +355,9 @@ export function CommentsPanel({
                   onClick={() => onClickComment(c)}
                   onDelete={canModify(c) ? () => onDeleteComment(c.id) : undefined}
                   onCopyLink={onCopyCommentLink ? () => onCopyCommentLink(c.id) : undefined}
+                  threadsEnabled={threadsEnabled}
+                  canEditReplies={canEdit}
+                  canAddressReplies={canAddress}
                   now={currentTime}
                 />
               );
@@ -387,6 +383,9 @@ interface CommentCardProps {
   onDelete?: () => void;
   onCopyLink?: () => void;
   now: Date;
+  threadsEnabled: boolean;
+  canEditReplies: boolean;
+  canAddressReplies: boolean;
 }
 
 function CommentCard({
@@ -398,6 +397,9 @@ function CommentCard({
   onDelete,
   onCopyLink,
   now,
+  threadsEnabled,
+  canEditReplies,
+  canAddressReplies,
 }: CommentCardProps) {
   const [editing, setEditing] = useState(false);
   const [editBody, setEditBody] = useState(c.body);
@@ -601,6 +603,15 @@ function CommentCard({
             </div>
           )}
         </div>
+      )}
+      {threadsEnabled && !c.anchor_metadata && (
+        <CommentThread
+          comment={c}
+          selected={!!isSelected}
+          canEdit={canEditReplies}
+          canAddress={canAddressReplies}
+          now={now}
+        />
       )}
     </div>
   );

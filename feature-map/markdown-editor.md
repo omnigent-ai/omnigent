@@ -292,3 +292,22 @@ instead of treating one comparison clip as complete feature verification.
   or Android verification. Record those gaps explicitly when relevant.
 - The 64/256 KiB probes are report-only. Readiness checks can fail, but there is
   no machine-dependent latency assertion and no silent plain-text fallback.
+
+### File comment replies
+
+On servers advertising `comment_replies`, select a file comment in the Comments
+panel to read its thread. Replies remain oldest-first; long threads initially
+show the latest three with **Show earlier replies** above them. Unselected cards
+show the reply count and last author. Local PR review comments use their existing
+review conversation UI instead.
+
+Focus **Reply…** to expand the composer. **Reply** (or Command/Ctrl+Enter) saves
+without starting an agent turn. **Ask agent** saves first, then sends that comment's
+thread to the registered agent and moves the comment to Sent. Cancel and Escape
+collapse the composer while keeping the draft. Editors can delete their own user
+replies; agent replies cannot be deleted here. Read-only viewers can read threads.
+
+Coverage: `web/src/hooks/useCommentReplies.test.tsx`,
+`web/src/shell/CommentThread.test.tsx`, and
+`web/src/shell/CommentsPanel.replies.test.tsx` cover API pagination, invalidation,
+send paths, ownership, read-only access, IME input, and capability compatibility.
