@@ -4674,11 +4674,6 @@ function ComposerImpl(
                   <p className="mt-2 text-xs text-muted-foreground">Press Esc to close</p>
                 </div>
               )}
-              {/* Highlight overlay: a textarea can only paint its text one color, so
-            to tint just the command or skill token we hide the textarea's own glyphs
-            (text-transparent, caret kept visible) and render an aligned mirror
-            behind it, pinned to the textarea's box. Same typography so wrapping
-            matches the textarea exactly. Only mounted while the draft is a command. */}
             </>
           ),
           inputBackdrop: highlight.backdrop,

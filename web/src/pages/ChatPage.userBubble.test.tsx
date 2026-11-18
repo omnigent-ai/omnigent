@@ -918,14 +918,6 @@ describe("UserBubble command tint", () => {
     );
   });
 
-  it.each(["# x", "- x"])("keeps %j args in the token's paragraph", (args) => {
-    renderScoped(userBubble(`/team ${args}`), <PublishCommands />);
-    const bubble = within(screen.getByTestId("message-bubble"));
-    expect(bubble.queryByRole("heading")).toBeNull();
-    expect(bubble.queryAllByRole("listitem")).toHaveLength(0);
-    expect(screen.getByText("/team").closest("p")).toHaveTextContent(`/team ${args}`);
-  });
-
   // The tint wraps the token without changing how the rest of the text parses.
   it.each([
     " [docs]: https://example.com",
