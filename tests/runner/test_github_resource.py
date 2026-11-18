@@ -160,10 +160,13 @@ def test_github_info_pr_via_pr_view(repo: Path, monkeypatch: pytest.MonkeyPatch)
     assert not any(c[:2] == ("pr", "list") for c in calls)
 
 
-def test_github_info_no_pr(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("host", ["github.com", "ghe.example.com"])
+def test_github_info_no_pr(repo: Path, monkeypatch: pytest.MonkeyPatch, host: str) -> None:
     """A branch with no PR yields ``pr``/``base_ref`` null (bare ``gh pr view`` empty).
 
-    gh's "no pull requests" failure names no refused field, so it is not retried.
+    gh's "no pull requests" failure names no refused field, so it is not retried. The
+    reachable repo names its host, as the provider also serves Enterprise, and is the
+    workspace's own.
     """
     calls: list[tuple[str, ...]] = []
 
@@ -174,31 +177,6 @@ def test_github_info_no_pr(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         head = tuple(argv[:2])
         if head == ("auth", "status"):
             return (0, "", "")
-        if head == ("repo", "view"):
-            return (0, json.dumps({"nameWithOwner": "o/r"}), "")
-        if head == ("pr", "view"):
-            return (1, "", "no pull requests found for branch")
-        return (1, "", "no stub")
-
-    monkeypatch.setattr(github_resource, "_gh", fake_gh)
-    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: "/usr/bin/gh")
-
-    info = github_info(str(repo))
-    assert info["pr"] is None
-    assert info["base_ref"] is None
-    assert sum(c[:2] == ("pr", "view") for c in calls) == 1
-
-
-@pytest.mark.parametrize("host", ["github.com", "ghe.example.com"])
-def test_github_info_no_pr_reports_repo_host(
-    repo: Path, monkeypatch: pytest.MonkeyPatch, host: str
-) -> None:
-    """A reachable repo with no PR names its host; the provider also serves Enterprise."""
-
-    def fake_gh(
-        argv: Sequence[str], *, cwd: str, token: str | None = None
-    ) -> tuple[int, str, str]:
-        head = tuple(argv[:2])
         if head == ("repo", "view"):
             fields = argv[argv.index("--json") + 1].split(",")
             view = {"nameWithOwner": "corp/app", "url": f"https://{host}/corp/app"}
@@ -212,7 +190,9 @@ def test_github_info_no_pr_reports_repo_host(
 
     info = github_info(str(repo))
     assert info["pr"] is None
-    assert info["repo"] == {"name_with_owner": "corp/app", "host": host}
+    assert info["base_ref"] is None
+    assert sum(c[:2] == ("pr", "view") for c in calls) == 1
+    assert info["repo"] == info["workspace_repo"] == {"name_with_owner": "corp/app", "host": host}
 
 
 def test_reference_info_without_gh_reports_repo_host(
@@ -596,6 +576,7 @@ def test_github_info_skips_account_enumeration_on_happy_path(
     info = github_info(str(repo))
     assert info["pr"]["number"] == 42
     assert info["repo"] == {"name_with_owner": "acme/repo", "host": "github.com"}  # from pr.url
+    assert info["workspace_repo"] == info["repo"]
     assert info["authenticated"] is True
     # The two per-poll network calls are gone on the happy path.
     assert not any(c[:4] == ("auth", "status", "--json", "hosts") for c in calls)

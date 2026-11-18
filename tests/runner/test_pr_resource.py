@@ -198,6 +198,46 @@ def test_tracked_github_pr_info_carries_the_provider_fields(
     assert [pr["provider"] for pr in info["prs"]] == ["github"]
 
 
+@pytest.mark.parametrize(
+    ("origin", "gh_host", "workspace_repo"),
+    [
+        (
+            "https://github.com/owner/app.git",
+            None,
+            {"name_with_owner": "owner/app", "host": "github.com"},
+        ),
+        (
+            "https://ghe.example.com/owner/ws.git",
+            "ghe.example.com",
+            {"name_with_owner": "owner/ws", "host": "ghe.example.com"},
+        ),
+        # No provider claims the remote, so nothing names the workspace's repo.
+        ("https://ghe.example.com/owner/ws.git", None, None),
+    ],
+)
+def test_tracked_pr_info_names_the_workspace_repo(
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    origin: str,
+    gh_host: str | None,
+    workspace_repo: dict[str, str] | None,
+) -> None:
+    """``repo`` stays the tracked PR's; ``workspace_repo`` names the checkout's own."""
+    _git(repo, "remote", "add", "origin", origin)
+    if gh_host is not None:
+        monkeypatch.setenv("GH_HOST", gh_host)
+    url = "https://github.com/owner/other/pull/7"
+    SessionPrRegistry("session").record(
+        [PullRequestRef.from_url(url)], relationship="created", source="test"
+    )
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: None)
+
+    info = pr_resource.pr_info(str(repo), session_id="session")
+
+    assert info["repo"] == {"name_with_owner": "owner/other", "host": "github.com"}
+    assert info.get("workspace_repo") == workspace_repo
+
+
 def test_a_directory_outside_git_reports_not_a_git_repo_from_github(tmp_path: Path) -> None:
     info = pr_resource.pr_info(str(tmp_path))
 

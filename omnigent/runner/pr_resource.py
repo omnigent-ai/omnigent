@@ -179,6 +179,20 @@ def _workspace_providers(root: str) -> list[ProviderResolution]:
     ]
 
 
+def _add_workspace_repo(root: str, info: dict[str, Any]) -> None:
+    """Name the checkout's own repo when the provider hasn't, from its first remote.
+
+    ``repo`` names a tracked PR's repo, which can differ from the checkout's. This
+    is a local config read; in a fork checkout it may name the fork.
+    """
+    if "workspace_repo" in info:
+        return
+    url = next((url for url in _remote_urls(root) if host_of(url)), None)
+    parsed = resolve_remote(url) if url is not None else None
+    if parsed is not None:
+        info["workspace_repo"] = {"name_with_owner": parsed.repository, "host": parsed.host}
+
+
 def _workspace_provider(root: str) -> ProviderResolution:
     """Choose the default display provider; discovery still visits every provider."""
     return _workspace_providers(root)[0]
@@ -561,6 +575,7 @@ def pr_info(
         info["provider_display"] = (
             provider_display(provider_id) if isinstance(provider_id, str) else None
         )
+        _add_workspace_repo(root, info)
         return info
     request_deadline = time.monotonic() + _PR_TITLE_REQUEST_SECONDS
     registry = SessionPrRegistry(session_id)
@@ -619,6 +634,7 @@ def pr_info(
             info.setdefault("discovery_warnings", []).extend(candidate.get("warnings", []))
     info["prs"] = _session_prs_with_titles(root, info, registry, entries, request_deadline)
     info["tracking_available"] = True
+    _add_workspace_repo(root, info)
     provider_id = info.get("provider")
     info["provider_display"] = (
         provider_display(provider_id) if isinstance(provider_id, str) else None

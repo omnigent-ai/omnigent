@@ -59,6 +59,8 @@ Additive fields:
 - ``remote_host``: only with ``reason: "unsupported_remote"``.
 - ``repo.host``: the host of the repository's forge instance, e.g. ``"github.com"``;
   omitted when the provider doesn't know it.
+- ``workspace_repo``: ``{name_with_owner, host}`` of the workspace checkout's own
+  repository, whichever PR ``repo`` describes; omitted when no remote names one.
 - PR associations in ``prs`` carry ``provider``.
 - The dispatcher adds descriptor ``provider_display`` to info and associations.
 - ``checks`` may also count ``cancelled`` and ``skipped`` jobs, with matching ``runs``

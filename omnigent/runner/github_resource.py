@@ -1075,6 +1075,7 @@ def _workspace_github_info(root: str) -> dict[str, Any]:
         payload["authenticated"] = True
         payload["base_ref"] = data.get("baseRefName")
         payload["repo"] = _repo_payload(_owner_repo_from_pr_url(data.get("url")), data.get("url"))
+        payload["workspace_repo"] = dict(payload["repo"])
         return payload
 
     # No PR. Probe repo reachability to tell "no PR yet" from "can't reach repo".
@@ -1088,6 +1089,7 @@ def _workspace_github_info(root: str) -> dict[str, Any]:
         if nwo:
             payload["authenticated"] = True
             payload["repo"] = _repo_payload(nwo, url)
+            payload["workspace_repo"] = dict(payload["repo"])
             return payload  # -> no-pr
 
     # Repo unreachable / not signed in — enumerate accounts so the panel can offer

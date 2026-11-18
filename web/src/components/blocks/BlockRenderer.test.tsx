@@ -2887,6 +2887,7 @@ describe("BlockRenderer pull request references", () => {
       object: "session.github.info",
       available: true,
       repo: { name_with_owner: "acme/app", host: "github.com" },
+      workspace_repo: { name_with_owner: "acme/app", host: "github.com" },
     });
     // A description field renders as Markdown prose, the same renderer as assistant text.
     const output = JSON.stringify({

@@ -302,7 +302,11 @@ export interface PullRequestInfo {
    *  @deprecated Legacy GitHub field; read `auth.authenticated`. Removal in 0.19.0. */
   authenticated?: boolean;
   branch?: string;
+  /** The selected PR's repo when one is tracked, else the workspace's. */
   repo?: PullRequestRepo | null;
+  /** The workspace checkout's own repo, whatever PR is selected; absent from older hosts
+   *  and when no remote names one. */
+  workspace_repo?: PullRequestRepo;
   /** The PR's base branch; null when there's no PR (the tab is a PR view). */
   base_ref?: string | null;
   pr?: PullRequest | null;

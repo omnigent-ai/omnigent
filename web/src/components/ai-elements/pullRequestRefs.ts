@@ -26,10 +26,12 @@ const BARE_NUMBER = /^[1-9]\d{3,9}$/;
 const EXPLICIT_NUMBER = /^[1-9]\d{0,9}$/;
 const GITHUB_OWNER = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/;
 const GITHUB_REPO = /^[A-Za-z0-9._-]{1,100}$/;
-// `docs/setup.md#3` is a file path; an extensionless `src/foo#12` still links.
-// This also leaves dotted repos like `vercel/next.js#1` as text; a wrong link is worse than none.
-const FILE_EXTENSION =
-  /\.(md|mdx|py|ts|tsx|js|jsx|json|ya?ml|txt|sh|go|rs|java|scala|css|scss|less|html?|toml|xml|ini|cfg|lock|c|h|cpp|hpp|rb|kt|swift|sql|php|cs|vue|svelte|mjs|cjs|mts|cts|jsonc|tf|proto|ipynb|csv|svg|gradle|bzl|env)$/i;
+// `docs/setup.md#3` and `assets/logo.png#3` are file paths; an extensionless `src/foo#12`
+// still links. This also leaves dotted repos like `vercel/next.js#1` as text; a wrong link
+// is worse than none.
+const FILE_EXTENSION = /\.[A-Za-z0-9]{1,5}$/;
+// Prose (`and/or#1`, `24/7#1`) and git refs (`origin/main#1`) that read as `owner/repo`.
+const NON_OWNER = /^(\d+|origin|upstream|and|or)$/i;
 
 /** Repo for bare references when the session's repo is unknown; null leaves them as text. */
 const FALLBACK_PULL_REQUEST_REPO: string | null = null;
@@ -74,7 +76,8 @@ export function splitPullRequestRefs(text: string): MarkdownNode[] {
     const valid = explicit
       ? EXPLICIT_NUMBER.test(number) &&
         isGitHubRepo(`${owner}/${repo}`) &&
-        !FILE_EXTENSION.test(repo)
+        !FILE_EXTENSION.test(repo) &&
+        !NON_OWNER.test(owner)
       : BARE_NUMBER.test(number);
     if (!valid) continue;
     if (start > last) nodes.push({ type: "text", value: text.slice(last, start) });
@@ -125,40 +128,24 @@ function canonicalRepo(nameWithOwner: string): string | null {
 
 /**
  * The github.com repo a bare reference in this session points at, or null to
- * leave it as text. Only github.com sessions link: an Enterprise repo's name
- * could land on an unrelated (possibly squatted) github.com repo.
+ * leave it as text. It is the workspace's own repo: `repo` names a tracked PR's,
+ * which can live in another repo or on another host. Only github.com workspaces
+ * link, as an Enterprise repo's name could land on an unrelated (possibly
+ * squatted) github.com repo; older servers that don't report the workspace's
+ * repo leave references as text.
  */
 export function sessionPullRequestRepo(
   info: PullRequestInfo | undefined,
   fallback: string | null = FALLBACK_PULL_REQUEST_REPO,
 ): string | null {
-  if (!isGitHubSession(info)) return null;
-  const own = info?.repo?.name_with_owner;
+  if (!isGitHubWorkspace(info)) return null;
+  const own = info?.workspace_repo?.name_with_owner;
   if (own) return isGitHubRepo(own) ? canonicalRepo(own) : null;
   return fallback;
 }
 
-function isGitHubSession(info: PullRequestInfo | undefined): boolean {
-  // `null` is the host saying no provider serves this workspace.
-  if (info?.provider === null || info?.reason === "unsupported_remote") return false;
-  if (typeof info?.provider === "string" && info.provider !== "github") return false;
-  if (info?.remote_host && info.remote_host !== "github.com") return false;
-  // The GitHub provider also serves Enterprise hosts, and a signed-in gh account
-  // names no remote, so only a host the repo or PR reports counts. Older servers
-  // that report neither leave references as text.
-  const hosts = [info?.repo?.host, urlHostname(info?.pr?.url), urlHostname(info?.selected_pr_url)];
-  const known = hosts.filter((host) => host !== undefined);
-  return known.length > 0 && known.every((host) => host === "github.com");
-}
-
-function urlHostname(url: string | null | undefined): string | undefined {
-  if (!url) return undefined;
-  try {
-    return new URL(url).hostname;
-  } catch {
-    // Present but unparseable: evidence against, not absence of evidence.
-    return "";
-  }
+function isGitHubWorkspace(info: PullRequestInfo | undefined): boolean {
+  return info?.workspace_repo?.host === "github.com";
 }
 
 /** Where `ref` links in this session, or null when it should stay text. */
@@ -167,7 +154,7 @@ export function pullRequestRefUrl(
   info: PullRequestInfo | undefined,
   fallback: string | null = FALLBACK_PULL_REQUEST_REPO,
 ): string | null {
-  if (ref.repo !== null && !isGitHubSession(info)) return null;
+  if (ref.repo !== null && !isGitHubWorkspace(info)) return null;
   const repo = ref.repo !== null ? canonicalRepo(ref.repo) : sessionPullRequestRepo(info, fallback);
   return repo ? gitHubPullRequestUrl(repo, ref.number) : null;
 }

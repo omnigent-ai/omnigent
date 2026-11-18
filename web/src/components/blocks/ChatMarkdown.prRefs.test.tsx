@@ -75,6 +75,7 @@ function githubInfo(overrides: Partial<PullRequestInfo> = {}): PullRequestInfo {
     object: "session.github.info",
     available: true,
     repo: { name_with_owner: "acme/app", host: "github.com" },
+    workspace_repo: { name_with_owner: "acme/app", host: "github.com" },
     ...overrides,
   };
 }
@@ -123,7 +124,7 @@ describe("pull request references in chat markdown", () => {
   });
 
   it("leaves a bare reference as text when the session's repo is unknown", () => {
-    seed(githubInfo({ repo: { name_with_owner: null, host: "github.com" } }));
+    seed(githubInfo({ workspace_repo: { name_with_owner: null, host: "github.com" } }));
     renderMarkdown("See #4242 and acme/app#12");
     expect(hrefs()).toEqual(["https://github.com/acme/app/pull/12"]);
     expect(screen.getByText("#4242")).toBeVisible();
@@ -158,16 +159,13 @@ describe("pull request references in chat markdown", () => {
   });
 
   it("keeps references as text when the session isn't on GitHub", () => {
-    seed(githubInfo({ provider: "gitlab" }));
+    seed(
+      githubInfo({
+        provider: "gitlab",
+        workspace_repo: { name_with_owner: "acme/app", host: "gitlab.com" },
+      }),
+    );
     renderMarkdown("See #4242 and acme/app#12");
-    expect(screen.queryByRole("link")).not.toBeInTheDocument();
-    expect(screen.getByText("#4242")).toBeVisible();
-  });
-
-  // pullRequestRefs.test.ts covers the other malformed names.
-  it("keeps references as text for a malformed repo name", () => {
-    seed(githubInfo({ repo: { name_with_owner: "javascript:alert(1)", host: "github.com" } }));
-    renderMarkdown("See #4242");
     expect(screen.queryByRole("link")).not.toBeInTheDocument();
     expect(screen.getByText("#4242")).toBeVisible();
   });
@@ -200,7 +198,7 @@ describe("pull request references in chat markdown", () => {
     seed(githubInfo());
     client.setQueryData(
       ["github-info", "conv_child"],
-      githubInfo({ repo: { name_with_owner: "acme/lib", host: "github.com" } }),
+      githubInfo({ workspace_repo: { name_with_owner: "acme/lib", host: "github.com" } }),
     );
     renderMarkdown("See #4242", true, (children) => (
       <ConversationScopeContext.Provider value="conv_child">
@@ -220,7 +218,7 @@ describe("pull request references in chat markdown", () => {
     seed(githubInfo());
     client.setQueryData(
       ["github-info", "conv_child"],
-      githubInfo({ repo: { name_with_owner: "acme/lib", host: "github.com" } }),
+      githubInfo({ workspace_repo: { name_with_owner: "acme/lib", host: "github.com" } }),
     );
     renderMarkdown("See #4242", true, (children) => (
       <ConversationScopeContext.Provider value="conv_child">
