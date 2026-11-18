@@ -30,6 +30,18 @@ def _policy(backend: str = "linux_bwrap", *, active: bool = True) -> sb.SandboxP
     )
 
 
+def _disposable_interpreter(runtime: Path) -> tuple[Path, Path]:
+    venv.EnvBuilder(with_pip=False, symlinks=True).create(runtime)
+    interpreter = runtime / "bin" / "python"
+    packages = (
+        runtime
+        / "lib"
+        / f"python{sys.version_info.major}.{sys.version_info.minor}"
+        / "site-packages"
+    )
+    return interpreter, packages
+
+
 @pytest.fixture
 def runtime_layout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     system = tmp_path / "system"
@@ -493,15 +505,7 @@ def test_runner_added_parent_import_path_remains_writable(
 def test_isolated_pth_import_root_remains_protected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    runtime = tmp_path / "runtime"
-    venv.EnvBuilder(with_pip=False, symlinks=True).create(runtime)
-    interpreter = runtime / "bin" / "python"
-    packages = (
-        runtime
-        / "lib"
-        / f"python{sys.version_info.major}.{sys.version_info.minor}"
-        / "site-packages"
-    )
+    interpreter, packages = _disposable_interpreter(tmp_path / "runtime")
     external = tmp_path / "startup-imports"
     external.mkdir()
     (packages / "external.pth").write_text(str(external) + "\n")
@@ -531,15 +535,7 @@ def test_isolated_pth_import_root_remains_protected(
 def test_external_pth_import_is_rejected_before_startup_code_runs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    runtime = tmp_path / "runtime"
-    venv.EnvBuilder(with_pip=False, symlinks=True).create(runtime)
-    interpreter = runtime / "bin/python"
-    packages = (
-        runtime
-        / "lib"
-        / f"python{sys.version_info.major}.{sys.version_info.minor}"
-        / "site-packages"
-    )
+    interpreter, packages = _disposable_interpreter(tmp_path / "runtime")
     external = tmp_path / "external"
     external.mkdir()
     workspace = tmp_path / "workspace"
@@ -566,15 +562,7 @@ def test_external_pth_import_is_rejected_before_startup_code_runs(
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX disposable venv")
 def test_unsupported_pth_startup_form_fails_closed(tmp_path: Path) -> None:
-    runtime = tmp_path / "runtime"
-    venv.EnvBuilder(with_pip=False, symlinks=True).create(runtime)
-    interpreter = runtime / "bin/python"
-    packages = (
-        runtime
-        / "lib"
-        / f"python{sys.version_info.major}.{sys.version_info.minor}"
-        / "site-packages"
-    )
+    interpreter, packages = _disposable_interpreter(tmp_path / "runtime")
     marker = tmp_path / "startup-ran"
     (packages / "dynamic.pth").write_text(
         f"import pathlib; pathlib.Path({str(marker)!r}).touch()\n"
@@ -762,15 +750,7 @@ def install():
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX disposable venv")
 def test_isolated_pth_roots_are_read_again_after_change(tmp_path: Path) -> None:
-    runtime = tmp_path / "runtime"
-    venv.EnvBuilder(with_pip=False, symlinks=True).create(runtime)
-    interpreter = runtime / "bin/python"
-    packages = (
-        runtime
-        / "lib"
-        / f"python{sys.version_info.major}.{sys.version_info.minor}"
-        / "site-packages"
-    )
+    interpreter, packages = _disposable_interpreter(tmp_path / "runtime")
     startup = packages / "external.pth"
     first = tmp_path / "first"
     second = tmp_path / "second"
@@ -794,15 +774,7 @@ def test_launcher_rejects_staged_coverage_startup(
 def test_wrapped_launcher_clears_inherited_coverage_before_python_startup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    runtime = tmp_path / "runtime"
-    venv.EnvBuilder(with_pip=False, symlinks=True).create(runtime)
-    interpreter = runtime / "bin/python"
-    packages = (
-        runtime
-        / "lib"
-        / f"python{sys.version_info.major}.{sys.version_info.minor}"
-        / "site-packages"
-    )
+    interpreter, packages = _disposable_interpreter(tmp_path / "runtime")
     marker = tmp_path / "coverage-ran"
     (packages / "coverage.py").write_text(
         f"from pathlib import Path\nPath({str(marker)!r}).touch()\n"
@@ -889,14 +861,7 @@ def test_disposable_runtime_startup_poison_is_rejected(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runtime = tmp_path / "workspace" / ".venv"
-    venv.EnvBuilder(with_pip=False, symlinks=True).create(runtime)
-    interpreter = runtime / "bin" / "python"
-    packages = (
-        runtime
-        / "lib"
-        / f"python{sys.version_info.major}.{sys.version_info.minor}"
-        / "site-packages"
-    )
+    interpreter, packages = _disposable_interpreter(runtime)
     marker = tmp_path / "host-startup-ran"
     startup = packages / "poison_startup.py"
     (packages / "poison.pth").write_text("import poison_startup\n")

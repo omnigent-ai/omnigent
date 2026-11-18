@@ -25,6 +25,7 @@ def validate_results(suite: str, needs: dict, *, draft: bool) -> None:
             outputs["database"] == "true",
         )
         selected["pytest"] = outputs["backend"] == "true"
+        selected["claude-containment"] = outputs["backend"] == "true"
         selected.update(
             {"omnidev": outputs["omnidev"] == "true", "codex-parity": outputs["sidecar"] == "true"}
         )

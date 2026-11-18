@@ -676,6 +676,19 @@ def test_workflows_connect_selection_to_jobs():
     assert sdk_check["if"] == "matrix.group == 'server-rest'"
     assert "kubernetes._ensure_sdk()" in sdk_check["run"]
     assert "openshell._ensure_sdk()" in sdk_check["run"]
+    claude_job = jobs["claude-containment"]
+    assert claude_job["needs"] == "scope"
+    assert "needs.scope.outputs.backend == 'true'" in claude_job["if"]
+    cli_test = next(
+        step
+        for step in claude_job["steps"]
+        if step.get("name") == "Test real CLI skill and child execution paths"
+    )
+    assert cli_test["env"]["OMNIGENT_CLAUDE_CLI_E2E"] == "1"
+    assert "--reruns 0" in cli_test["run"]
+    assert "test_real_cli_bash_tool_round_trip_and_inline_skill_finish" in cli_test["run"]
+    assert "test_each_cli_execution_path_inherits_the_sandbox" in cli_test["run"]
+    assert "len(cases) != 16 or skipped" in cli_test["run"]
     for name in ("pytest", "stores-postgres", "stores-cockroachdb", "stores-mysql"):
         assert jobs[name]["needs"] == "scope"
         output = "backend" if name == "pytest" else "database"
