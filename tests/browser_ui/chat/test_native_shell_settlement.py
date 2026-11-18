@@ -11,6 +11,89 @@ _USER = '[data-testid="message-bubble"][data-role="user"]'
 
 
 @pytest.mark.parametrize("width", [1280, 390], ids=["desktop", "mobile"])
+def test_cancelled_native_input_survives_reload_and_late_recording(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    output_path: str,
+    width: int,
+) -> None:
+    chat = chat_session_contract
+    chat.harness = "codex-native"
+    chat.event_ack = {"queued": True, "pending_id": "pending-cancelled"}
+    page.set_viewport_size({"width": width, "height": 844})
+    page.goto(chat.url)
+    chat.wait_for_stream()
+    composer = page.get_by_label("Message the agent")
+    composer.fill("Keep my original cancelled input")
+    with page.expect_response(
+        lambda response: response.url.endswith(f"/{chat.session_id}/events")
+    ):
+        page.get_by_role("button", name="Send", exact=True).click()
+    expect(page.locator(_USER)).to_have_count(1)
+    original = message_item(
+        "cancelled-user", "user", "Keep my original cancelled input", response_id="cancelled-turn"
+    )
+    original["native_input_state"] = "cancelled"
+    for state in ("cancelled", "cancelled"):
+        chat.emit(
+            {
+                "event": "session.input.consumed",
+                "data": {
+                    "type": "session.input.consumed",
+                    "data": {
+                        "item_id": original["id"],
+                        "type": "message",
+                        "cleared_pending_id": "pending-cancelled",
+                        "data": {
+                            "role": "user",
+                            "content": original["content"],
+                            "native_input_state": state,
+                        },
+                    },
+                },
+            }
+        )
+    bubble = page.locator(f'{_USER}[data-user-message-id="cancelled-user"]')
+    expect(bubble).to_contain_text("Keep my original cancelled input")
+    expect(bubble.get_by_text("Cancelled", exact=True)).to_be_visible()
+    expect(page.locator(_USER)).to_have_count(1)
+    page.screenshot(path=str(Path(output_path) / "cancelled-live.png"), full_page=True)
+
+    chat.set_items([original])
+    chat.update_session(pending_inputs=[])
+    page.reload()
+    chat.wait_for_stream()
+    expect(bubble.get_by_text("Cancelled", exact=True)).to_be_visible()
+    expect(page.locator(_USER)).to_have_count(1)
+    page.screenshot(path=str(Path(output_path) / "cancelled-reload.png"), full_page=True)
+
+    for state in ("recorded", "cancelled"):
+        chat.emit(
+            {
+                "event": "session.input.consumed",
+                "data": {
+                    "type": "session.input.consumed",
+                    "data": {
+                        "item_id": original["id"],
+                        "type": "message",
+                        "cleared_pending_id": "pending-cancelled",
+                        "data": {
+                            "role": "user",
+                            "content": original["content"],
+                            "native_input_state": state,
+                        },
+                    },
+                },
+            }
+        )
+    expect(bubble.get_by_text("Cancelled", exact=True)).to_have_count(0)
+    expect(bubble).to_contain_text("Keep my original cancelled input")
+    expect(page.locator(_USER)).to_have_count(1)
+    assert len(chat.event_posts) == 1
+    page.screenshot(path=str(Path(output_path) / "late-recorded.png"), full_page=True)
+
+
+@pytest.mark.parametrize("width", [1280, 390], ids=["desktop", "mobile"])
 def test_shell_mirror_settles_its_bubble_before_the_next_prompt(
     page: Page,
     chat_session_contract: ChatSessionContract,

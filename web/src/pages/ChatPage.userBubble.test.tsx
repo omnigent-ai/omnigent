@@ -61,15 +61,40 @@ function assistantBubble(
 }
 
 function renderBubble(bubble: Bubble) {
-  // File mention pills check the workspace through a query.
-  return render(
-    <QueryClientProvider client={new QueryClient()}>
-      <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
-        <BubbleView bubble={bubble} />
-      </FileViewerContext.Provider>
-    </QueryClientProvider>,
-  );
+  const client = new QueryClient();
+  return render(<BubbleView bubble={bubble} />, {
+    wrapper: ({ children }) => (
+      <QueryClientProvider client={client}>
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>{children}</FileViewerContext.Provider>
+      </QueryClientProvider>
+    ),
+  });
 }
+
+describe("confirmed native input cancellation", () => {
+  it("keeps the original message and explains that the agent did not record it", () => {
+    renderBubble(userBubble("Keep these **notes**", { nativeInputState: "cancelled" }));
+
+    expect(screen.getByText("notes")).toBeInTheDocument();
+    expect(screen.getByText("Cancelled")).toBeInTheDocument();
+    expect(screen.getByText("Stopped before the agent recorded this message.")).toBeInTheDocument();
+    expect(screen.queryByText(/Retry/)).not.toBeInTheDocument();
+  });
+
+  it("updates the same bubble when a verified native receipt arrives", () => {
+    const view = renderBubble(userBubble("Original text", { nativeInputState: "cancelled" }));
+    const original = screen.getByTestId("message-bubble");
+    expect(screen.getByText("Cancelled")).toBeInTheDocument();
+
+    view.rerender(
+      <BubbleView bubble={userBubble("Original text", { nativeInputState: "recorded" })} />,
+    );
+
+    expect(screen.getByTestId("message-bubble")).toBe(original);
+    expect(screen.queryByText("Cancelled")).not.toBeInTheDocument();
+    expect(screen.getAllByText("Original text")).toHaveLength(1);
+  });
+});
 
 describe("UserBubble markdown rendering", () => {
   it.each([false, true])(

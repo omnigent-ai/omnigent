@@ -84,6 +84,18 @@ function functionCallOutput(
 }
 
 describe("itemsToBlocks — flat shape", () => {
+  it.each(["cancelled", "recorded"] as const)(
+    "preserves native input state %s on reload",
+    (state) => {
+      const item = { ...userMessage("codex_turn", "original input"), native_input_state: state };
+      expect(itemsToBlocks([item])[0]).toMatchObject({
+        type: "user_message",
+        nativeInputState: state,
+        content: [{ type: "input_text", text: "original input" }],
+      });
+    },
+  );
+
   it("skips meta messages so hidden skill context is not rendered on reload", () => {
     const items: ConversationItem[] = [
       {

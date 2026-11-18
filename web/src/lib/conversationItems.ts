@@ -12,7 +12,7 @@
 // passed through silently as `BaseItem & Record<string, unknown>` so the
 // translator can skip them without crashing.
 
-import type { MessageContentBlock } from "./blocks";
+import type { MessageContentBlock, NativeInputState } from "./blocks";
 
 export interface BaseItem {
   id: string;
@@ -35,6 +35,7 @@ export interface MessageItem extends BaseItem {
   /** Explicit user action, possibly server-expanded skill instructions.
    * Independent of is_meta; client-settable by convention, not a trust signal. */
   user_authored?: boolean;
+  native_input_state?: NativeInputState;
   /** Hidden durable context such as injected skill instructions. */
   is_meta?: boolean;
   /** Assistant-only marker for durable partial text from an interrupted turn. */
