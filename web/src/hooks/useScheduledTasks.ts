@@ -7,6 +7,7 @@
 // row — no patch-in-place gymnastics are needed here.
 
 import {
+  keepPreviousData,
   useInfiniteQuery,
   useMutation,
   useQueries,
@@ -15,6 +16,7 @@ import {
   type InfiniteData,
   type QueryClient,
 } from "@tanstack/react-query";
+import { useEffect, useRef } from "react";
 import { invalidateSessionGrants } from "@/hooks/usePermissions";
 import { LIST_ROW_QUERY_ROOTS } from "@/lib/sessionListCache";
 import {
@@ -260,7 +262,7 @@ export function useScheduledTaskRunSteps(
   });
 }
 
-/** How often a page whose PRs may still change asks again. */
+/** How often a page whose PRs may still change, or whose last request failed, asks again. */
 const RUN_PULL_REQUESTS_REFETCH_MS = 60_000;
 /** A run's last PR report can reach the server this long after the run finished. */
 const RUN_PULL_REQUESTS_LATE_REPORT_MS = 5 * 60_000;
@@ -306,6 +308,20 @@ export function useScheduledTaskRunPullRequests(
     pages.push((runs ?? []).slice(start, start + RUN_STEPS_PAGE));
   }
   const newestUnsettled = hasUnsettledRun(pages[0]);
+  // A run's status or session activity can bring new PRs. The pages ask again
+  // without changing their keys, so a failed answer keeps the PRs already known.
+  const queryClient = useQueryClient();
+  const activity = (runs ?? [])
+    .map((run) => `${run.id}:${run.status}:${run.conversationUpdatedAt ?? ""}`)
+    .join(",");
+  const seenActivity = useRef(activity);
+  useEffect(() => {
+    if (seenActivity.current === activity) return;
+    seenActivity.current = activity;
+    if (enabled) {
+      void queryClient.invalidateQueries({ queryKey: ["scheduled-task-run-pull-requests", id] });
+    }
+  }, [activity, enabled, id, queryClient]);
   return useQueries({
     queries: pages.map((page, index) => {
       const after = index === 0 ? undefined : pages[index - 1]!.at(-1)!.id;
@@ -314,15 +330,20 @@ export function useScheduledTaskRunPullRequests(
           "scheduled-task-run-pull-requests",
           id,
           after ?? null,
-          page.map((run) => [run.id, run.status, run.conversationUpdatedAt]),
+          page.map((run) => run.id),
         ],
         queryFn: () => listScheduledTaskRunPullRequests(id, { limit: RUN_STEPS_PAGE, after }),
         enabled,
         staleTime: 30_000,
-        refetchInterval: (query: { state: { data?: ScheduledTaskRunPullRequestsPage } }) =>
+        // A page that shifts when a run is added keeps its PRs until it answers.
+        placeholderData: keepPreviousData,
+        refetchInterval: (query: {
+          state: { data?: ScheduledTaskRunPullRequestsPage; status: string };
+        }) =>
           index === 0 && newestUnsettled
             ? RUNS_REFETCH_INTERVAL_MS
-            : runPullRequestsMayChange(page, query.state.data, Date.now())
+            : query.state.status === "error" ||
+                runPullRequestsMayChange(page, query.state.data, Date.now())
               ? RUN_PULL_REQUESTS_REFETCH_MS
               : false,
       };

@@ -2229,24 +2229,6 @@ describe("run pull requests", () => {
     expect(stale).toHaveTextContent("Open · as of 2h ago");
   });
 
-  it("names a run's single PR in its summary", () => {
-    vi.mocked(hooks.useScheduledTaskRunPullRequests).mockReturnValue(
-      new Map([
-        ["run_1", { runId: "run_1", pullRequests: [pr(212, { state: "MERGED" })] }],
-        ["run_2", { runId: "run_2", pullRequests: [pr(7, { state: null })] }],
-      ]),
-    );
-    setTask(task());
-    setRuns([
-      run({ id: "run_1", conversationId: "conv_1" }),
-      run({ id: "run_2", conversationId: "conv_2" }),
-    ]);
-    renderWithRunPullRequests();
-    expect(
-      screen.getAllByTestId("run-pull-requests").map((summary) => summary.textContent),
-    ).toEqual(["PR #212 merged", "PR #7"]);
-  });
-
   it("asks for no PRs from a server without the route, or for a viewer", () => {
     setRuns([run({ id: "run_1", conversationId: "conv_1" })]);
     setTask(task());

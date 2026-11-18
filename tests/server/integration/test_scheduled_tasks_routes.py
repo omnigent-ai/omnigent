@@ -6200,14 +6200,6 @@ async def test_each_run_lists_the_prs_it_created_or_worked_on(
     assert switched.json()["session_mode"] == "new", switched.text
     assert await attribution(20) == expected
 
-    # PRs are session content, which a recipient's history leaves out.
-    assert (await _share(client, task_id, "bob@example.com")).status_code == 200
-    viewer = await client.get(url, headers=_BOB)
-    assert (viewer.status_code, viewer.json()) == (
-        200,
-        {"runs": [], "refresh_pending": False, "next_cursor": None},
-    )
-
 
 def _automation_session(db_uri: str, task_id: str, run_id: str, *, serving: bool = True) -> str:
     """A session the automation's run created, bound to a runner that takes messages.

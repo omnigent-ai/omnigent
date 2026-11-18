@@ -1215,7 +1215,7 @@ def register_events_routes(
     pull_request_store = server_prs.open_store(conversation_store)
 
     async def _end_run_pull_request_turn(
-        request: Request | _RunnerEventContext, session_id: str, labels: Mapping[str, str]
+        app: Any, session_id: str, labels: Mapping[str, str]
     ) -> None:
         """End the run's PR attribution because a person wrote to the session.
 
@@ -1228,7 +1228,7 @@ def register_events_routes(
             return
         run_finished = False
         if SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX + run_id in labels:
-            scheduled_store = getattr(request.app.state, "scheduled_task_store", None)
+            scheduled_store = getattr(getattr(app, "state", None), "scheduled_task_store", None)
             run = (
                 await asyncio.to_thread(scheduled_store.get_run, run_id)
                 if scheduled_store is not None
@@ -2562,7 +2562,8 @@ def register_events_routes(
             async def _direct_input() -> None:
                 # Typed in a native terminal; read the label as the item lands.
                 current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-                await _end_run_pull_request_turn(request, session_id, (current or conv).labels)
+                labels = current.labels if current is not None else conv.labels if conv else {}
+                await _end_run_pull_request_turn(getattr(request, "app", None), session_id, labels)
 
             item_id = await _persist_external_conversation_item(
                 session_id,
@@ -3812,7 +3813,7 @@ def register_events_routes(
             raise _session_not_found()
         conv = refreshed_conv
         if human_input:
-            await _end_run_pull_request_turn(request, session_id, conv.labels)
+            await _end_run_pull_request_turn(request.app, session_id, conv.labels)
         # A human's next turn ends attribution from an earlier continuation.
         # Leave a newer fire or a prompt still being dispatched untouched.
         pending_run_finished = False

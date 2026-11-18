@@ -753,20 +753,31 @@ describe("useScheduledTaskRunPullRequests", () => {
     }
   });
 
-  it("keeps the PRs it has when asking again fails", async () => {
+  it("keeps the PRs it has when asking again fails, and asks until the server is back", async () => {
     vi.useFakeTimers({ shouldAdvanceTime: false });
     try {
-      const { wrapper } = makeWrapper();
+      const { wrapper, queryClient } = makeWrapper();
       vi.mocked(api.listScheduledTaskRunPullRequests)
-        .mockResolvedValueOnce(page(["OPEN"]))
-        .mockRejectedValue(new Error("server unavailable"));
-      const { result } = renderHook(() => useScheduledTaskRunPullRequests("st_1", runs, true), {
-        wrapper,
-      });
+        .mockResolvedValueOnce(page(["MERGED"]))
+        .mockRejectedValueOnce(new Error("server unavailable"))
+        .mockResolvedValue(page(["MERGED", "OPEN"]));
+      const { result, rerender } = renderHook(
+        ({ current }) => useScheduledTaskRunPullRequests("st_1", current, true),
+        { wrapper, initialProps: { current: runs } },
+      );
       await tick(0);
-      await tick(60_000);
+      // Settled, so nothing asks again on its own.
+      await tick(180_000);
+      expect(api.listScheduledTaskRunPullRequests).toHaveBeenCalledTimes(1);
+      // Chat in the run's session makes the page ask again, and that request fails.
+      rerender({ current: [{ ...runs[0]!, conversationUpdatedAt: 1_700_000_900 }] });
+      await tick(0);
       expect(api.listScheduledTaskRunPullRequests).toHaveBeenCalledTimes(2);
-      expect(result.current.get("run_1")?.pullRequests[0]?.state).toBe("OPEN");
+      expect(result.current.get("run_1")?.pullRequests[0]?.state).toBe("MERGED");
+      // It keeps asking each minute after the failure, and recovers.
+      await tick(60_000);
+      expect(api.listScheduledTaskRunPullRequests).toHaveBeenCalledTimes(3);
+      expect(cachedStates(queryClient)).toEqual(["MERGED", "OPEN"]);
     } finally {
       vi.useRealTimers();
     }
