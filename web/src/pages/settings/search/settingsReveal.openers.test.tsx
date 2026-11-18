@@ -294,31 +294,37 @@ describe("a part shown only in some states", () => {
     }
   });
 
-  it("stops waiting once the user types in another field of the row, before any control has focus", async () => {
-    let enableSave: () => void = () => {};
-    function LateSave() {
-      const [enabled, setEnabled] = useState(false);
-      enableSave = () => setEnabled(true);
-      return (
-        <SettingsItem entry={TITLES}>
-          <textarea disabled {...settingsControlProps(TITLES)} />
-          <input aria-label="Notes" />
-          {enabled && (
-            <button type="button" {...settingsControlProps(TITLES, "save")}>
-              Save
-            </button>
-          )}
-        </SettingsItem>
-      );
-    }
-    chooseResult(TITLES, "save", <LateSave />);
-    const notes = document.querySelector<HTMLInputElement>('input[aria-label="Notes"]')!;
-    notes.focus();
-    fireEvent.keyDown(notes, { key: "a" });
-    act(() => enableSave());
-    await act(async () => {});
-    expect(document.activeElement).toBe(notes);
-  });
+  it.each([
+    ["types", (field: HTMLElement) => fireEvent.keyDown(field, { key: "a" })],
+    ["clicks", (field: HTMLElement) => fireEvent.pointerDown(field)],
+  ])(
+    "stops waiting once the user %s in another field of the row, before any control has focus",
+    async (_verb, interact) => {
+      let enableSave: () => void = () => {};
+      function LateSave() {
+        const [enabled, setEnabled] = useState(false);
+        enableSave = () => setEnabled(true);
+        return (
+          <SettingsItem entry={TITLES}>
+            <textarea disabled {...settingsControlProps(TITLES)} />
+            <input aria-label="Notes" />
+            {enabled && (
+              <button type="button" {...settingsControlProps(TITLES, "save")}>
+                Save
+              </button>
+            )}
+          </SettingsItem>
+        );
+      }
+      chooseResult(TITLES, "save", <LateSave />);
+      const notes = document.querySelector<HTMLInputElement>('input[aria-label="Notes"]')!;
+      notes.focus();
+      interact(notes);
+      act(() => enableSave());
+      await act(async () => {});
+      expect(document.activeElement).toBe(notes);
+    },
+  );
 
   it("stops waiting to take over once the reveal window closes", async () => {
     let enableSave: () => void = () => {};
