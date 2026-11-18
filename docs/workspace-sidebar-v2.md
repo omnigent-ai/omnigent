@@ -45,7 +45,10 @@ Being added:
   wheel through an omnigent extra. The host starts it on first use and stops
   it when idle. The host still authorizes each request, then forwards only an
   allowlist of read-only calls to the helper.
-- Search, and the git calls the Diffs page needs, in the workspace API.
+- Search, and the git calls the Diffs page needs, in the workspace API. Git
+  runs with the programs a repository's config can name turned off (external
+  diff commands, textconv drivers and filesystem-monitor hooks), so a read
+  never runs code the repository chose.
 
 Without the helper, file reads fall back to the host's Python reader, then to
 the REST file routes.
