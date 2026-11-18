@@ -103,7 +103,9 @@ def _ask_for_long_link(
 
 def _link_cells(rows: list[str], url: str) -> tuple[tuple[int, int], tuple[int, int]]:
     """Return a ``(row, column)`` inside the link on its first and its wrapped row."""
-    first_row = next(index for index, row in enumerate(rows) if "See https://" in row)
+    first_row = next((index for index, row in enumerate(rows) if "See https://" in row), None)
+    pane = "\n".join(rows)
+    assert first_row is not None and first_row + 1 < len(rows), f"link not on screen:\n{pane}"
     assert url not in rows[first_row], f"the link did not wrap: {rows[first_row]!r}"
     first_column = rows[first_row].index("https://") + len("https://") + 2
     continuation = rows[first_row + 1]
@@ -210,7 +212,7 @@ def test_fullscreen_claude_keeps_plain_clicks_and_command_click_opens(
     page.wait_for_timeout(2_000)  # custom-lint: disable=sleep-then-assert -- no tab may open
     assert opened == []
     assert len(page.context.pages) == 1
-    assert reports and all(code & 3 == 0 for code in reports)
+    assert [(code & 3, phase) for code, phase in reports] == [(0, "M"), (0, "m")], reports
 
     reports.clear()
     _command_click_opens(page, point, url)

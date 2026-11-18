@@ -34,7 +34,7 @@ _WRAPPED_URL = (
 )
 _TRACKED_URL = f"https://{_WRAPPED_URL_HOST}/docs/mouse-tracking"
 # SGR mouse report: ESC [ < button ; column ; row, then M for a press or m for a release.
-_SGR_BUTTON_REPORT = re.compile(r"\x1b\[<(\d+);\d+;\d+[Mm]")
+_SGR_BUTTON_REPORT = re.compile(r"\x1b\[<(\d+);\d+;\d+([Mm])")
 _SGR_MOTION_BIT = 32
 
 
@@ -112,14 +112,14 @@ def _record_pane_sizes(page: Page) -> list[list[tuple[int, int]]]:
     return panes
 
 
-def record_terminal_mouse_reports(page: Page) -> list[int]:
-    """Collect the button codes of SGR mouse reports the page sends to terminal sockets."""
-    reports: list[int] = []
+def record_terminal_mouse_reports(page: Page) -> list[tuple[int, str]]:
+    """Collect ``(button code, "M" press or "m" release)`` SGR reports sent to terminal sockets."""
+    reports: list[tuple[int, str]] = []
 
     def _on_frame(payload: str | bytes) -> None:
         text = payload.decode("latin-1") if isinstance(payload, bytes) else payload
         reports.extend(
-            int(match.group(1))
+            (int(match.group(1)), match.group(2))
             for match in _SGR_BUTTON_REPORT.finditer(text)
             if not int(match.group(1)) & _SGR_MOTION_BIT
         )
@@ -242,8 +242,8 @@ def test_mouse_tracking_program_keeps_plain_clicks_and_command_click_opens_the_l
         pass
     else:
         raise AssertionError("a plain click opened the link while the program tracks the mouse")
-    assert reports and all(code & 3 == 0 for code in reports), (
-        f"the plain click never reached the program as a left-button press: {reports}"
+    assert [(code & 3, phase) for code, phase in reports] == [(0, "M"), (0, "m")], (
+        f"the plain click did not reach the program as a left press and release: {reports}"
     )
 
     reports.clear()
