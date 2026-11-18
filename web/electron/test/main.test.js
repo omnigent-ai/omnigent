@@ -386,6 +386,7 @@ function loadNavigationHarness({
           findBars.push(bar);
           return bar;
         }
+        (calls.windowOptions ??= []).push(options);
         return win;
       },
       {
@@ -454,7 +455,12 @@ function loadNavigationHarness({
       }),
     },
     "./update_overlay": {
-      createUpdateOverlay: () => ({ ensureOverlay: () => {}, registerIpc: () => {} }),
+      createUpdateOverlay: () => ({
+        ensureOverlay: () => {
+          calls.overlays = (calls.overlays ?? 0) + 1;
+        },
+        registerIpc: () => {},
+      }),
     },
     "./localhost_cors": {
       isLocalhostUrl: require("../src/localhost_cors").isLocalhostUrl,
@@ -2858,6 +2864,8 @@ describe("panel windows", () => {
     assert.equal(h.api.mainWindows().length, 1);
     assert.equal(h.api.mainWindows()[0], h.win);
     assert.equal(h.api.activeWindow(), h.win);
+    assert.equal(h.calls.overlays, 1);
+    assert.equal(h.calls.windowOptions.at(-1).minWidth, 720);
     h.emitWindow("close");
     assert.deepEqual(savedBounds(h), { x: 0, y: 0, width: 1280, height: 860, maximized: false });
   });
@@ -2874,9 +2882,33 @@ describe("panel windows", () => {
     assert.equal(h.api.windows.get(h.win).origin, "https://host.example");
     assert.equal(h.api.mainWindows().length, 0);
     assert.equal(h.api.activeWindow(), null);
+    // Built from its own options, with the shell's webPreferences, and no update overlay.
+    const options = h.calls.windowOptions.at(-1);
+    assert.equal(options.type, "panel");
+    assert.equal(options.width, 560);
+    assert.equal(options.minWidth, undefined);
+    assert.equal(options.titleBarStyle, undefined);
+    assert.equal(options.webPreferences.contextIsolation, true);
+    assert.equal(h.calls.overlays, undefined);
     h.emitWindow("close");
     assert.equal(savedBounds(h), undefined);
   });
+
+  for (const [platform, closesPanel] of [
+    ["linux", true],
+    ["darwin", false],
+  ]) {
+    it(`${closesPanel ? "closes" : "keeps"} panels with the last main window on ${platform}`, (t) => {
+      const h = loadNavigationHarness({ platform });
+      t.after(h.cleanup);
+      h.api.createWindow();
+      let closed = 0;
+      const panel = { isDestroyed: () => false, close: () => (closed += 1) };
+      h.api.windows.set(panel, { origin: "https://host.example", role: "panel" });
+      h.emitWindow("closed");
+      assert.equal(closed, closesPanel ? 1 : 0);
+    });
+  }
 });
 
 describe("managed server preference wiring", () => {

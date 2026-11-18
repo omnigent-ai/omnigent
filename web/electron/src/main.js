@@ -1635,7 +1635,8 @@ function broadcastHostStatus() {
 
 /**
  * True for a regular shell window. A panel (see createWindow's `role`) is tracked too, but
- * app-level actions (menus, deep links, placement, the Dock) never target it.
+ * main-window fallbacks, deep links, placement and the Dock skip it. Menu items that act on
+ * the focused window still act on a focused panel.
  *
  * @param {BrowserWindow | null | undefined} win
  */
@@ -2946,6 +2947,10 @@ function createWindow(targetUrl, opts = {}) {
     awayWatches.delete(win);
     windows.delete(win);
     updateBadge(); // drop this window's contribution from the app-wide badge
+    // Off macOS the app quits once every window has closed, so panels go with the last main one.
+    if (isMain && process.platform !== "darwin" && mainWindows().length === 0) {
+      for (const panel of [...windows.keys()]) if (!panel.isDestroyed()) panel.close();
+    }
   });
   attachContextMenu(win);
   if (isMain) {
@@ -5964,7 +5969,8 @@ function closeFocused() {
     sendDesktopCommand(target, "close", {
       browserViewId: focusedBrowserViewId(target),
       // Off macOS, closing the last window quits; the page's confirmation says so.
-      closingQuits: process.platform !== "darwin" && mainWindows().length === 1,
+      closingQuits:
+        process.platform !== "darwin" && isMainWindow(target) && mainWindows().length === 1,
     });
     return;
   }
