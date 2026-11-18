@@ -320,27 +320,41 @@ async function disconnectHost(cliCommand, serverUrl) {
  *
  * @param {Parameters<typeof cli.cliCommandParts>[0]} cliCommand
  * @param {string} serverUrl
- * @param {{ onLogin?: () => void, loginTimeoutMs?: number }} [opts] `onLogin`
- *   fires just before the login (which may open the browser) runs.
+ * @param {{ onLogin?: () => void, loginTimeoutMs?: number, signal?: AbortSignal }} [opts]
+ *   `onLogin` fires just before the login (which may open the browser) runs;
+ *   aborting `signal` stops the login and resolves `{ ok: false, canceled: true }`.
  * @returns {Promise<{
  *   ok: boolean,
  *   authError?: boolean,
+ *   canceled?: boolean,
  *   error?: string,
  *   errorMessage?: string,
  *   errorAction?: string,
  *   failure?: import("./omnigent_cli").CliFailure,
  * }>}
  */
-async function ensureServerAuth(cliCommand, serverUrl, { onLogin, loginTimeoutMs } = {}) {
+async function ensureServerAuth(cliCommand, serverUrl, { onLogin, loginTimeoutMs, signal } = {}) {
+  if (signal?.aborted) return { ok: false, canceled: true };
   if (cli.isLoopbackServer(serverUrl)) return { ok: true };
-  const probe = await cli.probeServerAuth(serverUrl);
+  const probe = await cli.probeServerAuth(serverUrl, signal ? { signal } : undefined);
+  // Cancelled during the probe: neither report success nor start a login.
+  if (signal?.aborted) return { ok: false, canceled: true };
   const managedOmni = cli.cliCommandParts(cliCommand).prefixArgs[0] === "omni";
   // A legacy token can pass /v1/me but cannot supply the managed host's OAuth grant.
   // Skip unreachable servers so the connect attempt reports the connectivity error.
   if ((!managedOmni && probe.authed) || !probe.reachable) return { ok: true };
   onLogin?.();
-  const loginOptions = loginTimeoutMs === undefined ? [] : [{ timeoutMs: loginTimeoutMs }];
+  const loginOptions =
+    loginTimeoutMs === undefined && !signal
+      ? []
+      : [
+          {
+            ...(loginTimeoutMs === undefined ? {} : { timeoutMs: loginTimeoutMs }),
+            ...(signal ? { signal } : {}),
+          },
+        ];
   const res = await cli.loginServer(cliCommand, serverUrl, ...loginOptions);
+  if (signal?.aborted) return { ok: false, canceled: true };
   if (res.ok) return { ok: true };
   const { errorMessage, errorAction } = loginFailureCopy(
     cliCommand,

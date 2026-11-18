@@ -22,6 +22,9 @@ vi.mock("@/hooks/useProactiveAgentSettings", () => ({
     settings: mocks.advisor,
   }),
 }));
+vi.mock("@/components/ProactiveAgentAdminControls", () => ({
+  ProactiveAgentAdminControls: () => <div data-testid="advisor-admin-controls" />,
+}));
 vi.mock("@/components/ProactiveAgentSettingControl", () => ({
   ProactiveAgentSettingControl: ({ scope }: { scope: string }) => (
     <div data-testid={`advisor-control-${scope}`} />
@@ -65,6 +68,7 @@ describe("AdminGeneralPage", () => {
     mocks.advisor = { can_manage_workspace: true };
     renderPage();
     expect(screen.getByTestId("advisor-control-workspace")).toBeInTheDocument();
+    expect(screen.getByTestId("advisor-admin-controls")).toBeInTheDocument();
     expect(screen.queryByRole("combobox", { name: "Nested agent destinations" })).toBeNull();
   });
 
@@ -72,6 +76,7 @@ describe("AdminGeneralPage", () => {
     mocks.advisor = { can_manage_workspace: false };
     renderPage();
     expect(screen.queryByTestId("advisor-control-workspace")).toBeNull();
+    expect(screen.queryByTestId("advisor-admin-controls")).toBeNull();
     expect(screen.queryByTestId("settings-group-admin-proactive-agent")).toBeNull();
   });
 

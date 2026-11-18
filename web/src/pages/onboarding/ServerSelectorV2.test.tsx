@@ -266,7 +266,7 @@ describe("ServerSelectorV2", () => {
     expect(screen.getByText(/connecting to the local server/i)).toBeInTheDocument();
   });
 
-  it("a new MDM user's typed URL with no runner to set up opens directly, without installing", async () => {
+  it("a new MDM user's typed URL with no runner to set up and the CLI installed opens directly", async () => {
     const getRunnerOptions = vi.fn().mockResolvedValue({ remote: false, bundledCli: false });
     const onConnect = vi.fn().mockResolvedValue({});
     const onInstallCli = vi.fn().mockResolvedValue({ ok: true });
@@ -274,7 +274,7 @@ describe("ServerSelectorV2", () => {
     render(
       <ServerSelectorV2
         setup={makeSetup({
-          installed: false,
+          installed: true,
           managedServers: ["https://team.example.com/"],
           getRunnerOptions,
           onConnect,
@@ -296,6 +296,77 @@ describe("ServerSelectorV2", () => {
     expect(screen.queryByRole("heading", { name: /where do you work today/i })).toBeNull();
     expect(onInstallCli).not.toHaveBeenCalled();
     expect(onConnectRunner).not.toHaveBeenCalled();
+  });
+
+  // A new MDM user without the CLI joins a server that has no runner to set up.
+  function joinManagedServer(over: Partial<ServerSelectorV2Setup>) {
+    render(
+      <ServerSelectorV2
+        setup={makeSetup({
+          installed: false,
+          managedServers: ["https://team.example.com/"],
+          getRunnerOptions: vi.fn().mockResolvedValue({ remote: false, bundledCli: false }),
+          onConnectRunner: vi.fn().mockResolvedValue({ ok: true }),
+          onInstallCli: vi.fn().mockResolvedValue({ ok: true }),
+          ...over,
+        })}
+      />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: /join your team \(team\)/i }));
+  }
+
+  it("a new MDM user without the CLI can just join a server with no runner", async () => {
+    const onConnect = vi.fn().mockResolvedValue({});
+    const onInstallCli = vi.fn().mockResolvedValue({ ok: true });
+    const onConnectRunner = vi.fn().mockResolvedValue({ ok: true });
+    joinManagedServer({ onConnect, onInstallCli, onConnectRunner });
+    await screen.findByRole("heading", { name: /how do you want to join/i });
+    expect(screen.getByRole("radio", { name: /just join/i })).toBeChecked();
+    fireEvent.click(screen.getByRole("button", { name: "Open Omnigent" }));
+    await waitFor(() =>
+      expect(onConnect).toHaveBeenCalledWith("https://team.example.com/", expect.any(Function)),
+    );
+    expect(onInstallCli).not.toHaveBeenCalled();
+    expect(onConnectRunner).not.toHaveBeenCalled();
+  });
+
+  it("a new MDM user's typed URL gets the choice, and Install CLI first connects this laptop", async () => {
+    const calls: string[] = [];
+    const record = <T,>(name: string, result: T) =>
+      vi.fn(async () => {
+        calls.push(name);
+        return result;
+      });
+    const onConnectRunner = record("runner", { ok: true });
+    render(
+      <ServerSelectorV2
+        setup={makeSetup({
+          installed: false,
+          managedServers: ["https://team.example.com/"],
+          getRunnerOptions: vi.fn().mockResolvedValue({ remote: false, bundledCli: false }),
+          onInstallCli: record("install", { ok: true }),
+          onConnectRunner,
+          onConnect: record("connect", {}),
+        })}
+      />,
+    );
+    openPresetDropdown();
+    fireEvent.change(screen.getByLabelText("Server URL"), {
+      target: { value: "https://typed.example.com" },
+    });
+    fireEvent.keyDown(screen.getByLabelText("Server URL"), { key: "Enter" });
+    fireEvent.click(screen.getByRole("button", { name: "Join your team (typed.example.com)" }));
+    fireEvent.click(await screen.findByRole("radio", { name: /install cli first/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+    await waitFor(() => expect(calls).toEqual(["install", "runner", "connect"]));
+    expect(onConnectRunner).toHaveBeenCalledWith("https://typed.example.com/", "local");
+  });
+
+  it("Back from the MDM join choice returns to the landing", async () => {
+    joinManagedServer({});
+    await screen.findByRole("heading", { name: /how do you want to join/i });
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    expect(screen.getByRole("button", { name: /join your team \(team\)/i })).toBeInTheDocument();
   });
 
   it("a new MDM user's typed local install keeps the runner step", async () => {
@@ -872,6 +943,382 @@ describe("ServerSelectorV2", () => {
     render(<ServerSelectorV2 setup={makeSetup(over)} />);
     open();
     expect(screen.getByLabelText("Server URL")).toBeInTheDocument();
+  });
+
+  // A new user adds a server under "Join your team" and clicks Open.
+  function joinTypedServer(over: Partial<ServerSelectorV2Setup>) {
+    render(<ServerSelectorV2 setup={makeSetup(over)} />);
+    fireEvent.click(screen.getByRole("button", { name: /join your team/i }));
+    fireEvent.change(screen.getByLabelText("Server URL"), {
+      target: { value: "team.example.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Join" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Omnigent" }));
+  }
+
+  it("a new user without the CLI can just join from the server list, installing nothing", async () => {
+    const onConnect = vi.fn().mockResolvedValue({});
+    const onInstallCli = vi.fn().mockResolvedValue({ ok: true });
+    const onConnectRunner = vi.fn().mockResolvedValue({ ok: true });
+    joinTypedServer({ installed: false, onConnect, onInstallCli, onConnectRunner });
+    expect(
+      await screen.findByRole("heading", { name: /how do you want to join/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("radio", { name: /just join/i })).toBeChecked();
+    expect(screen.getByRole("radio", { name: /install cli first/i })).not.toBeChecked();
+    fireEvent.click(screen.getByRole("button", { name: "Open Omnigent" }));
+    await waitFor(() =>
+      expect(onConnect).toHaveBeenCalledWith("https://team.example.com/", expect.any(Function)),
+    );
+    expect(onInstallCli).not.toHaveBeenCalled();
+    expect(onConnectRunner).not.toHaveBeenCalled();
+  });
+
+  it("Install CLI first installs, connects this laptop, then opens the server", async () => {
+    const calls: string[] = [];
+    const record = <T,>(name: string, result: T) =>
+      vi.fn(async () => {
+        calls.push(name);
+        return result;
+      });
+    const onConnectRunner = record("runner", { ok: true });
+    joinTypedServer({
+      installed: false,
+      onInstallCli: record("install", { ok: true }),
+      onConnectRunner,
+      onConnect: record("connect", {}),
+    });
+    fireEvent.click(await screen.findByRole("radio", { name: /install cli first/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+    await waitFor(() => expect(calls).toEqual(["install", "runner", "connect"]));
+    expect(onConnectRunner).toHaveBeenCalledWith("https://team.example.com/", "local");
+  });
+
+  it("a failed CLI install from the server list can continue without a host", async () => {
+    const onConnect = vi.fn().mockResolvedValue({});
+    const onConnectRunner = vi.fn().mockResolvedValue({ ok: true });
+    const onInstallCli = vi.fn().mockResolvedValue({ ok: false, error: "Installer failed" });
+    joinTypedServer({ installed: false, onInstallCli, onConnectRunner, onConnect });
+    fireEvent.click(await screen.findByRole("radio", { name: /install cli first/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+    await screen.findByText("Installer failed");
+    expect(screen.getByRole("button", { name: "Retry" })).toBeInTheDocument();
+    onConnect.mockResolvedValueOnce({ error: "Server unavailable" });
+    fireEvent.click(screen.getByRole("button", { name: "Continue anyway" }));
+    await screen.findByText("Server unavailable");
+    expect(screen.queryByRole("button", { name: "Continue anyway" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(onConnect).toHaveBeenCalledTimes(2));
+    expect(onInstallCli).toHaveBeenCalledOnce();
+    expect(onConnectRunner).not.toHaveBeenCalled();
+  });
+
+  it("a failed CLI install can be retried, then connects this laptop and opens the server", async () => {
+    const onConnect = vi.fn().mockResolvedValue({});
+    const onConnectRunner = vi.fn().mockResolvedValue({ ok: true });
+    const onInstallCli = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: false, error: "Installer failed" })
+      .mockResolvedValueOnce({ ok: true });
+    joinTypedServer({ installed: false, onInstallCli, onConnectRunner, onConnect });
+    fireEvent.click(await screen.findByRole("radio", { name: /install cli first/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+    await screen.findByText("Installer failed");
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(onConnect).toHaveBeenCalledOnce());
+    expect(onInstallCli).toHaveBeenCalledTimes(2);
+    expect(onConnectRunner).toHaveBeenCalledWith("https://team.example.com/", "local");
+  });
+
+  it("Cancel during the install returns to the join choice, and a later finish does nothing", async () => {
+    let finishInstall: (v: { ok: boolean }) => void = () => {};
+    const onInstallCli = vi.fn(
+      () =>
+        new Promise<{ ok: boolean }>((resolve) => {
+          finishInstall = resolve;
+        }),
+    );
+    const onConnectRunner = vi.fn().mockResolvedValue({ ok: true });
+    const onConnect = vi.fn().mockResolvedValue({});
+    joinTypedServer({ installed: false, onInstallCli, onConnectRunner, onConnect });
+    fireEvent.click(await screen.findByRole("radio", { name: /install cli first/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+    await waitFor(() => expect(onInstallCli).toHaveBeenCalledOnce());
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await screen.findByRole("heading", { name: /how do you want to join/i });
+
+    await act(async () => finishInstall({ ok: true }));
+
+    expect(onConnectRunner).not.toHaveBeenCalled();
+    expect(onConnect).not.toHaveBeenCalled();
+  });
+
+  it.each([true, false])(
+    "Cancel during the laptop sign-in returns to the join choice (shell cancel resolves %s)",
+    async (shellStopped) => {
+      const onCancelRunnerConnect = vi.fn().mockResolvedValue(shellStopped);
+      const onConnectRunner = vi.fn(() => new Promise<{ ok: boolean }>(() => {}));
+      const onConnect = vi.fn().mockResolvedValue({});
+      joinTypedServer({
+        installed: false,
+        onInstallCli: vi.fn().mockResolvedValue({ ok: true }),
+        onConnectRunner,
+        onConnect,
+        onCancelRunnerConnect,
+      });
+      fireEvent.click(await screen.findByRole("radio", { name: /install cli first/i }));
+      fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+      await waitFor(() => expect(onConnectRunner).toHaveBeenCalledOnce());
+      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      await screen.findByRole("heading", { name: /how do you want to join/i });
+      expect(onCancelRunnerConnect).toHaveBeenCalledOnce();
+      expect(onConnect).not.toHaveBeenCalled();
+    },
+  );
+
+  it("a laptop connect that succeeds after Cancel doesn't open the server", async () => {
+    let finishRunner: (v: { ok: boolean }) => void = () => {};
+    const onConnectRunner = vi.fn(
+      () =>
+        new Promise<{ ok: boolean }>((resolve) => {
+          finishRunner = resolve;
+        }),
+    );
+    const onConnect = vi.fn().mockResolvedValue({});
+    joinTypedServer({
+      installed: false,
+      onInstallCli: vi.fn().mockResolvedValue({ ok: true }),
+      onConnectRunner,
+      onConnect,
+      onCancelRunnerConnect: vi.fn().mockResolvedValue(true),
+    });
+    fireEvent.click(await screen.findByRole("radio", { name: /install cli first/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+    await waitFor(() => expect(onConnectRunner).toHaveBeenCalledOnce());
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await screen.findByRole("heading", { name: /how do you want to join/i });
+
+    await act(async () => finishRunner({ ok: true }));
+
+    expect(onConnect).not.toHaveBeenCalled();
+    expect(screen.getByRole("heading", { name: /how do you want to join/i })).toBeInTheDocument();
+  });
+
+  it("a remote-environment connect offers no Cancel, since it can't be stopped from here", async () => {
+    await installFromRunnerStep(
+      {
+        installed: true,
+        getRunnerOptions: vi.fn().mockResolvedValue({ remote: true }),
+        onConnectRunner: vi.fn(() => new Promise<{ ok: boolean }>(() => {})),
+      },
+      undefined,
+      "Open Omnigent",
+    );
+    await screen.findByText(/connecting your remote environment/i);
+    expect(screen.queryByRole("button", { name: "Cancel" })).not.toBeInTheDocument();
+  });
+
+  it("starting the local server offers no Cancel, since it can't be stopped from here", async () => {
+    const onStartLocal = vi.fn(() => new Promise<{ ok: boolean }>(() => {}));
+    render(<ServerSelectorV2 setup={makeSetup({ installed: true, onStartLocal })} />);
+    fireEvent.click(screen.getByRole("button", { name: /get started locally/i }));
+    fireEvent.click(screen.getByRole("button", { name: /^(start|open) omnigent$/i }));
+    await waitFor(() => expect(onStartLocal).toHaveBeenCalledOnce());
+    expect(screen.queryByRole("button", { name: "Cancel" })).not.toBeInTheDocument();
+  });
+
+  it("a failed laptop connect after the install can retry or continue without a host", async () => {
+    const onConnect = vi.fn().mockResolvedValue({});
+    const onConnectRunner = vi.fn().mockResolvedValue({ ok: false, error: "no host" });
+    joinTypedServer({
+      installed: false,
+      onInstallCli: vi.fn().mockResolvedValue({ ok: true }),
+      onConnectRunner,
+      onConnect,
+    });
+    fireEvent.click(await screen.findByRole("radio", { name: /install cli first/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+    await screen.findByText("no host");
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    await screen.findByRole("heading", { name: /how do you want to join/i });
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    expect(screen.getByText("team.example.com")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open Omnigent" }));
+    fireEvent.click(await screen.findByRole("radio", { name: /install cli first/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+    await screen.findByText("no host");
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(onConnectRunner).toHaveBeenCalledTimes(3));
+    expect(onConnectRunner).toHaveBeenLastCalledWith("https://team.example.com/", "local");
+    fireEvent.click(await screen.findByRole("button", { name: "Continue anyway" }));
+    await waitFor(() => expect(onConnect).toHaveBeenCalledOnce());
+    expect(onConnectRunner).toHaveBeenCalledTimes(3);
+  });
+
+  it.each<[string, Partial<ServerSelectorV2Setup>]>([
+    ["can't install anything", {}],
+    ["can connect a runner but not install", { onConnectRunner: vi.fn() }],
+  ])("a shell that %s opens directly instead of offering the choice", async (_n, over) => {
+    const onConnect = vi.fn().mockResolvedValue({});
+    joinTypedServer({ installed: false, onConnect, ...over });
+    await waitFor(() => expect(onConnect).toHaveBeenCalledOnce());
+    expect(screen.queryByRole("heading", { name: /how do you want to join/i })).toBeNull();
+  });
+
+  it("a runner lookup that resolves after Back does nothing", async () => {
+    let resolveOptions: (v: { remote: boolean; bundledCli: boolean }) => void = () => {};
+    const getRunnerOptions = vi.fn(
+      () =>
+        new Promise<{ remote: boolean; bundledCli: boolean }>((resolve) => {
+          resolveOptions = resolve;
+        }),
+    );
+    const onConnect = vi.fn().mockResolvedValue({});
+    joinTypedServer({
+      installed: false,
+      getRunnerOptions,
+      onConnect,
+      onInstallCli: vi.fn().mockResolvedValue({ ok: true }),
+    });
+    await waitFor(() => expect(getRunnerOptions).toHaveBeenCalledOnce());
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    await act(async () => resolveOptions({ remote: false, bundledCli: false }));
+    expect(onConnect).not.toHaveBeenCalled();
+    expect(screen.queryByRole("heading", { name: /how do you want to join/i })).toBeNull();
+    expect(screen.getByRole("button", { name: /join your team/i })).toBeInTheDocument();
+  });
+
+  it("a failed CLI install can continue on shells without connectRunner", async () => {
+    const onConnect = vi.fn().mockResolvedValue({});
+    joinTypedServer({
+      installed: false,
+      onInstallCli: vi.fn().mockResolvedValue({ ok: false, error: "Installer failed" }),
+      onConnect,
+    });
+    fireEvent.click(await screen.findByRole("radio", { name: /install cli first/i }));
+    fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+    await screen.findByText("Installer failed");
+    fireEvent.click(screen.getByRole("button", { name: "Continue anyway" }));
+    await waitFor(() => expect(onConnect).toHaveBeenCalledOnce());
+  });
+
+  it.each<[string, Partial<ServerSelectorV2Setup>]>([
+    ["with connectRunner", { onConnectRunner: vi.fn().mockResolvedValue({ ok: true }) }],
+    ["without connectRunner", {}],
+  ])(
+    "without in-app install, Install CLI first shows the manual instructions (%s)",
+    async (_n, over) => {
+      const onConnect = vi.fn().mockResolvedValue({});
+      joinTypedServer({ installed: false, installSupported: false, onConnect, ...over });
+      fireEvent.click(await screen.findByRole("radio", { name: /install cli first/i }));
+      fireEvent.click(screen.getByRole("button", { name: "Install Omnigent" }));
+      expect(screen.getByRole("link", { name: "Installation instructions" })).toBeInTheDocument();
+      expect(onConnect).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: "Continue anyway" }));
+      await waitFor(() => expect(onConnect).toHaveBeenCalledOnce());
+    },
+  );
+
+  it("Back from the join choice returns to the server list", async () => {
+    joinTypedServer({
+      installed: false,
+      onInstallCli: vi.fn().mockResolvedValue({ ok: true }),
+      onRemoveServer: vi.fn(),
+    });
+    await screen.findByRole("heading", { name: /how do you want to join/i });
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    expect(screen.getByText("team.example.com")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open Omnigent" })).toBeEnabled();
+    fireEvent.pointerDown(
+      screen.getByRole("button", { name: /More options for team.example.com/ }),
+      {
+        button: 0,
+      },
+    );
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete from list" }));
+    expect(screen.queryByText("team.example.com")).not.toBeInTheDocument();
+  });
+
+  it("a removed session server stays removed after another trip through the join choice", async () => {
+    joinTypedServer({
+      installed: false,
+      onInstallCli: vi.fn().mockResolvedValue({ ok: true }),
+      onRemoveServer: vi.fn(),
+    });
+    await screen.findByRole("heading", { name: /how do you want to join/i });
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add server" }));
+    fireEvent.change(screen.getByLabelText("Server URL"), {
+      target: { value: "second.example.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Join" }));
+    fireEvent.pointerDown(
+      screen.getByRole("button", { name: /More options for team.example.com/ }),
+      { button: 0 },
+    );
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete from list" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Omnigent" }));
+    await screen.findByRole("heading", { name: /how do you want to join/i });
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    expect(screen.getByText("second.example.com")).toBeInTheDocument();
+    expect(screen.queryByText("team.example.com")).not.toBeInTheDocument();
+  });
+
+  it("Open shows it is busy and ignores repeat clicks while the runner lookup is pending", async () => {
+    const getRunnerOptions = vi.fn(() => new Promise<{ remote: boolean }>(() => {}));
+    joinTypedServer({
+      installed: false,
+      onInstallCli: vi.fn().mockResolvedValue({ ok: true }),
+      getRunnerOptions,
+    });
+    await waitFor(() => expect(getRunnerOptions).toHaveBeenCalledOnce());
+    const busy = screen.getByRole("button", { busy: true });
+    expect(busy).toBeDisabled();
+    fireEvent.click(busy);
+    expect(getRunnerOptions).toHaveBeenCalledOnce();
+  });
+
+  it("Back from the join choice keeps every server added this session", async () => {
+    joinTypedServer({ installed: false, onInstallCli: vi.fn().mockResolvedValue({ ok: true }) });
+    await screen.findByRole("heading", { name: /how do you want to join/i });
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    fireEvent.click(screen.getByRole("button", { name: "Add server" }));
+    fireEvent.change(screen.getByLabelText("Server URL"), {
+      target: { value: "second.example.com" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Join" }));
+    fireEvent.click(screen.getByRole("button", { name: "Open Omnigent" }));
+    await screen.findByRole("heading", { name: /how do you want to join/i });
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    expect(screen.getByText("team.example.com")).toBeInTheDocument();
+    expect(screen.getByText("second.example.com")).toBeInTheDocument();
+  });
+
+  it.each<[string, Partial<ServerSelectorV2Setup>]>([
+    // The connect must not wait for a runner lookup that never answers.
+    [
+      "the CLI is installed",
+      {
+        installed: true,
+        getRunnerOptions: vi.fn(() => new Promise<{ remote: boolean }>(() => {})),
+      },
+    ],
+    [
+      "the server has a bundled host CLI",
+      {
+        installed: false,
+        getRunnerOptions: vi.fn().mockResolvedValue({ remote: false, bundledCli: true }),
+      },
+    ],
+  ])("the server list opens directly when %s", async (_name, over) => {
+    const onConnect = vi.fn().mockResolvedValue({});
+    const onInstallCli = vi.fn().mockResolvedValue({ ok: true });
+    joinTypedServer({ onConnect, onInstallCli, ...over });
+    await waitFor(() =>
+      expect(onConnect).toHaveBeenCalledWith("https://team.example.com/", expect.any(Function)),
+    );
+    expect(screen.queryByRole("heading", { name: /how do you want to join/i })).toBeNull();
+    expect(onInstallCli).not.toHaveBeenCalled();
   });
 
   it("opens directly on the server step when a connect error is present", () => {

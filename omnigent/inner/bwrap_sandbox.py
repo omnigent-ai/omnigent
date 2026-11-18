@@ -87,6 +87,7 @@ from .sandbox import (
     HOST_SANDBOX_BACKEND_ENV,
     SandboxBackend,
     SandboxPolicy,
+    _check_relative_grant_containment,
     register_backend,
 )
 
@@ -315,18 +316,18 @@ class BwrapSandboxBackend(SandboxBackend):
 
         read_roots: list[Path] | None = None
         if sandbox_spec.read_paths is not None:
-            read_roots = [_resolve_root(cwd, root) for root in sandbox_spec.read_paths]
+            read_roots = [_resolve_grant(cwd, root) for root in sandbox_spec.read_paths]
 
         # Bwrap-specific default: cwd is RO unless the spec opts in.
         # Empty default honors the "no surprise writes" contract from
         # the design plan — agents that need an editable project tree
         # opt in via ``write_paths: ["."]``.
         write_grants = [
-            (_resolve_root(cwd, grant.path), grant.copy_on_write)
+            (_resolve_grant(cwd, grant.path), grant.copy_on_write)
             for grant in sandbox_spec.write_path_specs
         ]
         write_roots = [path for path, _ in write_grants]
-        write_files = [_resolve_root(cwd, path) for path in sandbox_spec.write_files or []]
+        write_files = [_resolve_grant(cwd, path) for path in sandbox_spec.write_files or []]
         copy_on_write_roots = sorted({path for path, disposable in write_grants if disposable})
         for root in copy_on_write_roots:
             if not root.is_dir():
@@ -347,6 +348,11 @@ class BwrapSandboxBackend(SandboxBackend):
             if sandbox_spec.cwd_allow_hidden is not None
             else list(_DEFAULT_CWD_ALLOW_HIDDEN)
         )
+        if ".git" in cwd_allow_hidden or "*" in cwd_allow_hidden:
+            _LOGGER.warning(
+                "linux_bwrap: cwd_allow_hidden grants the agent access to .git "
+                "in sandbox roots; audit whether the agent actually needs it."
+            )
 
         mask_paths = (
             [_resolve_root(cwd, path) for path in sandbox_spec.mask_paths]
@@ -909,6 +915,19 @@ def _resolve_root(cwd: Path, root: str) -> Path:
     if not path.is_absolute():
         path = cwd / path
     return path.resolve(strict=False)
+
+
+def _resolve_grant(cwd: Path, root: str) -> Path:
+    """
+    Resolve a read or write grant against *cwd* and reject a relative
+    grant whose target leaves *cwd* through a symlink.
+
+    Mask paths use :func:`_resolve_root` directly: a mask only denies
+    access, so a symlink there must not block the launch.
+    """
+    resolved = _resolve_root(cwd, root)
+    _check_relative_grant_containment(cwd, root)
+    return resolved
 
 
 def _is_same_path(a: Path, b: Path) -> bool:

@@ -1,4 +1,4 @@
-// Hand-written client for the six `/v1/scheduled-tasks` endpoints, mirroring
+// Hand-written client for the `/v1/scheduled-tasks` endpoints, mirroring
 // `omnigent/server/routes/scheduled_tasks.py`. Follows the same conventions as
 // the sibling `sessionsApi.ts`: requests go through the Vite `/v1` proxy, the
 // wire is snake_case while the TS surface is camelCase, and non-OK responses
@@ -28,6 +28,9 @@ export type ScheduledTaskExecutionTarget = "connected_host" | "managed_sandbox";
 
 /** Whether each run starts a new session or continues one. */
 export type ScheduledTaskSessionMode = "new" | "continue";
+
+/** The caller's role on a task: its owner, or someone it is shared with, who may only read it. */
+export type ScheduledTaskViewerRole = "owner" | "viewer";
 
 /** Terminal + in-flight statuses a single run can hold. */
 export type ScheduledTaskRunStatus =
@@ -99,6 +102,10 @@ export interface ScheduledTask {
    * next-run can't match the server anchor for INTERVAL>1 rules.
    */
   nextRunAt: string | null;
+  /** `"viewer"` when the task is shared with the caller; absent (older servers) means owner. */
+  viewerRole?: ScheduledTaskViewerRole;
+  /** The owner's display name, sent to a viewer; `null` for the owner. */
+  ownerDisplayName?: string | null;
 }
 
 /** One run of a scheduled task, camelCased from `_run_to_response`. */
@@ -263,6 +270,9 @@ interface ScheduledTaskWire {
   last_run_status: ScheduledTaskRunStatus | null;
   last_run_conversation_id: string | null;
   next_run_at: string | null;
+  // Absent on servers that predate sharing automations.
+  viewer_role?: ScheduledTaskViewerRole;
+  owner_display_name?: string | null;
 }
 
 /** Wire shape of a run row (snake_case), matching `_run_to_response`. */
@@ -352,6 +362,8 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     lastRunStatus: wire.last_run_status,
     lastRunConversationId: wire.last_run_conversation_id,
     nextRunAt: wire.next_run_at,
+    viewerRole: wire.viewer_role ?? "owner",
+    ownerDisplayName: wire.owner_display_name ?? null,
   };
 }
 
@@ -382,13 +394,45 @@ export async function listScheduledTasks(): Promise<ScheduledTask[]> {
   return (body.scheduled_tasks ?? []).map(taskFromWire);
 }
 
-/** Fetch one of the caller's scheduled tasks (404 if not owned). */
+/** One page of the automations other users shared with the caller. */
+export interface SharedScheduledTasksPage {
+  tasks: ScheduledTask[];
+  /** Cursor for the next page, or `null` on the last; a page can be short while it is set. */
+  nextCursor: string | null;
+}
+
+/** Page size for {@link listSharedScheduledTasks}; the server allows up to 100. */
+export const SHARED_SCHEDULED_TASKS_PAGE_SIZE = 50;
+
+/**
+ * List one page of the automations shared with the caller, directly or through a
+ * group, ordered by ID. Each task's `viewerRole` is `"viewer"`.
+ *
+ * @param after - The previous page's `nextCursor`, or `null` for the first page.
+ */
+export async function listSharedScheduledTasks(
+  after: string | null,
+): Promise<SharedScheduledTasksPage> {
+  const params = new URLSearchParams({ limit: String(SHARED_SCHEDULED_TASKS_PAGE_SIZE) });
+  if (after !== null) params.set("after", after);
+  const res = await authenticatedFetch(`/v1/scheduled-tasks/shared?${params}`);
+  const body = await readJsonOrThrow<{
+    scheduled_tasks?: ScheduledTaskWire[];
+    next_cursor?: string | null;
+  }>(res);
+  return {
+    tasks: (body.scheduled_tasks ?? []).map(taskFromWire),
+    nextCursor: body.next_cursor ?? null,
+  };
+}
+
+/** Fetch a scheduled task the caller owns or that is shared with them (404 otherwise). */
 export async function getScheduledTask(id: string): Promise<ScheduledTask> {
   const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}`);
   return taskFromWire(await readJsonOrThrow<ScheduledTaskWire>(res));
 }
 
-/** List a task's run history, most-recent-first (404 if not owned). */
+/** List a task's run history, most-recent-first (404 unless owned or shared). */
 export async function listScheduledTaskRuns(id: string): Promise<ScheduledTaskRun[]> {
   const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}/runs`);
   const body = await readJsonOrThrow<{ runs: ScheduledTaskRunWire[] }>(res);

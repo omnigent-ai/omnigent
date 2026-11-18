@@ -375,6 +375,31 @@ describe("HostBadge", () => {
     expect(tooltip).not.toHaveTextContent("Status:");
   });
 
+  it.each(["composer", "header"] as const)(
+    "opens the host picker from the %s menu when the session has no bindings",
+    (appearance) => {
+      useSessionMock.mockReturnValue({
+        session: { hostId: null, runnerId: null, workspace: null },
+        isLoading: false,
+        error: null,
+      });
+      useHostsMock.mockReturnValue({ data: undefined });
+      useSessionHostOnlineMock.mockReturnValue(null);
+      const { rerender } = render(
+        <HostBadge sessionId="conv_1" appearance={appearance} readOnly />,
+      );
+      const trigger = screen.getByTestId("composer-host-select");
+      expect(trigger).toHaveAccessibleName("No host bound");
+      fireEvent.pointerDown(trigger, { button: 0 });
+      expect(screen.queryByRole("menuitem", { name: "Switch host…" })).not.toBeInTheDocument();
+      rerender(<HostBadge sessionId="conv_1" appearance={appearance} />);
+      const item = screen.getByRole("menuitem", { name: "Switch host…" });
+      expect(item).not.toHaveAttribute("aria-disabled", "true");
+      fireEvent.click(item);
+      expect(screen.getByTestId("switch-host-dialog")).toHaveAttribute("data-current-host", "");
+    },
+  );
+
   it("keeps the composer host tooltip closed while the host menu is open", async () => {
     render(<HostBadge sessionId="conv_1" appearance="composer" />);
     const trigger = screen.getByTestId("composer-host-select");
@@ -781,6 +806,7 @@ describe("HostBadge during a sandbox launch", () => {
     expect(menu).not.toHaveTextContent("No host bound");
     expect(menu).not.toHaveTextContent("no host binding");
     expect(screen.queryByRole("menuitem", { name: "Reconnect host" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Switch host…" })).not.toBeInTheDocument();
   });
 
   it("names the launching provider until the bound sandbox's host record loads", () => {

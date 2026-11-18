@@ -509,6 +509,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   `tests/e2e_ui/start_session/test_sandbox_gateway_models_without_binding.py`,
   `tests/e2e_ui/start_session/test_sandbox_model_selection.py::test_optional_gateway_preview_without_a_host`
   and `tests/e2e_ui/start_session/test_sandbox_model_selection.py::test_sandbox_harness_without_reachable_models_blocks_launch`.
+  With no sandbox catalog for the harness (no model capability, or discovery
+  reports it `unconfigured`), Codex, Devin and Pi offer one "Default" row that
+  launches the harness's own default, while Claude Code lists its built-in
+  models.
 - Open a project's actions menu in the sidebar → **Project settings**, pick
   Claude Code, Codex, or Pi as the agent, then set **Model** and **Effort**.
   Click **New session in project** and check the pill shows both.
@@ -577,6 +581,11 @@ first message. Follow the **Side-chat settings** recipe in [Sessions](sessions.m
 for draft persistence and parent-isolation checks. The microphone beside
 **Ask a side question...** starts dictation. Edit and resend (pencil) on a sent
 side-chat message loads it into that side chat's composer, not the main one.
+
+**Grid cell** (desktop session grids, see [Sessions](sessions.md)): each cell's
+one-row composer shows the session's host status, permission mode (switchable by
+the owner) and harness. Switch hosts and see or switch the model from the
+full-screen view.
 
 ## Driving it with the repro environment
 

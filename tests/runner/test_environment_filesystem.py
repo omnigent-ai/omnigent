@@ -1664,7 +1664,7 @@ async def test_filesystem_changes_modified(
     resp = await client_with_registry.get(
         f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
     )
-    assert resp.status_code == 200
+    assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["object"] == "list"
     entries_by_path = {e["path"]: e for e in body["data"]}
@@ -2320,7 +2320,7 @@ async def test_content_search_limits_errors_and_hidden_files(
 
 @pytest.mark.parametrize("mode", ["missing", "timeout", "long-line"])
 def test_content_search_process_boundaries(tmp_path: Path, mode: str) -> None:
-    """Exercise the sandbox script with controlled executables and a short deadline."""
+    """Exercise the sandbox script with controlled executables and a bounded timeout."""
     from omnigent.runner.content_search import _SEARCH_SCRIPT
 
     if mode != "missing":
@@ -2335,15 +2335,17 @@ def test_content_search_process_boundaries(tmp_path: Path, mode: str) -> None:
     parameters = (
         "query = 'needle'\ncase_sensitive = False\nregex = False\nlimit = 2\nglob_args = []\n"
     )
-    # Record the owned child's PID before the shortened timer can kill it.
-    timer = (
-        "import threading\noriginal_timer = threading.Timer\n"
-        "def shortened_timer(seconds, callback):\n"
-        f"    with open({str(tmp_path / 'pid')!r}, 'w') as marker:\n"
-        "        marker.write(str(process.pid))\n"
-        "    return original_timer(0.2, callback)\n"
-        "threading.Timer = shortened_timer\n"
-    )
+    timer = ""
+    if mode == "timeout":
+        # Record the owned child's PID before the shortened timer can kill it.
+        timer = (
+            "import threading\noriginal_timer = threading.Timer\n"
+            "def shortened_timer(seconds, callback):\n"
+            f"    with open({str(tmp_path / 'pid')!r}, 'w') as marker:\n"
+            "        marker.write(str(process.pid))\n"
+            "    return original_timer(0.2, callback)\n"
+            "threading.Timer = shortened_timer\n"
+        )
     completed = subprocess.run(
         [sys.executable, "-I", "-c", parameters + timer + _SEARCH_SCRIPT],
         env={**os.environ, "PATH": str(tmp_path)},
@@ -3680,3 +3682,31 @@ def test_download_over_the_wire_fails_instead_of_truncating(
     message = str(excinfo.value)
     assert str(_DOWNLOAD_CHUNK) in message
     assert str(_SHRINK_SIZE) in message
+
+
+@pytest.mark.parametrize("directory", ["", "tree"])
+async def test_runner_listing_matches_the_host_reader(
+    client: httpx.AsyncClient, workspace: Path, directory: str
+) -> None:
+    """The workspace API lists through the host's reader, so it must answer like the runner."""
+    from omnigent.workspace_fs import WorkspaceReader
+
+    tree = workspace / "tree"
+    (tree / "sub").mkdir(parents=True)
+    (tree / "empty").mkdir()
+    (tree / ".hidden").write_text("x")
+    (tree / "file.txt").write_text("12345")
+    (tree / "dir-link").symlink_to(tree / "sub")
+    (tree / "broken-link").symlink_to(tree / "missing")
+    if sys.platform.startswith("linux"):
+        # Skipped by both: a non-UTF-8 name can't travel in JSON.
+        with open(os.path.join(os.fsencode(tree), b"bad-\xff"), "wb") as handle:
+            handle.write(b"x")
+    url = _FS_URL + (f"/{directory}" if directory else "")
+
+    runner = await client.get(url, params={"limit": 1000, "order": "asc"})
+    host = WorkspaceReader(workspace).list_directory(directory, limit=1000, after=None)
+
+    assert runner.status_code == 200, runner.text
+    assert runner.json()["data"] == host.data
+    assert runner.json()["has_more"] is host.has_more

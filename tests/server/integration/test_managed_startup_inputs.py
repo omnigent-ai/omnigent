@@ -45,6 +45,7 @@ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests._helpers.polling import poll_until_async
+from tests.budgets import budget
 from tests.server.helpers import build_agent_bundle, create_test_agent
 from tests.server.integration.test_managed_launch_failure_teardown import (
     _Env,
@@ -1272,7 +1273,8 @@ async def test_launch_cancelled_at_shutdown_before_binding_fails_its_saved_input
     env = startup_env
     session_id = await _create(env)
 
-    await asyncio.wait_for(cancel_managed_launch_tasks(drain_s=0.2), timeout=5)
+    # The drain precedes the launch's five-second failure-recording window.
+    await asyncio.wait_for(cancel_managed_launch_tasks(drain_s=0.2), timeout=budget(10.0))
 
     conv = env.conv_store.get_conversation(session_id)
     assert conv is not None and conv.labels[STARTUP_LABEL] == "failed"

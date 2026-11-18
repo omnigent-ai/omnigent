@@ -19,6 +19,34 @@ export const WAITING_FOR_YOU = "Waiting for you";
 /** The phase of a workflow question's prompt, which already marks its own task waiting. */
 export const WORKFLOW_QUESTION_PHASE = "workflow_request_input";
 
+/** What an agent last wrote about its work: a step's status and the few words it gave. */
+export interface StatusText {
+  status: StepStatus;
+  text: string;
+}
+
+/**
+ * The newest status text among *statuses*: the words the agent gave for the
+ * status it wrote last, e.g. "Opened 2 PRs". A status without text, such as
+ * `started`, doesn't count. `null` when no status has any.
+ *
+ * @param statuses - Status entries, e.g. each step's newest from a run's plan.
+ */
+export function latestStatusText(statuses: readonly JournalEntry[]): StatusText | null {
+  let newest: JournalEntry | null = null;
+  let found: StatusText | null = null;
+  for (const entry of statuses) {
+    const status = statusOf(entry);
+    const text = textOf(entry)?.trim();
+    if (entry.kind !== "status" || !status || !text) continue;
+    if (newest === null || entry.position > newest.position) {
+      newest = entry;
+      found = { status, text };
+    }
+  }
+  return found;
+}
+
 /** One plan step, as a plan entry's content lists it. */
 export interface JournalPlanStep {
   id: string;
@@ -70,6 +98,29 @@ export async function fetchJournalPage(
   );
   if (!response.ok) throw new Error(`Couldn't load the session's tasks (${response.status})`);
   return (await response.json()) as JournalPage;
+}
+
+/**
+ * Where an entry sits in the session's journal, from the entry just before it: positions run
+ * 0, 1, 2, … without gaps.
+ *
+ * @returns The entry's position, or null when the journal doesn't hold it.
+ */
+export async function fetchJournalEntryPosition(
+  conversationId: string,
+  entryId: string,
+  signal?: AbortSignal,
+): Promise<number | null> {
+  const params = new URLSearchParams({ order: "desc", after: entryId, limit: "1" });
+  const response = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(conversationId)}/journal?${params}`,
+    { signal },
+  );
+  if (response.status === 400 && (await response.clone().text()).includes("stale_cursor"))
+    return null;
+  if (!response.ok) throw new Error(`Couldn't place the journal entry (${response.status})`);
+  const page = (await response.json()) as JournalPage;
+  return page.data.length > 0 ? page.data[0].position + 1 : 0;
 }
 
 /** Entries in position order, without duplicates; later copies of an entry win. */

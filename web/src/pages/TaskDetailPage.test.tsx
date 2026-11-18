@@ -1012,6 +1012,165 @@ describe("sharing", () => {
   });
 });
 
+describe("an automation shared with the viewer", () => {
+  const sharingInfo: ServerInfo = {
+    ...SERVER_INFO_OFFLINE_FALLBACK,
+    scheduled_task_sharing: true,
+    features: { workflows: true },
+  };
+  const sharedTask = (overrides: Partial<ScheduledTask> = {}) =>
+    task({
+      ownerUserId: "alice@example.com",
+      viewerRole: "viewer",
+      ownerDisplayName: "Alice",
+      hostId: "h_owner",
+      projectId: "proj_owner",
+      ...overrides,
+    });
+
+  function renderShared(data: ScheduledTask, entry = "/tasks/st_1") {
+    vi.mocked(useViewerId).mockReturnValue("bob@example.com");
+    setTask(data);
+    render(<CapabilitiesProvider info={sharingInfo}>{pageTree([entry])}</CapabilitiesProvider>);
+  }
+
+  it("names its owner and shows every change disabled with why", () => {
+    renderShared(sharedTask(), "/tasks/st_1?share=1");
+    expect(screen.getByTestId("task-detail-owner")).toHaveTextContent("Shared by Alice");
+    const controls: [string, string][] = [
+      ["Share automation", "Only the automation's owner can share it."],
+      ["Edit automation", "Only the automation's owner can edit it."],
+      ["Delete automation", "Only the automation's owner can delete it."],
+      ["Run now", "Only the automation's owner can run it."],
+      ["Pause automation", "Only the automation's owner can pause it."],
+    ];
+    for (const [label, reason] of controls) {
+      const wrapper = screen.getByRole("group", { name: label });
+      expect(wrapper).toHaveAttribute("aria-disabled", "true");
+      const control = within(wrapper).getByRole(label === "Pause automation" ? "switch" : "button");
+      expect(control).toBeDisabled();
+      fireEvent.click(control);
+      fireEvent.focus(wrapper);
+      expect(screen.getByRole("tooltip")).toHaveTextContent(reason);
+      fireEvent.blur(wrapper);
+    }
+    expect(updateMutate).not.toHaveBeenCalled();
+    expect(deleteMutate).not.toHaveBeenCalled();
+    expect(runNowMutate).not.toHaveBeenCalled();
+    expect(screen.queryByTestId("edit-dialog-open")).toBeNull();
+    // A share link the owner would follow opens nothing for a viewer.
+    expect(screen.queryByTestId("share-dialog-open")).toBeNull();
+  });
+
+  it("says Resume on a paused automation", () => {
+    renderShared(sharedTask({ state: "paused" }));
+    expect(screen.getByRole("group", { name: "Resume automation" })).toHaveAttribute(
+      "aria-disabled",
+      "true",
+    );
+  });
+
+  it("keeps the owner's host, project and source session private", () => {
+    renderShared(sharedTask({ sourceSessionId: "conv_copy" }));
+    expect(screen.getByTestId("task-detail-starts-from")).toHaveTextContent(
+      "Each run starts with a copy of a session the owner chose.",
+    );
+    expect(screen.queryByRole("link", { name: "Weekly rubric copy" })).toBeNull();
+    openConfiguration();
+    expect(screen.getByTestId("task-detail-host")).toHaveTextContent("The owner's host");
+    expect(screen.queryByTestId("task-detail-project")).toBeNull();
+  });
+
+  it("lists each run's outcome without its session's data or tasks", () => {
+    const steps: ScheduledTaskRunSteps = {
+      runId: "run_1",
+      planId: "plan_1",
+      planGraphRevision: "graph-0",
+      isCurrent: true,
+      workflowId: "9".repeat(32),
+      planName: "Triage",
+      steps: [
+        { id: "explore", name: "Explore", goal: null, depends_on: [] },
+        { id: "fix", name: "Fix", goal: null, depends_on: ["explore"] },
+      ],
+      statuses: [],
+    };
+    // The server leaves every session field of a viewer's runs empty.
+    const withoutSession = {
+      conversationUpdatedAt: null,
+      conversationStatus: null,
+      viewerLastSeen: null,
+      viewerUnread: null,
+      sessionCostUsd: null,
+      conversationPendingApprovals: 0,
+      errorDetail: null,
+    };
+    setRuns([
+      run({ id: "run_1", conversationId: "c_9", ...withoutSession }),
+      run({
+        id: "run_2",
+        status: "failed",
+        errorCode: "runner_start_failed",
+        conversationId: "c_7",
+        ...withoutSession,
+      }),
+      run({ id: "run_3", status: "skipped", errorCode: "no_online_host", ...withoutSession }),
+    ]);
+    // Even a session the viewer flagged unread shows no dot on its run.
+    markConversationUnread("c_9", 1_700_000_500);
+    vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(new Map([["run_1", steps]]));
+    renderShared(sharedTask());
+
+    expect(hooks.useScheduledTaskRunSteps).toHaveBeenLastCalledWith(
+      "st_1",
+      expect.any(Array),
+      false,
+    );
+    const [succeeded, failed, skipped] = screen.getAllByTestId("task-detail-run");
+    expect(within(succeeded!).getByTestId("run-open")).toHaveAttribute("href", "/c/c_9");
+    expect(succeeded).toHaveAttribute("data-run-unread", "false");
+    expect(within(succeeded!).getByTestId("run-status-dot")).toHaveAttribute(
+      "data-run-icon",
+      "read",
+    );
+    expect(within(failed!).getByTestId("run-open")).toHaveAttribute("href", "/c/c_7");
+    expect(within(failed!).getByTestId("run-failure")).toHaveTextContent(
+      "Runner · The agent didn't start.",
+    );
+    expect(within(skipped!).getByTestId("run-failure")).toHaveTextContent(
+      "Host · None of your hosts was online.",
+    );
+    for (const testId of [
+      "run-cost",
+      "run-pending-approval",
+      "run-failure-detail",
+      "run-status-label",
+      "tasks-progress-segment",
+      "run-graph-button",
+    ]) {
+      expect(screen.queryByTestId(testId)).toBeNull();
+    }
+    expect(screen.queryByText(/Session cost is each session/)).toBeNull();
+
+    // The owner's same row shows its tasks and their controls.
+    cleanup();
+    vi.mocked(useViewerId).mockReturnValue("alice@example.com");
+    setTask(sharedTask({ viewerRole: "owner", ownerDisplayName: null }));
+    setRuns([run({ id: "run_1", status: "succeeded", conversationId: "c_9" })]);
+    render(<CapabilitiesProvider info={sharingInfo}>{pageTree()}</CapabilitiesProvider>);
+    expect(hooks.useScheduledTaskRunSteps).toHaveBeenLastCalledWith(
+      "st_1",
+      expect.any(Array),
+      true,
+    );
+    const ownersRow = screen.getByTestId("task-detail-run");
+    expect(within(ownersRow).getAllByTestId("tasks-progress-segment")).toHaveLength(2);
+    expect(within(ownersRow).getByTestId("plan-continue")).toBeInTheDocument();
+    expect(within(ownersRow).getByTestId("run-workflow-button")).toBeInTheDocument();
+    expect(screen.queryByTestId("task-detail-owner")).toBeNull();
+  });
+});
+
 describe("run history", () => {
   it.each([
     [1.234, "$1.23"],
@@ -1524,6 +1683,7 @@ it.each(["continue", "new"] as const)(
     setTask(
       task({
         prompt: "This automation watches Jira and starts one Omnigent session",
+        rrule: "FREQ=MINUTELY;INTERVAL=10",
         sessionMode,
         nextRunAt: "2026-03-10T14:00:00Z",
       }),
@@ -1538,14 +1698,15 @@ it.each(["continue", "new"] as const)(
         {pageTree()}
       </CapabilitiesProvider>,
     );
+    const schedule = screen.getByTestId("task-detail-schedule");
     if (sessionMode === "continue") {
-      expect(screen.getByTestId("task-detail-schedule")).toHaveTextContent(
-        "Runs when new items match",
-      );
-      expect(screen.getByTestId("task-detail-schedule")).not.toHaveTextContent("Next run");
+      expect(schedule).toHaveTextContent("Runs when new items match");
+      expect(schedule).not.toHaveTextContent("Every 10 minutes");
+      expect(schedule).not.toHaveTextContent("Next run");
       expect(screen.queryByTestId("task-detail-run-now")).not.toBeInTheDocument();
     } else {
-      expect(screen.getByTestId("task-detail-schedule")).toHaveTextContent("Next run");
+      expect(schedule).toHaveTextContent("Every 10 minutes");
+      expect(schedule).toHaveTextContent("Next run");
       expect(screen.getByTestId("task-detail-run-now")).toBeInTheDocument();
     }
   },
@@ -1581,6 +1742,16 @@ describe("runs of a saved workflow", () => {
   beforeEach(() => {
     vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(new Map());
   });
+
+  // Runs show their plans only while the server offers workflows.
+  const renderWithWorkflows = () =>
+    render(
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { workflows: true } }}
+      >
+        {pageTree()}
+      </CapabilitiesProvider>,
+    );
 
   it.each([false, true])("shows each run's tasks and graph (trigger header=%s)", (header) => {
     const prompt = header
@@ -1764,6 +1935,11 @@ describe("runs of a saved workflow", () => {
       expect(within(old!).queryByTestId("plan-continue")).toBeNull();
       expect(within(old!).queryByTestId("run-status-label")).toBeNull();
       expect(within(current!).getByRole("button", { name: "Stop" })).toBeInTheDocument();
+      // Both runs share the session, and each row keeps its own run's words.
+      expect(within(old!).getByTestId("run-status-text")).toHaveTextContent(
+        completed ? "Done: Found it" : "Started: Working",
+      );
+      expect(within(current!).getByTestId("run-status-text")).toHaveTextContent("Done: Found it");
       fireEvent.focus(within(old!).getAllByTestId("tasks-progress-segment")[0]!);
       expect(await screen.findByTestId("tasks-progress-card")).toHaveTextContent("Explore");
       expect(screen.queryByTestId("tasks-progress-menu")).toBeNull();
@@ -1773,6 +1949,104 @@ describe("runs of a saved workflow", () => {
       );
     },
   );
+
+  it("says what each run's agent last wrote about its work", () => {
+    setTask(task({ prompt: WORKFLOW_PROMPT }));
+    setRuns([
+      run({ id: "run_1", status: "succeeded", conversationId: "c_9" }),
+      run({ id: "run_2", status: "succeeded", conversationId: "c_8" }),
+      run({ id: "run_3", status: "succeeded", conversationId: "c_7" }),
+      run({ id: "run_4", status: "succeeded", conversationId: "c_6" }),
+    ]);
+    const written = (position: number, step: string, status: string, text: string | null) => ({
+      ...STEPS.statuses[0]!,
+      id: `s${position}`,
+      position,
+      step,
+      content: { status, text },
+    });
+    vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(
+      new Map([
+        ["run_1", STEPS],
+        [
+          "run_2",
+          {
+            ...STEPS,
+            runId: "run_2",
+            statuses: [
+              written(1, "explore", "done", "Found it"),
+              written(2, "fix", "failed", "CI is down"),
+            ],
+          },
+        ],
+        [
+          "run_3",
+          {
+            ...STEPS,
+            runId: "run_3",
+            // An earlier invocation of a continued session keeps its own words.
+            isCurrent: false,
+            statuses: [
+              written(1, "explore", "done", "Found it"),
+              written(2, "fix", "needs_input", "Approve the deploy?"),
+              written(3, "ship", "started", null),
+            ],
+          },
+        ],
+        [
+          "run_4",
+          {
+            ...STEPS,
+            runId: "run_4",
+            statuses: [
+              written(1, "explore", "done", "Found it"),
+              written(2, "fix", "started", "Retrying the build"),
+            ],
+          },
+        ],
+      ]),
+    );
+    renderWithWorkflows();
+
+    const [first, second, third, fourth] = screen
+      .getAllByTestId("task-detail-run")
+      .map((row) => within(row).getByTestId("run-status-text"));
+    expect(first).toHaveTextContent("Done: Found it");
+    expect(first!.className).not.toContain("text-amber");
+    // A failed step stands out, and what happened is shown before the words.
+    expect(second).toHaveTextContent("Failed: CI is down");
+    expect(within(second!).getByText("Failed:")).not.toHaveClass("sr-only");
+    expect(second).toHaveAttribute("data-run-status", "failed");
+    expect(second!.className).toContain("text-amber-700");
+    expect(second).toHaveAttribute("title", "CI is down");
+    // A started step has no words, so the newest ones are shown.
+    expect(third).toHaveTextContent("Waiting for you: Approve the deploy?");
+    // A started step that has words shows them, after its own prefix.
+    expect(fourth).toHaveTextContent("Started: Retrying the build");
+    expect(fourth).toHaveAttribute("data-run-status", "started");
+  });
+
+  it("shows no status text for a run without a plan, or whose agent gave no words", () => {
+    setTask(task({ prompt: WORKFLOW_PROMPT }));
+    setRuns([
+      run({ id: "run_1", status: "succeeded", conversationId: "c_9" }),
+      run({ id: "run_2", status: "succeeded", conversationId: "c_8" }),
+    ]);
+    vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(
+      new Map([
+        [
+          "run_2",
+          {
+            ...STEPS,
+            runId: "run_2",
+            statuses: [{ ...STEPS.statuses[0]!, content: { status: "started", text: null } }],
+          },
+        ],
+      ]),
+    );
+    renderWithWorkflows();
+    expect(screen.queryByTestId("run-status-text")).toBeNull();
+  });
 
   it("opens the run's workflow left of the graph button, with the Workflows page on", () => {
     setTask(task({ prompt: WORKFLOW_PROMPT }));
