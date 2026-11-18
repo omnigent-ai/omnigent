@@ -5270,7 +5270,20 @@ def test_prepare_claude_cli_path_wrap_failure_prevents_launch(monkeypatch) -> No
     launcher.assert_not_called()
 
 
-def test_launcher_integrity_failure_stops_default_and_explicit_cli(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("launcher_error", "default_guidance"),
+    [
+        ("untrusted runtime", None),
+        (
+            "mutable hard-link alias for trusted runtime",
+            "uv tool upgrade --reinstall --link-mode copy",
+        ),
+        ("unsupported .pth startup form", "Remove the unsupported Python startup hook"),
+    ],
+)
+def test_launcher_integrity_failure_stops_default_and_explicit_cli(
+    monkeypatch, launcher_error: str, default_guidance: str | None
+) -> None:
     from omnigent.inner import claude_sdk_executor as claude
 
     monkeypatch.setattr(claude.sys, "platform", "linux")
@@ -5279,13 +5292,18 @@ def test_launcher_integrity_failure_stops_default_and_explicit_cli(monkeypatch) 
     backend = Mock()
     backend.wrap_launcher_argv.return_value = ["sandboxed", "/usr/bin/claude"]
     monkeypatch.setattr(claude, "get_backend", lambda _: backend)
-    launcher = Mock(side_effect=OSError("untrusted runtime"))
+    launcher = Mock(side_effect=OSError(launcher_error))
     monkeypatch.setattr(claude, "create_exec_launcher", launcher)
 
-    with pytest.raises(OSError, match="untrusted runtime"):
+    with pytest.raises(OSError) as default_error:
         claude.prepare_tight_cli_process("/usr/bin/claude", cwd="/tmp/work")
-    with pytest.raises(OSError, match="untrusted runtime"):
+    assert launcher_error in str(default_error.value)
+    if default_guidance is not None:
+        assert "Default Claude CLI sandbox startup failed" in str(default_error.value)
+        assert default_guidance in str(default_error.value)
+    with pytest.raises(OSError) as explicit_error:
         claude.prepare_claude_cli_path("/usr/bin/claude", _wrap_probe_spec())
+    assert str(explicit_error.value) == launcher_error
     assert launcher.call_count == 2
 
 

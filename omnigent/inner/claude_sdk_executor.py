@@ -2316,7 +2316,23 @@ def prepare_tight_cli_process(
         raise OSError("Default Claude CLI sandbox resolved to an inactive policy")
     sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
     sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
-    launcher = create_exec_launcher(real_cli_path, sandbox)
+    launcher: str | None = None
+    try:
+        launcher = create_exec_launcher(real_cli_path, sandbox)
+    except OSError as exc:
+        if "mutable hard-link alias" in str(exc):
+            raise OSError(
+                f"Default Claude CLI sandbox startup failed: {exc}. For an older uv tool "
+                "install, run 'uv tool upgrade --reinstall --link-mode copy omnigent'."
+            ) from exc
+        if "unsupported .pth" in str(exc):
+            raise OSError(
+                f"Default Claude CLI sandbox startup failed: {exc}. Remove the unsupported "
+                "Python startup hook."
+            ) from exc
+        raise
+    if launcher is None:
+        raise OSError("Default Claude CLI sandbox launcher was not created")
     return PreparedClaudeCli(
         cli_path=launcher,
         enable_native_tools=False,

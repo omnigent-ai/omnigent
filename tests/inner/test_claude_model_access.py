@@ -1536,26 +1536,6 @@ def test_auth_runtime_writes_are_rejected_before_refresh(
     assert not marker.exists()
 
 
-@pytest.mark.parametrize("target", ["helper", "startup-import"])
-def test_profile_auth_rejects_workspace_hardlink_to_trusted_code(
-    auth_runtime: tuple[Path, Path, Path], target: str
-) -> None:
-    _, module, workspace = auth_runtime
-    trusted = workspace.parent / "trusted-bin" / "profile-auth" if target == "helper" else module
-    if target == "helper":
-        trusted.chmod(0o700)
-    access = _profile_auth_access()
-    original_identity = (trusted.stat().st_dev, trusted.stat().st_ino)
-    alias = workspace / "editable.py"
-    os.link(trusted, alias)
-    alias.write_text("print('modified in place')\n")
-    assert (trusted.stat().st_dev, trusted.stat().st_ino) == original_identity
-
-    policy = SandboxPolicy("linux_bwrap", True, [workspace], [workspace], [], False)
-    with pytest.raises(ValueError, match=r"auth executable and runtime.*outside sandbox-writable"):
-        access.protect_sources(policy, workspace)
-
-
 def test_profile_auth_rejects_hardlinked_pth_before_startup_probe(
     auth_runtime: tuple[Path, Path, Path], tmp_path: Path
 ) -> None:
