@@ -2954,10 +2954,11 @@ async def test_runner_os_env_helper_retires_after_returned_error_and_shell(
         assert shell_result["exit_code"] == 0
         cwd, pid = shell_result["stdout"].split()
         assert Path(cwd).resolve() == tmp_path.resolve()
-        assert int(pid) == replacement
-        assert not process_alive(replacement)
+        assert int(pid) != replacement
+        assert not process_alive(int(pid))
+        assert process_alive(replacement)
         after_shell = await _os_env_helper_pid(registry, spec, "conv_retire")
-        assert after_shell != replacement
+        assert after_shell == replacement
     finally:
         await registry.cleanup_session("conv_retire")
     assert not process_alive(after_shell)
@@ -2967,10 +2968,13 @@ async def test_runner_os_env_helper_retires_after_returned_error_and_shell(
 @pytest.mark.posix_only
 async def test_runner_os_env_helper_restarts_replaces_workspace_and_times_out(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A crash, workspace change or timeout replaces the helper and closes the old one."""
+    """Crashes and workspace changes replace file helpers; timed-out shells close their own."""
     import signal
+    from subprocess import Popen
 
+    from omnigent.inner import os_env as os_env_module
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.runner.tool_dispatch import _execute_os_env_tool
 
@@ -2999,6 +3003,15 @@ async def test_runner_os_env_helper_restarts_replaces_workspace_and_times_out(
         assert moved != restarted
         assert not process_alive(restarted)
 
+        processes: list[Popen[str]] = []
+        start_helper = os_env_module._HelperProcessClient._start_locked
+
+        def record_start(helper: os_env_module._HelperProcessClient) -> None:
+            start_helper(helper)
+            assert helper._proc is not None
+            processes.append(helper._proc)
+
+        monkeypatch.setattr(os_env_module._HelperProcessClient, "_start_locked", record_start)
         # A timed-out command's descendants may outlive it, so its helper is retired.
         timed_out = await _execute_os_env_tool(
             "sys_os_shell",
@@ -3008,8 +3021,10 @@ async def test_runner_os_env_helper_restarts_replaces_workspace_and_times_out(
             resource_registry=registry,
         )
         assert json.loads(timed_out)["timed_out"] is True
-        assert not process_alive(moved)
-        moved = await _os_env_helper_pid(registry, agent(tmp_path / "b"), "conv_a")
+        assert len(processes) == 1
+        assert processes[0].poll() is not None
+        assert process_alive(moved)
+        assert await _os_env_helper_pid(registry, agent(tmp_path / "b"), "conv_a") == moved
 
     finally:
         await registry.cleanup_session("conv_a")
@@ -3022,8 +3037,9 @@ async def test_runner_os_env_busy_helper_serves_concurrent_calls_and_cancellatio
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Concurrent calls bypass a busy session helper; a cancelled call's helper is closed."""
+    """A held file helper forces fallback; shell cancellation closes only its own helper."""
     import errno
+    from subprocess import Popen
     from unittest.mock import Mock
 
     import omnigent.inner.os_env as os_env_module
@@ -3037,9 +3053,19 @@ async def test_runner_os_env_busy_helper_serves_concurrent_calls_and_cancellatio
         ),
     )
     registry = SessionResourceRegistry()
+    held_lease = None
     blocked: asyncio.Task[str] | None = None
     gate_fd: int | None = None
     fifo = tmp_path / "gate"
+    processes: list[Popen[str]] = []
+    start_helper = os_env_module._HelperProcessClient._start_locked
+
+    def record_start(helper: os_env_module._HelperProcessClient) -> None:
+        start_helper(helper)
+        assert helper._proc is not None
+        processes.append(helper._proc)
+
+    monkeypatch.setattr(os_env_module._HelperProcessClient, "_start_locked", record_start)
 
     def open_gate() -> bool:
         nonlocal gate_fd
@@ -3053,6 +3079,8 @@ async def test_runner_os_env_busy_helper_serves_concurrent_calls_and_cancellatio
 
     try:
         session_helper = await _os_env_helper_pid(registry, spec, "conv_busy")
+        held_lease = await registry.lease_tool_environment("conv_busy", spec.os_env)
+        assert held_lease is not None
         os.mkfifo(fifo)
         (tmp_path / "note.txt").write_text("hi\n")
         blocked = asyncio.create_task(
@@ -3095,6 +3123,11 @@ async def test_runner_os_env_busy_helper_serves_concurrent_calls_and_cancellatio
         gate_fd = None
         with pytest.raises(asyncio.CancelledError):
             await blocked
+        assert len(processes) == 3
+        assert processes[1].poll() is not None
+        assert process_alive(session_helper)
+        await held_lease.release(reusable=False)
+        held_lease = None
         assert not process_alive(session_helper)
         replacement = await _os_env_helper_pid(registry, spec, "conv_busy")
         assert replacement != session_helper
@@ -3104,8 +3137,11 @@ async def test_runner_os_env_busy_helper_serves_concurrent_calls_and_cancellatio
         if blocked is not None:
             blocked.cancel()
             await asyncio.gather(blocked, return_exceptions=True)
+        if held_lease is not None:
+            await held_lease.release(reusable=False)
         await registry.cleanup_session("conv_busy")
     assert not process_alive(replacement)
+    assert all(process.poll() is not None for process in processes)
 
 
 _REVERT_NATIVE_TEXT = f"one{os.linesep}two{os.linesep}"
@@ -3355,17 +3391,30 @@ async def test_runner_os_env_surrogate_path_is_httpx_transport_safe(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("shared_copy_on_write", [True, False], ids=["shared-cow", "fork"])
+@pytest.mark.parametrize(
+    "shared_copy_on_write,credential_proxy",
+    [
+        pytest.param(True, False, id="shared-cow"),
+        pytest.param(False, False, id="fork"),
+        pytest.param(False, True, id="credential-proxy"),
+    ],
+)
 async def test_runner_os_env_dispatch_preserves_shared_and_fork_ownership(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     shared_copy_on_write: bool,
+    credential_proxy: bool,
 ) -> None:
-    """Shared overlays borrow the primary owner; fork calls own separate environments."""
+    """Overlays borrow their owner; forks and credential proxies use disposable helpers."""
     from unittest.mock import AsyncMock, Mock, call
 
     from omnigent.entities import DEFAULT_ENVIRONMENT_ID
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, WritePathSpec
+    from omnigent.inner.datamodel import (
+        CredentialProxySpec,
+        OSEnvSandboxSpec,
+        OSEnvSpec,
+        WritePathSpec,
+    )
     from omnigent.inner.os_env import OSEnvironment
     from omnigent.runner.tool_dispatch import _execute_os_env_tool
 
@@ -3386,10 +3435,11 @@ async def test_runner_os_env_dispatch_preserves_shared_and_fork_ownership(
         os_env=OSEnvSpec(
             type="caller_process",
             cwd=str(tmp_path),
-            fork=not shared_copy_on_write,
+            fork=not (shared_copy_on_write or credential_proxy),
             sandbox=OSEnvSandboxSpec(
                 type="none",
                 write_paths=[WritePathSpec(".", copy_on_write=shared_copy_on_write)],
+                credential_proxy=CredentialProxySpec(entries=[]) if credential_proxy else None,
             ),
         ),
     )
@@ -3516,6 +3566,143 @@ async def test_runner_os_env_error_is_httpx_transport_safe(
     finally:
         await registry.cleanup_session(session_id)
     assert [environment.close_count for environment in environments] == [1, 1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "start_in_scratch,outcome",
+    [
+        pytest.param(False, "success", id="cold-success"),
+        pytest.param(False, "error", id="cold-error"),
+        pytest.param(False, "timeout", id="cold-timeout"),
+        pytest.param(False, "raised", id="cold-raised"),
+        pytest.param(False, "cancelled", id="cold-cancelled"),
+        pytest.param(True, "success", id="scratch-workspace-retired"),
+    ],
+)
+async def test_runner_os_env_cold_shell_preserves_file_helper(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    start_in_scratch: bool,
+    outcome: str,
+) -> None:
+    """Cold shell calls leave file leases intact; scratch calls retain their workspace."""
+    from functools import partial
+    from unittest.mock import AsyncMock, Mock, call
+
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.os_env import OSEnvironment
+    from omnigent.inner.sandbox import SandboxPolicy
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+
+    shell_started = asyncio.Event()
+    shell_blocked = asyncio.Event()
+    shell_result = {
+        "success": {"stdout": "done", "exit_code": 0},
+        "error": {"error": "command failed", "exit_code": 1},
+        "timeout": {"error": "command timed out", "timed_out": True},
+        "raised": {"error": "shell failed"},
+    }
+
+    async def shell(**kwargs: object) -> dict[str, object]:
+        del kwargs
+        shell_started.set()
+        if outcome == "cancelled":
+            await shell_blocked.wait()
+        if outcome == "raised":
+            raise RuntimeError("shell failed")
+        return shell_result[outcome]
+
+    environments: list[Mock] = []
+
+    def create_environment(*args: object, **kwargs: object) -> Mock:
+        del args, kwargs
+        environment = Mock(spec=OSEnvironment)
+        environment.cwd = tmp_path.resolve()
+        environment.read = AsyncMock(return_value={"content": "file"})
+        environment.shell = AsyncMock(side_effect=shell)
+        environments.append(environment)
+        return environment
+
+    create = Mock(side_effect=create_environment)
+    monkeypatch.setattr("omnigent.inner.os_env.create_os_environment", create)
+    monkeypatch.setattr(
+        "omnigent.runner.resource_registry.resolve_sandbox",
+        lambda *_: SandboxPolicy(
+            backend_type="linux_bwrap",
+            active=True,
+            read_roots=None,
+            write_roots=[tmp_path],
+            write_files=[],
+            allow_network=False,
+        ),
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=str(tmp_path),
+            start_in_scratch=start_in_scratch,
+            sandbox=OSEnvSandboxSpec(type="linux_bwrap"),
+        ),
+    )
+    session_id = "conv_cold_shell"
+    registry = SessionResourceRegistry()
+    execute = partial(
+        _execute_os_env_tool,
+        agent_spec=spec,
+        conversation_id=session_id,
+        resource_registry=registry,
+    )
+    task: asyncio.Task[str] | None = None
+    try:
+        assert json.loads(await execute("sys_os_read", {"path": "note.txt"})) == {
+            "content": "file"
+        }
+        file_environment = environments[0]
+        task = asyncio.create_task(
+            execute("sys_os_shell", {"command": "example-command", "timeout": 7})
+        )
+        await asyncio.wait_for(shell_started.wait(), timeout=1.0)
+        if outcome == "cancelled":
+            assert not task.done()
+            assert json.loads(await execute("sys_os_read", {"path": "note.txt"})) == {
+                "content": "file"
+            }
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            assert json.loads(await task) == shell_result[outcome]
+
+        assert len(environments) == (1 if start_in_scratch else 2)
+        shell_environment = environments[0 if start_in_scratch else 1]
+        shell_environment.shell.assert_awaited_once_with(command="example-command", timeout=7)
+        shell_environment.close.assert_called_once_with()
+        if start_in_scratch:
+            assert create.call_count == 1
+        else:
+            file_environment.shell.assert_not_awaited()
+            file_environment.close.assert_not_called()
+            shell_environment.read.assert_not_awaited()
+            assert create.call_args_list[1] == call(
+                spec.os_env, additional_read_roots=[registry.codex_skills_dir(session_id)]
+            )
+        assert json.loads(await execute("sys_os_read", {"path": "note.txt"})) == {
+            "content": "file"
+        }
+        assert create.call_count == 2
+        assert file_environment.read.await_count == (
+            1 if start_in_scratch else 3 if outcome == "cancelled" else 2
+        )
+        environments[1 if start_in_scratch else 0].close.assert_not_called()
+    finally:
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await registry.cleanup_session(session_id)
+    for environment in environments:
+        environment.close.assert_called_once_with()
 
 
 @pytest.mark.asyncio
