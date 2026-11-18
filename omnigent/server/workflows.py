@@ -399,8 +399,9 @@ def create_workflows_router(
         """List one page of the workflows other people shared with the caller.
 
         A grant to the caller or to any of their groups counts, and each workflow is
-        listed once, ordered by ID. Deleted workflows and the caller's own are left
-        out, so a page can be short, or empty while ``next_cursor`` is set. Each item
+        listed once, ordered by ID. Deleted workflows, those of deleted accounts and the
+        caller's own are left out, so a page can be short, or empty while
+        ``next_cursor`` is set. Each item
         has ``viewer_role`` ``"viewer"`` and the owner's ``owner_display_name``. Empty
         on a server that cannot share workflows and for the local user.
 
@@ -431,11 +432,16 @@ def create_workflows_router(
                 principals, limit=limit, after_workflow_id=cursor
             )
             loaded = store.get_many(workflow_ids)
+            # A deleted owner's workflows stop being shared before their cleanup ends.
+            deleted = permission_store.deleted_accounts(
+                [workflow.user_id for workflow in loaded.values()]
+            )
             shared = [
                 workflow
                 for workflow_id in workflow_ids
                 if (workflow := loaded.get(workflow_id)) is not None
                 and workflow.user_id != user_id
+                and workflow.user_id not in deleted
             ]
             return shared, next_cursor
 

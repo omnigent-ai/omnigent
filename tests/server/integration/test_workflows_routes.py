@@ -1034,6 +1034,39 @@ async def test_people_a_workflow_is_shared_with_run_it_and_keep_their_runs_priva
     ).status_code == 200
 
 
+async def test_a_deleted_owners_workflow_stops_being_shared_before_its_cleanup_ends(
+    client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server import accounts_store as accounts_module
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+
+    workflow = await _save_workflow(client, "Release")
+    await _share(client, workflow["id"])
+    agent = await create_test_agent(client, user=BOB)
+    run = {"agent_id": agent["id"], "workflow_id": workflow["id"]}
+    started = await client.post("/v1/sessions", json=run, headers=_headers(BOB))
+    assert started.status_code == 201, started.text
+
+    def interrupted(*args: object, **kwargs: object) -> int:
+        raise RuntimeError("cleanup interrupted")
+
+    # The account is deleted, but removing its workflows fails at the first batch.
+    monkeypatch.setattr(accounts_module, "delete_grants_on_workflows", interrupted)
+    assert SqlAlchemyAccountStore(db_uri).delete_user(ALICE) is True
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    assert permissions.resolve_workflow_access([BOB], workflow["id"]) == LEVEL_READ
+
+    path = f"/v1/workflows/{workflow['id']}"
+    assert (await client.get(path, headers=_headers(BOB))).status_code == 404
+    assert (await client.get("/v1/workflows/shared", headers=_headers(BOB))).json()["data"] == []
+    again = await client.post("/v1/sessions", json=run, headers=_headers(BOB))
+    assert again.status_code == 400, again.text
+    assert "workflow_not_found" in again.json()["error"]["message"]
+    # The run Bob already made stays his.
+    journal = f"/v1/sessions/{started.json()['id']}/journal"
+    assert (await client.get(journal, headers=_headers(BOB))).status_code == 200
+
+
 async def test_deleting_a_workflow_deletes_who_it_was_shared_with(
     client: httpx.AsyncClient, db_uri: str
 ) -> None:

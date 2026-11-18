@@ -28830,7 +28830,7 @@
     },
     "/v1/workflows/shared": {
       "get": {
-        "description": "List one page of the workflows other people shared with the caller.\n\nA grant to the caller or to any of their groups counts, and each workflow is\nlisted once, ordered by ID. Deleted workflows and the caller's own are left\nout, so a page can be short, or empty while `next_cursor` is set. Each item\nhas `viewer_role` `\"viewer\"` and the owner's `owner_display_name`. Empty\non a server that cannot share workflows and for the local user.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 403 for an agent's request, 400 for a malformed cursor.",
+        "description": "List one page of the workflows other people shared with the caller.\n\nA grant to the caller or to any of their groups counts, and each workflow is\nlisted once, ordered by ID. Deleted workflows, those of deleted accounts and the\ncaller's own are left out, so a page can be short, or empty while\n`next_cursor` is set. Each item\nhas `viewer_role` `\"viewer\"` and the owner's `owner_display_name`. Empty\non a server that cannot share workflows and for the local user.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 403 for an agent's request, 400 for a malformed cursor.",
         "operationId": "list_shared_workflows_v1_workflows_shared_get",
         "parameters": [
           {

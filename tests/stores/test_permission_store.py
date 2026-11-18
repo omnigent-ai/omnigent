@@ -2154,6 +2154,7 @@ def test_store_without_workflow_grants_keeps_safe_defaults() -> None:
     assert minimal.resolve_workflow_access(["alice@example.com"], "flow") is None
     assert minimal.list_workflows_shared_with(["alice@example.com"]) == ([], None)
     assert minimal.delete_for_workflow("flow") == 0
+    assert minimal.deleted_accounts(["alice@example.com"]) == set()
 
 
 def test_direct_session_reads_default_to_the_stores_reads() -> None:

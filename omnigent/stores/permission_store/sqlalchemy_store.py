@@ -1036,6 +1036,22 @@ class SqlAlchemyPermissionStore(PermissionStore):
             row = session.get(SqlUser, (current_workspace_id(), user_id))
             return _to_account(row) if row is not None and row.deleted_at is None else None
 
+    def deleted_accounts(self, user_ids: Sequence[str]) -> set[str]:
+        """Read the tombstones among *user_ids* by primary key. See base class."""
+        wanted = sorted(set(user_ids))
+        if not wanted:
+            return set()
+        with self._session("read_deleted_accounts") as session:
+            return set(
+                session.execute(
+                    select(SqlUser.id).where(
+                        SqlUser.workspace_id == current_workspace_id(),
+                        SqlUser.id.in_(wanted),
+                        SqlUser.deleted_at.is_not(None),
+                    )
+                ).scalars()
+            )
+
     def user_exists(self, user_id: str) -> bool:
         """Check for a user row. See base class for contract."""
         with self._session("select_user_exists") as session:

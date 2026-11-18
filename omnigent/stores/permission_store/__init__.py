@@ -300,6 +300,18 @@ class PermissionStore(ABC):
         """Read the target account and generation before an operation on another user."""
         ...
 
+    def deleted_accounts(self, user_ids: Sequence[str]) -> set[str]:  # noqa: ARG002
+        """Return those of *user_ids* that name a deleted account, read in one batch.
+
+        Callers refuse what a deleted owner shared while the account's cleanup is
+        still removing it. An identity with no account row, such as one an SSO proxy
+        supplies, is never deleted. The default knows of no deleted accounts.
+
+        :param user_ids: User IDs, e.g. the owners of a page of shared workflows.
+        :returns: The deleted ones.
+        """
+        return set()
+
     @abstractmethod
     def user_exists(self, user_id: str) -> bool:
         """Check whether a user row exists, without creating it.

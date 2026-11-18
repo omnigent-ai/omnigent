@@ -624,6 +624,19 @@ def test_reregistration_finishes_an_interrupted_workflow_grant_cleanup(db_uri, m
     assert held_grants() == 0
 
 
+def test_deleted_accounts_names_only_tombstoned_users(db_uri):
+    accounts = SqlAlchemyAccountStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    accounts.create_user_with_password("alice", "alice-hash")
+    accounts.create_user_with_password("bob", "bob-hash")
+    assert accounts.delete_user("alice") is True
+    # "carol" has no account row, as an identity an SSO proxy supplies may not.
+    assert permissions.deleted_accounts(["alice", "bob", "carol", "alice"]) == {"alice"}
+    assert permissions.deleted_accounts([]) == set()
+    accounts.create_user_with_password("alice", "replacement-hash")
+    assert permissions.deleted_accounts(["alice"]) == set()
+
+
 def test_deletion_removes_all_preferences_only_for_user_in_workspace(db_uri: str) -> None:
     from sqlalchemy import select
     from sqlalchemy.orm import Session
