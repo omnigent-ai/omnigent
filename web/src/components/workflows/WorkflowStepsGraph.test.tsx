@@ -129,29 +129,18 @@ describe("WorkflowStepsGraph", () => {
     expect(screen.queryByTestId("workflow-graph-overlay")).toBeNull();
   });
 
-  it("shows a step's full name and goal on hover, with no menu", async () => {
-    render(<WorkflowStepsGraph steps={STEPS} title="Triage flaky tests" />);
+  it("shows a step's full name and goal on hover, wrapped inside its card, with no menu", async () => {
+    const goal = `\`${LONG_PATH}\` passes`;
+    render(
+      <WorkflowStepsGraph steps={[STEPS[0]!, { ...STEPS[1]!, goal }]} title="Triage flaky tests" />,
+    );
     const fix = screen.getAllByTestId("workflow-step-node")[1]!;
     expect(within(fix).queryByTestId("workflow-step-node-menu")).toBeNull();
+    expect(within(fix).getByText(goal).parentElement).toHaveClass("wrap-anywhere");
     await userEvent.hover(fix);
     const card = await screen.findByTestId("workflow-step-card");
     expect(card).toHaveTextContent("Step 2 of 2");
     expect(card).toHaveTextContent("Fix the test");
-    expect(card).toHaveTextContent("The suite passes");
-  });
-
-  it("wraps a long path in a step's box and in its card, which zooming doesn't scale", async () => {
-    const goal = `\`${LONG_PATH}\` passes`;
-    render(
-      <WorkflowStepsGraph
-        steps={[{ id: "check", name: "Run the suite", goal, depends_on: [] }]}
-        title="Triage flaky tests"
-      />,
-    );
-    const node = screen.getByTestId("workflow-step-node");
-    expect(within(node).getByText(goal).parentElement).toHaveClass("wrap-anywhere");
-    await userEvent.hover(node);
-    const card = await screen.findByTestId("workflow-step-card");
     expect(card).toHaveTextContent(goal);
     // The graph zooms by scaling what's inside it; the card opens outside it.
     expect(screen.getByTestId("react-flow")).not.toContainElement(card);
