@@ -587,10 +587,12 @@ side-chat message loads it into that side chat's composer, not the main one.
 one-row composer shares its session's draft with the full-screen composer, sends
 its tags and review comments as the full-screen composer does, and shows the
 review comments as chips. It also shows the session's host, permission mode
-(switchable by the owner) and harness. Shift+Tab in the cell's composer steps that
-session's mode too; side chats and subagent tabs keep Shift+Tab for focus. Switch
-the host from the cell's host menu when you can edit the session. See or switch
-the model from the full-screen view.
+(switchable by the owner), and the same model and effort picker as the full-screen
+composer, which changes only that session (Smart Routing too, where eligible).
+Shift+Tab in the cell's composer steps that session's mode too; side chats and
+subagent tabs keep Shift+Tab for focus. Switch the host from the cell's host menu
+when you can edit the session. The model picker is inert for a viewer who can't
+edit the session and while the session is unreachable.
 
 ## Driving it with the repro environment
 

@@ -15,9 +15,13 @@ import { isFeatureEnabled } from "@/lib/capabilities";
 import { cn } from "@/lib/utils";
 import { Maximize2Icon, XIcon } from "lucide-react";
 import { SideChatPane } from "@/components/chat/SideChatPane";
-import { COMPOSER_COLLAPSED_LABEL_CLASS } from "@/components/composer/ChatComposer";
+import { SessionHarnessPicker } from "@/components/composer/SessionHarnessPicker";
+import {
+  composerHarnessLabel,
+  modelResetSupported,
+  useSessionPickerInputs,
+} from "@/components/composer/sessionPickerInputs";
 import { ComposerPermissionPicker } from "@/components/composer/ComposerControls";
-import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { HostBadge } from "@/components/HostBadge";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { Button } from "@/components/ui/button";
@@ -38,13 +42,14 @@ import { terminalTabKey, useDeleteTerminal } from "@/hooks/useTerminals";
 import { useWorkspaceResources } from "@/shell/useWorkspaceResources";
 import { supportsBrowser } from "@/lib/nativeBridge";
 import {
+  isNativeTerminalSession,
   isNativeWrapper,
-  nativeCodingAgentForHarness,
   nativeCodingAgentForSubagentWrapper,
 } from "@/lib/nativeCodingAgents";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import type { Session } from "@/lib/types";
 import { retrySession } from "@/lib/sessionsApi";
+import { useBrainHarnessLabels } from "@/lib/agentLabels";
 import { readTranscriptViewDefault } from "@/lib/transcriptViewPreferences";
 import { MainTerminalView } from "@/shell/MainTerminalView";
 import { TerminalFirstContextProvider, type TerminalFirstView } from "@/shell/TerminalFirstContext";
@@ -467,7 +472,14 @@ export function GridSessionPane({
                         <GridPermissionPicker permission={permission} />
                       </>
                     ),
-                    trailing: session && <GridHarnessStatus session={session} />,
+                    trailing: session && (
+                      <GridSessionHarnessPicker
+                        sessionId={sessionId}
+                        session={session}
+                        disabled={!canEdit || unreachable}
+                        wakesSession={isNativeTerminalSession(session) && runnerOnline === false}
+                      />
+                    ),
                     cyclePermissionMode: permission.cycle,
                   }}
                 />
@@ -624,26 +636,61 @@ function GridPermissionPicker({ permission }: { permission: GridPermissionContro
   );
 }
 
-/** The cell session's harness, read-only; the model is shown and switched full screen. */
-function GridHarnessStatus({ session }: { session: Session }) {
-  const agent = nativeCodingAgentForHarness(session.harness);
-  const label = agent?.displayName ?? session.agentName ?? "Session";
+/**
+ * The cell session's model, effort and Smart Routing picker, as the full-screen
+ * composer shows it. It reads and writes this session only; the busy state is this cell's.
+ */
+function GridSessionHarnessPicker({
+  sessionId,
+  session,
+  disabled,
+  wakesSession,
+}: {
+  sessionId: string;
+  session: Session;
+  disabled: boolean;
+  wakesSession: boolean;
+}) {
+  const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
+  const brainHarnessLabels = useBrainHarnessLabels();
+  // shortcut: no sandbox launch-preview fallback, so a launching sandbox lists no
+  // models until its host is bound; pass ChatPage's launchPreviewOptions if that matters.
+  const inputs = useSessionPickerInputs(sessionId, session);
+  const wrapper = session.labels?.["omnigent.wrapper"] ?? null;
   return (
-    <span
-      title={label}
-      aria-label={label}
-      data-testid="grid-harness-status"
-      className="flex h-8 min-w-0 items-center gap-1 px-2 text-muted-foreground md:h-7"
-    >
-      <ComposerAgentIcon
-        agent={{
-          name: agent?.agentName ?? session.agentName ?? "",
-          harness: agent?.harness ?? session.harness ?? null,
-        }}
-      />
-      <span className={cn("min-w-0 truncate text-ui", COMPOSER_COLLAPSED_LABEL_CLASS)}>
-        {label}
-      </span>
-    </span>
+    <SessionHarnessPicker
+      sessionId={sessionId}
+      appearance="composer"
+      busy={busy}
+      busyRef={busyRef}
+      setBusy={setBusy}
+      agentName={session.agentName}
+      harnessLabel={composerHarnessLabel(
+        inputs.modelPickerKind,
+        session.agentName,
+        session.harness ?? null,
+        brainHarnessLabels,
+        wrapper,
+      )}
+      showModels={inputs.showModels}
+      showEffort={inputs.showEffort}
+      effortLevels={inputs.effortLevels}
+      modelPickerKind={inputs.modelPickerKind}
+      supportsModelReset={modelResetSupported({
+        inferenceConfigured: inputs.inferenceConfigured,
+        modelPickerKind: inputs.modelPickerKind,
+        isNativeWrapper: isNativeWrapper(wrapper),
+      })}
+      codexModelOptions={inputs.codexModelOptions}
+      inferenceConfigured={inputs.inferenceConfigured}
+      inferenceError={inputs.inferenceError}
+      modelsFromLaunchPreview={inputs.modelsFromLaunchPreview}
+      modelLabelOptions={inputs.modelLabelOptions}
+      modelLabelHostId={session.hostId}
+      costRoutingEligible={inputs.costRoutingEligible}
+      modelPickWakesSession={wakesSession}
+      disabled={disabled}
+    />
   );
 }
