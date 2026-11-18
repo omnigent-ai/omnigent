@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
@@ -81,7 +83,21 @@ async def test_completed_context_compaction_item_clears_spinner() -> None:
 
 
 @pytest.mark.asyncio
-async def test_persist_codex_compaction_item_posts_uuid_window_id(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("held_operation", "cancel"),
+    [(None, False)]
+    + [
+        (operation, cancel)
+        for operation in ("state", "discovery", "history")
+        for cancel in (False, True)
+    ],
+)
+async def test_persist_codex_compaction_item_posts_uuid_window_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    held_operation: str | None,
+    cancel: bool,
+) -> None:
     """Codex's UUID window id is posted with the compaction checkpoint."""
     import json as _json
 
@@ -128,11 +144,59 @@ async def test_persist_codex_compaction_item_posts_uuid_window_id(tmp_path: Path
     post_resp.raise_for_status = MagicMock()
     client.post = AsyncMock(return_value=post_resp)
 
-    await _persist_codex_compaction_item(
-        client,
-        session_id="conv_codex",
-        bridge_dir=tmp_path,
+    entered = asyncio.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    loop = asyncio.get_running_loop()
+    operation_name = {"state": "read_text", "discovery": "glob", "history": "open"}
+    if held_operation is not None:
+        method_name = operation_name[held_operation]
+        original = getattr(Path, method_name)
+        held_path = {
+            "state": tmp_path / "state.json",
+            "discovery": codex_home,
+            "history": rollout,
+        }[held_operation]
+
+        def hold_read(path: Path, *args: object, **kwargs: object) -> object:
+            if path != held_path:
+                return original(path, *args, **kwargs)
+            loop.call_soon_threadsafe(entered.set)
+            try:
+                assert release.wait(3), "test did not release snapshot I/O"
+                return original(path, *args, **kwargs)
+            finally:
+                finished.set()
+
+        monkeypatch.setattr(Path, method_name, hold_read)
+
+    task = asyncio.create_task(
+        _persist_codex_compaction_item(client, session_id="conv_codex", bridge_dir=tmp_path)
     )
+    emergency_release = threading.Timer(2, release.set)
+    emergency_release.start()
+    try:
+        if held_operation is not None:
+            await asyncio.wait_for(entered.wait(), timeout=3)
+            assert not release.is_set(), "snapshot I/O blocked the runner event loop"
+            client.post.assert_not_called()
+        if cancel:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            client.post.assert_not_called()
+        release.set()
+        if not cancel:
+            await task
+    finally:
+        release.set()
+        emergency_release.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        if held_operation is not None:
+            assert await asyncio.to_thread(finished.wait, 3)
+    if cancel:
+        client.post.assert_not_called()
+        return
 
     client.post.assert_called_once()
     _url, kwargs = client.post.call_args
