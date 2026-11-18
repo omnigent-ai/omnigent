@@ -16,6 +16,8 @@ inject the faults the tests need:
   line per Open/CloseWorkspace.
 - ``FAKE_HELPER_OPEN_DELAY=<s>``: wait that long before answering OpenWorkspace.
 
+Like the real helper, it refuses compressed requests (``grpc-encoding``).
+
 SearchText answers one match per entry under the workspace root, in batches
 of one, waiting ``FAKE_HELPER_TEXT_DELAY`` seconds before each, and exits
 the process mid-stream when the query is ``"crash"``. With
@@ -227,6 +229,15 @@ async def _serve(connection_fd: int) -> None:
 
     async def run(stream_id: int, headers: list[tuple[str, str]]) -> None:
         pseudo = dict(item for item in headers if item[0].startswith(":"))
+        encoding = dict(headers).get("grpc-encoding", "identity")
+        if encoding != "identity":
+            # The real helper's answer, as a gRPC trailers-only response.
+            refusal = f"Content is compressed with `{encoding}` which isn't supported"
+            response = [(":status", "200"), ("content-type", "application/grpc")]
+            response += [("grpc-status", "12"), ("grpc-message", refusal)]
+            conn.send_headers(stream_id, response, end_stream=True)
+            flush()
+            return
         path = pseudo[":path"]
         app = (
             next((a for a in apps if path.startswith("/" + a.path.strip("/") + "/")), None)

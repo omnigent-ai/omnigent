@@ -253,12 +253,20 @@ async def client_for(
     request: pytest.FixtureRequest,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path_factory: pytest.TempPathFactory,
+    caplog: pytest.LogCaptureFixture,
 ) -> AsyncIterator[ClientFor]:
     """Return a client for one workspace on every route, protocol and backend."""
     async for make in _clients(
         *request.param, monkeypatch, lambda: tmp_path_factory.mktemp("helper")
     ):
         yield make
+    # The Python reader answering instead of the helper would pass parity unnoticed.
+    fallbacks = [
+        record.getMessage()
+        for record in caplog.get_records("call")
+        if "so the host's reader did" in record.getMessage()
+    ]
+    assert fallbacks == []
 
 
 @pytest.fixture(params=list(_PYTHON_ROUTES.values()), ids=list(_PYTHON_ROUTES))

@@ -568,6 +568,7 @@ async def test_listing_falls_back_when_the_helper_dies(
     fake_helper: Callable[..., str],
     events: _Events,
     proxies: list[WorkspaceHelperProxy],
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     (root,) = _roots(tmp_path, 1)
     proxy = WorkspaceHelperProxy(fake_helper(FAKE_HELPER_OPEN_DELAY="5"))
@@ -579,3 +580,4 @@ async def test_listing_falls_back_when_the_helper_dies(
     os.kill(events.pids()[0], signal.SIGKILL)
 
     assert [entry.name for entry in (await listing).entries] == ["a.txt"]
+    assert "couldn't answer ListDirectory, so the host's reader did" in caplog.text

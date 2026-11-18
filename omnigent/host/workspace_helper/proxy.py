@@ -99,14 +99,21 @@ class _Generation:
     @classmethod
     def connect(cls, helper: HelperProcess, number: int) -> _Generation:
         http = Client(helper.transport)
+        # Compression only costs CPU on a local socket, and the helper refuses compressed calls.
         return cls(
             helper=helper,
             number=number,
             workspace_client=WorkspaceServiceClient(
-                _HELPER_ADDRESS, protocol=ProtocolType.GRPC, http_client=http
+                _HELPER_ADDRESS,
+                protocol=ProtocolType.GRPC,
+                http_client=http,
+                send_compression=None,
             ),
             control_client=WorkspaceHelperServiceClient(
-                _HELPER_ADDRESS, protocol=ProtocolType.GRPC, http_client=http
+                _HELPER_ADDRESS,
+                protocol=ProtocolType.GRPC,
+                http_client=http,
+                send_compression=None,
             ),
         )
 

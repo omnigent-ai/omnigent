@@ -140,8 +140,8 @@ class WorkspaceService(WorkspaceServiceMethods):
         if await self._helper_serves(method):
             try:
                 response = await self._forward_unary(method, reader, request)
-            except _HelperGone:
-                pass
+            except _HelperGone as exc:
+                _log_fallback(method, exc)
             else:
                 return cast("ListDirectoryResponse", response)
         page = await _read(
@@ -180,12 +180,13 @@ class WorkspaceService(WorkspaceServiceMethods):
                     sent = True
                     yield cast("ReadFileResponse", response)
                 return
-            except _HelperGone:
+            except _HelperGone as exc:
                 # A read the helper started can't be finished by another reader.
                 if sent:
                     raise ConnectError(
                         Code.UNAVAILABLE, "The workspace helper stopped during the read"
                     ) from None
+                _log_fallback(method, exc)
         file = await _read(reader.read_file_bytes, request.path)
         yield ReadFileResponse(
             metadata=FileMetadata(
@@ -238,6 +239,14 @@ class WorkspaceService(WorkspaceServiceMethods):
             if exc.code == Code.UNAVAILABLE:
                 raise _HelperGone(exc.message) from exc
             raise
+
+
+def _log_fallback(method: WorkspaceMethod, exc: ConnectError) -> None:
+    _logger.warning(
+        "The workspace helper couldn't answer %s, so the host's reader did: %s",
+        method.name,
+        exc.message,
+    )
 
 
 class _HelperGone(ConnectError):
