@@ -4901,6 +4901,7 @@ async def test_sandboxed_managed_cli_sees_its_own_relay_and_the_managed_config_o
     grants the managed config, its own bridge and its own control-socket directory, and
     never another session's or a shared root."""
     from omnigent.harnesses.claude_native import bridge
+    from omnigent.inner.claude_model_access import ClaudeModelAccess
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.inner.sandbox import SandboxPolicy
@@ -4934,6 +4935,15 @@ async def test_sandboxed_managed_cli_sees_its_own_relay_and_the_managed_config_o
     monkeypatch.setattr(f"{prefix}.resolve_sandbox", lambda spec, cwd: base)
     monkeypatch.setattr(f"{prefix}._claude_internal_write_roots", list)
     monkeypatch.setattr(f"{prefix}._claude_internal_write_files", list)
+    monkeypatch.setattr(
+        f"{prefix}.resolve_claude_model_access",
+        lambda *args, **kwargs: ClaudeModelAccess(
+            "https://model.test",
+            "x-api-key",
+            lambda: "synthetic-key",
+            static_credential_value="synthetic-key",
+        ),
+    )
     monkeypatch.setattr(f"{prefix}.create_exec_launcher", record_launcher)
     executor = ClaudeSDKExecutor(
         os_env=OSEnvSpec(
