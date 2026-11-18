@@ -34,12 +34,18 @@ from omnigent._platform import IS_WINDOWS, normalize_interactive_shells
 from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.inner import _proc
 from omnigent.runner.busy_check import RunnerBusyCheck
+from omnigent.runner.credential_rejections import (
+    CREDENTIAL_REJECTION_WINDOW_S,
+    credential_rejections,
+    refuses_credentials,
+)
 from omnigent.runner.identity import RUNNER_AUTH_REJECTED_EXIT_CODE, RUNNER_SLICE_KEY_ENV_VAR
 from omnigent.runner.session_requests import remember_session_host
 from omnigent.runner.transports.ws_tunnel.serve import (
     RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX,
     RUNNER_TUNNEL_REJECTION_PREFIX,
     RunnerTunnelAuthRejectedError,
+    _reauth_hint,
     _reset_recoverable_decline,
 )
 from omnigent.util.event_loop_watchdog import monitor_event_loop
@@ -324,6 +330,29 @@ async def _run_inactivity_monitor(
         await asyncio.sleep(min(poll_interval_s, idle_timeout_s - elapsed_s))
 
 
+async def _raise_when_credentials_rejected(server_url: str | None) -> None:
+    """Raise the sign-in exit once every server call has been refused on credentials.
+
+    :raises RunnerTunnelAuthRejectedError: When the rejection has persisted.
+    """
+    loop = asyncio.get_running_loop()
+    rejected = asyncio.Event()
+
+    def _signal_rejected() -> None:
+        loop.call_soon_threadsafe(rejected.set)
+
+    credential_rejections.on_rejected = _signal_rejected
+    try:
+        await rejected.wait()
+    finally:
+        credential_rejections.on_rejected = None
+    raise RunnerTunnelAuthRejectedError(
+        f"{RUNNER_TUNNEL_REJECTION_PREFIX}(every call to the server refused this "
+        f"runner's credentials for {CREDENTIAL_REJECTION_WINDOW_S:.0f}s); "
+        f"{_reauth_hint(server_url)}"
+    )
+
+
 class _RunnerDatabricksAuth(ThreadedAuth):
     """httpx Auth that mints a fresh Databricks OAuth token per request.
 
@@ -381,6 +410,21 @@ class _RunnerDatabricksAuth(ThreadedAuth):
         :raises httpx.RequestError: When the factory is configured
             but returns no token.
         """
+        try:
+            response = yield from self._send_with_fresh_token(request)
+        except Exception:
+            # A token that cannot be minted refuses the call as surely as a 401.
+            credential_rejections.record(rejected=True)
+            raise
+        credential_rejections.record(rejected=refuses_credentials(response))
+
+    def _send_with_fresh_token(
+        self, request: httpx.Request
+    ) -> Generator[httpx.Request, httpx.Response, httpx.Response]:
+        """Run the auth flow described in :meth:`auth_flow`.
+
+        :returns: The final response the server sent.
+        """
         # Workspace routing: name the workspace or the request routes to the
         # account (the forwarder's POST /events otherwise 403s). Empty when
         # none recorded. Set once here; it persists across the retry yield.
@@ -402,27 +446,28 @@ class _RunnerDatabricksAuth(ThreadedAuth):
                     # would brick every callback on a no-auth server.
                     response = yield request
                     if not _is_login_redirect_or_unauthorized(response):
-                        return
+                        return response
                     # Rejected bare: the server needs auth, so re-mint after a
                     # recoverable decline; a 400/404 refusal must not re-probe.
                     if not _reset_recoverable_decline(self._factory):
-                        return
+                        return response
                     token = self._factory()
                     if token:
                         request.headers["Authorization"] = f"Bearer {token}"
-                        yield request
-                    return
+                        response = yield request
+                    return response
                 raise httpx.RequestError("Databricks token refresh returned no token")
             request.headers["Authorization"] = f"Bearer {token}"
         response = yield request
         if self._factory is None:
-            return
+            return response
         if _is_login_redirect_or_unauthorized(response):
             _invalidate_auth_token_factory(self._factory)
             token = self._factory()
             if token:
                 request.headers["Authorization"] = f"Bearer {token}"
-                yield request
+                response = yield request
+        return response
 
 
 def _is_login_redirect_or_unauthorized(response: httpx.Response) -> bool:
@@ -443,18 +488,9 @@ def _is_login_redirect_or_unauthorized(response: httpx.Response) -> bool:
     :returns: ``True`` when the response indicates the request should
         be retried with a fresh token, ``False`` otherwise.
     """
-    if response.status_code in (401, 403):
-        # Databricks Apps returns 403 "Invalid Token" for an expired bearer
-        # in addition to the 302→/oidc/ bounce; treat both as re-auth signals.
-        return True
-    if not response.is_redirect:
-        return False
-    location = response.headers.get("location", "")
-    # Match the Apps front-door OAuth flow specifically. ``/oidc/`` is
-    # the OAuth provider mount; ``/.auth/`` covers the callback path
-    # (e.g. ``/.auth/callback``) the Apps proxy uses when stitching the
-    # browser-style flow back together.
-    return "/oidc/" in location or "/.auth/" in location
+    # Databricks Apps returns 403 "Invalid Token" for an expired bearer
+    # in addition to the 302→/oidc/ bounce; treat both as re-auth signals.
+    return response.status_code == 403 or refuses_credentials(response)
 
 
 def _call_factory_with_declined(
@@ -2242,6 +2278,9 @@ async def _run_tunnel_from_env() -> None:
         name=f"runner-ws-tunnel:{runner_id}",
     )
     stop_task = asyncio.create_task(stop_event.wait(), name="runner-signal-wait")
+    rejected_task = asyncio.create_task(
+        _raise_when_credentials_rejected(server_url), name="runner-credentials-rejected"
+    )
     idle_task: asyncio.Task[None] | None = None
     if idle_timeout_s > 0:
 
@@ -2306,7 +2345,7 @@ async def _run_tunnel_from_env() -> None:
             name=f"runner-parent-killer:{parent_pid}",
             daemon=True,
         ).start()
-    wait_tasks = {tunnel_task, stop_task}
+    wait_tasks = {tunnel_task, stop_task, rejected_task}
     if idle_task is not None:
         wait_tasks.add(idle_task)
     try:
@@ -2314,6 +2353,8 @@ async def _run_tunnel_from_env() -> None:
             wait_tasks,
             return_when=asyncio.FIRST_COMPLETED,
         )
+        if rejected_task in done:
+            await rejected_task
         if tunnel_task in done:
             # The tunnel returning first means the WS connection ended on its
             # own rather than a signal/idle/parent-death shutdown request.
@@ -2342,6 +2383,8 @@ async def _run_tunnel_from_env() -> None:
             task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await stop_task
+        with contextlib.suppress(asyncio.CancelledError, RunnerTunnelAuthRejectedError):
+            await rejected_task
         with contextlib.suppress(asyncio.CancelledError):
             await tunnel_task
         if idle_task is not None:
