@@ -72,6 +72,7 @@ from omnigent.inner.executor import (
 from omnigent.inner.executor import (
     Message as _RecoveryMessage,
 )
+from omnigent.inner.executor import NativeTurnAcceptance
 from omnigent.inner.executor import (
     ToolSpec as _RecoveryToolSpec,
 )
@@ -11851,11 +11852,25 @@ async def test_on_proxy_stream_end_spares_superseded_response() -> None:
         "late_created",
     ],
 )
-@pytest.mark.parametrize("successor", ["starting", "running", "finished", "unchanged"])
+@pytest.mark.parametrize(
+    ("successor", "native_receipt"),
+    [
+        pytest.param("starting", False, id="starting"),
+        pytest.param("running", False, id="running"),
+        pytest.param("finished", False, id="finished"),
+        pytest.param("unchanged", False, id="unchanged"),
+        pytest.param("starting", True, id="native-starting"),
+        pytest.param("running", True, id="native-running"),
+    ],
+)
 @pytest.mark.parametrize("delivery", ["stream", "background"])
 @pytest.mark.asyncio
 async def test_superseded_harness_stream_cannot_settle_newer_turn(
-    outcome: str, successor: str, delivery: str, monkeypatch: pytest.MonkeyPatch
+    outcome: str,
+    successor: str,
+    native_receipt: bool,
+    delivery: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Late stream outcomes cannot consume a successor's status or exit evidence."""
     conv = "conv_late_stream"
@@ -11868,8 +11883,13 @@ async def test_superseded_harness_stream_cannot_settle_newer_turn(
     newer = asyncio.create_task(asyncio.Event().wait())
     exit_error = {"code": "required_terminal_exited", "message": "successor terminal exited"}
     clears_at_boundary: list[str] = []
+    old_requests: set[subagent_work._ChildAcceptanceRequest] = set()
+    successor_request: subagent_work._ChildAcceptanceRequest | None = None
+    successor_work: subagent_work._SubagentWorkEntry | None = None
+    successor_acceptance = NativeTurnAcceptance(conv, "thread_new", "codex_new")
 
     def replace_turn() -> None:
+        nonlocal successor_request, successor_work
         if successor != "unchanged":
             app.state.begin_turn_slot(conv)
             app.state.active_turns[conv] = newer
@@ -11879,6 +11899,25 @@ async def test_superseded_harness_stream_cannot_settle_newer_turn(
                 pm.mark_in_flight(conv, "resp_new")
             if successor == "finished":
                 app.state.on_proxy_stream_end(conv, owner_response_id="resp_new")
+        if native_receipt:
+            old_requests.update(subagent_work._pending_child_acceptances[conv])
+            assert len(old_requests) == 1
+            successor_work = subagent_work.register_subagent_work(
+                parent_session_id="parent_late_stream",
+                child_session_id=conv,
+                agent="codex-native",
+                title="successor",
+                wrapper_label="codex-native-ui",
+            )
+            subagent_work.mark_subagent_work_started(conv)
+            successor_request = subagent_work.begin_subagent_child_acceptance(conv)
+            subagent_work.arm_subagent_child_start_timeout(
+                conv, acceptance=successor_acceptance, request=successor_request, now=5000.0
+            )
+            assert subagent_work._pending_child_acceptances[conv] == old_requests | {
+                successor_request
+            }
+            assert successor_work.awaiting_child_start_since == 5000.0
         app.state.required_terminal_exit_errors[conv] = exit_error
         clears_at_boundary[:] = pm.cleared_in_flight
         queue = app.state.session_event_queues[conv]
@@ -11896,7 +11935,16 @@ async def test_superseded_harness_stream_cannot_settle_newer_turn(
         elif outcome in {"completed", "late_created"}:
             if outcome == "late_created":
                 yield _SSE_RESPONSE_CREATED
-            yield _SSE_RESPONSE_COMPLETED
+            completed = _SSE_RESPONSE_COMPLETED
+            if native_receipt:
+                event = json.loads(completed.split("data: ", 1)[1])
+                event["native_acceptance"] = {
+                    "session_id": conv,
+                    "thread_id": "thread_old",
+                    "response_id": "codex_old",
+                }
+                completed = f"event: response.completed\ndata: {json.dumps(event)}\n\n"
+            yield completed
 
     @asynccontextmanager
     async def stream(*args: Any, **kwargs: Any) -> AsyncIterator[Any]:
@@ -11912,12 +11960,27 @@ async def test_superseded_harness_stream_cannot_settle_newer_turn(
                 json={
                     "type": "message",
                     "role": "user",
-                    "harness": "openai-agents",
+                    "harness": "codex-native" if native_receipt else "openai-agents",
+                    **({"harness_override": "codex-native"} if native_receipt else {}),
                     "content": [{"type": "input_text", "text": "original work"}],
                 },
             )
             assert response.status_code == (200 if delivery == "stream" else 202)
             await _await_bg_turn_task(conv)
+
+            if native_receipt:
+                assert subagent_work.get_subagent_work(conv) is successor_work
+                assert successor_work is not None
+                assert successor_work.status == "running"
+                assert successor_work.native_acceptance == successor_acceptance
+                assert successor_work.awaiting_child_start_since == 5000.0
+                assert subagent_work._pending_child_acceptances[conv] == {successor_request}
+                assert successor_request is not None
+                assert successor_request.finished is False
+                assert successor_request.started_response_ids == set()
+                assert successor_request.settled_response_ids == set()
+                assert successor_request.unidentified_settlement is False
+                assert all(request.finished for request in old_requests)
 
             if successor == "unchanged":
                 assert conv not in app.state.active_turns
@@ -11948,6 +12011,9 @@ async def test_superseded_harness_stream_cannot_settle_newer_turn(
         with contextlib.suppress(asyncio.CancelledError):
             await newer
         app.state.active_turns.pop(conv, None)
+        if successor_request is not None:
+            subagent_work.finish_subagent_child_acceptance(successor_request)
+        subagent_work.unregister_subagent_work_for_session(conv)
 
 
 @pytest.mark.parametrize("replacement", ["none", "task", "stream", "finished"])
