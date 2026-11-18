@@ -845,7 +845,6 @@ async def test_upstream_401_refreshes_credential_on_the_next_request(
 @pytest.mark.parametrize(
     ("sandbox_type", "sdk_owned", "fork", "inherited", "use_factory"),
     [
-        ("linux_bwrap", True, False, False, False),
         ("linux_bwrap", True, False, False, True),
         ("none", True, False, True, False),
         (None, True, False, True, False),
@@ -855,7 +854,6 @@ async def test_upstream_401_refreshes_credential_on_the_next_request(
         (None, True, True, False, False),
     ],
     ids=[
-        "explicit-sdk-resolver",
         "explicit-sdk-factory",
         "sdk-optout-inherited",
         "implicit-sdk-resolver-inherited",

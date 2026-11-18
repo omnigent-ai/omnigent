@@ -8,6 +8,7 @@ import shlex
 import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -17,10 +18,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock
 
+import httpx
 import pytest
 
 from omnigent.inner import claude_sdk_executor as claude
 from omnigent.inner.claude_model_access import ClaudeModelAccess
+from omnigent.inner.credential_proxy import CredentialRewriteRule
 from omnigent.inner.datamodel import (
     CredentialProxyEntry,
     CredentialProxySpec,
@@ -30,7 +33,10 @@ from omnigent.inner.datamodel import (
 )
 from omnigent.inner.egress.ca import ensure_ca, ensure_ca_bundle
 from omnigent.inner.egress.certs import HostCertCache
+from omnigent.inner.egress.proxy import EgressProxy
 from omnigent.inner.sandbox import SandboxPolicy
+from tests._helpers.live_server import terminate_process
+from tests._helpers.stdio_jsonrpc import read_json_line
 
 
 @pytest.fixture(autouse=True)
@@ -377,8 +383,11 @@ def test_filtered_worker_networking_preserves_policy_credentials_and_gateway_thi
     launcher = Path(prepared.cli_path or "")
     scratch = prepared._runtime_tmpdir
     assert scratch is not None
+    settings_path = prepared.settings_for_cli(None)
     probe = f"""
 import json, os, socket, urllib.request, urllib.error
+with open({settings_path!r}) as settings:
+    os.environ.update(json.load(settings)['env'])
 assert 'NO_PROXY' not in os.environ
 assert 'CLAUDE_TEST_PARENT_SECRET' not in os.environ
 assert os.environ['ANTHROPIC_AUTH_TOKEN'].startswith('oa_cred_')
@@ -429,6 +438,159 @@ print(json.dumps(result))
     assert not scratch.exists()
 
 
+@pytest.mark.parametrize("proxy_factory", ["generic", "automatic-model"])
+def test_prepared_cli_authenticates_shared_loopback_credential_relay(
+    real_worker_spec: OSEnvSpec,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+    proxy_factory: str,
+) -> None:
+    """A host-local client needs the CLI's proxy capability before credentials resolve."""
+    cert, key = ensure_ca(cache_dir=tmp_path / "ca")
+    bundle = ensure_ca_bundle(cert, cache_dir=tmp_path / "ca")
+    monkeypatch.setattr("omnigent.inner.egress.controller.ensure_ca", lambda: (cert, key))
+    monkeypatch.setattr("omnigent.inner.egress.controller.ensure_ca_bundle", lambda _: bundle)
+    captured: list[tuple[str | None, str | None, bytes]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            body = self.rfile.read(int(self.headers["Content-Length"]))
+            captured.append(
+                (self.headers.get("Authorization"), self.headers.get("Proxy-Authorization"), body)
+            )
+            self.send_response(200)
+            self.send_header("Content-Length", "2")
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server.socket = (
+        HostCertCache(cert, key)
+        .get_ssl_context("localhost")
+        .wrap_socket(server.socket, server_side=True)
+    )
+    accept_upstream = Mock(wraps=server.get_request)
+    monkeypatch.setattr(server, "get_request", accept_upstream)
+    _start_test_server(server, request)
+    endpoint = f"https://localhost:{server.server_port}/credential-bound"
+    assert real_worker_spec.sandbox is not None
+    real_worker_spec.sandbox.egress_rules = ["POST localhost/credential-bound"]
+    real_worker_spec.sandbox.egress_allow_private_destinations = True
+    real_worker_spec.sandbox.credential_proxy = CredentialProxySpec(
+        entries=[
+            CredentialProxyEntry(
+                host="localhost",
+                scheme="bearer",
+                source=CredentialSourceSpec(kind="env", env="CLAUDE_TEST_PARENT_SECRET"),
+            )
+        ]
+    )
+    monkeypatch.setenv("CLAUDE_TEST_PARENT_SECRET", "synthetic-parent-credential")
+    original_resolver = CredentialRewriteRule.resolve_secret
+    resolve_credential = Mock(side_effect=original_resolver)
+    monkeypatch.setattr(
+        CredentialRewriteRule, "resolve_secret", lambda rule: resolve_credential(rule)
+    )
+    resolve_model = Mock(
+        side_effect=AssertionError("non-model traffic must not resolve model auth")
+    )
+    access = ClaudeModelAccess("https://model.test", "x-api-key", resolve_model)
+    if proxy_factory == "generic":
+        monkeypatch.setattr(
+            ClaudeModelAccess,
+            "create_proxy",
+            lambda self, *args, **kwargs: EgressProxy(*args, **kwargs),
+        )
+    monkeypatch.setattr(
+        claude, "create_exec_launcher", Mock(return_value=str(tmp_path / "unused-launcher"))
+    )
+    environment = {"PATH": os.environ["PATH"]}
+    prepared = claude.prepare_claude_cli_path(
+        sys.executable, real_worker_spec, worker_env=environment, model_access=access
+    )
+    handle = prepared._egress_handle
+    assert handle is not None
+    scratch = prepared._runtime_tmpdir
+    assert scratch is not None
+    relay_code = (
+        "import json, sys; from omnigent.inner.egress.relay import start_relay; "
+        "ready = start_relay(int(sys.argv[1]), sys.argv[2]); assert ready.wait(5); "
+        "print(json.dumps({'status': 'READY'}), flush=True); sys.stdin.read()"
+    )
+    try:
+        # Run outside a network namespace so another host process can reach the relay.
+        with subprocess.Popen(
+            [sys.executable, "-c", relay_code, str(handle.relay_port), str(handle.socket_path)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ) as relay:
+            try:
+                assert relay.stdout is not None
+                assert read_json_line(relay.stdout, timeout_s=10) == {"status": "READY"}
+                trust = ssl.create_default_context(cafile=str(bundle))
+                with httpx.Client(
+                    proxy=f"http://127.0.0.1:{handle.relay_port}",
+                    verify=trust,
+                    trust_env=False,
+                    timeout=5,
+                ) as unauthorized:
+                    message = unauthorized.build_request("POST", endpoint, content=b"unauthorized")
+                    assert "Authorization" not in message.headers
+                    assert "Proxy-Authorization" not in message.headers
+                    try:
+                        response = unauthorized.send(message)
+                    except httpx.ProxyError as error:
+                        assert "407 Proxy Authentication Required" in str(error)
+                    else:
+                        pytest.fail(
+                            f"unauthenticated client received {response.status_code}; "
+                            f"credential resolutions={resolve_credential.call_count}, "
+                            f"upstream requests={len(captured)}"
+                        )
+                resolve_credential.assert_not_called()
+                resolve_model.assert_not_called()
+                accept_upstream.assert_not_called()
+                assert captured == []
+                assert handle.auth_token is not None
+                settings = prepared.settings_for_cli(None)
+                assert settings is not None
+                settings_path = Path(settings)
+                assert settings_path.is_relative_to(scratch)
+                assert settings_path.stat().st_mode & 0o777 == 0o600
+                settings_text = settings_path.read_text()
+                assert "synthetic-parent-credential" not in settings_text
+                assert "synthetic-parent-credential" not in json.dumps(environment)
+                assert handle.auth_token not in json.dumps(environment)
+                proxy_url = json.loads(settings_text)["env"]["HTTPS_PROXY"]
+                with httpx.Client(
+                    proxy=proxy_url, verify=trust, trust_env=False, timeout=5
+                ) as authorized:
+                    message = authorized.build_request("POST", endpoint, content=b"authorized")
+                    assert "Authorization" not in message.headers
+                    response = authorized.send(message)
+                assert response.status_code == 200
+                assert response.content == b"ok"
+                resolve_credential.assert_called_once()
+                resolve_model.assert_not_called()
+                accept_upstream.assert_called_once()
+                assert captured == [("Bearer synthetic-parent-credential", None, b"authorized")]
+            finally:
+                terminate_process(relay, timeout_s=5)
+    finally:
+        prepared.close()
+    assert relay.poll() is not None
+    assert not handle._thread.is_alive()
+    assert not handle.socket_path.exists()
+    assert not scratch.exists()
+    assert not settings_path.exists()
+
+
 def test_model_inference_is_automatic_and_credentials_stay_outside_real_worker(
     real_worker_spec: OSEnvSpec,
     monkeypatch: pytest.MonkeyPatch,
@@ -471,7 +633,14 @@ def test_model_inference_is_automatic_and_credentials_stay_outside_real_worker(
     proxy = prepared._egress_handle._proxy
     monkeypatch.setattr(proxy, "_provider_port", server.server_port)
     monkeypatch.setattr(proxy, "_assert_destination_allowed", AsyncMock(return_value="127.0.0.1"))
-    probe = """
+    settings_path = prepared.settings_for_cli(None)
+    probe = (
+        f"""
+import json, os
+with open({settings_path!r}) as settings:
+    os.environ.update(json.load(settings)['env'])
+"""
+        + """
 import json, os, urllib.request, urllib.error
 assert 'ANTHROPIC_API_KEY' not in os.environ
 assert 'parent-secret' not in json.dumps(dict(os.environ))
@@ -488,6 +657,7 @@ for path in ('/v1/messages', '/v1/messages/count_tokens', '/v1/models'):
         result[path] = exc.code
 print(json.dumps(result))
 """
+    )
     try:
         result = subprocess.run(
             [prepared.cli_path or "", "-c", probe],
@@ -644,8 +814,17 @@ def cli_model_server(
 
 
 def _cli_args(
-    prompt: str, *, streaming: bool = False, tools: str = "", bare: bool = True
+    prompt: str,
+    *,
+    streaming: bool = False,
+    tools: str = "",
+    bare: bool = True,
+    prepared: claude.PreparedClaudeCli | None = None,
+    settings: dict | None = None,
 ) -> list[str]:
+    payload = json.dumps(settings if settings is not None else {"disableAllHooks": True})
+    settings_arg = prepared.settings_for_cli(payload) if prepared is not None else payload
+    assert settings_arg is not None
     return [
         *(["--bare"] if bare else []),
         "--print",
@@ -657,7 +836,7 @@ def _cli_args(
         "--setting-sources",
         "",
         "--settings",
-        '{"disableAllHooks":true}',
+        settings_arg,
         "--max-turns",
         "3",
         "--tools",
@@ -689,7 +868,12 @@ def test_real_cli_completes_streamed_inference_with_parent_owned_auth(
             [
                 prepared.cli_path,
                 # Bare mode deliberately skips the CLI's OAuth login flow.
-                *_cli_args("Say the test marker.", streaming=True, bare=auth_kind != "oauth"),
+                *_cli_args(
+                    "Say the test marker.",
+                    streaming=True,
+                    bare=auth_kind != "oauth",
+                    prepared=prepared,
+                ),
             ],
             cwd=real_worker_spec.cwd,
             env=env,
@@ -798,7 +982,7 @@ def test_real_cli_bash_tool_round_trip_and_inline_skill_finish(
                 prepared.cli_path,
                 "--plugin-dir",
                 str(prepared.plugin_dir),
-                *_cli_args("/cli-probe:probe", tools="Bash,Skill"),
+                *_cli_args("/cli-probe:probe", tools="Bash,Skill", prepared=prepared),
             ],
             cwd=workspace,
             env=env,
@@ -981,6 +1165,9 @@ async def test_sdk_real_cli_keeps_working_across_turns(
             assert "CLAUDE_AGENT_SDK_CLIENT_APP=omnigent\n" in inherited
             assert "ENABLE_CLAUDEAI_MCP_SERVERS=false\n" in inherited
             assert f"HOME={Path.home()}\n" not in inherited
+        prepared = executor._prepared_cli
+        assert prepared is not None and prepared._runtime_tmpdir is not None
+        assert len(list(prepared._runtime_tmpdir.glob("cli-settings-*.json"))) == 1
     finally:
         await executor.close()
 
@@ -1388,8 +1575,9 @@ def test_each_cli_execution_path_inherits_the_sandbox(
         "Run the isolation probe, then return the marker.",
         tools=tools,
         bare=False,
+        prepared=prepared,
+        settings=settings,
     )
-    args[args.index("--settings") + 1] = json.dumps(settings)
     try:
         result = subprocess.run(
             [prepared.cli_path, *extra_args, *args],
@@ -1528,9 +1716,11 @@ def test_real_cli_hook_cannot_retrieve_login_keychain_canary(
         "ANTHROPIC_BASE_URL": "https://model.test",
     }
     prepared = claude.prepare_claude_cli_path(real_claude_cli, real_worker_spec, worker_env=env)
-    args = _cli_args("Return the marker.", bare=False)
-    args[args.index("--settings") + 1] = json.dumps(
-        {
+    args = _cli_args(
+        "Return the marker.",
+        bare=False,
+        prepared=prepared,
+        settings={
             "hooks": {
                 "SessionStart": [
                     {
@@ -1543,7 +1733,7 @@ def test_real_cli_hook_cannot_retrieve_login_keychain_canary(
                     }
                 ]
             }
-        }
+        },
     )
     try:
         child = subprocess.run(

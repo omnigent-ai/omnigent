@@ -59,6 +59,19 @@ placeholder and private HOME, with neither the inherited host bearer token nor
 the real provider key. The real provider credential stays in the trusted parent,
 including when the CLI exercises an `apiKeyHelper` child.
 
+The CLI relay also requires a session-specific proxy capability before it can
+resolve or forward credentials. Claude reads authenticated proxy URLs from an
+explicit settings file with mode `0600` in its private runtime directory, after
+startup; the capability stays out of the CLI's initial environment, arguments,
+and serialized sandbox policy. Commands launched by Claude inherit that scoped
+proxy access. The shared-loopback regression verifies unauthenticated clients
+receive `407` before any credential resolution or upstream traffic, including
+ordinary swap-on-access credentials alongside automatic model access.
+On macOS, the baseline Seatbelt profile blocks process-argument sysctls and
+other processes' PID information. Commands can inherit the scoped proxy URL;
+the sibling-sandbox probe verifies they cannot recover it from those commands'
+process environment, even when the sibling has general network access.
+
 Terminal cases use automatic model access without a model egress rule. The
 public terminal-tool case calls `sys_terminal_launch`, then `sys_terminal_send`
 to run a containment probe and the actual Claude CLI inside the sandboxed tmux

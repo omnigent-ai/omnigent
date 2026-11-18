@@ -4917,6 +4917,16 @@ async def test_sandboxed_managed_cli_sees_its_own_relay_and_the_managed_config_o
     with patch(f"{prefix}._ensure_sdk", return_value=_make_recovery_fake_sdk()):
         clients = {key: await _managed_turn(executor, key, tools) for key in ("one", "two")}
         for key, client in clients.items():
+            prepared = executor._prepared_cli
+            assert prepared is not None and prepared._egress_handle is not None
+            token = prepared._egress_handle.auth_token
+            assert token is not None
+            settings_path = Path(client.options.settings)
+            assert settings_path.parent == prepared._runtime_tmpdir
+            assert settings_path.stat().st_mode & 0o777 == 0o600
+            settings = json.loads(settings_path.read_text())
+            assert token in settings["env"]["HTTPS_PROXY"]
+            assert token not in json.dumps(client.options.env)
             assert client.options.cli_path != base_launcher
             own_bridge, own_socket = relay_dirs(client)
             other_bridge, other_socket = relay_dirs(clients["two" if key == "one" else "one"])

@@ -1272,6 +1272,32 @@ class PreparedClaudeCli:
     model_access: ClaudeModelAccess | None = None
     plugin_dir: pathlib.Path | None = None
 
+    def settings_for_cli(self, settings: str | None) -> str | None:
+        """Deliver proxy access through a private file read after CLI startup."""
+        handle = self._egress_handle
+        if handle is None or handle.auth_token is None:
+            return settings
+        if self._runtime_tmpdir is None:
+            raise OSError("Authenticated Claude relay requires private runtime settings")
+        payload = json.loads(settings) if settings is not None else {}
+        proxy_env: dict[str, str] = {}
+        apply_egress_env(
+            proxy_env,
+            relay_port=handle.relay_port,
+            ca_bundle_path=handle.ca_bundle_path,
+            auth_token=handle.auth_token,
+        )
+        payload["env"] = {**payload.get("env", {}), **proxy_env}
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            prefix="cli-settings-",
+            suffix=".json",
+            dir=self._runtime_tmpdir,
+            delete=False,
+        ) as output:
+            json.dump(payload, output)
+        return output.name
+
     def close(self) -> None:
         """Release the launcher and its parent-owned network proxy."""
         launcher, self._owned_launcher = self._owned_launcher, None
@@ -2154,7 +2180,7 @@ def prepare_claude_cli_path(
                 rules=egress_rules,
                 tmpdir=runtime_tmpdir,
                 allow_private_destinations=sandbox_spec.egress_allow_private_destinations,
-                require_auth=False,
+                require_auth=True,
                 credential_rewrites=credential_runtime.rewrites,
                 request_body_transform=request_body_transform,
                 model_access=model_access,
@@ -2744,6 +2770,10 @@ class ClaudeSDKExecutor(Executor):
         if state is None:
             mcp_auth = _claude_mcp_auth_statuses()
             await self._route_options_through_gateway_shim(options)
+            if self._prepared_cli is not None:
+                options.settings = self._prepared_cli.settings_for_cli(
+                    getattr(options, "settings", None)
+                )
             # Tee CLI stderr so the connect timeout error carries the
             # tail; ``_on_stderr`` alone only logs at DEBUG.
             connect_stderr: list[str] = []

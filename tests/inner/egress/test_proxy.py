@@ -12,10 +12,12 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from omnigent.inner.claude_model_access import ClaudeModelAccess
 from omnigent.inner.credential_proxy import (
     CODEX_GATEWAY_TOKEN_ENV,
     SYNTHETIC_CREDENTIAL_PREFIX,
@@ -28,6 +30,7 @@ from omnigent.inner.datamodel import (
     CredentialProxySpec,
     CredentialSourceSpec,
 )
+from omnigent.inner.egress import controller
 from omnigent.inner.egress.ca import ensure_ca, ensure_ca_bundle
 from omnigent.inner.egress.certs import HostCertCache
 from omnigent.inner.egress.proxy import EgressProxy
@@ -224,6 +227,157 @@ async def test_proxy_start_unix(ca_paths: tuple[Path, Path, Path], short_tmp_par
     # Socket file is created
     assert sock_path.exists()
     await proxy.stop()
+
+
+@pytest.mark.parametrize("with_model_access", [False, True], ids=["generic", "model-access"])
+def test_controller_rejects_unauthenticated_credential_rewrites_before_setup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    with_model_access: bool,
+) -> None:
+    resolve_secret = Mock(side_effect=AssertionError("credential must not be resolved"))
+    access = (
+        ClaudeModelAccess("https://model.test", "authorization", resolve_secret)
+        if with_model_access
+        else None
+    )
+    setup = Mock(side_effect=AssertionError("proxy setup must not start"))
+    monkeypatch.setattr(controller, "IS_WINDOWS", False)
+    monkeypatch.setattr(controller, "ensure_ca", setup)
+    monkeypatch.setattr(controller, "EgressProxy", setup)
+    monkeypatch.setattr(ClaudeModelAccess, "create_proxy", setup)
+
+    with pytest.raises(ValueError, match="credential rewrites require proxy authentication"):
+        controller.start_egress_proxy(
+            rules=[],
+            tmpdir=tmp_path,
+            allow_private_destinations=False,
+            require_auth=False,
+            credential_rewrites=[
+                CredentialRewriteRule(
+                    host="api.example.test", scheme="bearer", secret_provider=resolve_secret
+                )
+            ],
+            model_access=access,
+        )
+
+    setup.assert_not_called()
+    resolve_secret.assert_not_called()
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "listener-error",
+        "readiness-timeout",
+        "startup-completes-at-deadline",
+        "listener-fails-at-deadline",
+    ],
+)
+def test_controller_startup_failure_reaches_caller_and_releases_resources(
+    ca_paths: tuple[Path, Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    cert_path, key_path, bundle_path = ca_paths
+    scratch = tmp_path / "proxy"
+    scratch.mkdir()
+    proxy = EgressProxy([], cert_path, key_path)
+    listener = Mock(close=Mock(), wait_closed=AsyncMock())
+    entered_start = threading.Event()
+    ready = threading.Event()
+    startup_tasks: list[asyncio.Task[None]] = []
+    worker_threads: list[threading.Thread] = []
+    loops: list[asyncio.AbstractEventLoop] = []
+    listener_error = OSError("listener unavailable")
+
+    async def start_listener(_path: str) -> None:
+        loop = asyncio.get_running_loop()
+        loops.append(loop)
+        worker_threads.append(threading.current_thread())
+        task = asyncio.current_task()
+        assert task is not None
+        startup_tasks.append(task)
+        # A partially started listener must also be closed on startup failure.
+        proxy._servers.append(listener)
+        if failure in ("listener-error", "listener-fails-at-deadline"):
+            entered_start.set()
+            raise listener_error
+        startup_pending = loop.create_future()
+        if failure == "startup-completes-at-deadline":
+            stop = loop.stop
+
+            def complete_before_stop() -> None:
+                # Complete startup in the same loop iteration that consumes stop.
+                monkeypatch.setattr(loop, "stop", stop)
+                task.add_done_callback(lambda _task: stop())
+                startup_pending.set_result(None)
+
+            monkeypatch.setattr(loop, "stop", complete_before_stop)
+        entered_start.set()
+        await startup_pending
+
+    def readiness_wait(timeout: float) -> bool:
+        if failure == "listener-error":
+            return ready.wait(timeout)
+        assert entered_start.wait(1), "proxy thread did not enter listener startup"
+        if failure == "listener-fails-at-deadline":
+            worker_threads[0].join(timeout=1)
+            assert loops[0].is_closed()
+        return False
+
+    # The listener is stubbed, so exercise the lifecycle on every host.
+    monkeypatch.setattr(controller, "IS_WINDOWS", False)
+    monkeypatch.setattr(controller, "ensure_ca", lambda: (cert_path, key_path))
+    monkeypatch.setattr(controller, "ensure_ca_bundle", lambda _cert: bundle_path)
+    monkeypatch.setattr(controller, "EgressProxy", Mock(return_value=proxy))
+    monkeypatch.setattr(proxy, "start_unix", start_listener)
+    # Keep Thread's own bootstrap event real; only the controller's wait expires.
+    monkeypatch.setattr(
+        controller,
+        "threading",
+        SimpleNamespace(
+            Thread=threading.Thread,
+            Event=Mock(
+                side_effect=[
+                    SimpleNamespace(set=ready.set, wait=readiness_wait),
+                    threading.Event(),
+                ]
+            ),
+        ),
+    )
+
+    error_type = OSError if failure == "listener-error" else TimeoutError
+    message = "could not start" if failure == "listener-error" else "did not become ready"
+    try:
+        with pytest.raises(error_type, match=message) as raised:
+            controller.start_egress_proxy(
+                rules=[],
+                tmpdir=scratch,
+                allow_private_destinations=False,
+                require_auth=True,
+            )
+
+        if failure == "listener-error":
+            assert raised.value.__cause__ is listener_error
+        assert len(worker_threads) == 1
+        assert not worker_threads[0].is_alive()
+        assert loops[0].is_closed()
+        listener.close.assert_called_once_with()
+        listener.wait_closed.assert_awaited_once_with()
+        assert proxy._servers == []
+        assert all(task.done() for task in startup_tasks)
+        if failure == "readiness-timeout":
+            assert startup_tasks[0].cancelled()
+        elif failure == "startup-completes-at-deadline":
+            assert startup_tasks[0].result() is None
+    finally:
+        for loop, worker in zip(loops, worker_threads, strict=True):
+            if worker.is_alive():
+                loop.call_soon_threadsafe(asyncio.BaseEventLoop.stop, loop)
+                worker.join(timeout=1)
 
 
 @pytest.mark.asyncio

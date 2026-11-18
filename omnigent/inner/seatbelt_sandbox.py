@@ -740,6 +740,8 @@ def _build_profile(
             "(allow process-fork)",
             "(allow process-exec*)",
             "(allow process-info* (target self))",
+            # Argument sysctls can fall back to pidinfo on other processes.
+            "(deny process-info-pidinfo (require-not (target self)))",
             "(allow signal (target self))",
             "",
             ";; Mach / IPC / sysctl baseline. Verified empirically as the",
@@ -759,6 +761,8 @@ def _build_profile(
             "(allow ipc-posix-shm)",
             "(allow ipc-posix-sem)",
             "(allow sysctl-read)",
+            # Include the PID suffix on modern and legacy process-argument sysctls.
+            '(deny sysctl-read (sysctl-name-prefix "kern.procargs"))',
             "(allow file-ioctl)",
             # M7 (security 2026-07-15): Bun's WriteStream constructor calls fstat(2) on
             # its inherited pipe file descriptors (stdout/stderr) at startup for ANSI
