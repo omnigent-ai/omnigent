@@ -617,6 +617,67 @@ describe("searchFilesViaWorkspaceApi", () => {
     expect(grantRequests()).toBe(1);
   });
 
+  it("tries a refused method again once its back-off ends", async () => {
+    enable("workspace_direct_access");
+    serve(() => {
+      throw new Error("the server route is off");
+    });
+    let refusesSearch = true;
+    socket.mockImplementation(async (request) => {
+      const method = methodOf((request as { path: string }).path);
+      if (method === "GetCapabilities") {
+        return { status: 200, headers: PROTO_HEADERS, body: capabilitiesBody(...SEARCH_FILES) };
+      }
+      if (method === "ReadFile") return fromSocket(textFile());
+      if (refusesSearch)
+        return fromSocket(new TextEncoder().encode('{"code":"unimplemented"}'), 501);
+      return { status: 200, headers: PROTO_HEADERS, body: foundEntries };
+    });
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      expect(await searchFilesViaWorkspaceApi("s-retry", "main", SEARCH_OPTIONS)).toBeNull();
+
+      vi.setSystemTime(Date.now() + 5 * 60_000 + 1_000);
+      refusesSearch = false;
+      expect(await searchFilesViaWorkspaceApi("s-retry", "main", SEARCH_OPTIONS)).not.toBeNull();
+      expect((await readFileViaWorkspaceApi("s-retry", "notes.md"))?.content).toBe("héllo");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("reads a restarted direct host's capabilities after it refuses the token", async () => {
+    enable("workspace_direct_access");
+    serve(() => {
+      throw new Error("the server route is off");
+    });
+    let restarted = false;
+    socket.mockImplementation(async (request) => {
+      const method = methodOf((request as { path: string }).path);
+      if (method === "GetCapabilities") {
+        // A restarted host serves only reads.
+        const served = restarted ? ["ReadFile"] : SEARCH_FILES;
+        return { status: 200, headers: PROTO_HEADERS, body: capabilitiesBody(...served) };
+      }
+      if (method === "ReadFile") return fromSocket(textFile());
+      if (restarted) return fromSocket(new TextEncoder().encode('{"code":"unauthenticated"}'), 401);
+      return { status: 200, headers: PROTO_HEADERS, body: foundEntries };
+    });
+
+    expect(await searchFilesViaWorkspaceApi("s-restart", "main", SEARCH_OPTIONS)).not.toBeNull();
+    restarted = true;
+    // The refused token ends this search, and the next one asks what the restarted host serves.
+    expect(await searchFilesViaWorkspaceApi("s-restart", "main", SEARCH_OPTIONS)).toBeNull();
+    expect(await searchFilesViaWorkspaceApi("s-restart", "main", SEARCH_OPTIONS)).toBeNull();
+
+    const methods = socket.mock.calls.map(([request]) =>
+      methodOf((request as { path: string }).path),
+    );
+    expect(methods.filter((method) => method === "GetCapabilities")).toHaveLength(2);
+    expect(methods.filter((method) => method === "SearchFiles")).toHaveLength(2);
+    expect(grantRequests()).toBe(2);
+  });
+
   it("leaves the search to REST while the host's file list is still being built", async () => {
     enable("workspace_api_server_access");
     const refreshing = create(SearchFilesResponseSchema, { refreshing: true });

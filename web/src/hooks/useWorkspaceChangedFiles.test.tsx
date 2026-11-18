@@ -860,6 +860,40 @@ describe("useWorkspaceFileSearch through the workspace API", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
+  it("falls back to REST when the workspace API declines a folder search", async () => {
+    onlineMock.mockReturnValue(true);
+    vi.mocked(searchFilesViaWorkspaceApi).mockResolvedValueOnce(null);
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        object: "list",
+        data: [
+          {
+            id: "src/b.ts",
+            name: "b.ts",
+            path: "src/b.ts",
+            type: "file",
+            bytes: 1,
+            modified_at: 1,
+          },
+        ],
+        has_more: false,
+      }),
+    );
+
+    render(
+      <Wrap>
+        <SearchPathsProbe location="src" />
+      </Wrap>,
+    );
+
+    await waitFor(() => expect(screen.getByTestId("paths")).toHaveTextContent("b.ts"));
+    expect(searchFilesViaWorkspaceApi).toHaveBeenCalledTimes(1);
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining("/search/src?"),
+      expect.anything(),
+    );
+  });
+
   it("searches a folder outside the workspace through REST only", async () => {
     onlineMock.mockReturnValue(true);
     fetchMock.mockResolvedValue(jsonResponse({ object: "list", data: [], has_more: false }));
