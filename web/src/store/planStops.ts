@@ -2,15 +2,12 @@ import { create } from "zustand";
 
 /** A Stop the user asked of a run's main agent; `sent` once its session took the message. */
 export interface PlanStopRequest {
-  /** Tells this Stop from a later one, across its `sent` update. */
+  /** Tells this Stop from a later one, across its updates. */
   id: number;
   sent: boolean;
-  /** The stop message's conversation item, once the session took it, when the server names it. */
-  itemId?: string;
+  /** Whether the transcript has shown a stop message as the latest request since this Stop. */
+  seen?: boolean;
 }
-
-/** How delivering a stop message went: null when the session didn't take it. */
-export type PlanStopDelivery = { itemId?: string } | null;
 
 interface PlanStopsState {
   requests: Readonly<Partial<Record<string, PlanStopRequest>>>;
@@ -49,31 +46,33 @@ function currentRequest(sessionId: string): PlanStopRequest | undefined {
  * Show *sessionId*'s run as stopping while *send* delivers the Stop, then until
  * the run stops. A Stop the session doesn't take restores the Stop control.
  *
- * @param send Delivers the stop message.
+ * @param send Delivers the stop message, resolving to whether the session took it.
  */
 export async function trackPlanStop(
   sessionId: string,
-  send: () => Promise<PlanStopDelivery>,
+  send: () => Promise<boolean>,
 ): Promise<void> {
   const sending: PlanStopRequest = { id: nextRequestId++, sent: false };
   replaceRequest(sessionId, currentRequest(sessionId), sending);
-  let delivery: PlanStopDelivery = null;
+  let taken = false;
   try {
-    delivery = await send();
+    taken = await send();
   } finally {
-    replaceRequest(
-      sessionId,
-      sending,
-      delivery
-        ? { ...sending, sent: true, ...(delivery.itemId ? { itemId: delivery.itemId } : {}) }
-        : undefined,
-    );
+    const current = currentRequest(sessionId);
+    if (current?.id === sending.id) {
+      replaceRequest(sessionId, current, taken ? { ...current, sent: true } : undefined);
+    }
   }
 }
 
 /** End *request*, unless a later Stop took its place. */
 export function endPlanStop(sessionId: string, request: PlanStopRequest): void {
   replaceRequest(sessionId, request, undefined);
+}
+
+/** The transcript shows a stop message as the latest request, so a later request ends *request*. */
+export function notePlanStopSeen(sessionId: string, request: PlanStopRequest): void {
+  if (!request.seen) replaceRequest(sessionId, request, { ...request, seen: true });
 }
 
 /**

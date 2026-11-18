@@ -3638,7 +3638,7 @@ describe("chatStore — send (first-send ordering)", () => {
       abortController: new AbortController(),
       pendingUserMessages: [],
     });
-    await trackPlanStop("conv_existing", async () => ({}));
+    await trackPlanStop("conv_existing", async () => true);
     fetchMock.mockImplementation((input, init) => {
       if (String(input).endsWith("/v1/sessions/conv_existing/events")) {
         return mockResponse({ error: "boom" }, { ok: false, status: 500 });
@@ -3674,7 +3674,7 @@ describe("chatStore — send (first-send ordering)", () => {
 
     const sending = useChatStore.getState().send("Keep the logs", "agent_xyz");
     await vi.waitFor(() => expect(landMessage).toBeDefined());
-    await trackPlanStop("conv_existing", async () => ({}));
+    await trackPlanStop("conv_existing", async () => true);
     landMessage!();
     await sending;
     expect(usePlanStops.getState().requests.conv_existing).toMatchObject({ sent: true });
@@ -5596,7 +5596,7 @@ describe("chatStore — sendSlashCommand", () => {
       conversationId: "conv_existing",
       abortController: new AbortController(),
     });
-    await trackPlanStop("conv_existing", async () => ({}));
+    await trackPlanStop("conv_existing", async () => true);
     fetchMock.mockImplementation((input, init) => {
       if (String(input).endsWith("/v1/sessions/conv_existing/events")) {
         return mockResponse({ error: "boom" }, { ok: false, status: 500 });

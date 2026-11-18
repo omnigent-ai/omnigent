@@ -20,12 +20,7 @@ import type { JournalEntry, StepProgress } from "@/lib/sessionJournal";
 import { continuePlanMessage, stopPlanMessage } from "@/lib/workflow";
 import type { ConversationState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
-import {
-  type PlanStopDelivery,
-  supersedePlanStop,
-  trackPlanStop,
-  usePlanStops,
-} from "@/store/planStops";
+import { supersedePlanStop, trackPlanStop, usePlanStops } from "@/store/planStops";
 import {
   openTasksTab,
   registerContinuePlan,
@@ -777,21 +772,21 @@ describe("TasksPanel", () => {
 
     /** Registers the composer's Stop, whose message the session takes once `deliver` settles. */
     function registerTrackedStop() {
-      let deliver!: (delivery: PlanStopDelivery) => void;
+      let deliver!: (taken: boolean) => void;
       const withdraw = registerStopWork(
         "conv",
         () =>
           void trackPlanStop(
             "conv",
             () =>
-              new Promise<PlanStopDelivery>((resolve) => {
+              new Promise<boolean>((resolve) => {
                 deliver = resolve;
               }),
           ),
       );
       onTestFinished(() => act(withdraw));
       onTestFinished(() => usePlanStops.setState({ requests: {}, settledStops: {} }));
-      return (taken: boolean) => act(async () => deliver(taken ? {} : null));
+      return (taken: boolean) => act(async () => deliver(taken));
     }
 
     beforeEach(() => {
@@ -861,7 +856,33 @@ describe("TasksPanel", () => {
       setSession({
         blocks: [userMessage("stop", stopPlanMessage(null))],
         pendingUserMessages: [
-          { tempId: "pend_1", content: [{ type: "input_text", text: continuePlanMessage(null) }] },
+          {
+            tempId: "pend_1",
+            content: [{ type: "input_text", text: continuePlanMessage(null) }],
+            posted: true,
+          },
+        ],
+      });
+      expect(screen.queryByTestId("plan-stopping")).toBeNull();
+      expect(screen.getByTestId("plan-stop")).toBeInTheDocument();
+    });
+
+    it("shows Stop once the transcript shows a request after the stop message, as from another tab", async () => {
+      const deliver = registerTrackedStop();
+      setSession({ sessionStatus: "running" });
+      renderPanel();
+      fireEvent.click(screen.getByTestId("plan-stop"));
+      await deliver(true);
+      setSession({ blocks: [userMessage("stop", stopPlanMessage(null))] });
+      expect(screen.getByTestId("plan-stopping")).toBeInTheDocument();
+
+      // Background work keeps the session working while another tab continues the run.
+      setSession({
+        sessionStatus: "idle",
+        backgroundTaskCount: 1,
+        blocks: [
+          userMessage("stop", stopPlanMessage(null)),
+          userMessage("go", continuePlanMessage(null)),
         ],
       });
       expect(screen.queryByTestId("plan-stopping")).toBeNull();

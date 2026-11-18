@@ -4,13 +4,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { AnyBlock } from "@/lib/blocks";
 import { continuePlanMessage, stopPlanMessage } from "@/lib/workflow";
 import { conversationRegistry } from "@/store/conversationRegistry";
-import {
-  type PlanStopDelivery,
-  supersedePlanStop,
-  trackPlanStop,
-  usePlanStops,
-} from "@/store/planStops";
-import { hasRequestAfter, latestStopRequest, usePlanStopping } from "./usePlanStopping";
+import { supersedePlanStop, trackPlanStop, usePlanStops } from "@/store/planStops";
+import { latestStopRequest, usePlanStopping } from "./usePlanStopping";
 
 const SESSION = "e".repeat(32);
 
@@ -33,33 +28,41 @@ function slashCommand(itemId: string, name: string): AnyBlock {
   };
 }
 
-function pendingSend(tempId: string, text: string) {
-  return { tempId, content: [{ type: "input_text" as const, text }] };
+/** A send the composer shows, `posted` once the session accepted it. */
+function pendingSend(tempId: string, text: string, posted?: boolean) {
+  return {
+    tempId,
+    content: [{ type: "input_text" as const, text }],
+    ...(posted === undefined ? {} : { posted }),
+  };
 }
+
+const STOP = userMessage("stop", stopPlanMessage(null));
+const CONTINUE = userMessage("go", continuePlanMessage(null));
 
 /** A stop whose message is still on its way, and how to settle it. */
 function sendStop() {
-  let settle!: (delivery: PlanStopDelivery) => void;
+  let settle!: (taken: boolean) => void;
   let fail!: (error: Error) => void;
   let tracked!: Promise<void>;
   act(() => {
     tracked = trackPlanStop(
       SESSION,
       () =>
-        new Promise<PlanStopDelivery>((resolve, reject) => {
+        new Promise<boolean>((resolve, reject) => {
           settle = resolve;
           fail = reject;
         }),
     );
   });
-  const settleWith = (delivery: PlanStopDelivery) =>
+  const settleWith = (taken: boolean) =>
     act(async () => {
-      settle(delivery);
+      settle(taken);
       await tracked;
     });
   return {
-    take: (itemId?: string) => settleWith(itemId ? { itemId } : {}),
-    refuse: () => settleWith(null),
+    take: () => settleWith(true),
+    refuse: () => settleWith(false),
     fail: (error: Error) =>
       act(async () => {
         fail(error);
@@ -74,6 +77,11 @@ function renderStopping(working: boolean) {
   });
 }
 
+/** The session's streamed transcript. */
+function transcript() {
+  return conversationRegistry.acquire(SESSION);
+}
+
 afterEach(() => {
   cleanup();
   conversationRegistry.clear();
@@ -82,14 +90,14 @@ afterEach(() => {
 
 describe("usePlanStopping", () => {
   it("stops from the Stop until the session stops working, and not on a later wake", async () => {
-    const entry = conversationRegistry.acquire(SESSION);
+    const entry = transcript();
     const { result, rerender } = renderStopping(true);
     expect(result.current).toBe(false);
 
     const stop = sendStop();
     expect(result.current).toBe(true);
     await stop.take();
-    act(() => entry.setState({ blocks: [userMessage("stop", stopPlanMessage(null))] }));
+    act(() => entry.setState({ blocks: [STOP] }));
     expect(result.current).toBe(true);
 
     rerender({ working: false });
@@ -131,63 +139,83 @@ describe("usePlanStopping", () => {
     expect(result.current).toBe(false);
   });
 
-  it("keeps stopping when a message sent before the Stop lands after it", async () => {
+  it("keeps stopping when a message sent before a Stop lands after it", async () => {
     const { result } = renderStopping(true);
-    const endStop = supersedePlanStop(SESSION);
-    const stop = sendStop();
-    await stop.take();
-    act(endStop);
+    const endNoStop = supersedePlanStop(SESSION);
+    await sendStop().take();
+    act(endNoStop);
     expect(result.current).toBe(true);
+
+    // Stop A, then a follow-up, then Stop B: the follow-up only ends A.
+    const endStopA = supersedePlanStop(SESSION);
+    await sendStop().take();
+    act(endStopA);
+    expect(result.current).toBe(true);
+    expect(usePlanStops.getState().requests[SESSION]).toMatchObject({ sent: true });
   });
 
-  it("ends when the transcript shows a request after the Stop's own message, as from another tab", async () => {
-    const entry = conversationRegistry.acquire(SESSION);
+  it("ends when the transcript shows a later request after the stop message, as from another tab", async () => {
+    const entry = transcript();
     const { result } = renderStopping(true);
-    await sendStop().take("stop_item");
-    act(() => entry.setState({ blocks: [userMessage("stop_item", stopPlanMessage(null))] }));
+    // The delivery names no item, as a native session's doesn't.
+    await sendStop().take();
+    act(() => entry.setState({ blocks: [STOP] }));
+    act(() =>
+      entry.setState({
+        blocks: [STOP, userMessage("report", "[Message from session 9b8b]\nStopped my shells.")],
+      }),
+    );
     expect(result.current).toBe(true);
 
-    act(() =>
-      entry.setState({
-        blocks: [
-          userMessage("stop_item", stopPlanMessage(null)),
-          userMessage("report", "[Message from session 9b8b]\nStopped my shells."),
-        ],
-      }),
-    );
+    // A transcript with no requests, as once its stream closes, isn't a later request.
+    act(() => entry.setState({ blocks: [] }));
     expect(result.current).toBe(true);
-    act(() =>
-      entry.setState({
-        blocks: [
-          userMessage("stop_item", stopPlanMessage(null)),
-          userMessage("go", continuePlanMessage(null)),
-        ],
-      }),
-    );
+
+    // Background work keeps the session working throughout.
+    act(() => entry.setState({ blocks: [STOP, CONTINUE] }));
     expect(result.current).toBe(false);
     expect(usePlanStops.getState().requests[SESSION]).toBeUndefined();
   });
 
+  it("follows the order the session took requests in, not when their sends were accepted", async () => {
+    const entry = transcript();
+    const { result } = renderStopping(true);
+    await sendStop().take();
+    act(() => entry.setState({ blocks: [STOP] }));
+
+    // A follow-up sent before the Stop is accepted after it.
+    act(() =>
+      entry.setState({ pendingUserMessages: [pendingSend("pend_1", "Keep the logs", true)] }),
+    );
+    expect(result.current).toBe(true);
+    // The session took it first.
+    act(() =>
+      entry.setState({
+        blocks: [userMessage("logs", "Keep the logs"), STOP],
+        pendingUserMessages: [],
+      }),
+    );
+    expect(result.current).toBe(true);
+  });
+
   it("drops the Stop once no surface watches the session, which can't see it stop", async () => {
-    const watching = renderStopping(true);
-    await sendStop().take("stop_item");
-    expect(watching.result.current).toBe(true);
-    watching.unmount();
+    const first = renderStopping(true);
+    const second = renderStopping(true);
+    await sendStop().take();
+    first.unmount();
+    expect(second.result.current).toBe(true);
+    expect(usePlanStops.getState().requests[SESSION]).toMatchObject({ sent: true });
+    second.unmount();
     expect(usePlanStops.getState().requests[SESSION]).toBeUndefined();
 
     // Unwatched, the run stopped and was continued from another tab; the session runs again.
-    conversationRegistry.acquire(SESSION).setState({
-      blocks: [
-        userMessage("stop_item", stopPlanMessage(null)),
-        userMessage("go", continuePlanMessage(null)),
-      ],
-    });
+    transcript().setState({ blocks: [STOP, CONTINUE] });
     expect(renderStopping(true).result.current).toBe(false);
   });
 
   it("reads a Stop from the transcript after a reload, until the session is seen to stop", () => {
-    const entry = conversationRegistry.acquire(SESSION);
-    entry.setState({ blocks: [userMessage("stop", stopPlanMessage(null))] });
+    const entry = transcript();
+    entry.setState({ blocks: [STOP] });
     const { result, rerender } = renderStopping(true);
     expect(result.current).toBe(true);
     rerender({ working: false });
@@ -196,38 +224,32 @@ describe("usePlanStopping", () => {
     expect(result.current).toBe(false);
 
     // A new Stop is its own.
-    act(() =>
-      entry.setState({
-        blocks: [
-          userMessage("stop", stopPlanMessage(null)),
-          userMessage("again", stopPlanMessage(null)),
-        ],
-      }),
-    );
+    act(() => entry.setState({ blocks: [STOP, userMessage("again", stopPlanMessage(null))] }));
     expect(result.current).toBe(true);
   });
-});
 
-describe("hasRequestAfter", () => {
-  it("finds a request from the user after the message, not a notice or a report", () => {
-    const stop = userMessage("stop_item", stopPlanMessage(null));
-    expect(hasRequestAfter([stop], "stop_item")).toBe(false);
-    expect(hasRequestAfter([], "stop_item")).toBe(false);
-    expect(
-      hasRequestAfter(
-        [
-          stop,
-          userMessage("notice", "[System: timer t1 fired]"),
-          userMessage("report", "[Message from session 9b8b]\nDone."),
-        ],
-        "stop_item",
-      ),
-    ).toBe(false);
-    expect(hasRequestAfter([stop, slashCommand("cmd", "workflow")], "stop_item")).toBe(true);
-    expect(hasRequestAfter([userMessage("go", continuePlanMessage(null)), stop], "stop_item")).toBe(
-      false,
-    );
-  });
+  it.each([
+    ["message", "Keep the logs", userMessage("logs", "Keep the logs")],
+    ["slash command", "/workflow Fix the tests", slashCommand("cmd", "workflow")],
+  ])(
+    "keeps a transcript's Stop until the session accepts a follow-up %s",
+    (_kind, text, committed) => {
+      const entry = transcript();
+      entry.setState({ blocks: [STOP] });
+      const { result } = renderStopping(true);
+
+      act(() => entry.setState({ pendingUserMessages: [pendingSend("pend_1", text)] }));
+      expect(result.current).toBe(true);
+      // Refused: its bubble goes away.
+      act(() => entry.setState({ pendingUserMessages: [] }));
+      expect(result.current).toBe(true);
+
+      act(() => entry.setState({ pendingUserMessages: [pendingSend("pend_2", text, true)] }));
+      expect(result.current).toBe(false);
+      act(() => entry.setState({ blocks: [STOP, committed], pendingUserMessages: [] }));
+      expect(result.current).toBe(false);
+    },
+  );
 });
 
 describe("latestStopRequest", () => {
@@ -247,16 +269,15 @@ describe("latestStopRequest", () => {
     ).toBe("stop");
   });
 
-  it("ends with a later message or command from the user, sent or still on its way", () => {
-    expect(latestStopRequest([stop, userMessage("go", continuePlanMessage(null))], [])).toBeNull();
+  it("ends with a later message or command from the user, once the session has it", () => {
+    expect(latestStopRequest([stop, CONTINUE], [])).toBeNull();
     expect(latestStopRequest([stop, slashCommand("cmd", "workflow")], [])).toBeNull();
-    expect(latestStopRequest([stop], [pendingSend("pend_1", "Keep the logs")])).toBeNull();
+    expect(latestStopRequest([stop], [pendingSend("pend_1", "Keep the logs", true)])).toBeNull();
+    // A send the session hasn't accepted doesn't count yet.
+    expect(latestStopRequest([stop], [pendingSend("pend_1", "Keep the logs")])).toBe("stop");
     expect(
-      latestStopRequest(
-        [userMessage("go", continuePlanMessage(null))],
-        [pendingSend("pend_2", stopPlanMessage(null))],
-      ),
+      latestStopRequest([CONTINUE], [pendingSend("pend_2", stopPlanMessage(null), true)]),
     ).toBe("pend_2");
-    expect(latestStopRequest([], [])).toBeNull();
+    expect(latestStopRequest([], [])).toBeUndefined();
   });
 });

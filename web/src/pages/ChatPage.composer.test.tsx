@@ -7208,11 +7208,16 @@ describe("Composer workflow entry point", () => {
       );
       fireEvent.change(textarea(), { target: { value: "An unsent note" } });
       act(() => useSessionTasksActions.getState().stopWork.conv_test?.());
+      // The run shows as stopping from the click, and still once the session takes the message.
+      expect(usePlanStops.getState().requests.conv_test).toMatchObject({ sent: false });
       await waitFor(() =>
         expect(fetchMessage).toHaveBeenCalledWith(
           "/v1/sessions/conv_test/events",
           expect.objectContaining({ method: "POST" }),
         ),
+      );
+      await waitFor(() =>
+        expect(usePlanStops.getState().requests.conv_test).toMatchObject({ sent: true }),
       );
       expect(JSON.parse(fetchMessage.mock.calls[0]![1]!.body as string)).toMatchObject({
         type: "message",
@@ -7238,7 +7243,7 @@ describe("Composer workflow entry point", () => {
     },
   );
 
-  it("keeps the run stopping once the session takes the Stop, and restores Stop when it fails", async () => {
+  it("restores Stop when the stop message fails, with the error", async () => {
     setComposerState({
       conversationId: "conv_test",
       sessionHarness: "openai-agents",
@@ -7247,13 +7252,7 @@ describe("Composer workflow entry point", () => {
     });
     const fetchMessage = vi
       .spyOn(globalThis, "fetch")
-      .mockResolvedValueOnce(
-        new Response(JSON.stringify({ queued: true, item_id: "stop_message" }), {
-          status: 200,
-          headers: { "Content-Type": "application/json" },
-        }),
-      )
-      .mockResolvedValueOnce(new Response(JSON.stringify({ error: "boom" }), { status: 500 }));
+      .mockResolvedValue(new Response(JSON.stringify({ error: "boom" }), { status: 500 }));
     const error = vi.spyOn(toast, "error");
     onTestFinished(() => {
       fetchMessage.mockRestore();
@@ -7262,14 +7261,6 @@ describe("Composer workflow entry point", () => {
     });
     renderWithWorkflows(<Composer {...composerProps()} />);
 
-    act(() => useSessionTasksActions.getState().stopWork.conv_test?.());
-    expect(usePlanStops.getState().requests.conv_test).toMatchObject({ sent: false });
-    await waitFor(() =>
-      expect(usePlanStops.getState().requests.conv_test).toMatchObject({ sent: true }),
-    );
-    expect(error).not.toHaveBeenCalled();
-
-    act(() => usePlanStops.setState({ requests: {}, settledStops: {} }));
     act(() => useSessionTasksActions.getState().stopWork.conv_test?.());
     expect(usePlanStops.getState().requests.conv_test).toMatchObject({ sent: false });
     await waitFor(() => expect(error).toHaveBeenCalledOnce());
