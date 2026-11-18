@@ -189,6 +189,70 @@ def test_resolved_spec_json_provenance_survives_production_reload(
     assert env["UNRELATED_TOKEN"] == "keep-me"
 
 
+@pytest.mark.parametrize("already_expanded", [False, True])
+def test_directory_upload_keeps_credential_out_of_passthrough(
+    tmp_path: Path,
+    isolated_auth: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    already_expanded: bool,
+) -> None:
+    from omnigent.cli import _bundle
+    from omnigent.spec.tar_utils import extract_safe
+
+    secret = "parent-only-model-credential"
+    monkeypatch.setenv("MODEL_CREDENTIAL", secret)
+    source = tmp_path / "upload-source"
+    source.mkdir()
+    (source / "config.yaml").write_text(
+        yaml.safe_dump(
+            {
+                "spec_version": 1,
+                "name": "private-auth",
+                "executor": {
+                    "type": "omnigent",
+                    "config": {"harness": "claude-sdk"},
+                    "auth": {
+                        "type": "api_key",
+                        "api_key": secret if already_expanded else "${MODEL_CREDENTIAL}",
+                        "base_url": "https://model.test/gateway",
+                    },
+                },
+                "os_env": {
+                    "type": "caller_process",
+                    "sandbox": {
+                        "type": "linux_bwrap",
+                        "env_passthrough": ["MODEL_CREDENTIAL", "MODEL_ALIAS", "UNRELATED_ENV"],
+                    },
+                },
+            }
+        )
+    )
+    restored_dir = tmp_path / "restored"
+    extract_safe(_bundle(source), restored_dir)
+    restored = load(restored_dir, expand_env=False)
+    auth = restored.executor.auth
+    assert isinstance(auth, ApiKeyAuth)
+    assert auth.api_key == secret
+    assert set(auth.source_env_names) == (
+        set() if already_expanded else {"MODEL_CREDENTIAL", "OMNIGENT_MODEL_CREDENTIAL"}
+    )
+    assert restored.os_env is not None and restored.os_env.sandbox is not None
+    assert "MODEL_ALIAS" in restored.os_env.sandbox.env_passthrough
+
+    access = workflow.claude_terminal_model_access(restored)
+    assert access is not None
+    env = {
+        "MODEL_CREDENTIAL": secret,
+        "OMNIGENT_MODEL_CREDENTIAL": secret,
+        "MODEL_ALIAS": f"Bearer {secret}",
+        "UNRELATED_ENV": "keep-me",
+    }
+    access.worker_environment(env, tmp_path / "private-home")
+    assert not {"MODEL_CREDENTIAL", "OMNIGENT_MODEL_CREDENTIAL", "MODEL_ALIAS"} & env.keys()
+    assert env["UNRELATED_ENV"] == "keep-me"
+    assert env["ANTHROPIC_AUTH_TOKEN"] == access.placeholder
+
+
 @pytest.mark.parametrize("expand_env", [True, False])
 def test_serialized_auth_provenance_unions_raw_refs_and_aliases(
     tmp_path: Path, isolated_auth: Path, expand_env: bool

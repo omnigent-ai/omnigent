@@ -261,8 +261,9 @@ def validate_claude_sandbox_backend(policy: SandboxPolicy) -> None:
 class _CredentialResolver:
     """Parent-only resolver shared by equal callback access and the running relay."""
 
-    def __init__(self, resolve: Callable[[], str]) -> None:
+    def __init__(self, resolve: Callable[[], str], static_secret: str | None = None) -> None:
         self._resolve = resolve
+        self._static_secret = static_secret
         self._generation = 0
         self._lock = threading.Lock()
 
@@ -271,11 +272,17 @@ class _CredentialResolver:
             resolve = self._resolve
         return resolve()
 
+    def static_secret(self) -> str | None:
+        with self._lock:
+            return self._static_secret
+
     def replace(self, replacement: _CredentialResolver) -> None:
         with replacement._lock:
             resolve = replacement._resolve
+            static_secret = replacement._static_secret
         with self._lock:
             self._resolve = resolve
+            self._static_secret = static_secret
             self._generation += 1
 
 
@@ -289,6 +296,9 @@ class ClaudeModelAccess:
     base_url: str
     auth_header: str
     credential: Callable[[], str] = field(repr=False, compare=False)
+    static_credential_value: str | None = field(
+        default=None, repr=False, compare=False, kw_only=True
+    )
     source_paths: tuple[Path, ...] = ()
     oauth: bool = False
     placeholder: str = field(
@@ -330,7 +340,7 @@ class ClaudeModelAccess:
             raise ValueError("unsupported Claude credential type")
         resolver = self.credential
         if not isinstance(resolver, _CredentialResolver):
-            resolver = _CredentialResolver(resolver)
+            resolver = _CredentialResolver(resolver, self.static_credential_value)
         object.__setattr__(self, "_credential_resolver", resolver)
         object.__setattr__(self, "credential", resolver)
         if is_databricks_ai_gateway_url(self.base_url):
@@ -426,14 +436,17 @@ class ClaudeModelAccess:
 
     def worker_environment(self, env: MutableMapping[str, str], home: Path) -> None:
         """Install only a session placeholder and isolated Claude state."""
+        static_secret = self._credential_resolver.static_secret()
         for key in (*_SECRET_ENV, *self.source_env_names):
             for name in env_names_with_omnigent_prefix(key):
                 env.pop(name, None)
         for key in _BYPASS_ENV:
             env.pop(key, None)
-        for key in list(env):
-            if _is_claude_credential_env_name(key) or key.removeprefix("OMNIGENT_").startswith(
-                ("HARNESS_", "DATABRICKS_")
+        for key, value in list(env.items()):
+            if (
+                _is_claude_credential_env_name(key)
+                or key.removeprefix("OMNIGENT_").startswith(("HARNESS_", "DATABRICKS_"))
+                or (bool(static_secret) and static_secret in value)
             ):
                 env.pop(key)
         env["HOME"] = str(home)
@@ -867,7 +880,12 @@ def resolve_claude_model_access(
                 else "authorization"
             )
             return ClaudeModelAccess(
-                base_url, header, lambda: token, private_paths, source_env_names=source_env_names
+                base_url,
+                header,
+                lambda: token,
+                private_paths,
+                source_env_names=source_env_names,
+                static_credential_value=token,
             )
         if databricks_profile:
             authority = f"https://{urlsplit(base_url).hostname}"
@@ -917,6 +935,7 @@ def resolve_claude_model_access(
                 private_paths,
                 oauth,
                 source_env_names=source_env_names,
+                static_credential_value=token,
             )
 
     if user_settings_has_api_key_helper:

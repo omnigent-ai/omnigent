@@ -346,6 +346,18 @@ def test_worker_gets_only_placeholder_and_private_state(tmp_path: Path) -> None:
     assert env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] == "1000"
 
 
+def test_replaced_static_credential_scrubs_current_value(tmp_path: Path) -> None:
+    access = ClaudeModelAccess(
+        "https://model.test", "authorization", lambda: "old-key", static_credential_value="old-key"
+    )
+    replacement = replace(access, credential=lambda: "new-key", static_credential_value="new-key")
+    access._adopt_credential(replacement)
+    env = {"MODEL_ALIAS": "Bearer new-key", "UNRELATED_ENV": "keep-me"}
+    access.worker_environment(env, tmp_path)
+    assert "MODEL_ALIAS" not in env
+    assert env["UNRELATED_ENV"] == "keep-me"
+
+
 def test_credentials_inside_granted_workspace_are_rejected(tmp_path: Path) -> None:
     source = tmp_path / ".credentials.json"
     source.write_text("private")
