@@ -882,7 +882,20 @@ def test_get_conversation_takes_one_checkout_per_engine(
 
 @pytest.mark.parametrize("single_database", [False, True])
 @pytest.mark.parametrize(
-    "superseded", [None, "input", "stop", "runner", "host", "approval", "archive"]
+    "superseded",
+    [
+        None,
+        "input",
+        "skill",
+        "authored-meta",
+        "synthetic-meta",
+        "command",
+        "stop",
+        "runner",
+        "host",
+        "approval",
+        "archive",
+    ],
 )
 def test_recovery_admission_checks_input_and_binding(
     store: SqlAlchemyConversationStore,
@@ -893,7 +906,7 @@ def test_recovery_admission_checks_input_and_binding(
     from dataclasses import replace
 
     from omnigent.db.db_models import workspace_scope
-    from omnigent.entities import MessageData, NewConversationItem
+    from omnigent.entities import MessageData, NewConversationItem, SlashCommandData
     from omnigent.session_recovery import SessionRecovery
 
     if single_database:
@@ -908,7 +921,7 @@ def test_recovery_admission_checks_input_and_binding(
         launch_runner_id=conv.runner_id,
     )
     assert store.replace_session_recovery(conv.id, None, intent)
-    if superseded == "input":
+    if superseded in {"input", "authored-meta", "synthetic-meta"}:
         store.append(
             conv.id,
             [
@@ -916,7 +929,23 @@ def test_recovery_admission_checks_input_and_binding(
                     response_id="user",
                     type="message",
                     data=MessageData(
-                        role="user", content=[{"type": "input_text", "text": "New work"}]
+                        role="user",
+                        content=[{"type": "input_text", "text": "New work"}],
+                        is_meta=superseded != "input",
+                        user_authored=superseded == "authored-meta",
+                    ),
+                )
+            ],
+        )
+    elif superseded in {"skill", "command"}:
+        store.append(
+            conv.id,
+            [
+                NewConversationItem(
+                    response_id="user",
+                    type="slash_command",
+                    data=SlashCommandData(
+                        agent="test", kind=superseded, name="inspect", arguments=""
                     ),
                 )
             ],
@@ -933,7 +962,9 @@ def test_recovery_admission_checks_input_and_binding(
         store.update_conversation(conv.id, archived=True)
     with workspace_scope(42):
         assert not store.admit_session_recovery(conv.id, intent)
-    assert store.admit_session_recovery(conv.id, intent) is (superseded is None)
+    assert store.admit_session_recovery(conv.id, intent) is (
+        superseded in {None, "synthetic-meta", "command"}
+    )
 
 
 @pytest.mark.parametrize("legacy_counter", [False, True])

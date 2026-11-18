@@ -93,7 +93,9 @@ import {
 } from "@/pages/settings/search/catalog/updates";
 import { SettingsEntryLabel, SettingsItem } from "@/pages/settings/search/SettingsItem";
 import {
+  type SettingsControlProps,
   settingsControlProps,
+  settingsFileInputProps,
   settingsDescriptionId,
   settingsLabelId,
 } from "@/pages/settings/search/settingsControl";
@@ -103,10 +105,37 @@ import {
 } from "@/pages/settings/search/catalog/archived";
 import {
   SettingsDataRegion,
+  SettingsOwner,
   settingsOverlayProps,
   settingsRowOverlayProps,
   settingsRuntimeChoiceProps,
 } from "@/pages/settings/search/settingsOwnership";
+import {
+  ALWAYS_STEER_ENTRY,
+  BACKGROUND_SESSION_TITLES_ENTRY,
+  OPEN_SUBAGENTS_IN_PANEL_ENTRY,
+  SUBMIT_WITH_MOD_ENTER_ENTRY,
+} from "@/pages/settings/search/catalog/general";
+import {
+  APPEARANCE_DATA_ENTRY,
+  CODE_FONT_FAMILY_ENTRY,
+  CODE_FONT_SIZE_ENTRY,
+  CODE_FONT_WEIGHT_ENTRY,
+  COLOR_THEME_ENTRY,
+  HIDE_UNCONFIGURED_HARNESSES_ENTRY,
+  PEER_SESSION_MESSAGES_ENTRY,
+  SHOW_FINAL_ANSWER_ENTRY,
+  TERMINAL_THEME_ENTRY,
+  THEME_MODE_ENTRY,
+  TRANSCRIPT_VIEW_DEFAULT_ENTRY,
+  DEFAULT_WORKSPACE_TAB_ENTRY,
+  PROJECT_FOLDER_PAGINATION_ENTRY,
+  SESSION_ROW_QUICK_ACTIONS_ENTRY,
+  UI_FONT_FAMILY_ENTRY,
+  UI_FONT_SIZE_ENTRY,
+  WORKSPACE_PANEL_DEFAULT_ENTRY,
+  WORKSPACE_TABS_ENTRY,
+} from "@/pages/settings/search/catalog/appearance";
 import { MCP_SERVICES_ENTRY } from "@/pages/settings/search/catalog/mcp";
 import {
   ACCOUNT_PASSWORD_ENTRY,
@@ -550,6 +579,18 @@ const workspaceTabCards: {
   { value: "tasks", label: "Tasks", icon: ListChecksIcon },
 ];
 
+/** Each tab's pin control, named on the Sidebar tabs row. */
+const WORKSPACE_TAB_PIN_PARTS: Record<
+  DefaultWorkspaceTab,
+  "pinFiles" | "pinChanges" | "pinPullRequests" | "pinAgents" | "pinTasks"
+> = {
+  files: "pinFiles",
+  changes: "pinChanges",
+  github: "pinPullRequests",
+  subagents: "pinAgents",
+  tasks: "pinTasks",
+};
+
 /** Inline icon and label for compact settings choices. */
 function iconButtonBody(Icon: ComponentType<{ className?: string }>, label: string) {
   return (
@@ -563,18 +604,25 @@ function iconButtonBody(Icon: ComponentType<{ className?: string }>, label: stri
 /** A labeled Appearance subsection: heading + one-line helper + its control. */
 function ThemeSubsection({
   labelId,
+  descriptionId,
   title,
   helper,
   children,
 }: {
   labelId: string;
+  descriptionId?: string;
   title: string;
   helper: string;
   children: ReactNode;
 }) {
   return (
     <div className="flex flex-col gap-3">
-      <SettingsLabel label={title} labelId={labelId} description={helper} />
+      <SettingsLabel
+        label={title}
+        labelId={labelId}
+        descriptionId={descriptionId}
+        description={helper}
+      />
       {children}
     </div>
   );
@@ -586,21 +634,16 @@ function ModeControl() {
   const mode = normalizeThemeMode(theme);
   const followsHost = useHostTheme() !== undefined;
   const themeSettingsUrl = followsHost ? getOmnigentThemeSettingsUrl() : undefined;
-  const labelId = useId();
   return (
-    <div className="flex items-center justify-between gap-4">
+    <SettingsItem entry={THEME_MODE_ENTRY} className="flex items-center justify-between gap-4">
       <div className="flex-1">
-        <SettingsLabel
-          label="Mode"
-          labelId={labelId}
-          description={
-            followsHost
-              ? "Follow Databricks, or force light or dark."
-              : "Follow your system, or force light or dark."
-          }
+        <SettingsEntryLabel
+          entry={THEME_MODE_ENTRY}
+          description={followsHost ? "Follow Databricks, or force light or dark." : undefined}
         />
         {themeSettingsUrl && (
           <a
+            {...settingsControlProps(THEME_MODE_ENTRY, "databricksSettings")}
             href={themeSettingsUrl}
             target="_blank"
             rel="noreferrer"
@@ -610,82 +653,84 @@ function ModeControl() {
           </a>
         )}
       </div>
-      <IconSegmentedControl<ThemeMode>
-        labelledBy={labelId}
-        value={mode}
-        onSelect={(next) => setTheme(next)}
-        componentId="settings.appearance.theme_mode"
-        items={themeCards.map((card) => ({
-          value: card.mode,
-          testId: `theme-${card.mode}`,
-          label: card.mode === "system" && followsHost ? "Use Databricks setting" : card.label,
-          icon: card.icon,
-        }))}
-      />
-    </div>
+      <SettingsOwner entry={THEME_MODE_ENTRY}>
+        <IconSegmentedControl<ThemeMode>
+          labelledBy={settingsLabelId(THEME_MODE_ENTRY)}
+          value={mode}
+          onSelect={(next) => setTheme(next)}
+          componentId="settings.appearance.theme_mode"
+          items={themeCards.map((card) => ({
+            value: card.mode,
+            testId: `theme-${card.mode}`,
+            label: card.mode === "system" && followsHost ? "Use Databricks setting" : card.label,
+            icon: card.icon,
+          }))}
+        />
+      </SettingsOwner>
+    </SettingsItem>
   );
 }
 
 /** Terminal light/dark/match-app theme — its own section. */
 function TerminalThemeControl() {
   const [mode, setMode] = useState(() => readTerminalThemeMode());
-  const labelId = useId();
   const choose = useCallback((next: TerminalThemeMode) => {
     setMode(next);
     writeTerminalThemeMode(next);
   }, []);
   return (
-    <div className="flex items-center justify-between gap-4">
-      <SettingsLabel
-        label="Terminal theme"
-        labelId={labelId}
-        description="Use a light or dark terminal, or match the app."
-        className="flex-1"
-      />
-      <IconSegmentedControl<TerminalThemeMode>
-        labelledBy={labelId}
-        value={mode}
-        onSelect={choose}
-        componentId="settings.appearance.terminal_theme"
-        items={terminalThemeCards.map((card) => ({
-          value: card.mode,
-          testId: `terminal-theme-${card.mode}`,
-          label: card.label,
-          icon: card.icon,
-        }))}
-      />
-    </div>
+    <SettingsItem entry={TERMINAL_THEME_ENTRY} className="flex items-center justify-between gap-4">
+      <SettingsEntryLabel entry={TERMINAL_THEME_ENTRY} className="flex-1" />
+      <SettingsOwner entry={TERMINAL_THEME_ENTRY}>
+        <IconSegmentedControl<TerminalThemeMode>
+          labelledBy={settingsLabelId(TERMINAL_THEME_ENTRY)}
+          value={mode}
+          onSelect={choose}
+          componentId="settings.appearance.terminal_theme"
+          items={terminalThemeCards.map((card) => ({
+            value: card.mode,
+            testId: `terminal-theme-${card.mode}`,
+            label: card.label,
+            icon: card.icon,
+          }))}
+        />
+      </SettingsOwner>
+    </SettingsItem>
   );
 }
 
 /** Default surface for terminal-first transcripts without a per-tab choice. */
 function TranscriptViewDefaultControl() {
   const [value, setValue] = useState(() => readTranscriptViewDefault());
-  const labelId = useId();
   const choose = useCallback((next: TranscriptViewDefault) => {
     setValue(next);
     writeTranscriptViewDefault(next);
   }, []);
   return (
-    <ThemeSubsection
-      labelId={labelId}
-      title="Default transcript view"
-      helper="Open terminal-backed chats in Chat or Terminal view. In-chat choices are remembered for the current tab."
-    >
-      <CardRadioGroup<TranscriptViewDefault>
-        compact
-        labelledBy={labelId}
-        value={value}
-        onSelect={choose}
-        componentId="settings.appearance.transcript_view"
-        className="flex flex-wrap gap-2"
-        items={transcriptViewCards.map((card) => ({
-          value: card.value,
-          testId: `transcript-view-default-${card.value}`,
-          body: iconButtonBody(card.icon, card.label),
-        }))}
-      />
-    </ThemeSubsection>
+    <SettingsItem entry={TRANSCRIPT_VIEW_DEFAULT_ENTRY}>
+      <ThemeSubsection
+        labelId={settingsLabelId(TRANSCRIPT_VIEW_DEFAULT_ENTRY)}
+        descriptionId={settingsDescriptionId(TRANSCRIPT_VIEW_DEFAULT_ENTRY)}
+        title="Default transcript view"
+        helper="Open terminal-backed chats in Chat or Terminal view. In-chat choices are remembered for the current tab."
+      >
+        <SettingsOwner entry={TRANSCRIPT_VIEW_DEFAULT_ENTRY}>
+          <CardRadioGroup<TranscriptViewDefault>
+            compact
+            labelledBy={settingsLabelId(TRANSCRIPT_VIEW_DEFAULT_ENTRY)}
+            value={value}
+            onSelect={choose}
+            componentId="settings.appearance.transcript_view"
+            className="flex flex-wrap gap-2"
+            items={transcriptViewCards.map((card) => ({
+              value: card.value,
+              testId: `transcript-view-default-${card.value}`,
+              body: iconButtonBody(card.icon, card.label),
+            }))}
+          />
+        </SettingsOwner>
+      </ThemeSubsection>
+    </SettingsItem>
   );
 }
 
@@ -696,31 +741,35 @@ function TranscriptViewDefaultControl() {
  */
 function WorkspacePanelDefaultControl() {
   const [value, setValue] = useState(() => readWorkspacePanelDefault());
-  const labelId = useId();
   const choose = useCallback((next: WorkspacePanelDefault) => {
     setValue(next);
     writeWorkspacePanelDefault(next);
   }, []);
   return (
-    <ThemeSubsection
-      labelId={labelId}
-      title="Workspace panel"
-      helper="Show the Workspace panel in new chats. Opening or closing it updates this default; existing chats keep their layout."
-    >
-      <CardRadioGroup<WorkspacePanelDefault>
-        compact
-        labelledBy={labelId}
-        value={value}
-        onSelect={choose}
-        componentId="settings.appearance.workspace_panel"
-        className="flex flex-wrap gap-2"
-        items={workspacePanelCards.map((card) => ({
-          value: card.value,
-          testId: `workspace-panel-default-${card.value}`,
-          body: iconButtonBody(card.icon, card.label),
-        }))}
-      />
-    </ThemeSubsection>
+    <SettingsItem entry={WORKSPACE_PANEL_DEFAULT_ENTRY}>
+      <ThemeSubsection
+        labelId={settingsLabelId(WORKSPACE_PANEL_DEFAULT_ENTRY)}
+        descriptionId={settingsDescriptionId(WORKSPACE_PANEL_DEFAULT_ENTRY)}
+        title="Workspace panel"
+        helper="Show the Workspace panel in new chats. Opening or closing it updates this default; existing chats keep their layout."
+      >
+        <SettingsOwner entry={WORKSPACE_PANEL_DEFAULT_ENTRY}>
+          <CardRadioGroup<WorkspacePanelDefault>
+            compact
+            labelledBy={settingsLabelId(WORKSPACE_PANEL_DEFAULT_ENTRY)}
+            value={value}
+            onSelect={choose}
+            componentId="settings.appearance.workspace_panel"
+            className="flex flex-wrap gap-2"
+            items={workspacePanelCards.map((card) => ({
+              value: card.value,
+              testId: `workspace-panel-default-${card.value}`,
+              body: iconButtonBody(card.icon, card.label),
+            }))}
+          />
+        </SettingsOwner>
+      </ThemeSubsection>
+    </SettingsItem>
   );
 }
 
@@ -728,8 +777,8 @@ function WorkspacePanelDefaultControl() {
 function WorkspaceTabsControl() {
   const [value, setValue] = useState(() => readDefaultWorkspaceTab());
   const [pinned, setPinned] = useState(() => readPinnedWorkspaceTabs());
-  const labelId = useId();
-  const pinnedLabelId = useId();
+  const labelId = settingsLabelId(DEFAULT_WORKSPACE_TAB_ENTRY);
+  const pinnedLabelId = settingsLabelId(WORKSPACE_TABS_ENTRY);
   const pinnedCards = workspaceTabCards.filter((card) => pinned.includes(card.value));
   const firstTab = pinnedCards.find((card) => card.value === value) ?? pinnedCards[0];
   const previewTabs = firstTab
@@ -748,89 +797,97 @@ function WorkspaceTabsControl() {
   };
   return (
     <div className="flex flex-col gap-4">
-      <ThemeSubsection
-        labelId={pinnedLabelId}
-        title="Sidebar tabs"
-        helper="Pin the pages you use most. Everything else stays in the + menu."
-      >
-        <div
-          role="img"
-          aria-label={`Sidebar preview: ${previewTabs.length ? `${previewTabs.map((tab) => tab.label).join(", ")} pinned` : "all pages in the + menu"}.`}
-          className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-muted/25 px-3 py-2.5"
+      <SettingsItem entry={WORKSPACE_TABS_ENTRY}>
+        <ThemeSubsection
+          labelId={pinnedLabelId}
+          descriptionId={settingsDescriptionId(WORKSPACE_TABS_ENTRY)}
+          title="Sidebar tabs"
+          helper="Pin the pages you use most. Everything else stays in the + menu."
         >
-          <span className="text-sm text-muted-foreground">Sidebar preview</span>
-          <div aria-hidden="true" className="flex shrink-0 items-center gap-1">
-            {previewTabs.map(({ value: tab, icon: Icon }) => (
-              <span
-                key={tab}
-                className={cn(
-                  "flex size-7 items-center justify-center rounded-md text-muted-foreground",
-                  tab === firstTab?.value && "bg-background text-foreground shadow-xs",
-                )}
-              >
-                <Icon className="size-4" />
-              </span>
-            ))}
-            {previewTabs.length > 0 && <span className="mx-1 h-4 w-px bg-border" />}
-            <span className="flex size-7 items-center justify-center text-muted-foreground">
-              <PlusIcon className="size-4" />
-            </span>
-          </div>
-        </div>
-        <div role="group" aria-labelledby={pinnedLabelId} className="divide-y divide-border">
-          {workspaceTabCards.map(({ value: tab, label, icon: Icon }) => {
-            const isPinned = pinned.includes(tab);
-            return (
-              <div key={tab} className="flex items-center gap-3 py-2.5">
-                <Icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
-                <span className="flex-1 text-ui">{label}</span>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  size="sm"
-                  aria-label={`Pin ${label}`}
-                  aria-pressed={isPinned}
-                  title={`${isPinned ? "Unpin" : "Pin"} ${label}`}
-                  onClick={() => togglePin(tab, !isPinned)}
+          <div
+            role="img"
+            aria-label={`Sidebar preview: ${previewTabs.length ? `${previewTabs.map((tab) => tab.label).join(", ")} pinned` : "all pages in the + menu"}.`}
+            className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-muted/25 px-3 py-2.5"
+          >
+            <span className="text-sm text-muted-foreground">Sidebar preview</span>
+            <div aria-hidden="true" className="flex shrink-0 items-center gap-1">
+              {previewTabs.map(({ value: tab, icon: Icon }) => (
+                <span
+                  key={tab}
                   className={cn(
-                    "min-w-24",
-                    isPinned
-                      ? "bg-primary/8 text-primary hover:bg-primary/12"
-                      : "text-muted-foreground",
+                    "flex size-7 items-center justify-center rounded-md text-muted-foreground",
+                    tab === firstTab?.value && "bg-background text-foreground shadow-xs",
                   )}
-                  componentId={`settings.appearance.pin_workspace_${tab}`}
                 >
-                  <PinIcon
-                    aria-hidden="true"
-                    className={cn("size-3.5", isPinned && "fill-current")}
-                  />
-                  {isPinned ? "Pinned" : "Pin"}
-                </Button>
-              </div>
-            );
-          })}
-        </div>
-      </ThemeSubsection>
+                  <Icon className="size-4" />
+                </span>
+              ))}
+              {previewTabs.length > 0 && <span className="mx-1 h-4 w-px bg-border" />}
+              <span className="flex size-7 items-center justify-center text-muted-foreground">
+                <PlusIcon className="size-4" />
+              </span>
+            </div>
+          </div>
+          <div role="group" aria-labelledby={pinnedLabelId} className="divide-y divide-border">
+            {workspaceTabCards.map(({ value: tab, label, icon: Icon }) => {
+              const isPinned = pinned.includes(tab);
+              return (
+                <div key={tab} className="flex items-center gap-3 py-2.5">
+                  <Icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+                  <span className="flex-1 text-ui">{label}</span>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    {...settingsControlProps(WORKSPACE_TABS_ENTRY, WORKSPACE_TAB_PIN_PARTS[tab])}
+                    aria-pressed={isPinned}
+                    title={`${isPinned ? "Unpin" : "Pin"} ${label}`}
+                    onClick={() => togglePin(tab, !isPinned)}
+                    className={cn(
+                      "min-w-24",
+                      isPinned
+                        ? "bg-primary/8 text-primary hover:bg-primary/12"
+                        : "text-muted-foreground",
+                    )}
+                    componentId={`settings.appearance.pin_workspace_${tab}`}
+                  >
+                    <PinIcon
+                      aria-hidden="true"
+                      className={cn("size-3.5", isPinned && "fill-current")}
+                    />
+                    {isPinned ? "Pinned" : "Pin"}
+                  </Button>
+                </div>
+              );
+            })}
+          </div>
+        </ThemeSubsection>
+      </SettingsItem>
       {firstTab && (
         <div className="border-t border-border pt-4">
-          <ThemeSubsection
-            labelId={labelId}
-            title="Default Workspace tab"
-            helper="Open this tab first, including in existing chats after reopening or refreshing. Later choices are remembered; file links still open their target."
-          >
-            <CardRadioGroup<DefaultWorkspaceTab>
-              compact
-              labelledBy={labelId}
-              value={firstTab.value}
-              onSelect={choose}
-              className="flex flex-wrap gap-2"
-              items={pinnedCards.map((card) => ({
-                value: card.value,
-                testId: `workspace-tab-default-${card.value}`,
-                body: iconButtonBody(card.icon, card.label),
-              }))}
-            />
-          </ThemeSubsection>
+          <SettingsItem entry={DEFAULT_WORKSPACE_TAB_ENTRY}>
+            <ThemeSubsection
+              labelId={labelId}
+              descriptionId={settingsDescriptionId(DEFAULT_WORKSPACE_TAB_ENTRY)}
+              title="Default Workspace tab"
+              helper="Open this tab first, including in existing chats after reopening or refreshing. Later choices are remembered; file links still open their target."
+            >
+              <SettingsOwner entry={DEFAULT_WORKSPACE_TAB_ENTRY}>
+                <CardRadioGroup<DefaultWorkspaceTab>
+                  compact
+                  labelledBy={labelId}
+                  value={firstTab.value}
+                  onSelect={choose}
+                  className="flex flex-wrap gap-2"
+                  items={pinnedCards.map((card) => ({
+                    value: card.value,
+                    testId: `workspace-tab-default-${card.value}`,
+                    body: iconButtonBody(card.icon, card.label),
+                  }))}
+                />
+              </SettingsOwner>
+            </ThemeSubsection>
+          </SettingsItem>
         </div>
       )}
     </div>
@@ -843,7 +900,6 @@ function ColorThemeControl() {
   const isDark = useResolvedThemeMode() === "dark";
   const [selection, setSelection] = useState<ThemeSelection>(() => readThemePalette());
   const [customTheme, setCustomTheme] = useState<CustomTheme>(() => readCustomTheme());
-  const labelId = useId();
 
   const choose = useCallback(
     (next: ThemeSelection) => {
@@ -897,116 +953,128 @@ function ColorThemeControl() {
       : selectedPalette?.blurb;
 
   return (
-    <ThemeSubsection
-      labelId={labelId}
-      title="Color theme"
-      helper="Choose a preset, then tune it across light and dark mode."
-    >
-      <div
-        data-testid="color-theme-editor"
-        className="overflow-hidden rounded-xl border bg-transparent"
+    <SettingsItem entry={COLOR_THEME_ENTRY}>
+      <ThemeSubsection
+        labelId={settingsLabelId(COLOR_THEME_ENTRY)}
+        descriptionId={settingsDescriptionId(COLOR_THEME_ENTRY)}
+        title="Color theme"
+        helper="Choose a preset, then tune it across light and dark mode."
       >
-        <div className="flex flex-col gap-3 border-b bg-muted/30 p-4 sm:flex-row sm:items-center sm:justify-between">
-          <div className="flex min-w-0 items-center gap-3">
-            <div className="w-28 shrink-0 overflow-hidden rounded-lg shadow-sm">
-              <PaletteSwatchPreview swatch={isDark ? selected.dark : selected.light} />
-            </div>
-            <SettingsLabel
-              label="Theme palette"
-              description={paletteDescription}
-              descriptionClassName="truncate"
-            />
-          </div>
-          <Select
-            value={selection}
-            onValueChange={(next) => {
-              if (isThemeSelection(next)) choose(next);
-            }}
-            componentId="settings.appearance.color_theme"
-            valueHasNoPii
-          >
-            <SelectTrigger
-              aria-labelledby={labelId}
-              data-testid="color-theme-select"
-              className="w-full gap-2 sm:w-48"
-            >
-              <SelectValue>
-                <PaletteChip swatch={isDark ? selected.dark : selected.light} />
-                <span>{selected.label}</span>
-              </SelectValue>
-            </SelectTrigger>
-            <SelectContent>
-              {PALETTES.map((palette) => (
-                <SelectItem
-                  key={palette.id}
-                  value={palette.id}
-                  data-testid={`palette-${palette.id}`}
-                >
-                  <PaletteChip swatch={isDark ? palette.dark : palette.light} />
-                  <span>{palette.label}</span>
-                </SelectItem>
-              ))}
-              <SelectItem value="custom" data-testid="palette-custom">
-                <PaletteChip swatch={isDark ? customSwatches.dark : customSwatches.light} />
-                <span>Custom</span>
-              </SelectItem>
-            </SelectContent>
-          </Select>
-        </div>
-
-        <div className="px-4">
-          <ThemeColorPicker
-            label="Accent"
-            value={isDark ? editableTheme.darkAccent : editableTheme.accent}
-            testId="custom-theme-accent"
-            onChange={(accent) => updateCustomTheme(isDark ? { darkAccent: accent } : { accent })}
-          />
-          <ThemeColorPicker
-            label="Background tint"
-            value={isDark ? editableTheme.darkTint : editableTheme.tint}
-            testId="custom-theme-tint"
-            onChange={(tint) => updateCustomTheme(isDark ? { darkTint: tint } : { tint })}
-          />
-          <div className="flex items-center justify-between gap-4 border-b border-border/70 py-4">
-            <SettingsLabel label="Contrast" description="Separates text, borders, and surfaces." />
-            <div className="flex w-52 items-center gap-3">
-              <input
-                id="custom-theme-contrast"
-                type="range"
-                min="0"
-                max="100"
-                value={editableTheme.contrast}
-                aria-label="Theme contrast"
-                data-testid="custom-theme-contrast"
-                onChange={(event) => updateCustomTheme({ contrast: Number(event.target.value) })}
-                className="theme-contrast-range min-w-0 flex-1 cursor-pointer"
-                style={{ "--range-progress": `${editableTheme.contrast}%` } as CSSProperties}
+        <div
+          data-testid="color-theme-editor"
+          className="overflow-hidden rounded-xl border bg-transparent"
+        >
+          <div className="flex flex-col gap-3 border-b bg-muted/30 p-4 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex min-w-0 items-center gap-3">
+              <div className="w-28 shrink-0 overflow-hidden rounded-lg shadow-sm">
+                <PaletteSwatchPreview swatch={isDark ? selected.dark : selected.light} />
+              </div>
+              <SettingsLabel
+                label="Theme palette"
+                description={paletteDescription}
+                descriptionClassName="truncate"
               />
-              <output
-                htmlFor="custom-theme-contrast"
-                data-testid="custom-theme-contrast-value"
-                className="w-7 text-right text-sm font-medium tabular-nums"
+            </div>
+            <Select
+              value={selection}
+              onValueChange={(next) => {
+                if (isThemeSelection(next)) choose(next);
+              }}
+              componentId="settings.appearance.color_theme"
+              valueHasNoPii
+            >
+              <SelectTrigger
+                {...settingsControlProps(COLOR_THEME_ENTRY)}
+                data-testid="color-theme-select"
+                className="w-full gap-2 sm:w-48"
               >
-                {editableTheme.contrast}
-              </output>
+                <SelectValue>
+                  <PaletteChip swatch={isDark ? selected.dark : selected.light} />
+                  <span>{selected.label}</span>
+                </SelectValue>
+              </SelectTrigger>
+              <SelectContent {...settingsOverlayProps(COLOR_THEME_ENTRY)}>
+                {PALETTES.map((palette) => (
+                  <SelectItem
+                    key={palette.id}
+                    value={palette.id}
+                    data-testid={`palette-${palette.id}`}
+                  >
+                    <PaletteChip swatch={isDark ? palette.dark : palette.light} />
+                    <span>{palette.label}</span>
+                  </SelectItem>
+                ))}
+                <SelectItem value="custom" data-testid="palette-custom">
+                  <PaletteChip swatch={isDark ? customSwatches.dark : customSwatches.light} />
+                  <span>Custom</span>
+                </SelectItem>
+              </SelectContent>
+            </Select>
+          </div>
+
+          <div className="px-4">
+            <SettingsOwner entry={COLOR_THEME_ENTRY} part="accent">
+              <ThemeColorPicker
+                label="Accent"
+                value={isDark ? editableTheme.darkAccent : editableTheme.accent}
+                testId="custom-theme-accent"
+                onChange={(accent) =>
+                  updateCustomTheme(isDark ? { darkAccent: accent } : { accent })
+                }
+              />
+            </SettingsOwner>
+            <SettingsOwner entry={COLOR_THEME_ENTRY} part="tint">
+              <ThemeColorPicker
+                label="Background tint"
+                value={isDark ? editableTheme.darkTint : editableTheme.tint}
+                testId="custom-theme-tint"
+                onChange={(tint) => updateCustomTheme(isDark ? { darkTint: tint } : { tint })}
+              />
+            </SettingsOwner>
+            <div className="flex items-center justify-between gap-4 border-b border-border/70 py-4">
+              <SettingsLabel
+                label="Contrast"
+                description="Separates text, borders, and surfaces."
+              />
+              <div className="flex w-52 items-center gap-3">
+                <input
+                  id="custom-theme-contrast"
+                  type="range"
+                  min="0"
+                  max="100"
+                  value={editableTheme.contrast}
+                  {...settingsControlProps(COLOR_THEME_ENTRY, "contrast")}
+                  data-testid="custom-theme-contrast"
+                  onChange={(event) => updateCustomTheme({ contrast: Number(event.target.value) })}
+                  className="theme-contrast-range min-w-0 flex-1 cursor-pointer"
+                  style={{ "--range-progress": `${editableTheme.contrast}%` } as CSSProperties}
+                />
+                <output
+                  htmlFor="custom-theme-contrast"
+                  data-testid="custom-theme-contrast-value"
+                  className="w-7 text-right text-sm font-medium tabular-nums"
+                >
+                  {editableTheme.contrast}
+                </output>
+              </div>
+            </div>
+            <div className="flex items-center justify-between gap-4 py-4">
+              <SettingsLabel
+                label="Translucent sidebars"
+                description="Show the canvas through the conversation and Workspace sidebars."
+              />
+              <Switch
+                {...settingsControlProps(COLOR_THEME_ENTRY, "translucentSidebars")}
+                checked={editableTheme.translucentSidebar}
+                onCheckedChange={(translucentSidebar) => updateCustomTheme({ translucentSidebar })}
+                data-testid="custom-theme-translucent-sidebar"
+                componentId="settings.appearance.translucent_sidebar"
+              />
             </div>
           </div>
-          <div className="flex items-center justify-between gap-4 py-4">
-            <SettingsLabel
-              label="Translucent sidebars"
-              description="Show the canvas through the conversation and Workspace sidebars."
-            />
-            <Switch
-              aria-label="Translucent sidebars"
-              checked={editableTheme.translucentSidebar}
-              onCheckedChange={(translucentSidebar) => updateCustomTheme({ translucentSidebar })}
-              data-testid="custom-theme-translucent-sidebar"
-              componentId="settings.appearance.translucent_sidebar"
-            />
-          </div>
         </div>
-      </div>
-    </ThemeSubsection>
+      </ThemeSubsection>
+    </SettingsItem>
   );
 }
 
@@ -1018,77 +1086,77 @@ function ColorThemeControl() {
  */
 function HideUnconfiguredHarnessesControl() {
   const [value, setValue] = useState(() => readHideUnconfiguredHarnesses());
-  const labelId = useId();
   const toggle = useCallback((next: boolean) => {
     setValue(next);
     writeHideUnconfiguredHarnesses(next);
   }, []);
   return (
-    <div className="flex items-start justify-between gap-6">
-      <SettingsLabel
-        label="Hide unconfigured harnesses"
-        labelId={labelId}
-        description="Hide harnesses that need a CLI install or sign-in on the selected host from the new-chat picker."
-      />
+    <SettingsItem
+      entry={HIDE_UNCONFIGURED_HARNESSES_ENTRY}
+      className="flex items-start justify-between gap-6"
+    >
+      <SettingsEntryLabel entry={HIDE_UNCONFIGURED_HARNESSES_ENTRY} />
       <Switch
-        aria-labelledby={labelId}
+        {...settingsControlProps(HIDE_UNCONFIGURED_HARNESSES_ENTRY)}
         checked={value}
         onCheckedChange={toggle}
         data-testid="hide-unconfigured-harnesses-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.appearance.hide_unconfigured_harnesses"
       />
-    </div>
+    </SettingsItem>
   );
 }
 
 /** How messages other sessions send appear in a chat, e.g. a supervisor's. */
 function PeerSessionMessageDisplayControl() {
   const value = usePeerSessionMessageDisplay();
-  const labelId = useId();
   return (
-    <ThemeSubsection
-      labelId={labelId}
-      title="Messages from other sessions"
-      helper="Collapse or hide messages that agents in other sessions send to a chat. The agent still reads them in full."
-    >
-      <CardRadioGroup<PeerSessionMessageDisplay>
-        compact
-        labelledBy={labelId}
-        value={value}
-        onSelect={writePeerSessionMessageDisplay}
-        componentId="settings.appearance.peer_session_messages"
-        className="flex flex-wrap gap-2"
-        items={peerSessionMessageCards.map((card) => ({
-          value: card.value,
-          testId: `peer-session-messages-${card.value}`,
-          body: iconButtonBody(card.icon, card.label),
-        }))}
-      />
-    </ThemeSubsection>
+    <SettingsItem entry={PEER_SESSION_MESSAGES_ENTRY}>
+      <ThemeSubsection
+        labelId={settingsLabelId(PEER_SESSION_MESSAGES_ENTRY)}
+        descriptionId={settingsDescriptionId(PEER_SESSION_MESSAGES_ENTRY)}
+        title="Messages from other sessions"
+        helper="Collapse or hide messages that agents in other sessions send to a chat. The agent still reads them in full."
+      >
+        <SettingsOwner entry={PEER_SESSION_MESSAGES_ENTRY}>
+          <CardRadioGroup<PeerSessionMessageDisplay>
+            compact
+            labelledBy={settingsLabelId(PEER_SESSION_MESSAGES_ENTRY)}
+            value={value}
+            onSelect={writePeerSessionMessageDisplay}
+            componentId="settings.appearance.peer_session_messages"
+            className="flex flex-wrap gap-2"
+            items={peerSessionMessageCards.map((card) => ({
+              value: card.value,
+              testId: `peer-session-messages-${card.value}`,
+              body: iconButtonBody(card.icon, card.label),
+            }))}
+          />
+        </SettingsOwner>
+      </ThemeSubsection>
+    </SettingsItem>
   );
 }
 
 /** Opt-in: fold other agents' progress messages the way Codex turns fold. */
 function FoldAssistantNarrationControl() {
   const enabled = useFoldAssistantNarration();
-  const labelId = useId();
   return (
-    <div className="flex items-start justify-between gap-6">
-      <SettingsLabel
-        label="Show only the final answer"
-        labelId={labelId}
-        description="Fold other agents' progress into the Worked row, keeping each turn's last message visible. Codex already folds completed turns."
-      />
+    <SettingsItem
+      entry={SHOW_FINAL_ANSWER_ENTRY}
+      className="flex items-start justify-between gap-6"
+    >
+      <SettingsEntryLabel entry={SHOW_FINAL_ANSWER_ENTRY} />
       <Switch
-        aria-labelledby={labelId}
+        {...settingsControlProps(SHOW_FINAL_ANSWER_ENTRY)}
         checked={enabled}
         onCheckedChange={writeFoldAssistantNarration}
         data-testid="fold-assistant-narration-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.appearance.fold_assistant_narration"
       />
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -1098,18 +1166,12 @@ function ProjectFolderPaginationControl() {
   const pageSize = useProjectFolderPageSize();
   // The text being typed; null shows the saved size, so a bad entry reverts on blur.
   const [draft, setDraft] = useState<string | null>(null);
-  const collapseLabelId = useId();
-  const pageSizeLabelId = useId();
   return (
-    <>
+    <SettingsItem entry={PROJECT_FOLDER_PAGINATION_ENTRY}>
       <div className="flex items-start justify-between gap-6">
-        <SettingsLabel
-          label='Collapse project sessions behind "Show more"'
-          labelId={collapseLabelId}
-          description="An expanded project folder lists its first sessions and a Show more row for the rest. Turn this off to list every session, loading more as you scroll."
-        />
+        <SettingsEntryLabel entry={PROJECT_FOLDER_PAGINATION_ENTRY} />
         <Switch
-          aria-labelledby={collapseLabelId}
+          {...settingsControlProps(PROJECT_FOLDER_PAGINATION_ENTRY)}
           checked={collapse}
           onCheckedChange={writeProjectFolderCollapse}
           data-testid="project-folder-collapse-toggle"
@@ -1121,7 +1183,6 @@ function ProjectFolderPaginationControl() {
         <div className="mt-4 flex items-center justify-between gap-6 border-t border-border pt-4">
           <SettingsLabel
             label='Sessions to show before "Show more"'
-            labelId={pageSizeLabelId}
             description={`Each Show more click reveals this many more. Use a whole number from ${PROJECT_FOLDER_PAGE_SIZE_MIN} to ${PROJECT_FOLDER_PAGE_SIZE_MAX}.`}
           />
           <Input
@@ -1130,7 +1191,7 @@ function ProjectFolderPaginationControl() {
             min={PROJECT_FOLDER_PAGE_SIZE_MIN}
             max={PROJECT_FOLDER_PAGE_SIZE_MAX}
             step={1}
-            aria-labelledby={pageSizeLabelId}
+            {...settingsControlProps(PROJECT_FOLDER_PAGINATION_ENTRY, "pageSize")}
             data-testid="project-folder-page-size-input"
             className="h-9 w-20 shrink-0 tabular-nums"
             value={draft ?? String(pageSize)}
@@ -1146,30 +1207,28 @@ function ProjectFolderPaginationControl() {
           />
         </div>
       )}
-    </>
+    </SettingsItem>
   );
 }
 
 /** On by default: sidebar rows show hover Pin and Archive buttons beside the "…" menu. */
 function SessionRowQuickActionsControl() {
   const shown = useSessionRowQuickActions();
-  const labelId = useId();
   return (
-    <div className="flex items-start justify-between gap-6">
-      <SettingsLabel
-        label="Show Pin and Archive buttons on session rows"
-        labelId={labelId}
-        description={`Turn this off to keep Pin and Archive in the session row's "…" menu and right-click menu only, so they are harder to click by mistake.`}
-      />
+    <SettingsItem
+      entry={SESSION_ROW_QUICK_ACTIONS_ENTRY}
+      className="flex items-start justify-between gap-6"
+    >
+      <SettingsEntryLabel entry={SESSION_ROW_QUICK_ACTIONS_ENTRY} />
       <Switch
-        aria-labelledby={labelId}
+        {...settingsControlProps(SESSION_ROW_QUICK_ACTIONS_ENTRY)}
         checked={shown}
         onCheckedChange={writeSessionRowQuickActions}
         data-testid="session-row-quick-actions-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.appearance.session_row_quick_actions"
       />
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -1350,10 +1409,14 @@ function AppearanceSection() {
         </div>
 
         <SettingsGroup title="Settings data" testId="settings-group-data">
-          <div className="flex flex-col gap-2 md:flex-row md:flex-wrap md:items-center md:justify-end">
+          <SettingsItem
+            entry={APPEARANCE_DATA_ENTRY}
+            className="flex flex-col gap-2 md:flex-row md:flex-wrap md:items-center md:justify-end"
+          >
             <Button
               variant="outline"
               size="sm"
+              {...settingsControlProps(APPEARANCE_DATA_ENTRY, "export")}
               data-testid="export-settings-button"
               onClick={exportSettings}
             >
@@ -1363,6 +1426,7 @@ function AppearanceSection() {
             <Button
               variant="outline"
               size="sm"
+              {...settingsControlProps(APPEARANCE_DATA_ENTRY, "import")}
               data-testid="import-settings-button"
               onClick={() => {
                 setImportError(null);
@@ -1377,13 +1441,14 @@ function AppearanceSection() {
                 <Button
                   variant="outline"
                   size="sm"
+                  {...settingsControlProps(APPEARANCE_DATA_ENTRY, "reset")}
                   data-testid="reset-appearance-button"
                   componentId="settings.appearance.open_reset_dialog"
                 >
                   Reset to defaults
                 </Button>
               </DialogTrigger>
-              <DialogContent>
+              <DialogContent {...settingsOverlayProps(APPEARANCE_DATA_ENTRY, "reset")}>
                 <DialogHeader>
                   <DialogTitle>Reset appearance?</DialogTitle>
                   <DialogDescription>
@@ -1397,6 +1462,7 @@ function AppearanceSection() {
                   <Button
                     variant="default"
                     onClick={confirmResetAppearance}
+                    {...settingsControlProps(APPEARANCE_DATA_ENTRY, "confirmReset")}
                     data-testid="reset-appearance-confirm"
                     componentId="settings.appearance.reset"
                   >
@@ -1405,7 +1471,7 @@ function AppearanceSection() {
                 </DialogFooter>
               </DialogContent>
             </Dialog>
-          </div>
+          </SettingsItem>
         </SettingsGroup>
       </div>
 
@@ -1414,6 +1480,7 @@ function AppearanceSection() {
         type="file"
         accept=".json"
         className="hidden"
+        {...settingsFileInputProps(APPEARANCE_DATA_ENTRY, "chooseFile")}
         data-testid="import-settings-file-input"
         onChange={(e) => {
           const file = e.target.files?.[0];
@@ -1422,7 +1489,7 @@ function AppearanceSection() {
         }}
       />
       <Dialog open={isImportDialogOpen} onOpenChange={setIsImportDialogOpen}>
-        <DialogContent>
+        <DialogContent {...settingsOverlayProps(APPEARANCE_DATA_ENTRY, "import")}>
           <DialogHeader>
             <DialogTitle>Import settings</DialogTitle>
             <DialogDescription>
@@ -1444,6 +1511,7 @@ function AppearanceSection() {
             </DialogClose>
             <Button
               variant="default"
+              {...settingsControlProps(APPEARANCE_DATA_ENTRY, "chooseFile")}
               data-testid="import-settings-choose-file"
               onClick={() => fileInputRef.current?.click()}
             >
@@ -1855,46 +1923,39 @@ function DatabricksIntegrationControl() {
  */
 function AlwaysSteerControl() {
   const [value, setValue] = useState(() => readAlwaysSteer());
-  const labelId = useId();
   const toggle = useCallback((next: boolean) => {
     setValue(next);
     writeAlwaysSteer(next);
   }, []);
   return (
-    <div className="flex items-start justify-between gap-6">
-      <SettingsLabel
-        label="Always steer"
-        labelId={labelId}
-        className="flex-1"
-        description="Send follow-ups into the running turn. Harnesses without steering support use them on the next turn."
-      />
+    <SettingsItem entry={ALWAYS_STEER_ENTRY} className="flex items-start justify-between gap-6">
+      <SettingsEntryLabel entry={ALWAYS_STEER_ENTRY} className="flex-1" />
       <Switch
-        aria-labelledby={labelId}
+        {...settingsControlProps(ALWAYS_STEER_ENTRY)}
         checked={value}
         onCheckedChange={toggle}
         data-testid="always-steer-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.general.always_steer"
       />
-    </div>
+    </SettingsItem>
   );
 }
 
 function ComposerSendShortcutControl() {
   const [enabled, setEnabled] = useState(() => readSubmitWithModEnter());
-  const labelId = useId();
-  const descriptionId = useId();
   const toggle = useCallback((next: boolean) => {
     setEnabled(next);
     writeSubmitWithModEnter(next);
   }, []);
 
   return (
-    <div className="flex items-start justify-between gap-6">
-      <SettingsLabel
-        label={`Submit with ${MOD_KEY} + Enter on desktop`}
-        labelId={labelId}
-        descriptionId={descriptionId}
+    <SettingsItem
+      entry={SUBMIT_WITH_MOD_ENTER_ENTRY}
+      className="flex items-start justify-between gap-6"
+    >
+      <SettingsEntryLabel
+        entry={SUBMIT_WITH_MOD_ENTER_ENTRY}
         className="flex-1"
         description={
           <>
@@ -1904,15 +1965,14 @@ function ComposerSendShortcutControl() {
         }
       />
       <Switch
-        aria-labelledby={labelId}
-        aria-describedby={descriptionId}
+        {...settingsControlProps(SUBMIT_WITH_MOD_ENTER_ENTRY)}
         checked={enabled}
         onCheckedChange={toggle}
         data-testid="composer-submit-with-mod-enter-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.general.submit_with_mod_enter"
       />
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -1982,8 +2042,6 @@ function OpenLinksInAppControl() {
 
 function BackgroundSessionTitlesControl() {
   const [enabled, setEnabled] = useState(readBackgroundSessionTitlesEnabled);
-  const labelId = useId();
-  const descriptionId = useId();
 
   const toggle = useCallback((next: boolean) => {
     setEnabled(next);
@@ -1991,31 +2049,25 @@ function BackgroundSessionTitlesControl() {
   }, []);
 
   return (
-    <div className="flex items-start justify-between gap-6">
-      <SettingsLabel
-        label="Automatically name new sessions"
-        labelId={labelId}
-        descriptionId={descriptionId}
-        className="flex-1"
-        description="Name sessions after the first message. Turn off to keep default names."
-      />
+    <SettingsItem
+      entry={BACKGROUND_SESSION_TITLES_ENTRY}
+      className="flex items-start justify-between gap-6"
+    >
+      <SettingsEntryLabel entry={BACKGROUND_SESSION_TITLES_ENTRY} className="flex-1" />
       <Switch
-        aria-labelledby={labelId}
-        aria-describedby={descriptionId}
+        {...settingsControlProps(BACKGROUND_SESSION_TITLES_ENTRY)}
         checked={enabled}
         onCheckedChange={toggle}
         data-testid="background-session-titles-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.general.background_session_titles"
       />
-    </div>
+    </SettingsItem>
   );
 }
 
 function OpenSubagentsInPanelControl() {
   const [enabled, setEnabled] = useState(readOpenSubagentsInPanel);
-  const labelId = useId();
-  const descriptionId = useId();
 
   const toggle = useCallback((next: boolean) => {
     // Sub-agent clicks read the stored value, so only show what was saved.
@@ -2024,24 +2076,20 @@ function OpenSubagentsInPanelControl() {
   }, []);
 
   return (
-    <div className="flex items-start justify-between gap-6">
-      <SettingsLabel
-        label="Open sub-agents in the Workspace panel"
-        labelId={labelId}
-        descriptionId={descriptionId}
-        className="flex-1"
-        description="Open sub-agent chats beside the main chat. On phones, they still open full screen."
-      />
+    <SettingsItem
+      entry={OPEN_SUBAGENTS_IN_PANEL_ENTRY}
+      className="flex items-start justify-between gap-6"
+    >
+      <SettingsEntryLabel entry={OPEN_SUBAGENTS_IN_PANEL_ENTRY} className="flex-1" />
       <Switch
-        aria-labelledby={labelId}
-        aria-describedby={descriptionId}
+        {...settingsControlProps(OPEN_SUBAGENTS_IN_PANEL_ENTRY)}
         checked={enabled}
         onCheckedChange={toggle}
         data-testid="open-subagents-in-panel-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.general.open_subagents_in_panel"
       />
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -2309,12 +2357,8 @@ function UiFontSizeControl() {
   const atMax = px >= UI_FONT_SIZE_MAX;
 
   return (
-    <div className="flex items-center justify-between gap-6">
-      <SettingsLabel
-        className="flex-1"
-        label="Interface font size"
-        description="Sets interface and conversation text. Icons and spacing stay fixed."
-      />
+    <SettingsItem entry={UI_FONT_SIZE_ENTRY} className="flex items-center justify-between gap-6">
+      <SettingsEntryLabel entry={UI_FONT_SIZE_ENTRY} className="flex-1" />
       {/* One cohesive pill: [ −  | value px |  + ]. Segments share the pill
           border via inner dividers rather than floating as separate boxes. */}
       <div
@@ -2326,7 +2370,7 @@ function UiFontSizeControl() {
         )}
       >
         <StepperButton
-          label="Decrease interface font size"
+          control={settingsControlProps(UI_FONT_SIZE_ENTRY, "decrease")}
           testId="ui-font-size-dec"
           disabled={atMin}
           onClick={() => commit(px - UI_FONT_SIZE_STEP)}
@@ -2341,7 +2385,7 @@ function UiFontSizeControl() {
             min={UI_FONT_SIZE_MIN}
             max={UI_FONT_SIZE_MAX}
             step={UI_FONT_SIZE_STEP}
-            aria-label="Interface font size in pixels"
+            {...settingsControlProps(UI_FONT_SIZE_ENTRY, "field")}
             data-testid="ui-font-size-input"
             className="w-8 bg-transparent text-center text-ui font-medium tabular-nums outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
             value={draft}
@@ -2353,7 +2397,7 @@ function UiFontSizeControl() {
           />
         </div>
         <StepperButton
-          label="Increase interface font size"
+          control={settingsControlProps(UI_FONT_SIZE_ENTRY, "increase")}
           testId="ui-font-size-inc"
           disabled={atMax}
           onClick={() => commit(px + UI_FONT_SIZE_STEP)}
@@ -2362,7 +2406,7 @@ function UiFontSizeControl() {
           <PlusIcon className="ui-icon" />
         </StepperButton>
       </div>
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -2386,20 +2430,18 @@ function UiFontFamilyControl() {
   const isDefault = family.trim() === UI_FONT_FAMILY_DEFAULT;
 
   return (
-    <div
+    <SettingsItem
+      entry={UI_FONT_FAMILY_ENTRY}
       role="group"
       aria-label="Font family"
       className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-3 md:grid-cols-[minmax(0,1fr)_auto_auto]"
     >
-      <SettingsLabel
-        label="Font family"
-        className="md:mr-4"
-        description="Use an installed font. Leave blank for the system default."
-      />
+      <SettingsEntryLabel entry={UI_FONT_FAMILY_ENTRY} className="md:mr-4" />
       <Button
         type="button"
         variant="ghost"
         size="sm"
+        {...settingsControlProps(UI_FONT_FAMILY_ENTRY, "reset")}
         data-testid="ui-font-family-reset"
         disabled={isDefault}
         className={cn("h-9", isDefault && "invisible")}
@@ -2410,7 +2452,7 @@ function UiFontFamilyControl() {
       </Button>
       <Input
         type="text"
-        aria-label="UI font family"
+        {...settingsControlProps(UI_FONT_FAMILY_ENTRY, "field")}
         data-testid="ui-font-family-input"
         placeholder="System default"
         spellCheck={false}
@@ -2420,7 +2462,7 @@ function UiFontFamilyControl() {
         value={family}
         onChange={(e) => update(e.target.value)}
       />
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -2470,12 +2512,8 @@ function UiCodeFontSizeControl() {
   const atMax = px >= CODE_FONT_SIZE_MAX;
 
   return (
-    <div className="flex items-center justify-between gap-6">
-      <SettingsLabel
-        label="Code font size"
-        className="flex-1"
-        description="Size of code in the editor and terminal."
-      />
+    <SettingsItem entry={CODE_FONT_SIZE_ENTRY} className="flex items-center justify-between gap-6">
+      <SettingsEntryLabel entry={CODE_FONT_SIZE_ENTRY} className="flex-1" />
       {/* One cohesive pill: [ −  | value px |  + ] — same shell as the UI
           font-size control. */}
       <div
@@ -2487,7 +2525,7 @@ function UiCodeFontSizeControl() {
         )}
       >
         <StepperButton
-          label="Decrease code font size"
+          control={settingsControlProps(CODE_FONT_SIZE_ENTRY, "decrease")}
           testId="code-font-size-dec"
           disabled={atMin}
           onClick={() => commit(px - CODE_FONT_SIZE_STEP)}
@@ -2502,7 +2540,7 @@ function UiCodeFontSizeControl() {
             min={CODE_FONT_SIZE_MIN}
             max={CODE_FONT_SIZE_MAX}
             step={CODE_FONT_SIZE_STEP}
-            aria-label="Code font size in pixels"
+            {...settingsControlProps(CODE_FONT_SIZE_ENTRY, "field")}
             data-testid="code-font-size-input"
             className="w-8 bg-transparent text-center text-ui font-medium tabular-nums outline-none [appearance:textfield] [&::-webkit-inner-spin-button]:appearance-none [&::-webkit-outer-spin-button]:appearance-none"
             value={draft}
@@ -2514,7 +2552,7 @@ function UiCodeFontSizeControl() {
           />
         </div>
         <StepperButton
-          label="Increase code font size"
+          control={settingsControlProps(CODE_FONT_SIZE_ENTRY, "increase")}
           testId="code-font-size-inc"
           disabled={atMax}
           onClick={() => commit(px + CODE_FONT_SIZE_STEP)}
@@ -2523,7 +2561,7 @@ function UiCodeFontSizeControl() {
           <PlusIcon className="ui-icon" />
         </StepperButton>
       </div>
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -2544,20 +2582,18 @@ function UiCodeFontFamilyControl() {
   const isDefault = family.trim() === CODE_FONT_FAMILY_DEFAULT;
 
   return (
-    <div
+    <SettingsItem
+      entry={CODE_FONT_FAMILY_ENTRY}
       role="group"
       aria-label="Code font family"
       className="grid grid-cols-[minmax(0,1fr)_auto] items-center gap-x-2 gap-y-3 md:grid-cols-[minmax(0,1fr)_auto_auto]"
     >
-      <SettingsLabel
-        label="Code font family"
-        className="md:mr-4"
-        description="Font for the editor and terminal. Leave blank for the default."
-      />
+      <SettingsEntryLabel entry={CODE_FONT_FAMILY_ENTRY} className="md:mr-4" />
       <Button
         type="button"
         variant="ghost"
         size="sm"
+        {...settingsControlProps(CODE_FONT_FAMILY_ENTRY, "reset")}
         data-testid="code-font-family-reset"
         disabled={isDefault}
         className={cn("h-9", isDefault && "invisible")}
@@ -2568,7 +2604,7 @@ function UiCodeFontFamilyControl() {
       </Button>
       <Input
         type="text"
-        aria-label="Code font family"
+        {...settingsControlProps(CODE_FONT_FAMILY_ENTRY, "field")}
         data-testid="code-font-family-input"
         placeholder="Editor default"
         spellCheck={false}
@@ -2578,7 +2614,7 @@ function UiCodeFontFamilyControl() {
         value={family}
         onChange={(e) => update(e.target.value)}
       />
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -2592,34 +2628,34 @@ function UiCodeFontWeightControl() {
   };
 
   return (
-    <div className="flex items-center justify-between gap-6" data-testid="code-font-weight-control">
-      <SettingsLabel
-        label="Heavier code font"
-        className="flex-1"
-        description="Use heavier text in the editor and terminal."
-      />
+    <SettingsItem
+      entry={CODE_FONT_WEIGHT_ENTRY}
+      className="flex items-center justify-between gap-6"
+      data-testid="code-font-weight-control"
+    >
+      <SettingsEntryLabel entry={CODE_FONT_WEIGHT_ENTRY} className="flex-1" />
       <Switch
-        aria-label="Use heavier code text"
+        {...settingsControlProps(CODE_FONT_WEIGHT_ENTRY, "toggle")}
         checked={heavier}
         onCheckedChange={toggle}
         data-testid="heavier-code-text-toggle"
         className="shrink-0"
         componentId="settings.appearance.heavier_code_text"
       />
-    </div>
+    </SettingsItem>
   );
 }
 
 /** Flanking +/- segment of the font-size pill: square, ghost-hover, no border. */
 function StepperButton({
-  label,
+  control,
   testId,
   disabled,
   onClick,
   componentId,
   children,
 }: {
-  label: string;
+  control: SettingsControlProps;
   testId: string;
   disabled: boolean;
   onClick: () => void;
@@ -2630,7 +2666,7 @@ function StepperButton({
   return (
     <button
       type="button"
-      aria-label={label}
+      {...control}
       data-testid={testId}
       disabled={disabled}
       onClick={() => {

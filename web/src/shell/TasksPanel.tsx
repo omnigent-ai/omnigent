@@ -37,12 +37,14 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
+import { StepDescription } from "@/components/workflows/StepDescription";
 import { useConversationEntryValue } from "@/hooks/useConversationEntryState";
 import { useNow } from "@/hooks/useNow";
 import { useSavedWorkflows } from "@/hooks/useSavedWorkflows";
 import { useSessionTasks } from "@/hooks/useSessionTasks";
 import { pendingWorkflowQuestions } from "@/lib/blocks";
 import { isFeatureEnabled } from "@/lib/capabilities";
+import { markdownPreviewText } from "@/lib/markdownPreviewText";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import {
   absoluteTime,
@@ -211,20 +213,27 @@ export function CantStart({ failedNames }: { failedNames: readonly string[] }) {
   );
 }
 
+/** A step's goal as one line of plain text, for a row or card that shows only its start. */
+function goalPreview(step: JournalPlanStep): string | null {
+  return step.goal && markdownPreviewText(step.goal);
+}
+
 /** @param failedNames - The failed tasks it waits on, by name, when that's why it can't start. */
 function stepDetail(item: StepProgress, failedNames: readonly string[] = []): ReactNode {
   const text = item.status ? textOf(item.status) : null;
   switch (item.state) {
     case "waiting":
-      if (failedNames.length === 0) return item.step.goal;
+      if (failedNames.length === 0) return goalPreview(item.step);
       return <CantStart failedNames={failedNames} />;
-    case "ready":
+    case "ready": {
+      const goal = goalPreview(item.step);
       return (
         <>
           <span className="font-medium text-session-active">Ready</span>
-          {item.step.goal && ` · ${item.step.goal}`}
+          {goal && ` · ${goal}`}
         </>
       );
+    }
     case "needs_input":
       // A running task becomes this while a prompt waits; its start has no text.
       return (
@@ -301,19 +310,17 @@ function listNames(names: readonly string[]): string {
 
 /**
  * Each status a task recorded, oldest first, after what it waits on and its
- * goal. A line marks where each later attempt begins.
+ * whole goal, which its row shows only the start of. A line marks where each
+ * later attempt begins.
  */
 function StepHistory({
   step,
   entries,
   names,
-  showGoal,
 }: {
   step: JournalPlanStep;
   entries: readonly JournalEntry[];
   names: ReadonlyMap<string, string>;
-  /** False when the step's row already shows its goal. */
-  showGoal: boolean;
 }) {
   const history = entries.flatMap((entry) => {
     const status = entry.step === step.id && entry.kind === "status" ? statusOf(entry) : null;
@@ -330,7 +337,7 @@ function StepHistory({
           </span>
         </p>
       )}
-      {showGoal && step.goal && <p className="break-words text-muted-foreground">{step.goal}</p>}
+      {step.goal && <StepDescription text={step.goal} />}
       {history.length === 0 ? (
         <p className="text-muted-foreground">Nothing recorded yet.</p>
       ) : (
@@ -612,12 +619,7 @@ function StepRow({
       </div>
       {open && (
         <div className="pr-2 pl-[38px]">
-          <StepHistory
-            step={item.step}
-            entries={entries}
-            names={names}
-            showGoal={item.state !== "waiting" && item.state !== "ready"}
-          />
+          <StepHistory step={item.step} entries={entries} names={names} />
         </div>
       )}
     </li>
@@ -670,11 +672,12 @@ function statusLine(
 
 /**
  * What a task's hover card says: which task it is, where it stands, and its
- * newest result or its goal.
+ * newest result or the start of its goal.
  *
  * @param pending - The tasks it waits on that aren't done, by name.
  * @param failedNames - The failed tasks it waits on, by name, when that's why it can't start.
- * @param full - Also show the goal beside a result, uncut, for a graph node whose box cuts both short.
+ * @param full - Show the whole goal as Markdown, below a result too, for a graph node whose box
+ *   cuts both short.
  * @param menu - Its ⋯ menu, in the top corner.
  */
 export function TaskCardDetails({
@@ -697,7 +700,10 @@ export function TaskCardDetails({
   const text = item.status ? textOf(item.status) : null;
   const detail =
     item.state === "waiting" || item.state === "ready" ? item.step.goal : (text ?? item.step.goal);
-  const goal = full && detail !== item.step.goal ? item.step.goal : null;
+  const detailIsGoal = detail === item.step.goal;
+  // A cut card shows the start of its goal as plain text, if any text remains.
+  const shownDetail = detailIsGoal && !full ? goalPreview(item.step) : detail;
+  const goal = full && !detailIsGoal ? item.step.goal : null;
   return (
     <>
       <span className="flex w-full items-center justify-between gap-3">
@@ -713,10 +719,20 @@ export function TaskCardDetails({
           {statusLine(item, pending, failedNames)}
         </span>
       </span>
-      {detail && (
-        <span className={cn("text-muted-foreground", !full && "line-clamp-3")}>{detail}</span>
+      {shownDetail &&
+        (full && detailIsGoal ? (
+          <StepDescription text={shownDetail} />
+        ) : (
+          <span className={cn("text-muted-foreground", !full && "line-clamp-3")}>
+            {shownDetail}
+          </span>
+        ))}
+      {goal && (
+        <>
+          <span className="text-muted-foreground">Goal</span>
+          <StepDescription text={goal} />
+        </>
       )}
-      {goal && <span className="text-muted-foreground">Goal: {goal}</span>}
     </>
   );
 }

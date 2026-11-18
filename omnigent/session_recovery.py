@@ -45,3 +45,5 @@ class SessionRecovery:
     retry_at: int = 0
     launch_runner_id: str | None = None
     response_id: str | None = None
+    # A witnessed native start awaiting its matching input echo.
+    next_response_id: str | None = None

@@ -1173,6 +1173,77 @@ describe("TasksPanel", () => {
     ).toEqual([expect.stringMatching(/^Started/), expect.stringMatching(/^Failed · Reverted/)]);
   });
 
+  it("previews a task's goal as plain text, and shows all of it as Markdown in its history", async () => {
+    const goal = [
+      "**Inputs:** the flaky test's name.",
+      "",
+      "**What it does:**",
+      "- Reruns it",
+      "- Fixes its cause",
+      "",
+      "**Outputs:** a passing run.",
+      "",
+      // Details past the preview's cutoff, which only the history shows.
+      `**Details:** ${"Check the logs. ".repeat(130)}Then run the sentinel-check command.`,
+    ].join("\n");
+    const preview =
+      "Inputs: the flaky test's name. What it does: Reruns it · Fixes its cause · Outputs: a passing run.";
+    showJournal([
+      journalEntry(0, {
+        kind: "plan",
+        content: {
+          name: "The plan",
+          version: 1,
+          source: "agent",
+          steps: [
+            { id: "rerun", name: "Rerun the test", goal, depends_on: [] },
+            { id: "fix", name: "Fix the test", goal, depends_on: ["rerun"] },
+          ],
+        },
+      }),
+    ]);
+    renderPanel();
+    const [ready, waiting] = screen.getAllByTestId("tasks-row");
+    expect(ready).toHaveTextContent(`Ready · ${preview}`);
+    expect(waiting).toHaveTextContent(preview);
+    fireEvent.focus(screen.getAllByTestId("tasks-progress-segment")[1]);
+    const card = await screen.findByTestId("tasks-progress-card");
+    expect(card).toHaveTextContent(preview);
+    for (const element of [ready, waiting, card]) {
+      expect(element.textContent).not.toContain("**");
+      expect(element.textContent).not.toContain("sentinel-check");
+    }
+
+    // The row shows only the start of the goal, so its history shows all of it.
+    fireEvent.click(within(waiting).getByTestId("tasks-row-history"));
+    expect(within(waiting).getByText("Inputs:")).toHaveAttribute("data-streamdown", "strong");
+    expect(
+      within(waiting)
+        .getAllByRole("listitem")
+        .map((item) => item.textContent),
+    ).toEqual(["Reruns it", "Fixes its cause"]);
+    expect(within(waiting).getByText(/Then run the sentinel-check command\.$/)).toBeInTheDocument();
+  });
+
+  it("leaves a goal with no text out of a task's card, rather than an empty line", async () => {
+    showJournal([
+      journalEntry(0, {
+        kind: "plan",
+        content: {
+          name: "The plan",
+          version: 1,
+          source: "agent",
+          steps: [{ id: "rerun", name: "Rerun the test", goal: "---", depends_on: [] }],
+        },
+      }),
+    ]);
+    renderPanel();
+    fireEvent.focus(screen.getByTestId("tasks-progress-segment"));
+    const card = await screen.findByTestId("tasks-progress-card");
+    expect(card).toHaveTextContent("Ready to start");
+    expect(card.querySelector(".line-clamp-3")).toBeNull();
+  });
+
   it("shows when a finished task ended, stamped the way chat messages are", async () => {
     const done = status(2, "build", "done");
     const failed = status(4, "deploy", "failed", "Reverted");
