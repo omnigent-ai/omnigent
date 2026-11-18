@@ -151,13 +151,14 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
         "terminal_remainder",
         "adjacent_tables",
         "oversized_nonassessment",
+        "nonprogress",
     ),
     [
-        (None, 0, "", False, "run", None, None, False, False),
-        ((20000, 45000, 20000), 0, "", False, "run", None, None, False, False),
-        ((3000,) * 30, 59194, "", False, "run", None, None, False, False),
-        (None, 0, "  ", False, "run", None, None, False, False),
-        ((70000,), 0, "", False, "run", None, None, False, False),
+        (None, 0, "", False, "run", None, None, False, False, False),
+        ((20000, 45000, 20000), 0, "", False, "run", None, None, False, False, False),
+        ((3000,) * 30, 59194, "", False, "run", None, None, False, False, False),
+        (None, 0, "  ", False, "run", None, None, False, False, False),
+        ((70000,), 0, "", False, "run", None, None, False, False, False),
         # Align an escaped pipe with the fully wrapped comment boundary.
         (
             ("y" * 69 + ("x" * 70 + r"\|") * 1100,),
@@ -169,19 +170,32 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
             None,
             False,
             False,
+            False,
         ),
-        (None, 0, "", True, "run", None, None, False, False),
-        (("Reason",), 0, "", False, "run", 0, None, False, False),
-        (("Reason",), 0, "", False, "run", 1, None, False, False),
-        (("Reason",), 0, "", False, "run", 2, None, False, False),
-        ((177655, "Tail."), 0, "", False, "run", None, " | \t", False, False),
-        ((177654, "Tail."), 0, "", False, "run", None, "| \t", False, False),
-        ((177653, "Tail."), 0, "", False, "run", None, " \t", False, False),
-        ((177652, "Tail."), 0, "", False, "run", None, "\t", False, False),
-        ((177651, "Tail."), 0, "", False, "run", None, "", False, False),
-        (("Reason." + " " * 135000 + "Tail.",), 0, "", False, "run", None, None, False, False),
-        (None, 0, "", False, "run", None, None, True, False),
-        (("Reason",), 0, "", False, "run", None, None, False, True),
+        (None, 0, "", True, "run", None, None, False, False, False),
+        (("Reason",), 0, "", False, "run", 0, None, False, False, False),
+        (("Reason",), 0, "", False, "run", 1, None, False, False, False),
+        (("Reason",), 0, "", False, "run", 2, None, False, False, False),
+        ((177655, "Tail."), 0, "", False, "run", None, " | \t", False, False, False),
+        ((177654, "Tail."), 0, "", False, "run", None, "| \t", False, False, False),
+        ((177653, "Tail."), 0, "", False, "run", None, " \t", False, False, False),
+        ((177652, "Tail."), 0, "", False, "run", None, "\t", False, False, False),
+        ((177651, "Tail."), 0, "", False, "run", None, "", False, False, False),
+        (
+            ("Reason." + " " * 135000 + "Tail.",),
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            False,
+        ),
+        (None, 0, "", False, "run", None, None, True, False, False),
+        (("Reason",), 0, "", False, "run", None, None, False, True, False),
+        (("Reason",), 0, "", False, "run", None, None, False, False, True),
     ],
     ids=[
         "many-rows",
@@ -202,6 +216,7 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
         "interior-whitespace",
         "adjacent-tables",
         "oversized-nonassessment",
+        "escaped-pipe-whitespace-progress",
     ],
 )
 def test_long_review_parts_preserve_all_assessments_and_markdown_context(
@@ -214,9 +229,114 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
     terminal_remainder: str | None,
     adjacent_tables: bool,
     oversized_nonassessment: bool,
+    nonprogress: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    unrenderable_whitespace = any(
+        isinstance(spec, str) and " " * _HELPERS["COMMENT_BYTE_LIMIT"] in spec
+        for spec in rationale_specs or ()
+    )
+    if (
+        oversized_field is not None
+        or terminal_remainder is not None
+        or unrenderable_whitespace
+        or adjacent_tables
+        or oversized_nonassessment
+        or nonprogress
+    ):
+        review_path = tmp_path / "review.md"
+        receipt = tmp_path / "receipt.txt"
+        receipt.write_text("stale receipt\n")
+        for name, value in {
+            "HEAD_SHA": "a" * 40,
+            "GITHUB_RUN_ID": "10",
+            "GITHUB_RUN_ATTEMPT": "1",
+            "RUN_URL": "https://example.test/run",
+            "PR_NUMBER": "1",
+            "REPO": "test/repo",
+        }.items():
+            monkeypatch.setenv(name, value)
+        posts = []
+        monkeypatch.setattr(
+            subprocess, "run", lambda argv, **kwargs: posts.append(Path(argv[-1]).read_text())
+        )
+    if nonprogress:
+        split = _HELPERS["split_review"]
+        encoded_lengths = []
+        cuts = []
+
+        # Bound the component fault before an empty slice can reach the parts list.
+        class ProgressCheckedReview(str):
+            def encode(self, encoding="utf-8", errors="strict"):
+                if len(encoded_lengths) >= 2:
+                    raise AssertionError("Splitter exceeded the two bounded iterations")
+                encoded_lengths.append(len(self))
+                return super().encode(encoding, errors)
+
+            def __getitem__(self, key):
+                if isinstance(key, slice):
+                    if key.start is None and key.stop is not None:
+                        if key.stop <= 0:
+                            raise AssertionError("Splitter attempted a nonpositive cut")
+                        cuts.append(key.stop)
+                    return type(self)(super().__getitem__(key))
+                return super().__getitem__(key)
+
+        def bounded_split(_text: str, _limit: int) -> list[str]:
+            return split(ProgressCheckedReview("|aa\\|  \n"), 4)
+
+        monkeypatch.setitem(_HELPERS["review_comments"].__globals__, "split_review", bounded_split)
+        review = _HELPERS["compose_review"](
+            _REVIEW + "x" * _HELPERS["COMMENT_BYTE_LIMIT"],
+            {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]},
+        )
+        review_path.write_text(review, encoding="utf-8")
+        with pytest.raises(ValueError, match="split cannot make progress"):
+            _HELPERS["publish_review"](review_path, receipt)
+        assert encoded_lengths == [8, 5]
+        assert cuts == [3]
+        assert not posts
+        assert not receipt.exists()
+        assert not list(tmp_path.glob("comment*.md"))
+        return
+
+    if adjacent_tables:
+        header, delimiter = _REVIEW.split("### Tests\n", 1)[1].splitlines()[:2]
+        raw_limit = 59000
+        prefix = _HELPERS["compose_review"](
+            _REVIEW, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+        )
+        assessment_table = "\n".join(_REVIEW.split("### Tests\n", 1)[1].splitlines()[:3]) + "\n"
+        padding = raw_limit - len((prefix + "\n\n" + assessment_table).encode("utf-8"))
+        prefix += "x" * padding + "\n\n" + assessment_table
+        new_table = "\n| Label | Value |\n| --- | --- |\n| extra | retained |\n"
+        adjacent_review = prefix + new_table + "Following paragraph.\n" * 100
+        split = _HELPERS["split_review"]
+        boundary_chunks = split(adjacent_review, raw_limit)
+        assert len(prefix.encode("utf-8")) == raw_limit
+        assert boundary_chunks[0] == prefix
+        assert boundary_chunks[1].startswith(new_table)
+        assert "".join(boundary_chunks) == adjacent_review
+        # Pin a legal raw cut independently of the fully wrapped 60,000-byte cap.
+        monkeypatch.setitem(
+            _HELPERS["review_comments"].__globals__,
+            "split_review",
+            lambda text, limit: split(text, min(limit, raw_limit)),
+        )
+        review_path.write_text(adjacent_review, encoding="utf-8")
+        _HELPERS["publish_review"](review_path, receipt)
+        comments = [
+            (tmp_path / "comment.md").read_text(),
+            (tmp_path / "comment-part-2.md").read_text(),
+        ]
+        assert posts == [comments[1], comments[0]]
+        assert receipt.read_text() == "a" * 40 + "\n"
+        assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
+        assert sum(comment.count(new_table) for comment in comments) == 1
+        assert header not in comments[1]
+        return
+
     rationales = (
         ["Guards the regression without a second setup."] * 1200
         if rationale_specs is None
@@ -251,33 +371,13 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
     composed = _HELPERS["compose_review"](
         review, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
     )
-    unrenderable_whitespace = any(
-        " " * _HELPERS["COMMENT_BYTE_LIMIT"] in rationale for rationale in rationales
-    )
     if (
         oversized_field is not None
         or terminal_remainder is not None
         or unrenderable_whitespace
-        or adjacent_tables
         or oversized_nonassessment
     ):
-        review_path = tmp_path / "review.md"
         review_path.write_text(composed, encoding="utf-8")
-        receipt = tmp_path / "receipt.txt"
-        receipt.write_text("stale receipt\n")
-        for name, value in {
-            "HEAD_SHA": "a" * 40,
-            "GITHUB_RUN_ID": "10",
-            "GITHUB_RUN_ATTEMPT": "1",
-            "RUN_URL": "https://example.test/run",
-            "PR_NUMBER": "1",
-            "REPO": "test/repo",
-        }.items():
-            monkeypatch.setenv(name, value)
-        posts = []
-        monkeypatch.setattr(
-            subprocess, "run", lambda argv, **kwargs: posts.append(Path(argv[-1]).read_text())
-        )
     if oversized_field is not None or unrenderable_whitespace or oversized_nonassessment:
         message = (
             "assessment fragments need all five populated fields"
@@ -388,40 +488,6 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         assert "tests/test_parser.py::test_case[0]" not in context[0]
         assert not context[1].startswith(" |\n")
         assert context[2] == header + "\n" + delimiter + "\n"
-
-    if adjacent_tables:
-        raw_limit = 59000
-        prefix = _HELPERS["compose_review"](
-            _REVIEW, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
-        )
-        assessment_table = "\n".join(_REVIEW.split("### Tests\n", 1)[1].splitlines()[:3]) + "\n"
-        padding = raw_limit - len((prefix + "\n\n" + assessment_table).encode("utf-8"))
-        prefix += "x" * padding + "\n\n" + assessment_table
-        new_table = "\n| Label | Value |\n| --- | --- |\n| extra | retained |\n"
-        adjacent_review = prefix + new_table + "Following paragraph.\n" * 100
-        split = _HELPERS["split_review"]
-        boundary_chunks = split(adjacent_review, raw_limit)
-        assert len(prefix.encode("utf-8")) == raw_limit
-        assert boundary_chunks[0] == prefix
-        assert boundary_chunks[1].startswith(new_table)
-        assert "".join(boundary_chunks) == adjacent_review
-        # Pin a legal raw cut independently of the fully wrapped 60,000-byte cap.
-        monkeypatch.setitem(
-            _HELPERS["review_comments"].__globals__,
-            "split_review",
-            lambda text, limit: split(text, min(limit, raw_limit)),
-        )
-        review_path.write_text(adjacent_review, encoding="utf-8")
-        _HELPERS["publish_review"](review_path, receipt)
-        comments = [
-            (tmp_path / "comment.md").read_text(),
-            (tmp_path / "comment-part-2.md").read_text(),
-        ]
-        assert posts == [comments[1], comments[0]]
-        assert receipt.read_text() == "a" * 40 + "\n"
-        assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
-        assert sum(comment.count(new_table) for comment in comments) == 1
-        assert header not in comments[1]
 
 
 def test_unicode_and_wrapper_bytes_are_included_in_comment_limit() -> None:

@@ -302,10 +302,10 @@ def split_review(review: str, byte_limit: int) -> list[str]:
                 if content.endswith("|") and not content.endswith(r"\|"):
                     content = content[:-1].rstrip()
                 end = len(content) - 1
-                if end <= 0:
-                    raise ValueError("Polly review assessment tail exceeds comment capacity.")
             if review[end - 1 : end + 1] == r"\|":
                 end -= 1
+        if end <= 0:
+            raise ValueError("Polly review split cannot make progress within comment capacity.")
         parts.append(review[:end])
         review = review[end:]
     parts.append(review)
@@ -316,6 +316,8 @@ def _markdown_context(text: str, *, validate_assessments: bool = False) -> tuple
     """Reopen Markdown context and optionally validate final assessment rows.
 
     Mid-row continuation requires five parsed fields; other widths fail closed.
+    Disclosure balancing supports lowercase <details>/</details> without attributes
+    at the first nonblank position; <summary> may share an opening line.
     """
     details = 0
     fence = ""
