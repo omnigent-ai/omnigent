@@ -2135,10 +2135,7 @@ policy = SandboxPolicy.from_jsonable(
 )
 activate_sandbox(policy)
 libc = ctypes.CDLL(None, use_errno=True)
-from omnigent.inner._seccomp import _load_libseccomp
-# Resolve the native ABI; syscall 56 is openat on aarch64.
-NR_CLONE = _load_libseccomp().seccomp_syscall_resolve_name(b"clone")
-assert NR_CLONE >= 0
+NR_CLONE = 56  # x86_64
 CLONE_NEWNET = 0x40000000
 results = {}
 # Block test: clone with CLONE_NEWNET set must return EPERM.

@@ -23,6 +23,9 @@ command must not be able to poison trusted code used before containment on the
 next startup. Run Omnigent from a separate installation and virtualenv outside
 those write grants; an editable installation inside a writable workspace can
 therefore be rejected.
+User-owned hard links to trusted runtime files also cause a fail-closed launch,
+even when the other link is outside the grant. Install dependencies as copies
+or copy-on-write clones; repository uv installs use `link-mode = "copy"`.
 
 The automatic skill overlay exposes only bundled skills and their supporting
 files. It excludes the original bundle's credentials-bearing root configuration

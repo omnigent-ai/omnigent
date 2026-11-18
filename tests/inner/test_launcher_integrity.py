@@ -317,6 +317,36 @@ def test_trusted_inode_scan_follows_directory_symlinks_without_loop(tmp_path: Pa
         sb._validate_trusted_hardlink_aliases(policy, set(), {trusted_dir})
 
 
+@pytest.mark.parametrize("target_kind", ["intermediate", "dangling"])
+def test_launcher_rejects_nested_runtime_symlink_hops(
+    runtime_layout: SimpleNamespace,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    target_kind: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    startup = runtime_layout.packages / "startup.py"
+    startup.parent.mkdir(parents=True)
+    if target_kind == "intermediate":
+        harmless = tmp_path / "harmless.py"
+        harmless.write_text("value = 'trusted'\n")
+        hop = workspace / "hop.py"
+        hop.symlink_to(harmless)
+        startup.symlink_to(hop)
+    else:
+        startup.symlink_to(workspace / "missing.py")
+    monkeypatch.setattr(
+        sb,
+        "_isolated_launcher_import_roots",
+        lambda _interpreter: pytest.fail("startup probe ran before symlink validation"),
+    )
+    policy = _policy()
+    policy.write_roots = [workspace]
+
+    with pytest.raises(OSError, match="trusted launcher runtime"):
+        sb.create_exec_launcher("/bin/true", policy)
+
+
 def test_trusted_inode_scan_fails_closed_on_large_tree(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

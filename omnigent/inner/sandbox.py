@@ -1665,18 +1665,28 @@ def _validate_trusted_hardlink_aliases(
             raise OSError("Cannot validate trusted runtime: too many entries")
         path, recursive = pending.pop()
         try:
+            link_info = path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise OSError(f"Cannot validate trusted runtime inode: {path}") from exc
+        if stat.S_ISLNK(link_info.st_mode):
+            variants = _launcher_path_variants(path)
+            try:
+                target_info = path.stat()
+            except FileNotFoundError:
+                target_info = None
+            _validate_launcher_write_grants(
+                sandbox,
+                set() if target_info is None or stat.S_ISDIR(target_info.st_mode) else variants,
+                variants if target_info is None or stat.S_ISDIR(target_info.st_mode) else set(),
+            )
+        try:
             info = path.stat()
         except FileNotFoundError:
             continue
         except OSError as exc:
             raise OSError(f"Cannot validate trusted runtime inode: {path}") from exc
-        if path.is_symlink():
-            resolved = path.resolve(strict=True)
-            _validate_launcher_write_grants(
-                sandbox,
-                set() if stat.S_ISDIR(info.st_mode) else {resolved},
-                {resolved} if stat.S_ISDIR(info.st_mode) else set(),
-            )
         if stat.S_ISDIR(info.st_mode):
             identity = (info.st_dev, info.st_ino)
             if not recursive or identity in visited_directories:
