@@ -1,5 +1,5 @@
 import type { ComponentType, ReactNode } from "react";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -44,6 +44,22 @@ const STEPS: WorkflowStep[] = [
   { id: "fix", name: "Fix the test", goal: "The suite passes", depends_on: ["explore"] },
 ];
 
+// The hover card's open delay (WorkflowStepsGraph's HoverCard) is 300ms.
+const HOVER_CARD_OPEN_DELAY_MS = 300;
+
+/**
+ * Radix can leave a hover card's open timer pending when focus opens the card
+ * after a pointer enter. jsdom tears the window down before that timer fires,
+ * so let pending timers run while the cards are still mounted.
+ */
+async function settleHoverCards() {
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      setTimeout(resolve, HOVER_CARD_OPEN_DELAY_MS + 50);
+    });
+  });
+}
+
 /** A step's newest status, as the run's journal records it. */
 function statusEntry(step: string, status: string, text: string): JournalEntry {
   return {
@@ -70,7 +86,10 @@ function progress(...states: StepProgress["state"][]): StepProgress[] {
 }
 
 describe("WorkflowStepsGraph", () => {
-  afterEach(cleanup);
+  afterEach(async () => {
+    await settleHoverCards();
+    cleanup();
+  });
 
   it("numbers the workflow's steps, and opens them full screen", () => {
     render(<WorkflowStepsGraph steps={STEPS} title="Triage flaky tests" />);
@@ -103,7 +122,10 @@ describe("WorkflowStepsGraph", () => {
 });
 
 describe("WorkflowGraphOverlay", () => {
-  afterEach(cleanup);
+  afterEach(async () => {
+    await settleHoverCards();
+    cleanup();
+  });
 
   it("shows where each of a run's steps stands, with a legend", () => {
     const onClose = vi.fn();
