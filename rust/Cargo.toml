@@ -1,0 +1,11 @@
+[workspace]
+members = ["workspace-helper"]
+resolver = "2"
+
+# The helper ships in a wheel and starts on demand, so keep it small and fast.
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+opt-level = 3

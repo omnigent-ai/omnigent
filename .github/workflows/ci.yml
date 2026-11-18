@@ -70,6 +70,7 @@ jobs:
       python_matrix: ${{ steps.scope.outputs.python_matrix }}
       omnidev: ${{ steps.scope.outputs.omnidev }}
       sidecar: ${{ steps.scope.outputs.sidecar }}
+      workspace_helper: ${{ steps.scope.outputs.workspace_helper }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -400,6 +401,50 @@ jobs:
       - name: Test omnidev
         run: cargo test --locked --manifest-path dev/omnidev/Cargo.toml
 
+  workspace-helper:
+    name: Rust tests (workspace helper)
+    needs: scope
+    if: ${{ !github.event.pull_request.draft && needs.scope.outputs.workspace_helper == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      # rust/rust-toolchain.toml pins the version; this installs rustup's components for it.
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: "1.89.0"
+          components: clippy, rustfmt
+      - id: rustc
+        working-directory: rust
+        run: echo "version=$(rustc --version | tr ' ' '-')" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry
+            rust/target
+          key: workspace-helper-${{ runner.os }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('rust/**', '!rust/target/**', 'omnigent/api/workspace/v1alpha1/*.proto') }}
+      - name: Check formatting
+        run: cargo fmt --manifest-path rust/Cargo.toml --check
+      - name: Clippy
+        run: cargo clippy --locked --manifest-path rust/Cargo.toml --all-targets -- -D warnings
+      - name: Test
+        run: cargo test --locked --manifest-path rust/Cargo.toml
+      # The helper must answer ListDirectory and ReadFile as the Python host does.
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version-file: ".python-version"
+      - name: Set up uv
+        uses: ./.github/actions/setup-uv
+        with:
+          enable-cache: true
+      - name: Install Python dependencies
+        run: uv sync --locked --extra all --group test
+      - name: Compare with the Python host
+        env:
+          OMNIGENT_WORKSPACE_HELPER: ${{ github.workspace }}/rust/target/debug/omnigent-workspace-helper
+        run: uv run --no-sync pytest tests/host/test_workspace_helper_parity.py
+
   codex-parity:
     name: Pytest (codex-parity)
     needs: scope
@@ -498,7 +543,7 @@ jobs:
   result:
     name: CI result
     if: always()
-    needs: [scope, pytest, stores-postgres, stores-cockroachdb, stores-mysql, omnidev, codex-parity]
+    needs: [scope, pytest, stores-postgres, stores-cockroachdb, stores-mysql, omnidev, workspace-helper, codex-parity]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:

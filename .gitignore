@@ -74,6 +74,9 @@ artifacts/
 # repo under ~/.cache/omnidev/, so only the build dir needs ignoring.
 dev/omnidev/target/
 
+# Workspace helper Rust build output.
+rust/target/
+
 # Playwright test run output (screenshots, traces, videos).
 test-results/
 output/playwright/

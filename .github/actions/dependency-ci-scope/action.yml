@@ -37,6 +37,9 @@ outputs:
   sidecar:
     description: Build and run Codex parity tests.
     value: ${{ steps.scope.outputs.sidecar }}
+  workspace_helper:
+    description: Build and test the Rust workspace helper.
+    value: ${{ steps.scope.outputs.workspace_helper }}
   ui:
     description: Run full, dependency smoke, sidecar, or none of the UI E2E suite.
     value: ${{ steps.scope.outputs.ui }}

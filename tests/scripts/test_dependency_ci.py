@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parents[2]
 CI = ROOT / ".github/scripts/ci"
 OMNIDEV = "dev/omnidev/Cargo.lock"
 SIDECAR = "tests/codex_parity/sidecar/Cargo.lock"
+WORKSPACE_HELPER = "rust/Cargo.lock"
 HOOKS = ".pre-commit-config.yaml"
 
 
@@ -377,7 +378,15 @@ def merged_repo(tmp_path):
     git("config", "user.name", "Test")
     git("config", "commit.gpgsign", "false")
     git("config", "core.hooksPath", "/dev/null")
-    for name in (OMNIDEV, SIDECAR, HOOKS, "pnpm-lock.yaml", "web/package.json", "uv.lock"):
+    for name in (
+        OMNIDEV,
+        SIDECAR,
+        WORKSPACE_HELPER,
+        HOOKS,
+        "pnpm-lock.yaml",
+        "web/package.json",
+        "uv.lock",
+    ):
         path = repo / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
@@ -419,18 +428,20 @@ def run_selection(tmp_path, repo, head, merge, *, event_name="pull_request"):
 
 
 @pytest.mark.parametrize(
-    ("paths", "backend", "e2e", "omnidev", "sidecar", "ui"),
+    ("paths", "backend", "e2e", "omnidev", "sidecar", "ui", "workspace_helper"),
     [
-        ([OMNIDEV], False, False, True, False, "none"),
-        ([SIDECAR], False, False, False, True, "sidecar"),
-        ([OMNIDEV, SIDECAR], False, False, True, True, "sidecar"),
-        ([HOOKS], False, False, False, False, "none"),
-        (["pnpm-lock.yaml"], False, True, False, False, "full"),
-        (["pnpm-lock.yaml", "web/package.json"], False, True, False, False, "full"),
-        ([OMNIDEV, "pnpm-lock.yaml"], False, True, True, False, "full"),
-        ([SIDECAR, HOOKS], False, False, False, True, "sidecar"),
-        ([SIDECAR, "uv.lock"], True, True, False, True, "full"),
-        (["omnigent/runner/app.py"], True, True, True, True, "full"),
+        ([OMNIDEV], False, False, True, False, "none", False),
+        ([SIDECAR], False, False, False, True, "sidecar", False),
+        ([WORKSPACE_HELPER], False, False, False, False, "none", True),
+        ([OMNIDEV, SIDECAR], False, False, True, True, "sidecar", False),
+        ([HOOKS], False, False, False, False, "none", False),
+        (["pnpm-lock.yaml"], False, True, False, False, "full", False),
+        (["pnpm-lock.yaml", "web/package.json"], False, True, False, False, "full", False),
+        ([OMNIDEV, "pnpm-lock.yaml"], False, True, True, False, "full", False),
+        ([SIDECAR, HOOKS], False, False, False, True, "sidecar", False),
+        ([SIDECAR, "uv.lock"], True, True, False, True, "full", False),
+        (["omnigent/runner/app.py"], True, True, True, True, "full", True),
+        (["rust/workspace-helper/src/server.rs"], True, True, True, True, "full", True),
         (
             [".github/actions/setup-harness-cli/locks/codex/package-lock.json"],
             True,
@@ -438,12 +449,13 @@ def run_selection(tmp_path, repo, head, merge, *, event_name="pull_request"):
             True,
             True,
             "full",
+            True,
         ),
-        ([".github/workflows/ci.yml"], True, True, True, True, "full"),
+        ([".github/workflows/ci.yml"], True, True, True, True, "full", True),
     ],
 )
 def test_merge_diff_selects_union_and_drives_existing_matrices(
-    tmp_path, merged_repo, paths, backend, e2e, omnidev, sidecar, ui
+    tmp_path, merged_repo, paths, backend, e2e, omnidev, sidecar, ui, workspace_helper
 ):
     repo, git = merged_repo
     for name in paths:
@@ -468,12 +480,14 @@ def test_merge_diff_selects_union_and_drives_existing_matrices(
     checkout = tmp_path / "checkout"
     subprocess.run(["git", "clone", "-q", "--depth=2", repo.as_uri(), str(checkout)], check=True)
     scope = run_selection(tmp_path, checkout, head, merge)
-    assert {key: scope[key] for key in ("backend", "e2e", "omnidev", "sidecar", "ui")} == {
+    keys = ("backend", "e2e", "omnidev", "sidecar", "ui", "workspace_helper")
+    assert {key: scope[key] for key in keys} == {
         "backend": str(backend).lower(),
         "e2e": str(e2e).lower(),
         "omnidev": str(omnidev).lower(),
         "sidecar": str(sidecar).lower(),
         "ui": ui,
+        "workspace_helper": str(workspace_helper).lower(),
     }
     for script, selected in (
         ("e2e-shard-matrix.sh", e2e),
@@ -657,6 +671,7 @@ def test_workflows_connect_selection_to_jobs():
     assert sidecar_cache["with"]["path"] == ".tmp-codex-parity-target"
     for job, manifest in (
         ("omnidev", "dev/omnidev/Cargo.toml"),
+        ("workspace-helper", "rust/Cargo.toml"),
         ("codex-parity", "tests/codex_parity/sidecar/Cargo.toml"),
     ):
         rust_test = next(
@@ -680,7 +695,11 @@ def test_workflows_connect_selection_to_jobs():
         assert jobs[name]["needs"] == "scope"
         output = "backend" if name == "pytest" else "database"
         assert f"needs.scope.outputs.{output} == 'true'" in jobs[name]["if"]
-    for name, output in (("omnidev", "omnidev"), ("codex-parity", "sidecar")):
+    for name, output in (
+        ("omnidev", "omnidev"),
+        ("workspace-helper", "workspace_helper"),
+        ("codex-parity", "sidecar"),
+    ):
         assert f"needs.scope.outputs.{output} == 'true'" in jobs[name]["if"]
     for name, output in (("e2e", "e2e"), ("integration", "integration")):
         matrix = next(
@@ -787,6 +806,7 @@ def _check_reads(tmp_path: Path) -> int:
     [
         "none",
         "omnidev",
+        "workspace_helper",
         "parity",
         "ui",
         "scope",
@@ -820,13 +840,15 @@ def test_merge_gate_waits_for_selected_rust_checks(tmp_path, fault):
         "Docker result": ("completed", "success"),
         "Build unsigned AAB": ("completed", "success"),
         "Rust tests (omnidev)": ("completed", "success"),
+        "Rust tests (workspace helper)": ("completed", "success"),
         "Pytest (codex-parity)": ("completed", "success"),
         "E2E UI Tests (shard 0/2)": ("completed", "success"),
         "E2E UI Tests (shard 1/2)": ("completed", "success"),
     }
-    if fault in {"omnidev", "parity", "ui", "scope", "android"}:
+    if fault in {"omnidev", "workspace_helper", "parity", "ui", "scope", "android"}:
         name = {
             "omnidev": "Rust tests (omnidev)",
+            "workspace_helper": "Rust tests (workspace helper)",
             "parity": "Pytest (codex-parity)",
             "ui": "E2E UI Tests (shard 1/2)",
             "scope": "CI coverage scope",
@@ -862,6 +884,7 @@ def test_merge_gate_waits_for_selected_rust_checks(tmp_path, fault):
             "UI coverage scope",
             "E2E UI result",
             "Rust tests (omnidev)",
+            "Rust tests (workspace helper)",
         ):
             del checks[name]
     workflows = {

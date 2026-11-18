@@ -1,0 +1,42 @@
+[package]
+name = "workspace-helper"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Serves a workspace's files, file search, text search, and Git comparisons to the Omnigent host over gRPC"
+publish = false
+
+# Installed on PATH by the omnigent-workspace-helper wheel, so the name is specific.
+[[bin]]
+name = "omnigent-workspace-helper"
+path = "src/main.rs"
+
+[dependencies]
+globset = "0.4"
+grep-matcher = "0.1"
+grep-regex = "0.1"
+grep-searcher = "0.1"
+ignore = "0.4"
+regex = "1"
+libc = "0.2"
+nucleo-matcher = "0.3"
+prost = "0.14.1"
+prost-types = "0.14.1"
+rayon = "1.11"
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "fs", "io-std", "io-util", "net", "signal", "sync", "time"] }
+tokio-stream = { version = "0.1.17", features = ["net", "sync"] }
+tonic = "0.14.2"
+tonic-prost = "0.14.2"
+
+[build-dependencies]
+protoc-bin-vendored = "3.2"
+tonic-prost-build = "0.14.2"
+
+[dev-dependencies]
+# Paused time for the file list's refresh timing tests.
+tokio = { version = "1.47", features = ["test-util"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tempfile = "3"
+tower = { version = "0.5", features = ["util"] }

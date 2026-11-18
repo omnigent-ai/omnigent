@@ -23,6 +23,7 @@ REQUIRED=(
   "UI coverage scope"
   "E2E UI result"
   "Rust tests (omnidev)"
+  "Rust tests (workspace helper)"
   "Pytest (codex-parity)"
   "Pytest (runtime-harnesses)"
   "Pytest (runtime-policies)"
@@ -88,6 +89,7 @@ ALLOW_SKIP=(
   "UI coverage scope"
   "E2E UI result"
   "Rust tests (omnidev)"
+  "Rust tests (workspace helper)"
   "Pytest (codex-parity)"
   "Pytest (runtime-harnesses)"
   "Pytest (runtime-policies)"
@@ -169,7 +171,7 @@ workflow_for() {
     "Web scope"|"Web coverage scope"|"Web result") echo "web Tests" ;;
     "Build unsigned AAB") echo "Android Bundle" ;;
     "Docker scope"|"Docker result"|"Docker build")          echo "Docker build" ;;
-    "CI scope"|"CI coverage scope"|"CI result"|"Rust tests (omnidev)") echo "CI" ;;
+    "CI scope"|"CI coverage scope"|"CI result"|"Rust tests ("*) echo "CI" ;;
     "UI scope"|"UI coverage scope"|"E2E UI result") echo "E2E UI Tests" ;;
     "Pytest ("*)             echo "CI" ;;
     "E2E Tests (shard "*)    echo "E2E Tests" ;;

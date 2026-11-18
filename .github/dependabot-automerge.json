@@ -195,6 +195,21 @@
             "Rust tests (omnidev)"
           ]
         }
+      },
+      "rust/Cargo.lock": {
+        "workflows": [
+          "ci.yml"
+        ],
+        "checks": [
+          "Rust tests (workspace helper)"
+        ],
+        "workflow_test_jobs": {
+          "ci.yml": [
+            "CI coverage scope",
+            "CI result",
+            "Rust tests (workspace helper)"
+          ]
+        }
       }
     }
   },

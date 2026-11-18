@@ -91,10 +91,11 @@ updates:
     commit-message:
       prefix: "chore(deps)"
 
-  # ── Rust: the omnidev tool and the codex-parity test sidecar ─────────────
+  # ── Rust: the omnidev tool, the workspace helper and the codex-parity sidecar
   - package-ecosystem: cargo
     directories:
       - "/dev/omnidev"
+      - "/rust"
       - "/tests/codex_parity/sidecar"
     schedule:
       interval: weekly

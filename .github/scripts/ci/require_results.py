@@ -17,7 +17,7 @@ def validate_results(suite: str, needs: dict, *, draft: bool) -> None:
     if suite == "ci":
         if any(
             outputs[key] not in {"true", "false"}
-            for key in ("backend", "database", "omnidev", "sidecar")
+            for key in ("backend", "database", "omnidev", "sidecar", "workspace_helper")
         ):
             raise ValueError("Invalid CI selection outputs")
         selected = dict.fromkeys(
@@ -26,7 +26,11 @@ def validate_results(suite: str, needs: dict, *, draft: bool) -> None:
         )
         selected["pytest"] = outputs["backend"] == "true"
         selected.update(
-            {"omnidev": outputs["omnidev"] == "true", "codex-parity": outputs["sidecar"] == "true"}
+            {
+                "omnidev": outputs["omnidev"] == "true",
+                "codex-parity": outputs["sidecar"] == "true",
+                "workspace-helper": outputs["workspace_helper"] == "true",
+            }
         )
     elif suite == "ui":
         if outputs["ui"] not in {"full", "dependency", "sidecar", "none"}:

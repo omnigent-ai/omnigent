@@ -108,6 +108,16 @@ storybook-build: _ensure-web
 generate-theme-palettes: _ensure-web
     cd web && node --experimental-strip-types scripts/generate-theme-palettes.mjs
 
+# --- Workspace helper (rust/workspace-helper) ---
+
+# fmt, clippy and tests, then the release-mode speed test.
+[group('rust')]
+test-workspace-helper:
+    cargo fmt --manifest-path rust/Cargo.toml --check
+    cargo clippy --locked --manifest-path rust/Cargo.toml --all-targets -- -D warnings
+    cargo test --locked --manifest-path rust/Cargo.toml
+    cargo test --locked --release --manifest-path rust/Cargo.toml --test speed -- --ignored
+
 # --- Electron desktop app ---
 
 _ensure-electron:

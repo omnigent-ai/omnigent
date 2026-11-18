@@ -13,6 +13,9 @@ from pathlib import Path
 DEPENDENCY_SCOPES = {
     "dev/omnidev/Cargo.lock": "omnidev",
     "dev/omnidev/Cargo.toml": "omnidev",
+    "rust/Cargo.lock": "workspace_helper",
+    "rust/Cargo.toml": "workspace_helper",
+    "rust/workspace-helper/Cargo.toml": "workspace_helper",
     "tests/codex_parity/sidecar/Cargo.lock": "sidecar",
     "tests/codex_parity/sidecar/Cargo.toml": "sidecar",
     ".pre-commit-config.yaml": "hooks",
@@ -194,6 +197,7 @@ def select_scope(files: list[dict], *, read=None, reason: str = "") -> dict[str,
         ).lower(),
         "omnidev": str(full or bool(scopes & {"omnidev", "actions"})).lower(),
         "sidecar": str(full or bool(scopes & {"sidecar", "actions"})).lower(),
+        "workspace_helper": str(full or bool(scopes & {"workspace_helper", "actions"})).lower(),
         "ui": ui,
         "reason": reason
         or f"Dependency scopes: {', '.join(sorted(scopes)) if not full else 'full'}",

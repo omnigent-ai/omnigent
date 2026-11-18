@@ -18,6 +18,7 @@ CI_JOBS = (
     "stores-cockroachdb",
     "stores-mysql",
     "omnidev",
+    "workspace-helper",
     "codex-parity",
 )
 UI_JOBS = ("build-sidecar", "e2e-ui", "browser-contract")
@@ -36,7 +37,9 @@ def run_result(suite, needs, *, draft=False):
 def full_needs(suite):
     if suite == "ci":
         selection, jobs = "scope", CI_JOBS
-        outputs = dict.fromkeys(("backend", "database", "omnidev", "sidecar"), "true")
+        outputs = dict.fromkeys(
+            ("backend", "database", "omnidev", "sidecar", "workspace_helper"), "true"
+        )
     elif suite in {"web", "docker"}:
         selection = "scope"
         jobs = ("web-test", "ios") if suite == "web" else ("build",)
@@ -73,32 +76,79 @@ def test_selected_consumer_must_succeed(suite, job, result):
     [
         (
             "ci",
-            {"database": "true", "backend": "true", "omnidev": "true", "sidecar": "true"},
+            {
+                "database": "true",
+                "backend": "true",
+                "omnidev": "true",
+                "sidecar": "true",
+                "workspace_helper": "true",
+            },
             CI_JOBS,
         ),
         (
             "ci",
-            {"database": "false", "backend": "false", "omnidev": "true", "sidecar": "false"},
+            {
+                "database": "false",
+                "backend": "false",
+                "omnidev": "true",
+                "sidecar": "false",
+                "workspace_helper": "false",
+            },
             ("omnidev",),
         ),
         (
             "ci",
-            {"database": "false", "backend": "false", "omnidev": "false", "sidecar": "true"},
+            {
+                "database": "false",
+                "backend": "false",
+                "omnidev": "false",
+                "sidecar": "true",
+                "workspace_helper": "false",
+            },
             ("codex-parity",),
         ),
         (
             "ci",
-            {"database": "false", "backend": "false", "omnidev": "true", "sidecar": "true"},
+            {
+                "database": "false",
+                "backend": "false",
+                "omnidev": "true",
+                "sidecar": "true",
+                "workspace_helper": "false",
+            },
             ("omnidev", "codex-parity"),
         ),
         (
             "ci",
-            {"database": "false", "backend": "false", "omnidev": "false", "sidecar": "false"},
+            {
+                "database": "false",
+                "backend": "false",
+                "omnidev": "false",
+                "sidecar": "false",
+                "workspace_helper": "true",
+            },
+            ("workspace-helper",),
+        ),
+        (
+            "ci",
+            {
+                "database": "false",
+                "backend": "false",
+                "omnidev": "false",
+                "sidecar": "false",
+                "workspace_helper": "false",
+            },
             (),
         ),
         (
             "ci",
-            {"database": "false", "backend": "true", "omnidev": "false", "sidecar": "false"},
+            {
+                "database": "false",
+                "backend": "true",
+                "omnidev": "false",
+                "sidecar": "false",
+                "workspace_helper": "false",
+            },
             ("pytest",),
         ),
         ("ui", {"ui": "full"}, UI_JOBS),
