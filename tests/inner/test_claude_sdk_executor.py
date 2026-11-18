@@ -5241,7 +5241,7 @@ def test_prepare_claude_cli_path_wrap_failure_prevents_launch(monkeypatch) -> No
     launcher.assert_not_called()
 
 
-def test_launcher_validation_failure_is_optional_only_without_os_env(monkeypatch) -> None:
+def test_launcher_integrity_failure_stops_default_and_explicit_cli(monkeypatch) -> None:
     from omnigent.inner import claude_sdk_executor as claude
 
     monkeypatch.setattr(claude.sys, "platform", "linux")
@@ -5252,13 +5252,26 @@ def test_launcher_validation_failure_is_optional_only_without_os_env(monkeypatch
     launcher = Mock(side_effect=OSError("untrusted runtime"))
     monkeypatch.setattr(claude, "create_exec_launcher", launcher)
 
+    with pytest.raises(OSError, match="untrusted runtime"):
+        claude.prepare_tight_cli_process("/usr/bin/claude", cwd="/tmp/work")
+    with pytest.raises(OSError, match="untrusted runtime"):
+        claude.prepare_claude_cli_path("/usr/bin/claude", _wrap_probe_spec())
+    assert launcher.call_count == 2
+
+
+def test_default_cli_process_falls_back_only_when_backend_is_unavailable(monkeypatch) -> None:
+    from omnigent.inner import claude_sdk_executor as claude
+
+    monkeypatch.setattr(claude.sys, "platform", "linux")
+    monkeypatch.setattr(claude, "resolve_sandbox", Mock(side_effect=OSError("bwrap unavailable")))
+    launcher = Mock()
+    monkeypatch.setattr(claude, "create_exec_launcher", launcher)
+
     optional = claude.prepare_tight_cli_process("/usr/bin/claude", cwd="/tmp/work")
     assert optional.cli_path == "/usr/bin/claude"
     assert not optional.enable_native_tools
     assert not optional.sandboxed
-    with pytest.raises(OSError, match="untrusted runtime"):
-        claude.prepare_claude_cli_path("/usr/bin/claude", _wrap_probe_spec())
-    assert launcher.call_count == 2
+    launcher.assert_not_called()
 
 
 @pytest.mark.asyncio

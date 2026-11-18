@@ -2302,9 +2302,16 @@ def prepare_tight_cli_process(
             allow_network=True,
         ),
     )
+    resolved_cwd = _resolve_sandbox_cwd(cwd)
     try:
-        resolved_cwd = _resolve_sandbox_cwd(cwd)
         sandbox = resolve_sandbox(spec, resolved_cwd)
+    except (OSError, NotImplementedError) as exc:
+        logger.warning(
+            "Could not apply default local CLI sandbox; continuing without it: %s",
+            exc,
+        )
+        return unwrapped
+    else:
         if not sandbox.active:
             return unwrapped
         sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
@@ -2315,12 +2322,6 @@ def prepare_tight_cli_process(
             enable_native_tools=False,
             sandbox=sandbox,
         )
-    except (OSError, NotImplementedError) as exc:
-        logger.warning(
-            "Could not apply default local CLI sandbox; continuing without it: %s",
-            exc,
-        )
-        return unwrapped
 
 
 def _claude_managed_config_dirs() -> list[pathlib.Path]:
