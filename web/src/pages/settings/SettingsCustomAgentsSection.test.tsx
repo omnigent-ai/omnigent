@@ -329,6 +329,14 @@ describe("Custom agents settings", () => {
     fireEvent.click(screen.getByRole("button", { name: "Delete agent" }));
     fireEvent.click(within(screen.getByRole("dialog")).getByRole("button", { name: "Delete" }));
     expect(await screen.findByText(/2 session\(s\) still use/)).toBeVisible();
+    expect(screen.getByRole("dialog")).toHaveAttribute(
+      "data-settings-overlay-owner",
+      "custom-agent-detail:delete",
+    );
+    expect(screen.getByRole("button", { name: "Remove anyway" })).toHaveAttribute(
+      "data-settings-control",
+      "custom-agent-detail:confirmDelete",
+    );
     expect(authenticatedFetch).not.toHaveBeenCalledWith(
       expect.stringContaining("force=true"),
       expect.anything(),
