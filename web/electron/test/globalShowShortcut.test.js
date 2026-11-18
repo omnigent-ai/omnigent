@@ -5,6 +5,7 @@ const { EventEmitter } = require("node:events");
 const {
   GLOBAL_SHORTCUTS,
   acceleratorLabel,
+  chordKey,
   createGlobalShortcuts,
   createGlobalShowShortcut,
 } = require("../src/globalShowShortcut");
@@ -394,17 +395,21 @@ describe("recording a chord", () => {
 });
 
 describe("createGlobalShortcuts", () => {
-  /** Both shortcuts over one settings store and one fake GlobalShortcut. */
+  /**
+   * Both shortcuts over one settings store and a fake GlobalShortcut that, like Electron,
+   * refuses a chord already registered in any spelling.
+   */
   function shortcuts(settings = {}) {
     let stored = structuredClone(settings);
-    const live = new Set();
+    const live = new Map();
     const built = createGlobalShortcuts({
       globalShortcut: {
         register: (accelerator) => {
-          live.add(accelerator);
+          if (live.has(chordKey(accelerator, true))) return false;
+          live.set(chordKey(accelerator, true), accelerator);
           return true;
         },
-        unregister: (accelerator) => live.delete(accelerator),
+        unregister: (accelerator) => live.delete(chordKey(accelerator, true)),
       },
       loadSettings: () => structuredClone(stored),
       saveSettings: (next) => {
@@ -413,7 +418,7 @@ describe("createGlobalShortcuts", () => {
       isMac: true,
       presses: { show: () => {}, floatingComposer: () => {} },
     });
-    return { ...built, saved: () => stored, registered: () => [...live] };
+    return { ...built, saved: () => stored, registered: () => [...live.values()] };
   }
 
   it("keeps each shortcut under its own settings key", () => {
@@ -442,29 +447,85 @@ describe("createGlobalShortcuts", () => {
     assert.deepEqual(s.show.current(), show);
   });
 
-  it("refuses a chord another shortcut holds, before asking and without saving", async () => {
-    const s = shortcuts();
-    s.floatingComposer.apply();
-    let asked = false;
-    const result = await s.show.set(
-      { enabled: true, accelerator: "CommandOrControl+Shift+Space" },
-      async () => (asked = true),
-    );
-    assert.equal(result.ok, false);
+  // The recorder writes the default's chord as `Shift+Command+Space` on macOS.
+  for (const accelerator of ["CommandOrControl+Shift+Space", "Shift+Command+Space"]) {
+    for (const held of ["registered", "on by default"]) {
+      it(`refuses ${accelerator} while another shortcut has it ${held}, before asking`, async () => {
+        const s = shortcuts();
+        if (held === "registered") s.floatingComposer.apply();
+        let asked = false;
+        const result = await s.show.set({ enabled: true, accelerator }, async () => (asked = true));
+        assert.match(result.error, /Another Omnigent shortcut/);
+        assert.equal(asked, false);
+        assert.equal(s.saved().global_shortcut, undefined);
+      });
+    }
+  }
+
+  it("refuses a chord another shortcut took while the user was deciding", async () => {
+    const s = shortcuts({ floating_composer_shortcut: { enabled: false, accelerator: "Alt+K" } });
+    const result = await s.show.set({ enabled: true, accelerator: "Alt+K" }, async () => {
+      await s.floatingComposer.set({ enabled: true, accelerator: "Alt+K" }, async () => true);
+      return true;
+    });
     assert.match(result.error, /Another Omnigent shortcut/);
-    assert.equal(asked, false);
+    assert.deepEqual(s.registered(), ["Alt+K"]);
     assert.equal(s.saved().global_shortcut, undefined);
   });
 
-  it("lets a chord the user saved win over another shortcut's default", () => {
-    const s = shortcuts({
-      global_shortcut: { enabled: true, accelerator: "CommandOrControl+Shift+Space" },
-    });
-    s.show.apply();
+  it("saves another spelling of its own chord without asking or registering it twice", async () => {
+    const s = shortcuts();
     s.floatingComposer.apply();
+    let asked = false;
+    const result = await s.floatingComposer.set(
+      { enabled: true, accelerator: "Shift+Command+Space" },
+      async () => (asked = true),
+    );
+    assert.equal(result.ok, true);
+    assert.equal(asked, false);
     assert.deepEqual(s.registered(), ["CommandOrControl+Shift+Space"]);
-    assert.match(s.floatingComposer.current().error, /Another Omnigent shortcut/);
-    assert.equal(s.show.current().error, undefined);
+  });
+
+  for (const order of [
+    ["show", "floatingComposer"],
+    ["floatingComposer", "show"],
+  ]) {
+    it(`lets a chord the user saved win over another shortcut's default (${order.join(" first, ")} last)`, () => {
+      const s = shortcuts({
+        global_shortcut: { enabled: true, accelerator: "Shift+Command+Space" },
+      });
+      for (const id of order) s[id].apply();
+      assert.deepEqual(s.registered(), ["Shift+Command+Space"]);
+      assert.match(s.floatingComposer.current().error, /Another Omnigent shortcut/);
+      assert.equal(s.show.current().error, undefined);
+    });
+  }
+
+  it("gives a chord both saved on to the first shortcut in the table, in either order", () => {
+    for (const order of [
+      ["show", "floatingComposer"],
+      ["floatingComposer", "show"],
+    ]) {
+      const s = shortcuts({
+        global_shortcut: { enabled: true, accelerator: "Alt+K" },
+        floating_composer_shortcut: { enabled: true, accelerator: "Alt+k" },
+      });
+      for (const id of order) s[id].apply();
+      assert.deepEqual(s.registered(), ["Alt+K"]);
+      assert.equal(s.show.current().error, undefined);
+      assert.match(s.floatingComposer.current().error, /Another Omnigent shortcut/);
+    }
+  });
+});
+
+describe("chordKey", () => {
+  it("spells a chord one way for its platform", () => {
+    assert.equal(chordKey("CommandOrControl+Shift+Space", true), "shift+command+space");
+    assert.equal(chordKey("Shift+Cmd+space", true), "shift+command+space");
+    assert.equal(chordKey("Super+Shift+Space", true), "shift+command+space");
+    assert.equal(chordKey("CmdOrCtrl+Option+K", false), "control+alt+k");
+    assert.equal(chordKey("Ctrl+Alt+K", false), "control+alt+k");
+    assert.notEqual(chordKey("Super+K", false), chordKey("Control+K", false));
   });
 });
 
