@@ -34,6 +34,7 @@ def test_sibling_composer_placement_and_survivor(
     for prompt in (
         "Research the API",
         "Implement the client",
+        "Draft the release note",
         "Still here after deletion",
         "Still here after fork deletion",
     ):

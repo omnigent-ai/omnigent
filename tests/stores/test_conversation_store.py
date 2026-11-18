@@ -10478,6 +10478,7 @@ async def test_family_limit_cleans_up_rejected_creation(
 
 @pytest.mark.parametrize("split_database", [False, True])
 def test_archiving_a_sibling_leaves_its_family(tmp_path, split_database, monkeypatch) -> None:
+    from omnigent.db.db_models import SqlConversationLabel, current_workspace_id
     from omnigent.errors import OmnigentError
     from omnigent.stores.conversation_store import (
         MAX_SESSION_FAMILY_MEMBERS,
@@ -10490,7 +10491,7 @@ def test_archiving_a_sibling_leaves_its_family(tmp_path, split_database, monkeyp
     )
     pin_key = family_pinned_label_key("alice")
     source = store.create_conversation(conversation_id="1" * 32)
-    members = [store.create_conversation(conversation_id=f"{n}" * 32) for n in (2, 3, 4)]
+    members = [store.create_conversation(conversation_id=f"{n}" * 32) for n in (2, 3, 4, 5)]
     for member in members:
         store.add_new_sibling(source.id, member.id, user_id="alice")
     store.set_family_pin(source.id, "123", user_id="alice")
@@ -10503,6 +10504,36 @@ def test_archiving_a_sibling_leaves_its_family(tmp_path, split_database, monkeyp
     assert restored.family_id is None
     store.add_new_sibling(members[0].id, store.create_conversation().id, user_id="alice")
     assert len(store.get_session_family(members[0].id)) == 2
+
+    # Pin cleanup that fails after membership commits is retried when the session is restored.
+    real_clear = SqlAlchemyConversationStore._clear_family_pins
+    failures = []
+
+    def fail_clear_once(session, *, session_id):
+        if not failures:
+            failures.append(session_id)
+            raise RuntimeError("conversation database unavailable")
+        real_clear(session, session_id=session_id)
+
+    monkeypatch.setattr(
+        SqlAlchemyConversationStore, "_clear_family_pins", staticmethod(fail_clear_once)
+    )
+    store.update_conversation(members[3].id, archived=True)
+    assert failures == [members[3].id]
+    assert store.get_conversation(members[3].id).family_id is None
+    with store._conv_session("read_stale_pins") as session:
+        stale = session.get(SqlConversationLabel, (current_workspace_id(), members[3].id, pin_key))
+        assert stale is not None
+    store.update_conversation(members[3].id, archived=False)
+    monkeypatch.setattr(
+        SqlAlchemyConversationStore, "_clear_family_pins", staticmethod(real_clear)
+    )
+    assert pin_key not in store.get_conversation(members[3].id).labels
+    with store._conv_session("read_stale_pins") as session:
+        assert (
+            session.get(SqlConversationLabel, (current_workspace_id(), members[3].id, pin_key))
+            is None
+        )
 
     # Archiving the session whose id keys the family moves the rest to a member's id.
     store.update_conversation(source.id, archived=True)

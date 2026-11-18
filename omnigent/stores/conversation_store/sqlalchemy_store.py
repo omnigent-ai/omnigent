@@ -2162,13 +2162,13 @@ class SqlAlchemyConversationStore(ConversationStore):
         A concurrent re-key is followed to the family's new id.
 
         :param session_id: The leaving session, e.g. ``"9f2c..."``; a session
-            without a family is left unchanged.
+            without a family only has stale family pins cleared.
         """
         meta = self._get_meta(session_id)
         family_id = meta.family_id if meta is not None else None
         for _ in range(_FAMILY_LEAVE_ATTEMPTS):
             if family_id is None:
-                return
+                break
             outcome = run_write_transaction(
                 self._session_immediate,
                 "leave_session_family",
@@ -2176,12 +2176,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                     self._leave_family_write, session_id=session_id, family_id=family_id
                 ),
             )
-            if outcome == "":
+            if outcome in ("", None):
                 break
             family_id = outcome
         else:
             raise OmnigentError("Session family changed", code=ErrorCode.CONFLICT)
         # Membership commits first, so a failed pin cleanup never unpins a member.
+        # It runs even without a family, so a retry repairs an earlier failed cleanup.
         run_write_transaction(
             self._conv_session_immediate,
             "clear_family_pins",
@@ -2253,6 +2254,30 @@ class SqlAlchemyConversationStore(ConversationStore):
             self.leave_session_family(session_id)
         except Exception:
             _logger.exception("archived session %s could not leave its family", session_id)
+
+    def _settle_family_after_archive_change(self, session_id: str, *, archived: bool) -> bool:
+        """
+        Leave the family on archive; on unarchive, clear a standalone session's stale pins.
+
+        Either change retries a pin cleanup that failed after an earlier leave.
+
+        :returns: Whether the session is now standalone, so it carries no family pins.
+        """
+        if archived:
+            self._leave_family_after_archive(session_id)
+            return True
+        meta = self._get_meta(session_id)
+        if meta is not None and meta.family_id is not None:
+            return False
+        try:
+            run_write_transaction(
+                self._conv_session_immediate,
+                "clear_stale_family_pins",
+                functools.partial(self._clear_family_pins, session_id=session_id),
+            )
+        except Exception:
+            _logger.exception("unarchived session %s kept stale family pins", session_id)
+        return True
 
     def archive_if_idle(self, conversation_id: str, idle_before: int) -> bool:
         """
@@ -4946,9 +4971,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         if ap_result is None:
             return None
         row, labels, reasoning_effort_changed, model_override_changed = ap_result
-        if archived and row.archived:
-            # An archived session leaves its family and returns standalone if unarchived.
-            self._leave_family_after_archive(conversation_id)
+        if archived is not None and self._settle_family_after_archive_change(
+            conversation_id, archived=archived
+        ):
             labels = {
                 key: value
                 for key, value in labels.items()
