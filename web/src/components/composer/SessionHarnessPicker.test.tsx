@@ -131,3 +131,56 @@ it("renders and switches Antigravity live models and reflects terminal /model mi
   );
   expect(screen.getByTestId("composer-config-gear")).toHaveTextContent("Gemini 3.8 Flash (Low)");
 });
+
+it("opens the Antigravity model submenu and focuses the active item on openNonce (/model)", async () => {
+  const agyOptions = [
+    { id: "gemini-3.8-flash-high", displayName: "Gemini 3.8 Flash (High)" },
+    { id: "claude-sonnet-4-6", displayName: "Claude Sonnet 4.6 (Thinking)" },
+  ];
+  conversationRegistry.acquire("agy_nonce").setState({
+    sessionHarness: "antigravity-native",
+    nativeVendorOwnsModel: true,
+    llmModel: "Claude Sonnet 4.6 (Thinking)",
+    sessionModelOverride: null,
+  });
+
+  const baseProps = {
+    sessionId: "agy_nonce",
+    busy: false,
+    busyRef: { current: false },
+    setBusy: () => {},
+    agentName: "antigravity-native-ui",
+    harnessLabel: "Antigravity",
+    showModels: true,
+    showEffort: false,
+    effortLevels: [] as readonly string[],
+    modelPickerKind: "antigravity" as const,
+    supportsModelReset: false,
+    codexModelOptions: agyOptions,
+    modelLabelOptions: agyOptions,
+    modelLabelHostId: null,
+    costRoutingEligible: false,
+    modelPickWakesSession: false,
+    disabled: false,
+  };
+
+  const { rerender } = render(
+    <TooltipProvider>
+      <SessionHarnessPicker {...baseProps} openNonce={0} />
+    </TooltipProvider>,
+  );
+
+  rerender(
+    <TooltipProvider>
+      <SessionHarnessPicker {...baseProps} openNonce={1} />
+    </TooltipProvider>,
+  );
+
+  const configMenu = await screen.findByTestId("composer-agent-config-menu");
+  expect(configMenu).toBeTruthy();
+  await waitFor(() =>
+    expect(document.activeElement).toBe(
+      screen.getByTestId("composer-agent-model-claude-sonnet-4-6"),
+    ),
+  );
+});
