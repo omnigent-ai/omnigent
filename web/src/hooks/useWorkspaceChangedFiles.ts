@@ -594,7 +594,7 @@ export interface WorkspaceFileSearchResult {
   unavailable: boolean;
 }
 
-// Matches returned by one Go to File search, through either route.
+// One cap for both routes, so the API and REST return the same matches.
 const FILE_SEARCH_LIMIT = 500;
 
 async function fetchWorkspaceFileSearch(
@@ -615,10 +615,12 @@ async function fetchWorkspaceFileSearch(
     );
     if (viaApi) {
       return {
-        files: mapFilesystemEntries(
-          { object: "list", data: viaApi.data, has_more: viaApi.hasMore },
-          location,
-        ),
+        // Already relative to `location`; stripping it again would break a nested same-named folder.
+        files: mapFilesystemEntries({
+          object: "list",
+          data: viaApi.data,
+          has_more: viaApi.hasMore,
+        }),
         truncated: viaApi.truncated,
         hasMore: viaApi.hasMore,
         unavailable: false,
