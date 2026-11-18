@@ -1609,6 +1609,7 @@ def login_keychain_probe(
     tmp_path: Path,
     request: pytest.FixtureRequest,
 ) -> tuple[str, Path]:
+    _require_cli_e2e()
     # A unique service avoids colliding with concurrent Claude credential lookups.
     account = f"omnigent-containment-probe-{uuid.uuid4().hex}"
     service = f"{account}-credentials"
