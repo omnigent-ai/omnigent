@@ -2556,6 +2556,7 @@ async def test_auto_create_claude_terminal_turns_its_own_memory_off_with_omnigen
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             del terminal_name, session_key
             captured["spec"] = spec
