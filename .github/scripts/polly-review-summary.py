@@ -520,6 +520,8 @@ def _markdown_context(
                     re.IGNORECASE,
                 )
                 paragraph_start = indented_start = None
+                table_header = previous = ""
+                assessment_table = inline_ambiguous = False
         if raw_end is not None:
             ending = raw_end.search(line)
             if ending:

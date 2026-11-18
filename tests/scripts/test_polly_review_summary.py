@@ -1740,6 +1740,8 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         ("html-pre-open-attribute", "unsupported"),
         ("html-comment", "literal-markers"),
         ("html-pre", "literal-markers"),
+        ("html-comment", "table-boundary"),
+        ("html-pre", "table-boundary"),
         ("inline-comment", "oversized"),
         ("paragraph-indent", "boundary"),
         ("paragraph-tab", "boundary"),
@@ -1819,13 +1821,19 @@ def test_multipart_keeps_literal_blocks_and_paragraph_dependencies_indivisible(
     if form in {"boundary", "multiline", "literal-markers"}:
         prefix = "p" * (capacity - len(target) - 2) + "\n\n"
         assert len(prefix + target) == capacity
+    if form == "table-boundary":
+        earlier = "| Earlier | Reason |\n| --- | --- |\n| item | retained |\n"
+        block = block.removesuffix("\n")
+        prefix = "p" * (capacity - len(earlier + block) - 2) + "\n\n" + earlier
+        assert len(prefix + block) == capacity
     short = form == "short"
     tail = "After.\n\n" + ("" if short else "z" * 70000 + "\n\n")
+    if form == "table-boundary":
+        tail = "| plain | following |\n\n" + tail
     review = prefix + block + tail + composed
     original = parser.parse(review)
-    assert sum(token.type == "table_open" for token in original) == (
-        0 if form == "unclosed" else 1
-    )
+    expected_tables = 0 if form == "unclosed" else 2 if form == "table-boundary" else 1
+    assert sum(token.type == "table_open" for token in original) == expected_tables
     if kind.startswith("paragraph-"):
         assert any(
             token.type == "inline"
@@ -1864,7 +1872,10 @@ def test_multipart_keeps_literal_blocks_and_paragraph_dependencies_indivisible(
     assert len(comments) > 1
     assert "".join(fragments) == review
     rendered = [parser.parse(comment) for comment in comments]
-    assert sum(token.type == "table_open" for tokens in rendered for token in tokens) == 1
+    assert (
+        sum(token.type == "table_open" for tokens in rendered for token in tokens)
+        == expected_tables
+    )
     assert sum(comment.count("<!-- polly-reviewed-sha:") for comment in comments) == 1
     row = next(line for line in _REVIEW.splitlines() if line.startswith("| tests/"))
     assert sum(comment.count(row) for comment in comments) == 1
@@ -1911,6 +1922,14 @@ def test_multipart_keeps_literal_blocks_and_paragraph_dependencies_indivisible(
 
     if form in {"boundary", "multiline", "literal-markers"}:
         assert fragments[0] == prefix, "The calibrated dependency must move as a whole"
+    if form == "table-boundary":
+        assert fragments[0] == prefix + block
+        assert [
+            token.content
+            for tokens in rendered
+            for index, token in enumerate(tokens)
+            if token.type == "inline" and tokens[index - 1].type == "th_open"
+        ].count("Earlier") == 1, "A raw block must not carry a prior table header forward"
     assert sum(block.rstrip("\n") in fragment for fragment in fragments) == 1
 
     class FooterContext(HTMLParser):
