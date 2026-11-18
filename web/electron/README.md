@@ -579,6 +579,13 @@ that resolve to any of them, and non-web schemes remain restricted. Existing
 tool approvals are unchanged; whether a tool call asks for approval depends on
 the harness and its policy.
 
+The shell-owned reconnect console, which the host picker's connect action also
+uses, is not modal: the app window stays usable while a slow start runs, and
+only clicks in the console itself count as consent. After a successful run it
+closes itself about 1.5 seconds later. After a failure it stays open with the
+command's output. Closing it, or the app window, while the command runs cancels
+the command.
+
 ### Local network permission
 
 Sites in the embedded pane can ask for **local network access**, including
