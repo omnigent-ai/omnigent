@@ -176,6 +176,31 @@ _FAKE_CATALOG["fireworks_ai"] = {
     },
 }
 
+_FAKE_CATALOG["bedrock"] = {
+    "schema_version": "1.0",
+    "models": {
+        "global.openai.gpt-6.1-sol": {
+            "mode": "chat",
+            "capabilities": {"function_calling": True},
+            "context_window": {"max_input": 272000, "max_output": 128000},
+            "pricing": {
+                "input_per_million_tokens": 2.0,
+                "output_per_million_tokens": 10.0,
+                "cache_read_per_million_tokens": 0.1,
+            },
+        },
+        "openai.gpt-oss-120b-1:0": {
+            "mode": "chat",
+            "capabilities": {"function_calling": True},
+            "context_window": {"max_input": 128000, "max_output": 128000},
+            "pricing": {
+                "input_per_million_tokens": 0.15,
+                "output_per_million_tokens": 0.6,
+            },
+        },
+    },
+}
+
 _REAL_FETCH_PROVIDER_CATALOG = _providers_mod._fetch_provider_catalog
 
 
@@ -309,6 +334,10 @@ def test_get_models_preserves_context_and_cache_pricing_metadata() -> None:
         ("anthropic.claude-opus-4-8-v1:0", "anthropic", "claude-opus-4-8"),
         ("us.anthropic.claude-opus-4-8-v1:0", "anthropic", "claude-opus-4-8"),
         ("anthropic.claude-opus-4-8", "anthropic", "claude-opus-4-8"),
+        ("global.openai.gpt-6.1-sol", "bedrock", "global.openai.gpt-6.1-sol"),
+        ("GLOBAL.OPENAI.GPT-6.1-SOL", "bedrock", "global.openai.gpt-6.1-sol"),
+        ("openai.gpt-oss-120b-1:0", "bedrock", "openai.gpt-oss-120b-1:0"),
+        ("openai.gpt-5.5", "openai", "gpt-5.5"),
         ("kimi-k3", "moonshot", "kimi-k3"),
         ("KIMI-K3", "moonshot", "kimi-k3"),
         ("kimi-k2.7-code", "moonshot", "kimi-k2.7-code"),
@@ -356,6 +385,24 @@ def test_kimi_native_forwarder_ids_price_and_size_from_the_catalog() -> None:
     assert find_model_context_window("kimi-k3-databricks") == 262_144
 
     assert fetch_model_pricing("system.ai.no-such-model") is None
+
+
+def test_bedrock_openai_ids_price_from_the_bedrock_catalog() -> None:
+    """Bedrock OpenAI ids price and size from the bedrock catalog row with the same id."""
+    from omnigent.llms.context_window import fetch_model_pricing, find_model_context_window
+
+    pricing = fetch_model_pricing("global.openai.gpt-6.1-sol")
+    assert pricing is not None
+    assert pricing.input_per_token == pytest.approx(2.0e-6)
+    assert pricing.output_per_token == pytest.approx(10.0e-6)
+    assert pricing.cache_read_per_token == pytest.approx(0.1e-6)
+    assert find_model_context_window("global.openai.gpt-6.1-sol") == 272_000
+
+    versioned = fetch_model_pricing("openai.gpt-oss-120b-1:0")
+    assert versioned is not None
+    assert versioned.input_per_token == pytest.approx(0.15e-6)
+
+    assert fetch_model_pricing("global.openai.gpt-no-such-model") is None
 
 
 def test_find_catalog_models_matches_vendor_namespaced_families() -> None:
