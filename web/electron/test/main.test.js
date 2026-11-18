@@ -2891,7 +2891,7 @@ describe("panel windows", () => {
     assert.equal(h.api.windows.get(h.win).origin, "https://host.example");
     assert.equal(h.api.mainWindows().length, 0);
     assert.equal(h.api.activeWindow(), null);
-    // Built from its own options, with the shell's webPreferences, and no update overlay.
+    // A caller's webPreferences must never weaken the shell's isolation.
     const options = h.calls.windowOptions.at(-1);
     assert.equal(options.type, "panel");
     assert.equal(options.width, 560);
