@@ -109,10 +109,8 @@ function StepNode({ id, data }: NodeProps<Node<StepNodeData>>) {
             data-state={data.state}
           >
             <StepGlyph state={data.state ?? "waiting"} number={data.number} />
-            <div className="min-w-0 flex-1">
-              <p className="line-clamp-2 break-words text-sm font-medium leading-[18px]">
-                {data.name}
-              </p>
+            <div className="min-w-0 flex-1 wrap-anywhere">
+              <p className="line-clamp-2 text-sm font-medium leading-[18px]">{data.name}</p>
               {/* A step that can't start says why in place of its goal, which its card shows. */}
               {data.failedNames ? (
                 <p className="mt-0.5 line-clamp-2 text-xs leading-snug text-muted-foreground">
@@ -141,7 +139,10 @@ function StepNode({ id, data }: NodeProps<Node<StepNodeData>>) {
           side="right"
           align="start"
           sideOffset={8}
-          className="flex w-fit max-w-72 flex-col items-start gap-1 px-3 py-2 text-sm"
+          collisionPadding={8}
+          // break-words would let a long path or command set the text's width past the card.
+          // Zooming in leaves less room beside the step, so the card shrinks to fit the window.
+          className="flex max-h-(--radix-hover-card-content-available-height) w-fit max-w-[min(18rem,var(--radix-hover-card-content-available-width))] flex-col items-start gap-1 overflow-y-auto wrap-anywhere px-3 py-2 text-sm"
           data-testid="workflow-step-card"
         >
           {item ? (
@@ -159,8 +160,8 @@ function StepNode({ id, data }: NodeProps<Node<StepNodeData>>) {
               <span className="text-muted-foreground">
                 Step {data.number} of {graph.total}
               </span>
-              <span className="break-words font-medium">{data.name}</span>
-              {data.goal && <span className="break-words text-muted-foreground">{data.goal}</span>}
+              <span className="font-medium">{data.name}</span>
+              {data.goal && <span className="text-muted-foreground">{data.goal}</span>}
             </>
           )}
         </HoverCardContent>
