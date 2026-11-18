@@ -1731,7 +1731,9 @@ def _run_upgrade_command(command: str, console: Console) -> int:
 
     console.print(f"[yellow]Running:[/yellow] {command}")
     try:
-        result = subprocess.run(shlex.split(command), check=False)
+        argv = shlex.split(command)
+        env = {**os.environ, "UV_LINK_MODE": "copy"} if argv[:2] == ["uv", "tool"] else None
+        result = subprocess.run(argv, check=False, env=env)
     except (OSError, ValueError) as exc:
         # OSError: binary not on PATH. ValueError: shlex.split
         # rejected the command (extremely unlikely for our

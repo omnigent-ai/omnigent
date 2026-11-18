@@ -2138,12 +2138,16 @@ def test_run_upgrade_command_invokes_subprocess(
     from omnigent.update_check import _run_upgrade_command
 
     captured_args: list[list[str]] = []
+    captured_env: list[dict[str, str] | None] = []
 
     class _FakeResult:
         returncode = 7  # arbitrary value to prove it propagates
 
-    def _fake_run(args: list[str], check: bool = False) -> _FakeResult:
+    def _fake_run(
+        args: list[str], check: bool = False, env: dict[str, str] | None = None
+    ) -> _FakeResult:
         captured_args.append(args)
+        captured_env.append(env)
         # Loud failure if anyone ever flips us to shell=True.
         assert isinstance(args, list)
         assert check is False
@@ -2168,6 +2172,8 @@ def test_run_upgrade_command_invokes_subprocess(
             "git+https://example.test/repo.git",
         ]
     ]
+    assert captured_env[0] is not None
+    assert captured_env[0]["UV_LINK_MODE"] == "copy"
     # The exit code must propagate unchanged so the caller's
     # success/failure branching works.
     assert code == 7

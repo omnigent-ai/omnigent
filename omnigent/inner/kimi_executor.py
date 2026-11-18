@@ -496,6 +496,8 @@ class KimiExecutor(Executor):
             cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
             sandbox = resolve_sandbox(os_env, cwd)
             if not sandbox.active:
+                if os_env.sandbox is not None:
+                    raise OSError("Requested sandbox resolved to an inactive policy")
                 return self._binary_path
             # kimi is a curl-installed single binary: it must read its own
             # install dir and write its config dir ($KIMI_CODE_HOME, default
@@ -509,8 +511,8 @@ class KimiExecutor(Executor):
             sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
             return create_exec_launcher(resolved_bin, sandbox)
         except (OSError, ImportError, NotImplementedError) as exc:
-            _logger.warning("Could not apply sandbox for kimi; running unsandboxed: %s", exc)
-            return self._binary_path
+            _logger.warning("Could not apply sandbox for kimi: %s", exc)
+            raise
 
     def _build_argv(self, *, prompt_text: str) -> list[str]:
         """Assemble the kimi argv for one turn.

@@ -539,7 +539,7 @@ install_omnigent() {
   fi
   # --force so re-running upgrades instead of no-op'ing; -q hides uv's
   # "Installed N executables" summary (the package also ships an `omni` alias).
-  run_with_spinner "uv tool install" uv tool install --force -q --python "$(python_request)" "$target"
+  run_with_spinner "uv tool install" uv tool install --force -q --link-mode copy --python "$(python_request)" "$target"
 }
 
 install_databricks_cli() (

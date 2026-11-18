@@ -741,6 +741,13 @@ def test_sandbox_launch_path_wraps_when_sandbox_requested(
     assert Path("/srv/custom-kimi-home") in captured_write_roots
     assert Path.home() / ".kimi-code" not in captured_write_roots
 
+    def _reject_launcher(_target: str, _policy: _ActivePolicy) -> str:
+        raise OSError("trusted runtime is writable")
+
+    monkeypatch.setattr(sandbox_mod, "create_exec_launcher", _reject_launcher)
+    with pytest.raises(OSError, match="trusted runtime is writable"):
+        ex._sandbox_launch_path(("PATH",))
+
 
 def test_run_turn_emits_error_when_kimi_binary_missing(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(kimi_executor.shutil, "which", lambda _binary: None)

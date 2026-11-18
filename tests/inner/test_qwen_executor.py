@@ -429,13 +429,21 @@ def test_sandbox_launch_path_wraps_active_policy(
     assert "PATH" in policy.spawn_env_allowlist
     assert "OPENAI_BASE_URL" in policy.spawn_env_allowlist
 
+    def _reject_launcher(_target: str, _policy: SandboxPolicy) -> str:
+        raise OSError("trusted runtime is writable")
 
-def test_sandbox_launch_path_falls_back_when_backend_unavailable(
+    monkeypatch.setattr(sandbox_mod, "create_exec_launcher", _reject_launcher)
+    with pytest.raises(OSError, match="trusted runtime is writable"):
+        executor._sandbox_launch_path(("PATH",))
+
+
+def test_sandbox_launch_path_stops_when_backend_unavailable(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
-    """A backend failure degrades to the bare binary, never blocks startup."""
+    """A requested sandbox must stop startup when its backend fails."""
     from omnigent.inner import sandbox as sandbox_mod
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.sandbox import SandboxPolicy
 
     def _boom(_os_env, _cwd) -> None:
         raise NotImplementedError("no bwrap on this platform")
@@ -447,7 +455,16 @@ def test_sandbox_launch_path_falls_back_when_backend_unavailable(
         qwen_path="/usr/bin/qwen",
         os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
     )
-    assert executor._sandbox_launch_path(["PATH"]) == "/usr/bin/qwen"
+    with pytest.raises(NotImplementedError, match="no bwrap on this platform"):
+        executor._sandbox_launch_path(["PATH"])
+
+    monkeypatch.setattr(
+        sandbox_mod,
+        "resolve_sandbox",
+        lambda *_args: SandboxPolicy("none", False, [], [], [], True),
+    )
+    with pytest.raises(OSError, match="inactive policy"):
+        executor._sandbox_launch_path(["PATH"])
 
 
 @pytest.mark.asyncio

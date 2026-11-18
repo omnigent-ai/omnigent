@@ -394,6 +394,8 @@ class QwenExecutor(Executor):
             cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
             sandbox = resolve_sandbox(os_env, cwd)
             if not sandbox.active:
+                if os_env.sandbox is not None:
+                    raise OSError("Requested sandbox resolved to an inactive policy")
                 return self._qwen_path
             # qwen is an npm CLI: it must read its own install + node_modules
             # and write its config dir (~/.qwen), or it can't start
@@ -404,8 +406,8 @@ class QwenExecutor(Executor):
             sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
             return create_exec_launcher(self._qwen_path, sandbox)
         except (OSError, ImportError, NotImplementedError) as exc:
-            logger.warning("Could not apply sandbox for qwen; running unsandboxed: %s", exc)
-            return self._qwen_path
+            logger.warning("Could not apply sandbox for qwen: %s", exc)
+            raise
 
     async def _build_spawn_env(self) -> dict[str, str]:
         """The env handed to the qwen subprocess.

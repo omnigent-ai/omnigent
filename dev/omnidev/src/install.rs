@@ -96,7 +96,15 @@ pub fn run_uv_install(config: &InstallConfig, reinstall: bool) -> Result<()> {
     let spec = config.spec();
 
     let mut cmd = Command::new("uv");
-    cmd.args(["tool", "install", "--force", "--python", PYTHON_VERSION]);
+    cmd.args([
+        "tool",
+        "install",
+        "--force",
+        "--link-mode",
+        "copy",
+        "--python",
+        PYTHON_VERSION,
+    ]);
     if reinstall {
         cmd.arg("--reinstall");
     }

@@ -43,6 +43,6 @@ if command -v omnigent >/dev/null 2>&1 \
 fi
 
 echo "update_nightly: installing ${tag}"
-uv tool install --reinstall --python "$PYTHON_VERSION" \
+uv tool install --reinstall --link-mode copy --python "$PYTHON_VERSION" \
   "omnigent @ git+${REPO}@${tag}"
 omnigent --version

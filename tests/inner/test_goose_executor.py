@@ -1256,8 +1256,8 @@ def test_sandbox_launch_path_wraps_active_policy(monkeypatch, tmp_path) -> None:
     assert "GOOSE_PROVIDER" in policy.spawn_env_allowlist
 
 
-def test_sandbox_launch_path_falls_back_when_backend_unavailable(monkeypatch, tmp_path) -> None:
-    """A backend failure degrades to the bare binary, never blocks startup."""
+def test_sandbox_launch_path_stops_when_backend_unavailable(monkeypatch, tmp_path) -> None:
+    """A requested sandbox must stop startup when its backend fails."""
     from omnigent.inner import sandbox as sandbox_mod
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
@@ -1270,7 +1270,8 @@ def test_sandbox_launch_path_falls_back_when_backend_unavailable(monkeypatch, tm
         goose_path="/usr/bin/goose",
         os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
     )
-    assert executor._sandbox_launch_path(("PATH",)) == "/usr/bin/goose"
+    with pytest.raises(NotImplementedError, match="no bwrap here"):
+        executor._sandbox_launch_path(("PATH",))
 
 
 @pytest.mark.asyncio

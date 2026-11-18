@@ -383,6 +383,8 @@ def test_install_target_selects_extras_and_python(
         "install",
         "--force",
         "-q",
+        "--link-mode",
+        "copy",
         "--python",
         python_request,
         target,
