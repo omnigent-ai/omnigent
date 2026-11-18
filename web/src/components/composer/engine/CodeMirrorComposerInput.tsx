@@ -369,6 +369,8 @@ function CodeMirrorComposer({
     if (current === value) return;
     view.dispatch({
       changes: minimalChange(current, value),
+      // As a textarea's value setter does: a new value puts the caret at its end.
+      selection: EditorSelection.cursor(value.length),
       annotations: [controlledUpdate.of(true), Transaction.addToHistory.of(false)],
     });
   }, [value]);

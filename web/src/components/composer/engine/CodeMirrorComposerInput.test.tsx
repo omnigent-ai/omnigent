@@ -164,6 +164,16 @@ describe("CodeMirrorComposerInput change events", () => {
     act(() => void undo(EditorView.findFromDOM(content)!));
     expect(target().value).toBe("ab");
   });
+
+  it("puts the caret at the end of a longer value after a caret move past the old end", () => {
+    // A caret set before the new value commits clamps to the old end, as a mention pick's does.
+    const { target, rerender } = mount({ value: "Check " });
+    act(() => target().setSelectionRange(99, 99));
+    expect(target().selectionStart).toBe("Check ".length);
+
+    rerender(<CodeMirrorComposerInput aria-label="Message the agent" value="Check @README.md" />);
+    expect([target().selectionStart, target().selectionEnd]).toEqual([16, 16]);
+  });
 });
 
 describe("COMPOSER_EDITING_KEYMAP", () => {

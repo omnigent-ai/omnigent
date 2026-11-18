@@ -137,3 +137,16 @@ describe.each([
     expect([target().selectionStart, target().selectionEnd]).toEqual([4, 7]);
   });
 });
+
+// The fake surface has no controlled-value sync, so only the rendered engines take a value.
+describe.each([
+  ["textarea", mountTextarea],
+  ["codemirror", mountCodeMirror],
+])("ComposerTextTarget controlled value on the %s engine", (_engine, mount) => {
+  it("puts the caret at the end of a new value", () => {
+    const { target, setValue } = mount("hello world");
+    act(() => target().setSelectionRange(2, 2));
+    setValue("hello there, friend");
+    expect([target().selectionStart, target().selectionEnd]).toEqual([19, 19]);
+  });
+});
