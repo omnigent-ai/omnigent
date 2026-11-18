@@ -7,6 +7,7 @@ import errno
 import json
 import logging
 import shutil
+import ssl
 import subprocess
 import sys
 import threading
@@ -15,8 +16,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
 from typing import NoReturn
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
+import httpx
 import pytest
 
 import omnigent.inner.terminal as terminal_mod
@@ -42,7 +44,9 @@ from omnigent.inner.terminal_lifecycle import (
 from omnigent.native import owner_claim
 from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
 from omnigent.runner.resource_registry import trim_terminal_output
+from tests._helpers.live_server import terminate_process
 from tests._helpers.polling import poll_until
+from tests._helpers.stdio_jsonrpc import read_json_line
 
 
 @dataclass
@@ -3971,6 +3975,70 @@ async def test_terminal_model_relay_restores_thinking_only_for_selected_gateway(
                 body,
             )
     finally:
+        await instance.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_model_relay_rejects_missing_or_wrong_placeholder(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    terminal_proxy_ca: None,
+) -> None:
+    """A terminal's unauthenticated proxy port cannot resolve model credentials alone."""
+    credential = Mock(return_value="parent-only-key")
+    access = ClaudeModelAccess("https://model.test", "x-api-key", credential)
+    instance = TerminalInstance(
+        "shell",
+        "main",
+        tmp_path / "terminal/tmux.sock",
+        tmp_path / "terminal",
+        model_access=access,
+    )
+    policy = SandboxPolicy("linux_bwrap", True, [tmp_path], [tmp_path], [], False)
+    environment: dict[str, str] = {}
+    relay: subprocess.Popen[str] | None = None
+    try:
+        instance._bootstrap_egress_proxy(policy, environment)
+        handle = instance._egress_handle
+        assert handle is not None
+        assert environment["ANTHROPIC_AUTH_TOKEN"] == access.placeholder
+        assert "@" not in environment["HTTPS_PROXY"]
+        monkeypatch.setattr(
+            handle._proxy, "_assert_destination_allowed", AsyncMock(return_value="127.0.0.1")
+        )
+        credential.reset_mock()
+        relay_code = (
+            "import json, sys; from omnigent.inner.egress.relay import start_relay; "
+            "ready = start_relay(int(sys.argv[1]), sys.argv[2]); assert ready.wait(5); "
+            "print(json.dumps({'status': 'READY'}), flush=True); sys.stdin.read()"
+        )
+        relay = subprocess.Popen(
+            [sys.executable, "-c", relay_code, str(handle.relay_port), str(handle.socket_path)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        assert relay.stdout is not None
+        assert read_json_line(relay.stdout, timeout_s=10) == {"status": "READY"}
+        trust = ssl.create_default_context(cafile=str(handle.ca_bundle_path))
+        async with httpx.AsyncClient(
+            proxy=f"http://127.0.0.1:{handle.relay_port}",
+            verify=trust,
+            trust_env=False,
+            timeout=5,
+        ) as client:
+            for headers in ({}, {"x-api-key": "wrong"}):
+                response = await client.post(
+                    "https://model.test/v1/messages",
+                    json={"model": "claude-test", "messages": []},
+                    headers=headers,
+                )
+                assert response.status_code == 403
+        credential.assert_not_called()
+    finally:
+        if relay is not None:
+            terminate_process(relay, timeout_s=5)
         await instance.close()
 
 
