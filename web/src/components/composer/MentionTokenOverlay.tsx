@@ -1,6 +1,10 @@
 import { forwardRef, type ReactNode, type RefObject, useLayoutEffect } from "react";
 
 import { findMentionTokens } from "@/lib/composerMentions";
+import {
+  isComposerTextarea,
+  type ComposerTextTarget,
+} from "@/components/composer/engine/composerInput";
 
 /**
  * Pill look for an inline ``@`` token in the composer mirror. Background, ring
@@ -32,17 +36,21 @@ export function renderMentionTokens(text: string, tokens: readonly string[]): Re
 /**
  * Pin a mirror overlay to its textarea's box and scroll position while
  * ``active``. The input area also holds the textarea's line-box descent, which
- * would otherwise cut the mirror's scroll range short.
+ * would otherwise cut the mirror's scroll range short. Only a textarea has a
+ * mirror; other engines paint their own text.
  */
 export function useComposerMirrorAlignment(
   overlayRef: RefObject<HTMLDivElement | null>,
-  textareaRef: RefObject<HTMLTextAreaElement | null>,
+  textareaRef: RefObject<ComposerTextTarget | null>,
   active: boolean,
+  // The textarea node, passed when an engine switch can replace it so alignment re-binds.
+  textareaNode: ComposerTextTarget | null = null,
 ) {
   useLayoutEffect(() => {
     const overlay = overlayRef.current;
-    const textarea = textareaRef.current;
-    if (!active || !overlay || !textarea) return;
+    const target = textareaRef.current;
+    if (!active || !overlay || !target || !isComposerTextarea(target)) return;
+    const textarea = target;
     const align = () => {
       overlay.style.top = `${textarea.offsetTop}px`;
       overlay.style.height = `${textarea.offsetHeight}px`;
@@ -53,7 +61,7 @@ export function useComposerMirrorAlignment(
     const observer = new ResizeObserver(align);
     observer.observe(textarea);
     return () => observer.disconnect();
-  }, [overlayRef, textareaRef, active]);
+  }, [overlayRef, textareaRef, active, textareaNode]);
 }
 
 /** Classes that hand glyph painting to the mirror; the caret stays visible. */
