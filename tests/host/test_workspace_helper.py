@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import mimetypes
 import os
 import signal
 import time
@@ -592,6 +593,36 @@ async def test_capabilities_list_only_what_clients_may_use(
     with pytest.raises(ConnectError) as unserved:
         await client.search_files(SearchFilesRequest(query="a"))
     assert unserved.value.code == Code.UNIMPLEMENTED
+
+
+async def test_host_fills_the_content_type_from_its_own_mime_table(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fake_helper: Callable[..., str],
+    proxies: list[WorkspaceHelperProxy],
+) -> None:
+    """The helper leaves the type empty; the host's table names it, as REST would here."""
+    (root,) = _roots(tmp_path, 1)
+    (root / "notes.example").write_text("x")
+    original = mimetypes.guess_type
+
+    def this_machine(url: str, strict: bool = True) -> tuple[str | None, str | None]:
+        # A type only the host's table knows, as /etc/mime.types may add.
+        if url.endswith(".example"):
+            return "text/x-example", None
+        return original(url, strict)
+
+    monkeypatch.setattr(mimetypes, "guess_type", this_machine)
+    proxy = WorkspaceHelperProxy(fake_helper())
+    proxies.append(proxy)
+    client = _service(proxy, root)
+
+    read = [m async for m in client.read_file(ReadFileRequest(path="notes.example"))]
+    unknown = [m async for m in client.read_file(ReadFileRequest(path="a.txt"))]
+
+    assert read[0].metadata.content_type == "text/x-example"
+    assert unknown[0].metadata.content_type == "text/plain"
+    assert b"".join(m.data for m in read) == b"x"
 
 
 async def test_refused_caller_starts_no_helper(

@@ -69,7 +69,7 @@ from omnigent.host.workspace_methods import (
 from omnigent.host.workspace_tokens import new_token_key, verify_token
 from omnigent.inner.async_utils import run_sync_on_thread
 from omnigent.util.uvicorn_server import NoSignalServer
-from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
+from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError, guess_content_type
 
 _logger = logging.getLogger(__name__)
 
@@ -181,7 +181,11 @@ class WorkspaceService(WorkspaceServiceMethods):
             try:
                 async for response in self._forward_stream(method, reader, request):
                     sent = True
-                    yield cast("ReadFileResponse", response)
+                    message = cast("ReadFileResponse", response)
+                    if message.HasField("metadata"):
+                        # The helper leaves the type to the host, so it matches REST here.
+                        message.metadata.content_type = guess_content_type(request.path) or ""
+                    yield message
                 return
             except _HelperGone as exc:
                 # A read the helper started can't be finished by another reader.

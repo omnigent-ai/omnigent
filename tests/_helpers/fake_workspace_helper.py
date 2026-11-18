@@ -16,7 +16,8 @@ inject the faults the tests need:
   line per Open/CloseWorkspace.
 - ``FAKE_HELPER_OPEN_DELAY=<s>``: wait that long before answering OpenWorkspace.
 
-Like the real helper, it refuses compressed requests (``grpc-encoding``).
+Like the real helper, it refuses compressed requests (``grpc-encoding``) and
+leaves ReadFile's ``content_type`` for the host to fill.
 
 SearchText answers one match per entry under the workspace root, in batches
 of one, waiting ``FAKE_HELPER_TEXT_DELAY`` seconds before each, and exits
@@ -156,6 +157,14 @@ def _services() -> list[Any]:  # type: ignore[explicit-any]
     class Workspace(PythonWorkspaceService, WorkspaceService):
         def __init__(self) -> None:
             super().__init__(reader_for)
+
+        async def read_file(  # type: ignore[explicit-any]
+            self, request: Any, ctx: Any
+        ) -> AsyncIterator[Any]:
+            async for response in super().read_file(request, ctx):
+                if response.HasField("metadata"):
+                    response.metadata.content_type = ""
+                yield response
 
         async def stat_path(self, request: Any, ctx: Any) -> Any:  # type: ignore[explicit-any]
             reader = reader_for(ctx)
