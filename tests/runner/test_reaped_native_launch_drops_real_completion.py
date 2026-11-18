@@ -128,9 +128,16 @@ async def test_reaped_native_launch_must_not_discard_childs_real_completion(
     native_acceptance = NativeTurnAcceptance(child_id, "thread_review", "codex_turn_review")
     old_acceptance = NativeTurnAcceptance(child_id, "thread_review", "codex_turn_previous")
     delivery_gate = asyncio.Event()
+    clock = [1000.0]
     harness = (
-        _BlockingHarnessClient(_turn_frames("resp_previous", old_acceptance), delivery_gate)
-        if delayed_previous_acceptance
+        _BlockingHarnessClient(
+            _turn_frames(
+                "resp_previous" if delayed_previous_acceptance else "resp_wake",
+                old_acceptance if delayed_previous_acceptance else native_acceptance,
+            ),
+            delivery_gate,
+        )
+        if prompt_accepted
         else _ScriptedHarnessClient(
             _turn_frames("resp_wake", native_acceptance if prompt_accepted else None),
             stream_finished=turn_streamed,
@@ -227,6 +234,8 @@ async def test_reaped_native_launch_must_not_discard_childs_real_completion(
         prior_receipts = server_client.label_patches[:]
         earliest_start = latest_start = entry.created_at
         if prompt_accepted:
+            monkeypatch.setattr(subagent_work.time, "time", lambda: clock[0])
+            delivery_gate.clear()
             async with _runner_client(app) as client:
                 earliest_start = time.time()
                 resp = await client.post(
@@ -241,17 +250,19 @@ async def test_reaped_native_launch_must_not_discard_childs_real_completion(
                     },
                 )
                 assert resp.status_code == 202, resp.text
-                await asyncio.wait_for(
-                    harness.post_seen.wait()
-                    if isinstance(harness, _BlockingHarnessClient)
-                    else turn_streamed.wait(),
-                    timeout=5.0,
-                )
+                assert isinstance(harness, _BlockingHarnessClient)
+                await asyncio.wait_for(harness.post_seen.wait(), timeout=5.0)
+                assert child_id in subagent_work._pending_child_acceptances
+                assert entry.awaiting_child_start_since is None
+                # Receipt delivery is delayed; the runner has not finalized it yet.
+                clock[0] = 1100.0
+                delivery_gate.set()
                 await _wait_until(
                     lambda: child_id not in app.state.active_turns,
                     "the codex-native delivery turn never ended",
                 )
                 latest_start = time.time()
+                assert subagent_work._children_accepted_turns[child_id].accepted_at == latest_start
                 assert child_id not in subagent_work._pending_child_acceptances
                 if delayed_previous_acceptance:
                     # The current acceptance precedes the parent's fresh registration.
@@ -268,8 +279,9 @@ async def test_reaped_native_launch_must_not_discard_childs_real_completion(
                     assert entry.native_acceptance == native_acceptance
             assert harness.posted_bodies, "the brief never reached the codex-native harness"
             assert entry.status == "running"
-            # Registration may predate acceptance; only acceptance starts this bound.
+            # Registration and native acceptance may predate runner finalization.
             entry.created_at -= 600.0
+            assert entry.awaiting_child_start_since == latest_start
 
         assert (
             subagent_work.reap_stalled_subagent_launches(
@@ -278,6 +290,14 @@ async def test_reaped_native_launch_must_not_discard_childs_real_completion(
             )
             == []
         ), "the bound fired before its budget elapsed"
+        if prompt_accepted:
+            assert (
+                subagent_work.reap_stalled_subagent_launches(
+                    now=latest_start + budget_s - 1.0,
+                    mark_terminal=app.state.mark_subagent_terminal_and_wake,
+                )
+                == []
+            ), "the delivery delay consumed the finalization-based budget"
         reaped = subagent_work.reap_stalled_subagent_launches(
             now=latest_start + budget_s,
             mark_terminal=app.state.mark_subagent_terminal_and_wake,
@@ -425,6 +445,7 @@ async def test_reaped_native_launch_must_not_discard_childs_real_completion(
         ("claude-native", None, "missing"),
         ("codex-native", "running", "valid"),
         ("codex-native", "waiting", "valid"),
+        ("codex-native", "running", "valid-stream"),
         ("codex-native", None, "missing"),
         ("codex-native", None, "explicit-null"),
         ("codex-native", None, "malformed"),
@@ -435,6 +456,7 @@ async def test_reaped_native_launch_must_not_discard_childs_real_completion(
         "claude-native-steer",
         "codex-native-reported-start",
         "codex-native-reported-approval",
+        "valid-receipt-stream",
         "legacy-codex",
         "null-receipt-stream",
         "malformed-receipt",
@@ -503,7 +525,7 @@ async def test_native_prompt_delivery_takes_dispatch_out_of_launching(
             # The parent's follow-up: the runner injects it into the child's
             # native pane as a background turn that ends once the paste is
             # verifiably submitted.
-            streaming = receipt_kind == "explicit-null"
+            streaming = receipt_kind in ("explicit-null", "valid-stream")
             resp = await client.post(
                 f"/v1/sessions/{child_id}/events" + ("?stream=true" if streaming else ""),
                 json={
@@ -523,6 +545,8 @@ async def test_native_prompt_delivery_takes_dispatch_out_of_launching(
                 lambda: child_id not in app.state.active_turns,
                 "the steered native turn never ended",
             )
+            if receipt_kind == "valid-stream":
+                assert entry.native_acceptance == receipt
             if reported_status is not None:
                 resp = await client.post(
                     f"/v1/sessions/{child_id}/events",

@@ -56,6 +56,9 @@ def _clean_subagent_registry() -> Iterator[None]:
         set(subagent_work._drained_delivered_subagent_children),
         set(subagent_work._subagent_recovery_done),
         dict(subagent_work._subagent_recovery_locks),
+        dict(subagent_work._children_reporting_start),
+        dict(subagent_work._children_accepted_turns),
+        {k: set(v) for k, v in subagent_work._pending_child_acceptances.items()},
     )
     subagent_work._subagent_work_by_child.clear()
     subagent_work._subagent_work_by_parent.clear()
@@ -63,6 +66,9 @@ def _clean_subagent_registry() -> Iterator[None]:
     subagent_work._drained_delivered_subagent_children.clear()
     subagent_work._subagent_recovery_done.clear()
     subagent_work._subagent_recovery_locks.clear()
+    subagent_work._children_reporting_start.clear()
+    subagent_work._children_accepted_turns.clear()
+    subagent_work._pending_child_acceptances.clear()
     try:
         yield
     finally:
@@ -78,6 +84,12 @@ def _clean_subagent_registry() -> Iterator[None]:
         subagent_work._subagent_recovery_done.update(saved[4])
         subagent_work._subagent_recovery_locks.clear()
         subagent_work._subagent_recovery_locks.update(saved[5])
+        subagent_work._children_reporting_start.clear()
+        subagent_work._children_reporting_start.update(saved[6])
+        subagent_work._children_accepted_turns.clear()
+        subagent_work._children_accepted_turns.update(saved[7])
+        subagent_work._pending_child_acceptances.clear()
+        subagent_work._pending_child_acceptances.update(saved[8])
 
 
 class _SnapshotServerClient(NullServerClient):

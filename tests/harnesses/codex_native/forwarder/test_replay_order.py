@@ -1189,14 +1189,7 @@ async def test_live_item_does_not_republish_running_that_resume_reported(
 
 
 def _fail_first_running_publish(monkeypatch: pytest.MonkeyPatch, mode: str) -> list[str]:
-    """Make the first ``running`` status publish fail, then pass later publishes through.
-
-    ``mode`` is how the failed publish fails: ``"rejected"`` answers HTTP 500 without
-    raising, ``"raised"`` raises, ``"cancelled"`` is cancelled mid-publish, and
-    ``"missing"`` returns no response.
-
-    :returns: The outcome of each ``running`` publish attempt, in order.
-    """
+    """Fail the first running-status publish using the requested mode."""
     real_post_session_event = fwd._post_session_event
     outcomes: list[str] = []
 

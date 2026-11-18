@@ -149,9 +149,9 @@ class _SubagentWorkEntry:
         already in flight.
     :param child_start_response_id: Identity of a reported native start; ``None``
         preserves unidentified or restart-recovered start evidence.
-    :param awaiting_child_start_since: Unix timestamp when a harness that
-        reports its own turn start accepted the prompt, or ``None`` when no
-        such report is awaited.
+    :param awaiting_child_start_since: Unix timestamp when runner delivery
+        finalization first recorded a validated native receipt, or ``None``
+        when no turn-start report is awaited.
     """
 
     parent_session_id: str
@@ -517,6 +517,8 @@ def arm_subagent_child_start_timeout(
 ) -> None:
     """Bound an authoritative accepted native turn, never a settled or unidentified receipt.
 
+    The clock starts when runner delivery finalization records a validated receipt.
+    Repeated receipts for the same unresolved turn retain its first recorded time.
     Missing identity cannot arm a deadline or erase unresolved evidence. The generic
     response ID remains the request-ownership guard, independently of native identity.
     """
