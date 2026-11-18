@@ -42,7 +42,9 @@ implements them separately, so a fix for one harness does not reach the others.
 - `pi-claude-plugins`: with `OMNIGENT_FEATURES=pi_claude_plugins`, managed Pi sessions
   (pi-native and the Pi gateway executor) load the skills, `/<plugin>:<command>`
   prompts and Pi packages of the Claude Code plugins enabled for the user. Disabled
-  plugins stay out, and a path the user's Pi settings name or exclude is not added again.
+  plugins stay out, and a resource the user's Pi settings already list by the same
+  path is not added again. Excluding one resource of a plugin is not supported yet:
+  disable the plugin in Claude Code to drop it.
 - `claude-managed-mcp-relay`: on a machine with Claude Code's enterprise
   `managed-mcp.json`, Claude Code refuses `--mcp-config`, so Claude native
   sessions (web-launched and `omnigent claude`) reach Omnigent's tools through
