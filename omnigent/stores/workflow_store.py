@@ -342,7 +342,8 @@ class WorkflowStore:
         :param expected_description: Apply *description* only while the stored
             description is still this text, so a newer one written meanwhile stays.
         :param description_source: The journal entry ID of the planning-chat proposal
-            *description* comes from; a description written without one clears it.
+            *description* was saved from or kept over; a description written without
+            one clears it.
         :param steps: New steps replacing the old ones, or ``None`` to keep them.
         :param planning_session_id: An owner-checked planning session, or ``None`` to keep it.
         :returns: The updated workflow, or ``None`` if the owner has no such workflow.

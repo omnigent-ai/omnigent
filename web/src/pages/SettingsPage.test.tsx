@@ -1924,6 +1924,114 @@ describe("SettingsPage", () => {
     ).toBe("settings-delete-worktrees-on-archive-label");
   });
 
+  it("renders the Appearance theme rows from their Settings catalog entries", () => {
+    renderPage("/settings/appearance");
+    for (const id of ["theme-mode", "terminal-theme", "color-theme"]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+    expect(
+      document
+        .querySelector('[data-settings-control="theme-mode:"]')
+        ?.getAttribute("aria-labelledby"),
+    ).toBe("settings-theme-mode-label");
+    expect(
+      document
+        .querySelector('[data-settings-control="color-theme:accent"]')
+        ?.getAttribute("aria-label"),
+    ).toMatch(/^Accent: #/);
+    expect(
+      document.querySelector('[data-settings-control="color-theme:translucentSidebars"]'),
+    ).toHaveAttribute("aria-label", "Translucent sidebars");
+  });
+
+  it("renders the typography rows and their controls from their Settings catalog entries", () => {
+    renderPage("/settings/appearance");
+    for (const id of [
+      "ui-font-size",
+      "ui-font-family",
+      "code-font-size",
+      "code-font-family",
+      "code-font-weight",
+    ]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+    expect(
+      document.querySelector('[data-settings-control="ui-font-size:decrease"]'),
+    ).toHaveAttribute("aria-label", "Decrease interface font size");
+    expect(
+      document.querySelector('[data-settings-control="code-font-weight:toggle"]'),
+    ).toHaveAttribute("aria-label", "Use heavier code text");
+  });
+
+  it("names the Settings data buttons and opens their dialogs as its overlays", async () => {
+    renderPage("/settings/appearance");
+    expect(document.querySelector('[data-settings-item="appearance-data"]')).not.toBeNull();
+    expect(
+      document.querySelector('[data-settings-control="appearance-data:export"]'),
+    ).toHaveAttribute("aria-label", "Export");
+    fireEvent.click(screen.getByTestId("reset-appearance-button"));
+    const dialog = await screen.findByRole("dialog", { name: "Reset appearance?" });
+    expect(dialog).toHaveAttribute("data-settings-overlay-owner", "appearance-data:reset");
+    expect(
+      document.querySelector('[data-settings-control="appearance-data:confirmReset"]'),
+    ).toHaveAttribute("aria-label", "Reset");
+  });
+
+  it("renders the chat default rows from their Settings catalog entries", async () => {
+    renderPage("/settings/appearance");
+    for (const id of [
+      "transcript-view-default",
+      "hide-unconfigured-harnesses",
+      "picker-visibility",
+      "show-final-answer",
+      "peer-session-messages",
+    ]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+    expect(
+      document.querySelector('[data-settings-control="picker-visibility:edit"]'),
+    ).toHaveAttribute("aria-label", "Edit");
+    expect(
+      document.querySelector('[data-settings-control="hide-unconfigured-harnesses:"]'),
+    ).toHaveAttribute("aria-labelledby", "settings-hide-unconfigured-harnesses-label");
+  });
+
+  it("renders the sidebar rows and their pins from their Settings catalog entries", () => {
+    renderPage("/settings/appearance");
+    for (const id of [
+      "workspace-panel-default",
+      "workspace-tabs",
+      "default-workspace-tab",
+      "session-row-quick-actions",
+      "project-folder-pagination",
+    ]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+    expect(
+      document.querySelector('[data-settings-control="workspace-tabs:pinPullRequests"]'),
+    ).toHaveAttribute("aria-label", "Pin Pull Requests");
+    expect(
+      document.querySelector('[data-settings-control="project-folder-pagination:pageSize"]'),
+    ).toHaveAttribute("aria-label", 'Sessions to show before "Show more"');
+  });
+
+  it("renders the General composer, session and sub-agent rows from their Settings catalog entries", () => {
+    renderPage("/settings/general");
+    for (const id of [
+      "submit-with-mod-enter",
+      "always-steer",
+      "background-session-titles",
+      "open-subagents-in-panel",
+    ]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+    expect(
+      document
+        .querySelector('[data-settings-control="always-steer:"]')
+        ?.getAttribute("aria-labelledby"),
+    ).toBe("settings-always-steer-label");
+  });
+
   it("renders the Sandbox Integrations rows from their Settings catalog entries", async () => {
     mocks.enabledConnections = ["github", "databricks"];
     renderPage("/settings/integrations");

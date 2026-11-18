@@ -175,8 +175,9 @@ class SysJournalWritePlanTool(Tool):
                     "maxLength": PLAN_DESCRIPTION_MAX_CHARS,
                     "description": (
                         "Only in a workflow page's planning chat: the workflow's description "
-                        "for this proposal, what it does and what a run needs. Save plan "
-                        "stores it with the steps."
+                        "for this proposal, in the current description's wording, changed "
+                        "only where the plan needs it. The user reviews a change before Save "
+                        "plan stores it."
                     ),
                 },
             },
@@ -199,7 +200,16 @@ def _steps_schema(description: str) -> dict[str, Any]:
                     "type": "string",
                     "description": "A short name, e.g. 'Profile the endpoint'.",
                 },
-                "goal": {"type": "string", "description": "What done means for this step."},
+                "goal": {
+                    "type": "string",
+                    "description": (
+                        "The step's description, in Markdown written for a person first: "
+                        "'**Inputs:**' (what it reads, and from where), '**What it does:**' "
+                        "(a few short bullets) and '**Outputs:**' (what it produces, which is "
+                        "what done means), then '**Details:**' with the exact commands, paths "
+                        "and flags the work needs. Separate the parts with blank lines."
+                    ),
+                },
                 "depends_on": {
                     "type": "array",
                     "items": {"type": "string", "pattern": _STEP_ID_PATTERN},

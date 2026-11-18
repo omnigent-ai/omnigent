@@ -1217,15 +1217,19 @@ def test_append_encodes_item_data_in_one_batch_call(db_uri: str) -> None:
     assert [item.data.content[0]["text"] for item in read_back] == texts
 
 
+@pytest.mark.parametrize("recovering", [False, True])
 def test_append_retry_reuses_prepared_id_and_encoded_payload(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    recovering: bool,
 ) -> None:
     """A serialization replay repeats SQL, not ID generation or encoding."""
     from contextlib import contextmanager
     from unittest.mock import MagicMock
 
     from sqlalchemy.exc import DBAPIError
+
+    from omnigent.session_recovery import RECOVERY_PROMPT, SessionRecovery
 
     class SerializationFailure(Exception):
         sqlstate = "40001"
@@ -1269,6 +1273,11 @@ def test_append_retry_reuses_prepared_id_and_encoded_payload(
     )
     store = RecordingStore(db_uri)
     conv = store.create_conversation()
+    recovery = SessionRecovery(
+        "a" * 32, "runner", 100, phase="dispatching", attempts=1, attempt_id="attempt"
+    )
+    if recovering:
+        assert store.replace_session_recovery(conv.id, None, recovery)
     retrying_maker = RetryOnceMaker(store._conv_session_immediate)
     store._conv_session_immediate = retrying_maker
     statements: list[str] = []
@@ -1293,7 +1302,12 @@ def test_append_retry_reuses_prepared_id_and_encoded_payload(
                     response_id="resp_retry",
                     data=MessageData(
                         role="user",
-                        content=[{"type": "input_text", "text": "retry once"}],
+                        content=[
+                            {
+                                "type": "input_text",
+                                "text": RECOVERY_PROMPT if recovering else "retry once",
+                            }
+                        ],
                     ),
                 )
             ],
@@ -1309,6 +1323,8 @@ def test_append_retry_reuses_prepared_id_and_encoded_payload(
     assert id_calls == 1
     assert store.encode_calls == 1
     assert persisted.id == item_id
+    assert persisted.data.is_meta is recovering
+    assert store.get_session_recovery(conv.id) == (recovery if recovering else None)
     assert [item.id for item in store.list_items(conv.id).data] == [item_id]
 
 

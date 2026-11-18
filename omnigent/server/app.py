@@ -1923,6 +1923,7 @@ def create_app(
     inbox_item_store: InboxItemStore | None = None,
     user_inbox: DeploymentGate | None = None,
     proactive_agent: DeploymentGate | None = None,
+    host_session_recovery: DeploymentGate = False,
     proactive_agent_settings_store: ProactiveAgentSettingsStore | None = None,
     memory_store: MemoryStore | None = None,
 ) -> FastAPI:
@@ -1979,6 +1980,8 @@ def create_app(
         When off, ``/v1/inbox/items`` returns 404, runners drop the Inbox tools,
         the proactive agent is off too, and ``GET /v1/info`` reports
         ``inbox_items_available`` false.
+    :param host_session_recovery: Live permission for explicitly opted-in hosts
+        to continue interrupted tasks. Embedded deployments default to disabled.
     :param proactive_agent: Whether the deployment offers the proactive agent to
         this request's caller. A static bool or a zero-arg callable resolved per
         request; ``None`` follows the ``proactive_agent`` release feature (off by
@@ -2603,6 +2606,8 @@ def create_app(
             )
             if startup_inputs is not None:
                 await startup_inputs.shutdown()
+            if host_session_recoverer is not None:
+                await host_session_recoverer.shutdown()
             await background_title_coordinator.shutdown()
             _uninstall_subagent_block_notifier()
             set_resource_registry(None)
@@ -2842,6 +2847,24 @@ def create_app(
         if _owner_credentials:
             sandbox_config = _dc_replace(sandbox_config, owner_credentials=_owner_credentials)
             app.state.sandbox_config = sandbox_config
+    from omnigent.server.host_session_recovery import HostSessionRecoverer
+
+    host_session_recoverer = (
+        HostSessionRecoverer(
+            conversation_store,
+            host_registry,
+            host_store,
+            runner_router,
+            runner_session_initializer,
+            sandbox_config=sandbox_config,
+            deployment_gate=host_session_recovery,
+            recovery_prompt=(server_config or {}).get("recovery_prompt"),
+        )
+        if host_store is not None and host_session_recovery is not False
+        else None
+    )
+    app.state.host_session_recoverer = host_session_recoverer
+
     from omnigent.server.sandbox_profiles import SandboxProfileCatalog
 
     sandbox_profiles = (
@@ -3063,7 +3086,9 @@ def create_app(
     # scheduled-task store additionally enables the event-driven
     # run-completion hook (persist_scheduled_run_completion) fired from
     # _publish_status when a fired conversation's turn reaches terminal.
-    session_live_state.configure(conversation_store, scheduled_task_store)
+    session_live_state.configure(
+        conversation_store, scheduled_task_store, host_session_recoverer=host_session_recoverer
+    )
     # Extend a managed sandbox while its runner tunnel is live (the managed-path
     # caller for SandboxHostLauncher.keep_alive); no-op without a sandbox config.
     managed_host_keepalive.configure(conversation_store, host_store, sandbox_config)
@@ -4686,6 +4711,7 @@ def create_app(
         # Event-driven: `register` resolves the wait the instant the runner
         # reconnects here. A non-positive grace collapses to an immediate
         # registry check, matching the sleep(0) behavior tests pin.
+        interrupted_at = reference_stamp if reference_stamp is not None else int(time.time())
         reconnected = await tunnel_registry.wait_for_runner(
             runner_id, timeout_s=RUNNER_DISCONNECT_GRACE_S
         )
@@ -4835,6 +4861,8 @@ def create_app(
             error,
             conversation_store,
             disconnect_evidence=drop_attributes(evidence, hold_s=hold_s, hold_outcome=hold),
+            host_session_recoverer=host_session_recoverer,
+            interrupted_at=interrupted_at,
         )
         if relaunch_host_id is not None:
             # Settlement must still own the old binding before a launch rotates it.
@@ -4880,6 +4908,12 @@ def create_app(
             return
         for conv in roots:
             try:
+                if (
+                    host_session_recoverer is not None
+                    and await asyncio.to_thread(host_session_recoverer.enabled, host_id)
+                    and host_conn.hello.recover_interrupted_sessions
+                ):
+                    continue
                 fresh = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
                 last_error = _last_task_error_from_labels(fresh.labels) if fresh else None
                 if (
@@ -5021,13 +5055,30 @@ def create_app(
         return _HostOfflineHold(outcome, mid_turn_sessions, owners)
 
     async def _relay_turn_held_for_host(runner_id: str, session_id: str) -> bool:
-        """Whether this replica's disconnect task holds a lost relay's turn for its host."""
+        """Whether host recovery owns the lost relay's outcome."""
         task = _disconnect_grace_tasks.get(runner_id)
-        if task is None or task.done():
+        if (task is None or task.done()) and host_session_recoverer is None:
             return False
         try:
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if (
+                conv is not None
+                and host_session_recoverer is not None
+                and await asyncio.to_thread(host_session_recoverer.enabled, conv.host_id)
+            ):
+                recovery = await asyncio.to_thread(
+                    conversation_store.get_session_recovery, session_id
+                )
+                if (
+                    recovery is not None
+                    and recovery.host_id == conv.host_id
+                    and recovery.runner_id == conv.runner_id
+                    and recovery.phase in {"pending", "launching", "dispatching", "submitted"}
+                ):
+                    return True
         except Exception:  # noqa: BLE001 — unreadable: the relay fails the turn as before
+            return False
+        if task is None or task.done():
             return False
         return conv is not None and await _host_offline(await _routing_host_id([conv])) is True
 
@@ -5177,6 +5228,8 @@ def create_app(
             ErrorDetail(code=failure_code, message=error),
             conversation_store,
             fail_idle_top_level=not runner_ran,
+            host_session_recoverer=host_session_recoverer,
+            interrupted_at=int(time.time()),
         )
 
     async def _on_runner_connect(runner_id: str, connection: RunnerSession) -> None:
@@ -5456,6 +5509,16 @@ def create_app(
                             generation=connection.generation,
                             store_slots=store_slots,
                             trigger="runner_connect",
+                            suppress_recovery_turn=bool(
+                                host_session_recoverer is not None
+                                and await asyncio.to_thread(
+                                    host_session_recoverer.enabled, conv.host_id
+                                )
+                                and await asyncio.to_thread(
+                                    conversation_store.get_session_recovery, conv.id
+                                )
+                                is not None
+                            ),
                         )
                         # A removed agent was already logged as expected.
                         if is_session_agent_removed(response):
@@ -5593,6 +5656,12 @@ def create_app(
             if startup_inputs is not None:
                 startup_inputs.host_changed(app, _host_id)
 
+        async def _on_host_connected(host_id: str, owner: str | None) -> None:
+            await _on_hosts_changed(host_id, owner)
+            connection = host_registry.get(host_id)
+            if connection is not None and host_session_recoverer is not None:
+                host_session_recoverer.schedule_retirement(connection)
+
         app.include_router(
             create_host_tunnel_router(
                 host_registry,
@@ -5600,7 +5669,10 @@ def create_app(
                 auth_provider=auth_provider,
                 runner_exit_reports=runner_exit_reports,
                 on_runner_exited=_on_runner_exited,
-                on_host_connect=_on_hosts_changed,
+                on_session_recovery=(
+                    host_session_recoverer.recover if host_session_recoverer is not None else None
+                ),
+                on_host_connect=_on_host_connected,
                 on_host_disconnect=_on_hosts_changed,
                 on_host_update=_on_hosts_changed,
                 harness_install=app.state.harness_install,

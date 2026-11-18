@@ -16142,7 +16142,7 @@
                 "type": "null"
               }
             ],
-            "description": "The journal entry ID of the planning-chat proposal `description` comes from; a description written without one clears it.",
+            "description": "The journal entry ID of the planning-chat proposal `description` was saved from or kept over; a description written without one clears it.",
             "title": "Description Source"
           },
           "expected_description": {
@@ -16595,7 +16595,7 @@
                 "type": "null"
               }
             ],
-            "description": "The planning conversation's journal entry for the proposal the description was saved from, until the description is written otherwise.",
+            "description": "The planning conversation's journal entry for the proposal the description was saved from or kept over, until the description is written otherwise.",
             "title": "Description Source"
           },
           "id": {
@@ -16942,7 +16942,7 @@
                 "type": "null"
               }
             ],
-            "description": "What the step achieves, at most 300 characters, or `None`.",
+            "description": "The step's description in Markdown, e.g. what it reads, does and produces, or `None`.",
             "title": "Goal"
           },
           "id": {

@@ -1,6 +1,7 @@
 import type * as TerminalsModule from "@/hooks/useTerminals";
 import type * as SessionsApi from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
+import type * as ConversationEntryStateModule from "@/hooks/useConversationEntryState";
 import type * as FilesPanelModule from "@/shell/FilesPanel";
 import type * as GridSessionsModule from "./GridSessionsContext";
 import {
@@ -65,6 +66,7 @@ const fixture = vi.hoisted(() => ({
   // Sessions the viewer can't edit, and each session's sandbox launch.
   readOnlySessions: [] as string[],
   launches: {} as Record<string, { stage: string; error: null }>,
+  inferenceConfigured: undefined as boolean | undefined,
 }));
 vi.mock("@/lib/sessionsApi", async (original) => ({
   ...(await original<typeof SessionsApi>()),
@@ -124,6 +126,7 @@ vi.mock("@/hooks/useSession", () => ({
       agentId: `agent-${id}`,
       labels: fixture.labels,
       permissionLevel: fixture.permissionLevel,
+      inferenceConfigured: fixture.inferenceConfigured,
     },
   }),
   useRootSessionId: (id: string) => id,
@@ -135,7 +138,9 @@ vi.mock("@/hooks/useSession", () => ({
 vi.mock("@/hooks/usePermissions", () => ({
   useCanEdit: (id: string) => !fixture.readOnlySessions.includes(id),
 }));
-vi.mock("@/hooks/useConversationEntryState", () => ({
+vi.mock("@/hooks/useConversationEntryState", async (importOriginal) => ({
+  // The real value hook: the cell's picker reads each session's registry entry.
+  ...(await importOriginal<typeof ConversationEntryStateModule>()),
   useConversationEntryState: (id: string) => ({
     terminalPending: fixture.terminalPending,
     claudePermissionMode: "default",
@@ -279,6 +284,7 @@ afterEach(() => {
   fixture.discardEdits = null;
   fixture.readOnlySessions = [];
   fixture.launches = {};
+  fixture.inferenceConfigured = undefined;
   vi.restoreAllMocks();
 });
 
@@ -300,9 +306,8 @@ it("shows each cell's session controls and targets that session's permission mod
   // Named from the cells' snapshots; neither session is on a loaded sidebar page.
   await waitFor(() => expect(document.title).toBe("first + second"));
   const second = within(screen.getByRole("region", { name: "second" }));
-  // The harness is read-only here; models are switched full screen.
   expect(second.getByText("Host for second")).toBeInTheDocument();
-  expect(second.getByTestId("grid-harness-status")).toHaveAccessibleName("Claude Code");
+  expect(second.getByRole("button", { name: "Configure session" })).toBeEnabled();
   fireEvent.pointerDown(second.getByRole("button", { name: "Permission mode: Manual" }), {
     button: 0,
   });
@@ -885,4 +890,99 @@ it("shares one workspace, preserves per-session files and drafts, and persists g
     "data-width",
     "504",
   );
+});
+
+const CELL_MODELS = [
+  { id: "opus", displayName: "Opus" },
+  { id: "sonnet", displayName: "Sonnet" },
+];
+
+/** The named cell's model picker trigger. */
+function cellModelTrigger(cellName: string) {
+  return within(screen.getByRole("region", { name: new RegExp(`^${cellName}`) })).getByRole(
+    "button",
+    { name: "Configure session" },
+  );
+}
+
+/** Opens the named cell's model list with the keyboard, as in the composer. */
+function openCellModelList(cellName: string) {
+  fireEvent.keyDown(cellModelTrigger(cellName), { key: "ArrowDown" });
+  fireEvent.click(screen.getByTestId("composer-agent-edit"));
+}
+
+it("shows each cell's own model, not the active conversation's", () => {
+  const initialChatState = useChatStore.getState();
+  onTestFinished(() => useChatStore.setState(initialChatState, true));
+  useChatStore.setState({ conversationId: "active", llmModel: "opus" });
+  const view = renderClaudeCells();
+  act(() => {
+    conversationRegistry.acquire("first").setState({ codexModelOptions: CELL_MODELS });
+    conversationRegistry
+      .acquire("second")
+      .setState({ llmModel: "sonnet", codexModelOptions: CELL_MODELS });
+  });
+  expect(
+    within(screen.getByRole("region", { name: "second" })).getByTestId("composer-config-gear"),
+  ).toHaveTextContent("Sonnet");
+  expect(
+    within(screen.getByRole("region", { name: /^first/ })).getByTestId("composer-config-gear"),
+  ).not.toHaveTextContent(/opus/i);
+  view.unmount();
+});
+
+it("writes a cell's model pick to its own session, and leaves the other cell's picker free", async () => {
+  const view = renderClaudeCells();
+  act(() => {
+    for (const id of ["first", "second"])
+      conversationRegistry.acquire(id).setState({ codexModelOptions: CELL_MODELS });
+  });
+  // The first cell's switch stays in flight; the second cell's picker must still work.
+  vi.mocked(updateSession).mockReturnValueOnce(new Promise<never>(() => {}));
+  openCellModelList("first");
+  fireEvent.click(screen.getByTestId("composer-agent-model-opus"));
+  await waitFor(() =>
+    expect(updateSession).toHaveBeenCalledWith("first", { modelOverride: "opus" }),
+  );
+  expect(cellModelTrigger("first")).toBeDisabled();
+  openCellModelList("second");
+  fireEvent.click(screen.getByTestId("composer-agent-model-sonnet"));
+  await waitFor(() =>
+    expect(updateSession).toHaveBeenCalledWith("second", { modelOverride: "sonnet" }),
+  );
+  expect(updateSession).toHaveBeenCalledTimes(2);
+  view.unmount();
+});
+
+it("keeps each cell's picker inert for a read-only viewer and while its session is unreachable", () => {
+  // The composer is hidden from a viewer who can't edit in production; this checks the picker's own gate.
+  fixture.readOnlySessions = ["first"];
+  const view = renderClaudeCells();
+  expect(cellModelTrigger("first")).toHaveAttribute("aria-disabled", "true");
+  expect(cellModelTrigger("second")).toHaveAttribute("aria-disabled", "false");
+  fireEvent.keyDown(cellModelTrigger("first"), { key: "ArrowDown" });
+  expect(screen.queryByTestId("composer-agent-edit")).not.toBeInTheDocument();
+  fixture.livenessKind = "host_offline";
+  view.rerender(twoCellGrid());
+  expect(cellModelTrigger("second")).toHaveAttribute("aria-disabled", "true");
+  fireEvent.keyDown(cellModelTrigger("second"), { key: "ArrowDown" });
+  expect(screen.queryByTestId("composer-agent-edit")).not.toBeInTheDocument();
+  expect(updateSession).not.toHaveBeenCalled();
+  view.unmount();
+});
+
+it("keeps a Claude Code sub-agent child's picker disabled, with no PATCH, even with configured inference", () => {
+  fixture.labels = { "omnigent.wrapper": "claude-code-native-ui-subagent" };
+  fixture.inferenceConfigured = true;
+  for (const id of ["first", "second"])
+    conversationRegistry.acquire(id).setState({ codexModelOptions: CELL_MODELS });
+  onTestFinished(() => conversationRegistry.clear());
+  vi.mocked(updateSession).mockClear();
+  const view = render(twoCellGrid());
+  // Editable and reachable, with models offered: only the read-only sub-agent gate disables it.
+  expect(cellModelTrigger("second")).toHaveAttribute("aria-disabled", "true");
+  fireEvent.keyDown(cellModelTrigger("second"), { key: "ArrowDown" });
+  expect(screen.queryByTestId("composer-agent-edit")).not.toBeInTheDocument();
+  expect(updateSession).not.toHaveBeenCalled();
+  view.unmount();
 });
