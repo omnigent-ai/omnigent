@@ -30,6 +30,7 @@ export function SetupTerminalStep({
   runningHint = "Starting the local server…",
   connection = null,
   onCancelConnect,
+  onCancel,
 }: {
   /** Install the CLI first (when missing). Absent → skip straight to onRun. */
   onInstallCli?: () => Promise<SetupResult>;
@@ -49,6 +50,8 @@ export function SetupTerminalStep({
   /** Progress of the run phase's server connect (null when not connecting). */
   connection?: ConnectProgress | null;
   onCancelConnect?: () => void;
+  /** Leave while installing or connecting (e.g. a browser sign-in that never finishes). */
+  onCancel?: () => void;
 }) {
   const [phase, setPhase] = useState<Phase>(onInstallCli ? "installing" : "running");
   const [error, setError] = useState<string | undefined>();
@@ -227,6 +230,14 @@ export function SetupTerminalStep({
       </div>
 
       <ConnectStatus connection={connection} onCancel={onCancelConnect} />
+
+      {inProgress && connection === null && onCancel && (
+        <div className="mt-3 flex">
+          <Button variant="outline" onClick={onCancel}>
+            Cancel
+          </Button>
+        </div>
+      )}
 
       {phase === "failed" && (
         <div className="mt-3 flex justify-between gap-2">

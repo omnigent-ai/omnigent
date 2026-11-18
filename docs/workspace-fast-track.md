@@ -30,8 +30,8 @@ answers such as "not found" go to REST, so callers keep the errors they expect.
 | Where       | What                                                                                                    |
 | ----------- | ------------------------------------------------------------------------------------------------------- |
 | Server      | `OMNIGENT_FEATURES=workspace_direct_access,workspace_api_server_access`                                 |
-| Server      | `omnigent[workspace-api]`, for the server API route only                                                |
-| Hosts       | `omnigent[workspace-api]`. A host with it always opens its workspace socket; it has no flag of its own. |
+| Server      | `omnigent[workspace-api]`, for the server API route only. `omnigent[databricks]` includes it.           |
+| Hosts       | `omnigent[workspace-api]`, or `omnigent[databricks]`. A host with it always opens its workspace socket. |
 | Desktop app | A release with the workspace socket bridge. Older shells fall back to the server routes.                |
 
 Both flags are off by default and appear in `/v1/info`, which is how the page

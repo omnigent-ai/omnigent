@@ -216,7 +216,6 @@ def test_handle_mcp_request_emits_progress_notifications(
             request_id,
             "tools/call",
             params,
-            {},  # tools dict (relay tools handled via _call_relay_tool)
             bridge_dir,
             stdout_lock,
             False,  # framed
@@ -253,13 +252,13 @@ def test_handle_mcp_request_emits_progress_notifications(
     )
 
 
-def test_handle_mcp_request_no_heartbeat_for_local_tools(
+def test_handle_mcp_request_no_heartbeat_for_unadvertised_tools(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A hung LOCAL (non-relay) tool must stay killable by the client's static
-    timeout: the bridge must NOT emit keep-alive progress for it, or a wedged
-    local tool would reset opencode's deadline forever.
+    """A call to a name no relay advertises gets no keep-alive progress: the
+    bridge heartbeats only relay calls, whose execution and approval waits are
+    bounded, so nothing else can reset opencode's deadline indefinitely.
     """
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
@@ -271,12 +270,12 @@ def test_handle_mcp_request_no_heartbeat_for_local_tools(
             notifications_emitted.append(payload)
 
     monkeypatch.setattr(claude_native_bridge, "_write_jsonrpc", _capturing_write)
-    # No relay advertises this tool — it is a local tool.
+    # No relay advertises this tool.
     monkeypatch.setattr(claude_native_bridge, "_read_relay_tool_names", lambda _path: set())
 
     # Slow handler: a wrongly-started heartbeat would emit its immediate first
     # tick during this window, making the assertion below deterministic.
-    def _slow_handle(method: str, params: object, tools: dict, bridge_dir: Path) -> dict:
+    def _slow_handle(method: str, params: object, bridge_dir: Path) -> dict:
         time.sleep(0.3)
         return {"content": [{"type": "text", "text": "done"}]}
 
@@ -288,11 +287,10 @@ def test_handle_mcp_request_no_heartbeat_for_local_tools(
         7,
         "tools/call",
         {
-            "name": "local_tool",
+            "name": "unadvertised_tool",
             "arguments": {},
-            "_meta": {"progressToken": "tok-local"},
+            "_meta": {"progressToken": "tok-unadvertised"},
         },
-        {},
         bridge_dir,
         threading.Lock(),
         False,

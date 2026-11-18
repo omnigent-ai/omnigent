@@ -872,7 +872,9 @@ async def _resolve_agent_spec_cwd(
     agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
     if agent is None or agent.bundle_location is None:
         return None
-    loaded = await asyncio.to_thread(agent_cache.load, agent.id, agent.bundle_location)
+    loaded = await asyncio.to_thread(
+        agent_cache.load, agent.id, agent.bundle_location, expand_env=agent.operator_authored
+    )
     os_env = getattr(loaded.spec, "os_env", None)
     return getattr(os_env, "cwd", None) if os_env is not None else None
 
@@ -902,7 +904,9 @@ async def _resolve_agent_harness(
     agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
     if agent is None or agent.bundle_location is None:
         return None
-    loaded = await asyncio.to_thread(agent_cache.load, agent.id, agent.bundle_location)
+    loaded = await asyncio.to_thread(
+        agent_cache.load, agent.id, agent.bundle_location, expand_env=agent.operator_authored
+    )
     return canonicalize_harness(loaded.spec.executor.harness_kind)
 
 

@@ -44,6 +44,7 @@ from omnigent.inner.datamodel import (
     OSEnvSpec,
 )
 from omnigent.onboarding import ambient, harness_install
+from omnigent.runtime.harnesses.process_manager import _build_harness_spawn_env
 from omnigent.runtime.workflow import (
     _apply_codex_provider_env,
     _bind_codex_gateway_credential,
@@ -58,6 +59,7 @@ from omnigent.runtime.workflow import (
     _resolve_catalog_default_model,
     _resolve_provider_for_build,
 )
+from omnigent.spec.parser import parse
 from omnigent.spec.types import (
     AgentSpec,
     ApiKeyAuth,
@@ -521,18 +523,7 @@ def test_locked_codex_gateway_requires_private_renewable_source_and_exact_route(
         _build_codex_spawn_env(spec)
 
 
-@pytest.mark.parametrize(
-    "settings",
-    [
-        {},
-        {"web_search": False, "disable_native_tools": True},
-        {"web_search": "false", "disable_native_tools": 1},
-    ],
-)
-def test_codex_gateway_keeps_auth_for_ordinary_same_host_binding(
-    config_home: Path, settings: dict[str, object]
-) -> None:
-    _write_config(config_home, _openai_default_config())
+def test_codex_binding_keeps_ordinary_auth_for_non_reserved_same_host_token() -> None:
     binding = CredentialProxyEntry(
         host="openai.example.com",
         scheme="bearer",
@@ -545,13 +536,191 @@ def test_codex_gateway_keeps_auth_for_ordinary_same_host_binding(
         credential_proxy=CredentialProxySpec(entries=[binding]),
     )
     spec = _make_spec(harness="codex", os_env=OSEnvSpec(sandbox=sandbox))
+    ordinary_env = {
+        "HARNESS_CODEX_GATEWAY_BASE_URL": "https://openai.example.com/v1",
+        "HARNESS_CODEX_GATEWAY_AUTH_COMMAND": "printf %s sk-oai-secret",
+    }
+    env = ordinary_env.copy()
+
+    _bind_codex_gateway_credential(env, spec)
+
+    assert env == ordinary_env
+    assert "HARNESS_CODEX_BROKERED_GATEWAY" not in env
+
+
+@pytest.mark.parametrize(
+    ("settings", "tool_env"),
+    [
+        ({}, {}),
+        (
+            {"web_search": False, "disable_native_tools": True},
+            {
+                "HARNESS_CODEX_ENABLE_WEB_SEARCH": "false",
+                "HARNESS_CODEX_DISABLE_NATIVE_TOOLS": "true",
+            },
+        ),
+        ({"web_search": True, "disable_native_tools": False}, {}),
+    ],
+)
+def test_codex_gateway_without_proxy_retains_ordinary_auth(
+    config_home: Path, settings: dict[str, object], tool_env: dict[str, str]
+) -> None:
+    _write_config(config_home, _openai_default_config())
+    sandbox = OSEnvSandboxSpec(
+        type="darwin_seatbelt",
+        egress_rules=["POST openai.example.com/v1/responses"],
+    )
+    spec = _make_spec(harness="codex", os_env=OSEnvSpec(sandbox=sandbox))
     spec.executor.config.update(settings)
 
     env = _build_codex_spawn_env(spec)
 
     assert env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"] == "printf %s sk-oai-secret"
-    assert "HARNESS_CODEX_ENABLE_WEB_SEARCH" not in env
-    assert "HARNESS_CODEX_DISABLE_NATIVE_TOOLS" not in env
+    assert "HARNESS_CODEX_BROKERED_GATEWAY" not in env
+    assert {
+        key: value
+        for key, value in env.items()
+        if key in ("HARNESS_CODEX_ENABLE_WEB_SEARCH", "HARNESS_CODEX_DISABLE_NATIVE_TOOLS")
+    } == tool_env
+
+
+@pytest.mark.parametrize(("key", "value"), [("web_search", "false"), ("disable_native_tools", 1)])
+def test_codex_tool_switches_reject_non_boolean_values(
+    config_home: Path, key: str, value: object
+) -> None:
+    spec = _make_spec(harness="codex")
+    spec.executor.config[key] = value
+
+    with pytest.raises(OmnigentError, match=rf"executor\.config\.{key} must be a boolean"):
+        _build_codex_spawn_env(spec)
+
+
+def test_codex_permissive_switches_keep_operator_restrictions(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("HARNESS_CODEX_ENABLE_WEB_SEARCH", "false")
+    monkeypatch.setenv("HARNESS_CODEX_DISABLE_NATIVE_TOOLS", "true")
+    spec = _make_spec(harness="codex")
+    spec.executor.config.update({"web_search": True, "disable_native_tools": False})
+
+    env = _build_harness_spawn_env(_build_codex_spawn_env(spec))
+
+    assert env["HARNESS_CODEX_ENABLE_WEB_SEARCH"] == "false"
+    assert env["HARNESS_CODEX_DISABLE_NATIVE_TOOLS"] == "true"
+
+
+def _parse_bundle(directory: Path, config_yaml: str) -> AgentSpec:
+    directory.mkdir()
+    (directory / "config.yaml").write_text(config_yaml)
+    return parse(directory)
+
+
+@pytest.mark.parametrize(
+    "provider_config", [{}, _openai_default_config()], ids=["codex-login", "key-provider"]
+)
+@pytest.mark.parametrize(
+    ("web_search_yaml", "disable_native_tools_yaml", "tool_env"),
+    [
+        (
+            "false",
+            "true",
+            {
+                "HARNESS_CODEX_ENABLE_WEB_SEARCH": "false",
+                "HARNESS_CODEX_DISABLE_NATIVE_TOOLS": "true",
+            },
+        ),
+        ("null", "null", {}),
+    ],
+    ids=["restrictive", "null"],
+)
+def test_codex_spec_tool_switches_reach_ordinary_spawn_env(
+    config_home: Path,
+    tmp_path: Path,
+    provider_config: dict[str, object],
+    web_search_yaml: str,
+    disable_native_tools_yaml: str,
+    tool_env: dict[str, str],
+) -> None:
+    _write_config(config_home, provider_config)
+    spec = _parse_bundle(
+        tmp_path / "codex-worker",
+        f"""\
+spec_version: 1
+name: codex-worker
+prompt: You are a worker.
+executor:
+  config:
+    harness: codex
+    disable_native_tools: {disable_native_tools_yaml}
+    web_search: {web_search_yaml}
+""",
+    )
+
+    env = _build_codex_spawn_env(spec)
+
+    assert {
+        key: value
+        for key, value in env.items()
+        if key in ("HARNESS_CODEX_ENABLE_WEB_SEARCH", "HARNESS_CODEX_DISABLE_NATIVE_TOOLS")
+    } == tool_env
+
+
+def test_locked_codex_profile_yaml_builds_brokered_spawn_env(
+    config_home: Path, tmp_path: Path
+) -> None:
+    _write_config(
+        config_home,
+        {
+            "providers": {
+                "locked-model": {
+                    "kind": "gateway",
+                    "openai": {
+                        "base_url": "https://model.example.com/cyber/v1",
+                        "wire_api": "responses",
+                        "auth_command": "false",
+                        "models": {"default": "gpt-locked-model"},
+                    },
+                }
+            }
+        },
+    )
+    spec = _parse_bundle(
+        tmp_path / "locked-codex",
+        """\
+spec_version: 1
+name: locked-codex
+prompt: You are a worker.
+executor:
+  model: gpt-locked-model
+  auth:
+    type: provider
+    name: locked-model
+  config:
+    harness: codex
+    broker_gateway: true
+    web_search: false
+    disable_native_tools: true
+os_env:
+  type: caller_process
+  sandbox:
+    type: linux_bwrap
+    egress_rules:
+      - "POST model.example.com/cyber/v1/responses"
+    credential_proxy:
+      - type: https_bearer
+        target: model.example.com
+        env: OMNIGENT_CODEX_GATEWAY_TOKEN
+        source:
+          unix_socket: /private/model-token.sock
+          refresh_interval_seconds: 300
+""",
+    )
+
+    env = _build_codex_spawn_env(spec)
+
+    assert env["HARNESS_CODEX_BROKERED_GATEWAY"] == "true"
+    assert env["HARNESS_CODEX_DISABLE_NATIVE_TOOLS"] == "true"
+    assert env["HARNESS_CODEX_ENABLE_WEB_SEARCH"] == "false"
 
 
 @pytest.mark.parametrize("auth_source", ["spec", "global"])

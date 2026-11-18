@@ -576,6 +576,49 @@ def test_resolve_sandbox_none_populates_grants_relative_to_cwd(tmp_path: Path) -
     assert policy.write_files == [(cwd / ".." / "sibling" / "f.json").resolve()]
 
 
+def test_relative_grant_resolves_against_cwd_outside_runner_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A forked environment's cwd lies outside the runner workspace; grants must still resolve."""
+    runner_workspace = (tmp_path / "workspace").resolve()
+    runner_workspace.mkdir()
+    fork_root = (tmp_path / "omnigent-fork-abc" / "root").resolve()
+    (fork_root / "sub").mkdir(parents=True)
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(runner_workspace))
+    spec = OSEnvSpec(
+        type="caller_process",
+        cwd=str(fork_root),
+        sandbox=OSEnvSandboxSpec(
+            type="none",
+            read_paths=[".", "sub"],
+            write_paths=["sub"],
+            write_files=["notes.json"],
+        ),
+    )
+    policy = resolve_sandbox(spec, fork_root)
+    assert policy.read_roots == [fork_root, fork_root / "sub"]
+    assert policy.write_roots == [fork_root / "sub"]
+    assert policy.write_files == [fork_root / "notes.json"]
+
+
+def test_relative_grant_following_symlink_out_of_cwd_is_rejected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cwd = (tmp_path / "ws").resolve()
+    cwd.mkdir()
+    outside = (tmp_path / "outside").resolve()
+    outside.mkdir()
+    (cwd / "linked").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path))
+    spec = OSEnvSpec(
+        type="caller_process",
+        cwd=str(cwd),
+        sandbox=OSEnvSandboxSpec(type="none", read_paths=["linked/file"]),
+    )
+    with pytest.raises(ValueError, match="outside its working directory"):
+        resolve_sandbox(spec, cwd)
+
+
 def test_resolve_sandbox_none_still_rejects_network_restriction(tmp_path: Path) -> None:
     spec = OSEnvSpec(
         type="caller_process",

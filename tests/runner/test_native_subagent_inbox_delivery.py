@@ -35,7 +35,7 @@ from tests.runner.conftest import (
 )
 
 # Reuse the proven runner-turn stubs from the sessions-native suite.
-from tests.runner.helpers import NullServerClient
+from tests.runner.helpers import NullServerClient, accept_subagent_turn
 
 PARENT_SESSION_ID = "conv_parent_orchestrator"
 CHILD_SESSION_ID = "conv_child_reviewer"
@@ -56,6 +56,9 @@ def _clean_subagent_registry() -> Iterator[None]:
         set(subagent_work._drained_delivered_subagent_children),
         set(subagent_work._subagent_recovery_done),
         dict(subagent_work._subagent_recovery_locks),
+        dict(subagent_work._children_reporting_start),
+        dict(subagent_work._children_accepted_turns),
+        {k: set(v) for k, v in subagent_work._pending_child_acceptances.items()},
     )
     subagent_work._subagent_work_by_child.clear()
     subagent_work._subagent_work_by_parent.clear()
@@ -63,6 +66,9 @@ def _clean_subagent_registry() -> Iterator[None]:
     subagent_work._drained_delivered_subagent_children.clear()
     subagent_work._subagent_recovery_done.clear()
     subagent_work._subagent_recovery_locks.clear()
+    subagent_work._children_reporting_start.clear()
+    subagent_work._children_accepted_turns.clear()
+    subagent_work._pending_child_acceptances.clear()
     try:
         yield
     finally:
@@ -78,6 +84,12 @@ def _clean_subagent_registry() -> Iterator[None]:
         subagent_work._subagent_recovery_done.update(saved[4])
         subagent_work._subagent_recovery_locks.clear()
         subagent_work._subagent_recovery_locks.update(saved[5])
+        subagent_work._children_reporting_start.clear()
+        subagent_work._children_reporting_start.update(saved[6])
+        subagent_work._children_accepted_turns.clear()
+        subagent_work._children_accepted_turns.update(saved[7])
+        subagent_work._pending_child_acceptances.clear()
+        subagent_work._pending_child_acceptances.update(saved[8])
 
 
 class _SnapshotServerClient(NullServerClient):
@@ -1194,6 +1206,43 @@ async def test_recovered_pending_child_outlives_launch_timeout_and_delivers_orig
     assert late.delivered and not late.delivered_now
     assert inbox.empty()
     assert child["runner_id"] == "other-live-runner"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("settle_reported_start", [False, True])
+async def test_recovered_child_steered_after_restart_is_not_start_bounded(
+    _clean_subagent_registry: None,
+    settle_reported_start: bool,
+) -> None:
+    """A steer into a turn that survived the restart reports no new start, so it is not bounded."""
+    server = _RecoveryServerClient([_child_summary(current_task_status="in_progress")])
+    app = create_runner_app(server_client=server)  # type: ignore[arg-type]
+    await app.state.recover_undrained_subagent_results(PARENT_SESSION_ID)
+    entry = subagent_work.get_subagent_work(CHILD_SESSION_ID)
+    assert entry is not None and entry.status == "waiting"
+    if settle_reported_start:
+        subagent_work.note_subagent_child_start_reported(
+            CHILD_SESSION_ID, response_id="codex_previous"
+        )
+        subagent_work.note_subagent_child_turn_settled(
+            CHILD_SESSION_ID, response_id="codex_previous"
+        )
+
+    # What a codex-native steer's clean delivery end does to the reused entry.
+    subagent_work.mark_subagent_work_started(CHILD_SESSION_ID)
+    accept_subagent_turn(
+        CHILD_SESSION_ID,
+        thread_id="thread_recovered",
+        response_id="codex_recovered",
+        now=entry.created_at,
+    )
+
+    assert (
+        subagent_work.reap_stalled_subagent_launches(now=entry.created_at + 900, timeout_s=180)
+        == []
+    )
+    assert entry.status == "running"
+    assert subagent_work._session_inboxes_ref[PARENT_SESSION_ID].empty()
 
 
 def _wake_candidate(

@@ -1743,6 +1743,16 @@ describe("runs of a saved workflow", () => {
     vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(new Map());
   });
 
+  // Runs show their plans only while the server offers workflows.
+  const renderWithWorkflows = () =>
+    render(
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { workflows: true } }}
+      >
+        {pageTree()}
+      </CapabilitiesProvider>,
+    );
+
   it.each([false, true])("shows each run's tasks and graph (trigger header=%s)", (header) => {
     const prompt = header
       ? encodeTriggerPrompt(
@@ -1925,6 +1935,11 @@ describe("runs of a saved workflow", () => {
       expect(within(old!).queryByTestId("plan-continue")).toBeNull();
       expect(within(old!).queryByTestId("run-status-label")).toBeNull();
       expect(within(current!).getByRole("button", { name: "Stop" })).toBeInTheDocument();
+      // Both runs share the session, and each row keeps its own run's words.
+      expect(within(old!).getByTestId("run-status-text")).toHaveTextContent(
+        completed ? "Done: Found it" : "Started: Working",
+      );
+      expect(within(current!).getByTestId("run-status-text")).toHaveTextContent("Done: Found it");
       fireEvent.focus(within(old!).getAllByTestId("tasks-progress-segment")[0]!);
       expect(await screen.findByTestId("tasks-progress-card")).toHaveTextContent("Explore");
       expect(screen.queryByTestId("tasks-progress-menu")).toBeNull();
@@ -1934,6 +1949,104 @@ describe("runs of a saved workflow", () => {
       );
     },
   );
+
+  it("says what each run's agent last wrote about its work", () => {
+    setTask(task({ prompt: WORKFLOW_PROMPT }));
+    setRuns([
+      run({ id: "run_1", status: "succeeded", conversationId: "c_9" }),
+      run({ id: "run_2", status: "succeeded", conversationId: "c_8" }),
+      run({ id: "run_3", status: "succeeded", conversationId: "c_7" }),
+      run({ id: "run_4", status: "succeeded", conversationId: "c_6" }),
+    ]);
+    const written = (position: number, step: string, status: string, text: string | null) => ({
+      ...STEPS.statuses[0]!,
+      id: `s${position}`,
+      position,
+      step,
+      content: { status, text },
+    });
+    vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(
+      new Map([
+        ["run_1", STEPS],
+        [
+          "run_2",
+          {
+            ...STEPS,
+            runId: "run_2",
+            statuses: [
+              written(1, "explore", "done", "Found it"),
+              written(2, "fix", "failed", "CI is down"),
+            ],
+          },
+        ],
+        [
+          "run_3",
+          {
+            ...STEPS,
+            runId: "run_3",
+            // An earlier invocation of a continued session keeps its own words.
+            isCurrent: false,
+            statuses: [
+              written(1, "explore", "done", "Found it"),
+              written(2, "fix", "needs_input", "Approve the deploy?"),
+              written(3, "ship", "started", null),
+            ],
+          },
+        ],
+        [
+          "run_4",
+          {
+            ...STEPS,
+            runId: "run_4",
+            statuses: [
+              written(1, "explore", "done", "Found it"),
+              written(2, "fix", "started", "Retrying the build"),
+            ],
+          },
+        ],
+      ]),
+    );
+    renderWithWorkflows();
+
+    const [first, second, third, fourth] = screen
+      .getAllByTestId("task-detail-run")
+      .map((row) => within(row).getByTestId("run-status-text"));
+    expect(first).toHaveTextContent("Done: Found it");
+    expect(first!.className).not.toContain("text-amber");
+    // A failed step stands out, and what happened is shown before the words.
+    expect(second).toHaveTextContent("Failed: CI is down");
+    expect(within(second!).getByText("Failed:")).not.toHaveClass("sr-only");
+    expect(second).toHaveAttribute("data-run-status", "failed");
+    expect(second!.className).toContain("text-amber-700");
+    expect(second).toHaveAttribute("title", "CI is down");
+    // A started step has no words, so the newest ones are shown.
+    expect(third).toHaveTextContent("Waiting for you: Approve the deploy?");
+    // A started step that has words shows them, after its own prefix.
+    expect(fourth).toHaveTextContent("Started: Retrying the build");
+    expect(fourth).toHaveAttribute("data-run-status", "started");
+  });
+
+  it("shows no status text for a run without a plan, or whose agent gave no words", () => {
+    setTask(task({ prompt: WORKFLOW_PROMPT }));
+    setRuns([
+      run({ id: "run_1", status: "succeeded", conversationId: "c_9" }),
+      run({ id: "run_2", status: "succeeded", conversationId: "c_8" }),
+    ]);
+    vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(
+      new Map([
+        [
+          "run_2",
+          {
+            ...STEPS,
+            runId: "run_2",
+            statuses: [{ ...STEPS.statuses[0]!, content: { status: "started", text: null } }],
+          },
+        ],
+      ]),
+    );
+    renderWithWorkflows();
+    expect(screen.queryByTestId("run-status-text")).toBeNull();
+  });
 
   it("opens the run's workflow left of the graph button, with the Workflows page on", () => {
     setTask(task({ prompt: WORKFLOW_PROMPT }));

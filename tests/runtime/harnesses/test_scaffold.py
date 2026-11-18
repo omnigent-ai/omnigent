@@ -226,6 +226,11 @@ async def test_build_terminal_event_waits_for_run_task_failure() -> None:
         raise RuntimeError("terminal boom")
 
     ctx = TurnContext("resp_late_failure", asyncio.Queue(), asyncio.Event())
+    from omnigent.inner.executor import NativeTurnAcceptance
+
+    ctx.native_acceptance = NativeTurnAcceptance(
+        "conv_native", "thread_native", "codex_turn_native"
+    )
     task = asyncio.create_task(_late_failure())
 
     terminal = await HarnessApp()._build_terminal_event(
@@ -240,6 +245,7 @@ async def test_build_terminal_event_waits_for_run_task_failure() -> None:
     assert terminal.response.status == "failed"
     assert terminal.response.error is not None
     assert terminal.response.error.message == "terminal boom"
+    assert "native_acceptance" not in terminal.model_dump()
 
 
 @pytest.mark.asyncio
@@ -259,6 +265,11 @@ async def test_build_terminal_event_handles_pending_task_cancellation() -> None:
         await asyncio.sleep(60)
 
     ctx = TurnContext("resp_cancel_race", asyncio.Queue(), asyncio.Event())
+    from omnigent.inner.executor import NativeTurnAcceptance
+
+    ctx.native_acceptance = NativeTurnAcceptance(
+        "conv_native", "thread_native", "codex_turn_native"
+    )
     task = asyncio.create_task(_wait_forever())
     await task_started.wait()
     ctx.cancelled.set()
@@ -274,6 +285,7 @@ async def test_build_terminal_event_handles_pending_task_cancellation() -> None:
     assert terminal.type == "response.cancelled"
     assert terminal.sequence_number == 3
     assert terminal.response.status == "cancelled"
+    assert "native_acceptance" not in terminal.model_dump()
 
 
 @pytest.mark.asyncio
