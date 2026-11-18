@@ -26,6 +26,9 @@ therefore be rejected.
 User-owned hard links to trusted runtime files also cause a fail-closed launch,
 even when the other link is outside the grant. Install dependencies as copies
 or copy-on-write clones; repository uv installs use `link-mode = "copy"`.
+The launcher starts its trusted Python probe with `-I`, so dependencies needed
+at startup must be installed in the runtime environment. `PYTHONPATH` and the
+user site are not searched by that probe.
 
 The automatic skill overlay exposes only bundled skills and their supporting
 files. It excludes the original bundle's credentials-bearing root configuration

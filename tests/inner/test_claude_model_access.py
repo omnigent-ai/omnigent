@@ -860,6 +860,15 @@ async def test_inference_works_without_rules_and_broad_rules_cannot_bypass_signi
             )
             assert denied.status_code == 403
             token_for_request.assert_not_awaited()
+            reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
+            try:
+                writer.write(b"CONNECT model.test:444 HTTP/1.1\r\nHost: model.test:444\r\n\r\n")
+                await writer.drain()
+                assert (await reader.readuntil(b"\r\n\r\n")).startswith(b"HTTP/1.1 403")
+            finally:
+                writer.close()
+                await writer.wait_closed()
+            token_for_request.assert_not_awaited()
             credentials.assert_called_once_with()
     finally:
         await relay.stop()
