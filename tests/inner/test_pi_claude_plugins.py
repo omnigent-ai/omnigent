@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
 
 from omnigent.inner.pi_claude_plugins import (
+    MAX_PLUGIN_COMMANDS,
     PI_CLAUDE_PLUGIN_RESOURCES_DIR,
+    _bounded_files,
     add_claude_plugin_resources,
 )
 from omnigent.server.feature_flags import FEATURES_ENV_VAR
@@ -147,17 +150,23 @@ def test_pi_manifest_plugin_loads_as_package_and_keeps_commands(
 
 
 def test_user_choices_are_preserved_without_duplicates(claude_dir: Path, tmp_path: Path) -> None:
-    """A path the user names or excludes is not added again; user entries stay in order."""
+    """An existing skill entry is not added again, and user entries keep their order."""
     root = _install(claude_dir, "dp@market", files=_skill("review"))
     skill_dir = str(root / "skills" / "review")
-    settings = {
-        "skills": ["/user/skills", skill_dir],
-        "packages": [{"source": str(root)}],
-    }
 
-    result = add_claude_plugin_resources(settings, tmp_path / "managed")
+    result = add_claude_plugin_resources({"skills": ["/user/skills", skill_dir]}, tmp_path / "m")
 
     assert result["skills"] == ["/user/skills", skill_dir]
+
+
+def test_user_package_claim_is_checked_separately(claude_dir: Path, tmp_path: Path) -> None:
+    """A package claim on the plugin root is not a skill dedupe; it blocks fallback skills."""
+    root = _install(claude_dir, "dp@market", files=_skill("review"))
+    listed = {"packages": [{"source": str(root)}]}
+
+    result = add_claude_plugin_resources(listed, tmp_path / "m")
+
+    assert "skills" not in result
     assert result["packages"] == [{"source": str(root)}]
 
 
@@ -358,3 +367,171 @@ def test_native_provider_launch_writes_plugin_entries(claude_dir: Path, tmp_path
 
     written = json.loads((agent_dir / "settings.json").read_text(encoding="utf-8"))
     assert written["skills"] == [str(root / "skills" / "review")]
+
+
+@dataclass(frozen=True)
+class _Targets:
+    """Paths one consumer decides on, all resolved."""
+
+    cache: Path
+    root: Path
+    skill_dir: Path
+    skill_file: Path
+    command: Path
+    sibling: Path
+
+
+def _install_for(consumer: str, claude: Path, tmp_path: Path) -> _Targets:
+    """Install a plugin shaped for *consumer* and return the paths to decide on."""
+    if consumer == "commands":
+        root = _install(
+            claude,
+            "dp@market",
+            files={"commands/go.md": "GO\n", "commands/other.md": "OTHER\n"},
+        )
+    elif consumer == "packages":
+        root = _install(
+            claude,
+            "dp@market",
+            files={
+                "package.json": json.dumps({"name": "dp", "pi": {"extensions": ["./x.js"]}}),
+                **_skill("review"),
+            },
+        )
+    else:
+        root = _install(claude, "dp@market", files=_skill("review"))
+    return _Targets(
+        cache=claude / "plugins" / "cache",
+        root=root,
+        skill_dir=root / "skills" / "review",
+        skill_file=root / "skills" / "review" / "SKILL.md",
+        command=root / "commands" / "go.md",
+        sibling=root / "commands" / "other.md",
+    )
+
+
+_CONSUMER_KEY = {"skills": "skills", "packages": "packages", "commands": "prompts"}
+_ENTRY_KINDS = (
+    "absolute",
+    "include",
+    "exclude",
+    "relative",
+    "tilde",
+    "tilde_unknown_user",
+    "symlink_loop",
+    "nul",
+    "ancestor_exclusion",
+    "descendant_exclusion",
+    "glob_ancestor",
+    "glob_target",
+    "glob_unrelated",
+)
+# Kinds the user has not decided on: the plugin entry is still bridged.
+_NOT_DECIDING = {"relative", "tilde_unknown_user", "symlink_loop", "nul", "glob_unrelated"}
+
+
+def _entry(kind: str, consumer: str, t: _Targets, tmp_path: Path) -> str:
+    target = {"skills": t.skill_dir, "packages": t.root, "commands": t.command}[consumer]
+    below = {"skills": t.skill_file, "packages": t.root / "package.json", "commands": t.sibling}
+    loop = tmp_path / "loop-a"
+    if kind == "absolute":
+        return str(target)
+    if kind == "include":
+        return f"+{target}"
+    if kind == "exclude":
+        return f"-{target}"
+    if kind == "relative":
+        return target.relative_to(t.root).as_posix()
+    if kind == "tilde":
+        return f"~/{target.relative_to(tmp_path).as_posix()}"
+    if kind == "tilde_unknown_user":
+        return "~nonexistent_user_zz/skills"
+    if kind == "symlink_loop":
+        loop.unlink(missing_ok=True)
+        (tmp_path / "loop-b").unlink(missing_ok=True)
+        loop.symlink_to(tmp_path / "loop-b")
+        (tmp_path / "loop-b").symlink_to(loop)
+        return str(loop)
+    if kind == "nul":
+        return "bad\0entry"
+    if kind == "ancestor_exclusion":
+        return f"-{t.cache}"
+    if kind == "descendant_exclusion":
+        return f"-{below[consumer]}"
+    if kind == "glob_ancestor":
+        return f"!{t.cache}/*"
+    if kind == "glob_target":
+        return f"!{target}"
+    if kind == "glob_unrelated":
+        return f"!{tmp_path}/nowhere-at-all/*"
+    raise AssertionError(kind)
+
+
+def _decided_by_user(kind: str, consumer: str) -> bool:
+    """Whether the user's entry of this kind makes the consumer's plugin entry absent."""
+    if kind in _NOT_DECIDING:
+        return False
+    if kind == "descendant_exclusion":
+        # A command has no children to exclude, so a sibling exclusion leaves it bridged.
+        return consumer != "commands"
+    return True
+
+
+@pytest.mark.parametrize("kind", _ENTRY_KINDS)
+@pytest.mark.parametrize("consumer", ["skills", "packages", "commands"])
+def test_user_entry_table(
+    kind: str,
+    consumer: str,
+    claude_dir: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Each entry kind decides, or does not decide, each consumer the same way everywhere."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    targets = _install_for(consumer, claude_dir, tmp_path)
+    key = _CONSUMER_KEY[consumer]
+    entry = _entry(kind, consumer, targets, tmp_path)
+    settings = {key: [entry]}
+    managed = tmp_path / "managed"
+
+    result = add_claude_plugin_resources(settings, managed)
+
+    assert result[key][0] == entry, "the user's own entry is kept first"
+    added = result[key][1:]
+    if consumer == "commands":
+        bridged = (managed / PI_CLAUDE_PLUGIN_RESOURCES_DIR / "prompts" / "dp:go.md").exists()
+    elif consumer == "skills":
+        bridged = str(targets.skill_dir) in added
+    else:
+        bridged = str(targets.root) in added
+    assert bridged == (not _decided_by_user(kind, consumer)), (
+        f"{kind} for {consumer}: bridged={bridged}"
+    )
+
+
+def test_single_directory_stops_at_the_file_budget(tmp_path: Path) -> None:
+    """One directory with more files than the budget is cut off inside its own loop."""
+    commands = tmp_path / "commands"
+    commands.mkdir()
+    for index in range(MAX_PLUGIN_COMMANDS + 40):
+        (commands / f"c{index:04d}.md").write_text("x", encoding="utf-8")
+
+    found = _bounded_files(commands, lambda name: name.endswith(".md"))
+
+    assert len(found) == MAX_PLUGIN_COMMANDS
+
+
+def test_unknown_home_prefix_never_aborts_preparation(
+    claude_dir: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A ``~user`` entry is skipped with a warning, with or without enabled plugins."""
+    settings = {
+        "skills": ["~nonexistent_user_zz/skills"],
+        "packages": ["~nonexistent_user_zz/pkg"],
+        "prompts": ["~nonexistent_user_zz/p"],
+    }
+
+    result = add_claude_plugin_resources(settings, tmp_path / "managed")
+
+    assert result == settings
+    assert "Ignoring Pi resource path" in caplog.text
