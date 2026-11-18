@@ -770,7 +770,10 @@ def create_workflows_router(
         return runs, page[-1] if more and page else None
 
     def _name_workflows(runs: Sequence[WorkflowRun], user_id: str | None) -> None:
-        """Name each run's workflow, and its descendants', if the caller can read it."""
+        """Name each run's workflow, and its descendants', if the caller can read it.
+
+        A workflow shared by a deleted owner goes unnamed, as it is unreadable.
+        """
         every = [*runs, *(descendant for run in runs for descendant in run.descendant_runs)]
         workflow_ids = list(dict.fromkeys(run.workflow_id for run in every if run.workflow_id))
         names = _store().names(workflow_ids, user_id=user_id)
@@ -780,9 +783,14 @@ def create_workflows_router(
             if stores_workflow_grants(permission_store):
                 assert permission_store is not None
                 principals = permission_store.caller_principals(user_id)
-                for workflow_id, workflow in _store().get_many(others).items():
+                shared = _store().get_many(others)
+                deleted = permission_store.deleted_accounts(
+                    [workflow.user_id for workflow in shared.values()]
+                )
+                for workflow_id, workflow in shared.items():
                     if (
-                        permission_store.resolve_workflow_access(principals, workflow_id)
+                        workflow.user_id not in deleted
+                        and permission_store.resolve_workflow_access(principals, workflow_id)
                         is not None
                     ):
                         names[workflow_id] = workflow.name

@@ -1046,6 +1046,14 @@ async def test_a_deleted_owners_workflow_stops_being_shared_before_its_cleanup_e
     run = {"agent_id": agent["id"], "workflow_id": workflow["id"]}
     started = await client.post("/v1/sessions", json=run, headers=_headers(BOB))
     assert started.status_code == 201, started.text
+    # Renamed after Bob's run started, so its name comes from storage, not the run.
+    renamed = await client.patch(
+        f"/v1/workflows/{workflow['id']}", json={"name": "Release v2"}, headers=_headers(ALICE)
+    )
+    assert renamed.status_code == 200, renamed.text
+    session_runs = f"/v1/workflows/{workflow['id']}/runs?session_id={started.json()['id']}"
+    (before,) = (await client.get(session_runs, headers=_headers(BOB))).json()["data"]
+    assert before["workflow_name"] == "Release v2"
 
     def interrupted(*args: object, **kwargs: object) -> int:
         raise RuntimeError("cleanup interrupted")
@@ -1062,9 +1070,11 @@ async def test_a_deleted_owners_workflow_stops_being_shared_before_its_cleanup_e
     again = await client.post("/v1/sessions", json=run, headers=_headers(BOB))
     assert again.status_code == 400, again.text
     assert "workflow_not_found" in again.json()["error"]["message"]
-    # The run Bob already made stays his.
+    # The run Bob already made stays his, but no longer names the workflow.
     journal = f"/v1/sessions/{started.json()['id']}/journal"
     assert (await client.get(journal, headers=_headers(BOB))).status_code == 200
+    (after,) = (await client.get(session_runs, headers=_headers(BOB))).json()["data"]
+    assert after["workflow_name"] is None
 
 
 async def test_deleting_a_workflow_deletes_who_it_was_shared_with(
