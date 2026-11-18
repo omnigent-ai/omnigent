@@ -377,7 +377,11 @@ describe("HarnessCredentialForm as a Settings overlay", () => {
       "data-settings-control",
       "harness-codex-native-detail:gatewayUrl",
     );
-    const saves = screen.getAllByRole("button", { name: "Save" });
+    expect(screen.getByLabelText("Gateway API key")).toHaveAttribute(
+      "data-settings-control",
+      "harness-codex-native-detail:gatewayKey",
+    );
+    const saves = screen.getAllByRole("button", { name: /^Save/ });
     expect(saves.map((save) => save.getAttribute("data-settings-control"))).toEqual([
       "harness-codex-native-detail:saveKey",
       "harness-codex-native-detail:saveGateway",

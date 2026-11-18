@@ -1615,7 +1615,7 @@ describe("HarnessFixDialog", () => {
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: "Use an API key or gateway URL instead" }));
     await user.type(screen.getByPlaceholderText("Paste an API key"), "secret");
-    await user.click(screen.getAllByRole("button", { name: "Save" })[0]);
+    await user.click(screen.getAllByRole("button", { name: /^Save/ })[0]);
 
     await waitFor(() =>
       expect(props.onFixed).toHaveBeenCalledWith({
@@ -1651,7 +1651,7 @@ describe("HarnessFixDialog", () => {
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: "Use an API key or gateway URL instead" }));
     await user.type(screen.getByPlaceholderText("Paste an API key"), "secret");
-    await user.click(screen.getAllByRole("button", { name: "Save" })[0]);
+    await user.click(screen.getAllByRole("button", { name: /^Save/ })[0]);
 
     expect(
       await screen.findByRole("heading", { name: "Set up tmux on Local laptop" }),

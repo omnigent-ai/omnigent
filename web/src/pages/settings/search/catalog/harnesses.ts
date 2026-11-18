@@ -55,12 +55,12 @@ export const HARNESSES_GRID_ENTRY = settingsEntry({
 
 /** The credential form's controls, shown in the fix dialog's credentials step. */
 const CREDENTIAL_FORM_PARTS = {
-  adoptCredential: "Use it",
+  adoptCredential: "Use it for the detected credential",
   apiKey: "API key",
-  saveKey: "Save",
+  saveKey: "Save API key",
   gatewayUrl: "Gateway base URL",
   gatewayKey: "Gateway API key",
-  saveGateway: "Save",
+  saveGateway: "Save gateway",
 } as const;
 
 /** The fix dialog's controls, by part. Each is shown inside the dialog that one of its openers opens. */
