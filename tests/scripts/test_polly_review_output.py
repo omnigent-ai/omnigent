@@ -179,15 +179,24 @@ def test_failure_diagnostics_preserves_logs_without_gateway_secrets(
     assert not (destination / "polly-review.txt").exists()
 
 
-@pytest.mark.parametrize("failure_step", ["secret-scan", "posting", "timeout", None])
 @pytest.mark.parametrize(
-    "scope_suffix",
+    ("failure_step", "scope_suffix"),
     [
-        "",
-        "<!-- POLLY_SCOPE_START -->\n{malformed\n<!-- POLLY_SCOPE_END -->\n",
-        "<!-- POLLY_SCOPE_START -->\n{}\n<!-- POLLY_SCOPE_END --> (see above)\n" * 2,
-    ],
-    ids=["plain-prose", "malformed-legacy-scope", "duplicate-legacy-scope"],
+        pytest.param(failure_step, scope_suffix, id=f"{scope_id}-{failure_step}")
+        for scope_id, scope_suffix in [
+            ("plain-prose", ""),
+            (
+                "malformed-legacy-scope",
+                "<!-- POLLY_SCOPE_START -->\n{malformed\n<!-- POLLY_SCOPE_END -->\n",
+            ),
+            (
+                "duplicate-legacy-scope",
+                "<!-- POLLY_SCOPE_START -->\n{}\n<!-- POLLY_SCOPE_END --> (see above)\n" * 2,
+            ),
+        ]
+        for failure_step in ["secret-scan", "posting", "timeout", None]
+    ]
+    + [pytest.param("setup-timeout", "", id="plain-prose-setup-timeout")],
 )
 def test_review_diagnostics_retain_raw_stdout(
     tmp_path: Path, failure_step: str | None, scope_suffix: str
@@ -206,7 +215,10 @@ def test_review_diagnostics_retain_raw_stdout(
     (tmp_path / "review_prompt.txt").write_text("Synthetic review; no model calls.")
     (tmp_path / "python3").symlink_to(sys.executable)
     commands = {
-        "uv": 'cat "$POLLY_TEST_STDOUT"\necho "stderr: test-api-secret" >&2\n',
+        "uv": (
+            'printf "%s" "$OMNIGENT_HEADLESS_TIMEOUT_S" > headless-timeout.txt\n'
+            'cat "$POLLY_TEST_STDOUT"\necho "stderr: test-api-secret" >&2\n'
+        ),
         "gh": 'echo "Forced posting failure" >&2\nexit 42\n' if failure_step else "exit 0\n",
     }
     if failure_step == "timeout":
@@ -256,7 +268,24 @@ def test_review_diagnostics_retain_raw_stdout(
     assert 0 < remaining < workflow["jobs"]["review"]["timeout-minutes"] * 60
     if failure_step == "timeout":
         env["POLLY_REVIEW_DEADLINE"] = str(int(time.time()) + 2)
+    elif failure_step == "setup-timeout":
+        env["POLLY_REVIEW_DEADLINE"] = str(int(time.time()) - 1)
+    before_review = int(time.time())
     result = run_step("Run Polly review")
+    after_review = int(time.time())
+    if failure_step == "setup-timeout":
+        assert result.returncode == 124, result.stdout + result.stderr
+        assert "time budget was exhausted during setup" in result.stdout
+        assert not (tmp_path / "headless-timeout.txt").exists()
+        assert not (tmp_path / "github_output").exists()
+        assert not (tmp_path / "polly_review.txt").exists()
+        return
+    headless_timeout = float((tmp_path / "headless-timeout.txt").read_text())
+    deadline = int(env["POLLY_REVIEW_DEADLINE"])
+    assert 0 < headless_timeout <= deadline - before_review
+    assert deadline - after_review <= headless_timeout
+    if failure_step != "timeout":
+        assert headless_timeout > 1800
     if failure_step == "timeout":
         assert result.returncode == 124, result.stdout + result.stderr
         assert "no review was published" in result.stdout
