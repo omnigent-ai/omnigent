@@ -5177,13 +5177,11 @@ export function ConversationMenuItems({
     : [];
   const { forkDisabledReason } = useSessionActionRestrictions(conversation.id, conversation);
   const showQuickActions = useSessionRowQuickActions();
-  // Mobile lacks the horizontal room for a side-opening submenu, so the
-  // project picker replaces the menu body in place instead of flying out
-  // to the side. `view` swaps between the main actions and that sub-view;
-  // desktop always renders the native side-flyout submenu regardless.
+  // Mobile replaces the menu body at each step; desktop uses native flyouts.
   const isMobile = useIsMobileViewport();
   const { trackClick } = useOmnigentAnalytics();
-  const [view, setView] = useState<"main" | "projects">("main");
+  const [view, setView] = useState<"main" | "move" | "projects" | "nests">("main");
+  const hasNestActions = canJoinNest || canDetachNest;
 
   // The project pick / create / remove flow — shared verbatim by the desktop
   // side-flyout submenu and the mobile in-place sub-view so both behave
@@ -5204,15 +5202,15 @@ export function ConversationMenuItems({
     moveToProject.mutate({ id: conversation.id, project: "" });
   };
 
-  const movePicker = (
+  const movePicker = (target: "projects" | "nests") => (
     <SessionMovePickerMenu
       components={C}
       currentProject={currentProject}
       onSelect={handleProjectSelect}
       conversation={conversation}
-      canMoveProject={canMoveProject}
-      canJoinNest={canJoinNest}
-      canDetachNest={canDetachNest}
+      canMoveProject={target === "projects" && canMoveProject}
+      canJoinNest={target === "nests" && canJoinNest}
+      canDetachNest={target === "nests" && canDetachNest}
       nestSaving={moveToNest.isPending}
       onNestSelect={(destination) => {
         setMenuOpen(false);
@@ -5225,27 +5223,57 @@ export function ConversationMenuItems({
     />
   );
 
-  // Mobile project sub-view: replaces the entire menu body in place (the
-  // "Back" row flips `view` without closing the menu or navigating). Reachable
-  // only via the mobile project item below, which sits behind the same
-  // `isOwner` gate.
-  if (isMobile && view === "projects") {
+  const moveChoices = (["projects", "nests"] as const)
+    .filter((target) => (target === "projects" ? canMoveProject : hasNestActions))
+    .map((target) => {
+      const label = target === "projects" ? "Project" : "Session";
+      const icon =
+        target === "projects" ? (
+          <FolderInputIcon className="size-3.5" />
+        ) : (
+          <GitBranchIcon className="size-3.5" />
+        );
+      return isMobile ? (
+        <C.Item
+          key={target}
+          className="mobile-touch-target"
+          onSelect={(event) => {
+            event.preventDefault();
+            setView(target);
+          }}
+        >
+          {icon}
+          {label}
+          <ChevronRightIcon className="ml-auto size-3.5" />
+        </C.Item>
+      ) : (
+        <C.Sub key={target}>
+          <C.SubTrigger className="mobile-touch-target">
+            {icon}
+            {label}
+          </C.SubTrigger>
+          <C.SubContent className="min-w-56">{movePicker(target)}</C.SubContent>
+        </C.Sub>
+      );
+    });
+
+  // Mobile uses the same steps in place, with Back returning one level.
+  if (isMobile && view !== "main") {
     return (
       <>
         <C.Item
           data-testid="project-picker-back"
           className="mobile-touch-target whitespace-nowrap"
-          // Keep the menu open — just flip back to the main actions.
           onSelect={(e) => {
             e.preventDefault();
-            setView("main");
+            setView(view !== "move" && hasNestActions ? "move" : "main");
           }}
         >
           <ChevronLeftIcon className="size-3.5" />
           Back
         </C.Item>
         <C.Separator />
-        {movePicker}
+        {view === "move" ? moveChoices : movePicker(view)}
       </>
     );
   }
@@ -5425,15 +5453,13 @@ export function ConversationMenuItems({
       {isOwner &&
         (canMoveProject || canJoinNest || canDetachNest) &&
         (isMobile ? (
-          // Mobile: no room for a side flyout, so this item swaps the menu
-          // body to the project picker in place (see the `view === "projects"`
-          // branch above). `preventDefault` keeps the menu open on select.
+          // Keep the mobile menu open while choosing a destination type.
           <C.Item
             data-testid="move-to-project"
             className="mobile-touch-target whitespace-nowrap"
             onSelect={(e) => {
               e.preventDefault();
-              setView("projects");
+              setView(hasNestActions ? "move" : "projects");
             }}
           >
             <FolderInputIcon className="size-3.5" />
@@ -5453,7 +5479,7 @@ export function ConversationMenuItems({
             <C.SubContent className="min-w-56">
               {/* A native submenu flyout — no separate popover layer, so no
                   open/dismiss race with the parent menu. */}
-              {movePicker}
+              {hasNestActions ? moveChoices : movePicker("projects")}
             </C.SubContent>
           </C.Sub>
         ))}
@@ -7640,38 +7666,30 @@ function SessionMovePickerMenu({
     row.id === row.family?.representative_id
       ? conversationDisplayLabel(row)
       : (row.family?.representative_title ?? conversationDisplayLabel(row));
-  const filtered = canMoveProject ? projects.filter((project) => matchesSearch(project.name)) : [];
+  const filtered = canMoveProject ? projectsMatching(projects, search) : [];
   const filteredNests = canJoinNest
     ? availableNests.filter(
         (row) => row.family?.id !== conversation.family?.id && matchesSearch(nestLabel(row)),
       )
     : [];
-  const canCreate =
-    canMoveProject &&
-    trimmed.length > 0 &&
-    !projects.some((project) => project.name.toLowerCase() === trimmed.toLowerCase());
+  const canCreate = canMoveProject && canCreateProject(projects, search);
   const currentProjectIcon = projects.find((project) => project.name === currentProject)?.icon;
   const canChooseDestination = canMoveProject || canJoinNest;
 
   return (
     <>
-      {canChooseDestination && (
-        <div className="flex items-center gap-2 border-b px-2 py-1.5">
-          <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" />
-          <input
-            className="w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
-            placeholder={canJoinNest ? "Search destinations" : "Search or create project"}
-            value={search}
-            onChange={(event) => setSearch(event.target.value)}
-            onKeyDown={(event) => event.stopPropagation()}
-          />
-        </div>
-      )}
+      <div className="flex items-center gap-2 border-b px-2 py-1.5">
+        <SearchIcon className="size-3.5 shrink-0 text-muted-foreground" />
+        <input
+          className="w-full bg-transparent text-sm outline-none placeholder:text-muted-foreground"
+          placeholder={canMoveProject ? "Search or create project" : "Search sessions"}
+          value={search}
+          onChange={(event) => setSearch(event.target.value)}
+          onKeyDown={(event) => event.stopPropagation()}
+        />
+      </div>
       {canChooseDestination && (
         <div className="max-h-48 overflow-y-auto">
-          {canJoinNest && canMoveProject && filtered.length > 0 && (
-            <div className="px-2 py-1.5 text-xs text-muted-foreground">Projects</div>
-          )}
           {filtered.map((project) => (
             <C.Item
               key={project.name}
@@ -7686,9 +7704,6 @@ function SessionMovePickerMenu({
               )}
             </C.Item>
           ))}
-          {filteredNests.length > 0 && (
-            <div className="px-2 py-1.5 text-xs text-muted-foreground">Nests</div>
-          )}
           {filteredNests.map((nest) => (
             <C.Item
               key={nest.id}
@@ -7746,7 +7761,7 @@ function SessionMovePickerMenu({
         <div className="border-t pt-1">
           <C.Item className="px-2 py-1" onSelect={() => onSelect(trimmed)}>
             <PlusIcon className="size-3.5 shrink-0 text-muted-foreground" />
-            {canJoinNest ? "Create project" : "Create"}{" "}
+            Create{" "}
             <span className="truncate rounded bg-muted px-1 py-0.5 font-mono text-[0.95em]">
               {trimmed}
             </span>

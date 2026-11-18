@@ -1301,7 +1301,7 @@ describe("Move session nest destinations", () => {
   const openMove = async (
     mobile: boolean,
     id = CONV.id,
-    placeholder: string | null = "Search destinations",
+    target: "Project" | "Session" = "Session",
   ) => {
     const row = screen
       .getByRole("link", { name: id === CONV.id ? CONV.title! : "Research" })
@@ -1317,9 +1317,49 @@ describe("Move session nest destinations", () => {
       act(() => move.focus());
       fireEvent.keyDown(move, { key: "ArrowRight" });
     }
-    if (placeholder) await screen.findByPlaceholderText(placeholder);
-    else await screen.findByRole("menuitem", { name: "Remove from nest" });
+    const choice = await screen.findByRole("menuitem", { name: target });
+    expect(screen.queryByRole("textbox")).toBeNull();
+    if (mobile) fireEvent.click(choice);
+    else {
+      act(() => choice.focus());
+      fireEvent.keyDown(choice, { key: "ArrowRight" });
+    }
+    await screen.findByPlaceholderText(
+      target === "Project" ? "Search or create project" : "Search sessions",
+    );
   };
+
+  it.each([false, true])("searches projects in their own Move step: mobile %s", async (mobile) => {
+    mocks.isMobile = mobile;
+    mocks.projects = ["Planning", "Roadmap"];
+    mockConversations([CONV, destination]);
+    renderSidebar(undefined, serverInfo({ sibling_sessions: true, session_nest_moves: true }));
+    await openMove(mobile, CONV.id, "Project");
+    expect(screen.queryByRole("menuitem", { name: "Research" })).toBeNull();
+    fireEvent.change(screen.getByPlaceholderText("Search or create project"), {
+      target: { value: "road" },
+    });
+    expect(screen.queryByRole("menuitem", { name: "Planning" })).toBeNull();
+    expect(mocks.sessionSearch).toHaveBeenLastCalledWith(
+      "",
+      "title",
+      expect.objectContaining({ enabled: false }),
+    );
+    if (mobile) {
+      fireEvent.click(screen.getByTestId("project-picker-back"));
+      expect(screen.getByRole("menuitem", { name: "Project" })).toBeInTheDocument();
+      expect(screen.getByRole("menuitem", { name: "Session" })).toBeInTheDocument();
+      expect(screen.queryByRole("textbox")).toBeNull();
+      fireEvent.click(screen.getByRole("menuitem", { name: "Project" }));
+      expect(screen.getByPlaceholderText("Search or create project")).toHaveValue("");
+    }
+    fireEvent.click(screen.getByRole("menuitem", { name: "Roadmap" }));
+    expect(mocks.moveToProject.mutate).toHaveBeenCalledExactlyOnceWith({
+      id: CONV.id,
+      project: "Roadmap",
+    });
+    expect(mocks.moveToNest).not.toHaveBeenCalled();
+  });
 
   it.each([
     { mobile: false, partial: false },
@@ -1370,12 +1410,12 @@ describe("Move session nest destinations", () => {
     fireEvent.click(screen.getAllByRole("button", { name: "Collapse session family" })[0]);
     expect(screen.queryByRole("link", { name: "Peer" })).toBeNull();
     await openMove(mobile);
-    expect(screen.getByRole("menuitem", { name: "Planning" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Planning" })).toBeNull();
     expect(screen.queryByRole("menuitem", { name: "Peer" })).toBeNull();
     expect(screen.queryByRole("menuitem", { name: "Other standalone" })).toBeNull();
     expect(screen.queryByRole("menuitem", { name: "Shared nest" })).toBeNull();
     expect(screen.queryByRole("menuitem", { name: "Loaded member" })).toBeNull();
-    fireEvent.change(screen.getByPlaceholderText("Search destinations"), {
+    fireEvent.change(screen.getByPlaceholderText("Search sessions"), {
       target: { value: "research" },
     });
     expect(screen.queryByRole("menuitem", { name: "Planning" })).toBeNull();
@@ -1386,7 +1426,7 @@ describe("Move session nest destinations", () => {
         sourceId: partial ? "available-peer" : "nest",
       }),
     );
-    expect(screen.queryByPlaceholderText("Search destinations")).toBeNull();
+    expect(screen.queryByPlaceholderText("Search sessions")).toBeNull();
     expect(mocks.moveToProject.mutate).not.toHaveBeenCalled();
     expect(screen.queryByRole("link", { name: "Peer" })).toBeNull();
     await act(async () => resolveMove());
@@ -1418,30 +1458,16 @@ describe("Move session nest destinations", () => {
         undefined,
         serverInfo({ sibling_sessions: siblingSessions, session_nest_moves: true }),
       );
-      await openMove(
-        mobile,
-        id,
-        siblingSessions
-          ? "Search destinations"
-          : id === CONV.id
-            ? null
-            : "Search or create project",
-      );
+      await openMove(mobile, id);
       expect(screen.queryByRole("menuitem", { name: "Research" })).toBeNull();
       expect(screen.queryByRole("menuitem", { name: "Available nest" }) !== null).toBe(
         siblingSessions,
       );
-      if (id === CONV.id) expect(screen.queryByRole("menuitem", { name: "Planning" })).toBeNull();
-      else expect(screen.getByRole("menuitem", { name: "Planning" })).toBeInTheDocument();
+      expect(screen.queryByRole("menuitem", { name: "Planning" })).toBeNull();
       if (!siblingSessions) {
-        if (id === CONV.id) {
-          expect(screen.queryByRole("textbox")).toBeNull();
-          expect(screen.queryByText("No projects yet.")).toBeNull();
-        } else {
-          fireEvent.change(screen.getByPlaceholderText("Search or create project"), {
-            target: { value: "research" },
-          });
-        }
+        fireEvent.change(screen.getByPlaceholderText("Search sessions"), {
+          target: { value: "research" },
+        });
         expect(mocks.sessionSearch).toHaveBeenLastCalledWith(
           "",
           "title",
@@ -1490,7 +1516,7 @@ describe("Move session nest destinations", () => {
     );
     await openMove(false);
     expect(screen.queryByRole("menuitem", { name: "Research" })).toBeNull();
-    fireEvent.change(screen.getByPlaceholderText("Search destinations"), {
+    fireEvent.change(screen.getByPlaceholderText("Search sessions"), {
       target: { value: "research" },
     });
     expect(screen.getByText("Searching nests…")).toBeInTheDocument();
@@ -1505,7 +1531,7 @@ describe("Move session nest destinations", () => {
     });
     fireEvent.click(screen.getByRole("menuitem", { name: "Show more" }));
     expect(fetchNextPage).toHaveBeenCalledExactlyOnceWith();
-    expect(screen.getByPlaceholderText("Search destinations")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("Search sessions")).toBeInTheDocument();
     fireEvent.click(await screen.findByRole("menuitem", { name: "Research archive" }));
     await waitFor(() =>
       expect(mocks.moveToNest).toHaveBeenCalledExactlyOnceWith({
@@ -1534,12 +1560,12 @@ describe("Move session nest destinations", () => {
     }));
     renderSidebar(undefined, serverInfo({ sibling_sessions: true, session_nest_moves: true }));
     await openMove(false);
-    fireEvent.change(screen.getByPlaceholderText("Search destinations"), {
+    fireEvent.change(screen.getByPlaceholderText("Search sessions"), {
       target: { value: "research" },
     });
     fireEvent.click(await screen.findByRole("menuitem", { name: "Couldn’t search nests. Retry" }));
     expect(nextPage ? fetchNextPage : refetch).toHaveBeenCalledExactlyOnceWith();
-    expect(screen.getByPlaceholderText("Search destinations")).toBeInTheDocument();
+    expect(screen.getByPlaceholderText("Search sessions")).toBeInTheDocument();
     expect(screen.queryByText("No matching destinations.")).toBeNull();
   });
 

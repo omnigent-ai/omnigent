@@ -879,6 +879,7 @@ async def test_each_run_lists_its_descendants_up_to_its_own_cap(
         assert [run["session_id"] for run in renewed["descendant_runs"]] == fresh
         assert renewed["descendant_run_count"] == 2
 
+
 async def test_a_run_whose_session_waits_on_its_sandbox_is_launching(
     client: httpx.AsyncClient, db_uri: str
 ) -> None:
@@ -929,4 +930,3 @@ async def test_a_run_whose_session_waits_on_its_sandbox_is_launching(
     current, earlier = await runs(ready)
     assert current["is_current"] and current["sandbox_launching"] is True
     assert earlier["sandbox_launching"] is False
-

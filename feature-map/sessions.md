@@ -400,8 +400,9 @@ family representatives can be dragged to pin or reorder a pin.
 the highlight and drag preview say which nest will receive the session. Drop
 near the top or bottom of the row to reorder instead. Dragging a nest member
 also reveals **Remove from nest** above the sidebar sections. For keyboard or
-touch use, open the row's kebab or right-click menu → **Move session**, then
-choose a nest or **Remove from nest**. The destination nest expands after a move.
+touch use, open the row's kebab or right-click menu → **Move session** → **Session**,
+then search for a nest or choose **Remove from nest**. **Project** opens its own
+searchable project picker. The destination nest expands after a move.
 Typing a nest name also searches beyond the sessions already loaded in the sidebar.
 **Show more** loads the next page without closing the picker. If a search or
 page fails, **Couldn’t search nests. Retry** retries that request.
