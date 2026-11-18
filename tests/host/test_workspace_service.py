@@ -23,7 +23,7 @@ import time
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, NoReturn, cast
 
 import httpx
 import pytest
@@ -65,7 +65,7 @@ from omnigent.host.workspace_service import (
 from omnigent.host.workspace_tokens import mint_token
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.host_registry import HostConnection, HostRegistry, deliver_workspace_reply
-from omnigent.workspace_fs import WorkspaceReader
+from omnigent.workspace_fs import _MAX_READ_BYTES, WorkspaceReader
 from tests._helpers.fake_workspace_helper import relax_helper_deadlines, write_fake_helper
 from tests._helpers.polling import poll_until_async
 from tests.server.routes.test_shell_permission_gate import _StubAgentStore, _StubConversationStore
@@ -201,6 +201,10 @@ def _server_app(
 ClientFor = Callable[[Path], WorkspaceServiceClient]
 
 
+def _forbidden_fallback(*_args: object, **_kwargs: object) -> NoReturn:
+    raise AssertionError("The host's Python reader answered instead of the helper")
+
+
 _PYTHON_ROUTES = {
     "host-connect": ("host", ProtocolType.CONNECT, False),
     "host-grpc-web": ("host", ProtocolType.GRPC_WEB, False),
@@ -231,8 +235,10 @@ async def _clients(
             write_fake_helper(helper_directory())
         )
         helper = WorkspaceHelperProxy(binary)
-        # A helper that didn't start would leave the Python reader answering unnoticed.
-        assert "ListDirectory" in await helper.capabilities()
+        assert {"ListDirectory", "ReadFile"} <= await helper.capabilities()
+        # The host's own reader must not answer, or parity would pass without the helper.
+        for name in ("list_directory", "read_file_bytes"):
+            monkeypatch.setattr(WorkspaceReader, name, _forbidden_fallback)
 
     def make(root: Path) -> WorkspaceServiceClient:
         if route == "server":
@@ -377,6 +383,32 @@ async def test_read_file_flags_a_truncated_stream_like_rest(
     assert metadata.truncated is rest["truncated"] is True
     assert metadata.encoding == CONTENT_ENCODING_UTF8
     assert b"".join(m.data for m in messages) == str(rest["content"]).encode() == b"h"
+
+
+@pytest.mark.parametrize(
+    ("size", "truncated"),
+    [(_MAX_READ_BYTES, False), (_MAX_READ_BYTES + 1, True)],
+    ids=["at-ceiling", "over-ceiling"],
+)
+async def test_read_file_caps_at_the_ceiling_like_rest(
+    tmp_path: Path, client_for: ClientFor, size: int, truncated: bool
+) -> None:
+    """At the real 10 MiB ceiling, a cut through "é" keeps only the whole characters before it."""
+    # "é" is two bytes; its first one is the last byte the ceiling lets through.
+    text = "a" * (_MAX_READ_BYTES - 1) + "é" + "b" * (size - _MAX_READ_BYTES - 1)
+    (tmp_path / "large.txt").write_text(text if truncated else "a" * size)
+    reader = WorkspaceReader(tmp_path)
+    client = client_for(tmp_path)
+
+    messages = [m async for m in client.read_file(ReadFileRequest(path="large.txt"))]
+
+    metadata = messages[0].metadata
+    rest = reader.list_or_read("large.txt")
+    data = b"".join(m.data for m in messages)
+    assert metadata.truncated is rest["truncated"] is truncated
+    assert metadata.encoding == CONTENT_ENCODING_UTF8
+    assert data == str(rest["content"]).encode()
+    assert len(data) == (_MAX_READ_BYTES - 1 if truncated else size)
 
 
 @pytest.mark.parametrize(

@@ -10,6 +10,7 @@ through the helper lives in ``test_workspace_service.py``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import signal
 import time
@@ -30,6 +31,7 @@ from omnigent.api.workspace.v1alpha1.workspace_connect import (
 from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     GetCapabilitiesRequest,
     ListDirectoryRequest,
+    ReadFileRequest,
     SearchFilesRequest,
     SearchTextRequest,
     StatPathRequest,
@@ -333,6 +335,81 @@ async def test_lease_released_on_error_and_cancellation(
         await _answering_root(proxy, root)
 
     await poll_until_async(lambda: bool(events.matching("close w1")), timeout_s=_FAKE_START_S)
+
+
+async def test_cancelled_reads_return_their_flow_control_credit(
+    tmp_path: Path, fake_helper: Callable[..., str], proxies: list[WorkspaceHelperProxy]
+) -> None:
+    """Calls share one connection window, so unread DATA of an abandoned read must be credited."""
+    (root,) = _roots(tmp_path, 1)
+    (root / "big.bin").write_bytes(os.urandom(1024 * 1024))
+    proxy = WorkspaceHelperProxy(fake_helper())
+    proxies.append(proxy)
+
+    async def abandon_reads_then_read() -> bytes:
+        for _ in range(20):
+            async with proxy.call(root) as call:
+                request = ReadFileRequest(path="big.bin")
+                reading = call.client.read_file(request, headers=call.headers)
+                async with contextlib.aclosing(reading) as stream:
+                    async for message in stream:
+                        if message.data:
+                            # A pause lets the helper fill the window before the caller leaves.
+                            await asyncio.sleep(0.2)
+                            break
+        async with proxy.call(root) as call:
+            reading = call.client.read_file(ReadFileRequest(path="big.bin"), headers=call.headers)
+            return b"".join([message.data async for message in reading])
+
+    # Without the credit, a read stalls for good once the window is used up.
+    data = await asyncio.wait_for(abandon_reads_then_read(), timeout=_FAKE_START_S)
+
+    assert data == (root / "big.bin").read_bytes()
+
+
+async def test_repeated_close_under_cancellation_leaves_nothing_behind(
+    tmp_path: Path, fake_helper: Callable[..., str], spawned: list[asyncio.subprocess.Process]
+) -> None:
+    """A shutdown cancelled mid-cleanup still closes and reaps; a later close waits for it."""
+    (root,) = _roots(tmp_path, 1)
+    fds_before = _open_fds()
+    proxy = WorkspaceHelperProxy(
+        fake_helper(FAKE_HELPER_HANG_CLOSE="1", FAKE_HELPER_IGNORE_TERM="1")
+    )
+    await _answering_root(proxy, root)
+
+    for _ in range(3):
+        closing = asyncio.ensure_future(proxy.close())
+        await asyncio.sleep(0.3)
+        closing.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await closing
+    await proxy.close()
+
+    assert _reaped(spawned)
+    assert _helper_tasks() == []
+    assert _open_fds() == fds_before
+
+
+async def test_cancelled_cleanup_task_still_reaps(
+    tmp_path: Path, fake_helper: Callable[..., str], spawned: list[asyncio.subprocess.Process]
+) -> None:
+    """Cancelling the stop task itself, as a loop shutdown does, can't skip the reap."""
+    (root,) = _roots(tmp_path, 1)
+    proxy = WorkspaceHelperProxy(fake_helper(FAKE_HELPER_HANG_CLOSE="1"))
+    await _answering_root(proxy, root)
+    closing = asyncio.ensure_future(proxy.close())
+    await poll_until_async(lambda: bool(_stop_tasks()), timeout_s=_FAKE_START_S)
+
+    for task in _stop_tasks():
+        task.cancel()
+    await closing
+
+    assert _reaped(spawned)
+
+
+def _stop_tasks() -> list[asyncio.Task[object]]:
+    return [task for task in _helper_tasks() if task.get_name() == "workspace-helper-stop"]
 
 
 async def test_hung_close_workspace_still_terminates(

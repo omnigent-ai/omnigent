@@ -64,11 +64,11 @@ class _ResponseBody(AsyncIterator[bytes]):
         item = await self._stream.body.get()
         if item is None:
             self._stream.ended = True
-            self._transport._forget(self._stream_id)
+            self._transport._discard(self._stream_id)
             raise StopAsyncIteration
         if isinstance(item, BaseException):
             self._stream.ended = True
-            self._transport._forget(self._stream_id)
+            self._transport._discard(self._stream_id)
             raise item
         data, flow_length = item
         # Acknowledge as the caller consumes, so a slow reader slows the helper.
@@ -150,15 +150,21 @@ class SocketHTTP2Transport(Transport):
 
     async def close(self) -> None:
         """Close the connection; open calls fail with :class:`HelperConnectionLost`."""
-        self._fail_all(HelperConnectionLost("The workspace helper connection closed"))
+        self.abort()
         if self._reader_task is not None:
-            self._reader_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._reader_task
         if self._writer is not None:
-            self._writer.close()
             with contextlib.suppress(Exception):
                 await self._writer.wait_closed()
+
+    def abort(self) -> None:
+        """Close the connection at once, without waiting; safe to repeat."""
+        self._fail_all(HelperConnectionLost("The workspace helper connection closed"))
+        if self._reader_task is not None:
+            self._reader_task.cancel()
+        if self._writer is not None:
+            self._writer.close()
         else:
             self._sock.close()
 
@@ -232,8 +238,9 @@ class SocketHTTP2Transport(Transport):
                 if stream is not None:
                     stream.body.put_nowait(None)
             case h2.events.StreamReset(stream_id=stream_id, error_code=code):
-                stream = self._streams.pop(stream_id, None)
+                stream = self._streams.get(stream_id)
                 if stream is not None:
+                    self._discard(stream_id)
                     self._fail(stream, HelperConnectionLost(f"The helper reset the call ({code})"))
             case h2.events.WindowUpdated() | h2.events.RemoteSettingsChanged():
                 self._window_open.set()
@@ -254,8 +261,18 @@ class SocketHTTP2Transport(Transport):
         # Senders waiting for window space wake up and see the loss.
         self._window_open.set()
 
-    def _forget(self, stream_id: int) -> None:
-        self._streams.pop(stream_id, None)
+    def _discard(self, stream_id: int) -> None:
+        """Forget a stream, returning the flow-control credit of DATA nobody will read."""
+        stream = self._streams.pop(stream_id, None)
+        if stream is None:
+            return
+        unread = 0
+        while not stream.body.empty():
+            item = stream.body.get_nowait()
+            if isinstance(item, tuple):
+                unread += item[1]
+        # The credit is the connection's too, so dropping it would starve every other call.
+        self._acknowledge(stream_id, unread)
 
     def _acknowledge(self, stream_id: int, length: int) -> None:
         if self._lost is not None or not length:
@@ -265,7 +282,7 @@ class SocketHTTP2Transport(Transport):
         self._flush()
 
     def _reset(self, stream_id: int) -> None:
-        self._streams.pop(stream_id, None)
+        self._discard(stream_id)
         if self._lost is not None:
             return
         with contextlib.suppress(h2.exceptions.StreamClosedError, h2.exceptions.ProtocolError):

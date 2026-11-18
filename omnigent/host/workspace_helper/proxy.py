@@ -43,6 +43,7 @@ from omnigent.host.workspace_helper.process import (
     HelperUnavailable,
     find_helper_binary,
     start_helper,
+    wait_for_abandoned_starts,
 )
 
 _logger = logging.getLogger(__name__)
@@ -230,6 +231,8 @@ class WorkspaceHelperProxy:
         self._disabled: str | None = None if binary else "no workspace helper is installed"
         self._closed = False
         self._stopping: set[asyncio.Task[None]] = set()
+        # Every helper started and not yet known to be reaped, for shutdown to wait on.
+        self._helpers: list[HelperProcess] = []
 
     @classmethod
     def from_environment(cls) -> WorkspaceHelperProxy:
@@ -275,16 +278,26 @@ class WorkspaceHelperProxy:
             generation.last_active = time.monotonic()
 
     async def close(self) -> None:
-        """Stop the helper for good, for the daemon's shutdown."""
+        """Stop the helper for good, for the daemon's shutdown.
+
+        Cancelling it doesn't cancel the cleanup, and calling it again waits
+        for whatever cleanup is still running.
+        """
         self._closed = True
+        # asyncio.wait, unlike gather, doesn't cancel what it waits on when this is cancelled.
         if self._starting is not None:
             self._starting.cancel()
-            with contextlib.suppress(BaseException):
-                await self._starting
+            await asyncio.wait({self._starting})
         if self._generation is not None:
             self._retire(self._generation, "shutdown")
         while self._stopping:
-            await asyncio.gather(*self._stopping, return_exceptions=True)
+            await asyncio.wait(set(self._stopping))
+        # A stop that was itself cancelled still left its helper reaping.
+        reaping = {helper.reap() for helper in self._helpers}
+        if reaping:
+            await asyncio.wait(reaping)
+        self._helpers.clear()
+        await wait_for_abandoned_starts()
 
     async def _current(self) -> _Generation | None:
         generation = self._generation
@@ -315,6 +328,8 @@ class WorkspaceHelperProxy:
             return None
         finally:
             self._starting = None
+        self._helpers = [known for known in self._helpers if known.process.returncode is None]
+        self._helpers.append(helper)
         if self._closed:
             await helper.close()
             return None

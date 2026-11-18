@@ -15,7 +15,7 @@ import logging
 import os
 import socket
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from omnigent.host.workspace_helper.transport import SocketHTTP2Transport
 from omnigent.inner._subprocess_lifecycle import close_subprocess_transport, terminate_subprocess
@@ -80,6 +80,7 @@ class HelperProcess:
     transport: SocketHTTP2Transport
     version: str
     capabilities: frozenset[str]
+    _reaping: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
 
     @property
     def running(self) -> bool:
@@ -102,12 +103,25 @@ class HelperProcess:
         :param close_workspaces: Releases the helper's open workspaces first,
             given up to a second; skipped when the helper no longer runs.
         """
-        if close_workspaces is not None and self.running:
+        try:
+            if close_workspaces is not None and self.running:
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(close_workspaces(), _CLOSE_WORKSPACES_TIMEOUT_S)
             with contextlib.suppress(Exception):
-                await asyncio.wait_for(close_workspaces(), _CLOSE_WORKSPACES_TIMEOUT_S)
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(self.transport.close(), _TRANSPORT_CLOSE_TIMEOUT_S)
-        await _stop_process(self.process)
+                await asyncio.wait_for(self.transport.close(), _TRANSPORT_CLOSE_TIMEOUT_S)
+        finally:
+            # Even when cancelled, the connection closes and the process is stopped and reaped.
+            await asyncio.shield(self.reap())
+
+    def reap(self) -> asyncio.Task[None]:
+        """Close the connection now, then stop and reap the process; once.
+
+        :returns: The task doing it, which outlives a cancelled caller.
+        """
+        if self._reaping is None:
+            self.transport.abort()
+            self._reaping = asyncio.ensure_future(_stop_process(self.process))
+        return self._reaping
 
 
 async def _stop_process(process: asyncio.subprocess.Process) -> None:
@@ -177,8 +191,21 @@ async def start_helper(binary: str) -> HelperProcess:
         )
     except BaseException:
         # Includes cancellation: a half-started helper is never left behind.
-        await asyncio.shield(_abandon(process, transport, host_end))
+        abandoning = asyncio.ensure_future(_abandon(process, transport, host_end))
+        _ABANDONING.add(abandoning)
+        abandoning.add_done_callback(_ABANDONING.discard)
+        await asyncio.shield(abandoning)
         raise
+
+
+# Cleanups of failed starts; held here so a cancelled start can't drop one.
+_ABANDONING: set[asyncio.Task[None]] = set()
+
+
+async def wait_for_abandoned_starts() -> None:
+    """Wait until every failed start has stopped and reaped its process."""
+    while _ABANDONING:
+        await asyncio.wait(set(_ABANDONING))
 
 
 async def _read_ready_line(stdout: asyncio.StreamReader) -> dict[str, object]:
@@ -205,8 +232,7 @@ async def _abandon(
     host_end: socket.socket,
 ) -> None:
     if transport is not None:
-        with contextlib.suppress(Exception):
-            await asyncio.wait_for(transport.close(), _TRANSPORT_CLOSE_TIMEOUT_S)
+        transport.abort()
     else:
         host_end.close()
     if process is not None:
