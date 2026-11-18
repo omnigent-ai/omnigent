@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import runpy
 import subprocess
 import sys
@@ -140,6 +141,34 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
         )
 
 
+def test_split_review_rejects_nonprogress_on_escaped_pipe_whitespace() -> None:
+    split = _HELPERS["split_review"]
+    encoded_lengths = []
+    cuts = []
+
+    # Bound the component fault before an empty slice can reach the parts list.
+    class ProgressCheckedReview(str):
+        def encode(self, encoding="utf-8", errors="strict"):
+            if len(encoded_lengths) >= 2:
+                raise AssertionError("Splitter exceeded the two bounded iterations")
+            encoded_lengths.append(len(self))
+            return super().encode(encoding, errors)
+
+        def __getitem__(self, key):
+            if isinstance(key, slice):
+                if key.start is None and key.stop is not None:
+                    if key.stop <= 0:
+                        raise AssertionError("Splitter attempted a nonpositive cut")
+                    cuts.append(key.stop)
+                return type(self)(super().__getitem__(key))
+            return super().__getitem__(key)
+
+    with pytest.raises(ValueError, match="split cannot make progress"):
+        split(ProgressCheckedReview("|aa\\|  \n"), 4)
+    assert encoded_lengths == [8, 5]
+    assert cuts == [3]
+
+
 @pytest.mark.parametrize(
     (
         "rationale_specs",
@@ -151,34 +180,18 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
         "terminal_remainder",
         "adjacent_tables",
         "oversized_nonassessment",
-        "nonprogress",
         "final_table_newline",
         "rationale_separator",
         "table_variant",
     ),
     [
-        (None, 0, "", False, "run", None, None, False, False, False, None, None, None),
+        (None, 0, "", False, "run", None, None, False, False, None, None, None),
+        ((20000, 45000, 20000), 0, "", False, "run", None, None, False, False, None, None, None),
+        ((3000,) * 30, 59194, "", False, "run", None, None, False, False, None, None, None),
+        (None, 0, "  ", False, "run", None, None, False, False, None, None, None),
+        ((70000,), 0, "", False, "run", None, None, False, False, None, None, None),
         (
-            (20000, 45000, 20000),
-            0,
-            "",
-            False,
-            "run",
-            None,
-            None,
-            False,
-            False,
-            False,
-            None,
-            None,
-            None,
-        ),
-        ((3000,) * 30, 59194, "", False, "run", None, None, False, False, False, None, None, None),
-        (None, 0, "  ", False, "run", None, None, False, False, False, None, None, None),
-        ((70000,), 0, "", False, "run", None, None, False, False, False, None, None, None),
-        # Align an escaped pipe with the fully wrapped comment boundary.
-        (
-            ("y" * 69 + ("x" * 70 + r"\|") * 1100,),
+            ("y" * 69 + ("x" * 70 + "\\|") * 1100,),
             0,
             "",
             False,
@@ -187,76 +200,19 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
             None,
             False,
             False,
-            False,
             None,
             None,
             None,
         ),
-        (None, 0, "", True, "run", None, None, False, False, False, None, None, None),
-        (("Reason",), 0, "", False, "run", 0, None, False, False, False, None, None, None),
-        (("Reason",), 0, "", False, "run", 1, None, False, False, False, None, None, None),
-        (("Reason",), 0, "", False, "run", 2, None, False, False, False, None, None, None),
-        (
-            (177655, "Tail."),
-            0,
-            "",
-            False,
-            "run",
-            None,
-            " | \t",
-            False,
-            False,
-            False,
-            None,
-            None,
-            None,
-        ),
-        (
-            (177654, "Tail."),
-            0,
-            "",
-            False,
-            "run",
-            None,
-            "| \t",
-            False,
-            False,
-            False,
-            None,
-            None,
-            None,
-        ),
-        (
-            (177653, "Tail."),
-            0,
-            "",
-            False,
-            "run",
-            None,
-            " \t",
-            False,
-            False,
-            False,
-            None,
-            None,
-            None,
-        ),
-        (
-            (177652, "Tail."),
-            0,
-            "",
-            False,
-            "run",
-            None,
-            "\t",
-            False,
-            False,
-            False,
-            None,
-            None,
-            None,
-        ),
-        ((177651, "Tail."), 0, "", False, "run", None, "", False, False, False, None, None, None),
+        (None, 0, "", True, "run", None, None, False, False, None, None, None),
+        (("Reason",), 0, "", False, "run", 0, None, False, False, None, None, None),
+        (("Reason",), 0, "", False, "run", 1, None, False, False, None, None, None),
+        (("Reason",), 0, "", False, "run", 2, None, False, False, None, None, None),
+        ((177655, "Tail."), 0, "", False, "run", None, " | \t", False, False, None, None, None),
+        ((177654, "Tail."), 0, "", False, "run", None, "| \t", False, False, None, None, None),
+        ((177653, "Tail."), 0, "", False, "run", None, " \t", False, False, None, None, None),
+        ((177652, "Tail."), 0, "", False, "run", None, "\t", False, False, None, None, None),
+        ((177651, "Tail."), 0, "", False, "run", None, "", False, False, None, None, None),
         (
             ("Reason." + " " * 135000 + "Tail.",),
             0,
@@ -267,21 +223,24 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
             None,
             False,
             False,
-            False,
             None,
             None,
             None,
         ),
-        (None, 0, "", False, "run", None, None, True, False, False, None, None, None),
-        (("Reason",), 0, "", False, "run", None, None, False, True, False, None, None, None),
-        (("Reason",), 0, "", False, "run", None, None, False, False, True, None, None, None),
-        (None, 0, "", False, "run", None, None, False, False, False, "", None, None),
-        (None, 0, "", False, "run", None, None, False, False, False, "\n", None, None),
-        (None, 0, "", False, "run", None, None, False, False, False, None, "\u2028", None),
-        (None, 0, "", False, "run", None, None, False, False, False, None, "\u0085", None),
-        (None, 0, "", False, "run", None, None, False, False, False, None, "\f", None),
-        (None, 0, "", False, "run", None, None, False, False, False, None, " ", None),
-        (None, 0, "", False, "run", None, None, False, False, False, None, None, "large-identity"),
+        (None, 0, "", False, "run", None, None, True, False, None, None, None),
+        (("Reason",), 0, "", False, "run", None, None, False, True, None, None, None),
+        (None, 0, "", False, "run", None, None, False, False, "", None, None),
+        (None, 0, "", False, "run", None, None, False, False, "\n", None, None),
+        (None, 0, "", False, "run", None, None, False, False, None, "\u2028", None),
+        (None, 0, "", False, "run", None, None, False, False, None, "\x85", None),
+        (None, 0, "", False, "run", None, None, False, False, None, "\x0c", None),
+        (None, 0, "", False, "run", None, None, False, False, None, " ", None),
+        (None, 0, "", False, "run", None, None, False, False, None, None, "ordinary-empty-cell"),
+        (None, 0, "", False, "run", None, None, False, False, None, None, "oversized-header"),
+        (None, 0, "", False, "run", None, None, False, False, None, None, "part-limit"),
+        (None, 0, "", False, "run", None, None, False, False, None, None, "work-limit"),
+        (None, 0, "", False, "run", None, None, False, False, None, None, "incremental-work"),
+        (None, 0, "", False, "run", None, None, False, False, None, None, "fenced-header-control"),
         (
             None,
             0,
@@ -292,42 +251,9 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
             None,
             False,
             False,
-            False,
             None,
             None,
-            "ordinary-empty-cell",
-        ),
-        (
-            None,
-            0,
-            "",
-            False,
-            "run",
-            None,
-            None,
-            False,
-            False,
-            False,
-            None,
-            None,
-            "oversized-header",
-        ),
-        (None, 0, "", False, "run", None, None, False, False, False, None, None, "part-limit"),
-        (None, 0, "", False, "run", None, None, False, False, False, None, None, "work-limit"),
-        (
-            None,
-            0,
-            "",
-            False,
-            "run",
-            None,
-            None,
-            False,
-            False,
-            False,
-            None,
-            None,
-            "incremental-work",
+            "oversized-fence-backticks",
         ),
         (
             None,
@@ -339,10 +265,65 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
             None,
             False,
             False,
+            None,
+            None,
+            "oversized-fence-tildes",
+        ),
+        (
+            None,
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
             False,
             None,
             None,
-            "fenced-header-control",
+            "unsafe-inline-run-backticks",
+        ),
+        (
+            None,
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            None,
+            None,
+            "unsafe-inline-run-tildes",
+        ),
+        (
+            None,
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            None,
+            None,
+            "unsafe-fence-whitespace-backticks",
+        ),
+        (
+            None,
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            None,
+            None,
+            "unsafe-fence-whitespace-tildes",
         ),
     ],
     ids=[
@@ -364,20 +345,24 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
         "interior-whitespace",
         "adjacent-tables",
         "oversized-nonassessment",
-        "escaped-pipe-whitespace-progress",
         "final-table-no-newline",
         "final-table-newline",
         "rationale-line-separator",
         "rationale-next-line",
         "rationale-form-feed",
         "rationale-space-control",
-        "large-identity",
         "ordinary-empty-cell",
         "oversized-header",
         "part-limit",
         "work-limit",
         "incremental-work",
         "fenced-header-control",
+        "oversized-fence-backticks",
+        "oversized-fence-tildes",
+        "unsafe-inline-run-backticks",
+        "unsafe-inline-run-tildes",
+        "unsafe-fence-whitespace-backticks",
+        "unsafe-fence-whitespace-tildes",
     ],
 )
 def test_long_review_parts_preserve_all_assessments_and_markdown_context(
@@ -390,7 +375,6 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
     terminal_remainder: str | None,
     adjacent_tables: bool,
     oversized_nonassessment: bool,
-    nonprogress: bool,
     final_table_newline: str | None,
     rationale_separator: str | None,
     table_variant: str | None,
@@ -407,7 +391,6 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         or unrenderable_whitespace
         or adjacent_tables
         or oversized_nonassessment
-        or nonprogress
         or final_table_newline is not None
         or rationale_separator is not None
         or table_variant is not None
@@ -466,9 +449,37 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
             == rationale
         )
 
-    if table_variant in {"oversized-header", "part-limit", "work-limit", "fenced-header-control"}:
+    if table_variant in {
+        "oversized-header",
+        "part-limit",
+        "work-limit",
+        "fenced-header-control",
+        "oversized-fence-backticks",
+        "oversized-fence-tildes",
+        "unsafe-inline-run-backticks",
+        "unsafe-inline-run-tildes",
+        "unsafe-fence-whitespace-backticks",
+        "unsafe-fence-whitespace-tildes",
+    }:
         review = _REVIEW
-        if table_variant in {"oversized-header", "fenced-header-control"}:
+        if table_variant.startswith(
+            ("oversized-fence-", "unsafe-inline-run-", "unsafe-fence-whitespace-")
+        ):
+            char = "`" if table_variant.endswith("backticks") else "~"
+            fence = char * 3
+            if table_variant.startswith("oversized-fence-"):
+                fence = char * 70000
+                code = "literal" + "\n"
+                message = "fence delimiter cannot fit within comment capacity"
+            else:
+                code = (
+                    "x" + char * 130000 + "a" + "\n"
+                    if table_variant.startswith("unsafe-inline-run-")
+                    else fence + " " * 130000 + "a" + "\n"
+                )
+                message = "literal fence run cannot fit within comment capacity"
+            review = fence + "text\n" + code + fence + "\n\n" + review
+        elif table_variant in {"oversized-header", "fenced-header-control"}:
             table = "| " + "H" * 70000 + " | Details |\n| --- | --- |\n| item | note |\n"
             review = (
                 (
@@ -508,48 +519,8 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
             assert not list(tmp_path.glob("comment*.md"))
         return
 
-    if nonprogress:
-        split = _HELPERS["split_review"]
-        encoded_lengths = []
-        cuts = []
-
-        # Bound the component fault before an empty slice can reach the parts list.
-        class ProgressCheckedReview(str):
-            def encode(self, encoding="utf-8", errors="strict"):
-                if len(encoded_lengths) >= 2:
-                    raise AssertionError("Splitter exceeded the two bounded iterations")
-                encoded_lengths.append(len(self))
-                return super().encode(encoding, errors)
-
-            def __getitem__(self, key):
-                if isinstance(key, slice):
-                    if key.start is None and key.stop is not None:
-                        if key.stop <= 0:
-                            raise AssertionError("Splitter attempted a nonpositive cut")
-                        cuts.append(key.stop)
-                    return type(self)(super().__getitem__(key))
-                return super().__getitem__(key)
-
-        def bounded_split(_text: str, _limit: int, **_kwargs) -> list[str]:
-            return split(ProgressCheckedReview("|aa\\|  \n"), 4)
-
-        monkeypatch.setitem(_HELPERS["review_comments"].__globals__, "split_review", bounded_split)
-        review = _HELPERS["compose_review"](
-            _REVIEW + "x" * _HELPERS["COMMENT_BYTE_LIMIT"],
-            {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]},
-        )
-        review_path.write_text(review, encoding="utf-8")
-        with pytest.raises(ValueError, match="split cannot make progress"):
-            _HELPERS["publish_review"](review_path, receipt)
-        assert encoded_lengths == [8, 5]
-        assert cuts == [3]
-        assert not posts
-        assert not receipt.exists()
-        assert not list(tmp_path.glob("comment*.md"))
-        return
-
     if table_variant is not None:
-        large_identity = table_variant in {"large-identity", "incremental-work"}
+        large_identity = table_variant == "incremental-work"
         rationale = "x" * 70000
         header, delimiter, original = _REVIEW.split("### Tests\n", 1)[1].split("\n")[:3]
         if large_identity:
@@ -576,22 +547,21 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
             assert len(small_comments[0].encode("utf-8")) < 52000
             (tmp_path / "small-comment.md").write_text(small_comments[0], encoding="utf-8")
             with monkeypatch.context() as render_patch:
-                if table_variant == "incremental-work":
-                    context = _HELPERS["_markdown_context"]
-                    visited = set()
+                context = _HELPERS["_markdown_context"]
+                visited = set()
 
-                    def checked_context(text: str, **kwargs):
-                        if text != composed and not text.startswith("<!--"):
-                            assert text not in visited, "Accepted review prefix was parsed again"
-                            assert len(visited) < 32, "Exceeded bounded component context visits"
-                            visited.add(text)
-                        return context(text, **kwargs)
+                def checked_context(text: str, **kwargs):
+                    if text != composed and not text.startswith("<!--"):
+                        assert text not in visited, "Accepted review prefix was parsed again"
+                        assert len(visited) < 32, "Exceeded bounded component context visits"
+                        visited.add(text)
+                    return context(text, **kwargs)
 
-                    render_patch.setitem(
-                        _HELPERS["review_comments"].__globals__,
-                        "_markdown_context",
-                        checked_context,
-                    )
+                render_patch.setitem(
+                    _HELPERS["review_comments"].__globals__,
+                    "_markdown_context",
+                    checked_context,
+                )
                 comments = _HELPERS["review_comments"](composed, **metadata)
             for part, comment in enumerate(comments, 1):
                 (tmp_path / f"rendered-part-{part}.md").write_text(comment, encoding="utf-8")
@@ -850,6 +820,92 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         assert "tests/test_parser.py::test_case[0]" not in context[0]
         assert not context[1].startswith(" |\n")
         assert context[2] == header + "\n" + delimiter + "\n"
+
+
+@pytest.mark.parametrize(
+    ("fence", "literal", "shape"),
+    [
+        ("```", "```", "line-end"),
+        ("~~~", "~~~", "line-end"),
+        ("`````", "`````", "line-end"),
+        ("~~~~~", "~~~~~", "line-end"),
+        ("```", "`````", "line-end"),
+        ("~~~", "~~~~~", "line-end"),
+        ("```", "`" * 10000, "inline-prose"),
+        ("```", "``` ```", "overlap"),
+        ("```", "```", "leading-run"),
+        ("~~~", "~" * 10000, "inline-prose"),
+        ("~~~", "~~~ ~~~", "overlap"),
+        ("~~~", "~~~", "leading-run"),
+    ],
+    ids=[
+        "backticks",
+        "tildes",
+        "long-backticks",
+        "long-tildes",
+        "longer-backticks",
+        "longer-tildes",
+        "inline-prose-backticks",
+        "overlap-backticks",
+        "leading-run-backticks",
+        "inline-prose-tildes",
+        "overlap-tildes",
+        "leading-run-tildes",
+    ],
+)
+def test_fence_continuations_preserve_literal_content_and_footer_context(
+    fence: str, literal: str, shape: str
+) -> None:
+    if shape == "leading-run":
+        code = literal + " " * 58000 + "a" + "\n" + "y" * 70000 + "\n"
+    else:
+        code = (
+            "x" * 59471
+            + literal
+            + ("" if shape == "line-end" else "a")
+            + "\n"
+            + "y" * 70000
+            + "\n"
+        )
+    review = fence + "text\n" + code + fence + "\nAfter."
+    comments = _HELPERS["review_comments"](
+        review, head_sha="a" * 40, run_id="10-1", run_url="https://example.test/run"
+    )
+    assert 1 < len(comments) <= _HELPERS["MAX_REVIEW_PARTS"]
+    assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
+    fragments = []
+    for comment in comments:
+        active = ""
+        offset = content_start = 0
+        footer_seen = False
+        for line in comment.splitlines(keepends=True):
+            if active:
+                if re.fullmatch(rf" {{0,3}}{re.escape(active[0])}{{{len(active)},}}\s*", line):
+                    fragments.append(comment[content_start:offset])
+                    active = ""
+            elif opening := re.match(r"^ {0,3}(`{3,}|~{3,})", line):
+                active = opening[1]
+                content_start = offset + len(line)
+            if line.startswith("<sub>Automated review by Polly"):
+                assert not active, "Publication footer is inside a fenced code block"
+                footer_seen = True
+            if line.strip() == "After.":
+                assert not active, "Following prose is inside a fenced code block"
+            offset += len(line)
+        assert not active
+        assert footer_seen
+    remaining = code
+    reconstructed = ""
+    for fragment in fragments:
+        if not remaining.startswith(fragment):
+            assert fragment.endswith("\n")
+            fragment = fragment[:-1]  # The synthetic closing fence adds one newline.
+        assert remaining.startswith(fragment)
+        reconstructed += fragment
+        remaining = remaining[len(fragment) :]
+    assert reconstructed == code
+    assert not remaining
+    assert sum(comment.count("After.") for comment in comments) == 1
 
 
 def test_unicode_and_wrapper_bytes_are_included_in_comment_limit() -> None:

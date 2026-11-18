@@ -14,6 +14,7 @@ CATEGORIES = (TESTS, "Documentation", "Dependencies and lockfiles", "Implementat
 TEST_FIELD_COUNT = 5
 TEST_HEADER = ["test / case", "behavior protected", "layer", "needed?", "action / rationale"]
 COMMENT_BYTE_LIMIT = 60000
+# The part ceiling is not guaranteed capacity: repeated scans also consume work.
 MAX_REVIEW_PARTS = 64
 RENDER_WORK_BYTE_LIMIT = COMMENT_BYTE_LIMIT * MAX_REVIEW_PARTS * 16
 LINKED_ISSUE_BODY_LIMIT = 4096
@@ -322,7 +323,7 @@ def _markdown_context(
     *,
     validate_assessments: bool = False,
     continuing: bool = True,
-    header_spans: list[tuple[int, int]] | None = None,
+    protected_spans: list[tuple[int, int, str]] | None = None,
 ) -> tuple[str, str, str]:
     """Reopen Markdown context and optionally validate final assessment rows.
 
@@ -338,16 +339,39 @@ def _markdown_context(
     assessment_table = False
     previous = ""
     offset = previous_start = 0
+
+    def protect_span(start: int, end: int, kind: str) -> None:
+        if protected_spans is None:
+            return
+        if protected_spans and start < protected_spans[-1][1]:
+            prior_start, prior_end, prior_kind = protected_spans[-1]
+            protected_spans[-1] = (prior_start, max(prior_end, end), prior_kind)
+        else:
+            protected_spans.append((start, end, kind))
+
     for line in text.removesuffix("\n").split("\n"):
         line_start = offset
         offset += len(line) + 1
         if fence:
             if re.fullmatch(rf" {{0,3}}{re.escape(fence[0])}{{{len(fence)},}}\s*", line):
+                protect_span(line_start, min(offset, len(text)), "fence delimiter")
                 fence = ""
+            elif protected_spans is not None:
+                for literal in re.finditer(
+                    rf" {{0,3}}({re.escape(fence[0])}{{{len(fence)},}})", line
+                ):
+                    start = max(0, literal.start() - 1)
+                    end = literal.end(1)
+                    # A run needs a left guard, or nonspace text after it, to stay literal.
+                    if re.fullmatch(r" {0,3}", line[start : literal.start(1)]):
+                        following = re.search(r"\S", line[end:])
+                        end += following.end() if following else len(line) - end
+                    protect_span(line_start + start, line_start + end, "literal fence run")
             continue
         opening = re.match(r"^ {0,3}(`{3,}|~{3,})", line)
         if opening:
             fence, fence_line = opening[1], line
+            protect_span(line_start, min(offset, len(text)), "fence delimiter")
             table_header = ""
             assessment_table = False
             continue
@@ -360,8 +384,7 @@ def _markdown_context(
                 re.fullmatch(r"\s*:?-+:?\s*", cell) for cell in cells
             ):
                 table_header = previous + "\n" + line + "\n"
-                if header_spans is not None:
-                    header_spans.append((previous_start, min(offset, len(text))))
+                protect_span(previous_start, min(offset, len(text)), "table header")
                 assessment_table = [
                     cell.strip().lower() for cell in split_table_row(previous.strip().strip("|"))
                 ] == TEST_HEADER
@@ -447,8 +470,8 @@ def review_comments(review: str, *, head_sha: str, run_id: str, run_url: str) ->
             raise ValueError("Polly review exceeds the rendering work budget.")
 
     charge_work(review)
-    header_spans: list[tuple[int, int]] = []
-    _markdown_context(review, continuing=False, header_spans=header_spans)
+    protected_spans: list[tuple[int, int, str]] = []
+    _markdown_context(review, continuing=False, protected_spans=protected_spans)
     contents = []
     before = ""
     pending = review
@@ -464,15 +487,15 @@ def review_comments(review: str, *, head_sha: str, run_id: str, run_url: str) ->
                 pending, capacity, in_table_row=prefix.endswith("| "), split_once=True
             )[0]
             end = len(before) + len(chunk)
-            for header_start, header_end in header_spans:
-                if header_start >= end:
+            for span_start, span_end, kind in protected_spans:
+                if span_start >= end:
                     break
-                if header_start < end < header_end:
-                    if header_start <= len(before):
+                if span_start < end < span_end:
+                    if span_start <= len(before):
                         raise ValueError(
-                            "Polly review table header cannot fit within comment capacity."
+                            f"Polly review {kind} cannot fit within comment capacity."
                         )
-                    chunk = chunk[: header_start - len(before)]
+                    chunk = chunk[: span_start - len(before)]
                     break
             tail = pending[len(chunk) :]
             next_before = before + chunk
