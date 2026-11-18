@@ -180,6 +180,7 @@ import {
   useBulkDeleteConversations,
   useBulkMoveToProject,
   useProjects,
+  useProjectDeletePreflight,
   useProjectSessions,
   useLeaveSession,
   useMoveToProject,
@@ -7268,6 +7269,8 @@ function useProjectFolderMenu(
   //   null = staged removal. Reset to `undefined` each time the modal opens.
   const [pendingIcon, setPendingIcon] = useState<string | null | undefined>(undefined);
   const deleteProject = useDeleteProject();
+  const deletePreflight = useProjectDeletePreflight();
+  const resetDeletePreflight = deletePreflight.reset;
   const renameProject = useRenameProject();
   const updateConfig = useUpdateProjectConfig();
   // Fetch the full config only while the menu or rename modal is open, so we can
@@ -7304,6 +7307,7 @@ function useProjectFolderMenu(
       openDelete: () => {
         menuOpenedDialogRef.current = true;
         setDeleteRunningCount(null);
+        resetDeletePreflight();
         setDeleteOpen(true);
       },
       onMenuOpen: () => {
@@ -7316,7 +7320,7 @@ function useProjectFolderMenu(
         if (menuOpenedDialogRef.current) event.preventDefault();
       },
     }),
-    [projectName],
+    [projectName, resetDeletePreflight],
   );
 
   const dialogs = (
@@ -7546,9 +7550,9 @@ function useProjectFolderMenu(
               </DialogDescription>
             )}
           </DialogHeader>
-          {deleteProject.isError && (
+          {deletePreflight.isError && (
             <p className="text-ui text-destructive" role="alert">
-              Some sessions couldn't be archived (you may not own them); the rest were archived.
+              Couldn&apos;t check this project&apos;s sessions. Try again.
             </p>
           )}
           <DialogFooter className="border-t-0 bg-transparent">
@@ -7556,30 +7560,26 @@ function useProjectFolderMenu(
               type="button"
               variant="ghost"
               onClick={() => setDeleteOpen(false)}
-              disabled={deleteProject.isPending}
+              disabled={deletePreflight.isPending}
             >
               Cancel
             </Button>
             <Button
               type="button"
               variant="destructive"
-              loading={deleteProject.isPending}
+              loading={deletePreflight.isPending}
               onClick={() => {
-                deleteProject.mutate(
-                  deleteRunningCount === null
-                    ? { id: projectId, name: projectName }
-                    : { id: projectId, name: projectName, stopRunning: true },
-                  {
-                    onSuccess: (result) => {
-                      if (result.status === "needs_running_confirmation") {
-                        setDeleteRunningCount(result.runningCount);
-                        return;
-                      }
-                      setDeleteOpen(false);
-                      setMenuOpen(false);
-                    },
+                deletePreflight.mutate(projectName, {
+                  onSuccess: ({ members, runningCount }) => {
+                    if (deleteRunningCount === null && runningCount > 0) {
+                      setDeleteRunningCount(runningCount);
+                      return;
+                    }
+                    setDeleteOpen(false);
+                    setMenuOpen(false);
+                    deleteProject.mutate({ id: projectId, name: projectName, members });
                   },
-                );
+                });
               }}
             >
               {deleteRunningCount === null ? "Delete project" : "Delete anyway"}

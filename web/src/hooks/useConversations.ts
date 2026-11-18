@@ -2835,9 +2835,26 @@ async function archiveAndUnfileConversation(id: string): Promise<Conversation> {
   return (await res.json()) as Conversation;
 }
 
-export type DeleteProjectResult =
-  | { status: "deleted"; succeeded: string[]; failed: string[] }
-  | { status: "needs_running_confirmation"; runningCount: number };
+export interface ProjectDeletePreflight {
+  members: Conversation[];
+  runningCount: number;
+}
+
+/** Load the current members before Delete project archives any running agents. */
+export function useProjectDeletePreflight() {
+  return useMutation({
+    mutationFn: async (name: string): Promise<ProjectDeletePreflight> => {
+      const members = await fetchAllProjectSessions(name);
+      return { members, runningCount: members.filter(isSessionWorking).length };
+    },
+  });
+}
+
+export interface DeleteProjectResult {
+  status: "deleted";
+  succeeded: string[];
+  failed: string[];
+}
 
 /**
  * Delete a project: archive AND unfile every member session, then delete the
@@ -2849,26 +2866,20 @@ export type DeleteProjectResult =
  * which has none). Throws a `BulkConversationMutationError` if any member
  * failed (e.g. a shared session the user can't modify), leaving those in place.
  *
- * Archiving a working member stops its agent, so unless `stopRunning` is set
- * a project with working members is left untouched and the result reports how
- * many are working, for the caller to confirm (as every other archive path
- * does through `useArchivePrompt`).
+ * The caller supplies the fresh member list from `useProjectDeletePreflight`.
+ * The folder and its cached rows leave the sidebar in `onMutate`; failed member
+ * archives roll back only those rows, while successfully archived rows stay
+ * archived. Failures surface in a toast because the dialog has already closed.
  */
 export function useDeleteProject() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async ({
       id,
-      name,
-      stopRunning = false,
+      members,
     }: Pick<ProjectSummary, "id" | "name"> & {
-      stopRunning?: boolean;
+      members: Conversation[];
     }): Promise<DeleteProjectResult> => {
-      const members = await fetchAllProjectSessions(name);
-      if (!stopRunning) {
-        const runningCount = members.filter(isSessionWorking).length;
-        if (runningCount > 0) return { status: "needs_running_confirmation", runningCount };
-      }
       const ids = members.map((member) => member.id);
       const representatives = new Map(
         members
@@ -2915,9 +2926,45 @@ export function useDeleteProject() {
       if (id !== null) await apiDeleteProject(id);
       return { status: "deleted", succeeded, failed };
     },
-    onSettled: (result) => {
-      // Nothing was written while the caller is still confirming.
-      if (result?.status === "needs_running_confirmation") return;
+    onMutate: async ({ id, name, members }) => {
+      const ids = members.map((member) => member.id);
+      await queryClient.cancelQueries({ queryKey: ["projects"] });
+      const projects = queryClient.getQueryData<ProjectSummary[]>(["projects"]);
+      const archive = await paintConversationsArchived(queryClient, ids, true);
+      queryClient.setQueryData<ProjectSummary[]>(["projects"], (old) =>
+        old?.filter((project) => (id === null ? project.name !== name : project.id !== id)),
+      );
+      return { projects, archive };
+    },
+    onError: (error, { name, members }, context) => {
+      if (context?.projects !== undefined) {
+        queryClient.setQueryData(["projects"], context.projects);
+      }
+      if (context?.archive.snapshot) {
+        restoreArchiveLists(queryClient, context.archive.snapshot);
+      }
+      if (error instanceof BulkConversationMutationError) {
+        unmarkSessionsArchiving(error.failed, context?.archive.marked);
+      }
+      reapplyLiveSessionTombstones(queryClient);
+      showToast(
+        error instanceof BulkConversationMutationError
+          ? `Couldn't delete ${name}: ${error.failed.length} ${error.failed.length === 1 ? "session" : "sessions"} couldn't be archived. The project and those sessions are back in the sidebar.`
+          : members.length === 0
+            ? `Couldn't delete ${name} — it's back in the sidebar.`
+            : `Couldn't delete ${name}. Its ${members.length === 1 ? "session was" : "sessions were"} archived; the empty project is back in the sidebar.`,
+        { duration: 0 },
+      );
+    },
+    onSettled: (result, error, { members }, context) => {
+      const archived =
+        result?.succeeded ??
+        (error instanceof BulkConversationMutationError
+          ? error.succeeded
+          : members.map((member) => member.id));
+      if (context?.archive.marked !== undefined) {
+        expireSessionsArchiving(context.archive.marked, archived);
+      }
       // Refresh regardless of partial failure so the sidebar reflects whatever
       // was actually archived.
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
