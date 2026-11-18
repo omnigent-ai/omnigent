@@ -306,6 +306,7 @@ async def test_list_directory_matches_rest_listing_across_pages(
                 "directory" if e.type == ENTRY_TYPE_DIRECTORY else "file",
                 e.size if e.HasField("size") else None,
                 e.modify_time.seconds,
+                e.is_symlink,
             )
             for e in page.entries
         ]
@@ -315,7 +316,14 @@ async def test_list_directory_matches_rest_listing_across_pages(
 
     rest = reader.list_or_read("", limit=1000, order="asc")["data"]
     assert listed == [
-        (e["name"], e["path"], e["type"], e["bytes"], e["modified_at"])
+        (
+            e["name"],
+            e["path"],
+            e["type"],
+            e["bytes"],
+            e["modified_at"],
+            (tmp_path / str(e["path"])).is_symlink(),
+        )
         for e in cast("list[dict[str, object]]", rest)
     ]
 

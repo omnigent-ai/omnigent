@@ -150,6 +150,8 @@ class WorkspaceService(WorkspaceServiceMethods):
             limit=min(request.page_size or _MAX_PAGE_SIZE, _MAX_PAGE_SIZE),
             after=request.page_token or None,
         )
+        # The REST listing has no symlink flag, so look at each entry itself.
+        links = await _read(_symlinks, reader.root, [item["path"] for item in page.data])
         entries = [
             Entry(
                 name=item["name"],
@@ -157,6 +159,7 @@ class WorkspaceService(WorkspaceServiceMethods):
                 type=ENTRY_TYPE_DIRECTORY if item["type"] == "directory" else ENTRY_TYPE_FILE,
                 size=item["bytes"],
                 modify_time=Timestamp(seconds=item["modified_at"]),
+                is_symlink=item["path"] in links,
             )
             for item in page.data
         ]
@@ -239,6 +242,11 @@ class WorkspaceService(WorkspaceServiceMethods):
             if exc.code == Code.UNAVAILABLE:
                 raise _HelperGone(exc.message) from exc
             raise
+
+
+def _symlinks(root: Path, paths: list[str]) -> set[str]:
+    """The ``paths`` under ``root`` that are symlinks themselves."""
+    return {path for path in paths if (root / path).is_symlink()}
 
 
 def _log_fallback(method: WorkspaceMethod, exc: ConnectError) -> None:
