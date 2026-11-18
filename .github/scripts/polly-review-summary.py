@@ -345,7 +345,7 @@ def _disclosure_code_spans(line: str) -> list[tuple[int, int]]:
             contexts: list[str] = []
             quote = ""
             for token in re.finditer(
-                r"\\.|<!--|-->|<!\[CDATA\[|\]\]>|<\?|\?>|<(?=\S|$)|\]\(|\]\[|[()\[\]>\"']",
+                r"\\.|<!--|--!?>|<!\[CDATA\[|\]\]>|<\?|\?>|<(?=\S|$)|\]\(|\]\[|[()\[\]>\"']",
                 preceding,
             ):
                 symbol = token[0]
@@ -355,12 +355,15 @@ def _disclosure_code_spans(line: str) -> list[tuple[int, int]]:
                     if symbol == quote:
                         quote = ""
                 elif contexts and contexts[-1] in {"-->", "]]>", "?>"}:
+                    if symbol == "--!>" and contexts[-1] == "-->":
+                        # CommonMark and HTML disagree; later closers cannot remove ambiguity.
+                        break
                     if symbol == contexts[-1]:
                         contexts.pop()
                 elif contexts and contexts[-1] == ">":
                     if symbol in {'"', "'"}:
                         quote = symbol
-                    elif symbol == ">":
+                    elif symbol in {">", "--!>"}:
                         contexts.pop()
                 elif contexts and contexts[-1] == "]":
                     if symbol == "]":

@@ -572,6 +572,17 @@ def test_split_review_rejects_nonprogress_on_escaped_pipe_whitespace() -> None:
                 "code-span-link-title-quoted-close",
                 "short-code-span-comparison-tags",
                 "short-code-span-completed-link-tags",
+                *[
+                    f"code-span-comment-{context}-{tag}-{placement}"
+                    for context in ("standard", "alternate", "alternate-attribute")
+                    for tag in ("details", "summary")
+                    for placement in ("prose", "rationale")
+                ],
+                *[
+                    f"short-code-span-comment-alternate-{tag}-{placement}"
+                    for tag in ("details", "summary")
+                    for placement in ("prose", "rationale")
+                ],
             )
         ],
     ],
@@ -675,6 +686,17 @@ def test_split_review_rejects_nonprogress_on_escaped_pipe_whitespace() -> None:
         "code-span-link-title-quoted-close",
         "short-code-span-comparison-tags",
         "short-code-span-completed-link-tags",
+        *[
+            f"code-span-comment-{context}-{tag}-{placement}"
+            for context in ("standard", "alternate", "alternate-attribute")
+            for tag in ("details", "summary")
+            for placement in ("prose", "rationale")
+        ],
+        *[
+            f"short-code-span-comment-alternate-{tag}-{placement}"
+            for tag in ("details", "summary")
+            for placement in ("prose", "rationale")
+        ],
     ],
 )
 def test_long_review_parts_preserve_all_assessments_and_markdown_context(
@@ -712,6 +734,7 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         variant = table_variant.removeprefix("short-")
         table_rows = []
         assessment_review = _REVIEW
+        comment_context = None
         code_span_refusal = variant in {
             "code-span-unmatched",
             "code-span-escaped-opener",
@@ -766,7 +789,23 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
                     "Use a [link](https://example.test/) and `<details>` / `<summary>` tags."
                 ),
             }
-            if literal_context:
+            comment_context = re.fullmatch(
+                r"code-span-comment-(standard|alternate|alternate-attribute)-"
+                r"(details|summary)-(prose|rationale)",
+                variant,
+            )
+            if comment_context:
+                prefix = {
+                    "standard": "Use <!-- harmless --> and ",
+                    "alternate": "Use <!-- harmless --!> and ",
+                    "alternate-attribute": 'Use <!-- harmless --!> <span title="--> ',
+                }[comment_context[1]]
+                ending = (
+                    '">logs</span>.' if comment_context[1] == "alternate-attribute" else " tags."
+                )
+                literal = prefix + f"`<{comment_context[2]}>`" + ending
+                code_span_refusal = not short and comment_context[1] != "standard"
+            elif literal_context:
                 prefix = {
                     "comparison": "Use x < 3 and ",
                     "completed-link": "Use a [link](https://example.test/) and ",
@@ -937,7 +976,46 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
                     assert self.depth > 0, "A rendered comment has an unmatched disclosure closer"
                     self.depth -= 1
 
+        class CommentEndContext(DisclosureContext):
+            def __init__(self) -> None:
+                super().__init__()
+                self.code_elements = self.code_depth = 0
+
+            def parse_comment(self, start: int, report: int = 1) -> int:
+                # Model HTML's alternate comment end; CommonMark still uses its own parser.
+                alternate = self.rawdata.find("--!>", start + 4)
+                ordinary = self.rawdata.find("-->", start + 4)
+                if alternate >= 0 and (ordinary < 0 or alternate < ordinary):
+                    if report:
+                        self.handle_comment(self.rawdata[start + 4 : alternate])
+                    return alternate + 4
+                return super().parse_comment(start, report)
+
+            def handle_starttag(self, tag: str, attrs: list) -> None:
+                super().handle_starttag(tag, attrs)
+                if tag == "code":
+                    self.code_elements += 1
+                    self.code_depth += 1
+                elif tag == "sub":
+                    assert self.code_depth == 0, "Publication footer is inside code"
+
+            def handle_endtag(self, tag: str) -> None:
+                super().handle_endtag(tag)
+                if tag == "code":
+                    self.code_depth -= 1
+
         original = parser.parse(review)
+        if comment_context:
+            children = [child for token in parser.parse(literal) for child in token.children or []]
+            assert [token.content for token in children if token.type == "code_inline"] == [
+                f"<{comment_context[2]}>"
+            ]
+            reference = CommentEndContext()
+            reference.feed(parser.render(literal))
+            reference.close()
+            assert reference.code_elements == (
+                0 if comment_context[1] == "alternate-attribute" else 1
+            ), "The HTML comment end changes whether CommonMark's code remains an element"
         if variant.startswith("code-span-") and literal_context:
             literal_tokens = [
                 child
@@ -965,12 +1043,13 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
             tmp_path, monkeypatch, head_sha="a" * 40, run_url="https://example.test/run"
         )
         if code_span_refusal:
-            assert any(
-                "<details>" in token.content
-                for block in parser.parse(lead)
-                for token in ([block] if block.type == "html_block" else block.children or [])
-                if token.type in {"html_block", "html_inline"}
-            ), "An ambiguous backtick must not hide an independently parsed real tag"
+            if comment_context is None:
+                assert any(
+                    "<details>" in token.content
+                    for block in parser.parse(lead)
+                    for token in ([block] if block.type == "html_block" else block.children or [])
+                    if token.type in {"html_block", "html_inline"}
+                ), "An ambiguous backtick must not hide an independently parsed real tag"
             with pytest.raises(ValueError, match=r"Polly review noncanonical (details|summary)"):
                 _published_comments(review, review_path, receipt)
             assert not posts and not receipt.exists()
@@ -1015,6 +1094,12 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         else:
             assert 1 < len(comments) <= _HELPERS["MAX_REVIEW_PARTS"]
         rendered = [parser.parse(comment) for comment in comments]
+        if comment_context:
+            for comment in comments:
+                reference = CommentEndContext()
+                reference.feed(parser.render(comment))
+                reference.close()
+                assert reference.code_depth == reference.depth == reference.summary_depth == 0
         assert [item for tokens in rendered for item in containers(tokens)] == expected, (
             "Multipart publication changed independently parsed quote/list structure"
         )
