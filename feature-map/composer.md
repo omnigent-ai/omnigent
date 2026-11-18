@@ -586,11 +586,19 @@ side-chat message loads it into that side chat's composer, not the main one.
 **Grid cell** (desktop session grids, see [Sessions](sessions.md)): each cell's
 one-row composer shares its session's draft with the full-screen composer, sends
 its tags and review comments as the full-screen composer does, and shows the
-review comments as chips. It also shows the session's host, permission mode
-(switchable by the owner) and harness. Shift+Tab in the cell's composer steps that
-session's mode too; side chats and subagent tabs keep Shift+Tab for focus. Switch
-the host from the cell's host menu when you can edit the session. See or switch
-the model from the full-screen view.
+review comments as chips. Sending while the session works queues the message on
+that session, as the full-screen composer does: it waits in the cell's queue strip
+(edit, steer, remove) and sends when the turn ends. With Always steer on it steers
+into the running turn instead, and Mod+Enter steers the whole queue. Editing a
+queued message brings its tags back as tokens. The queue belongs to the session, so
+the full-screen view shows and flushes the same messages; a reload drops a cell's
+queued messages, where the full-screen composer restores its own. Escape does not
+stop a cell's turn, and Interrupt shows only while the draft is empty, so a draft
+sends. It also shows the session's host, permission mode (switchable by the owner)
+and harness. Shift+Tab in the cell's composer steps that session's mode too; side
+chats and subagent tabs keep Shift+Tab for focus. Switch the host from the cell's
+host menu when you can edit the session. See or switch the model from the
+full-screen view.
 
 ## Driving it with the repro environment
 
