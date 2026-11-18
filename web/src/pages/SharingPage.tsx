@@ -62,7 +62,7 @@ function BlockedBy({
     <Tooltip>
       <TooltipTrigger asChild>
         <div
-          {...control}
+          data-settings-control={control["data-settings-control"]}
           tabIndex={0}
           className="cursor-not-allowed opacity-50"
           data-blocked="true"
@@ -137,11 +137,14 @@ export function SharingPage() {
   // effective value; the saved value returns once the blocker is lifted.
   const sharingOff = current === "off";
   const publicBlockedReason = sharingOff ? PUBLIC_ACCESS_ENTRY.parts.blocked : null;
-  const defaultPublicBlockedByPart = sharingOff ? "blockedBySharing" : "blockedByPublicAccess";
-  const defaultPublicBlockedReason =
-    sharingOff || !publicEnabled
-      ? DEFAULT_PUBLIC_SESSIONS_ENTRY.parts[defaultPublicBlockedByPart]
+  const defaultPublicBlockedByPart = sharingOff
+    ? "blockedBySharing"
+    : !publicEnabled
+      ? "blockedByPublicAccess"
       : null;
+  const defaultPublicBlockedReason = defaultPublicBlockedByPart
+    ? DEFAULT_PUBLIC_SESSIONS_ENTRY.parts[defaultPublicBlockedByPart]
+    : null;
   const effectivePublic = publicEnabled && !sharingOff;
   const effectiveDefaultPublic = defaultPublicBlockedReason ? "off" : defaultPublic;
   const publicDisabled = !publicEditable || setMode.isPending || publicBlockedReason !== null;
@@ -256,8 +259,7 @@ export function SharingPage() {
                         className="flex-1"
                         description={
                           <>
-                            Anyone with the link can access after signing in. Turning this off
-                            blocks new public grants; existing grants stay accessible and revocable.
+                            {PUBLIC_ACCESS_ENTRY.description}
                             {!publicEditable && (
                               <span className="mt-1 block">
                                 Managed by this deployment and can&apos;t be changed here.
@@ -286,8 +288,7 @@ export function SharingPage() {
                     className="min-w-0 flex-1"
                     description={
                       <>
-                        Limit access through public links. Lowering to Read limits existing Edit
-                        grants; raising it does not upgrade Read grants.
+                        {PUBLIC_MAX_PERMISSION_ENTRY.description}
                         {!publicMaxEditable && (
                           <span className="mt-1 block">Managed by this deployment.</span>
                         )}
@@ -330,7 +331,7 @@ export function SharingPage() {
                     reason={defaultPublicBlockedReason}
                     control={settingsControlProps(
                       DEFAULT_PUBLIC_SESSIONS_ENTRY,
-                      defaultPublicBlockedByPart,
+                      defaultPublicBlockedByPart ?? undefined,
                     )}
                   >
                     <div className="flex items-center justify-between gap-4">
@@ -340,8 +341,7 @@ export function SharingPage() {
                         className="flex-1"
                         description={
                           <>
-                            New sessions allow public read access with a link and sign-in. Owners
-                            can revoke it in Share. Existing sessions stay unchanged.
+                            {DEFAULT_PUBLIC_SESSIONS_ENTRY.description}
                             {!defaultPublicEditable && (
                               <span className="mt-1 block">
                                 Managed by this deployment and can&apos;t be changed here.

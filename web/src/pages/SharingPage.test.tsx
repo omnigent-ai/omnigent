@@ -341,6 +341,9 @@ describe("SharingPage", () => {
       expect(radios.find((r) => r.value === "sandbox")!.checked).toBe(true);
       expect(screen.getByRole("radio", { name: "Managed hosts only" })).toBeChecked();
       expect(screen.getByText(/Local sessions start private/)).toBeInTheDocument();
+      expect(screen.getByRole("switch", { name: TOGGLE })).toHaveAccessibleDescription(
+        /New sessions allow public read access/,
+      );
     });
 
     it("hides scope while off and enables managed hosts only by default", async () => {
@@ -626,5 +629,16 @@ describe("SharingPage Settings rows", () => {
     expect(
       document.querySelector('[data-settings-control="default-public-sessions:blockedBySharing"]'),
     ).not.toBeNull();
+  });
+
+  it("names public access as the reason the default-sharing row is greyed out", async () => {
+    setSharingState(state({ sharing_mode: "on", public_sharing_enabled: false }));
+    renderPage();
+    await screen.findByRole("switch", { name: "Public access" });
+    expect(
+      document.querySelector(
+        '[data-settings-control="default-public-sessions:blockedByPublicAccess"]',
+      ),
+    ).toHaveAttribute("tabindex", "0");
   });
 });

@@ -74,7 +74,7 @@ export const PUBLIC_MAX_PERMISSION_ENTRY = settingsEntry({
   description:
     "Limit access through public links. Lowering to Read limits existing Edit grants; raising it does not upgrade Read grants.",
   keywords: ["public", "permission", "read", "edit", "link", "limit"],
-  choices: ["Read", "Edit"],
+  choices: ["Read"],
 });
 
 export const DEFAULT_PUBLIC_SESSIONS_ENTRY = settingsEntry({
