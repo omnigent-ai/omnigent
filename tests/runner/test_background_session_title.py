@@ -492,9 +492,13 @@ async def test_background_title_maps_claude_native_to_claude_cli(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("lookup_stage", ["config", "launcher", "binary", "validation"])
+@pytest.mark.parametrize("cancel_before_spawn", [False, True])
 async def test_claude_native_title_uses_tool_free_print_mode(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path,
+    lookup_stage: str,
+    cancel_before_spawn: bool,
 ) -> None:
     from omnigent.harnesses.claude_native.main import ClaudeNativeUcodeConfig
 
@@ -512,13 +516,32 @@ async def test_claude_native_title_uses_tool_free_print_mode(
     loop = asyncio.get_running_loop()
     lookup_started = asyncio.Event()
     lookup_release = threading.Event()
+    lookup_finished = threading.Event()
     loop_progressed: list[bool] = []
+
+    def wait_for_lookup(stage: str) -> None:
+        if stage == lookup_stage:
+            loop.call_soon_threadsafe(lookup_started.set)
+            loop_progressed.append(lookup_release.wait(timeout=1.0))
+            lookup_finished.set()
 
     def resolve_config(*, spec: object = None) -> ClaudeNativeUcodeConfig:
         assert spec is None
-        loop.call_soon_threadsafe(lookup_started.set)
-        loop_progressed.append(lookup_release.wait(timeout=1.0))
+        wait_for_lookup("config")
         return claude_config
+
+    def resolve_launch(command: str, args: list[str]) -> tuple[str, list[str]]:
+        wait_for_lookup("launcher")
+        return command, args
+
+    def resolve_binary(name: str) -> str:
+        assert name == "claude"
+        wait_for_lookup("binary")
+        return "/usr/local/bin/claude"
+
+    def validate_interpreter(path: str) -> None:
+        assert path == "/usr/local/bin/claude"
+        wait_for_lookup("validation")
 
     class FakeProcess:
         returncode = 0
@@ -536,7 +559,12 @@ async def test_claude_native_title_uses_tool_free_print_mode(
     )
     monkeypatch.setattr(
         "omnigent.claude_launcher.resolve_claude_launch",
-        lambda command, args: (command, args),
+        resolve_launch,
+    )
+    monkeypatch.setattr("omnigent._platform.resolve_cli_binary", resolve_binary)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge.validate_claude_hook_interpreter_compatibility",
+        validate_interpreter,
     )
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
 
@@ -554,13 +582,22 @@ async def test_claude_native_title_uses_tool_free_print_mode(
     )
     try:
         await asyncio.wait_for(lookup_started.wait(), timeout=2.0)
-        lookup_release.set()
-        title = await task
+        if cancel_before_spawn:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            lookup_release.set()
+            title = await task
     finally:
         lookup_release.set()
         await asyncio.gather(task, return_exceptions=True)
+        assert await asyncio.to_thread(lookup_finished.wait, 2.0)
 
-    assert loop_progressed == [True], "title provider resolution blocked the runner's event loop"
+    assert loop_progressed == [True], "title launch preparation blocked the runner's event loop"
+    if cancel_before_spawn:
+        assert captured == {}, "a cancelled title request launched a process"
+        return
     assert title == "Debug authentication timeout"
     assert captured["command"] == "claude"
     args = list(captured["args"])
