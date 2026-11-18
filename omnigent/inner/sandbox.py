@@ -2033,6 +2033,25 @@ def _project_import_inode_roots(root: Path) -> tuple[set[Path], set[Path]]:
     return entries, trees
 
 
+def _shared_python_runtime_entries(stdlib_roots: set[Path]) -> set[Path]:
+    """Name shared Python binaries beside stdlib roots without scanning whole prefixes."""
+    entries: set[Path] = set()
+    for stdlib in stdlib_roots:
+        if re.fullmatch(r"python\d+\.\d+[a-z]*", stdlib.name) is None:
+            continue
+        prefix = stdlib.parent.parent
+        libraries = {stdlib.parent, prefix / "lib", prefix / "lib64"}
+        for library in libraries:
+            for directory in (library, *library.glob("*-linux-gnu")):
+                for pattern in (f"lib{stdlib.name}*.so*", f"lib{stdlib.name}*.dylib"):
+                    entries.update(directory.glob(pattern))
+        if prefix.parent.name == "Versions" and prefix.parent.parent.name.endswith(".framework"):
+            binary = prefix / prefix.parent.parent.name.removesuffix(".framework")
+            if binary.is_file() or binary.is_symlink():
+                entries.add(binary)
+    return entries
+
+
 def _validate_launcher_runtime(sandbox: SandboxPolicy) -> None:
     """Reject writes to code or startup configuration used before containment."""
     if not sandbox.active or sandbox.backend_type not in _SPAWN_WRAP_BACKENDS:
@@ -2069,12 +2088,26 @@ def _validate_launcher_runtime(sandbox: SandboxPolicy) -> None:
     )
     startup_trees.update(Path(path) for path in site.getsitepackages())
     python_library_name = Path(paths["stdlib"]).name
+    runtime_stdlibs = {Path(paths[key]) for key in ("stdlib", "platstdlib")}
+    for prefix in (
+        Path(sys.prefix),
+        Path(sys.base_prefix),
+        Path(sys.exec_prefix),
+        Path(sys.base_exec_prefix),
+    ):
+        runtime_stdlibs.update(
+            prefix / library / python_library_name for library in ("lib", "lib64")
+        )
     for executable in _launcher_path_variants(Path(sys.executable)):
         runtime_root = executable.parent.parent
+        runtime_stdlibs.update(
+            runtime_root / library / python_library_name for library in ("lib", "lib64")
+        )
         startup_trees.update(
             runtime_root / library / python_library_name / "site-packages"
             for library in ("lib", "lib64")
         )
+    entries.update(_shared_python_runtime_entries(runtime_stdlibs))
     # copy_on_write imports _proc (and psutil) before the spawn-time wrap.
     dependency = importlib.util.find_spec("psutil")
     if dependency is None or dependency.origin is None:

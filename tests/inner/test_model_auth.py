@@ -94,8 +94,9 @@ def test_auth_runtime_rejects_writable_hardlink_alias(
         _validate_auth_runtime(pinned, policy)
 
 
-def test_auth_runtime_rejects_copied_interpreter_base_stdlib_alias_before_probe(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("trusted_source", ["site", "shared_runtime"])
+def test_auth_runtime_rejects_copied_interpreter_base_runtime_alias_before_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, trusted_source: str
 ) -> None:
     from omnigent.inner import sandbox
 
@@ -109,6 +110,8 @@ def test_auth_runtime_rejects_copied_interpreter_base_stdlib_alias_before_probe(
     (stdlib / "json" / "__init__.py").write_text("# disposable stdlib\n")
     site = stdlib / "site.py"
     site.write_text("# disposable stdlib\n")
+    shared_runtime = stdlib.parent / "libpython3.12.so"
+    shared_runtime.write_bytes(b"disposable shared runtime")
     runtime = tmp_path / "auth-venv"
     (runtime / "bin").mkdir(parents=True)
     interpreter = runtime / "bin" / "python"
@@ -125,8 +128,8 @@ def test_auth_runtime_rejects_copied_interpreter_base_stdlib_alias_before_probe(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     alias = workspace / "editable.py"
-    os.link(site, alias)
-    alias.write_text("# worker can change base site import\n")
+    os.link(site if trusted_source == "site" else shared_runtime, alias)
+    alias.write_text("worker can change trusted runtime\n")
     probe = Mock(side_effect=AssertionError("auth interpreter probe ran"))
     monkeypatch.setattr(sandbox, "_validate_launcher_runtime", lambda _policy: None)
     monkeypatch.setattr(sandbox, "_isolated_launcher_import_roots", probe)

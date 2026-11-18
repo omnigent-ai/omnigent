@@ -263,6 +263,7 @@ def _validate_auth_runtime(executable: _TrustedExecutable, policy: SandboxPolicy
     from .sandbox import (
         _isolated_launcher_import_roots,
         _launcher_path_variants,
+        _shared_python_runtime_entries,
         _validate_launcher_runtime,
         _validate_launcher_write_grants,
         _validate_trusted_hardlink_aliases,
@@ -288,7 +289,20 @@ def _validate_auth_runtime(executable: _TrustedExecutable, policy: SandboxPolicy
             for path in _auth_base_runtime_trees(executable.interpreter)
             for variant in _launcher_path_variants(path)
         }
-        _validate_launcher_write_grants(policy, set(), base_trees)
+        runtime_stdlibs = set(base_trees)
+        for interpreter in _launcher_path_variants(executable.interpreter):
+            runtime_stdlibs.update(
+                interpreter.parent.parent / library / stdlib.name
+                for stdlib in base_trees
+                for library in ("lib", "lib64")
+            )
+        shared_entries = {
+            variant
+            for path in _shared_python_runtime_entries(runtime_stdlibs)
+            for variant in _launcher_path_variants(path)
+        }
+        _validate_launcher_write_grants(policy, shared_entries, base_trees)
+        _validate_trusted_hardlink_aliases(policy, shared_entries, set())
         _validate_trusted_hardlink_aliases(policy, set(), base_trees)
         # The liveness supervisor also starts Python in the trusted parent.
         _validate_launcher_runtime(policy)

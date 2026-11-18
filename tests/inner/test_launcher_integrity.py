@@ -188,7 +188,9 @@ def test_launcher_rejects_alias_and_intermediate_interpreter_hops(
         sb.create_exec_launcher("/bin/true", policy)
 
 
-@pytest.mark.parametrize("trusted_source", ["package", "framework", "native", "root_package"])
+@pytest.mark.parametrize(
+    "trusted_source", ["package", "framework", "native", "root_package", "shared_runtime"]
+)
 @pytest.mark.parametrize("grant_kind", ["write_roots", "write_files"])
 def test_launcher_rejects_writable_hardlink_to_startup_import(
     runtime_layout: SimpleNamespace, tmp_path: Path, trusted_source: str, grant_kind: str
@@ -198,6 +200,7 @@ def test_launcher_rejects_writable_hardlink_to_startup_import(
         "framework": runtime_layout.framework / "uuid.py",
         "native": runtime_layout.framework / f"uuid{EXTENSION_SUFFIXES[0]}",
         "root_package": runtime_layout.framework / "shadow" / "__init__.py",
+        "shared_runtime": runtime_layout.system / "lib" / "libpython3.12.so",
     }[trusted_source]
     startup.parent.mkdir(parents=True)
     startup.write_text("value = 'trusted'\n")
@@ -213,6 +216,24 @@ def test_launcher_rejects_writable_hardlink_to_startup_import(
     setattr(policy, grant_kind, [workspace if grant_kind == "write_roots" else alias])
     with pytest.raises(OSError, match="hard-link alias"):
         sb.create_exec_launcher("/bin/true", policy)
+
+
+def test_framework_shared_runtime_hardlink_is_trusted(tmp_path: Path) -> None:
+    prefix = tmp_path / "Python.framework" / "Versions" / "3.12"
+    stdlib = prefix / "lib" / "python3.12"
+    stdlib.mkdir(parents=True)
+    binary = prefix / "Python"
+    binary.write_bytes(b"disposable shared runtime")
+    workspace = tmp_path / "contained"
+    workspace.mkdir()
+    os.link(binary, workspace / "editable")
+
+    entries = sb._shared_python_runtime_entries({stdlib})
+    assert binary in entries
+    policy = _policy()
+    policy.write_roots = [workspace]
+    with pytest.raises(OSError, match="hard-link alias"):
+        sb._validate_trusted_hardlink_aliases(policy, entries, set())
 
 
 def test_launcher_allows_unrelated_hardlinks(
