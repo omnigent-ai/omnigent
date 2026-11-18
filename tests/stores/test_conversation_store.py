@@ -32,7 +32,7 @@ from omnigent.entities import (
     ResourceEventData,
 )
 from omnigent.errors import StaleCursorError
-from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL
+from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL
 from omnigent.session_import import (
     IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
     IMPORT_SOURCE_LABEL_KEY,
@@ -8167,8 +8167,12 @@ def test_list_conversations_filters_by_project_name_dual_read(
 
 
 @pytest.mark.parametrize("user_id", ["alice", "a" * 112])
+@pytest.mark.parametrize("split_database", [False, True])
 def test_list_conversations_filters_by_pinned_label(
-    conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
+    tmp_path,
+    monkeypatch,
+    split_database,
     user_id: str,
 ) -> None:
     """``list_conversations(pinned=True, pinned_owner=<user>)`` returns only the
@@ -8178,9 +8182,15 @@ def test_list_conversations_filters_by_pinned_label(
     on the same session does not match; clearing the label drops it."""
     from omnigent.stores.conversation_store import pinned_label_key
 
-    pinned = conversation_store.create_conversation(title="pinned")
-    other = conversation_store.create_conversation(title="other")
-    also_pinned_by_bob = conversation_store.create_conversation(title="bob's pin")
+    database_uri = db_uri
+    conversation_store = SqlAlchemyConversationStore(
+        database_uri, f"sqlite:///{tmp_path / 'messages.db'}" if split_database else None
+    )
+    pinned = conversation_store.create_conversation(conversation_id="1" * 32, title="pinned")
+    other = conversation_store.create_conversation(conversation_id="2" * 32, title="other")
+    also_pinned_by_bob = conversation_store.create_conversation(
+        conversation_id="3" * 32, title="bob's pin"
+    )
     # Alice pins one; Bob pins a different one — each under their own key.
     conversation_store.set_labels(pinned.id, {pinned_label_key(user_id): "1721760000000"})
     conversation_store.set_labels(
@@ -8206,6 +8216,66 @@ def test_list_conversations_filters_by_pinned_label(
     } == {pinned.id, other.id}
     conversation_store.set_family_pin(pinned.id, "", user_id=user_id)
     assert conversation_store.list_conversations(pinned=True, pinned_owner=user_id).data == []
+
+    dormant = [other]
+    for digit in ("4", "5"):
+        member = conversation_store.create_conversation(conversation_id=digit * 32)
+        conversation_store.set_session_nest(member.id, pinned.id, user_id=user_id)
+        dormant.append(member)
+    for member in dormant:
+        conversation_store.set_labels(member.id, {pinned_label_key(user_id): "234"})
+    visible = [
+        conversation_store.create_conversation(
+            conversation_id=digit * 32, labels={pinned_label_key(user_id): "345"}
+        )
+        for digit in ("8", "9")
+    ]
+    monkeypatch.setattr(
+        "omnigent.stores.conversation_store.sqlalchemy_store._FAMILY_READ_BATCH_SIZE", 2
+    )
+    permissions = SqlAlchemyPermissionStore(database_uri)
+    for member in [pinned, *dormant, *visible]:
+        permissions.grant(user_id, member.id, LEVEL_OWNER)
+    permissions.grant("bob", other.id, LEVEL_READ)
+    conversation_store.set_labels(other.id, {pinned_label_key("bob"): "456"})
+
+    for viewer in ({}, {"accessible_by": user_id}, {"owned_by": user_id}):
+        for order in ("asc", "desc"):
+            expected = visible if order == "asc" else visible[::-1]
+            options = dict(pinned=True, pinned_owner=user_id, sort_by="id", order=order, **viewer)
+            first = conversation_store.list_conversations(limit=1, **options)
+            assert [row.id for row in first.data] == [expected[0].id]
+            assert first.has_more
+            second = conversation_store.list_conversations(limit=1, after=first.last_id, **options)
+            assert [row.id for row in second.data] == [expected[1].id]
+            assert not second.has_more
+            previous = conversation_store.list_conversations(
+                limit=1, before=second.first_id, **options
+            )
+            assert [row.id for row in previous.data] == [expected[0].id]
+            assert not previous.has_more
+    assert {
+        row.id
+        for row in conversation_store.list_conversations(
+            pinned=True, pinned_owner="bob", accessible_by="bob", shared_only=True
+        ).data
+    } == {other.id}
+    conversation_store.set_family_pin(pinned.id, "567", user_id=user_id)
+    assert {
+        row.id
+        for row in conversation_store.list_conversations(
+            pinned=True, pinned_owner=user_id, owned_by=user_id
+        ).data
+    } == {member.id for member in [pinned, *dormant, *visible]}
+    conversation_store.set_family_pin(pinned.id, "", user_id=user_id)
+    conversation_store.set_session_nest(other.id, None, user_id=user_id)
+    assert conversation_store.get_conversation(other.id).labels[pinned_label_key(user_id)] == "234"
+    assert {
+        row.id
+        for row in conversation_store.list_conversations(
+            pinned=True, pinned_owner=user_id, owned_by=user_id
+        ).data
+    } == {member.id for member in [other, *visible]}
 
 
 @pytest.mark.parametrize("length", [105, 106, 112, 113, 128, 200])

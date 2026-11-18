@@ -4792,7 +4792,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         :raises StaleCursorError: If a cursor names a vanished conversation,
             or one that ``accessible_by``/``owned_by`` has no grant on.
         """
-        from omnigent.server.auth import LEVEL_OWNER
+        from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_LOCAL
 
         self._repair_pending_nest_labels_batch(best_effort=True)
         sort_col = self._resolve_sort_column(sort_by)
@@ -4828,6 +4828,25 @@ class SqlAlchemyConversationStore(ConversationStore):
         # each). Split-DB: a cross-DB EXISTS is impossible, so keep the
         # prefetch fallback.
         acl_pushdown = needs_meta_filter and self._conv_engine is self._engine
+        split_pin_filter = pinned and self._conv_engine is not self._engine
+        pin_key = pinned_label_key(pinned_owner)
+        family_pin_key = family_pinned_label_key(pinned_owner)
+        owned_nest_stmt = select(SqlConversationMetadata.id).where(
+            SqlConversationMetadata.workspace_id == current_workspace_id(),
+            SqlConversationMetadata.family_id.is_not(None),
+        )
+        if needs_meta_filter:
+            owned_nest_stmt = owned_nest_stmt.where(
+                select(SqlSessionPermission.conversation_id)
+                .where(
+                    SqlSessionPermission.workspace_id == SqlConversationMetadata.workspace_id,
+                    SqlSessionPermission.conversation_id == SqlConversationMetadata.id,
+                    SqlSessionPermission.user_id
+                    == (pinned_owner if pinned_owner is not None else RESERVED_USER_LOCAL),
+                    SqlSessionPermission.level >= LEVEL_OWNER,
+                )
+                .exists()
+            )
 
         qualifying_ids: list[str] | None = None
         if needs_meta_filter and not acl_pushdown:
@@ -5104,26 +5123,28 @@ class SqlAlchemyConversationStore(ConversationStore):
                         )
                     )
             if pinned:
-                # Restrict to sessions the caller has pinned. Pins are per-user,
-                # so match the caller's own key (``omnigent.pinned.<user>``), not
-                # a shared key — otherwise one user's pin would surface for every
-                # user with access. The row exists only while pinned (unpin
-                # deletes it), so key presence alone is the filter; the value is
-                # the pin timestamp, not a flag. Colocated on the AP DB, so an
-                # inline IN-subquery is enough (no cross-DB prefetch).
-                stmt = stmt.where(
-                    SqlConversation.id.in_(
+
+                def has_pin(key: str) -> ColumnElement[bool]:
+                    return SqlConversation.id.in_(
                         select(SqlConversationLabel.conversation_id).where(
                             SqlConversationLabel.workspace_id == current_workspace_id(),
-                            SqlConversationLabel.key.in_(
-                                [
-                                    pinned_label_key(pinned_owner),
-                                    family_pinned_label_key(pinned_owner),
-                                ]
-                            ),
+                            SqlConversationLabel.key == key,
                         )
                     )
-                )
+
+                if split_pin_filter:
+                    stmt = stmt.where(or_(has_pin(pin_key), has_pin(family_pin_key)))
+                else:
+                    # Saved personal pins are dormant while the viewer sees an owned nest.
+                    owned_nest = owned_nest_stmt.where(
+                        SqlConversationMetadata.id == SqlConversation.id
+                    ).exists()
+                    stmt = stmt.where(
+                        or_(
+                            and_(owned_nest, has_pin(family_pin_key)),
+                            and_(~owned_nest, has_pin(pin_key)),
+                        )
+                    )
             if after:
                 stmt = self._apply_cursor(
                     session,
@@ -5147,16 +5168,54 @@ class SqlAlchemyConversationStore(ConversationStore):
             stmt = stmt.order_by(
                 sort_fn(sort_col),
                 sort_fn(self._tiebreaker_col),  # insertion-order tiebreaker for timestamp ties
-            ).limit(limit + 1)
-            rows = list(session.execute(stmt).scalars().all())
+            )
+            labels_by_conv = {}
+            if split_pin_filter:
+                # Dormant pins must not consume the page or its has_more sentinel.
+                rows = []
+                window = min(limit + 1, _FAMILY_READ_BATCH_SIZE)
+                candidate_stmt = stmt
+                while len(rows) <= limit:
+                    candidates = list(session.scalars(candidate_stmt.limit(window)))
+                    if not candidates:
+                        break
+                    candidate_ids = [row.id for row in candidates]
+                    candidate_labels = _fetch_labels_bulk(session, candidate_ids)
+                    with self._session("list_conversations") as meta_sess:
+                        owned_nest_ids = set(
+                            meta_sess.scalars(
+                                owned_nest_stmt.where(
+                                    SqlConversationMetadata.id.in_(candidate_ids)
+                                )
+                            )
+                        )
+                    for row in candidates:
+                        labels = candidate_labels.get(row.id, {})
+                        key = family_pin_key if row.id in owned_nest_ids else pin_key
+                        if key in labels:
+                            rows.append(row)
+                            labels_by_conv[row.id] = labels
+                    if len(rows) > limit or len(candidates) < window:
+                        break
+                    candidate_stmt = self._apply_cursor(
+                        session,
+                        stmt,
+                        candidates[-1].id,
+                        sort_col,
+                        is_desc,
+                        tiebreaker_col=self._tiebreaker_col,
+                        forward=True,
+                    )
+            else:
+                rows = list(session.scalars(stmt.limit(limit + 1)))
             has_more = len(rows) > limit
             if has_more:
                 rows = rows[:limit]
             row_ids = [r.id for r in rows]
-            # Fetch labels for all returned conversations in a single IN-clause
-            # query so the list-path is O(1) queries regardless of page size.
-            # The agent binding + overrides ride on each conversation row.
-            labels_by_conv = _fetch_labels_bulk(session, row_ids)
+            # Split pinned scans already loaded labels; other pages fetch them in one query.
+            # Agent bindings and overrides ride on each conversation row.
+            if not split_pin_filter:
+                labels_by_conv = _fetch_labels_bulk(session, row_ids)
             # On a content search, fetch a preview excerpt of the matching
             # chat text so the UI can show *where* each session matched (the
             # match is often invisible in the title). Title-only matches keep

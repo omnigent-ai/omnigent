@@ -1,6 +1,6 @@
 import { renderSidebar } from "@/test/sidebarTestHelpers";
 import { conversation as conv, conversationPage } from "@/test/sidebarMockHelpers";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
@@ -40,7 +40,7 @@ vi.mock("@/hooks/useConversations", async () => {
 });
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
 
-import { useConversations } from "@/hooks/useConversations";
+import { useConversations, useProjects } from "@/hooks/useConversations";
 import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
 import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "./sidebarNav";
@@ -147,23 +147,59 @@ describe("moving sessions between nests by drag", () => {
   });
 
   it.each(["conv_c", "conv_b", "conv_a"])("moves only %s into the target nest", async (source) => {
-    renderNests();
-    await dropOnto(source, "conv_d", {
-      expectTarget: false,
-      whileOver: () => {
-        expect(screen.getByRole("link", { name: "conv_d" }).closest("li")).toHaveAttribute(
-          "data-nest-drop-target",
-          "true",
+    const verifyReveal = source === "conv_c";
+    await vi.mocked(useProjects, { partial: true }).withImplementation(
+      () => ({ data: verifyReveal ? [{ id: "p_Planning", name: "Planning" }] : [] }),
+      async () => {
+        if (verifyReveal)
+          vi.mocked(useConversations).mockImplementation(() =>
+            conversationPage([
+              conv("conv_a", { family: original }),
+              conv("conv_b", { family: original }),
+              conv("conv_c"),
+              conv("conv_d", { family: destination, project_id: "p_Planning" }),
+              conv("conv_peer", { family: destination, project_id: "p_Planning" }),
+            ]),
+          );
+        renderNests();
+        const project = verifyReveal ? screen.getByRole("button", { name: /^Planning/ }) : null;
+        if (project) {
+          fireEvent.click(project);
+          const target = screen.getByRole("link", { name: "conv_d" }).closest("li")!;
+          fireEvent.click(within(target).getByRole("button", { name: "Collapse session family" }));
+        }
+        await dropOnto(source, "conv_d", {
+          expectTarget: false,
+          whileOver: () => {
+            expect(screen.getByRole("link", { name: "conv_d" }).closest("li")).toHaveAttribute(
+              "data-nest-drop-target",
+              "true",
+            );
+            expect(screen.getByText("Move into nest: conv_d")).toBeInTheDocument();
+          },
+        });
+        expect(mocks.moveToNest).toHaveBeenCalledExactlyOnceWith(
+          { id: source, sourceId: "conv_d" },
+          expect.any(Object),
         );
-        expect(screen.getByText("Move into nest: conv_d")).toBeInTheDocument();
+        expect(mocks.pinFn).not.toHaveBeenCalled();
+        expect(mocks.reorderPins).not.toHaveBeenCalled();
+        if (project) {
+          expect(screen.queryByRole("link", { name: "conv_peer" })).toBeNull();
+          // dnd-kit suppresses clicks for 50 ms after the drop.
+          await act(async () => {
+            await new Promise<void>((resolve) => {
+              setTimeout(resolve, 50);
+            });
+          });
+          fireEvent.click(project);
+          expect(project).toHaveAttribute("aria-expanded", "false");
+          await act(async () => mocks.moveToNest.mock.calls[0][1].onSuccess());
+          expect(project).toHaveAttribute("aria-expanded", "true");
+          expect(screen.getByRole("link", { name: "conv_peer" })).toBeInTheDocument();
+        }
       },
-    });
-    expect(mocks.moveToNest).toHaveBeenCalledExactlyOnceWith(
-      { id: source, sourceId: "conv_d" },
-      expect.any(Object),
     );
-    expect(mocks.pinFn).not.toHaveBeenCalled();
-    expect(mocks.reorderPins).not.toHaveBeenCalled();
   });
 
   it.each(

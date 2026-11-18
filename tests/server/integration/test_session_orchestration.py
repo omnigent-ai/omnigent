@@ -3110,6 +3110,12 @@ async def test_owner_can_move_independent_sessions_between_nests(
     listed = next(row for row in listing if row["id"] == target["id"])
     for response in (joined.json(), snapshot, listed):
         assert "omnigent.pinned" not in response["labels"]
+    pins = (
+        await auth_client.get(
+            "/v1/sessions", params={"visibility": "mine", "pinned": True, "limit": 1}
+        )
+    ).json()
+    assert pins["data"] == [] and pins["has_more"] is False
     unchanged = await auth_client.patch(f"/v1/sessions/{target['id']}", json={"title": "Renamed"})
     assert unchanged.status_code == 200, unchanged.text
     assert unchanged.json()["family"]["id"] == source["id"]
@@ -3129,6 +3135,12 @@ async def test_owner_can_move_independent_sessions_between_nests(
     assert shared_pin.status_code == 200, shared_pin.text
     assert shared_pin.json().get("family") is None
     assert shared_pin.json()["labels"]["omnigent.pinned"] == "shared-pin"
+    shared_pins = await auth_client.get(
+        "/v1/sessions",
+        params={"visibility": "shared", "pinned": True},
+        headers={"X-Forwarded-Email": "bob"},
+    )
+    assert [row["id"] for row in shared_pins.json()["data"]] == [target["id"]]
     refused = await auth_client.patch(
         f"/v1/sessions/{target['id']}",
         json={"nest_source_id": None},
@@ -3156,6 +3168,10 @@ async def test_owner_can_move_independent_sessions_between_nests(
     assert detached.json().get("family") is None
     assert detached.json()["labels"]["omnigent.pinned"] == "personal-pin"
     assert store.get_conversation(target["id"]).family_id is None
+    pins = (
+        await auth_client.get("/v1/sessions", params={"visibility": "mine", "pinned": True})
+    ).json()
+    assert [row["id"] for row in pins["data"]] == [target["id"]]
 
 
 @pytest.mark.parametrize("policy", ["current_host", "current_host_or_new_sandbox"])
