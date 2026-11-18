@@ -2156,6 +2156,16 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         ("tab-disclosure", "short-inside-close"),
         ("indented-disclosure", "fenced-literal"),
         ("tab-disclosure", "raw-literal"),
+        ("commented-disclosure", "open-comment-close"),
+        ("commented-disclosure", "close-comment-open"),
+        ("commented-disclosure", "summary-comment-close"),
+        ("commented-disclosure", "summary-comment-open"),
+        ("commented-disclosure", "summary-comment-tags"),
+        ("commented-disclosure", "benign-comment-boundaries"),
+        ("commented-disclosure", "short-open-comment-close"),
+        ("commented-disclosure", "short-summary-comment-close"),
+        ("commented-disclosure", "fenced-literal"),
+        ("commented-disclosure", "raw-literal"),
     ],
     ids=lambda value: value,
 )
@@ -2177,6 +2187,10 @@ def test_multipart_keeps_literal_blocks_and_paragraph_dependencies_indivisible(
         raw_depth = 0
         details_depth = 0
         details_openings = 0
+        comment_tag_lookalikes = 0
+
+        def handle_comment(self, data: str) -> None:
+            self.comment_tag_lookalikes += bool(re.search(r"</?(details|summary)\b", data))
 
         def handle_starttag(self, tag: str, attrs: list) -> None:
             if tag in {"pre", "textarea", "code"}:
@@ -2202,6 +2216,7 @@ def test_multipart_keeps_literal_blocks_and_paragraph_dependencies_indivisible(
     amount = 130000 if form == "oversized" else 100
     prefix = ""
     indented_disclosure = kind in {"indented-disclosure", "tab-disclosure"}
+    commented_disclosure = kind == "commented-disclosure"
     literal_control = form in {"fenced-literal", "raw-literal"}
     if indented_disclosure:
         indentation = "\t" if kind == "tab-disclosure" else "    "
@@ -2219,6 +2234,35 @@ def test_multipart_keeps_literal_blocks_and_paragraph_dependencies_indivisible(
             block = "<!--\n" + block + "-->\n\n"
         if "inside" in form:
             prefix = "<details>\n<summary>Real disclosure</summary>\n\n"
+    elif commented_disclosure:
+        variant = form.removeprefix("short-")
+        if variant == "open-comment-close":
+            block = "<details><!-- </details> -->\n<summary>Real disclosure</summary>\n\n"
+        elif variant == "close-comment-open":
+            block = (
+                "<details>\n<summary>Real disclosure</summary>\n\nBody.\n\n"
+                "</details><!-- <details> -->\n\n"
+            )
+        elif variant in {"summary-comment-close", "summary-comment-open"}:
+            lookalike = "</details>" if variant.endswith("close") else "<details>"
+            block = f"<details><summary>Real <!-- {lookalike} --> disclosure</summary>\n\n"
+        elif variant == "summary-comment-tags":
+            block = (
+                "<details><!-- <summary>Literal</summary> -->\n"
+                "<summary>Real disclosure</summary>\n\n"
+            )
+        elif variant == "benign-comment-boundaries":
+            block = (
+                "<details><!-- harmless --><summary>Real</summary><!-- also harmless -->\n\n"
+                "Body.\n\n</details>\n\n"
+            )
+        else:
+            literal = "<details><!-- </details> -->\n</details>\n"
+            block = (
+                "```text\n" + literal + "```\n\n"
+                if form == "fenced-literal"
+                else "<pre>\n" + literal + "</pre>\n\n"
+            )
     elif kind.startswith("html-"):
         opener, closer = {
             "html-comment": ("<!--", "-->"),
@@ -2284,6 +2328,13 @@ def test_multipart_keeps_literal_blocks_and_paragraph_dependencies_indivisible(
     tail = "After.\n\n" + ("" if short else "z" * 70000 + "\n\n")
     if indented_disclosure and "inside" in form:
         tail += "</details>\n\n"
+    if commented_disclosure and form.removeprefix("short-") in {
+        "open-comment-close",
+        "summary-comment-close",
+        "summary-comment-open",
+        "summary-comment-tags",
+    }:
+        tail += "</details>\n\n"
     if form in {
         "closing-tail-context",
         "closing-tail-cdata",
@@ -2297,7 +2348,7 @@ def test_multipart_keeps_literal_blocks_and_paragraph_dependencies_indivisible(
     original = parser.parse(review)
     expected_tables = 0 if form == "unclosed" else 2 if form == "table-boundary" else 1
     assert sum(token.type == "table_open" for token in original) == expected_tables
-    if indented_disclosure:
+    if indented_disclosure or commented_disclosure:
         original_context = FooterContext()
         original_context.feed(parser.render(review))
         original_context.close()
@@ -2305,13 +2356,21 @@ def test_multipart_keeps_literal_blocks_and_paragraph_dependencies_indivisible(
         composed_context = FooterContext()
         composed_context.feed(parser.render(composed))
         composed_context.close()
-        assert original_context.details_openings == (
-            composed_context.details_openings + int("inside" in form)
-        )
-        if not literal_control:
-            assert [token.content for token in original if token.type == "code_block"] == [
-                literal + "\n"
-            ], "The disclosure-looking tag must independently parse as literal code"
+        if commented_disclosure:
+            assert original_context.details_openings == (
+                composed_context.details_openings + int(form != "fenced-literal")
+            )
+            assert bool(original_context.comment_tag_lookalikes) == (
+                form not in {"benign-comment-boundaries", "fenced-literal"}
+            ), "HTMLParser must distinguish actual comments from visible tags and fenced text"
+        else:
+            assert original_context.details_openings == (
+                composed_context.details_openings + int("inside" in form)
+            )
+            if not literal_control:
+                assert [token.content for token in original if token.type == "code_block"] == [
+                    literal + "\n"
+                ], "The disclosure-looking tag must independently parse as literal code"
     elif kind.startswith("paragraph-"):
         assert any(
             token.type == "inline"
@@ -2343,15 +2402,25 @@ def test_multipart_keeps_literal_blocks_and_paragraph_dependencies_indivisible(
         assert not posts and not receipt.exists()
         assert sorted(path.name for path in tmp_path.iterdir()) == ["review.md"]
         return
-    if indented_disclosure:
+    requires_refusal = (
+        (indented_disclosure or (commented_disclosure and form != "benign-comment-boundaries"))
+        and not short
+        and not literal_control
+    )
+    if indented_disclosure or commented_disclosure:
         review_path, receipt, posts = _prepare_publication(
             tmp_path, monkeypatch, head_sha=metadata["head_sha"], run_url=metadata["run_url"]
         )
-        message = "Polly review indented disclosure tags are not supported in multipart comments."
+        message = (
+            "Polly review commented disclosure tags are not supported in multipart comments."
+            if commented_disclosure
+            else "Polly review indented disclosure tags are not supported in multipart comments."
+        )
         try:
             comments = _published_comments(review, review_path, receipt)
         except ValueError as error:
             assert not short and not literal_control
+            assert requires_refusal
             assert str(error) == message
             assert not posts and not receipt.exists()
             assert sorted(path.name for path in tmp_path.iterdir()) == ["review.md"]
@@ -2363,7 +2432,7 @@ def test_multipart_keeps_literal_blocks_and_paragraph_dependencies_indivisible(
     else:
         comments = _HELPERS["review_comments"](review, **metadata)
     assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
-    if not short or indented_disclosure:
+    if not short or indented_disclosure or commented_disclosure:
         for comment in comments:
             context = FooterContext()
             context.feed(parser.render(comment))
@@ -2371,8 +2440,12 @@ def test_multipart_keeps_literal_blocks_and_paragraph_dependencies_indivisible(
             assert context.footers == 1, "Footer is hidden inside an HTML comment"
             assert context.raw_depth == 0
             assert context.details_depth == 0, "A comment leaves a disclosure open"
-    if indented_disclosure and not short and not literal_control:
-        pytest.fail("Indented disclosure tags must refuse before multipart publication")
+    if requires_refusal:
+        pytest.fail(
+            "Commented disclosure tags must refuse before multipart publication"
+            if commented_disclosure
+            else "Indented disclosure tags must refuse before multipart publication"
+        )
     if short:
         assert len(comments) == 1
         assert comments[0].split("Polly AI Review\n\n", 1)[1].rsplit("\n---\n", 1)[0] == review
@@ -2402,7 +2475,7 @@ def test_multipart_keeps_literal_blocks_and_paragraph_dependencies_indivisible(
     assert sum(comment.count("<!-- polly-reviewed-sha:") for comment in comments) == 1
     row = next(line for line in _REVIEW.splitlines() if line.startswith("| tests/"))
     assert sum(comment.count(row) for comment in comments) == 1
-    if indented_disclosure:
+    if indented_disclosure or commented_disclosure:
         for token_type in ("fence", "code_block", "html_block"):
             expected = [token.content for token in original if token.type == token_type]
             actual = [
