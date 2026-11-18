@@ -716,22 +716,10 @@ def test_overflow_error_message_names_unfinished_node_modules(tmp_path: Path) ->
     )
 
 
-def test_overflow_warn_message_distinguishes_partial_and_bounds_list(
+def test_overflow_warn_log_omits_private_paths(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """
-    The ``warn`` overflow log must (a) distinguish the directory it was
-    mid-scan of ("partially scanned") and (b) bound the list with a
-    ``(+N more)`` suffix when many directories remain, so a huge tree
-    can't produce a multi-KB log line.
-
-    Setup: 15 top-level dirs each holding one file, cap=15. The walker
-    pushes all 15 dirs while scanning cwd (entries 1..15), then trips
-    on the first grandchild file (entry 16) while inside the
-    last-popped dir — making that dir "partially scanned" and leaving
-    14 dirs queued. 1 partial + 14 not-scanned = 15 lines; the first
-    10 are shown and the remaining 5 collapse to ``(+5 more)``.
-    """
+    """Warning logs report mask risk without publishing operator path names."""
     for i in range(15):
         d = tmp_path / f"d{i:02d}"
         d.mkdir()
@@ -744,17 +732,9 @@ def test_overflow_warn_message_distinguishes_partial_and_bounds_list(
         f"{[r.getMessage() for r in caplog.records]}"
     )
     rendered = records[0].getMessage()
-    assert "partially scanned" in rendered, (
-        f"Message must mark the mid-scan directory as partially scanned. Got: {rendered!r}"
-    )
-    assert "not scanned" in rendered, (
-        f"Message must mark the never-reached directories as not scanned. Got: {rendered!r}"
-    )
-    # 15 unfinished dirs - 10 shown = 5 collapsed into the suffix.
-    assert "(+5 more)" in rendered, (
-        f"Unfinished-dir list must be bounded to {10} entries with a (+5 more) "
-        f"suffix so the log line stays small. Got: {rendered!r}"
-    )
+    assert "16 entries" in rendered
+    assert str(tmp_path) not in rendered
+    assert "d14" not in rendered
 
 
 # ---------------------------------------------------------------------------

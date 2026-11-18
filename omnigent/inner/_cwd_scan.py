@@ -364,9 +364,8 @@ def _handle_scan_overflow(
     React to the entry cap being hit: raise (``"error"``) or log a
     ``CRITICAL`` warning (``"warn"`` / ``"unlimited"``).
 
-    Builds the shared overflow message — which names the unfinished
-    directories via :func:`_summarize_unfinished_dirs` — and then either
-    fails loud or fails soft depending on *overflow*.
+    Error mode names unfinished directories. Warning mode logs counts without
+    exposing paths from the scanned tree.
 
     :param scope_label: Human label for the scan scope, e.g. ``"cwd"``
         or ``"read_paths root /work"``; prefixes the message.
@@ -390,19 +389,19 @@ def _handle_scan_overflow(
         logger), e.g. ``logging.getLogger("omnigent.inner._cwd_scan")``.
     :raises OSError: When *overflow* is ``"error"``.
     """
-    unfinished = _summarize_unfinished_dirs(
-        partial_dir=partial_dir,
-        not_scanned=not_scanned,
-        deprioritize_names=deprioritize_names,
-    )
-    message = (
-        f"{scope_label} dotfile scan visited more than {max_entries} entries under "
-        f"{cwd}. Unfinished directories (dotfiles inside these are NOT masked): "
-        f"{unfinished}. Raise os_env.sandbox.cwd_hidden_scan_max_entries, or set "
-        "os_env.sandbox.cwd_hidden_scan_overflow ('warn' = partial mask [default], "
-        "'error' = fail loud, 'unlimited' = no cap)."
-    )
     if overflow == "error":
+        unfinished = _summarize_unfinished_dirs(
+            partial_dir=partial_dir,
+            not_scanned=not_scanned,
+            deprioritize_names=deprioritize_names,
+        )
+        message = (
+            f"{scope_label} dotfile scan visited more than {max_entries} entries under "
+            f"{cwd}. Unfinished directories (dotfiles inside these are NOT masked): "
+            f"{unfinished}. Raise os_env.sandbox.cwd_hidden_scan_max_entries, or set "
+            "os_env.sandbox.cwd_hidden_scan_overflow ('warn' = partial mask [default], "
+            "'error' = fail loud, 'unlimited' = no cap)."
+        )
         raise OSError(message)
     # ``"warn"`` and ``"unlimited"`` — fail-soft with an obvious log
     # line. We deliberately do NOT swallow the truncation silently;
@@ -415,18 +414,17 @@ def _handle_scan_overflow(
     # readable by the sandboxed agent. ``"warn"`` is an availability /
     # security trade-off; deprioritizing ``node_modules`` keeps the
     # most-likely-unmasked remainder low-sensitivity, and the warning
-    # escalates to ``CRITICAL`` (naming the unfinished dirs) so it
+    # escalates to ``CRITICAL`` so it
     # can't be lost in INFO-noise logs. Untrusted trees should switch
     # to ``"error"``.
     logger.critical(
-        "%s Mask is incomplete (overflow=%r): %d entries "
+        "Dotfile scan Mask is incomplete (overflow=%r): %d entries "
         "visited so far, %d masks emitted. Dotfiles past the "
         "cap are READABLE by the sandboxed helper — including "
         "any credentials checked in or planted under cwd. "
         "Switch overflow to 'error' to fail loud instead, or "
         "raise cwd_hidden_scan_max_entries to scan the full "
         "tree.",
-        message,
         overflow,
         entries_visited,
         masks_emitted,
