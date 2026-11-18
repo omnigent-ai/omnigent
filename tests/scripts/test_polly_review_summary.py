@@ -743,6 +743,7 @@ def _check_review_context(
                     fragment = token.content
                     if not remaining_code.startswith(fragment):
                         assert fragment.endswith("\n")
+                        assert not fragment.endswith("\n\n")
                         fragment = fragment[:-1]
                     assert remaining_code.startswith(fragment)
                     remaining_code = remaining_code[len(fragment) :]
@@ -757,8 +758,12 @@ def _check_review_context(
                 assert fragment.startswith("```text\n")
                 fragment = fragment.removeprefix("```text\n")
             if not remaining.startswith(fragment):
-                assert fragment.endswith("\n```\n")
-                fragment = fragment.removesuffix("\n```\n")
+                assert fragment.endswith("```\n")
+                fragment = fragment.removesuffix("```\n")
+                if not remaining.startswith(fragment):
+                    assert fragment.endswith("\n")
+                    assert not fragment.endswith("\n\n")
+                    fragment = fragment[:-1]
             assert remaining.startswith(fragment)
             remaining = remaining[len(fragment) :]
         assert not remaining
@@ -2614,6 +2619,10 @@ def test_multipart_keeps_literal_blocks_and_paragraph_dependencies_indivisible(
         ("~~~", "    ", "container-continuation"),
         ("```", "- ", "short-fenced-example"),
         ("~~~", "- ", "short-fenced-example"),
+        ("```", "", "numbered-lines"),
+        ("~~~", "", "numbered-lines"),
+        ("`````", "", "numbered-lines"),
+        ("~~~~~", "", "numbered-lines"),
     ],
     ids=[
         "backticks",
@@ -2688,6 +2697,10 @@ def test_multipart_keeps_literal_blocks_and_paragraph_dependencies_indivisible(
         "container-continuation-nested-tildes",
         "short-fenced-example-backticks",
         "short-fenced-example-tildes",
+        "numbered-lines-backticks",
+        "numbered-lines-tildes",
+        "numbered-lines-long-backticks",
+        "numbered-lines-long-tildes",
     ],
 )
 def test_fence_continuations_preserve_literal_content_and_footer_context(
@@ -2995,6 +3008,7 @@ def test_fence_continuations_preserve_literal_content_and_footer_context(
                         fragment = token.content
                         if not remaining_code.startswith(fragment):
                             assert fragment.endswith("\n")
+                            assert not fragment.endswith("\n\n")
                             fragment = fragment[:-1]
                         assert remaining_code.startswith(fragment)
                         remaining_code = remaining_code[len(fragment) :]
@@ -3015,9 +3029,13 @@ def test_fence_continuations_preserve_literal_content_and_footer_context(
                 if number and not remaining.startswith(fragment) and fragment.startswith(opening):
                     fragment = fragment[len(opening) :]
                 if not remaining.startswith(fragment):
-                    suffix = "\n" + fence + "\n"
+                    suffix = fence + "\n"
                     assert fragment.endswith(suffix)
                     fragment = fragment[: -len(suffix)]
+                    if not remaining.startswith(fragment):
+                        assert fragment.endswith("\n")
+                        assert not fragment.endswith("\n\n")
+                        fragment = fragment[:-1]
                 assert remaining.startswith(fragment)
                 remaining = remaining[len(fragment) :]
                 reconstructed += fragment
@@ -3181,7 +3199,11 @@ def test_fence_continuations_preserve_literal_content_and_footer_context(
         assert sum(comment.count("After.") for comment in comments) == 1
         assert sum(comment.count("<!-- polly-reviewed-sha:") for comment in comments) == 1
         return
-    if shape == "leading-run":
+    if shape == "numbered-lines":
+        code = "".join(
+            f"L{number:05d}\n" + ("\n" if number % 1000 == 999 else "") for number in range(19000)
+        )
+    elif shape == "leading-run":
         code = literal + " " * 58000 + "a" + "\n" + "y" * 70000 + "\n"
     else:
         code = (
@@ -3194,6 +3216,10 @@ def test_fence_continuations_preserve_literal_content_and_footer_context(
         )
     info = "x`info" if shape == "tilde-info-backtick" else "text"
     review = fence + info + "\n" + code + fence + "\nAfter."
+    if shape == "numbered-lines":
+        review += "\n\n" + _HELPERS["compose_review"](
+            _REVIEW, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+        )
     comments = _HELPERS["review_comments"](
         review, head_sha="a" * 40, run_id="10-1", run_url="https://example.test/run"
     )
@@ -3224,12 +3250,24 @@ def test_fence_continuations_preserve_literal_content_and_footer_context(
             )
             == 1
         ), "Every footer must be independently parsed outside code"
+    if shape == "numbered-lines":
+        assert "".join(fragments) == code, "Multipart fences must preserve every code newline"
+        assert (
+            sum(
+                token.type == "table_open"
+                for comment in comments
+                for token in parser.parse(comment)
+            )
+            == 1
+        )
+        assert all(fragment.endswith("\n") for fragment in fragments)
     remaining = code
     reconstructed = ""
     for fragment in fragments:
         if not remaining.startswith(fragment):
             assert fragment.endswith("\n")
-            fragment = fragment[:-1]  # The synthetic closing fence adds one newline.
+            assert not fragment.endswith("\n\n")
+            fragment = fragment[:-1]  # Only a cut inside a code line needs a newline.
         assert remaining.startswith(fragment)
         reconstructed += fragment
         remaining = remaining[len(fragment) :]

@@ -858,7 +858,7 @@ def _markdown_context(
     suffix = "\n\n</details>" * details
     if fence:
         prefix += fence_line + "\n"
-        suffix = "\n" + fence + "\n" + suffix
+        suffix = ("" if text.endswith("\n") else "\n") + fence + "\n" + suffix
         table_header = ""
     if continuing and table_header and not text.endswith("\n"):
         row = previous.strip()
