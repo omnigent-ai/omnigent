@@ -548,6 +548,19 @@ describe("design outbox storage", () => {
     await vi.waitFor(() => expect(ids()).toEqual(["saved"]));
   });
 
+  it("keeps saving a request as its first owner's after the account changes", async () => {
+    const id = queueDesignRequest({ tabId: TAB, label: "Annotate", text: "Alice's" });
+    await designOutboxSaved();
+    identity.user = "bob";
+    useDesignOutbox.setState((state) => ({
+      requests: state.requests.map((request) =>
+        request.id === id ? { ...request, status: "failed", error: "Couldn't send: x" } : request,
+      ),
+    }));
+    await designOutboxSaved();
+    expect((await records())[0]).toMatchObject({ id, userId: "alice", status: "failed" });
+  });
+
   it("saves a status change, so a reload sees why it failed", async () => {
     const id = queueDesignRequest({ tabId: TAB, label: "Annotate", text: "Green" });
     await designOutboxSaved();

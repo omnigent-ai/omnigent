@@ -384,6 +384,9 @@ useDesignOutbox.subscribe(({ requests }) =>
 // once its write succeeded; one whose save failed is tried again on the next change.
 const savedAs = new Map<string, string>();
 const saving = new Map<string, string>();
+// Who each request belongs to, fixed at its first save: a later account change in this
+// page mustn't re-save it as the new user's.
+const owners = new Map<string, string>();
 // Requests removed here whose saved copy isn't deleted yet: a failed delete is tried
 // again, so a removed request can't come back (and send itself) on the next page.
 const deleting = new Map<string, "pending" | "failed">();
@@ -443,9 +446,10 @@ function persist(requests: readonly DesignRequest[]): void {
     void write(() => {
       if (request.status === "sent") return deleteRequest(request.id);
       // Who it belongs to as the write runs: the user may have become known meanwhile.
-      const userId = getCurrentUserId();
+      const userId = owners.get(request.id) ?? getCurrentUserId();
       unknownUser = userId === null;
       if (userId === null) return Promise.reject(new Error("Not signed in yet"));
+      owners.set(request.id, userId);
       return saveRequest(request, userId);
     }).then((ok) => {
       if (saving.get(request.id) === form) saving.delete(request.id);
@@ -458,6 +462,7 @@ function persist(requests: readonly DesignRequest[]): void {
     const wasSent = savedAs.get(id) === "sent";
     savedAs.delete(id);
     saving.delete(id);
+    owners.delete(id);
     if (!wasSent) forgetSaved(id);
   }
   for (const [id, state] of deleting) {
@@ -555,7 +560,10 @@ export async function restoreSavedDesignRequests(): Promise<void> {
       ...restoredStatus(record),
     }));
   if (restored.length === 0) return;
-  for (const request of restored) notePendingId(request);
+  for (const request of restored) {
+    owners.set(request.id, userId);
+    notePendingId(request);
+  }
   useDesignOutbox.setState((state) => ({ requests: [...restored, ...state.requests] }));
 }
 
@@ -600,6 +608,7 @@ export function resetDesignOutbox(): void {
   awaitingUser?.();
   awaitingUser = null;
   savedAs.clear();
+  owners.clear();
   saving.clear();
   deleting.clear();
   if (deleteTimer !== null) clearTimeout(deleteTimer);
