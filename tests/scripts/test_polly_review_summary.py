@@ -297,6 +297,53 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
             None,
             "ordinary-empty-cell",
         ),
+        (
+            None,
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            False,
+            None,
+            None,
+            "oversized-header",
+        ),
+        (None, 0, "", False, "run", None, None, False, False, False, None, None, "part-limit"),
+        (None, 0, "", False, "run", None, None, False, False, False, None, None, "work-limit"),
+        (
+            None,
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            False,
+            None,
+            None,
+            "incremental-work",
+        ),
+        (
+            None,
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            False,
+            None,
+            None,
+            "fenced-header-control",
+        ),
     ],
     ids=[
         "many-rows",
@@ -326,6 +373,11 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
         "rationale-space-control",
         "large-identity",
         "ordinary-empty-cell",
+        "oversized-header",
+        "part-limit",
+        "work-limit",
+        "incremental-work",
+        "fenced-header-control",
     ],
 )
 def test_long_review_parts_preserve_all_assessments_and_markdown_context(
@@ -395,6 +447,67 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         assert sum(comment.count("<!-- polly-reviewed-sha:") for comment in comments) == 1
         return comments
 
+    def assert_fragments(
+        fragments: list[list[str]],
+        expected: list[str],
+        rationale: str,
+        *,
+        minimum: int = 1,
+        ordinary_empty_cell: bool = False,
+    ) -> None:
+        assert len(fragments) >= minimum
+        assert all(len(cells) == 5 and cells[:4] == expected[:4] for cells in fragments)
+        if ordinary_empty_cell:
+            assert all(cells[1].strip() == "" for cells in fragments)
+        else:
+            assert all(all(cell.strip() for cell in cells) for cells in fragments)
+        assert (
+            "".join(cells[4].removeprefix(" ").removesuffix(" ") for cells in fragments)
+            == rationale
+        )
+
+    if table_variant in {"oversized-header", "part-limit", "work-limit", "fenced-header-control"}:
+        review = _REVIEW
+        if table_variant in {"oversized-header", "fenced-header-control"}:
+            table = "| " + "H" * 70000 + " | Details |\n| --- | --- |\n| item | note |\n"
+            review = (
+                (
+                    "```text\n" + table + "```\n"
+                    if table_variant == "fenced-header-control"
+                    else table
+                )
+                + "\n"
+                + review
+            )
+            message = "table header cannot fit within comment capacity"
+        else:
+            review = review.replace("Empty input", "Empty input" + "b" * 31000)
+            review = review.replace("Guards the regression.", "x" * 70000)
+            setting, limit, message = (
+                ("MAX_REVIEW_PARTS", 2, "part limit")
+                if table_variant == "part-limit"
+                else ("RENDER_WORK_BYTE_LIMIT", 1, "rendering work budget")
+            )
+            monkeypatch.setitem(_HELPERS["review_comments"].__globals__, setting, limit)
+        composed = _HELPERS["compose_review"](
+            review, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+        )
+        if table_variant == "fenced-header-control":
+            comments = published_comments(composed)
+            assert sum(comment.count("H") for comment in comments) == 70000
+            assert sum(comment.count("| item | note |") for comment in comments) == 1
+            assert all(
+                comment.count("```text") == comment.count("\n```\n") for comment in comments
+            )
+        else:
+            review_path.write_text(composed, encoding="utf-8")
+            with pytest.raises(ValueError, match=message):
+                _HELPERS["publish_review"](review_path, receipt)
+            assert not posts
+            assert not receipt.exists()
+            assert not list(tmp_path.glob("comment*.md"))
+        return
+
     if nonprogress:
         split = _HELPERS["split_review"]
         encoded_lengths = []
@@ -417,7 +530,7 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
                     return type(self)(super().__getitem__(key))
                 return super().__getitem__(key)
 
-        def bounded_split(_text: str, _limit: int) -> list[str]:
+        def bounded_split(_text: str, _limit: int, **_kwargs) -> list[str]:
             return split(ProgressCheckedReview("|aa\\|  \n"), 4)
 
         monkeypatch.setitem(_HELPERS["review_comments"].__globals__, "split_review", bounded_split)
@@ -436,9 +549,10 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         return
 
     if table_variant is not None:
+        large_identity = table_variant in {"large-identity", "incremental-work"}
         rationale = "x" * 70000
         header, delimiter, original = _REVIEW.split("### Tests\n", 1)[1].split("\n")[:3]
-        if table_variant == "large-identity":
+        if large_identity:
             row = original.replace("Empty input", "Empty input" + "b" * 31000)
             row = row.replace("Guards the regression.", rationale)
             review = _REVIEW.replace(original, row)
@@ -450,7 +564,7 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
             review, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
         )
         review_path.write_text(composed, encoding="utf-8")
-        if table_variant == "large-identity":
+        if large_identity:
             metadata = {
                 "head_sha": "a" * 40,
                 "run_id": "10-1",
@@ -461,7 +575,24 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
             assert len(small_comments) == 1
             assert len(small_comments[0].encode("utf-8")) < 52000
             (tmp_path / "small-comment.md").write_text(small_comments[0], encoding="utf-8")
-            comments = _HELPERS["review_comments"](composed, **metadata)
+            with monkeypatch.context() as render_patch:
+                if table_variant == "incremental-work":
+                    context = _HELPERS["_markdown_context"]
+                    visited = set()
+
+                    def checked_context(text: str, **kwargs):
+                        if text != composed and not text.startswith("<!--"):
+                            assert text not in visited, "Accepted review prefix was parsed again"
+                            assert len(visited) < 32, "Exceeded bounded component context visits"
+                            visited.add(text)
+                        return context(text, **kwargs)
+
+                    render_patch.setitem(
+                        _HELPERS["review_comments"].__globals__,
+                        "_markdown_context",
+                        checked_context,
+                    )
+                comments = _HELPERS["review_comments"](composed, **metadata)
             for part, comment in enumerate(comments, 1):
                 (tmp_path / f"rendered-part-{part}.md").write_text(comment, encoding="utf-8")
         else:
@@ -476,21 +607,13 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
                 assert header + "\n" + delimiter in comment
             for line in rows:
                 cells = _HELPERS["split_table_row"](line.strip().strip("|"))
-                assert len(cells) == 5
-                assert cells[:4] == expected[:4]
-                if table_variant == "large-identity":
-                    assert all(cell.strip() for cell in cells)
-                else:
-                    assert cells[1].strip() == ""
                 fragments.append(cells)
         assert len(comments) > 1
-        assert len(fragments) >= 2
-        assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
-        assert (
-            "".join(cells[4].removeprefix(" ").removesuffix(" ") for cells in fragments)
-            == rationale
+        assert_fragments(
+            fragments, expected, rationale, minimum=2, ordinary_empty_cell=not large_identity
         )
-        if table_variant == "large-identity":
+        assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
+        if large_identity:
             later_rationale = "Retains the later independent identity."
             later_row = original.replace("test_empty", "test_later").replace(
                 "Empty input", "Different input" + "c" * 40000
@@ -517,13 +640,7 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
                         if line.startswith("|" + expected[0] + "|"):
                             assert header + "\n" + delimiter in comment
                             fragments.append(_HELPERS["split_table_row"](line.strip().strip("|")))
-                assert fragments
-                assert all(len(cells) == 5 and cells[:4] == expected[:4] for cells in fragments)
-                assert all(all(cell.strip() for cell in cells) for cells in fragments)
-                assert (
-                    "".join(cells[4].removeprefix(" ").removesuffix(" ") for cells in fragments)
-                    == expected_rationale
-                )
+                assert_fragments(fragments, expected, expected_rationale)
         return
 
     if final_table_newline is not None:
@@ -559,15 +676,8 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
                 assert rows
             for line in rows:
                 cells = _HELPERS["split_table_row"](line.strip().strip("|"))
-                assert len(cells) == 5
-                assert all(cell.strip() for cell in cells)
-                assert cells[:4] == expected[:4]
                 fragments.append(cells)
-        assert len(fragments) >= 2
-        assert (
-            "".join(cells[4].removeprefix(" ").removesuffix(" ") for cells in fragments)
-            == rationale
-        )
+        assert_fragments(fragments, expected, rationale, minimum=2)
         return
 
     if adjacent_tables:
@@ -720,12 +830,7 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
                 for line in comment.splitlines()
                 if line.lstrip().startswith("|" + expected[0] + "|")
             ]
-            assert len(fragments) >= 2
-            assert all(len(cells) == 5 and cells[:4] == expected[:4] for cells in fragments)
-            reconstructed = "".join(
-                cells[4].removeprefix(" ").removesuffix(" ") for cells in fragments
-            )
-            assert reconstructed == rationale
+            assert_fragments(fragments, expected, rationale, minimum=2)
         else:
             assert sum(comment.count(row) for comment in comments) == 1
     assert len(comments) >= 3

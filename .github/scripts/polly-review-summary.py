@@ -14,6 +14,8 @@ CATEGORIES = (TESTS, "Documentation", "Dependencies and lockfiles", "Implementat
 TEST_FIELD_COUNT = 5
 TEST_HEADER = ["test / case", "behavior protected", "layer", "needed?", "action / rationale"]
 COMMENT_BYTE_LIMIT = 60000
+MAX_REVIEW_PARTS = 64
+RENDER_WORK_BYTE_LIMIT = COMMENT_BYTE_LIMIT * MAX_REVIEW_PARTS * 16
 LINKED_ISSUE_BODY_LIMIT = 4096
 LINKED_ISSUES_QUERY = """query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) { pullRequest(number: $number) {
@@ -316,7 +318,11 @@ def split_review(
 
 
 def _markdown_context(
-    text: str, *, validate_assessments: bool = False, continuing: bool = True
+    text: str,
+    *,
+    validate_assessments: bool = False,
+    continuing: bool = True,
+    header_spans: list[tuple[int, int]] | None = None,
 ) -> tuple[str, str, str]:
     """Reopen Markdown context and optionally validate final assessment rows.
 
@@ -331,7 +337,10 @@ def _markdown_context(
     table_header = ""
     assessment_table = False
     previous = ""
+    offset = previous_start = 0
     for line in text.removesuffix("\n").split("\n"):
+        line_start = offset
+        offset += len(line) + 1
         if fence:
             if re.fullmatch(rf" {{0,3}}{re.escape(fence[0])}{{{len(fence)},}}\s*", line):
                 fence = ""
@@ -351,6 +360,8 @@ def _markdown_context(
                 re.fullmatch(r"\s*:?-+:?\s*", cell) for cell in cells
             ):
                 table_header = previous + "\n" + line + "\n"
+                if header_spans is not None:
+                    header_spans.append((previous_start, min(offset, len(text))))
                 assessment_table = [
                     cell.strip().lower() for cell in split_table_row(previous.strip().strip("|"))
                 ] == TEST_HEADER
@@ -366,6 +377,7 @@ def _markdown_context(
             table_header = ""
             assessment_table = False
         previous = line
+        previous_start = line_start
     prefix = "<details>\n<summary>Review continued</summary>\n\n" * details
     suffix = "\n\n</details>" * details
     if fence:
@@ -424,32 +436,65 @@ def review_comments(review: str, *, head_sha: str, run_id: str, run_url: str) ->
     single = wrap(review, 1, 1)
     if len(single.encode("utf-8")) <= COMMENT_BYTE_LIMIT:
         return validated([single])
-    chunks = split_review(review, COMMENT_BYTE_LIMIT)
-    while True:
-        comments = []
-        before = ""
-        context = ("", "", "")
-        for part, chunk in enumerate(chunks, 1):
+    if len(review.encode("utf-8")) > COMMENT_BYTE_LIMIT * MAX_REVIEW_PARTS:
+        raise ValueError("Polly review exceeds the publication part limit.")
+    work_left = RENDER_WORK_BYTE_LIMIT
+
+    def charge_work(*texts: str) -> None:
+        nonlocal work_left
+        work_left -= sum(len(text.encode("utf-8")) for text in texts)
+        if work_left < 0:
+            raise ValueError("Polly review exceeds the rendering work budget.")
+
+    charge_work(review)
+    header_spans: list[tuple[int, int]] = []
+    _markdown_context(review, continuing=False, header_spans=header_spans)
+    contents = []
+    before = ""
+    pending = review
+    context = ("", "", "")
+    while pending:
+        if len(contents) >= MAX_REVIEW_PARTS:
+            raise ValueError("Polly review exceeds the publication part limit.")
+        capacity = COMMENT_BYTE_LIMIT
+        while True:
+            charge_work(pending, before)
             prefix, _, table_header = context
-            before += chunk
-            context = _markdown_context(before, continuing=part < len(chunks))
-            _, suffix, _ = context
+            chunk = split_review(
+                pending, capacity, in_table_row=prefix.endswith("| "), split_once=True
+            )[0]
+            end = len(before) + len(chunk)
+            for header_start, header_end in header_spans:
+                if header_start >= end:
+                    break
+                if header_start < end < header_end:
+                    if header_start <= len(before):
+                        raise ValueError(
+                            "Polly review table header cannot fit within comment capacity."
+                        )
+                    chunk = chunk[: header_start - len(before)]
+                    break
+            tail = pending[len(chunk) :]
+            next_before = before + chunk
+            charge_work(next_before)
+            next_context = _markdown_context(next_before, continuing=bool(tail))
+            _, suffix, _ = next_context
             if chunk.lstrip(" \t").startswith("|"):
                 prefix += table_header
-            comment = wrap(prefix + chunk + suffix, part, len(chunks))
+            content = prefix + chunk + suffix
+            charge_work(content)
+            # Reserve the largest count so accepted parts never need rebuilding.
+            comment = wrap(content, len(contents) + 1, MAX_REVIEW_PARTS)
             overflow = len(comment.encode("utf-8")) - COMMENT_BYTE_LIMIT
             if overflow > 0:
-                # Only this fragment pays for its wrapper and repeated context.
-                chunks[part - 1 :] = split_review(
-                    "".join(chunks[part - 1 :]),
-                    len(chunk.encode("utf-8")) - overflow,
-                    in_table_row=prefix.endswith("| "),
-                    split_once=True,
-                )
-                break
-            comments.append(comment)
-        else:
-            return validated(comments)
+                capacity = len(chunk.encode("utf-8")) - overflow
+                continue
+            contents.append(content)
+            before, pending, context = next_before, tail, next_context
+            break
+    comments = [wrap(content, part, len(contents)) for part, content in enumerate(contents, 1)]
+    charge_work(*comments)
+    return validated(comments)
 
 
 def publish_review(review: Path, receipt: Path) -> None:
