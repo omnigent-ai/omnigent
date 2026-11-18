@@ -2885,12 +2885,19 @@ async def test_family_project_removal_precedes_archive(auth_client, peers, db_ur
     assert not store.get_conversation(sibling_id).archived
     assert store.get_conversation(sibling_id).project_id is None
     store.update_conversation(sibling_id, archived=True)
-    # Archived members leave the family, so unarchiving returns them standalone.
+    snapshot = (await auth_client.get(f"/v1/sessions/{source['id']}")).json()
+    assert snapshot["family"]["representative_id"] == source["id"]
+
+    unpinned = await auth_client.patch(
+        f"/v1/sessions/{source['id']}", json={"labels": {"omnigent.pinned": ""}}
+    )
+    assert unpinned.status_code == 200, unpinned.text
     for session_id in (source["id"], sibling_id):
-        store.update_conversation(session_id, archived=False)
         snapshot = (await auth_client.get(f"/v1/sessions/{session_id}")).json()
-        assert snapshot.get("family") is None
-        assert store.get_conversation(session_id).family_id is None
+        assert not snapshot["family"]["pinned"]
+        store.update_conversation(session_id, archived=False)
+    snapshot = (await auth_client.get(f"/v1/sessions/{source['id']}")).json()
+    assert not snapshot["family"]["pinned"]
 
 
 @pytest.mark.parametrize("scenario", ["allowed", "foreign_host", "restricted", "shared_source"])

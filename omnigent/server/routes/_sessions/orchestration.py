@@ -1055,6 +1055,16 @@ async def _archive_stop(
     # possibly on another replica) — it's live again, so leave its runner alone.
     if conv is None or not conv.archived:
         return
+    # Past the Undo window an archived session leaves its family, freeing its slot.
+    try:
+        await asyncio.to_thread(conversation_store.leave_session_family, session_id)
+    except Exception:  # noqa: BLE001
+        _logger.warning(
+            "Archived session %s could not leave its family; a later repair detaches it",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
     # Past the point of no return: unregister so a late cancel (an Undo racing
     # this teardown) can't interrupt it mid-stop and strand the intentional-
     # stop marker below, which would exclude the session from child recovery.

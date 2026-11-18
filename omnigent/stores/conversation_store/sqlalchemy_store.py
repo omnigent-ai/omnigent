@@ -129,6 +129,7 @@ from omnigent.stores.conversation_store import (
     SessionConnectivity,
     SessionTodosUpdate,
     SpawnTreeUsage,
+    archived_family_leave_is_due,
     family_pinned_label_key,
     pinned_label_key,
     runner_seen_is_fresh,
@@ -171,6 +172,11 @@ _logger = logging.getLogger(__name__)
 
 # Concurrent re-keys a leaving session follows before giving up.
 _FAMILY_LEAVE_ATTEMPTS = 5
+
+
+class _FamilyFullError(OmnigentError):
+    """A sibling would exceed the family member cap."""
+
 
 _DELETE_METADATA_BATCH_SIZE = 100
 _DELETE_LABEL_BATCH_SIZE = 100
@@ -2069,7 +2075,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                         code=ErrorCode.CONFLICT,
                     )
                 if len(set(members) | {source_id, session_id}) > MAX_SESSION_FAMILY_MEMBERS:
-                    raise OmnigentError(
+                    raise _FamilyFullError(
                         f"A family supports up to {MAX_SESSION_FAMILY_MEMBERS} sessions",
                         code=ErrorCode.INVALID_INPUT,
                     )
@@ -2087,7 +2093,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             source_meta.family_id = family_id
             target_meta.family_id = family_id
 
-        run_write_transaction(self._session_immediate, "create_sibling_membership", write)
+        try:
+            run_write_transaction(self._session_immediate, "create_sibling_membership", write)
+        except _FamilyFullError:
+            # Archives whose deferred leave never ran (a restart in the Undo window) hold slots.
+            if not self._leave_overdue_archived_members(family_id):
+                raise
+            run_write_transaction(self._session_immediate, "create_sibling_membership", write)
         if self._conv_engine is not self._engine:
             # Commit membership before moving pins in a separate database.
             def finish_labels(session: Session) -> None:
@@ -2113,6 +2125,18 @@ class SqlAlchemyConversationStore(ConversationStore):
                 family_lock.value = "{}"
 
             run_write_transaction(self._session_immediate, "copy_sibling_labels", finish_labels)
+
+    def _leave_overdue_archived_members(self, family_id: str) -> bool:
+        """Detach archived members past their family leave; ``True`` if any left."""
+        now = now_epoch()
+        overdue = [
+            member.id
+            for member in self.get_session_families([family_id]).get(family_id, [])
+            if archived_family_leave_is_due(member, now)
+        ]
+        for member_id in overdue:
+            self.leave_session_family(member_id)
+        return bool(overdue)
 
     def leave_session_family(self, session_id: str) -> None:
         """
@@ -2185,7 +2209,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         Archive a session only if it has had no activity since ``idle_before``.
 
         The idle check and the archive are one conditional write, so activity
-        landing after a caller's read keeps the session open.
+        landing after a caller's read keeps the session open. Like any archive,
+        it leaves its family when archive teardown runs.
 
         :param conversation_id: The session to archive, e.g. ``"9f2c..."``.
         :param idle_before: Unix epoch seconds; a later ``updated_at`` skips it.
@@ -2209,19 +2234,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             _upsert_labels(session, conversation_id, {ARCHIVED_AT_LABEL_KEY: str(now)}, now)
             return True
 
-        archived = run_write_transaction(
-            self._conv_session_immediate, "archive_idle_session", write
-        )
-        if archived:
-            self._leave_family_after_archive(conversation_id)
-        return archived
-
-    def _leave_family_after_archive(self, conversation_id: str) -> None:
-        """Leave the family after a committed archive; a failure leaves it for repair."""
-        try:
-            self.leave_session_family(conversation_id)
-        except Exception:
-            _logger.exception("archived session %s could not leave its family", conversation_id)
+        return run_write_transaction(self._conv_session_immediate, "archive_idle_session", write)
 
     def set_family_pin(self, session_id: str, value: str, *, user_id: str | None) -> None:
         value = _prepare_label_updates({PINNED_LABEL_KEY: value})[PINNED_LABEL_KEY]
@@ -4878,14 +4891,6 @@ class SqlAlchemyConversationStore(ConversationStore):
         if ap_result is None:
             return None
         row, labels, reasoning_effort_changed, model_override_changed = ap_result
-        if archived:
-            # An archived session leaves its family and returns standalone if unarchived.
-            self._leave_family_after_archive(conversation_id)
-            labels = {
-                key: value
-                for key, value in labels.items()
-                if not key.startswith(FAMILY_PIN_LABEL_PREFIX)
-            }
         if terminal_launch_args is not None:
             recreated_metadata_kind = encode_conversation_kind(
                 "sub_agent" if row.parent_conversation_id else "default"

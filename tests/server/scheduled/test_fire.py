@@ -5258,7 +5258,7 @@ async def test_trigger_run_archives_only_its_idle_launched_siblings(tmp_path, mo
             .where(SqlConversation.id.notin_([sessions["active"].id, sessions["resumed"].id]))
             .values(updated_at=stale)
         )
-        # An archive that committed before its family leave failed.
+        # An archive whose deferred family leave never ran (no recent archive time).
         connection.execute(
             update(SqlConversation)
             .where(SqlConversation.id == sessions["half_archived"].id)
@@ -5304,8 +5304,9 @@ async def test_trigger_run_archives_only_its_idle_launched_siblings(tmp_path, mo
     archived = {name for name, s in sessions.items() if store.get_conversation(s.id).archived}
     assert archived == {"idle", "half_archived"}
     assert not store.get_conversation(monitor.id).archived
-    # Archived members leave the family, freeing their slots.
+    # The new archive leaves its family when teardown runs; the overdue one is repaired now.
     family = {member.id for member in real_families([monitor.id])[monitor.id]}
     assert family == {monitor.id} | {
-        sessions[name].id for name in ("active", "resumed", "elsewhere", "owner_added", "other")
+        sessions[name].id
+        for name in ("idle", "active", "resumed", "elsewhere", "owner_added", "other")
     }

@@ -171,6 +171,7 @@ from omnigent.stores.conversation_store import (
     SCHEDULED_TASK_RUN_LABEL_KEY,
     SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
+    archived_family_leave_is_due,
 )
 
 if TYPE_CHECKING:
@@ -1126,8 +1127,8 @@ async def archive_idle_launched_sessions(
 
     They are that session's siblings, so this reads one bounded family. Only
     members carrying this automation's launch label are archived, never the
-    session itself or nested agents the owner added. Archived members still in
-    the family, left by an interrupted archive, are detached. Never raises.
+    session itself or nested agents the owner added. Archived members whose
+    deferred family leave never ran are detached. Never raises.
 
     :param deps: The fire's stores and lifecycle handles.
     :param task: The automation being fired.
@@ -1153,7 +1154,9 @@ async def archive_idle_launched_sessions(
             if member.id == conv.id:
                 continue
             if member.archived:
-                await asyncio.to_thread(store.leave_session_family, member.id)
+                # An archive whose deferred family leave never ran still holds a slot.
+                if archived_family_leave_is_due(member, int(time.time())):
+                    await asyncio.to_thread(store.leave_session_family, member.id)
                 continue
             if (
                 member.updated_at > cutoff

@@ -589,6 +589,30 @@ async def test_undo_within_grace_keeps_runner_alive(
         _sessions_common._session_status_cache.pop(session_id, None)
 
 
+async def test_archived_sibling_leaves_its_family_when_teardown_runs(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """An Undo inside the grace keeps family membership; teardown afterwards frees the slot."""
+    source = await create_test_session(client, name="family-source")
+    sibling = await create_test_session(client, name="family-sibling")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.add_new_sibling(source["id"], sibling["id"], user_id=None)
+
+    with patch.object(_sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 30.0):
+        await client.patch(f"/v1/sessions/{sibling['id']}", json={"archived": True})
+        assert conv_store.get_conversation(sibling["id"]).family_id == source["id"]
+        await client.patch(f"/v1/sessions/{sibling['id']}", json={"archived": False})
+        await _drain_detached_stops()
+    assert conv_store.get_conversation(sibling["id"]).family_id == source["id"]
+
+    await client.patch(f"/v1/sessions/{sibling['id']}", json={"archived": True})
+    await _drain_detached_stops()
+    assert conv_store.get_conversation(sibling["id"]).family_id is None
+    restored = await client.patch(f"/v1/sessions/{sibling['id']}", json={"archived": False})
+    assert restored.json().get("family") is None
+
+
 async def test_archive_stop_skips_when_row_unarchived(
     client: httpx.AsyncClient,
     db_uri: str,

@@ -10477,8 +10477,15 @@ async def test_family_limit_cleans_up_rejected_creation(
 
 
 @pytest.mark.parametrize("split_database", [False, True])
-def test_archiving_a_sibling_leaves_its_family(tmp_path, split_database) -> None:
+def test_archived_sibling_leaves_its_family_after_the_undo_window(
+    tmp_path, split_database
+) -> None:
+    import time
+
+    from omnigent.errors import OmnigentError
     from omnigent.stores.conversation_store import (
+        ARCHIVED_AT_LABEL_KEY,
+        ARCHIVED_FAMILY_LEAVE_AFTER_S,
         MAX_SESSION_FAMILY_MEMBERS,
         family_pinned_label_key,
     )
@@ -10494,24 +10501,22 @@ def test_archiving_a_sibling_leaves_its_family(tmp_path, split_database) -> None
         store.add_new_sibling(source.id, member.id, user_id="alice")
     store.set_family_pin(source.id, "123", user_id="alice")
 
-    # A full family frees a slot once a member is archived.
-    for _ in range(MAX_SESSION_FAMILY_MEMBERS - 1 - len(members)):
-        store.add_new_sibling(source.id, store.create_conversation().id, user_id="alice")
-    archived = store.update_conversation(members[0].id, archived=True)
-    assert archived.family_id is None
-    assert pin_key not in archived.labels
-    store.add_new_sibling(source.id, store.create_conversation().id, user_id="alice")
-    assert len(store.get_session_family(source.id)) == MAX_SESSION_FAMILY_MEMBERS
+    # Archive alone keeps membership, so an Undo returns the session to its family.
+    store.update_conversation(members[0].id, archived=True)
+    assert store.update_conversation(members[0].id, archived=False).family_id == source.id
 
-    # Unarchiving returns it standalone, able to start its own family.
+    # Teardown's leave frees the slot; a later unarchive is standalone and can start a family.
+    store.update_conversation(members[0].id, archived=True)
+    store.leave_session_family(members[0].id)
     restored = store.update_conversation(members[0].id, archived=False)
     assert restored.family_id is None
     assert pin_key not in restored.labels
     store.add_new_sibling(members[0].id, store.create_conversation().id, user_id="alice")
     assert len(store.get_session_family(members[0].id)) == 2
 
-    # Archiving the session whose id keys the family moves the rest to a member's id.
+    # Leaving the session whose id keys the family moves the rest to a member's id.
     store.update_conversation(source.id, archived=True)
+    store.leave_session_family(source.id)
     remaining = store.get_session_family(members[1].id)
     assert source.id not in {member.id for member in remaining}
     new_family_ids = {member.family_id for member in remaining}
@@ -10526,8 +10531,23 @@ def test_archiving_a_sibling_leaves_its_family(tmp_path, split_database) -> None
         follow_up.id,
     ]
 
+    # A full family reclaims an archive whose leave never ran, but not one still in its window.
+    anchor = members[1].id
+    for _ in range(MAX_SESSION_FAMILY_MEMBERS - len(remaining)):
+        store.add_new_sibling(anchor, store.create_conversation().id, user_id="alice")
+    store.update_conversation(members[2].id, archived=True)
+    with pytest.raises(OmnigentError, match=f"up to {MAX_SESSION_FAMILY_MEMBERS}"):
+        store.add_new_sibling(anchor, store.create_conversation().id, user_id="alice")
+    overdue = int(time.time()) - ARCHIVED_FAMILY_LEAVE_AFTER_S - 1
+    store.set_labels(members[2].id, {ARCHIVED_AT_LABEL_KEY: str(overdue)})
+    store.add_new_sibling(anchor, store.create_conversation().id, user_id="alice")
+    assert store.get_conversation(members[2].id).family_id is None
+    assert len(store.get_session_family(anchor)) == MAX_SESSION_FAMILY_MEMBERS
 
-def test_archive_family_leave_survives_races_and_failures(conversation_store, monkeypatch) -> None:
+
+def test_family_leave_follows_a_concurrent_rekey_and_idle_archive_is_conditional(
+    conversation_store, monkeypatch
+) -> None:
     import time
 
     from sqlalchemy import update
@@ -10536,13 +10556,13 @@ def test_archive_family_leave_survives_races_and_failures(conversation_store, mo
 
     store = conversation_store
     source = store.create_conversation(conversation_id="1" * 32)
-    members = [store.create_conversation(conversation_id=f"{n}" * 32) for n in (2, 3, 4)]
+    members = [store.create_conversation(conversation_id=f"{n}" * 32) for n in (2, 3)]
     for member in members:
         store.add_new_sibling(source.id, member.id, user_id="alice")
 
     # A member that read the old family id before the key session re-keyed it still leaves.
     stale_meta = store._get_meta(members[0].id)
-    store.update_conversation(source.id, archived=True)
+    store.leave_session_family(source.id)
     real_get_meta = store._get_meta
     monkeypatch.setattr(
         store,
@@ -10551,36 +10571,23 @@ def test_archive_family_leave_survives_races_and_failures(conversation_store, mo
             stale_meta if session_id == members[0].id else real_get_meta(session_id)
         ),
     )
-    store.update_conversation(members[0].id, archived=True)
-    monkeypatch.setattr(store, "_get_meta", real_get_meta)
-    assert store.get_conversation(members[0].id).family_id is None
-
-    # A failed leave keeps the committed archive, and a later leave repairs it.
-    def fail_leave(session_id):
-        raise RuntimeError("metadata database unavailable")
-
-    monkeypatch.setattr(store, "leave_session_family", fail_leave)
-    archived = store.update_conversation(members[1].id, archived=True)
+    store.leave_session_family(members[0].id)
     monkeypatch.undo()
-    assert archived.archived
-    assert store.get_conversation(members[1].id).family_id is not None
-    store.leave_session_family(members[1].id)
-    assert store.get_conversation(members[1].id).family_id is None
+    assert store.get_conversation(members[0].id).family_id is None
 
     # The idle check and the archive are one write: activity after the cutoff wins.
     cutoff = int(time.time()) - 60
-    assert not store.archive_if_idle(members[2].id, cutoff)
-    assert not store.get_conversation(members[2].id).archived
+    assert not store.archive_if_idle(members[1].id, cutoff)
+    assert not store.get_conversation(members[1].id).archived
     with store._conv_engine.begin() as connection:
         connection.execute(
             update(SqlConversation)
-            .where(SqlConversation.id == members[2].id)
+            .where(SqlConversation.id == members[1].id)
             .values(updated_at=cutoff - 1)
         )
-    assert store.archive_if_idle(members[2].id, cutoff)
-    assert not store.archive_if_idle(members[2].id, cutoff)
-    idle = store.get_conversation(members[2].id)
-    assert idle.archived and idle.family_id is None
+    assert store.archive_if_idle(members[1].id, cutoff)
+    assert not store.archive_if_idle(members[1].id, cutoff)
+    assert store.get_conversation(members[1].id).archived
 
 
 @pytest.mark.parametrize(
