@@ -40,6 +40,7 @@ from omnigent.host.connect import HostProcess
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
+    HostHarnessReadinessFrame,
     HostHelloFrame,
     HostLaunchRunnerFrame,
     HostLaunchRunnerResultFrame,
@@ -148,7 +149,7 @@ def app(runtime_init: None, db_uri: str, tmp_path) -> FastAPI:
     return _host_app(db_uri, tmp_path)
 
 
-def _host_app(db_uri: str, tmp_path: Path) -> FastAPI:
+def _host_app(db_uri: str, tmp_path: Path, **options: Any) -> FastAPI:
     """Build one server replica with independent host tunnels and shared stores."""
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     return create_app(
@@ -162,7 +163,71 @@ def _host_app(db_uri: str, tmp_path: Path) -> FastAPI:
         ),
         comment_store=SqlAlchemyCommentStore(db_uri),
         host_store=HostStore(db_uri),
+        **options,
     )
+
+
+@pytest.mark.parametrize("retirement", ["blocked", "failed"])
+async def test_host_notifications_survive_recovery_retirement(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    retirement: str,
+) -> None:
+    from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
+    from omnigent.server.startup_inputs import ManagedStartupInputs
+    from tests._helpers.polling import poll_until_async
+
+    app = _host_app(
+        db_uri,
+        tmp_path,
+        host_session_recovery=True,
+        sandbox_config=ManagedSandboxDeployment.single(
+            ManagedSandboxConfig(
+                server_url="https://server.example.test",
+                launcher_factory=Mock(),
+                token_ttl_s=3600,
+                provider="test",
+            )
+        ),
+    )
+    entered = asyncio.Event()
+
+    async def retire(_connection: HostConnection) -> None:
+        entered.set()
+        if retirement == "failed":
+            raise RuntimeError("store unavailable")
+        await asyncio.Future()
+
+    service = app.state.host_session_recoverer
+    monkeypatch.setattr(service, "retire_disabled", retire)
+    announced, startup = Mock(), Mock()
+    monkeypatch.setattr("omnigent.server.app.announce_hosts_changed", announced)
+    monkeypatch.setattr(ManagedStartupInputs, "host_changed", startup)
+    comm = await _connect_host(app)
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=budget(5.0))
+        connection = app.state.host_registry.get(_HOST_ID)
+        assert not connection.hello.recover_interrupted_sessions
+        announced.assert_called_once_with(connection.owner)
+        startup.assert_called_once_with(app, _HOST_ID)
+        # A second host frame must be processed even while retirement is blocked.
+        await comm.send_input(
+            {
+                "type": "websocket.receive",
+                "text": encode_host_frame(
+                    HostHarnessReadinessFrame(configured_harnesses={"codex-native": True})
+                ),
+            }
+        )
+        await poll_until_async(lambda: announced.call_count == 2, timeout_s=budget(5.0))
+        assert startup.call_count == 2
+    finally:
+        await service.shutdown()
+        assert not service._retirement_tasks
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=budget(5.0))
 
 
 async def _connect_host(

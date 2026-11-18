@@ -176,6 +176,7 @@ class HostSessionRecoverer:
         self.sandbox_config = sandbox_config
         self.deployment_gate = deployment_gate
         self.recovery_prompt = recovery_prompt
+        self._retirement_tasks: set[asyncio.Task[None]] = set()
         self._validate_prompt(recovery_prompt)
         for config in sandbox_config.configs if sandbox_config is not None else ():
             settings = (config.host_config or {}).get("host", {})
@@ -231,6 +232,26 @@ class HostSessionRecoverer:
     def stop_recovery(self, conv: Conversation, *, only_pending: bool = False) -> None:
         if self.store.supports_session_recovery:
             _stop_recovery(self.store, conv, only_pending=only_pending)
+
+    def schedule_retirement(self, connection: HostConnection) -> None:
+        """Keep opt-out bookkeeping independent of normal host connection handling."""
+
+        async def retire() -> None:
+            try:
+                await self.retire_disabled(connection)
+            except Exception:
+                _logger.exception("Host recovery retirement failed for %s", connection.host_id)
+
+        task = asyncio.create_task(retire(), name=f"host-recovery-retire-{connection.host_id}")
+        self._retirement_tasks.add(task)
+        task.add_done_callback(self._retirement_tasks.discard)
+
+    async def shutdown(self) -> None:
+        """Drain connection bookkeeping when the server stops."""
+        tasks = list(self._retirement_tasks)
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     async def retire_disabled(self, connection: HostConnection) -> None:
         """Opting out closes existing episodes without storing a host preference."""

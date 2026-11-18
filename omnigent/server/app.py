@@ -2602,6 +2602,8 @@ def create_app(
             )
             if startup_inputs is not None:
                 await startup_inputs.shutdown()
+            if host_session_recoverer is not None:
+                await host_session_recoverer.shutdown()
             await background_title_coordinator.shutdown()
             _uninstall_subagent_block_notifier()
             set_resource_registry(None)
@@ -5629,10 +5631,10 @@ def create_app(
                 startup_inputs.host_changed(app, _host_id)
 
         async def _on_host_connected(host_id: str, owner: str | None) -> None:
+            await _on_hosts_changed(host_id, owner)
             connection = host_registry.get(host_id)
             if connection is not None and host_session_recoverer is not None:
-                await host_session_recoverer.retire_disabled(connection)
-            await _on_hosts_changed(host_id, owner)
+                host_session_recoverer.schedule_retirement(connection)
 
         app.include_router(
             create_host_tunnel_router(
