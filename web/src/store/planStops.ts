@@ -5,7 +5,12 @@ export interface PlanStopRequest {
   /** Tells this Stop from a later one, across its `sent` update. */
   id: number;
   sent: boolean;
+  /** The stop message's conversation item, once the session took it, when the server names it. */
+  itemId?: string;
 }
+
+/** How delivering a stop message went: null when the session didn't take it. */
+export type PlanStopDelivery = { itemId?: string } | null;
 
 interface PlanStopsState {
   requests: Readonly<Partial<Record<string, PlanStopRequest>>>;
@@ -15,8 +20,8 @@ interface PlanStopsState {
 
 /**
  * Per session, the Stop the user asked of its run's main agent, kept until the
- * run stops, the message fails or the session takes another message from the
- * user. The Tasks tab and the run rows all read it, so they agree the run is stopping.
+ * run stops, the message fails or the session takes another request. The
+ * Tasks tab and the run rows all read it, so they agree the run is stopping.
  */
 export const usePlanStops = create<PlanStopsState>(() => ({ requests: {}, settledStops: {} }));
 
@@ -44,20 +49,31 @@ function currentRequest(sessionId: string): PlanStopRequest | undefined {
  * Show *sessionId*'s run as stopping while *send* delivers the Stop, then until
  * the run stops. A Stop the session doesn't take restores the Stop control.
  *
- * @param send Delivers the stop message, resolving to whether the session took it.
+ * @param send Delivers the stop message.
  */
 export async function trackPlanStop(
   sessionId: string,
-  send: () => Promise<boolean>,
+  send: () => Promise<PlanStopDelivery>,
 ): Promise<void> {
   const sending: PlanStopRequest = { id: nextRequestId++, sent: false };
   replaceRequest(sessionId, currentRequest(sessionId), sending);
-  let taken = false;
+  let delivery: PlanStopDelivery = null;
   try {
-    taken = await send();
+    delivery = await send();
   } finally {
-    replaceRequest(sessionId, sending, taken ? { ...sending, sent: true } : undefined);
+    replaceRequest(
+      sessionId,
+      sending,
+      delivery
+        ? { ...sending, sent: true, ...(delivery.itemId ? { itemId: delivery.itemId } : {}) }
+        : undefined,
+    );
   }
+}
+
+/** End *request*, unless a later Stop took its place. */
+export function endPlanStop(sessionId: string, request: PlanStopRequest): void {
+  replaceRequest(sessionId, request, undefined);
 }
 
 /**
@@ -69,7 +85,7 @@ export async function trackPlanStop(
 export function supersedePlanStop(sessionId: string | null): () => void {
   const superseded = sessionId === null ? undefined : currentRequest(sessionId);
   return () => {
-    if (sessionId !== null && superseded) replaceRequest(sessionId, superseded, undefined);
+    if (sessionId !== null && superseded) endPlanStop(sessionId, superseded);
   };
 }
 
@@ -84,7 +100,7 @@ export function settlePlanStop(
   request: PlanStopRequest | undefined,
   stopMessage: string | null,
 ): void {
-  if (request?.sent) replaceRequest(sessionId, request, undefined);
+  if (request?.sent) endPlanStop(sessionId, request);
   if (stopMessage === null || usePlanStops.getState().settledStops[sessionId] === stopMessage) {
     return;
   }

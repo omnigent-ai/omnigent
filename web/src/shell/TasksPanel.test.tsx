@@ -20,7 +20,12 @@ import type { JournalEntry, StepProgress } from "@/lib/sessionJournal";
 import { continuePlanMessage, stopPlanMessage } from "@/lib/workflow";
 import type { ConversationState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
-import { supersedePlanStop, trackPlanStop, usePlanStops } from "@/store/planStops";
+import {
+  type PlanStopDelivery,
+  supersedePlanStop,
+  trackPlanStop,
+  usePlanStops,
+} from "@/store/planStops";
 import {
   openTasksTab,
   registerContinuePlan,
@@ -772,21 +777,21 @@ describe("TasksPanel", () => {
 
     /** Registers the composer's Stop, whose message the session takes once `deliver` settles. */
     function registerTrackedStop() {
-      let deliver!: (taken: boolean) => void;
+      let deliver!: (delivery: PlanStopDelivery) => void;
       const withdraw = registerStopWork(
         "conv",
         () =>
           void trackPlanStop(
             "conv",
             () =>
-              new Promise<boolean>((resolve) => {
+              new Promise<PlanStopDelivery>((resolve) => {
                 deliver = resolve;
               }),
           ),
       );
       onTestFinished(() => act(withdraw));
       onTestFinished(() => usePlanStops.setState({ requests: {}, settledStops: {} }));
-      return (taken: boolean) => act(async () => deliver(taken));
+      return (taken: boolean) => act(async () => deliver(taken ? {} : null));
     }
 
     beforeEach(() => {
@@ -826,6 +831,20 @@ describe("TasksPanel", () => {
       await deliver(false);
       expect(screen.queryByTestId("plan-stopping")).toBeNull();
       expect(screen.getByTestId("plan-stop")).toBeEnabled();
+    });
+
+    it("keeps Stopping… while background work outlives the agent's turn", async () => {
+      const deliver = registerTrackedStop();
+      setSession({ sessionStatus: "running" });
+      renderPanel();
+      fireEvent.click(screen.getByTestId("plan-stop"));
+      await deliver(true);
+
+      setSession({ sessionStatus: "idle", backgroundTaskCount: 1 });
+      expect(screen.getByTestId("plan-stopping")).toBeInTheDocument();
+      setSession({ backgroundTaskCount: 0 });
+      expect(screen.queryByTestId("plan-stopping")).toBeNull();
+      expect(screen.getByTestId("plan-continue")).toBeInTheDocument();
     });
 
     it("shows Stop again once the session takes Continue while it stops", async () => {

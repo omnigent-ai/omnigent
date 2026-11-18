@@ -3638,7 +3638,7 @@ describe("chatStore — send (first-send ordering)", () => {
       abortController: new AbortController(),
       pendingUserMessages: [],
     });
-    await trackPlanStop("conv_existing", async () => true);
+    await trackPlanStop("conv_existing", async () => ({}));
     fetchMock.mockImplementation((input, init) => {
       if (String(input).endsWith("/v1/sessions/conv_existing/events")) {
         return mockResponse({ error: "boom" }, { ok: false, status: 500 });
@@ -3674,7 +3674,7 @@ describe("chatStore — send (first-send ordering)", () => {
 
     const sending = useChatStore.getState().send("Keep the logs", "agent_xyz");
     await vi.waitFor(() => expect(landMessage).toBeDefined());
-    await trackPlanStop("conv_existing", async () => true);
+    await trackPlanStop("conv_existing", async () => ({}));
     landMessage!();
     await sending;
     expect(usePlanStops.getState().requests.conv_existing).toMatchObject({ sent: true });
@@ -5588,6 +5588,27 @@ describe("chatStore — sendSlashCommand", () => {
     await useChatStore.getState().sendSlashCommand("deslop", "", "agent_xyz");
 
     expect(lastEventBody().data).toEqual({ kind: "skill", name: "deslop", arguments: "" });
+  });
+
+  it("ends a plan's Stop in progress once the session takes the command, not when it refuses it", async () => {
+    onTestFinished(() => usePlanStops.setState({ requests: {}, settledStops: {} }));
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+    await trackPlanStop("conv_existing", async () => ({}));
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events")) {
+        return mockResponse({ error: "boom" }, { ok: false, status: 500 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().sendSlashCommand("workflow", "Fix the tests", "agent_xyz");
+    expect(usePlanStops.getState().requests.conv_existing).toMatchObject({ sent: true });
+
+    fetchMock.mockImplementation(defaultFetchHandler);
+    await useChatStore.getState().sendSlashCommand("workflow", "Fix the tests", "agent_xyz");
+    expect(usePlanStops.getState().requests.conv_existing).toBeUndefined();
   });
 
   it("sets streaming status and pushes an optimistic echo of the typed command", async () => {

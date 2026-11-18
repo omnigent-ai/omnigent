@@ -4211,12 +4211,12 @@ function ComposerImpl(
       void trackPlanStop(sessionId, async () => {
         try {
           const result = await sendUserMessage(sessionId, message);
-          if (result.denied) toast.error("A policy blocked the message.");
-          return !result.denied;
+          if (!result.denied) return result;
+          toast.error("A policy blocked the message.");
         } catch (error) {
           toast.error(error instanceof Error ? error.message : "Couldn't reach the session.");
-          return false;
         }
+        return null;
       });
     }
   };

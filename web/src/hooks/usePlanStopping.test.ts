@@ -4,8 +4,13 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { AnyBlock } from "@/lib/blocks";
 import { continuePlanMessage, stopPlanMessage } from "@/lib/workflow";
 import { conversationRegistry } from "@/store/conversationRegistry";
-import { supersedePlanStop, trackPlanStop, usePlanStops } from "@/store/planStops";
-import { latestStopRequest, usePlanStopping } from "./usePlanStopping";
+import {
+  type PlanStopDelivery,
+  supersedePlanStop,
+  trackPlanStop,
+  usePlanStops,
+} from "@/store/planStops";
+import { hasRequestAfter, latestStopRequest, usePlanStopping } from "./usePlanStopping";
 
 const SESSION = "e".repeat(32);
 
@@ -34,27 +39,27 @@ function pendingSend(tempId: string, text: string) {
 
 /** A stop whose message is still on its way, and how to settle it. */
 function sendStop() {
-  let settle!: (taken: boolean) => void;
+  let settle!: (delivery: PlanStopDelivery) => void;
   let fail!: (error: Error) => void;
   let tracked!: Promise<void>;
   act(() => {
     tracked = trackPlanStop(
       SESSION,
       () =>
-        new Promise<boolean>((resolve, reject) => {
+        new Promise<PlanStopDelivery>((resolve, reject) => {
           settle = resolve;
           fail = reject;
         }),
     );
   });
-  const settleWith = (taken: boolean) =>
+  const settleWith = (delivery: PlanStopDelivery) =>
     act(async () => {
-      settle(taken);
+      settle(delivery);
       await tracked;
     });
   return {
-    take: () => settleWith(true),
-    refuse: () => settleWith(false),
+    take: (itemId?: string) => settleWith(itemId ? { itemId } : {}),
+    refuse: () => settleWith(null),
     fail: (error: Error) =>
       act(async () => {
         fail(error);
@@ -135,13 +140,48 @@ describe("usePlanStopping", () => {
     expect(result.current).toBe(true);
   });
 
+  it("ends when the transcript shows a request after the Stop's own message, as from another tab", async () => {
+    const entry = conversationRegistry.acquire(SESSION);
+    const { result } = renderStopping(true);
+    await sendStop().take("stop_item");
+    act(() => entry.setState({ blocks: [userMessage("stop_item", stopPlanMessage(null))] }));
+    expect(result.current).toBe(true);
+
+    act(() =>
+      entry.setState({
+        blocks: [
+          userMessage("stop_item", stopPlanMessage(null)),
+          userMessage("report", "[Message from session 9b8b]\nStopped my shells."),
+        ],
+      }),
+    );
+    expect(result.current).toBe(true);
+    act(() =>
+      entry.setState({
+        blocks: [
+          userMessage("stop_item", stopPlanMessage(null)),
+          userMessage("go", continuePlanMessage(null)),
+        ],
+      }),
+    );
+    expect(result.current).toBe(false);
+    expect(usePlanStops.getState().requests[SESSION]).toBeUndefined();
+  });
+
   it("drops the Stop once no surface watches the session, which can't see it stop", async () => {
     const watching = renderStopping(true);
-    await sendStop().take();
+    await sendStop().take("stop_item");
     expect(watching.result.current).toBe(true);
     watching.unmount();
     expect(usePlanStops.getState().requests[SESSION]).toBeUndefined();
 
+    // Unwatched, the run stopped and was continued from another tab; the session runs again.
+    conversationRegistry.acquire(SESSION).setState({
+      blocks: [
+        userMessage("stop_item", stopPlanMessage(null)),
+        userMessage("go", continuePlanMessage(null)),
+      ],
+    });
     expect(renderStopping(true).result.current).toBe(false);
   });
 
@@ -165,6 +205,28 @@ describe("usePlanStopping", () => {
       }),
     );
     expect(result.current).toBe(true);
+  });
+});
+
+describe("hasRequestAfter", () => {
+  it("finds a request from the user after the message, not a notice or a report", () => {
+    const stop = userMessage("stop_item", stopPlanMessage(null));
+    expect(hasRequestAfter([stop], "stop_item")).toBe(false);
+    expect(hasRequestAfter([], "stop_item")).toBe(false);
+    expect(
+      hasRequestAfter(
+        [
+          stop,
+          userMessage("notice", "[System: timer t1 fired]"),
+          userMessage("report", "[Message from session 9b8b]\nDone."),
+        ],
+        "stop_item",
+      ),
+    ).toBe(false);
+    expect(hasRequestAfter([stop, slashCommand("cmd", "workflow")], "stop_item")).toBe(true);
+    expect(hasRequestAfter([userMessage("go", continuePlanMessage(null)), stop], "stop_item")).toBe(
+      false,
+    );
   });
 });
 
