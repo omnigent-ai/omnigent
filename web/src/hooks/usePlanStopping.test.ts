@@ -4,8 +4,13 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { AnyBlock } from "@/lib/blocks";
 import { continuePlanMessage, stopPlanMessage } from "@/lib/workflow";
 import { conversationRegistry } from "@/store/conversationRegistry";
-import { supersedePlanStop, trackPlanStop, usePlanStops } from "@/store/planStops";
-import { latestStopRequest, usePlanStopping } from "./usePlanStopping";
+import {
+  latestStopRequest,
+  supersedePlanStop,
+  trackPlanStop,
+  usePlanStops,
+} from "@/store/planStops";
+import { usePlanStopping } from "./usePlanStopping";
 
 const SESSION = "e".repeat(32);
 
@@ -152,6 +157,44 @@ describe("usePlanStopping", () => {
     act(endStopA);
     expect(result.current).toBe(true);
     expect(usePlanStops.getState().requests[SESSION]).toMatchObject({ sent: true });
+  });
+
+  it("keeps a Stop that began after a follow-up the transcript shows later", async () => {
+    const entry = transcript();
+    const { result } = renderStopping(true);
+    await sendStop().take();
+    act(() => entry.setState({ blocks: [STOP] }));
+    // A follow-up the session accepts ends Stop A; its transcript item comes later.
+    const endStopA = supersedePlanStop(SESSION);
+    act(endStopA);
+    const followUp = pendingSend("pend_1", "Keep the logs", true);
+    act(() => entry.setState({ pendingUserMessages: [followUp] }));
+    expect(result.current).toBe(false);
+
+    // Stop B, while the transcript still ends in A.
+    await sendStop().take();
+    expect(result.current).toBe(true);
+    const logs = userMessage("logs", "Keep the logs");
+    act(() => entry.setState({ blocks: [STOP, logs], pendingUserMessages: [] }));
+    expect(result.current).toBe(true);
+    // B's own message, then a later request.
+    const stopB = userMessage("stop_b", stopPlanMessage(null));
+    act(() => entry.setState({ blocks: [STOP, logs, stopB] }));
+    expect(result.current).toBe(true);
+    act(() => entry.setState({ blocks: [STOP, logs, stopB, CONTINUE] }));
+    expect(result.current).toBe(false);
+  });
+
+  it("ends a transcript's Stop once the session accepts a follow-up sent outside the chat", () => {
+    const entry = transcript();
+    entry.setState({ blocks: [STOP] });
+    const { result } = renderStopping(true);
+    expect(result.current).toBe(true);
+
+    // A run row's Retry: no pending bubble, and its item comes later.
+    const endStop = supersedePlanStop(SESSION);
+    act(endStop);
+    expect(result.current).toBe(false);
   });
 
   it("ends when the transcript shows a later request after the stop message, as from another tab", async () => {

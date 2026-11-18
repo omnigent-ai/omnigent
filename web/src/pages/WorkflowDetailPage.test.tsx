@@ -1,7 +1,7 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import { showToast } from "@/components/ui/toast";
 import { SessionDescendantRuns } from "@/components/workflows/WorkflowRunRow";
@@ -1546,12 +1546,34 @@ describe("WorkflowDetailPage", () => {
 
     it("shows Stop again once the session takes another message while it stops", async () => {
       vi.mocked(sendUserMessage).mockClear().mockResolvedValue({ queued: true });
+      onTestFinished(() => act(() => conversationRegistry.clear()));
       renderPage();
       const row = screen.getByTestId("workflow-run");
       fireEvent.click(within(row).getByRole("button", { name: "Stop" }));
       await waitFor(() => expect(sendUserMessage).toHaveBeenCalledTimes(1));
       expect(within(row).getByTestId("plan-stopping")).toBeInTheDocument();
+      // The session's stream is still open from a visit to it, and shows the stop message.
+      act(() =>
+        conversationRegistry.acquire(session).setState({
+          blocks: [
+            {
+              type: "user_message",
+              ctx: {
+                agent: null,
+                depth: 0,
+                turn: 0,
+                timestamp: 0,
+                responseId: "t",
+                itemId: "stop",
+              },
+              content: [{ type: "input_text", text: stopPlanMessage(WORKFLOW.name) }],
+            },
+          ],
+        }),
+      );
+      expect(within(row).getByTestId("plan-stopping")).toBeInTheDocument();
 
+      // Retry is accepted before its message reaches the transcript.
       fireEvent.focus(within(row).getAllByTestId("tasks-progress-segment")[1]!);
       fireEvent.pointerDown(await screen.findByTestId("tasks-progress-menu"), { button: 0 });
       fireEvent.click(screen.getByTestId("tasks-progress-retry"));

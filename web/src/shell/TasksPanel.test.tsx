@@ -20,7 +20,7 @@ import type { JournalEntry, StepProgress } from "@/lib/sessionJournal";
 import { continuePlanMessage, stopPlanMessage } from "@/lib/workflow";
 import type { ConversationState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
-import { supersedePlanStop, trackPlanStop, usePlanStops } from "@/store/planStops";
+import { trackPlanStop, usePlanStops } from "@/store/planStops";
 import {
   openTasksTab,
   registerContinuePlan,
@@ -840,31 +840,6 @@ describe("TasksPanel", () => {
       setSession({ backgroundTaskCount: 0 });
       expect(screen.queryByTestId("plan-stopping")).toBeNull();
       expect(screen.getByTestId("plan-continue")).toBeInTheDocument();
-    });
-
-    it("shows Stop again once the session takes Continue while it stops", async () => {
-      const deliver = registerTrackedStop();
-      setSession({ sessionStatus: "running" });
-      renderPanel();
-      fireEvent.click(screen.getByTestId("plan-stop"));
-      await deliver(true);
-      expect(screen.getByTestId("plan-stopping")).toBeInTheDocument();
-
-      // What the composer's send does: Continue goes out, and the session takes it.
-      const endStop = supersedePlanStop("conv");
-      act(endStop);
-      setSession({
-        blocks: [userMessage("stop", stopPlanMessage(null))],
-        pendingUserMessages: [
-          {
-            tempId: "pend_1",
-            content: [{ type: "input_text", text: continuePlanMessage(null) }],
-            posted: true,
-          },
-        ],
-      });
-      expect(screen.queryByTestId("plan-stopping")).toBeNull();
-      expect(screen.getByTestId("plan-stop")).toBeInTheDocument();
     });
 
     it("shows Stop once the transcript shows a request after the stop message, as from another tab", async () => {
