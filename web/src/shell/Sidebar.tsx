@@ -24,6 +24,7 @@ import {
 import { useSessionRowQuickActions } from "@/lib/sessionRowQuickActionsPreferences";
 import { useCuratedOutHarnesses } from "@/hooks/useCuratedOutHarnesses";
 import { useInertRef } from "@/hooks/useInertRef";
+import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { useMenuGuardedTooltip } from "@/hooks/useMenuGuardedTooltip";
 import { useSidebarDisplayPagination } from "@/hooks/useSidebarDisplayPagination";
 import { useSidebarWorkingIds } from "@/hooks/useSidebarWorkingIds";
@@ -184,6 +185,7 @@ import {
   useProjectSessions,
   useMoveToProject,
   useMoveToNest,
+  useSessionSearch,
   useDeleteProject,
   useRenameProject,
   useProjectConfig,
@@ -455,7 +457,7 @@ const RowEditHoldContext = createContext<(id: string, editing: boolean) => void>
 // Moves a session into another row's slot in the Custom order (row menu Move up/down).
 const SessionReorderContext = createContext<(fromId: string, toId: string) => void>(() => {});
 const NestDestinationsContext = createContext<readonly Conversation[]>([]);
-const RevealNestContext = createContext<(sourceId: string | null) => void>(() => {});
+const RevealNestContext = createContext<(destination: Conversation | null) => void>(() => {});
 
 // Stable callback identity that always runs the latest `fn` — keeps the row
 // handlers from changing on every Sidebar render and defeating the row memo.
@@ -489,7 +491,7 @@ function SidebarRowDataProvider({
   onActivate: (id: string, event: MouseEvent<HTMLAnchorElement>) => void;
   onReorder: (fromId: string, toId: string) => void;
   nestDestinations: readonly Conversation[];
-  onRevealNest: (sourceId: string | null) => void;
+  onRevealNest: (destination: Conversation | null) => void;
   children: ReactNode;
 }) {
   return (
@@ -3483,8 +3485,7 @@ function ConversationList({
       ].map(([representative]) => representative),
     [allConversations, folderConversations, viewerId],
   );
-  const revealNest = useStableCallback((sourceId: string | null) => {
-    const destination = nestDestinations.find((row) => row.id === sourceId);
+  const revealNest = useStableCallback((destination: Conversation | null) => {
     if (!destination?.family) return;
     setCollapsedFamilies(
       (previous) => new Set([...previous].filter((id) => id !== destination.family!.id)),
@@ -5200,11 +5201,11 @@ export function ConversationMenuItems({
       canMoveProject={canMoveProject}
       nestingEnabled={nestingEnabled && !isArchived}
       nestSaving={moveToNest.isPending}
-      onNestSelect={(sourceId) => {
+      onNestSelect={(destination) => {
         setMenuOpen(false);
         moveToNest.mutate(
-          { id: conversation.id, sourceId },
-          { onSuccess: () => revealNest(sourceId) },
+          { id: conversation.id, sourceId: destination?.id ?? null },
+          { onSuccess: () => revealNest(destination) },
         );
       }}
     />
@@ -7583,12 +7584,35 @@ function SessionMovePickerMenu({
   canMoveProject: boolean;
   nestingEnabled: boolean;
   nestSaving: boolean;
-  onNestSelect: (sourceId: string | null) => void;
+  onNestSelect: (destination: Conversation | null) => void;
 }) {
   const { data: projects = [] } = useProjects();
   const nests = useContext(NestDestinationsContext);
+  const viewerId = useContext(ViewerIdContext);
   const [search, setSearch] = useState("");
   const trimmed = search.trim();
+  const debouncedQuery = useDebouncedValue(nestingEnabled ? trimmed : "", 300);
+  const nestSearch = useSessionSearch(debouncedQuery, "title", {
+    enabled: nestingEnabled && debouncedQuery !== "",
+    limit: 20,
+    includeArchived: false,
+    visibility: "mine",
+  });
+  const searchingNests = nestingEnabled && trimmed !== "";
+  const searchPending = searchingNests && (debouncedQuery !== trimmed || nestSearch.isPending);
+  const searchError = searchingNests && debouncedQuery === trimmed && nestSearch.isError;
+  const hasMoreNests = searchingNests && debouncedQuery === trimmed && nestSearch.hasNextPage;
+  const searchRows =
+    searchingNests && debouncedQuery === trimmed
+      ? (nestSearch.data?.pages.flatMap((page) => page.data) ?? [])
+      : [];
+  const availableNests = [
+    ...sessionFamilyGroups(
+      dedupeConversationsById([...searchRows, ...nests]).filter(
+        (row) => !row.archived && !row.provisional && isOwnedByViewer(row, viewerId),
+      ),
+    ).values(),
+  ].map(([representative]) => representative);
   const matchesSearch = (name: string) => name.toLowerCase().includes(trimmed.toLowerCase());
   const nestLabel = (row: Conversation) =>
     row.id === row.family?.representative_id
@@ -7596,7 +7620,7 @@ function SessionMovePickerMenu({
       : (row.family?.representative_title ?? conversationDisplayLabel(row));
   const filtered = canMoveProject ? projects.filter((project) => matchesSearch(project.name)) : [];
   const filteredNests = nestingEnabled
-    ? nests.filter(
+    ? availableNests.filter(
         (row) => row.family?.id !== conversation.family?.id && matchesSearch(nestLabel(row)),
       )
     : [];
@@ -7645,17 +7669,51 @@ function SessionMovePickerMenu({
             className="px-2 py-1"
             textValue={nestLabel(nest)}
             disabled={nestSaving}
-            onSelect={() => onNestSelect(nest.id)}
+            onSelect={() => onNestSelect(nest)}
           >
             <GitBranchIcon className="size-3.5 shrink-0 text-muted-foreground" />
             <span className="flex-1 truncate text-left">{nestLabel(nest)}</span>
           </C.Item>
         ))}
-        {filtered.length === 0 && filteredNests.length === 0 && !canCreate && (
-          <p className="px-2 py-1.5 text-sm text-muted-foreground">
-            {nestingEnabled ? "No matching destinations." : "No projects yet."}
+        {searchPending && (
+          <p role="status" className="px-2 py-1.5 text-sm text-muted-foreground">
+            Searching nests…
           </p>
         )}
+        {searchError ? (
+          <C.Item
+            className="px-2 py-1"
+            onSelect={(event) => {
+              event.preventDefault();
+              void (nestSearch.isFetchNextPageError
+                ? nestSearch.fetchNextPage()
+                : nestSearch.refetch());
+            }}
+          >
+            Couldn’t search nests. Retry
+          </C.Item>
+        ) : hasMoreNests ? (
+          <C.Item
+            className="px-2 py-1"
+            disabled={nestSearch.isFetching}
+            onSelect={(event) => {
+              event.preventDefault();
+              void nestSearch.fetchNextPage();
+            }}
+          >
+            {nestSearch.isFetchingNextPage ? "Loading…" : "Show more"}
+          </C.Item>
+        ) : null}
+        {filtered.length === 0 &&
+          filteredNests.length === 0 &&
+          !canCreate &&
+          !searchPending &&
+          !searchError &&
+          !hasMoreNests && (
+            <p className="px-2 py-1.5 text-sm text-muted-foreground">
+              {nestingEnabled ? "No matching destinations." : "No projects yet."}
+            </p>
+          )}
       </div>
       {canCreate && (
         <div className="border-t pt-1">

@@ -321,7 +321,7 @@ describe("useSessionSearch", () => {
     },
   );
 
-  it("keeps archived and unarchived searches of the same text apart", async () => {
+  it("keeps archived, unarchived and owner-only searches of the same text apart", async () => {
     fetchMock.mockResolvedValue(
       mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
     );
@@ -333,17 +333,31 @@ describe("useSessionSearch", () => {
     renderHook(() => useSessionSearch("kestrel", "title", { limit: 8, includeArchived: false }), {
       wrapper,
     });
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+    renderHook(
+      () =>
+        useSessionSearch("kestrel", "title", {
+          limit: 8,
+          includeArchived: false,
+          visibility: "mine",
+        }),
+      { wrapper },
+    );
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3));
 
     const archivedParams = fetchMock.mock.calls.map((call) =>
       new URL(String(call[0]), "http://localhost").searchParams.get("include_archived"),
     );
-    expect(archivedParams.sort()).toEqual([null, "true"]);
+    expect(archivedParams.sort()).toEqual([null, null, "true"]);
+    expect(
+      fetchMock.mock.calls
+        .map((call) => new URL(String(call[0]), "http://localhost").searchParams.get("visibility"))
+        .sort(),
+    ).toEqual(["all", "all", "mine"]);
     const keys = queryClient
       .getQueryCache()
       .findAll({ queryKey: ["session-search", "kestrel"] })
       .map((query) => query.queryKey);
-    expect(keys).toHaveLength(2);
+    expect(keys).toHaveLength(3);
   });
 
   it("does not fetch for an empty query", async () => {

@@ -8,6 +8,13 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 export function conversationHooksMock() {
   return {
     useConversations: vi.fn(),
+    useSessionSearch: () => ({
+      data: undefined,
+      isPending: false,
+      isError: false,
+      isFetching: false,
+      hasNextPage: false,
+    }),
     // Same gate as the real hook, so tests drive it through the server info.
     useAutomationsEnabled: () => {
       const info = useServerInfo();

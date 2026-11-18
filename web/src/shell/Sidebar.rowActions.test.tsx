@@ -66,6 +66,7 @@ const mocks = vi.hoisted(() => {
     projectIcons: {} as Record<string, string | null | undefined>,
     moveToProject: { mutate: vi.fn() },
     moveToNest: { mutate: vi.fn(), isPending: false },
+    sessionSearch: vi.fn(),
     leave: { mutate: vi.fn(), isPending: false },
     // The signed-in viewer. Rows with no `owner` read as owned by them; a row
     // owned by someone else is the shared case Leave applies to.
@@ -127,6 +128,7 @@ vi.mock("@/hooks/useConversations", async () => {
     }),
     useMoveToProject: () => mocks.moveToProject,
     useMoveToNest: () => mocks.moveToNest,
+    useSessionSearch: (...args: unknown[]) => mocks.sessionSearch(...args),
   };
 });
 
@@ -299,6 +301,13 @@ beforeEach(() => {
   mocks.rename.isError = false;
   mocks.moveToProject.mutate.mockReset();
   mocks.moveToNest.mutate.mockReset();
+  mocks.sessionSearch.mockReset().mockReturnValue({
+    data: undefined,
+    isPending: false,
+    isError: false,
+    isFetching: false,
+    hasNextPage: false,
+  });
   mocks.leave.mutate.mockReset();
   mocks.projects = [];
   mocks.projectIcons = {};
@@ -1379,6 +1388,70 @@ describe("Move session nest destinations", () => {
     );
   });
 
+  it("finds an unloaded nest by title and pages without closing the picker", async () => {
+    const fetchNextPage = vi.fn();
+    const unloaded = { ...destination, project_id: "p_Planning" };
+    mocks.projects = ["Planning"];
+    mocks.sessionSearch.mockImplementation((query) => ({
+      data: query ? { pages: [{ data: [unloaded, unloaded, CONV] }] } : undefined,
+      hasNextPage: query !== "",
+      isPending: false,
+      isError: false,
+      isFetching: false,
+      fetchNextPage,
+    }));
+    renderSidebar(undefined, serverInfo({ sibling_sessions: true, session_nest_moves: true }));
+    await openMove(false);
+    expect(screen.queryByRole("menuitem", { name: "Research" })).toBeNull();
+    fireEvent.change(screen.getByPlaceholderText("Search destinations"), {
+      target: { value: "research" },
+    });
+    expect(screen.getByText("Searching nests…")).toBeInTheDocument();
+    await screen.findByRole("menuitem", { name: "Research" });
+    expect(screen.getAllByRole("menuitem", { name: "Research" })).toHaveLength(1);
+    expect(mocks.sessionSearch).toHaveBeenLastCalledWith("research", "title", {
+      enabled: true,
+      limit: 20,
+      includeArchived: false,
+      visibility: "mine",
+    });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Show more" }));
+    expect(fetchNextPage).toHaveBeenCalledExactlyOnceWith();
+    expect(screen.getByPlaceholderText("Search destinations")).toBeInTheDocument();
+    mocks.moveToNest.mutate.mockImplementation((_variables, options) => options.onSuccess());
+    fireEvent.click(screen.getByRole("menuitem", { name: "Research" }));
+    expect(mocks.moveToNest.mutate).toHaveBeenCalledWith(
+      { id: CONV.id, sourceId: "nest" },
+      expect.any(Object),
+    );
+    expect(screen.getByRole("button", { name: /^Planning/ })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+  });
+
+  it.each([false, true])("retries a failed nest search page: %s", async (nextPage) => {
+    const refetch = vi.fn();
+    const fetchNextPage = vi.fn();
+    mocks.sessionSearch.mockImplementation((query) => ({
+      isPending: false,
+      isError: query !== "",
+      isFetchNextPageError: nextPage,
+      hasNextPage: nextPage,
+      refetch,
+      fetchNextPage,
+    }));
+    renderSidebar(undefined, serverInfo({ sibling_sessions: true, session_nest_moves: true }));
+    await openMove(false);
+    fireEvent.change(screen.getByPlaceholderText("Search destinations"), {
+      target: { value: "research" },
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Couldn’t search nests. Retry" }));
+    expect(nextPage ? fetchNextPage : refetch).toHaveBeenCalledExactlyOnceWith();
+    expect(screen.getByPlaceholderText("Search destinations")).toBeInTheDocument();
+    expect(screen.queryByText("No matching destinations.")).toBeNull();
+  });
+
   it.each([
     { sibling_sessions: false, session_nest_moves: true },
     { sibling_sessions: true, session_nest_moves: false },
@@ -1394,6 +1467,14 @@ describe("Move session nest destinations", () => {
     fireEvent.click(screen.getByTestId("move-to-project"));
     expect(screen.getByPlaceholderText("Search or create project")).toBeInTheDocument();
     expect(screen.queryByRole("menuitem", { name: "Research" })).toBeNull();
+    fireEvent.change(screen.getByPlaceholderText("Search or create project"), {
+      target: { value: "research" },
+    });
+    expect(mocks.sessionSearch).toHaveBeenLastCalledWith(
+      "",
+      "title",
+      expect.objectContaining({ enabled: false }),
+    );
   });
 });
 
