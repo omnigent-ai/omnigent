@@ -1,7 +1,17 @@
 import { describe, expect, it } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
+import {
+  DEFAULT_AUTOMATION_PROJECT,
+  SCHEDULED_TASK_LAUNCH_LABEL_KEY,
+} from "@/lib/automationSessions";
 import type { StatusBucket } from "@/shell/sidebarNav";
-import { filterKanbanCards, kanbanColumns, kanbanDropAction, takeArrivals } from "./projectKanban";
+import {
+  filterKanbanCards,
+  kanbanColumns,
+  kanbanDropAction,
+  projectBoardRows,
+  takeArrivals,
+} from "./projectKanban";
 
 const family = { id: "family", representative_id: "parent", pinned: false };
 const row = (id: string, created_at: number, inFamily = false) =>
@@ -59,6 +69,27 @@ describe("project kanban", () => {
     expect(filterKanbanCards(cards, "  login ")).toEqual([lone, withNested]);
     expect(filterKanbanCards(cards, "missing")).toEqual([]);
     expect(filterKanbanCards(cards, " ")).toEqual(cards);
+  });
+
+  it("adds runs shared with the viewer to the default automation board only", () => {
+    const session = (id: string, fields: Partial<Conversation>) =>
+      ({ id, created_at: 1, owner: "viewer", ...fields }) as Conversation;
+    const own = session("own", { project_id: "automation" });
+    const ownArchived = session("own_archived", { project_id: "automation", archived: true });
+    const sharedRun = session("shared_run", {
+      owner: "teammate",
+      labels: { [SCHEDULED_TASK_LAUNCH_LABEL_KEY]: "task" },
+    });
+    const sharedChat = session("shared_chat", { owner: "teammate" });
+    const automation = { id: "automation", name: DEFAULT_AUTOMATION_PROJECT };
+    const ids = (rows: Conversation[]) => rows.map((conversation) => conversation.id);
+
+    expect(
+      ids(projectBoardRows([own, ownArchived], [own, sharedRun, sharedChat], automation, "viewer")),
+    ).toEqual(["own", "shared_run"]);
+    expect(
+      ids(projectBoardRows([], [sharedRun], { id: "other", name: "Other project" }, "viewer")),
+    ).toEqual([]);
   });
 
   it("reports only newly created rows as arrivals, once each", () => {

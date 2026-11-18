@@ -1,6 +1,13 @@
 import type { Conversation } from "@/hooks/useConversations";
 import { sessionFamilyGroups } from "@/lib/sessionFamilies";
-import { filterConversations, STATUS_BUCKETS, type StatusBucket } from "@/shell/sidebarNav";
+import {
+  dedupeConversationsById,
+  filterConversations,
+  isSharedAutomationRun,
+  sessionInSidebarFolder,
+  STATUS_BUCKETS,
+  type StatusBucket,
+} from "@/shell/sidebarNav";
 
 export interface KanbanCard {
   /** The family's head row, or the lone session. */
@@ -18,6 +25,23 @@ export const KANBAN_COLUMNS: readonly StatusBucket[] = [
   "Unread",
   "Done",
 ];
+
+/**
+ * The board's unarchived sessions, filed as the sidebar folder files them: the
+ * viewer's own project sessions and, on the default automation board, other
+ * users' runs shared with the viewer from the sidebar's loaded rows.
+ */
+export function projectBoardRows(
+  projectRows: readonly Conversation[],
+  loadedRows: readonly Conversation[],
+  project: { id: string | null; name: string },
+  viewerId: string | null,
+): Conversation[] {
+  const sharedRuns = loadedRows.filter((row) => isSharedAutomationRun(row, viewerId));
+  return dedupeConversationsById([...projectRows, ...sharedRuns]).filter(
+    (row) => !row.archived && sessionInSidebarFolder(row, project, viewerId, true),
+  );
+}
 
 /**
  * One card per family (or lone session) in the sidebar's Status-grouping columns,

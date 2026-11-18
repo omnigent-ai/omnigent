@@ -54,7 +54,7 @@ import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useHosts, type Host } from "@/hooks/useHosts";
 import { getSessionState } from "@/hooks/useSessionState";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { useOptionalSidebarShow } from "@/hooks/useSidebarData";
+import { useOptionalLoadedConversations, useOptionalSidebarShow } from "@/hooks/useSidebarData";
 import {
   isConversationUnseen,
   markConversationRead,
@@ -74,7 +74,6 @@ import { ConversationMenuItems } from "@/shell/Sidebar";
 import {
   conversationDisplayLabel,
   isOwnedByViewer,
-  sessionBelongsToProject,
   statusBucket,
   type StatusBucket,
 } from "@/shell/sidebarNav";
@@ -91,6 +90,7 @@ import {
   KANBAN_COLUMNS,
   kanbanColumns,
   kanbanDropAction,
+  projectBoardRows,
   takeArrivals,
   type KanbanCard,
 } from "./projectKanban";
@@ -187,17 +187,19 @@ export function ProjectKanbanBoard({
   const { data: projects } = useProjects();
   const projectId = projects?.find((project) => project.name === projectName)?.id ?? null;
   const query = useProjectSessions(projectName, true);
+  const loaded = useOptionalLoadedConversations();
   // Read marks and drafts live outside the query cache; re-render when they change.
   useUnseenTick();
   useSessionDraftIds();
   const rows = useMemo(
     () =>
-      (query.data?.pages.flatMap((page) => page.data) ?? []).filter(
-        (row) =>
-          !row.archived &&
-          sessionBelongsToProject(row, { id: projectId, name: projectName }, viewerId),
+      projectBoardRows(
+        query.data?.pages.flatMap((page) => page.data) ?? [],
+        loaded?.pages.flatMap((page) => page.data) ?? [],
+        { id: projectId, name: projectName },
+        viewerId,
       ),
-    [query.data, projectId, projectName, viewerId],
+    [query.data, loaded, projectId, projectName, viewerId],
   );
   const columns = kanbanColumns(rows, columnOf);
   const arrivedIds = useArrivedIds(rows, query.isSuccess);
