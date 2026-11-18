@@ -17,8 +17,7 @@ disables it. Explicit disables win regardless of order, so appending
 `-claude_osc_status` is a kill switch even if `claude_osc_status` is also present.
 Unknown names, including unknown negative overrides, fail startup. Retired names
 (`custom_agents_settings_ui`, `sidebar_grouping_ui`) are ignored with a startup warning,
-with or without `-`. `GET /v1/info` keeps reporting `sidebar_grouping_ui` as true for web
-builds that predate its removal; that compatibility key is deprecated and goes in 0.24.0.
+with or without `-`.
 The former `OMNIGENT_HARNESS_INSTALL_ENABLED` switch is rejected with a
 migration hint; use `OMNIGENT_FEATURES=harness_install` instead. The server resolves the set once at startup and publishes frontend-visible
 values in `GET /v1/info` under `features`. Users must reload the web app after a

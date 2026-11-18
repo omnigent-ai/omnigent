@@ -43,7 +43,6 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "harness_install": False,
         "canvas": False,
         "import_review": False,
-        "sidebar_grouping_ui": True,
         "workspace_content_search": True,
         "grid_sessions_display_ui": True,
         "automations_v2": True,
@@ -168,13 +167,6 @@ def test_retired_feature_is_ignored_with_warning(
 
     assert flags == resolve_feature_flags({FEATURES_ENV_VAR: "usage_page"})
     assert f"{override} has been retired" in caplog.text
-
-
-@pytest.mark.parametrize("override", ["", "sidebar_grouping_ui", "-sidebar_grouping_ui"])
-def test_retired_frontend_feature_stays_reported_on(override: str) -> None:
-    flags = resolve_feature_flags({FEATURES_ENV_VAR: override})
-
-    assert flags.frontend_dict()["sidebar_grouping_ui"] is True
 
 
 def test_removed_harness_install_variable_fails_with_migration_hint() -> None:

@@ -20,9 +20,6 @@ FEATURES_ENV_VAR = "OMNIGENT_FEATURES"
 _REMOVED_HARNESS_INSTALL_ENV_VAR = "OMNIGENT_HARNESS_INSTALL_ENABLED"
 # Features made unconditional; leftover names or ``-name`` kill switches are ignored.
 _RETIRED_FEATURES = frozenset({"custom_agents_settings_ui", "sidebar_grouping_ui"})
-# Retired features still reported as on, for web builds that predate their removal.
-# Deprecated: stop reporting them in 0.24.0.
-_ADVERTISED_RETIRED_FEATURES = ("sidebar_grouping_ui",)
 
 
 class Feature(StrEnum):
@@ -336,12 +333,9 @@ class FeatureFlags:
     def frontend_dict(self) -> dict[str, bool]:
         """Return every frontend-visible feature and its resolved value."""
         return {
-            **{
-                definition.feature.value: self.enabled(definition.feature)
-                for definition in FEATURE_DEFINITIONS
-                if definition.frontend_visible
-            },
-            **dict.fromkeys(_ADVERTISED_RETIRED_FEATURES, True),
+            definition.feature.value: self.enabled(definition.feature)
+            for definition in FEATURE_DEFINITIONS
+            if definition.frontend_visible
         }
 
     def enabled_names(self) -> tuple[str, ...]:
