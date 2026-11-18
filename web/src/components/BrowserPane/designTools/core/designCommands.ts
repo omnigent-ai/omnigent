@@ -10,10 +10,10 @@ export interface DesignCommand {
 
 export type CommandResult = { ok: true } | { ok: false; error: string };
 
-/** Run `command` if nothing blocks it (its later outcome goes unheard). */
+/** Run `command` if nothing blocks it (its later outcome goes unheard, a failure logged). */
 export function runCommand(command: DesignCommand): CommandResult {
   const { blocked } = command;
   if (blocked) return { ok: false, error: blocked };
-  void command.run();
+  command.run()?.catch((error: unknown) => console.error("A design command failed", error));
   return { ok: true };
 }

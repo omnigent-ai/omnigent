@@ -8,14 +8,20 @@ const identity = vi.hoisted(() => ({
   user: "alice" as string | null,
   // Who the server says is signed in; undefined follows `user`.
   signedIn: undefined as string | null | undefined,
+  // The server can't be reached to say; counts the asks.
+  unreachable: false,
+  asks: 0,
   listeners: new Set<() => void>(),
 }));
 vi.mock("@/lib/identity", async (importOriginal) => ({
   ...(await importOriginal<typeof Identity>()),
   getCurrentUserId: () => identity.user,
   resolveIdentity: async () => identity.user,
-  fetchSignedInUserId: async () =>
-    identity.signedIn === undefined ? identity.user : identity.signedIn,
+  fetchSignedInUserId: async () => {
+    identity.asks += 1;
+    if (identity.unreachable) return undefined;
+    return identity.signedIn === undefined ? identity.user : identity.signedIn;
+  },
   subscribeIdentity: (listener: () => void) => {
     identity.listeners.add(listener);
     return () => identity.listeners.delete(listener);
@@ -137,6 +143,8 @@ function installLocks(openTabs: string[] = [], server = thisServer()) {
 beforeEach(async () => {
   identity.user = "alice";
   identity.signedIn = undefined;
+  identity.unreachable = false;
+  identity.asks = 0;
   // No session is ready, so requests stay unsent.
   useChatStore.setState({ conversationId: null, boundAgentId: null });
   await designOutboxSaved();
@@ -364,6 +372,23 @@ describe("design outbox storage", () => {
     await vi.waitFor(() => expect(ids()).toEqual(["alices"]));
     // Bob's stays saved for Bob.
     expect(await savedIds()).toEqual(["alices", "bobs"]);
+  });
+
+  it("asks the server who's signed in less often while it can't be reached", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    await putRecord(record({ id: "saved" }));
+    identity.unreachable = true;
+    await restoreSavedDesignRequests();
+    expect(identity.asks).toBe(1);
+    await vi.advanceTimersByTimeAsync(RESTORE_RETRY_MS);
+    expect(identity.asks).toBe(2);
+    // The next ask waits twice as long.
+    await vi.advanceTimersByTimeAsync(RESTORE_RETRY_MS);
+    expect(identity.asks).toBe(2);
+    identity.unreachable = false;
+    await vi.advanceTimersByTimeAsync(RESTORE_RETRY_MS);
+    expect(identity.asks).toBe(3);
+    await vi.waitFor(() => expect(ids()).toEqual(["saved"]));
   });
 
   it("brings back nothing when the server says another account is signed in now", async () => {

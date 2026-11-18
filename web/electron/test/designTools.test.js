@@ -322,6 +322,19 @@ describe("design tools: the overlay", () => {
     assert.equal(t.host.webContents.focused, 1);
   });
 
+  it("takes the keys only once it's over its page, if the page left while it opened", () => {
+    const t = openTool();
+    t.start();
+    const decision = t.windowOpen();
+    t.host.contentView.removeChildView(t.view);
+    decision.createWindow({ webContents: t.views.contents(), webPreferences: {} });
+    const overlay = t.views.made.at(-1);
+    assert.equal(overlay.webContents.isFocused(), false);
+    t.host.contentView.addChildView(t.view);
+    t.tools.viewAttached(t.host, t.view);
+    assert.equal(overlay.webContents.isFocused(), true);
+  });
+
   it("covers only the page's part of its view while DevTools are docked there", async () => {
     const t = openTool({ zoom: 2 });
     const overlay = t.open();

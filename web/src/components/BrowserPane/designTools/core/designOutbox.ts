@@ -77,10 +77,8 @@ export const RESTORE_RETRY_MS = 5_000;
 const RESTORE_RETRY_MAX_MS = 300_000;
 
 const DENIED = "A policy blocked this request, so it wasn't sent.";
-// Brought back after a reload: never sent on its own (the user said Send on an earlier
-// page, and may have changed their mind, or sent it from another tab), so it needs a Retry.
-// A reload can land after the send but before its "sending" was saved, so a request saved
-// as waiting may have gone too.
+// Brought back after a reload: never sent on its own, so it needs a Retry. The reload may
+// have beaten saving "sending", so one saved as waiting may have gone too.
 const RESTORED =
   "The app reloaded before this was confirmed sent, so it may have reached the agent. " +
   "Look in the chat: if it isn't there, Retry sends it.";
@@ -513,7 +511,10 @@ export async function restoreSavedDesignRequests(): Promise<void> {
   // The cached user can be stale: adopt only for the account the server says is signed in.
   const signedIn = await fetchSignedInUserId();
   if (signedIn !== userId) {
-    if (signedIn === undefined) later(restoreRetryMs, () => void restoreSavedDesignRequests());
+    if (signedIn === undefined) {
+      later(restoreRetryMs, () => void restoreSavedDesignRequests());
+      restoreRetryMs = Math.min(restoreRetryMs * 2, RESTORE_RETRY_MAX_MS);
+    }
     return;
   }
   let saved: SavedRequest[];

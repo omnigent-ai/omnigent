@@ -383,8 +383,9 @@ function createDesignTools({
         });
         // The recent-session shortcut works from it as from the page (it takes the keys).
         session.entry.forwardRecentSessionInput?.(contents);
+        // A tool takes the keys once it's over its page: now, or when its page is back.
+        if (session.mode === "tool") session.refocus = true;
         place(session);
-        if (session.mode === "tool") contents.focus();
         return contents;
       },
     };
@@ -588,6 +589,7 @@ function createDesignTools({
       height: bounds.height / zoom,
     };
     const wanted = asRect(args.rect);
+    if (args.rect !== undefined && !wanted) return invalid();
     const rect = wanted && clampRect(wanted, viewport);
     if (wanted && !rect) return { ok: false, error: OFF_SCREEN };
     const image = await withTimeout(

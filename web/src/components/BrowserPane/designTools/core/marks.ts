@@ -22,6 +22,7 @@ export function drawShape(context: CanvasRenderingContext2D, shape: Shape): void
   if (!start) return;
   if (shape.kind === "text") {
     // A contrasting halo keeps the words readable over any part of the page.
+    context.save();
     context.font = TEXT_FONT;
     context.textBaseline = "middle";
     context.lineWidth = 4;
@@ -29,7 +30,7 @@ export function drawShape(context: CanvasRenderingContext2D, shape: Shape): void
     context.strokeText(shape.text ?? "", start.x, start.y);
     context.fillStyle = shape.color;
     context.fillText(shape.text ?? "", start.x, start.y);
-    context.lineWidth = 3;
+    context.restore();
     return;
   }
   context.strokeStyle = shape.color;
