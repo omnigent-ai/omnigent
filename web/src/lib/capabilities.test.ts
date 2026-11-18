@@ -624,3 +624,12 @@ describe("resolveServerInfo scheduled_task_worktrees", () => {
     );
   });
 });
+
+describe("comment reply capability", () => {
+  it.each([undefined, false, "true", 1, true])(
+    "requires an explicit boolean true (%j)",
+    async (value) => {
+      expect((await probe({ comment_replies: value })).comment_replies).toBe(value === true);
+    },
+  );
+});

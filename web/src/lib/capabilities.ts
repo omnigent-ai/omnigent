@@ -344,6 +344,8 @@ export interface ServerInfo {
   session_pull_requests?: boolean;
   /** Session comments preserve PR revision and line anchors; absent on older servers. */
   comment_anchor_metadata?: boolean;
+  /** File comments support user and agent reply threads. */
+  comment_replies?: boolean;
   /**
    * True when the server keeps session journals (``/v1/sessions/{id}/journal`` and
    * ``session.journal.appended``), which the Tasks tab shows; absent on older servers (off).
@@ -545,6 +547,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   session_fork_workspaces: false,
   move_to_managed_sandbox: false,
   comment_anchor_metadata: false,
+  comment_replies: false,
   branding: null,
   picker: UNRESTRICTED_PICKER,
 };
@@ -761,6 +764,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_title_instructions: data.session_title_instructions === true,
           admin_view: data.admin_view === true,
           comment_anchor_metadata: data.comment_anchor_metadata === true,
+          comment_replies: data.comment_replies === true,
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           scheduled_task_projects: data.scheduled_task_projects === true,
           scheduled_task_inbox: data.scheduled_task_inbox === true,

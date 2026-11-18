@@ -40,6 +40,13 @@ export interface Comment {
   anchor_content: string | null;
   created_by: string | null;
   anchor_metadata?: LocalReviewAnchor | null;
+  reply_count?: number;
+  last_reply?: {
+    author_kind: "user" | "agent";
+    created_by: string | null;
+    /** Epoch microseconds. */
+    created_at: number;
+  } | null;
 }
 
 // ── Query helpers ────────────────────────────────────────────────────────────

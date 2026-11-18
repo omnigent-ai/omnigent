@@ -1,3 +1,7 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+import { CommentSenderProvider } from "@/hooks/CommentSenderContext";
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { userEvent, within } from "storybook/test";
 import type { Comment } from "@/hooks/useComments";
@@ -80,8 +84,14 @@ const meta = {
     now,
   },
   decorators: [
-    (Story) => (
-      <div className="flex h-[600px] w-[900px] justify-end overflow-hidden rounded-lg border bg-muted/20 [&>div]:!w-[360px]">
+    (Story, context) => (
+      <div
+        className={
+          context.parameters.threadDemo
+            ? "flex h-[640px] w-[360px] justify-end overflow-hidden rounded-lg border bg-muted/20 text-foreground [&>div]:!w-[360px]"
+            : "flex h-[600px] w-[900px] justify-end overflow-hidden rounded-lg border bg-muted/20 [&>div]:!w-[360px]"
+        }
+      >
         <Story />
       </div>
     ),
@@ -153,5 +163,76 @@ export const ReadOnlyAddressedTab: Story = {
   },
   play: async ({ canvasElement }) => {
     await userEvent.click(within(canvasElement).getByRole("button", { name: /sent/i }));
+  },
+};
+
+const threadClient = new QueryClient({ defaultOptions: { queries: { staleTime: Infinity } } });
+threadClient.setQueryData(
+  ["comments", "conversation-story", "replies", "thread-comment", 1_718_440_200 * 1_000_000],
+  [
+    {
+      id: "reply-1",
+      author_kind: "agent",
+      created_by: null,
+      body: "The offsets keep comments in file order, including multi-line selections.",
+      created_at: 1_718_450_400_000_000,
+    },
+    {
+      id: "reply-2",
+      author_kind: "user",
+      created_by: null,
+      body: "What about two comments with the same start?",
+      created_at: 1_718_450_460_000_000,
+    },
+    {
+      id: "reply-3",
+      author_kind: "agent",
+      created_by: null,
+      body: "Ties keep creation order.",
+      created_at: 1_718_450_520_000_000,
+    },
+    {
+      id: "reply-4",
+      author_kind: "user",
+      created_by: "reviewer@example.com",
+      body: "A short comment in the code would help the next reader.",
+      created_at: 1_718_450_580_000_000,
+    },
+  ],
+);
+
+export const ReplyThread: Story = {
+  parameters: { threadDemo: true },
+  args: {
+    comments: [
+      comment({
+        id: "thread-comment",
+        reply_count: 4,
+        body: "Why sort by character offset rather than line number?",
+      }),
+    ],
+    addressedComments: [],
+    activeSelection: {
+      start_index: 0,
+      end_index: 10,
+      comment_id: "thread-comment",
+      anchor_content: "def compute_totals(rows):",
+    },
+  },
+  decorators: [
+    (Story) => (
+      <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, comment_replies: true }}>
+        <QueryClientProvider client={threadClient}>
+          <CommentSenderProvider sessionId="conversation-story" agentId="agent-story">
+            <Story />
+          </CommentSenderProvider>
+        </QueryClientProvider>
+      </CapabilitiesProvider>
+    ),
+  ],
+  play: async ({ canvasElement }) => {
+    const input = within(canvasElement).getByRole("textbox", { name: "Reply to comment" });
+    await userEvent.click(input);
+    await userEvent.type(input, "Could you add that explanation?");
   },
 };
