@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { journalEntry, journalPlan } from "@/test/journalFixtures";
 import { planSteps } from "./sessionJournal";
 
-import { describeWorkflowRun, type WorkflowRun } from "./workflowRuns";
+import { describeWorkflowRun, isWorkflowRunWorking, type WorkflowRun } from "./workflowRuns";
 
 function run(
   progress: Partial<WorkflowRun["progress"]>,
@@ -85,6 +85,15 @@ describe("describeWorkflowRun", () => {
       describeWorkflowRun({ ...active, progress: { ...active.progress, needsInput: 1 } }).kind,
     ).toBe("waiting");
     expect(describeWorkflowRun(active, false).kind).toBe("stopped");
+  });
+
+  it("counts a run whose sandbox is still launching as running", () => {
+    const launching = { ...run({}), sandboxLaunching: true };
+    expect(isWorkflowRunWorking(launching)).toBe(true);
+    expect(describeWorkflowRun(launching)).toEqual({ kind: "running", label: "0 of 5 done" });
+    // A failed launch fails the session instead.
+    expect(describeWorkflowRun(run({}, "failed")).kind).toBe("failed");
+    expect(isWorkflowRunWorking({ ...launching, isCurrent: false })).toBe(false);
   });
 
   it("says a stopped run failed, or how far it got", () => {

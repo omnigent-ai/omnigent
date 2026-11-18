@@ -24,6 +24,7 @@ import type { StepState } from "@/lib/sessionJournal";
 import { cn } from "@/lib/utils";
 import {
   describeWorkflowRun,
+  isWorkflowRunLaunching,
   isWorkflowRunWorking,
   runStepProgress,
   type WorkflowRun,
@@ -69,10 +70,10 @@ export function WorkflowRunRow({
   /** For a run listed below another, that run's session, whose runs need no "Started by". */
   parentSessionId?: string;
 }) {
-  const sessionWorking = useSessionWorking(
-    run.isCurrent ? run.sessionId : null,
-    isWorkflowRunWorking(run),
-  );
+  // The sidebar's status for the session leaves out a sandbox launch, so it can't settle one.
+  const sessionWorking =
+    useSessionWorking(run.isCurrent ? run.sessionId : null, isWorkflowRunWorking(run)) ||
+    isWorkflowRunLaunching(run);
   const state = describeWorkflowRun(run, sessionWorking);
   const progress = useMemo(() => runStepProgress(run, sessionWorking), [run, sessionWorking]);
   const nested = parentSessionId !== undefined;

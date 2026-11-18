@@ -16733,6 +16733,12 @@
             "$ref": "#/components/schemas/WorkflowRunProgress",
             "description": "Where the run's steps stand."
           },
+          "sandbox_launching": {
+            "default": false,
+            "description": "Whether the session's sandbox is still launching, so the run is starting; `False` once it is up and for a failed launch.",
+            "title": "Sandbox Launching",
+            "type": "boolean"
+          },
           "session_id": {
             "description": "The session that ran it.",
             "title": "Session Id",
