@@ -93,7 +93,8 @@ reload: the tab, picker entry and shortcut should be unavailable.
 - Searches return at most 500 matching lines and stop after 15 seconds. Partial
   results are labeled; exceptionally long matching lines may be omitted with a warning.
 - Older runners show guidance to update the host and restart the session. Offline
-  runners or missing ripgrep show an error. Search has no host-daemon fallback.
+  runners or missing ripgrep show an error. Search tries the workspace API first
+  when the host lists it, and otherwise uses the REST search.
 - Workspace file-sharing permissions apply. A shared conversation alone does not
   grant access to its file contents.
 - On mobile, tapping a result opens the file viewer; its back button returns
