@@ -417,6 +417,7 @@ def _markdown_context(
     Complete comments, plain raw HTML blocks, indented blocks and setext headings stay
     indivisible; raw closing lines allow only space/tab and structural CR tails in
     multipart comments. Other raw HTML and unclosed literal blocks fail closed.
+    Reference-definition-like lines outside fenced/raw blocks fail closed in multipart.
     Inline-code formatting across fragments is not balanced.
     """
     details = 0
@@ -438,6 +439,7 @@ def _markdown_context(
     disclosure_tag = re.compile(r"</?details(?=[ \t\f\r/>]|$)", re.IGNORECASE)
     summary_tag = re.compile(r"</?summary(?=[ \t\f\r/>]|$)", re.IGNORECASE)
     comment_end = re.compile(r"--!?>")
+    reference_definition = re.compile(r"\[(?:\\[\s\S]|[^\[\]\\])+\]:")
 
     def protect_span(start: int, end: int, kind: str) -> None:
         if protected_spans is None:
@@ -550,6 +552,10 @@ def _markdown_context(
                     break
                 container = True
                 position = marker.end()
+            if reference_definition.match(text, line_start + position):
+                raise ValueError(
+                    "Polly review reference definitions are not supported in multipart comments."
+                )
             if container and line.startswith(("```", "~~~"), position):
                 raise ValueError(
                     "Polly review container fences are not supported in multipart comments."

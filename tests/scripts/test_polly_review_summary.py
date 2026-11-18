@@ -214,12 +214,19 @@ def _check_context_refusal(
     code_span_refusal: bool,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    *,
+    reference_refusal: bool = False,
 ) -> None:
     review_path, receipt, posts = _prepare_publication(
         tmp_path, monkeypatch, head_sha="a" * 40, run_url="https://example.test/run"
     )
-    if code_span_refusal:
-        with pytest.raises(ValueError, match=r"Polly review noncanonical (details|summary)"):
+    if code_span_refusal or reference_refusal:
+        message = (
+            "Polly review reference definitions are not supported in multipart comments."
+            if reference_refusal
+            else r"Polly review noncanonical (details|summary)"
+        )
+        with pytest.raises(ValueError, match=re.escape(message) if reference_refusal else message):
             _published_comments(review, review_path, receipt)
         assert not posts and not receipt.exists()
         assert sorted(path.name for path in tmp_path.iterdir()) == ["review.md"]
@@ -253,6 +260,15 @@ def _check_context_refusal(
     assert sorted(path.name for path in tmp_path.iterdir()) == ["review.md"]
 
 
+def _resolved_destinations(tokens: list) -> list[tuple[str, str]]:
+    return [
+        (child.type, child.attrGet("href" if child.type == "link_open" else "src"))
+        for token in tokens
+        for child in token.children or []
+        if child.type in {"link_open", "image"}
+    ]
+
+
 def _check_review_context(
     table_variant: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -265,6 +281,7 @@ def _check_review_context(
     table_rows = []
     assessment_review = _REVIEW
     comment_context = None
+    reference_refusal = False
     code_span_refusal = variant in {
         "code-span-unmatched",
         "code-span-escaped-opener",
@@ -560,6 +577,9 @@ def _check_review_context(
         assert not any(token.type == "html_inline" for token in literal_tokens)
         if literal_context[1].startswith(("completed-", "leading-")):
             assert any(token.type == "link_open" for token in literal_tokens)
+        if literal_context[1] == "completed-reference":
+            assert _resolved_destinations(original) == [("link_open", "https://example.test/")]
+            reference_refusal = not short
     expected = containers(original)
     assert bool(expected) == ("blockquote" in variant or "continuation" in variant)
     optional_table = variant.startswith("boundary-table-") and variant != "boundary-table-fenced"
@@ -582,8 +602,16 @@ def _check_review_context(
         or (variant.startswith("boundary-summary") and variant != "boundary-summary-fitting")
         or variant == "boundary-inline-oversized-guard"
     )
-    if code_span_refusal or unsupported:
-        _check_context_refusal(review, variant, short, code_span_refusal, tmp_path, monkeypatch)
+    if code_span_refusal or unsupported or reference_refusal:
+        _check_context_refusal(
+            review,
+            variant,
+            short,
+            code_span_refusal,
+            tmp_path,
+            monkeypatch,
+            reference_refusal=reference_refusal,
+        )
         return
     comments = _HELPERS["review_comments"](
         review, head_sha="a" * 40, run_id="10-1", run_url="https://example.test/run"
@@ -595,6 +623,12 @@ def _check_review_context(
     else:
         assert 1 < len(comments) <= _HELPERS["MAX_REVIEW_PARTS"]
     rendered = [parser.parse(comment) for comment in comments]
+    assert [
+        destination
+        for tokens in rendered
+        for destination in _resolved_destinations(tokens)
+        if destination[1] != "https://example.test/run"
+    ] == _resolved_destinations(original), "A comment lost an independently resolved destination"
     if comment_context:
         for comment in comments:
             reference = CommentEndContext()
@@ -940,443 +974,137 @@ def _check_identity_and_work(table_variant: str, monkeypatch: pytest.MonkeyPatch
 
 
 @pytest.mark.parametrize(
-    (
-        "rationale_specs",
-        "preceding_paragraph_length",
-        "row_indentation",
-        "inline_details",
-        "run_path",
-        "oversized_field",
-        "terminal_remainder",
-        "adjacent_tables",
-        "oversized_nonassessment",
-        "final_table_newline",
-        "rationale_separator",
-        "table_variant",
-    ),
+    "form",
     [
-        (None, 0, "", False, "run", None, None, False, False, None, None, None),
-        ((20000, 45000, 20000), 0, "", False, "run", None, None, False, False, None, None, None),
-        ((3000,) * 30, 59194, "", False, "run", None, None, False, False, None, None, None),
-        (None, 0, "  ", False, "run", None, None, False, False, None, None, None),
-        ((70000,), 0, "", False, "run", None, None, False, False, None, None, None),
-        (
-            ("y" * 69 + ("x" * 70 + "\\|") * 1100,),
-            0,
-            "",
-            False,
-            "r" * 66,
-            None,
-            None,
-            False,
-            False,
-            None,
-            None,
-            None,
-        ),
-        (None, 0, "", True, "run", None, None, False, False, None, None, None),
-        (("Reason",), 0, "", False, "run", 0, None, False, False, None, None, None),
-        (("Reason",), 0, "", False, "run", 1, None, False, False, None, None, None),
-        (("Reason",), 0, "", False, "run", 2, None, False, False, None, None, None),
-        ((177655, "Tail."), 0, "", False, "run", None, " | \t", False, False, None, None, None),
-        ((177654, "Tail."), 0, "", False, "run", None, "| \t", False, False, None, None, None),
-        ((177653, "Tail."), 0, "", False, "run", None, " \t", False, False, None, None, None),
-        ((177652, "Tail."), 0, "", False, "run", None, "\t", False, False, None, None, None),
-        ((177651, "Tail."), 0, "", False, "run", None, "", False, False, None, None, None),
-        (
-            ("Reason." + " " * 135000 + "Tail.",),
-            0,
-            "",
-            False,
-            "run",
-            None,
-            None,
-            False,
-            False,
-            None,
-            None,
-            None,
-        ),
-        (None, 0, "", False, "run", None, None, True, False, None, None, None),
-        (("Reason",), 0, "", False, "run", None, None, False, True, None, None, None),
-        (None, 0, "", False, "run", None, None, False, False, "", None, None),
-        (None, 0, "", False, "run", None, None, False, False, "\n", None, None),
-        (None, 0, "", False, "run", None, None, False, False, None, "\u2028", None),
-        (None, 0, "", False, "run", None, None, False, False, None, "\x85", None),
-        (None, 0, "", False, "run", None, None, False, False, None, "\x0c", None),
-        (None, 0, "", False, "run", None, None, False, False, None, " ", None),
-        (None, 0, "", False, "run", None, None, False, False, None, None, "ordinary-empty-cell"),
-        (None, 0, "", False, "run", None, None, False, False, None, None, "oversized-header"),
-        (None, 0, "", False, "run", None, None, False, False, None, None, "part-limit"),
-        (None, 0, "", False, "run", None, None, False, False, None, None, "work-limit"),
-        (None, 0, "", False, "run", None, None, False, False, None, None, "incremental-work"),
-        (None, 0, "", False, "run", None, None, False, False, None, None, "fenced-header-control"),
-        (
-            None,
-            0,
-            "",
-            False,
-            "run",
-            None,
-            None,
-            False,
-            False,
-            None,
-            None,
-            "oversized-fence-backticks",
-        ),
-        (
-            None,
-            0,
-            "",
-            False,
-            "run",
-            None,
-            None,
-            False,
-            False,
-            None,
-            None,
-            "oversized-fence-tildes",
-        ),
-        (
-            None,
-            0,
-            "",
-            False,
-            "run",
-            None,
-            None,
-            False,
-            False,
-            None,
-            None,
-            "unsafe-inline-run-backticks",
-        ),
-        (
-            None,
-            0,
-            "",
-            False,
-            "run",
-            None,
-            None,
-            False,
-            False,
-            None,
-            None,
-            "unsafe-inline-run-tildes",
-        ),
-        (
-            None,
-            0,
-            "",
-            False,
-            "run",
-            None,
-            None,
-            False,
-            False,
-            None,
-            None,
-            "unsafe-fence-whitespace-backticks",
-        ),
-        (
-            None,
-            0,
-            "",
-            False,
-            "run",
-            None,
-            None,
-            False,
-            False,
-            None,
-            None,
-            "unsafe-fence-whitespace-tildes",
-        ),
-        (None, 0, "", False, "run", None, None, False, False, None, None, "nested-list"),
-        (None, 0, "", False, "run", None, None, False, False, None, None, "container-blockquote"),
-        (
-            None,
-            0,
-            "",
-            False,
-            "run",
-            None,
-            None,
-            False,
-            False,
-            None,
-            None,
-            "container-list-continuation",
-        ),
-        (
-            None,
-            0,
-            "",
-            False,
-            "run",
-            None,
-            None,
-            False,
-            False,
-            None,
-            None,
-            "container-attributed-details",
-        ),
-        (
-            None,
-            0,
-            "",
-            False,
-            "run",
-            None,
-            None,
-            False,
-            False,
-            None,
-            None,
-            "container-lazy-blockquote",
-        ),
-        (
-            None,
-            0,
-            "",
-            False,
-            "run",
-            None,
-            None,
-            False,
-            False,
-            None,
-            None,
-            "container-ordered-continuation",
-        ),
-        (
-            None,
-            0,
-            "",
-            False,
-            "run",
-            None,
-            None,
-            False,
-            False,
-            None,
-            None,
-            "container-multiline-details",
-        ),
-        (
-            None,
-            0,
-            "",
-            False,
-            "run",
-            None,
-            None,
-            False,
-            False,
-            None,
-            None,
-            "short-container-blockquote",
-        ),
-        (
-            None,
-            0,
-            "",
-            False,
-            "run",
-            None,
-            None,
-            False,
-            False,
-            None,
-            None,
-            "short-container-list-continuation",
-        ),
-        (
-            None,
-            0,
-            "",
-            False,
-            "run",
-            None,
-            None,
-            False,
-            False,
-            None,
-            None,
-            "short-container-attributed-details",
-        ),
-        (
-            None,
-            0,
-            "",
-            False,
-            "run",
-            None,
-            None,
-            False,
-            False,
-            None,
-            None,
-            "container-bounded-blockquote",
-        ),
-        (
-            None,
-            0,
-            "",
-            False,
-            "run",
-            None,
-            None,
-            False,
-            False,
-            None,
-            None,
-            "fenced-container-literal",
-        ),
-        (
-            None,
-            0,
-            "",
-            False,
-            "run",
-            None,
-            None,
-            False,
-            False,
-            None,
-            None,
-            "container-empty-list-continuation",
-        ),
-        *[
-            (None, 0, "", False, "run", None, None, False, False, None, None, variant)
-            for variant in (
-                "boundary-table-no-leading",
-                "boundary-table-header-no-leading",
-                "boundary-table-delimiter-no-leading",
-                "boundary-table-body-no-leading",
-                "short-boundary-table-no-leading",
-                "boundary-table-fenced",
-                "boundary-inline-quote",
-                "boundary-inline-dash",
-                "boundary-inline-plus",
-                "boundary-inline-star",
-                "boundary-inline-dot",
-                "boundary-inline-paren",
-                "boundary-inline-whitespace",
-                "boundary-inline-overlap",
-                "boundary-inline-oversized-guard",
-                "boundary-inline-indented",
-                "boundary-inline-heading",
-                "boundary-inline-thematic",
-                "boundary-summary",
-                "boundary-summary-multiline",
-                "boundary-summary-attributes",
-                "boundary-summary-fitting",
-                "short-boundary-summary",
-                "code-span-details-prose",
-                "code-span-summary-prose",
-                "code-span-details-rationale",
-                "code-span-summary-rationale",
-                "code-span-matched-runs",
-                "code-span-even-backslashes",
-                "code-span-cut-guard",
-                "short-code-span-tags",
-                "code-span-unmatched",
-                "code-span-escaped-opener",
-                "code-span-real-tag",
-                "code-span-raw-html",
-                "code-span-html-attribute",
-                "code-span-link-title",
-                "code-span-cross-line-ambiguity",
-                *[
-                    f"code-span-{context}-{tag}-{placement}"
-                    for context in ("comparison", "completed-link", "completed-reference")
-                    for tag in ("details", "summary")
-                    for placement in ("prose", "rationale")
-                ],
-                "code-span-comparison-cut-guard",
-                "code-span-completed-link-cut-guard",
-                "code-span-html-attribute-quoted-close",
-                "code-span-link-title-quoted-close",
-                "short-code-span-comparison-tags",
-                "short-code-span-completed-link-tags",
-                *[
-                    f"code-span-{context}-{tag}-{placement}"
-                    for context in (
-                        "less-equal",
-                        "less-digit",
-                        "leading-autolink",
-                        "leading-email",
-                    )
-                    for tag in ("details", "summary")
-                    for placement in ("prose", "rationale")
-                ],
-                *[
-                    f"short-code-span-{context}-{tag}-prose"
-                    for context in (
-                        "less-equal",
-                        "less-digit",
-                        "leading-autolink",
-                        "leading-email",
-                    )
-                    for tag in ("details", "summary")
-                ],
-                *[
-                    f"code-span-comment-{context}-{tag}-{placement}"
-                    for context in ("standard", "alternate", "alternate-attribute")
-                    for tag in ("details", "summary")
-                    for placement in ("prose", "rationale")
-                ],
-                *[
-                    f"short-code-span-comment-alternate-{tag}-{placement}"
-                    for tag in ("details", "summary")
-                    for placement in ("prose", "rationale")
-                ],
-            )
-        ],
+        "full",
+        "collapsed",
+        "shortcut",
+        "image",
+        "forward",
+        "multiline-label",
+        "escaped-label",
+        "quoted-definition",
+        "list-definition",
+        "short",
+        "fenced-literal",
+        "inline-control",
     ],
-    ids=[
-        "many-rows",
-        "unequal-rows",
-        "header-boundary",
-        "indented-rows",
-        "oversized-row",
-        "escaped-pipe-boundary",
-        "inline-details",
-        "oversized-test",
-        "oversized-behavior",
-        "oversized-layer",
-        "terminal-before-space",
-        "terminal-before-delimiter",
-        "terminal-after-delimiter",
-        "terminal-in-whitespace",
-        "terminal-before-newline",
-        "interior-whitespace",
-        "adjacent-tables",
-        "oversized-nonassessment",
-        "final-table-no-newline",
-        "final-table-newline",
-        "rationale-line-separator",
-        "rationale-next-line",
-        "rationale-form-feed",
-        "rationale-space-control",
-        "ordinary-empty-cell",
-        "oversized-header",
-        "part-limit",
-        "work-limit",
-        "incremental-work",
-        "fenced-header-control",
-        "oversized-fence-backticks",
-        "oversized-fence-tildes",
-        "unsafe-inline-run-backticks",
-        "unsafe-inline-run-tildes",
-        "unsafe-fence-whitespace-backticks",
-        "unsafe-fence-whitespace-tildes",
-        "nested-list",
+)
+def test_multipart_reference_dependencies_are_refused(
+    form: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from markdown_it import MarkdownIt
+
+    parser = MarkdownIt("commonmark").enable("table")
+    destination = "https://example.test/reference"
+    definition = f"[docs]: {destination}\n\n"
+    use = "Use a [link][docs] here.\n"
+    if form == "collapsed":
+        use = "Use [docs][] here.\n"
+    elif form == "shortcut":
+        use = "Use [docs] here.\n"
+    elif form == "image":
+        use = "![description][docs]\n"
+    elif form == "multiline-label":
+        definition = f"[doc\nname]: {destination}\n\n"
+        use = "Use a [link][doc name] here.\n"
+    elif form == "escaped-label":
+        definition = f"[doc\\]]: {destination}\n\n"
+        use = "Use a [link][doc\\]] here.\n"
+    elif form == "quoted-definition":
+        definition = "> " + definition
+    elif form == "list-definition":
+        definition = "- " + definition
+    elif form == "fenced-literal":
+        definition = "```text\n" + definition + "```\n\n"
+    elif form == "inline-control":
+        definition = (
+            "[A note] is ordinary prose; use a [link](https://example.test/direct) and "
+            f"`[docs]: {destination}` literally.\n\n"
+        )
+    padding = "Ordinary finding.\n" * (1 if form == "short" else 4500) + "\n"
+    lead = use + "\n" + padding + definition if form == "forward" else definition + padding + use
+    review = (
+        lead
+        + "\n"
+        + _HELPERS["compose_review"](
+            _REVIEW, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+        )
+    )
+    original = parser.parse(review)
+    expected = (
+        []
+        if form == "fenced-literal"
+        else [("link_open", "https://example.test/direct")]
+        if form == "inline-control"
+        else [("image" if form == "image" else "link_open", destination)]
+    )
+    assert _resolved_destinations(original) == expected
+    assert sum(token.type == "table_open" for token in original) == 1
+    assert _HELPERS["COMMENT_BYTE_LIMIT"] == 60000
+    assert (len(review.encode("utf-8")) < 60000) == (form == "short")
+    if form not in {"short", "fenced-literal", "inline-control"}:
+        _check_context_refusal(
+            review,
+            "reference-" + form,
+            False,
+            False,
+            tmp_path,
+            monkeypatch,
+            reference_refusal=True,
+        )
+        return
+
+    comments = _HELPERS["review_comments"](
+        review, head_sha="a" * 40, run_id="10-1", run_url="https://example.test/run"
+    )
+    assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
+    if form == "short":
+        assert len(comments) == 1
+        fragments = [comments[0].split("Polly AI Review\n\n", 1)[1].rsplit("\n---\n", 1)[0]]
+    else:
+        assert 1 < len(comments) <= _HELPERS["MAX_REVIEW_PARTS"]
+        fragments = [
+            comment.split("part 1 appears.\n\n", 1)[1].rsplit("\n\n---\n", 1)[0]
+            for comment in comments
+        ]
+    assert "".join(fragments) == review
+    rendered = [parser.parse(comment) for comment in comments]
+    assert [
+        item
+        for tokens in rendered
+        for item in _resolved_destinations(tokens)
+        if item[1] != "https://example.test/run"
+    ] == expected, "Each comment must resolve its links independently"
+    assert sum(token.type == "table_open" for tokens in rendered for token in tokens) == 1
+    row = next(line for line in review.splitlines() if line.startswith("| tests/"))
+    assert sum(comment.count(row) for comment in comments) == 1
+    assert [token.content for tokens in rendered for token in tokens if token.type == "fence"] == [
+        token.content for token in original if token.type == "fence"
+    ]
+    for tokens in rendered:
+        assert not any(
+            "<sub>Automated review by Polly" in token.content
+            for token in tokens
+            if token.type in {"fence", "code_block"}
+        )
+    assert [
+        child.content
+        for fragment in fragments
+        for token in parser.parse(fragment)
+        for child in token.children or []
+        if child.type == "code_inline"
+    ] == [
+        child.content
+        for token in original
+        for child in token.children or []
+        if child.type == "code_inline"
+    ]
+
+
+@pytest.mark.parametrize(
+    "table_variant",
+    [
         "container-blockquote",
         "container-list-continuation",
         "container-attributed-details",
@@ -1427,40 +1155,467 @@ def _check_identity_and_work(table_variant: str, monkeypatch: pytest.MonkeyPatch
         "code-span-html-attribute",
         "code-span-link-title",
         "code-span-cross-line-ambiguity",
-        *[
-            f"code-span-{context}-{tag}-{placement}"
-            for context in ("comparison", "completed-link", "completed-reference")
-            for tag in ("details", "summary")
-            for placement in ("prose", "rationale")
-        ],
+        "code-span-comparison-details-prose",
+        "code-span-comparison-details-rationale",
+        "code-span-comparison-summary-prose",
+        "code-span-comparison-summary-rationale",
+        "code-span-completed-link-details-prose",
+        "code-span-completed-link-details-rationale",
+        "code-span-completed-link-summary-prose",
+        "code-span-completed-link-summary-rationale",
+        "code-span-completed-reference-details-prose",
+        "code-span-completed-reference-details-rationale",
+        "code-span-completed-reference-summary-prose",
+        "code-span-completed-reference-summary-rationale",
         "code-span-comparison-cut-guard",
         "code-span-completed-link-cut-guard",
         "code-span-html-attribute-quoted-close",
         "code-span-link-title-quoted-close",
         "short-code-span-comparison-tags",
         "short-code-span-completed-link-tags",
-        *[
-            f"code-span-{context}-{tag}-{placement}"
-            for context in ("less-equal", "less-digit", "leading-autolink", "leading-email")
-            for tag in ("details", "summary")
-            for placement in ("prose", "rationale")
-        ],
-        *[
-            f"short-code-span-{context}-{tag}-prose"
-            for context in ("less-equal", "less-digit", "leading-autolink", "leading-email")
-            for tag in ("details", "summary")
-        ],
-        *[
-            f"code-span-comment-{context}-{tag}-{placement}"
-            for context in ("standard", "alternate", "alternate-attribute")
-            for tag in ("details", "summary")
-            for placement in ("prose", "rationale")
-        ],
-        *[
-            f"short-code-span-comment-alternate-{tag}-{placement}"
-            for tag in ("details", "summary")
-            for placement in ("prose", "rationale")
-        ],
+        "code-span-less-equal-details-prose",
+        "code-span-less-equal-details-rationale",
+        "code-span-less-equal-summary-prose",
+        "code-span-less-equal-summary-rationale",
+        "code-span-less-digit-details-prose",
+        "code-span-less-digit-details-rationale",
+        "code-span-less-digit-summary-prose",
+        "code-span-less-digit-summary-rationale",
+        "code-span-leading-autolink-details-prose",
+        "code-span-leading-autolink-details-rationale",
+        "code-span-leading-autolink-summary-prose",
+        "code-span-leading-autolink-summary-rationale",
+        "code-span-leading-email-details-prose",
+        "code-span-leading-email-details-rationale",
+        "code-span-leading-email-summary-prose",
+        "code-span-leading-email-summary-rationale",
+        "short-code-span-less-equal-details-prose",
+        "short-code-span-less-equal-summary-prose",
+        "short-code-span-less-digit-details-prose",
+        "short-code-span-less-digit-summary-prose",
+        "short-code-span-leading-autolink-details-prose",
+        "short-code-span-leading-autolink-summary-prose",
+        "short-code-span-leading-email-details-prose",
+        "short-code-span-leading-email-summary-prose",
+        "code-span-comment-standard-details-prose",
+        "code-span-comment-standard-details-rationale",
+        "code-span-comment-standard-summary-prose",
+        "code-span-comment-standard-summary-rationale",
+        "code-span-comment-alternate-details-prose",
+        "code-span-comment-alternate-details-rationale",
+        "code-span-comment-alternate-summary-prose",
+        "code-span-comment-alternate-summary-rationale",
+        "code-span-comment-alternate-attribute-details-prose",
+        "code-span-comment-alternate-attribute-details-rationale",
+        "code-span-comment-alternate-attribute-summary-prose",
+        "code-span-comment-alternate-attribute-summary-rationale",
+        "short-code-span-comment-alternate-details-prose",
+        "short-code-span-comment-alternate-details-rationale",
+        "short-code-span-comment-alternate-summary-prose",
+        "short-code-span-comment-alternate-summary-rationale",
+        "short-code-span-completed-reference-details-prose",
+        "short-code-span-completed-reference-details-rationale",
+        "short-code-span-completed-reference-summary-prose",
+        "short-code-span-completed-reference-summary-rationale",
+    ],
+)
+def test_review_comments_preserve_supported_markdown_context(
+    table_variant: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _check_review_context(table_variant, tmp_path, monkeypatch)
+
+
+@pytest.mark.parametrize(
+    "table_variant",
+    [
+        "oversized-header",
+        "part-limit",
+        "work-limit",
+        "fenced-header-control",
+        "oversized-fence-backticks",
+        "oversized-fence-tildes",
+        "unsafe-inline-run-backticks",
+        "unsafe-inline-run-tildes",
+        "unsafe-fence-whitespace-backticks",
+        "unsafe-fence-whitespace-tildes",
+    ],
+)
+def test_review_comments_enforce_capacity_and_work_limits(
+    table_variant: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _check_capacity_and_work_limits(table_variant, tmp_path, monkeypatch)
+
+
+@pytest.mark.parametrize(
+    "table_variant",
+    [
+        "ordinary-empty-cell",
+        "incremental-work",
+    ],
+)
+def test_review_comments_preserve_identity_with_bounded_work(
+    table_variant: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _check_identity_and_work(table_variant, monkeypatch)
+
+
+def test_multipart_nested_lists_are_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _check_nested_list_refusal(tmp_path, monkeypatch)
+
+
+@pytest.mark.parametrize(
+    (
+        "rationale_specs",
+        "preceding_paragraph_length",
+        "row_indentation",
+        "inline_details",
+        "run_path",
+        "oversized_field",
+        "terminal_remainder",
+        "adjacent_tables",
+        "oversized_nonassessment",
+        "final_table_newline",
+        "rationale_separator",
+    ),
+    [
+        pytest.param(
+            None,
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            None,
+            None,
+            id="many-rows",
+        ),
+        pytest.param(
+            (20000, 45000, 20000),
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            None,
+            None,
+            id="unequal-rows",
+        ),
+        pytest.param(
+            (3000,) * 30,
+            59194,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            None,
+            None,
+            id="header-boundary",
+        ),
+        pytest.param(
+            None,
+            0,
+            "  ",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            None,
+            None,
+            id="indented-rows",
+        ),
+        pytest.param(
+            (70000,),
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            None,
+            None,
+            id="oversized-row",
+        ),
+        pytest.param(
+            ("y" * 69 + ("x" * 70 + "\\|") * 1100,),
+            0,
+            "",
+            False,
+            "r" * 66,
+            None,
+            None,
+            False,
+            False,
+            None,
+            None,
+            id="escaped-pipe-boundary",
+        ),
+        pytest.param(
+            None,
+            0,
+            "",
+            True,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            None,
+            None,
+            id="inline-details",
+        ),
+        pytest.param(
+            ("Reason",),
+            0,
+            "",
+            False,
+            "run",
+            0,
+            None,
+            False,
+            False,
+            None,
+            None,
+            id="oversized-test",
+        ),
+        pytest.param(
+            ("Reason",),
+            0,
+            "",
+            False,
+            "run",
+            1,
+            None,
+            False,
+            False,
+            None,
+            None,
+            id="oversized-behavior",
+        ),
+        pytest.param(
+            ("Reason",),
+            0,
+            "",
+            False,
+            "run",
+            2,
+            None,
+            False,
+            False,
+            None,
+            None,
+            id="oversized-layer",
+        ),
+        pytest.param(
+            (177655, "Tail."),
+            0,
+            "",
+            False,
+            "run",
+            None,
+            " | \t",
+            False,
+            False,
+            None,
+            None,
+            id="terminal-before-space",
+        ),
+        pytest.param(
+            (177654, "Tail."),
+            0,
+            "",
+            False,
+            "run",
+            None,
+            "| \t",
+            False,
+            False,
+            None,
+            None,
+            id="terminal-before-delimiter",
+        ),
+        pytest.param(
+            (177653, "Tail."),
+            0,
+            "",
+            False,
+            "run",
+            None,
+            " \t",
+            False,
+            False,
+            None,
+            None,
+            id="terminal-after-delimiter",
+        ),
+        pytest.param(
+            (177652, "Tail."),
+            0,
+            "",
+            False,
+            "run",
+            None,
+            "\t",
+            False,
+            False,
+            None,
+            None,
+            id="terminal-in-whitespace",
+        ),
+        pytest.param(
+            (177651, "Tail."),
+            0,
+            "",
+            False,
+            "run",
+            None,
+            "",
+            False,
+            False,
+            None,
+            None,
+            id="terminal-before-newline",
+        ),
+        pytest.param(
+            ("Reason." + " " * 135000 + "Tail.",),
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            None,
+            None,
+            id="interior-whitespace",
+        ),
+        pytest.param(
+            None,
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            True,
+            False,
+            None,
+            None,
+            id="adjacent-tables",
+        ),
+        pytest.param(
+            ("Reason",),
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            True,
+            None,
+            None,
+            id="oversized-nonassessment",
+        ),
+        pytest.param(
+            None,
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            "",
+            None,
+            id="final-table-no-newline",
+        ),
+        pytest.param(
+            None,
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            "\n",
+            None,
+            id="final-table-newline",
+        ),
+        pytest.param(
+            None,
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            None,
+            "\u2028",
+            id="rationale-line-separator",
+        ),
+        pytest.param(
+            None,
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            None,
+            "\x85",
+            id="rationale-next-line",
+        ),
+        pytest.param(
+            None,
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            None,
+            "\x0c",
+            id="rationale-form-feed",
+        ),
+        pytest.param(
+            None,
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            None,
+            " ",
+            id="rationale-space-control",
+        ),
     ],
 )
 def test_long_review_parts_preserve_all_assessments_and_markdown_context(
@@ -1475,26 +1630,9 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
     oversized_nonassessment: bool,
     final_table_newline: str | None,
     rationale_separator: str | None,
-    table_variant: str | None,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if table_variant and table_variant.startswith(
-        (
-            "container-",
-            "short-container-",
-            "fenced-container-",
-            "boundary-",
-            "short-boundary-",
-            "code-span-",
-            "short-code-span-",
-        )
-    ):
-        _check_review_context(table_variant, tmp_path, monkeypatch)
-        return
-    if table_variant == "nested-list":
-        _check_nested_list_refusal(tmp_path, monkeypatch)
-        return
     unrenderable_whitespace = any(
         isinstance(spec, str) and " " * _HELPERS["COMMENT_BYTE_LIMIT"] in spec
         for spec in rationale_specs or ()
@@ -1504,24 +1642,6 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
             tmp_path, monkeypatch, head_sha="a" * 40, run_url="https://example.test/run"
         )
 
-    if table_variant in {
-        "oversized-header",
-        "part-limit",
-        "work-limit",
-        "fenced-header-control",
-        "oversized-fence-backticks",
-        "oversized-fence-tildes",
-        "unsafe-inline-run-backticks",
-        "unsafe-inline-run-tildes",
-        "unsafe-fence-whitespace-backticks",
-        "unsafe-fence-whitespace-tildes",
-    }:
-        _check_capacity_and_work_limits(table_variant, tmp_path, monkeypatch)
-        return
-
-    if table_variant is not None:
-        _check_identity_and_work(table_variant, monkeypatch)
-        return
     if final_table_newline is not None:
         final_table = "\n| A | B |\n| --- | --- |\n| x | é🙂 |" + final_table_newline
         composed = _HELPERS["compose_review"](
