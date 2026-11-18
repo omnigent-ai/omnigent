@@ -313,7 +313,10 @@ result['env'] = os.environ.get('OMNIGENT_SKILL_PRIVATE_CANARY')
 print(json.dumps(result))
 """
     prepared = claude.prepare_claude_cli_path(
-        sys.executable, real_worker_spec, worker_env=worker_env
+        sys.executable,
+        real_worker_spec,
+        worker_env=worker_env,
+        model_access=ClaudeModelAccess("https://model.test", "x-api-key", lambda: "synthetic-key"),
     )
     assert prepared.cli_path is not None
     try:
@@ -486,6 +489,7 @@ def test_filtered_worker_networking_preserves_policy_credentials_and_gateway_thi
         real_worker_spec,
         worker_env=env,
         request_body_transform=claude.gateway_body_transform(base_url),
+        model_access=ClaudeModelAccess("https://model.test", "x-api-key", lambda: "synthetic-key"),
     )
     launcher = Path(prepared.cli_path or "")
     scratch = prepared._runtime_tmpdir
@@ -605,7 +609,9 @@ def test_prepared_cli_authenticates_shared_loopback_credential_relay(
     resolve_model = Mock(
         side_effect=AssertionError("non-model traffic must not resolve model auth")
     )
-    access = ClaudeModelAccess("https://model.test", "x-api-key", resolve_model)
+    access = ClaudeModelAccess(
+        "https://model.test", "x-api-key", resolve_model, static_credential_value="synthetic-key"
+    )
     if proxy_factory == "generic":
         monkeypatch.setattr(
             ClaudeModelAccess,
