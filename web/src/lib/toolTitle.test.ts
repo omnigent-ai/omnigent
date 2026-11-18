@@ -578,3 +578,113 @@ describe("summarizeArgs", () => {
     expect(summarizeArgs({ a: "1", b: "2", c: "3", d: "4" })).toBe("1 · 2 · 3");
   });
 });
+
+describe("Antigravity native tool formatting", () => {
+  it("formats streamed and polled Antigravity tool calls", () => {
+    expect(formatToolTitle("run_command", { commandLine: "pytest -q" })).toEqual({
+      verb: null,
+      body: "pytest -q",
+      isShellCommand: true,
+    });
+    expect(formatToolTitle("run_command", { CommandLine: "git status" })).toEqual({
+      verb: null,
+      body: "git status",
+      isShellCommand: true,
+    });
+    expect(
+      formatToolTitle("view_file", { absolutePathUri: "file:///repo/my%20app/package.json" }),
+    ).toEqual({
+      verb: "Read",
+      body: "/repo/my app/package.json",
+      filePath: "/repo/my app/package.json",
+    });
+    expect(formatToolTitle("read_file", { Path: "/repo/main.py" })).toEqual({
+      verb: "Read",
+      body: "/repo/main.py",
+      filePath: "/repo/main.py",
+    });
+    expect(formatToolTitle("edit_file", { path: "/repo/a.py" })).toEqual({
+      verb: "Edit",
+      body: "/repo/a.py",
+      filePath: "/repo/a.py",
+    });
+    expect(formatToolTitle("write_to_file", { TargetFile: "/repo/b.py" })).toEqual({
+      verb: "Write",
+      body: "/repo/b.py",
+      filePath: "/repo/b.py",
+    });
+    expect(formatToolTitle("replace_file_content", { TargetFile: "/repo/c.py" })).toEqual({
+      verb: "Edit",
+      body: "/repo/c.py",
+      filePath: "/repo/c.py",
+    });
+    expect(formatToolTitle("list_dir", { directoryPathUri: "file:///repo/src" })).toEqual({
+      verb: "List",
+      body: "/repo/src",
+    });
+    expect(formatToolTitle("grep_search", { Query: "ToolCard" })).toEqual({
+      verb: "Search:",
+      body: "ToolCard",
+    });
+    expect(formatToolTitle("find_by_name", { Pattern: "*.tsx" })).toEqual({
+      verb: "Find files:",
+      body: "*.tsx",
+    });
+    expect(formatToolTitle("search_web", { query: "omnigent" })).toEqual({
+      verb: "Web search:",
+      body: '"omnigent"',
+    });
+    expect(formatToolTitle("read_url_content", { Url: "https://example.com" })).toEqual({
+      verb: "Web read:",
+      body: "https://example.com",
+    });
+    expect(
+      formatToolTitle("invoke_subagent", {
+        subagents: [{ typeName: "research", role: "Codebase Researcher" }],
+      }),
+    ).toEqual({
+      verb: "Sub-agent:",
+      body: "Codebase Researcher",
+    });
+    expect(formatToolTitle("invoke_subagent", { TypeName: "research" })).toEqual({
+      verb: "Sub-agent:",
+      body: "research",
+    });
+    expect(
+      formatToolTitle("view_file", {
+        absolutePathUri: "",
+        AbsolutePath: "file:///C:/Users/dev/app.ts",
+      }),
+    ).toEqual({
+      verb: "Read",
+      body: "C:/Users/dev/app.ts",
+      filePath: "C:/Users/dev/app.ts",
+    });
+    expect(formatToolTitle("view_file", { absolutePathUri: "file://" })).toEqual({
+      verb: "Read",
+      body: "file://",
+      filePath: "file://",
+    });
+  });
+
+  it("recognizes run_command in shellToolCall and folded run labels", () => {
+    expect(shellToolCall("run_command", { commandLine: "pnpm test" })).toEqual({
+      command: "pnpm test",
+      outputFormat: "codex-suffix",
+    });
+    expect(shellToolCall("run_command", { CommandLine: "pytest" })).toEqual({
+      command: "pytest",
+      outputFormat: "codex-suffix",
+    });
+    expect(
+      formatToolRunLabel([
+        { name: "run_command", args: { commandLine: "pytest" } },
+        { name: "run_command", args: { commandLine: "ls -la" } },
+        { name: "list_dir", args: { directoryPathUri: "/repo" } },
+        { name: "view_file", args: { absolutePathUri: "/repo/a.py" } },
+        { name: "edit_file", args: { path: "/repo/a.py" } },
+        { name: "grep_search", args: { query: "foo" } },
+      ]),
+    ).toBe("Ran 1 shell command, listed 2 directories, read 1 file, edited 1 file, ran 1 search");
+  });
+});

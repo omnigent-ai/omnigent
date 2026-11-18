@@ -49,8 +49,10 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from dataclasses import dataclass
 from typing import Literal, TypedDict
+from urllib.parse import unquote, urlparse
 
 _logger = logging.getLogger(__name__)
 
@@ -95,6 +97,11 @@ _TYPE_USER_INPUT = "CORTEX_STEP_TYPE_USER_INPUT"
 _TYPE_PLANNER_RESPONSE = "CORTEX_STEP_TYPE_PLANNER_RESPONSE"
 _TYPE_RUN_COMMAND = "CORTEX_STEP_TYPE_RUN_COMMAND"
 _TYPE_LIST_DIRECTORY = "CORTEX_STEP_TYPE_LIST_DIRECTORY"
+_TYPE_FIND = "CORTEX_STEP_TYPE_FIND"
+_TYPE_VIEW_FILE = "CORTEX_STEP_TYPE_VIEW_FILE"
+_TYPE_CODE_ACTION = "CORTEX_STEP_TYPE_CODE_ACTION"
+_TYPE_MCP_TOOL = "CORTEX_STEP_TYPE_MCP_TOOL"
+_TYPE_INVOKE_SUBAGENT = "CORTEX_STEP_TYPE_INVOKE_SUBAGENT"
 
 # RPC step status constants (CORTEX_STEP_STATUS_* enum values).
 _STATUS_DONE = "CORTEX_STEP_STATUS_DONE"
@@ -462,19 +469,122 @@ def _tool_body(step: dict[str, object], step_type: str) -> dict[str, object] | N
     return body if isinstance(body, dict) else None
 
 
+_WINDOWS_DRIVE_URI_RE = re.compile(r"^/([A-Za-z]:/)")
+_MCP_SERVER_INVALID_RE = re.compile(r"[^A-Za-z0-9_-]+|__+")
+
+
+def _normalize_file_uri(value: str) -> str:
+    """Convert a local ``file://`` URI into a decoded filesystem path."""
+    if not value.startswith("file://"):
+        return value
+    parsed = urlparse(value)
+    if parsed.netloc not in ("", "localhost") or not parsed.path:
+        return value
+    decoded = unquote(parsed.path)
+    return _WINDOWS_DRIVE_URI_RE.sub(r"\1", decoded)
+
+
+def _parse_json_object(raw: object, step_type: str) -> dict[str, object] | None:
+    """Parse a JSON object string into a dict with agy display keys removed."""
+    if not isinstance(raw, str):
+        return None
+    if not raw.strip():
+        return {}
+    try:
+        parsed: object = json.loads(raw)
+    except json.JSONDecodeError:
+        _logger.warning("agy RPC tool step argumentsJson not valid JSON: type=%s", step_type)
+        return None
+    if isinstance(parsed, dict):
+        return _strip_tool_display_args(parsed)
+    return None
+
+
+def _sanitize_mcp_server(server_name: str) -> str:
+    """Normalize an MCP server name so ``mcp__<server>__<tool>`` parses cleanly."""
+    return _MCP_SERVER_INVALID_RE.sub("-", server_name).strip("_-")
+
+
+def _mcp_tool_name(body: dict[str, object]) -> str | None:
+    """Derive ``mcp__<server>__<tool>`` from an ``mcpTool`` step body."""
+    inner_call = body.get("toolCall")
+    if not isinstance(inner_call, dict):
+        return None
+    tool_name = inner_call.get("name")
+    if not isinstance(tool_name, str) or not tool_name:
+        return None
+    server_name = body.get("serverName")
+    if isinstance(server_name, str) and server_name and not tool_name.startswith("mcp__"):
+        # Strip agy's single-underscore (`mcp_<server>_`) or `server__` prefix before re-prefixing.
+        for prefix in (f"mcp_{server_name}_", f"{server_name}__"):
+            if tool_name.startswith(prefix) and len(tool_name) > len(prefix):
+                tool_name = tool_name[len(prefix) :]
+                break
+        safe_server = _sanitize_mcp_server(server_name)
+        if safe_server:
+            return f"mcp__{safe_server}__{tool_name}"
+    return tool_name
+
+
+def _code_action_is_create(body: dict[str, object]) -> bool:
+    """Return whether a ``codeAction`` body creates a file rather than editing one."""
+    action_spec = body.get("actionSpec")
+    if isinstance(action_spec, dict) and isinstance(action_spec.get("createFile"), dict):
+        return True
+    action_result = body.get("actionResult")
+    if isinstance(action_result, dict):
+        edit = action_result.get("edit")
+        if isinstance(edit, dict) and edit.get("createFile") is True:
+            return True
+    return False
+
+
+def _code_action_path(body: dict[str, object]) -> str | None:
+    """Extract and normalize the target file path from a ``codeAction`` body."""
+    candidates: list[object] = []
+    action_result = body.get("actionResult")
+    if isinstance(action_result, dict):
+        edit = action_result.get("edit")
+        if isinstance(edit, dict):
+            candidates.append(edit.get("absoluteUri"))
+    action_spec = body.get("actionSpec")
+    if isinstance(action_spec, dict):
+        create_file = action_spec.get("createFile")
+        if isinstance(create_file, dict):
+            path_obj = create_file.get("path")
+            if isinstance(path_obj, dict):
+                candidates.append(path_obj.get("absoluteUri"))
+        command = action_spec.get("command")
+        if isinstance(command, dict):
+            file_obj = command.get("file")
+            if isinstance(file_obj, dict):
+                candidates.append(file_obj.get("absoluteUri"))
+    for uri in candidates:
+        if isinstance(uri, str) and uri:
+            return _normalize_file_uri(uri)
+    return None
+
+
 def _tool_name(step: dict[str, object], step_type: str) -> str:
     """
     Name the tool a step invoked.
 
-    Prefers agy's own ``metadata.toolCall.name`` when the shape carries it;
-    otherwise derives the name from the step type, which matches agy's naming
-    for every observed type except ``LIST_DIRECTORY`` (agy calls it
-    ``list_dir``), so that one is aliased.
+    Prefers ``mcpTool``'s canonical ``serverName`` + ``toolCall.name`` for MCP
+    steps so stream and poll emit the same ``mcp__<server>__<tool>`` name; next
+    uses ``metadata.toolCall.name`` when present; otherwise derives the name
+    from the step type (with aliases for ``LIST_DIRECTORY``, ``FIND``, and
+    ``CODE_ACTION``).
 
     :param step: The tool step.
     :param step_type: The step's ``CORTEX_STEP_TYPE_*`` string.
     :returns: Tool name for the mirrored ``function_call`` item.
     """
+    if step_type == _TYPE_MCP_TOOL:
+        body = _tool_body(step, step_type)
+        if body is not None:
+            mcp_name = _mcp_tool_name(body)
+            if mcp_name is not None:
+                return mcp_name
     tool_call = _tool_call_block(step)
     if tool_call is not None:
         name = tool_call.get("name")
@@ -482,6 +592,12 @@ def _tool_name(step: dict[str, object], step_type: str) -> str:
             return name
     if step_type == _TYPE_LIST_DIRECTORY:
         return "list_dir"
+    if step_type == _TYPE_FIND:
+        return "find_by_name"
+    if step_type == _TYPE_CODE_ACTION:
+        body = _tool_body(step, step_type)
+        if body is not None:
+            return "write_file" if _code_action_is_create(body) else "edit_file"
     return step_type.removeprefix("CORTEX_STEP_TYPE_").lower()
 
 
@@ -518,7 +634,10 @@ def _arguments_from_body(step: dict[str, object], body: dict[str, object]) -> di
             (key for lowered, key in body_keys.items() if lowered.startswith(wanted)), None
         )
         if match is not None:
-            args[match] = body[match]
+            val = body[match]
+            if isinstance(val, str) and match.lower().endswith("uri"):
+                val = _normalize_file_uri(val)
+            args[match] = val
     return args
 
 
@@ -526,35 +645,78 @@ def _tool_arguments(step: dict[str, object], step_type: str) -> dict[str, object
     """
     Extract the arguments a tool step was invoked with.
 
-    Three sources, in descending fidelity: agy's verbatim
-    ``metadata.toolCall.argumentsJson`` (poll shape and streamed ``GENERIC``
-    steps); a ``generic`` body's ``args`` dict; else the typed body, narrowed to
-    the argument fields by :func:`_arguments_from_body`.
+    Sources in descending fidelity: ``mcpTool.toolCall.argumentsJson`` for MCP
+    steps; agy's verbatim ``metadata.toolCall.argumentsJson`` (poll shape and
+    streamed ``GENERIC`` steps); a ``generic`` body's ``args`` dict; else the
+    typed body narrowed by :func:`_arguments_from_body` with structured fallbacks
+    for nested streamed bodies (``codeAction``, ``viewFile``, ``runCommand``,
+    ``invokeSubagent``).
 
     :param step: The tool step.
     :param step_type: The step's ``CORTEX_STEP_TYPE_*`` string.
     :returns: Arguments dict with agy's display-only keys removed.
     """
+    body = _tool_body(step, step_type)
+    if step_type == _TYPE_MCP_TOOL and body is not None:
+        inner_call = body.get("toolCall")
+        if isinstance(inner_call, dict):
+            parsed_mcp = _parse_json_object(inner_call.get("argumentsJson"), step_type)
+            return parsed_mcp if parsed_mcp is not None else {}
     tool_call = _tool_call_block(step)
     if tool_call is not None:
-        raw = tool_call.get("argumentsJson")
-        if isinstance(raw, str):
-            try:
-                parsed: object = json.loads(raw)
-            except json.JSONDecodeError:
-                _logger.warning(
-                    "agy RPC tool step argumentsJson not valid JSON: type=%s", step_type
-                )
-                parsed = None
-            if isinstance(parsed, dict):
-                return _strip_tool_display_args(parsed)
-    body = _tool_body(step, step_type)
+        parsed_call = _parse_json_object(tool_call.get("argumentsJson"), step_type)
+        if parsed_call is not None:
+            if step_type == _TYPE_RUN_COMMAND and body is not None:
+                cwd = body.get("cwd")
+                if (
+                    isinstance(cwd, str)
+                    and cwd
+                    and "cwd" not in parsed_call
+                    and "Cwd" not in parsed_call
+                ):
+                    parsed_call = {**parsed_call, "cwd": cwd}
+            return parsed_call
     if body is None:
         return {}
     args = body.get("args")
     if isinstance(args, dict):
         return _strip_tool_display_args(args)
-    return _arguments_from_body(step, body)
+    extracted = _arguments_from_body(step, body)
+    if step_type == _TYPE_RUN_COMMAND:
+        cmd = body.get("commandLine")
+        if (
+            isinstance(cmd, str)
+            and cmd
+            and not any(k in extracted for k in ("commandLine", "CommandLine", "command"))
+        ):
+            extracted["commandLine"] = cmd
+        cwd = body.get("cwd")
+        if isinstance(cwd, str) and cwd and "cwd" not in extracted and "Cwd" not in extracted:
+            extracted["cwd"] = cwd
+    elif step_type == _TYPE_VIEW_FILE:
+        if not any(k in extracted for k in ("absolutePathUri", "absolutePath", "path", "Path")):
+            uri = body.get("absolutePathUri")
+            if isinstance(uri, str) and uri:
+                extracted["path"] = _normalize_file_uri(uri)
+    elif step_type == _TYPE_LIST_DIRECTORY:
+        if not any(
+            k in extracted for k in ("directoryPathUri", "directoryPath", "DirectoryPath", "path")
+        ):
+            uri = body.get("directoryPathUri")
+            if isinstance(uri, str) and uri:
+                extracted["directoryPathUri"] = _normalize_file_uri(uri)
+    elif step_type == _TYPE_CODE_ACTION:
+        path = _code_action_path(body)
+        if path is not None and "path" not in extracted:
+            extracted["path"] = path
+        description = body.get("description")
+        if isinstance(description, str) and description and "description" not in extracted:
+            extracted["description"] = description
+    elif step_type == _TYPE_INVOKE_SUBAGENT:
+        subagents = body.get("subagents")
+        if isinstance(subagents, list) and subagents and "subagents" not in extracted:
+            extracted["subagents"] = subagents
+    return extracted
 
 
 def planner_message_id(conversation_id: str, step_idx: int) -> str:
@@ -870,21 +1032,57 @@ def _function_call_output_event(
     )
 
 
+def _parse_exit_code(raw: object) -> int | None:
+    """Parse an integer exit code (excluding bool), accepting signed digit strings."""
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        text = raw.strip()
+        if text.lstrip("-").isdigit() and text != "-":
+            return int(text)
+    return None
+
+
 def _run_command_output(step: dict[str, object]) -> str | None:
     """
-    Extract the combined output text from a RUN_COMMAND step.
+    Extract the combined output text and non-zero exit code from a RUN_COMMAND step.
+
+    Appends ``[exit code: N]`` on non-zero exits (matching ``codex-suffix`` in
+    ``shellToolOutput.ts``) while leaving exit-0 output untouched.
 
     :param step: RUN_COMMAND step dict.
-    :returns: ``runCommand.combinedOutput.full`` text, or ``None`` when absent.
+    :returns: Output text (with optional exit-code suffix), or ``None`` when absent.
     """
     run_command = step.get("runCommand")
     if not isinstance(run_command, dict):
         return None
     combined = run_command.get("combinedOutput")
-    if not isinstance(combined, dict):
-        return None
-    full = combined.get("full")
-    return full if isinstance(full, str) else None
+    full = combined.get("full") if isinstance(combined, dict) else None
+    text = full if isinstance(full, str) else None
+    exit_code = _parse_exit_code(run_command.get("exitCode"))
+    if exit_code is not None and exit_code != 0:
+        suffix = f"[exit code: {exit_code}]"
+        stripped = text.rstrip("\r\n") if text is not None else ""
+        if stripped:
+            return f"{stripped}\n{suffix}"
+        return suffix
+    return text
+
+
+def _mcp_tool_output(body: dict[str, object]) -> str | None:
+    """Extract the unwrapped result text from an ``mcpTool`` step body."""
+    if body.get("userRejected") is True:
+        return "Error: Tool call rejected by user."
+    result_str = body.get("resultString")
+    if isinstance(result_str, str) and result_str:
+        return result_str
+    result_uri = body.get("resultUri")
+    if isinstance(result_uri, str) and result_uri:
+        return f"[output saved to {_normalize_file_uri(result_uri)}]"
+    result = body.get("result")
+    if isinstance(result, dict):
+        return _json_string(result)
+    return None
 
 
 def _tool_result_output(step: dict[str, object], step_type: str) -> str | None:
@@ -902,6 +1100,8 @@ def _tool_result_output(step: dict[str, object], step_type: str) -> str | None:
     body = _tool_body(step, step_type)
     if body is None:
         return None
+    if step_type == _TYPE_MCP_TOOL:
+        return _mcp_tool_output(body)
     # A ``generic`` step nests its payload under ``result``; every other typed
     # body IS the result (agy folds the arguments in alongside it).
     result = body.get("result")
