@@ -764,6 +764,98 @@ def test_delayed_terminal_cannot_close_a_new_turn(recovery: Any) -> None:
     assert store.get_session_recovery(conv.id).phase == "active"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", [None, "stop", "completion", "old-completion"])
+async def test_native_start_before_input_needs_matching_echo(
+    recovery: Any, terminal: str | None
+) -> None:
+    store, conv, service = recovery.store, recovery.conv, recovery.service
+    original_input = NewConversationItem(
+        type="message",
+        response_id="turn-1",
+        stable_id="b" * 32,
+        data=MessageData(
+            role="user", content=[{"type": "input_text", "text": "Earlier terminal work"}]
+        ),
+    )
+    store.append(conv.id, [original_input])
+    record_turn(store, conv.id, "old", "turn-1", finished=True)
+    stopped = store.get_session_recovery(conv.id)
+    record_turn(store, conv.id, "old", "turn-1", finished=False)
+    assert store.get_session_recovery(conv.id) == stopped
+    recovery.clock[0] += 10
+    record_turn(store, conv.id, "old", "turn-2", finished=False)
+    assert store.get_session_recovery(conv.id).phase == "stopped"
+    await service.recover(recovery.connection, [])
+    recovery.launch.assert_not_awaited()
+    if terminal == "stop":
+        service.stop_recovery(store.get_conversation(conv.id))
+    elif terminal is not None:
+        record_turn(
+            store,
+            conv.id,
+            "old",
+            "turn-1" if terminal == "old-completion" else "turn-2",
+            finished=True,
+        )
+    store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="turn-2",
+                stable_id="c" * 32,
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "New terminal work"}]
+                ),
+            )
+        ],
+    )
+    recoverable = terminal in {None, "old-completion"}
+    state = store.get_session_recovery(conv.id)
+    assert state.phase == ("active" if recoverable else "stopped")
+    assert state.response_id == "turn-2"
+    assert state.next_response_id is None
+    if recoverable:
+        assert state.interrupted_at == recovery.clock[0]
+    record_turn(store, conv.id, "old", "turn-1", finished=False)
+    store.append(conv.id, [original_input])
+    service.record_interruption(store.get_conversation(conv.id))
+    assert store.get_session_recovery(conv.id).phase == ("pending" if recoverable else "stopped")
+    await service.recover(recovery.connection, [])
+    assert recovery.launch.await_count == int(recoverable)
+
+
+def test_completion_cannot_stop_a_racing_native_start(recovery: Any) -> None:
+    store, conv = recovery.store, recovery.conv
+    record_turn(store, conv.id, "old", "turn-1", finished=True)
+    record_turn(store, conv.id, "old", "turn-2", finished=False)
+    replace_recovery = store.replace_session_recovery
+
+    def start_before_completion(*args: Any, **kwargs: Any) -> bool:
+        store.replace_session_recovery = replace_recovery
+        record_turn(store, conv.id, "old", "turn-3", finished=False)
+        return replace_recovery(*args, **kwargs)
+
+    store.replace_session_recovery = start_before_completion
+    record_turn(store, conv.id, "old", "turn-2", finished=True)
+    assert store.get_session_recovery(conv.id).next_response_id == "turn-3"
+    store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="turn-3",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "New terminal work"}]
+                ),
+            )
+        ],
+    )
+    state = store.get_session_recovery(conv.id)
+    assert state.phase == "active" and state.response_id == "turn-3"
+
+
 @pytest.mark.parametrize("terminal", ["stop", "completion"])
 @pytest.mark.parametrize("start_new_turn", [False, True])
 def test_new_input_racing_terminal_fence_is_preserved(
