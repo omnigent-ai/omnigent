@@ -594,11 +594,16 @@ queued message brings its tags back as tokens. The queue belongs to the session,
 the full-screen view shows and flushes the same messages; a reload drops a cell's
 queued messages, where the full-screen composer restores its own. Escape does not
 stop a cell's turn, and Interrupt shows only while the draft is empty, so a draft
-sends. It also shows the session's host, permission mode (switchable by the owner)
-and harness. Shift+Tab in the cell's composer steps that session's mode too; side
-chats and subagent tabs keep Shift+Tab for focus. Switch the host from the cell's
-host menu when you can edit the session. See or switch the model from the
-full-screen view.
+sends. It also shows the session's host, permission mode (switchable by the owner),
+and the same model and effort picker as the full-screen composer, which changes only
+that session (Smart Routing too, where eligible). Shift+Tab in the cell's composer
+steps that session's mode too; side chats and subagent tabs keep Shift+Tab for focus.
+Switch the host from the cell's host menu when you can edit the session. The picker
+is hidden along with the composer for a viewer who can't edit the session. It is
+inert while the session is unreachable or structurally read-only, such as a Claude
+Code sub-agent. A cell whose managed sandbox is still launching lists no models until
+its host is bound, unlike the full-screen composer, which previews the sandbox's
+catalog.
 
 ## Driving it with the repro environment
 
