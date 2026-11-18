@@ -13,7 +13,8 @@ other the way they do on the web. The pages are:
 
 - **Files**: the workspace tree, with the file viewer and editor beside it.
 - **Diffs**: a commit list and a list of changes, each opening a review of the
-  diff, including rendered Markdown diffs.
+  diff, including rendered Markdown diffs. Rendered Markdown is sanitized
+  before it reaches the page, as the existing file viewer's is.
 - **Pull Requests**: a filterable list of pull requests and a page for each one.
 
 The goal is for it to work on mobile from the start, with the same pages laid
