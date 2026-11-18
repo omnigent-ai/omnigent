@@ -126,7 +126,7 @@ async def default_profile_for_unrecorded_host(
     catalog: Any,
     session_id: str,
     host_id: str,
-    provider: str,
+    provider: str | None,
     *,
     user_id: str | None,
 ) -> dict[str, Any] | None:
