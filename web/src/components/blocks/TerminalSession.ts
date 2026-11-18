@@ -828,13 +828,14 @@ export class TerminalSession {
       },
       { capture: true, signal },
     );
-    // Keep a link-opening ⌘/Ctrl-click from a mouse-tracking program, which would act on it or
-    // open the link again. The link provider listens on this element, so it still sees the press.
+    // Keep a link-opening press (⌘/Ctrl-click, touch or pen) from a mouse-tracking program, which
+    // would act on it or open the link again. The link provider listens here, so it still sees it.
     this.term.element?.querySelector<HTMLElement>(".xterm-screen")?.addEventListener(
       "mousedown",
       (event) => {
-        if (!this.linkHovered || this.term.modes.mouseTrackingMode === "none") return;
-        if (!hasCommandModifier(event)) return;
+        const mode = this.term.modes.mouseTrackingMode;
+        if (!this.linkHovered || mode === "none") return;
+        if (!terminalLinkClickOpens(event, mode, this.lastPointerType)) return;
         event.preventDefault();
         event.stopPropagation();
         this.term.focus();

@@ -849,7 +849,7 @@ describe("TerminalSession", () => {
       session.dispose();
     });
 
-    it("keeps a Ctrl-click on a hovered link from the program's mouse reporting", async () => {
+    it("keeps a link-opening press on a hovered link from the program's mouse reporting", async () => {
       const { session } = makeSession();
       const term = termOf(session);
       const screen = term.element!.querySelector(".xterm-screen")!;
@@ -872,6 +872,12 @@ describe("TerminalSession", () => {
       expect(linkPress.defaultPrevented).toBe(true);
 
       press({});
+      expect(reported).toHaveBeenCalledTimes(2);
+
+      const touch = new Event("pointerdown", { bubbles: true });
+      Object.defineProperty(touch, "pointerType", { value: "touch" });
+      screen.dispatchEvent(touch);
+      expect(press({}).defaultPrevented).toBe(true);
       expect(reported).toHaveBeenCalledTimes(2);
 
       term.options.linkHandler?.leave?.(new MouseEvent("mousemove"), LINK, range);
