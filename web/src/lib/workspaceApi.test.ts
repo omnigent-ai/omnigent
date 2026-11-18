@@ -702,6 +702,28 @@ describe("searchFilesViaWorkspaceApi", () => {
     expect(methodCalls("SearchFiles")).toHaveLength(0);
   });
 
+  it("falls back to REST when the capability check stalls", async () => {
+    enable("workspace_api_server_access");
+    vi.useFakeTimers();
+    try {
+      // Like fetch, a stalled call rejects once its signal aborts.
+      vi.mocked(authenticatedFetch).mockImplementation(
+        (_input, init) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+          }),
+      );
+
+      const search = searchFilesViaWorkspaceApi("s-stalled", "main", SEARCH_OPTIONS);
+      await vi.advanceTimersByTimeAsync(10_000);
+
+      expect(await search).toBeNull();
+      expect(methodCalls("SearchFiles")).toHaveLength(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("reads a host's capabilities again once the cached answer expires", async () => {
     enable("workspace_api_server_access");
     vi.useFakeTimers({ toFake: ["Date"] });
