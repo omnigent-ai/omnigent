@@ -595,20 +595,24 @@ class SqlAlchemyAccountStore:
                 _logger.exception("Inbox cleanup deferred for a deleted account")
         return deleted
 
-    def _owned_workflow_ids(self, session: Session, user_id: str, *, limit: int) -> list[str]:
-        """Read a bounded page through the unique owner-and-name index."""
-        return list(
-            session.scalars(
-                select(SqlWorkflow.id)
-                .where(
-                    SqlWorkflow.workspace_id == current_workspace_id(),
-                    SqlWorkflow.user_id == user_id,
-                )
-                .order_by(SqlWorkflow.name)
-                .limit(limit)
-                .with_hint(SqlWorkflow, "FORCE INDEX (uq_workflows_user_id_name)", "mysql")
+    def _owned_workflow_ids(
+        self, session: Session, user_id: str, *, limit: int, lock: bool = False
+    ) -> list[str]:
+        """Read a bounded page through the unique owner-and-name index.
+
+        :param lock: Lock the rows, as a grant does, so no grant lands on one meanwhile.
+        """
+        stmt = (
+            select(SqlWorkflow.id)
+            .where(
+                SqlWorkflow.workspace_id == current_workspace_id(),
+                SqlWorkflow.user_id == user_id,
             )
+            .order_by(SqlWorkflow.name)
+            .limit(limit)
+            .with_hint(SqlWorkflow, "FORCE INDEX (uq_workflows_user_id_name)", "mysql")
         )
+        return list(session.scalars(stmt.with_for_update() if lock else stmt))
 
     def _delete_deleted_workflows(self, user_id: str) -> None:
         """Finish bounded cleanup before a tombstoned username can be registered again.
@@ -622,7 +626,11 @@ class SqlAlchemyAccountStore:
             account = lock_account(session, user_id)
             if account is None or account.deleted_at is None:
                 return False
-            ids = self._owned_workflow_ids(session, user_id, limit=self._cleanup_batch_size)
+            # Locked before their grants are read, the order a grant takes, so a grant
+            # already in flight commits first and is deleted here, or finds no workflow.
+            ids = self._owned_workflow_ids(
+                session, user_id, limit=self._cleanup_batch_size, lock=True
+            )
             if not ids:
                 return False
             if delete_grants_on_workflows(session, ids, batch_size=self._cleanup_batch_size):
