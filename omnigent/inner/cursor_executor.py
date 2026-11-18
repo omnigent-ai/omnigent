@@ -807,7 +807,11 @@ class CursorExecutor(Executor):
         return {"block": False, "reason": ""}
 
     async def _gate_native_tool(self, name: str, args: _JsonObject) -> _PolicyGate:
-        """Resolve policy and user approval before Cursor runs a native tool; fails closed."""
+        """Resolve policy and user approval before Cursor runs a native tool; fails closed.
+
+        The server resolves an ASK verdict before it answers, so an ASK that
+        reaches here is denied and never prompts.
+        """
         evaluator = self._policy_evaluator
         if evaluator is None:
             return {"block": True, "reason": "policy evaluator unavailable"}
