@@ -1395,6 +1395,12 @@ html[data-electron-mac]
   html[data-electron-mac] .sidebar-header-row {
     padding-left: var(--mac-traffic-light-width);
   }
+  /* Drag regions ignore clipping and opacity, so the collapsed docked sidebar's
+   * header buttons would still block the title bar. Hide them once the fade ends. */
+  html[data-electron-mac] .conversations-sidebar[data-collapsed] .sidebar-header-row {
+    visibility: hidden;
+    transition: visibility 200ms;
+  }
 }
 /* Drag regions ignore z-order, so controls and overlays need counter-regions.
  * Scoped from <html> to cover portals outside AppShell on macOS only. */
