@@ -3437,7 +3437,8 @@ class WorkflowStep(BaseModel):
     :param id: Stable step ID, e.g. ``"build"``: lowercase letters, digits,
         ``-`` and ``_``, starting with a letter or digit; at most 64 characters.
     :param name: One line of at most 80 characters, e.g. ``"Build"``.
-    :param goal: What the step achieves, at most 300 characters, or ``None``.
+    :param goal: The step's description in Markdown, e.g. what it reads, does and
+        produces, or ``None``.
     :param depends_on: IDs of the steps that must be done before it.
     """
 

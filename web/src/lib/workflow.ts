@@ -163,6 +163,7 @@ export function editWorkflowPlanPrompt(workflow: {
     `Workflow description: ${workflow.description}`,
     "This is a planning conversation. Load the existing workflow with sys_workflow_load. Explore context if useful, but do not execute the workflow or make changes to the project.",
     "Use sys_journal_write_plan to publish the proposed steps, and write a new plan whenever I ask for revisions. Keep step IDs stable. Do not set workflow_id on this journal plan: this conversation is for planning, not an execution run.",
+    "Write each step's goal for me first, in plain language and short Markdown bullets, as the save-workflow skill's Step descriptions section shows: **Inputs:** (what it reads and from where, such as a Slack channel, a PR or another MCP server), **What it does:** (a few bullets) and **Outputs:** (what it produces, such as a PR link or a report). Put the exact commands, paths and flags a run needs after them, under **Details:**. A run works from the same goal, so keep those details.",
     "Set description on every plan you publish: what the workflow does and what a run needs, written for the proposed steps. Save plan stores it as the workflow description, so keep the inputs and constraints from the current description that still apply.",
     "The workflow already exists. Do not call sys_workflow_save or create another workflow. I will use Save plan on the workflow page to apply the proposal.",
     hasSavedPlan
