@@ -162,12 +162,22 @@ async def test_structured_source_evidence_wins_over_parsed_wire_text() -> None:
         {
             "status": "failed",
             "output": json.dumps({"error": {"code": "weaker-text-code", "param": "input"}}),
-            "failure_context": {"provider_error_code": "source-code"},
+            "failure_context": {
+                "provider_error_code": "source-code",
+                "http_status": 400,
+                "native_error_request_id": "inference-request",
+                "origin": "forged-origin",
+                "api_key": "synthetic-secret",
+            },
         },
         [],
     )
     assert result["failure_context"]["provider_error_code"] == "source-code"
     assert result["failure_context"]["provider_error_param"] == "input"
+    assert result["failure_context"]["http_status"] == 400
+    assert result["failure_context"]["native_error_request_id"] == "inference-request"
+    assert "forged-origin" not in str(result)
+    assert "synthetic-secret" not in str(result)
 
 
 @pytest.mark.asyncio
