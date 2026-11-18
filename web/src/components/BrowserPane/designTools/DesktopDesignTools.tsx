@@ -85,6 +85,9 @@ function useOverlayRect(overlay: OverlayDocument | null): LayerRect | null {
   return { left: 0, top: 0, ...size };
 }
 
+const noSubscribe = () => () => {};
+const noOverlay = () => null;
+
 /** A notice alone, in an overlay of its own size: it measures itself for main. */
 function OverlayNotice({ overlay, text }: { overlay: DesignOverlay; text: string }) {
   const ref = useRef<HTMLDivElement | null>(null);
@@ -158,7 +161,13 @@ export function DesktopDesignTools({
     [overlay, viewId],
   );
   const { tool, session } = useTabTools(viewId);
-  const [notice, setNotice] = useState<string | null>(null);
+  // Each its own object, so the same message again shows its full time.
+  const [shownNotice, setShownNotice] = useState<{ text: string } | null>(null);
+  const notice = shownNotice?.text ?? null;
+  const setNotice = useCallback(
+    (text: string | null) => setShownNotice(text === null ? null : { text }),
+    [],
+  );
   const noticeRef = useRef(notice);
   noticeRef.current = notice;
   // A notice whose overlay couldn't open shows in the toolbar instead.
@@ -170,8 +179,8 @@ export function DesktopDesignTools({
   const usable = hasView && active && room;
   const mode = tool !== null ? "tool" : notice !== null ? "notice" : null;
   const shown = useSyncExternalStore(
-    overlay?.subscribe ?? (() => () => {}),
-    overlay?.current ?? (() => null),
+    overlay?.subscribe ?? noSubscribe,
+    overlay?.current ?? noOverlay,
   );
   const rect = useOverlayRect(shown);
 
@@ -181,13 +190,13 @@ export function DesktopDesignTools({
     if (usable) return;
     closeTool(viewId);
     setNotice(null);
-  }, [usable, viewId]);
+  }, [usable, viewId, setNotice]);
   useEffect(() => () => closeTool(viewId), [viewId]);
   useEffect(() => {
-    if (!notice) return;
-    const timer = setTimeout(() => setNotice(null), NOTICE_MS);
+    if (!shownNotice) return;
+    const timer = setTimeout(() => setShownNotice(null), NOTICE_MS);
     return () => clearTimeout(timer);
-  }, [notice]);
+  }, [shownNotice]);
   useEffect(() => {
     if (!unplaced) return;
     const timer = setTimeout(() => setUnplaced(null), NOTICE_MS);
@@ -213,7 +222,7 @@ export function DesktopDesignTools({
         if (noticeRef.current !== null) setUnplaced({ text: noticeRef.current });
         setNotice(null);
       }),
-    [overlay, viewId],
+    [overlay, viewId, setNotice],
   );
   // Main ended the opening (the page changed, or went), or its overlay went.
   useEffect(() => {
@@ -238,7 +247,7 @@ export function DesktopDesignTools({
       stopEvents();
       stopLost();
     };
-  }, [bridge, overlay, viewId]);
+  }, [bridge, overlay, viewId, setNotice]);
   // The overlay's document resized: main lays it over the page again, at its zoom.
   const width = rect?.width;
   const height = rect?.height;

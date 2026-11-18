@@ -56,3 +56,36 @@ it("tries a chunk that can't load again less often each time, and shows it once 
   await act(() => vi.advanceTimersByTimeAsync(CHUNK_RETRY_MAX_MS * 2));
   expect(chunk.loads).toBe(loads);
 });
+
+it("tries again only while something shows the chunk", async () => {
+  const chunk = { broken: true, loads: 0 };
+  const loaded = retryingChunk<object>(async () => {
+    chunk.loads += 1;
+    if (chunk.broken) throw new TypeError("Failed to fetch dynamically imported module");
+    return () => <p>Loaded</p>;
+  });
+  function Shown() {
+    const Component = loaded.useComponent();
+    return <Component />;
+  }
+  const view = render(
+    <Suspense fallback={null}>
+      <Shown />
+    </Suspense>,
+  );
+  await act(() => vi.advanceTimersByTimeAsync(0));
+  expect(chunk.loads).toBe(1);
+  view.unmount();
+  await act(() => vi.advanceTimersByTimeAsync(CHUNK_RETRY_MAX_MS * 4));
+  expect(chunk.loads).toBe(1);
+  // Shown again: the try that came due runs then.
+  chunk.broken = false;
+  render(
+    <Suspense fallback={null}>
+      <Shown />
+    </Suspense>,
+  );
+  await act(() => vi.advanceTimersByTimeAsync(0));
+  expect(chunk.loads).toBe(2);
+  expect(screen.getByText("Loaded")).toBeTruthy();
+});

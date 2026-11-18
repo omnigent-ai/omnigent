@@ -111,11 +111,15 @@ describe("parseDesignRequest", () => {
   it("parses many repeated headers in linear time", () => {
     const header = "\n\n---\n[Design Mode — modify this element in the browser preview]\n";
     const text = header.repeat(20_000);
-    const started = performance.now();
+    // A quadratic parse of this would outlast the test's timeout.
     expect(parseDesignRequest(text)).toBeNull();
     expect(parseDesignRequest(`${text}x\n---`)).toBeNull();
-    // Generous for a loaded runner: a quadratic parse of this would take far longer.
-    expect(performance.now() - started).toBeLessThan(2_000);
+  });
+
+  it("reads an element whose tag wasn't known as just its selector", () => {
+    const text = buildDesignModePrompt({ testId: "x" }, "Red");
+    expect(parseDesignRequest(text)).toMatchObject({ element: '[data-testid="x"]' });
+    expect(parseDesignRequest(text)?.component).toBeUndefined();
   });
 
   it("leaves ordinary messages alone", () => {

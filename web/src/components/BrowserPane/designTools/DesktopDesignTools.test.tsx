@@ -284,6 +284,37 @@ describe("DesktopDesignTools: the overlay", () => {
     }
   });
 
+  it("shows the same notice again its full time", async () => {
+    const shell = fakeShell();
+    const overlays = fakeOverlays();
+    renderTools();
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await open("Annotate an element");
+      await shell.emit({ type: "ended", reason: "navigated" });
+      await settle();
+      await act(async () => {
+        vi.advanceTimersByTime(NOTICE_MS - 1000);
+      });
+      await open("Annotate an element");
+      await shell.emit({ type: "ended", reason: "navigated" });
+      await settle();
+      // Past the first notice's time, though not the second's.
+      await act(async () => {
+        vi.advanceTimersByTime(2000);
+      });
+      expect(overlays.view().getByRole("status")).toHaveTextContent(
+        "The page changed, so the tool closed.",
+      );
+      await act(async () => {
+        vi.advanceTimersByTime(NOTICE_MS);
+      });
+      expect(overlays.view().queryByRole("status")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("shows a notice alone, in an overlay of its own size, when the page changed", async () => {
     const shell = fakeShell();
     const overlays = fakeOverlays();

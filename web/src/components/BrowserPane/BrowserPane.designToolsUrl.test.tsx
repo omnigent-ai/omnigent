@@ -34,7 +34,7 @@ function setToolsAvailable(available: boolean) {
   for (const listener of [...toolsState.listeners]) listener();
 }
 
-/** A shell with one view, its url-changed listener handed to `onUrl`. */
+/** A shell with one loaded view; `overrides` replace its bridge methods. */
 function installBridge(overrides: Record<string, unknown> = {}) {
   const unsubscribe = () => {};
   const bridge = {
@@ -72,30 +72,16 @@ describe("BrowserPane's design tools", () => {
   it("name the page the view loaded, not what's typed in the address bar", async () => {
     let urlChanged: (payload: { conversationId: string; url: string }) => void = () => {};
     let viewClosed: (payload: { conversationId: string; reason: string | null }) => void = () => {};
-    const unsubscribe = () => {};
-    (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop = {
-      browserHasView: vi.fn().mockResolvedValue({ exists: true, url: "https://a.example/" }),
-      onBrowserViewCreated: () => unsubscribe,
-      onBrowserHostActiveChanged: () => unsubscribe,
+    installBridge({
       onBrowserViewClosed: (callback: typeof viewClosed) => {
         viewClosed = callback;
-        return unsubscribe;
+        return () => {};
       },
       onBrowserUrlChanged: (callback: typeof urlChanged) => {
         urlChanged = callback;
-        return unsubscribe;
+        return () => {};
       },
-      onBrowserNavState: () => unsubscribe,
-      browserSetActive: vi.fn().mockResolvedValue({ ok: true }),
-      browserResize: vi.fn().mockResolvedValue({ ok: true }),
-    };
-    vi.stubGlobal(
-      "ResizeObserver",
-      class {
-        observe() {}
-        disconnect() {}
-      },
-    );
+    });
     render(<BrowserPane conversationId="conv_url" />);
     const tools = await screen.findByLabelText("Tools' page");
     await act(async () => {});

@@ -10,36 +10,47 @@ export interface RetryingChunk<P> {
   missing: () => boolean;
   /** Calls `listener` when the chunk fails to load, and when a later try loads it. */
   subscribe: (listener: () => void) => () => void;
-  /** The chunk's component, kept up to date; it renders nothing while the chunk can't load. */
+  /** The chunk's component, kept up to date; `fallback` while the chunk can't load. */
   useComponent: () => ComponentType<P>;
 }
 
+const Nothing = () => null;
+
 /**
  * A component loaded in its own chunk, off the app's first paint. A chunk that can't load
- * (a deploy replaced it, the network dropped) is tried again later, less often each time.
+ * (a deploy replaced it, the network dropped) is tried again later, less often each time,
+ * and only while something shows it.
  */
 export function retryingChunk<P extends object>(
   load: () => Promise<ComponentType<P>>,
+  fallback: ComponentType<P> = Nothing,
 ): RetryingChunk<P> {
   let retryMs = CHUNK_RETRY_MS;
   let missing = false;
+  // A try came due while nothing showed the chunk: the next subscriber makes it.
+  let due = false;
   const listeners = new Set<() => void>();
   const changed = () => {
     for (const listener of [...listeners]) listener();
   };
-  const Nothing: ComponentType<P> = () => null;
+
+  function tryAgain(): void {
+    if (listeners.size === 0) {
+      due = true;
+      return;
+    }
+    load().then((loaded) => {
+      Component = loaded;
+      missing = false;
+      retryMs = CHUNK_RETRY_MS;
+      changed();
+    }, retryLater);
+  }
 
   function retryLater(): void {
     const waitMs = retryMs;
     retryMs = Math.min(retryMs * 2, CHUNK_RETRY_MAX_MS);
-    setTimeout(() => {
-      load().then((loaded) => {
-        Component = loaded;
-        missing = false;
-        retryMs = CHUNK_RETRY_MS;
-        changed();
-      }, retryLater);
-    }, waitMs);
+    setTimeout(tryAgain, waitMs);
   }
 
   let Component: ComponentType<P> = lazy(() =>
@@ -49,13 +60,17 @@ export function retryingChunk<P extends object>(
         missing = true;
         changed();
         retryLater();
-        return { default: Nothing };
+        return { default: fallback };
       },
     ),
   );
 
   function subscribe(listener: () => void): () => void {
     listeners.add(listener);
+    if (due) {
+      due = false;
+      tryAgain();
+    }
     return () => {
       listeners.delete(listener);
     };

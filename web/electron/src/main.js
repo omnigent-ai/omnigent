@@ -2974,6 +2974,11 @@ function createWindow(targetUrl, opts = {}) {
   // A page's beforeunload objecting (unsaved changes) cancels a close or reload with no
   // prompt unless main asks: ask, as a browser would.
   win.webContents.on("will-prevent-unload", (event) => {
+    // Quitting has already stopped the server, so staying would leave a broken app.
+    if (quitConfirmation.isQuitting()) {
+      event.preventDefault();
+      return;
+    }
     const choice = dialog.showMessageBoxSync(win, {
       type: "question",
       title: "Omnigent",

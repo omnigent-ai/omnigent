@@ -91,7 +91,8 @@ function elementRequest(request: string, lines: string[]): DesignRequest | null 
   const selector = field(lines, "CSS selector");
   const name = field(lines, "Element");
   if (selector === undefined || name === undefined) return null;
-  const bare = name.replace(/^<|>$/g, "");
+  // `<element>` is the prompt's stand-in for an element whose tag wasn't known.
+  const bare = name === "<element>" ? "" : name.replace(/^<|>$/g, "");
   // `p` and `#blurb` read as `p#blurb`; a component's name stays apart from the selector.
   const tag = TAG.test(bare) ? bare : "";
   const element = selector && !selector.startsWith(tag) ? `${tag}${selector}` : selector || tag;
