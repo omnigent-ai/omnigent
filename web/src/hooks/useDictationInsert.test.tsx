@@ -11,10 +11,13 @@
 
 import { act, render, renderHook } from "@testing-library/react";
 import { StrictMode, useRef, useState, type ReactNode } from "react";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { useDictationInsert } from "./useDictationInsert";
 import type { ComposerTextTarget } from "@/components/composer/engine/composerInput";
-import { createFakeComposerSurface } from "@/components/composer/engine/testing/fakeComposerSurface";
+import {
+  createFakeComposerSurface,
+  type FakeComposerSurface,
+} from "@/components/composer/engine/testing/fakeComposerSurface";
 
 type Api = ReturnType<typeof useDictationInsert>;
 
@@ -378,8 +381,17 @@ describe("useDictationInsert", () => {
 });
 
 describe("useDictationInsert on a non-textarea composer surface", () => {
+  const mountedSurfaces: FakeComposerSurface[] = [];
+  afterEach(() => {
+    for (const surface of mountedSurfaces.splice(0)) {
+      surface.unregister();
+      surface.element.remove();
+    }
+  });
+
   function renderSurfaceComposer(initial: string) {
     const surface = createFakeComposerSurface(initial);
+    mountedSurfaces.push(surface);
     const box: { api: Api | null } = { api: null };
     function Composer() {
       const [value, setValue] = useState(initial);
@@ -407,6 +419,12 @@ describe("useDictationInsert on a non-textarea composer surface", () => {
     composer.click(0);
     act(() => composer.surface.blur());
     composer.surface.scrollTop = 40;
+    // Browsers scroll an unfocused element to reveal a new selection; the hook must undo that.
+    const setSelection = composer.surface.setSelectionRange;
+    composer.surface.setSelectionRange = (start, end) => {
+      setSelection(start, end);
+      composer.surface.scrollTop = 0;
+    };
 
     act(() => composer.api().appendFinal("Refactor this:"));
 

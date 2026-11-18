@@ -8,6 +8,7 @@ import {
   composerTargetOf,
   isComposerInput,
   isComposerTargetFocused,
+  registerComposerSurface,
 } from "./composerInput";
 import { createFakeComposerSurface } from "./testing/fakeComposerSurface";
 
@@ -49,6 +50,18 @@ describe("composer input targets", () => {
 
     surface.unregister();
     expect(composerTargetOf(surface.element)).toBeNull();
+  });
+
+  it("keeps a replacement registered when the surface it replaced unregisters", () => {
+    const first = createFakeComposerSurface("first");
+    const second = { ...createFakeComposerSurface("second"), element: first.element };
+    const unregisterSecond = registerComposerSurface(second);
+
+    first.unregister();
+    expect(composerTargetOf(first.element)).toBe(second);
+
+    unregisterSecond();
+    expect(composerTargetOf(first.element)).toBeNull();
   });
 
   it("reports focus on the surface's node", () => {
