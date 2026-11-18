@@ -22,6 +22,29 @@ describe("markdownPreviewText", () => {
     );
   });
 
+  it("joins a paragraph's lines with spaces, and separates blocks", () => {
+    expect(
+      markdownPreviewText(
+        [
+          "Reads the logs of each",
+          "failing check",
+          "",
+          "- Fixes the cause",
+          "  and pushes",
+          "- Reports back",
+          "",
+          "> Quoted on",
+          "> two lines",
+          "## Next",
+          "Then stop",
+        ].join("\n"),
+      ),
+    ).toBe(
+      "Reads the logs of each failing check · Fixes the cause and pushes · Reports back · " +
+        "Quoted on two lines · Next · Then stop",
+    );
+  });
+
   it("keeps code as written, without its backticks or fences", () => {
     expect(markdownPreviewText("Match `**/*.ts` and `` a`b `` in **`src`** files")).toBe(
       "Match **/*.ts and a`b in src files",
@@ -29,6 +52,8 @@ describe("markdownPreviewText", () => {
     expect(markdownPreviewText("Run:\n\n```sh\npnpm test --filter web\n```\n\nThen push.")).toBe(
       "Run: pnpm test --filter web · Then push.",
     );
+    // An escaped backtick is a backtick, not code.
+    expect(markdownPreviewText("Type \\`not code\\` here")).toBe("Type `not code` here");
   });
 
   it("shows a link's label and an image's alt text, without block markers", () => {
@@ -48,6 +73,8 @@ describe("markdownPreviewText", () => {
     expect(
       markdownPreviewText("| Flag | Use |\n| --- | :-: |\n| `--json` | Output |\n\n---\n\nDone."),
     ).toBe("Flag · Use · --json · Output · Done.");
+    // An escaped pipe stays in its cell, in code too.
+    expect(markdownPreviewText("| `a\\|b` | c\\|d |")).toBe("a|b · c|d");
   });
 
   it("leaves asterisks and underscores that mark nothing, and escaped ones, as written", () => {
@@ -63,6 +90,11 @@ describe("markdownPreviewText", () => {
     expect(markdownPreviewText("Create the release-<date> branch from <base>.")).toBe(
       "Create the release-<date> branch from <base>.",
     );
+  });
+
+  it("drops private-use characters that would read as its code span placeholders", () => {
+    const privateUse = String.fromCharCode(0xe000);
+    expect(markdownPreviewText(`${privateUse}1${privateUse} and \`x\``)).toBe("1 and x");
   });
 
   it("is empty when no text remains", () => {

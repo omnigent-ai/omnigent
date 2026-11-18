@@ -701,6 +701,8 @@ export function TaskCardDetails({
   const detail =
     item.state === "waiting" || item.state === "ready" ? item.step.goal : (text ?? item.step.goal);
   const detailIsGoal = detail === item.step.goal;
+  // A cut card shows the start of its goal as plain text, if any text remains.
+  const shownDetail = detailIsGoal && !full ? goalPreview(item.step) : detail;
   const goal = full && !detailIsGoal ? item.step.goal : null;
   return (
     <>
@@ -717,12 +719,12 @@ export function TaskCardDetails({
           {statusLine(item, pending, failedNames)}
         </span>
       </span>
-      {detail &&
+      {shownDetail &&
         (full && detailIsGoal ? (
-          <StepDescription text={detail} />
+          <StepDescription text={shownDetail} />
         ) : (
           <span className={cn("break-words text-muted-foreground", !full && "line-clamp-3")}>
-            {detailIsGoal ? goalPreview(item.step) : detail}
+            {shownDetail}
           </span>
         ))}
       {goal && (

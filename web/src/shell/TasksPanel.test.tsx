@@ -1214,6 +1214,25 @@ describe("TasksPanel", () => {
     ).toEqual(["Reruns it", "Fixes its cause"]);
   });
 
+  it("leaves a goal with no text out of a task's card, rather than an empty line", async () => {
+    showJournal([
+      journalEntry(0, {
+        kind: "plan",
+        content: {
+          name: "The plan",
+          version: 1,
+          source: "agent",
+          steps: [{ id: "rerun", name: "Rerun the test", goal: "---", depends_on: [] }],
+        },
+      }),
+    ]);
+    renderPanel();
+    fireEvent.focus(screen.getByTestId("tasks-progress-segment"));
+    const card = await screen.findByTestId("tasks-progress-card");
+    expect(card).toHaveTextContent("Ready to start");
+    expect(card.querySelector(".line-clamp-3")).toBeNull();
+  });
+
   it("shows when a finished task ended, stamped the way chat messages are", async () => {
     const done = status(2, "build", "done");
     const failed = status(4, "deploy", "failed", "Reverted");

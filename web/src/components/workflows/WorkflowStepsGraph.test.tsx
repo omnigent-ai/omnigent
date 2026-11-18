@@ -216,27 +216,6 @@ describe("WorkflowGraphOverlay", () => {
   });
 
   it("shows all of a run's step on hover: where it stands, its result and its goal", async () => {
-    const run = progress("done", "failed");
-    run[1] = { ...run[1]!, status: statusEntry("fix", "failed", "The upload test still fails") };
-    render(
-      <WorkflowGraphOverlay
-        title="Triage flaky tests"
-        steps={STEPS}
-        progress={run}
-        onClose={vi.fn()}
-      />,
-    );
-    await userEvent.hover(screen.getAllByTestId("workflow-step-node")[1]!);
-    const card = await screen.findByTestId("workflow-step-card");
-    expect(card).toHaveTextContent("Task 2 of 2");
-    expect(card).toHaveTextContent("Fix the test");
-    expect(within(card).getByRole("img", { name: "Failed" })).toBeInTheDocument();
-    expect(card).toHaveTextContent("The upload test still fails");
-    expect(within(card).getByText("Goal")).toBeInTheDocument();
-    expect(within(card).getByText("The suite passes")).toBeInTheDocument();
-  });
-
-  it("shows a run's step goal as Markdown on hover, below its result", async () => {
     const run = progress("done", "failed").map((item, index) => ({
       ...item,
       step: MARKDOWN_STEPS[index]!,
@@ -252,7 +231,11 @@ describe("WorkflowGraphOverlay", () => {
     );
     await userEvent.hover(screen.getAllByTestId("workflow-step-node")[1]!);
     const card = await screen.findByTestId("workflow-step-card");
+    expect(card).toHaveTextContent("Task 2 of 2");
+    expect(card).toHaveTextContent("Fix the test");
+    expect(within(card).getByRole("img", { name: "Failed" })).toBeInTheDocument();
     expect(card).toHaveTextContent("The upload test still fails");
+    // The whole goal follows its result, as Markdown.
     expect(within(card).getByText("Goal")).toBeInTheDocument();
     expectMarkdownGoal(card);
   });

@@ -91,6 +91,7 @@ function StepNode({ id, data }: NodeProps<Node<StepNodeData>>) {
   const [cardOpen, setCardOpen] = useState(false);
   // The card steps aside while the node's menu is open.
   const [menuOpen, setMenuOpen] = useState(false);
+  const goalPreview = data.goal ? markdownPreviewText(data.goal) : "";
   return (
     <>
       <Handle type="target" position={Position.Top} className={HANDLE_CLASS} />
@@ -121,9 +122,9 @@ function StepNode({ id, data }: NodeProps<Node<StepNodeData>>) {
                   <CantStart failedNames={data.failedNames} />
                 </p>
               ) : (
-                data.goal && (
+                goalPreview && (
                   <p className="mt-0.5 line-clamp-2 text-xs leading-snug text-muted-foreground">
-                    {markdownPreviewText(data.goal)}
+                    {goalPreview}
                   </p>
                 )
               )}
