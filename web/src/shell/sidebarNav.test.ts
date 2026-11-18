@@ -1096,6 +1096,23 @@ describe("automation runs shared with the viewer", () => {
     );
   });
 
+  it("files a shared run in the renamed folder the tag points at, not the old name", () => {
+    const run = session({ [LAUNCH]: "st_1", omni_project: "Alpha" });
+    const renamed = { id: "p_1", name: "Automations" };
+    const defaultFolder = { id: "p_1", name: "Automations" };
+    expect(sessionInSidebarFolder(run, renamed, "bob@example.com", true, defaultFolder)).toBe(true);
+    // An untagged folder that still carries the old name doesn't capture them.
+    expect(
+      sessionInSidebarFolder(
+        run,
+        { id: "p_2", name: "Omnigent Automation" },
+        "bob@example.com",
+        true,
+        defaultFolder,
+      ),
+    ).toBe(false);
+  });
+
   it("places the default automation folder where a new project would go", () => {
     const projects = [
       { id: "p_a", name: "Alpha" },
@@ -1117,5 +1134,21 @@ describe("automation runs shared with the viewer", () => {
     expect(withAutomationFolder(projects, false, false)).toBe(projects);
     const existing = [{ id: null, name: "Omnigent Automation" }];
     expect(withAutomationFolder(existing, true, false)).toBe(existing);
+  });
+
+  it("keeps the placeholder away while the tagged folder exists under another name", () => {
+    const projects = [
+      { id: "p_a", name: "Alpha" },
+      { id: "p_auto", name: "Automations" },
+    ];
+    const defaultFolder = { id: "p_auto", name: "Automations" };
+    expect(withAutomationFolder(projects, true, false, defaultFolder)).toBe(projects);
+    // Placeholder naming and ordering use the tagged project's current name.
+    expect(withAutomationFolder([{ id: "p_z", name: "Zeta" }], true, false, defaultFolder)).toEqual(
+      [
+        { id: null, name: "Automations", placeholder: true },
+        { id: "p_z", name: "Zeta" },
+      ],
+    );
   });
 });

@@ -114,10 +114,18 @@ const PROJECTS = [
 const projectsQuery = vi.hoisted(() => ({
   current: { data: undefined as unknown, isPending: false, isSuccess: false, isError: false },
 }));
+// The marker query behind the default project row; `data` is a full project
+// (with config), null once loaded with no match, undefined while loading.
+const defaultAutomationProjectQuery = vi.hoisted(() => ({
+  current: { data: undefined as unknown },
+}));
 const resolveOrCreateProjectId = vi.hoisted(() => vi.fn());
+const resolveOrCreateAutomationProjectId = vi.hoisted(() => vi.fn());
 vi.mock("@/hooks/useConversations", () => ({
   useProjects: () => projectsQuery.current,
+  useDefaultAutomationProject: () => defaultAutomationProjectQuery.current,
   useResolveOrCreateProjectId: () => resolveOrCreateProjectId,
+  useResolveOrCreateAutomationProjectId: () => resolveOrCreateAutomationProjectId,
 }));
 vi.mock("@/shell/WorkspacePicker", () => ({
   isNavigablePath: (path: string) => path.startsWith("/"),
@@ -341,9 +349,11 @@ beforeEach(() => {
     data: undefined,
   } as ReturnType<typeof sandboxModelsHook.useSandboxModelOptions>);
   projectsQuery.current = { data: PROJECTS, isPending: false, isSuccess: true, isError: false };
+  defaultAutomationProjectQuery.current = { data: undefined };
   mutateAsync.mockReset().mockResolvedValue({ id: "st_new" });
   updateMutateAsync.mockReset().mockResolvedValue({ id: "st_1" });
   resolveOrCreateProjectId.mockReset();
+  resolveOrCreateAutomationProjectId.mockReset();
   vi.mocked(agentsHook.useAvailableAgents).mockReturnValue({
     data: AGENTS,
   } as unknown as ReturnType<typeof agentsHook.useAvailableAgents>);
@@ -2857,13 +2867,64 @@ describe("CreateScheduledTaskDialog project", () => {
   }
 
   it("files new automations in the default project at save time", async () => {
-    resolveOrCreateProjectId.mockResolvedValueOnce("proj_automation");
+    resolveOrCreateAutomationProjectId.mockResolvedValueOnce("proj_automation");
     renderWithProjects();
     fillRequired();
     expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Omnigent Automation");
     expect(resolveOrCreateProjectId).not.toHaveBeenCalled();
+    expect(resolveOrCreateAutomationProjectId).not.toHaveBeenCalled();
     expect(await submitCreate()).toMatchObject({ projectId: "proj_automation" });
-    expect(resolveOrCreateProjectId).toHaveBeenCalledWith("Omnigent Automation");
+    expect(resolveOrCreateAutomationProjectId).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps filing into the default project after it is renamed", async () => {
+    // The marker query finds the project the user renamed; the sidebar list
+    // carries its current name.
+    defaultAutomationProjectQuery.current = {
+      data: { id: "proj_auto", name: "Automations", config: { default_automations: true } },
+    };
+    projectsQuery.current = {
+      data: [...PROJECTS, { id: "proj_auto", name: "Automations", icon: null }],
+      isPending: false,
+      isSuccess: true,
+      isError: false,
+    };
+    resolveOrCreateAutomationProjectId.mockResolvedValueOnce("proj_auto");
+    renderWithProjects();
+    fillRequired();
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Automations");
+    expect(await submitCreate()).toMatchObject({ projectId: "proj_auto" });
+    expect(resolveOrCreateProjectId).not.toHaveBeenCalled();
+  });
+
+  it("files into the tagged project on save while the project lists are still loading", async () => {
+    // The dialog's display queries are pending (slow lists), but the save
+    // re-lists server-side, so the renamed tagged project is still the target.
+    projectsQuery.current = { data: undefined, isPending: true, isSuccess: false, isError: false };
+    defaultAutomationProjectQuery.current = { data: undefined };
+    resolveOrCreateAutomationProjectId.mockResolvedValueOnce("proj_auto");
+    renderWithProjects();
+    fillRequired();
+    // The trigger shows the fallback name until the lists resolve.
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Omnigent Automation");
+    expect(await submitCreate()).toMatchObject({ projectId: "proj_auto" });
+    expect(resolveOrCreateAutomationProjectId).toHaveBeenCalledTimes(1);
+    expect(resolveOrCreateProjectId).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a failed default-project stamp and creates nothing", async () => {
+    // A failed marker write fails the save: filing without it would recreate
+    // the duplicate folder on a rename.
+    resolveOrCreateAutomationProjectId.mockRejectedValueOnce(
+      new Error("500 Internal Server Error"),
+    );
+    renderWithProjects();
+    fillRequired();
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    expect(await screen.findByTestId("create-error")).toHaveTextContent(
+      "500 Internal Server Error",
+    );
+    expect(mutateAsync).not.toHaveBeenCalled();
   });
 
   it("allows opting out of the default project", async () => {

@@ -214,6 +214,34 @@ export function isSharedAutomationRun(
 }
 
 /**
+ * Identity of the folder other users' shared automation runs file into: the
+ * viewer's tagged (or legacy default-named) automations project, or the
+ * fallback name while they have neither.
+ */
+export interface DefaultAutomationFolder {
+  id: string | null;
+  name: string;
+}
+
+/** The {@link DefaultAutomationFolder} used when no tagged project is known. */
+export const FALLBACK_AUTOMATION_FOLDER: DefaultAutomationFolder = {
+  id: null,
+  name: DEFAULT_AUTOMATION_PROJECT,
+};
+
+/**
+ * Whether *project* is the automations default folder: by id when both have
+ * one (survives renames), else by name.
+ */
+export function isDefaultAutomationFolder(
+  project: { id: string | null; name: string },
+  defaultFolder: DefaultAutomationFolder,
+): boolean {
+  if (project.id !== null && defaultFolder.id !== null) return project.id === defaultFolder.id;
+  return project.name === defaultFolder.name;
+}
+
+/**
  * Sidebar folder membership: {@link sessionBelongsToProject}, and with
  * `includeSharedRuns` other users' automation runs shared with the viewer go
  * in the default automation folder, wherever their owner filed them.
@@ -223,11 +251,12 @@ export function sessionInSidebarFolder(
   project: { id: string | null; name: string },
   viewerId: string | null,
   includeSharedRuns: boolean,
+  defaultFolder: DefaultAutomationFolder = FALLBACK_AUTOMATION_FOLDER,
 ): boolean {
   return (
     sessionBelongsToProject(conversation, project, viewerId) ||
     (includeSharedRuns &&
-      project.name === DEFAULT_AUTOMATION_PROJECT &&
+      isDefaultAutomationFolder(project, defaultFolder) &&
       isSharedAutomationRun(conversation, viewerId))
   );
 }
@@ -241,26 +270,28 @@ export interface PlaceholderProjectFolder {
 
 /**
  * The viewer's project folders, plus a placeholder default automation folder
- * when `needed` and they have no project of that name. It takes the place a new
- * project would: by name, as the server sorts, or last under a manual order.
- * Creating the real project later replaces it in that spot.
+ * when `needed` and none of them is the default (matched by
+ * {@link isDefaultAutomationFolder}). It takes the place a new project would:
+ * by name, as the server sorts, or last under a manual order. Creating the
+ * real project later replaces it in that spot.
  */
-export function withAutomationFolder<Project extends { name: string }>(
+export function withAutomationFolder<Project extends { id: string | null; name: string }>(
   projects: Project[],
   needed: boolean,
   manualOrder: boolean,
+  defaultFolder: DefaultAutomationFolder = FALLBACK_AUTOMATION_FOLDER,
 ): (Project | PlaceholderProjectFolder)[] {
-  if (!needed || projects.some((project) => project.name === DEFAULT_AUTOMATION_PROJECT)) {
+  if (!needed || projects.some((project) => isDefaultAutomationFolder(project, defaultFolder))) {
     return projects;
   }
   const folder: PlaceholderProjectFolder = {
     id: null,
-    name: DEFAULT_AUTOMATION_PROJECT,
+    name: defaultFolder.name,
     placeholder: true,
   };
   const index = manualOrder
     ? -1
-    : projects.findIndex((project) => project.name > DEFAULT_AUTOMATION_PROJECT);
+    : projects.findIndex((project) => project.name > defaultFolder.name);
   return index < 0
     ? [...projects, folder]
     : [...projects.slice(0, index), folder, ...projects.slice(index)];

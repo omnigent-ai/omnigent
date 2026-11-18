@@ -17,6 +17,7 @@ import {
   fetchAllArchivedProjectNames,
   fetchProjectSessionIds,
   renameConversation,
+  resolveOrCreateAutomationProjectId,
   useArchiveConversation,
   useArchivedProjectNames,
   useBulkArchiveConversations,
@@ -2996,6 +2997,233 @@ describe("fetchProjectSessionIds", () => {
       visibility: "all",
       include_archived: "true",
     });
+  });
+});
+
+describe("resolveOrCreateAutomationProjectId", () => {
+  it("returns the marker-stamped project without creating, even after a rename", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        object: "list",
+        data: [
+          { id: "p_other", name: "Work" },
+          { id: "p_auto", name: "Automations", config: { default_automations: true } },
+        ],
+      }),
+    );
+
+    await expect(resolveOrCreateAutomationProjectId()).resolves.toBe("p_auto");
+
+    // One bounded page, no create: the renamed folder is reused as-is.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/projects?limit=200");
+  });
+
+  it("adopts the name-matched legacy project, stamps it, and keeps it across a rename", async () => {
+    // First automation: the project predates the marker, so only its name
+    // (plus an icon default to preserve) identifies it.
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({
+          object: "list",
+          data: [{ id: "p_legacy", name: "Omnigent Automation", config: { icon: "⚡" } }],
+        }),
+      )
+      .mockResolvedValueOnce(
+        mockResponse({
+          id: "p_legacy",
+          object: "project",
+          name: "Omnigent Automation",
+          config: { icon: "⚡", default_automations: true },
+        }),
+      );
+
+    await expect(resolveOrCreateAutomationProjectId()).resolves.toBe("p_legacy");
+
+    const [patchUrl, patchInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(patchUrl).toBe("/v1/projects/p_legacy");
+    expect(patchInit.method).toBe("PATCH");
+    // The stamp merges onto the stored config instead of wiping it.
+    expect(JSON.parse(patchInit.body as string)).toEqual({
+      config: { icon: "⚡", default_automations: true },
+    });
+
+    // The user renames the folder; the next automation still lands in it.
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        object: "list",
+        data: [
+          {
+            id: "p_legacy",
+            name: "Automations",
+            config: { icon: "⚡", default_automations: true },
+          },
+        ],
+      }),
+    );
+
+    await expect(resolveOrCreateAutomationProjectId()).resolves.toBe("p_legacy");
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("creates a marked project when none exists (first automation, or after a delete)", async () => {
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ object: "list", data: [] }))
+      .mockResolvedValueOnce(
+        mockResponse({
+          id: "p_new",
+          object: "project",
+          name: "Omnigent Automation",
+          config: { default_automations: true },
+        }),
+      );
+
+    await expect(resolveOrCreateAutomationProjectId()).resolves.toBe("p_new");
+
+    const [createUrl, createInit] = fetchMock.mock.calls[1] as [string, RequestInit];
+    expect(createUrl).toBe("/v1/projects");
+    expect(createInit.method).toBe("POST");
+    expect(JSON.parse(createInit.body as string)).toEqual({
+      name: "Omnigent Automation",
+      config: { default_automations: true },
+    });
+  });
+
+  it("uses a racer's project when the create loses a 409 race", async () => {
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ object: "list", data: [] }))
+      .mockResolvedValueOnce(
+        mockResponse({ message: "already exists" }, { ok: false, status: 409 }),
+      )
+      .mockResolvedValueOnce(
+        mockResponse({
+          object: "list",
+          data: [
+            { id: "p_winner", name: "Omnigent Automation", config: { default_automations: true } },
+          ],
+        }),
+      );
+
+    await expect(resolveOrCreateAutomationProjectId()).resolves.toBe("p_winner");
+  });
+
+  it("stamps an unmarked 409 race winner so a later rename can't duplicate it", async () => {
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ object: "list", data: [] }))
+      .mockResolvedValueOnce(
+        mockResponse({ message: "already exists" }, { ok: false, status: 409 }),
+      )
+      // The racer created the folder the plain (pre-marker) way: name only.
+      .mockResolvedValueOnce(
+        mockResponse({
+          object: "list",
+          data: [{ id: "p_winner", name: "Omnigent Automation", config: { icon: "⚡" } }],
+        }),
+      )
+      .mockResolvedValueOnce(
+        mockResponse({
+          id: "p_winner",
+          object: "project",
+          name: "Omnigent Automation",
+          config: { icon: "⚡", default_automations: true },
+        }),
+      );
+
+    await expect(resolveOrCreateAutomationProjectId()).resolves.toBe("p_winner");
+
+    const [patchUrl, patchInit] = fetchMock.mock.calls[3] as [string, RequestInit];
+    expect(patchUrl).toBe("/v1/projects/p_winner");
+    expect(patchInit.method).toBe("PATCH");
+    expect(JSON.parse(patchInit.body as string)).toEqual({
+      config: { icon: "⚡", default_automations: true },
+    });
+  });
+
+  it("resolves multiple tagged folders to the earliest-created one", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        object: "list",
+        // Creation order puts the older tagged folder first, so it wins and
+        // later pages are never fetched.
+        data: [
+          {
+            id: "p_old",
+            name: "Automations",
+            created_at: 100,
+            config: { default_automations: true },
+          },
+          {
+            id: "p_new",
+            name: "Omnigent Automation",
+            created_at: 200,
+            config: { default_automations: true },
+          },
+        ],
+        last_id: "p_new",
+        has_more: true,
+      }),
+    );
+
+    await expect(resolveOrCreateAutomationProjectId()).resolves.toBe("p_old");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/projects?limit=200");
+  });
+
+  it("prefers a tagged project on a later page over a legacy name match", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({
+          object: "list",
+          data: [{ id: "p_legacy", name: "Omnigent Automation" }],
+          last_id: "p_legacy",
+          has_more: true,
+        }),
+      )
+      .mockResolvedValueOnce(
+        mockResponse({
+          object: "list",
+          data: [
+            {
+              id: "p_auto",
+              name: "Automations",
+              config: { default_automations: true },
+            },
+          ],
+          last_id: "p_auto",
+          has_more: false,
+        }),
+      );
+
+    await expect(resolveOrCreateAutomationProjectId()).resolves.toBe("p_auto");
+
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/projects?limit=200");
+    expect(fetchMock.mock.calls[1][0]).toBe("/v1/projects?limit=200&after=p_legacy");
+  });
+
+  it("fails the save when stamping the adopted project fails", async () => {
+    // The marker is the only identity a rename can't break, so a failed stamp
+    // must not pass as a successful save.
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({
+          object: "list",
+          data: [{ id: "p_legacy", name: "Omnigent Automation" }],
+        }),
+      )
+      .mockResolvedValueOnce(mockResponse({ message: "boom" }, { ok: false, status: 500 }));
+
+    await expect(resolveOrCreateAutomationProjectId()).rejects.toThrow("boom");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("rethrows the create error when the recovery listing finds no candidate", async () => {
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ object: "list", data: [] }))
+      .mockResolvedValueOnce(mockResponse({ message: "boom" }, { ok: false, status: 500 }))
+      .mockResolvedValueOnce(mockResponse({ object: "list", data: [] }));
+
+    await expect(resolveOrCreateAutomationProjectId()).rejects.toThrow("boom");
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 });
 

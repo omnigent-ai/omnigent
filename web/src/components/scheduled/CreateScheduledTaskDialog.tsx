@@ -108,7 +108,12 @@ import {
 import { WorkspacePickerDialog } from "@/shell/WorkspacePickerDialog";
 import { AgentHarnessPicker } from "@/shell/NewChatDialog";
 import { ProjectPicker, ProjectRowIcon } from "@/shell/ProjectPicker";
-import { useProjects, useResolveOrCreateProjectId } from "@/hooks/useConversations";
+import {
+  useDefaultAutomationProject,
+  useProjects,
+  useResolveOrCreateAutomationProjectId,
+  useResolveOrCreateProjectId,
+} from "@/hooks/useConversations";
 import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
 import { useHostWorktrees } from "@/hooks/useHostWorktrees";
@@ -295,6 +300,7 @@ export function CreateScheduledTaskDialog({
     isError: projectsFailed,
   } = useProjects({ enabled: open && projectsSupported });
   const resolveProjectId = useResolveOrCreateProjectId();
+  const resolveAutomationProjectId = useResolveOrCreateAutomationProjectId();
   const worktreesSupported = info !== "loading" && info.scheduled_task_worktrees === true;
   const sessionModesSupported = info !== "loading" && info.scheduled_task_session_modes === true;
   const triggersSupported =
@@ -806,11 +812,24 @@ export function CreateScheduledTaskDialog({
   const savedProjectId = editingTask?.projectId ?? null;
   const savedProjectName =
     savedProjectId !== null ? projects.find((p) => p.id === savedProjectId)?.name : "";
+  // The project new automations file into — found by marker so it survives
+  // renames; while it loads or none exists yet, the trigger shows the name a
+  // new one will get.
+  const { data: defaultAutomationProject } = useDefaultAutomationProject({
+    enabled: open && projectsSupported && !isEdit,
+  });
+  // Join the marker query's id against the fresh sidebar list, so a rename
+  // shows here as soon as that list does.
+  const defaultProject =
+    defaultAutomationProject != null
+      ? (projects.find((p) => p.id === defaultAutomationProject.id) ?? defaultAutomationProject)
+      : undefined;
+  const defaultProjectName = defaultProject?.name ?? DEFAULT_AUTOMATION_PROJECT;
   // A picked project is shown by its id, so a rename elsewhere shows the new name.
   const pickedProject =
     pickedProjectId !== null ? projects.find((p) => p.id === pickedProjectId) : undefined;
   const effectiveProjectChoice =
-    projectChoice ?? (!isEdit && projectsSupported ? DEFAULT_AUTOMATION_PROJECT : null);
+    projectChoice ?? (!isEdit && projectsSupported ? defaultProjectName : null);
   const projectName = pickedProject?.name ?? effectiveProjectChoice ?? savedProjectName ?? "";
   const projectIcon = (pickedProject ?? projects.find((p) => p.name === projectName))?.icon;
   // The saved project has no name while the list loads, if it fails to load,
@@ -1678,13 +1697,17 @@ export function CreateScheduledTaskDialog({
         ...workspacePatch,
         ...((editingTask?.sessionMode ?? "new") !== sessionMode ? { sessionMode } : {}),
       };
-      const projectInput = await projectChangeInput(
-        // Saving over a deleted project clears it, matching the "No project" shown.
-        effectiveProjectChoice ?? (savedProjectDeleted ? "" : null),
-        pickedProjectId,
-        savedProjectId,
-        resolveProjectId,
-      );
+      // The untouched default resolves by marker; a picked project resolves by name.
+      const projectInput =
+        !isEdit && projectsSupported && projectChoice === null
+          ? { projectId: await resolveAutomationProjectId() }
+          : await projectChangeInput(
+              // Saving over a deleted project clears it, matching the "No project" shown.
+              effectiveProjectChoice ?? (savedProjectDeleted ? "" : null),
+              pickedProjectId,
+              savedProjectId,
+              resolveProjectId,
+            );
       if (editingTask) {
         // Continued-session edits omit launch settings, except to clear a stored mode
         // the server refuses; new targets clear stale overrides.

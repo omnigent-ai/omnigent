@@ -67,6 +67,7 @@ import type { ExtensionCatalogItem } from "@/extensions/types";
 const {
   projectsMock,
   projectRowsRef,
+  automationProjectRef,
   moveToProjectSpy,
   deleteProjectSpy,
   renameProjectSpy,
@@ -83,6 +84,14 @@ const {
 } = vi.hoisted(() => ({
   projectsMock: [] as string[],
   projectRowsRef: { current: undefined as { id: string; name: string }[] | undefined },
+  // The tagged automations project the sidebar joins shared-run filing against.
+  automationProjectRef: {
+    current: null as {
+      id: string;
+      name: string;
+      config?: { default_automations?: boolean };
+    } | null,
+  },
   moveToProjectSpy: vi.fn(),
   deleteProjectSpy: vi.fn(),
   renameProjectSpy: vi.fn(),
@@ -161,6 +170,7 @@ vi.mock("@/hooks/useConversations", async () => {
       data:
         projectRowsRef.current ?? projectsMock.map((name: string) => ({ id: `p_${name}`, name })),
     }),
+    useDefaultAutomationProject: () => ({ data: automationProjectRef.current }),
     useProjectSessions: (project: string, enabled: boolean, _sortBy: unknown, archived = false) => {
       const override = projectSessionsMock.current[project];
       const loading = enabled && projectSessionsLoadingRef.current;
@@ -374,6 +384,7 @@ beforeEach(() => {
   clearOptimisticTitles();
   projectsMock.length = 0;
   projectRowsRef.current = undefined;
+  automationProjectRef.current = null;
   moveToProjectSpy.mockReset();
   deleteProjectSpy.mockReset();
   fetchProjectSessionIdsMock.mockReset();
@@ -5661,6 +5672,33 @@ describe("sidebar_grouping_ui release flag", () => {
     // The Shared filter lists them all, flat.
     showSharedTab();
     for (const run of SHARED_RUNS) expect(screen.getByText(run.id)).toBeInTheDocument();
+  });
+
+  it("files shared runs into the tagged automation folder after a rename", () => {
+    // The viewer's automations project is tagged and was renamed; nothing is
+    // named "Omnigent Automation" anymore.
+    projectsMock.push("Alpha", "Automations");
+    automationProjectRef.current = {
+      id: "p_Automations",
+      name: "Automations",
+      config: { default_automations: true },
+    };
+    mockScopedConversations([
+      conv("conv_own_run", "Claude Code", { project_id: "p_Automations" }),
+      ...SHARED_RUNS,
+    ]);
+    renderGroupingSidebar();
+    selectSessionFilter("all");
+    // The renamed folder takes the shared runs; no placeholder spawns for the old name.
+    expect(screen.queryByRole("button", { name: /^Omnigent Automation/ })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /^Automations/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Alpha" }));
+    const folder = screen.getByRole("button", { name: /^Automations/ }).closest("section")!;
+    const shared = screen.getByRole("button", { name: "Shared with me" }).closest("section")!;
+    for (const id of ["conv_own_run", "conv_shared_run", "conv_shared_launch"]) {
+      expect(within(folder).getByText(id)).toBeInTheDocument();
+      expect(within(shared).queryByText(id)).toBeNull();
+    }
   });
 
   it("shows the folder where the viewer's project will go until they have it", () => {
