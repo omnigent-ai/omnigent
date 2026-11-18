@@ -19,7 +19,16 @@ import type * as IdentityModule from "@/lib/identity";
 import { sideChatSettingsMutationKey } from "@/lib/sideChat";
 
 import { type InfiniteData, QueryClient, QueryObserver } from "@tanstack/react-query";
-import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
+import {
+  afterEach,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  onTestFinished,
+  vi,
+  type MockInstance,
+} from "vitest";
 import { toast } from "sonner";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 import type {
@@ -16098,6 +16107,570 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  describe("periodic committed-item check", () => {
+    const id = "conv_committed_gap";
+    const before = userMessage("resp_before", "Before the gap");
+    const reply = assistantMessage("resp_missed", "Saved without a stream event");
+    let sinks: StreamSink[];
+    let controller: AbortController;
+    let bound: ReturnType<typeof bindConversationForTest>;
+    let loop: Promise<void>;
+    let warn: MockInstance<typeof console.warn>;
+
+    const itemReads = () =>
+      fetchMock.mock.calls
+        .map(([input]) => String(input))
+        .filter((url) => url.startsWith(`/v1/sessions/${id}/items?`));
+    const diagnostics = () =>
+      warn.mock.calls.filter(([message]) => String(message).includes("committed items"));
+    const advanceCheck = () =>
+      advanceWithHeartbeats(() => sinks.at(-1)!, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
+
+    function holdItems(limit: number) {
+      const route = fetchMock.getMockImplementation()!;
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      let requested = false;
+      fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).includes(`/items?limit=${limit}&`)) {
+          requested = true;
+          await held;
+        }
+        return route(input, init);
+      });
+      return { release, requested: () => requested };
+    }
+
+    async function pushSemanticEvent() {
+      sinks[0]!.push(
+        sse("session.resource.deleted", {
+          session_id: id,
+          resource_type: "file",
+          resource_id: "file_1",
+        }),
+      );
+      await drainAsync();
+    }
+
+    beforeEach(async () => {
+      Object.defineProperty(document, "hidden", { configurable: true, value: false });
+      seedSession(id, [before]);
+      sinks = routeStreamOpens();
+      controller = new AbortController();
+      bound = bindConversationForTest(id, {
+        abortController: controller,
+        blocks: itemsToBlocks([before]),
+      });
+      warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+      loop = startStreamPump(id, controller, bound.set, bound.get);
+      await drainAsync();
+    });
+
+    afterEach(async () => {
+      controller.abort();
+      sinks.at(-1)!.close();
+      await drainAsync(2);
+      await loop;
+      warn.mockRestore();
+      Reflect.deleteProperty(document, "hidden");
+    });
+
+    it("recovers a newer committed item within one interval while heartbeats keep the visible chat alive", async () => {
+      seedSessionItems(id, [before, reply]);
+      await advanceCheck();
+
+      expect(bound.get().blocks.map((block) => block.ctx.itemId)).toEqual([before.id, reply.id]);
+      expect(sinks).toHaveLength(1);
+      expect(itemReads()).toEqual([
+        `/v1/sessions/${id}/items?limit=2&order=desc`,
+        `/v1/sessions/${id}/items?limit=${SESSION_HISTORY_PAGE_SIZE}&order=desc`,
+      ]);
+      expect(diagnostics()).toEqual([
+        [
+          "Recovered committed items missing from the stream",
+          { trigger: "poll", count: 1, secondsSinceLastByte: expect.any(Number) },
+        ],
+      ]);
+      expect(diagnostics()[0]![1].secondsSinceLastByte).toBeGreaterThan(14);
+      expect(diagnostics()[0]![1].secondsSinceLastByte).toBeLessThanOrEqual(15);
+      await advanceCheck();
+      expect(diagnostics()).toHaveLength(1);
+    });
+
+    it.each(["resource_event", "is_meta"] as const)(
+      "converges after reconciling a trailing %s item",
+      async (kind) => {
+        const tail: ConversationItem =
+          kind === "is_meta"
+            ? { ...userMessage("resp_meta", "Internal context"), is_meta: true }
+            : {
+                id: "resource_tail",
+                response_id: id,
+                type: "resource_event",
+                status: "completed",
+                event: "session.resource.created",
+                resource_type: "terminal",
+                resource_id: "terminal_1",
+              };
+        seedSessionItems(id, [before, tail]);
+        const blocks = bound.get().blocks;
+        await advanceCheck();
+        expect(itemReads()).toHaveLength(2);
+        expect(bound.get().blocks).toBe(blocks);
+        fetchMock.mockClear();
+        await advanceCheck();
+        await advanceCheck();
+        expect(itemReads()).toEqual(Array(2).fill(`/v1/sessions/${id}/items?limit=2&order=desc`));
+        expect(bound.get().blocks).toBe(blocks);
+        expect(diagnostics()).toEqual([]);
+        bound.set({ historyGeneration: bound.get().historyGeneration + 1 });
+        fetchMock.mockClear();
+        await advanceCheck();
+        expect(itemReads()).toHaveLength(2);
+      },
+    );
+
+    it.each(["incremental", "rehydrate"] as const)(
+      "reconnect preserves committed error ordering on %s",
+      async (mode) => {
+        const error: ConversationItem = {
+          id: "err_order",
+          response_id: "resp_order",
+          type: "error",
+          status: "completed",
+          source: "harness",
+          code: "execution_failed",
+          message: "Turn failed",
+          created_at: 1040,
+        };
+        const errorBlock = itemsToBlocks([error])[0]!;
+        bound.set({
+          blocks: [
+            ...itemsToBlocks([before]),
+            {
+              ...errorBlock,
+              ctx: {
+                ...errorBlock.ctx,
+                itemId: null,
+                createdAtS: undefined,
+                clientCreatedAtS: 1040,
+              },
+            },
+          ],
+        });
+        const gap = Array.from({ length: mode === "rehydrate" ? 100 : 2 }, (_, index) => ({
+          ...assistantMessage(`resp_order_${index}`, "Committed"),
+          created_at: 1000 + index,
+        }));
+        const items = [before, ...gap.slice(0, 40), error, ...gap.slice(40)];
+        seedSessionItems(id, items);
+        sinks[0]!.error();
+        await drainAsync();
+        const expected = mode === "rehydrate" ? items.slice(-INITIAL_WINDOW_ITEMS) : items;
+        expect(
+          bound
+            .get()
+            .blocks.filter((b) => b.ctx.itemId)
+            .map((b) => b.ctx.itemId),
+        ).toEqual(expected.map((item) => item.id));
+      },
+    );
+
+    it("reconnect retains errors from distinct sources with the same text", async () => {
+      const errors: ConversationItem[] = ["llm", "harness"].map((source) => ({
+        id: `err_${source}`,
+        response_id: "resp_sources",
+        type: "error" as const,
+        status: "completed" as const,
+        source,
+        code: "execution_failed",
+        message: "Turn failed",
+      }));
+      const liveErrorBlock = itemsToBlocks(errors)[1]!;
+      bound.set({
+        blocks: [
+          ...itemsToBlocks([before]),
+          { ...liveErrorBlock, ctx: { ...liveErrorBlock.ctx, itemId: null } },
+        ],
+      });
+      seedSessionItems(id, [before, ...errors]);
+      sinks[0]!.error();
+      await drainAsync();
+      const persisted = bound
+        .get()
+        .blocks.filter(
+          (block): block is ErrorBlock => block.type === "error" && Boolean(block.ctx.itemId),
+        );
+      expect(persisted.map((b) => ({ id: b.ctx.itemId, source: b.source }))).toEqual([
+        { id: "err_llm", source: "llm" },
+        { id: "err_harness", source: "harness" },
+      ]);
+    });
+
+    it.each([
+      "reply_before_error",
+      "reply_after_error",
+      "different_response",
+      "earlier_turn",
+      "different_source",
+    ] as const)("recovers unseen committed output with %s", async (scenario) => {
+      const error = { code: "execution_failed", message: "Turn failed" };
+      sinks[0]!.push(
+        sse("response.created", { id: "resp_failed", status: "in_progress", output: [] }),
+      );
+      sinks[0]!.push(
+        sse("response.failed", {
+          source: "harness",
+          response: { id: "resp_failed", status: "failed", model: "test-agent", error },
+        }),
+      );
+      await drainAsync();
+      if (scenario === "earlier_turn") {
+        bound.set({
+          activeResponse: { responseId: "resp_later", state: "completed", error: null },
+        });
+      }
+      const savedError: ConversationItem = {
+        id: "err_saved",
+        response_id: scenario === "different_response" ? "resp_other" : "resp_failed",
+        type: "error",
+        status: "completed",
+        source: scenario === "different_source" ? "llm" : "harness",
+        ...error,
+      };
+      const unseenReply = assistantMessage("resp_failed", "Saved partial reply");
+      seedSessionItems(
+        id,
+        scenario === "reply_after_error"
+          ? [before, savedError, unseenReply]
+          : [before, unseenReply, savedError],
+      );
+      fetchMock.mockClear();
+      await advanceCheck();
+      await advanceCheck();
+      expect(bound.get().blocks.map((block) => block.ctx.itemId)).toContain(unseenReply.id);
+      expect(diagnostics()).toHaveLength(1);
+    });
+
+    it.each([
+      { state: "failed", hasPrecedingItem: true },
+      { state: "completed", hasPrecedingItem: true },
+      { state: "failed", hasPrecedingItem: false },
+    ] as const)(
+      "skips a persisted terminal error already rendered live on poll after $state status (preceding item: $hasPrecedingItem)",
+      async ({ state, hasPrecedingItem }) => {
+        const error = { code: "execution_failed", message: "Turn failed" };
+        sinks[0]!.push(
+          sse("response.created", { id: "resp_failed", status: "in_progress", output: [] }),
+        );
+        sinks[0]!.push(
+          sse("response.failed", {
+            source: "harness",
+            response: { id: "resp_failed", status: "failed", model: "test-agent", error },
+          }),
+        );
+        await drainAsync();
+        expect(bound.get().blocks.filter((block) => block.type === "error")).toHaveLength(1);
+        seedSessionItems(id, [
+          ...(hasPrecedingItem ? [before] : []),
+          {
+            id: "err_1",
+            response_id: "resp_failed",
+            type: "error",
+            status: "completed",
+            source: "harness",
+            ...error,
+          },
+        ]);
+        bound.set({
+          activeResponse: { ...bound.get().activeResponse!, state },
+          blocks: bound
+            .get()
+            .blocks.filter((block) => hasPrecedingItem || block.ctx.itemId !== before.id),
+        });
+        fetchMock.mockClear();
+        await advanceCheck();
+        await advanceCheck();
+        expect(itemReads()).toEqual(Array(2).fill(`/v1/sessions/${id}/items?limit=2&order=desc`));
+        expect(bound.get().blocks.filter((block) => block.type === "error")).toHaveLength(1);
+        expect(bound.get().blocks.find((block) => block.type === "error")!.ctx.itemId).toBeNull();
+        expect(diagnostics()).toEqual([]);
+      },
+    );
+
+    it("counts only the persisted id when recovering a skill receipt", async () => {
+      seedSessionItems(id, [
+        before,
+        {
+          id: "skill_1",
+          response_id: "resp_skill",
+          type: "slash_command",
+          status: "completed",
+          kind: "skill",
+          name: "inspect",
+          arguments: "",
+        },
+      ]);
+      await advanceCheck();
+      expect(bound.get().blocks).toHaveLength(3);
+      expect(diagnostics()).toEqual([
+        [
+          "Recovered committed items missing from the stream",
+          { trigger: "poll", count: 1, secondsSinceLastByte: expect.any(Number) },
+        ],
+      ]);
+    });
+
+    it("keeps blocks identical and avoids reconciliation when there is no newer item", async () => {
+      const blocks = bound.get().blocks;
+      await advanceCheck();
+      expect(bound.get().blocks).toBe(blocks);
+      expect(itemReads()).toEqual([`/v1/sessions/${id}/items?limit=2&order=desc`]);
+      expect(diagnostics()).toEqual([]);
+    });
+
+    it("emits no diagnostic when the backfill recovers no items", async () => {
+      seedSessionItems(id, [before, reply]);
+      const route = fetchMock.getMockImplementation()!;
+      fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const response = await route(input, init);
+        if (String(input).includes("/items?limit=2&")) seedSessionItems(id, [before]);
+        return response;
+      });
+      await advanceCheck();
+      expect(itemReads()).toHaveLength(2);
+      expect(bound.get().blocks.map((block) => block.ctx.itemId)).toEqual([before.id]);
+      expect(diagnostics()).toEqual([]);
+    });
+
+    it("does no extra reads while hidden", async () => {
+      Object.defineProperty(document, "hidden", { configurable: true, value: true });
+      seedSessionItems(id, [before, reply]);
+      fetchMock.mockClear();
+      await advanceCheck();
+      expect(itemReads()).toEqual([]);
+      expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
+        expect.stringContaining(`/v1/sessions/${id}?`),
+      ]);
+      expect(diagnostics()).toEqual([]);
+    });
+
+    it.each(["streaming", "latched"] as const)(
+      "skips the item check during a %s turn",
+      async (phase) => {
+        bound.set({
+          ...(phase === "streaming"
+            ? {
+                activeResponse: {
+                  responseId: "resp_live",
+                  state: "streaming",
+                  error: null,
+                } as const,
+              }
+            : { sendLatchedAt: Date.now() }),
+        });
+        seedSessionItems(id, [before, reply]);
+        // Keep the existing status recovery from ending the turn in this control.
+        const route = fetchMock.getMockImplementation()!;
+        fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+          const response = await route(input, init);
+          if (String(input).startsWith(`/v1/sessions/${id}?`)) {
+            return mockResponse({ ...(await response.json()), status: "running" });
+          }
+          return response;
+        });
+        await advanceCheck();
+        expect(itemReads()).toEqual([]);
+        expect(bound.get().blocks.map((block) => block.ctx.itemId)).toEqual([before.id]);
+        expect(diagnostics()).toEqual([]);
+      },
+    );
+
+    it.each(["probe", "backfill"] as const)(
+      "discards the %s when a semantic stream event arrives during its read",
+      async (phase) => {
+        seedSessionItems(id, [before, reply]);
+        const held = holdItems(phase === "probe" ? 2 : SESSION_HISTORY_PAGE_SIZE);
+        await advanceCheck();
+        expect(held.requested()).toBe(true);
+        await pushSemanticEvent();
+        held.release();
+        await drainAsync();
+        expect(bound.get().blocks.map((block) => block.ctx.itemId)).toEqual([before.id]);
+        expect(itemReads()).toHaveLength(phase === "probe" ? 1 : 2);
+        expect(diagnostics()).toEqual([]);
+      },
+    );
+
+    it.each(["generation", "controller", "switch", "revision"] as const)(
+      "discards a status snapshot after its %s changes",
+      async (change) => {
+        bound.set({ sessionStatus: "running" });
+        seedSessionItems(id, [before, reply]);
+        const release = holdNextSessionSnapshot(id);
+        await advanceCheck();
+        if (change === "generation")
+          bound.set({ historyGeneration: bound.get().historyGeneration + 1 });
+        if (change === "controller") bound.set({ abortController: new AbortController() });
+        if (change === "switch") bindConversationForTest("conv_other");
+        if (change === "revision") await pushSemanticEvent();
+        release();
+        await drainAsync();
+        expect(bound.get().sessionStatus).toBe("running");
+        expect(itemReads()).toEqual([]);
+      },
+    );
+
+    it.each(["hidden", "streaming", "switch"] as const)(
+      "discards a full-window rehydrate after the chat becomes %s",
+      async (change) => {
+        const gap = Array.from({ length: 100 }, (_, index) =>
+          assistantMessage(`resp_gap_${index}`, "Committed"),
+        );
+        seedSessionItems(id, [before, ...gap]);
+        const blocks = bound.get().blocks;
+        const held = holdItems(INITIAL_WINDOW_ITEMS);
+        await advanceCheck();
+        expect(held.requested()).toBe(true);
+        if (change === "hidden")
+          Object.defineProperty(document, "hidden", { configurable: true, value: true });
+        if (change === "streaming")
+          bound.set({
+            activeResponse: { responseId: "resp_new", state: "streaming", error: null },
+          });
+        if (change === "switch") bindConversationForTest("conv_other");
+        held.release();
+        await drainAsync();
+        expect(bound.get().blocks).toBe(blocks);
+        expect(diagnostics()).toEqual([]);
+      },
+    );
+
+    it("retries a failed poll through a new probe without owing an unguarded hidden backfill", async () => {
+      seedSessionItems(id, [before, reply]);
+      const route = fetchMock.getMockImplementation()!;
+      let failBackfill = true;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (failBackfill && String(input).includes(`/items?limit=${SESSION_HISTORY_PAGE_SIZE}&`))
+          return mockResponse({}, { ok: false, status: 503 });
+        return route(input, init);
+      });
+      await advanceCheck();
+      expect(itemReads()).toHaveLength(2);
+      Object.defineProperty(document, "hidden", { configurable: true, value: true });
+      failBackfill = false;
+      fetchMock.mockClear();
+      await advanceCheck();
+      expect(itemReads()).toEqual([]);
+      expect(bound.get().blocks.map((block) => block.ctx.itemId)).toEqual([before.id]);
+      Object.defineProperty(document, "hidden", { configurable: true, value: false });
+      await advanceCheck();
+      expect(itemReads()).toHaveLength(2);
+      expect(bound.get().blocks.map((block) => block.ctx.itemId)).toEqual([before.id, reply.id]);
+    });
+
+    it("keeps a concurrent reconnect failure owed after a guarded poll is skipped", async () => {
+      await advanceWithHeartbeats(() => sinks.at(-1)!, 45_000);
+      sinks[0]!.push(sse("session.heartbeat", {}));
+      await vi.advanceTimersByTimeAsync(14_000);
+      seedSessionItems(id, [before, reply]);
+      const route = fetchMock.getMockImplementation()!;
+      const releases: ((failed: boolean) => void)[] = [];
+      fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
+        if (
+          String(input).includes(`/items?limit=${SESSION_HISTORY_PAGE_SIZE}&`) &&
+          releases.length < 2
+        ) {
+          const failed = await new Promise<boolean>((resolve) => {
+            releases.push(resolve);
+          });
+          if (failed) return mockResponse({}, { ok: false, status: 503 });
+        }
+        return route(input, init);
+      });
+      sinks[0]!.error();
+      await drainAsync();
+      expect(releases).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(1_000);
+      await drainAsync();
+      expect(releases).toHaveLength(2);
+      sinks.at(-1)!.push(
+        sse("session.resource.deleted", {
+          session_id: id,
+          resource_type: "file",
+          resource_id: "file_1",
+        }),
+      );
+      await drainAsync();
+      releases[1]!(false);
+      await drainAsync();
+      releases[0]!(true);
+      await drainAsync();
+      expect(bound.get().blocks.map((block) => block.ctx.itemId)).toEqual([before.id]);
+      Object.defineProperty(document, "hidden", { configurable: true, value: true });
+      fetchMock.mockClear();
+      await advanceCheck();
+      expect(itemReads()).toEqual([
+        `/v1/sessions/${id}/items?limit=${SESSION_HISTORY_PAGE_SIZE}&order=desc`,
+      ]);
+      expect(bound.get().blocks.map((block) => block.ctx.itemId)).toEqual([before.id, reply.id]);
+      expect(diagnostics()).toEqual([]);
+    });
+
+    it("leaves reconnect catch-up ticks free of freshness probes", async () => {
+      sinks[0]!.error();
+      await drainAsync();
+      fetchMock.mockClear();
+      await advanceWithHeartbeats(() => sinks.at(-1)!, 30_000);
+      expect(itemReads()).toEqual([]);
+    });
+
+    it.each(["probe", "backfill"] as const)(
+      "discards a %s that finishes after switching chats",
+      async (phase) => {
+        seedSessionItems(id, [before, reply]);
+        const held = holdItems(phase === "probe" ? 2 : SESSION_HISTORY_PAGE_SIZE);
+        await advanceCheck();
+        expect(held.requested()).toBe(true);
+        const other = bindConversationForTest("conv_other");
+        const otherBlocks = other.get().blocks;
+        held.release();
+        await drainAsync();
+        expect(other.get().blocks).toBe(otherBlocks);
+        if (phase === "probe") expect(itemReads()).toHaveLength(1);
+        expect(bound.get().blocks.map((block) => block.ctx.itemId)).toEqual([before.id]);
+        expect(diagnostics()).toEqual([]);
+      },
+    );
+
+    it.each(["streaming", "latched", "hidden", "generation"] as const)(
+      "discards a backfill when %s state changes during its read",
+      async (change) => {
+        seedSessionItems(id, [before, reply]);
+        const held = holdItems(SESSION_HISTORY_PAGE_SIZE);
+        await advanceCheck();
+        expect(held.requested()).toBe(true);
+        if (change === "streaming") {
+          bound.set({
+            activeResponse: { responseId: "resp_live", state: "streaming", error: null },
+          });
+        } else if (change === "latched") {
+          bound.set({ sendLatchedAt: Date.now() });
+        } else if (change === "hidden") {
+          Object.defineProperty(document, "hidden", { configurable: true, value: true });
+        } else {
+          bound.set({ historyGeneration: bound.get().historyGeneration + 1 });
+        }
+        held.release();
+        await drainAsync();
+        expect(bound.get().blocks.map((block) => block.ctx.itemId)).toEqual([before.id]);
+        expect(diagnostics()).toEqual([]);
+      },
+    );
+  });
+
   it("reconciles status when a heartbeat-only stream misses the idle event", async () => {
     seedSession("conv_heartbeat_gap", []);
     const sink = pushableStream();
@@ -16170,7 +16743,8 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     fetchMock.mockImplementation(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = typeof input === "string" ? input : input.toString();
       if (url.startsWith(`/v1/sessions/${id}/items`)) {
-        itemFetches += 1;
+        // Count history backfills separately from the two-item freshness probe.
+        if (!url.includes("limit=2&")) itemFetches += 1;
         if (await itemsDown(url)) {
           return mockResponse({ error: "unavailable" }, { ok: false, status: 503 });
         }
@@ -16232,6 +16806,28 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       },
     };
   }
+
+  it("recovers a missed terminal status and reply while the active chat stays hidden", async () => {
+    const pump = await startMissedEventPump("conv_hidden_status", "idle");
+    pump.bound.set({ pendingUserMessages: [] });
+    const reply = assistantMessage("resp_live", "Committed reply");
+    seedSessionItems("conv_hidden_status", [pump.before, reply]);
+    Object.defineProperty(document, "hidden", { configurable: true, value: true });
+    onTestFinished(() => {
+      Reflect.deleteProperty(document, "hidden");
+    });
+    await advanceWithHeartbeats(
+      () => pump.sinks.at(-1)!,
+      ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS,
+    );
+    expect(pump.sinks).toHaveLength(2);
+    expect(pump.bound.get().blocks.map((block) => block.ctx.itemId)).toEqual([
+      pump.before.id,
+      reply.id,
+    ]);
+    expect(pump.bound.get().sessionStatus).toBe("idle");
+    await pump.stop();
+  });
 
   /** Hold every send POST for `id` until the returned release runs. */
   function holdSendPosts(id: string): () => void {
