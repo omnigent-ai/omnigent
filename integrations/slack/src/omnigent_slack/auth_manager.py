@@ -197,8 +197,9 @@ class AuthManager:
             current = await tokens.get(team, user, server_url)
             if current is None:
                 return None
-            # OIDC session JWTs carry no refresh token — nothing to rotate.
-            # Drop the expired token so the next turn prompts a fresh login.
+            # A session JWT from an OIDC server without a login-grant store
+            # has no refresh token — nothing to rotate. Drop the expired
+            # token so the next turn prompts a fresh login.
             if not current.refresh_token:
                 await tokens.delete(team, user, server_url)
                 return None
@@ -493,8 +494,9 @@ class AuthManager:
             return 0
         tokens = await self._tokens.list_for_user(team_id, user_id)
         for server_url, record in tokens:
-            # Only device-grant tokens are server-revocable; an OIDC session
-            # JWT (no refresh token) is just dropped locally and expires.
+            # Only tokens backed by a grant (device grant or OIDC login grant)
+            # are server-revocable; a standalone session JWT (no refresh
+            # token) is just dropped locally and expires.
             if record.refresh_token:
                 await self._revoke(server_url, record.refresh_token)
             await self._tokens.delete(team_id, user_id, server_url)

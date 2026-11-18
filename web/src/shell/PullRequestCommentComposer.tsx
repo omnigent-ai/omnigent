@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { MessageResponse } from "@/components/ai-elements/message";
+import { hasCommandModifier } from "@/lib/hotkeys";
 import {
   MAX_PULL_REQUEST_COMMENT_CHARACTERS,
   pullRequestCommentTooLong,
@@ -33,6 +34,8 @@ export function PullRequestCommentForm({
   inline = false,
   newThread = false,
   disabled = false,
+  local = false,
+  destinationControl,
 }: {
   draft: PullRequestCommentDraft;
   setBody: (body: string) => void;
@@ -41,6 +44,8 @@ export function PullRequestCommentForm({
   inline?: boolean;
   newThread?: boolean;
   disabled?: boolean;
+  local?: boolean;
+  destinationControl?: ReactNode;
 }) {
   const [tab, setTab] = useState("write");
   const formRef = useRef<HTMLFormElement>(null);
@@ -58,6 +63,7 @@ export function PullRequestCommentForm({
   }, [compactReply, draft.pending, draft.error, draft.body]);
   const collapsed = compactReply && !replyExpanded && !draft.pending;
   const tooLong = pullRequestCommentTooLong(draft.body);
+  const canSubmit = !disabled && !collapsed && !draft.pending && !!draft.body.trim() && !tooLong;
   return (
     <form
       ref={formRef}
@@ -71,7 +77,22 @@ export function PullRequestCommentForm({
       }
       onSubmit={(event) => {
         event.preventDefault();
-        if (!disabled && !collapsed) post();
+        if (canSubmit) post();
+      }}
+      onKeyDown={(event) => {
+        if (
+          event.key !== "Enter" ||
+          !hasCommandModifier(event) ||
+          event.altKey ||
+          event.shiftKey ||
+          event.repeat ||
+          event.nativeEvent.isComposing ||
+          event.keyCode === 229
+        )
+          return;
+        event.preventDefault();
+        event.stopPropagation();
+        formRef.current?.requestSubmit();
       }}
     >
       {collapsed ? (
@@ -132,15 +153,21 @@ export function PullRequestCommentForm({
               {draft.error}
             </p>
           )}
-          <div className="flex shrink-0 flex-wrap items-center gap-2">
-            <Button
-              type="submit"
-              size="sm"
-              className="shrink-0"
-              disabled={disabled || draft.pending || !draft.body.trim() || tooLong}
-            >
-              {draft.pending ? "Posting…" : inline && !newThread ? "Reply" : "Post comment"}
-            </Button>
+          <div className="flex shrink-0 items-center gap-2">
+            {destinationControl}
+            {local && <span className="flex-1" />}
+            {!local && (
+              <p
+                className="min-w-0 flex-1 truncate text-right text-ui text-muted-foreground"
+                title={account ? `Comment as ${account}` : undefined}
+              >
+                {account
+                  ? newThread
+                    ? `@${account}`
+                    : `Comment as ${account}`
+                  : "Host’s GitHub account"}
+              </p>
+            )}
             {compactReply && (
               <Button
                 type="button"
@@ -156,12 +183,15 @@ export function PullRequestCommentForm({
                 Cancel
               </Button>
             )}
-            <p
-              className="min-w-0 truncate text-ui text-muted-foreground"
-              title={account ?? undefined}
-            >
-              {account ? `Comment as ${account}` : "Comment using the host’s GitHub account"}
-            </p>
+            <Button type="submit" size="sm" className="shrink-0" disabled={!canSubmit}>
+              {draft.pending
+                ? local
+                  ? "Saving…"
+                  : "Posting…"
+                : inline && !newThread
+                  ? "Reply"
+                  : "Submit"}
+            </Button>
           </div>
         </>
       )}

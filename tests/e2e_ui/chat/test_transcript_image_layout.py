@@ -1,4 +1,4 @@
-"""Image attachments fit their contents and keep compact gaps when wrapping."""
+"""User image attachments stay compact and wrap above the message text."""
 
 from __future__ import annotations
 
@@ -10,6 +10,14 @@ from playwright.sync_api import Page, expect
 from tests.e2e_ui.conftest import _server_state
 
 _IMAGE_NAME = "shot.png"
+_IMAGE_NAMES = (
+    _IMAGE_NAME,
+    "second-shot.png",
+    "third-shot.png",
+    "fourth-shot.png",
+    "fifth-shot.png",
+    "sixth-shot.png",
+)
 _REPLY = "Reviewing the screenshot."
 
 # A real 240x180 PNG, inline so the fixture needs no image library.
@@ -25,11 +33,11 @@ _PNG_B64 = (
 
 
 def _seed_image_turn(base_url: str, session_id: str) -> None:
-    """Attach an image to *session_id* and commit a turn that renders it.
+    """Attach six image blocks to *session_id* and commit a turn that renders them.
 
     Uploads through the real file endpoint so the transcript's
     ``input_image`` block resolves to genuine stored bytes, then writes the
-    turn straight to the store — the same shortcut
+    turn straight to the store, the same shortcut
     :func:`tests.e2e_ui.conftest.seed_committed_turn` takes, so no agent turn
     or model call is involved.
 
@@ -58,17 +66,11 @@ def _seed_image_turn(base_url: str, session_id: str) -> None:
                 data=MessageData(
                     role="user",
                     content=[
-                        {"type": "input_text", "text": "Here is the screenshot."},
-                        {
-                            "type": "input_image",
-                            "file_id": file_id,
-                            "filename": _IMAGE_NAME,
-                        },
-                        {
-                            "type": "input_image",
-                            "file_id": file_id,
-                            "filename": "second-shot.png",
-                        },
+                        {"type": "input_text", "text": "Here are the screenshots."},
+                        *(
+                            {"type": "input_image", "file_id": file_id, "filename": name}
+                            for name in _IMAGE_NAMES
+                        ),
                     ],
                 ),
             ),
@@ -85,11 +87,11 @@ def _seed_image_turn(base_url: str, session_id: str) -> None:
     )
 
 
-def test_image_previews_wrap_with_compact_spacing(
+def test_image_thumbnails_wrap_above_text_with_compact_spacing(
     page: Page,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Wrapped previews leave only the attachment gap, with no blank padding."""
+    """Six previews wrap in fixed squares while the text remains right aligned."""
     base_url, session_id = seeded_session
     _seed_image_turn(base_url, session_id)
     page.set_viewport_size({"width": 375, "height": 900})
@@ -98,7 +100,7 @@ def test_image_previews_wrap_with_compact_spacing(
     page.wait_for_function(
         """() => {
             const images = [...document.querySelectorAll('img[alt$="shot.png"]')];
-            return images.length === 2 &&
+            return images.length === 6 &&
                 images.every(img => img.complete && img.naturalWidth > 0);
         }""",
         timeout=30_000,
@@ -106,20 +108,36 @@ def test_image_previews_wrap_with_compact_spacing(
     layout = page.evaluate(
         """() => {
             const images = [...document.querySelectorAll('img[alt$="shot.png"]')];
-            const [first, second] = images.map(img => img.getBoundingClientRect());
+            const boxes = images.map(img => img.closest('div').getBoundingClientRect());
+            const row = document.querySelector('[data-testid="user-image-attachments"]')
+                .getBoundingClientRect();
+            const text = document.querySelector('[data-testid="user-message-content"]')
+                .getBoundingClientRect();
+            const rowTops = [...new Set(boxes.map(box => Math.round(box.top)))]
+                .sort((a, b) => a - b);
             return {
-                gap: second.top - first.bottom,
+                boxSizes: boxes.map(box => [box.width, box.height]),
+                rowCount: rowTops.length,
+                rowGap: rowTops[1] - rowTops[0] - boxes[0].height,
+                textGap: text.top - row.bottom,
+                rightEdgeDifference: Math.abs(row.right - text.right),
                 heights: images.map(img => ({
                     image: img.getBoundingClientRect().height,
-                    box: img.closest('div').getBoundingClientRect().height,
+                    width: img.getBoundingClientRect().width,
                 })),
             };
         }"""
     )
-    assert abs(layout["gap"] - 8) <= 1, layout
+    assert layout["rowCount"] == 2, layout
+    assert abs(layout["rowGap"] - 6) <= 1, layout
+    assert abs(layout["textGap"] - 6) <= 1, layout
+    assert layout["rightEdgeDifference"] <= 1, layout
+    for width, height in layout["boxSizes"]:
+        assert abs(width - 80) <= 1 and abs(height - 80) <= 1, layout
     for heights in layout["heights"]:
-        assert 0 < heights["image"] <= 256, layout
-        assert abs(heights["box"] - heights["image"]) <= 1, layout
+        assert 0 < heights["image"] <= 80, layout
+        assert 0 < heights["width"] <= 80, layout
 
     page.get_by_role("button", name="Zoom image: second-shot.png").click()
     expect(page.get_by_role("dialog")).to_be_visible()
+    assert page.get_by_role("dialog").locator("img").evaluate("img => img.naturalWidth") == 240

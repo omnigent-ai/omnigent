@@ -23,6 +23,7 @@ import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useSession } from "@/hooks/useSession";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { authenticatedFetch } from "@/lib/identity";
+import { listDirectoryViaWorkspaceApi } from "@/lib/workspaceApi";
 import { isTempConvId } from "@/lib/tempConversationId";
 import { useChatStore } from "@/store/chatStore";
 
@@ -105,6 +106,7 @@ interface WorkspaceQueryOptions {
 export interface WorkspaceChangedFile {
   path: string;
   name: string;
+  repository_root?: string;
   /** Change status: "created", "modified", or "deleted". */
   status: "created" | "modified" | "deleted";
   bytes: number | null;
@@ -113,6 +115,8 @@ export interface WorkspaceChangedFile {
   lines_added: number | null;
   /** Lines removed, or null when unknown. */
   lines_removed: number | null;
+  /** An untracked file's own lines; absent from runners that don't count them. */
+  untracked_lines?: number | null;
 }
 
 export interface WorkspaceChangedFilesResult {
@@ -239,11 +243,13 @@ interface ChangedFilesResponse {
   data: {
     path: string;
     name: string;
+    repository_root?: string;
     status: "created" | "modified" | "deleted";
     bytes: number | null;
     modified_at: number | null;
     lines_added: number | null;
     lines_removed: number | null;
+    untracked_lines?: number | null;
   }[];
   has_more: boolean;
 }
@@ -283,11 +289,13 @@ async function fetchWorkspaceChangedFiles(
   const data: WorkspaceChangedFile[] = json.data.map((e) => ({
     path: e.path,
     name: e.name,
+    repository_root: e.repository_root,
     status: e.status,
     bytes: e.bytes,
     modified_at: e.modified_at,
     lines_added: e.lines_added ?? null,
     lines_removed: e.lines_removed ?? null,
+    untracked_lines: e.untracked_lines ?? null,
   }));
   return { available: true, data };
 }
@@ -394,10 +402,24 @@ function mapFilesystemEntries(
   });
 }
 
+/** A workspace directory listed through the workspace API, or null to list through REST. */
+async function listViaWorkspaceApi(
+  conversationId: string,
+  location: string,
+  maxEntries: number,
+): Promise<FilesystemListResponse | null> {
+  // The workspace API only lists inside the workspace.
+  if (browseLocationBase(location)) return null;
+  const listed = await listDirectoryViaWorkspaceApi(conversationId, location, maxEntries);
+  return listed && { object: "list", data: listed.data, has_more: listed.hasMore };
+}
+
 async function fetchWorkspaceAllFiles(
   conversationId: string,
   location = "",
 ): Promise<WorkspaceAllFilesResult> {
+  const viaApi = await listViaWorkspaceApi(conversationId, location, 1000);
+  if (viaApi) return { available: true, data: mapFilesystemEntries(viaApi, location) };
   const segment = browseLocationSegment(location);
   const params = new URLSearchParams({ limit: "1000", order: "asc" });
   const base = browseLocationBase(location);
@@ -563,6 +585,13 @@ export interface WorkspaceFileSearchResult {
    * definitive "no match".
    */
   truncated: boolean;
+  /** True when the server returned its full result limit, so more matches may exist. */
+  hasMore: boolean;
+  /**
+   * True when the workspace couldn't be searched (no OS environment, or the runner
+   * is unavailable). `files` is then empty, which doesn't mean nothing matched.
+   */
+  unavailable: boolean;
 }
 
 async function fetchWorkspaceFileSearch(
@@ -571,6 +600,7 @@ async function fetchWorkspaceFileSearch(
   include: string,
   exclude: string,
   location: string,
+  signal?: AbortSignal,
 ): Promise<WorkspaceFileSearchResult> {
   const params = new URLSearchParams({ limit: "500" });
   if (query) params.set("q", query);
@@ -581,15 +611,22 @@ async function fetchWorkspaceFileSearch(
   if (base) params.set("base", base);
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/search${segment ? `/${segment}` : ""}?${params}`,
+    { signal },
   );
   // 404 means the runner has no OS environment for this session (cloud-only
   // agent).  Mirror the behaviour of useWorkspaceAllFiles: return empty
   // results rather than surfacing an error.
-  if (res.status === 404) return { files: [], truncated: false };
-  if (await isRunnerUnavailable503(res)) return { files: [], truncated: false };
+  const unavailable = { files: [], truncated: false, hasMore: false, unavailable: true };
+  if (res.status === 404) return unavailable;
+  if (await isRunnerUnavailable503(res)) return unavailable;
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const json = (await res.json()) as FilesystemListResponse;
-  return { files: mapFilesystemEntries(json, location), truncated: !!json.truncated };
+  return {
+    files: mapFilesystemEntries(json, location),
+    truncated: !!json.truncated,
+    hasMore: !!json.has_more,
+    unavailable: false,
+  };
 }
 
 /**
@@ -629,8 +666,16 @@ export function useWorkspaceFileSearch(
       trimmedExclude,
       location,
     ],
-    queryFn: () =>
-      fetchWorkspaceFileSearch(conversationId!, trimmed, trimmedInclude, trimmedExclude, location),
+    // React Query aborts the signal when a newer query replaces this one.
+    queryFn: ({ signal }) =>
+      fetchWorkspaceFileSearch(
+        conversationId!,
+        trimmed,
+        trimmedInclude,
+        trimmedExclude,
+        location,
+        signal,
+      ),
     enabled:
       (options.enabled ?? true) && !!conversationId && trimmed.length > 0 && serveable !== false,
     staleTime: 5_000,
@@ -646,6 +691,9 @@ async function fetchWorkspaceDirectory(
   location = "",
 ): Promise<WorkspaceFile[]> {
   const target = joinBrowseLocation(location, dirPath);
+  const viaApi = await listViaWorkspaceApi(conversationId, target, 1000);
+  // The tree addresses children relative to the location it is rooted at.
+  if (viaApi) return mapFilesystemEntries(viaApi, target, dirPath);
   const encodedPath = browseLocationSegment(target);
   const params = new URLSearchParams({ limit: "1000", order: "asc" });
   const base = browseLocationBase(target);
@@ -819,6 +867,8 @@ async function fetchDirEntriesTolerant(
   // ``base=host`` (see ``browseLocationSegment``). Entries of an absolute
   // listing echo back base-relative names, so the listed dir is re-attached
   // below and callers compare full paths uniformly.
+  const viaApi = await listViaWorkspaceApi(conversationId, dirPath, FILE_EXISTENCE_SCAN_LIMIT);
+  if (viaApi) return { files: mapFilesystemEntries(viaApi), truncated: viaApi.has_more };
   const base = `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem`;
   const params = new URLSearchParams({ order: "asc" });
   const hostBase = browseLocationBase(dirPath);

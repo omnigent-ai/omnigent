@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import re
 import warnings
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 
 import httpx
@@ -22,6 +22,9 @@ _MODEL_SERVICES_MAX_RESULTS = 1000
 _MODEL_SERVICES_PARENT = "schemas/system.ai"
 #: Wire API a model service must advertise for the codex Responses route to serve it.
 _CODEX_RESPONSES_API_TYPE = "codex/v1/responses"
+#: Wire API name and prefix a model service advertises for the native Gemini gateway route.
+_GEMINI_API_TYPE = "gemini"
+_GEMINI_API_TYPE_PREFIX = "gemini/"
 _PAGE_SIZE = 100
 _MAX_PAGES = 100
 _HTTP_TIMEOUT_S = 10.0
@@ -153,19 +156,38 @@ def preferred_served_claude_model(
     return _models_by_claude_family(claude_ids, marker="claude-").get(preferred_family)
 
 
+def _reported_api_types(service: dict[str, object]) -> tuple[bool, set[str]]:
+    """Return ``(has_explicit_list, normalized_values)`` for ``supported_api_types``."""
+    api_types = service.get("supported_api_types")
+    if api_types is None or api_types == []:
+        return False, set()
+    if not isinstance(api_types, list):
+        return True, set()
+    reported = {value.strip().lower() for value in api_types if isinstance(value, str)}
+    return True, reported
+
+
 def _advertises_api_type(service: dict[str, object], api_type: str) -> bool:
     """Whether *service* serves *api_type*, compared trimmed and case-insensitively.
 
     A missing, ``null`` or empty ``supported_api_types`` counts as yes, matching
     listings that predate the field; any other non-list value counts as no.
     """
-    api_types = service.get("supported_api_types")
-    if api_types is None or api_types == []:
+    has_explicit, reported = _reported_api_types(service)
+    if not has_explicit:
         return True
-    if not isinstance(api_types, list):
-        return False
-    reported = {value.strip().lower() for value in api_types if isinstance(value, str)}
     return api_type.lower() in reported
+
+
+def _is_gemini_service(service: dict[str, object], model_id: str) -> bool:
+    """Whether *service* supports the native Gemini gateway wire protocol."""
+    has_explicit, reported = _reported_api_types(service)
+    if not has_explicit:
+        return _bare_model_id(model_id).startswith("gemini-")
+    return any(
+        value == _GEMINI_API_TYPE or value.startswith(_GEMINI_API_TYPE_PREFIX)
+        for value in reported
+    )
 
 
 def _list_model_service_ids(
@@ -174,11 +196,14 @@ def _list_model_service_ids(
     headers: dict[str, str],
     *,
     api_type: str | None = None,
+    service_filter: Callable[[dict[str, object], str], bool] | None = None,
 ) -> list[str]:
     """List Databricks-managed ``system.ai`` model-service identifiers.
 
     :param api_type: When set, keep only services that advertise it, e.g.
         ``"codex/v1/responses"`` (see :func:`_advertises_api_type`).
+    :param service_filter: Optional predicate receiving each service dict and its
+        normalized ``system.ai`` model identifier.
     """
     model_ids: list[str] = []
     page_token: str | None = None
@@ -202,7 +227,9 @@ def _list_model_service_ids(
         services = payload.get("model_services")
         if isinstance(services, list):
             for service in services:
-                raw_name = service.get("name") if isinstance(service, dict) else None
+                if not isinstance(service, dict):
+                    continue
+                raw_name = service.get("name")
                 if not isinstance(raw_name, str):
                     continue
                 if api_type is not None and not _advertises_api_type(service, api_type):
@@ -210,8 +237,11 @@ def _list_model_service_ids(
                 model_id = raw_name.strip()
                 if model_id.startswith(_MODEL_SERVICE_PREFIX):
                     model_id = model_id[len(_MODEL_SERVICE_PREFIX) :]
-                if model_id.startswith(_SYSTEM_MODEL_PREFIX):
-                    model_ids.append(model_id)
+                if not model_id.startswith(_SYSTEM_MODEL_PREFIX):
+                    continue
+                if service_filter is not None and not service_filter(service, model_id):
+                    continue
+                model_ids.append(model_id)
         raw_next = payload.get("next_page_token")
         if not isinstance(raw_next, str) or not raw_next:
             break
@@ -416,37 +446,33 @@ def discover_databricks_codex_models(
 def discover_databricks_gemini_models(
     workspace_url: str, token: str, *, transport: httpx.BaseTransport | None = None
 ) -> tuple[str, ...]:
-    """List Gemini model services accepted by the native Gemini gateway route."""
+    """List model services accepted by the native Gemini gateway route."""
     with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
         models = _list_model_service_ids(
-            client, workspace_url, {"Authorization": f"Bearer {token}"}
+            client,
+            workspace_url,
+            {"Authorization": f"Bearer {token}"},
+            service_filter=_is_gemini_service,
         )
-    return tuple(model for model in models if _bare_model_id(model).startswith("gemini-"))
+    return tuple(models)
 
 
 def _codex_preference_rank(model_id: str) -> tuple[int, int, int, int, str]:
-    """Order codex-servable ids so the best launch default sorts first.
+    """Order codex-servable ids newest generation first.
 
     The listing says what a workspace *can* serve, not which to start on, and a
     name sort has no opinion either (it ranks ``kimi-k3`` over every GPT).
-    Tiers, highest first: the owned curated codex catalog in its declared
-    cheapest-safe-first order; then versioned ``gpt``/``codex`` ids, newest
-    generation first and untiered ahead of a same-generation tier; then the
-    rest by name, for determinism.
+    Versioned ``gpt``/``codex`` ids sort first, newest generation first and
+    untiered ahead of a same-generation tier; then the rest by name, for
+    determinism. :func:`order_by_codex_catalog` refines this with Codex's own
+    ranking when its catalog is readable.
 
     :param model_id: A servable id, e.g. ``"system.ai.gpt-5-6-sol"``.
     :returns: A sort key; compare descending.
     """
     from omnigent.models.codex_model_vocabulary import comparable_model_id
-    from omnigent.models.model_fallbacks import static_model_fallback
-    from omnigent.onboarding.provider_config import SUBSCRIPTION_KIND
 
     bare = comparable_model_id(model_id)
-    curated = static_model_fallback(SUBSCRIPTION_KIND, "codex")
-    order = [comparable_model_id(m) for m in (curated.model_ids if curated else ())]
-    if bare in order:
-        # Negated so the earliest curated entry sorts highest under reverse=True.
-        return (2, -order.index(bare), 0, 0, "")
     match = _GPT_VERSIONED_ID_RE.match(bare)
     if match is None:
         return (0, 0, 0, 0, bare)
@@ -454,22 +480,63 @@ def _codex_preference_rank(model_id: str) -> tuple[int, int, int, int, str]:
     return (1, int(major), int(minor), 0 if tier else 1, tier or "")
 
 
+def order_by_codex_catalog(
+    model_ids: Sequence[str], catalog_models: Sequence[object]
+) -> tuple[str, ...]:
+    """Put the servable ids Codex's own catalog ranks first, in Codex's order.
+
+    Codex starts on its lowest-``priority`` visible catalog row, so this ranks
+    servable ids the way an unpinned Codex launch would. Ids the catalog does
+    not carry keep their relative order after the ranked ones.
+
+    :param model_ids: Servable ids, e.g. ``("system.ai.gpt-5-6-sol",)``.
+    :param catalog_models: The ``models`` rows of ``codex debug models``, e.g.
+        ``[{"slug": "gpt-6.1-sol", "priority": 1, "visibility": "list"}]``.
+    :returns: *model_ids* reordered.
+    """
+    from omnigent.models.codex_model_vocabulary import comparable_model_id
+
+    visible: list[tuple[float, int, str]] = []
+    for index, row in enumerate(catalog_models):
+        if not isinstance(row, dict) or row.get("visibility") == "hide":
+            continue
+        slug = row.get("slug")
+        priority = row.get("priority")
+        if not isinstance(slug, str) or not slug:
+            continue
+        rank = priority if isinstance(priority, (int, float)) else float("inf")
+        visible.append((rank, index, comparable_model_id(slug)))
+    codex_rank: dict[str, int] = {}
+    for position, (_priority, _index, bare) in enumerate(sorted(visible)):
+        codex_rank.setdefault(bare, position)
+    unranked = len(codex_rank)
+    return tuple(
+        sorted(
+            model_ids,
+            key=lambda model_id: codex_rank.get(comparable_model_id(model_id), unranked),
+        )
+    )
+
+
 def select_servable_model(requested: str, servable: Iterable[str]) -> str | None:
     """Resolve *requested* against the ids a workspace actually serves.
 
-    Compared on the bare id, so a request naming the legacy ``databricks-``
-    spelling resolves to the ``system.ai.`` id serving that same model — only
-    the served spelling is routable.
+    Compared on the bare id with codex's dotted versions folded, so a request
+    naming the legacy ``databricks-`` spelling or a codex slug resolves to the
+    ``system.ai.`` id serving that same model — only the served spelling is
+    routable.
 
-    :param requested: Model id in either vocabulary, e.g.
-        ``"databricks-gpt-5-6-luna"``.
+    :param requested: Model id in any vocabulary, e.g.
+        ``"databricks-gpt-5-6-luna"`` or ``"gpt-5.6-luna"``.
     :param servable: Ids the workspace serves, e.g. the result of
         :func:`discover_databricks_codex_models`.
     :returns: The servable id for *requested*, or ``None`` when the workspace
         serves no such model.
     """
-    wanted = _bare_model_id(requested)
+    from omnigent.models.codex_model_vocabulary import comparable_model_id
+
+    wanted = comparable_model_id(requested)
     for model_id in servable:
-        if _bare_model_id(model_id) == wanted:
+        if comparable_model_id(model_id) == wanted:
             return model_id
     return None

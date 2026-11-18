@@ -9,11 +9,12 @@ from typing import TYPE_CHECKING
 from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import native_terminal_name
-from omnigent.harness_availability import harness_launch_availability
+from omnigent.harness_availability import HARNESS_TMUX_UNAVAILABLE, harness_launch_availability
 from omnigent.host.frames import CAP_CODEX_PLAN_AT_LAUNCH
 from omnigent.stores import ConversationStore
 from omnigent.stores.conversation_store import CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY
 from omnigent.stores.host_store import HostStore
+from omnigent.util.tmux_compat import MIN_TMUX_VERSION_HINT
 
 if TYPE_CHECKING:
     from omnigent.server.host_registry import HostRegistry
@@ -68,6 +69,14 @@ async def validate_create_harness_readiness(
     available, reason = harness_launch_availability(harness, host.configured_harnesses)
     if available is not False:
         return
+    if reason == HARNESS_TMUX_UNAVAILABLE:
+        raise OmnigentError(
+            f"Harness {harness!r} needs tmux {MIN_TMUX_VERSION_HINT} or newer on the target "
+            "host. Install or upgrade tmux there (macOS: `brew install tmux`), then check "
+            "the harness again. If Omnigent still can't find it, quit and reopen the "
+            "Omnigent app, or choose another harness.",
+            code=ErrorCode.HARNESS_NOT_CONFIGURED,
+        )
     raise OmnigentError(
         f"Harness {harness!r} is not configured on the target host ({reason}). "
         "Install or configure the harness on that host, or choose an available harness.",

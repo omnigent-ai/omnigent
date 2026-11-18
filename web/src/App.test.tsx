@@ -29,6 +29,10 @@ vi.mock("@/pages/ChatPage", () => ({
 vi.mock("@/pages/NotFoundPage", () => ({ NotFoundPage: () => <div>not found</div> }));
 vi.mock("@/pages/UsagePage", () => ({ UsagePage: () => <div>usage page</div> }));
 vi.mock("@/pages/TaskDetailPage", () => ({ TaskDetailPage: () => <div>task detail page</div> }));
+vi.mock("@/pages/WorkflowsPage", () => ({ WorkflowsPage: () => <div>workflows page</div> }));
+vi.mock("@/pages/WorkflowDetailPage", () => ({
+  WorkflowDetailPage: () => <div>workflow detail page</div>,
+}));
 vi.mock("@/pages/SettingsPage", async () => {
   const { useLocation, useNavigationType } = await import("react-router-dom");
   return {
@@ -80,6 +84,7 @@ vi.mock("@/extensions/ExtensionProvider", () => ({
 }));
 
 import App from "./App";
+import { useOmnigentPageView } from "@/lib/analytics";
 
 const chunkError = vi.hoisted(
   () => new TypeError("Failed to fetch dynamically imported module: /assets/old.js"),
@@ -171,6 +176,7 @@ describe("ordinary page render failures", () => {
     { path: "/mount/tasks", basename: "/mount", needsSetup: false },
     { path: "/setup", basename: undefined, needsSetup: true },
   ])("offers recovery at $path without reloading", async ({ path, basename, needsSetup }) => {
+    vi.mocked(useOmnigentPageView).mockClear();
     render(
       <CapabilitiesProvider
         info={{ ...FALLBACK_SERVER_INFO, accounts_enabled: needsSetup, needs_setup: needsSetup }}
@@ -191,6 +197,7 @@ describe("ordinary page render failures", () => {
     ).toBeInTheDocument();
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
     expect(reload).not.toHaveBeenCalled();
+    if (!needsSetup) expect(useOmnigentPageView).not.toHaveBeenCalled();
   });
 
   it.each([
@@ -253,6 +260,21 @@ function renderRoute(
     </CapabilitiesProvider>,
   );
 }
+
+describe("Workflow routes", () => {
+  it.each([
+    ["/workflows", "workflows page"],
+    ["/workflows/saved", "workflow detail page"],
+  ])("gates %s with the server workflows flag", async (path, page) => {
+    renderRoute(path);
+    expect(await screen.findByText("not found")).toBeInTheDocument();
+    expect(screen.queryByText(page)).toBeNull();
+    cleanup();
+
+    renderRoute(path, { workflows: true });
+    expect(await screen.findByText(page)).toBeInTheDocument();
+  });
+});
 
 describe("Canvas route", () => {
   it("preserves healthy chat state across pathname changes", () => {
@@ -346,7 +368,32 @@ describe("Usage release feature route", () => {
   });
 });
 
-describe("Automation detail release feature route", () => {
+describe("Automation routes", () => {
+  it.each(["/tasks", "/tasks/templates", "/tasks/st_1"])(
+    "blocks %s when automations are disabled",
+    async (path) => {
+      renderRoute(
+        path,
+        {},
+        {
+          ...FALLBACK_SERVER_INFO,
+          automations_enabled: false,
+          features: { automations_v2: true },
+        },
+      );
+      expect(await screen.findByText("not found")).toBeInTheDocument();
+      expect(screen.queryByText("task detail page")).toBeNull();
+      expect(screen.queryByText("Tasks recovered")).toBeNull();
+    },
+  );
+
+  it("waits for server info before loading automations", () => {
+    renderRoute("/tasks", {}, "loading");
+    expect(screen.getByRole("status")).toHaveTextContent("Loading Omnigent");
+    expect(screen.queryByText("not found")).toBeNull();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
   it("does not register /tasks/:taskId while automations_v2 is off", async () => {
     renderRoute("/tasks/st_1");
     expect(await screen.findByText("not found")).toBeInTheDocument();

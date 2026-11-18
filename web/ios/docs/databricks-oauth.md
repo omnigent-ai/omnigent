@@ -198,6 +198,11 @@ to setup rather than loading a different workspace or silently retrying sign-in.
 These are client validation rules; verify the deployment's actual cookie-setting
 redirect chain during integration.
 
+On each return to the foreground, a present `DBAUTH` cookie is checked with one
+`GET <workspace>/omnigent/v1/me` (keeping `o`, no redirects followed). A 401 or a
+redirect to a sign-in path runs the same silent recovery; a 403 shows the
+permission error. Network failures, timeouts, and other answers keep the session.
+
 `DatabricksWebStore` uses a stable, named `WKWebsiteDataStore` for the credential
 context: entered origin, optional `o`, and client ID. Different contexts have separate
 cookies and other web storage. New native navigation URLs recreate the WebView while

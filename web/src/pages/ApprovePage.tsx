@@ -29,6 +29,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Button } from "@/components/ui/button";
 import { authenticatedFetch } from "@/lib/identity";
 import { formatPreview } from "@/lib/previewFormat";
+import { fileEditRequestFromWire } from "@/lib/toolEditDiff";
 
 interface ElicitationData {
   status: "pending" | "resolved";
@@ -39,6 +40,7 @@ interface ElicitationData {
   content_preview?: string;
   native_delivery?: NativePermissionDelivery;
   permission_directories?: string[];
+  file_edit?: unknown;
 }
 
 type PageState =
@@ -168,6 +170,13 @@ export function ApprovePage() {
     [sessionId, elicitationId, state],
   );
 
+  const fileEdit = state.kind === "pending" ? fileEditRequestFromWire(state.data.file_edit) : null;
+  const usesApprovalCard =
+    state.kind === "pending" &&
+    (Boolean(state.data.native_delivery) ||
+      Boolean(state.data.permission_directories?.length) ||
+      fileEdit !== null);
+
   return (
     <div className="mx-auto flex min-h-screen max-w-xl items-center justify-center p-6">
       {state.kind === "loading" && (
@@ -221,65 +230,60 @@ export function ApprovePage() {
         </Alert>
       )}
 
-      {state.kind === "pending" &&
-        (state.data.native_delivery || Boolean(state.data.permission_directories?.length)) && (
-          <ApprovalCard
-            elicitationId={elicitationId!}
-            message={state.data.message ?? ""}
-            phase={state.data.phase ?? ""}
-            policyName={state.data.policy_name ?? ""}
-            contentPreview={state.data.content_preview ?? ""}
-            requestedSchema={{}}
-            status="pending"
-            response={null}
-            nativeDelivery={state.data.native_delivery}
-            permissionDirectories={state.data.permission_directories}
-            onSubmit={(_id, action, content, meta) => void submit(action, content, meta)}
-          />
-        )}
-      {state.kind === "pending" &&
-        !state.data.native_delivery &&
-        !state.data.permission_directories?.length && (
-          <Alert className="flex flex-col gap-3 py-4 px-5">
-            <AlertTitle className="flex items-center gap-2 text-ui">
-              <MessageCircleQuestionMark className="size-4 text-yellow-600 dark:text-yellow-400" />
-              Approval required
-              {state.data.policy_name && (
-                <span className="text-muted-foreground text-sm">· {state.data.policy_name}</span>
-              )}
-              {state.data.phase && (
-                <span className="text-muted-foreground text-sm">({state.data.phase})</span>
-              )}
-            </AlertTitle>
-            <AlertDescription className="flex flex-col gap-2">
-              <ElicitationMessage message={state.data.message ?? ""} />
-              {state.data.content_preview && (
-                <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-sm whitespace-pre-wrap break-words">
-                  {formatPreview(state.data.content_preview)}
-                </pre>
-              )}
-              <div className="flex flex-wrap gap-2 pt-1">
-                <Button
-                  size="sm"
-                  onClick={() => void submit("accept")}
-                  componentId="approve.approve"
-                >
-                  <CheckIcon className="mr-1 size-3.5" />
-                  Approve
-                </Button>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() => void submit("decline")}
-                  componentId="approve.reject"
-                >
-                  <XIcon className="mr-1 size-3.5" />
-                  Reject
-                </Button>
-              </div>
-            </AlertDescription>
-          </Alert>
-        )}
+      {state.kind === "pending" && usesApprovalCard && (
+        <ApprovalCard
+          elicitationId={elicitationId!}
+          message={state.data.message ?? ""}
+          phase={state.data.phase ?? ""}
+          policyName={state.data.policy_name ?? ""}
+          contentPreview={state.data.content_preview ?? ""}
+          requestedSchema={{}}
+          status="pending"
+          response={null}
+          nativeDelivery={state.data.native_delivery}
+          permissionDirectories={state.data.permission_directories}
+          fileEdit={fileEdit}
+          onSubmit={(_id, action, content, meta) => void submit(action, content, meta)}
+          keyboardActive
+        />
+      )}
+      {state.kind === "pending" && !usesApprovalCard && (
+        <Alert className="flex flex-col gap-3 py-4 px-5">
+          <AlertTitle className="flex items-center gap-2 text-ui">
+            <MessageCircleQuestionMark className="size-4 text-yellow-600 dark:text-yellow-400" />
+            Approval required
+            {state.data.policy_name && (
+              <span className="text-muted-foreground text-sm">· {state.data.policy_name}</span>
+            )}
+            {state.data.phase && (
+              <span className="text-muted-foreground text-sm">({state.data.phase})</span>
+            )}
+          </AlertTitle>
+          <AlertDescription className="flex flex-col gap-2">
+            <ElicitationMessage message={state.data.message ?? ""} />
+            {state.data.content_preview && (
+              <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-sm whitespace-pre-wrap break-words">
+                {formatPreview(state.data.content_preview)}
+              </pre>
+            )}
+            <div className="flex flex-wrap gap-2 pt-1">
+              <Button size="sm" onClick={() => void submit("accept")} componentId="approve.approve">
+                <CheckIcon className="mr-1 size-3.5" />
+                Approve
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => void submit("decline")}
+                componentId="approve.reject"
+              >
+                <XIcon className="mr-1 size-3.5" />
+                Reject
+              </Button>
+            </div>
+          </AlertDescription>
+        </Alert>
+      )}
     </div>
   );
 }

@@ -137,6 +137,15 @@ def _remove_skill_overlay(path: Path) -> None:
     shutil.rmtree(path)
 
 
+def claude_agents_skill_overlay(bridge_dir: Path) -> Path:
+    """Return the session-owned directory :func:`claude_agents_skill_args` adds.
+
+    :param bridge_dir: Session-owned bridge directory.
+    :returns: The overlay path, e.g. ``bridge_dir / "agent-skills"``.
+    """
+    return bridge_dir / "agent-skills"
+
+
 def claude_agents_skill_args(
     bridge_dir: Path,
     roots: tuple[Path, ...],
@@ -149,7 +158,7 @@ def claude_agents_skill_args(
     :param skills_filter: Host skill selection from the agent spec.
     :returns: Claude CLI arguments loading the selected portable skills.
     """
-    overlay = bridge_dir / "agent-skills"
+    overlay = claude_agents_skill_overlay(bridge_dir)
     _remove_skill_overlay(overlay)
     ctx = skill_source_context_from_env(
         roots=roots,

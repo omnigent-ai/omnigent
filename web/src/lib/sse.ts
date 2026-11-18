@@ -10,7 +10,9 @@ import { parseNativePermissionDelivery } from "./nativePermissionDelivery";
 // catch — please add an SSE-parser test when you touch this.
 
 import { assistantMessagePhase } from "./conversationItems";
+import type { JournalEntry } from "./sessionJournal";
 import { readSubagentActivity } from "./subagentActivity";
+import { readTaskActivity } from "./taskActivity";
 import type {
   BrowserActionRequestEvent,
   ClientTaskCancel,
@@ -39,6 +41,7 @@ import type {
   SessionBtwSidechatEvent,
   SessionChangedFilesInvalidatedEvent,
   SessionChildSessionUpdatedEvent,
+  SessionJournalAppendedEvent,
   SessionModelOptionsEvent,
   SessionCreatedEvent,
   SessionInputConsumedEvent,
@@ -55,6 +58,7 @@ import type {
   SessionTitleEvent,
   SessionCollaborationModeEvent,
   SessionPermissionModeEvent,
+  SessionBackgroundTasksEvent,
   SessionCodexApprovalModeEvent,
   SessionReasoningEffortEvent,
   SessionAgentChangedEvent,
@@ -74,6 +78,7 @@ import type {
   ToolResult,
 } from "./events";
 import { NATIVE_TOOL_TYPES } from "./events";
+import { fileEditRequestFromWire } from "./toolEditDiff";
 import { routingExtrasFromWire } from "./routingDecision";
 import type {
   AgyPermission,
@@ -568,6 +573,8 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
           ? data.background_task_count
           : undefined;
       const backgroundTasks = parseBackgroundTasks(data.background_tasks);
+      const backgroundAgents =
+        status === "waiting" ? parseBackgroundTasks(data.background_agents) : undefined;
       const rawError = data.error;
       // Parse via parseErrorInfo so a classified failure's optional
       // title/cause/remediation flow through, but keep the guard that both
@@ -590,6 +597,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
         responseId,
         backgroundTaskCount,
         ...(backgroundTasks !== undefined ? { backgroundTasks } : {}),
+        ...(backgroundAgents !== undefined ? { backgroundAgents } : {}),
         ...(blockedOn !== undefined ? { blockedOn } : {}),
         ...(error !== undefined ? { error } : {}),
       } satisfies SessionStatusEvent;
@@ -699,6 +707,24 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       conversationId,
       permissionMode,
     } satisfies SessionPermissionModeEvent;
+  }
+  if (eventType === "session.background_tasks") {
+    const conversationId = data.conversation_id;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    const backgroundTaskCount = data.background_task_count;
+    if (
+      typeof backgroundTaskCount !== "number" ||
+      !Number.isInteger(backgroundTaskCount) ||
+      backgroundTaskCount < 0
+    ) {
+      return null;
+    }
+    return {
+      type: "session_background_tasks",
+      conversationId,
+      backgroundTaskCount,
+      backgroundTasks: parseBackgroundTasks(data.background_tasks) ?? [],
+    } satisfies SessionBackgroundTasksEvent;
   }
   if (eventType === "session.codex_approval_mode") {
     const conversationId = data.conversation_id;
@@ -882,7 +908,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       type: "session_superseded",
       conversationId,
       targetConversationId,
-      reason: "clear",
+      reason: data.reason === "rewind" ? "rewind" : "clear",
     } satisfies SessionSupersededEvent;
   }
   if (eventType === "session.btw_sidechat") {
@@ -934,6 +960,19 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       childSessionId,
       child: child as Record<string, unknown>,
     } satisfies SessionChildSessionUpdatedEvent;
+  }
+  if (eventType === "session.journal.appended") {
+    const conversationId = data.conversation_id;
+    const entry = data.entry;
+    if (typeof conversationId !== "string" || !conversationId) return null;
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+    const { id, position } = entry as Record<string, unknown>;
+    if (typeof id !== "string" || typeof position !== "number") return null;
+    return {
+      type: "session_journal_appended",
+      conversationId,
+      entry: entry as JournalEntry,
+    } satisfies SessionJournalAppendedEvent;
   }
   if (eventType === "session.changed_files.invalidated") {
     const sessionId = data.session_id;
@@ -1108,6 +1147,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       ...(p.native_delivery
         ? { nativeDelivery: parseNativePermissionDelivery(p.native_delivery) }
         : {}),
+      ...(p.is_blocking === false ? { isBlocking: false as const } : {}),
       elicitationId,
       targetSessionId:
         typeof targetSessionId === "string" && targetSessionId ? targetSessionId : null,
@@ -1127,10 +1167,14 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
         !Array.isArray(askUserQuestionRaw)
           ? (askUserQuestionRaw as Record<string, unknown>)
           : null,
+      ...(typeof p.journal_step === "string" && p.journal_step
+        ? { journalStep: p.journal_step }
+        : {}),
       exitPlanMode:
         exitPlanModeRaw && typeof exitPlanModeRaw === "object" && !Array.isArray(exitPlanModeRaw)
           ? (exitPlanModeRaw as Record<string, unknown>)
           : null,
+      fileEdit: fileEditRequestFromWire(p.file_edit),
       codexCommand:
         phase === "codex_command_approval" && typeof command === "string" && command
           ? {
@@ -1142,6 +1186,9 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
                 execPolicyAmendment.every((entry): entry is string => typeof entry === "string")
                   ? execPolicyAmendment
                   : null,
+              ...(typeof p.approval_request_fingerprint === "string"
+                ? { requestFingerprint: p.approval_request_fingerprint }
+                : {}),
             }
           : null,
       allowAllEdits,
@@ -1342,7 +1389,8 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
     } satisfies TerminalCommandEvent;
   }
 
-  if (readSubagentActivity(rec)) {
+  // Task markers place and fold like sub-agent markers, so they share the notice kind.
+  if (readSubagentActivity(rec) || readTaskActivity(rec)) {
     return {
       type: "native_tool_call",
       toolType: "subagent_activity",

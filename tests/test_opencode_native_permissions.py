@@ -2,84 +2,71 @@
 
 from __future__ import annotations
 
+import pytest
+
 from omnigent.harnesses.opencode_native.permissions import (
     OPENCODE_NATIVE_HARNESS,
     decision_to_reply,
     map_verdict_to_decision,
     normalize_for_policy,
     parse_permission_request,
-    reply_body,
 )
 
 
-def test_parse_permission_request_from_event_properties() -> None:
-    req = parse_permission_request(
-        {
-            "id": "per_1",
-            "sessionID": "ses_1",
-            "action": "bash",
-            "resources": [{"command": "rm -rf build"}],
-            "metadata": {"path": "/repo/build"},
-            "source": "tool",
-        }
-    )
+def _asked(**overrides: object) -> dict[str, object]:
+    """A v2 ``permission.asked`` payload as captured from opencode 2.0.x."""
+    data: dict[str, object] = {
+        "id": "per_1",
+        "sessionID": "ses_1",
+        "action": "shell",
+        "resources": ["rm -rf build"],
+        "save": ["rm *"],
+        "source": {"type": "tool", "messageID": "msg_1", "id": "call_1"},
+    }
+    data.update(overrides)
+    return data
+
+
+def test_parse_permission_request_reads_v2_fields() -> None:
+    req = parse_permission_request(_asked(metadata={"filepath": "a.py"}, message="why"))
     assert req is not None
     assert req.request_id == "per_1"
     assert req.session_id == "ses_1"
-    assert req.action == "bash"
-    assert req.source == "tool"
+    assert req.action == "shell"
+    assert req.resources == ["rm -rf build"]
+    assert req.metadata == {"filepath": "a.py"}
+    assert req.source == {"type": "tool", "messageID": "msg_1", "id": "call_1"}
+    assert req.tool_call_id == "call_1"
+    assert req.message_id == "msg_1"
+    assert req.message == "why"
 
 
-def test_parse_permission_request_v1_uses_permission_field() -> None:
-    """opencode 1.17.x emits v1 ``permission.asked`` with the category in
-    ``permission`` (not ``action``). Missing this left the policy tool name as
-    the literal "permission" so no tool-name policy fired (e.g. "Require
-    Approval for File & Shell Operations"). Live-verified payload shape.
-    """
+def test_parse_permission_request_ignores_v1_fields() -> None:
+    """v1 ``permission``/``patterns`` are no longer read: the action stays unset."""
     req = parse_permission_request(
-        {
-            "id": "per_v1",
-            "sessionID": "ses_1",
-            "permission": "bash",
-            "patterns": ["echo hello"],
-            "metadata": {"command": "echo hello"},
-            "always": ["echo *"],
-            "tool": {"messageID": "msg_1", "callID": "call_1"},
-        }
+        {"id": "per_v1", "sessionID": "ses_1", "permission": "bash", "patterns": ["ls"]}
     )
     assert req is not None
-    assert req.action == "bash"  # from the v1 ``permission`` field
-    assert req.resources == ["echo hello"]  # from v1 ``patterns``
+    assert req.action is None
+    assert req.resources == []
 
 
-def test_parse_permission_request_accepts_request_id_alias() -> None:
-    req = parse_permission_request({"requestID": "per_2", "action": "edit"})
+def test_parse_permission_request_drops_non_string_resources() -> None:
+    req = parse_permission_request(_asked(resources=["a.py", {"path": "b"}, 3]))
     assert req is not None
-    assert req.request_id == "per_2"
+    assert req.resources == ["a.py"]
+
+
+def test_parse_permission_request_without_source() -> None:
+    req = parse_permission_request(_asked(source=None))
+    assert req is not None
+    assert req.source is None
+    assert req.tool_call_id is None
 
 
 def test_parse_permission_request_requires_id() -> None:
-    assert parse_permission_request({"action": "bash"}) is None
-
-
-def test_normalize_for_policy_extracts_command_and_path() -> None:
-    req = parse_permission_request(
-        {
-            "id": "per_1",
-            "sessionID": "ses_1",
-            "action": "bash",
-            "resources": [{"command": "ls", "path": "/repo/x"}],
-        }
-    )
-    assert req is not None
-    normalized = normalize_for_policy(req, omnigent_session_id="conv_1", workspace="/repo")
-    assert normalized["harness"] == OPENCODE_NATIVE_HARNESS
-    assert normalized["action"] == "bash"
-    assert normalized["command"] == "ls"
-    assert normalized["path"] == "/repo/x"
-    assert normalized["working_directory"] == "/repo"
-    assert normalized["omnigent_session_id"] == "conv_1"
-    assert normalized["opencode_session_id"] == "ses_1"
+    assert parse_permission_request({"action": "shell"}) is None
+    assert parse_permission_request({"requestID": "per_2", "action": "edit"}) is None
 
 
 def test_map_verdict_allow_variants() -> None:
@@ -111,9 +98,68 @@ def test_decision_to_reply() -> None:
     assert decision_to_reply("ask") is None
 
 
-def test_reply_body() -> None:
-    assert reply_body("once") == {"reply": "once"}
-    assert reply_body("reject", message="blocked by policy") == {
-        "reply": "reject",
-        "message": "blocked by policy",
-    }
+def test_v1_reply_body_is_gone() -> None:
+    """The v2 client owns the reply body (``{decision, message}``)."""
+    import omnigent.harnesses.opencode_native.permissions as permissions
+
+    assert not hasattr(permissions, "reply_body")
+
+
+@pytest.mark.parametrize(
+    ("action", "resources", "metadata", "expected"),
+    [
+        ("shell", ["git status", "rm -rf x"], {}, {"command": "git status\nrm -rf x"}),
+        ("read", ["src/a.py"], {}, {"path": "src/a.py"}),
+        (
+            "edit",
+            ["a.py", "b.py"],
+            {"filepath": "a.py, b.py"},
+            {"path": "a.py", "paths": ["a.py", "b.py"]},
+        ),
+        ("external_directory", ["/etc/*"], {}, {"path": "/etc/*"}),
+        ("grep", ["secret"], {"path": "src"}, {"pattern": "secret", "path": "src"}),
+        ("glob", ["**/*.py"], {"path": None}, {"pattern": "**/*.py"}),
+        ("webfetch", ["https://x.test"], {"url": "https://x.test"}, {"url": "https://x.test"}),
+        ("websearch", ["opencode v2"], {}, {"query": "opencode v2"}),
+        ("skill", ["deploy"], {}, {"skill": "deploy"}),
+        ("subagent", ["explore"], {}, {"agent": "explore"}),
+        ("omnigent_sys_session_list", ["*"], {}, {}),
+        ("opencode_read_mcp_resource", ["srv:file://x"], {}, {"resources": ["srv:file://x"]}),
+    ],
+)
+def test_normalize_for_policy_builds_action_arguments(
+    action: str, resources: list[str], metadata: dict[str, object], expected: dict[str, object]
+) -> None:
+    req = parse_permission_request(
+        {
+            "id": "per_1",
+            "sessionID": "ses_1",
+            "action": action,
+            "resources": resources,
+            "metadata": metadata,
+            "source": {"type": "tool", "messageID": "msg_1", "id": "call_9"},
+        }
+    )
+    assert req is not None
+    normalized = normalize_for_policy(req, omnigent_session_id="conv_1", workspace="/repo")
+    assert normalized["arguments"] == expected
+    assert normalized["action"] == action
+    assert normalized["resources"] == resources
+    assert normalized["tool_call_id"] == "call_9"
+    assert normalized["harness"] == OPENCODE_NATIVE_HARNESS
+    assert normalized["working_directory"] == "/repo"
+    assert normalized["omnigent_session_id"] == "conv_1"
+    assert normalized["opencode_session_id"] == "ses_1"
+
+
+def test_normalize_for_policy_keeps_flat_command_path_url() -> None:
+    """The flat keys stay for callers that predate ``arguments``."""
+    shell = parse_permission_request({"id": "p", "action": "shell", "resources": ["ls"]})
+    read = parse_permission_request({"id": "p", "action": "read", "resources": ["a.py"]})
+    fetch = parse_permission_request({"id": "p", "action": "webfetch", "resources": ["https://u"]})
+    assert shell and read and fetch
+    assert normalize_for_policy(shell, omnigent_session_id="c", workspace=None)["command"] == "ls"
+    assert normalize_for_policy(read, omnigent_session_id="c", workspace=None)["path"] == "a.py"
+    assert (
+        normalize_for_policy(fetch, omnigent_session_id="c", workspace=None)["url"] == "https://u"
+    )

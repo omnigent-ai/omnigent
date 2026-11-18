@@ -20,6 +20,22 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from pydantic import BaseModel, ConfigDict
+
+
+class ScheduledRunLogContext(BaseModel):
+    """Occurrence identity retained with a saved prompt across replica changes."""
+
+    model_config = ConfigDict(frozen=True)
+
+    task_id: str
+    run_id: str
+    task_workspace_id: int
+    scheduled_at: int
+    trigger_key: str | None = None
+    target: str
+    session_mode: str
+
 
 @dataclass
 class ScheduledTask:
@@ -28,7 +44,7 @@ class ScheduledTask:
 
     A task's trigger is a required recurring ``rrule``.
 
-    :param id: UUID primary key (bare 32-char hex string, no dashes).
+    :param id: Primary key from the store's allocator; by default a bare 32-char hex UUID.
     :param workspace_id: Tenant partition key that owns this row.
     :param name: Human-readable task name, e.g. ``"nightly triage"``.
     :param prompt: The instruction dispatched to the agent on each firing.
@@ -45,11 +61,13 @@ class ScheduledTask:
         ``"claude-opus-4-7"``. ``None`` means use the agent default.
     :param reasoning_effort: Per-task reasoning-effort hint, e.g. ``"high"``.
         ``None`` means use the agent default.
-    :param permission_mode: Per-task permission mode for native coding harnesses
-        that support one (currently Claude Code), e.g. ``"acceptEdits"`` or
-        ``"bypassPermissions"``. The fire path turns it into the runner's
-        ``["--permission-mode", <value>]`` terminal launch args. ``None`` means
-        use the agent's configured default.
+    :param permission_mode: Harness-specific permission or execution mode.
+        The fire path translates it into that harness's launch options.
+        ``None`` means use the agent's configured default.
+    :param mcp_services: MCP services every fired session starts with, as the
+        deployment's service names, e.g. ``("github", "linear")``. The server's
+        session MCP selection turns them into session labels at fire time.
+        Empty means fired sessions get no MCP selection.
     :param max_cost_usd: Optional per-firing cost budget in USD. When set, the
         fire path attaches a ``cost_budget`` policy to each spawned session that
         blocks all models once cumulative spend reaches this limit. ``None``
@@ -60,10 +78,13 @@ class ScheduledTask:
     :param session_id: The session a ``"continue"`` task sends its prompt to.
         ``None`` until its first firing creates one, unless the owner picked an
         existing session.
-    :param workspace: Absolute existing path where a fired session's connected
-        host runner should start. ``None`` only for legacy or invalid rows.
-    :param base_branch: Reserved legacy column; scheduled tasks currently do
-        not create git worktrees at fire time.
+    :param source_session_id: The session each firing copies. Every run starts a
+        new session that begins with that session's history. ``None`` for a
+        task whose runs start empty.
+    :param workspace: Connected-host directory or managed-sandbox repository URL.
+        ``None`` uses the execution target's default workspace.
+    :param base_branch: Create a random worktree from this ref for each new
+        session. ``None`` runs in the selected workspace; ``"HEAD"`` opts in.
     :param execution_target: ``"connected_host"`` for a pinned host, or
         ``"managed_sandbox"`` for a fresh sandbox per occurrence.
     :param host_id: Specific connected host to run on. ``None`` only for legacy
@@ -77,6 +98,9 @@ class ScheduledTask:
         firing, or ``None``.
     :param updated_at: Unix epoch seconds of the last write, or ``None`` if the
         row has never been updated.
+    :param kind: ``"automation"``, or ``"reminder"`` for a one-time message an
+        agent set for its own session. Clients list reminders apart from
+        automations; scheduling and firing ignore it.
     """
 
     id: str
@@ -91,9 +115,12 @@ class ScheduledTask:
     model_override: str | None = None
     reasoning_effort: str | None = None
     permission_mode: str | None = None
+    mcp_services: tuple[str, ...] = ()
     max_cost_usd: float | None = None
     session_mode: str = "new"
+    kind: str = "automation"
     session_id: str | None = None
+    source_session_id: str | None = None
     workspace: str | None = None
     base_branch: str | None = None
     execution_target: str = "connected_host"
@@ -120,8 +147,8 @@ class ScheduledTaskRun:
     table.
 
     :param id: UUID primary key (bare 32-char hex string, no dashes).
-    :param scheduled_task_id: The task this run belongs to (a bare 32-char hex
-        UUID string).
+    :param scheduled_task_id: The ID of the task this run belongs to; by default a
+        bare 32-char hex UUID.
     :param status: Lifecycle state — one of ``"scheduled"``, ``"starting"``, ``"running"``,
         ``"succeeded"``, ``"failed"``, ``"skipped"``.
     :param scheduled_at: Unix epoch seconds. Persistent dispatch records the

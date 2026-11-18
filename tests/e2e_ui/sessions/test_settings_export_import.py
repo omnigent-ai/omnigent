@@ -54,7 +54,7 @@ def test_settings_persist_to_localstorage(page: Page, live_server: str) -> None:
 
     # Change several appearance preferences away from defaults.
     font_size_inc = page.get_by_test_id("ui-font-size-inc")
-    for _ in range(3):
+    for _ in range(2):
         font_size_inc.click()
     expect(page.get_by_test_id("ui-font-size-input")).to_have_value("16")
 
@@ -76,7 +76,7 @@ def test_import_restores_localstorage_settings(page: Page, live_server: str) -> 
 
     # Step 1: Set preferences and capture them.
     font_size_inc = page.get_by_test_id("ui-font-size-inc")
-    for _ in range(5):
+    for _ in range(4):
         font_size_inc.click()
     expect(page.get_by_test_id("ui-font-size-input")).to_have_value("18")
 

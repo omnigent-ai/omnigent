@@ -1,4 +1,5 @@
 import { act, cleanup, renderHook } from "@testing-library/react";
+import { useLayoutEffect } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   readSessionWorkspaceState,
@@ -86,13 +87,23 @@ describe("side-chat soft tabs", () => {
       openSideChats: ["conv_b1"],
       selectedSideChatId: "conv_b1",
     });
-    const { result, rerender } = renderHook(({ id }) => useSideChats(id), {
-      initialProps: { id: "session-a" },
-    });
+    // Every committed selection, so the switch can't commit session-a's tabs first.
+    const committed: (string | null)[] = [];
+    const { result, rerender } = renderHook(
+      ({ id }) => {
+        const sideChats = useSideChats(id);
+        useLayoutEffect(() => {
+          committed.push(sideChats.selected);
+        });
+        return sideChats;
+      },
+      { initialProps: { id: "session-a" } },
+    );
     expect(result.current.tabs).toEqual(["conv_a1"]);
     rerender({ id: "session-b" });
     expect(result.current.tabs).toEqual(["conv_b1"]);
     expect(result.current.selected).toBe("conv_b1");
+    expect(committed).toEqual(["conv_a1", "conv_b1"]);
   });
 
   it("persists tabs and selection across remount, isolated per session", () => {
@@ -135,6 +146,43 @@ describe("side-chat soft tabs", () => {
     expect(result.current.selected).toBe("conv_2");
   });
 
+  it("adds remote chats without duplicates or reopening locally closed tabs", () => {
+    const first = renderHook(() => useSideChats("session-a"));
+    act(() => first.result.current.open("local"));
+    act(() => first.result.current.open(subagentTabId("native")));
+    act(() => first.result.current.select("local"));
+    act(() => first.result.current.restore(["remote", "local", "native"]));
+    expect(first.result.current.tabs).toEqual(["local", "remote", subagentTabId("native")]);
+    expect(first.result.current.selected).toBe("local");
+    act(() => first.result.current.close("remote"));
+    act(() => first.result.current.close(subagentTabId("native")));
+    first.unmount();
+
+    const restored = renderHook(() => useSideChats("session-a"));
+    act(() => restored.result.current.restore(["remote", "new-remote", "native"]));
+    expect(restored.result.current.tabs).toEqual(["local", "new-remote"]);
+    expect(restored.result.current.selected).toBe("local");
+    act(() => restored.result.current.open("remote"));
+    expect(readSessionWorkspaceState("session-a").closedSideChats).toEqual(["native"]);
+    restored.unmount();
+
+    localStorage.clear();
+    const otherDevice = renderHook(() => useSideChats("session-a"));
+    act(() => otherDevice.result.current.restore(["remote"]));
+    expect(otherDevice.result.current.tabs).toEqual(["remote"]);
+    expect(otherDevice.result.current.selected).toBe("remote");
+  });
+
+  it("keeps existing tabs when discovery would exceed the stored tab limit", () => {
+    const local = Array.from({ length: 19 }, (_, i) => `local-${i}`);
+    writeSessionWorkspaceState("session-a", { openSideChats: local, selectedSideChatId: local[0] });
+    const { result } = renderHook(() => useSideChats("session-a"));
+    act(() => result.current.restore(["remote-1", "remote-2"]));
+    expect(result.current.tabs).toEqual([...local, "remote-1"]);
+    expect(readSessionWorkspaceState("session-a").openSideChats).toEqual(result.current.tabs);
+    expect(result.current.selected).toBe(local[0]);
+  });
+
   it("select changes the active tab and can clear it", () => {
     const { result } = renderHook(() => useSideChats("session-a"));
     act(() => result.current.open("conv_1"));
@@ -173,10 +221,11 @@ describe("sub-agent tabs", () => {
       selectedSideChatId: subagentTab,
     });
 
-    // Without sub-agent tabs, the store is written exactly as before.
+    // Closing a native side chat opened as a sub-agent must also survive discovery.
     act(() => result.current.close(subagentTab));
     expect(readSessionWorkspaceState("session-a")).toEqual({
       openSideChats: ["conv_a"],
+      closedSideChats: ["conv_child"],
       selectedSideChatId: "conv_a",
     });
   });
@@ -279,6 +328,7 @@ describe("side-chat tabs when storage writes fail", () => {
 
       expect(readSessionWorkspaceState("session-a")).toEqual({
         openSideChats: sideChats,
+        ...(_change === "closes a tab" ? { closedSideChats: ["conv_z"] } : {}),
         openSubagentTabs: [subagentTab],
         selectedSideChatId: subagentTab,
       });

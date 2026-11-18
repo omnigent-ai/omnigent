@@ -12,6 +12,7 @@ from urllib.parse import parse_qs, urlsplit
 import pytest
 from playwright.sync_api import Page, Route, expect
 
+from tests._helpers.pull_request_ui import open_session_pull_requests
 from tests.e2e_ui.conftest import open_right_rail, stub_session_pull_requests
 from tests.e2e_ui.github.test_github_tab import _INFO, _stub_github
 
@@ -147,22 +148,23 @@ def test_azure_devops_tab_shows_provider_repo_and_pull_request(
     page.goto(f"{base_url}/c/{session_id}")
 
     link = page.get_by_test_id("composer-pr-link")
-    expect(link).to_have_text("!7", timeout=30_000)
+    if not mobile:
+        expect(link).to_have_text("!7", timeout=30_000)
     if entry == "rail":
         open_right_rail(page)
         page.get_by_role("tab", name="Pull Requests", exact=True).click()
     else:
-        link.click()
+        open_session_pull_requests(page, mobile=mobile)
     rail = (
         page.get_by_test_id("github-panel-drawer")
         if mobile
         else page.get_by_role("complementary", name="Workspace")
     )
 
-    rail.get_by_role(
-        "button", name="dev.azure.com/contoso/web/app !7 — Add the widget", exact=True
-    ).click()
     expect(rail.get_by_title("Azure DevOps")).to_be_visible(timeout=30_000)
+    expect(rail.get_by_role("heading", name="Pull Requests", exact=True)).to_be_visible()
+    expect(rail.get_by_role("list", name="Pull requests")).to_have_count(0)
+    expect(rail.get_by_role("button", name=re.compile("All pull requests"))).to_have_count(0)
     expect(rail.get_by_text("contoso/web/app", exact=False).first).to_be_visible()
     expect(rail.get_by_text("Add the widget", exact=True)).to_be_visible()
     expect(rail.get_by_text("!7", exact=True)).to_be_visible()
@@ -229,9 +231,6 @@ def test_azure_partial_results_keep_loaded_data_and_explain_unavailable_diff(
     rail = page.get_by_role("complementary", name="Workspace")
     rail.get_by_role("tab", name="Pull Requests").click()
 
-    rail.get_by_role(
-        "button", name="dev.azure.com/contoso/web/app !7 — Add the widget", exact=True
-    ).click()
     expect(rail.get_by_text("Add the widget", exact=True)).to_be_visible()
     expect(rail.get_by_text(re.compile(r"1\s*passed"))).to_be_visible()
     page.screenshot(path=tmp_path / "azure-partial-summary.png", animations="disabled")
@@ -340,6 +339,8 @@ def test_azure_link_select_unlink_explains_outside_workspace_diff(
     panel.get_by_role("button", name="Link a PR", exact=True).click()
     panel.get_by_role("textbox", name="Pull request URL").fill(_SECOND_URL)
     panel.get_by_role("button", name="Link", exact=True).click()
+    expect(panel.get_by_text("Another repository", exact=True)).to_be_visible()
+    panel.get_by_role("button", name="All pull requests (2)").click()
     panel.get_by_role(
         "button", name="dev.azure.com/contoso/web/other !12 — Another repository", exact=True
     ).click()

@@ -1,7 +1,7 @@
 """Real setup -> local daemon -> runner -> agy, using a fake Gemini gateway.
 
 Run with OMNIGENT_E2E_ANTIGRAVITY=mock. The UI CI job installs pinned agy
-1.2.4; this journey checks the backend used by a host-bound native chat.
+1.5.2; this journey checks the backend used by a host-bound native chat.
 """
 
 from __future__ import annotations

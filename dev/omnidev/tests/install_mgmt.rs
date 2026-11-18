@@ -2,8 +2,6 @@
 //! spec building, config round-trip, and the update-availability/staleness
 //! decisions.
 
-use std::sync::{Mutex, MutexGuard};
-
 // These modules reference each other via `crate::`, so declare the whole set at
 // the test crate root. Each test target exercises only part of the included
 // source, so allow dead code rather than chase per-item warnings.
@@ -18,14 +16,8 @@ mod paths;
 mod update_check;
 
 use install::InstallConfig;
+use paths::lock_test_env;
 use update_check::{is_stale, update_available, CheckCache};
-
-/// Tests here mutate process-global `XDG_*` env vars; serialize them.
-static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-fn lock_env() -> MutexGuard<'static, ()> {
-    ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
 
 #[test]
 fn spec_default_has_databricks_extra_and_main() {
@@ -64,7 +56,7 @@ fn spec_reflects_custom_ref_and_extras() {
 
 #[test]
 fn config_round_trips_through_disk() {
-    let _guard = lock_env();
+    let _guard = lock_test_env();
     let tmp = tempdir();
     std::env::set_var("XDG_CONFIG_HOME", &tmp);
 
@@ -82,7 +74,7 @@ fn config_round_trips_through_disk() {
 
 #[test]
 fn missing_config_loads_as_none() {
-    let _guard = lock_env();
+    let _guard = lock_test_env();
     let tmp = tempdir();
     std::env::set_var("XDG_CONFIG_HOME", &tmp);
 

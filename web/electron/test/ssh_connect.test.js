@@ -159,7 +159,14 @@ describe("loginScript on a real shell", () => {
             return true;
           }
           const stat = `/proc/${pid}/stat`;
-          return fs.existsSync(stat) && / Z /.test(fs.readFileSync(stat, "utf8"));
+          if (!fs.existsSync(stat)) return false;
+          try {
+            return / Z /.test(fs.readFileSync(stat, "utf8"));
+          } catch (error) {
+            // Reaped between the existence check and the read.
+            if (error.code === "ENOENT") return true;
+            throw error;
+          }
         };
         for (let waited = 0; waited < 3000 && !pids.every(stopped); waited += 50) {
           // Polling is sequential by design.
@@ -1024,6 +1031,8 @@ describe("createSshSession", () => {
     await session.forwardLocal(8021);
     await session.cancelLocal(8021);
     await session.holdRemote(8020);
+    await session.forwardSocket("/tmp/s/w1.sock", "/tmp/omnigent-workspace-ab/workspace.sock");
+    await session.cancelSocket("/tmp/s/w1.sock", "/tmp/omnigent-workspace-ab/workspace.sock");
     await session.exec("true").promise;
 
     // The user's config reaches the connection and commands, but never its ControlMaster,
@@ -1051,6 +1060,20 @@ describe("createSshSession", () => {
       [...control, "forward", "-L", "localhost:8021:127.0.0.1:8021", "my-ec2"],
       [...control, "cancel", "-L", "localhost:8021:127.0.0.1:8021", "my-ec2"],
       [...control, "forward", "-R", "8020:127.0.0.1:9", "my-ec2"],
+      [
+        ...control,
+        "forward",
+        "-L",
+        "/tmp/s/w1.sock:/tmp/omnigent-workspace-ab/workspace.sock",
+        "my-ec2",
+      ],
+      [
+        ...control,
+        "cancel",
+        "-L",
+        "/tmp/s/w1.sock:/tmp/omnigent-workspace-ab/workspace.sock",
+        "my-ec2",
+      ],
       [
         "ssh",
         "-S",

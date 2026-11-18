@@ -35,7 +35,7 @@ import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
-from omnigent.harnesses.codex_native import stderr_diagnostics
+from omnigent.harnesses import diagnostics as shared_diagnostics
 from omnigent.harnesses.codex_native.app_server import CodexNativeAppServer
 from omnigent.process_logging import configure_process_logging
 
@@ -47,7 +47,7 @@ if fail_worker:
             if self.name.startswith('codex-stderr-diagnostics'):
                 raise RuntimeError('synthetic-start-secret')
             super().start()
-    stderr_diagnostics.threading = SimpleNamespace(
+    shared_diagnostics.threading = SimpleNamespace(
         Thread=UnavailableThread, Lock=threading.Lock, Event=threading.Event,
     )
 

@@ -70,6 +70,9 @@ The system WebView must support AndroidX WebKit's multi-profile feature; the app
 fails closed rather than putting workspace cookies in the process-wide default
 profile. Expired web sessions recover from the retained native grant, and local
 workspace sign-out clears both that grant and its profile before reconnecting.
+On each return to the foreground the shell asks the workspace whether it still
+accepts the session and runs that same recovery when it doesn't, so a session
+the server has revoked is noticed without waiting for a request to fail.
 Build/redirect setup and the security model are documented in
 [`docs/databricks-oauth.md`](docs/databricks-oauth.md).
 
@@ -77,8 +80,8 @@ A Databricks workspace serves its own landing page at the root and mounts the
 Omnigent SPA at `/omnigent`, so the shell rewrites a **bare** workspace root to
 that mount (`Origins.databricksWorkspaceUiUrl`):
 
-- `https://dbc-a5d4177a-49dc.cloud.databricks.com` →
-  `https://dbc-a5d4177a-49dc.cloud.databricks.com/omnigent`
+- `https://dbc-12345678-abcd.cloud.databricks.com` →
+  `https://dbc-12345678-abcd.cloud.databricks.com/omnigent`
 - `?o=<org>` and any fragment are preserved; a URL that already carries a path
   (a deep link, or `/omnigent` itself) is left alone.
 

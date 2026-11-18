@@ -123,5 +123,12 @@ export function useRegistrySignIn(refresh: () => Promise<RegistryService[] | und
     [refresh],
   );
   const clearError = useCallback(() => setError(null), []);
-  return { signIn, authorizing, error, clearError };
+  /** Drop a pending sign-in, so its completion selects nothing. */
+  const cancel = useCallback(() => {
+    authorization.current?.abort();
+    authorization.current = null;
+    setAuthorizing(null);
+    setError(null);
+  }, []);
+  return { signIn, authorizing, error, clearError, cancel };
 }

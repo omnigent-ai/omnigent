@@ -502,6 +502,17 @@ check_bubblewrap() {
   fi
 }
 
+python_request() {
+  # Rosetta reports x86_64 even on Apple Silicon. Pin the native interpreter
+  # so uv cannot reuse an Intel Python already installed on these machines.
+  if [ "$(uname -s)" = Darwin ] &&
+    { [ "$(uname -m)" = arm64 ] || [ "$(sysctl -in sysctl.proc_translated 2>/dev/null || true)" = 1 ]; }; then
+    printf 'cpython-%s-macos-aarch64\n' "$PYTHON_VERSION"
+  else
+    printf '%s\n' "$PYTHON_VERSION"
+  fi
+}
+
 install_omnigent() {
   # PyPI wheels bundle the web UI; --repo builds it from source with npm.
   # Extras apply to every install mode, including Databricks by default.
@@ -528,7 +539,7 @@ install_omnigent() {
   fi
   # --force so re-running upgrades instead of no-op'ing; -q hides uv's
   # "Installed N executables" summary (the package also ships an `omni` alias).
-  run_with_spinner "uv tool install" uv tool install --force -q --python "$PYTHON_VERSION" "$target"
+  run_with_spinner "uv tool install" uv tool install --force -q --python "$(python_request)" "$target"
 }
 
 install_databricks_cli() (

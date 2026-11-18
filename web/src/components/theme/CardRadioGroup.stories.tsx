@@ -77,24 +77,25 @@ export const SystemSelected: Story = { render: () => <ModeGroup initialValue="sy
 export const DarkSelected: Story = { render: () => <ModeGroup initialValue="dark" /> };
 
 export const TwoColumnIconCards: Story = {
+  name: "Inline icon buttons",
   render: () => (
     <div className="w-[560px] space-y-3 rounded-xl border bg-card p-4">
       <h2 id="story-terminal-theme" className="font-medium">
         Terminal theme
       </h2>
       <CardRadioGroup
+        compact
         labelledBy="story-terminal-theme"
         value="auto"
         onSelect={() => undefined}
-        className="grid grid-cols-2 gap-3"
-        cardClassName="items-center gap-2 p-4"
+        className="flex flex-wrap gap-2"
         items={[
           {
             value: "auto",
             testId: "story-terminal-auto",
             body: (
               <>
-                <MonitorIcon className="size-6 text-muted-foreground" />
+                <MonitorIcon aria-hidden="true" className="size-4 text-muted-foreground" />
                 <span>Match app</span>
               </>
             ),
@@ -104,7 +105,7 @@ export const TwoColumnIconCards: Story = {
             testId: "story-terminal-light",
             body: (
               <>
-                <SunIcon className="size-6 text-muted-foreground" />
+                <SunIcon aria-hidden="true" className="size-4 text-muted-foreground" />
                 <span>Light</span>
               </>
             ),

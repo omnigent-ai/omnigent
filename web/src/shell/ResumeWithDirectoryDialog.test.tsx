@@ -11,6 +11,7 @@ import { useDirectorySessions } from "@/hooks/useDirectorySessions";
 import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { getSessionSlim, launchRunner } from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 
 // Heavy children are exercised by their own tests; stub them so this
 // test focuses on the dialog's prefill + bind + fallback logic.
@@ -63,7 +64,11 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 vi.mock("@/hooks/useRecentWorkspaces", () => ({
   useRecentWorkspaces: () => ({ recent: [], addRecent: vi.fn() }),
 }));
-vi.mock("@/lib/sessionsApi", () => ({ getSessionSlim: vi.fn(), launchRunner: vi.fn() }));
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
+  getSessionSlim: vi.fn(),
+  launchRunner: vi.fn(),
+}));
 // Radix Select uses a portal + pointer events that jsdom can't drive, so
 // stub it to a native <select>; lets tests switch the selected host.
 vi.mock("@/components/ui/select", () => ({

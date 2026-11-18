@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import mimetypes
 import pathlib
-from urllib.parse import quote
 
 import httpx
 
 from ._errors import raise_for_status, require_json_object, response_body
+from ._http import session_url
 from ._types import File, PaginatedList
 
 
@@ -119,7 +119,18 @@ class SessionFilesNamespace:
 
         :returns: Fully qualified endpoint URL.
         """
-        return f"{self._base}/v1/sessions/{quote(self._session_id, safe='')}/resources/files"
+        return session_url(self._base, self._session_id, "resources", "files")
+
+    def _file_path(self, file_id: str, *subpath: str) -> str:
+        """
+        URL of one file under this session, every id kept to one path segment.
+
+        :param file_id: Server-issued file id, e.g. ``"file_abc123"``.
+        :param subpath: Further segments, e.g. ``"content"``.
+        :returns: Fully qualified endpoint URL.
+        :raises ValueError: If the session or file id is not a single segment.
+        """
+        return session_url(self._base, self._session_id, "resources", "files", file_id, *subpath)
 
     @staticmethod
     def _resource_to_file(data: dict[str, object]) -> File:
@@ -193,7 +204,7 @@ class SessionFilesNamespace:
         :param file_id: Server-issued file id, e.g. ``"file_abc123"``.
         :returns: File metadata.
         """
-        resp = await self._http.get(f"{self._path}/{quote(file_id, safe='')}")
+        resp = await self._http.get(self._file_path(file_id))
         raise_for_status(resp.status_code, response_body(resp))
         return self._resource_to_file(
             require_json_object(resp, "GET /v1/sessions/{session_id}/resources/files/{file_id}")
@@ -206,10 +217,7 @@ class SessionFilesNamespace:
         :param file_id: Server-issued file id, e.g. ``"file_abc123"``.
         :returns: Raw file bytes.
         """
-        resp = await self._http.get(
-            f"{self._path}/{quote(file_id, safe='')}/content",
-            timeout=30.0,
-        )
+        resp = await self._http.get(self._file_path(file_id, "content"), timeout=30.0)
         if resp.status_code >= 400:
             raise_for_status(resp.status_code, response_body(resp))
         return resp.content
@@ -235,6 +243,6 @@ class SessionFilesNamespace:
         :param file_id: Server-issued file id, e.g. ``"file_abc123"``.
         :returns: None.
         """
-        resp = await self._http.delete(f"{self._path}/{quote(file_id, safe='')}")
+        resp = await self._http.delete(self._file_path(file_id))
         if resp.status_code >= 400:
             raise_for_status(resp.status_code, response_body(resp))

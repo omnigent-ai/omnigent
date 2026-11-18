@@ -1,6 +1,11 @@
 import { type RefObject, useEffect, useId, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { FileIcon, FilterIcon, SearchIcon } from "lucide-react";
+import {
+  contentSearchPattern,
+  fitsContentSearchLimit,
+  wholeWordRegexProblem,
+} from "@/lib/contentSearch";
 import { authenticatedFetch } from "@/lib/identity";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -27,6 +32,8 @@ interface ContentSearchInput {
   query: string;
   caseSensitive: boolean;
   regex: boolean;
+  /** Optional so an input cached before this option existed still reads as off. */
+  wholeWord?: boolean;
   include: string;
   exclude: string;
 }
@@ -43,7 +50,14 @@ export function ContentSearchPanel({
   const queryClient = useQueryClient();
   const cachedInput = useQuery<ContentSearchInput>({
     queryKey: ["content-search-input", conversationId],
-    initialData: { query: "", caseSensitive: false, regex: false, include: "", exclude: "" },
+    initialData: {
+      query: "",
+      caseSensitive: false,
+      regex: false,
+      wholeWord: false,
+      include: "",
+      exclude: "",
+    },
     enabled: false,
     gcTime: Infinity,
   });
@@ -51,6 +65,13 @@ export function ContentSearchPanel({
   const [showFilters, setShowFilters] = useState(false);
   const filtersId = useId();
   const { query, caseSensitive, regex, include, exclude } = input;
+  const wholeWord = input.wholeWord === true;
+  // Whole word is sent as a regular expression, which can outgrow the server's query limit.
+  const sent = contentSearchPattern({ query, regex, wholeWord });
+  const tooLong = wholeWord && !fitsContentSearchLimit(sent.pattern);
+  // Such an expression could escape the Whole word wrapper and lose its boundaries.
+  const regexProblem = wholeWord && regex ? wholeWordRegexProblem(query) : null;
+  const canSearch = query.trim() !== "" && !tooLong && regexProblem === null;
   useEffect(() => {
     queryClient.setQueryData(["content-search-input", conversationId], input);
   }, [conversationId, input, queryClient]);
@@ -62,9 +83,9 @@ export function ContentSearchPanel({
     // Keep the latest search, including in-flight work, when its panel unmounts.
     queryFn: async (): Promise<ContentSearchResult & { query: string }> => {
       const params = new URLSearchParams({
-        q: query,
+        q: sent.pattern,
         case_sensitive: String(caseSensitive),
-        regex: String(regex),
+        regex: String(sent.regex),
         include,
         exclude,
       });
@@ -95,7 +116,7 @@ export function ContentSearchPanel({
         className="space-y-2 border-b border-border p-3"
         onSubmit={(event) => {
           event.preventDefault();
-          if (query.trim() && !search.isFetching) void search.refetch();
+          if (canSearch && !search.isFetching) void search.refetch();
         }}
       >
         <div className="flex gap-2">
@@ -124,7 +145,7 @@ export function ContentSearchPanel({
               <FilterIcon className="size-4" />
             </Button>
           </div>
-          <Button type="submit" disabled={!query.trim() || search.isFetching}>
+          <Button type="submit" disabled={!canSearch || search.isFetching}>
             <SearchIcon className="size-4" />
             Search
           </Button>
@@ -141,12 +162,37 @@ export function ContentSearchPanel({
           <label className="flex items-center gap-1.5">
             <input
               type="checkbox"
+              checked={wholeWord}
+              onChange={(event) => setInput({ ...input, wholeWord: event.target.checked })}
+            />
+            Whole word
+          </label>
+          <label className="flex items-center gap-1.5">
+            <input
+              type="checkbox"
               checked={regex}
               onChange={(event) => setInput({ ...input, regex: event.target.checked })}
             />
             Regular expression
           </label>
         </div>
+        {tooLong && (
+          <p role="alert" className="text-xs text-destructive">
+            This search is too long to match whole words. Shorten it, or turn off Whole word.
+          </p>
+        )}
+        {regexProblem === "unopened-group" && (
+          <p role="alert" className="text-xs text-destructive">
+            This expression closes a group it never opened, so it can’t match whole words. Balance
+            its parentheses, or turn off Whole word.
+          </p>
+        )}
+        {regexProblem === "verbose" && (
+          <p role="alert" className="text-xs text-destructive">
+            Whole word can’t be used with verbose mode (?x). Remove that flag, or turn off Whole
+            word.
+          </p>
+        )}
         <div id={filtersId} hidden={!showFilters} className="space-y-2 text-xs">
           <label className="block space-y-1">
             <span>Include</span>

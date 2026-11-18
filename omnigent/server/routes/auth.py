@@ -47,6 +47,7 @@ from omnigent.server.admin_list import AdminList, promote_if_listed
 from omnigent.server.auth import (
     _RESERVED_USERS,
     UnifiedAuthProvider,
+    effective_admin,
 )
 from omnigent.server.device_grant_store import DeviceGrantStore
 from omnigent.server.oidc import (
@@ -79,7 +80,9 @@ _CLI_UPGRADE_TICKET = "upgrade-required"
 _CLI_UPGRADE_MESSAGE = (
     "Upgrade Omnigent to sign in: this server requires a newer login client. "
     "For the CLI, run `omni upgrade`, then retry `omnigent login`. "
-    "For mobile, update the app. For Slack, ask your administrator to update the integration."
+    "For mobile, install the newest app version, or ask your administrator if the app store "
+    "has no compatible build yet. "
+    "For Slack, ask your administrator to update the integration."
 )
 _CLI_LOGIN_MAX_BODY_BYTES = 4096
 _CLI_BROWSER_HEADERS = {
@@ -154,9 +157,9 @@ class _CliTicket:
     """
 
     created_at: float = field(default_factory=time.time)
-    token: str | None = None
+    token: str | None = field(default=None, repr=False)
     user_id: str | None = None
-    refresh_token: str | None = None
+    refresh_token: str | None = field(default=None, repr=False)
     code_challenge: str = ""
     user_code: str = ""
     denied: bool = False
@@ -356,7 +359,7 @@ def create_auth_router(
             "code_challenge": code_challenge,
             "code_challenge_method": "S256",
         }
-        if reauth:
+        if reauth and config.reauth_prompt:
             # Ask the IdP to force the user to re-enter credentials
             # rather than silently reusing an existing IdP session.
             params["prompt"] = "login"
@@ -693,7 +696,7 @@ def create_auth_router(
             is_admin = (
                 permission_store is not None and permission_store.is_admin(caller)
             ) or admin_list.is_admin(caller)
-            if not is_admin:
+            if not effective_admin(is_admin):
                 return JSONResponse(status_code=403, content={"error": "admin only"})
 
             token_id = secrets.token_urlsafe(32)
@@ -1163,7 +1166,7 @@ def create_auth_router(
         is_admin = (
             permission_store is not None and permission_store.is_admin(caller)
         ) or admin_list.is_admin(caller)
-        if not is_admin:
+        if not effective_admin(is_admin):
             return JSONResponse(status_code=403, content={"error": "admin only"})
 
         users = permission_store.list_users(limit=limit) if permission_store is not None else []
@@ -1205,15 +1208,15 @@ def _cli_consent_html(
     if upgrade_required:
         body = (
             "<h1>Update Omnigent to sign in</h1>"
-            "<p>This server has a security update that requires a newer version "
-            "of the app you used to start sign-in. This login attempt did not "
-            "grant access.</p>"
+            "<p>This server requires a newer sign-in client than the one you used. "
+            "This login attempt did not grant access.</p>"
             "<ul><li><b>CLI:</b> Run <code>omni upgrade</code>, then run your "
             "<code>omnigent login</code> command again. If the upgrade command "
             "is unavailable, update using your original installer.</li>"
-            "<li><b>iOS or Android:</b> Update the Omnigent app through your "
-            "app store or your organization's distribution channel, then "
-            "start sign-in again.</li>"
+            "<li><b>iOS or Android:</b> Install the newest Omnigent app from your "
+            "app store or your organization's distribution channel, then start "
+            "sign-in again. If no newer version is offered, a compatible build may "
+            "not be released yet.</li>"
             "<li><b>Slack:</b> Ask your administrator to update the Omnigent "
             "Slack integration, then restart setup in Slack.</li></ul>"
             "<p>If no compatible update is available, contact your server "

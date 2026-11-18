@@ -15,11 +15,12 @@ from typing import TYPE_CHECKING
 
 import httpx
 
-from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError, WrongReplicaError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
 from omnigent.runtime import telemetry
 from omnigent.runtime.harnesses import _HARNESS_MODULES
+from omnigent.scheduled_context import add_scheduled_run_header
 from omnigent.spec import AgentSpec
 from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
 
@@ -215,6 +216,7 @@ class RunnerRouter:
         if conv is None:
             raise OmnigentError("conversation not found", code=ErrorCode.NOT_FOUND)
         if conv.runner_id:
+            self.require_runtime_support(conv)
             return self._routed_pinned_runner(conv, conv.runner_id, harness=harness)
         raise OmnigentError(
             f"conversation {conversation_id!r} is not bound to a runner; "
@@ -244,6 +246,25 @@ class RunnerRouter:
         :raises OmnigentError: If the conversation is missing, the
             pinned runner is offline, or no online runner is available.
         """
+        return self._client_for_session(
+            conversation_id, conversation=conversation, check_runtime=True
+        )
+
+    def client_for_session_control(
+        self, conversation_id: str, *, conversation: Conversation | None = None
+    ) -> RoutedRunner:
+        """Route control and observation without admitting execution."""
+        return self._client_for_session(
+            conversation_id, conversation=conversation, check_runtime=False
+        )
+
+    def _client_for_session(
+        self,
+        conversation_id: str,
+        *,
+        conversation: Conversation | None,
+        check_runtime: bool,
+    ) -> RoutedRunner:
         conv = conversation
         if conv is not None and conv.id != conversation_id:
             raise ValueError(
@@ -256,10 +277,13 @@ class RunnerRouter:
         if conv.runner_id:
             session = self._registry.get(conv.runner_id)
             if session is None:
-                raise OmnigentError(
+                raise self._runner_absent_error(
+                    conv,
+                    conv.runner_id,
                     f"runner {conv.runner_id!r} is offline for conversation {conversation_id!r}",
-                    code=self._runner_absent_code(routing_host_id(conv, self._conversation_store)),
                 )
+            if check_runtime:
+                self.require_runtime_support(conv)
             return RoutedRunner(
                 runner_id=conv.runner_id,
                 client=self._client_for_runner(conv.runner_id),
@@ -275,8 +299,8 @@ class RunnerRouter:
         """
         Return the pinned runner client for an already-started conversation.
 
-        Used by server surfaces like terminal listing and interrupt
-        forwarding that know the conversation but do not know the
+        Used by terminal attachment and background requests that
+        know the conversation but do not know the
         harness kind. Unpinned or missing conversations return
         ``None`` so callers can fall back to local test/in-process
         behavior.
@@ -292,10 +316,12 @@ class RunnerRouter:
             return None
         session = self._registry.get(conv.runner_id)
         if session is None:
-            raise OmnigentError(
+            raise self._runner_absent_error(
+                conv,
+                conv.runner_id,
                 f"runner {conv.runner_id!r} is offline for conversation {conversation_id!r}",
-                code=self._runner_absent_code(routing_host_id(conv, self._conversation_store)),
             )
+        self.require_runtime_support(conv)
         return RoutedRunner(
             runner_id=conv.runner_id,
             client=self._client_for_runner(conv.runner_id),
@@ -311,21 +337,25 @@ class RunnerRouter:
         """
         return self._registry.get(runner_id) is not None
 
-    def require_mcp_registry_support(self, conversation: Conversation) -> None:
-        """Validate the connected runner before sending it a registry-backed agent."""
-        from omnigent.host.frames import CAP_MCP_REGISTRY
+    def runner_has_capability(self, runner_id: str, capability: str) -> bool:
+        """
+        Return whether connected runner *runner_id* advertised *capability*.
 
+        :param runner_id: Runner UUID, e.g. ``"runner_0123456789abcdef"``.
+        :param capability: Hello capability token, e.g. ``"mcp_registry"``.
+        :returns: ``False`` when the runner is offline or lacks the token.
+        """
+        connection = self._registry.get(runner_id)
+        return connection is not None and capability in connection.hello.capabilities
+
+    def require_runtime_support(self, conversation: Conversation) -> None:
+        """Validate the connected runner before sending it a restricted agent."""
         connection = self._registry.get(conversation.runner_id) if conversation.runner_id else None
-        if (
-            connection is None
-            or CAP_MCP_REGISTRY in connection.hello.capabilities
-            or self._agent_store is None
-            or self._agent_cache is None
-        ):
+        if connection is None or self._agent_store is None or self._agent_cache is None:
             return
-        from omnigent.server.mcp_compatibility import require_session_registry_mcp_support
+        from omnigent.server.runtime_compatibility import require_session_runtime_support
 
-        require_session_registry_mcp_support(
+        require_session_runtime_support(
             conversation,
             connection.hello.capabilities,
             component="runner",
@@ -388,9 +418,10 @@ class RunnerRouter:
         """
         session = self._registry.get(runner_id)
         if session is None:
-            raise OmnigentError(
+            raise self._runner_absent_error(
+                conv,
+                runner_id,
                 f"runner {runner_id!r} is offline; resume the session to bind a registered runner",
-                code=self._runner_absent_code(routing_host_id(conv, self._conversation_store)),
             )
         if not _runner_supports_harness(session, harness):
             raise OmnigentError(
@@ -398,6 +429,27 @@ class RunnerRouter:
                 code=ErrorCode.RUNNER_CAPABILITY_MISMATCH,
             )
         return RoutedRunner(runner_id=runner_id, client=self._client_for_runner(runner_id))
+
+    def _runner_absent_error(
+        self, conv: Conversation, runner_id: str, offline_message: str
+    ) -> OmnigentError:
+        """
+        Return the error for a bound runner whose tunnel is not on this replica.
+
+        :param conv: The conversation bound to *runner_id*; its routing host
+            classifies the miss (see :meth:`_runner_absent_code`).
+        :param runner_id: The bound runner, e.g. ``"runner_0123456789abcdef"``.
+        :param offline_message: The message when the runner is genuinely offline.
+        :returns: A :class:`WrongReplicaError` naming the routing host, or a
+            ``RUNNER_UNAVAILABLE`` error with *offline_message*.
+        """
+        host_id = routing_host_id(conv, self._conversation_store)
+        code = self._runner_absent_code(host_id)
+        if host_id and code == ErrorCode.WRONG_REPLICA:
+            return WrongReplicaError(
+                f"runner {runner_id!r} is on another replica", host_id=host_id
+            )
+        return OmnigentError(offline_message, code=code)
 
     def _runner_absent_code(self, host_id: str | None) -> str:
         """
@@ -409,8 +461,8 @@ class RunnerRouter:
 
         - host set, absent from this replica's ``HostRegistry``, and still
           live elsewhere (``host_store.is_online``) → wrong replica. Return
-          :data:`~ErrorCode.WRONG_REPLICA` so the client re-addresses without
-          the key and reaches the host via the default route.
+          :data:`~ErrorCode.WRONG_REPLICA` so the client re-addresses with the
+          slice key the response names.
         - otherwise (no host, no registry/store wired, host is on this
           replica, or host not live anywhere) → genuinely offline. Return
           :data:`~ErrorCode.RUNNER_UNAVAILABLE`.
@@ -462,6 +514,7 @@ class RunnerRouter:
             client = self._clients.get(runner_id)
             if client is None:
                 client = httpx.AsyncClient(
+                    event_hooks={"request": [add_scheduled_run_header]},
                     transport=WSTunnelTransport(self._registry, runner_id),
                     base_url="http://runner",
                     timeout=httpx.Timeout(5.0, read=None),
