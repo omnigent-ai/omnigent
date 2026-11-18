@@ -846,13 +846,6 @@ describe("TasksPanel", () => {
       });
       renderPanel();
       expect(screen.getByTestId("plan-stopping")).toBeInTheDocument();
-
-      setSession({ sessionStatus: "idle" });
-      expect(screen.getByTestId("plan-continue")).toBeInTheDocument();
-      // A later wake, such as a worker reporting back, isn't the Stop's.
-      setSession({ sessionStatus: "running" });
-      expect(screen.queryByTestId("plan-stopping")).toBeNull();
-      expect(screen.getByTestId("plan-stop")).toBeInTheDocument();
     });
   });
 

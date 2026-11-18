@@ -17,11 +17,12 @@ import { usePlanStopping } from "./usePlanStopping";
 
 const SESSION = "e".repeat(32);
 
-function userMessage(itemId: string, text: string): AnyBlock {
+function userMessage(itemId: string, text: string, stableKey?: string): AnyBlock {
   return {
     type: "user_message",
     ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "turn", itemId },
     content: [{ type: "input_text", text }],
+    ...(stableKey ? { stableKey } : {}),
   };
 }
 
@@ -45,7 +46,8 @@ function pendingSend(tempId: string, text: string, posted?: boolean) {
   };
 }
 
-const stopMessage = (itemId: string) => userMessage(itemId, stopPlanMessage(null));
+const stopMessage = (itemId: string, stableKey?: string) =>
+  userMessage(itemId, stopPlanMessage(null), stableKey);
 const STOP = stopMessage("stop");
 const CONTINUE = userMessage("go", continuePlanMessage(null));
 
@@ -120,6 +122,18 @@ describe("usePlanStopping", () => {
     expect(usePlanStops.getState().requests[SESSION]).toBeUndefined();
     // The Stop is still the latest request, but a later wake, such as a timer, isn't its.
     rerender({ working: true });
+    expect(result.current).toBe(false);
+  });
+
+  it("knows a Stop seen to finish without its transcript when the transcript loads later", async () => {
+    const { result, rerender } = renderStopping(true);
+    await sendStop().take({ itemId: "stop" });
+    rerender({ working: false });
+    expect(result.current).toBe(false);
+
+    // The session wakes from a worker's report, then its transcript loads.
+    rerender({ working: true });
+    act(() => transcript().setState({ blocks: [STOP] }));
     expect(result.current).toBe(false);
   });
 
@@ -240,11 +254,12 @@ describe("usePlanStopping", () => {
     expect(result.current).toBe(false);
 
     // A receipt that arrives before the delivery's response counts too.
+    const again = sendStop();
     act(() => {
       entry.setState({ blocks: [] });
       notePlanStopReceipt(SESSION, "pending_again", "again");
     });
-    await sendStop().take({ pendingId: "pending_again" });
+    await again.take({ pendingId: "pending_again" });
     expect(usePlanStops.getState().requests[SESSION]).toMatchObject({ itemId: "again" });
   });
 
@@ -254,6 +269,18 @@ describe("usePlanStopping", () => {
     await sendStop().take({ itemId: "stop_b" });
     await sendFollowUp()();
     act(() => entry.setState({ blocks: [stopMessage("stop_b")] }));
+    expect(result.current).toBe(false);
+
+    // A native Stop's block can arrive under a follow-up's pending key, before the follow-up lands.
+    await sendStop().take({ pendingId: "pending_x" });
+    const acceptFollowUp = sendFollowUp();
+    act(() => {
+      notePlanStopReceipt(SESSION, "pending_x", "stop_x");
+      entry.setState({
+        blocks: [stopMessage("stop_b"), stopMessage("stop_x", "pend_follow")],
+      });
+    });
+    await acceptFollowUp();
     expect(result.current).toBe(false);
 
     // A native Stop's message, once its receipt names it.
@@ -366,7 +393,7 @@ describe("latestStopRequest", () => {
         ],
         [],
       ),
-    ).toBe("stop");
+    ).toEqual(["stop"]);
   });
 
   it("ends with a later message or command from the user, once the session has it", () => {
@@ -374,10 +401,14 @@ describe("latestStopRequest", () => {
     expect(latestStopRequest([stop, slashCommand("cmd", "workflow")], [])).toBeNull();
     expect(latestStopRequest([stop], [pendingSend("pend_1", "Keep the logs", true)])).toBeNull();
     // A send the session hasn't accepted doesn't count yet.
-    expect(latestStopRequest([stop], [pendingSend("pend_1", "Keep the logs")])).toBe("stop");
+    expect(latestStopRequest([stop], [pendingSend("pend_1", "Keep the logs")])).toEqual(["stop"]);
     expect(
       latestStopRequest([CONTINUE], [pendingSend("pend_2", stopPlanMessage(null), true)]),
-    ).toBe("pend_2");
+    ).toEqual(["pend_2"]);
+    // A promoted send goes by its pending key as well as its item.
+    expect(
+      latestStopRequest([userMessage("stop", stopPlanMessage("Daily Sync"), "pend_3")], []),
+    ).toEqual(["stop", "pend_3"]);
     expect(latestStopRequest([], [])).toBeUndefined();
   });
 });

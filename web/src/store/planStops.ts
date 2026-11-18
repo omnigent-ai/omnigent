@@ -33,8 +33,9 @@ export interface PendingSend {
 interface PlanStopsState {
   requests: Readonly<Partial<Record<string, PlanStopRequest>>>;
   /**
-   * Per session, transcript stop messages that are over: the run was seen to
-   * stop after them, or the session took a later request.
+   * Per session, the item IDs and pending keys of transcript stop messages
+   * that are over: the run was seen to stop after them, or the session took a
+   * later request.
    */
   settledStops: Readonly<Partial<Record<string, readonly string[]>>>;
 }
@@ -51,12 +52,12 @@ const RECENT_KEPT = 8;
 
 let nextRequestId = 1;
 const watcherCounts = new Map<string, number>();
-/** Per session, the items recent native receipts named, by pending input. */
+/** Per session with a Stop to place, the items recent native receipts named, by pending input. */
 const receiptItems = new Map<string, Map<string, string>>();
 /** Per session, pending inputs of Stops a later request ended before their items were known. */
 const supersededPendingStops = new Map<string, Set<string>>();
-/** Stops a later request ended while their messages were still on the way. */
-const supersededSendingStops = new Set<number>();
+/** Per session, Stops a later request ended while their messages were still on the way. */
+const supersededSendingStops = new Map<string, Set<number>>();
 
 function messageText(content: readonly MessageContentBlock[]): string {
   return content
@@ -80,25 +81,39 @@ function isUserRequest(block: AnyBlock): boolean {
 
 /**
  * The latest request the user sent the session, when it asks its main agent
- * to stop the plan: its key, null for another request, or undefined without
- * any. A send the session accepted but the agent hasn't taken yet is the
- * latest; one still on its way doesn't count.
+ * to stop the plan: the identities it goes by (its item ID and the pending key
+ * it arrived under), null for another request, or undefined without any. A
+ * send the session accepted but the agent hasn't taken yet is the latest; one
+ * still on its way doesn't count.
  */
 export function latestStopRequest(
   blocks: readonly AnyBlock[],
   pending: readonly PendingSend[],
-): string | null | undefined {
+): string[] | null | undefined {
   const latestPending = pending.findLast((send) => send.posted === true);
   if (latestPending) {
-    return isStopPlanMessage(messageText(latestPending.content)) ? latestPending.tempId : null;
+    return isStopPlanMessage(messageText(latestPending.content)) ? [latestPending.tempId] : null;
   }
   const latest = blocks.findLast(isUserRequest);
   if (latest === undefined) return undefined;
   if (latest.type !== "user_message" || !isStopPlanMessage(messageText(latest.content))) {
     return null;
   }
-  // A send the agent took keeps its pending key, so it stays the same message.
-  return latest.stableKey ?? latest.ctx.itemId ?? "";
+  const identities = [latest.ctx.itemId, latest.stableKey].filter((id) => id != null);
+  return identities.length > 0 ? identities : [""];
+}
+
+/**
+ * Whether the latest request is a stop message whose Stop isn't over, so the
+ * run reads as stopping while its session works.
+ */
+export function isOpenStopLatest(
+  blocks: readonly AnyBlock[],
+  pending: readonly PendingSend[],
+  settled: readonly string[],
+): boolean {
+  const identities = latestStopRequest(blocks, pending);
+  return Array.isArray(identities) && !identities.some((id) => settled.includes(id));
 }
 
 /** Whether the transcript shows another request from the user after the item *itemId*. */
@@ -107,11 +122,15 @@ export function hasRequestAfter(blocks: readonly AnyBlock[], itemId: string): bo
   return index !== -1 && blocks.slice(index + 1).some(isUserRequest);
 }
 
-/** The stop message the streamed transcript holds as its latest request, if any. */
-function committedStopMessage(sessionId: string): string | null {
-  const entry = conversationRegistry.peek(sessionId);
-  const latest = entry ? latestStopRequest(entry.getState().blocks, []) : null;
-  return typeof latest === "string" ? latest : null;
+/**
+ * The identities of the stop message the streamed transcript holds as its
+ * latest request, if any; with *pending*, of an accepted send too.
+ */
+function transcriptStopIdentities(sessionId: string, withPending: boolean): string[] {
+  const state = conversationRegistry.peek(sessionId)?.getState();
+  if (!state) return [];
+  const identities = latestStopRequest(state.blocks, withPending ? state.pendingUserMessages : []);
+  return Array.isArray(identities) ? identities : [];
 }
 
 /** Replace *sessionId*'s request, unless a later Stop already took the place of *current*. */
@@ -125,30 +144,51 @@ function replaceRequest(
     const others = Object.entries(state.requests).filter(([id]) => id !== sessionId);
     return { requests: Object.fromEntries(next ? [...others, [sessionId, next]] : others) };
   });
+  if (!next) forgetReceiptsUnlessNeeded(sessionId);
 }
 
 function currentRequest(sessionId: string): PlanStopRequest | undefined {
   return usePlanStops.getState().requests[sessionId];
 }
 
-function retireStopMessage(sessionId: string, stopMessage: string): void {
+/** Whether a Stop of *sessionId*'s waits on a native receipt, to be placed or retired. */
+function awaitsReceipts(sessionId: string): boolean {
+  const request = currentRequest(sessionId);
+  return (
+    (request !== undefined && request.itemId === undefined) ||
+    (supersededPendingStops.get(sessionId)?.size ?? 0) > 0 ||
+    (supersededSendingStops.get(sessionId)?.size ?? 0) > 0
+  );
+}
+
+/** Native receipts only matter while a Stop waits on one. */
+function forgetReceiptsUnlessNeeded(sessionId: string): void {
+  if (awaitsReceipts(sessionId)) return;
+  receiptItems.delete(sessionId);
+  supersededPendingStops.delete(sessionId);
+  supersededSendingStops.delete(sessionId);
+}
+
+function retireStopMessage(sessionId: string, identities: readonly string[]): void {
   usePlanStops.setState((state) => {
     const settled = state.settledStops[sessionId] ?? [];
-    if (settled.includes(stopMessage)) return state;
+    const added = identities.filter((id) => !settled.includes(id));
+    if (added.length === 0) return state;
     return {
       settledStops: {
         ...state.settledStops,
-        [sessionId]: [...settled, stopMessage].slice(-RECENT_KEPT),
+        [sessionId]: [...settled, ...added].slice(-RECENT_KEPT),
       },
     };
   });
 }
 
-/** Retire a superseded Stop's own message, now or once a native receipt names it. */
+/** Retire a Stop's own message, now or once a native receipt names it. */
 function retireOwnStopMessage(sessionId: string, receipt: MessageReceipt): void {
   const itemId =
-    receipt.itemId ?? (receipt.pendingId && receiptItems.get(sessionId)?.get(receipt.pendingId));
-  if (itemId) retireStopMessage(sessionId, itemId);
+    receipt.itemId ??
+    (receipt.pendingId ? receiptItems.get(sessionId)?.get(receipt.pendingId) : undefined);
+  if (itemId) retireStopMessage(sessionId, [itemId]);
   else if (receipt.pendingId) {
     const pending = supersededPendingStops.get(sessionId) ?? new Set<string>();
     supersededPendingStops.set(sessionId, pending.add(receipt.pendingId));
@@ -173,8 +213,9 @@ export async function trackPlanStop(
     receipt = await send();
   } finally {
     const current = currentRequest(sessionId);
-    if (supersededSendingStops.delete(sending.id)) {
+    if (supersededSendingStops.get(sessionId)?.delete(sending.id)) {
       if (receipt) retireOwnStopMessage(sessionId, receipt);
+      forgetReceiptsUnlessNeeded(sessionId);
     } else if (current?.id === sending.id) {
       const itemId =
         receipt?.itemId ??
@@ -191,6 +232,7 @@ export async function trackPlanStop(
             }
           : undefined,
       );
+      if (itemId) forgetReceiptsUnlessNeeded(sessionId);
     }
   }
 }
@@ -200,17 +242,21 @@ export async function trackPlanStop(
  * *itemId*, which places a Stop's message in the transcript.
  */
 export function notePlanStopReceipt(sessionId: string, pendingId: string, itemId: string): void {
-  const items = receiptItems.get(sessionId) ?? new Map<string, string>();
-  items.set(pendingId, itemId);
-  for (const oldest of [...items.keys()].slice(0, -RECENT_KEPT)) items.delete(oldest);
-  receiptItems.set(sessionId, items);
+  if (!awaitsReceipts(sessionId)) return;
   if (supersededPendingStops.get(sessionId)?.delete(pendingId)) {
-    retireStopMessage(sessionId, itemId);
+    retireStopMessage(sessionId, [itemId]);
   }
   const request = currentRequest(sessionId);
   if (request?.pendingId === pendingId && request.itemId === undefined) {
     replaceRequest(sessionId, request, { ...request, itemId });
+  } else {
+    // The receipt may beat the delivery's response, which names the pending input.
+    const items = receiptItems.get(sessionId) ?? new Map<string, string>();
+    items.set(pendingId, itemId);
+    for (const oldest of [...items.keys()].slice(0, -RECENT_KEPT)) items.delete(oldest);
+    receiptItems.set(sessionId, items);
   }
+  forgetReceiptsUnlessNeeded(sessionId);
 }
 
 /** End *request*, unless a later Stop took its place. */
@@ -229,13 +275,16 @@ export function endPlanStop(sessionId: string, request: PlanStopRequest): void {
 export function supersedePlanStop(sessionId: string | null): () => void {
   if (sessionId === null) return () => undefined;
   const superseded = currentRequest(sessionId);
-  const stopMessage = committedStopMessage(sessionId);
+  const stopMessage = transcriptStopIdentities(sessionId, false);
   return () => {
-    if (stopMessage !== null) retireStopMessage(sessionId, stopMessage);
+    retireStopMessage(sessionId, stopMessage);
     const request = currentRequest(sessionId);
     if (superseded === undefined || request?.id !== superseded.id) return;
     if (request.sent) retireOwnStopMessage(sessionId, request);
-    else supersededSendingStops.add(request.id);
+    else {
+      const sending = supersededSendingStops.get(sessionId) ?? new Set<number>();
+      supersededSendingStops.set(sessionId, sending.add(request.id));
+    }
     endPlanStop(sessionId, request);
   };
 }
@@ -243,16 +292,13 @@ export function supersedePlanStop(sessionId: string | null): () => void {
 /**
  * The session stopped working: its sent Stop, if any, is done, and so is the
  * stop message the transcript last shows, so a later wake isn't stopping.
- *
- * @param stopMessage The key of the transcript's latest stop message, or null.
  */
-export function settlePlanStop(
-  sessionId: string,
-  request: PlanStopRequest | undefined,
-  stopMessage: string | null,
-): void {
-  if (request?.sent) endPlanStop(sessionId, request);
-  if (stopMessage !== null) retireStopMessage(sessionId, stopMessage);
+export function settlePlanStop(sessionId: string, request: PlanStopRequest | undefined): void {
+  if (request?.sent && currentRequest(sessionId)?.id === request.id) {
+    retireOwnStopMessage(sessionId, request);
+    endPlanStop(sessionId, request);
+  }
+  retireStopMessage(sessionId, transcriptStopIdentities(sessionId, true));
 }
 
 /**

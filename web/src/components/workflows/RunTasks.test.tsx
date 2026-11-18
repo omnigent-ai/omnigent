@@ -100,6 +100,8 @@ describe("RunPlanButton", () => {
       expect(invalidate).toHaveBeenCalledWith({ queryKey: ["workflow-runs", "wf_1"] });
       expect(api.interrupt).not.toHaveBeenCalled();
       expect(screen.getByRole("button", { name: "Stop" })).toBeEnabled();
+      // The run's controls no longer show it stopping.
+      expect(usePlanStops.getState().requests.sess_1).toBeUndefined();
     },
   );
 

@@ -4,7 +4,7 @@ import { useConversationEntryValue } from "@/hooks/useConversationEntryState";
 import {
   endPlanStop,
   hasRequestAfter,
-  latestStopRequest,
+  isOpenStopLatest,
   settlePlanStop,
   usePlanStops,
   watchPlanStop,
@@ -28,8 +28,8 @@ export function usePlanStopping(sessionId: string | null, sessionWorking: boolea
   const settledStops = usePlanStops((state) =>
     sessionId === null ? NO_SETTLED_STOPS : (state.settledStops[sessionId] ?? NO_SETTLED_STOPS),
   );
-  const latestStop = useConversationEntryValue(sessionId, (state) =>
-    latestStopRequest(state.blocks, state.pendingUserMessages),
+  const stopIsLatest = useConversationEntryValue(sessionId, (state) =>
+    isOpenStopLatest(state.blocks, state.pendingUserMessages, settledStops),
   );
   const stopItem = request?.itemId;
   const followed = useConversationEntryValue(
@@ -40,12 +40,9 @@ export function usePlanStopping(sessionId: string | null, sessionWorking: boolea
   useEffect(() => {
     if (sessionId === null) return;
     if (request && followed) endPlanStop(sessionId, request);
-    if (!sessionWorking) {
-      settlePlanStop(sessionId, request, typeof latestStop === "string" ? latestStop : null);
-    }
-  }, [sessionId, sessionWorking, request, followed, latestStop]);
+    if (!sessionWorking) settlePlanStop(sessionId, request);
+  }, [sessionId, sessionWorking, request, followed, stopIsLatest]);
   const stopRequested = request !== undefined && !followed;
   if (stopRequested && !request.sent) return true;
-  const stopIsLatest = typeof latestStop === "string" && !settledStops.includes(latestStop);
   return sessionWorking && (stopRequested || stopIsLatest);
 }

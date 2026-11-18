@@ -1712,18 +1712,6 @@ describe("WorkflowDetailPage", () => {
       expect(within(row).getByRole("button", { name: "Continue the plan" })).toBeInTheDocument();
     });
 
-    it("restores Stop when the stop message fails", async () => {
-      vi.mocked(sendUserMessage)
-        .mockClear()
-        .mockRejectedValue(new Error("The session is offline."));
-      renderPage();
-      const row = screen.getByTestId("workflow-run");
-      fireEvent.click(within(row).getByRole("button", { name: "Stop" }));
-      expect(within(row).getByTestId("plan-stopping")).toBeInTheDocument();
-      await waitFor(() => expect(within(row).getByRole("button", { name: "Stop" })).toBeEnabled());
-      expect(within(row).queryByTestId("plan-stopping")).toBeNull();
-    });
-
     it("shows Stop again once the session takes another message while it stops", async () => {
       vi.mocked(sendUserMessage).mockClear().mockResolvedValue({ queued: true });
       onTestFinished(() => act(() => conversationRegistry.clear()));

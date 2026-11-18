@@ -12,6 +12,7 @@ import type { Comment } from "@/hooks/useComments";
 import { childSessionsQueryKey } from "@/hooks/useChildSessions";
 import { basenamedRouting, RoutingProvider } from "@/lib/routing";
 import { useChatStore, type ChatState } from "@/store/chatStore";
+import { trackPlanStop, usePlanStops } from "@/store/planStops";
 import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { NEW_SESSION_HANDOFF_PARAM, peekNewSessionHandoff } from "@/lib/newSessionHandoff";
@@ -94,6 +95,7 @@ afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
   useChatStore.setState(initialStoreState);
+  usePlanStops.setState({ requests: {}, settledStops: {} });
 });
 
 describe("Mermaid diagram width", () => {
@@ -654,6 +656,24 @@ describe("AssistantBubble error retry", () => {
 
     expect(screen.queryByTestId("error-pill")).toBeNull();
     expect(useChatStore.getState().failedSendDraft).toBe(draft);
+  });
+
+  it("ends a run's Stop once the session accepts the continuation, not when it refuses it", async () => {
+    await trackPlanStop("conv_retry", async () => ({}));
+    fetchMock.mockResolvedValueOnce(jsonResponse({ queued: false, denied: true }));
+    const { unmount } = render(
+      <BubbleView bubble={errorBubble("transient_upstream_error")} isLastAssistant />,
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+    await act(async () => {});
+    expect(usePlanStops.getState().requests.conv_retry).toMatchObject({ sent: true });
+    unmount();
+
+    fetchMock.mockResolvedValueOnce(jsonResponse({ queued: true, pending_id: "pending_retry" }));
+    render(<BubbleView bubble={errorBubble("transient_upstream_error")} isLastAssistant />);
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    await waitFor(() => expect(usePlanStops.getState().requests.conv_retry).toBeUndefined());
   });
 
   it("continues a transient upstream failure in place instead of resuming the runner", async () => {
