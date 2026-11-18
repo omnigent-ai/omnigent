@@ -8181,6 +8181,7 @@ def test_list_conversations_filters_by_pinned_label(
     Key-presence based (the value is the epoch-ms pin time). Another user's pin
     on the same session does not match; clearing the label drops it."""
     from omnigent.stores.conversation_store import pinned_label_key
+    from omnigent.stores.conversation_store import sqlalchemy_store as store_module
 
     database_uri = db_uri
     conversation_store = SqlAlchemyConversationStore(
@@ -8239,42 +8240,85 @@ def test_list_conversations_filters_by_pinned_label(
     permissions.grant("bob", other.id, LEVEL_READ)
     conversation_store.set_labels(other.id, {pinned_label_key("bob"): "456"})
 
+    label_reads = []
+    fetch_labels = store_module._fetch_labels_bulk
+
+    def capture_labels(session, conversation_ids):
+        label_reads.append(list(conversation_ids))
+        return fetch_labels(session, conversation_ids)
+
+    monkeypatch.setattr(store_module, "_fetch_labels_bulk", capture_labels)
+
+    def read_pinned_pages(*, limit=1, **options):
+        candidate_limits = []
+
+        def capture_candidates(_conn, _cursor, _statement, _parameters, context, _many):
+            query = context.compiled.statement if context.compiled is not None else None
+            if any(
+                column.get("expr") is store_module.SqlConversation
+                for column in getattr(query, "column_descriptions", [])
+            ):
+                candidate_limits.append(
+                    context.compiled_parameters[0][
+                        context.compiled.bind_names[query._limit_clause]
+                    ]
+                    if query._limit_clause is not None
+                    else None
+                )
+
+        pages = []
+        after = None
+        event.listen(conversation_store._conv_engine, "before_cursor_execute", capture_candidates)
+        try:
+            while True:
+                label_reads.clear()
+                candidate_limits.clear()
+                page = conversation_store.list_conversations(
+                    pinned=True, limit=limit, after=after, **options
+                )
+                if split_database:
+                    assert candidate_limits == [min(limit, 2) + 1]
+                    assert len(label_reads) == 1
+                    assert len(label_reads[0]) <= min(limit, 2)
+                pages.append(page)
+                if not page.has_more:
+                    return pages
+                assert page.last_id is not None and page.last_id != after
+                after = page.last_id
+        finally:
+            event.remove(
+                conversation_store._conv_engine, "before_cursor_execute", capture_candidates
+            )
+
     for viewer in ({}, {"accessible_by": user_id}, {"owned_by": user_id}):
         for order in ("asc", "desc"):
             expected = visible if order == "asc" else visible[::-1]
-            options = dict(pinned=True, pinned_owner=user_id, sort_by="id", order=order, **viewer)
-            first = conversation_store.list_conversations(limit=1, **options)
-            assert [row.id for row in first.data] == [expected[0].id]
-            assert first.has_more
-            second = conversation_store.list_conversations(limit=1, after=first.last_id, **options)
-            assert [row.id for row in second.data] == [expected[1].id]
-            assert not second.has_more
-            previous = conversation_store.list_conversations(
-                limit=1, before=second.first_id, **options
-            )
-            assert [row.id for row in previous.data] == [expected[0].id]
-            assert not previous.has_more
+            options = dict(pinned_owner=user_id, sort_by="id", order=order, **viewer)
+            pages = read_pinned_pages(**options)
+            assert [row.id for page in pages for row in page.data] == [row.id for row in expected]
+            if split_database:
+                assert sum(not page.data for page in pages) == len(dormant)
+                assert all(page.first_id is None for page in pages if not page.data)
+            previous = read_pinned_pages(before=expected[1].id, **options)
+            assert [row.id for page in previous for row in page.data] == [expected[0].id]
     assert {
         row.id
-        for row in conversation_store.list_conversations(
-            pinned=True, pinned_owner="bob", accessible_by="bob", shared_only=True
-        ).data
+        for page in read_pinned_pages(pinned_owner="bob", accessible_by="bob", shared_only=True)
+        for row in page.data
     } == {other.id}
     conversation_store.set_family_pin(pinned.id, "567", user_id=user_id)
     assert {
         row.id
-        for row in conversation_store.list_conversations(
-            pinned=True, pinned_owner=user_id, owned_by=user_id
-        ).data
+        for page in read_pinned_pages(limit=3, pinned_owner=user_id, owned_by=user_id)
+        for row in page.data
     } == {member.id for member in [pinned, *dormant, *visible]}
     conversation_store.set_family_pin(pinned.id, "", user_id=user_id)
     conversation_store.set_session_nest(other.id, None, user_id=user_id)
     assert conversation_store.get_conversation(other.id).labels[pinned_label_key(user_id)] == "234"
     assert {
         row.id
-        for row in conversation_store.list_conversations(
-            pinned=True, pinned_owner=user_id, owned_by=user_id
-        ).data
+        for page in read_pinned_pages(limit=3, pinned_owner=user_id, owned_by=user_id)
+        for row in page.data
     } == {member.id for member in [other, *visible]}
 
 

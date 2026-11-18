@@ -1067,6 +1067,10 @@ class ConversationStore(ABC):
         selected by ``sort_by`` (``"desc"`` = newest-first,
         ``"asc"`` = oldest-first).
 
+        Pinned-only reads across split databases examine bounded candidate
+        pages. A page may be partial or empty with ``has_more=True``; continue
+        with ``after=last_id``, which identifies the last examined candidate.
+
         :param limit: Maximum number of conversations to return.
         :param after: Cursor conversation ID; return conversations
             appearing after this one in sort order,

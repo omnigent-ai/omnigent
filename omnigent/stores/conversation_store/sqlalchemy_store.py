@@ -5171,16 +5171,16 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             labels_by_conv = {}
             if split_pin_filter:
-                # Dormant pins must not consume the page or its has_more sentinel.
+                # Advance over dormant pins without scanning beyond one bounded window.
                 rows = []
-                window = min(limit + 1, _FAMILY_READ_BATCH_SIZE)
-                candidate_stmt = stmt
-                while len(rows) <= limit:
-                    candidates = list(session.scalars(candidate_stmt.limit(window)))
-                    if not candidates:
-                        break
-                    candidate_ids = [row.id for row in candidates]
-                    candidate_labels = _fetch_labels_bulk(session, candidate_ids)
+                window = min(limit, _FAMILY_READ_BATCH_SIZE)
+                candidates = list(session.scalars(stmt.limit(window + 1)))
+                has_more = len(candidates) > window
+                candidates = candidates[:window]
+                last_id = candidates[-1].id if candidates else None
+                candidate_ids = [row.id for row in candidates]
+                candidate_labels = _fetch_labels_bulk(session, candidate_ids)
+                if candidate_ids:
                     with self._session("list_conversations") as meta_sess:
                         owned_nest_ids = set(
                             meta_sess.scalars(
@@ -5195,22 +5195,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                         if key in labels:
                             rows.append(row)
                             labels_by_conv[row.id] = labels
-                    if len(rows) > limit or len(candidates) < window:
-                        break
-                    candidate_stmt = self._apply_cursor(
-                        session,
-                        stmt,
-                        candidates[-1].id,
-                        sort_col,
-                        is_desc,
-                        tiebreaker_col=self._tiebreaker_col,
-                        forward=True,
-                    )
             else:
                 rows = list(session.scalars(stmt.limit(limit + 1)))
-            has_more = len(rows) > limit
-            if has_more:
-                rows = rows[:limit]
+                has_more = len(rows) > limit
+                if has_more:
+                    rows = rows[:limit]
+                last_id = rows[-1].id if rows else None
             row_ids = [r.id for r in rows]
             # Split pinned scans already loaded labels; other pages fetch them in one query.
             # Agent bindings and overrides ride on each conversation row.
@@ -5255,7 +5245,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         return PagedList(
             data=convs,
             first_id=convs[0].id if convs else None,
-            last_id=convs[-1].id if convs else None,
+            last_id=last_id,
             has_more=has_more,
         )
 

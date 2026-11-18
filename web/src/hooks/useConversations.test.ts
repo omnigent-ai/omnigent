@@ -2386,6 +2386,9 @@ describe("fetchPinnedConversations filter-honored detection", () => {
       fetchMock
         .mockResolvedValueOnce(mockResponse({ data: members, has_more: true, last_id: "b" }))
         .mockResolvedValueOnce(
+          mockResponse({ data: [], has_more: true, last_id: "scanned-unpinned" }),
+        )
+        .mockResolvedValueOnce(
           mockResponse({ data: [members[2], pinnedRow("old")], has_more: false, last_id: "old" }),
         );
 
@@ -2394,8 +2397,10 @@ describe("fetchPinnedConversations filter-honored detection", () => {
       expect(result.conversations.map((row) => row.id)).toEqual(["old", "a", "c", "b"]);
       expect(result.filterHonored).toBe(true);
       expect(
-        new URL(String(fetchMock.mock.calls[1][0]), "http://test").searchParams.get("after"),
-      ).toBe("b");
+        fetchMock.mock.calls.map(([url]) =>
+          new URL(String(url), "http://test").searchParams.get("after"),
+        ),
+      ).toEqual([null, "b", "scanned-unpinned"]);
       const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
       client.setQueryData(PINNED_CONVERSATIONS_KEY, result);
       const invalidate = vi.spyOn(client, "invalidateQueries");
