@@ -3333,6 +3333,7 @@ async def _persist_external_conversation_item(
     created_by: str | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     enabled: bool = True,
+    on_direct_input: Callable[[], Awaitable[None]] | None = None,
 ) -> str:
     """
     Persist and broadcast a conversation item produced outside AP.
@@ -3357,6 +3358,7 @@ async def _persist_external_conversation_item(
             created_by=created_by,
             background_title_coordinator=background_title_coordinator,
             enabled=enabled,
+            on_direct_input=on_direct_input,
         )
     )
     try:
@@ -3394,6 +3396,7 @@ async def _persist_external_conversation_item_serialized(
     created_by: str | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     enabled: bool = True,
+    on_direct_input: Callable[[], Awaitable[None]] | None = None,
 ) -> str:
     """
     Run :func:`_persist_external_conversation_item_unlocked` under the mirror lock.
@@ -3409,6 +3412,7 @@ async def _persist_external_conversation_item_serialized(
             created_by=created_by,
             background_title_coordinator=background_title_coordinator,
             enabled=enabled,
+            on_direct_input=on_direct_input,
         )
 
 
@@ -3420,6 +3424,7 @@ async def _persist_external_conversation_item_unlocked(
     created_by: str | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     enabled: bool = True,
+    on_direct_input: Callable[[], Awaitable[None]] | None = None,
 ) -> str:
     """
     Persist and broadcast a conversation item produced outside AP.
@@ -3433,6 +3438,10 @@ async def _persist_external_conversation_item_unlocked(
     :param conv: Conversation row for title seeding.
     :param body: External item event body.
     :param conversation_store: Store used to append the item.
+    :param on_direct_input: Called once a newly persisted input landed that no
+        queued message accounts for: a person typing in the native terminal, not
+        a web or automation message's echo or a replayed item. Its failure is
+        logged and never fails the persist.
     :param created_by: Authenticated identity of the actor whose
         request triggered the forwarder POST, e.g.
         ``"alice@example.com"``. Used to attribute user messages typed
@@ -3616,6 +3625,21 @@ async def _persist_external_conversation_item_unlocked(
     # go back into play.
     _release_drained_inputs(session_id, [*skipped_pending, *uncertain_pending, drained])
     _restore_drained_inputs(session_id, held_older, None)
+    # Typed in the terminal: no queued message, not even by position, matched it.
+    if (
+        on_direct_input is not None
+        and drains_pending_inputs
+        and drained is None
+        and body.data.get("agent_message_candidate") is not True
+    ):
+        try:
+            await on_direct_input()
+        except Exception:  # noqa: BLE001 — a follow-up must not fail the mirror
+            _logger.warning(
+                "Direct native input follow-up failed",
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
     if item.replaces_pending_id is not None and conv.host_id is not None:
         # A saved startup input's receipt frees the next one queued behind it.
         wake_startup_worker(conv.host_id)

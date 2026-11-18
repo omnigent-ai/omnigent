@@ -534,6 +534,9 @@ def test_every_remote_provider_is_discovered_and_unlink_stays_removed(
     monkeypatch.setattr(github, "on_inferred_pr", lambda *_: None)
     monkeypatch.setattr(github, "titles_available", lambda _: True)
     monkeypatch.setattr(
+        github, "pr_status", lambda *_: pytest.fail("Discovery already read the title")
+    )
+    monkeypatch.setattr(
         github, "pr_title", lambda *_: pytest.fail("Discovery already read the title")
     )
     monkeypatch.setattr(

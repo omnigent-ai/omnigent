@@ -6122,7 +6122,7 @@ async def test_each_run_lists_the_prs_it_created_or_worked_on(
     )
     conversations.set_labels(own, {SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY: newest})
     serve(own, newest)
-    inferred = link(own, 2, "inferred")
+    link(own, 2, "inferred")
     # Each continued run "finished" when its prompt was delivered.
     for run_id, start, session in (
         (newest, 3000, own),
@@ -6191,7 +6191,6 @@ async def test_each_run_lists_the_prs_it_created_or_worked_on(
         await client.get(f"/v1/sessions/{shared}/pull-requests", headers=_headers())
     ).json()
     assert {pr["url"] for pr in session_prs["data"]} == {first, chat, second}
-    assert inferred not in {pr for _, run_prs in expected for pr, _ in run_prs}
     assert set(refreshed) == {own}
     assert (await client.get(url, headers=_headers())).json()["refresh_pending"] is True
 
@@ -6210,28 +6209,20 @@ async def test_each_run_lists_the_prs_it_created_or_worked_on(
     )
 
 
-async def test_a_persons_message_ends_a_runs_pr_attribution_in_a_session_it_created(
-    workflows_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Chat in an automation's own session adds no PR to its run, though the label stays."""
+def _automation_session(db_uri: str, task_id: str, run_id: str, *, serving: bool = True) -> str:
+    """A session the automation's run created, bound to a runner that takes messages.
+
+    :param serving: Whether the session's run label already names the run.
+    """
     from omnigent.runner.identity import token_bound_runner_id
     from omnigent.server.auth import LEVEL_OWNER
-    from omnigent.server.routes._sessions.helpers import _publish_status
     from omnigent.stores.conversation_store import (
         SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
         SCHEDULED_TASK_RUN_LABEL_KEY,
     )
-    from omnigent.stores.session_pull_request_store import (
-        PullRequestReport,
-        SessionPullRequestStore,
-    )
-    from tests.server.integration.test_sessions_harness_override import _stub_late_runner_bind
 
-    client = workflows_client
-    task_id = await _create_task(client)
     conversations = SqlAlchemyConversationStore(db_uri)
-    run_id, next_run_id = uuid.uuid4().hex, uuid.uuid4().hex
     session = conversations.create_conversation().id
     SqlAlchemyPermissionStore(db_uri).grant("alice@example.com", session, LEVEL_OWNER)
     conversations.set_labels(
@@ -6239,59 +6230,164 @@ async def test_a_persons_message_ends_a_runs_pr_attribution_in_a_session_it_crea
         {
             SCHEDULED_TASK_ORIGIN_LABEL_KEY: task_id,
             SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY: run_id,
-            SCHEDULED_TASK_RUN_LABEL_KEY: run_id,
+            **({SCHEDULED_TASK_RUN_LABEL_KEY: run_id} if serving else {}),
         },
     )
     conversations.set_runner_id(session, token_bound_runner_id("run-prs-test-runner"))
-    for run, start in ((run_id, 1000), (next_run_id, 2000)):
-        _seed_run(db_uri, task_id, run, scheduled_at=start, conversation_id=session)
-    prs = SessionPullRequestStore(db_uri)
+    return session
 
-    def link(number: int) -> str:
-        url = f"https://github.com/example/repo/pull/{number}"
-        prs.apply_report(
-            session,
-            [
-                PullRequestReport(
-                    url=url,
-                    provider="github",
-                    host="github.com",
-                    repository="example/repo",
-                    number=number,
-                    relationship="created",
-                    first_seen_at=1.0,
-                    last_seen_at=1.0,
-                )
-            ],
-            complete=True,
-        )
-        return url
 
-    worked = link(1)
-    _publish_status(session, "idle")
-    _stub_late_runner_bind(monkeypatch)
-    human = await client.post(
+def _report_pr(db_uri: str, session: str, number: int) -> str:
+    """Store a PR as the session's runner reports one."""
+    from omnigent.stores.session_pull_request_store import (
+        PullRequestReport,
+        SessionPullRequestStore,
+    )
+
+    url = f"https://github.com/example/repo/pull/{number}"
+    SessionPullRequestStore(db_uri).apply_report(
+        session,
+        [
+            PullRequestReport(
+                url=url,
+                provider="github",
+                host="github.com",
+                repository="example/repo",
+                number=number,
+                relationship="created",
+                first_seen_at=1.0,
+                last_seen_at=1.0,
+            )
+        ],
+        complete=True,
+    )
+    return url
+
+
+async def _post_human_message(client: httpx.AsyncClient, session: str, text: str) -> None:
+    response = await client.post(
         f"/v1/sessions/{session}/events",
         json={
             "type": "message",
-            "data": {"role": "user", "content": [{"type": "text", "text": "Open another PR"}]},
+            "data": {"role": "user", "content": [{"type": "text", "text": text}]},
         },
         headers=_headers(),
     )
-    assert human.status_code == 202, human.text
-    # The journal still attributes the session to the run.
-    assert conversations.get_conversation(session).labels[SCHEDULED_TASK_RUN_LABEL_KEY] == run_id
-    link(2)
-    conversations.set_labels(session, {SCHEDULED_TASK_RUN_LABEL_KEY: next_run_id})
-    later = link(3)
+    assert response.status_code == 202, response.text
 
+
+async def _mirror_terminal_input(
+    client: httpx.AsyncClient, session: str, text: str, source_id: str
+) -> None:
+    """Post a user message the native forwarder read from the terminal transcript."""
+    response = await client.post(
+        f"/v1/sessions/{session}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "item_data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
+                "response_id": "resp_native",
+                "source_id": source_id,
+            },
+        },
+        headers=_headers(),
+    )
+    assert response.status_code in (200, 201, 202), response.text
+
+
+async def _run_prs(client: httpx.AsyncClient, task_id: str) -> dict[str, set[str]]:
     body = (
         await client.get(f"/v1/scheduled-tasks/{task_id}/run-pull-requests", headers=_headers())
     ).json()
-    assert {run["run_id"]: [pr["url"] for pr in run["pull_requests"]] for run in body["runs"]} == {
-        next_run_id: [later],
-        run_id: [worked],
+    return {run["run_id"]: {pr["url"] for pr in run["pull_requests"]} for run in body["runs"]}
+
+
+async def test_a_persons_message_ends_a_runs_pr_attribution_in_a_session_it_created(
+    workflows_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Chat in an automation's own session adds no PR to its run, though the label stays.
+
+    That holds for a message sent through the server and for input typed in the
+    native terminal, but not for the terminal echoing the automation's prompt or
+    a replayed transcript item.
+    """
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes._sessions.helpers import _publish_status
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
+    from tests.server.integration.test_sessions_harness_override import _stub_late_runner_bind
+
+    client = workflows_client
+    task_id = await _create_task(client)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    run_id, next_run_id = uuid.uuid4().hex, uuid.uuid4().hex
+    session = _automation_session(db_uri, task_id, run_id)
+    for run, start in ((run_id, 1000), (next_run_id, 2000)):
+        _seed_run(db_uri, task_id, run, scheduled_at=start, conversation_id=session)
+    worked = _report_pr(db_uri, session, 1)
+    _publish_status(session, "idle")
+    _stub_late_runner_bind(monkeypatch)
+    await _post_human_message(client, session, "Open another PR")
+    # The journal still attributes the session to the run.
+    assert conversations.get_conversation(session).labels[SCHEDULED_TASK_RUN_LABEL_KEY] == run_id
+    _report_pr(db_uri, session, 2)
+    conversations.set_labels(session, {SCHEDULED_TASK_RUN_LABEL_KEY: next_run_id})
+    later = _report_pr(db_uri, session, 3)
+    # The terminal echoes the next run's prompt, and a transcript replay re-posts it.
+    pending_inputs.record(session, [{"type": "input_text", "text": "Run the nightly check"}])
+    await _mirror_terminal_input(client, session, "Run the nightly check", "echo:0:message")
+    await _mirror_terminal_input(client, session, "Run the nightly check", "echo:0:message")
+    echoed = _report_pr(db_uri, session, 4)
+    # A person types in the terminal.
+    await _mirror_terminal_input(client, session, "Also bump the lockfile", "typed:0:message")
+    _report_pr(db_uri, session, 5)
+
+    assert await _run_prs(client, task_id) == {
+        next_run_id: {later, echoed},
+        run_id: {worked},
     }
+
+
+@pytest.mark.parametrize(
+    ("run_status", "stale", "ends"),
+    [("running", False, False), ("succeeded", False, True), ("running", True, True)],
+    ids=["dispatching", "finished", "stale-stamp"],
+)
+async def test_a_persons_message_waits_only_for_a_prompt_still_being_dispatched(
+    workflows_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    run_status: str,
+    stale: bool,
+    ends: bool,
+) -> None:
+    """A pending stamp a failed settlement left behind doesn't keep the run's turn open."""
+    from omnigent.server.routes._sessions.helpers import _publish_status
+    from omnigent.server.scheduled import run_reconciler
+    from omnigent.stores.conversation_store import (
+        SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX,
+        SCHEDULED_TASK_RUN_LABEL_KEY,
+    )
+    from tests.server.integration.test_sessions_harness_override import _stub_late_runner_bind
+
+    client = workflows_client
+    task_id = await _create_task(client)
+    run_id = uuid.uuid4().hex
+    session = _automation_session(db_uri, task_id, run_id, serving=False)
+    _seed_run(db_uri, task_id, run_id, status=run_status, conversation_id=session)
+    # A dispatch stamps the run before delivering its prompt.
+    conversations = SqlAlchemyConversationStore(db_uri)
+    conversations.update_scheduled_run_label(session, run_id, action="begin")
+    labels = conversations.get_conversation(session).labels
+    assert labels[SCHEDULED_TASK_RUN_LABEL_KEY] == run_id
+    assert SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX + run_id in labels
+    if stale:
+        monkeypatch.setattr(run_reconciler, "STALE_RUN_MAX_AGE_SECONDS", -1)
+    _publish_status(session, "idle")
+    _stub_late_runner_bind(monkeypatch)
+    await _post_human_message(client, session, "Look at this instead")
+    after = _report_pr(db_uri, session, 1)
+    assert await _run_prs(client, task_id) == ({} if ends else {run_id: {after}})
 
 
 async def test_a_shared_reminder_is_not_shown_to_recipients(

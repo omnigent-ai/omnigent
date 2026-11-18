@@ -38,6 +38,7 @@ from omnigent.db.db_models import (
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
+    now_epoch,
     now_epoch_us,
     run_write_transaction,
 )
@@ -645,21 +646,41 @@ class SessionPullRequestStore:
             value = session.execute(stmt.limit(1)).scalar_one_or_none()
         return value if isinstance(value, str) and value else None
 
-    def end_run_turn(self, conversation_id: str, run_id: str) -> None:
+    def end_run_turn(
+        self, conversation_id: str, run_id: str, *, run_finished: bool = False
+    ) -> bool:
         """Record that a person wrote to the session during ``run_id``'s turn.
 
         PRs first stored after this record no run until another run starts. Writes
-        at most once per run.
+        at most once per run. A prompt still being dispatched keeps its run: like
+        :meth:`ConversationStore.clear_scheduled_run_label`, a pending stamp for
+        ``run_id`` blocks this unless its run finished or the stamp is stale.
 
         :param conversation_id: The session, e.g. ``"conv_abc123"``.
         :param run_id: The run the session's label names.
+        :param run_finished: Whether ``run_id`` reached a terminal state.
+        :returns: Whether the turn ended.
         :raises UnreadablePullRequestsError: The stored document cannot be read.
         """
+        from omnigent.server.scheduled.run_reconciler import STALE_RUN_MAX_AGE_SECONDS
+        from omnigent.stores.conversation_store import SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX
+
+        if not run_finished:
+            stmt = select(SqlConversationLabel.updated_at).where(
+                SqlConversationLabel.workspace_id == current_workspace_id(),
+                SqlConversationLabel.conversation_id == conversation_id,
+                SqlConversationLabel.key == SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX + run_id,
+            )
+            with self._session("get_session_pending_run") as session:
+                stamped_at = session.execute(stmt.limit(1)).scalar_one_or_none()
+            if stamped_at is not None and stamped_at > now_epoch() - STALE_RUN_MAX_AGE_SECONDS:
+                return False
         self._update(
             "end_session_pull_request_run_turn",
             conversation_id,
             lambda document: replace(document, ended_run_id=run_id),
         )
+        return True
 
     def initial_run_ids(self, conversation_ids: Sequence[str]) -> dict[str, str]:
         """Return the run that created each session, for the sessions a run created.

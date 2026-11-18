@@ -13,6 +13,7 @@ import {
   createScheduledTask,
   deleteScheduledTask,
   getScheduledTask,
+  listScheduledTaskRunPullRequests,
   listScheduledTaskRuns,
   listScheduledTasks,
   listSharedScheduledTasks,
@@ -492,5 +493,56 @@ describe("random worktree setting", () => {
     const task = await updateScheduledTask("st_1", { baseBranch });
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ base_branch: baseBranch });
     expect(task.baseBranch).toBe(baseBranch);
+  });
+});
+
+describe("listScheduledTaskRunPullRequests", () => {
+  it("pages after a run and maps each run's PRs and the refresh flag", async () => {
+    const pr = {
+      url: "https://github.com/example/repo/pull/1",
+      provider: "github",
+      repository: "example/repo",
+      number: 1,
+      relationship: "created",
+      state: "MERGED",
+      is_draft: false,
+      state_checked_at: 1_700_000_100,
+    };
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        runs: [{ run_id: "run_1", pull_requests: [pr] }, { run_id: "run_2" }],
+        refresh_pending: true,
+        next_cursor: null,
+      }),
+    );
+    const page = await listScheduledTaskRunPullRequests("st/1", { limit: 20, after: "run 0" });
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/v1/scheduled-tasks/st%2F1/run-pull-requests?limit=20&after=run+0",
+    );
+    expect(page).toEqual({
+      runs: [
+        { runId: "run_1", pullRequests: [pr] },
+        { runId: "run_2", pullRequests: [] },
+      ],
+      refreshPending: true,
+    });
+  });
+
+  it("reads an answer without runs or the refresh flag as empty and settled", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({}));
+    expect(await listScheduledTaskRunPullRequests("st_1", { limit: 20 })).toEqual({
+      runs: [],
+      refreshPending: false,
+    });
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/scheduled-tasks/st_1/run-pull-requests?limit=20");
+  });
+
+  it("rejects with the server's error", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ detail: "Scheduled task not found" }, { ok: false, status: 404 }),
+    );
+    await expect(listScheduledTaskRunPullRequests("st_1", { limit: 20 })).rejects.toMatchObject({
+      status: 404,
+    });
   });
 });
