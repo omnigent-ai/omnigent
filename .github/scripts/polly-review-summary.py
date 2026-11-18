@@ -333,10 +333,12 @@ def _markdown_context(
     at the first nonblank position; <summary> may share an opening line.
     Multipart preflight rejects nested lists and container-prefixed or indented
     fences outside active fences, and keeps ordinary list/quote blocks indivisible.
-    Other disclosure forms fail closed before multipart publication.
+    Tables require leading pipes; disclosure summaries must be canonical single-line
+    headers that fit indivisibly. Other forms fail closed before multipart publication.
     Inline-code formatting across fragments is not balanced.
     """
     details = 0
+    details_starts: list[int | None] = []
     fence = ""
     fence_line = ""
     table_header = ""
@@ -347,14 +349,13 @@ def _markdown_context(
     container_start = None
     container_blank = False
     container_marker = re.compile(r">|[-+*](?=[ \t\r]|$)|[0-9]{1,9}[.)](?=[ \t\r]|$)")
+    literal_marker = re.compile(r">+|[-+*#_]+|[0-9]{1,9}[.)](?=[ \t\r]|$)")
     disclosure_tag = re.compile(r"</?details(?=[ \t\f\r/>]|$)", re.IGNORECASE)
+    summary_tag = re.compile(r"</?summary(?=[ \t\f\r/>]|$)", re.IGNORECASE)
 
     def protect_span(start: int, end: int, kind: str) -> None:
         if protected_spans is None:
             return
-        while protected_spans and start < protected_spans[-1][1]:
-            prior_start, prior_end, _ = protected_spans.pop()
-            start, end = min(start, prior_start), max(end, prior_end)
         protected_spans.append((start, end, kind))
 
     def protect_literals(line: str, line_start: int, active_fence: str = "") -> None:
@@ -430,7 +431,7 @@ def _markdown_context(
             invalidating = line.find("`", opening.end())
             if invalidating >= 0:
                 # Keep the backtick that makes the info string invalid with its opener.
-                protect_span(line_start, line_start + invalidating + 1, "invalid fence opener")
+                protect_span(line_start, line_start + invalidating + 1, "literal fence run")
                 opening = None
         if opening:
             if protected_spans is not None and opening.start(1):
@@ -443,6 +444,33 @@ def _markdown_context(
             assessment_table = False
             continue
         if protected_spans is not None:
+            if not line.lstrip().startswith("|"):
+                for marker in literal_marker.finditer(line):
+                    start, end = marker.span()
+                    if marker[0][0] != ">" and end < len(line) and line[end] not in " \t\r":
+                        continue
+                    while start and line[start - 1] in " \t":
+                        start -= 1
+                    start = max(0, start - 1)
+                    while end < len(line) and line[end] in " \t":
+                        end += 1
+                    if line.startswith(("```", "~~~"), end):
+                        raise ValueError(
+                            "Polly review container fences are not supported "
+                            "in multipart comments."
+                        )
+                    protect_span(
+                        line_start + start,
+                        line_start + min(end + 1, len(line)),
+                        "literal container marker",
+                    )
+                for space in re.finditer(r"[ \t]+", line):
+                    if space.start() and (len(space[0]) >= 4 or "\t" in space[0]):
+                        protect_span(
+                            line_start + space.start() - 1,
+                            line_start + min(space.end() + 1, len(line)),
+                            "literal indentation",
+                        )
             protect_literals(line, line_start)
             tags = list(disclosure_tag.finditer(line))
             if tags and (
@@ -456,9 +484,50 @@ def _markdown_context(
                 raise ValueError(
                     "Polly review noncanonical details are not supported in multipart comments."
                 )
-        if line.lstrip().startswith(("<details>", "</details>")):
-            for tag in re.findall(r"</?details>", line):
-                details = max(0, details + (1 if tag == "<details>" else -1))
+            summaries = list(summary_tag.finditer(line))
+            if summaries and (
+                [tag[0] for tag in summaries] != ["<summary", "</summary"]
+                or not line.lstrip().startswith(("<details>", "<summary>"))
+                or any(line[tag.end() : tag.end() + 1] != ">" for tag in summaries)
+            ):
+                raise ValueError(
+                    "Polly review noncanonical summary is not supported in multipart comments."
+                )
+            cells = (
+                split_table_row(line.strip().strip("|"))
+                if "|" in line and re.fullmatch(r"[\s|:-]+", line)
+                else []
+            )
+            delimiter = len(cells) > 1 and all(
+                re.fullmatch(r"\s*:?-+:?\s*", cell) for cell in cells
+            )
+            if (
+                delimiter
+                and "|" in previous
+                and not (line.lstrip().startswith("|") and previous.lstrip().startswith("|"))
+            ) or (table_header and "|" in line and not line.lstrip().startswith("|")):
+                raise ValueError(
+                    "Polly review tables without leading pipes are not supported "
+                    "in multipart comments."
+                )
+        if line.lstrip().startswith(("<details>", "</details>", "<summary>")):
+            for tag in re.findall(r"</?details>|</?summary>", line):
+                if tag == "<details>":
+                    details += 1
+                    details_starts.append(line_start)
+                elif tag == "</details>":
+                    details = max(0, details - 1)
+                    if details_starts:
+                        details_starts.pop()
+                elif tag == "</summary>":
+                    start = details_starts[-1] if details_starts else None
+                    protect_span(
+                        line_start if start is None else start,
+                        min(offset, len(text)),
+                        "disclosure header",
+                    )
+                    if details_starts:
+                        details_starts[-1] = None
         if line.lstrip().startswith("|"):
             cells = split_table_row(line.strip().strip("|"))
             if previous.lstrip().startswith("|") and all(
@@ -486,6 +555,16 @@ def _markdown_context(
         protect_span(container_start, len(text), "Markdown container")
     if nested_list:
         raise ValueError("Polly review nested lists are not supported in multipart comments.")
+    if protected_spans is not None:
+        spans = sorted(protected_spans)
+        protected_spans.clear()
+        for start, end, kind in spans:
+            if protected_spans and start < protected_spans[-1][1]:
+                prior_start, prior_end, prior_kind = protected_spans.pop()
+                start = prior_start
+                if prior_end >= end:
+                    end, kind = prior_end, prior_kind
+            protected_spans.append((start, end, kind))
     prefix = "<details>\n<summary>Review continued</summary>\n\n" * details
     suffix = "\n\n</details>" * details
     if fence:
