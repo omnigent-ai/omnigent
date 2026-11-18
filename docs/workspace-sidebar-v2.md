@@ -19,15 +19,14 @@ other the way they do on the web. The pages are:
 The goal is for it to work on mobile from the start, with the same pages laid
 out for a narrow screen.
 
-## Turning it on
+## Flag
 
-One server feature flag, `workspace_sidebar_v2`, in
-`omnigent/server/feature_flags.py`, gates the whole sidebar. It is off by
-default and appears in `/v1/info`. With it off, the sidebar is unchanged.
-
-```bash
-OMNIGENT_FEATURES=workspace_sidebar_v2
-```
+The change that routes the sidebar to v2 adds one server feature flag,
+`workspace_sidebar_v2`, in `omnigent/server/feature_flags.py`, to gate the
+whole sidebar. The flag doesn't exist yet. Once it does, it is off by default
+and appears in `/v1/info`, and a server turns it on with
+`OMNIGENT_FEATURES=workspace_sidebar_v2`. With it off, the sidebar is
+unchanged.
 
 ## How data reaches it
 
@@ -63,9 +62,10 @@ New:
 
 ### Base UI
 
-The web app's primitives use Radix. The pull request list and the diff review
-toolbar need a cascading "Add filter" menu where typing searches every
-submenu while the arrow keys move through the matches. Radix menus have no
+The web app's primitives use Radix. The pull request list needs a cascading
+"Add filter" menu where typing searches every submenu while the arrow keys
+move through the matches. Other filters, such as the diff review toolbar's,
+stay on Radix and share only the filter chips. Radix menus have no
 filter input, and their typeahead takes the same keystrokes; Base UI's `Menu`
 supports a filter input that keeps focus. We ask for a green light to use
 `@base-ui/react` for this one component. Base UI may be the better long-term
