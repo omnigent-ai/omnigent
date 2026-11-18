@@ -486,10 +486,9 @@ async def test_explicit_recovery_deduplicates_history_heuristic(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("event_type", ["interrupt", "stop_session"])
 @pytest.mark.parametrize(
-    "before_initialization", [False, True], ids=["during-init", "before-init"]
+    "before_initialization,pause", [(True, "history"), (False, "history"), (False, "admission")]
 )
 @pytest.mark.parametrize("native", [False, True], ids=["sdk", "native"])
-@pytest.mark.parametrize("pause", ["history", "admission"])
 async def test_stop_fences_delayed_recovery_initialization(
     monkeypatch: pytest.MonkeyPatch,
     event_type: str,
@@ -582,6 +581,27 @@ async def test_stop_fences_delayed_recovery_initialization(
             assert result.status_code == 201
             assert result.json()["recovery_turn"] == "none"
         assert len(harness.posted_bodies) == 1
+
+        # Parent-owned child restoration keeps its existing recovery behavior.
+        if native:
+            result = await client.post(
+                f"/v1/sessions/{SESSION_ID}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {"status": "idle", "turn_completed": True},
+                },
+            )
+            assert result.status_code == 204
+        payload["session_init"].update(
+            recovery_id="new-child-episode", require_recovery_admission=False
+        )
+        result = await client.post("/v1/sessions", json=payload)
+        assert result.status_code == 201, result.text
+        assert result.json()["recovery_turn"] == "recovery_prompt"
+        turn = app.state.active_turns.get(SESSION_ID)
+        if turn is not None:
+            await asyncio.wait_for(turn, timeout=5)
+        assert len(harness.posted_bodies) == 2
 
 
 @pytest.mark.asyncio

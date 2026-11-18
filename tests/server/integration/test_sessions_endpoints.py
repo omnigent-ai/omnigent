@@ -2790,6 +2790,7 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     metadata_rows: list[dict[str, object]],
+    db_uri: str,
 ) -> None:
     """
     Structured skill slash commands persist two durable records.
@@ -2829,6 +2830,7 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
                 json={"meta_text": format_skill_meta_text(skill, payload.get("arguments", ""))},
             )
         if request.method == "POST" and request.url.path.endswith("/events"):
+            assert not store.admit_session_recovery(session["id"], intent)
             forwarded.append(json.loads(request.content))
         return httpx.Response(202, json={"queued": True})
 
@@ -2851,6 +2853,20 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
         )
         session = await _create_session(client, agent["id"])
 
+        store = SqlAlchemyConversationStore(db_uri)
+        store.set_host_id(session["id"], "a" * 32, workspace="/restored")
+        conv = store.get_conversation(session["id"])
+        intent = SessionRecovery(
+            conv.host_id,
+            conv.runner_id,
+            100,
+            phase="dispatching",
+            attempt_id="attempt",
+            launch_runner_id=conv.runner_id,
+        )
+        assert store.replace_session_recovery(session["id"], None, intent)
+        assert store.admit_session_recovery(session["id"], intent)
+
         resp = await client.post(
             f"/v1/sessions/{session['id']}/events",
             json={
@@ -2863,6 +2879,7 @@ async def test_skill_slash_command_persists_visible_item_and_hidden_meta_message
             },
         )
         assert resp.status_code == 202, resp.text
+        assert store.get_session_recovery(session["id"]) is None
 
     _assert_activity_metadata(metadata_rows, session["id"], "slash_command")
     assert resp.json()["queued"] is True

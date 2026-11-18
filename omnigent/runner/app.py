@@ -3797,7 +3797,11 @@ def create_runner_app(
             if (
                 admitted
                 and not execution_seen
-                and session_id not in _recovery_blocked_sessions
+                and (
+                    session_id not in _recovery_blocked_sessions
+                    or init_context.envelope is None
+                    or not init_context.envelope.require_recovery_admission
+                )
                 and session_id not in _active_turns
                 and not resource_registry.session_turn_is_active(session_id)
             ):
