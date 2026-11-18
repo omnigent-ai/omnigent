@@ -1,0 +1,179 @@
+import { redo, undo } from "@codemirror/commands";
+import { EditorView } from "@codemirror/view";
+import { act, fireEvent, render } from "@testing-library/react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { insertComposerText } from "@/lib/composerText";
+import { CodeMirrorComposerInput } from "./testing/codeMirrorComposer";
+import { COMPOSER_EDITING_KEYMAP } from "./CodeMirrorComposerInput";
+import {
+  isComposerInput,
+  isHistoryInput,
+  type ComposerInputEvent,
+  type ComposerKeyboardEvent,
+  type ComposerPasteEvent,
+  type ComposerTextTarget,
+} from "./composerInput";
+
+function mount(props: Partial<Parameters<typeof CodeMirrorComposerInput>[0]> = {}) {
+  const box: { target: ComposerTextTarget | null } = { target: null };
+  const view = render(
+    <CodeMirrorComposerInput
+      aria-label="Message the agent"
+      value=""
+      {...props}
+      ref={(target) => {
+        box.target = target;
+      }}
+    />,
+  );
+  const content = view.container.querySelector<HTMLElement>(".cm-content")!;
+  return { ...view, content, target: () => box.target! };
+}
+
+afterEach(() => {
+  document.body.replaceChildren();
+});
+
+describe("CodeMirrorComposerInput", () => {
+  it.each([
+    ["compact", "180px"],
+    ["unbounded", "none"],
+  ] as const)("sizes its scroller for the %s height", (heightMode, maxHeight) => {
+    const { container } = mount({ heightMode });
+    const scroller = getComputedStyle(container.querySelector(".cm-scroller")!);
+    expect(scroller.maxHeight).toBe(maxHeight);
+  });
+
+  it("resizes its scroller when the height changes", () => {
+    const { container, rerender } = mount({ heightMode: "compact" });
+    rerender(
+      <CodeMirrorComposerInput aria-label="Message the agent" value="" heightMode="unbounded" />,
+    );
+    const scroller = getComputedStyle(container.querySelector(".cm-scroller")!);
+    expect(scroller.maxHeight).toBe("none");
+  });
+
+  it("is a labelled multi-line composer input", () => {
+    const { content } = mount();
+    expect(isComposerInput(content)).toBe(true);
+    expect(content.getAttribute("aria-label")).toBe("Message the agent");
+    expect(content.getAttribute("aria-multiline")).toBe("true");
+  });
+
+  it("drops multi-line semantics when it is a combobox", () => {
+    const { content, rerender } = mount({ role: "combobox" });
+    expect(content.getAttribute("role")).toBe("combobox");
+    expect(content.hasAttribute("aria-multiline")).toBe(false);
+    rerender(<CodeMirrorComposerInput aria-label="Message the agent" value="" />);
+    expect(content.getAttribute("aria-multiline")).toBe("true");
+  });
+
+  it("hands keys to the composer first and skips CodeMirror's own binding when claimed", () => {
+    const onKeyDown = vi.fn((event: ComposerKeyboardEvent) => event.preventDefault());
+    const { content, target } = mount({ value: "draft", onKeyDown });
+    act(() => target().setSelectionRange(5, 5));
+
+    fireEvent.keyDown(content, { key: "Backspace" });
+
+    expect(onKeyDown).toHaveBeenCalledTimes(1);
+    expect(onKeyDown.mock.calls[0][0].currentTarget).toBe(target());
+    expect(target().value).toBe("draft");
+  });
+
+  it("leaves keys alone during IME composition", () => {
+    const onKeyDown = vi.fn();
+    const { content } = mount({ onKeyDown });
+    fireEvent.keyDown(content, { key: "Process", keyCode: 229 });
+    fireEvent.keyDown(content, { key: "Enter", isComposing: true });
+    expect(onKeyDown).not.toHaveBeenCalled();
+  });
+
+  it("passes a paste's clipboard data to the composer, which can claim it", () => {
+    const onPaste = vi.fn((event: ComposerPasteEvent) => event.preventDefault());
+    const { content, target } = mount({ value: "draft", onPaste });
+    const clipboardData = { getData: () => "pasted", files: [], items: [], types: ["text/plain"] };
+
+    fireEvent.paste(content, { clipboardData });
+
+    expect(onPaste).toHaveBeenCalledTimes(1);
+    expect(onPaste.mock.calls[0][0].currentTarget).toBe(target());
+    expect(target().value).toBe("draft");
+  });
+
+  it("reports focus and blur", () => {
+    const onFocus = vi.fn();
+    const onBlur = vi.fn();
+    const { target } = mount({ onFocus, onBlur });
+    act(() => target().focus());
+    act(() => target().blur());
+    expect(onFocus).toHaveBeenCalledTimes(1);
+    expect(onBlur).toHaveBeenCalledTimes(1);
+  });
+
+  it("can't be edited while disabled or read-only, and says so", () => {
+    const { content, rerender } = mount({ disabled: true });
+    expect(content.getAttribute("contenteditable")).toBe("false");
+    expect(content.getAttribute("aria-disabled")).toBe("true");
+    rerender(<CodeMirrorComposerInput value="" readOnly />);
+    expect(content.getAttribute("aria-readonly")).toBe("true");
+  });
+
+  it("refuses an insert into a read-only draft and leaves it unchanged", () => {
+    const { target } = mount({ value: "draft", readOnly: true });
+    expect(insertComposerText(target(), "x", 0, 0)).toBe(false);
+    expect(target().value).toBe("draft");
+  });
+
+  it("takes a caller's text size in place of the composer's own", () => {
+    const host = (className?: string) => {
+      const { container, unmount } = mount({ className });
+      const classes = [...container.querySelector("[data-composer-engine]")!.classList];
+      unmount();
+      return classes;
+    };
+    expect(host()).toContain("text-ui");
+    const sized = host("text-sm");
+    expect(sized).toContain("text-sm");
+    expect(sized).not.toContain("text-ui");
+    expect(sized).toContain("text-foreground");
+  });
+});
+
+describe("CodeMirrorComposerInput change events", () => {
+  it("says when an undo or redo made the change", () => {
+    const onChange = vi.fn((event: ComposerInputEvent) => isHistoryInput(event));
+    const { content, target } = mount({ onChange });
+    act(() => {
+      insertComposerText(target(), "draft", 0, 0);
+    });
+    const editor = EditorView.findFromDOM(content)!;
+    act(() => void undo(editor));
+    act(() => void redo(editor));
+    expect(onChange.mock.results.map((result) => result.value)).toEqual([false, true, true]);
+  });
+
+  it("takes a controlled value without reporting it or making it undoable", () => {
+    const onChange = vi.fn();
+    const { content, target, rerender } = mount({ value: "a", onChange });
+    rerender(
+      <CodeMirrorComposerInput aria-label="Message the agent" value="ab" onChange={onChange} />,
+    );
+    expect(target().value).toBe("ab");
+    expect(onChange).not.toHaveBeenCalled();
+
+    act(() => void undo(EditorView.findFromDOM(content)!));
+    expect(target().value).toBe("ab");
+  });
+});
+
+describe("COMPOSER_EDITING_KEYMAP", () => {
+  it("leaves Enter to the composer and claims no Control+Option chord", () => {
+    const keys = COMPOSER_EDITING_KEYMAP.flatMap((binding) =>
+      [binding.key, binding.mac, binding.win, binding.linux].filter(
+        (key): key is string => key !== undefined,
+      ),
+    );
+    expect(keys).not.toContain("Enter");
+    expect(keys.filter((key) => /Ctrl-/.test(key) && /Alt-/.test(key))).toEqual([]);
+  });
+});

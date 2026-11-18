@@ -8,20 +8,22 @@ import { createTextFieldMirror } from "@/lib/textFieldMirror";
 /**
  * Replace ``[start, end)`` (default: the selection) as typed input, so onChange
  * sees it. The editing commands also keep it on the undo stack; the fallback
- * covers environments without them.
+ * covers environments without them. Returns false when the input is locked and
+ * nothing changed.
  */
 export function insertComposerText(
   target: ComposerTextTarget,
   text: string,
   start = target.selectionStart,
   end = target.selectionEnd,
-) {
+): boolean {
   if (!isComposerTextarea(target)) {
-    target.insertText(text, start, end);
-    target.revealCaret();
-    return;
+    const inserted = target.insertText(text, start, end);
+    if (inserted) target.revealCaret();
+    return inserted;
   }
   const textarea = target;
+  if (textarea.readOnly || textarea.disabled) return false;
   textarea.setSelectionRange(start, end);
   const inserted =
     typeof document.execCommand === "function" &&
@@ -33,6 +35,7 @@ export function insertComposerText(
     textarea.dispatchEvent(new Event("input", { bubbles: true }));
   }
   revealCaretLine(textarea);
+  return true;
 }
 
 // Typing scrolls the caret's line into view, but Chromium skips that after a

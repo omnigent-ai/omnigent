@@ -57,6 +57,7 @@ export function createFakeComposerSurface(initial = ""): FakeComposerSurface {
       inserts.push({ text, start, end });
       surface.value = surface.value.slice(0, start) + text + surface.value.slice(end);
       selection = [start + text.length, start + text.length];
+      return true;
     },
     revealCaret() {
       reveals += 1;
