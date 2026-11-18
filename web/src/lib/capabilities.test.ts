@@ -92,6 +92,11 @@ describe("sandboxProviderOptions", () => {
     expect(options).toEqual([null]);
     expect(sandboxOptionLabel(options[0])).toBe("New Sandbox");
   });
+
+  it("keeps a provider's own casing instead of title-casing its id", () => {
+    // kosa8 writes its name in lowercase; the fallback would show "Kosa8".
+    expect(sandboxOptionLabel("kosa8")).toBe("kosa8 Sandbox");
+  });
 });
 
 describe("resolveServerInfo sandbox_providers", () => {

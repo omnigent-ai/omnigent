@@ -159,6 +159,15 @@ def test_instantiate_loads_gensee_from_core() -> None:
     assert launcher.__class__.__module__ == "omnigent.onboarding.sandboxes.gensee"
 
 
+def test_instantiate_loads_kosa8_from_core() -> None:
+    """kosa8 resolves to the built-in HTTP launcher without a plugin package."""
+    reset_plugin_state_for_tests()
+    assert "kosa8" in available_providers()
+    launcher = instantiate("kosa8")
+    assert launcher.provider == "kosa8"
+    assert launcher.__class__.__module__ == "omnigent.onboarding.sandboxes.kosa8"
+
+
 def test_instantiate_unknown_raises() -> None:
     """Instantiating an unknown provider raises SandboxRegistryError."""
     reset_plugin_state_for_tests()

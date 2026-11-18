@@ -183,6 +183,9 @@ def sandbox() -> None:
       islo     Uses the built-in HTTP client. Needs ISLO_API_KEY
                (and optionally ISLO_BASE_URL for non-default API
                endpoints).
+      kosa8    Uses the built-in HTTP client. No lifetime cap;
+               sandboxes sleep with their memory and wake in place.
+               Needs KOSA8_API_KEY.
 
     For provider-side sandbox lifecycle (list / status / delete /
     start / stop), use the provider's own CLI or dashboard directly
