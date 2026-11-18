@@ -21,7 +21,7 @@ import os
 import shlex
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
-from contextlib import AsyncExitStack, suppress
+from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
@@ -970,10 +970,19 @@ class McpServerConnection:
             self._close_event.set()
         task = self._lifecycle_task
         if task is not None and not task.done():
+            startup_cancelled = self._ready_future is not None and self._ready_future.cancelled()
+            if startup_cancelled:
+                # Cancelling connect() cancels its future, not the owning lifecycle task.
+                task.cancel()
             # Logged inside ``_run_lifecycle``; caller (RunnerMcpManager.shutdown)
             # only cares that close() ran to completion.
-            with suppress(Exception):
+            try:
                 await task
+            except asyncio.CancelledError:
+                if not startup_cancelled:
+                    raise
+            except Exception:
+                pass
         self._lifecycle_task = None
         self._close_event = None
         self._ready_future = None

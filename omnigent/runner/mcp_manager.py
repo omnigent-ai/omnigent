@@ -82,6 +82,8 @@ def _build_accept_content(
 
 
 _POOL_SPEC_CAPACITY = 8
+# Return partial discovery before the proxy's 30-second HTTP deadline.
+_SCHEMA_DISCOVERY_TIMEOUT_S = 20.0
 
 
 @dataclass
@@ -415,7 +417,7 @@ class RunnerMcpManager:
             self._touch(spec_hash)
 
     async def schemas_for(self, spec: AgentSpec) -> McpSchemasResult:
-        """Resolve MCP schemas for *spec*; awaits any in-flight connect."""
+        """Return ready schemas within a bounded wait, retaining pending connects."""
         configs = [c for c in (spec.mcp_servers or []) if c.transport != "registry"]
         if not configs:
             return McpSchemasResult(schemas=[], tool_names=set(), failures={})
@@ -424,6 +426,7 @@ class RunnerMcpManager:
             entry = self._ensure_entry(spec_hash, configs)
             self._touch(spec_hash)
             refs = list(entry.servers.values())
+            has_ready_server = any(ref.entry.connection is not None for ref in refs)
             for ref in refs:
                 self._retain_server_ref(ref.entry)
             connect_tasks = {
@@ -435,7 +438,13 @@ class RunnerMcpManager:
         try:
             if connect_tasks:
                 try:
-                    await asyncio.gather(*connect_tasks.values())
+                    # A pending login must not hide healthy tools or restart on retries.
+                    done, _pending = await asyncio.wait(
+                        connect_tasks.values(),
+                        timeout=0 if has_ready_server else _SCHEMA_DISCOVERY_TIMEOUT_S,
+                    )
+                    for task in done:
+                        task.result()
                 except Exception:
                     _logger.exception(
                         "runner mcp connect task raised; surfacing partial results",
@@ -449,6 +458,9 @@ class RunnerMcpManager:
                 server = ref.entry
                 if server.error is not None:
                     failures[ref.config.name] = server.error
+                    continue
+                if server.connection is None:
+                    failures[ref.config.name] = "Connection still initializing"
                     continue
                 allowed = self._allowed_tools(ref)
                 for td in server.tools:

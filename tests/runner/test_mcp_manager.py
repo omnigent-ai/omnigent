@@ -172,6 +172,69 @@ async def test_partial_failure_surfaces_healthy_servers(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_discovery", [False, True])
+async def test_pending_connect_preserves_healthy_tools_and_finishes_once(
+    patch_connection: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    cancel_discovery: bool,
+) -> None:
+    """A slow login cannot hide ready tools or restart on discovery retries."""
+    monkeypatch.setattr(_mcp_manager_module, "_SCHEMA_DISCOVERY_TIMEOUT_S", 0.02, raising=False)
+    patch_connection["__tools_for__"]["ready"] = [_make_tool_def("read")]
+    patch_connection["__tools_for__"]["delayed"] = [_make_tool_def("late")]
+    started = asyncio.Event()
+    finish = asyncio.Event()
+    attempts = 0
+    original_connect = _FakeConn.connect
+
+    async def connect(connection: _FakeConn) -> list[McpToolDef]:
+        nonlocal attempts
+        if any(tool.name == "late" for tool in connection._tools):
+            attempts += 1
+            started.set()
+            await finish.wait()
+        return await original_connect(connection)
+
+    monkeypatch.setattr(_FakeConn, "connect", connect)
+    spec = _make_spec(_make_config("ready"), _make_config("delayed"))
+    manager = RunnerMcpManager()
+    discovery = asyncio.create_task(manager.schemas_for(spec))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        if cancel_discovery:
+            discovery.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await discovery
+            result = await asyncio.wait_for(manager.schemas_for(spec), timeout=1)
+        else:
+            result = await asyncio.wait_for(discovery, timeout=1)
+        assert result.tool_names == {"ready__read"}
+        assert set(result.failures) == {"delayed"}
+        assert await manager.call_tool(spec, "ready__read", {}) == "called read with {}"
+
+        # A ready pool must not wait through the cold-start budget again.
+        monkeypatch.setattr(_mcp_manager_module, "_SCHEMA_DISCOVERY_TIMEOUT_S", 60)
+        retry = await asyncio.wait_for(manager.schemas_for(spec), timeout=1)
+        assert retry.tool_names == result.tool_names
+        assert set(retry.failures) == {"delayed"}
+        pending = manager._servers[compute_server_hash(spec.mcp_servers[1])].connect_task
+        assert pending is not None and not pending.done()
+        assert attempts == 1
+
+        finish.set()
+        await asyncio.wait_for(asyncio.shield(pending), timeout=1)
+        recovered = await manager.schemas_for(spec)
+        assert recovered.tool_names == {"ready__read", "delayed__late"}
+        assert recovered.failures == {}
+        assert attempts == 1
+    finally:
+        discovery.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await discovery
+        await manager.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_pool_reuses_connection_for_same_spec(
     patch_connection: dict[str, Any],
 ) -> None:

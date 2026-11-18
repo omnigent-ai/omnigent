@@ -10,12 +10,14 @@ the runner-side version of what used to be a ToolManager test.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sys
 from pathlib import Path
 
 import pytest
 
+from omnigent.runner import mcp_manager as mcp_manager_module
 from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
 from omnigent.runner.mcp_manager import RunnerMcpManager
 from omnigent.spec.types import AgentSpec, MCPServerConfig
@@ -37,8 +39,11 @@ def echo_mcp_spec() -> AgentSpec:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("pending_connection", [False, True])
 async def test_stdio_mcp_discovers_tool_via_real_subprocess(
     echo_mcp_spec: AgentSpec,
+    monkeypatch: pytest.MonkeyPatch,
+    pending_connection: bool,
 ) -> None:
     """``schemas_for`` spawns the subprocess and surfaces the echo tool schema.
 
@@ -47,8 +52,18 @@ async def test_stdio_mcp_discovers_tool_via_real_subprocess(
     stdio_client), and MCP ``tools/list`` discovery.
     """
     manager = RunnerMcpManager()
+    if pending_connection:
+        monkeypatch.setattr(mcp_manager_module, "_SCHEMA_DISCOVERY_TIMEOUT_S", 5)
+        echo_mcp_spec.mcp_servers.append(
+            MCPServerConfig(
+                name="pending",
+                transport="stdio",
+                command=sys.executable,
+                args=["-c", "import sys; sys.stdin.read()"],
+            )
+        )
     try:
-        result = await manager.schemas_for(echo_mcp_spec)
+        result = await asyncio.wait_for(manager.schemas_for(echo_mcp_spec), timeout=10)
         # Tool names are namespaced as {server}__{tool}; the echo-test
         # server exposes "echo", so the full name is "echo-test__echo".
         assert "echo-test__echo" in result.tool_names, (
@@ -61,6 +76,10 @@ async def test_stdio_mcp_discovers_tool_via_real_subprocess(
         assert "text" in properties, (
             f"Expected 'text' param in echo schema; got {properties.keys()}"
         )
+        if pending_connection:
+            assert set(result.failures) == {"pending"}
+            response = await manager.call_tool(echo_mcp_spec, "echo-test__echo", {"text": "ping"})
+            assert response == "echo: ping"
     finally:
         await manager.shutdown()
 
