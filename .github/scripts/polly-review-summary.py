@@ -312,7 +312,9 @@ def split_review(review: str, byte_limit: int) -> list[str]:
     return parts
 
 
-def _markdown_context(text: str, *, validate_assessments: bool = False) -> tuple[str, str, str]:
+def _markdown_context(
+    text: str, *, validate_assessments: bool = False, continuing: bool = True
+) -> tuple[str, str, str]:
     """Reopen Markdown context and optionally validate final assessment rows.
 
     Mid-row continuation requires five parsed fields; other widths fail closed.
@@ -366,7 +368,7 @@ def _markdown_context(text: str, *, validate_assessments: bool = False) -> tuple
         prefix += fence_line + "\n"
         suffix = "\n" + fence + "\n" + suffix
         table_header = ""
-    if table_header and not text.endswith("\n"):
+    if continuing and table_header and not text.endswith("\n"):
         row = previous.strip()
         cells = split_table_row(row.strip("|"))
         if len(cells) != TEST_FIELD_COUNT:
@@ -427,7 +429,7 @@ def review_comments(review: str, *, head_sha: str, run_id: str, run_url: str) ->
         for part, chunk in enumerate(chunks, 1):
             prefix, _, table_header = context
             before += chunk
-            context = _markdown_context(before)
+            context = _markdown_context(before, continuing=part < len(chunks))
             _, suffix, _ = context
             if chunk.lstrip(" \t").startswith("|"):
                 prefix += table_header

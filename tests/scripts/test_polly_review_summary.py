@@ -152,13 +152,14 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
         "adjacent_tables",
         "oversized_nonassessment",
         "nonprogress",
+        "final_table_newline",
     ),
     [
-        (None, 0, "", False, "run", None, None, False, False, False),
-        ((20000, 45000, 20000), 0, "", False, "run", None, None, False, False, False),
-        ((3000,) * 30, 59194, "", False, "run", None, None, False, False, False),
-        (None, 0, "  ", False, "run", None, None, False, False, False),
-        ((70000,), 0, "", False, "run", None, None, False, False, False),
+        (None, 0, "", False, "run", None, None, False, False, False, None),
+        ((20000, 45000, 20000), 0, "", False, "run", None, None, False, False, False, None),
+        ((3000,) * 30, 59194, "", False, "run", None, None, False, False, False, None),
+        (None, 0, "  ", False, "run", None, None, False, False, False, None),
+        ((70000,), 0, "", False, "run", None, None, False, False, False, None),
         # Align an escaped pipe with the fully wrapped comment boundary.
         (
             ("y" * 69 + ("x" * 70 + r"\|") * 1100,),
@@ -171,16 +172,17 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
             False,
             False,
             False,
+            None,
         ),
-        (None, 0, "", True, "run", None, None, False, False, False),
-        (("Reason",), 0, "", False, "run", 0, None, False, False, False),
-        (("Reason",), 0, "", False, "run", 1, None, False, False, False),
-        (("Reason",), 0, "", False, "run", 2, None, False, False, False),
-        ((177655, "Tail."), 0, "", False, "run", None, " | \t", False, False, False),
-        ((177654, "Tail."), 0, "", False, "run", None, "| \t", False, False, False),
-        ((177653, "Tail."), 0, "", False, "run", None, " \t", False, False, False),
-        ((177652, "Tail."), 0, "", False, "run", None, "\t", False, False, False),
-        ((177651, "Tail."), 0, "", False, "run", None, "", False, False, False),
+        (None, 0, "", True, "run", None, None, False, False, False, None),
+        (("Reason",), 0, "", False, "run", 0, None, False, False, False, None),
+        (("Reason",), 0, "", False, "run", 1, None, False, False, False, None),
+        (("Reason",), 0, "", False, "run", 2, None, False, False, False, None),
+        ((177655, "Tail."), 0, "", False, "run", None, " | \t", False, False, False, None),
+        ((177654, "Tail."), 0, "", False, "run", None, "| \t", False, False, False, None),
+        ((177653, "Tail."), 0, "", False, "run", None, " \t", False, False, False, None),
+        ((177652, "Tail."), 0, "", False, "run", None, "\t", False, False, False, None),
+        ((177651, "Tail."), 0, "", False, "run", None, "", False, False, False, None),
         (
             ("Reason." + " " * 135000 + "Tail.",),
             0,
@@ -192,10 +194,13 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
             False,
             False,
             False,
+            None,
         ),
-        (None, 0, "", False, "run", None, None, True, False, False),
-        (("Reason",), 0, "", False, "run", None, None, False, True, False),
-        (("Reason",), 0, "", False, "run", None, None, False, False, True),
+        (None, 0, "", False, "run", None, None, True, False, False, None),
+        (("Reason",), 0, "", False, "run", None, None, False, True, False, None),
+        (("Reason",), 0, "", False, "run", None, None, False, False, True, None),
+        (None, 0, "", False, "run", None, None, False, False, False, ""),
+        (None, 0, "", False, "run", None, None, False, False, False, "\n"),
     ],
     ids=[
         "many-rows",
@@ -217,6 +222,8 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
         "adjacent-tables",
         "oversized-nonassessment",
         "escaped-pipe-whitespace-progress",
+        "final-table-no-newline",
+        "final-table-newline",
     ],
 )
 def test_long_review_parts_preserve_all_assessments_and_markdown_context(
@@ -230,6 +237,7 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
     adjacent_tables: bool,
     oversized_nonassessment: bool,
     nonprogress: bool,
+    final_table_newline: str | None,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -244,6 +252,7 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         or adjacent_tables
         or oversized_nonassessment
         or nonprogress
+        or final_table_newline is not None
     ):
         review_path = tmp_path / "review.md"
         receipt = tmp_path / "receipt.txt"
@@ -299,6 +308,31 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         assert not posts
         assert not receipt.exists()
         assert not list(tmp_path.glob("comment*.md"))
+        return
+
+    if final_table_newline is not None:
+        final_table = "\n| A | B |\n| --- | --- |\n| x | é🙂 |" + final_table_newline
+        composed = _HELPERS["compose_review"](
+            _REVIEW + "x" * 61000 + final_table,
+            {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]},
+        )
+        assert composed.endswith(final_table)
+        review_path.write_text(composed, encoding="utf-8")
+        _HELPERS["publish_review"](review_path, receipt)
+        paths = [
+            tmp_path / "comment.md",
+            *sorted(
+                tmp_path.glob("comment-part-*.md"),
+                key=lambda path: int(path.stem.rsplit("-", 1)[1]),
+            ),
+        ]
+        comments = [path.read_text(encoding="utf-8") for path in paths]
+        assert len(comments) > 1
+        assert posts == [*comments[1:], comments[0]]
+        assert receipt.read_text() == "a" * 40 + "\n"
+        assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
+        assert sum(comment.count(final_table) for comment in comments) == 1
+        assert sum(comment.count("<!-- polly-reviewed-sha:") for comment in comments) == 1
         return
 
     if adjacent_tables:
