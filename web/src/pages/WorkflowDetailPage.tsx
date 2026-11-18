@@ -1,6 +1,7 @@
 /**
  * A workflow's plan, its planning conversation, and the sessions that ran it.
- * Drafts become runnable when the user saves the agent's proposed plan.
+ * Drafts become runnable when the user saves the agent's proposed plan. Someone a
+ * workflow is shared with sees it read-only, with Run and Clone, and their own runs.
  */
 
 import { useEffect, useId, useLayoutEffect, useRef, useState } from "react";
@@ -8,16 +9,20 @@ import {
   ChevronDownIcon,
   ChevronLeftIcon,
   ClockIcon,
+  CopyIcon,
   Loader2Icon,
   PencilIcon,
   PlayIcon,
   SaveIcon,
+  ShareIcon,
   Trash2Icon,
   WorkflowIcon,
 } from "lucide-react";
 
+import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { KeyboardShortcutTooltip } from "@/components/KeyboardShortcut";
 import { PageScroll } from "@/components/PageScroll";
+import { PermissionsModal } from "@/components/PermissionsModal";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import { DeleteWorkflowDialog } from "@/components/workflows/DeleteWorkflowDialog";
 import { WorkflowAutomations } from "@/components/workflows/WorkflowAutomations";
@@ -33,6 +38,7 @@ import { WorkflowRunRow } from "@/components/workflows/WorkflowRunRow";
 import { WorkflowStepsGraph } from "@/components/workflows/WorkflowStepsGraph";
 import { useNow } from "@/hooks/useNow";
 import {
+  useCloneWorkflow,
   useWorkflow,
   useWorkflowRuns,
   useSaveWorkflowDescription,
@@ -47,6 +53,8 @@ import { WorkflowPlanningChat } from "@/components/workflows/WorkflowPlanningCha
 import { automationPagePath } from "@/lib/automationFromSession";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isSharingOff, SHARING_OFF_REASON } from "@/lib/capabilities";
+import { UNSHAREABLE_WORKFLOW_MESSAGE, workflowSharingAvailable } from "@/lib/permissionsApi";
 import { Link, useNavigate, useParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { currentPlan, planDescription, planSteps } from "@/lib/sessionJournal";
@@ -55,6 +63,13 @@ import { useChatStore } from "@/store/chatStore";
 
 // The planning chat's outline flash lasts as long as `.animate-user-msg-flash`.
 const PLANNING_CHAT_FLASH_MS = 800;
+
+/** Why someone a workflow is shared with can't take each action only its owner takes. */
+const OWNER_ONLY_REASONS = {
+  edit: "Only the workflow's owner can edit it.",
+  share: "Only the workflow's owner can share it.",
+  delete: "Only the workflow's owner can delete it.",
+} as const;
 
 export function WorkflowDetailPage() {
   const { workflowId = "" } = useParams<{ workflowId: string }>();
@@ -74,14 +89,18 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
   const [sessionRequest, setSessionRequest] = useState<WorkflowSessionRequest | null>(null);
   const [sessionOpen, setSessionOpen] = useState(false);
   const [automationOpen, setAutomationOpen] = useState(false);
+  const [shareOpen, setShareOpen] = useState(false);
+  const cloneWorkflow = useCloneWorkflow();
   const [plannerOpen, setPlannerOpen] = useState<boolean | null>(null);
   const [plannerExpanded, setPlannerExpanded] = useState(false);
   // Non-zero while the open planning chat flashes; each press restarts it.
   const [plannerFlash, setPlannerFlash] = useState(0);
-  const showPlanner = plannerOpen ?? workflow?.is_draft ?? false;
+  // Someone it is shared with only reads it, and its planning chat is its owner's.
+  const isViewer = workflow?.viewer_role === "viewer";
+  const showPlanner = !isViewer && (plannerOpen ?? workflow?.is_draft ?? false);
   const isMobile = useIsMobileViewport();
   const { session: planningSession, error: planningSessionError } = useSession(
-    workflow?.planning_session_id,
+    isViewer ? undefined : workflow?.planning_session_id,
   );
   // Known archived or deleted; a session still loading may yet open.
   const planningSessionGone =
@@ -175,6 +194,17 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
     (stepSignature(proposedSteps) !== stepSignature(workflow.steps) || newDescription !== null);
   const isDraft = workflow.is_draft ?? workflow.steps.length === 0;
   const canRun = !isDraft && !hasChanges;
+  const canShare = !isViewer && workflowSharingAvailable(info);
+  const shareDisabledReason = isSharingOff(info)
+    ? SHARING_OFF_REASON
+    : workflow.shareable === false
+      ? UNSHAREABLE_WORKFLOW_MESSAGE
+      : undefined;
+  const clone = () =>
+    cloneWorkflow.mutate(workflow.id, {
+      onSuccess: (copy) => navigate(`/workflows/${copy.id}`),
+      onError: (cloneError) => showToast(`Couldn’t clone workflow. ${cloneError.message}`),
+    });
   // Expanded, the planner covers the page, which keeps its width underneath so
   // it doesn't reflow; `invisible` keeps its scroll position and tab order out.
   const plannerFillsPage = showPlanner && !isMobile && plannerExpanded;
@@ -215,29 +245,81 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
                 Draft
               </span>
             )}
+            {isViewer && (
+              <p className="mt-1 text-sm text-muted-foreground" data-testid="workflow-detail-owner">
+                Shared by {workflow.owner_display_name ?? "another user"}
+              </p>
+            )}
           </div>
           <div className="flex flex-wrap items-center gap-2">
-            <KeyboardShortcutTooltip label="Edit plan with agent">
+            {isViewer ? (
+              <DisabledActionTooltip reason={OWNER_ONLY_REASONS.edit} label="Edit plan with agent">
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="Edit plan with agent"
+                  data-testid="workflow-detail-edit"
+                  disabled
+                >
+                  <PencilIcon className="size-4" />
+                </Button>
+              </DisabledActionTooltip>
+            ) : (
+              <KeyboardShortcutTooltip label="Edit plan with agent">
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="Edit plan with agent"
+                  data-testid="workflow-detail-edit"
+                  onClick={openPlanner}
+                >
+                  <PencilIcon className="size-4" />
+                </Button>
+              </KeyboardShortcutTooltip>
+            )}
+            <DisabledActionTooltip
+              reason={isViewer ? OWNER_ONLY_REASONS.delete : undefined}
+              label="Delete workflow"
+            >
               <Button
                 variant="ghost"
                 size="icon-sm"
-                aria-label="Edit plan with agent"
-                data-testid="workflow-detail-edit"
-                onClick={openPlanner}
+                aria-label="Delete workflow"
+                data-testid="workflow-detail-delete"
+                disabled={isViewer}
+                onClick={() => setDeleteOpen(true)}
               >
-                <PencilIcon className="size-4" />
+                <Trash2Icon className="size-4" />
               </Button>
-            </KeyboardShortcutTooltip>
+            </DisabledActionTooltip>
+            {(isViewer || canShare) && (
+              <DisabledActionTooltip
+                reason={isViewer ? OWNER_ONLY_REASONS.share : shareDisabledReason}
+                label="Share workflow"
+              >
+                <Button
+                  variant="ghost"
+                  size="icon-sm"
+                  aria-label="Share workflow"
+                  data-testid="workflow-detail-share"
+                  disabled={isViewer || shareDisabledReason !== undefined}
+                  onClick={() => setShareOpen(true)}
+                >
+                  <ShareIcon className="size-4" />
+                </Button>
+              </DisabledActionTooltip>
+            )}
             <Button
-              variant="ghost"
-              size="icon-sm"
-              aria-label="Delete workflow"
-              data-testid="workflow-detail-delete"
-              onClick={() => setDeleteOpen(true)}
+              variant="outline"
+              data-testid="workflow-detail-clone"
+              disabled={cloneWorkflow.isPending}
+              loading={cloneWorkflow.isPending}
+              onClick={clone}
             >
-              <Trash2Icon className="size-4" />
+              <CopyIcon className="size-4" />
+              Clone
             </Button>
-            {automationsEnabled && (
+            {automationsEnabled && !isViewer && (
               <Button
                 variant="outline"
                 data-testid="workflow-detail-create-automation"
@@ -264,6 +346,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
         <WorkflowDescription
           workflowId={workflow.id}
           text={newDescription ?? workflow.description}
+          readOnly={isViewer}
         />
 
         <section className="mt-6">
@@ -323,12 +406,18 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
             <div className="flex flex-col items-center gap-2 rounded-xl border border-dashed border-border bg-card px-6 py-16 text-center">
               <WorkflowIcon className="size-8 text-muted-foreground/50" />
               <p className="text-ui font-medium">No plan yet</p>
-              <p className="max-w-sm text-sm text-muted-foreground">
-                Describe the workflow to an agent.
-                <br />
-                Your proposed steps will appear here.
-              </p>
-              {!showPlanner && (
+              {isViewer ? (
+                <p className="max-w-sm text-sm text-muted-foreground">
+                  Its owner hasn’t saved a plan yet.
+                </p>
+              ) : (
+                <p className="max-w-sm text-sm text-muted-foreground">
+                  Describe the workflow to an agent.
+                  <br />
+                  Your proposed steps will appear here.
+                </p>
+              )}
+              {!showPlanner && !isViewer && (
                 <Button variant="outline" size="sm" onClick={openPlanner}>
                   Create plan
                 </Button>
@@ -337,7 +426,7 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
           )}
         </section>
 
-        {automationsEnabled && !isDraft && (
+        {automationsEnabled && !isDraft && !isViewer && (
           <WorkflowAutomations workflowId={workflowId} now={now} />
         )}
 
@@ -401,6 +490,9 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
           open={sessionOpen}
           onOpenChange={setSessionOpen}
         />
+        {canShare && shareDisabledReason === undefined && (
+          <PermissionsModal workflow={workflow} open={shareOpen} onOpenChange={setShareOpen} />
+        )}
         <CreateScheduledTaskDialog
           open={automationsEnabled && automationOpen}
           onOpenChange={setAutomationOpen}
@@ -469,7 +561,16 @@ function WorkflowDetail({ workflowId }: { workflowId: string }) {
  * an ellipsis, with a chevron to show the rest when there is more. Its pencil
  * edits it in place, like a pull request's description.
  */
-function WorkflowDescription({ workflowId, text }: { workflowId: string; text: string }) {
+function WorkflowDescription({
+  workflowId,
+  text,
+  readOnly = false,
+}: {
+  workflowId: string;
+  text: string;
+  /** For someone the workflow is shared with: no pencil. */
+  readOnly?: boolean;
+}) {
   const [expanded, setExpanded] = useState(false);
   const [clamped, setClamped] = useState(false);
   // The text being edited; null while the description is shown.
@@ -548,7 +649,7 @@ function WorkflowDescription({ workflowId, text }: { workflowId: string; text: s
             "Description"
           )}
         </h2>
-        {!editing && (
+        {!editing && !readOnly && (
           <KeyboardShortcutTooltip label="Edit description">
             <Button
               variant="ghost"

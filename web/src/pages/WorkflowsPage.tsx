@@ -1,10 +1,10 @@
 /**
- * Workflows page (`/workflows`): the user's saved workflows, a search, and a
- * "New workflow" button. Laid out like the Automations page.
+ * Workflows page (`/workflows`): the user's saved workflows, those shared with them,
+ * a search, and a "New workflow" button. Laid out like the Automations page.
  *
  * New workflow saves a draft and opens its plan editor; Run asks where a saved one's session runs. Create
  * automation opens New automation with the workflow chosen and locked. Delete
- * removes one.
+ * removes one. A shared workflow offers Run and Clone; only its owner changes it.
  */
 
 import { useMemo, useState } from "react";
@@ -22,7 +22,11 @@ import {
   type WorkflowSessionRequest,
   WorkflowSessionDialog,
 } from "@/components/workflows/WorkflowSessionDialog";
-import { type SavedWorkflow, useSavedWorkflows } from "@/hooks/useSavedWorkflows";
+import {
+  type SavedWorkflow,
+  useSavedWorkflows,
+  useSharedWorkflows,
+} from "@/hooks/useSavedWorkflows";
 import { useAutomationsEnabled } from "@/hooks/useConversations";
 import { automationPagePath } from "@/lib/automationFromSession";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -31,6 +35,7 @@ import { useCloneWorkflow, useCreateWorkflowDraft } from "@/hooks/useWorkflow";
 
 export function WorkflowsPage() {
   const { workflows, isLoading, isError, refresh, pagination } = useSavedWorkflows();
+  const shared = useSharedWorkflows();
   const createDraft = useCreateWorkflowDraft();
   const cloneWorkflow = useCloneWorkflow();
   const navigate = useNavigate();
@@ -50,16 +55,18 @@ export function WorkflowsPage() {
   const [automationTarget, setAutomationTarget] = useState<SavedWorkflow | null>(null);
   const [automationOpen, setAutomationOpen] = useState(false);
 
-  const hasAnyWorkflows = workflows.length > 0;
-  const filtered = useMemo(() => {
-    const query = search.trim().toLowerCase();
-    if (!query) return workflows;
-    return workflows.filter(
-      (workflow) =>
-        workflow.name.toLowerCase().includes(query) ||
-        workflow.description.toLowerCase().includes(query),
-    );
-  }, [workflows, search]);
+  const hasAnyWorkflows = workflows.length > 0 || shared.workflows.length > 0;
+  const query = search.trim().toLowerCase();
+  const filtered = useMemo(() => matching(workflows, query), [workflows, query]);
+  const sharedFiltered = useMemo(
+    () => matching(shared.workflows, query),
+    [shared.workflows, query],
+  );
+  const clone = (workflow: SavedWorkflow) =>
+    cloneWorkflow.mutate(workflow.id, {
+      onSuccess: (copy) => navigate(`/workflows/${copy.id}`),
+      onError: (error) => showToast(`Couldn’t clone workflow. ${error.message}`),
+    });
   const takenNames = useMemo(() => workflows.map((workflow) => workflow.name), [workflows]);
 
   return (
@@ -112,9 +119,9 @@ export function WorkflowsPage() {
           <Loader2Icon className="size-4 animate-spin" />
           Loading workflows…
         </div>
-      ) : filtered.length === 0 ? (
+      ) : filtered.length === 0 && sharedFiltered.length === 0 ? (
         <EmptyState hasAny={hasAnyWorkflows} />
-      ) : (
+      ) : filtered.length === 0 ? null : (
         <div className="flex flex-col gap-2" data-testid="workflows-list">
           {filtered.map((workflow) => (
             <WorkflowRow
@@ -129,12 +136,7 @@ export function WorkflowsPage() {
                     }
                   : undefined
               }
-              onClone={() =>
-                cloneWorkflow.mutate(workflow.id, {
-                  onSuccess: (copy) => navigate(`/workflows/${copy.id}`),
-                  onError: (error) => showToast(`Couldn’t clone workflow. ${error.message}`),
-                })
-              }
+              onClone={clone}
               cloning={cloneWorkflow.isPending}
               onDelete={() => setDeleteTarget(workflow)}
             />
@@ -152,6 +154,34 @@ export function WorkflowsPage() {
         >
           {pagination.loadingMore ? "Loading…" : "Load more workflows"}
         </Button>
+      )}
+
+      {!isLoading && !isError && sharedFiltered.length > 0 && (
+        <section className="mt-8" data-testid="workflows-shared">
+          <h2 className="mb-2 text-sm font-medium text-muted-foreground">Shared with you</h2>
+          <div className="flex flex-col gap-2">
+            {sharedFiltered.map((workflow) => (
+              <WorkflowRow
+                key={workflow.id}
+                workflow={workflow}
+                onRun={() => startSession({ kind: "run", workflow })}
+                onClone={clone}
+                cloning={cloneWorkflow.isPending}
+              />
+            ))}
+          </div>
+          {shared.pagination.hasMore && (
+            <Button
+              variant="outline"
+              className="mt-4"
+              disabled={shared.pagination.loadingMore}
+              onClick={shared.pagination.loadMore}
+              componentId="workflows.shared.load-more"
+            >
+              {shared.pagination.loadingMore ? "Loading…" : "Load more shared workflows"}
+            </Button>
+          )}
+        </section>
       )}
 
       {deleteTarget && (
@@ -184,6 +214,16 @@ export function WorkflowsPage() {
         />
       )}
     </PageScroll>
+  );
+}
+
+/** The workflows whose name or description contains *query*, already lowercased. */
+function matching(workflows: readonly SavedWorkflow[], query: string): readonly SavedWorkflow[] {
+  if (!query) return workflows;
+  return workflows.filter(
+    (workflow) =>
+      workflow.name.toLowerCase().includes(query) ||
+      workflow.description.toLowerCase().includes(query),
   );
 }
 
