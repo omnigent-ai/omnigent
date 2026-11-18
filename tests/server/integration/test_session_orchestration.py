@@ -2510,7 +2510,7 @@ async def test_siblings_are_private_roots_and_owner_only_in_lists(
     assert expanded.json()["page_boundary"]["id"] == sibling_id
     # Filtering a cursor side chat must not move the boundary into appended family context.
     from omnigent.server.auth import LEVEL_OWNER
-    from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY
+    from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, pinned_label_key
 
     with monkeypatch.context() as clock:
         clock.setattr(
@@ -2540,13 +2540,13 @@ async def test_siblings_are_private_roots_and_owner_only_in_lists(
         f"/v1/sessions/{sibling_id}", json={"labels": {"omnigent.pinned": "1"}}
     )
     assert pinned.status_code == 200, pinned.text
+    assert store.get_conversation(sibling_id).labels[pinned_label_key("alice")] == "1"
+    assert not pinned.json()["family"]["pinned"]
     for expand in (False, True):
         pinned_page = await auth_client.get(
             "/v1/sessions", params={"pinned": True, "expand_families": expand}
         )
-        assert {row["id"] for row in pinned_page.json()["data"]} == (
-            {source["id"], sibling_id} if expand else {sibling_id}
-        )
+        assert pinned_page.json()["data"] == []
     ids = []
     after = None
     while True:
