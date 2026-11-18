@@ -6628,10 +6628,23 @@ async def _launch_runner_on_host_impl(
             # waiting on this lock, doesn't take it for its result.
             return _move_in_progress_attempt(fresh.runner_id or "")
         last = _relaunch_last_attempt.get(conv.id)
+        # Recovery can rotate the binding without launching it. Ordinary input
+        # needs its own admission after that recovery is cancelled.
+        retry_cancelled_recovery = (
+            recovery is None
+            and last is not None
+            and last.runner_id == fresh.runner_id
+            and last.error_code == "recovery_cancelled"
+        )
         # A waiter may already have read the active flight's replacement binding.
-        if last is not None and last is not previous_attempt and last.runner_id == fresh.runner_id:
+        if (
+            not retry_cancelled_recovery
+            and last is not None
+            and last is not previous_attempt
+            and last.runner_id == fresh.runner_id
+        ):
             return last
-        if fresh.runner_id and fresh.runner_id != conv.runner_id:
+        if not retry_cancelled_recovery and fresh.runner_id and fresh.runner_id != conv.runner_id:
             if last is not None and last.runner_id == fresh.runner_id:
                 return last
             return _HostLaunchAttempt(runner_id=fresh.runner_id)

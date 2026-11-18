@@ -4452,6 +4452,80 @@ async def test_relaunch_stops_the_superseded_runner(
 
 
 @pytest.mark.parametrize(
+    "cancel_after_rotation,snapshot_after_rotation",
+    [(False, False), (True, False), (True, True)],
+    ids=["before-binding", "after-binding-old-snapshot", "after-binding-new-snapshot"],
+)
+async def test_ordinary_launch_retries_cancelled_recovery(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    cancel_after_rotation: bool,
+    snapshot_after_rotation: bool,
+) -> None:
+    from omnigent.db.utils import now_epoch
+    from omnigent.server.routes._sessions.helpers import _launch_runner_on_host_impl
+    from omnigent.session_recovery import SessionRecovery
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    store = SqlAlchemyConversationStore(db_uri)
+    original = store.get_conversation(session["id"])
+    intent = SessionRecovery(_HOST_ID, original.runner_id, now_epoch(), phase="launching")
+    assert store.replace_session_recovery(original.id, None, intent)
+    entered, ordinary_entered = asyncio.Event(), asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    checks = 0
+
+    def allowed() -> bool:
+        nonlocal checks
+        checks += 1
+        if checks == (2 if cancel_after_rotation else 1):
+            loop.call_soon_threadsafe(entered.set)
+            assert release.wait(timeout=budget(10.0))
+            return False
+        return True
+
+    registry = app.state.host_registry
+    connection = registry.get(_HOST_ID)
+    recovery = asyncio.create_task(
+        _launch_runner_on_host_impl(
+            original, store, registry, connection, recovery=intent, recovery_allowed=allowed
+        )
+    )
+    ordinary = responder = None
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=budget(5.0))
+        snapshot = store.get_conversation(original.id) if snapshot_after_rotation else original
+
+        async def launch_ordinary() -> Any:
+            ordinary_entered.set()
+            return await _launch_runner_on_host_impl(snapshot, store, registry, connection)
+
+        ordinary = asyncio.create_task(launch_ordinary())
+        await asyncio.wait_for(ordinary_entered.wait(), timeout=budget(5.0))
+        responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+        release.set()
+        cancelled, result, frame = await asyncio.wait_for(
+            asyncio.gather(recovery, ordinary, responder), timeout=budget(10.0)
+        )
+        assert cancelled.error_code == "recovery_cancelled"
+        assert result.acknowledged and result.error_code is None
+        assert not frame.recovery
+        assert result.runner_id == token_bound_runner_id(frame.binding_token)
+        assert store.get_conversation(original.id).runner_id == result.runner_id
+    finally:
+        release.set()
+        tasks = [task for task in (recovery, ordinary, responder) if task is not None]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=budget(5.0))
+
+
+@pytest.mark.parametrize(
     "snapshot_after_rotation", [False, True], ids=["old-binding", "new-binding"]
 )
 async def test_concurrent_relaunches_are_single_flight(
