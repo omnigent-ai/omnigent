@@ -713,7 +713,7 @@ function loadNavigationHarness({
   const source =
     fs.readFileSync(mainPath, "utf8") +
     "\nmodule.exports.sshHosts = sshHosts;" +
-    "\nmodule.exports.windowHelpers = { activeWindow, mainWindows };" +
+    "\nmodule.exports.panelTestApi = { activeWindow, mainWindows, enqueueDeepLink };" +
     "\nmodule.exports.testApi = { handleDeepLink, buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, setBlockedHintDelayMs: (ms) => { blockedHintDelayMs = ms; }, blockedHintDelayMs: () => blockedHintDelayMs, setServerResponseTimeoutMs: (ms) => { serverResponseTimeoutMs = ms; }, serverResponseTimeoutMs: () => serverResponseTimeoutMs, cancelReconnect };";
   const module = { exports: {} };
   const sandbox = {
@@ -746,7 +746,7 @@ function loadNavigationHarness({
 
   vm.runInNewContext(source, sandbox, { filename: mainPath });
   const api = module.exports.testApi;
-  Object.assign(api, module.exports.windowHelpers);
+  Object.assign(api, module.exports.panelTestApi);
   api.windows.set(win, {
     origin: new URL(serverUrl).origin,
     serverUrl,
@@ -2875,7 +2875,16 @@ describe("panel windows", () => {
     t.after(h.cleanup);
     h.api.createWindow("https://host.example/ml/omnigents", {
       role: "panel",
-      windowOptions: { type: "panel", width: 560, height: 300 },
+      windowOptions: {
+        type: "panel",
+        width: 560,
+        height: 300,
+        webPreferences: {
+          preload: "/tmp/other.js",
+          contextIsolation: false,
+          nodeIntegration: true,
+        },
+      },
     });
     h.electron.BrowserWindow.getFocusedWindow = () => h.win;
     assert.equal(h.api.windows.get(h.win).role, "panel");
@@ -2888,7 +2897,9 @@ describe("panel windows", () => {
     assert.equal(options.width, 560);
     assert.equal(options.minWidth, undefined);
     assert.equal(options.titleBarStyle, undefined);
+    assert.match(options.webPreferences.preload, /src[\\/]preload\.js$/);
     assert.equal(options.webPreferences.contextIsolation, true);
+    assert.equal(options.webPreferences.nodeIntegration, false);
     assert.equal(h.calls.overlays, undefined);
     h.emitWindow("close");
     assert.equal(savedBounds(h), undefined);
@@ -3717,6 +3728,29 @@ describe("deep links with a panel open", () => {
     );
     assert.deepEqual(panelSends, []);
   });
+
+  for (const [mainOpen, opensDefault] of [
+    [false, true],
+    [true, false],
+  ]) {
+    const when = mainOpen ? "a main window is still open" : "only a panel and a utility window are";
+    it(`${opensDefault ? "open" : "don't open"} the default window after a cancelled link when ${when}`, async (t) => {
+      const h = loadNavigationHarness({
+        deepLinks: { ...require("../src/deepLink"), acceptCliDeepLink: async () => false },
+      });
+      t.after(h.cleanup);
+      if (!mainOpen) h.api.windows.delete(h.win);
+      const panel = { isDestroyed: () => false };
+      h.api.windows.set(panel, { origin: "https://host.example", role: "panel" });
+      // The utility window (a find bar, About) isn't in the window map.
+      h.electron.BrowserWindow.getAllWindows = () => [panel, { isDestroyed: () => false }];
+      h.electron.app.isReady = () => true;
+      const built = h.calls.windowOptions?.length ?? 0;
+      h.api.enqueueDeepLink("omnigent://localhost:6767/");
+      await new Promise(setImmediate);
+      assert.equal((h.calls.windowOptions?.length ?? 0) - built, opensDefault ? 1 : 0);
+    });
+  }
 });
 
 describe("deep-link ingestion wiring (src/main.js)", () => {

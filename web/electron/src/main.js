@@ -6123,10 +6123,8 @@ function drainPendingDeepLinks() {
       deepLinkInFlight = false;
       if (pendingDeepLinks.length > 0) {
         drainPendingDeepLinks();
-      } else if (
-        BrowserWindow.getAllWindows().every((win) => windows.has(win) && !isMainWindow(win))
-      ) {
-        // A cancelled consent at cold start left no window (a panel doesn't count) — open the default.
+      } else if (mainWindows().length === 0) {
+        // A cancelled consent at cold start left no main window — open the default.
         createWindow();
       }
     });
