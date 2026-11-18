@@ -12,6 +12,7 @@ import sysconfig
 import time
 import venv
 from collections.abc import Awaitable, Callable
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -673,10 +674,16 @@ def test_relative_config_dir_provenance_uses_session_cwd(
         launch = Mock(return_value=str(launcher))
         monkeypatch.setattr(claude, "create_exec_launcher", launch)
         spec = OSEnvSpec(cwd=".", sandbox=OSEnvSandboxSpec(type="linux_bwrap"))
-        prepared = claude.prepare_claude_cli_path("/bin/claude", spec, worker_env=dict(env))
+        prepared = claude.prepare_claude_cli_path(
+            "/bin/claude",
+            spec,
+            worker_env=dict(env),
+            response_header_timeout_seconds=75.5,
+        )
         try:
             access = prepared.model_access
             assert access is not None
+            assert access.response_header_timeout_seconds == 75.5
             assert prepared.sandbox is not None
             assert config in (prepared.sandbox.credential_source_paths or [])
         finally:
@@ -786,6 +793,137 @@ async def _start_model_upstream(
     monkeypatch.setattr(asyncio, "open_connection", connect)
     monkeypatch.setattr(EgressProxy, "_assert_destination_allowed", allow_destination)
     return cert, key, bundle, upstream
+
+
+def _response_relay(tmp_path: Path, **timeouts: float) -> _ClaudeRelay:
+    cert, key = ensure_ca(cache_dir=tmp_path)
+    bundle = ensure_ca_bundle(cert, cache_dir=tmp_path)
+    access = ClaudeModelAccess(
+        "https://model.test/gateway", "x-api-key", lambda: "parent-only-key", **timeouts
+    )
+    relay = access.create_proxy([], cert, key, upstream_ca_bundle=bundle)
+    assert isinstance(relay, _ClaudeRelay)
+    return relay
+
+
+@pytest.mark.parametrize(
+    "deadline_field",
+    (
+        "response_header_timeout_seconds",
+        "response_idle_timeout_seconds",
+        "response_total_timeout_seconds",
+    ),
+)
+def test_changed_relay_deadline_restarts_warm_helper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, deadline_field: str
+) -> None:
+    from omnigent.inner.os_env import _HelperProcessClient
+
+    sandbox = SandboxPolicy("linux_bwrap", True, [tmp_path], [tmp_path], [], False)
+    monkeypatch.setattr(ClaudeModelAccess, "protect_sources", lambda self, policy, cwd: policy)
+    helper = _HelperProcessClient(cwd=tmp_path, shell_path="/bin/sh", sandbox=sandbox)
+    stop = Mock()
+    monkeypatch.setattr(helper, "_stop_locked", stop)
+    access = ClaudeModelAccess("https://model.test", "x-api-key", lambda: "first")
+    try:
+        helper.isolate_model_credentials(access)
+        helper.isolate_model_credentials(replace(access, credential=lambda: "rotated"))
+        assert stop.call_count == 1
+
+        changed = replace(access, **{deadline_field: 75.0})
+        helper.isolate_model_credentials(changed)
+        assert stop.call_count == 2
+        assert helper._model_access is changed
+        with pytest.raises(ValueError, match="unchanged authority"):
+            access._adopt_credential(changed)
+    finally:
+        helper.close()
+
+
+async def test_relay_waits_for_headers_beyond_signer_idle_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("omnigent.inner.model_signer_service._RESPONSE_IDLE_TIMEOUT_SECONDS", 0.01)
+    relay = _response_relay(tmp_path)
+    upstream = asyncio.StreamReader()
+    output = bytearray()
+    downstream = SimpleNamespace(write=output.extend, drain=AsyncMock())
+
+    async def send_response() -> None:
+        await asyncio.sleep(0.03)
+        upstream.feed_data(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+        upstream.feed_eof()
+
+    sender = asyncio.create_task(send_response())
+    try:
+        relayed, status, keep_alive = await asyncio.wait_for(
+            relay._relay_response_observing_status(upstream, downstream), timeout=1
+        )
+    finally:
+        await sender
+    assert (relayed, status, keep_alive) == (len(output), 200, True)
+    assert output.endswith(b"\r\n\r\n{}")
+
+
+async def test_relay_stream_survives_signer_total_and_idle_limits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("omnigent.inner.model_signer_service._RESPONSE_IDLE_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(
+        "omnigent.inner.model_signer_service._RESPONSE_TOTAL_TIMEOUT_SECONDS", 0.04
+    )
+    relay = _response_relay(tmp_path)
+    upstream = asyncio.StreamReader()
+    upstream.feed_data(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n"
+    )
+    output = bytearray()
+    downstream = SimpleNamespace(write=output.extend, drain=AsyncMock())
+
+    async def send_stream() -> None:
+        for chunk in (b"5\r\nhello\r\n", b"5\r\nworld\r\n", b"0\r\n\r\n"):
+            await asyncio.sleep(0.025)
+            upstream.feed_data(chunk)
+        upstream.feed_eof()
+
+    sender = asyncio.create_task(send_stream())
+    try:
+        relayed, status, keep_alive = await asyncio.wait_for(
+            relay._relay_response_observing_status(upstream, downstream), timeout=1
+        )
+    finally:
+        await sender
+    assert (relayed, status, keep_alive) == (len(output), 200, False)
+    assert output.endswith(b"\r\n\r\nhelloworld")
+
+
+async def test_relay_honors_explicit_short_header_deadline(tmp_path: Path) -> None:
+    relay = _response_relay(tmp_path, response_header_timeout_seconds=0.01)
+    output = bytearray()
+    downstream = SimpleNamespace(write=output.extend, drain=AsyncMock())
+
+    result = await asyncio.wait_for(
+        relay._relay_response_observing_status(asyncio.StreamReader(), downstream), timeout=1
+    )
+
+    assert result == (0, 0, False)
+    assert not output
+
+
+async def test_relay_bounds_downstream_backpressure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("omnigent.inner.claude_model_access._RESPONSE_WRITE_TIMEOUT_SECONDS", 0.01)
+    relay = _response_relay(tmp_path)
+    upstream = asyncio.StreamReader()
+    upstream.feed_data(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+    upstream.feed_eof()
+    downstream = SimpleNamespace(write=Mock(), drain=lambda: asyncio.Future())
+
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(
+            relay._relay_response_observing_status(upstream, downstream), timeout=1
+        )
 
 
 async def test_inference_works_without_rules_and_broad_rules_cannot_bypass_signing(

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import math
 import os
 import re
 import secrets
@@ -14,9 +15,11 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Collection, Mapping, MutableMapping, Sequence
+from collections.abc import Awaitable, Callable, Collection, Mapping, MutableMapping, Sequence
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import TypeVar, cast
 from urllib.parse import urlsplit
 
 from omnigent.databricks_ai_gateway import (
@@ -77,6 +80,9 @@ _ALTERNATE_TRANSPORT_FLAGS = (
 _BETA = re.compile(r"[a-z0-9][a-z0-9.-]{0,100}(?:,[a-z0-9][a-z0-9.-]{0,100})*\Z")
 # Match the Messages API request limit so attachments the provider accepts still pass.
 _MAX_REQUEST_BODY_BYTES = 32 * 1024 * 1024
+_DEFAULT_RESPONSE_HEADER_TIMEOUT_SECONDS = 150.0
+_RESPONSE_WRITE_TIMEOUT_SECONDS = 60.0
+_T = TypeVar("_T")
 
 
 def _is_claude_credential_env_name(name: str) -> bool:
@@ -277,7 +283,7 @@ class _CredentialResolver:
 class ClaudeModelAccess:
     """Trusted authority, never serialized into a sandbox policy or launcher.
 
-    Equality covers the endpoint and credential sources, not per-instance secrets.
+    Equality covers the endpoint, credential sources, and relay deadlines, not secrets.
     """
 
     base_url: str
@@ -290,10 +296,21 @@ class ClaudeModelAccess:
     )
     auth_executable: _TrustedExecutable | None = field(default=None, repr=False)
     source_env_names: frozenset[str] = frozenset()
+    response_header_timeout_seconds: float | None = _DEFAULT_RESPONSE_HEADER_TIMEOUT_SECONDS
+    response_idle_timeout_seconds: float | None = None
+    response_total_timeout_seconds: float | None = None
     _attribution_headers: tuple[tuple[str, str], ...] = field(init=False, default=(), repr=False)
     _credential_resolver: _CredentialResolver = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
+        for name in (
+            "response_header_timeout_seconds",
+            "response_idle_timeout_seconds",
+            "response_total_timeout_seconds",
+        ):
+            value = getattr(self, name)
+            if value is not None and (not math.isfinite(value) or value <= 0):
+                raise ValueError(f"{name} must be a positive finite number or None")
         parsed = urlsplit(self.base_url)
         if (
             parsed.scheme != "https"
@@ -332,7 +349,9 @@ class ClaudeModelAccess:
 
     def _adopt_credential(self, access: ClaudeModelAccess) -> None:
         if self != access:
-            raise ValueError("model credential replacement requires unchanged authority")
+            raise ValueError(
+                "model credential replacement requires unchanged authority and policy"
+            )
         self._credential_resolver.replace(access._credential_resolver)
 
     @property
@@ -582,6 +601,17 @@ class _ClaudeCredential:
             self._until = 0
 
 
+class _BoundedResponseWriter:
+    def __init__(self, writer: asyncio.StreamWriter) -> None:
+        self._writer = writer
+
+    def write(self, data: bytes) -> None:
+        self._writer.write(data)
+
+    async def drain(self) -> None:
+        await asyncio.wait_for(self._writer.drain(), timeout=_RESPONSE_WRITE_TIMEOUT_SECONDS)
+
+
 class _ClaudeRelay(_SignerRelay):
     def __init__(
         self,
@@ -606,6 +636,9 @@ class _ClaudeRelay(_SignerRelay):
             provider_port=None,
         )
         self._access = access
+        self._response_headers_complete: ContextVar[bool] = ContextVar(
+            "claude_response_headers_complete", default=False
+        )
         self._rules = [
             *rules,
             *parse_rules(
@@ -633,6 +666,47 @@ class _ClaudeRelay(_SignerRelay):
 
     def _allows_http2_passthrough(self, host: str) -> bool:
         return host.lower() != self._access.host and super()._allows_http2_passthrough(host)
+
+    async def _relay_response_observing_status(
+        self,
+        upstream_reader: asyncio.StreamReader,
+        client_writer: asyncio.StreamWriter,
+    ) -> tuple[int, int, bool]:
+        token = self._response_headers_complete.set(False)
+        try:
+            writer = cast(asyncio.StreamWriter, _BoundedResponseWriter(client_writer))
+            return await super()._relay_response_observing_status(upstream_reader, writer)
+        finally:
+            self._response_headers_complete.reset(token)
+
+    def _observe_upstream_status(self, status: int) -> None:
+        super()._observe_upstream_status(status)
+        self._response_headers_complete.set(True)
+
+    async def _read_response_part(self, awaitable: Awaitable[_T], *, started: float) -> _T:
+        limits: list[float] = []
+        if self._response_headers_complete.get():
+            if self._access.response_idle_timeout_seconds is not None:
+                limits.append(self._access.response_idle_timeout_seconds)
+            if self._access.response_total_timeout_seconds is not None:
+                limits.append(
+                    self._access.response_total_timeout_seconds
+                    - (asyncio.get_running_loop().time() - started)
+                )
+        elif self._access.response_header_timeout_seconds is not None:
+            limits.append(
+                self._access.response_header_timeout_seconds
+                - (asyncio.get_running_loop().time() - started)
+            )
+        if not limits:
+            return await awaitable
+        timeout = min(limits)
+        if timeout <= 0:
+            close = getattr(awaitable, "close", None)
+            if close is not None:
+                close()
+            raise TimeoutError
+        return await asyncio.wait_for(awaitable, timeout=timeout)
 
     def _parse_tunnel_request_line(self, host: str, raw: bytes) -> tuple[str, str]:
         if host.lower() == self._access.host:

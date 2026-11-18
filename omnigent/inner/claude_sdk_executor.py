@@ -2069,6 +2069,7 @@ def prepare_claude_cli_path(
     databricks_profile: str | None = None,
     user_settings_source_paths: tuple[pathlib.Path, ...] = (),
     user_settings_has_api_key_helper: bool = False,
+    response_header_timeout_seconds: float | None = None,
 ) -> PreparedClaudeCli:
     """Contain the whole Claude CLI when the agent requires a sandbox.
 
@@ -2130,6 +2131,10 @@ def prepare_claude_cli_path(
             model_access = replace(
                 model_access,
                 source_paths=(*model_access.source_paths, *user_settings_source_paths),
+            )
+        if response_header_timeout_seconds is not None:
+            model_access = replace(
+                model_access, response_header_timeout_seconds=response_header_timeout_seconds
             )
         model_access = model_access.with_bundle_sources(bundle_dir)
         sandbox = model_access.protect_sources(sandbox, cwd)
@@ -2720,6 +2725,12 @@ class ClaudeSDKExecutor(Executor):
                     databricks_profile=self._databricks_profile if self._gateway else None,
                     user_settings_source_paths=user_settings_source_paths,
                     user_settings_has_api_key_helper=user_settings_has_api_key_helper,
+                    # The CLI owns its header deadline; allow the relay scheduling grace.
+                    response_header_timeout_seconds=(
+                        self._retry_policy.timeout_per_request_s + 30.0
+                        if self._retry_policy.timeout_per_request_s is not None
+                        else None
+                    ),
                     request_body_transform=gateway_body_transform(
                         self._extra_env["ANTHROPIC_BASE_URL"]
                     )

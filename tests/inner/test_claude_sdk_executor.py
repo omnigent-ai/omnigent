@@ -2771,6 +2771,23 @@ async def test_retry_policy_reaches_cli_options() -> None:
     assert "ANTHROPIC_REQUEST_TIMEOUT_SECONDS" not in options.env
 
 
+def test_sandboxed_retry_policy_reaches_relay_header_deadline(monkeypatch) -> None:
+    from omnigent.inner import claude_sdk_executor as claude
+    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.spec.types import RetryPolicy
+
+    monkeypatch.setattr(claude, "_find_system_claude", lambda: "/bin/claude")
+    prepare = Mock(return_value=claude.PreparedClaudeCli("/bin/wrapped", True, sandboxed=True))
+    monkeypatch.setattr(claude, "prepare_claude_cli_path", prepare)
+
+    executor = claude.ClaudeSDKExecutor(
+        os_env=OSEnvSpec(), retry_policy=RetryPolicy(timeout_per_request_s=45.5)
+    )
+
+    assert executor._extra_env["API_TIMEOUT_MS"] == "45500"
+    assert prepare.call_args.kwargs["response_header_timeout_seconds"] == 75.5
+
+
 async def test_turn_without_output_cap_keeps_cli_defaults() -> None:
     options = await _turn_options(_default_executor())
 
