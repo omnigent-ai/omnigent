@@ -8,6 +8,7 @@ import contextlib
 import errno
 import json
 import logging
+import threading
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
@@ -1955,6 +1956,175 @@ def test_shell_wait_timeout_and_cancellation_do_not_consume_followup(
     assert _FakeCodexNativeClient.requests[-1][0] == "turn/start"
     settled = read_bridge_state(tmp_path)
     assert settled is not None and settled.active_shell_turn_id is None
+
+
+@pytest.mark.parametrize("operation", ["read", "reconcile"])
+@pytest.mark.parametrize("cancel_wait", [False, True], ids=["timeout", "cancel"])
+@pytest.mark.parametrize("require_idle", [True, False], ids=["followup", "accepted-shell"])
+async def test_shell_wait_slow_metadata_remains_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    operation: str,
+    cancel_wait: bool,
+    require_idle: bool,
+) -> None:
+    """A stalled state file cannot freeze cancellation or extend the shell wait."""
+    _seed_bridge(tmp_path)
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    state = replace(state, pending_shell_command_id="pending-shell")
+    write_bridge_state(tmp_path, state)
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    holds: list[None] = []
+    original_read = Path.read_text
+    original_write = codex_native_executor.reconcile_shell_command_state
+
+    def hold() -> None:
+        holds.append(None)
+        started.set()
+        assert release.wait(5), "test did not release shell metadata"
+
+    def read(path: Path, *args: Any, **kwargs: Any) -> str:
+        if operation == "read" and path == tmp_path / "state.json":
+            hold()
+        try:
+            return original_read(path, *args, **kwargs)
+        finally:
+            if operation == "read" and path == tmp_path / "state.json":
+                finished.set()
+
+    def reconcile(*args: Any, **kwargs: Any) -> None:
+        hold()
+        try:
+            original_write(*args, **kwargs)
+        finally:
+            finished.set()
+
+    class FenceClient(_FakeCodexNativeClient):
+        requests = []
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            type(self).requests.append((method, params))
+            assert method == "turn/steer" and params["input"] == []
+            raise CodexAppServerResponseError(
+                {"code": -32600, "message": "no active turn to steer"}
+            )
+
+    monkeypatch.setattr(Path, "read_text", read)
+    if operation == "reconcile":
+        monkeypatch.setattr(codex_native_executor, "reconcile_shell_command_state", reconcile)
+    monkeypatch.setattr(codex_native_executor, "_SHELL_RECONCILIATION_RPC_SECONDS", 0.05)
+    guard = threading.Timer(3, release.set)
+    guard.start()
+    task = asyncio.create_task(
+        codex_native_executor._wait_for_shell_completion(
+            FenceClient(), tmp_path, state, wait_seconds=0.5, require_idle=require_idle
+        )
+    )
+    try:
+        assert await asyncio.to_thread(started.wait, 2)
+        assert not release.is_set(), "shell metadata blocked the runner event loop"
+        if cancel_wait:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, 1)
+        elif require_idle:
+            with pytest.raises(codex_native_executor._CodexNativeInputUndelivered) as failure:
+                await asyncio.wait_for(task, 1)
+            assert failure.value.failure.code == "codex_shell_busy"
+        else:
+            assert await asyncio.wait_for(task, 1) == state
+        assert not finished.is_set()
+        assert len(holds) == 1, "a held metadata operation was retried on another worker"
+        requests = list(FenceClient.requests)
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 2)
+        await asyncio.sleep(0)
+        assert FenceClient.requests == requests
+        assert all(params["input"] == [] for _, params in requests)
+    finally:
+        release.set()
+        guard.cancel()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_shell_wait_observes_completion_during_its_final_poll(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A shell turn that ends during the last poll interval releases the waiting prompt."""
+    _seed_bridge(tmp_path, active_turn_id="turn_shell")
+    seeded = read_bridge_state(tmp_path)
+    assert seeded is not None
+    state = replace(seeded, active_shell_turn_id="turn_shell")
+    write_bridge_state(tmp_path, state)
+    monkeypatch.setattr(codex_native_executor, "_SHELL_TURN_POLL_SECONDS", 0.5)
+
+    class _FinishingShellClient(_FakeCodexNativeClient):
+        native_active_turn_id = "turn_shell"
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            asyncio.get_running_loop().call_later(
+                0.25, clear_active_turn_id_if_matches, tmp_path, "turn_shell"
+            )
+            return await super().request(method, params)
+
+    settled = await codex_native_executor._wait_for_shell_completion(
+        _FinishingShellClient(), tmp_path, state, wait_seconds=0.5
+    )
+
+    assert settled.active_turn_id is None and settled.active_shell_turn_id is None
+
+
+async def test_shell_marker_outlasts_idle_fence_before_its_turn_starts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Codex can report no active turn before it starts an acknowledged shell turn."""
+    _FakeCodexNativeClient.requests = []
+
+    class _LateShellClient(_FakeCodexNativeClient):
+        shell_queued = False
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            try:
+                return await super().request(method, params)
+            finally:
+                if method == "thread/shellCommand":
+                    type(self).shell_queued = True
+                elif type(self).shell_queued and params.get("input") == []:
+                    type(self).shell_queued = False
+                    type(self).native_active_turn_id = "turn_shell"
+                    update_active_turn_id(tmp_path, "turn_shell")
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _LateShellClient
+    )
+    monkeypatch.setattr(codex_native_executor, "_SHELL_TURN_WAIT_SECONDS", 0.1)
+    monkeypatch.setattr(codex_native_executor, "_SHELL_TURN_POLL_SECONDS", 0.01)
+    _seed_bridge(tmp_path)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    async def collect(text: str) -> list[Any]:
+        return [
+            event async for event in executor.run_turn([{"role": "user", "content": text}], [], "")
+        ]
+
+    with native_shell_authorization("sleep 1"):
+        assert [type(event) for event in await collect("!sleep 1")] == [TurnComplete]
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.pending_shell_command_id is not None
+
+    followup = asyncio.create_task(collect("and then?"))
+    await asyncio.sleep(0.05)
+    assert not followup.done()
+    _LateShellClient.native_active_turn_id = None
+    clear_active_turn_id_if_matches(tmp_path, "turn_shell")
+    assert [type(event) for event in await asyncio.wait_for(followup, 2)] == [TurnComplete]
+    assert [
+        method for method, params in _FakeCodexNativeClient.requests if params.get("input") != []
+    ] == ["thread/shellCommand", "turn/start"]
 
 
 @pytest.mark.parametrize(
