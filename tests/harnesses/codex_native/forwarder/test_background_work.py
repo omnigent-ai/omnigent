@@ -406,7 +406,7 @@ async def test_goal_stopped_by_a_limit_fails_the_session_once(
     assert client.posts == [
         _background_work_post(True),
         _background_work_post(False),
-        _failed_status_post(output),
+        _failed_status_post(output, response_id="codex_turn_1"),
     ]
 
 
@@ -568,7 +568,14 @@ async def test_turn_completion_after_a_goal_limit_keeps_the_failure(
     ]
     assert statuses == [
         _background_work_post(False),
-        _failed_status_post("Codex stopped the goal: token budget reached."),
+        _failed_status_post(
+            "Codex stopped the goal: token budget reached.",
+            **(
+                {"response_id": "codex_turn_1"}
+                if turn_id == "present" or start_seen or delta == "item"
+                else {}
+            ),
+        ),
     ]
     bridge_state = read_bridge_state(tmp_path)
     assert bridge_state is None or bridge_state.active_turn_id is None
@@ -656,7 +663,9 @@ async def test_reconnect_reading_a_stopped_goal_still_fails_on_its_notification(
 
     assert client.posts == [
         _background_work_post(False),
-        _failed_status_post("Codex stopped the goal: token budget reached."),
+        _failed_status_post(
+            "Codex stopped the goal: token budget reached.", response_id="codex_turn_1"
+        ),
         # The failure cleared the server's terminal list, so the turn's listing resends it.
         _background_work_post(None, []),
     ]

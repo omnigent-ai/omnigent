@@ -206,6 +206,7 @@ class _ChildAcceptanceRequest:
     settled_response_ids: set[str] = dataclasses.field(default_factory=set)
     started_response_ids: set[str] = dataclasses.field(default_factory=set)
     unidentified_settlement: bool = False
+    unidentified_settlement_work_ids: set[str | None] = dataclasses.field(default_factory=set)
     finished: bool = False
 
 
@@ -410,6 +411,8 @@ def finish_subagent_child_acceptance(request: _ChildAcceptanceRequest) -> None:
     request.finished = True
     request.settled_response_ids.clear()
     request.started_response_ids.clear()
+    request.unidentified_settlement = False
+    request.unidentified_settlement_work_ids.clear()
 
 
 def note_subagent_child_start_reported(
@@ -447,9 +450,11 @@ def note_subagent_child_turn_settled(
     """Settle only matching evidence; stale receipts live no longer than pending requests."""
     if not response_id or not response_id.startswith("codex_") or response_id == "codex_":
         response_id = None
+    entry = _subagent_work_by_child.get(child_session_id)
     for request in _pending_child_acceptances.get(child_session_id, ()):
         if response_id is None:
             request.unidentified_settlement = True
+            request.unidentified_settlement_work_ids.add(entry.work_id if entry else None)
         else:
             request.settled_response_ids.add(response_id)
             request.started_response_ids.discard(response_id)
@@ -460,7 +465,6 @@ def note_subagent_child_turn_settled(
         accepted is not None and accepted.acceptance.response_id == response_id
     ):
         _children_accepted_turns.pop(child_session_id, None)
-    entry = _subagent_work_by_child.get(child_session_id)
     if (
         entry is not None
         and response_id is not None
@@ -528,7 +532,13 @@ def arm_subagent_child_start_timeout(
     ):
         return
     entry = _subagent_work_by_child.get(child_session_id)
-    if request.unidentified_settlement:
+    # An unidentified edge settles the tracked work, not an identified replacement.
+    # Without a tracked work boundary, retain the conservative exemption.
+    if request.unidentified_settlement and (
+        entry is None
+        or None in request.unidentified_settlement_work_ids
+        or entry.work_id in request.unidentified_settlement_work_ids
+    ):
         _children_accepted_turns.pop(child_session_id, None)
         if entry is not None:
             entry.awaiting_child_start_since = None

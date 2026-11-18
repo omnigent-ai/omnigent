@@ -110,6 +110,9 @@ from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from tests._helpers.polling import poll_until_async
 from tests._helpers.providers import isolate_provider_resolution
 from tests.runner.conftest import (
+    _BlockingHarnessClient as _RecoveryBlockingHarnessClient,
+)
+from tests.runner.conftest import (
     _FakeProcessManager as _RecoveryFakeProcessManager,
 )
 from tests.runner.conftest import (
@@ -14068,11 +14071,22 @@ async def test_named_send_adopts_busy_child_as_running_not_launching(
         assert inbox.empty()
 
 
-@pytest.mark.parametrize("drain_during_post", [False, True])
+@pytest.mark.parametrize(
+    ("drain_during_post", "delayed_failure"),
+    [
+        pytest.param(False, None, id="False"),
+        pytest.param(True, None, id="True"),
+        pytest.param(False, "unidentified", id="retained-unidentified-failure"),
+        pytest.param(True, "unidentified", id="drained-unidentified-failure"),
+        pytest.param(False, "identified", id="retained-identified-failure"),
+        pytest.param(True, "identified", id="drained-identified-failure"),
+    ],
+)
 @pytest.mark.asyncio
 async def test_named_send_registers_fresh_when_tracked_turn_already_ended(
     monkeypatch: pytest.MonkeyPatch,
     drain_during_post: bool,
+    delayed_failure: str | None,
 ) -> None:
     """The busy→ended race registers a fresh entry, not the drained one.
 
@@ -14091,9 +14105,34 @@ async def test_named_send_registers_fresh_when_tracked_turn_already_ended(
     stamped: list[str] = []
     event_posts: list[dict[str, Any]] = []
     create_posts: list[int] = []
+    parent_wakes: list[str] = []
+    pending_requests: list[subagent_work._ChildAcceptanceRequest] = []
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    delivery_gate = asyncio.Event()
+    acceptance = NativeTurnAcceptance(child_id, "thread_fresh", "codex_fresh")
+    harness = _RecoveryBlockingHarnessClient(
+        [
+            'data: {"type":"response.created","response":{"id":"resp_fresh"}}\n\n',
+            "data: "
+            + json.dumps(
+                {
+                    "type": "response.completed",
+                    "response": {"id": "resp_fresh", "status": "completed"},
+                    "native_acceptance": {
+                        "session_id": acceptance.session_id,
+                        "thread_id": acceptance.thread_id,
+                        "response_id": acceptance.response_id,
+                    },
+                }
+            )
+            + "\n\n",
+        ],
+        delivery_gate,
+    )
 
     monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
     monkeypatch.setattr(subagent_work, "register_child_session", lambda *a, **k: None)
+    monkeypatch.setattr(subagent_work.time, "time", lambda: 5000.0)
 
     # A stale entry from the turn that just ended: terminal and already delivered.
     stale = subagent_work.register_subagent_work(
@@ -14102,6 +14141,10 @@ async def test_named_send_registers_fresh_when_tracked_turn_already_ended(
     stale.status = "completed"
     stale.delivered = True
     stale_work_id = stale.work_id
+    if delayed_failure:
+        stale.status = "running"
+        stale.delivered = False
+        subagent_work.note_subagent_child_start_reported(child_id, response_id="codex_previous")
 
     base_handler = _running_child_server_handler(
         parent_id,
@@ -14113,6 +14156,41 @@ async def test_named_send_registers_fresh_when_tracked_turn_already_ended(
     )
 
     async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == f"/v1/sessions/{parent_id}/events":
+            parent_wakes.append(json.loads(request.content)["data"]["content"][0]["text"])
+            return httpx.Response(202, json={"queued": True})
+        if (
+            delayed_failure
+            and request.method == "POST"
+            and request.url.path == f"/v1/sessions/{child_id}/events"
+        ):
+            response = await client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag_child",
+                    "model": "test-agent",
+                    "harness_override": "codex-native",
+                    "content": [{"type": "input_text", "text": "Continue the merge."}],
+                },
+            )
+            assert response.status_code == 202, response.text
+            await asyncio.wait_for(harness.post_seen.wait(), timeout=5.0)
+            pending_requests.extend(subagent_work._pending_child_acceptances[child_id])
+            assert len(pending_requests) == 1
+            failure = {"status": "failed", "output": "Previous goal failed."}
+            if delayed_failure == "identified":
+                failure["response_id"] = "codex_previous"
+            response = await client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={"type": "external_session_status", "data": failure},
+            )
+            assert response.status_code == 204, response.text
+            assert stale.status == "failed"
+            assert stale.delivered
+            await poll_until_async(lambda: len(parent_wakes) == 1, timeout_s=5.0)
+            assert inbox.get_nowait()["output"] == "Previous goal failed."
         if (
             drain_during_post
             and request.method == "POST"
@@ -14124,45 +14202,137 @@ async def test_named_send_registers_fresh_when_tracked_turn_already_ended(
             )
         return await base_handler(request)
 
-    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
     reaped: list[subagent_work._SubagentWorkEntry] = []
     # Codex accepts the new turn before the message POST returns to the parent, so the
     # acceptance lands while the stale entry is still the child's only record.
-    accept_subagent_turn(child_id, thread_id="thread_fresh", response_id="codex_fresh")
+    if not delayed_failure:
+        accept_subagent_turn(child_id, thread_id="thread_fresh", response_id="codex_fresh")
+    subagent_work._session_inboxes_ref[parent_id] = inbox
     try:
-        output = await _run_named_continuation(parent_id, handler)
-        work = subagent_work.get_subagent_work(child_id)
-        assert work is not None
-        # The child never reported running for the turn this steer started, so the
-        # acceptance recorded before registration must start its launch bound.
-        assert work.child_start_reported is False
-        assert work.awaiting_child_start_since is not None
-        assert work.native_acceptance is not None
-        assert work.native_acceptance.session_id == child_id
-        assert work.native_acceptance.thread_id == "thread_fresh"
-        assert work.native_acceptance.response_id == "codex_fresh"
-        assert work.delivered is False
-        subagent_work._session_inboxes_ref[parent_id] = inbox
-        reaped = subagent_work.reap_stalled_subagent_launches(
-            now=time.time() + 7200.0, timeout_s=180.0
-        )
-    finally:
-        subagent_work.unregister_subagent_work_for_session(child_id)
-        subagent_work._session_inboxes_ref.pop(parent_id, None)
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://server"
+        ) as server_client:
+            app = create_runner_app(
+                process_manager=_RecoveryFakeProcessManager(harness),  # type: ignore[arg-type]
+                server_client=server_client,
+            )
+            async with _runner_test_client(app) as client:
+                output = await _run_named_continuation(parent_id, handler)
+                work = subagent_work.get_subagent_work(child_id)
+                assert work is not None
+                if delayed_failure:
+                    assert work.native_acceptance is None
+                    assert work.awaiting_child_start_since is None
+                    assert not pending_requests[0].finished
+                    delivery_gate.set()
+                    await _await_bg_turn_task(child_id)
+                    assert pending_requests[0].finished
+                    assert not pending_requests[0].settled_response_ids
+                    assert not pending_requests[0].unidentified_settlement
+                    assert not pending_requests[0].unidentified_settlement_work_ids
+                    assert child_id not in subagent_work._pending_child_acceptances
+                # Acceptance may precede registration or finish after the previous
+                # turn's failure and replacement, but still bounds this silent turn.
+                assert work.child_start_reported is False
+                assert work.awaiting_child_start_since is not None
+                assert work.awaiting_child_start_since == 5000.0
+                assert work.native_acceptance is not None
+                assert work.native_acceptance.session_id == child_id
+                assert work.native_acceptance.thread_id == "thread_fresh"
+                assert work.native_acceptance.response_id == "codex_fresh"
+                assert work.delivered is False
+                if delayed_failure:
+                    response = await client.post(
+                        f"/v1/sessions/{parent_id}/events",
+                        json={
+                            "type": "message",
+                            "role": "user",
+                            "agent_id": "ag_parent",
+                            "model": "test-agent",
+                            "harness": "openai-agents",
+                            "content": [{"type": "input_text", "text": "Read the old failure."}],
+                        },
+                    )
+                    assert response.status_code == 202, response.text
+                    await _await_bg_turn_task(parent_id)
+                wakes_before_timeout = len(parent_wakes)
+                assert (
+                    subagent_work.reap_stalled_subagent_launches(now=5179.0, timeout_s=180.0) == []
+                )
+                reaped = subagent_work.reap_stalled_subagent_launches(
+                    now=5181.0,
+                    timeout_s=180.0,
+                    mark_terminal=app.state.mark_subagent_terminal_and_wake,
+                )
 
-    payload = json.loads(output)
-    assert payload["status"] == "running"
-    # A fresh entry is registered under a NEW dispatch id (not the drained one),
-    # in "running", so the new turn's completion has a live entry to deliver to.
-    assert len(stamped) == 1
-    assert work.work_id == stamped[0]
-    assert work.work_id != stale_work_id
-    assert len(event_posts) == 1
-    assert [entry.child_session_id for entry in reaped] == [child_id]
-    assert work.status == "failed"
-    notice = inbox.get_nowait()
-    assert notice["status"] == "failed"
-    assert "no turn start" in notice["output"]
+                payload = json.loads(output)
+                assert payload["status"] == "running"
+                # The replacement's dispatch id must own its eventual completion.
+                assert len(stamped) == 1
+                assert work.work_id == stamped[0]
+                assert work.work_id != stale_work_id
+                assert len(event_posts) == 1
+                assert [entry.child_session_id for entry in reaped] == [child_id]
+                assert work.status == "failed"
+                notice = inbox.get_nowait()
+                assert notice["status"] == "failed"
+                assert "no turn start" in notice["output"]
+                assert work.launch_timed_out
+                assert inbox.empty()
+                assert (
+                    subagent_work.reap_stalled_subagent_launches(now=9000.0, timeout_s=180.0) == []
+                )
+                await poll_until_async(
+                    lambda: len(parent_wakes) == wakes_before_timeout + 1, timeout_s=5.0
+                )
+                assert "finished (failed)" in parent_wakes[-1]
+                response = await client.post(
+                    f"/v1/sessions/{parent_id}/events",
+                    json={
+                        "type": "message",
+                        "role": "user",
+                        "agent_id": "ag_parent",
+                        "model": "test-agent",
+                        "harness": "openai-agents",
+                        "content": [
+                            {"type": "input_text", "text": "Read the provisional failure."}
+                        ],
+                    },
+                )
+                assert response.status_code == 202, response.text
+                delivery_gate.set()
+                await _await_bg_turn_task(parent_id)
+                response = await client.post(
+                    f"/v1/sessions/{child_id}/events",
+                    json={
+                        "type": "external_session_status",
+                        "data": {
+                            "status": "idle",
+                            "turn_outcome": "completed",
+                            "response_id": acceptance.response_id,
+                            "output": "Fresh merge result.",
+                        },
+                    },
+                )
+                assert response.status_code == 204, response.text
+                assert subagent_work.get_subagent_work(child_id) is work
+                assert work.status == "completed"
+                assert not work.launch_timed_out
+                result = inbox.get_nowait()
+                assert result["status"] == "completed"
+                assert result["output"] == "Fresh merge result."
+                assert inbox.empty()
+                await poll_until_async(
+                    lambda: len(parent_wakes) == wakes_before_timeout + 2, timeout_s=5.0
+                )
+                assert "finished (completed)" in parent_wakes[-1]
+    finally:
+        delivery_gate.set()
+        await _await_bg_turn_task(child_id)
+        await _await_bg_turn_task(parent_id)
+        subagent_work.unregister_subagent_work_for_session(child_id)
+        subagent_work._session_inboxes_ref.pop(child_id, None)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
 
 @pytest.mark.asyncio

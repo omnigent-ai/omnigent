@@ -603,8 +603,10 @@ def _drive_steer_lifecycle(
                 raise AssertionError(f"unknown event {event!r}")
     finally:
         subagent_work.finish_subagent_child_acceptance(previous_request)
+        assert not previous_request.unidentified_settlement_work_ids
         if steer_request is not None:
             subagent_work.finish_subagent_child_acceptance(steer_request)
+            assert not steer_request.unidentified_settlement_work_ids
         assert child_id not in subagent_work._pending_child_acceptances
     return fresh
 
@@ -784,6 +786,20 @@ def _drive_steer_lifecycle(
             "codex_steer",
             None,
             id="unidentified-settlement-during-request-stays-unbounded",
+        ),
+        pytest.param(
+            ["register", "begin_steer", "settle_unidentified", "accept_steer"],
+            "codex_previous",
+            "codex_steer",
+            None,
+            id="unidentified-settlement-on-current-work-stays-unbounded",
+        ),
+        pytest.param(
+            ["begin_steer", "drain_old", "settle_unidentified", "register", "accept_steer"],
+            "codex_previous",
+            "codex_steer",
+            None,
+            id="untracked-unidentified-settlement-stays-unbounded",
         ),
         pytest.param(
             ["settle_unidentified", "accept_steer", "register"],

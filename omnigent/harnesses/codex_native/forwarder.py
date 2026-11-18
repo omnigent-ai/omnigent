@@ -4967,7 +4967,13 @@ async def _handle_thread_goal_notification(
             # The turn's start was missed, so its boundary is recognized when it arrives.
             forwarder_state.goal_failure_awaits_turn = True
         forwarder_state.turn_failure_surfaced = True
-        await _post_status(client, session_id, "failed", output=failure_output)
+        await _post_status(
+            client,
+            session_id,
+            "failed",
+            response_id=_response_id(_params_with_turn_id({}, turn_id)) if turn_id else None,
+            output=failure_output,
+        )
         await forwarder_state.forget_posted_terminals()
 
 

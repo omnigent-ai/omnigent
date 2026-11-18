@@ -117,7 +117,7 @@ def _build_text_only() -> Executor:
     """
     executor = MockExecutor()
     raw_acceptance = os.environ.get("MOCK_EXECUTOR_NATIVE_ACCEPTANCE")
-    executor._turns.append(
+    executor.enqueue_events(
         [
             TurnComplete(
                 response="hello from mock",
