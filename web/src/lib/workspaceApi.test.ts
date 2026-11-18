@@ -695,9 +695,31 @@ describe("searchFilesViaWorkspaceApi", () => {
     ).toBeNull();
     expect((await readFileViaWorkspaceApi("s-no-capabilities", "notes.md"))?.content).toBe("héllo");
 
-    // The refusal backs off the search for this route, so the capability query isn't repeated.
+    // Every method on this route skips it, so the capability query isn't repeated.
+    enable("workspace_content_search");
+    expect(await searchTextViaWorkspaceApi("s-no-capabilities", "needle", TEXT_OPTIONS)).toBeNull();
     expect(methodCalls("GetCapabilities")).toHaveLength(1);
     expect(methodCalls("SearchFiles")).toHaveLength(0);
+  });
+
+  it("reads a host's capabilities again once the cached answer expires", async () => {
+    enable("workspace_api_server_access");
+    vi.useFakeTimers({ toFake: ["Date"] });
+    try {
+      serveMethods({
+        GetCapabilities: () =>
+          new Response(capabilitiesBody("ReadFile", ...SEARCH_FILES), { headers: PROTO_HEADERS }),
+        SearchFiles: () => new Response(foundEntries, { headers: PROTO_HEADERS }),
+      });
+
+      expect(await searchFilesViaWorkspaceApi("s-expiry", "main", SEARCH_OPTIONS)).not.toBeNull();
+      vi.setSystemTime(Date.now() + 5 * 60_000 + 1_000);
+      expect(await searchFilesViaWorkspaceApi("s-expiry", "main", SEARCH_OPTIONS)).not.toBeNull();
+
+      expect(methodCalls("GetCapabilities")).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
