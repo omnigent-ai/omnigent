@@ -407,10 +407,12 @@ def test_overflow_error_raises_with_actionable_message(tmp_path: Path) -> None:
     cap raises :class:`OSError` whose message names both spec keys
     the user can tune — Fail-Loud per project conventions.
     """
-    for i in range(50):
-        (tmp_path / f"file_{i}.txt").write_text("x")
+    for i in range(20):
+        directory = tmp_path / f"dir_{i:02d}"
+        directory.mkdir()
+        (directory / "file.txt").write_text("x")
     with pytest.raises(OSError) as exc_info:
-        _scan(tmp_path, max_entries=10, overflow="error")
+        _scan(tmp_path, max_entries=20, overflow="error")
     msg = str(exc_info.value)
     assert "cwd_hidden_scan_max_entries" in msg, (
         f"OSError must name the cap field so users can find the tuning knob. Got: {msg!r}"
@@ -419,6 +421,8 @@ def test_overflow_error_raises_with_actionable_message(tmp_path: Path) -> None:
         f"OSError must name the overflow field so users know about the "
         f"warn / unlimited escape hatches. Got: {msg!r}"
     )
+    assert "more)" in msg
+    assert msg.count("(not scanned") + msg.count("(partially scanned") <= 10
 
 
 def test_overflow_warn_returns_partial_mask_and_logs(

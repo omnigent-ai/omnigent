@@ -119,7 +119,7 @@ def worker_policy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SandboxPol
 def test_network_denial_still_contains_the_cli(
     worker_policy: SandboxPolicy, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """Network denial used to return an unwrapped CLI with Skill still enabled."""
+    """Network denial must still contain the CLI."""
     launcher = Mock(return_value=str(tmp_path / "launcher"))
     monkeypatch.setattr(claude, "create_exec_launcher", launcher)
     prepared = claude.prepare_claude_cli_path("/bin/claude", OSEnvSpec())
@@ -237,6 +237,15 @@ def test_brokered_model_access_requires_worker_environment(
 
     with pytest.raises(ValueError, match="owned worker environment"):
         claude.prepare_claude_cli_path("/bin/claude", OSEnvSpec(), model_access=access)
+
+    with pytest.raises(ValueError, match="owned worker environment"):
+        claude.prepare_claude_cli_path(
+            "/bin/claude",
+            OSEnvSpec(sandbox=OSEnvSandboxSpec(egress_rules=["POST model.test/v1/messages"])),
+        )
+
+    with pytest.raises(OSError, match="caller_process"):
+        claude.prepare_claude_cli_path("/bin/claude", OSEnvSpec(type="none"), model_access=access)
 
     create_runtime.assert_not_called()
 
