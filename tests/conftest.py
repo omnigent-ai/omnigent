@@ -326,14 +326,14 @@ def _no_workspace_probe(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.fixture
 def frozen_recurrence_clock(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep a runner stall from tripping the RRULE search's elapsed-time limit.
+    """Keep a slow runner from tripping the RRULE search's CPU-time limit.
 
     Searches then end only on the deterministic work budget. Tests of the time
     limit patch this clock themselves, which overrides the frozen one.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
-    monkeypatch.setattr("omnigent.server.scheduled._bounded_rrule.monotonic", lambda: 0.0)
+    monkeypatch.setattr("omnigent.server.scheduled._bounded_rrule.thread_time", lambda: 0.0)
 
 
 @pytest.fixture(autouse=True)
@@ -504,6 +504,35 @@ def _isolate_claude_managed_settings(
     if "claude_managed_settings" in request.fixturenames:
         return
     monkeypatch.setattr("omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
+
+
+@pytest.fixture()
+def pi_host_mcp_servers() -> None:
+    """Opt back in to adding the host's MCP inventory to managed Pi agent dirs.
+
+    :returns: None.
+    """
+
+
+@pytest.fixture(autouse=True)
+def _isolate_pi_host_mcp_servers(
+    request: pytest.FixtureRequest,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep the machine's Claude, Codex, and Cursor MCP servers out of managed Pi dirs.
+
+    Every managed Pi launch reads the host MCP inventory from the real ``$HOME``,
+    so without this a developer's configured servers would change which
+    ``mcp.json`` a test sees. Tests of that behavior request
+    :func:`pi_host_mcp_servers` and point the inventory at a temporary home.
+
+    :param request: Pytest request, inspected for the opt-in fixture.
+    :param monkeypatch: Pytest monkeypatch fixture; restores the reader at teardown.
+    :returns: None.
+    """
+    if "pi_host_mcp_servers" in request.fixturenames:
+        return
+    monkeypatch.setattr("omnigent.inner.pi_mcp._host_mcp_servers", list)
 
 
 @pytest.fixture()

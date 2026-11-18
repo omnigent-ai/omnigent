@@ -119,6 +119,25 @@ def _rows(caplog: pytest.LogCaptureFixture, event_name: str) -> list[dict[str, o
     ]
 
 
+async def test_background_resume_refusal_reaches_terminal_failure_card(launch: _Launch) -> None:
+    launch.instance._remember_exit_status("1 0")
+    launch.instance._remember_pane_snapshot(
+        "That session is running in the background (abcd1234). "
+        "Run `claude attach abcd1234` to open it, or `claude stop abcd1234` "
+        "first to resume it here.\nClaude Code exited with code 1\nPane is dead (status 0)"
+    )
+    launch.instance.running = False
+    launch.callbacks["on_exit"]()
+    await asyncio.wait_for(launch.resources.wait_for_terminal_exit_cleanup(), timeout=2)
+    statuses = _drain_session_event_queue(_session_event_queues_ref.get(_SESSION))
+    failures = [event["error"] for event in statuses if event.get("status") == "failed"]
+    assert len(failures) == 1
+    assert failures[0]["code"] == "required_terminal_exited"
+    assert failures[0]["title"] == "Claude session is already running in the background"
+    assert "claude attach <session-id>" in failures[0]["remediation"]
+    assert "claude stop <session-id>" in failures[0]["remediation"]
+
+
 @pytest.mark.parametrize("reason", ["prompt_input_exit", "logout", None])
 async def test_reason_survives_cleanup_and_sink_serialization_without_reclassifying_exit(
     launch: _Launch,
@@ -230,7 +249,7 @@ async def test_diagnostic_key_collisions_cannot_override_or_block_terminal_failu
     caplog.set_level(logging.INFO)
     released = asyncio.Event()
 
-    async def release(_self, session_id: str) -> None:
+    async def release(_self, session_id: str, **_kwargs: object) -> None:
         assert session_id == _SESSION
         released.set()
 
@@ -243,6 +262,7 @@ async def test_diagnostic_key_collisions_cannot_override_or_block_terminal_failu
             terminal_id="terminal_claude_main",
             terminal_name="claude",
             session_key="main",
+            terminal_instance_id=launch.instance.diagnostic_id,
             lifecycle=TerminalLifecycle.REQUIRED,
             command="claude",
             exit_status=1,

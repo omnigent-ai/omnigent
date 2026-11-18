@@ -16,6 +16,7 @@ from omnigent.db.db_models import (
     current_workspace_id,
 )
 from omnigent.db.enum_codecs import encode_agent_kind
+from omnigent.db.keyset import keyset_after
 from omnigent.db.utils import (
     get_or_create_conversation_engine,
     get_or_create_engine,
@@ -250,27 +251,27 @@ class SqlAlchemyAgentStore(AgentStore):
             )
             in_workspace = SqlAgent.workspace_id == current_workspace_id()
             stmt = select(SqlAgent).where(in_workspace, is_template)
-            if after:
-                sub = (
-                    select(SqlAgent.created_at)
-                    .where(in_workspace, SqlAgent.id == after, is_template)
-                    .scalar_subquery()
+            # Seeking on the whole (created_at, id) key keeps a page's scan at
+            # O(limit) even when many rows share the cursor's created_at.
+            sort_key = (SqlAgent.created_at, SqlAgent.id)
+            for cursor_id, newer in ((after, not is_desc), (before, is_desc)):
+                if not cursor_id:
+                    continue
+                cursor_at = session.execute(
+                    select(SqlAgent.created_at).where(
+                        in_workspace, SqlAgent.id == cursor_id, is_template
+                    )
+                ).scalar_one_or_none()
+                if cursor_at is None:
+                    return PagedList(data=[], first_id=None, last_id=None, has_more=False)
+                stmt = stmt.where(
+                    keyset_after(
+                        self._engine.dialect.name,
+                        sort_key,
+                        (cursor_at, cursor_id),
+                        descending=not newer,
+                    )
                 )
-                ts_cmp = SqlAgent.created_at < sub if is_desc else SqlAgent.created_at > sub
-                id_cmp = SqlAgent.id < after if is_desc else SqlAgent.id > after
-                # The non-strict bound makes the index seek start at the cursor.
-                bound = SqlAgent.created_at <= sub if is_desc else SqlAgent.created_at >= sub
-                stmt = stmt.where(bound, or_(ts_cmp, and_(SqlAgent.created_at == sub, id_cmp)))
-            if before:
-                sub = (
-                    select(SqlAgent.created_at)
-                    .where(in_workspace, SqlAgent.id == before, is_template)
-                    .scalar_subquery()
-                )
-                ts_cmp = SqlAgent.created_at > sub if is_desc else SqlAgent.created_at < sub
-                id_cmp = SqlAgent.id > before if is_desc else SqlAgent.id < before
-                bound = SqlAgent.created_at >= sub if is_desc else SqlAgent.created_at <= sub
-                stmt = stmt.where(bound, or_(ts_cmp, and_(SqlAgent.created_at == sub, id_cmp)))
             stmt = stmt.order_by(sort_fn(SqlAgent.created_at), sort_fn(SqlAgent.id)).limit(
                 limit + 1
             )

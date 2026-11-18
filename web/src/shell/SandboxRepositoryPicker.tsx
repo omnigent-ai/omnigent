@@ -11,6 +11,7 @@ import {
   CommandList,
 } from "@/components/ui/command";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { cn } from "@/lib/utils";
 import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
 import type { LastSandboxRepo } from "@/lib/repoPreferences";
 import {
@@ -59,7 +60,7 @@ function SandboxRepoCombobox({
           role="combobox"
           aria-expanded={open}
           aria-label="GitHub repository"
-          className={COMBOBOX_TRIGGER_CLASS}
+          className={cn("mobile-touch-target", COMBOBOX_TRIGGER_CLASS)}
           data-testid={`${testIdPrefix}-select`}
         >
           <span className="truncate">Choose a repository…</span>
@@ -67,14 +68,19 @@ function SandboxRepoCombobox({
         </button>
       </PopoverTrigger>
       <PopoverContent align="start" className="w-(--radix-popover-trigger-width) min-w-72 p-0">
-        <Command>
-          <CommandInput placeholder="Search repositories…" data-testid={`${testIdPrefix}-search`} />
+        <Command className="mobile-app:[&_[data-slot=input-group]]:min-h-[44px]">
+          <CommandInput
+            placeholder="Search repositories…"
+            className="mobile-touch-target"
+            data-testid={`${testIdPrefix}-search`}
+          />
           <CommandList>
             <CommandEmpty>No repositories found.</CommandEmpty>
             <CommandGroup>
               {repos.map((repo) => (
                 <CommandItem
                   key={repo.full_name}
+                  className="mobile-touch-target"
                   value={repo.full_name}
                   onSelect={() => {
                     onSelect(repo);

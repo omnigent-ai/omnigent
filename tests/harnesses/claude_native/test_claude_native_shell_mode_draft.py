@@ -37,11 +37,21 @@ class _InputBox:
     :param cursor: Cursor offset; ``None`` places it at the end.
     """
 
-    def __init__(self, mode: str, draft: str, *, cursor: int | None = None) -> None:
+    def __init__(
+        self, mode: str, draft: str, *, cursor: int | None = None, swallowed_enters: int = 0
+    ) -> None:
         self.mode = mode
         self.draft = draft
         self.cursor = len(draft) if cursor is None else cursor
+        self.swallowed_enters = swallowed_enters
         self.submitted: list[tuple[str, str]] = []
+
+    def paste(self, content: str) -> None:
+        # A leading "!" in an empty chat box switches it to shell mode instead of being typed.
+        if self.mode == "prompt" and not self.draft and content.startswith("!"):
+            self.mode, content = "bash", content[1:]
+        self.draft = content
+        self.cursor = len(content)
 
     def pane(self) -> str:
         glyph = "!" if self.mode == "bash" else "❯"
@@ -77,6 +87,10 @@ class _InputBox:
             self.draft = self.draft[: self.cursor] + " " + self.draft[self.cursor :]
             self.cursor += 1
         elif key == "Enter":
+            if self.swallowed_enters:
+                # An Enter racing the paste burst is taken as part of the paste.
+                self.swallowed_enters -= 1
+                return
             self.submitted.append((self.mode, self.draft.strip()))
             self.draft = ""
             self.cursor = 0
@@ -107,8 +121,7 @@ def _patch_tmux(
             return SimpleNamespace(returncode=0, stdout=box.pane(), stderr="")
         calls.append(cmd)
         if "paste-buffer" in cmd:
-            box.draft = content
-            box.cursor = len(content)
+            box.paste(content)
         elif "send-keys" in cmd:
             if "-l" in cmd and cmd[-1].startswith("/"):
                 box.draft = cmd[-1]
@@ -207,6 +220,40 @@ def test_shell_mode_draft(row: str, footer: str, expected: bool, stale_frame: bo
     if stale_frame and row == "!":
         expected = True
     assert claude_native_bridge._shell_mode_draft(pane) is expected
+
+
+def test_a_shell_command_sent_from_the_web_is_verified_and_resubmitted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    A ``!``-led web message is seen in the shell-mode box, so a swallowed Enter is retried.
+
+    The draft was looked for only after a ``❯`` glyph, so a shell command was
+    always submitted blind and a swallowed Enter left it unsent in the box.
+    """
+    monkeypatch.setattr(claude_native_bridge, "_SUBMIT_RETRY_INTERVAL_S", 0.01)
+    monkeypatch.setattr(claude_native_bridge, "_PASTE_COMMIT_TIMEOUT_S", 0.2)
+    box = _InputBox("prompt", "", swallowed_enters=1)
+    bridge_dir, _calls = _patch_tmux(monkeypatch, tmp_path, box, content="!git status --short")
+
+    inject_user_message(bridge_dir, content="!git status --short")
+
+    assert box.submitted == [("bash", "git status --short")]
+
+
+@pytest.mark.parametrize(
+    ("row", "needle", "expected"),
+    [
+        ("! git status --short", "!git status --short", True),
+        ("!", "!git status --short", False),
+        ("! ls -la", "!git status --short", False),
+    ],
+    ids=["shell-draft", "empty-shell-box", "other-shell-command"],
+)
+def test_draft_in_input_box_reads_a_shell_mode_box(row: str, needle: str, expected: bool) -> None:
+    """The draft's leading ``!`` became the box's glyph, so it is matched without it."""
+    pane = f"{_RULE}\n❯ earlier message\n{_RULE}\n{_RULE}\n{row}\n{_RULE}\n  ! for shell mode\n"
+    assert claude_native_bridge._draft_in_input_box(pane, needle) is expected
 
 
 def test_shell_mode_draft_ignores_a_pane_without_an_input_box() -> None:

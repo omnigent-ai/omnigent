@@ -38,6 +38,7 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.agent_config import agent_config_object, edit_agent_bundle
 from omnigent.server.auth import AuthProvider
 from omnigent.server.bundles import content_bundle_location, validate_agent_bundle
+from omnigent.server.proactive_agent import PROACTIVE_AGENT_IDS
 from omnigent.server.routes._auth_helpers import require_user as _require_user
 from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._origin import require_trusted_origin
@@ -86,6 +87,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
     skills: list[SkillSummary] = []
     terminals: list[str] = []
     harness: str | None = None
+    loads_user_settings = True
     # Prefer the stored entity's description; fall back to the spec's
     # top-level description when the stored value is unset (single-file
     # YAML agents don't persist it at registration today). Lets the
@@ -123,6 +125,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         # Kind for the Add Agent picker (Codex vs Claude). Stays None
         # when the bundle can't be loaded (the except below).
         harness = loaded.spec.executor.harness_kind
+        loads_user_settings = loaded.spec.loads_user_settings
     except Exception:  # spec load failure must not break the list
         _logger.debug(
             "Failed to load spec for agent %s; mcp_servers/skills will be empty",
@@ -139,6 +142,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         harness=harness,
         mcp_servers=mcp_servers,
         mcp_servers_editable=False,
+        loads_user_settings=loads_user_settings,
         skills=skills,
         terminals=terminals,
         # Seeded built-ins use a deterministic, name-derived id; an
@@ -454,9 +458,10 @@ def create_builtin_agents_router(
         is the last row the server read, which may not be in ``data``.
 
         Packaged built-ins the deployment suppressed via
-        ``OMNIGENT_SEEDED_AGENTS`` are filtered out after the store page is
-        read, so ``first_id``, ``last_id`` and ``has_more`` describe the rows
-        read, not the rows returned. A page can hold fewer than ``limit`` rows,
+        ``OMNIGENT_SEEDED_AGENTS``, and the built-in proactive agent, are
+        filtered out after the store page is read, so ``first_id``,
+        ``last_id`` and ``has_more`` describe the rows read, not the rows
+        returned. A page can hold fewer than ``limit`` rows,
         or none; keep following ``last_id`` while ``has_more`` is true.
         Suppressing hides a row without deleting it, so a session already
         bound to one keeps working.
@@ -480,7 +485,10 @@ def create_builtin_agents_router(
             )
             return AgentList(
                 data=[
-                    _to_agent_object(a, agent_cache) for a in page.data if a.name not in suppressed
+                    _to_agent_object(a, agent_cache)
+                    for a in page.data
+                    # The proactive agent runs only from its hidden tasks.
+                    if a.name not in suppressed and a.id not in PROACTIVE_AGENT_IDS
                 ],
                 first_id=page.first_id,
                 last_id=page.last_id,

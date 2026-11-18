@@ -141,8 +141,9 @@ def test_write_provider_config_is_0600_and_valid_json(tmp_path: Path) -> None:
     assert parsed["providers"]["databricks-gateway"]["settings"]["apiKey"] == "tok"
 
 
+@pytest.mark.parametrize("client_surface", [None, "desktop"])
 def test_write_provider_config_attributes_unity_gateway_models(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, client_surface: str | None
 ) -> None:
     """Each model of a Unity Gateway provider names OpenCode and Omnigent (+ ug)."""
     monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
@@ -162,13 +163,15 @@ def test_write_provider_config_attributes_unity_gateway_models(
         }
     }
 
-    path = write_opencode_provider_config(tmp_path, config)
+    path = write_opencode_provider_config(tmp_path, config, client_surface=client_surface)
 
     providers = json.loads(path.read_text())["providers"]
     assert providers["databricks"]["models"]["system.ai.glm-5"]["headers"] == {
         "User-Agent": "ucode/0.1.0 opencode/1.2.0",
         "Databricks-Custom-Coding-Agent": "opencode",
-        "Databricks-Custom-Client-Surfaces": "omnigent, ug",
+        "Databricks-Custom-Client-Surfaces": (
+            "omnigent-desktop, ug" if client_surface else "omnigent, ug"
+        ),
     }
     assert providers["serving"]["models"]["databricks-x"] == {"name": "databricks-x"}
     # The caller's config is left as it was.
@@ -539,6 +542,34 @@ def test_merge_mcp_v1_flat_and_v2_servers(monkeypatch: pytest.MonkeyPatch, tmp_p
         "codemode": False,
     }
     assert servers["modern"] == {"type": "remote", "url": "https://m", "codemode": False}
+
+
+def test_task_scoped_merge_excludes_ambient_user_mcp_servers(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A local-model bridge must not inherit a global MCP prompt surface."""
+    _user_config(
+        monkeypatch,
+        tmp_path,
+        json.dumps(
+            {
+                "mcp": {"servers": {"ambient": {"type": "remote", "url": "https://m/ambient"}}},
+                "providers": {"local": {"settings": {"baseURL": "http://localhost:1234/v1"}}},
+                "model": "local/test-model",
+                "plugins": ["/opt/user-plugin"],
+            }
+        ),
+    )
+    config: dict[str, object] = {
+        "mcp": {"servers": {"omnigent": {"type": "local", "command": ["relay"]}}}
+    }
+
+    result = maybe_merge_user_provider_config(config, include_user_mcp_servers=False)
+
+    assert result["mcp"] == config["mcp"]
+    assert result["providers"] == {"local": {"settings": {"baseURL": "http://localhost:1234/v1"}}}
+    assert result["model"] == "local/test-model"
+    assert result["plugins"] == ["/opt/user-plugin"]
 
 
 def test_merge_forces_codemode_off_on_user_mcp_servers(
@@ -1000,6 +1031,7 @@ def test_build_opencode_config_full_v2_shape() -> None:
     }
     assert cfg["plugins"] == ["/b/ucode-auth", "/b/omnigent-policy"]
     assert cfg["instructions"] == ["/x/opencode/AGENTS.md"]
+    assert "compaction" not in cfg
     for v1_key in ("provider", "permission", "plugin"):
         assert v1_key not in cfg
 

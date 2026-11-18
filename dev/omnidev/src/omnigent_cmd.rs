@@ -72,6 +72,7 @@ mod tests {
     }
 
     fn make_pod() -> Pod {
+        let _guard = crate::paths::lock_test_env();
         Pod::create(
             tempdir(),
             tempdir(),

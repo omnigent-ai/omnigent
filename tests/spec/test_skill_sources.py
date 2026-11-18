@@ -306,7 +306,8 @@ def test_codex_native_and_sdk_agree_without_a_configured_codex_home(
 ) -> None:
     """Without a configured ``$CODEX_HOME`` both codex harnesses read ``~/.codex``.
 
-    Both Codex harnesses include ``~/.agents/skills``. Absent a resolved
+    Both Codex harnesses include ``~/.agents/skills`` and, like the Codex CLI,
+    ``.agents/skills`` from the workspace up to its repo root. Absent a resolved
     ``$CODEX_HOME`` (``ctx.codex_home is None``), the native provider falls back
     to the same ``~/.codex/skills`` the SDK path uses — so the two agree until a
     custom codex home is in play (see the divergence test below).
@@ -315,13 +316,27 @@ def test_codex_native_and_sdk_agree_without_a_configured_codex_home(
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     _write_skill(home / ".codex" / "skills", "codex-host-skill")
     _write_skill(home / ".agents" / "skills", "agents-only-skill")
-    workspace = tmp_path / "ws"
-    workspace.mkdir()
+    _write_skill(tmp_path / ".agents" / "skills", "outside-repo-skill")
+    repo = tmp_path / "repo"
+    workspace = repo / "ws"
+    workspace.mkdir(parents=True)
+    (repo / ".git").mkdir()
+    _write_skill(workspace / ".agents" / "skills", "workspace-skill")
+    _write_skill(repo / ".agents" / "skills", "repo-root-skill")
     ctx = _ctx(workspace, home)
 
     native = {s.name for s in resolve_harness_skills(ctx, "codex-native")}
     sdk = {s.name for s in resolve_harness_skills(ctx, "codex")}
-    assert native == sdk == {"codex-host-skill", "agents-only-skill"}
+    assert (
+        native
+        == sdk
+        == {
+            "codex-host-skill",
+            "agents-only-skill",
+            "workspace-skill",
+            "repo-root-skill",
+        }
+    )
 
 
 def test_codex_native_honors_codex_home_sdk_keeps_home_codex(
@@ -350,6 +365,44 @@ def test_codex_native_honors_codex_home_sdk_keeps_home_codex(
     # Native reads $CODEX_HOME's skills; SDK ignores codex_home and reads ~/.codex.
     assert native == {"custom-codex-skill", "shared-skill"}
     assert sdk == {"default-codex-skill", "shared-skill"}
+
+
+@pytest.mark.parametrize("harness", ["codex", "codex-native"])
+def test_codex_repo_skills_outrank_same_named_user_skills(tmp_path: Path, harness: str) -> None:
+    """Like Codex, repo ``.agents`` skills outrank user skills; the nearest repo dir wins."""
+    home = tmp_path / "home"
+    repo = tmp_path / "repo"
+    workspace = repo / "app"
+    (repo / ".git").mkdir(parents=True)
+    for skills_dir in (home / ".codex" / "skills", home / ".agents" / "skills"):
+        _write_skill(skills_dir, "user-dup")
+    _write_skill(repo / ".agents" / "skills", "user-dup")
+    _write_skill(repo / ".agents" / "skills", "repo-dup")
+    _write_skill(workspace / ".agents" / "skills", "repo-dup")
+
+    menu = {s.name: s.skill_dir for s in resolve_harness_skills(_ctx(workspace, home), harness)}
+    assert menu["user-dup"].resolve() == (repo / ".agents" / "skills" / "user-dup").resolve()
+    assert menu["repo-dup"].resolve() == (workspace / ".agents" / "skills" / "repo-dup").resolve()
+
+
+@pytest.mark.parametrize("harness", ["codex", "codex-native"])
+@pytest.mark.parametrize(
+    ("skills_filter", "expected"),
+    [("none", {"repo-skill"}), (["picked"], {"repo-skill", "picked"})],
+)
+def test_codex_repo_skills_ignore_skills_filter(
+    tmp_path: Path, harness: str, skills_filter: str | list[str], expected: set[str]
+) -> None:
+    """Codex loads repo skills whatever the filter, so only the linked host skills are filtered."""
+    home = tmp_path / "home"
+    workspace = tmp_path / "ws"
+    (workspace / ".git").mkdir(parents=True)
+    for name in ("picked", "other"):
+        _write_skill(home / ".codex" / "skills", name)
+    _write_skill(workspace / ".agents" / "skills", "repo-skill")
+
+    ctx = _ctx(workspace, home, skills_filter=skills_filter)
+    assert {s.name for s in resolve_harness_skills(ctx, harness)} == expected
 
 
 def test_claude_provider_defaults_user_tier_to_home_claude(
@@ -745,16 +798,16 @@ def test_codex_provider_surfaces_skills_by_dir_name(tmp_path: Path) -> None:
     assert "triage" not in names
 
 
-def test_codex_menu_set_matches_executor_linked_set(tmp_path: Path) -> None:
+def test_codex_menu_set_matches_executor_linked_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """
-    Invariant: the menu provider and the executor's symlink path select the
-    SAME skill set from the SAME sources (both via codex_skill_sources +
-    select_codex_skill_dirs) — so a / menu entry is always actually linked.
+    Invariant: the menu provider and the executor's launch linking select the
+    SAME skill set from the SAME sources — so a / menu entry is always actually
+    linked — except workspace ``.agents`` skills, which Codex loads from its cwd
+    unlinked.
     """
-    from omnigent.inner.codex_executor import (
-        codex_skill_sources,
-        select_codex_skill_dirs,
-    )
+    from omnigent.inner.codex_executor import populate_codex_skills_from_bundle
 
     home = tmp_path / "home"
     host = home / ".codex" / "skills"
@@ -762,12 +815,18 @@ def test_codex_menu_set_matches_executor_linked_set(tmp_path: Path) -> None:
         d = host / n
         d.mkdir(parents=True)
         (d / "SKILL.md").write_text(f"---\nname: {n.split('--')[-1]}\ndescription: d\n---\nx\n")
+    workspace = tmp_path / "ws"
+    _write_skill(workspace / ".agents" / "skills", "workspace-skill")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.chdir(workspace)
 
-    # What the executor would symlink (keys = dir names linked into CODEX_HOME).
-    linked = set(select_codex_skill_dirs("all", codex_skill_sources(None, home)))
+    codex_home = tmp_path / "codex-home"
+    populate_codex_skills_from_bundle(codex_home, None, "all")
+    linked = {entry.name for entry in (codex_home / "skills").iterdir()}
     # What the menu surfaces.
-    menu = {s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "codex-native")}
-    assert menu == linked == {"alpha", "beta--gamma"}
+    menu = {s.name for s in resolve_harness_skills(_ctx(workspace, home), "codex-native")}
+    assert linked == {"alpha", "beta--gamma"}
+    assert menu == linked | {"workspace-skill"}
 
 
 def test_claude_provider_project_disable_overrides_global_enable(
@@ -799,15 +858,17 @@ def test_claude_provider_project_disable_overrides_global_enable(
 def test_claude_provider_install_path_from_later_scope_entry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """installPath is taken from the first entry that has one, not blindly entries[0]."""
+    """installPath comes from the first entry naming an existing directory, not entries[0]."""
     home = tmp_path / "home"
     install = home / ".claude" / "plugins" / "cache" / "mkt" / "sp" / "1.0.0"
     _write_skill(install / "skills", "using-superpowers")
+    missing = home / ".claude" / "plugins" / "cache" / "mkt" / "sp" / "0.9.0"
     (home / ".claude").mkdir(parents=True, exist_ok=True)
     (home / ".claude" / "settings.json").write_text(
         json.dumps({"enabledPlugins": {"sp@mkt": True}})
     )
-    # First entry lacks installPath; the second carries it.
+    # The first entry lacks installPath and the second names a directory that
+    # is gone; the third carries the real install.
     (home / ".claude" / "plugins" / "installed_plugins.json").write_text(
         json.dumps(
             {
@@ -815,6 +876,7 @@ def test_claude_provider_install_path_from_later_scope_entry(
                 "plugins": {
                     "sp@mkt": [
                         {"scope": "project"},
+                        {"scope": "local", "installPath": str(missing)},
                         {"scope": "user", "installPath": str(install)},
                     ]
                 },
@@ -951,6 +1013,149 @@ def test_claude_provider_skips_install_path_outside_plugins_root(
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     names = [s.name for s in resolve_harness_skills(_ctx(tmp_path / "ws", home), "claude-native")]
     assert "sp:using-superpowers" not in names
+
+
+def _config_dir_with_symlinked_cache(tmp_path: Path, plugins: dict[str, Path]) -> Path:
+    """A config dir whose ``plugins/cache`` links to a shared cache (ccs-style profile)."""
+    shared = tmp_path / "shared-cache"
+    shared.mkdir(exist_ok=True)
+    cfg = tmp_path / "profile"
+    (cfg / "plugins").mkdir(parents=True)
+    (cfg / "plugins" / "cache").symlink_to(shared, target_is_directory=True)
+    (cfg / "settings.json").write_text(
+        json.dumps({"enabledPlugins": dict.fromkeys(plugins, True)})
+    )
+    (cfg / "plugins" / "installed_plugins.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "plugins": {key: [{"installPath": str(path)}] for key, path in plugins.items()},
+            }
+        )
+    )
+    return cfg
+
+
+def test_claude_provider_follows_symlinked_plugin_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Plugins in a symlinked shared cache surface via either path spelling."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    shared = tmp_path / "shared-cache"
+    _write_skill(shared / "mkt" / "linked" / "1.0.0" / "skills", "review")
+    _write_skill(shared / "mkt" / "direct" / "1.0.0" / "skills", "plan")
+    cfg = _config_dir_with_symlinked_cache(
+        tmp_path,
+        {
+            "linked@mkt": tmp_path / "profile" / "plugins" / "cache" / "mkt" / "linked" / "1.0.0",
+            "direct@mkt": shared / "mkt" / "direct" / "1.0.0",
+        },
+    )
+
+    out = resolve_harness_skills(
+        _ctx(tmp_path / "ws", home, claude_config_dir=cfg), "claude-native"
+    )
+    assert sorted(s.name for s in out) == ["direct:plan", "linked:review"]
+
+
+@pytest.mark.parametrize("escape", ["direct", "nested_symlink"])
+def test_claude_provider_symlinked_cache_does_not_trust_its_siblings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    escape: str,
+) -> None:
+    """Only the cache target is trusted: neither its siblings nor a link escaping it."""
+    caplog.set_level(logging.WARNING, logger="omnigent.spec.skill_sources")
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    outside = tmp_path / "evil"
+    _write_skill(outside / "skills", "review")
+    install = outside
+    if escape == "nested_symlink":
+        # A plugin directory inside the shared cache that links out of it.
+        (tmp_path / "shared-cache" / "mkt" / "sp").mkdir(parents=True)
+        (tmp_path / "shared-cache" / "mkt" / "sp" / "1.0.0").symlink_to(
+            outside, target_is_directory=True
+        )
+        install = tmp_path / "profile" / "plugins" / "cache" / "mkt" / "sp" / "1.0.0"
+    cfg = _config_dir_with_symlinked_cache(tmp_path, {"sp@mkt": install})
+
+    out = resolve_harness_skills(
+        _ctx(tmp_path / "ws", home, claude_config_dir=cfg), "claude-native"
+    )
+    assert out == []
+    rejection = next(m for m in caplog.messages if "outside the trusted roots" in m)
+    assert str((cfg / "plugins").resolve()) in rejection
+    assert str((tmp_path / "shared-cache").resolve()) in rejection
+
+
+@pytest.mark.parametrize("cache_link", ["loop", "dangling", "loop_then_parent"])
+def test_claude_provider_survives_broken_plugin_cache_link(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    cache_link: str,
+) -> None:
+    """A looping or dangling ``plugins/cache`` link skips only the entries behind it."""
+    caplog.set_level(logging.WARNING, logger="omnigent.spec.skill_sources")
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    cfg = tmp_path / "profile"
+    (cfg / "plugins").mkdir(parents=True)
+    if cache_link == "loop_then_parent":
+        # The OS can't traverse ``cache`` (ELOOP at ``loop``), but a lexical
+        # resolve collapses ``loop/../..`` and lands on a real directory.
+        (cfg / "plugins" / "loop").symlink_to("loop")
+        (cfg / "plugins" / "cache").symlink_to("loop/../../outside")
+    else:
+        (cfg / "plugins" / "cache").symlink_to(
+            "cache" if cache_link == "loop" else tmp_path / "missing"
+        )
+    outside = cfg / "outside" / "mkt" / "escaped" / "1.0.0"
+    _write_skill(outside / "skills", "exfil")
+    ordinary = cfg / "plugins" / "ordinary" / "sp" / "1.0.0"
+    _write_skill(ordinary / "skills", "using-superpowers")
+    fallback = cfg / "plugins" / "ordinary" / "multi" / "1.0.0"
+    _write_skill(fallback / "skills", "plan")
+    behind_link = cfg / "plugins" / "cache" / "mkt" / "cached" / "1.0.0"
+    (cfg / "settings.json").write_text(
+        json.dumps(
+            {
+                "enabledPlugins": dict.fromkeys(
+                    ["sp@mkt", "cached@mkt", "multi@mkt", "escaped@mkt"], True
+                )
+            }
+        )
+    )
+    (cfg / "plugins" / "installed_plugins.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "plugins": {
+                    "sp@mkt": [{"installPath": str(ordinary)}],
+                    "cached@mkt": [{"installPath": str(behind_link)}],
+                    "multi@mkt": [
+                        {"installPath": str(behind_link)},
+                        {"installPath": str(fallback)},
+                    ],
+                    "escaped@mkt": [{"installPath": str(outside)}],
+                },
+            }
+        )
+    )
+
+    out = resolve_harness_skills(
+        _ctx(tmp_path / "ws", home, claude_config_dir=cfg), "claude-native"
+    )
+    # The entry behind the link is unresolvable (loop) or outside every root
+    # (dangling); the plugin's next scope entry still counts either way. A
+    # broken link never makes a directory outside the plugins root trusted.
+    assert sorted(s.name for s in out) == ["multi:plan", "sp:using-superpowers"]
+    assert any(
+        "plugins cache" in m and str(cfg / "plugins" / "cache") in m for m in caplog.messages
+    )
 
 
 def test_cursor_provider_tolerates_unreadable_skills_dir(

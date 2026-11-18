@@ -312,18 +312,24 @@ def test_family_shim_warns_and_delegates_to_the_catalog() -> None:
     assert families == {"opus": "system.ai.claude-opus-5"}
 
 
-def _discover_codex(model_services: list[dict[str, object]]) -> tuple[str, ...]:
-    """Run codex discovery against a canned ``system.ai`` model-services page."""
-    from omnigent.models.databricks_model_discovery import discover_databricks_codex_models
+def _uc_models_transport(model_services: list[dict[str, object]]) -> httpx.MockTransport:
+    """Return a mock transport serving a single ``schemas/system.ai`` page."""
 
     def _handler(request: httpx.Request) -> httpx.Response:
         assert request.url.params["parent"] == "schemas/system.ai"
         return httpx.Response(200, json={"model_services": model_services}, request=request)
 
+    return httpx.MockTransport(_handler)
+
+
+def _discover_codex(model_services: list[dict[str, object]]) -> tuple[str, ...]:
+    """Run codex discovery against a canned ``system.ai`` model-services page."""
+    from omnigent.models.databricks_model_discovery import discover_databricks_codex_models
+
     return discover_databricks_codex_models(
         "https://workspace.example.com",
         "token",
-        transport=httpx.MockTransport(_handler),
+        transport=_uc_models_transport(model_services),
     )
 
 
@@ -332,15 +338,14 @@ def _discover_codex(model_services: list[dict[str, object]]) -> tuple[str, ...]:
     [None, ["codex/v1/responses"], ["codex/v1/responses", "openai/v1/responses"]],
     ids=["legacy", "codex-route", "both-routes"],
 )
-def test_discover_codex_models_filters_non_codex_and_ranks_curated_first(
+def test_discover_codex_models_filters_non_codex_and_ranks_newest_first(
     api_types: list[str] | None,
 ) -> None:
-    """Codex discovery keeps only codex-servable ids, curated catalog first.
+    """Codex discovery keeps only codex-servable ids, newest generation first.
 
     The listing says what a workspace *can* serve, not which to launch on:
-    the owned curated codex catalog leads (in its declared order), then
-    versioned GPT ids newest-first, then the rest — and non-codex families
-    (Claude) are dropped entirely.
+    versioned GPT ids lead newest-first, then the rest — and non-codex
+    families (Claude) are dropped entirely.
     """
     services: list[dict[str, object]] = [
         {"name": "model-services/system.ai.gpt-5-5"},
@@ -357,12 +362,11 @@ def test_discover_codex_models_filters_non_codex_and_ranks_curated_first(
     servable = _discover_codex(services)
 
     assert servable == (
-        # Curated (cheapest-safe-first) beats a newer non-curated generation.
+        # A newer generation leads; no release-pinned arm outranks it.
+        "system.ai.gpt-6-1",
         "system.ai.gpt-5-6-sol",
         "system.ai.gpt-5-6-luna",
         "system.ai.gpt-5-5",
-        # Non-curated GPT, newest generation next.
-        "system.ai.gpt-6-1",
         # Codex-compatible but unversioned, last.
         "system.ai.kimi-k2",
         "system.ai.glm-9",
@@ -406,16 +410,118 @@ def test_discover_codex_models_drops_models_without_the_codex_route() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("catalog", "expected"),
+    [
+        pytest.param(
+            [
+                {"slug": "gpt-daybreak-latest", "priority": 0, "visibility": "hide"},
+                {"slug": "gpt-6-astra", "priority": 2, "visibility": "list"},
+                {"slug": "gpt-6.1-terra", "priority": 7, "visibility": "list"},
+                {"slug": "gpt-6.1-sol", "priority": 1, "visibility": "list"},
+                {"slug": "gpt-5.6-sol", "priority": 5, "visibility": "list"},
+            ],
+            (
+                "system.ai.gpt-6-1-sol",
+                "system.ai.gpt-5-6-sol",
+                "system.ai.gpt-6-1-terra",
+                "system.ai.gpt-daybreak-latest",
+                "system.ai.glm-5-2",
+            ),
+            id="codex-priority",
+        ),
+        pytest.param(
+            [],
+            (
+                "system.ai.gpt-6-1-terra",
+                "system.ai.gpt-6-1-sol",
+                "system.ai.gpt-5-6-sol",
+                "system.ai.gpt-daybreak-latest",
+                "system.ai.glm-5-2",
+            ),
+            id="unreadable-catalog",
+        ),
+    ],
+)
+def test_order_by_codex_catalog_follows_codex_priority(
+    catalog: list[dict[str, object]], expected: tuple[str, ...]
+) -> None:
+    """Servable ids follow Codex's visible catalog priority; the rest keep their order."""
+    from omnigent.models.databricks_model_discovery import order_by_codex_catalog
+
+    servable = (
+        "system.ai.gpt-6-1-terra",
+        "system.ai.gpt-6-1-sol",
+        "system.ai.gpt-5-6-sol",
+        "system.ai.gpt-daybreak-latest",
+        "system.ai.glm-5-2",
+    )
+
+    assert order_by_codex_catalog(servable, catalog) == expected
+
+
 def test_discover_codex_models_empty_listing_is_authoritative() -> None:
     """A listing that serves no codex model returns an empty tuple, not an error."""
     assert _discover_codex([{"name": "model-services/system.ai.claude-opus-5"}]) == ()
 
 
 def test_select_servable_model_matches_legacy_spelling() -> None:
-    """A legacy ``databricks-`` request resolves to the served ``system.ai.`` id."""
+    """A legacy ``databricks-`` or codex-slug request resolves to the served ``system.ai.`` id."""
     from omnigent.models.databricks_model_discovery import select_servable_model
 
     servable = ("system.ai.gpt-5-6-luna", "system.ai.gpt-5-5")
     assert select_servable_model("databricks-gpt-5-6-luna", servable) == "system.ai.gpt-5-6-luna"
+    assert select_servable_model("gpt-5.6-luna", servable) == "system.ai.gpt-5-6-luna"
     # A model the workspace does not serve is left for the caller to pass through.
     assert select_servable_model("databricks-gpt-9-9", servable) is None
+
+
+def test_discover_gemini_models_uses_supported_api_types_with_prefix_fallback() -> None:
+    """Gemini discovery honors declared Gemini wire types and falls back on legacy listings."""
+    from omnigent.models.databricks_model_discovery import discover_databricks_gemini_models
+
+    model_services: list[dict[str, object]] = [
+        # Non-gemini-* Google models advertising native Gemini wire routes.
+        {
+            "name": "model-services/system.ai.google-model-1",
+            "supported_api_types": ["gemini/v1beta/models", "mlflow/v1/chat/completions"],
+        },
+        {
+            "name": "model-services/system.ai.google-model-2",
+            "supported_api_types": [" Gemini/v1beta "],
+        },
+        {
+            "name": "model-services/system.ai.google-model-3",
+            "supported_api_types": ["gemini"],
+        },
+        # Gemini-named model serving only OpenAI/MLflow routes must be excluded.
+        {
+            "name": "model-services/system.ai.gemini-3-1-pro",
+            "supported_api_types": ["mlflow/v1/chat/completions", "mlflow/v1/responses"],
+        },
+        # Legacy entries without supported_api_types fall back to the gemini- prefix.
+        {"name": "model-services/system.ai.gemini-2-5-flash"},
+        {"name": "model-services/system.ai.gemini-2-5-pro", "supported_api_types": []},
+        {"name": "model-services/system.ai.gemini-2-5-lite", "supported_api_types": None},
+        {"name": "model-services/system.ai.claude-opus-5"},
+        # Malformed non-list supported_api_types is rejected rather than treated as legacy.
+        {
+            "name": "model-services/system.ai.gemini-9-9",
+            "supported_api_types": "gemini/v1beta/models",
+        },
+    ]
+
+    discovered = discover_databricks_gemini_models(
+        "https://workspace.example.com",
+        "token",
+        transport=_uc_models_transport(model_services),
+    )
+
+    assert discovered == (
+        "system.ai.gemini-2-5-flash",
+        "system.ai.gemini-2-5-lite",
+        "system.ai.gemini-2-5-pro",
+        "system.ai.google-model-1",
+        "system.ai.google-model-2",
+        "system.ai.google-model-3",
+    )

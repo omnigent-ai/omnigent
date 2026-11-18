@@ -6,6 +6,10 @@ their tunnels when Kubernetes replaces the server pods. It uses
 [kind](https://kind.sigs.k8s.io/), which runs a local Kubernetes cluster in
 Docker. Postgres and an artifact volume are shared by both server pods.
 
+The example keeps legacy scheduling (`OMNIGENT_FEATURES=-automations_v2`)
+because its replicas do not supply the host-ownership hooks required by the
+persistent scheduler.
+
 Two server pods let us test a deployment that normally serves requests from
 more than one replica. One server pod would also support a rolling update
 with a temporary replacement, but would not test steady-state replication.

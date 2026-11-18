@@ -29,6 +29,7 @@ from omnigent.runner.native.orchestration import (
     _auto_create_pi_terminal,
     _pi_native_model_from_spec,
 )
+from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests._helpers.pi_native import seed_pi_own_login_catalog
 from tests._helpers.polling import poll_until_async
@@ -179,7 +180,7 @@ async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
 
     launched: dict[str, Any] = {}
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         """Captures the launched terminal spec (args + env)."""
 
         terminal_registry = None
@@ -311,7 +312,7 @@ async def test_auto_create_pi_terminal_no_spec_model_uses_provider_default(
 
     launched: dict[str, Any] = {}
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         terminal_registry = None
 
         async def launch_required_terminal(
@@ -356,26 +357,14 @@ async def test_auto_create_pi_terminal_no_spec_model_uses_provider_default(
     assert entry.get("reasoning") is True
 
 
-@pytest.mark.asyncio
-async def test_auto_create_pi_terminal_bakes_tunnel_token_into_config(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Launch bakes the runner tunnel token into the extension config.
-
-    On a guest-on-shared-host runner there is no Databricks bearer, so the
-    extension authenticates its out-of-process posts with the tunnel binding
-    token. It must land in ``config.json``'s ``authHeaders`` at launch — the
-    per-turn refresh runs env-scrubbed and can only preserve it, never mint it.
-    """
+async def _launch_pi_with_tunnel_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, session_id: str
+) -> dict[str, Any]:
+    """Launch a Pi terminal with a tunnel binding token; return its extension config."""
     import omnigent.harnesses.pi_native.bridge as pi_bridge
     import omnigent.harnesses.pi_native.credentials as creds
-    from omnigent.runner.identity import (
-        RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
-        RUNNER_TUNNEL_TOKEN_HEADER,
-    )
+    from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
 
-    session_id = "conv_pi_tunnel_token"
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     monkeypatch.setattr(pi_bridge, "_BRIDGE_ROOT", tmp_path / "pi-native")
@@ -410,7 +399,7 @@ async def test_auto_create_pi_terminal_bakes_tunnel_token_into_config(
                 request=httpx.Request("GET", f"/v1/sessions/{session_id}"),
             )
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         terminal_registry = None
 
         async def launch_required_terminal(
@@ -445,12 +434,45 @@ async def test_auto_create_pi_terminal_bakes_tunnel_token_into_config(
         agent_spec=spec,
     )
 
-    config = json.loads(
+    return json.loads(
         pi_bridge.config_path(pi_bridge.bridge_dir_for_session_id(session_id)).read_text(
             encoding="utf-8"
         )
     )
+
+
+@pytest.mark.asyncio
+async def test_auto_create_pi_terminal_bakes_tunnel_token_into_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Launch bakes the runner tunnel token into the extension config.
+
+    On a guest-on-shared-host runner there is no Databricks bearer, so the
+    extension authenticates its out-of-process posts with the tunnel binding
+    token. It must land in ``config.json``'s ``authHeaders`` at launch — the
+    per-turn refresh runs env-scrubbed and can only preserve it, never mint it.
+    """
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER
+
+    config = await _launch_pi_with_tunnel_token(tmp_path, monkeypatch, "conv_pi_tunnel_token")
     assert config["authHeaders"][RUNNER_TUNNEL_TOKEN_HEADER] == "tok-abc"
+
+
+@pytest.mark.asyncio
+async def test_auto_create_pi_terminal_registers_no_tools_when_browser_filter_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed browser-tool filter leaves Pi with no Omnigent tools, not the unfiltered set."""
+    import omnigent.tools.browser_agent_tools as browser_agent_tools
+
+    async def _fail(*_args: Any, **_kwargs: Any) -> list[dict[str, Any]]:
+        raise KeyError("schema")
+
+    monkeypatch.setattr(browser_agent_tools, "filter_native_relay_browser_tools", _fail)
+    config = await _launch_pi_with_tunnel_token(tmp_path, monkeypatch, "conv_pi_filter_fails")
+    assert config["tools"] == []
 
 
 @pytest.mark.asyncio
@@ -521,7 +543,7 @@ async def test_auto_create_pi_terminal_cold_resume_keeps_persisted_pi_login_pick
 
     launched: dict[str, Any] = {}
 
-    class _FakeResourceRegistry:
+    class _FakeResourceRegistry(SessionResourceRegistry):
         terminal_registry = None
 
         async def launch_required_terminal(

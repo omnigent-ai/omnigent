@@ -414,7 +414,7 @@ export function ToolGroupSummary({ tools }: { tools: RenderItem[] }) {
     // any ancestor `.group[data-state=open]` and incorrectly rotate
     // chevrons of inner tool cards when this outer group is open).
     <Collapsible defaultOpen={false} className="group/tool-summary not-prose w-full">
-      <CollapsibleTrigger className="flex cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-ui transition-colors hover:text-foreground">
+      <CollapsibleTrigger className="flex cursor-pointer items-center gap-1.5 py-0.5 text-left text-muted-foreground text-ui transition-colors hover:text-foreground mobile-touch-target">
         <span>{label}</span>
         <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]/tool-summary:rotate-90" />
       </CollapsibleTrigger>
@@ -493,15 +493,20 @@ function ToolTriggerRow({
   return (
     <CollapsibleTrigger
       title={tooltip}
-      className="block w-full cursor-pointer py-0.5 text-left text-muted-foreground text-ui transition-colors hover:text-foreground"
+      className="block w-full cursor-pointer py-0.5 text-left text-muted-foreground text-ui transition-colors hover:text-foreground mobile-app:flex mobile-touch-target mobile-app:flex-col mobile-app:justify-center"
     >
       <span className="flex w-full items-center gap-1.5">
         <StatusIcon name={name} nativeToolType={nativeToolType} state={state} />
         {/* Only the title truncates, so the counts beside it stay visible. */}
         <span className="flex min-w-0 flex-1 items-center gap-1.5">
-          <span className="min-w-0 truncate">
+          <span
+            className={cn(
+              "min-w-0 truncate",
+              onBodyClick && "mobile-app:flex mobile-app:items-center mobile-app:gap-1",
+            )}
+          >
             {title.verb !== null && (
-              <span className="font-medium text-foreground">{title.verb}</span>
+              <span className="font-medium text-foreground mobile-app:shrink-0">{title.verb}</span>
             )}
             {title.verb !== null && title.body.length > 0 && " "}
             <ToolTitleBody title={title} displayPath={displayPath} onBodyClick={onBodyClick} />
@@ -559,7 +564,7 @@ function ToolTitleBody({
     <span
       role="link"
       tabIndex={0}
-      className="underline decoration-dotted underline-offset-2 hover:text-foreground transition-colors cursor-pointer"
+      className="mobile-touch-target mobile-app:inline-flex mobile-app:items-center underline decoration-dotted underline-offset-2 hover:text-foreground transition-colors cursor-pointer"
       onClick={(e) => {
         e.stopPropagation();
         onBodyClick();
@@ -572,7 +577,7 @@ function ToolTitleBody({
         }
       }}
     >
-      {displayPath ?? title.body}
+      <span className="mobile-app:truncate">{displayPath ?? title.body}</span>
     </span>
   );
 }
@@ -583,7 +588,7 @@ function ShellCommandLine({ command }: { command: string }) {
   const { env, rest } = splitEnvPrefix(firstLine);
   return (
     // Only the command truncates, so the line count stays visible.
-    <span className="inline-flex max-w-full items-baseline font-mono text-sm">
+    <span className="literal-code inline-flex max-w-full items-baseline font-mono text-sm">
       <span className="min-w-0 truncate">
         {env.length > 0 && <span className="opacity-60">{env}</span>}
         <span>{rest}</span>

@@ -50,7 +50,7 @@ def model_gateway_workspace_urls() -> list[str]:
 
     :returns: Gateway workspace URLs, each stripped of a trailing slash.
     """
-    # Lazy import: internal-beta workspace list, excluded from the OSS build.
+    # Lazy import; this module is not present in every build.
     import omnigent.onboarding.internal_beta as internal_beta  # type: ignore[import-not-found]
 
     return [

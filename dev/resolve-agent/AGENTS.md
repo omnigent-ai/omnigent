@@ -141,6 +141,6 @@ Add code comments only for non-obvious constraints; keep them to one or two line
 Remove redundant or stale comments in added or changed material before committing,
 including inherited tests you modify.
 
-Under a Databricks-network `--server`, public npm/PyPI registries are blocked.
+Under a network-restricted `--server`, public npm/PyPI registries are blocked.
 Read `dev/agent-environment.md` in the Omnigent source checkout before installing
 packages, and use the configured internal proxies or the target workflow's setup.

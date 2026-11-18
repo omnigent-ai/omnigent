@@ -56,28 +56,27 @@ def test_paste_keeps_its_text_when_the_clipboard_changes_mid_paste(
 def test_composer_takes_focus_once_it_enables(
     page: Page, chat_session_contract: ChatSessionContract
 ) -> None:
-    """A composer that mounts disabled focuses itself when it enables.
-
-    The composer stays disabled until the agent list loads; its mount-time
-    focus is a no-op then, so without the follow-up the first words typed or
-    dictated after a session opens go nowhere.
-    """
+    """Cold-session hydration must leave the newly enabled composer focused."""
     chat = chat_session_contract
     held: list[Route] = []
     holding = True
 
-    def hold_agents(route: Route) -> None:
-        if holding:
+    def hold_session(route: Route) -> None:
+        if holding and route.request.method == "GET":
             held.append(route)
         else:
             route.fallback()
 
-    chat.contract.route(
-        re.compile(rf"^{re.escape(chat.base_url)}/v1/agents(?:\?.*)?$"), hold_agents
+    snapshot = re.compile(
+        rf"^{re.escape(chat.base_url)}/v1/sessions/{re.escape(chat.session_id)}(?:\?.*)?$"
     )
-    page.goto(chat.url)
+    chat.contract.route(snapshot, hold_session)
+    with page.expect_request(snapshot):
+        page.goto(chat.url)
     composer = page.get_by_role("textbox", name="Message the agent")
-    expect(composer).to_be_disabled(timeout=30_000)
+    expect(page.get_by_text("Loading conversation…", exact=True)).to_be_visible()
+    expect(composer).to_have_count(0)
+    assert held, "The session snapshot must be held before hydration completes."
 
     holding = False
     for route in held:

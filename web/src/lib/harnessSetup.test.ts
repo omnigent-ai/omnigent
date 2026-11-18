@@ -255,6 +255,19 @@ describe("harnessReadinessOnHost", () => {
     }
   });
 
+  it("keeps a CLI that did not answer its version check selectable", () => {
+    // The host still launches a resolved CLI whose probe timed out.
+    const host = hostWith({ "pi-native": "cli-unresponsive" });
+    expect(harnessReadinessOnHost("pi-native", host)).toMatchObject({
+      state: "available",
+      reason: "cli-unresponsive",
+      selectable: true,
+      fallbackRelevant: false,
+    });
+    expect(harnessUnavailableReasonOnHost("pi-native", host)).toBe("cli-unresponsive");
+    expect(harnessWarningBadgeText("cli-unresponsive")).toBe("not responding");
+  });
+
   it("marks host-wide unavailability as irrelevant to harness fallback", () => {
     expect(
       harnessReadinessOnHost("codex-native", {
@@ -277,6 +290,34 @@ describe("harnessReadinessOnHost", () => {
       label: "Harness is not installed",
       description: "Install this harness on the selected host before using it.",
     });
+  });
+});
+
+describe("tmux-unavailable readiness", () => {
+  const host = hostWith({ "claude-native": "tmux-unavailable", "claude-sdk": true });
+
+  it("blocks the native harness with tmux repair copy", () => {
+    expect(harnessReadinessOnHost("claude-native", host)).toEqual({
+      state: "setup-required",
+      reason: "tmux-unavailable",
+      selectable: false,
+      fallbackRelevant: true,
+      explanation: {
+        label: "tmux is required",
+        description: "Install tmux 3.3 or newer on the selected host, then check again.",
+      },
+    });
+    expect(harnessUnavailableReasonOnHost("claude-native", host)).toBe("tmux-unavailable");
+    expect(harnessWarningBadgeText("tmux-unavailable")).toBe("needs tmux");
+    expect(harnessWarningBadgeText("tmux-unavailable", true)).toBe("needs setup");
+  });
+
+  it("leaves SDK harnesses on the same host ready", () => {
+    expect(harnessReadinessOnHost("claude-sdk", host)).toMatchObject({
+      state: "available",
+      reason: "ready",
+    });
+    expect(harnessUnavailableReasonOnHost("claude-sdk", host)).toBeNull();
   });
 });
 
@@ -432,6 +473,30 @@ describe("resolveSetupSteps", () => {
     const steps = resolveSetupSteps(generic, "cursor-native", hostWith({ "cursor-native": false }));
     expect(steps).toHaveLength(1);
     expect(steps[0].command).toBe("omni setup");
+  });
+
+  it("adds a tmux step after the done CLI steps when only tmux is missing", () => {
+    const steps = resolveSetupSteps(
+      CODEX_STEPS,
+      "codex-native",
+      hostWith({ "codex-native": "tmux-unavailable" }),
+    );
+    expect(steps.map((s) => [s.kind, s.status])).toEqual([
+      ["install", "done"],
+      ["auth", "done"],
+      ["tmux", "todo"],
+    ]);
+    expect(steps[2].title).toBe("Install tmux 3.3 or newer");
+    expect(steps[2].command).toBe("brew install tmux");
+  });
+
+  it("shows the tmux step even when the server publishes no steps", () => {
+    const steps = resolveSetupSteps(
+      undefined,
+      "codex-native",
+      hostWith({ "codex-native": "tmux-unavailable" }),
+    );
+    expect(steps.map((s) => [s.kind, s.status])).toEqual([["tmux", "todo"]]);
   });
 
   it("returns [] with no descriptor or no harness", () => {

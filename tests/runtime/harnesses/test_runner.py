@@ -162,10 +162,14 @@ def test_create_uvicorn_config_for_unix_socket() -> None:
     assert config.log_level == _runner._UVICORN_LOG_LEVEL
 
 
-def test_create_uvicorn_config_for_tcp_bind() -> None:
-    config = _runner._create_uvicorn_config(FastAPI(), None, "127.0.0.1:8765")
+@pytest.mark.parametrize(
+    "bind, host",
+    [("127.0.0.1:8765", "127.0.0.1"), ("[::1]:8765", "::1"), ("::1:8765", "::1")],
+)
+def test_create_uvicorn_config_for_tcp_bind(bind: str, host: str) -> None:
+    config = _runner._create_uvicorn_config(FastAPI(), None, bind)
 
-    assert config.host == "127.0.0.1"
+    assert config.host == host
     assert config.port == 8765
     assert config.timeout_graceful_shutdown == _runner._GRACEFUL_SHUTDOWN_TIMEOUT_S
     assert config.log_level == _runner._UVICORN_LOG_LEVEL

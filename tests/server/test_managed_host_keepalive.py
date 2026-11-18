@@ -8,6 +8,7 @@ few attributes off each, so a real store would add setup without adding cover.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from types import SimpleNamespace
 
@@ -15,6 +16,7 @@ import pytest
 
 from omnigent.onboarding.sandboxes.base import SandboxCapabilityError
 from omnigent.server import managed_host_keepalive
+from tests.budgets import budget
 
 
 class _Launcher:
@@ -349,3 +351,142 @@ def test_owner_identity_launcher_is_bound_to_the_hosts_owner(
     (resolve,) = launcher.bound
     resolve()  # type: ignore[operator]
     assert seen == ["alice"]
+
+
+def _wire_recording_executor(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Enable the keepalive with an executor that records submissions."""
+    submitted: list[str] = []
+
+    def _submit(*args: object) -> None:
+        # touch() submits ctx.run(fn, runner_id); the real job frees the in-flight slot.
+        runner_id = str(args[-1])
+        submitted.append(runner_id)
+        managed_host_keepalive._inflight.discard(runner_id)
+
+    monkeypatch.setattr(managed_host_keepalive, "_sandbox_config", object())
+    monkeypatch.setattr(managed_host_keepalive, "_host_store", object())
+    monkeypatch.setattr(managed_host_keepalive, "_executor", SimpleNamespace(submit=_submit))
+    monkeypatch.setattr(managed_host_keepalive, "_last_kept", {})
+    monkeypatch.setattr(managed_host_keepalive, "_inflight", set())
+    monkeypatch.setattr(managed_host_keepalive, "_reports", {})
+    return submitted
+
+
+@pytest.mark.parametrize(
+    ("keep_warm", "refreshed"),
+    [(True, True), (False, False), (None, True)],
+    ids=["keep-warm", "let-it-stop", "older-runner"],
+)
+def test_touch_follows_the_runners_latest_report(
+    monkeypatch: pytest.MonkeyPatch, keep_warm: bool | None, refreshed: bool
+) -> None:
+    submitted = _wire_recording_executor(monkeypatch)
+    managed_host_keepalive.open_report("r1")
+    assert managed_host_keepalive.touch("r1") is False, "no refresh before the first pong"
+    managed_host_keepalive.record_pong("r1", keep_warm)
+    assert managed_host_keepalive.touch("r1") is refreshed
+    assert submitted == (["r1"] if refreshed else [])
+
+
+def test_a_pong_wakes_the_loop_only_when_a_refresh_becomes_due(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _wire_recording_executor(monkeypatch)
+    report = managed_host_keepalive.open_report("r1")
+    for keep_warm, woken in (
+        (False, True),  # the first pong: the loop can now decide
+        (False, False),
+        (True, True),  # work resumed
+        (True, False),
+        (None, False),  # still refreshing
+        (False, False),
+        (None, True),  # an older runner took over the id
+    ):
+        report.wake.clear()
+        managed_host_keepalive.record_pong("r1", keep_warm)
+        assert report.wake.is_set() is woken, (keep_warm, woken)
+
+
+def test_dispatched_work_refreshes_before_the_next_pong(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The runner reported False (its grace ran out) but its sandbox has not
+    # expired yet; a message must renew it now, not at the next pong.
+    submitted = _wire_recording_executor(monkeypatch)
+    report = managed_host_keepalive.open_report("r1")
+    managed_host_keepalive.record_pong("r1", False)
+    assert managed_host_keepalive.touch("r1") is False
+    report.wake.clear()
+    managed_host_keepalive.record_work_dispatched("r1")
+    assert report.wake.is_set(), "the loop is woken to refresh at once"
+    assert managed_host_keepalive.touch("r1") is True
+    assert submitted == ["r1"]
+    # The runner's next pong reports the truth again.
+    managed_host_keepalive.record_pong("r1", False)
+    managed_host_keepalive._last_kept.clear()
+    assert managed_host_keepalive.touch("r1") is False
+
+
+def test_dispatched_work_leaves_a_refreshing_runner_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    _wire_recording_executor(monkeypatch)
+    report = managed_host_keepalive.open_report("r1")
+    for keep_warm in (True, None):
+        managed_host_keepalive.record_pong("r1", keep_warm)
+        report.wake.clear()
+        managed_host_keepalive.record_work_dispatched("r1")
+        assert not report.wake.is_set(), keep_warm
+        assert report.keep_warm is keep_warm, "an older runner stays an older runner"
+
+
+def test_a_reconnect_starts_from_its_own_first_pong(monkeypatch: pytest.MonkeyPatch) -> None:
+    _wire_recording_executor(monkeypatch)
+    old = managed_host_keepalive.open_report("r1")
+    managed_host_keepalive.record_pong("r1", True)
+    new = managed_host_keepalive.open_report("r1")  # the runner reconnected
+    managed_host_keepalive.close_report("r1", old)  # the old tunnel's teardown
+    assert managed_host_keepalive._reports == {"r1": new}
+    assert managed_host_keepalive.touch("r1") is False, "the new tunnel waits for its pong"
+    managed_host_keepalive.close_report("r1", new)
+    assert managed_host_keepalive._reports == {}
+
+
+async def test_keepalive_loop_refreshes_on_reports_and_keeps_its_schedule(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes import runner_tunnel
+    from tests._helpers.polling import poll_until_async
+
+    submitted = _wire_recording_executor(monkeypatch)
+    submitted_at: list[float] = []
+    record = managed_host_keepalive._executor.submit  # type: ignore[union-attr]
+    loop = asyncio.get_running_loop()
+
+    def _submit(*args: object) -> None:
+        submitted_at.append(loop.time())
+        record(*args)
+
+    monkeypatch.setattr(managed_host_keepalive, "_executor", SimpleNamespace(submit=_submit))
+    # Long enough that a refresh well inside it can only come from a wake.
+    interval = 2.0
+    monkeypatch.setattr(managed_host_keepalive, "_interval_for", lambda _rid: interval)
+
+    task = asyncio.create_task(runner_tunnel._keepalive_loop("r1"))
+    try:
+        await asyncio.sleep(0.05)
+        assert submitted == [], "the connect tick waits for the first pong"
+        woken_at = loop.time()
+        managed_host_keepalive.record_pong("r1", True)
+        await poll_until_async(lambda: len(submitted) == 1, timeout_s=budget(1), interval_s=0.01)
+        assert submitted_at[0] - woken_at < interval / 2, "woken at once, not at the next tick"
+        # The wake restarted the schedule: the next refresh is a full interval on.
+        await poll_until_async(lambda: len(submitted) == 2, timeout_s=budget(4), interval_s=0.01)
+        assert submitted_at[1] - submitted_at[0] >= interval * 0.95
+        managed_host_keepalive.record_pong("r1", False)
+        await asyncio.sleep(interval * 1.2)
+        assert len(submitted) == 2, "no refreshes while the runner says not to"
+        resumed_at = loop.time()
+        managed_host_keepalive.record_pong("r1", True)
+        await poll_until_async(lambda: len(submitted) == 3, timeout_s=budget(1), interval_s=0.01)
+        assert submitted_at[2] - resumed_at < interval / 2, "resumed work refreshes at once"
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert managed_host_keepalive._reports == {}, "the loop releases its report"

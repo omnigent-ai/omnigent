@@ -141,13 +141,23 @@ export function openTerminalLink(
     const target = withBasePath(sameOriginSessionPath);
     const currentPath = `${window.location.pathname}${window.location.search}${window.location.hash}`;
     if (target !== currentPath) {
-      window.history.pushState(null, "", target);
+      window.history.pushState(nextRouterHistoryState(), "", target);
       window.dispatchEvent(new PopStateEvent("popstate", { state: window.history.state }));
     }
     return;
   }
   if (!parseHttpUrl(uri)) return;
   window.open(uri, "_blank", "noopener,noreferrer");
+}
+
+/**
+ * A history entry in React Router's format, one past the current one, so the router
+ * (and Back's first-entry boundary) still know where this entry sits.
+ */
+function nextRouterHistoryState(): { usr: null; key: string; idx: number } | null {
+  const index = (window.history.state as { idx?: unknown } | null)?.idx;
+  if (typeof index !== "number") return null;
+  return { usr: null, key: Math.random().toString(36).slice(2, 10), idx: index + 1 };
 }
 
 function sameOriginSessionLink(uri: string): string | null {
@@ -987,6 +997,50 @@ export class TerminalSession {
    */
   focus(): void {
     this.term.focus();
+  }
+
+  /** Paste without Enter, waiting briefly for safe multiline input support. */
+  pasteCommand(text: string, onResult: (error: string | null) => void): () => void {
+    const command = text.replace(/\r\n/g, "\n").replace(/\n$/, "");
+    const hasControlCharacters = Array.from(command).some((char) => {
+      const code = char.charCodeAt(0);
+      return (code < 32 && code !== 9 && code !== 10) || (code >= 127 && code <= 159);
+    });
+    if (hasControlCharacters || this.disposed || this.ws.readyState !== WebSocket.OPEN) {
+      onResult(
+        hasControlCharacters
+          ? "This command contains terminal control characters."
+          : "The shell is not connected. Nothing was sent.",
+      );
+      return () => {};
+    }
+    let finished = false;
+    let listener: { dispose: () => void } | undefined;
+    let timer: number | undefined;
+    const cancel = () => {
+      finished = true;
+      listener?.dispose();
+      window.clearTimeout(timer);
+      this.listenerCtl.signal.removeEventListener("abort", cancel);
+    };
+    const tryPaste = () => {
+      if (finished || (/[\n\t]/.test(command) && !this.term.modes.bracketedPasteMode)) return;
+      cancel();
+      if (this.ws.readyState !== WebSocket.OPEN) {
+        onResult("The shell disconnected. Nothing was sent.");
+        return;
+      }
+      this.term.paste(command);
+      onResult(null);
+    };
+    listener = this.term.onWriteParsed(tryPaste);
+    timer = window.setTimeout(() => {
+      cancel();
+      onResult("The shell is not ready to safely paste this command. Nothing was sent.");
+    }, 5000);
+    this.listenerCtl.signal.addEventListener("abort", cancel, { once: true });
+    tryPaste();
+    return cancel;
   }
 
   /**

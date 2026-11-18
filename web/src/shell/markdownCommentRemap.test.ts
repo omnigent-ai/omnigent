@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import { MarkdownManager } from "@tiptap/markdown";
 import { Node } from "@tiptap/pm/model";
 import type { Comment } from "@/hooks/useComments";
+import { MAX_PREVIEW_MARKDOWN_BYTES, MAX_RICH_MARKDOWN_BYTES } from "./codeViewerHelpers";
 import { remapFormattedMarkdownComment } from "./markdownCommentRemap";
 
 describe("formatted Markdown source offsets", () => {
@@ -69,6 +70,21 @@ describe("formatted Markdown source offsets", () => {
     try {
       expect(remapFormattedMarkdownComment(comment, "😀".repeat(300_000))).toBe(comment);
       expect(parse).not.toHaveBeenCalled();
+    } finally {
+      parse.mockRestore();
+    }
+  });
+  it.each([
+    [MAX_RICH_MARKDOWN_BYTES + 1, true],
+    [MAX_PREVIEW_MARKDOWN_BYTES, true],
+    [MAX_PREVIEW_MARKDOWN_BYTES + 1, false],
+  ])("parses a %i-byte document for remapping: %s", (bytes, parses) => {
+    const parse = vi
+      .spyOn(MarkdownManager.prototype, "parse")
+      .mockReturnValue({ type: "doc", content: [] });
+    try {
+      remapFormattedMarkdownComment(comment, "a".repeat(bytes));
+      expect(parse).toHaveBeenCalledTimes(parses ? 1 : 0);
     } finally {
       parse.mockRestore();
     }

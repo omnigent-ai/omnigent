@@ -75,9 +75,8 @@ export function PickerVisibilitySetting() {
       <div className="flex min-w-0 flex-col">
         <span className="text-ui font-medium">Show in agent pickers</span>
         <span className="text-sm text-muted-foreground">
-          Choose which of this server's harnesses and agents appear when you start a chat, create an
-          automation or set a project default. Existing sessions are unaffected, and the entry you
-          have selected always stays visible.
+          Choose this server's harnesses and agents for new chats, automations, and project
+          defaults. Existing sessions stay unchanged; the selected entry stays visible.
         </span>
         <span className="mt-1 text-sm" data-testid="picker-visibility-summary">
           {summary}

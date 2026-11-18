@@ -41,49 +41,50 @@ describe("useHostWorktrees", () => {
     expect(result.current.data?.[0]).not.toHaveProperty("remote_provider");
   });
 
-  it("does not reuse a prior path's worktrees while the next path loads", async () => {
-    let resolveSecond: ((value: Response) => void) | undefined;
+  it.each([
+    { hostId: "host_1", path: "/ordinary" },
+    { hostId: "host_2", path: "/github" },
+  ])("ignores stale worktrees when switching to $hostId:$path", async (next) => {
+    let resolveStale!: (value: Response) => void;
+    let resolveNext!: (value: Response) => void;
+    const worktree = (branch: string) =>
+      response([{ path: "/github", branch, is_main: true, detached: false }]);
     authenticatedFetchMock
-      .mockResolvedValueOnce(
-        response([
-          {
-            path: "/github",
-            branch: "main",
-            is_main: true,
-            detached: false,
-          },
-        ]),
+      .mockResolvedValueOnce(worktree("original"))
+      .mockImplementationOnce(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveStale = resolve;
+          }),
       )
       .mockImplementationOnce(
         () =>
           new Promise<Response>((resolve) => {
-            resolveSecond = resolve;
+            resolveNext = resolve;
           }),
       );
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const { result, rerender } = renderHook(
-      ({ path }: { path: string }) => useHostWorktrees("host_1", path),
-      { initialProps: { path: "/github" }, wrapper: wrapper(client) },
-    );
-
-    await waitFor(() => expect(result.current.data?.[0].path).toBe("/github"));
-    rerender({ path: "/ordinary" });
+    const { result, rerender } = renderHook(({ hostId, path }) => useHostWorktrees(hostId, path), {
+      initialProps: { hostId: "host_1", path: "/github" },
+      wrapper: wrapper(client),
+    });
+    await waitFor(() => expect(result.current.data?.[0].branch).toBe("original"));
+    act(() => {
+      void result.current.refetch();
+    });
+    await waitFor(() => expect(resolveStale).toBeDefined());
+    rerender(next);
     expect(result.current.data).toBeUndefined();
     expect(result.current.isPlaceholderData).toBe(false);
-
+    await waitFor(() => expect(resolveNext).toBeDefined());
     await act(async () => {
-      resolveSecond?.(
-        response([
-          {
-            path: "/ordinary",
-            branch: "main",
-            is_main: true,
-            detached: false,
-          },
-        ]),
-      );
+      resolveNext(worktree("selected"));
     });
-    await waitFor(() => expect(result.current.data?.[0].path).toBe("/ordinary"));
+    await waitFor(() => expect(result.current.data?.[0].branch).toBe("selected"));
+    await act(async () => {
+      resolveStale(worktree("stale"));
+    });
+    expect(result.current.data?.[0].branch).toBe("selected");
   });
 });
 

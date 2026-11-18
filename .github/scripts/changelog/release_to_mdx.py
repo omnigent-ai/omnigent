@@ -41,7 +41,7 @@ WHATS_NEXT = """## What's Next
 Install or upgrade Omnigent:
 
 ```bash
-uv tool install --python 3.12 omnigent   # or: pip install "omnigent"
+curl -fsSL https://omnigent.ai/install.sh | sh
 ```
 
 - Star the project and file issues on [GitHub](https://github.com/omnigent-ai/omnigent).

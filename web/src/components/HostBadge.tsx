@@ -6,7 +6,7 @@ import { useSession } from "@/hooks/useSession";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
 import { useSessionHostOnline } from "@/hooks/RunnerHealthProvider";
 import { sandboxOptionLabel } from "@/lib/capabilities";
-import { SANDBOX_STAGE_LABELS } from "@/lib/sandboxStatus";
+import { isSandboxLaunchStopped, SANDBOX_STAGE_LABELS } from "@/lib/sandboxStatus";
 import type { SandboxStatus } from "@/lib/types";
 import { useChatStore } from "@/store/chatStore";
 import { DisabledActionTooltip } from "./DisabledActionTooltip";
@@ -17,6 +17,7 @@ import {
   ComposerConfigTooltipRows,
   ComposerHostTrigger,
   ComposerMenuTooltip,
+  HostStatusDot,
 } from "@/components/composer/ComposerControls";
 import {
   DropdownMenu,
@@ -97,12 +98,15 @@ function launchStatusWord(launch: SandboxStatus): string {
 export function HostBadge({
   sessionId,
   onReconnect,
+  starting = false,
   appearance = "status",
   readOnly = false,
 }: {
   sessionId: string;
   onReconnect?: () => void;
-  appearance?: "status" | "composer";
+  /** The session's sandbox is being woken; the composer dot spins until it is online. */
+  starting?: boolean;
+  appearance?: "status" | "composer" | "header";
   readOnly?: boolean;
 }) {
   const [switchOpen, setSwitchOpen] = useState(false);
@@ -110,8 +114,7 @@ export function HostBadge({
   const { session } = useSession(sessionId);
   const hostId = session?.hostId ?? null;
   // Keep sandbox hosts so managed sessions resolve to a provider label.
-  // Skip the fetch (and its 10s refetch loop) when there's no host to
-  // resolve — the badge renders nothing in that case anyway.
+  // Skip the fetch when there's no current host; the picker loads available hosts when opened.
   const { data: hosts } = useHosts({ includeSandbox: true, enabled: Boolean(hostId) });
   const liveOnline = useSessionHostOnline(sessionId);
 
@@ -154,27 +157,41 @@ export function HostBadge({
 
   const badge = resolveHostBadge({ hostId, host, online });
   const { switchHostDisabledReason } = useSessionActionRestrictions(sessionId);
-  const canSwitch = host !== undefined && !switchHostDisabledReason && !readOnly;
+  const canSwitch =
+    (host !== undefined || (session !== null && hostId === null && launch === null)) &&
+    !switchHostDisabledReason &&
+    !readOnly;
   useEffect(() => {
     if (!canSwitch) setSwitchOpen(false);
   }, [canSwitch]);
-  if (appearance === "composer") {
+  if (appearance === "composer" || appearance === "header") {
     // A launching sandbox has no host record yet: show the launch, not a missing host.
     const launchStatus = launch && !host ? launchStatusWord(launch) : null;
-    const reconnectable = !launchStatus && badge?.status === "offline" && !!onReconnect;
-    let label = badge ? `Host ${badge.label}, ${STATUS_WORD[badge.status]}` : "No host bound";
+    // A wake, or a launch or resume the server reports by stage, spins the status
+    // dot until the host itself is online. A launch waiting on the user isn't progress.
+    const launchInProgress = launch !== null && !isSandboxLaunchStopped(launch);
+    // The wake's owner ends `starting` when the launch reports a stop.
+    const localWakeRunning = starting && !!badge;
+    const hostStarting = (localWakeRunning || launchInProgress) && badge?.status !== "online";
+    const startingWord = launch && launchInProgress ? launchStatusWord(launch) : "Starting";
+    const dotStatus = hostStarting ? "starting" : (badge?.status ?? "unknown");
+    // Only this tab's own wake hides Reconnect: a server-reported stage can go stale.
+    const reconnectable =
+      !launchStatus && !localWakeRunning && badge?.status === "offline" && !!onReconnect;
+    const statusWord = hostStarting ? startingWord : STATUS_WORD[badge?.status ?? "unknown"];
+    let label = badge ? `Host ${badge.label}, ${statusWord}` : "No host bound";
     // A dormant resumable host wakes on the next message; it isn't disconnected.
     const asleep = badge?.status === "offline" && !!session?.hostResumable;
+    let connectionWord = CONNECTION_WORD[badge?.status ?? "unknown"];
+    if (hostStarting) connectionWord = startingWord;
+    else if (asleep) connectionWord = "Asleep — wakes on next message";
     let tooltipRows = badge
       ? [
           { label: "Host", value: badge.label },
           // An Arclet's host takes the Arclet's own name, e.g. "omnigent-arclet-1234",
           // which the provider label hides. Other providers' managed-<hex> names don't help.
           ...(host?.sandbox_provider === "arclet" ? [{ label: "Name", value: host.name }] : []),
-          {
-            label: "Status",
-            value: asleep ? "Asleep — wakes on next message" : CONNECTION_WORD[badge.status],
-          },
+          { label: "Status", value: connectionWord },
         ]
       : [{ label: "Host", value: "None" }];
     const launchHost = launch?.provider ? sandboxOptionLabel(launch.provider) : "Sandbox";
@@ -187,7 +204,7 @@ export function HostBadge({
     }
     return (
       <>
-        <DropdownMenu onOpenChange={setMenuOpen}>
+        <DropdownMenu modal={appearance !== "header"} onOpenChange={setMenuOpen}>
           <ComposerMenuTooltip
             menuOpen={menuOpen}
             content={<ComposerConfigTooltipRows rows={tooltipRows} />}
@@ -197,15 +214,16 @@ export function HostBadge({
             <DropdownMenuTrigger asChild>
               <ComposerHostTrigger
                 label={label}
-                status={launchStatus ? undefined : (badge?.status ?? "unknown")}
+                appearance={appearance}
+                status={launchStatus && !hostStarting ? undefined : dotStatus}
                 cloud={!!launchStatus || !!host?.sandbox_provider}
                 data-testid="composer-host-select"
               />
             </DropdownMenuTrigger>
           </ComposerMenuTooltip>
           <DropdownMenuContent
-            align="start"
-            side="top"
+            align={appearance === "header" ? "end" : "start"}
+            side={appearance === "header" ? "bottom" : "top"}
             sideOffset={8}
             className="composer-host-menu w-max min-w-[220px]"
             data-testid="composer-host-menu"
@@ -214,13 +232,8 @@ export function HostBadge({
               {launchStatus || host?.sandbox_provider ? "Cloud" : "My machines"}
             </div>
             <DropdownMenuItem disabled className="gap-2" data-selected="true">
-              {!launchStatus && (
-                <span
-                  className={cn(
-                    "size-2 shrink-0 rounded-full",
-                    STATUS_DOT_CLASS[badge?.status ?? "unknown"],
-                  )}
-                />
+              {(!launchStatus || hostStarting) && (
+                <HostStatusDot status={dotStatus} testId="composer-host-menu-status" />
               )}
               <span>{launchStatus ? launchHost : (badge?.label ?? "No host bound")}</span>
             </DropdownMenuItem>
@@ -257,8 +270,8 @@ export function HostBadge({
   }
   if (!badge) return null;
 
-  // An offline resumable managed host is idle-stopped; reconnecting asks the
-  // server to resume it rather than handing out `omnigent host`.
+  // An offline resumable managed host is resumed by the server on reconnect,
+  // not by handing out `omnigent host`.
   const reconnectable = badge.status === "offline" && !!onReconnect;
   const statusWord = reconnectable ? RECONNECT_WORD : STATUS_WORD[badge.status];
   const title = `Host ${badge.label}, ${statusWord}`;

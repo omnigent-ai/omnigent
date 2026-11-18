@@ -58,6 +58,18 @@ class TestSanitizeReturnTo:
 # ── _evict_expired_tickets ───────────────────────────────────────────
 
 
+def test_cli_ticket_repr_omits_credentials() -> None:
+    ticket = _CliTicket(token="session-secret", refresh_token="refresh-secret")
+
+    for representation in (repr(ticket), str(ticket), repr({"pending": ticket})):
+        assert "session-secret" not in representation
+        assert "refresh-secret" not in representation
+        assert "created_at=" in representation
+
+    assert ticket.token == "session-secret"
+    assert ticket.refresh_token == "refresh-secret"
+
+
 class TestEvictExpiredTickets:
     """Tests for CLI ticket expiry."""
 

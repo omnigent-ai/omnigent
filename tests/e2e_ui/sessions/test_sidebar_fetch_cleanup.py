@@ -8,6 +8,8 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 from playwright.sync_api import Page, Route, expect
 
+from tests.e2e_ui.sessions._sidebar_helpers import choose_session_filter
+
 
 def test_scope_requests_and_bounded_automatic_pagination(
     page: Page, request: pytest.FixtureRequest
@@ -183,8 +185,7 @@ def test_mine_filters_a_mixed_visibility_response(
     page.goto(base_url)
     expect(page.get_by_text("Owned from mixed response", exact=True)).to_be_visible()
     expect(page.get_by_text("Shared from mixed response", exact=True)).to_have_count(0)
-    page.get_by_test_id("session-filter").click()
-    page.get_by_test_id("session-filter-all").click()
+    choose_session_filter(page, "all")
     expect(page.get_by_text("Owned from mixed response", exact=True)).to_be_visible()
     expect(page.get_by_text("Shared from mixed response", exact=True)).to_be_visible()
 
@@ -252,8 +253,7 @@ def test_shared_loading_keeps_pins_and_projects_mounted(
     assert pin_element is not None and folder_element is not None
 
     # All needs the pending Shared cache even on a loopback-only test server.
-    page.get_by_test_id("session-filter").click()
-    page.get_by_test_id("session-filter-all").click()
+    choose_session_filter(page, "all")
     sessions = page.locator("section").filter(
         has=page.get_by_role("button", name="Sessions", exact=True)
     )
@@ -382,9 +382,8 @@ def test_archived_refreshes_on_entry_without_polling(
         route.fulfill(json={"data": data, "has_more": False})
 
     def select(scope: str) -> None:
-        page.get_by_test_id("session-filter").click()
+        choose_session_filter(page, scope)
         option = page.get_by_test_id(f"session-filter-{scope}")
-        option.click()
         expect(option).to_have_count(0)
         page.wait_for_load_state("networkidle")
 
