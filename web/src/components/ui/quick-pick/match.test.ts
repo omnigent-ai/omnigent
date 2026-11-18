@@ -292,7 +292,7 @@ describe("whole-query matches", () => {
   it("matches word by word when no field holds the words in order, and for one word", () => {
     expect(match("files show", candidate("Show Files")).wholeQuery).toBe(false);
     expect(match("show files", candidate("Show the files")).wholeQuery).toBe(false);
-    // A single word is the whole query for every candidate, so it ranks as before.
+    // Single-word queries never take the whole-query path.
     expect(match("files", candidate("Show Files")).wholeQuery).toBe(false);
   });
 });

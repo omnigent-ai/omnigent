@@ -1,8 +1,5 @@
-// Query matching for pickers. Each query word must match some field of a row;
-// rows rank by match class (exact, prefix, word-boundary substring, substring,
-// fuzzy subsequence), then penalty, then field weight. A field holding the whole
-// multi-word query as one phrase outranks words matched separately, so "show files"
-// finds "Show Files" before rows that only list those words as keywords.
+// Query matching for pickers: every query word must match some field of a row,
+// and a field holding the whole multi-word query as one phrase ranks first.
 
 /** A half-open `[start, end)` range of UTF-16 offsets into the source text. */
 export interface MatchRange {
