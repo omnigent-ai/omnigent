@@ -34,6 +34,7 @@ import pytest
 
 from omnigent.runtime import session_stream
 from omnigent.server.routes import sessions as sessions_routes
+from tests.budgets import budget
 from tests.server.helpers import create_test_agent
 
 pytestmark = pytest.mark.asyncio
@@ -417,17 +418,22 @@ async def test_claimed_renderer_uses_result_timeout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A renderer that claims but never answers gets the normal result timeout."""
-    monkeypatch.setattr(sessions_routes, "_BROWSER_ACTION_AWAIT_S", 0.05)
+    # Claiming is setup; expire only the result wait immediately after it succeeds.
+    monkeypatch.setattr(sessions_routes, "_BROWSER_ACTION_CLAIM_GRACE_S", budget(5.0))
+    monkeypatch.setattr(sessions_routes, "_BROWSER_ACTION_AWAIT_S", 0.0)
 
     agent = await create_test_agent(client, "test-browser-claimed-timeout")
     session_id = await _create_session(client, agent["id"])
     request_task, action_id = await _park_action_request(client, session_id, action="snapshot")
 
-    claim = await client.post(f"/v1/sessions/{session_id}/browser/action_claim/{action_id}")
-    assert claim.status_code == 200, claim.text
-    assert claim.json()["claimed"] is True
-
-    resp = await request_task
+    try:
+        claim = await client.post(f"/v1/sessions/{session_id}/browser/action_claim/{action_id}")
+        assert claim.status_code == 200, claim.text
+        assert claim.json()["claimed"] is True
+        resp = await request_task
+    finally:
+        request_task.cancel()
+        await asyncio.gather(request_task, return_exceptions=True)
     assert resp.status_code == 200, resp.text
     assert "timed out" in resp.json()["error"]
     assert sessions_routes._browser_action_registry == {}
