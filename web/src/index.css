@@ -1942,7 +1942,7 @@ html[data-electron-mac] .breadcrumb-folder {
 /* Wide settings pages scroll under the status bar; hide that band. The mask
  * makes the scroller a stacking context, which would trap the fixed phone
  * title beneath the header, so phones extend the header backdrop instead. */
-@media (width >= 48rem) {
+@media (width >= 73.8125rem) {
   :is([data-ios-native], [data-android-native]) .settings-page-scroll {
     mask-image: linear-gradient(
       to bottom,
