@@ -52,6 +52,8 @@ export function conversationHooksMock() {
     useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
     useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
     useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+    // No tagged project: shared runs fall back to the default-named folder.
+    useDefaultAutomationProject: () => ({ data: null }),
     useProjectConfig: () => ({ data: undefined, isLoading: false }),
     useUpdateProjectConfig: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
     fetchProjectSessionIds: () => Promise.resolve([]),

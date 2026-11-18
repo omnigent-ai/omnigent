@@ -2850,6 +2850,21 @@ describe("CreateScheduledTaskDialog project", () => {
     expect(resolveOrCreateProjectId).not.toHaveBeenCalled();
   });
 
+  it("files into the tagged project on save while the project lists are still loading", async () => {
+    // The dialog's display queries are pending (slow lists), but the save
+    // re-lists server-side, so the renamed tagged project is still the target.
+    projectsQuery.current = { data: undefined, isPending: true, isSuccess: false, isError: false };
+    defaultAutomationProjectQuery.current = { data: undefined };
+    resolveOrCreateAutomationProjectId.mockResolvedValueOnce("proj_auto");
+    renderWithProjects();
+    fillRequired();
+    // The trigger shows the fallback name until the lists resolve.
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Omnigent Automation");
+    expect(await submitCreate()).toMatchObject({ projectId: "proj_auto" });
+    expect(resolveOrCreateAutomationProjectId).toHaveBeenCalledTimes(1);
+    expect(resolveOrCreateProjectId).not.toHaveBeenCalled();
+  });
+
   it("allows opting out of the default project", async () => {
     renderWithProjects();
     fillRequired();

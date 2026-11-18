@@ -3107,6 +3107,64 @@ describe("resolveOrCreateAutomationProjectId", () => {
     await expect(resolveOrCreateAutomationProjectId()).resolves.toBe("p_winner");
   });
 
+  it("stamps an unmarked 409 race winner so a later rename can't duplicate it", async () => {
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ object: "list", data: [] }))
+      .mockResolvedValueOnce(
+        mockResponse({ message: "already exists" }, { ok: false, status: 409 }),
+      )
+      // The racer created the folder the plain (pre-marker) way: name only.
+      .mockResolvedValueOnce(
+        mockResponse({
+          object: "list",
+          data: [{ id: "p_winner", name: "Omnigent Automation", config: { icon: "⚡" } }],
+        }),
+      )
+      .mockResolvedValueOnce(
+        mockResponse({
+          id: "p_winner",
+          object: "project",
+          name: "Omnigent Automation",
+          config: { icon: "⚡", default_automations: true },
+        }),
+      );
+
+    await expect(resolveOrCreateAutomationProjectId()).resolves.toBe("p_winner");
+
+    const [patchUrl, patchInit] = fetchMock.mock.calls[3] as [string, RequestInit];
+    expect(patchUrl).toBe("/v1/projects/p_winner");
+    expect(patchInit.method).toBe("PATCH");
+    expect(JSON.parse(patchInit.body as string)).toEqual({
+      config: { icon: "⚡", default_automations: true },
+    });
+  });
+
+  it("resolves multiple tagged folders to the earliest-created one", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        object: "list",
+        data: [
+          {
+            id: "p_new",
+            name: "Omnigent Automation",
+            created_at: 200,
+            config: { default_automations: true },
+          },
+          // An older folder the user tagged (or an earlier duplicate): wins.
+          {
+            id: "p_old",
+            name: "Automations",
+            created_at: 100,
+            config: { default_automations: true },
+          },
+        ],
+      }),
+    );
+
+    await expect(resolveOrCreateAutomationProjectId()).resolves.toBe("p_old");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
   it("still returns an adopted project when stamping its marker fails", async () => {
     fetchMock
       .mockResolvedValueOnce(

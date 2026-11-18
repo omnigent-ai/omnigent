@@ -64,6 +64,20 @@ def test_automation_sandbox_repository(
                 [{"id": "automation-project", "name": "Omnigent Automation", "icon": None}]
             ),
         )
+
+        # Saving an automation adopts the default-named project, stamping the
+        # automations marker onto its config via PATCH.
+        def update_project_config(request: Request) -> dict[str, Any]:
+            return {
+                "id": "automation-project",
+                "object": "project",
+                "name": "Omnigent Automation",
+                "config": (request.post_data_json or {}).get("config", {}),
+            }
+
+        contract.json(
+            "/v1/projects/automation-project", update_project_config, method="PATCH"
+        )
         tasks: list[dict[str, Any]] = []
         contract.json("/v1/scheduled-tasks", lambda _: {"scheduled_tasks": tasks})
 

@@ -2465,11 +2465,16 @@ export function useResolveOrCreateProjectId(): (name: string) => Promise<string>
 
 /** The project from a full listing that new automations file their runs into. */
 function findAutomationProject(projects: Project[]): Project | undefined {
-  return (
-    projects.find((project) => project.config?.[AUTOMATION_DEFAULT_CONFIG_KEY]) ??
-    // Projects created before the marker existed carry only the default name.
-    projects.find((project) => project.name === DEFAULT_AUTOMATION_PROJECT)
-  );
+  const tagged = projects.filter((project) => project.config?.[AUTOMATION_DEFAULT_CONFIG_KEY]);
+  if (tagged.length > 0) {
+    // Multiple tagged folders (one can be recreated after a delete) resolve to
+    // the earliest-created so concurrent saves pick the same row.
+    return tagged.sort(
+      (a, b) => (a.created_at ?? Infinity) - (b.created_at ?? Infinity) || a.id.localeCompare(b.id),
+    )[0];
+  }
+  // Projects created before the marker existed carry only the default name.
+  return projects.find((project) => project.name === DEFAULT_AUTOMATION_PROJECT);
 }
 
 /**
@@ -2495,30 +2500,34 @@ export function useDefaultAutomationProject({ enabled = true }: { enabled?: bool
 }
 
 /**
+ * Stamp *project* as the automations default (best-effort) and return its id.
+ * A failed write logs and leaves the name match to find it on a later save.
+ */
+async function adoptAutomationProject(project: Project): Promise<string> {
+  if (project.config?.[AUTOMATION_DEFAULT_CONFIG_KEY]) return project.id;
+  try {
+    await apiUpdateProjectConfig(project.id, {
+      ...project.config,
+      [AUTOMATION_DEFAULT_CONFIG_KEY]: true,
+    });
+  } catch (err) {
+    console.warn("Couldn't mark the automations project; the next save retries", err);
+  }
+  return project.id;
+}
+
+/**
  * Resolve the project new automations file their runs into, creating it on
  * demand. Matched by its config marker so renaming the folder doesn't spawn a
  * duplicate; a project carrying only the default name (created before the
- * marker existed) is adopted and stamped. Deleting the project drops the
- * marker with it, so the next automation creates a fresh one.
+ * marker existed, or created by a racing save) is adopted and stamped.
+ * Deleting the project drops the marker with it, so the next automation
+ * creates a fresh one.
  */
 export async function resolveOrCreateAutomationProjectId(): Promise<string> {
   const projects = await apiListProjects();
   const existing = findAutomationProject(projects);
-  if (existing) {
-    if (!existing.config?.[AUTOMATION_DEFAULT_CONFIG_KEY]) {
-      // Stamp the adopted project best-effort; a failed write keeps the name
-      // match working until a later save retries it.
-      try {
-        await apiUpdateProjectConfig(existing.id, {
-          ...existing.config,
-          [AUTOMATION_DEFAULT_CONFIG_KEY]: true,
-        });
-      } catch {
-        // The adopted id is still correct for this save.
-      }
-    }
-    return existing.id;
-  }
+  if (existing) return adoptAutomationProject(existing);
   try {
     return (
       await apiCreateProject(DEFAULT_AUTOMATION_PROJECT, {
@@ -2527,12 +2536,12 @@ export async function resolveOrCreateAutomationProjectId(): Promise<string> {
     ).id;
   } catch (err) {
     // The create may have lost a race (a concurrent save created the same
-    // name → 409) or genuinely failed. Re-list: a racer's project — marked or
-    // still name-only — wins; otherwise rethrow the ORIGINAL error so the true
-    // cause isn't masked.
+    // name → 409) or genuinely failed. Re-list: the winner's project is
+    // adopted and stamped like a legacy one; otherwise rethrow the ORIGINAL
+    // error so the true cause isn't masked.
     const after = await apiListProjects();
     const created = findAutomationProject(after);
-    if (created) return created.id;
+    if (created) return adoptAutomationProject(created);
     throw err;
   }
 }
@@ -2540,13 +2549,15 @@ export async function resolveOrCreateAutomationProjectId(): Promise<string> {
 /**
  * {@link resolveOrCreateAutomationProjectId}, then refresh the cached project
  * lists so the sidebar and the dialog's default read the project it just
- * created or stamped.
+ * created or stamped, plus that project's config cache (an adoption stamp
+ * rewrites the config of the project it returns).
  */
 export function useResolveOrCreateAutomationProjectId(): () => Promise<string> {
   const queryClient = useQueryClient();
   return useCallback(async () => {
     const id = await resolveOrCreateAutomationProjectId();
     void queryClient.invalidateQueries({ queryKey: ["projects"] });
+    void queryClient.invalidateQueries({ queryKey: ["project-config", id] });
     return id;
   }, [queryClient]);
 }

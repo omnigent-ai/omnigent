@@ -196,6 +196,7 @@ import {
   useStopAndDeleteConversation,
   useStopSession,
   useAutomationsEnabled,
+  useDefaultAutomationProject,
 } from "@/hooks/useConversations";
 import { fetchConversationById, useOpenSessionRow } from "@/hooks/useOpenSessionRow";
 import { isOwnerLevel } from "@/lib/permissionsApi";
@@ -317,6 +318,8 @@ import {
   sessionInSidebarFolder,
   sessionsListAcceptsDrop,
   withAutomationFolder,
+  FALLBACK_AUTOMATION_FOLDER,
+  type DefaultAutomationFolder,
 } from "./sidebarNav";
 import { SidebarServerPicker } from "./SidebarServerPicker";
 import { isRowFullyVisible } from "./sidebarRowVisibility";
@@ -1684,6 +1687,7 @@ function ProjectFolder({
   projectId,
   placeholder = false,
   includeSharedRuns,
+  defaultAutomationFolder = FALLBACK_AUTOMATION_FOLDER,
   icon,
   windowConversations,
   archived,
@@ -1733,6 +1737,8 @@ function ProjectFolder({
   placeholder?: boolean;
   /** Whether other users' automation runs join the default automation folder. */
   includeSharedRuns: boolean;
+  /** Which folder those runs join: the tagged project's id, else its name. */
+  defaultAutomationFolder?: DefaultAutomationFolder;
   /** Chosen emoji icon (unicode grapheme), or null/absent for the default
       folder glyph. */
   icon?: string | null;
@@ -1803,7 +1809,13 @@ function ProjectFolder({
         [...byId.values()].filter(
           (c) =>
             (c.archived === true) === archived &&
-            sessionInSidebarFolder(c, { id: projectId, name }, viewerId, includeSharedRuns) &&
+            sessionInSidebarFolder(
+              c,
+              { id: projectId, name },
+              viewerId,
+              includeSharedRuns,
+              defaultAutomationFolder,
+            ) &&
             (archived || !isSessionPinned(c, pinnedSet)),
         ),
         activeOverride,
@@ -1826,6 +1838,7 @@ function ProjectFolder({
     name,
     viewerId,
     includeSharedRuns,
+    defaultAutomationFolder,
   ]);
   // Each expansion, archive switch or re-sort restarts the page count and auto-load
   // budget; when paginated, the open session is never left hidden.
@@ -2505,6 +2518,19 @@ function ConversationList({
   // Other users' automation runs join the default automation folder. My sessions
   // takes them from the shared rows already loaded, so none show when those aren't.
   const includeSharedRuns = activeTab !== "mine" || sharedActive;
+  // The tagged automations project (rename-proof) is joined against the
+  // summaries for its current name; the fallback name covers legacy folders
+  // and the not-yet-created one.
+  const { data: taggedAutomationProject } = useDefaultAutomationProject({
+    enabled: includeSharedRuns,
+  });
+  const defaultAutomationFolder = useMemo<DefaultAutomationFolder>(() => {
+    if (taggedAutomationProject == null) return FALLBACK_AUTOMATION_FOLDER;
+    const name =
+      projects.find((project) => project.id === taggedAutomationProject.id)?.name ??
+      taggedAutomationProject.name;
+    return { id: taggedAutomationProject.id, name };
+  }, [taggedAutomationProject, projects]);
   const mineSharedRuns = useMemo(
     () =>
       activeTab === "mine" && includeSharedRuns
@@ -2571,6 +2597,7 @@ function ConversationList({
             projects,
             sharedRunsToFile,
             projectOrder.data?.sort_mode === "manual",
+            defaultAutomationFolder,
           );
     const filedIds = new Set<string>();
     const projectGroups: {
@@ -2587,8 +2614,13 @@ function ConversationList({
       // and (filing being owner-only) the viewer owns it.
       const inProject = folderCandidates.filter(
         (c) =>
-          sessionInSidebarFolder(c, { id, name }, viewerId, includeSharedRuns) &&
-          !pinnedIdSet.has(c.id),
+          sessionInSidebarFolder(
+            c,
+            { id, name },
+            viewerId,
+            includeSharedRuns,
+            defaultAutomationFolder,
+          ) && !pinnedIdSet.has(c.id),
       );
       inProject.forEach((c) => filedIds.add(c.id));
       return {
@@ -2703,6 +2735,7 @@ function ConversationList({
     activeTab,
     includeSharedRuns,
     mineSharedRuns,
+    defaultAutomationFolder,
     viewerId,
     groupingUi,
     grouped,
@@ -3631,6 +3664,7 @@ function ConversationList({
                               key={group.name}
                               placeholder={group.placeholder}
                               includeSharedRuns={includeSharedRuns}
+                              defaultAutomationFolder={defaultAutomationFolder}
                               ordering={{
                                 disabled:
                                   group.placeholder ||
