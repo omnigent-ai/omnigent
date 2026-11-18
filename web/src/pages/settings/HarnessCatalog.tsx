@@ -93,17 +93,16 @@ export function HarnessCatalog({
   header,
   settings,
   host,
-  family,
   entries,
   defaultTab = "mcps",
 }: {
   header: ReactNode;
   settings: ReactNode;
   host: Host;
-  family: InventoryHarness;
   entries: InventoryPageEntries;
   defaultTab?: CatalogKind | "settings";
 }) {
+  const family = entries.family;
   // `?tab=settings` (the grid card's gear) opens on Settings; otherwise MCP servers.
   const [searchParams] = useSearchParams();
   const [tab, setTab] = useState<CatalogKind | "settings">(

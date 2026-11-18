@@ -625,11 +625,15 @@ describe("Harness plugin and skill catalog rows", () => {
 
     selectTab("Skills · 1");
     const skillRow = screen.getByTestId("catalog-row-review").closest("li");
+    expect(skillRow).toHaveAttribute("data-settings-region-row");
     expect(
       skillRow?.closest('[data-settings-region="harness-claude-native-detail:skills"]'),
     ).not.toBeNull();
 
     fireEvent.click(screen.getByTestId("catalog-row-review"));
+    expect(
+      document.querySelector('[data-settings-item="harness-claude-native-skill"]'),
+    ).toContainElement(screen.getByRole("heading", { name: "Instructions" }));
     expect(
       document.querySelector('[data-settings-content="harness-claude-native-skill:skill"]'),
     ).toContainElement(screen.getByRole("heading", { name: "Instructions" }));

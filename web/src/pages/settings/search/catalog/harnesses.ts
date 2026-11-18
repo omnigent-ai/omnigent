@@ -165,6 +165,17 @@ const INVENTORY_KINDS = [
 // A list whose rows each open a page, named by the row's own data, so none of it is searchable.
 const OPENS_BY_NAME = { rowActions: { open: { dataName: true } } } as const;
 
+/** The families whose skills open a page of their own, which also show their contents. */
+export const SKILL_PAGE_FAMILIES = [
+  "claude",
+  "codex",
+  "cursor",
+] as const satisfies readonly InventoryHarness[];
+
+function hasSkillPage(family: InventoryHarness): boolean {
+  return (SKILL_PAGE_FAMILIES as readonly InventoryHarness[]).includes(family);
+}
+
 /**
  * Each harness's own page, named by its title. Its setup warning's button is "Set up", or, by
  * what the host needs, Install, Update, Reconfigure or Set up tmux. A page whose harness has an
@@ -211,8 +222,10 @@ export const HARNESS_DETAIL_ENTRIES = settingsEntryFamily({
         ),
       },
       presence: { ...page.presence, tab: { states: ["lists its inventory"] } },
-      // Each plugin and skill row opens its own page.
-      regions: { plugins: OPENS_BY_NAME, skills: OPENS_BY_NAME },
+      regions: {
+        plugins: OPENS_BY_NAME,
+        ...(hasSkillPage(inventoryFamilyOf(harness)!) ? { skills: OPENS_BY_NAME } : {}),
+      },
     }) as InventoryHarnessDetailEntry;
   },
 });
@@ -239,17 +252,6 @@ export const HARNESS_CREDENTIAL_ENTRIES = settingsEntryFamily({
       presence: { credentialAction: { states: ["has a credential action"] } },
     }),
 });
-
-/** The families whose skills open a page of their own, which also show their contents. */
-export const SKILL_PAGE_FAMILIES = [
-  "claude",
-  "codex",
-  "cursor",
-] as const satisfies readonly InventoryHarness[];
-
-function hasSkillPage(family: InventoryHarness): boolean {
-  return (SKILL_PAGE_FAMILIES as readonly InventoryHarness[]).includes(family);
-}
 
 const INVENTORY_NATIVE_IDS = NATIVE_HARNESS_IDS.filter(
   (harness) => inventoryFamilyOf(harness) !== undefined,
@@ -279,7 +281,7 @@ export const HARNESS_PLUGIN_ENTRIES = settingsEntryFamily({
           PLUGIN_KINDS.map((kind) => [kind, { before: `${kind} · `, count: true }]),
         ),
       },
-      regions: { skills: OPENS_BY_NAME },
+      ...(hasSkillPage(inventoryFamilyOf(harness)!) ? { regions: { skills: OPENS_BY_NAME } } : {}),
       revealedBy: { entry: `harness-${harness}-detail`, part: "tab", choice: "Plugins" },
     }),
 });

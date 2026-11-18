@@ -812,7 +812,6 @@ function HarnessDetail({
           header={header}
           settings={settings}
           host={host}
-          family={inventoryPage.family}
           entries={inventoryPage}
           defaultTab={status.ready ? "mcps" : "settings"}
         />
