@@ -61,6 +61,7 @@ import {
   gridCellComposerKey,
   holdsInitialDraft,
   isCompactControl,
+  type QueuedMessage,
   rejectBusyCompact,
   restoredSendDraftUnchanged,
   takeFailedSendDraft,
@@ -85,7 +86,11 @@ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import { isNativeTerminalSession } from "@/lib/nativeCodingAgents";
 import { isPermissionModeCycleKey } from "@/lib/permissionModeCycle";
-import { sideChatSettingsMutationKey, usesNativeSideChatFork } from "@/lib/sideChat";
+import {
+  isSideChatCommand,
+  sideChatSettingsMutationKey,
+  usesNativeSideChatFork,
+} from "@/lib/sideChat";
 import { parentIdFromLabels } from "@/lib/sessionHost";
 import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
 import {
@@ -102,6 +107,7 @@ import {
 } from "@/lib/outgoingComposerMessage";
 import {
   composerInlineMentions,
+  mergeTaggedDrafts,
   presentTaggedMentions,
   recallFileMentions,
   recallSessionMentions,
@@ -130,20 +136,32 @@ function isPendingSideChat(id: string): boolean {
 }
 
 /**
- * A grid cell's message text with its session and file tags recalled as tokens, as
- * the full-screen composer does. Used by edit-and-resend, failed-send restore and the
- * delivered-draft check, so the three paths agree.
+ * A grid cell's message text with its session and file tags recalled as tokens, as the
+ * full-screen composer does; `quoteBefores` recalls quote cards' text the same way. Used
+ * by every grid path that restores a sent or queued message.
  */
-function recallGridDraft(text: string): { text: string; mentions: TaggedMentions | undefined } {
-  const sessions = recallSessionMentions(text);
-  const files = recallFileMentions(
-    sessions.main,
-    sessions.sessions.map((session) => session.token!),
-  );
-  const tagged = files.files.length > 0 || sessions.sessions.length > 0;
+function recallGridDraft(
+  text: string,
+  quoteBefores: readonly string[] = [],
+): { text: string; quoteBefores: string[]; mentions: TaggedMentions | undefined } {
+  const sessions = recallSessionMentions(text, quoteBefores);
+  const sessionTokens = sessions.sessions.map((session) => session.token!);
+  // One tag list across the segments, so a file named in two of them keeps one token.
+  let mentions: TaggedMentions = { files: [], sessions: sessions.sessions };
+  const segments = [sessions.main, ...sessions.others].map((segment) => {
+    const files = recallFileMentions(segment, sessionTokens);
+    const merged = mergeTaggedDrafts(mentions, {
+      text: files.text,
+      mentions: { files: files.files, sessions: [] },
+    });
+    mentions = merged.mentions!;
+    return merged.text;
+  });
+  const tagged = mentions.files.length > 0 || mentions.sessions.length > 0;
   return {
-    text: files.text,
-    mentions: tagged ? { files: files.files, sessions: sessions.sessions } : undefined,
+    text: segments[0]!,
+    quoteBefores: segments.slice(1),
+    mentions: tagged ? mentions : undefined,
   };
 }
 
@@ -163,6 +181,28 @@ function loadRecalledGridText(childId: string, text: string): void {
     autoFocus: true,
   }));
   setSessionMentions(childId, recalled.mentions);
+}
+
+/**
+ * A queued grid message as its composer draft: quote cards kept, tags recalled as tokens.
+ * The caller writes `mentions` with `setSessionMentions` after the draft's text.
+ */
+function recallGridQueuedDraft(message: Pick<QueuedMessage, "text" | "replyDraft">) {
+  const restored = restoreReplyDraft(message.text, message.replyDraft);
+  const recalled = recallGridDraft(
+    restored.text,
+    restored.quotes.map((quote) => quote.before),
+  );
+  return {
+    draft: {
+      text: recalled.text,
+      quotes: restored.quotes.map((quote, index) => ({
+        ...quote,
+        before: recalled.quoteBefores[index]!,
+      })),
+    },
+    mentions: recalled.mentions,
+  };
 }
 
 const TEXT_INPUT_TYPES = new Set(["text", "search", "email", "url", "password", "number", "tel"]);
@@ -692,8 +732,8 @@ function SideChatComposer({
     () => allQueuedMessages.filter((message) => message.conversationId === childId),
     [allQueuedMessages, childId],
   );
-  // Grid sessions keep waiting for the turn to end; side chats queue like the main composer.
-  const queues = !pending && !fullSession;
+  // Grid cells queue like the full-screen composer; other full sessions wait for the turn to end.
+  const queues = !pending && (!fullSession || gridCell);
   useEffect(() => {
     if (queues && queuedMessages.length > 0 && !settingsSaving) maybeFlushQueuedHead(childId);
   }, [queues, queuedMessages, busy, agentId, childId, maybeFlushQueuedHead, settingsSaving]);
@@ -1040,8 +1080,8 @@ function SideChatComposer({
     onTabComplete: completeMenuSelection,
     clearText: () => setText(""),
   });
-  // Like the main composer, a draft turns Interrupt into Send.
-  const showInterrupt = !pending && busy && (fullSession || !canSend);
+  // Like the main composer, a draft turns Interrupt into Send; a grid cell queues its draft.
+  const showInterrupt = !pending && busy && ((fullSession && !gridCell) || !canSend);
 
   const interruptSideChat = () => {
     if (interrupting || !interruptReady) return;
@@ -1060,7 +1100,8 @@ function SideChatComposer({
       void onStart(serializeReplyDraft({ quotes, text: trimmed }));
       return;
     }
-    if ((busy && fullSession) || !canSend || agentId === null) return;
+    // A grid cell queues or steers its send while the session works; other full sessions wait.
+    if ((busy && fullSession && !gridCell) || !canSend || agentId === null) return;
     // On in-process harnesses /help and skills resolve locally; native TUIs
     // (claude-native, codex-native) read the text themselves, and a quote, attachment,
     // tag or review comment is always an ordinary message.
@@ -1114,13 +1155,20 @@ function SideChatComposer({
         child.sessionStatus,
         useChatStore.getState().queuedMessages,
         readAlwaysSteer(),
-        false,
+        // A codex /side command posts now even mid-turn, as the full-screen composer does.
+        gridCell && usesNativeSideChatFork(harness) && isSideChatCommand(message.trim()),
         holdsInitialDraft(child),
       )
     ) {
       clearComposer(composerKey);
+      if (gridCell) clearLocalReviewContexts(childId);
       onSend();
-      enqueueMessage(message, outgoing, snapshotReplyDraft({ quotes, text: trimmed }), childId);
+      enqueueMessage(
+        message,
+        outgoing,
+        gridCell ? composed.replyDraft : snapshotReplyDraft({ quotes, text: trimmed }),
+        childId,
+      );
       return;
     }
     // A running Codex chat refuses a steered /compact; keep the draft as the main composer does.
@@ -1150,7 +1198,7 @@ function SideChatComposer({
       return;
     }
     // A grid pane is a whole session, so only side chats let Escape stop the turn.
-    if (event.key === "Escape" && queues && busy) {
+    if (event.key === "Escape" && queues && !fullSession && busy) {
       event.preventDefault();
       interruptSideChat();
       return;
@@ -1196,8 +1244,17 @@ function SideChatComposer({
             onEdit={(queueId) => {
               const target = queuedMessages.find((message) => message.queueId === queueId);
               if (!target) return;
-              const restored = restoreReplyDraft(target.text, target.replyDraft);
-              updateComposer(composerKey, () => ({ ...restored, files: target.files ?? [] }));
+              if (gridCell) {
+                const recalled = recallGridQueuedDraft(target);
+                updateComposer(composerKey, () => ({
+                  ...recalled.draft,
+                  files: target.files ?? [],
+                }));
+                setSessionMentions(childId, recalled.mentions);
+              } else {
+                const restored = restoreReplyDraft(target.text, target.replyDraft);
+                updateComposer(composerKey, () => ({ ...restored, files: target.files ?? [] }));
+              }
               dequeueMessage(queueId);
               tailTextareaRef.current?.focus();
             }}

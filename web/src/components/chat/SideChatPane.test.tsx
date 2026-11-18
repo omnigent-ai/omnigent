@@ -1837,6 +1837,222 @@ describe("grid cell composer shares its session's draft", () => {
     );
   });
 
+  it("queues a cell's send while its session works, and sends it when the turn ends", async () => {
+    writeAlwaysSteer(false);
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "running" });
+    gridCell();
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "Next step" } });
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+
+    expect(send).not.toHaveBeenCalled();
+    expect(input).toHaveValue("");
+    expect(screen.getByRole("list", { name: "Queued messages" })).toHaveTextContent("Next step");
+    expect(useChatStore.getState().queuedMessages).toEqual([
+      expect.objectContaining({
+        conversationId: childId,
+        text: "Next step",
+        agentId: "agent_side",
+      }),
+    ]);
+
+    act(() => conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" }));
+    await waitFor(() => expect(send).toHaveBeenCalledOnce());
+    expect(send).toHaveBeenCalledWith(
+      "Next step",
+      "agent_side",
+      undefined,
+      expect.objectContaining({ pinnedConversationId: childId }),
+    );
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+  });
+
+  it("queues a cell's tagged message with its review comments, then clears the cell's chips", () => {
+    writeAlwaysSteer(false);
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "running" });
+    bridgedCell({
+      text: "Compare @src/app.ts with @Fix CI",
+      files: [],
+      mentions: { files: [fileTag], sessions: [sessionTag] },
+      reviewComments: [reviewComment],
+    });
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+
+    expect(send).not.toHaveBeenCalled();
+    const [queued] = useChatStore.getState().queuedMessages;
+    expect(queued?.text).toMatch(
+      /^Compare \[Attached file: src\/app\.ts\] with \[Session: "Fix CI" id=sess_fix subagent=no\]\n\n```local-review-comment\n/,
+    );
+    expect(queued?.text).toContain('"body": "Rename this"');
+    expect(queued?.text.endsWith(SESSION_MENTION_HINT)).toBe(true);
+    expect(screen.queryByRole("button", { name: /Open local review comment/ })).toBeNull();
+    expect(getSessionDraft(childId)).toBeUndefined();
+  });
+
+  it("queues a cell's quote card with the reply draft of its tagged message", () => {
+    writeAlwaysSteer(false);
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "running" });
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "Ask @Fix CI", text: "Quoted line" }],
+      text: "Reply",
+    };
+    bridgedCell({
+      text: serializeReplyDraft(replyDraft),
+      files: [],
+      replyDraft,
+      mentions: { files: [], sessions: [sessionTag] },
+      reviewComments: [reviewComment],
+    });
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+
+    expect(useChatStore.getState().queuedMessages).toEqual([
+      expect.objectContaining({
+        replyDraft: {
+          version: 1,
+          quotes: [
+            { before: 'Ask [Session: "Fix CI" id=sess_fix subagent=no]', text: "Quoted line" },
+          ],
+          text: expect.stringContaining("```local-review-comment\n"),
+        },
+      }),
+    ]);
+  });
+
+  it("edits a queued cell message with its tags back as tokens, and resends it unchanged", () => {
+    writeAlwaysSteer(false);
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "running" });
+    bridgedCell({
+      text: "Compare @src/app.ts with @Fix CI",
+      files: [],
+      mentions: { files: [fileTag], sessions: [sessionTag] },
+    });
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    const queuedText = useChatStore.getState().queuedMessages[0]!.text;
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit queued message" }));
+    expect(screen.getByTestId("side-chat-input")).toHaveValue("Compare @src/app.ts with @Fix CI");
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+
+    act(() => conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" }));
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    expect(send).toHaveBeenCalledExactlyOnceWith(queuedText, "agent_side", undefined, {
+      pinnedConversationId: childId,
+    });
+  });
+
+  it("edits a queued cell quote card with its tags back as tokens, and resends it unchanged", () => {
+    writeAlwaysSteer(false);
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "running" });
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "Check @src/app.ts, ask @Fix CI", text: "Quoted line" }],
+      text: "Reply",
+    };
+    bridgedCell({
+      text: serializeReplyDraft(replyDraft),
+      files: [],
+      replyDraft,
+      mentions: { files: [fileTag], sessions: [sessionTag] },
+    });
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    const queued = useChatStore.getState().queuedMessages[0]!;
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit queued message" }));
+    expect(screen.getByRole("textbox", { name: "Reply text before quote 1" })).toHaveValue(
+      "Check @src/app.ts, ask @Fix CI",
+    );
+    expect(getSessionDraft(childId)?.mentions).toEqual({
+      files: [expect.objectContaining({ path: "src/app.ts", token: "@src/app.ts" })],
+      sessions: [expect.objectContaining({ id: "sess_fix" })],
+    });
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+
+    act(() => conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" }));
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    expect(send).toHaveBeenCalledExactlyOnceWith(queued.text, "agent_side", undefined, {
+      pinnedConversationId: childId,
+      replyDraft: queued.replyDraft,
+    });
+  });
+
+  it("posts a cell's /side command into its busy session, and queues other messages", () => {
+    writeAlwaysSteer(false);
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "running" });
+    gridCell();
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "/side Explain the failure" } });
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+
+    expect(send).toHaveBeenCalledExactlyOnceWith(
+      "/side Explain the failure",
+      "agent_side",
+      undefined,
+      { pinnedConversationId: childId },
+    );
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+
+    fireEvent.change(input, { target: { value: "Explain the failure" } });
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    expect(send).toHaveBeenCalledOnce();
+    expect(useChatStore.getState().queuedMessages).toEqual([
+      expect.objectContaining({ text: "Explain the failure", conversationId: childId }),
+    ]);
+  });
+
+  it("steers a cell's queued messages with Mod+Enter, as the full-screen composer does", () => {
+    writeAlwaysSteer(false);
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "running" });
+    gridCell();
+    const input = screen.getByTestId("side-chat-input");
+    for (const text of ["first", "second"]) {
+      fireEvent.change(input, { target: { value: text } });
+      fireEvent.keyDown(input, { key: "Enter" });
+    }
+    fireEvent.change(input, { target: { value: "third" } });
+    fireEvent.keyDown(input, { key: "Enter", ctrlKey: true });
+
+    expect(send.mock.calls.map(([text]) => text)).toEqual(["first", "second", "third"]);
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+  });
+
+  it("posts a cell's send into its busy session when Always steer is on", () => {
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "running" });
+    gridCell();
+    fireEvent.change(screen.getByTestId("side-chat-input"), {
+      target: { value: "Redirect now" },
+    });
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+
+    expect(send).toHaveBeenCalledExactlyOnceWith("Redirect now", "agent_side", undefined, {
+      pinnedConversationId: childId,
+    });
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+  });
+
+  it("offers Send, not Interrupt, for a cell's draft while its session works", () => {
+    writeAlwaysSteer(false);
+    // The streaming response makes Interrupt ready; a grid cell's Escape never interrupts.
+    conversationRegistry.acquire(childId).setState({
+      sessionStatus: "running",
+      activeResponse: { responseId: "codex_turn_side", state: "streaming", error: null },
+    });
+    gridCell();
+    const input = screen.getByTestId("side-chat-input");
+
+    fireEvent.change(input, { target: { value: "Keep going" } });
+    expect(screen.queryByRole("button", { name: "Interrupt session" })).toBeNull();
+    expect(screen.getByTestId("side-chat-send")).toBeEnabled();
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(sessionsApi.interrupt).not.toHaveBeenCalled();
+    expect(input).toHaveValue("Keep going");
+
+    fireEvent.change(input, { target: { value: "" } });
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(sessionsApi.interrupt).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Interrupt session" })).toBeEnabled();
+  });
+
   it("leaves a side chat alone when its session has a shared draft", () => {
     setSessionDraft(childId, {
       text: "shared @Fix CI",
