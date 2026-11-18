@@ -1000,6 +1000,8 @@ def test_real_cli_bash_tool_round_trip_and_inline_skill_finish(
                 prepared.cli_path,
                 "--plugin-dir",
                 str(prepared.plugin_dir),
+                "--permission-mode",
+                "bypassPermissions",
                 *_cli_args("/cli-probe:probe", tools="Bash,Skill", prepared=prepared),
             ],
             cwd=workspace,
