@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import functools
 import json
 import logging
@@ -174,7 +173,28 @@ _logger = logging.getLogger(__name__)
 
 # Concurrent re-keys a leaving session follows before giving up.
 _FAMILY_LEAVE_ATTEMPTS = 5
-# Exclusive upper bound of the family pin label keys, for a primary-key range delete.
+# Families are owner-private, so a session holds one family pin key per pinning
+# identity; this bounds the rows a leave examines and deletes even so.
+_FAMILY_PIN_KEYS_PER_LEAVE = 16
+
+
+class _LeaveLifecycle:
+    """A split database's conversation transaction, locked on first use by a family leave."""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+        self._locked = False
+
+    def locked(self) -> Session:
+        """Return the session, taking SQLite's write lock the first time; retries reuse it."""
+        if not self._locked:
+            if self._session.get_bind().dialect.name == "sqlite":
+                self._session.execute(text("BEGIN IMMEDIATE"))
+            self._locked = True
+        return self._session
+
+
+# Exclusive upper bound of the family pin label keys, for a primary-key range read.
 _FAMILY_PIN_LABEL_PREFIX_END = FAMILY_PIN_LABEL_PREFIX[:-1] + chr(
     ord(FAMILY_PIN_LABEL_PREFIX[-1]) + 1
 )
@@ -1033,6 +1053,13 @@ class SqlAlchemyConversationStore(ConversationStore):
             self._conv_engine,
             query_name_prefix="omnigent.conversation_store",
             immediate=True,
+        )
+        # A write session that runs nothing until first used, so a caller can take
+        # another lock first and still hold this one through its own commit.
+        self._conv_session_deferred_write = make_named_managed_session_maker(
+            self._conv_engine,
+            query_name_prefix="omnigent.conversation_store",
+            reuse_shared_reads=False,
         )
 
         # Dialect-appropriate row-locking flags. Each flag is derived from its
@@ -2175,18 +2202,30 @@ class SqlAlchemyConversationStore(ConversationStore):
         for _ in range(_FAMILY_LEAVE_ATTEMPTS):
             if family_id is None:
                 return
-            with contextlib.ExitStack() as lifecycle:
+            leave = functools.partial(
+                self._leave_family_write,
+                session_id=session_id,
+                family_id=family_id,
+                archive_generation=archive_generation,
+            )
+            if self._conv_engine is self._engine:
                 outcome = run_write_transaction(
-                    self._session_immediate,
-                    "leave_session_family",
-                    functools.partial(
-                        self._leave_family_write,
-                        session_id=session_id,
-                        family_id=family_id,
-                        archive_generation=archive_generation,
-                        lifecycle=lifecycle,
-                    ),
+                    self._session_immediate, "leave_session_family", leave
                 )
+            else:
+                # Opened first so query scopes nest; it runs nothing until the family lock
+                # is held, then keeps its lock past the membership commit and across retries.
+                with self._conv_session_deferred_write(
+                    "leave_session_family_lifecycle"
+                ) as lifecycle_session:
+                    lifecycle = _LeaveLifecycle(lifecycle_session)
+                    outcome = run_write_transaction(
+                        self._session_immediate,
+                        "leave_session_family",
+                        functools.partial(leave, lifecycle=lifecycle),
+                    )
+                    if outcome != "":
+                        lifecycle_session.rollback()
             if outcome is None or outcome == "":
                 return
             family_id = outcome
@@ -2199,14 +2238,14 @@ class SqlAlchemyConversationStore(ConversationStore):
         session_id: str,
         family_id: str,
         archive_generation: str | None,
-        lifecycle: contextlib.ExitStack,
+        lifecycle: _LeaveLifecycle | None = None,
     ) -> str | None:
         """
-        Leave *family_id* under its lock; the departure's lifecycle writes share one transaction.
+        Leave *family_id* under its lock, with the archive check and pin cleanup.
 
-        The conversation-database transaction opens after the family lock, matching
-        sibling creation's lock order, and commits after membership, so neither an
-        unarchive nor a newer family's pin can slip between the check and the commit.
+        In a split database, *lifecycle* carries the conversation-database transaction,
+        locked only after the family lock (sibling creation's order) and committed after
+        membership, so neither an unarchive nor a newer family's pin can slip in between.
 
         :returns: ``""`` when the session left, ``None`` when nothing changed, or
             the family's new id when a concurrent re-key moved it.
@@ -2220,12 +2259,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         if current.family_id != family_id:
             # Another leave re-keyed the family before this lock; follow it.
             return current.family_id
-        if self._conv_engine is self._engine:
-            labels_session = session
-        else:
-            labels_session = lifecycle.enter_context(
-                self._conv_session_immediate("leave_session_family_lifecycle")
-            )
+        labels_session = lifecycle.locked() if lifecycle is not None else session
         if archive_generation is not None and not self._archive_is_current(
             labels_session, session_id, archive_generation
         ):
@@ -2246,15 +2280,25 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
                 .values(family_id=remaining[0])
             )
-        # A primary-key range, so only this session's family pin rows are examined.
-        labels_session.execute(
-            delete(SqlConversationLabel).where(
+        pin_keys = labels_session.scalars(
+            select(SqlConversationLabel.key)
+            .where(
                 SqlConversationLabel.workspace_id == current_workspace_id(),
                 SqlConversationLabel.conversation_id == session_id,
                 SqlConversationLabel.key >= FAMILY_PIN_LABEL_PREFIX,
                 SqlConversationLabel.key < _FAMILY_PIN_LABEL_PREFIX_END,
             )
-        )
+            .order_by(SqlConversationLabel.key)
+            .limit(_FAMILY_PIN_KEYS_PER_LEAVE)
+        ).all()
+        if pin_keys:
+            labels_session.execute(
+                delete(SqlConversationLabel).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.conversation_id == session_id,
+                    SqlConversationLabel.key.in_(pin_keys),
+                )
+            )
         return ""
 
     @staticmethod

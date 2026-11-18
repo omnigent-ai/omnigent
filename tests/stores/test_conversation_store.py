@@ -10568,6 +10568,7 @@ def test_split_database_family_leave_holds_the_archive_until_membership_commits(
 ) -> None:
     import threading
 
+    from omnigent.db import current_query_name
     from omnigent.stores.conversation_store import ARCHIVED_AT_LABEL_KEY, family_pinned_label_key
 
     store = SqlAlchemyConversationStore(
@@ -10608,6 +10609,51 @@ def test_split_database_family_leave_holds_the_archive_until_membership_commits(
     left = store.get_conversation(member.id)
     assert left.family_id is None and not left.archived
     assert family_pinned_label_key("alice") not in left.labels
+    assert current_query_name() is None
+
+
+def test_split_database_family_leave_retries_inside_one_lifecycle(tmp_path, monkeypatch) -> None:
+    from omnigent.db import current_query_name
+    from omnigent.stores.conversation_store import (
+        ARCHIVED_AT_LABEL_KEY,
+        family_pinned_label_key,
+        sqlalchemy_store,
+    )
+
+    store = SqlAlchemyConversationStore(
+        f"sqlite:///{tmp_path / 'metadata.db'}", f"sqlite:///{tmp_path / 'messages.db'}"
+    )
+    source = store.create_conversation(conversation_id="1" * 32)
+    member = store.create_conversation(conversation_id="2" * 32)
+    store.add_new_sibling(source.id, member.id, user_id="alice")
+    store.set_family_pin(source.id, "123", user_id="alice")
+    store.update_conversation(member.id, archived=True)
+    generation = store.get_conversation(member.id).labels[ARCHIVED_AT_LABEL_KEY]
+
+    # The first membership attempt fails after its callback opened the lifecycle transaction.
+    real_run = sqlalchemy_store.run_write_transaction
+    attempts = []
+
+    def fail_first_leave(session_maker, operation_name, callback, *args, **kwargs):
+        if operation_name == "leave_session_family" and not attempts:
+            attempts.append(operation_name)
+            with pytest.raises(RuntimeError), session_maker(operation_name) as session:
+                callback(session)
+                raise RuntimeError("retryable metadata conflict")
+        return real_run(session_maker, operation_name, callback, *args, **kwargs)
+
+    monkeypatch.setattr(sqlalchemy_store, "run_write_transaction", fail_first_leave)
+    store.leave_session_family(member.id, archive_generation=generation)
+    monkeypatch.undo()
+
+    assert attempts
+    left = store.get_conversation(member.id)
+    assert left.family_id is None
+    assert family_pinned_label_key("alice") not in left.labels
+    assert store.get_conversation(source.id).labels[family_pinned_label_key("alice")] == "123"
+    # No lock outlives the leave: a conversation write proceeds at once.
+    store.update_conversation(member.id, archived=False)
+    assert current_query_name() is None
 
 
 def test_family_leave_follows_a_concurrent_rekey_and_idle_archive_is_conditional(
