@@ -56,6 +56,9 @@ def test_every_supported_executor_has_exactly_one_launch_hook():
         ("oversize", "oversized"),
         ("file-link", "symlink"),
         ("malformed", "unreadable_or_invalid"),
+        ("missing-envelope", "parsed"),
+        ("nonobject-envelope", "parsed"),
+        ("nondict-servers", "parsed"),
     ],
 )
 def test_native_failure_metadata_is_bounded_and_excludes_private_values(
@@ -83,13 +86,23 @@ def test_native_failure_metadata_is_bounded_and_excludes_private_values(
             }
         )
     )
-    (bridge / "mcp_startup.json").write_text(
-        json.dumps(
-            {
-                "omnigent": {"status": "failed", "error": private},
-                private: {"status": private},
-            }
-        )
+    startup = {
+        "servers": {
+            "omnigent": {"status": "failed", "error": private},
+            private: {"status": private},
+        }
+    }
+    if file_state == "missing-envelope":
+        startup = startup["servers"]
+    elif file_state == "nonobject-envelope":
+        startup = [startup]
+    elif file_state == "nondict-servers":
+        startup = {"servers": [startup["servers"]]}
+    (bridge / "mcp_startup.json").write_text(json.dumps(startup))
+    expected_startup_state = (
+        "unreadable_or_invalid"
+        if file_state in {"missing-envelope", "nonobject-envelope", "nondict-servers"}
+        else expected_state
     )
     for filename in ("tool_relay.json", "mcp_startup.json"):
         path = bridge / filename
@@ -159,7 +172,7 @@ def test_native_failure_metadata_is_bounded_and_excludes_private_values(
     assert projected["entries"][1]["name"]["known"] is None
     assert all(row["tools"]["entries"] == [] for row in metadata["requests"][1:])
     assert metadata["relay"]["state"] == expected_state
-    assert metadata["startup_observer_cache"]["state"] == expected_state
+    assert metadata["startup_observer_cache"]["state"] == expected_startup_state
     assert (
         metadata["startup_observer_cache"]["individual_success_not_implied_by_settlement"] is True
     )
@@ -167,7 +180,6 @@ def test_native_failure_metadata_is_bounded_and_excludes_private_values(
         assert metadata["relay"]["count"] == 130
         assert metadata["relay"]["omitted"] == 2
         assert metadata["relay"]["controls_in_inspected_prefix"]["sys_session_get_info"] is True
-        assert metadata["startup_observer_cache"]["servers"] == {"omnigent": "failed"}
     else:
         assert metadata["relay"]["tools_shape"] == "NoneType"
         assert metadata["relay"]["count"] is None
@@ -177,6 +189,9 @@ def test_native_failure_metadata_is_bounded_and_excludes_private_values(
             "sys_session_create": False,
             "sys_terminal_list": False,
         }
+    if expected_startup_state == "parsed":
+        assert metadata["startup_observer_cache"]["servers"] == {"omnigent": "failed"}
+    else:
         assert metadata["startup_observer_cache"]["servers"] == {}
 
 

@@ -134,6 +134,9 @@ def _mcp_failure_metadata(requests: list[dict], home: Path, session_id: str) -> 
     tools = relay.get("tools") if isinstance(relay, dict) else None
     inspected = tools[:128] if isinstance(tools, list) else []
     startup_state, startup = record("mcp_startup.json")
+    startup_servers = startup.get("servers") if isinstance(startup, dict) else None
+    if startup_state == "parsed" and not isinstance(startup_servers, dict):
+        startup_state = "unreadable_or_invalid"
     return {
         "requests": request_metadata,
         "requests_omitted": max(0, len(requests) - 8),
@@ -158,8 +161,8 @@ def _mcp_failure_metadata(requests: list[dict], home: Path, session_id: str) -> 
                 if status in ("starting", "ready", "failed", "cancelled")
                 else "unknown"
                 for server in servers
-                if isinstance(startup, dict)
-                and isinstance(row := startup.get(server), dict)
+                if isinstance(startup_servers, dict)
+                and isinstance(row := startup_servers.get(server), dict)
                 and (status := row.get("status")) is not None
             },
         },
