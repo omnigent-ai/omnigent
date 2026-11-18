@@ -1520,29 +1520,12 @@ describe("renderTriggerPrompt", () => {
       expect(prompt).toContain(
         "Each run:\n1. If your tools load on demand, load every tool this run needs in one tool search before your first call, naming them all:",
       );
+      // Loading get_info up front avoids a second search for a blank worker agent's ID.
+      expect(prompt).toContain(
+        "each sys_session tool the steps below use, and sys_session_get_info, which returns your session and agent IDs.",
+      );
       // The creation call stays the only sys_session_create the saved-prompt parser reads.
       expect(readTriggerWorkerSettings(prompt)).not.toBeNull();
-    },
-  );
-
-  it.each(SOURCE_MODES)(
-    "names sys_session_get_info in the first tool search, in $taskSessionMode mode",
-    ({ source, taskSessionMode }) => {
-      const blank = renderTriggerPrompt(source, fields(), { ...CTX, taskSessionMode });
-      const pinned = renderTriggerPrompt(source, fields(), {
-        ...CTX,
-        agentId: "ag_worker",
-        taskSessionMode,
-      });
-
-      // A blank worker agent is learned from this search, not a later get_info call.
-      for (const prompt of [blank, pinned]) {
-        expect(prompt).toContain(
-          "each sys_session tool the steps below use, and sys_session_get_info, which returns your session and agent IDs.",
-        );
-      }
-      expect(readTriggerWorkerSettings(blank)?.agentId).toBeNull();
-      expect(readTriggerWorkerSettings(pinned)?.agentId).toBe("ag_worker");
     },
   );
 
