@@ -679,6 +679,26 @@ describe("searchFilesViaWorkspaceApi", () => {
 
     expect(authenticatedFetch).toHaveBeenCalledTimes(1);
   });
+
+  it("searches through REST on a host without the capability query, keeping its reads", async () => {
+    enable("workspace_api_server_access");
+    // An older host has no GetCapabilities, so it answers unimplemented.
+    serveMethods({
+      ReadFile: () => new Response(textFile(), { headers: CONNECT_HEADERS }),
+    });
+
+    expect(
+      await searchFilesViaWorkspaceApi("s-no-capabilities", "main", SEARCH_OPTIONS),
+    ).toBeNull();
+    expect(
+      await searchFilesViaWorkspaceApi("s-no-capabilities", "main", SEARCH_OPTIONS),
+    ).toBeNull();
+    expect((await readFileViaWorkspaceApi("s-no-capabilities", "notes.md"))?.content).toBe("héllo");
+
+    // The refusal backs off the search for this route, so the capability query isn't repeated.
+    expect(methodCalls("GetCapabilities")).toHaveLength(1);
+    expect(methodCalls("SearchFiles")).toHaveLength(0);
+  });
 });
 
 const textMatches = (...messages: MessageInitShape<typeof SearchTextResponseSchema>[]) =>
