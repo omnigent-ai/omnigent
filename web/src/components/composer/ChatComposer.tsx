@@ -484,7 +484,18 @@ export function ComposerEngineInput({
 }) {
   const engine = useContext(ComposerEngineContext);
   const load = useCodeMirrorComposerLoad();
-  const { onKeyDown, ref, rows, heightMode, inputId, className, autoFocus, ...rest } = input;
+  const {
+    onKeyDown,
+    ref,
+    rows,
+    heightMode,
+    inputId,
+    className,
+    mentionTokens,
+    commandToken,
+    autoFocus,
+    ...rest
+  } = input;
   // Only the first input mount may take focus. An engine switch remounts the input, and the
   // handoff already restores whichever input had focus.
   const inputMounted = useRef(false);
@@ -506,6 +517,8 @@ export function ComposerEngineInput({
         ref={ref}
         inputId={inputId}
         heightMode={heightMode}
+        mentionTokens={mentionTokens}
+        commandToken={commandToken}
         autoFocus={autoFocusOnMount}
         onKeyDown={handleKeyDown}
       />

@@ -3,6 +3,9 @@
 // need a page reload before it succeeds.
 
 import type { ComponentType } from "react";
+import { findMentionTokens } from "@/lib/composerMentions";
+import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
+import { MENTION_TOKEN_CLASS } from "@/components/composer/MentionTokenOverlay";
 import type { CodeMirrorComposerEnvironment } from "./CodeMirrorComposerInput";
 import type * as CodeMirrorComposerModule from "./codeMirrorComposerModule";
 import {
@@ -28,6 +31,9 @@ export function codeMirrorComposerEnvironment(): CodeMirrorComposerEnvironment {
     inputAttribute: COMPOSER_INPUT_ATTRIBUTE,
     inputIdAttribute: COMPOSER_INPUT_ID_ATTRIBUTE,
     registerSurface: registerComposerSurface,
+    findMentionTokens,
+    mentionTokenClass: MENTION_TOKEN_CLASS,
+    commandTokenClass: COMMAND_TOKEN_CLASS,
   };
 }
 

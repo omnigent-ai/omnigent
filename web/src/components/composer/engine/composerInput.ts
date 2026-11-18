@@ -144,6 +144,10 @@ export interface ComposerInputProps {
   heightMode?: ComposerInputHeightMode;
   /** Which input this is within its composer, so an engine switch finds it again. */
   inputId?: string;
+  /** Tagged @-mention tokens to present as one unit, such as "@README.md". */
+  mentionTokens?: readonly string[];
+  /** The slash command or skill the draft starts with, such as "/context", to tint. */
+  commandToken?: string | null;
   onChange?: (event: ComposerInputEvent) => void;
   onSelect?: (event: ComposerInputEvent) => void;
   onFocus?: (event: ComposerInputEvent) => void;
