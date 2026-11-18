@@ -99,6 +99,7 @@ describe("ImportSessionsPanel", () => {
     } as unknown as ReturnType<typeof useHosts>);
     renderPanel();
     expect(screen.getByText("What to import")).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "What to import" })).toBeInTheDocument();
   });
 
   it("keeps a large batch compact and points to the existing session list", async () => {
