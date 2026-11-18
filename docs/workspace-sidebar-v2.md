@@ -49,6 +49,10 @@ Being added:
 Without the helper, file reads fall back to the host's Python reader, then to
 the REST file routes.
 
+Clients ask a host which workspace API methods it serves before calling a new
+one. A host that doesn't list search answers from the REST search routes, and
+its file reads are unaffected.
+
 ## npm dependencies
 
 Already in `web/package.json` and used as they are: `@pierre/diffs` renders
