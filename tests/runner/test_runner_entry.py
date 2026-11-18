@@ -26,7 +26,13 @@ import httpx
 import pytest
 
 from omnigent.errors import OmnigentError
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec, WritePathSpec
+from omnigent.inner.datamodel import (
+    HostWritePathSpec,
+    OSEnvSandboxSpec,
+    OSEnvSpec,
+    TerminalEnvSpec,
+    WritePathSpec,
+)
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.native import native_terminal
 from omnigent.policies.registry import (
@@ -177,14 +183,16 @@ def test_apply_host_sandbox_grants_extends_every_declared_sandbox(
     _apply_host_sandbox_grants(spec)
 
     assert shared.read_paths == ["docs", "/srv/example/repo/.git"]
-    assert shared.write_paths == [
+    assert shared.write_path_specs == [
         WritePathSpec("/srv/example/cache", copy_on_write=True),
-        "/srv/example/tmp",
+        HostWritePathSpec("/srv/example/tmp"),
     ]
+    assert shared.host_write_paths == ["/srv/example/tmp"]
     assert nested == OSEnvSandboxSpec(
         type="none",
         read_paths=["/srv/example/repo/.git"],
         write_paths=["/srv/example/cache", "/srv/example/tmp"],
+        host_write_paths=["/srv/example/cache", "/srv/example/tmp"],
     )
     assert spec.terminals is not None
     assert spec.terminals["inherited"].os_env == "inherit"
@@ -192,9 +200,18 @@ def test_apply_host_sandbox_grants_extends_every_declared_sandbox(
     assert spec.sub_agents[0].os_env is None
 
 
-@pytest.mark.parametrize("field", ["read_paths", "write_paths"])
+@pytest.mark.parametrize(
+    ("field", "expected"),
+    [
+        ("read_paths", {"read_paths": ["/srv/example/repo"]}),
+        (
+            "write_paths",
+            {"write_paths": ["/srv/example/repo"], "host_write_paths": ["/srv/example/repo"]},
+        ),
+    ],
+)
 def test_apply_host_sandbox_grants_leaves_unlisted_grant_kind_unset(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, field: str
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, field: str, expected: dict[str, list[str]]
 ) -> None:
     """A grant kind the host does not list keeps its authored ``None``."""
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
@@ -206,7 +223,7 @@ def test_apply_host_sandbox_grants_leaves_unlisted_grant_kind_unset(
 
     _apply_host_sandbox_grants(AgentSpec(spec_version=1, os_env=OSEnvSpec(sandbox=sandbox)))
 
-    assert sandbox == OSEnvSandboxSpec(**{field: ["/srv/example/repo"]})
+    assert sandbox == OSEnvSandboxSpec(**expected)
 
 
 class _TrackingTerminalRegistry:

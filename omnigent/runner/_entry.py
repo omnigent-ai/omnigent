@@ -134,12 +134,12 @@ def _apply_host_sandbox_grants(spec: AgentSpec) -> None:
                 *current_reads,
                 *(path for path in read_paths if path not in current_reads),
             ]
-        if write_paths:
-            current_writes = {grant.path for grant in sandbox.write_path_specs}
-            sandbox.write_paths = [
-                *(sandbox.write_paths or []),
-                *(path for path in write_paths if path not in current_writes),
-            ]
+        current_writes = {grant.path for grant in sandbox.write_path_specs}
+        added_writes = [path for path in write_paths if path not in current_writes]
+        if added_writes:
+            # Marked so an authored grant for the same resolved path keeps its mode.
+            sandbox.write_paths = [*(sandbox.write_paths or []), *added_writes]
+            sandbox.host_write_paths = [*(sandbox.host_write_paths or []), *added_writes]
 
 
 def _spec_sandboxes(spec: AgentSpec) -> Iterator[OSEnvSandboxSpec]:
