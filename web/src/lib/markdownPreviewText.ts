@@ -16,10 +16,9 @@ const TABLE_ROW_LINE = /^[ \t]*\|(.*)\|[ \t]*$/;
 // item's marker and its task box.
 const BLOCK_MARKERS =
   /^[ \t]*(?:>[ \t]?)*[ \t]*(?:#{1,6}(?=[ \t]|$)|(?:[-*+]|\d{1,9}[.)])(?=[ \t]|$)(?:[ \t]+\[[ xX]\](?=[ \t]|$))?)?/;
-// The rules below capture the character before a delimiter instead of looking
-// behind, which older Safari can't parse.
-
-// A code span: a run of backticks, its code, then a run of as many.
+// A code span: a run of backticks, its code, then a run of as many. This rule
+// and the ones below capture the character before a delimiter instead of
+// looking behind, which Safari before 16.4 can't parse.
 const CODE_SPAN = /(^|[^`])(`+)(?!`)(.*?[^`])\2(?!`)/g;
 // Code spans wait behind placeholders while the rules below run, so their
 // characters stay as written. Agents don't write private-use characters.
