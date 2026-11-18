@@ -823,11 +823,29 @@ export function readTriggerMessageMaxChars(prompt: string): number | null {
   return parsed === null ? null : Number(parsed.match[6]);
 }
 
-/** Placement remains part of the authored instructions when the poller moves. */
+/** Where the generated creation call starts matching sessions, as authored. */
 export function readTriggerWorkerPlacement(prompt: string): "managed" | "same_host" | null {
   const parsed = workerSettingsMatch(prompt);
   if (parsed === null) return null;
   return parsed.match[2].startsWith('placement "managed"') ? "managed" : "same_host";
+}
+
+/** Change only the creation call's placement, preserving the rest of the authored prompt. */
+export function updateTriggerWorkerPlacement(prompt: string, placement: WorkerPlacement): string {
+  const parsed = workerSettingsMatch(prompt);
+  if (parsed === null) return prompt;
+  const { parts, match } = parsed;
+  const args = match[2].replace(/^placement "(?:same_host|managed)"/, `placement "${placement}"`);
+  if (args === match[2]) return prompt;
+  const call = withCreationCallPlacementArgs(match, args);
+  const systemPrompt = parts.systemPrompt!.replace(match[0], () => call);
+  return combineTriggerPrompt(parts.userPrompt, systemPrompt);
+}
+
+/** The creation call with its placement/title/workflow_id arguments replaced. */
+function withCreationCallPlacementArgs(match: RegExpMatchArray, args: string): string {
+  const start = `call sys_session_create with agent_id ${match[1]}, `.length;
+  return `${match[0].slice(0, start)}${args}${match[0].slice(start + match[2].length)}`;
 }
 
 /** Change only the creation-call settings, preserving the rest of the authored prompt. */
@@ -882,8 +900,7 @@ export function syncTriggerWorkflowId(prompt: string, workflowIdSupported: boole
     match[2].replace(WORKFLOW_ID_ARGUMENT, "") +
     (workflowId ? `, workflow_id ${JSON.stringify(workflowId)}` : "");
   if (placement === match[2]) return prompt;
-  const start = `call sys_session_create with agent_id ${match[1]}, `.length;
-  const call = `${match[0].slice(0, start)}${placement}${match[0].slice(start + match[2].length)}`;
+  const call = withCreationCallPlacementArgs(match, placement);
   // The call is the first of its text: it sits in the generated text, which opens the prompt.
   return prompt.replace(match[0], () => call);
 }

@@ -4456,6 +4456,11 @@ def _codex_subagent_labels_from_body(
         value = body.data.get(data_key)
         if isinstance(value, str) and value:
             labels[label_key] = value
+    parent_item_id = body.data.get("parent_item_id")
+    if isinstance(parent_item_id, str):
+        from omnigent.harnesses.codex_native.side_chat import PARENT_REFERENCE_ITEM_LABEL
+
+        labels[PARENT_REFERENCE_ITEM_LABEL] = parent_item_id
     return labels
 
 
@@ -5936,6 +5941,26 @@ def _publish_btw_sidechat(
         truncated=truncated,
     )
     session_stream.publish(session_id, event.model_dump())
+
+
+def _codex_side_chat_resume_supported(
+    parent: Conversation | None,
+    runner_router: RunnerRouter | None,
+    host_registry: HostRegistry | None,
+) -> bool:
+    """Prefer the connected parent runner's report over its host's build support."""
+    from omnigent.host.frames import CAP_CODEX_SIDE_CHAT_RESUME
+
+    if parent is None:
+        return False
+    if (
+        parent.runner_id is not None
+        and runner_router is not None
+        and runner_router.runner_is_online(parent.runner_id)
+    ):
+        return runner_router.runner_has_capability(parent.runner_id, CAP_CODEX_SIDE_CHAT_RESUME)
+    host = host_registry.get(parent.host_id) if host_registry and parent.host_id else None
+    return host is not None and CAP_CODEX_SIDE_CHAT_RESUME in host.hello.capabilities
 
 
 async def _runner_supports_side_chat_settings(

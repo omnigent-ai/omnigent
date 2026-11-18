@@ -99,6 +99,7 @@ export const CodexCommand: Story = {
       cwd: "/workspace/omnigent",
       reason: "Verify the new component stories compile.",
       execPolicyAmendment: ["pnpm", "--filter", "web"],
+      requestFingerprint: "example-request-fingerprint",
     },
   },
 };

@@ -1477,7 +1477,8 @@ function LatestOutputPreview({ preview, fullText }: { preview: string; fullText?
       <HoverCardContent
         side="bottom"
         align="start"
-        className="max-h-[min(60vh,32rem)] w-[min(40rem,calc(100vw-2rem))] overflow-y-auto p-3"
+        collisionPadding={8}
+        className="max-h-[min(60vh,32rem,var(--radix-hover-card-content-available-height))] w-[min(40rem,calc(100vw-2rem))] overflow-y-auto p-3"
       >
         {/* No session is open here, so file paths stay plain text instead of
             resolving against whichever session the file viewer last showed. */}

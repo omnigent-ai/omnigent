@@ -114,8 +114,7 @@ export function HostBadge({
   const { session } = useSession(sessionId);
   const hostId = session?.hostId ?? null;
   // Keep sandbox hosts so managed sessions resolve to a provider label.
-  // Skip the fetch (and its 10s refetch loop) when there's no host to
-  // resolve — the badge renders nothing in that case anyway.
+  // Skip the fetch when there's no current host; the picker loads available hosts when opened.
   const { data: hosts } = useHosts({ includeSandbox: true, enabled: Boolean(hostId) });
   const liveOnline = useSessionHostOnline(sessionId);
 
@@ -158,7 +157,10 @@ export function HostBadge({
 
   const badge = resolveHostBadge({ hostId, host, online });
   const { switchHostDisabledReason } = useSessionActionRestrictions(sessionId);
-  const canSwitch = host !== undefined && !switchHostDisabledReason && !readOnly;
+  const canSwitch =
+    (host !== undefined || (session !== null && hostId === null && launch === null)) &&
+    !switchHostDisabledReason &&
+    !readOnly;
   useEffect(() => {
     if (!canSwitch) setSwitchOpen(false);
   }, [canSwitch]);
