@@ -154,13 +154,28 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
         "nonprogress",
         "final_table_newline",
         "rationale_separator",
+        "table_variant",
     ),
     [
-        (None, 0, "", False, "run", None, None, False, False, False, None, None),
-        ((20000, 45000, 20000), 0, "", False, "run", None, None, False, False, False, None, None),
-        ((3000,) * 30, 59194, "", False, "run", None, None, False, False, False, None, None),
-        (None, 0, "  ", False, "run", None, None, False, False, False, None, None),
-        ((70000,), 0, "", False, "run", None, None, False, False, False, None, None),
+        (None, 0, "", False, "run", None, None, False, False, False, None, None, None),
+        (
+            (20000, 45000, 20000),
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            False,
+            None,
+            None,
+            None,
+        ),
+        ((3000,) * 30, 59194, "", False, "run", None, None, False, False, False, None, None, None),
+        (None, 0, "  ", False, "run", None, None, False, False, False, None, None, None),
+        ((70000,), 0, "", False, "run", None, None, False, False, False, None, None, None),
         # Align an escaped pipe with the fully wrapped comment boundary.
         (
             ("y" * 69 + ("x" * 70 + r"\|") * 1100,),
@@ -175,16 +190,73 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
             False,
             None,
             None,
+            None,
         ),
-        (None, 0, "", True, "run", None, None, False, False, False, None, None),
-        (("Reason",), 0, "", False, "run", 0, None, False, False, False, None, None),
-        (("Reason",), 0, "", False, "run", 1, None, False, False, False, None, None),
-        (("Reason",), 0, "", False, "run", 2, None, False, False, False, None, None),
-        ((177655, "Tail."), 0, "", False, "run", None, " | \t", False, False, False, None, None),
-        ((177654, "Tail."), 0, "", False, "run", None, "| \t", False, False, False, None, None),
-        ((177653, "Tail."), 0, "", False, "run", None, " \t", False, False, False, None, None),
-        ((177652, "Tail."), 0, "", False, "run", None, "\t", False, False, False, None, None),
-        ((177651, "Tail."), 0, "", False, "run", None, "", False, False, False, None, None),
+        (None, 0, "", True, "run", None, None, False, False, False, None, None, None),
+        (("Reason",), 0, "", False, "run", 0, None, False, False, False, None, None, None),
+        (("Reason",), 0, "", False, "run", 1, None, False, False, False, None, None, None),
+        (("Reason",), 0, "", False, "run", 2, None, False, False, False, None, None, None),
+        (
+            (177655, "Tail."),
+            0,
+            "",
+            False,
+            "run",
+            None,
+            " | \t",
+            False,
+            False,
+            False,
+            None,
+            None,
+            None,
+        ),
+        (
+            (177654, "Tail."),
+            0,
+            "",
+            False,
+            "run",
+            None,
+            "| \t",
+            False,
+            False,
+            False,
+            None,
+            None,
+            None,
+        ),
+        (
+            (177653, "Tail."),
+            0,
+            "",
+            False,
+            "run",
+            None,
+            " \t",
+            False,
+            False,
+            False,
+            None,
+            None,
+            None,
+        ),
+        (
+            (177652, "Tail."),
+            0,
+            "",
+            False,
+            "run",
+            None,
+            "\t",
+            False,
+            False,
+            False,
+            None,
+            None,
+            None,
+        ),
+        ((177651, "Tail."), 0, "", False, "run", None, "", False, False, False, None, None, None),
         (
             ("Reason." + " " * 135000 + "Tail.",),
             0,
@@ -198,16 +270,33 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
             False,
             None,
             None,
+            None,
         ),
-        (None, 0, "", False, "run", None, None, True, False, False, None, None),
-        (("Reason",), 0, "", False, "run", None, None, False, True, False, None, None),
-        (("Reason",), 0, "", False, "run", None, None, False, False, True, None, None),
-        (None, 0, "", False, "run", None, None, False, False, False, "", None),
-        (None, 0, "", False, "run", None, None, False, False, False, "\n", None),
-        (None, 0, "", False, "run", None, None, False, False, False, None, "\u2028"),
-        (None, 0, "", False, "run", None, None, False, False, False, None, "\u0085"),
-        (None, 0, "", False, "run", None, None, False, False, False, None, "\f"),
-        (None, 0, "", False, "run", None, None, False, False, False, None, " "),
+        (None, 0, "", False, "run", None, None, True, False, False, None, None, None),
+        (("Reason",), 0, "", False, "run", None, None, False, True, False, None, None, None),
+        (("Reason",), 0, "", False, "run", None, None, False, False, True, None, None, None),
+        (None, 0, "", False, "run", None, None, False, False, False, "", None, None),
+        (None, 0, "", False, "run", None, None, False, False, False, "\n", None, None),
+        (None, 0, "", False, "run", None, None, False, False, False, None, "\u2028", None),
+        (None, 0, "", False, "run", None, None, False, False, False, None, "\u0085", None),
+        (None, 0, "", False, "run", None, None, False, False, False, None, "\f", None),
+        (None, 0, "", False, "run", None, None, False, False, False, None, " ", None),
+        (None, 0, "", False, "run", None, None, False, False, False, None, None, "large-identity"),
+        (
+            None,
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            False,
+            None,
+            None,
+            "ordinary-empty-cell",
+        ),
     ],
     ids=[
         "many-rows",
@@ -235,6 +324,8 @@ def test_incomplete_reviews_are_rejected_regardless_of_size(review: str) -> None
         "rationale-next-line",
         "rationale-form-feed",
         "rationale-space-control",
+        "large-identity",
+        "ordinary-empty-cell",
     ],
 )
 def test_long_review_parts_preserve_all_assessments_and_markdown_context(
@@ -250,6 +341,7 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
     nonprogress: bool,
     final_table_newline: str | None,
     rationale_separator: str | None,
+    table_variant: str | None,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -266,6 +358,7 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         or nonprogress
         or final_table_newline is not None
         or rationale_separator is not None
+        or table_variant is not None
     ):
         review_path = tmp_path / "review.md"
         receipt = tmp_path / "receipt.txt"
@@ -283,6 +376,25 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         monkeypatch.setattr(
             subprocess, "run", lambda argv, **kwargs: posts.append(Path(argv[-1]).read_text())
         )
+
+    def published_comments(review: str) -> list[str]:
+        review_path.write_text(review, encoding="utf-8")
+        _HELPERS["publish_review"](review_path, receipt)
+        paths = [
+            tmp_path / "comment.md",
+            *sorted(
+                tmp_path.glob("comment-part-*.md"),
+                key=lambda path: int(path.stem.rsplit("-", 1)[1]),
+            ),
+        ]
+        comments = [path.read_text(encoding="utf-8") for path in paths]
+        assert len(comments) > 1
+        assert posts == [*comments[1:], comments[0]]
+        assert receipt.read_text() == "a" * 40 + "\n"
+        assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
+        assert sum(comment.count("<!-- polly-reviewed-sha:") for comment in comments) == 1
+        return comments
+
     if nonprogress:
         split = _HELPERS["split_review"]
         encoded_lengths = []
@@ -323,6 +435,63 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         assert not list(tmp_path.glob("comment*.md"))
         return
 
+    if table_variant is not None:
+        rationale = "x" * 70000
+        header, delimiter, original = _REVIEW.split("### Tests\n", 1)[1].split("\n")[:3]
+        if table_variant == "large-identity":
+            row = original.replace("Empty input", "Empty input" + "b" * 31000)
+            row = row.replace("Guards the regression.", rationale)
+            review = _REVIEW.replace(original, row)
+        else:
+            header = "| Item | Details | Kind | Action | Notes |"
+            row = "| finding-0 | | Info | Keep | " + rationale + " |"
+            review = header + "\n" + delimiter + "\n" + row + "\n\n" + _REVIEW
+        composed = _HELPERS["compose_review"](
+            review, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+        )
+        review_path.write_text(composed, encoding="utf-8")
+        if table_variant == "large-identity":
+            metadata = {
+                "head_sha": "a" * 40,
+                "run_id": "10-1",
+                "run_url": "https://example.test/run",
+            }
+            smaller = composed.replace(rationale, "x" * 20000)
+            small_comments = _HELPERS["review_comments"](smaller, **metadata)
+            assert len(small_comments) == 1
+            assert len(small_comments[0].encode("utf-8")) < 52000
+            (tmp_path / "small-comment.md").write_text(small_comments[0], encoding="utf-8")
+            comments = _HELPERS["review_comments"](composed, **metadata)
+            for part, comment in enumerate(comments, 1):
+                (tmp_path / f"rendered-part-{part}.md").write_text(comment, encoding="utf-8")
+        else:
+            comments = published_comments(composed)
+        expected = _HELPERS["split_table_row"](row.strip().strip("|"))
+        fragments = []
+        for comment in comments:
+            rows = [
+                line for line in comment.split("\n") if line.startswith("|" + expected[0] + "|")
+            ]
+            if rows:
+                assert header + "\n" + delimiter in comment
+            for line in rows:
+                cells = _HELPERS["split_table_row"](line.strip().strip("|"))
+                assert len(cells) == 5
+                assert cells[:4] == expected[:4]
+                if table_variant == "large-identity":
+                    assert all(cell.strip() for cell in cells)
+                else:
+                    assert cells[1].strip() == ""
+                fragments.append(cells)
+        assert len(comments) > 1
+        assert len(fragments) >= 2
+        assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
+        assert (
+            "".join(cells[4].removeprefix(" ").removesuffix(" ") for cells in fragments)
+            == rationale
+        )
+        return
+
     if final_table_newline is not None:
         final_table = "\n| A | B |\n| --- | --- |\n| x | é🙂 |" + final_table_newline
         composed = _HELPERS["compose_review"](
@@ -330,22 +499,9 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
             {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]},
         )
         assert composed.endswith(final_table)
-        review_path.write_text(composed, encoding="utf-8")
-        _HELPERS["publish_review"](review_path, receipt)
-        paths = [
-            tmp_path / "comment.md",
-            *sorted(
-                tmp_path.glob("comment-part-*.md"),
-                key=lambda path: int(path.stem.rsplit("-", 1)[1]),
-            ),
-        ]
-        comments = [path.read_text(encoding="utf-8") for path in paths]
+        comments = published_comments(composed)
         assert len(comments) > 1
-        assert posts == [*comments[1:], comments[0]]
-        assert receipt.read_text() == "a" * 40 + "\n"
-        assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
         assert sum(comment.count(final_table) for comment in comments) == 1
-        assert sum(comment.count("<!-- polly-reviewed-sha:") for comment in comments) == 1
         return
 
     if rationale_separator is not None:
@@ -354,16 +510,7 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
             _REVIEW.replace("Guards the regression.", rationale),
             {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]},
         )
-        review_path.write_text(composed, encoding="utf-8")
-        _HELPERS["publish_review"](review_path, receipt)
-        paths = [
-            tmp_path / "comment.md",
-            *sorted(
-                tmp_path.glob("comment-part-*.md"),
-                key=lambda path: int(path.stem.rsplit("-", 1)[1]),
-            ),
-        ]
-        comments = [path.read_text(encoding="utf-8") for path in paths]
+        comments = published_comments(composed)
         header, delimiter, row = _REVIEW.split("### Tests\n", 1)[1].split("\n")[:3]
         expected = _HELPERS["split_table_row"](row.strip().strip("|"))
         fragments = []
@@ -387,10 +534,6 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
             "".join(cells[4].removeprefix(" ").removesuffix(" ") for cells in fragments)
             == rationale
         )
-        assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
-        assert posts == [*comments[1:], comments[0]]
-        assert receipt.read_text() == "a" * 40 + "\n"
-        assert sum(comment.count("<!-- polly-reviewed-sha:") for comment in comments) == 1
         return
 
     if adjacent_tables:
@@ -414,17 +557,10 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         monkeypatch.setitem(
             _HELPERS["review_comments"].__globals__,
             "split_review",
-            lambda text, limit: split(text, min(limit, raw_limit)),
+            lambda text, limit, **kwargs: split(text, min(limit, raw_limit), **kwargs),
         )
-        review_path.write_text(adjacent_review, encoding="utf-8")
-        _HELPERS["publish_review"](review_path, receipt)
-        comments = [
-            (tmp_path / "comment.md").read_text(),
-            (tmp_path / "comment-part-2.md").read_text(),
-        ]
-        assert posts == [comments[1], comments[0]]
-        assert receipt.read_text() == "a" * 40 + "\n"
-        assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
+        comments = published_comments(adjacent_review)
+        assert len(comments) == 2
         assert sum(comment.count(new_table) for comment in comments) == 1
         assert header not in comments[1]
         return
@@ -492,16 +628,6 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
             )
         return
 
-    byte_limits = []
-    if terminal_remainder is not None:
-        split = _HELPERS["split_review"]
-
-        def record_limit(text: str, limit: int) -> list[str]:
-            byte_limits.append(limit)
-            return split(text, limit)
-
-        monkeypatch.setitem(_HELPERS["review_comments"].__globals__, "split_review", record_limit)
-
     if preceding_paragraph_length:
         header, delimiter = _REVIEW.split("### Tests\n", 1)[1].splitlines()[:2]
         header, delimiter = header + "\n", delimiter + "\n"
@@ -531,7 +657,12 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         assert _HELPERS["COMMENT_BYTE_LIMIT"] == 60000
         # Pin the unadjusted byte cut independently of wrapper wording.
         row = rows.splitlines()[0]
-        assert row.encode("utf-8")[3 * byte_limits[-1] :] == terminal_remainder.encode()
+        raw_limit = 59243
+        assert row.encode("utf-8")[3 * raw_limit :] == terminal_remainder.encode()
+        boundary_chunks = _HELPERS["split_review"](row, raw_limit)
+        assert "".join(boundary_chunks) == row
+        assert all(len(chunk.encode("utf-8")) <= raw_limit for chunk in boundary_chunks)
+        assert all(chunk.strip(" |\t") for chunk in boundary_chunks)
 
     header, delimiter = _REVIEW.split("### Tests\n", 1)[1].splitlines()[:2]
     for comment in comments:

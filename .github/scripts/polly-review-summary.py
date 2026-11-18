@@ -267,12 +267,11 @@ def compose_review(review: str, stats: dict) -> str:
     )
 
 
-def split_review(review: str, byte_limit: int) -> list[str]:
+def split_review(review: str, byte_limit: int, *, in_table_row: bool = False) -> list[str]:
     """Partition without dropping text, preferring complete Markdown lines."""
     if byte_limit < 4:
         raise ValueError("Comment wrappers leave no room for review content.")
     parts = []
-    in_table_row = False
     while len(encoded := review.encode("utf-8")) > byte_limit:
         boundary = byte_limit
         while encoded[boundary] & 0xC0 == 0x80:
@@ -318,6 +317,7 @@ def _markdown_context(
     """Reopen Markdown context and optionally validate final assessment rows.
 
     Mid-row continuation requires five parsed fields; other widths fail closed.
+    Only canonical assessment rows require every field to be populated.
     Disclosure balancing supports lowercase <details>/</details> without attributes
     at the first nonblank position; <summary> may share an opening line.
     """
@@ -420,9 +420,8 @@ def review_comments(review: str, *, head_sha: str, run_id: str, run_url: str) ->
     single = wrap(review, 1, 1)
     if len(single.encode("utf-8")) <= COMMENT_BYTE_LIMIT:
         return validated([single])
-    byte_limit = COMMENT_BYTE_LIMIT
+    chunks = split_review(review, COMMENT_BYTE_LIMIT)
     while True:
-        chunks = split_review(review, byte_limit)
         comments = []
         before = ""
         context = ("", "", "")
@@ -433,11 +432,19 @@ def review_comments(review: str, *, head_sha: str, run_id: str, run_url: str) ->
             _, suffix, _ = context
             if chunk.lstrip(" \t").startswith("|"):
                 prefix += table_header
-            comments.append(wrap(prefix + chunk + suffix, part, len(chunks)))
-        overflow = max(len(comment.encode("utf-8")) for comment in comments) - COMMENT_BYTE_LIMIT
-        if overflow <= 0:
+            comment = wrap(prefix + chunk + suffix, part, len(chunks))
+            overflow = len(comment.encode("utf-8")) - COMMENT_BYTE_LIMIT
+            if overflow > 0:
+                # Only this fragment pays for its wrapper and repeated context.
+                chunks[part - 1 :] = split_review(
+                    "".join(chunks[part - 1 :]),
+                    len(chunk.encode("utf-8")) - overflow,
+                    in_table_row=prefix.endswith("| "),
+                )
+                break
+            comments.append(comment)
+        else:
             return validated(comments)
-        byte_limit -= overflow
 
 
 def publish_review(review: Path, receipt: Path) -> None:
