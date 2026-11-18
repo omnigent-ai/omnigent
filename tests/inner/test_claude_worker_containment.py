@@ -31,10 +31,10 @@ from omnigent.inner.datamodel import (
     OSEnvSandboxSpec,
     OSEnvSpec,
 )
-from omnigent.inner.egress.ca import ensure_ca, ensure_ca_bundle
 from omnigent.inner.egress.certs import HostCertCache
 from omnigent.inner.egress.proxy import EgressProxy
 from omnigent.inner.sandbox import SandboxPolicy
+from tests._helpers.egress_ca import prepare_isolated_egress_ca
 from tests._helpers.live_server import terminate_process
 from tests._helpers.polling import poll_until
 from tests._helpers.stdio_jsonrpc import read_json_line
@@ -558,10 +558,7 @@ def test_prepared_cli_authenticates_shared_loopback_credential_relay(
     proxy_factory: str,
 ) -> None:
     """A host-local client needs the CLI's proxy capability before credentials resolve."""
-    cert, key = ensure_ca(cache_dir=tmp_path / "ca")
-    bundle = ensure_ca_bundle(cert, cache_dir=tmp_path / "ca")
-    monkeypatch.setattr("omnigent.inner.egress.controller.ensure_ca", lambda: (cert, key))
-    monkeypatch.setattr("omnigent.inner.egress.controller.ensure_ca_bundle", lambda _: bundle)
+    cert, key, bundle = prepare_isolated_egress_ca(tmp_path / "ca", monkeypatch)
     captured: list[tuple[str | None, str | None, bytes]] = []
 
     class Handler(BaseHTTPRequestHandler):
@@ -711,10 +708,7 @@ def test_model_inference_is_automatic_and_credentials_stay_outside_real_worker(
     request: pytest.FixtureRequest,
 ) -> None:
     """The production launcher must work with network denied and no egress rules."""
-    cert, key = ensure_ca(cache_dir=tmp_path / "ca")
-    bundle = ensure_ca_bundle(cert, cache_dir=tmp_path / "ca")
-    monkeypatch.setattr("omnigent.inner.egress.controller.ensure_ca", lambda: (cert, key))
-    monkeypatch.setattr("omnigent.inner.egress.controller.ensure_ca_bundle", lambda _: bundle)
+    cert, key, _ = prepare_isolated_egress_ca(tmp_path / "ca", monkeypatch)
     requests: list[tuple[str | None, bytes]] = []
 
     class Handler(BaseHTTPRequestHandler):
@@ -819,10 +813,7 @@ def cli_model_server(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
 ):
     """Real TLS provider; only its address is substituted, after relay validation."""
-    cert, key = ensure_ca(cache_dir=tmp_path / "cli-ca")
-    bundle = ensure_ca_bundle(cert, cache_dir=tmp_path / "cli-ca")
-    monkeypatch.setattr("omnigent.inner.egress.controller.ensure_ca", lambda: (cert, key))
-    monkeypatch.setattr("omnigent.inner.egress.controller.ensure_ca_bundle", lambda _: bundle)
+    cert, key, _ = prepare_isolated_egress_ca(tmp_path / "cli-ca", monkeypatch)
     requests = []
     replies = []
 

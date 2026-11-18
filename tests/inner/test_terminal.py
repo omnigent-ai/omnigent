@@ -27,7 +27,6 @@ from omnigent.errors import ErrorCategory, ErrorImpact, classify_exception
 from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
 from omnigent.inner.claude_model_access import ClaudeModelAccess
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
-from omnigent.inner.egress.ca import ensure_ca, ensure_ca_bundle
 from omnigent.inner.sandbox import SandboxPolicy
 from omnigent.inner.terminal import (
     TerminalInstance,
@@ -44,6 +43,7 @@ from omnigent.inner.terminal_lifecycle import (
 from omnigent.native import owner_claim
 from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
 from omnigent.runner.resource_registry import trim_terminal_output
+from tests._helpers.egress_ca import prepare_isolated_egress_ca
 from tests._helpers.live_server import terminate_process
 from tests._helpers.polling import poll_until
 from tests._helpers.stdio_jsonrpc import read_json_line
@@ -3867,10 +3867,7 @@ def test_create_terminal_instance_denies_control_socket_but_keeps_private_dir_wr
 @pytest.fixture
 def terminal_proxy_ca(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Keep terminal relay certificates separate from the host's cached CA."""
-    cert, key = ensure_ca(cache_dir=tmp_path / "ca")
-    bundle = ensure_ca_bundle(cert, cache_dir=tmp_path / "ca")
-    monkeypatch.setattr("omnigent.inner.egress.controller.ensure_ca", lambda: (cert, key))
-    monkeypatch.setattr("omnigent.inner.egress.controller.ensure_ca_bundle", lambda _: bundle)
+    prepare_isolated_egress_ca(tmp_path / "ca", monkeypatch)
 
 
 @pytest.mark.parametrize("allow_private", [False, True])

@@ -33,6 +33,7 @@ from omnigent.inner.egress.ca import ensure_ca, ensure_ca_bundle
 from omnigent.inner.sandbox import SandboxPolicy
 from omnigent.runner.tool_dispatch import _execute_os_env_tool, execute_tool
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from tests._helpers.egress_ca import prepare_isolated_egress_ca
 
 
 @pytest.fixture
@@ -510,10 +511,7 @@ def real_callback_sandbox(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
         pytest.skip("requires Seatbelt or bubblewrap")
     if sys.platform == "linux" and shutil.which("bwrap") is None:
         pytest.skip("requires bubblewrap")
-    cert, key = ensure_ca(cache_dir=tmp_path / "ca")
-    bundle = ensure_ca_bundle(cert, cache_dir=tmp_path / "ca")
-    monkeypatch.setattr("omnigent.inner.egress.controller.ensure_ca", lambda: (cert, key))
-    monkeypatch.setattr("omnigent.inner.egress.controller.ensure_ca_bundle", lambda _: bundle)
+    prepare_isolated_egress_ca(tmp_path / "ca", monkeypatch)
 
 
 async def test_real_callback_child_cannot_read_secrets_or_use_direct_network(
