@@ -2894,19 +2894,22 @@ describe("panel windows", () => {
     assert.equal(savedBounds(h), undefined);
   });
 
-  for (const [platform, closesPanel] of [
-    ["linux", true],
-    ["darwin", false],
+  for (const [platform, otherMain, destroysPanel] of [
+    ["linux", false, true],
+    ["linux", true, false],
+    ["darwin", false, false],
   ]) {
-    it(`${closesPanel ? "closes" : "keeps"} panels with the last main window on ${platform}`, (t) => {
+    const when = otherMain ? "while another main window stays open" : "with the last main window";
+    it(`${destroysPanel ? "destroys" : "keeps"} panels ${when} on ${platform}`, (t) => {
       const h = loadNavigationHarness({ platform });
       t.after(h.cleanup);
       h.api.createWindow();
-      let closed = 0;
-      const panel = { isDestroyed: () => false, close: () => (closed += 1) };
+      if (otherMain) h.api.windows.set({ isDestroyed: () => false }, { role: "main" });
+      let destroyed = 0;
+      const panel = { isDestroyed: () => false, destroy: () => (destroyed += 1) };
       h.api.windows.set(panel, { origin: "https://host.example", role: "panel" });
       h.emitWindow("closed");
-      assert.equal(closed, closesPanel ? 1 : 0);
+      assert.equal(destroyed, destroysPanel ? 1 : 0);
     });
   }
 });
@@ -3687,11 +3690,12 @@ describe("CLI deep-link handoff", () => {
 });
 
 describe("deep links with a panel open", () => {
-  it("open in the server's main window, not a focused panel of that server", async () => {
+  it("open in the server's main window, not a focused panel of that server", async (t) => {
     const h = loadNavigationHarness({
       serverUrl: "http://localhost:6767/",
       deepLinks: { ...require("../src/deepLink"), acceptCliDeepLink: async () => true },
     });
+    t.after(h.cleanup);
     const panelSends = [];
     const panel = {
       isDestroyed: () => false,
@@ -3712,7 +3716,6 @@ describe("deep links with a panel open", () => {
       [{ channel: "omnigent:open-path", data: "/" }],
     );
     assert.deepEqual(panelSends, []);
-    h.api.disposeAuth();
   });
 });
 

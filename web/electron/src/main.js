@@ -2947,9 +2947,10 @@ function createWindow(targetUrl, opts = {}) {
     awayWatches.delete(win);
     windows.delete(win);
     updateBadge(); // drop this window's contribution from the app-wide badge
-    // Off macOS the app quits once every window has closed, so panels go with the last main one.
+    // Off macOS the app quits once every window has closed, so panels go with the last main
+    // one. Destroyed, not closed: a panel page's beforeunload must not keep the app running.
     if (isMain && process.platform !== "darwin" && mainWindows().length === 0) {
-      for (const panel of [...windows.keys()]) if (!panel.isDestroyed()) panel.close();
+      for (const panel of [...windows.keys()]) if (!panel.isDestroyed()) panel.destroy();
     }
   });
   attachContextMenu(win);
