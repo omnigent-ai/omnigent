@@ -84,3 +84,7 @@ export function isTextEntry(target: HTMLElement): boolean {
   if (target instanceof HTMLInputElement) return !NON_TEXT_INPUT_TYPES.has(target.type);
   return target.closest("[contenteditable]:not([contenteditable='false'])") !== null;
 }
+
+/** Focused controls that keep Enter for their own activation or typing. */
+export const ENTER_OWNING_SELECTOR =
+  "a[href], button, input, select, textarea, summary, [contenteditable]:not([contenteditable='false']), [role='button'], [role='link'], [role='checkbox'], [role='radio'], [role='switch'], [role='tab'], [role='menuitem'], [role='option'], [role='combobox'], [role='textbox'], [role='searchbox'], [role='slider']";

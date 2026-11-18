@@ -3,15 +3,20 @@ import { createPortal } from "react-dom";
 import { CornerUpLeftIcon, MessagesSquareIcon } from "lucide-react";
 import { ALT_KEY, CompactShortcutKeys, ENTER_KEY, SHIFT_KEY } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
+import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { getEmbedRoot } from "@/lib/host";
-import { isFocusInDialogOrMenu, isKeyOwningOverlayOpen, isTextEntry } from "@/lib/hotkeys";
-import { chordMatches } from "@/lib/shortcuts/chord";
+import {
+  ENTER_OWNING_SELECTOR,
+  isFocusInDialogOrMenu,
+  isKeyOwningOverlayOpen,
+} from "@/lib/hotkeys";
+import { matchesShortcut } from "@/lib/shortcuts/registry";
 
 function ownsSelectionHotkey(target: EventTarget | null): boolean {
   return (
     target instanceof HTMLElement &&
-    (isTextEntry(target) ||
-      target.closest("button, a[href], select, [role='button'], .xterm, .monaco-editor") !== null)
+    target.closest(`${ENTER_OWNING_SELECTOR}, .xterm, .monaco-editor`) !== null
   );
 }
 
@@ -28,6 +33,9 @@ export function SelectionPopup({
 }) {
   const [popupPos, setPopupPos] = useState<{ x: number; y: number } | null>(null);
   const selectedTextRef = useRef("");
+  const isMobileViewport = useIsMobileViewport();
+  const isCoarsePointer = useIsCoarsePointer();
+  const showKeyHints = !isMobileViewport && !isCoarsePointer;
 
   const getScopedSelection = useCallback(() => {
     const selection = window.getSelection();
@@ -83,9 +91,9 @@ export function SelectionPopup({
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.defaultPrevented || event.repeat || event.isComposing) return;
-      const action = chordMatches({ key: "Enter", alt: true }, event)
+      const action = matchesShortcut(event, "transcript.reply")
         ? onReply
-        : chordMatches({ key: "Enter", alt: true, shift: true }, event)
+        : matchesShortcut(event, "transcript.askInSideChat")
           ? onAskInSideChat
           : undefined;
       if (
@@ -139,7 +147,7 @@ export function SelectionPopup({
       >
         <CornerUpLeftIcon className="size-3.5" />
         Reply
-        <CompactShortcutKeys keys={[ALT_KEY, ENTER_KEY]} />
+        {showKeyHints && <CompactShortcutKeys keys={[ALT_KEY, ENTER_KEY]} />}
       </Button>
       {onAskInSideChat ? (
         <Button
@@ -157,7 +165,7 @@ export function SelectionPopup({
         >
           <MessagesSquareIcon className="size-3.5" />
           Ask in side chat
-          <CompactShortcutKeys keys={[ALT_KEY, SHIFT_KEY, ENTER_KEY]} />
+          {showKeyHints && <CompactShortcutKeys keys={[ALT_KEY, SHIFT_KEY, ENTER_KEY]} />}
         </Button>
       ) : null}
     </div>,

@@ -4,8 +4,15 @@ import { afterEach, expect, it, vi } from "vitest";
 import { setEmbedRoot } from "@/lib/host";
 import { SelectionPopup } from "./SelectionPopup";
 
+const device = vi.hoisted(() => ({ mobile: false, coarse: false }));
+vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => device.mobile }));
+vi.mock("@/hooks/useIsCoarsePointer", () => ({ useIsCoarsePointer: () => device.coarse }));
+
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
+  device.mobile = false;
+  device.coarse = false;
   setEmbedRoot(null);
   window.getSelection()?.removeAllRanges();
 });
@@ -140,21 +147,46 @@ it.each([
   expect(onAskInSideChat).not.toHaveBeenCalled();
 });
 
-it.each(["textarea", "input", "contenteditable", "button", "monaco-editor", "xterm"])(
+it.each([
+  "textarea",
+  "input",
+  "input:checkbox",
+  "input:radio",
+  "input:range",
+  "input:submit",
+  "input:button",
+  "input:reset",
+  "input:file",
+  "input:color",
+  "input:image",
+  "contenteditable",
+  "button",
+  "monaco-editor",
+  "xterm",
+])(
   "preserves selection shortcuts in a focused %s while transcript text is still selected",
   (surface) => {
     const onAskInSideChat = vi.fn();
-    const { container, onReply } = renderPopup(onAskInSideChat);
+    const { container, containerRef, onReply } = renderPopup(onAskInSideChat);
     const target = document.createElement(
-      ["textarea", "input", "button"].includes(surface) ? surface : "div",
+      surface.startsWith("input:")
+        ? "input"
+        : ["textarea", "input", "button"].includes(surface)
+          ? surface
+          : "div",
     );
+    if (surface.startsWith("input:")) target.setAttribute("type", surface.slice(6));
     target.tabIndex = 0;
     if (surface === "contenteditable") target.setAttribute("contenteditable", "true");
     else target.className = surface;
     container.append(target);
     target.focus();
-    expect(fireEvent.keyDown(target, { key: "Enter", altKey: true })).toBe(true);
-    expect(fireEvent.keyDown(target, { key: "Enter", altKey: true, shiftKey: true })).toBe(true);
+    selectText(containerRef.current!, false);
+    for (const shiftKey of [false, true]) {
+      expect(fireEvent.keyDown(target, { key: "Enter", altKey: true, shiftKey })).toBe(true);
+      expect(document.activeElement).toBe(target);
+      expect(window.getSelection()!.toString()).toBe("Selected message");
+    }
     expect(onReply).not.toHaveBeenCalled();
     expect(onAskInSideChat).not.toHaveBeenCalled();
   },
@@ -179,21 +211,49 @@ it("leaves modal and already-handled keys alone", () => {
   expect(onReply).not.toHaveBeenCalled();
 });
 
-it("keeps Enter activation of the focused side-chat button", () => {
+it("preserves shortcuts on a focused popup button and still handles its click", () => {
   const onAskInSideChat = vi.fn();
-  const { onReply } = renderPopup(onAskInSideChat);
+  const { containerRef, onReply } = renderPopup(onAskInSideChat);
   const button = screen.getByRole("button", { name: "Ask in side chat" });
   button.focus();
-  expect(fireEvent.keyDown(button, { key: "Enter" })).toBe(true);
+  selectText(containerRef.current!, false);
+  for (const shiftKey of [false, true]) {
+    expect(fireEvent.keyDown(button, { key: "Enter", altKey: true, shiftKey })).toBe(true);
+    expect(document.activeElement).toBe(button);
+    expect(window.getSelection()!.toString()).toBe("Selected message");
+  }
+  expect(onAskInSideChat).not.toHaveBeenCalled();
+  expect(onReply).not.toHaveBeenCalled();
   fireEvent.click(button);
   expect(onAskInSideChat).toHaveBeenCalledExactlyOnceWith("Selected message");
   expect(onReply).not.toHaveBeenCalled();
 });
 
 it("removes the shortcut listener when unmounted", () => {
-  const { unmount, onReply } = renderPopup();
+  const add = vi.spyOn(document, "addEventListener");
+  const remove = vi.spyOn(document, "removeEventListener");
+  const { unmount } = renderPopup();
+  const handler = add.mock.calls.find(([type]) => type === "keydown")?.[1];
+  expect(handler).toBeTypeOf("function");
   unmount();
-  expect(fireEvent.keyDown(document.body, { key: "Enter", altKey: true })).toBe(true);
+  expect(remove).toHaveBeenCalledWith("keydown", handler);
+});
+
+it.each([
+  { mobile: false, coarse: false },
+  { mobile: true, coarse: false },
+  { mobile: false, coarse: true },
+])("shows keyboard hints only on desktop layouts (%j)", (layout) => {
+  Object.assign(device, layout);
+  const onAskInSideChat = vi.fn();
+  const { onReply } = renderPopup(onAskInSideChat);
+  const reply = screen.getByRole("button", { name: "Reply" });
+  const ask = screen.getByRole("button", { name: "Ask in side chat" });
+  const hints = !layout.mobile && !layout.coarse;
+  expect(reply.querySelectorAll("kbd")).toHaveLength(hints ? 2 : 0);
+  expect(ask.querySelectorAll("kbd")).toHaveLength(hints ? 3 : 0);
+  fireEvent.click(ask);
+  expect(onAskInSideChat).toHaveBeenCalledExactlyOnceWith("Selected message");
   expect(onReply).not.toHaveBeenCalled();
 });
 

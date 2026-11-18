@@ -204,6 +204,14 @@ const BINDINGS = {
     label: "Split terminal down",
     chords: () => [{ mod: true, alt: true, code: "Minus" }],
   },
+  "transcript.reply": {
+    label: "Reply to selected chat text",
+    chords: () => [{ alt: true, key: "Enter", exactKey: true }],
+  },
+  "transcript.askInSideChat": {
+    label: "Ask about selected chat text in side chat",
+    chords: () => [{ alt: true, shift: true, key: "Enter", exactKey: true }],
+  },
 } satisfies Record<string, ShortcutBindingDefinition>;
 
 export type ShortcutId = keyof typeof BINDINGS;
