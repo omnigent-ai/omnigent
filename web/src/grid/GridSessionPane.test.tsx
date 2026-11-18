@@ -1,5 +1,6 @@
 import type * as TerminalsModule from "@/hooks/useTerminals";
 import type * as SessionsApi from "@/lib/sessionsApi";
+import type { Session } from "@/lib/types";
 import type * as FilesPanelModule from "@/shell/FilesPanel";
 import type * as GridSessionsModule from "./GridSessionsContext";
 import {
@@ -33,6 +34,9 @@ import { retrySession, updateSession } from "@/lib/sessionsApi";
 import { toast } from "sonner";
 import { revealFolderInFilesPanel } from "@/shell/FilesPanel";
 import { selectPullRequestInPanel } from "@/shell/PullRequestPanel";
+import { conversationRegistry } from "@/store/conversationRegistry";
+import { gridCellComposerKey, useChatStore } from "@/store/chatStore";
+import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
 
 const queryClient = new QueryClient();
 const LINKED_PR = "https://github.com/example/app/pull/42";
@@ -58,6 +62,9 @@ const fixture = vi.hoisted(() => ({
   renderError: new Error("Grid surface render failed"),
   // Set while a cell's viewer holds unsaved edits and is asking to discard them.
   discardEdits: null as (() => void) | null,
+  // Sessions the viewer can't edit, and each session's sandbox launch.
+  readOnlySessions: [] as string[],
+  launches: {} as Record<string, { stage: string; error: null }>,
 }));
 vi.mock("@/lib/sessionsApi", async (original) => ({
   ...(await original<typeof SessionsApi>()),
@@ -65,10 +72,20 @@ vi.mock("@/lib/sessionsApi", async (original) => ({
   updateSession: vi.fn(async () => ({ labels: {} })),
 }));
 vi.mock("@/components/HostBadge", () => ({
-  HostBadge: ({ sessionId, readOnly }: { sessionId: string; readOnly?: boolean }) => (
+  HostBadge: ({
+    sessionId,
+    readOnly,
+    launch,
+  }: {
+    sessionId: string;
+    readOnly?: boolean;
+    launch?: { stage: string } | null;
+  }) => (
     <span>
       Host for {sessionId}
       {readOnly && " (status only)"}
+      {launch && ` (launch ${launch.stage})`}
+      {launch === undefined && " (launch omitted)"}
     </span>
   ),
 }));
@@ -115,11 +132,14 @@ vi.mock("@/hooks/useSession", () => ({
     queryFn: async () => ({ id, title: id }),
   }),
 }));
-vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: () => true }));
+vi.mock("@/hooks/usePermissions", () => ({
+  useCanEdit: (id: string) => !fixture.readOnlySessions.includes(id),
+}));
 vi.mock("@/hooks/useConversationEntryState", () => ({
-  useConversationEntryState: () => ({
+  useConversationEntryState: (id: string) => ({
     terminalPending: fixture.terminalPending,
     claudePermissionMode: "default",
+    sandboxStatus: fixture.launches[id] ?? null,
   }),
 }));
 vi.mock("@/hooks/RunnerHealthProvider", () => ({
@@ -155,14 +175,25 @@ vi.mock("@/components/chat/SideChatPane", () => ({
     gridComposer,
   }: {
     childId: string;
-    gridComposer?: { leading?: ReactNode; trailing?: ReactNode };
+    gridComposer?: {
+      leading?: ReactNode;
+      trailing?: ReactNode;
+      cyclePermissionMode?: () => boolean;
+    };
   }) => {
     const context = useContext(FileViewerContext)!;
     const terminal = useTerminalFirst();
     if (childId === fixture.failedChat) throw fixture.renderError;
     return (
       <>
-        <textarea aria-label="Message" disabled={fixture.composerDisabled} />
+        <textarea
+          aria-label="Message"
+          disabled={fixture.composerDisabled}
+          onKeyDown={(event) => {
+            if (event.key === "Tab" && event.shiftKey && gridComposer?.cyclePermissionMode?.())
+              event.preventDefault();
+          }}
+        />
         <button type="button" onClick={() => terminal?.setView("terminal")}>
           Open terminal dialog
         </button>
@@ -246,6 +277,8 @@ afterEach(() => {
   fixture.failedChat = "";
   fixture.failedTerminal = "";
   fixture.discardEdits = null;
+  fixture.readOnlySessions = [];
+  fixture.launches = {};
   vi.restoreAllMocks();
 });
 
@@ -267,8 +300,8 @@ it("shows each cell's session controls and targets that session's permission mod
   // Named from the cells' snapshots; neither session is on a loaded sidebar page.
   await waitFor(() => expect(document.title).toBe("first + second"));
   const second = within(screen.getByRole("region", { name: "second" }));
-  // Host and harness are read-only here; switch hosts and models full screen.
-  expect(second.getByText("Host for second (status only)")).toBeInTheDocument();
+  // The harness is read-only here; models are switched full screen.
+  expect(second.getByText("Host for second")).toBeInTheDocument();
   expect(second.getByTestId("grid-harness-status")).toHaveAccessibleName("Claude Code");
   fireEvent.pointerDown(second.getByRole("button", { name: "Permission mode: Manual" }), {
     button: 0,
@@ -296,6 +329,27 @@ it("shows each cell's session controls and targets that session's permission mod
   expect(second.getByRole("button", { name: "Permission mode: Manual" })).toBeDisabled();
   view.unmount();
   expect(document.title).toBe("Single session");
+});
+
+it("gives each cell its own host-switch access and launch progress", () => {
+  fixture.readOnlySessions = ["first"];
+  fixture.launches = { second: { stage: "provisioning", error: null } };
+  render(twoCellGrid());
+  // The active cell's name gains an " (active)" suffix, hence the prefix match.
+  const first = within(screen.getByRole("region", { name: /^first/ }));
+  const second = within(screen.getByRole("region", { name: "second" }));
+  // A cell with no launch passes null, so its badge never shows the open session's.
+  expect(first.getByText("Host for first (status only)")).toBeInTheDocument();
+  expect(second.getByText("Host for second (launch provisioning)")).toBeInTheDocument();
+});
+
+it("opens each cell with its session's saved draft", () => {
+  onTestFinished(clearSessionDrafts);
+  setSessionDraft("second", { text: "half-typed", files: [] });
+  render(twoCellGrid());
+  const composers = useChatStore.getState().sideChatComposers;
+  expect(composers[gridCellComposerKey("second")]?.text).toBe("half-typed");
+  expect(composers[gridCellComposerKey("first")]).toBeUndefined();
 });
 
 it("opens agent-requested files only in the active workspace and respects navigation guards", () => {
@@ -408,6 +462,119 @@ it("opens chat-linked folders and PRs in that pane's workspace", () => {
   );
   expect(selectPullRequestInPanel).toHaveBeenCalledWith(queryClient, "second", LINKED_PR);
   expect(workspace).toHaveAttribute("data-tab", "github");
+});
+
+/** Renders the two-cell grid with both cells on claude-native sessions in "Manual" mode. */
+function renderClaudeCells() {
+  fixture.labels = { "omnigent.wrapper": "claude-code-native-ui" };
+  for (const id of ["first", "second"]) {
+    conversationRegistry.acquire(id).setState({ claudePermissionMode: "default" });
+  }
+  onTestFinished(() => conversationRegistry.clear());
+  vi.mocked(updateSession).mockClear();
+  return render(twoCellGrid());
+}
+
+/** Shift+Tab in the named cell's composer; false when the cell took the key. */
+function pressShiftTab(cellName: string) {
+  return fireEvent.keyDown(
+    within(screen.getByRole("region", { name: cellName })).getByLabelText("Message"),
+    { key: "Tab", shiftKey: true },
+  );
+}
+
+/** Waits until the named cell's chip is enabled, so its switch has settled. */
+async function settled(cellName: string) {
+  await waitFor(() =>
+    expect(
+      within(screen.getByRole("region", { name: cellName })).getByRole("button", {
+        name: "Permission mode: Manual",
+      }),
+    ).toBeEnabled(),
+  );
+}
+
+/** A PATCH response in which the server confirms *mode* for a claude-native session. */
+const claudeSessionConfirming = (mode: string) =>
+  ({ labels: { "omnigent.claude_native.permission_mode": mode } }) as unknown as Session;
+
+it("steps only the Shift+Tab cell's session to its next mode, for its owner and while reachable", async () => {
+  const view = renderClaudeCells();
+  expect(pressShiftTab("second")).toBe(false);
+  await waitFor(() =>
+    expect(updateSession).toHaveBeenCalledWith("second", { claudePermissionMode: "auto" }),
+  );
+  expect(updateSession).toHaveBeenCalledTimes(1);
+  await settled("second");
+
+  // The mocked PATCH cleared this cell's mode; restore it so only the gate can stop a press.
+  // Only the owner can switch modes.
+  conversationRegistry.acquire("second").setState({ claudePermissionMode: "default" });
+  fixture.permissionLevel = 2;
+  view.rerender(twoCellGrid());
+  expect(pressShiftTab("second")).toBe(true);
+  // Like the main composer, an unreachable session doesn't cycle.
+  conversationRegistry.acquire("second").setState({ claudePermissionMode: "default" });
+  fixture.permissionLevel = null;
+  fixture.livenessKind = "host_offline";
+  view.rerender(twoCellGrid());
+  expect(pressShiftTab("second")).toBe(true);
+  expect(updateSession).toHaveBeenCalledTimes(1);
+  view.unmount();
+});
+
+it("holds a cell's Shift+Tab while its switch is in flight", () => {
+  const view = renderClaudeCells();
+  vi.mocked(updateSession).mockReturnValueOnce(new Promise<never>(() => {}));
+  expect(pressShiftTab("second")).toBe(false);
+  expect(pressShiftTab("second")).toBe(false);
+  expect(updateSession).toHaveBeenCalledTimes(1);
+  view.unmount();
+});
+
+it("moves a cell past the mode its session refused on the next Shift+Tab", async () => {
+  const toastError = vi.spyOn(toast, "error").mockReturnValue("error");
+  const view = renderClaudeCells();
+  vi.mocked(updateSession).mockRejectedValueOnce(new Error("Runner unavailable"));
+  pressShiftTab("second");
+  await waitFor(() => expect(toastError).toHaveBeenCalledWith("Runner unavailable"));
+  await settled("second");
+  pressShiftTab("second");
+  await waitFor(() =>
+    expect(updateSession).toHaveBeenLastCalledWith("second", {
+      claudePermissionMode: "acceptEdits",
+    }),
+  );
+  view.unmount();
+});
+
+it("steps a cell on from the mode its session confirmed", async () => {
+  const view = renderClaudeCells();
+  vi.mocked(updateSession).mockResolvedValueOnce(claudeSessionConfirming("auto"));
+  pressShiftTab("second");
+  await settled("second");
+  pressShiftTab("second");
+  await waitFor(() =>
+    expect(updateSession).toHaveBeenLastCalledWith("second", {
+      claudePermissionMode: "acceptEdits",
+    }),
+  );
+  view.unmount();
+});
+
+it("moves a cell past the mode its session confirmed as a different one", async () => {
+  const view = renderClaudeCells();
+  // The server kept the session in Manual rather than the requested Auto.
+  vi.mocked(updateSession).mockResolvedValueOnce(claudeSessionConfirming("default"));
+  pressShiftTab("second");
+  await settled("second");
+  pressShiftTab("second");
+  await waitFor(() =>
+    expect(updateSession).toHaveBeenLastCalledWith("second", {
+      claudePermissionMode: "acceptEdits",
+    }),
+  );
+  view.unmount();
 });
 
 it("keeps cell views, input, permissions and shortcut targets independent", async () => {
