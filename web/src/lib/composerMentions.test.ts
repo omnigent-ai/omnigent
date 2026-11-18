@@ -11,6 +11,7 @@ import {
   mentionTokenAtCaret,
   newFileMentionToken,
   presentMentions,
+  presentTaggedMentions,
   rankSessionMentions,
   readableSentText,
   replaceSentMentions,
@@ -137,6 +138,19 @@ describe("expanding composer text", () => {
 
   it("drops mentions whose token was deleted from every segment", () => {
     expect(presentMentions(mentions, ["only @auth here"]).map((m) => m.token)).toEqual(["@auth"]);
+  });
+
+  it("keeps only the tagged files and sessions whose token is still present", () => {
+    const tagged = {
+      files: [{ path: "src/app.ts", isDir: false, token: "@src/app.ts" }],
+      sessions: [{ ...alpha, token: "@Alpha planning" }],
+    };
+    expect(presentTaggedMentions(tagged, ["check @Alpha planning"])).toEqual({
+      files: [],
+      sessions: [{ ...alpha, token: "@Alpha planning" }],
+    });
+    expect(presentTaggedMentions(tagged, ["nothing tagged"])).toBeUndefined();
+    expect(presentTaggedMentions(undefined, ["@src/app.ts"])).toBeUndefined();
   });
 
   it("appends the hint once, only when a session is tagged", () => {
