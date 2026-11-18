@@ -1884,12 +1884,12 @@ def register_core_routes(
                 host_id=launch_host_id,
             )
         if body.sibling_source_id is not None and conv is not None:
-            from omnigent.server.session_families import project_families
+            from omnigent.server.session_families import apply_family_projection, project_families
 
             _, families = await asyncio.to_thread(
                 project_families, conversation_store, permission_store, [conv], user_id
             )
-            resp.family = families.get(conv.id)
+            apply_family_projection(resp, families.get(conv.id))
         add_audit_attrs(session_id=resp.id, agent=resp.agent_id)
         return resp
 
@@ -2877,10 +2877,10 @@ def register_core_routes(
                     if conv.agent_id is not None
                 ]
             )
+        from omnigent.server.session_families import apply_family_projection
+
         for item in items:
-            item.family = family_info.get(item.id)
-            if item.family and item.family.pinned and item.family.representative_id == item.id:
-                item.labels[PINNED_LABEL_KEY] = item.family.pinned_at or "1"
+            apply_family_projection(item, family_info.get(item.id))
         # Apart from the bounded orphan-suspect probe above, the list does not
         # compute per-item liveness
         # (runner_online / host_online). No list consumer reads it: the
@@ -3058,7 +3058,7 @@ def register_core_routes(
         convs = await asyncio.to_thread(_load_sessions, accessible)
         if not convs:
             return []
-        from omnigent.server.session_families import project_families
+        from omnigent.server.session_families import apply_family_projection, project_families
 
         convs, family_info = await asyncio.to_thread(
             project_families, conversation_store, permission_store, convs, user_id
@@ -3098,9 +3098,7 @@ def register_core_routes(
             for conv in convs
         ]
         for item in items:
-            item.family = family_info.get(item.id)
-            if item.family and item.family.pinned and item.family.representative_id == item.id:
-                item.labels[PINNED_LABEL_KEY] = item.family.pinned_at or "1"
+            apply_family_projection(item, family_info.get(item.id))
         await _apply_liveness_to_items(items, liveness_lookup)
         # Full-row dumps (every field, nulls included) — NOT exclude_none. The
         # stream is a diff source: the client overlays these onto its cached

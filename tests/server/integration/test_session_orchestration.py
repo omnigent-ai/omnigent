@@ -3079,10 +3079,19 @@ async def test_explicit_host_endpoint_refuses_without_capability_or_source(
 
 
 async def test_owner_can_move_independent_sessions_between_nests(
-    auth_client, auth_app, peers, db_uri
+    auth_client, auth_app, peers, db_uri, monkeypatch
 ):
-    source, target, _ = peers
+    target, _, _ = peers
+    monkeypatch.setattr(
+        "omnigent.stores.conversation_store.sqlalchemy_store.now_epoch",
+        lambda: target["created_at"] + 1,
+    )
+    source = await _create_session_as(auth_client, "", "alice")
     store = SqlAlchemyConversationStore(db_uri)
+    pinned = await auth_client.patch(
+        f"/v1/sessions/{target['id']}", json={"labels": {"omnigent.pinned": "personal-pin"}}
+    )
+    assert pinned.status_code == 200, pinned.text
     for extra in ({"project_id": ""}, {"labels": {"omni_project": "Other"}}):
         refused = await auth_client.patch(
             f"/v1/sessions/{target['id']}", json={"nest_source_id": source["id"], **extra}
@@ -3094,6 +3103,13 @@ async def test_owner_can_move_independent_sessions_between_nests(
     )
     assert joined.status_code == 200, joined.text
     assert joined.json()["family"]["id"] == source["id"]
+    assert joined.json()["family"]["representative_id"] == target["id"]
+    assert not joined.json()["family"]["pinned"]
+    snapshot = (await auth_client.get(f"/v1/sessions/{target['id']}")).json()
+    listing = (await auth_client.get("/v1/sessions")).json()["data"]
+    listed = next(row for row in listing if row["id"] == target["id"])
+    for response in (joined.json(), snapshot, listed):
+        assert "omnigent.pinned" not in response["labels"]
     unchanged = await auth_client.patch(f"/v1/sessions/{target['id']}", json={"title": "Renamed"})
     assert unchanged.status_code == 200, unchanged.text
     assert unchanged.json()["family"]["id"] == source["id"]
@@ -3105,6 +3121,14 @@ async def test_owner_can_move_independent_sessions_between_nests(
     assert store.get_conversation(target["id"]).family_id == source["id"]
     permissions = SqlAlchemyPermissionStore(db_uri)
     permissions.grant("bob", target["id"], LEVEL_EDIT)
+    shared_pin = await auth_client.patch(
+        f"/v1/sessions/{target['id']}",
+        json={"labels": {"omnigent.pinned": "shared-pin"}},
+        headers={"X-Forwarded-Email": "bob"},
+    )
+    assert shared_pin.status_code == 200, shared_pin.text
+    assert shared_pin.json().get("family") is None
+    assert shared_pin.json()["labels"]["omnigent.pinned"] == "shared-pin"
     refused = await auth_client.patch(
         f"/v1/sessions/{target['id']}",
         json={"nest_source_id": None},
@@ -3130,6 +3154,7 @@ async def test_owner_can_move_independent_sessions_between_nests(
     )
     assert detached.status_code == 200, detached.text
     assert detached.json().get("family") is None
+    assert detached.json()["labels"]["omnigent.pinned"] == "personal-pin"
     assert store.get_conversation(target["id"]).family_id is None
 
 

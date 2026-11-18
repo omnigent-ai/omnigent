@@ -12,10 +12,11 @@ from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_OWNER
 from omnigent.server.feature_flags import Feature
-from omnigent.server.schemas import SessionFamily
+from omnigent.server.schemas import SessionFamily, SessionListItem, SessionResponse
 from omnigent.server.session_orchestration import require_owned_session
 from omnigent.server.sharing_settings import SiblingSessionDestinations
 from omnigent.stores.conversation_store import (
+    PINNED_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
     ConversationStore,
@@ -121,6 +122,18 @@ async def complete_sibling_creation(
         except Exception:
             _logger.exception("Failed to discard rejected sibling %s", session_id)
         raise
+
+
+def apply_family_projection(
+    response: SessionListItem | SessionResponse, family: SessionFamily | None
+) -> None:
+    """Project visible nest membership and its effective pin for older clients too."""
+    response.family = family
+    if family is None:
+        return
+    response.labels.pop(PINNED_LABEL_KEY, None)
+    if family.pinned and family.representative_id == response.id:
+        response.labels[PINNED_LABEL_KEY] = family.pinned_at or "1"
 
 
 def project_families(

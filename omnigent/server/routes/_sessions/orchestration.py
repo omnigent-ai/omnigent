@@ -15240,7 +15240,7 @@ async def _get_session_snapshot(
         agent=agent,
     )
     if request is not None:
-        from omnigent.server.session_families import project_families
+        from omnigent.server.session_families import apply_family_projection, project_families
 
         _, families = await asyncio.to_thread(
             project_families,
@@ -15249,13 +15249,7 @@ async def _get_session_snapshot(
             [conv],
             viewer_id,
         )
-        response.family = families.get(conv.id)
-        if (
-            response.family
-            and response.family.pinned
-            and response.family.representative_id == conv.id
-        ):
-            response.labels[PINNED_LABEL_KEY] = response.family.pinned_at or "1"
+        apply_family_projection(response, families.get(conv.id))
     response.side_chat_settings_supported = await _runner_supports_side_chat_settings(
         conv, conv_store, getattr(request.app.state, "tunnel_registry", None) if request else None
     )

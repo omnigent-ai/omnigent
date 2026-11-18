@@ -10,8 +10,12 @@ after per-repo storage would see no repo and clone an empty sandbox.
 
 from __future__ import annotations
 
+import pytest
+
 from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
 from omnigent.server.routes._sessions.orchestration import _labels_for_viewer
+from omnigent.server.schemas import SessionFamily, SessionListItem, SessionResponse
+from omnigent.server.session_families import apply_family_projection
 from omnigent.stores.conversation_store import pinned_label_key
 
 
@@ -48,3 +52,38 @@ def test_still_collapses_the_pin_family() -> None:
     # This viewer's pin surfaces as the canonical bare key; others' don't leak.
     assert viewer.get("omnigent.pinned") == "1721760000000"
     assert not any(k.startswith("omnigent.pinned.") for k in viewer)
+
+
+@pytest.mark.parametrize("response_type", [SessionListItem, SessionResponse])
+@pytest.mark.parametrize(
+    "family,expected_pin",
+    [
+        (None, "personal-pin"),
+        (SessionFamily(id="nest", representative_id="session"), None),
+        (
+            SessionFamily(
+                id="nest", representative_id="session", pinned=True, pinned_at="family-pin"
+            ),
+            "family-pin",
+        ),
+        (SessionFamily(id="nest", representative_id="other", pinned=True), None),
+    ],
+    ids=["standalone-or-shared", "unpinned-nest", "pinned-representative", "pinned-member"],
+)
+def test_family_projection_keeps_saved_pins_out_of_legacy_client_state(
+    response_type, family, expected_pin
+) -> None:
+    stored = {pinned_label_key("alice@example.com"): "personal-pin", "kept": "yes"}
+    response = response_type(
+        id="session",
+        agent_id="agent",
+        status="idle",
+        created_at=1,
+        updated_at=1,
+        labels=_labels_for_viewer(stored, "alice@example.com"),
+    )
+    apply_family_projection(response, family)
+    assert response.family == family
+    assert response.labels.get("omnigent.pinned") == expected_pin
+    assert response.labels["kept"] == "yes"
+    assert stored[pinned_label_key("alice@example.com")] == "personal-pin"
