@@ -10384,7 +10384,7 @@ async def test_sibling_family_lifecycle(tmp_path, split_database, user_id, monke
         for member in family
     )
     assert all(family_pinned_label_key(user_id) in member.labels for member in family)
-    assert pinned_label_key(user_id) not in family[0].labels
+    assert family[0].labels[pinned_label_key(user_id)] == "123"
     fork = store.fork_conversation(source.id)
     assert fork.family_id is None
     assert [member.id for member in store.get_session_family(fork.id)] == [fork.id]
@@ -10394,6 +10394,7 @@ async def test_sibling_family_lifecycle(tmp_path, split_database, user_id, monke
             store.add_new_sibling(parent.id, first.id, user_id=user_id)
     store.set_labels(first.id, {pinned_label_key(user_id): "234"})
     store.set_family_pin(source.id, "", user_id=user_id)
+    assert pinned_label_key(user_id) not in store.get_conversation(source.id).labels
     assert store.get_conversation(first.id).labels[pinned_label_key(user_id)] == "234"
     project_id = "4" * 32
     with pytest.raises(OmnigentError, match="representative"):
@@ -10562,7 +10563,9 @@ def test_failed_family_membership_preserves_source_pin(
     store.add_new_sibling(retry_source_id, target.id, user_id="alice")
     for member in store.get_session_family(source.id):
         assert member.labels[family_pinned_label_key("alice")] == "123"
-        assert pinned_label_key("alice") not in member.labels
+        assert member.labels.get(pinned_label_key("alice")) == (
+            "123" if member.id == source.id else None
+        )
     store.set_family_pin(source.id, "", user_id="alice")
     assert not store.list_conversations(pinned=True, pinned_owner="alice").data
 
@@ -10679,6 +10682,7 @@ def test_move_sessions_between_nests(tmp_path, split_database, monkeypatch):
         labels={"omni_project": "Other", pinned_label_key("alice"): "234", "custom": "keep"},
     )
     store.set_session_nest(moved.id, source.id, user_id="alice")
+    assert store.get_conversation(source.id).labels[pinned_label_key("alice")] == "123"
     saved = store.get_conversation(moved.id)
     assert saved.family_id == source.id
     assert saved.labels["omni_project"] == "Planning"
@@ -10724,8 +10728,10 @@ def test_move_sessions_between_nests(tmp_path, split_database, monkeypatch):
     assert saved.family_id is None
     assert saved.labels[pinned_label_key("alice")] == "234"
     store.set_session_nest(source.id, None, user_id="alice")
-    assert store.get_conversation(source.id).family_id is None
-    assert family_pinned_label_key("alice") not in store.get_conversation(source.id).labels
+    saved_source = store.get_conversation(source.id)
+    assert saved_source.family_id is None
+    assert saved_source.labels[pinned_label_key("alice")] == "123"
+    assert family_pinned_label_key("alice") not in saved_source.labels
     assert store.get_conversation(peer.id).family_id == source.id
     candidate = store.create_conversation()
     store.add_new_sibling(source.id, candidate.id, user_id="alice")
@@ -10921,7 +10927,7 @@ def test_failed_split_database_nest_move_restores_membership(
             assert saved.labels["omni_project"] == "Destination"
             if failure == "interrupted_initial":
                 destination_labels = store.get_conversation(destination.id).labels
-                assert pinned_label_key("alice") not in destination_labels
+                assert destination_labels[pinned_label_key("alice")] == "567"
             elif failure == "interrupted_initial_without_source":
                 peer_labels = store.get_conversation(peer.id).labels
                 assert peer_labels[family_pinned_label_key("alice")] == "567"
@@ -10953,6 +10959,45 @@ def test_failed_split_database_nest_move_restores_membership(
     assert saved.family_id == (None if detach else destination.id)
     assert saved.project_id == (("b" * 32 if interleave else None) if detach else "a" * 32)
     assert family_pinned_label_key("alice") not in saved.labels
+
+
+@pytest.mark.parametrize("split_database", [False, True])
+def test_preserved_creator_edges_page_and_follow_deletion(tmp_path, monkeypatch, split_database):
+    from omnigent.stores.conversation_store import CREATED_BY_SESSION_LABEL_KEY
+
+    clock = [100]
+    monkeypatch.setattr(
+        "omnigent.stores.conversation_store.sqlalchemy_store.now_epoch", lambda: clock[0]
+    )
+    store = SqlAlchemyConversationStore(
+        f"sqlite:///{tmp_path / 'metadata.db'}",
+        f"sqlite:///{tmp_path / 'messages.db'}" if split_database else None,
+    )
+    source = store.create_conversation()
+    workers = []
+    for created_at in (110, 125, 130, 210):
+        clock[0] = created_at
+        worker = store.create_conversation(labels={CREATED_BY_SESSION_LABEL_KEY: source.id})
+        store.add_new_sibling(source.id, worker.id, user_id="alice")
+        workers.append(worker.id)
+    first, removed, last, later = workers
+    store.set_session_nest(first, None, user_id="alice")
+    assert store.list_created_conversation_ids_page(source.id, start=110, end=200, limit=2) == [
+        (first, 110),
+        (removed, 125),
+    ]
+    assert store.list_created_conversation_ids_page(
+        source.id, start=110, end=200, after=(125, removed), limit=2
+    ) == [(last, 130)]
+    assert store.list_created_conversation_ids_page(source.id, start=125, end=130) == [
+        (removed, 125)
+    ]
+    assert asyncio.run(store.delete_conversation(removed))
+    assert store.list_created_conversation_ids_page(source.id) == [
+        (first, 110),
+        (last, 130),
+        (later, 210),
+    ]
 
 
 @pytest.mark.parametrize("split_database", [False, True])
@@ -11015,7 +11060,11 @@ def test_sibling_admission_rechecks_a_stale_source(tmp_path, monkeypatch, split_
 def test_legacy_split_database_finisher_preserves_initial_family_pin(
     tmp_path, monkeypatch, fresh_family_id
 ):
-    from omnigent.db.db_models import SqlConversationMetadata, current_workspace_id
+    from omnigent.db.db_models import (
+        SqlConversationLabel,
+        SqlConversationMetadata,
+        current_workspace_id,
+    )
     from omnigent.stores.conversation_store import (
         family_pinned_label_key,
         pinned_label_key,
@@ -11069,6 +11118,13 @@ def test_legacy_split_database_finisher_preserves_initial_family_pin(
                         project_id=source_meta.project_id,
                         user_id="alice",
                     )
+                    if initialize:
+                        personal_pin = labels_session.get(
+                            SqlConversationLabel,
+                            (current_workspace_id(), source.id, pinned_label_key("alice")),
+                        )
+                        assert personal_pin is not None
+                        labels_session.delete(personal_pin)
                 family_lock.value = "{}"
         return original_write(session_maker, operation_name, callback, **kwargs)
 
@@ -11079,4 +11135,6 @@ def test_legacy_split_database_finisher_preserves_initial_family_pin(
     assert {member.id for member in family} == {source.id, created.id, legacy_member.id}
     assert all(member.labels[family_pinned_label_key("alice")] == "123" for member in family)
     assert all(member.labels["omni_project"] == "Planning" for member in family)
-    assert pinned_label_key("alice") not in store.get_conversation(source.id).labels
+    assert store.get_conversation(source.id).labels.get(pinned_label_key("alice")) == (
+        "123" if fresh_family_id else None
+    )

@@ -31,6 +31,7 @@ The first seven items transcribe the whiteboard with the subsequent clarificatio
 3. Pinning the representative pins the family; nested members have no individual
    pin action. Personal pins are retained for detachment and do not override the
    family's pin state. Family pins survive promotion and include future members.
+   Explicitly unpinning the representative also clears its own saved personal pin.
 4. Owners can move an existing independent session into another nest or remove
    one member from its nest. Custom ordering moves the whole family and preserves its position when the
    representative changes. Status grouping uses the highest-priority member status.

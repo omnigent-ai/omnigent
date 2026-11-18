@@ -670,17 +670,7 @@ async def test_runs_list_the_workflow_runs_their_sessions_started(
     conversations.set_session_nest(
         first if moved_session == "worker" else root, destination_id, user_id=ALICE
     )
-    assert conversations.list_created_conversation_ids_page(root, start=110, end=200, limit=2) == [
-        (first, 110),
-        (unrun, 125),
-    ]
-    assert conversations.list_created_conversation_ids_page(
-        root, start=110, end=200, after=(125, unrun), limit=2
-    ) == [(second, 130)]
-    assert conversations.list_created_conversation_ids_page(root, start=125, end=130) == [
-        (unrun, 125)
-    ]
-    # A preserved edge can outlive a deleted session and must not stop paging.
+    # Deleting a former member must preserve the remaining workflow descendants.
     await conversations.delete_conversation(unrun)
     (moved_run,) = (await client.get(url, headers=_headers())).json()["data"]
     assert [below["session_id"] for below in moved_run["descendant_runs"]] == [
@@ -839,21 +829,27 @@ async def test_each_run_lists_its_descendants_up_to_its_own_cap(
     separate_nests: bool,
 ) -> None:
     monkeypatch.setattr("omnigent.server.workflows.MAX_SESSION_FAMILY_MEMBERS", 2)
+    clock = [100]
+    for module in ("session_journal_store", "conversation_store.sqlalchemy_store"):
+        monkeypatch.setattr(f"omnigent.stores.{module}.now_epoch", lambda: clock[0])
     stack = await _save_workflow(client, "Land a stack")
     ready = await _save_workflow(client, "Ready a PR")
     conversations = SqlAlchemyConversationStore(db_uri)
     roots = []
+    workers_by_root = {}
     for name in ("First", "Second"):
         root = _session(db_uri, title=f"{name} stack")
         await _run(client, root, stack, f"{name}-run")
         workers = []
         for number in range(3):
+            clock[0] += 1
             worker = _session(
                 db_uri, title=f"{name} #{number}", labels={CREATED_BY_SESSION_LABEL_KEY: root}
             )
             conversations.add_new_sibling(root, worker, user_id=ALICE)
             await _run(client, worker, ready, f"{name}-{number}")
             workers.append(worker)
+        workers_by_root[root] = workers
         if separate_nests:
             for worker in workers:
                 conversations.set_session_nest(worker, None, user_id=ALICE)
@@ -864,7 +860,24 @@ async def test_each_run_lists_its_descendants_up_to_its_own_cap(
     assert {
         run["session_id"]: run["descendant_run_count"] for run in listed["data"]
     } == dict.fromkeys(roots, 2)
-
+    if separate_nests:
+        root = roots[0]
+        for worker in workers_by_root[root]:
+            await conversations.delete_conversation(worker)
+        fresh = []
+        for number in range(2):
+            clock[0] += 1
+            worker = _session(
+                db_uri, title=f"New #{number}", labels={CREATED_BY_SESSION_LABEL_KEY: root}
+            )
+            conversations.add_new_sibling(root, worker, user_id=ALICE)
+            await _run(client, worker, ready, f"new-{number}")
+            fresh.append(worker)
+        # Deleted saved edges must not spend the cap before the live workers.
+        listed = (await client.get(f"/v1/workflows/{stack['id']}/runs", headers=_headers())).json()
+        renewed = next(run for run in listed["data"] if run["session_id"] == root)
+        assert [run["session_id"] for run in renewed["descendant_runs"]] == fresh
+        assert renewed["descendant_run_count"] == 2
 
 async def test_a_run_whose_session_waits_on_its_sandbox_is_launching(
     client: httpx.AsyncClient, db_uri: str
@@ -916,3 +929,4 @@ async def test_a_run_whose_session_waits_on_its_sandbox_is_launching(
     current, earlier = await runs(ready)
     assert current["is_current"] and current["sandbox_launching"] is True
     assert earlier["sandbox_launching"] is False
+

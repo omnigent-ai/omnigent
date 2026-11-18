@@ -407,7 +407,8 @@ Typing a nest name also searches beyond the sessions already loaded in the sideb
 page fails, **Couldn’t search nests. Retry** retries that request.
 Removing the representative promotes the oldest remaining active member.
 Personal pins remain saved for detachment and do not change the destination's
-pin state. On servers with restricted nested-agent destinations, start standalone
+pin state. Explicitly unpinning a nest clears the representative's own saved pin;
+other members keep theirs. On servers with restricted nested-agent destinations, start standalone
 sessions on a host before joining; a rejected move leaves the original nest intact.
 Disabling nested-agent creation blocks joining, while existing members can still leave.
 

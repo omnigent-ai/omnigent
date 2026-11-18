@@ -33,7 +33,7 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.engine import CursorResult
-from sqlalchemy.orm import QueryableAttribute, Session, load_only
+from sqlalchemy.orm import QueryableAttribute, Session, aliased, load_only
 from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy.sql.selectable import Subquery
 
@@ -1774,11 +1774,27 @@ class SqlAlchemyConversationStore(ConversationStore):
 
     def _record_session_creator_edges(self, session: Session, member_ids: list[str]) -> None:
         """Keep creator ancestry when a move separates an existing nest's sessions."""
+        # Deletion must finish after any capture that can still see its AP rows.
+        retained = []
+        for member_batch in batched(sorted(set(member_ids)), _FAMILY_READ_BATCH_SIZE):
+            retained.extend(
+                session.scalars(
+                    select(SqlConversationMetadata.id)
+                    .where(
+                        SqlConversationMetadata.workspace_id == current_workspace_id(),
+                        SqlConversationMetadata.id.in_(member_batch),
+                    )
+                    .order_by(SqlConversationMetadata.id)
+                    .with_for_update()
+                )
+            )
+        if not retained:
+            return
         with self._profile_label_session(
             session, read_only=True, operation="preserve_session_creator_edges"
         ) as labels_session:
             rows = []
-            for member_batch in batched(dict.fromkeys(member_ids), _FAMILY_READ_BATCH_SIZE):
+            for member_batch in batched(retained, _FAMILY_READ_BATCH_SIZE):
                 rows.extend(
                     labels_session.execute(
                         select(
@@ -2379,13 +2395,6 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
         if promote_pin and pin_key in source_labels:
             updates[family_pin_key] = source_labels[pin_key]
-            labels_session.execute(
-                delete(SqlConversationLabel).where(
-                    SqlConversationLabel.workspace_id == current_workspace_id(),
-                    SqlConversationLabel.conversation_id == label_source_id,
-                    SqlConversationLabel.key == pin_key,
-                )
-            )
         elif family_pin_key in source_labels:
             updates[family_pin_key] = source_labels[family_pin_key]
         if updates:
@@ -2785,7 +2794,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                         delete(SqlConversationLabel).where(
                             SqlConversationLabel.workspace_id == current_workspace_id(),
                             SqlConversationLabel.conversation_id.in_(ids),
-                            SqlConversationLabel.key == key,
+                            or_(
+                                SqlConversationLabel.key == key,
+                                and_(
+                                    SqlConversationLabel.conversation_id == session_id,
+                                    SqlConversationLabel.key == pinned_label_key(user_id),
+                                ),
+                            ),
                         )
                     )
 
@@ -8168,12 +8183,14 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         from omnigent.server.scheduled.schedule import continued_sandbox_host_id
 
-        def delete_ap(ap_sess: Session) -> tuple[list[str], dict[str, str]] | None:
+        def delete_ap(
+            ap_sess: Session,
+        ) -> tuple[list[str], dict[str, str], dict[str, tuple[str, str]]] | None:
             row = ap_sess.get(SqlConversation, (current_workspace_id(), conversation_id))
             if not row:
                 return None
             cte = (
-                select(SqlConversation.id)
+                select(SqlConversation.id, SqlConversation.created_at)
                 .where(
                     SqlConversation.workspace_id == current_workspace_id(),
                     SqlConversation.id == conversation_id,
@@ -8181,14 +8198,21 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .cte(name="subtree", recursive=True)
             )
             cte = cte.union_all(
-                select(SqlConversation.id).where(
+                select(SqlConversation.id, SqlConversation.created_at).where(
                     SqlConversation.workspace_id == current_workspace_id(),
                     SqlConversation.parent_conversation_id == cte.c.id,
                 )
             )
-            # Keep origin capture in the same snapshot as the existing subtree deletion.
+            # Capture cleanup keys before deleting labels, in the same subtree snapshot.
+            creator_label = aliased(SqlConversationLabel)
             entries = ap_sess.execute(
-                select(cte.c.id, SqlConversationLabel.value).outerjoin(
+                select(
+                    cte.c.id,
+                    cte.c.created_at,
+                    SqlConversationLabel.value.label("scheduled_origin"),
+                    creator_label.value.label("creator_id"),
+                )
+                .outerjoin(
                     SqlConversationLabel,
                     and_(
                         SqlConversationLabel.workspace_id == current_workspace_id(),
@@ -8196,13 +8220,35 @@ class SqlAlchemyConversationStore(ConversationStore):
                         SqlConversationLabel.key == SCHEDULED_TASK_ORIGIN_LABEL_KEY,
                     ),
                 )
+                .outerjoin(
+                    creator_label,
+                    and_(
+                        creator_label.workspace_id == current_workspace_id(),
+                        creator_label.conversation_id == cte.c.id,
+                        creator_label.key == CREATED_BY_SESSION_LABEL_KEY,
+                    ),
+                )
             ).all()
-            subtree_ids = [entry[0] for entry in entries]
+            subtree_ids = [entry.id for entry in entries]
             retained_tasks = {
-                continued_sandbox_host_id(task_id, current_workspace_id()): task_id
-                for _, task_id in entries
-                if task_id is not None
+                continued_sandbox_host_id(
+                    entry.scheduled_origin, current_workspace_id()
+                ): entry.scheduled_origin
+                for entry in entries
+                if entry.scheduled_origin is not None
             }
+            creator_edges = {}
+            for entry in entries:
+                if entry.creator_id is None:
+                    continue
+                try:
+                    creator_id = uuid_to_bytes(entry.creator_id).hex()
+                except ValueError:
+                    continue
+                creator_edges[entry.id] = (
+                    f"__session_creator_edges__:{creator_id}",
+                    f"{entry.created_at:020d}:{entry.id}",
+                )
             delete_fts_by_conversation_ids(ap_sess, list(subtree_ids))
             ap_sess.execute(
                 delete(SqlConversationItem).where(
@@ -8224,7 +8270,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 )
             )
             ap_sess.delete(row)
-            return subtree_ids, retained_tasks
+            return subtree_ids, retained_tasks, creator_edges
 
         ap_result = run_write_transaction(
             self._conv_session_immediate,
@@ -8233,7 +8279,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         )
         if ap_result is None:
             return False
-        subtree_ids, retained_tasks = ap_result
+        subtree_ids, retained_tasks, creator_edges = ap_result
 
         def delete_metadata(session: Session, batch_ids: tuple[str, ...]) -> None:
             host_ids = session.scalars(
@@ -8285,6 +8331,14 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                 )
             session.execute(metadata_delete)
+            edge_keys = [creator_edges[key] for key in batch_ids if key in creator_edges]
+            if edge_keys:
+                session.execute(
+                    delete(SqlPreference).where(
+                        SqlPreference.workspace_id == current_workspace_id(),
+                        tuple_(SqlPreference.user_id, SqlPreference.key).in_(edge_keys),
+                    )
+                )
 
             for host in hosts:
                 task_id = retained_tasks.get(host.host_id)
