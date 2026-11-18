@@ -1,9 +1,12 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Conversation } from "@/hooks/useConversations";
+import * as capabilities from "./capabilities";
 import { isIndentedSibling, isSessionPinned, orderSessionFamilies } from "./sessionFamilies";
 
 const member = (id: string, created_at: number, representative_id = "a") =>
   ({ id, created_at, family: { id: "family", representative_id, pinned: false } }) as Conversation;
+
+afterEach(() => vi.restoreAllMocks());
 
 describe("session families", () => {
   it("keeps family position, promotes the canonical representative and never nests twice", () => {
@@ -37,6 +40,10 @@ describe("session families", () => {
   });
 
   it("uses family pin state until a personally pinned representative leaves the nest", () => {
+    vi.spyOn(capabilities, "getCachedServerInfo").mockReturnValue({
+      ...capabilities.FALLBACK_SERVER_INFO,
+      session_nest_moves: true,
+    });
     const representative = { ...member("a", 1), labels: { "omnigent.pinned": "50" } };
     const sibling = { ...member("b", 2), labels: { "omnigent.pinned": "1" } };
     const personalPins = new Set(["a"]);
@@ -50,4 +57,23 @@ describe("session families", () => {
       expect(isSessionPinned({ ...row, family: { ...row.family!, pinned: true } })).toBe(true);
     }
   });
+
+  it.each([undefined, false, null])(
+    "keeps legacy personal pins after representative promotion with capability %j",
+    (nestMoves) => {
+      vi.spyOn(capabilities, "getCachedServerInfo").mockReturnValue(
+        nestMoves === null
+          ? null
+          : { ...capabilities.FALLBACK_SERVER_INFO, session_nest_moves: nestMoves },
+      );
+      const promoted = { ...member("b", 2, "b"), labels: { "omnigent.pinned": "1" } };
+      const sibling = { ...member("c", 3, "b"), labels: { "omnigent.pinned": "2" } };
+      expect(isSessionPinned(promoted)).toBe(true);
+      expect(isSessionPinned(member("b", 2, "b"), new Set(["b"]))).toBe(true);
+      expect(isSessionPinned(sibling)).toBe(false);
+      expect(isSessionPinned(sibling, new Set(["b"]))).toBe(true);
+      expect(isSessionPinned(sibling, new Set(["c"]))).toBe(false);
+      expect(isSessionPinned({ ...promoted, family: null })).toBe(true);
+    },
+  );
 });

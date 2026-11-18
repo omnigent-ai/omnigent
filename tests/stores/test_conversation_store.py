@@ -10748,6 +10748,13 @@ def test_move_sessions_between_nests(tmp_path, split_database, monkeypatch):
         with pytest.raises(OmnigentError, match="independent"):
             store.set_session_nest(unavailable.id, source.id, user_id="alice")
         assert store.get_conversation(unavailable.id).family_id is None
+    archived = store.create_conversation()
+    store.update_conversation(archived.id, archived=True)
+    for moved_id, destination_id in ((archived.id, source.id), (moved.id, archived.id)):
+        with pytest.raises(OmnigentError, match="active independent"):
+            store.set_session_nest(moved_id, destination_id, user_id="alice")
+        assert store.get_conversation(moved_id).family_id is None
+        assert store.get_conversation(archived.id).family_id is None
     monkeypatch.setattr(
         "omnigent.stores.conversation_store.sqlalchemy_store.MAX_SESSION_FAMILY_MEMBERS", 2
     )

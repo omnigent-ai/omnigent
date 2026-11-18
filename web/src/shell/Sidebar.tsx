@@ -5216,10 +5216,11 @@ export function ConversationMenuItems({
       nestSaving={moveToNest.isPending}
       onNestSelect={(destination) => {
         setMenuOpen(false);
-        moveToNest.mutate(
-          { id: conversation.id, sourceId: destination?.id ?? null },
-          { onSuccess: () => revealNest(destination) },
-        );
+        // Keep the reveal alive after this menu unmounts; the hook reports errors.
+        void moveToNest
+          .mutateAsync({ id: conversation.id, sourceId: destination?.id ?? null })
+          .then(() => revealNest(destination))
+          .catch(() => {});
       }}
     />
   );
