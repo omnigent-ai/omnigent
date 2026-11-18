@@ -37,17 +37,19 @@ function itemRow<Value>(
   item: QuickPickItem<Value>,
   ranges?: Record<string, MatchRange[]>,
 ): QuickPickItemRow<Value> {
+  // Client ranges replace provider highlights, so a field the query missed stays plain.
+  const source = ranges ?? item.highlights;
   return {
     kind: "item",
     key: `item:${item.id}`,
     item,
-    labelRanges: ranges?.label ?? item.highlights?.label ?? NO_RANGES,
-    descriptionRanges: ranges?.description ?? item.highlights?.description ?? NO_RANGES,
+    labelRanges: source?.label ?? NO_RANGES,
+    descriptionRanges: source?.description ?? NO_RANGES,
   };
 }
 
 function headingRow(sourceId: string, label: string): QuickPickHeadingRow {
-  return { kind: "heading", key: `heading:${sourceId}:${label}`, label };
+  return { kind: "heading", key: `heading:${JSON.stringify([sourceId, label])}`, label };
 }
 
 // Groups appear in order of first appearance; ungrouped items get no heading.
@@ -166,6 +168,11 @@ export type QuickPickNavigation =
   | { type: "first" }
   | { type: "last" };
 
+// Layout can report a fractional or NaN page size; a page is always at least one row.
+function pageStep(pageSize: number): number {
+  return Math.max(1, Math.floor(pageSize) || 1);
+}
+
 /** Returns the row index to activate, or -1 when nothing is selectable. */
 export function navigateQuickPick(
   rows: readonly QuickPickRow<unknown>[],
@@ -186,9 +193,9 @@ export function navigateQuickPick(
     case "previous":
       return selectable[position <= 0 ? last : position - 1];
     case "pageDown":
-      return selectable[Math.min(last, Math.max(position, 0) + navigation.pageSize)];
+      return selectable[Math.min(last, Math.max(position, 0) + pageStep(navigation.pageSize))];
     case "pageUp":
-      return selectable[Math.max(0, position - navigation.pageSize)];
+      return selectable[Math.max(0, position - pageStep(navigation.pageSize))];
   }
 }
 

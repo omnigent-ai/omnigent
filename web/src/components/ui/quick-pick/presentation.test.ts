@@ -34,7 +34,7 @@ describe("buildQuickPickRows", () => {
     ]);
   });
 
-  it("ranks within groups, keeps group order, and drops groups without matches", () => {
+  it("ranks within groups and keeps group order", () => {
     const rows = buildQuickPickRows({
       segments: [{ sourceId: "commands", ranking: "client", items: commands }],
       query: "se",
@@ -99,6 +99,21 @@ describe("buildQuickPickRows", () => {
     });
     expect(describeRows(rows)).toEqual(["# View", "open-settings"]);
     expect(rows[1].kind === "item" && rows[1].labelRanges).toEqual([]);
+  });
+
+  it("does not borrow a provider's highlights for a client-ranked row", () => {
+    const provided: QuickPickItem<string> = {
+      id: "open",
+      label: "Open settings",
+      description: "Preferences",
+      highlights: { description: [{ start: 0, end: 4 }] },
+      value: "open",
+    };
+    const [row] = buildQuickPickRows({
+      segments: [{ sourceId: "commands", ranking: "client", items: [provided] }],
+      query: "open",
+    });
+    expect(row).toMatchObject({ kind: "item", descriptionRanges: [] });
   });
 
   it("keeps provider-ranked order and highlights untouched", () => {
@@ -234,6 +249,8 @@ describe("navigateQuickPick", () => {
 
   it("pages without wrapping and jumps to the ends", () => {
     expect(navigateQuickPick(rows, 1, { type: "pageDown", pageSize: 10 })).toBe(5);
+    expect(navigateQuickPick(rows, 1, { type: "pageDown", pageSize: Number.NaN })).toBe(2);
+    expect(navigateQuickPick(rows, 5, { type: "pageUp", pageSize: 0 })).toBe(4);
     expect(navigateQuickPick(rows, 4, { type: "pageUp", pageSize: 1 })).toBe(2);
     expect(navigateQuickPick(rows, 5, { type: "pageUp", pageSize: 10 })).toBe(1);
     expect(navigateQuickPick(rows, 4, { type: "first" })).toBe(1);
