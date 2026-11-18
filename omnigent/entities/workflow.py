@@ -34,7 +34,7 @@ class Workflow:
     """
     A saved workflow.
 
-    :param id: Workflow ID, a bare 32-character hex UUID.
+    :param id: Workflow ID, bare 32-character hex; by default a UUID4.
     :param user_id: The owner, or the reserved ``local`` user in single-user mode.
     :param name: One line, e.g. ``"nightly-build"``; unique per owner.
     :param description: What the workflow is for; a run gives it to the agent

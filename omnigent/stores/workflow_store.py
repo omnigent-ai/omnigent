@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import uuid
 from collections.abc import Sequence
 from typing import Any, TypeVar
@@ -41,6 +42,8 @@ from omnigent.entities.workflow import (
 )
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.util.uuid import InvalidUuidError, uuid_to_bytes
+
+_logger = logging.getLogger(__name__)
 
 WORKFLOW_PAGE_MAX = 200
 _OWNER_NAME_INDEX = "uq_workflows_user_id_name"
@@ -145,6 +148,43 @@ class WorkflowStore:
         """
         self._stored_texts(description.strip(), None)
 
+    def allocate_workflow_id(self, *, user_id: str | None, name: str) -> str:
+        """Return the ID for a workflow :meth:`create` is about to save.
+
+        :meth:`create` calls this once the fields are valid, before it writes the row,
+        and calls :meth:`release_workflow_id` if the write fails. A deployment may
+        allocate IDs another way, e.g. from an external object, but they must be bare
+        32-char lowercase hex: ``workflows.id`` and ``session_journal_entries.workflow_id``
+        hold them as 16-byte UUIDs, and agent tools and the web app read them in that form.
+
+        :param user_id: The workflow's owner; ``None`` in single-user mode.
+        :param name: The workflow's name, e.g. ``"nightly-build"``.
+        :returns: A new workflow ID; by default a UUID4.
+        """
+        del user_id, name
+        return uuid.uuid4().hex
+
+    def release_workflow_id(self, workflow_id: str) -> None:
+        """Give back an ID from :meth:`allocate_workflow_id` whose workflow was never saved.
+
+        :meth:`create` calls this at most once per ID, when its write raised. A write
+        that raises after its commit succeeded (a dropped connection, say) leaves a
+        saved workflow with the ID, so a deployment should first check that none has it.
+        Best-effort: :meth:`create` logs what this raises and raises its own error. A
+        no-op by default.
+
+        :param workflow_id: The allocated ID.
+        """
+        del workflow_id
+
+    def _release_unsaved_id(self, workflow_id: str) -> None:
+        """Release an ID whose workflow wasn't saved; a failure is only logged."""
+        try:
+            self.release_workflow_id(workflow_id)
+        except Exception:
+            # The save's own error still reaches the caller.
+            _logger.exception("could not release the unused workflow ID %s", workflow_id)
+
     def _workflows(self, rows: Sequence[SqlWorkflow]) -> list[Workflow]:
         """Decode a page's descriptions and plans in one call."""
         texts = (
@@ -182,7 +222,8 @@ class WorkflowStore:
         :param name: One line, e.g. ``"nightly-build"``.
         :param description: What the workflow is for.
         :param steps: The graph, in the journal plan's step format.
-        :returns: The saved workflow, with its steps.
+        :returns: The saved workflow, with its steps, under an ID from
+            :meth:`allocate_workflow_id`.
         :raises InvalidWorkflowError: If a field is invalid or the steps are too large.
         :raises WorkflowNameTakenError: If the owner already uses the name.
         """
@@ -192,7 +233,7 @@ class WorkflowStore:
         stored_description, stored_plan = self._stored_texts(text, _plan_text(workflow_steps))
         now = now_epoch()
         workflow = Workflow(
-            id=uuid.uuid4().hex,
+            id=self.allocate_workflow_id(user_id=user_id, name=workflow_name),
             user_id=RESERVED_USER_LOCAL if user_id is None else user_id,
             name=workflow_name,
             description=text,
@@ -219,8 +260,9 @@ class WorkflowStore:
 
         try:
             return run_write_transaction(self._session_immediate, "create_workflow", write)
-        except IntegrityError as exc:
-            if _is_name_conflict(exc):
+        except Exception as exc:
+            self._release_unsaved_id(workflow.id)
+            if isinstance(exc, IntegrityError) and _is_name_conflict(exc):
                 raise WorkflowNameTakenError("a workflow with this name already exists") from exc
             raise
 
