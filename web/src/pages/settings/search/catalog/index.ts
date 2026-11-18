@@ -6,6 +6,7 @@ import type { SettingsSectionId } from "@/shell/settingsNav";
 import { ACCOUNT_SETTINGS } from "./account";
 import { ARCHIVED_SETTINGS } from "./archived";
 import { CLI_SETTINGS } from "./cli";
+import { CUSTOM_AGENTS_SETTINGS } from "./customAgents";
 import { GIT_SETTINGS } from "./git";
 import { IMPORT_SETTINGS } from "./import";
 import { INTEGRATION_SETTINGS } from "./integrations";
@@ -19,7 +20,7 @@ import { UPDATES_SETTINGS } from "./updates";
 export const SECTION_CATALOGS: Readonly<Record<SettingsSectionId, readonly SettingsEntry[]>> = {
   appearance: [],
   harnesses: [],
-  "custom-agents": [],
+  "custom-agents": CUSTOM_AGENTS_SETTINGS,
   general: [],
   git: GIT_SETTINGS,
   integrations: INTEGRATION_SETTINGS,
