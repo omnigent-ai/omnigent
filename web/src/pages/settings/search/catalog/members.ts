@@ -23,6 +23,8 @@ export const MEMBERS_INVITE_ENTRY = settingsEntry({
   },
   overlays: { invite: { dialogActions: ["Cancel", "Done"] } },
   focus: "invite",
+  // The invite button shows only where accounts can be managed; the list is always there.
+  revealedBy: "members-list",
 });
 
 export const MEMBERS_LIST_ENTRY = settingsEntry({

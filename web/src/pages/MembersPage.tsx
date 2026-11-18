@@ -494,6 +494,9 @@ export function MembersPage() {
   );
 }
 
+/** Attributes a shared copy field takes from the dialog and row that show it. */
+type FieldMarkers = Record<string, string | undefined>;
+
 /**
  * A read-only field paired with a one-click copy button.
  *
@@ -501,9 +504,6 @@ export function MembersPage() {
  * single-use sensitive values that need a frictionless copy path
  * since the user typically pastes them into Slack within seconds.
  */
-/** Attributes a shared copy field takes from the dialog and row that show it. */
-type FieldMarkers = Record<string, string | undefined>;
-
 function CopyableValue({
   value,
   fieldMarkers,
