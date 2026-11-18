@@ -196,8 +196,8 @@ Once the set is genuinely green:
      sections.
    - In **Summary**, start non-trivial changes with a 1–2 sentence ELI5 of the
      user-visible problem and result, inline rather than in a separate section.
-     Then explain the cause and implementation in 1–3 short bullets or
-     paragraphs. Use complete sentences and plain language. Add a small diagram
+     Then explain the cause, the implementation, and why it does not break
+     other callers or configurations in 1–3 short bullets or paragraphs. Use complete sentences and plain language. Add a small diagram
      when a relationship or sequence is hard to follow in prose. Never include
      placeholder diagrams or empty sections.
      State any intentional policy change, its historical rationale, and the
