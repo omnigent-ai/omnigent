@@ -3,13 +3,26 @@
 // desktop browser never does. The Settings preference overrides both ways.
 
 import { useSyncExternalStore } from "react";
-import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
 import {
   TERMINAL_EXTRA_KEYS_DEFAULT,
   readTerminalExtraKeysMode,
   subscribeTerminalExtraKeys,
 } from "@/lib/terminalExtraKeysPreferences";
+
+const COARSE_POINTER_QUERY = "(pointer: coarse)";
+
+function subscribeCoarsePointer(callback: () => void): () => void {
+  if (typeof window === "undefined" || !window.matchMedia) return () => {};
+  const mql = window.matchMedia(COARSE_POINTER_QUERY);
+  mql.addEventListener("change", callback);
+  return () => mql.removeEventListener("change", callback);
+}
+
+function readCoarsePointer(): boolean {
+  if (typeof window === "undefined" || !window.matchMedia) return false;
+  return window.matchMedia(COARSE_POINTER_QUERY).matches;
+}
 
 /**
  * True when the extra-keys row belongs under this terminal.
@@ -24,7 +37,11 @@ export function useTerminalExtraKeysVisibility(readOnly: boolean): boolean {
     readTerminalExtraKeysMode,
     () => TERMINAL_EXTRA_KEYS_DEFAULT,
   );
-  const coarsePointer = useIsCoarsePointer();
+  const coarsePointer = useSyncExternalStore(
+    subscribeCoarsePointer,
+    readCoarsePointer,
+    () => false,
+  );
   if (readOnly) return false;
   if (pref === "on") return true;
   if (pref === "off") return false;
