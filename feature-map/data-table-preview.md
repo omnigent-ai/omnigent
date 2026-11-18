@@ -46,4 +46,5 @@ Preconditions: install this checkout's web dependencies. Component checks need n
 - The server sends at most the first 10 MiB of a file; past that, the row count is a lower bound.
 - Older binary `.xls` workbooks and password-protected workbooks aren't read; they show a message.
 - Parquet files compressed with anything but Snappy (or uncompressed) aren't read yet; the message names the codec.
+- Parquet reads over 10 million values or 64 MiB of declared uncompressed chunk data skip nested columns first, then offer Download if the remaining columns still exceed the budget. This can happen below the server's file-size limit.
 - A Latin-1 file still shows the binary notice in Source view, because the raw view needs UTF-8 text.

@@ -12,12 +12,12 @@ import {
 } from "./dataTable";
 
 /**
- * Most values the preview decodes from the nested columns of the row groups it
- * reads. A list column can pack millions of values into a few bytes, and the
- * reader fills every one before the table's text budget applies; past this, the
- * nested columns aren't read.
+ * Most values in the selected chunks: the reader decodes whole pages before
+ * slicing to the requested rows, before the table's text budget applies.
  */
 export const PARQUET_MAX_VALUES = 10_000_000;
+/** Most uncompressed bytes in the chunks the preview may decode. */
+export const PARQUET_MAX_BYTES = 64 * 1024 * 1024;
 
 /** What a nested column shows when its values are past {@link PARQUET_MAX_VALUES}. */
 export const SKIPPED_NESTED_VALUE = "(too many values to preview)";
@@ -103,33 +103,37 @@ export function parquetCellText(
 }
 
 /**
- * Values the reader decodes for the first rows. A flat column stops at the rows
- * asked for; a nested one (a list, struct or map) decodes its row groups whole.
- *
- * @param nested - The kept columns that are nested, by name.
- * @param flatColumns - How many kept columns are flat.
+ * Bound whole chunks in the selected row groups, since even a flat column's
+ * first page can hold more values than the requested rows.
  */
-function valuesToRead(
+function withinReadBudget(
   metadata: Hyparquet.FileMetaData,
-  nested: Set<string>,
-  flatColumns: number,
-): number {
+  columns: Set<string>,
+  maxValues: number,
+): boolean {
   let rows = 0;
   let values = 0;
+  let bytes = 0;
   for (const group of metadata.row_groups) {
     if (rows >= DATA_TABLE_MAX_ROWS) break;
-    const groupRows = Math.max(0, Number(group.num_rows));
-    values += flatColumns * Math.min(groupRows, DATA_TABLE_MAX_ROWS - rows);
+    const groupRows = Number(group.num_rows);
+    if (!Number.isFinite(groupRows) || groupRows < 0) return false;
+    if (groupRows === 0) continue;
     rows += groupRows;
     for (const chunk of group.columns) {
-      const column = chunk.meta_data?.path_in_schema[0];
-      // A count the footer leaves out or gets wrong can't lower the total.
-      if (column !== undefined && nested.has(column)) {
-        values += Math.max(0, Number(chunk.meta_data?.num_values ?? 0));
-      }
+      const meta = chunk.meta_data;
+      if (!meta) return false;
+      if (!columns.has(meta.path_in_schema[0])) continue;
+      const chunkValues = Number(meta.num_values);
+      const chunkBytes = Number(meta.total_uncompressed_size);
+      if (!Number.isFinite(chunkValues) || chunkValues < 0) return false;
+      if (!Number.isFinite(chunkBytes) || chunkBytes < 0) return false;
+      values += chunkValues;
+      bytes += chunkBytes;
+      if (values > maxValues || bytes > PARQUET_MAX_BYTES) return false;
     }
   }
-  return values;
+  return true;
 }
 
 /**
@@ -184,17 +188,24 @@ export async function readParquet(
       .filter((node) => node.element.repetition_type === "REPEATED" || node.children.length > 0)
       .map((node) => node.element.name),
   );
-  const values = valuesToRead(metadata, nested, columns.length - nested.size);
-  // Past the limit (or on a footer count that isn't a number) the nested columns
-  // aren't read: their cells show a placeholder, and the flat columns still fill in.
-  const skipNested = !(values <= maxValues);
-  const readColumns = columns
-    .map((column) => column.name)
-    .filter((name) => !(skipNested && nested.has(name)));
+  const columnNames = columns.map((column) => column.name);
+  // Past the budget, skip nested columns first so flat columns can still show.
+  const skipNested = !withinReadBudget(metadata, new Set(columnNames), maxValues);
+  const readColumns = columnNames.filter((name) => !(skipNested && nested.has(name)));
+  if (skipNested && !withinReadBudget(metadata, new Set(readColumns), maxValues)) {
+    throw new ParquetError(
+      "Reading this file would exceed the preview's memory limit. Download it to open it.",
+    );
+  }
   // With every kept column skipped there is nothing to read, but the rows still show.
   const rows =
     readColumns.length > 0
-      ? await parquetReadObjects({ file, rowEnd: DATA_TABLE_MAX_ROWS, columns: readColumns })
+      ? await parquetReadObjects({
+          file,
+          rowEnd: DATA_TABLE_MAX_ROWS,
+          columns: readColumns,
+          utf8: false,
+        })
       : Array.from(
           { length: Math.min(Number(metadata.num_rows), DATA_TABLE_MAX_ROWS) },
           (): Record<string, unknown> => ({}),

@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import * as hyparquet from "hyparquet";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   compareCells,
   DATA_TABLE_MAX_CHARS,
@@ -7,7 +8,15 @@ import {
   DATA_TABLE_MAX_ROWS,
   inferColumnType,
 } from "./dataTable";
-import { ParquetError, parquetCellText, readParquet, SKIPPED_NESTED_VALUE } from "./parquet";
+import {
+  PARQUET_MAX_BYTES,
+  ParquetError,
+  parquetCellText,
+  readParquet,
+  SKIPPED_NESTED_VALUE,
+} from "./parquet";
+
+vi.mock("hyparquet", { spy: true });
 
 /** A fixture's bytes, copied into this realm's buffer as the browser's base64 decode makes them. */
 function fixture(name: string): Uint8Array {
@@ -18,6 +27,8 @@ function fixture(name: string): Uint8Array {
 }
 
 describe("readParquet", () => {
+  afterEach(() => vi.clearAllMocks());
+
   // Written by pyarrow with Snappy, its default: ints, floats, a date, a
   // timestamp, booleans, a list column and nulls.
   it("reads the schema and rows, showing each type as text", async () => {
@@ -38,6 +49,13 @@ describe("readParquet", () => {
     ]);
     expect(table?.columnTypes.slice(0, 5)).toEqual(["text", "number", "number", "date", "date"]);
     expect(table?.description).toBe("Parquet");
+  });
+
+  it("keeps binary columns as bytes while decoding annotated strings", async () => {
+    // Written by pyarrow: an unannotated BYTE_ARRAY and a UTF8 string.
+    const table = await readParquet(fixture("binary.parquet"));
+    expect(table?.header).toEqual(["blob", "name"]);
+    expect(table?.rows).toEqual([["(3 bytes)", "café"]]);
   });
 
   it("keeps the first rows and counts them all from the footer", async () => {
@@ -72,11 +90,31 @@ describe("readParquet", () => {
     expect(table?.totalRows).toBe(1000);
   });
 
-  it("counts only the first rows of a flat column against the value limit", async () => {
-    // 3 flat columns × 20,000 rows in one row group: 3,000 values are decoded.
-    const table = await readParquet(fixture("flat-one-group.parquet"), 10_000);
-    expect(table?.rows).toHaveLength(DATA_TABLE_MAX_ROWS);
-    expect(table?.totalRows).toBe(20_000);
+  it("counts whole flat chunks against the value limit before reading them", async () => {
+    // Each first page has 20,000 values, even though only 1,000 rows are requested.
+    const read = vi.mocked(hyparquet.parquetReadObjects);
+    await expect(readParquet(fixture("flat-one-group.parquet"), 50_000)).rejects.toThrow(
+      "Reading this file would exceed the preview's memory limit. Download it to open it.",
+    );
+    expect(read).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { total_uncompressed_size: BigInt(Math.floor(PARQUET_MAX_BYTES / 3) + 1) },
+    { num_values: -1n },
+    { num_values: Number.NaN },
+    { num_values: undefined },
+    { total_uncompressed_size: -1n },
+    { total_uncompressed_size: Number.POSITIVE_INFINITY },
+    { total_uncompressed_size: undefined },
+  ])("rejects a flat chunk outside the decode budget: %s", async (overrides) => {
+    const bytes = fixture("flat-one-group.parquet");
+    const metadata = hyparquet.parquetMetadata(bytes.buffer as ArrayBuffer);
+    for (const chunk of metadata.row_groups[0].columns) Object.assign(chunk.meta_data!, overrides);
+    vi.mocked(hyparquet.parquetMetadata).mockReturnValueOnce(metadata);
+    const read = vi.mocked(hyparquet.parquetReadObjects);
+    await expect(readParquet(bytes)).rejects.toThrow(ParquetError);
+    expect(read).not.toHaveBeenCalled();
   });
 
   it("shows placeholder rows when every column is nested and skipped", async () => {
