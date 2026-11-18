@@ -7198,7 +7198,7 @@ describe("Composer workflow entry point", () => {
           status: original.status,
           sessionStatus: original.sessionStatus,
         });
-        usePlanStops.setState({ requests: {} });
+        usePlanStops.setState({ requests: {}, settledStops: {} });
       });
       const onStop = vi.fn();
       const onSend = vi.fn(useChatStore.getState().enqueueMessage);
@@ -7258,18 +7258,20 @@ describe("Composer workflow entry point", () => {
     onTestFinished(() => {
       fetchMessage.mockRestore();
       error.mockRestore();
-      usePlanStops.setState({ requests: {} });
+      usePlanStops.setState({ requests: {}, settledStops: {} });
     });
     renderWithWorkflows(<Composer {...composerProps()} />);
 
     act(() => useSessionTasksActions.getState().stopWork.conv_test?.());
-    expect(usePlanStops.getState().requests.conv_test).toEqual({ sent: false });
-    await waitFor(() => expect(usePlanStops.getState().requests.conv_test).toEqual({ sent: true }));
+    expect(usePlanStops.getState().requests.conv_test).toMatchObject({ sent: false });
+    await waitFor(() =>
+      expect(usePlanStops.getState().requests.conv_test).toMatchObject({ sent: true }),
+    );
     expect(error).not.toHaveBeenCalled();
 
-    act(() => usePlanStops.setState({ requests: {} }));
+    act(() => usePlanStops.setState({ requests: {}, settledStops: {} }));
     act(() => useSessionTasksActions.getState().stopWork.conv_test?.());
-    expect(usePlanStops.getState().requests.conv_test).toEqual({ sent: false });
+    expect(usePlanStops.getState().requests.conv_test).toMatchObject({ sent: false });
     await waitFor(() => expect(error).toHaveBeenCalledOnce());
     expect(usePlanStops.getState().requests.conv_test).toBeUndefined();
   });

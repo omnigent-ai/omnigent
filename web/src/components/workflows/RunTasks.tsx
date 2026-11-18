@@ -16,7 +16,7 @@ import { cn } from "@/lib/utils";
 import { continuePlanMessage, stopPlanMessage, taskActionMessage } from "@/lib/workflow";
 import { PlanRunButton, type PlanRunButtonState } from "@/shell/PlanRunButton";
 import { ProgressStrip, taskMenuAction, type TaskMenuAction } from "@/shell/TasksPanel";
-import { clearPlanStop, trackPlanStop } from "@/store/planStops";
+import { supersedePlanStop, trackPlanStop } from "@/store/planStops";
 import { openTasksTab } from "@/store/sessionTasksActions";
 
 /** The queries that list a run, e.g. `["workflow-runs", workflowId]`. */
@@ -50,9 +50,10 @@ function useRunSession(sessionId: string, refreshKeys: RunRefreshKeys, runId: st
     if (result.denied) toast.error("A policy blocked the message.");
     return !result.denied;
   };
-  // Any other message the session takes ends a Stop in progress.
+  // Any other message the session takes ends the Stop in progress when it was sent.
   const post = async (text: string) => {
-    if (await deliver(text)) clearPlanStop(sessionId);
+    const endPlanStop = supersedePlanStop(sessionId);
+    if (await deliver(text)) endPlanStop();
   };
   return {
     pending,

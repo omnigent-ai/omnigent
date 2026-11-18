@@ -966,8 +966,9 @@ function RunRow({
   );
   // Room on the row's link for the buttons over its right end, in icon widths;
   // "Stopping…" takes about four.
+  const controlWidth = control === "stopping" ? 4 : Number(control !== null);
   const buttonPadding = ["", "pr-11", "pr-18", "pr-25", "pr-32", "pr-39", "pr-46"][
-    1 + (workflowId ? 1 : 0) + (control === "stopping" ? 4 : control ? 1 : 0)
+    1 + (workflowId ? 1 : 0) + controlWidth
   ];
   const duration = formatRunDuration(run.firedAt, run.finishedAt);
   // Unread only applies to a succeeded run that produced a conversation.

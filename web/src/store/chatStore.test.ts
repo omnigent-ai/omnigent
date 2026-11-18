@@ -3632,7 +3632,7 @@ describe("chatStore — send (first-send ordering)", () => {
   });
 
   it("ends a plan's Stop in progress once the session takes another message", async () => {
-    onTestFinished(() => usePlanStops.setState({ requests: {} }));
+    onTestFinished(() => usePlanStops.setState({ requests: {}, settledStops: {} }));
     useChatStore.setState({
       conversationId: "conv_existing",
       abortController: new AbortController(),
@@ -3648,11 +3648,36 @@ describe("chatStore — send (first-send ordering)", () => {
 
     // A message the session never took leaves the run stopping.
     await useChatStore.getState().send("Keep the logs", "agent_xyz");
-    expect(usePlanStops.getState().requests.conv_existing).toEqual({ sent: true });
+    expect(usePlanStops.getState().requests.conv_existing).toMatchObject({ sent: true });
 
     fetchMock.mockImplementation(defaultFetchHandler);
     await useChatStore.getState().send(continuePlanMessage(null), "agent_xyz");
     expect(usePlanStops.getState().requests.conv_existing).toBeUndefined();
+  });
+
+  it("keeps a plan's Stop when a message sent before it lands after it", async () => {
+    onTestFinished(() => usePlanStops.setState({ requests: {}, settledStops: {} }));
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      pendingUserMessages: [],
+    });
+    let landMessage: (() => void) | undefined;
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events")) {
+        return new Promise<Response>((resolve) => {
+          landMessage = () => resolve(defaultFetchHandler(input, init));
+        });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    const sending = useChatStore.getState().send("Keep the logs", "agent_xyz");
+    await vi.waitFor(() => expect(landMessage).toBeDefined());
+    await trackPlanStop("conv_existing", async () => true);
+    landMessage!();
+    await sending;
+    expect(usePlanStops.getState().requests.conv_existing).toMatchObject({ sent: true });
   });
 
   it("surfaces a visible error block with friendly copy when the runner is unavailable (503)", async () => {

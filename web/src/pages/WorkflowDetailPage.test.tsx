@@ -1509,7 +1509,7 @@ describe("WorkflowDetailPage", () => {
       mockWorkflow({});
       mockRuns([running]);
     });
-    afterEach(() => usePlanStops.setState({ requests: {} }));
+    afterEach(() => usePlanStops.setState({ requests: {}, settledStops: {} }));
 
     it("shows Stopping… from Stop until the run's session stops, then Continue", async () => {
       vi.mocked(sendUserMessage).mockClear().mockResolvedValue({ queued: true });
@@ -1562,6 +1562,30 @@ describe("WorkflowDetailPage", () => {
         `plan-${session}`,
       );
       expect(within(row).queryByTestId("plan-stopping")).toBeNull();
+    });
+
+    it("keeps Stopping… when a message sent before the Stop lands after it", async () => {
+      let landRetry!: () => void;
+      vi.mocked(sendUserMessage)
+        .mockClear()
+        .mockImplementationOnce(
+          () =>
+            new Promise((resolve) => {
+              landRetry = () => resolve({ queued: true });
+            }),
+        )
+        .mockResolvedValue({ queued: true });
+      renderPage();
+      const row = screen.getByTestId("workflow-run");
+      fireEvent.focus(within(row).getAllByTestId("tasks-progress-segment")[1]!);
+      fireEvent.pointerDown(await screen.findByTestId("tasks-progress-menu"), { button: 0 });
+      fireEvent.click(screen.getByTestId("tasks-progress-retry"));
+      await waitFor(() => expect(sendUserMessage).toHaveBeenCalledTimes(1));
+
+      fireEvent.click(within(row).getByRole("button", { name: "Stop" }));
+      await waitFor(() => expect(sendUserMessage).toHaveBeenCalledTimes(2));
+      await act(async () => landRetry());
+      expect(within(row).getByTestId("plan-stopping")).toBeInTheDocument();
     });
   });
 

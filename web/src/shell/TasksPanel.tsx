@@ -1213,7 +1213,7 @@ export function TasksPanel({
   const taskAction = useSessionTasksActions((state) => state.taskAction[conversationId]);
   const stopWork = useSessionTasksActions((state) => state.stopWork[conversationId]);
   const stopping = usePlanStopping(conversationId, tasks.sessionWorking);
-  // A run that is already stopping offers no Stop.
+  // A run that is already stopping offers no Stop, so its stop message isn't sent twice.
   const stopActiveWork = tasks.sessionWorking && !stopping ? stopWork : undefined;
   const continuePlan = useSessionTasksActions((state) => state.continuePlan[conversationId]);
   const entries = tasks.journalSupported ? journal.entries : NO_ENTRIES;

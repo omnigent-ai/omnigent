@@ -4,8 +4,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import type { AnyBlock } from "@/lib/blocks";
 import { continuePlanMessage, stopPlanMessage } from "@/lib/workflow";
 import { conversationRegistry } from "@/store/conversationRegistry";
-import { clearPlanStop, trackPlanStop, usePlanStops } from "@/store/planStops";
-import { latestRequestIsStop, usePlanStopping } from "./usePlanStopping";
+import { supersedePlanStop, trackPlanStop, usePlanStops } from "@/store/planStops";
+import { latestStopRequest, usePlanStopping } from "./usePlanStopping";
 
 const SESSION = "e".repeat(32);
 
@@ -26,6 +26,10 @@ function slashCommand(itemId: string, name: string): AnyBlock {
     arguments: "",
     output: null,
   };
+}
+
+function pendingSend(tempId: string, text: string) {
+  return { tempId, content: [{ type: "input_text" as const, text }] };
 }
 
 /** A stop whose message is still on its way, and how to settle it. */
@@ -59,34 +63,40 @@ function sendStop() {
   };
 }
 
+function renderStopping(working: boolean) {
+  return renderHook((props: { working: boolean }) => usePlanStopping(SESSION, props.working), {
+    initialProps: { working },
+  });
+}
+
 afterEach(() => {
   cleanup();
   conversationRegistry.clear();
-  usePlanStops.setState({ requests: {} });
+  usePlanStops.setState({ requests: {}, settledStops: {} });
 });
 
 describe("usePlanStopping", () => {
-  it("stops from the Stop until the session stops working, then lets the run's controls show", async () => {
-    const { result, rerender } = renderHook(({ working }) => usePlanStopping(SESSION, working), {
-      initialProps: { working: true },
-    });
+  it("stops from the Stop until the session stops working, and not on a later wake", async () => {
+    const entry = conversationRegistry.acquire(SESSION);
+    const { result, rerender } = renderStopping(true);
     expect(result.current).toBe(false);
 
     const stop = sendStop();
     expect(result.current).toBe(true);
     await stop.take();
+    act(() => entry.setState({ blocks: [userMessage("stop", stopPlanMessage(null))] }));
     expect(result.current).toBe(true);
 
     rerender({ working: false });
     expect(result.current).toBe(false);
     expect(usePlanStops.getState().requests[SESSION]).toBeUndefined();
-    // A later wake isn't the Stop's: the session shows Stop again.
+    // The Stop is still the latest request, but a later wake, such as a timer, isn't its.
     rerender({ working: true });
     expect(result.current).toBe(false);
   });
 
   it("restores the controls when the session refuses the Stop or it doesn't arrive", async () => {
-    const { result } = renderHook(() => usePlanStopping(SESSION, true));
+    const { result } = renderStopping(true);
 
     const refused = sendStop();
     expect(result.current).toBe(true);
@@ -100,39 +110,70 @@ describe("usePlanStopping", () => {
     expect(usePlanStops.getState().requests[SESSION]).toBeUndefined();
   });
 
-  it("ends when the session takes another message, such as Continue, even mid-send", async () => {
-    const { result } = renderHook(() => usePlanStopping(SESSION, true));
+  it("ends once the session takes a message sent after the Stop, even mid-send", async () => {
+    const { result } = renderStopping(true);
 
     const stop = sendStop();
     await stop.take();
-    act(() => clearPlanStop(SESSION));
+    act(() => supersedePlanStop(SESSION)());
     expect(result.current).toBe(false);
 
     // Continue lands while the Stop is still on its way; the Stop doesn't come back.
     const late = sendStop();
-    act(() => clearPlanStop(SESSION));
+    const endStop = supersedePlanStop(SESSION);
+    act(endStop);
     await late.take();
     expect(result.current).toBe(false);
   });
 
-  it("reads a Stop from the transcript after a reload, while the session works", () => {
+  it("keeps stopping when a message sent before the Stop lands after it", async () => {
+    const { result } = renderStopping(true);
+    const endStop = supersedePlanStop(SESSION);
+    const stop = sendStop();
+    await stop.take();
+    act(endStop);
+    expect(result.current).toBe(true);
+  });
+
+  it("drops the Stop once no surface watches the session, which can't see it stop", async () => {
+    const watching = renderStopping(true);
+    await sendStop().take();
+    expect(watching.result.current).toBe(true);
+    watching.unmount();
+    expect(usePlanStops.getState().requests[SESSION]).toBeUndefined();
+
+    expect(renderStopping(true).result.current).toBe(false);
+  });
+
+  it("reads a Stop from the transcript after a reload, until the session is seen to stop", () => {
     const entry = conversationRegistry.acquire(SESSION);
     entry.setState({ blocks: [userMessage("stop", stopPlanMessage(null))] });
-    const { result, rerender } = renderHook(({ working }) => usePlanStopping(SESSION, working), {
-      initialProps: { working: true },
-    });
+    const { result, rerender } = renderStopping(true);
     expect(result.current).toBe(true);
     rerender({ working: false });
     expect(result.current).toBe(false);
+    rerender({ working: true });
+    expect(result.current).toBe(false);
+
+    // A new Stop is its own.
+    act(() =>
+      entry.setState({
+        blocks: [
+          userMessage("stop", stopPlanMessage(null)),
+          userMessage("again", stopPlanMessage(null)),
+        ],
+      }),
+    );
+    expect(result.current).toBe(true);
   });
 });
 
-describe("latestRequestIsStop", () => {
+describe("latestStopRequest", () => {
   const stop = userMessage("stop", stopPlanMessage("Daily Sync"));
 
   it("skips runtime notices and other sessions' reports after the Stop", () => {
     expect(
-      latestRequestIsStop(
+      latestStopRequest(
         [
           userMessage("start", "Use the workflow skill to run the saved workflow."),
           stop,
@@ -141,23 +182,19 @@ describe("latestRequestIsStop", () => {
         ],
         [],
       ),
-    ).toBe(true);
+    ).toBe("stop");
   });
 
   it("ends with a later message or command from the user, sent or still on its way", () => {
-    expect(latestRequestIsStop([stop, userMessage("go", continuePlanMessage(null))], [])).toBe(
-      false,
-    );
-    expect(latestRequestIsStop([stop, slashCommand("cmd", "workflow")], [])).toBe(false);
+    expect(latestStopRequest([stop, userMessage("go", continuePlanMessage(null))], [])).toBeNull();
+    expect(latestStopRequest([stop, slashCommand("cmd", "workflow")], [])).toBeNull();
+    expect(latestStopRequest([stop], [pendingSend("pend_1", "Keep the logs")])).toBeNull();
     expect(
-      latestRequestIsStop([stop], [{ content: [{ type: "input_text", text: "Keep the logs" }] }]),
-    ).toBe(false);
-    expect(
-      latestRequestIsStop(
+      latestStopRequest(
         [userMessage("go", continuePlanMessage(null))],
-        [{ content: [{ type: "input_text", text: stopPlanMessage(null) }] }],
+        [pendingSend("pend_2", stopPlanMessage(null))],
       ),
-    ).toBe(true);
-    expect(latestRequestIsStop([], [])).toBe(false);
+    ).toBe("pend_2");
+    expect(latestStopRequest([], [])).toBeNull();
   });
 });

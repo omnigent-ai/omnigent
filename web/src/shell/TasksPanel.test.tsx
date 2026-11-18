@@ -20,7 +20,7 @@ import type { JournalEntry, StepProgress } from "@/lib/sessionJournal";
 import { continuePlanMessage, stopPlanMessage } from "@/lib/workflow";
 import type { ConversationState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
-import { clearPlanStop, trackPlanStop, usePlanStops } from "@/store/planStops";
+import { supersedePlanStop, trackPlanStop, usePlanStops } from "@/store/planStops";
 import {
   openTasksTab,
   registerContinuePlan,
@@ -785,7 +785,7 @@ describe("TasksPanel", () => {
           ),
       );
       onTestFinished(() => act(withdraw));
-      onTestFinished(() => usePlanStops.setState({ requests: {} }));
+      onTestFinished(() => usePlanStops.setState({ requests: {}, settledStops: {} }));
       return (taken: boolean) => act(async () => deliver(taken));
     }
 
@@ -836,8 +836,9 @@ describe("TasksPanel", () => {
       await deliver(true);
       expect(screen.getByTestId("plan-stopping")).toBeInTheDocument();
 
-      // What the composer's send does once the session takes the message.
-      act(() => clearPlanStop("conv"));
+      // What the composer's send does: Continue goes out, and the session takes it.
+      const endStop = supersedePlanStop("conv");
+      act(endStop);
       setSession({
         blocks: [userMessage("stop", stopPlanMessage(null))],
         pendingUserMessages: [
@@ -862,6 +863,10 @@ describe("TasksPanel", () => {
 
       setSession({ sessionStatus: "idle" });
       expect(screen.getByTestId("plan-continue")).toBeInTheDocument();
+      // A later wake, such as a worker reporting back, isn't the Stop's.
+      setSession({ sessionStatus: "running" });
+      expect(screen.queryByTestId("plan-stopping")).toBeNull();
+      expect(screen.getByTestId("plan-stop")).toBeInTheDocument();
     });
   });
 
