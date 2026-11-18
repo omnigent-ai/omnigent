@@ -1317,15 +1317,26 @@ async def test_permission_asked_dedupes() -> None:
 
 
 @pytest.mark.parametrize(
-    "turn_state", ["active", "next_step", "interrupted", "replacement", "replacement_before_task"]
+    "turn_state",
+    [
+        "active",
+        "next_step",
+        "interrupted",
+        "interrupted_flushing",
+        "replacement",
+        "replacement_before_task",
+    ],
 )
 async def test_permission_reply_failure_is_surfaced(turn_state: str) -> None:
     """A failed reply blocks only the turn that requested permission."""
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    flush_started, release_flush = asyncio.Event(), asyncio.Event()
 
     async def failing_reply(*_args: Any, **_kwargs: Any) -> bool:
         if turn_state == "next_step":
             await fwd.handle_event(_step_started("msg_2"))
+        elif turn_state == "interrupted_flushing":
+            await flush_started.wait()
         elif turn_state in {"interrupted", "replacement"}:
             await fwd.handle_event(_event("session.execution.interrupted", reason="user"))
             if turn_state == "replacement":
@@ -1335,11 +1346,35 @@ async def test_permission_reply_failure_is_surfaced(turn_state: str) -> None:
     opencode.reply_permission = failing_reply  # type: ignore[method-assign]
     fwd = _forwarder(server, opencode)
     await fwd.handle_event(_step_started("msg_1"))
+    if turn_state == "interrupted_flushing":
+        original_flush = fwd._flush_pending_text
+
+        async def held_flush(turn: fwd_mod._SessionTurn) -> None:
+            flush_started.set()
+            await release_flush.wait()
+            await original_flush(turn)
+
+        fwd._flush_pending_text = held_flush  # type: ignore[method-assign]
     await fwd.handle_event(_asked("per_err"))
     if turn_state == "replacement_before_task":
         await fwd.handle_event(_event("session.execution.interrupted", reason="user"))
         await fwd.handle_event(_step_started("msg_2"))
-    await _drain(fwd)
+    terminal = (
+        asyncio.create_task(
+            fwd.handle_event(_event("session.execution.interrupted", reason="user"))
+        )
+        if turn_state == "interrupted_flushing"
+        else None
+    )
+    try:
+        await _drain(fwd)
+        if terminal is not None:
+            assert flush_started.is_set()
+            assert not terminal.done()
+    finally:
+        if terminal is not None:
+            release_flush.set()
+            await terminal
     statuses = _datas(server.posts, "external_session_status")
     if turn_state in {"active", "next_step"}:
         assert statuses[-1]["status"] == "running"
@@ -1348,7 +1383,7 @@ async def test_permission_reply_failure_is_surfaced(turn_state: str) -> None:
         assert all("blocked_on" not in status for status in statuses)
         assert statuses[-1] == (
             {"status": "idle", "response_id": "msg_1"}
-            if turn_state == "interrupted"
+            if turn_state in {"interrupted", "interrupted_flushing"}
             else {"status": "running", "response_id": "msg_2"}
         )
 
