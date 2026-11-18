@@ -5535,6 +5535,7 @@ async def _bind_and_launch_managed_runner(
                 tunnel_registry,
                 tracker,
                 settle_failure=False,
+                conversation_store=conversation_store,
             )
             if not connected:
                 reason = "managed runner did not connect after launch"
@@ -6758,6 +6759,7 @@ async def _run_managed_wake(
                 runner_id,
                 tunnel_registry,
                 tracker,
+                conversation_store=conversation_store,
             )
             if not connected:
                 return

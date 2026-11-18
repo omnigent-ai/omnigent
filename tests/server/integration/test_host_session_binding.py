@@ -3612,6 +3612,7 @@ async def test_managed_wake_fails_when_runner_never_reconnects(
 
     monkeypatch.setattr("omnigent.server.managed_hosts.resume_managed_host", _resume_noop)
     monkeypatch.setattr(sessions_module, "_launch_runner_on_host", _launch_runner)
+    monkeypatch.setattr(sessions_module, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2)
     monkeypatch.setattr(
         sessions_module,
         "_publish_sandbox_status",
@@ -3640,6 +3641,108 @@ async def test_managed_wake_fails_when_runner_never_reconnects(
     assert launch.settled.is_set()
     assert launch.error == "managed runner did not connect after launch"
     assert stages[-1] == ("failed", "managed runner did not connect after launch")
+
+
+class _ConnectingTunnelRegistry:
+    """Tunnel registry fake where only *connects* registers, after *connect_after_s*."""
+
+    def __init__(self, connects: str, connect_after_s: float) -> None:
+        self._connects = connects
+        self._connect_at = time.monotonic() + connect_after_s
+        self.waited: list[str] = []
+
+    async def wait_for_runner(self, runner_id: str, *, timeout_s: float) -> object | None:
+        self.waited.append(runner_id)
+        if runner_id == self._connects:
+            delay = max(0.0, self._connect_at - time.monotonic())
+            if delay <= timeout_s:
+                await asyncio.sleep(delay)
+                return object()
+        await asyncio.sleep(timeout_s)
+        return None
+
+
+class _RebindingConversationStore:
+    """Conversation store fake whose runner binding changes to *rebind_to* after *after_s*."""
+
+    def __init__(self, session_id: str, runner_id: str, rebind_to: str, after_s: float) -> None:
+        self._session_id = session_id
+        self._runner_id = runner_id
+        self._rebind_to = rebind_to
+        self._rebind_at = time.monotonic() + after_s
+
+    def get_conversation(self, session_id: str) -> SimpleNamespace | None:
+        if session_id != self._session_id:
+            return None
+        if time.monotonic() >= self._rebind_at:
+            self._runner_id = self._rebind_to
+        return SimpleNamespace(id=session_id, runner_id=self._runner_id)
+
+
+@pytest.mark.parametrize(
+    ("rebind_to", "connected"),
+    [
+        # A message path's replacement runner serves the session: the launch succeeds.
+        ("runner_token_replacement", True),
+        # A move's claim is not a runner to wait for.
+        ("runner_token_move_0000000000000000", False),
+    ],
+)
+async def test_managed_launch_wait_follows_a_rebound_runner(
+    monkeypatch: pytest.MonkeyPatch, rebind_to: str, connected: bool
+) -> None:
+    """
+    A slow first runner can miss the host-bound grace, after which a message
+    path launches a replacement and rebinds the session to it. The launch wait
+    follows that rebinding instead of failing on the superseded runner.
+    """
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import helpers
+
+    session_id = "5d0c2c39a3f44f4c9d6d3b8f0e2a7c11"
+    first = "runner_token_first"
+    monkeypatch.setattr(sessions_module, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.6)
+    monkeypatch.setattr(helpers, "_MANAGED_RUNNER_REBIND_POLL_S", 0.05)
+    monkeypatch.setattr(sessions_module, "_publish_sandbox_status", lambda *_args, **_kwargs: None)
+    registry = _ConnectingTunnelRegistry(connects=rebind_to, connect_after_s=0.4)
+    store = _RebindingConversationStore(session_id, first, rebind_to, after_s=0.2)
+    tracker = ManagedLaunchTracker()
+    tracker.begin(session_id)
+
+    result = await sessions_module._wait_for_managed_runner_tunnel(
+        session_id,
+        first,
+        registry,  # type: ignore[arg-type]
+        tracker,
+        conversation_store=store,  # type: ignore[arg-type]
+    )
+
+    assert result is connected
+    assert (rebind_to in registry.waited) is connected
+    launch = tracker.get(session_id)
+    assert launch is not None
+    assert launch.settled.is_set() is not connected
+
+
+async def test_managed_launch_wait_without_a_store_waits_only_for_its_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Callers that pass no conversation store keep the single-runner wait."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    session_id = "8b7f6c2e0d1a4b3c9e8f7a6b5c4d3e2f"
+    monkeypatch.setattr(sessions_module, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.3)
+    registry = _ConnectingTunnelRegistry(connects="runner_token_first", connect_after_s=0.1)
+    tracker = ManagedLaunchTracker()
+    tracker.begin(session_id)
+
+    assert await sessions_module._wait_for_managed_runner_tunnel(
+        session_id,
+        "runner_token_first",
+        registry,  # type: ignore[arg-type]
+        tracker,
+    )
+    assert registry.waited == ["runner_token_first"]
 
 
 @pytest.mark.parametrize("replaced", [False, True])
@@ -3699,6 +3802,7 @@ async def test_managed_launch_fails_when_runner_never_connects(
             del timeout_s
 
     monkeypatch.setattr(sessions_module, "_launch_runner_on_host", _launch_runner)
+    monkeypatch.setattr(sessions_module, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2)
     monkeypatch.setattr(
         sessions_module,
         "_publish_sandbox_status",
