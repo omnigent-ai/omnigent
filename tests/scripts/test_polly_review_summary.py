@@ -789,9 +789,10 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         optional_table = (
             variant.startswith("boundary-table-") and variant != "boundary-table-fenced"
         )
-        assert sum(token.type == "table_open" for token in original) == (
-            2 if optional_table else 1
-        )
+        if optional_table:
+            assert sum(token.type == "table_open" for token in original) == 2
+        else:
+            assert sum(token.type == "table_open" for token in original) == 1
         assert _HELPERS["COMMENT_BYTE_LIMIT"] == 60000
         assert (len(review.encode("utf-8")) < 60000) == short
         review_path, receipt, posts = _prepare_publication(
@@ -803,23 +804,26 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
             assert not short and variant not in {
                 "container-bounded-blockquote",
                 "fenced-container-literal",
-                "boundary-table-fenced",
-                "boundary-summary-fitting",
             }
+            assert variant not in {"boundary-table-fenced", "boundary-summary-fitting"}
             assert (
                 not variant.startswith("boundary-inline-")
                 or variant == "boundary-inline-oversized-guard"
             )
-            assert str(error) in {
-                "Polly review Markdown container cannot fit within comment capacity.",
-                "Polly review noncanonical details are not supported in multipart comments.",
-                "Polly review tables without leading pipes are not supported "
-                "in multipart comments.",
-                "Polly review literal container marker cannot fit within comment capacity.",
-                "Polly review literal indentation cannot fit within comment capacity.",
-                "Polly review disclosure header cannot fit within comment capacity.",
-                "Polly review noncanonical summary is not supported in multipart comments.",
-            }
+            if variant.startswith("boundary-"):
+                assert str(error) in {
+                    "Polly review tables without leading pipes are not supported "
+                    "in multipart comments.",
+                    "Polly review literal container marker cannot fit within comment capacity.",
+                    "Polly review literal indentation cannot fit within comment capacity.",
+                    "Polly review disclosure header cannot fit within comment capacity.",
+                    "Polly review noncanonical summary is not supported in multipart comments.",
+                }
+            else:
+                assert str(error) in {
+                    "Polly review Markdown container cannot fit within comment capacity.",
+                    "Polly review noncanonical details are not supported in multipart comments.",
+                }
             assert not posts and not receipt.exists()
             assert sorted(path.name for path in tmp_path.iterdir()) == ["review.md"]
             return
