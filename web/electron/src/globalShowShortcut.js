@@ -130,8 +130,8 @@ function createGlobalShowShortcut({
   claimedElsewhere = () => false,
   outranked = () => false,
 }) {
+  if (!Object.hasOwn(GLOBAL_SHORTCUTS, id)) throw new Error(`Unknown global shortcut: ${id}`);
   const definition = GLOBAL_SHORTCUTS[id];
-  if (!definition) throw new Error(`Unknown global shortcut: ${id}`);
   /** @type {string | null} */
   let registeredAccelerator = null;
   // Why the saved shortcut is on but its chord didn't register at launch, else null.

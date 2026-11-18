@@ -484,10 +484,12 @@ describe("createGlobalShortcuts", () => {
     const keys = Object.values(GLOBAL_SHORTCUTS).map((definition) => definition.settingKey);
     assert.equal(new Set(keys).size, keys.length);
     assert.equal(GLOBAL_SHORTCUTS.show.settingKey, "global_shortcut");
-    assert.throws(
-      () => createGlobalShowShortcut({ id: "unknown", show: () => {} }),
-      /Unknown global shortcut/,
-    );
+    for (const id of ["unknown", "toString", "constructor"]) {
+      assert.throws(
+        () => createGlobalShowShortcut({ id, show: () => {} }),
+        /Unknown global shortcut/,
+      );
+    }
   });
 
   it("saving one shortcut leaves the other's setting as it was", async () => {
