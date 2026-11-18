@@ -316,6 +316,13 @@ changing status, error codes, displayed text, or failure classification. Unknown
 keys and malformed values are ignored; strings are bounded and credential-redacted.
 The original error category is independent of the text shown to the user.
 
+Codex context failures also carry `error_code=context_length_exceeded`, derived
+from the native `contextWindowExceeded` classification or its complete native
+refusal message. The server accepts that code only for a resolved Codex session
+with explicit wire output; assistant-text fallback and arbitrary reported codes
+do not establish that cause. Authentication and provider-token failures retain
+precedence. The turn stays failed and keeps its native diagnostic text.
+
 For example, a Claude `StopFailure` containing `error=server_error` and
 `last_assistant_message="I am waiting for a background task."` now retains
 `native_error_category=server_error` and

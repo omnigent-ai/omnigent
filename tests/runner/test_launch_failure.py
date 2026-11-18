@@ -941,3 +941,35 @@ def test_describe_failure_code_known(code: str, expected_substring: str) -> None
 @pytest.mark.parametrize("code", [None, "", "some_unknown_code"])
 def test_describe_failure_code_unknown(code: str | None) -> None:
     assert describe_failure_code(code) is None
+
+
+_CODEX_CONTEXT_REFUSAL = (
+    "Codex ran out of room in the model's context window. "
+    "Start a new thread or clear earlier history before retrying."
+)
+
+
+@pytest.mark.parametrize(
+    "code,message,expected",
+    [
+        ("codex_turn_error", _CODEX_CONTEXT_REFUSAL, "context_length_exceeded"),
+        (
+            "codex_turn_error",
+            _CODEX_CONTEXT_REFUSAL.replace("model's", "model’s"),
+            "context_length_exceeded",
+        ),
+        ("native_turn_error", _CODEX_CONTEXT_REFUSAL, "native_turn_error"),
+        ("codex_reauth_required", _CODEX_CONTEXT_REFUSAL, "codex_reauth_required"),
+        ("codex_turn_error", 'Tool quoted: "' + _CODEX_CONTEXT_REFUSAL + '"', "codex_turn_error"),
+        ("context_length_exceeded", _PROVIDER_AUTH_OUTPUT, "codex_provider_auth_failed"),
+        (
+            "context_length_exceeded",
+            "Diagnostic mentions a budget has reached its limit.",
+            "context_length_exceeded",
+        ),
+    ],
+)
+def test_codex_context_refusal_requires_complete_native_wire_message(
+    code: str, message: str, expected: str
+) -> None:
+    assert classify_native_turn_error(code, message) == expected
