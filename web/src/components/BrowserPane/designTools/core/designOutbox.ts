@@ -100,15 +100,18 @@ const running = new Map<string, AbortController>();
 const pendingIds = new Map<string, string>();
 // Requests heard to have arrived while their send still ran: its failure then doesn't count.
 const arrived = new Set<string>();
+// Receipts matching no request yet: a pending id can arrive before its hash is worked out.
+const unmatched = new Set<string>();
+const UNMATCHED_MAX = 100;
 
 /** Learn the pending-input id `request` would have, for hearing that it arrived. */
 function notePendingId(request: Pick<DesignRequest, "id" | "conversationId">): void {
   void nativePendingId(request.conversationId, request.id).then(
     (pendingId) => {
       // Not if it was dropped meanwhile.
-      if (useDesignOutbox.getState().requests.some((item) => item.id === request.id)) {
-        pendingIds.set(pendingId, request.id);
-      }
+      if (!useDesignOutbox.getState().requests.some((item) => item.id === request.id)) return;
+      pendingIds.set(pendingId, request.id);
+      if (unmatched.delete(pendingId)) delivered(pendingId);
     },
     () => {},
   );
@@ -263,6 +266,11 @@ function markSent(request: DesignRequest): void {
 function delivered(id: string): void {
   const requestId = pendingIds.get(id) ?? id;
   const request = useDesignOutbox.getState().requests.find((item) => item.id === requestId);
+  if (!request) {
+    unmatched.add(id);
+    if (unmatched.size > UNMATCHED_MAX) unmatched.delete(unmatched.values().next().value!);
+    return;
+  }
   // Sending: its send hears of it when it ends, whatever the POST's answer was.
   if (request?.status === "sending") arrived.add(request.id);
   if (request?.status !== "failed" && request?.status !== "waiting") return;
@@ -584,6 +592,7 @@ export function resetDesignOutbox(): void {
   attempts.clear();
   running.clear();
   pendingIds.clear();
+  unmatched.clear();
   arrived.clear();
   if (restoreTimer !== null) clearTimeout(restoreTimer);
   restoreTimer = null;

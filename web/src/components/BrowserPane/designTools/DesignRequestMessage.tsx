@@ -32,7 +32,8 @@ export function DesignRequestBody(props: DesignRequestCardProps) {
       name="the design request card"
       fallback={
         <div className="flex min-w-0 flex-col gap-1">
-          <DesignRequestContent {...props} />
+          {/* Without `words`: the chat's render of them is what most likely failed. */}
+          <DesignRequestContent request={props.request} />
         </div>
       }
     >

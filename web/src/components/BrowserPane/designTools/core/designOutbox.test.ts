@@ -321,6 +321,32 @@ describe("design outbox", () => {
     expect(statusOf(id)).toBe("sent");
   });
 
+  it("counts a send as sent when the runner's receipt beats working out its pending id", async () => {
+    const { subtle } = globalThis.crypto;
+    const digest = subtle.digest.bind(subtle);
+    let hold = true;
+    let release = () => {};
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    vi.spyOn(subtle, "digest").mockImplementation(async (...args) => {
+      if (hold) await held;
+      return digest(...args);
+    });
+    send.mockImplementationOnce(async (_t, _a, _f, opts) => {
+      hold = false;
+      runnerTook(await nativePendingId(SESSION, opts!.stableId!));
+      opts?.onError?.("Network down");
+    });
+    const id = queueDesignRequest({ tabId: TAB, label: "Annotate", text: "Native" });
+    await flush();
+    expect(statusOf(id)).toBe("failed");
+    // The outbox's own hash finishes last: the receipt it held now counts.
+    release();
+    await flush();
+    expect(statusOf(id)).toBe("sent");
+  });
+
   it("counts a stalled send the runner took while it ran as sent, leaving its turn running", async () => {
     // Without crypto.subtle the pending id is worked out at once, before the send runs.
     vi.stubGlobal("crypto", {});

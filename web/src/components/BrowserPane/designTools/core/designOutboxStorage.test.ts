@@ -371,8 +371,8 @@ describe("design outbox storage", () => {
     identity.user = "alice";
     for (const listener of identity.listeners) listener();
     await vi.waitFor(() => expect(ids()).toEqual(["alices"]));
-    // Bob's stays saved for Bob.
-    expect(await savedIds()).toEqual(["alices", "bobs"]);
+    // Bob's isn't left on a machine Alice is signed in on now.
+    expect(await savedIds()).toEqual(["alices"]);
   });
 
   it("asks the server who's signed in less often while it can't be reached", async () => {
@@ -463,13 +463,15 @@ describe("design outbox storage", () => {
 
   it("drops anyone's request saved longer ago than it's kept, and keeps the rest", async () => {
     const old = Date.now() - SAVED_REQUEST_TTL_MS - 1;
-    await putRecord(record({ id: "bobs_old", userId: "bob", savedAt: old }));
+    const elsewhere = "https://other.example/proxy/1";
+    await putRecord(record({ id: "bobs_old", userId: "bob", server: elsewhere, savedAt: old }));
     await putRecord(record({ id: "alices_old", savedAt: old }));
-    await putRecord(record({ id: "bobs", userId: "bob" }));
+    await putRecord(record({ id: "bobs_elsewhere", userId: "bob", server: elsewhere }));
     await putRecord(record({ id: "alices" }));
     await restoreSavedDesignRequests();
     expect(ids()).toEqual(["alices"]);
-    expect(await savedIds()).toEqual(["alices", "bobs"]);
+    // Another server's own users are its to sort out, once they're past the time.
+    expect(await savedIds()).toEqual(["alices", "bobs_elsewhere"]);
   });
 
   it("restores without the adopt lock when the browser refuses it", async () => {

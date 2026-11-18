@@ -199,6 +199,12 @@ export function AnnotateLayer({ tabId, rect, onNotice }: LayerProps) {
   );
 }
 
+interface TextDraft {
+  x: number;
+  y: number;
+  value: string;
+}
+
 export function DrawLayer({ tabId, url, rect, onNotice, popoverContainer }: LayerProps) {
   const { shapes, note, phase } = useTabTools(tabId);
   const session = useToolSession(tabId, onNotice, false);
@@ -216,18 +222,29 @@ export function DrawLayer({ tabId, url, rect, onNotice, popoverContainer }: Laye
     arrow: MARK_COLORS[0].value,
     text: MARK_COLORS[0].value,
   });
-  const [textDraft, setTextDraft] = useState<{ x: number; y: number; value: string } | null>(null);
+  const [textDraft, setTextDraftState] = useState<TextDraft | null>(null);
+  // Also kept in a ref: a blur after Enter or Escape (the field unmounting) must see none.
+  const draftRef = useRef<TextDraft | null>(null);
+  const setTextDraft = (draft: TextDraft | null) => {
+    draftRef.current = draft;
+    setTextDraftState(draft);
+  };
   const width = rect?.width ?? 0;
   const height = rect?.height ?? 0;
 
+  // Sized only when the frame is: resizing the backing store on each pointer move would stutter.
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ratio = windowOf(canvas).devicePixelRatio || 1;
+    canvas.width = Math.round(width * ratio);
+    canvas.height = Math.round(height * ratio);
+  }, [width, height]);
   useEffect(() => {
     const canvas = canvasRef.current;
     const context = canvas?.getContext("2d");
     if (!canvas || !context) return;
-    const ratio = windowOf(canvas).devicePixelRatio || 1;
-    canvas.width = Math.round(width * ratio);
-    canvas.height = Math.round(height * ratio);
-    prepareMarksCanvas(context, width, height, ratio);
+    prepareMarksCanvas(context, width, height, windowOf(canvas).devicePixelRatio || 1);
     for (const shape of current ? [...shapes, current] : shapes) drawShape(context, shape);
   }, [shapes, current, width, height]);
 
@@ -259,7 +276,7 @@ export function DrawLayer({ tabId, url, rect, onNotice, popoverContainer }: Laye
 
   /** Put the words being typed on the canvas; with `andSend`, then send (how that went). */
   const commitText = (andSend: boolean): Promise<CommandResult> | undefined => {
-    const draft = textDraft;
+    const draft = draftRef.current;
     setTextDraft(null);
     if (!draft?.value.trim()) {
       if (andSend) sendFromKeys();

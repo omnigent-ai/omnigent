@@ -1,5 +1,5 @@
 import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { DesignRequestBody } from "./DesignRequestMessage";
 import { NO_SCREENSHOT_NOTE } from "./parseDesignRequest";
 
@@ -26,6 +26,22 @@ describe("DesignRequestBody", () => {
       />,
     );
     expect(screen.queryByText(NO_SCREENSHOT_NOTE)).toBeNull();
+  });
+
+  it("shows the request's plain words when its rendered words fail", () => {
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    function Broken(): never {
+      throw new Error("The markdown broke");
+    }
+    render(
+      <DesignRequestBody
+        request={{ kind: "element", request: "Make it red", element: "p#blurb" }}
+        words={<Broken />}
+      />,
+    );
+    expect(screen.getByText("Make it red")).toBeInTheDocument();
+    expect(screen.getByText("p#blurb")).toBeInTheDocument();
+    vi.restoreAllMocks();
   });
 
   it("says which page a drawing was on", async () => {

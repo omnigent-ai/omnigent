@@ -238,12 +238,13 @@ export async function deleteRequest(id: string): Promise<void> {
 }
 
 /** How long an unsent request stays saved: anyone's older ones go, on a shared machine too. */
-export const SAVED_REQUEST_TTL_MS = 7 * 24 * 60 * 60_000;
+export const SAVED_REQUEST_TTL_MS = 24 * 60 * 60_000;
 
 /**
  * The saved requests of `userId` on this server this tab may take back: its own, and those
- * of tabs now closed, except those of `held` (this page's own, still live). Otherwise a
- * saved request goes only once it's sent or removed, or past SAVED_REQUEST_TTL_MS.
+ * of tabs now closed, except those of `held` (this page's own, still live). Another user's
+ * for this server, and anyone's past SAVED_REQUEST_TTL_MS, are deleted: `userId` is the
+ * server's answer to who is signed in, so they aren't left on a shared machine.
  */
 export function adoptSavedRequests(
   userId: string,
@@ -262,7 +263,9 @@ export function adoptSavedRequests(
       const all = reading.result as SavedRequest[];
       const expired = Date.now() - SAVED_REQUEST_TTL_MS;
       for (const record of all.sort((a, b) => a.savedAt - b.savedAt)) {
-        if (record.savedAt < expired && !(record.page === tab && held.has(record.id))) {
+        const mineHeld = record.page === tab && held.has(record.id);
+        const othersHere = record.server === server && record.userId !== userId;
+        if (!mineHeld && (record.savedAt < expired || othersHere)) {
           objects.delete(record.id);
           continue;
         }
