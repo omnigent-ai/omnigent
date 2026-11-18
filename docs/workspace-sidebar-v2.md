@@ -69,15 +69,3 @@ New:
 | `@types/hast` (dev) | Types for the Markdown syntax trees. |
 | `gemoji` | `:shortcode:` emoji in pull request comments, as GitHub shows them. |
 | `@tanstack/query-persist-client-core` | Keeps the pull request list's cache across restarts, so the list shows at once. |
-| `@base-ui/react` | Only the filterable menu (`web/src/components/ui/filter-menu.tsx`); see below. |
-
-### Base UI
-
-The web app's primitives use Radix. The pull request list needs a cascading
-"Add filter" menu where typing searches every submenu while the arrow keys
-move through the matches. Other filters, such as the diff review toolbar's,
-stay on Radix and share only the filter chips. Radix menus have no
-filter input, and their typeahead takes the same keystrokes; Base UI's `Menu`
-supports a filter input that keeps focus. We ask for a green light to use
-`@base-ui/react` for this one component. Base UI may be the better long-term
-base for the primitives, but moving to it is a separate decision.
