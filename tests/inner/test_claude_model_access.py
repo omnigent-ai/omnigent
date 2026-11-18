@@ -257,6 +257,16 @@ def test_relay_accepts_provider_sized_bodies_without_raising_the_shared_limit() 
     assert _ClaudeRelay._parse_inner_content_length(headers) == len(body)
     with pytest.raises(SigningRejected):
         _parse_strict_request_headers(headers)
+    prefix = b'{"model":"claude-test","messages":[{"content":"'
+    suffix = b'"}]}'
+    boundary_body = prefix + b"A" * (_MAX_REQUEST_BODY_BYTES - len(prefix) - len(suffix)) + suffix
+    assert len(boundary_body) == _MAX_REQUEST_BODY_BYTES
+    assert _request(access, body=boundary_body).body == boundary_body
+    boundary_headers = (
+        f"Host: model.test\r\nContent-Length: {_MAX_REQUEST_BODY_BYTES}\r\n\r\n".encode()
+    )
+    assert _ClaudeRelay._request_headers(boundary_headers)[1] == _MAX_REQUEST_BODY_BYTES
+    assert _ClaudeRelay._parse_inner_content_length(boundary_headers) == _MAX_REQUEST_BODY_BYTES
     oversized = _MAX_REQUEST_BODY_BYTES + 1
     with pytest.raises(SigningRejected):
         _ClaudeRelay._request_headers(
