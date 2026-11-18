@@ -1,4 +1,12 @@
-import { type KeyboardEvent, type ReactNode, useId, useMemo, useState } from "react";
+import {
+  type KeyboardEvent,
+  type ReactNode,
+  useId,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { SearchIcon } from "lucide-react";
 
 import { CompactShortcutKeys } from "@/components/ui/kbd";
@@ -7,7 +15,13 @@ import { cn } from "@/lib/utils";
 
 import { HighlightedText, type MatchHighlight } from "./HighlightedText";
 import type { QuickPickItem, QuickPickItemRow, QuickPickRow } from "./model";
-import { buildQuickPickRows, type QuickPickSegment, reconcileActiveIndex } from "./presentation";
+import {
+  buildQuickPickRows,
+  navigateQuickPick,
+  type QuickPickNavigation,
+  type QuickPickSegment,
+  reconcileActiveIndex,
+} from "./presentation";
 
 export interface QuickPickProps<Value> {
   /** Accessible name for the query field and results, such as "Command palette". */
@@ -29,6 +43,8 @@ export interface QuickPickProps<Value> {
   /** Trailing content beside the query field, such as a close button. */
   inputEnd?: ReactNode;
   autoFocus?: boolean;
+  /** Arrow keys wrap around at the ends; off by default, as in a menu. */
+  loop?: boolean;
   /** Grow the results to fill the container, such as a full-screen sheet on phones. */
   fillHeight?: boolean;
   className?: string;
@@ -64,6 +80,32 @@ function resultCountText(resultCount: number): string {
  * Keyboard-first picker: a query field over fuzzy-ranked rows grouped under
  * headings. The caller owns the query and what accepting a row does.
  */
+// Meta jumps to the ends and Alt moves between groups; Shift+Home/End stay with the query field.
+function navigationFor(
+  event: KeyboardEvent<HTMLInputElement>,
+  pageSize: () => number,
+): QuickPickNavigation | null {
+  switch (event.key) {
+    case "ArrowDown":
+    case "ArrowUp": {
+      const forward = event.key === "ArrowDown";
+      if (event.metaKey) return { type: forward ? "last" : "first" };
+      if (event.altKey) return { type: forward ? "nextGroup" : "previousGroup" };
+      return { type: forward ? "next" : "previous" };
+    }
+    case "Home":
+      return event.shiftKey ? null : { type: "first" };
+    case "End":
+      return event.shiftKey ? null : { type: "last" };
+    case "PageDown":
+      return { type: "pageDown", pageSize: pageSize() };
+    case "PageUp":
+      return { type: "pageUp", pageSize: pageSize() };
+    default:
+      return null;
+  }
+}
+
 export function QuickPick<Value>({
   label,
   placeholder,
@@ -77,6 +119,7 @@ export function QuickPick<Value>({
   listEnd,
   inputEnd,
   autoFocus = true,
+  loop = false,
   fillHeight = false,
   className,
 }: QuickPickProps<Value>) {
@@ -102,14 +145,51 @@ export function QuickPick<Value>({
   );
   const activeRow = activeIndex === -1 ? null : (rows[activeIndex] as QuickPickItemRow<Value>);
 
+  // Whenever the active row changes, by keys, a new query or new results, scroll it
+  // into view; a row the pointer picked is already visible, so the list stays put.
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const revealedIdRef = useRef<string | null>(null);
+  const pointerPickRef = useRef(false);
+  const activeItemId = activeRow?.item.id ?? null;
+  useLayoutEffect(() => {
+    // A pointer pick only covers the render it caused, even when the row was already active.
+    const pickedByPointer = pointerPickRef.current;
+    pointerPickRef.current = false;
+    if (activeItemId === revealedIdRef.current) return;
+    revealedIdRef.current = activeItemId;
+    if (activeItemId === null || pickedByPointer) return;
+    if (activeRow)
+      document.getElementById(optionId(activeRow))?.scrollIntoView?.({ block: "nearest" });
+  });
+
+  const navigate = (navigation: QuickPickNavigation) => {
+    const next = navigateQuickPick(rows, activeIndex, navigation, { loop });
+    const row = rows[next];
+    if (row?.kind !== "item") return;
+    pointerPickRef.current = false;
+    setActiveChoice({ query, id: row.item.id });
+  };
+
+  // A page is the options that fit in the list, less one kept for context.
+  const pageSize = () => {
+    const list = scrollRef.current;
+    const option = list?.querySelector<HTMLElement>('[role="option"]');
+    if (!list?.clientHeight || !option?.offsetHeight) return 10;
+    return Math.max(1, Math.floor(list.clientHeight / option.offsetHeight) - 1);
+  };
+
   const accept = (row: QuickPickItemRow<Value>) => {
     if (!row.item.disabledReason) onAccept(row.item);
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLInputElement>) => {
-    // Enter that confirms an IME composition belongs to the composition.
+    // Keys that drive an IME composition, including its Enter, belong to the composition.
     if (isImeCompositionKeyEvent(event)) return;
-    if (event.key === "Enter") {
+    const navigation = navigationFor(event, pageSize);
+    if (navigation) {
+      event.preventDefault();
+      navigate(navigation);
+    } else if (event.key === "Enter") {
       event.preventDefault();
       if (activeRow) accept(activeRow);
     }
@@ -131,7 +211,9 @@ export function QuickPick<Value>({
         // Hovering an enabled row makes it the user's pick, as in a menu, even when it
         // is already the top row, so a result arriving above it doesn't take over.
         onPointerMove={() => {
-          if (!disabled && activeChoice.id !== item.id) setActiveChoice({ query, id: item.id });
+          if (disabled || activeChoice.id === item.id) return;
+          pointerPickRef.current = true;
+          setActiveChoice({ query, id: item.id });
         }}
         // Keep focus in the query field.
         onMouseDown={(event) => event.preventDefault()}
@@ -211,6 +293,7 @@ export function QuickPick<Value>({
         {inputEnd}
       </div>
       <div
+        ref={scrollRef}
         data-slot="quick-pick-scroll"
         className={cn("overflow-y-auto p-1", fillHeight ? "min-h-0 flex-1" : "max-h-72")}
       >
