@@ -413,40 +413,48 @@ describe("createGlobalShortcuts", () => {
     return: "enter",
     esc: "escape",
   };
-  const electronChord = (accelerator) =>
+  /** Off macOS, CommandOrControl is Ctrl, and Command is the Win/Super key. */
+  const OTHER_NAMES = {
+    ...MAC_NAMES,
+    commandorcontrol: "ctrl",
+    cmdorctrl: "ctrl",
+    command: "super",
+    cmd: "super",
+    super: "super",
+    meta: "super",
+  };
+  const electronChord = (accelerator, isMac) =>
     accelerator
       .toLowerCase()
       .split("+")
-      .map((part) => MAC_NAMES[part] ?? part)
+      .map((part) => (isMac ? MAC_NAMES : OTHER_NAMES)[part] ?? part)
       .sort()
       .join("+");
 
   /**
    * Both shortcuts over one settings store and a fake GlobalShortcut that, like Electron,
-   * refuses a chord already registered in any spelling. `pressed` counts each action.
+   * refuses a chord already registered in any spelling. `pressed` counts each action; `ids`
+   * picks which shortcuts the app builds.
    */
-  function shortcuts(settings = {}) {
+  function shortcuts(settings = {}, { isMac = true, ids = ["show", "floatingComposer"] } = {}) {
     let stored = structuredClone(settings);
     const live = new Map();
     const pressed = { show: 0, floatingComposer: 0 };
     const built = createGlobalShortcuts({
       globalShortcut: {
         register: (accelerator, press) => {
-          if (live.has(electronChord(accelerator))) return false;
-          live.set(electronChord(accelerator), { accelerator, press });
+          if (live.has(electronChord(accelerator, isMac))) return false;
+          live.set(electronChord(accelerator, isMac), { accelerator, press });
           return true;
         },
-        unregister: (accelerator) => live.delete(electronChord(accelerator)),
+        unregister: (accelerator) => live.delete(electronChord(accelerator, isMac)),
       },
       loadSettings: () => structuredClone(stored),
       saveSettings: (next) => {
         stored = structuredClone(next);
       },
-      isMac: true,
-      presses: {
-        show: () => (pressed.show += 1),
-        floatingComposer: () => (pressed.floatingComposer += 1),
-      },
+      isMac,
+      presses: Object.fromEntries(ids.map((id) => [id, () => (pressed[id] += 1)])),
     });
     return {
       ...built,
@@ -456,7 +464,7 @@ describe("createGlobalShortcuts", () => {
       },
       registered: () => [...live.values()].map(({ accelerator }) => accelerator),
       press: (accelerator) => {
-        const entry = live.get(electronChord(accelerator));
+        const entry = live.get(electronChord(accelerator, isMac));
         assert.ok(
           entry,
           `${accelerator} isn't registered; registered: ${[...live.values()].map((e) => e.accelerator)}`,
@@ -478,6 +486,35 @@ describe("createGlobalShortcuts", () => {
     assert.deepEqual(s.pressed, { show: 1, floatingComposer: 0 });
     s.press("CommandOrControl+Shift+Space");
     assert.deepEqual(s.pressed, { show: 1, floatingComposer: 1 });
+  });
+
+  it("lets a shortcut the app doesn't build leave its default chord free", async () => {
+    const s = shortcuts({}, { ids: ["show"] });
+    assert.equal(s.floatingComposer, undefined);
+    const result = await s.show.set(
+      { enabled: true, accelerator: "CommandOrControl+Shift+Space" },
+      async () => true,
+    );
+    assert.equal(result.ok, true);
+    s.press("CommandOrControl+Shift+Space");
+    assert.deepEqual(s.pressed, { show: 1, floatingComposer: 0 });
+  });
+
+  it("off macOS, refuses Control for another shortcut's CommandOrControl but not Super", async () => {
+    const s = shortcuts({}, { isMac: false });
+    s.floatingComposer.apply();
+    let asked = 0;
+    const approve = async () => {
+      asked += 1;
+      return true;
+    };
+    const taken = await s.show.set({ enabled: true, accelerator: "Control+Shift+Space" }, approve);
+    assert.equal(taken.ok, false);
+    assert.match(taken.error, /Another Omnigent shortcut/);
+    assert.equal(asked, 0);
+    const free = await s.show.set({ enabled: true, accelerator: "Super+Shift+Space" }, approve);
+    assert.equal(free.ok, true);
+    assert.deepEqual(s.registered(), ["CommandOrControl+Shift+Space", "Super+Shift+Space"]);
   });
 
   it("keeps each shortcut under its own settings key", () => {
