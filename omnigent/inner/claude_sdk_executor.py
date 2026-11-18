@@ -85,7 +85,7 @@ from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, validate_effort
 
-from ._subprocess_lifecycle import close_anyio_subprocess_transport
+from ._subprocess_lifecycle import await_cleanup_task, close_anyio_subprocess_transport
 from .agent_env import clean_agent_env, declared_passthrough
 from .async_utils import run_sync_on_thread
 from .claude_gateway_shim import (
@@ -2992,7 +2992,35 @@ class ClaudeSDKExecutor(Executor):
 
         return dispatch
 
-    def _prepare_managed_cli(
+    def _build_managed_cli_launcher(
+        self, options: SdkOptions, relay: _ManagedMcpRelay | None
+    ) -> str:
+        assert self._cli_sandbox is not None and self._real_cli_path is not None
+        access = self._prepared_cli.model_access if self._prepared_cli is not None else None
+        managed_dirs = _claude_managed_config_dirs()
+        if access is not None:
+            _validate_claude_managed_config(managed_dirs, access.source_env_names)
+        policy = _client_cli_sandbox(
+            self._cli_sandbox,
+            managed_config_dirs=managed_dirs,
+            bridge_dir=relay.bridge_dir if relay is not None else None,
+            socket_dir=relay.socket_dir if relay is not None else None,
+        )
+        overrides = None
+        if access is not None:
+            policy = access.protect_sources(policy, pathlib.Path(self._cwd or os.getcwd()))
+            overrides = options.env
+            policy = with_spawn_env_allowlist(
+                policy, [*(policy.spawn_env_allowlist or []), *overrides]
+            )
+        return create_exec_launcher(
+            self._real_cli_path,
+            policy,
+            cwd=self._cwd,
+            env_overrides=overrides,
+        )
+
+    async def _prepare_managed_cli(
         self, options: SdkOptions, relay_tools: list[ToolSpec] | None
     ) -> tuple[_ManagedMcpRelay | None, str | None]:
         """Point a new CLI's managed relay entry at its own relay, or at nothing.
@@ -3023,32 +3051,22 @@ class ClaudeSDKExecutor(Executor):
             options.env.update(dict.fromkeys(MANAGED_MCP_RELAY_ENV_NAMES, ""))
         if self._cli_sandbox is None or self._real_cli_path is None:
             return relay, None
+        build_task = asyncio.create_task(
+            asyncio.to_thread(self._build_managed_cli_launcher, options, relay)
+        )
         try:
-            access = self._prepared_cli.model_access if self._prepared_cli is not None else None
-            managed_dirs = _claude_managed_config_dirs()
-            if access is not None:
-                _validate_claude_managed_config(managed_dirs, access.source_env_names)
-            policy = _client_cli_sandbox(
-                self._cli_sandbox,
-                managed_config_dirs=managed_dirs,
-                bridge_dir=relay.bridge_dir if relay is not None else None,
-                socket_dir=relay.socket_dir if relay is not None else None,
-            )
-            overrides = None
-            if access is not None:
-                policy = access.protect_sources(policy, pathlib.Path(self._cwd or os.getcwd()))
-                overrides = options.env
-                policy = with_spawn_env_allowlist(
-                    policy, [*(policy.spawn_env_allowlist or []), *overrides]
-                )
-            launcher = create_exec_launcher(
-                self._real_cli_path,
-                policy,
-                cwd=self._cwd,
-                env_overrides=overrides,
-            )
+            launcher = await asyncio.shield(build_task)
         except BaseException:
-            _release_client_cli(relay, None)
+            try:
+                await await_cleanup_task(build_task)
+            except BaseException:  # noqa: BLE001 - cleanup must finish after cancellation
+                launcher = None
+            else:
+                launcher = build_task.result()
+            cleanup_task = asyncio.create_task(
+                asyncio.to_thread(_release_client_cli, relay, launcher)
+            )
+            await await_cleanup_task(cleanup_task)
             raise
         options.cli_path = launcher
         return relay, launcher
@@ -4397,7 +4415,7 @@ class ClaudeSDKExecutor(Executor):
         cli_launcher = None
         # Freeze the full turn environment before a new contained CLI starts.
         if (managed_mcp or brokered) and session_key not in self._clients:
-            mcp_relay, cli_launcher = self._prepare_managed_cli(
+            mcp_relay, cli_launcher = await self._prepare_managed_cli(
                 options, managed_relay_tools if managed_mcp else None
             )
         try:

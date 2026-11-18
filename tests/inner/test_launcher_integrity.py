@@ -112,6 +112,7 @@ def runtime_layout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNam
 
 
 @pytest.mark.parametrize("grant_kind", ["write_roots", "write_files"])
+@pytest.mark.parametrize("backend", ["linux_bwrap", "darwin_seatbelt"])
 @pytest.mark.parametrize(
     "location",
     [
@@ -128,7 +129,7 @@ def runtime_layout(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNam
     ],
 )
 def test_launcher_rejects_runtime_writes(
-    runtime_layout: SimpleNamespace, grant_kind: str, location: str
+    runtime_layout: SimpleNamespace, grant_kind: str, backend: str, location: str
 ) -> None:
     layout = runtime_layout
     locations = {
@@ -143,17 +144,8 @@ def test_launcher_rejects_runtime_writes(
         "framework-module": layout.framework / "omnigent" / "inner" / "sandbox.py",
         "dependency-module": layout.dependency / "__init__.py",
     }
-    policy = _policy("linux_bwrap")
+    policy = _policy(backend)
     setattr(policy, grant_kind, [locations[location]])
-    with pytest.raises(OSError, match="conflicts with trusted launcher runtime"):
-        sb.create_exec_launcher("/bin/true", policy)
-
-
-def test_seatbelt_launcher_rejects_runtime_write(
-    runtime_layout: SimpleNamespace,
-) -> None:
-    policy = _policy("darwin_seatbelt")
-    policy.write_files = [runtime_layout.interpreter]
     with pytest.raises(OSError, match="conflicts with trusted launcher runtime"):
         sb.create_exec_launcher("/bin/true", policy)
 

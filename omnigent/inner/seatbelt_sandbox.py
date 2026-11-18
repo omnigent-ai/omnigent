@@ -1165,9 +1165,16 @@ def _build_profile(
                 f"(deny network-outbound (remote unix-socket (path-literal {_quote(canonical)})))"
             )
 
-    for source_path in policy.credential_source_paths or []:
-        quoted = _quote(str(source_path.resolve()))
+    protected_sources = [path.resolve() for path in policy.credential_source_paths or []]
+    file_denials: set[Path] = set()
+    for source_path in sorted(set(protected_sources), key=lambda path: len(path.parts)):
+        if any(parent in file_denials for parent in (source_path, *source_path.parents)):
+            continue
+        file_denials.add(source_path)
+        quoted = _quote(str(source_path))
         lines.append(f"(deny file-read* file-write* (subpath {quoted}))")
+    for source_path in protected_sources:
+        quoted = _quote(str(source_path))
         lines.append(f"(deny network-outbound (remote unix-socket (path-literal {quoted})))")
 
     if policy.credential_source_paths is not None:

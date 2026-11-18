@@ -626,6 +626,31 @@ def test_profile_network_section_for_allow_network_false_no_egress(
     assert "(allow network-inbound" not in profile
 
 
+def test_profile_collapses_nested_credential_file_denials_without_losing_socket_rules(
+    tmp_path: Path,
+) -> None:
+    protected = tmp_path / "protected"
+    protected.mkdir()
+    nested = protected / "settings.json"
+    nested.write_text("{}")
+    external = tmp_path / "external.json"
+    external.write_text("{}")
+    alias = protected / "external-link"
+    alias.symlink_to(external)
+    policy = _make_policy(tmp_path)
+    policy.credential_source_paths = [nested, protected, alias]
+
+    profile = _build_profile(policy, tmp_path)
+
+    file_deny = "(deny file-read* file-write* (subpath {}))"
+    socket_deny = "(deny network-outbound (remote unix-socket (path-literal {})))"
+    assert profile.count(file_deny.format(_quote(str(protected)))) == 1
+    assert file_deny.format(_quote(str(nested))) not in profile
+    assert file_deny.format(_quote(str(external))) in profile
+    for source in (nested, protected, external):
+        assert socket_deny.format(_quote(str(source))) in profile
+
+
 def test_profile_denies_unix_control_socket_after_allow_network(
     tmp_path: Path,
 ) -> None:

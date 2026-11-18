@@ -4828,6 +4828,35 @@ async def test_managed_mcp_relay_closes_when_its_turn_is_cancelled_or_its_cli_fa
         socket_dir = started[0].socket_dir
         assert not started[0].bridge_dir.exists()
         assert socket_dir is None or not socket_dir.exists()
+
+        # Slow runtime validation must leave the loop responsive and a cancelled
+        # turn must reclaim the launcher that finishes after cancellation.
+        validation_started = threading.Event()
+        release_validation = threading.Event()
+        delayed_launcher = tmp_path / "delayed-launcher"
+
+        def delayed_launcher_build(*_args: object, **_kwargs: object) -> str:
+            validation_started.set()
+            assert release_validation.wait(timeout=5)
+            delayed_launcher.write_text("launcher")
+            return str(delayed_launcher)
+
+        monkeypatch.setattr(
+            "omnigent.inner.claude_sdk_executor.create_exec_launcher", delayed_launcher_build
+        )
+        pending = asyncio.create_task(executor.run_turn(messages, tools, "").__anext__())
+        try:
+            assert await asyncio.wait_for(asyncio.to_thread(validation_started.wait, 2), 3)
+            assert started[-1].bridge_dir.exists()
+            pending.cancel()
+        finally:
+            release_validation.set()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert len(started) == 2
+        assert not started[-1].bridge_dir.exists()
+        assert not delayed_launcher.exists()
+        assert len(fake_sdk.created_clients) == clients_before
         executor._cli_sandbox = None
 
         # A relay that cannot start leaves no bridge directory and starts no CLI.
