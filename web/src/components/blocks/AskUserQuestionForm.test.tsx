@@ -686,11 +686,8 @@ describe("AskUserQuestionForm — key hints", () => {
     expect(screen.getByRole("button", { name: "Next" }).textContent).not.toContain("↵");
   });
 
-  it.each([
-    { name: "a coarse pointer", matches: (query: string) => query.includes("pointer: coarse") },
-    { name: "a narrow viewport", matches: (query: string) => query.includes("max-width") },
-  ])("hides hints and keeps Enter as a newline on $name", ({ matches }) => {
-    stubMedia(matches);
+  it("hides hints and keeps Enter as a newline on a narrow viewport", () => {
+    stubMedia((query: string) => query.includes("max-width"));
     const { onReject } = renderForm([framework, snacks]);
     expect(keyHints()).toHaveLength(0);
     expect(pressOnPage({ key: "Enter" })).toBe(true);

@@ -84,7 +84,6 @@ import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/h
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { showToast } from "@/components/ui/toast";
-import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useSidebarData } from "@/hooks/useSidebarData";
 import {
@@ -298,8 +297,7 @@ export function InboxPage() {
   const [replyStatuses, setReplyStatuses] = useState<Record<string, ReplyStatus>>({});
   const [submitWithModEnter] = useState(readSubmitWithModEnter);
   const isMobileViewport = useIsMobileViewport();
-  const isCoarsePointer = useIsCoarsePointer();
-  const preventsKeyboardSubmit = isMobileViewport || isCoarsePointer;
+  const preventsKeyboardSubmit = isMobileViewport;
 
   const { hasNextPage, isFetchingNextPage, fetchNextPage } = conversationsQuery;
   const rows = allRows.filter((c) => (c.pending_elicitations_count ?? 0) > 0);

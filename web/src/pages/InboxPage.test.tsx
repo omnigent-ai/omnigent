@@ -1171,10 +1171,10 @@ describe("InboxPage replies", () => {
     await waitFor(() => expect(sessionsApi.postEvent).toHaveBeenCalledTimes(1));
   });
 
-  it("never sends on Enter with a touch pointer", async () => {
+  it("never sends on Enter in the mobile layout", async () => {
     const realMatchMedia = window.matchMedia;
     window.matchMedia = ((query: string) => ({
-      matches: query === "(pointer: coarse)",
+      matches: query.includes("max-width"),
       media: query,
       onchange: null,
       addListener: () => {},

@@ -461,7 +461,7 @@ def test_agent_info_mcp_controls_require_owner(
             page.route(snapshot_url, snapshot_with_access(permission_level))
             with page.expect_response(snapshot_url):
                 page.goto(f"{base_url}/c/{session_id}")
-            if viewport_width < 952:
+            if viewport_width < 1181:
                 menu_name = "Conversation actions" if permission_level == 4 else "Session actions"
                 page.get_by_role("button", name=menu_name, exact=True).click()
                 page.get_by_role("menuitem", name="Agent info", exact=True).click()
@@ -522,7 +522,7 @@ def test_child_agent_info_mcp_controls_require_effective_owner(
         ) as page:
             page.goto(f"{server.public_url}/c/{child_id}")
             expect(page.get_by_placeholder(_COMPOSER)).to_be_visible(timeout=30_000)
-            if viewport_width < 952:
+            if viewport_width < 1181:
                 page.get_by_role(
                     "button", name=re.compile(r"^(Conversation|Session) actions$")
                 ).click()

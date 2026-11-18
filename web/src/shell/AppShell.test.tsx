@@ -142,7 +142,7 @@ vi.mock("@/hooks/useAgents", () => ({
 }));
 
 vi.mock("./Sidebar", () => ({
-  isMobileViewport: () => !window.matchMedia("(min-width: 952px)").matches,
+  isMobileViewport: () => !window.matchMedia("(min-width: 1181px)").matches,
   // Reflect the open/peek props so tests can assert sidebar collapse/expand and
   // whether it is peeking (a floating hover card rather than a docked panel).
   // Rendered as aside.conversations-sidebar like the real one, so the
@@ -2227,7 +2227,7 @@ describe("Workspace rail maximize", () => {
     const baseMatchMedia = window.matchMedia;
     const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
       ...baseMatchMedia(query),
-      matches: query === "(min-width: 952px)" ? viewport === "desktop" : false,
+      matches: query === "(min-width: 1181px)" ? viewport === "desktop" : false,
     }));
     onTestFinished(() => matchMedia.mockRestore());
     mockConversations([]);
@@ -2409,8 +2409,8 @@ describe("Sidebar across the md breakpoint", () => {
     let width = initialWidth;
     const listeners = new Map<string, Set<EventListenerOrEventListenerObject>>();
     const matches = (query: string) => {
-      if (query === "(min-width: 952px)") return width >= 952;
-      if (query === "(max-width: 951.98px)") return width < 952;
+      if (query === "(min-width: 1181px)") return width >= 1181;
+      if (query === "(max-width: 1180.98px)") return width < 1181;
       return false;
     };
     const baseMatchMedia = window.matchMedia;
@@ -5896,7 +5896,7 @@ describe("AppShell clone/fork action", () => {
     const baseMatchMedia = window.matchMedia;
     const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query: string) => ({
       ...baseMatchMedia(query),
-      matches: query === "(min-width: 952px)",
+      matches: query === "(min-width: 1181px)",
     }));
     onTestFinished(() => matchMedia.mockRestore());
     const parent = sessionSnapshot({ id: "conv_parent", title: "Parent title" });
@@ -6769,7 +6769,7 @@ describe("shell command drafts", () => {
       const matchMedia = window.matchMedia;
       const viewport = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
         ...matchMedia(query),
-        matches: query === "(min-width: 952px)" ? !mobile : matchMedia(query).matches,
+        matches: query === "(min-width: 1181px)" ? !mobile : matchMedia(query).matches,
       }));
       onTestFinished(() => viewport.mockRestore());
       const terminals: TerminalInfo[] = [];

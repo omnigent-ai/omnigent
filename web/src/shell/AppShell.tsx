@@ -46,6 +46,7 @@ import { useIdleNotifications } from "@/hooks/useIdleNotifications";
 import { useSeedReadState } from "@/hooks/useUnseenConversations";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { DESKTOP_VIEWPORT_QUERY, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useIsSideBySideSidebarViewport } from "@/hooks/useIsSideBySideSidebarViewport";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
@@ -453,6 +454,7 @@ function AppShellImpl() {
   // Below md an open sidebar is a full-window drawer, so narrowing closes it
   // (except the settings menu) and remembers the desktop state for widening.
   const mobileViewport = useIsMobileViewport();
+  const sideBySideSidebar = useIsSideBySideSidebarViewport();
   const atSettingsRoot =
     inSettings && location.pathname.replace(/\/$/, "") === rebasePath("/settings");
   const lastMobileViewportRef = useRef(mobileViewport);
@@ -855,6 +857,9 @@ function AppShellImpl() {
   const projectKanban = useProjectKanbanEnabled();
   const projectHomeName =
     extensionId === undefined && projectKanban ? projectNameFromHomePath(location.pathname) : null;
+  // Beside a docked tablet sidebar the header is empty on plain pages, so they skip its clearance.
+  const headerClearanceHidden =
+    sideBySideSidebar && sidebarOpen && !conversationId && projectHomeName === null && !canvasMode;
   // Positive "this is a top-level session" signal for the top-level-only
   // actions (Share/Clone). Gating those on ``!isChildSession`` flickered:
   // while the snapshot loads ``activeSession`` is null, so ``isChildSession``
@@ -3141,6 +3146,7 @@ function AppShellImpl() {
                     "--workspace-panel-offset": workspacePanelVisible
                       ? `${inlinePanelWidth}px`
                       : "0px",
+                    "--omnigent-header-height": headerClearanceHidden ? "0px" : undefined,
                   } as CSSProperties
                 }
               >

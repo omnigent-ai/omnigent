@@ -131,7 +131,7 @@ export function SharingPage() {
         contentClassName="px-4 md:px-8"
         extraBottom="2.5rem"
       >
-        <h1 className="settings-page-title mb-2 text-2xl font-medium">Session sharing</h1>
+        <h1 className="mb-2 text-2xl font-medium">Session sharing</h1>
         <p className="text-ui text-muted-foreground">
           You don't have permission to manage session sharing.
         </p>
@@ -185,7 +185,7 @@ export function SharingPage() {
     <PageScroll maxWidthClassName="max-w-4xl" contentClassName="px-4 md:px-8" extraBottom="2.5rem">
       <div>
         <div className="mb-6">
-          <h1 className="settings-page-title text-2xl font-medium">Session sharing</h1>
+          <h1 className="text-2xl font-medium">Session sharing</h1>
           <p className="mt-1 text-sm text-muted-foreground max-md:hidden">
             Control sharing server-wide. Mode and visibility defaults affect new shares; public
             permission limits also affect existing public grants. Changes apply immediately.

@@ -722,7 +722,7 @@ describe("SettingsPage", () => {
   it("renders the Appearance section and applies a theme on card click", () => {
     renderPage("/settings/appearance");
     const heading = screen.getByRole("heading", { name: "Appearance" });
-    expect(heading).toHaveClass("settings-page-title", "font-medium");
+    expect(heading).toHaveClass("font-medium");
     expect(heading).not.toHaveClass("font-semibold");
     expect(heading.closest("section")?.parentElement).toHaveClass("max-w-4xl", "px-4", "md:px-8");
     expect(screen.getByRole("button", { name: "About Interface font size" })).toHaveClass(

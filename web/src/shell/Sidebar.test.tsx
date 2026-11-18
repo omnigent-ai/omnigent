@@ -1102,11 +1102,11 @@ describe("Sidebar session list", () => {
   });
 
   it("docks the settings menu beside the page on a wide phone, collapsing from its header", () => {
-    const mediaQuery = window.matchMedia("(max-width: 951.98px)");
+    const mediaQuery = window.matchMedia("(max-width: 1180.98px)");
     const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
       ...mediaQuery,
       media: query,
-      matches: query.includes("pointer: coarse") || query === "(max-width: 951.98px)",
+      matches: query.includes("min-width: 600px") || query === "(max-width: 1180.98px)",
     }));
     try {
       mockConversations(THREE_TYPE_CONVERSATIONS);
@@ -1412,10 +1412,10 @@ describe("Sidebar session list", () => {
     ).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
     expect(selectSessions.parentElement).toHaveClass("flex", "gap-0.5");
     expect(selectSessions.parentElement?.parentElement).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100",
+      "md:opacity-0",
+      "md:group-hover/header:opacity-100",
+      "md:group-has-[[data-header-controls]:focus-within]/header:opacity-100",
+      "md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100",
     );
 
     const filterSessions = within(sessionsSection!).getByRole("button", {
@@ -1479,7 +1479,7 @@ describe("Sidebar session list", () => {
       "-translate-y-1/2",
       "opacity-0",
       "group-focus-visible/new-session:opacity-100",
-      "[@media((hover:hover)_and_(pointer:fine))]:group-hover/new-session:opacity-100",
+      "md:group-hover/new-session:opacity-100",
     );
   });
 
@@ -3250,7 +3250,7 @@ describe("Sidebar project sections", () => {
     );
   });
 
-  it("offers a desktop New session shortcut while keeping the touch menu accessible", async () => {
+  it("offers a desktop New session shortcut while keeping the mobile menu accessible", async () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
@@ -3259,7 +3259,7 @@ describe("Sidebar project sections", () => {
 
     const shortcut = screen.getByRole("link", { name: "New session in Customer X" });
     expect(shortcut).toHaveAttribute("href", "/?project=Customer%20X");
-    expect(shortcut).toHaveClass("hidden", "[@media((hover:hover)_and_(pointer:fine))]:flex");
+    expect(shortcut).toHaveClass("hidden", "md:flex");
     const menuButton = screen.getByTestId("project-actions");
     expect(menuButton).not.toHaveClass("hidden");
     expect(menuButton).not.toHaveClass("sr-only");
@@ -3269,11 +3269,11 @@ describe("Sidebar project sections", () => {
     });
     const menuItem = await screen.findByTestId("project-new-session-menu");
     expect(menuItem).not.toHaveClass("hidden");
-    expect(menuItem).toHaveClass("[@media((hover:hover)_and_(pointer:fine))]:hidden");
+    expect(menuItem).toHaveClass("md:hidden");
     expect(menuItem.closest("a")).toHaveAttribute("href", "/?project=Customer%20X");
   });
 
-  it("reveals project actions on hover only on wide fine-pointer layouts", () => {
+  it("reveals project actions on hover only in the desktop layout", () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_running", "Claude Code", {
@@ -3285,14 +3285,11 @@ describe("Sidebar project sections", () => {
 
     const kebab = screen.getByTestId("project-actions");
     const revealWrapper = kebab.closest("div[class*=transition-opacity]")!;
-    expect(revealWrapper).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100",
-    );
+    expect(revealWrapper).toHaveClass("md:opacity-0", "md:group-hover/header:opacity-100");
     const outerBox = kebab.closest("div[class*=absolute]")!;
     expect(outerBox).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:md:pointer-events-none",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:pointer-events-auto",
+      "md:pointer-events-none",
+      "md:group-hover/header:pointer-events-auto",
     );
   });
 });
@@ -3858,15 +3855,11 @@ describe("Sidebar collapsed project marker", () => {
     // rows' dots.
     expect(slot).toHaveClass("w-6", "justify-center");
     // Visible touch controls get their own column beside the marker.
+    expect(slot).toHaveClass("mr-7", "md:-mr-1");
     expect(slot).toHaveClass(
-      "mr-7",
-      "[@media((hover:hover)_and_(pointer:fine))]:mr-14",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:-mr-1",
-    );
-    expect(slot).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/section:opacity-0",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-0",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-0",
+      "md:group-hover/section:opacity-0",
+      "md:group-has-[[data-state=open]]/header:opacity-0",
+      "md:group-has-[[data-header-controls]:focus-within]/header:opacity-0",
     );
   });
 
@@ -4046,11 +4039,11 @@ describe("Sidebar move-to-project action", () => {
 
 describe("Sidebar mobile overlay background", () => {
   it("uses shared glass with an overridable background for the mobile overlay", () => {
-    const mediaQuery = window.matchMedia("(max-width: 951.98px)");
+    const mediaQuery = window.matchMedia("(max-width: 1180.98px)");
     const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
       ...mediaQuery,
       media: query,
-      matches: query === "(max-width: 951.98px)",
+      matches: query === "(max-width: 1180.98px)",
     }));
     try {
       mockConversations(THREE_TYPE_CONVERSATIONS);
@@ -4663,11 +4656,11 @@ describe("Sidebar view options", () => {
   });
 
   it("opens view submenus in place of the main menu on a mobile viewport", () => {
-    const mediaQuery = window.matchMedia("(max-width: 951.98px)");
+    const mediaQuery = window.matchMedia("(max-width: 1180.98px)");
     const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
       ...mediaQuery,
       media: query,
-      matches: query === "(max-width: 951.98px)",
+      matches: query === "(max-width: 1180.98px)",
     }));
     try {
       mockConversations([conv("conv_idle", "Codex", { status: "idle" })]);

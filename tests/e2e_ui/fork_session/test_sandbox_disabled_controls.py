@@ -153,18 +153,18 @@ def test_sandbox_fork_enabled_and_switch_host_disabled(
     page.keyboard.press("Escape")
     expect(page.get_by_test_id("fork-session-dialog")).to_have_count(0)
 
-    if viewport_width < 952:
+    if viewport_width < 1181:
         page.get_by_role("button", name="Open sidebar", exact=True).click()
     row = page.locator(f'li[data-sidebar-session-id="{session_id}"]')
     row.hover()
-    if viewport_width >= 952:
+    if viewport_width >= 1181:
         row.get_by_test_id("conversation-actions").click()
         expect(page.get_by_test_id("fork-conversation")).to_be_enabled()
         _close_menu(page)
     row.locator(f'a[href="/c/{session_id}"]').click(button="right")
     expect(page.get_by_test_id("fork-conversation")).to_be_enabled()
     _close_menu(page)
-    if viewport_width < 952:
+    if viewport_width < 1181:
         row.locator(f'a[href="/c/{session_id}"]').click()
 
     assistant.hover()

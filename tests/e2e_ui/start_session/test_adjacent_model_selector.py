@@ -15,7 +15,7 @@ from tests.e2e_ui.start_session.test_start_session import (
 )
 
 
-@pytest.mark.parametrize("width", [929, 1600])
+@pytest.mark.parametrize("width", [1181, 1600])
 @pytest.mark.parametrize("theme", ["light", "dark"])
 def test_model_selector_stays_adjacent_and_reachable(
     seeded_session: tuple[str, str], width: int, theme: str
@@ -47,7 +47,7 @@ async def _drive_adjacent_selector(base_url: str, session_id: str, width: int, t
             draft = page.get_by_test_id("new-chat-landing-input")
             await expect(draft).to_be_visible(timeout=30_000)
             await expect(draft).to_have_css("font-size", "16px")
-            await expect(draft).to_have_css("line-height", "28.8px")
+            await expect(draft).to_have_css("line-height", "25.6px")
             trigger = page.get_by_test_id("new-chat-landing-agent-select")
             await trigger.click()
             harness = page.get_by_test_id("new-chat-landing-agent-ag_claude_e2e")
@@ -118,7 +118,9 @@ async def _drive_adjacent_selector(base_url: str, session_id: str, width: int, t
                 child_box["x"] + child_box["width"],
             ) - max(trigger_box["x"], child_box["x"])
             assert overlap <= 4, (trigger_box, child_box)
-            await expect(child).to_have_attribute("data-side", "left" if width == 929 else "right")
+            await expect(child).to_have_attribute(
+                "data-side", "left" if width == 1181 else "right"
+            )
 
             await edit.hover()
             await page.mouse.move(parent_box["x"] + parent_box["width"] / 2, parent_box["y"] + 2)

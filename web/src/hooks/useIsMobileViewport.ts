@@ -8,8 +8,8 @@
 
 import { useSyncExternalStore } from "react";
 
-/** Tailwind's `md` breakpoint: an open foldable in landscape (951px) still gets the phone layout. */
-export const MOBILE_BREAKPOINT_PX = 952;
+/** Tailwind's `md` breakpoint: tablets up to an iPad Air in landscape (1180px) get the mobile layout. */
+export const MOBILE_BREAKPOINT_PX = 1181;
 /** Matches viewports at or above `md`, the desktop layout. */
 export const DESKTOP_VIEWPORT_QUERY = `(min-width: ${MOBILE_BREAKPOINT_PX}px)`;
 
@@ -30,7 +30,7 @@ function getSnapshot(): boolean {
 }
 
 /**
- * True when the viewport is narrower than Tailwind's `md` breakpoint (952px)
+ * True when the viewport is narrower than Tailwind's `md` breakpoint (1181px)
  * — i.e. the "mobile" layout the shell's `max-md:` classes target. Reactive:
  * components re-render when the viewport crosses the breakpoint. SSR-safe
  * (returns `false` on the server, matching `initialSidebarOpen`).

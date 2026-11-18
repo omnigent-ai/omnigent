@@ -17,7 +17,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { isFeatureEnabled } from "@/lib/capabilities";
@@ -53,8 +52,7 @@ export function KeyboardShortcutsList({
 }) {
   // Feature-based, stable per session; computed at render so tests can vary it.
   const isMobileViewport = useIsMobileViewport();
-  const isCoarsePointer = useIsCoarsePointer();
-  const preventsKeyboardSubmit = isMobileViewport || isCoarsePointer;
+  const preventsKeyboardSubmit = isMobileViewport;
   const serverInfo = useServerInfo();
   const groups = shortcutGroupsFor({
     native: isNativeShell(),

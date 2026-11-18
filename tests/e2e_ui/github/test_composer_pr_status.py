@@ -81,7 +81,7 @@ def test_composer_pr_status_preview(
     stub_session_pull_requests(page, lambda: pull_requests, lambda _url: None)
     page.set_viewport_size({"width": viewport_width, "height": 900})
     page.goto(f"{base_url}/c/{session_id}")
-    if viewport_width < 952:
+    if viewport_width < 1181:
         open_session_pull_requests(page, mobile=True)
     else:
         indicator = page.get_by_test_id("composer-pr-link")
@@ -137,7 +137,7 @@ def test_composer_pr_status_preview(
             indicator.click()
     panel = (
         page.get_by_test_id("github-panel-drawer")
-        if viewport_width < 952
+        if viewport_width < 1181
         else page.get_by_role("complementary", name="Workspace")
     )
     expect(panel.get_by_role("list", name="Pull requests")).to_be_visible()
@@ -145,7 +145,7 @@ def test_composer_pr_status_preview(
         panel.get_by_role("button", name="acme/app #44 — Resolve composer layout", exact=True)
     ).to_be_visible()
     page.screenshot(path=tmp_path / "composer-pr-panel.png", animations="disabled")
-    if viewport_width >= 952:
+    if viewport_width >= 1181:
         page.mouse.move(0, 0, steps=10)
         indicator.hover()
         expect(preview).to_be_visible()

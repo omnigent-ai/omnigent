@@ -7156,8 +7156,7 @@ describe("NewChatLandingScreen", () => {
 
   it("leaves plain Enter as a newline on a phone viewport", async () => {
     // Touch keyboards own the create action (the on-screen button), so plain
-    // Enter never creates — same rule as the in-session composer on a coarse
-    // pointer.
+    // Enter never creates — same rule as the in-session composer.
     const restoreViewport = forceMobileViewport();
     try {
       renderLanding();

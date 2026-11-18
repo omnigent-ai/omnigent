@@ -431,7 +431,7 @@ def test_composer_plan_and_goal_actions_fit_mobile_and_desktop(
                 bounds = _box(action)
                 assert bounds["x"] >= 0
                 assert bounds["x"] + bounds["width"] <= viewport["width"]
-                if native_kind:
+                if viewport["width"] < 1181:
                     assert bounds["width"] >= 44
                     assert bounds["height"] >= 44, f"{action_id} is only {bounds['height']}px tall"
                     assert action.evaluate("""element => {

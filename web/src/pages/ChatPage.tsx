@@ -377,7 +377,6 @@ import {
   taskActionMessage,
   workflowMessage,
 } from "@/lib/workflow";
-import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { ConnectionIndicator } from "./ChatIndicators";
 import { Transcript } from "@/components/chat/Transcript";
@@ -3015,8 +3014,7 @@ function ComposerImpl(
   // Keep desktop's fast-type affordance, but let mobile users explicitly tap
   // the composer when switching back from Terminal or changing sessions.
   const isMobile = useIsMobileViewport();
-  const isCoarsePointer = useIsCoarsePointer();
-  const preventsKeyboardSubmit = isMobile || isCoarsePointer;
+  const preventsKeyboardSubmit = isMobile;
   const isMobileRef = useRef(isMobile);
   isMobileRef.current = isMobile;
 

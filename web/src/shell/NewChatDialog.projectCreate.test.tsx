@@ -776,6 +776,10 @@ describe("NewChatLandingScreen nested agent creation", () => {
   it.each([false, true])(
     "submits the clicked source for JSON and uploaded agents (bundle=%s)",
     async (bundled) => {
+      // jsdom's default user agent names the OS running the tests; pin one the label maps.
+      const userAgent = vi
+        .spyOn(navigator, "userAgent", "get")
+        .mockReturnValue("Mozilla/5.0 (X11; Linux x86_64)");
       vi.mocked(getSessionSlim).mockImplementation(async (id) => ({ ...SOURCE_SESSION, id }));
       searchParams = new URLSearchParams("sibling=other");
       renderLanding({ sibling_sessions: true });
@@ -830,6 +834,7 @@ describe("NewChatLandingScreen nested agent creation", () => {
       );
       expect(screen.getByText("other.txt")).toBeVisible();
       expect(screen.queryByText("submitted.txt")).not.toBeInTheDocument();
+      userAgent.mockRestore();
     },
   );
 });

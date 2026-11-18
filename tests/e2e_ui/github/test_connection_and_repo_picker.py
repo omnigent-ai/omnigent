@@ -67,13 +67,13 @@ def test_github_connection_controls(
         re.compile(r"/v1/connections/github/(status|connect|disconnect)(?:\?|$)"), connection
     )
     page.goto(f"{base_url}/settings/integrations")
-    if width < 952:
+    if width < 1181:
         expect(page.locator("aside[aria-label='Conversations']")).to_have_attribute(
             "aria-hidden", "true"
         )
     page.get_by_role("button", name="Connect GitHub", exact=True).click()
     expect(page.get_by_role("status")).to_contain_text("GitHub account connected.")
-    if width < 952:
+    if width < 1181:
         expect(page.locator("aside[aria-label='Conversations']")).to_have_attribute(
             "aria-hidden", "true"
         )
@@ -88,7 +88,7 @@ def test_github_connection_controls(
     assert state["disconnects"] == 1
     page.screenshot(path=tmp_path / "github-disconnected.png", animations="disabled")
     page.goto(f"{base_url}/settings/integrations?github=error")
-    if width < 952:
+    if width < 1181:
         expect(page.locator("aside[aria-label='Conversations']")).to_have_attribute(
             "aria-hidden", "true"
         )
@@ -135,13 +135,15 @@ def test_github_repository_and_branch_picker(
     page.goto(base_url)
     chip = page.get_by_test_id("new-chat-landing-repo-chip")
     expect(chip).to_be_visible(timeout=30_000)
-    if native_kind:
+    # The mobile layout gives every pointer the 44px touch floor, native shell or not.
+    mobile = width < 1181
+    if mobile:
         chip_box = chip.bounding_box()
         row_box = page.get_by_test_id("new-chat-landing-workspace-controls").bounding_box()
         assert chip_box and row_box
         assert chip_box["height"] >= 44 and row_box["height"] <= 49
     # Tap just inside the bottom edge; positions exclude the 1px border.
-    chip.click(position={"x": 22, "y": 42} if native_kind else None)
+    chip.click(position={"x": 22, "y": 42} if mobile else None)
     expect(page.get_by_role("dialog")).to_have_attribute("data-side", "top")
     page.get_by_role("combobox", name="GitHub repository", exact=True).click()
     page.get_by_placeholder("Search repositories…").fill("hello")

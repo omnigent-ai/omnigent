@@ -21,7 +21,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useCreateHostDirectory, useHostFilesystem } from "@/hooks/useHostFilesystem";
 import { useHostWorktrees, useVerifiedGitWorktrees } from "@/hooks/useHostWorktrees";
-import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import {
   chooseDirectory,
@@ -471,7 +471,7 @@ export function WorkspacePicker({
   // Enter confirming an IME candidate must not open a folder.
   const isComposingRef = useRef(false);
   const listingId = useId();
-  const isCoarsePointer = useIsCoarsePointer();
+  const isMobileViewport = useIsMobileViewport();
   const [dropTarget, setDropTarget] = useState<HTMLDivElement | null>(null);
   const desktopHostId = useDesktopHostId();
   // The OS chooser and Finder drops yield this machine's paths, so they only
@@ -1036,7 +1036,7 @@ export function WorkspacePicker({
                 }}
                 // Typing and arrow keys work as soon as the picker opens; touch
                 // devices keep focus off it so the keyboard doesn't pop up.
-                autoFocus={!isCoarsePointer}
+                autoFocus={!isMobileViewport}
                 placeholder="Search or type a path"
                 aria-label="Search folders and files, or type a path"
                 role="combobox"

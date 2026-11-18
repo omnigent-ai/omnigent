@@ -433,16 +433,20 @@ def test_slash_menu_shows_a_long_single_match_from_the_keyboard(
     expect(composer).to_have_value("")
 
 
-@pytest.mark.browser_context_args(has_touch=True)
-def test_slash_menu_highlight_opens_no_tooltip_on_a_touch_screen(
-    page: Page, chat_session_contract
+@pytest.mark.parametrize(
+    "touch",
+    [False, pytest.param(True, marks=pytest.mark.browser_context_args(has_touch=True))],
+    ids=["mouse", "touch"],
+)
+def test_slash_menu_highlight_opens_no_tooltip_in_the_mobile_layout(
+    page: Page, chat_session_contract, touch: bool
 ) -> None:
     chat_session_contract.set_skills([{"name": "triage", "description": _LONG_SKILL_DESCRIPTION}])
     page.set_viewport_size(PHONE)
     page.goto(chat_session_contract.url)
     composer = _composer(page)
     expect(composer).to_be_visible()
-    assert page.evaluate("matchMedia('(pointer: coarse)').matches")
+    assert page.evaluate("matchMedia('(pointer: coarse)').matches") is touch
     composer.press_sequentially("/tri")
 
     expect(page.get_by_test_id("slash-menu-item-triage")).to_have_attribute("data-active", "true")
@@ -471,10 +475,11 @@ _FIRST_LINE_OFFSET = """element => {
 }"""
 
 
-@pytest.mark.parametrize("viewport", [DESKTOP, PHONE], ids=["desktop", "phone"])
 def test_slash_menu_bounds_a_very_long_skill_description(
-    page: Page, chat_session_contract, viewport: dict[str, int]
+    page: Page, chat_session_contract
 ) -> None:
+    # Highlight tooltips exist only in the desktop layout.
+    viewport = DESKTOP
     chat_session_contract.set_skills(
         [
             {"name": "review-pr", "description": "Review a pull request"},

@@ -190,7 +190,7 @@ object NativeBridgeScript {
                 // (overlays) Back should dismiss; at md+ they dock as persistent
                 // rails (md:relative md:translate-x-0, still data-state="open")
                 // that Back must NOT close. Modal dialogs dismiss at any width.
-                const narrow = window.innerWidth < 952;
+                const narrow = window.innerWidth < 1181;
                 // 1. Conversations sidebar (a drawer only when narrow; closed =
                 // data-collapsed).
                 if (narrow) {

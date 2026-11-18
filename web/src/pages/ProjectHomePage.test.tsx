@@ -5,7 +5,8 @@ import { ProjectHomePage } from "./ProjectHomePage";
 
 const mocks = vi.hoisted(() => ({ isMobile: false }));
 
-vi.mock("@/hooks/useIsMobileViewport", () => ({
+vi.mock(import("@/hooks/useIsMobileViewport"), async (importOriginal) => ({
+  ...(await importOriginal()),
   useIsMobileViewport: () => mocks.isMobile,
 }));
 vi.mock("@/shell/Sidebar", () => ({ useProjectFolderMenu: vi.fn() }));

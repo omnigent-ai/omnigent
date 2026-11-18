@@ -52,7 +52,7 @@ def test_continue_missing_workspace_in_another_directory(
 ) -> None:
     """Reject another absent path, then fork into a selected existing directory."""
     chat = chat_session_contract
-    page.set_viewport_size({"width": width, "height": 900 if width > 952 else 844})
+    page.set_viewport_size({"width": width, "height": 900 if width > 1181 else 844})
     chat.set_catalog(harness="claude-native", models=[], selected_model="")
     chat.update_session(
         title="Workspace recovery example",
@@ -217,7 +217,7 @@ def test_continue_missing_workspace_in_another_directory(
     contract.json(f"/v1/hosts/{chat.host_id}/runners", launch, method="POST")
 
     def activate(control: Locator) -> None:
-        if width < 952:
+        if width < 1181:
             control.tap()
         else:
             control.click()
@@ -257,7 +257,7 @@ def test_continue_missing_workspace_in_another_directory(
             f"localStorage.setItem('omnigent.sideChatInherited:{chat.session_id}', '[]');"
         )
         page.goto(parent.url)
-        if width < 952:
+        if width < 1181:
             activate(page.get_by_role("button", name="Conversation actions", exact=True))
             activate(page.get_by_role("menuitem", name="Side chats", exact=True))
             expect(page.get_by_test_id("side-chats-panel-drawer")).to_have_attribute(

@@ -89,13 +89,13 @@ def test_queued_attachments_keep_their_real_layout_contract(
             };
         }"""
     )
-    if width >= 952:
+    if width >= 1181:
         assert layout["sameLine"], layout
     elif text:
         assert not layout["sameLine"], layout
     assert layout["noOverlap"], layout
     assert layout["nameWidth"] >= 24, layout
-    assert layout["rowHeight"] <= (48 if width < 952 else 28), layout
+    assert layout["rowHeight"] <= (48 if width < 1181 else 28), layout
     if text:
         assert layout["textWidth"] >= 16, layout
     assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")

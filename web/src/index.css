@@ -16,24 +16,18 @@
 @source "../node_modules/streamdown/dist/*.js";
 
 @custom-variant dark (&:is(.dark *));
-/* Native shells and browsers whose primary input is touch share this layout. */
+/* Touch UI for the mobile layout. Width alone picks the layout, whatever the
+ * input device: below md is touch UI, md and up is the mouse-driven desktop UI. */
 @custom-variant mobile-app {
-  &:where([data-mobile-app="true"], [data-mobile-app="true"] *) {
-    @slot;
-  }
-  @media (pointer: coarse) and (hover: none) {
+  @media (width < 73.8125rem) {
     @slot;
   }
 }
 
-/* CSS-pixel floor for native shells and touch browsers, independent of width. */
+/* CSS-pixel touch floor for the mobile layout. */
 @utility mobile-touch-target {
-  &:is([data-mobile-app="true"], [data-mobile-app="true"] *) {
-    min-width: 44px;
-    min-height: 44px;
-  }
-  /* Match the native branch's specificity so row resets like min-h-0 can't win. */
-  @media (pointer: coarse) and (hover: none) {
+  /* Doubled specificity so row resets like min-h-0 can't win. */
+  @media (width < 73.8125rem) {
     &:is(:root, :root *) {
       min-width: 44px;
       min-height: 44px;
@@ -148,9 +142,9 @@
  * bypasses the runtime typography mapping. Unitless line heights scale with
  * font size: 1.6 for interface and message text, and 1.3 for captions. */
 @theme {
-  /* The phone layout runs up to an open foldable in landscape (951px). Raw
+  /* The mobile layout runs up to an iPad Air in landscape (1180px). Raw
    * `@media` rules below and MOBILE_BREAKPOINT_PX in useIsMobileViewport repeat it. */
-  --breakpoint-md: 59.5rem;
+  --breakpoint-md: 73.8125rem;
   /* App-default interface/body text — every control, label, and menu item. */
   --font-weight-normal: 450;
   --text-ui: 1rem;
@@ -493,7 +487,7 @@
   @apply mobile-touch-target;
 }
 
-@media (width < 59.5rem) {
+@media (width < 73.8125rem) {
   .composer-add-menu [role="menuitem"].mobile-touch-target {
     @apply h-7 rounded-md px-2 py-[3px] text-ui leading-4;
     min-height: 28px;
@@ -522,7 +516,7 @@
   background-color: var(--composer-surface-bg);
 }
 
-@media (width < 59.5rem) {
+@media (width < 73.8125rem) {
   [data-mobile-composer] {
     --composer-compact-start: 8px;
     --composer-compact-end: 8px;
@@ -701,7 +695,7 @@
   }
 }
 
-@media (width < 59.5rem) and (prefers-reduced-motion: reduce) {
+@media (width < 73.8125rem) and (prefers-reduced-motion: reduce) {
   [data-mobile-composer],
   [data-mobile-composer] > [aria-hidden="true"] > .glass-surface,
   [data-mobile-composer] > [data-composer-input-area] {
@@ -739,7 +733,7 @@
   border-top-right-radius: 0;
 }
 
-@media (width < 59.5rem) {
+@media (width < 73.8125rem) {
   .new-chat-workspace-controls .composer-context-bar {
     width: auto;
     max-width: 100%;
@@ -781,7 +775,7 @@
   background-image: none;
 }
 
-@media (width < 59.5rem) {
+@media (width < 73.8125rem) {
   .composer-queued-surface {
     --icon-container-default: 20px;
   }
@@ -857,7 +851,7 @@
 }
 
 /* Mobile icon controls change the glyph's opacity while the surface stays still. */
-@media (width < 59.5rem) {
+@media (width < 73.8125rem) {
   [data-slot="button"][data-size^="icon"],
   [data-mobile-icon-button] {
     --mobile-icon-button-background: transparent;
@@ -964,7 +958,7 @@
 
 /* Sidebars keep their short open/close slide under reduced motion: without it
    the whole layout jumps a sidebar's width at once. */
-@media (width >= 59.5rem) and (prefers-reduced-motion: reduce) {
+@media (width >= 73.8125rem) and (prefers-reduced-motion: reduce) {
   .workspace-panel-motion[data-animate-visibility],
   [data-workspace-panel-animate] .chat-header,
   .conversations-sidebar[data-sidebar-motion] {
@@ -1082,7 +1076,7 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
 }
 
 /* Mobile drawers use the shared glass layer behind their content. */
-@media (width < 59.5rem) {
+@media (width < 73.8125rem) {
   :root:not(.dark) .sidebar-glass-surface {
     --omni-glass-blur: 16px;
     --omni-glass-brightness: 1;
@@ -1113,7 +1107,7 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
   -webkit-mask-image: linear-gradient(to bottom, black calc(100% - 32px), transparent 100%);
 }
 
-@media (width < 59.5rem) {
+@media (width < 73.8125rem) {
   .session-chat-transcript > [role="log"] {
     --chat-edge-fade: linear-gradient(
       to bottom,
@@ -1250,7 +1244,7 @@ aside[aria-label="Workspace"][data-maximized] {
   backdrop-filter: var(--menu-surface-backdrop-filter);
 }
 
-@media (width < 59.5rem) {
+@media (width < 73.8125rem) {
   .mobile-menu-glass,
   .mobile-menu-glass-layer,
   .dark [data-radix-popper-content-wrapper] > :is(.mobile-menu-glass, .mobile-menu-glass-layer) {
@@ -1279,7 +1273,7 @@ html[data-electron-mac] {
 html[data-electron-mac][data-electron-full-screen] {
   --mac-traffic-light-width: 12px;
 }
-@media (min-width: 59.5rem) {
+@media (min-width: 73.8125rem) {
   /* Reserve the board's shared sidebar toggle only while navigation is closed. */
   .app-shell:not([data-sidebar-open]) .canvas-page-heading {
     padding-left: 4rem;
@@ -1393,7 +1387,7 @@ html[data-electron-mac]
 }
 /* Below md the phone header and drawer carry their own controls, so drop the
  * title-bar cluster and start those headers right of the lights. */
-@media (width < 59.5rem) {
+@media (width < 73.8125rem) {
   html[data-electron-mac] .electron-sidebar-header-actions {
     display: none;
   }
@@ -1491,8 +1485,8 @@ html[data-electron-mac] .breadcrumb-folder {
   margin-top: calc(var(--omnigent-header-height) + max(0px, var(--omnigent-safe-top) - 0.5rem));
 }
 
-/* Settings titles join the mobile header row beside the sidebar control. */
-@media (width < 59.5rem) {
+/* Settings pages scroll under the mobile header's fade, like the session header. */
+@media (width < 73.8125rem) {
   .settings-mobile-header::before {
     position: absolute;
     top: 0;
@@ -1503,31 +1497,10 @@ html[data-electron-mac] .breadcrumb-folder {
     content: "";
     background: linear-gradient(to bottom, var(--background) 0 48px, transparent 80px);
   }
-
-  .settings-page-title {
-    position: fixed;
-    top: 0;
-    right: 4rem;
-    left: 4rem;
-    z-index: 30;
-    height: var(--omnigent-header-height);
-    margin: 0;
-    overflow: hidden;
-    font-size: var(--text-ui);
-    line-height: var(--omnigent-header-height);
-    text-align: center;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    pointer-events: none;
-  }
-
-  :is([data-ios-native], [data-android-native]) .settings-page-title {
-    top: max(0px, calc(var(--omnigent-safe-top) - 0.5rem));
-  }
 }
 
 /* Remaining native-shell adjustments are specific to the mobile layout. */
-@media (width < 59.5rem) {
+@media (width < 73.8125rem) {
   :is([data-ios-native], [data-android-native]) .chat-header {
     --omnigent-header-top-overlap: 0.5rem;
   }
@@ -1667,7 +1640,7 @@ html[data-electron-mac] .breadcrumb-folder {
  * header sits at safe-top - 0.5rem (rule above), so mirror that offset here
  * or the paired bubbles drift 0.5rem apart. Keeps the specificity of the
  * padding rule above and follows it in source order so it wins the tie. */
-@media (width < 59.5rem) {
+@media (width < 73.8125rem) {
   :is([data-ios-native], [data-android-native])
     aside.conversations-sidebar:not(aside[aria-label="Workspace"] *):not([data-collapsed]):not(
       .is-peek
@@ -1676,7 +1649,7 @@ html[data-electron-mac] .breadcrumb-folder {
   }
 }
 
-@media (width < 59.5rem) and (prefers-reduced-motion: reduce) {
+@media (width < 73.8125rem) and (prefers-reduced-motion: reduce) {
   [data-ios-native] .conversations-sidebar {
     transition-duration: 1ms;
   }
@@ -1768,7 +1741,7 @@ html[data-electron-mac] .breadcrumb-folder {
  * while the fixed 16px root keeps every spacing/size utility geometrically
  * stable. Typed multiplication preserves each Tailwind text step relative to
  * the discrete Appearance value without affecting mobile. */
-@media (width >= 59.5rem) {
+@media (width >= 73.8125rem) {
   :root {
     /* The step factors below are Tailwind's rem ratios against a 16px base, so
      * they need the preference on that scale. The default 14px body maps to
@@ -1792,7 +1765,7 @@ html[data-electron-mac] .breadcrumb-folder {
 
 /* Mobile typography and sidebar geometry. The root remains at the global 16px
  * so rem-based controls and spacing keep the same scale across viewports. */
-@media (width < 59.5rem) {
+@media (width < 73.8125rem) {
   /* Mobile defaults to 15px when no preference is saved. An inline value from
    * the Appearance setting overrides this directly, without rescaling. */
   :root {
@@ -1836,8 +1809,8 @@ html[data-electron-mac] .breadcrumb-folder {
   font-size: var(--text-sm);
 }
 
-/* Plain-text message fallbacks use the body tier on touch and narrow screens. */
-@media (width < 59.5rem), (pointer: coarse) {
+/* Plain-text message fallbacks use the body tier in the mobile layout. */
+@media (width < 73.8125rem) {
   .plain-text-fallback.text-message {
     font-size: var(--text-message);
   }
@@ -2873,7 +2846,7 @@ html[data-electron-mac] .breadcrumb-folder {
   border-radius: 9999px;
   background: var(--primary);
 }
-@media (min-width: 59.5rem) {
+@media (min-width: 73.8125rem) {
   :root:not(.dark)[data-theme="custom"][data-custom-translucent-sidebar]
     :is(.conversations-sidebar, aside[aria-label="Workspace"]:not([data-maximized])) {
     background-color: var(--custom-light-sidebar);

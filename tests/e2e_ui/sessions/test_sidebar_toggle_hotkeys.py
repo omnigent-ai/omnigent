@@ -24,7 +24,7 @@ Two design points this exercises end-to-end that the unit test cannot:
 No LLM turn is needed — this is pure client-side keyboard + layout state — so
 it skips the nightly/real-agent markers the approval suites carry. The seeded
 session renders both rails on the desktop viewport these tests run at: the
-sidebar defaults open (``min-width: 768px``), the Workspace rail defaults open
+sidebar defaults open (``min-width: 1181px``), the Workspace rail defaults open
 and always has content (the Agents tab is unconditional).
 """
 

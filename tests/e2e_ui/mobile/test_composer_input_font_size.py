@@ -78,7 +78,7 @@ def test_composer_input_font_setting_and_alignment(
 ) -> None:
     """Landing, command backdrops and interleaved replies share the chosen typography."""
     base_url, session_id = seeded_session
-    mobile = width < 952
+    mobile = width < 1181
     page.set_viewport_size({"width": width, "height": 844})
     page.add_init_script(f"localStorage.setItem('omnigent:ui-font-size', '{font_size}')")
     if native:
@@ -176,7 +176,7 @@ def test_composer_input_font_setting_and_alignment(
     expected_size = font_size
     for name, measured in observed.items():
         assert measured["fontSize"] == pytest.approx(expected_size, abs=0.01), (name, measured)
-        assert measured["lineHeight"] == pytest.approx(expected_size * 1.8, abs=0.02), (
+        assert measured["lineHeight"] == pytest.approx(expected_size * 1.6, abs=0.02), (
             name,
             measured,
         )

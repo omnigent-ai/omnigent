@@ -382,6 +382,12 @@ describe("ChatHeader — open-sidebar toggle visibility", () => {
     expect(container.querySelector("header")).toHaveClass("settings-mobile-header");
   });
 
+  it("drops the settings header fade while the sidebar is open", () => {
+    const { container } = renderHeader({ sidebarOpen: true, settingsMode: true });
+
+    expect(container.querySelector("header")).not.toHaveClass("settings-mobile-header");
+  });
+
   it("cancels the pending peek as soon as the toggle is pressed", () => {
     vi.useFakeTimers();
     const onOpenSidebar = vi.fn();

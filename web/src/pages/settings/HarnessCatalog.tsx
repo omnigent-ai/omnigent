@@ -385,7 +385,7 @@ function PluginPage({
           <PlugIcon className="size-5 text-muted-foreground" />
         </span>
         <div className="flex min-w-0 flex-col">
-          <h1 className="settings-page-title truncate text-2xl font-medium">{plugin.name}</h1>
+          <h1 className="truncate text-2xl font-medium">{plugin.name}</h1>
           <span className="text-sm text-muted-foreground">{pluginDetail(plugin, mcps.length)}</span>
         </div>
       </div>
@@ -462,7 +462,7 @@ function SkillPage({
   return (
     <>
       <BackButton label={backLabel} onClick={onBack} />
-      <h1 className="settings-page-title truncate text-2xl font-medium">{name}</h1>
+      <h1 className="truncate text-2xl font-medium">{name}</h1>
       {query.isPending ? (
         <Notice>Loading skill contents…</Notice>
       ) : query.error ? (

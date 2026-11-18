@@ -445,7 +445,7 @@ function Section({
 }) {
   return (
     <section>
-      <h1 className="settings-page-title text-2xl font-medium">{title}</h1>
+      <h1 className="text-2xl font-medium">{title}</h1>
       {description && (
         <p className="mt-1 text-sm text-muted-foreground max-md:hidden">{description}</p>
       )}

@@ -172,13 +172,13 @@ def test_chat_turn_rail_matches_baseline(
     left inset ramps up (a width-driven clamp in ChatPage) only once the
     conversation area is narrow enough that the centered column would reach the
     rail. At the suite's default 1280px the area stays wide and the auto-margins
-    alone clear the rail, so the guard would be a no-op; 1024px puts the area in
-    the capped regime this baseline is meant to hold — the inset at its maximum,
-    column edge parked clear of the ticks (still past the ``md`` breakpoint that
-    gates the rail's visibility).
+    alone clear the rail, so the guard would be a no-op; 1181px (the narrowest
+    width at the ``md`` breakpoint that gates the rail's visibility) puts the area
+    in the capped regime this baseline is meant to hold — the inset at its maximum,
+    column edge parked clear of the ticks.
     """
     page = snapshot_page
-    page.set_viewport_size({"width": 1024, "height": 800})
+    page.set_viewport_size({"width": 1181, "height": 800})
 
     page.route("**/v1/agents", lambda r: fulfill_json(r, _AGENTS_BODY))
     page.route("**/v1/hosts", lambda r: fulfill_json(r, _HOSTS_BODY))
@@ -205,8 +205,8 @@ def test_chat_turn_rail_matches_baseline(
     # the ticks is what proves this baseline actually captures the rail.
     expect(page.locator(_TURN_TICK)).to_have_count(len(_TURNS), timeout=30_000)
     expect(page.locator('[data-testid="composer-config-gear"]')).to_be_visible(timeout=30_000)
-    # Rendered but collapsed to the harness icon: at 1024px the sidebar and rail
-    # leave the composer too narrow for the model text.
+    # The model text stays mounted even where the narrow composer collapses it
+    # to the harness icon.
     expect(page.locator('[data-testid="composer-agent-config-value"]')).to_have_count(1)
 
     # Hide the "Jump to top" pill for the capture: the initial layout settle

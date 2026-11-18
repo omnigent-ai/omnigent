@@ -603,7 +603,7 @@ export function ChatHeader({
         hasPageTitle && "md:h-26 md:pt-8 md:pb-0",
         // Pages scroll under the header without a background, so only its controls take clicks.
         !conversationId && "pointer-events-none *:pointer-events-auto",
-        settingsMode && "settings-mobile-header",
+        settingsMode && !sidebarOpen && "settings-mobile-header",
       )}
     >
       {/* Left slot: sidebar toggle (when sidebar is closed) and a

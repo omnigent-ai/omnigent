@@ -30,7 +30,7 @@ import os
 from playwright.sync_api import Browser, BrowserContext, Page, expect
 
 # iPhone-12/13-class portrait viewport -- comfortably below the Tailwind
-# ``md`` breakpoint (768px) so every ``max-md:`` rule is in effect.
+# ``md`` breakpoint (1181px) so every ``max-md:`` rule is in effect.
 _MOBILE_VIEWPORT = {"width": 390, "height": 844}
 
 # Minimum mobile tap target (Apple HIG 44pt; WCAG's enhanced target size).
@@ -81,7 +81,7 @@ def _open_session(page: Page, base_url: str, session_id: str) -> None:
     """Load the session page and prove the mobile layout branch is active."""
     page.goto(f"{base_url}/c/{session_id}")
     expect(page.get_by_label("Message the agent")).to_be_visible(timeout=30_000)
-    assert page.evaluate("matchMedia('(max-width: 951.98px)').matches"), (
+    assert page.evaluate("matchMedia('(max-width: 1180.98px)').matches"), (
         "expected the mobile (max-md) layout branch to be in effect"
     )
 

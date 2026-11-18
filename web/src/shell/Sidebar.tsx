@@ -1372,7 +1372,7 @@ function SidebarImpl({
                     src={omnigentWordmark}
                     alt="Omnigent"
                     data-testid="sidebar-wordmark"
-                    className="h-[15px] w-auto shrink-0 translate-y-px max-md:h-5 dark:invert"
+                    className="h-[15px] w-auto shrink-0 translate-y-px max-md:h-[18px] dark:invert"
                   />
                 )}
               </Link>
@@ -3926,14 +3926,13 @@ function SectionHeader({
   /** Whether this header represents the current page context. */
   active?: boolean;
   /** Whether the section also renders header controls overlaid at the right
-      edge. Those overlays are painted whenever hover isn't available (phones,
-      touch tablets/laptops at any width), so the collapsed badges reserve the
-      full control column there; only at rest on hover-capable desktops do the
-      badges return to the rows' badge column. */
+      edge. Those overlays are always painted in the mobile layout, so the
+      collapsed badges reserve the full control column there; only at rest on
+      desktop do the badges return to the rows' badge column. */
   hasAction?: boolean;
   /** Whether an always-visible control sits at the header's right edge (the
       Sessions filter), which the collapsed badges must clear even at rest on
-      hover-capable desktops. */
+      desktop. */
   hasPersistentAction?: boolean;
   /** Match badge fades to an overlay revealed by focus-visible rather than
       focus-within. Section groups use this to ignore pointer-returned focus. */
@@ -3953,17 +3952,17 @@ function SectionHeader({
   // desktops the marker returns to the right edge until the controls appear.
   const clusterRestMargin = showsMarker ? (icon ? "-mr-1" : "mr-1") : "mr-2";
   const clusterHoverDesktopMargin = hasPersistentAction
-    ? "[@media((hover:hover)_and_(pointer:fine))]:md:mr-7"
+    ? "md:mr-7"
     : showsMarker
       ? icon
-        ? "[@media((hover:hover)_and_(pointer:fine))]:md:-mr-1"
-        : "[@media((hover:hover)_and_(pointer:fine))]:md:mr-1"
-      : "[@media((hover:hover)_and_(pointer:fine))]:md:mr-2";
+        ? "md:-mr-1"
+        : "md:mr-1"
+      : "md:mr-2";
   const markerFade =
-    "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/section:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-0";
+    "md:group-hover/section:opacity-0 md:group-has-[[data-state=open]]/header:opacity-0";
   const actionFocusFade = actionFocusVisible
-    ? "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]_:focus-visible]/header:opacity-0"
-    : "[@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-0";
+    ? "md:group-has-[[data-header-controls]_:focus-visible]/header:opacity-0"
+    : "md:group-has-[[data-header-controls]:focus-within]/header:opacity-0";
   const button = (
     <button
       ref={
@@ -4016,7 +4015,7 @@ function SectionHeader({
               active && SIDEBAR_ACTIVE_HIGHLIGHT,
               hasAction &&
                 !showsMarker &&
-                "pr-8 [@media((hover:hover)_and_(pointer:fine))]:pr-14 [@media((hover:hover)_and_(pointer:fine))]:md:pr-2 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:pr-14 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:pr-14 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:pr-14",
+                "pr-8 md:pr-2 md:group-hover/header:pr-14 md:group-has-[[data-header-controls]:focus-within]/header:pr-14 md:group-has-[[data-state=open]]/header:pr-14",
             )
           : cn(
               "group flex h-7 w-full items-center gap-1 border-0 pr-0 pl-2 text-left text-sm font-normal text-muted-foreground transition-colors hover:text-foreground max-md:pl-4",
@@ -4068,12 +4067,9 @@ function SectionHeader({
         <span
           className={cn(
             "ml-auto flex shrink-0 items-center justify-center transition-opacity mobile-app:mr-0 mobile-app:opacity-100",
-            // Touch project rows have one menu; fine pointers also get a shortcut.
+            // Mobile project rows have one menu; desktop also gets a shortcut.
             hasAction
-              ? cn(
-                  icon ? "mr-7 [@media((hover:hover)_and_(pointer:fine))]:mr-14" : "mr-14",
-                  clusterHoverDesktopMargin,
-                )
+              ? cn(icon ? "mr-7" : "mr-14", clusterHoverDesktopMargin)
               : hasPersistentAction
                 ? "mr-7"
                 : clusterRestMargin,
@@ -4489,8 +4485,8 @@ function SectionGroup({
   collapsed: boolean;
   onToggleCollapsed: () => void;
   /** Optional control overlaid at the group header's right edge (e.g. the
-      "collapse all projects" toggle). Always shown without hover support and
-      hover/focus-revealed on hover-capable desktop displays. */
+      "collapse all projects" toggle). Always shown in the mobile layout and
+      hover/focus-revealed on desktop. */
   headerAction?: ReactNode;
   /** Optional control that remains visible at the header's right edge. */
   persistentHeaderAction?: ReactNode;
@@ -4516,7 +4512,7 @@ function SectionGroup({
             className="mobile-app:static mobile-app:translate-y-0 mobile-app:pr-1 mobile-app:pointer-events-auto -translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5"
           >
             {headerAction && (
-              <div className="flex items-center gap-0.5 transition-opacity [@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100">
+              <div className="flex items-center gap-0.5 transition-opacity md:opacity-0 md:has-[:focus-visible]:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100 md:group-hover/header:opacity-100">
                 {headerAction}
               </div>
             )}
@@ -4524,18 +4520,16 @@ function SectionGroup({
           </div>
         ) : (
           headerAction && (
-            // Always visible (and hit-testable) except on md+ displays with a
-            // fine, hover-capable primary pointer — phones, touch tablets and
-            // coarse-pointer convertibles have no reliable hover, and the "New
-            // project" control lives here (the only way to create a project).
-            // On mouse/trackpad desktops it's hover/keyboard-focus-revealed.
+            // Always visible (and hit-testable) in the mobile layout, where the
+            // "New project" control lives here (the only way to create a project).
+            // On desktop it's hover/keyboard-focus-revealed.
             // Reveal on :focus-visible (keyboard) — NOT :focus-within — so
             // clicking the button with the mouse doesn't leave it stuck visible:
             // React reuses the same node when it swaps expand↔revert, so the
             // clicked button keeps focus afterward.
             <div
               data-header-controls
-              className="mobile-app:static mobile-app:translate-y-0 mobile-app:pr-1 mobile-app:pointer-events-auto -translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity [@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100"
+              className="mobile-app:static mobile-app:translate-y-0 mobile-app:pr-1 mobile-app:pointer-events-auto -translate-y-1/2 absolute top-1/2 right-1 flex items-center transition-opacity md:opacity-0 md:has-[:focus-visible]:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100 md:group-hover/header:opacity-100"
             >
               {headerAction}
             </div>
@@ -4715,7 +4709,7 @@ function ConversationSection({
                   ? "ml-auto flex shrink-0 items-center gap-0.5 pr-1"
                   : "mobile-app:static mobile-app:translate-y-0 mobile-app:pr-1 mobile-app:pointer-events-auto -translate-y-1/2 absolute top-1/2 right-1 flex items-center gap-0.5",
                 protectsCollapsedBadge &&
-                  "[@media((hover:hover)_and_(pointer:fine))]:md:pointer-events-none [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:pointer-events-auto [@media((hover:hover)_and_(pointer:fine))]:md:has-[[aria-expanded=true]]:pointer-events-auto",
+                  "md:pointer-events-none md:group-has-[[data-header-controls]:focus-within]/header:pointer-events-auto md:group-hover/header:pointer-events-auto md:group-has-[[data-state=open]]/header:pointer-events-auto md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:pointer-events-auto md:has-[[aria-expanded=true]]:pointer-events-auto",
               )}
             >
               {headerAction && (
@@ -4727,7 +4721,7 @@ function ConversationSection({
                 <div
                   className={cn(
                     "flex items-center rounded transition-opacity",
-                    "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-header-controls]:focus-within]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-state=open]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:md:has-[[aria-expanded=true]]:opacity-100",
+                    "md:opacity-0 md:group-has-[[data-header-controls]:focus-within]/header:opacity-100 md:group-hover/header:opacity-100 md:group-has-[[data-state=open]]/header:opacity-100 md:group-has-[[data-testid=session-filter][aria-expanded=true]]/header:opacity-100 md:has-[[aria-expanded=true]]:opacity-100",
                   )}
                 >
                   {headerAction}
@@ -6692,7 +6686,7 @@ function NewSessionShortcutHint() {
     <CompactShortcutKeys
       keys={newSessionShortcutKeys()}
       className={cn(
-        "pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 opacity-0 transition-opacity group-focus-visible/new-session:opacity-100 [&_kbd]:w-auto [&_kbd]:min-w-4 [&_kbd]:px-0.5 [&_kbd]:font-sans [&_kbd]:text-[10px] [@media((hover:hover)_and_(pointer:fine))]:group-hover/new-session:opacity-100",
+        "pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 opacity-0 transition-opacity group-focus-visible/new-session:opacity-100 [&_kbd]:w-auto [&_kbd]:min-w-4 [&_kbd]:px-0.5 [&_kbd]:font-sans [&_kbd]:text-[10px] md:group-hover/new-session:opacity-100",
         held && "opacity-100",
       )}
     />
@@ -6797,7 +6791,7 @@ function ProjectFolderActions({
             size="icon-xs"
             aria-label={`New session in ${projectName}`}
             data-testid="project-new-session"
-            className="hidden text-muted-foreground [@media((hover:hover)_and_(pointer:fine))]:flex"
+            className="hidden text-muted-foreground md:flex"
           >
             <Link
               to={`/?project=${encodeURIComponent(projectName)}`}
@@ -6844,9 +6838,7 @@ function ProjectFolderMenuItems({
       <C.Item
         asChild
         data-testid="project-new-session-menu"
-        className={
-          hideNewSessionOnDesktop ? "[@media((hover:hover)_and_(pointer:fine))]:hidden" : undefined
-        }
+        className={hideNewSessionOnDesktop ? "md:hidden" : undefined}
       >
         <Link
           to={`/?project=${encodeURIComponent(projectName)}`}

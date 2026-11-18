@@ -266,7 +266,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
       <div className="mb-6 flex items-start justify-between gap-4">
         <div className="flex flex-col gap-1">
           <div className="flex items-center gap-1">
-            <h1 className="settings-page-title text-2xl font-medium">Automations</h1>
+            <h1 className="text-2xl font-medium">Automations</h1>
             <Button
               ref={introButtonRef}
               variant="ghost"

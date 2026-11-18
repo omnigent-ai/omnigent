@@ -53,9 +53,7 @@ describe("sub-agent activity", () => {
       expect(children[0]).toContainElement(screen.getByTestId("assistant-text-section"));
       expect(children[1]).toContainElement(screen.getByRole("button", { name: "Copy" }));
       expect(children[2]).toContainElement(screen.getByTestId("subagent-activity"));
-      expect(screen.getByRole("button", { name: "Copy" })).toHaveClass(
-        "[@media(pointer:coarse)]:size-8",
-      );
+      expect(screen.getByRole("button", { name: "Copy" })).toHaveClass("max-md:size-8");
     },
   );
 

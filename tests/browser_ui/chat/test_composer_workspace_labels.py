@@ -70,7 +70,7 @@ def test_composer_details_wrap_without_clipping(
     page.set_viewport_size({"width": viewport_width, "height": 900})
     page.goto(f"{base_url}/c/{session_id}")
     controls = page.get_by_test_id("composer-workspace-controls")
-    if viewport_width < 952:
+    if viewport_width < 1181:
         expect(controls).to_have_count(0)
         page.get_by_role("button", name=re.compile(r"^(?:Conversation|Session) actions$")).click()
         if has_binding:
@@ -169,7 +169,7 @@ def test_composer_workspace_labels_use_available_width(
     page.set_viewport_size({"width": viewport_width, "height": 900})
     page.goto(f"{base_url}/c/{session_id}")
     controls = page.get_by_test_id("composer-workspace-controls")
-    if viewport_width < 952:
+    if viewport_width < 1181:
         expect(controls).to_have_count(0)
         page.get_by_role("button", name=re.compile(r"^(?:Conversation|Session) actions$")).click()
         menu = page.get_by_role("menu")

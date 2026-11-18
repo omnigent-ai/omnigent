@@ -32,7 +32,7 @@ from playwright.sync_api import Page, ViewportSize, expect
 from tests.e2e_ui.conftest import configure_mock_llm
 
 # iPhone-12-class portrait viewport — comfortably below the Tailwind
-# ``md`` breakpoint (768px) so every ``md:`` rule resolves to its
+# ``md`` breakpoint (1181px) so every ``md:`` rule resolves to its
 # mobile branch.
 _MOBILE_VIEWPORT: ViewportSize = {"width": 390, "height": 844}
 

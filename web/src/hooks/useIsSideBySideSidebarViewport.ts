@@ -3,12 +3,11 @@
 import { useSyncExternalStore } from "react";
 import { MOBILE_BREAKPOINT_PX } from "./useIsMobileViewport";
 
-// Wide phones (an unfolded foldable, a small phone in landscape) are still below
-// `md`, but have room to show the sidebar beside the chat instead of over it:
-// Material's "medium" width class (600dp+) at a squarish-or-wider aspect ratio.
-// Tall narrow tablets and narrow desktop windows (fine pointer) stay on the
-// overlay drawer.
-const SIDE_BY_SIDE_QUERY = `(pointer: coarse) and (min-width: 600px) and (max-width: ${
+// Wide mobile viewports (an unfolded foldable, a small phone in landscape) are
+// still below `md`, but have room to show the sidebar beside the chat instead of
+// over it: Material's "medium" width class (600dp+) at a squarish-or-wider aspect
+// ratio. Tall narrow viewports stay on the overlay drawer.
+const SIDE_BY_SIDE_QUERY = `(min-width: 600px) and (max-width: ${
   MOBILE_BREAKPOINT_PX - 0.02
 }px) and (min-aspect-ratio: 3/4)`;
 

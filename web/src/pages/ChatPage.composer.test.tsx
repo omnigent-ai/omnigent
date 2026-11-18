@@ -318,10 +318,10 @@ function textarea() {
   return screen.getByLabelText("Message the agent") as HTMLTextAreaElement;
 }
 
-function forceDesktopCoarsePointer(): () => void {
+function forceMobileViewport(): () => void {
   const original = window.matchMedia;
   window.matchMedia = ((query: string) => ({
-    matches: query.includes("pointer: coarse"),
+    matches: query.includes("max-width"),
     media: query,
     onchange: null,
     addListener: () => {},
@@ -653,11 +653,11 @@ describe("Composer growth layout", () => {
   });
 
   it("publishes mobile overlay height only when it changes and clears it on unmount", () => {
-    const mediaQuery = window.matchMedia("(max-width: 951.98px)");
+    const mediaQuery = window.matchMedia("(max-width: 1180.98px)");
     vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
       ...mediaQuery,
       media: query,
-      matches: query === "(max-width: 951.98px)",
+      matches: query === "(max-width: 1180.98px)",
     }));
     let height = 48;
     const getRect = HTMLElement.prototype.getBoundingClientRect;
@@ -867,8 +867,8 @@ describe("Composer send shortcut", () => {
     expect(tooltipKeys(tooltip)).toEqual(["Ctrl", "↵"]);
   });
 
-  it("keeps Enter native and hides its hint on a desktop-width coarse pointer", () => {
-    const restorePointer = forceDesktopCoarsePointer();
+  it("keeps Enter native and hides its hint in the mobile layout", () => {
+    const restoreViewport = forceMobileViewport();
     const onSend = vi.fn();
     try {
       render(<Composer {...composerProps({ onSend })} />);
@@ -880,15 +880,14 @@ describe("Composer send shortcut", () => {
       fireEvent.focus(screen.getByRole("button", { name: "Send" }));
       expect(screen.queryByRole("tooltip")).toBeNull();
     } finally {
-      restorePointer();
+      restoreViewport();
     }
   });
 
-  it("leaves plain Enter as a newline on a coarse pointer, even with no menu open", async () => {
-    // Touch keyboards own the send action (the on-screen button), so Enter on
-    // a coarse pointer must stay a plain newline — same rule the landing
-    // composer follows on a phone viewport.
-    const restorePointer = forceDesktopCoarsePointer();
+  it("leaves plain Enter as a newline in the mobile layout, even with no menu open", async () => {
+    // Touch keyboards own the send action (the on-screen button), so Enter in
+    // the mobile layout must stay a plain newline, as in the landing composer.
+    const restoreViewport = forceMobileViewport();
     const onSend = vi.fn();
     try {
       const user = userEvent.setup();
@@ -897,7 +896,7 @@ describe("Composer send shortcut", () => {
       expect(textarea().value).toBe("first\nsecond");
       expect(onSend).not.toHaveBeenCalled();
     } finally {
-      restorePointer();
+      restoreViewport();
     }
   });
 
@@ -4098,11 +4097,11 @@ describe("Composer background tasks", () => {
   it.each([false, true])(
     "keeps a running monitor reachable after foreground work ends (mobile=%s)",
     (mobile) => {
-      const mediaQuery = window.matchMedia("(max-width: 951.98px)");
+      const mediaQuery = window.matchMedia("(max-width: 1180.98px)");
       const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
         ...mediaQuery,
         media: query,
-        matches: mobile && query === "(max-width: 951.98px)",
+        matches: mobile && query === "(max-width: 1180.98px)",
       }));
       onTestFinished(() => matchMedia.mockRestore());
       useChatStore.setState({

@@ -286,7 +286,7 @@ export const MobileMorePage: Story = {
   beforeEach: () => {
     const original = window.matchMedia.bind(window);
     window.matchMedia = (query) => {
-      if (query !== "(max-width: 951.98px)" && query !== "(pointer: coarse)")
+      if (query !== "(max-width: 1180.98px)" && query !== "(pointer: coarse)")
         return original(query);
       return {
         media: query,

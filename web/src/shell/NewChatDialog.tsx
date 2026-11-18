@@ -207,7 +207,6 @@ import {
 } from "@/store/chatStore";
 import { markSessionCreated } from "@/store/interactionTelemetry";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
-import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { MODEL_PICKER_KEYS, useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
 import { CliCommandBlock, renderTextWithInlineCode } from "./CliCommandBlock";
@@ -2304,7 +2303,7 @@ function NewChatWorkspaceControls({
   return (
     <fieldset
       disabled={disabled}
-      className="new-chat-workspace-controls relative isolate z-30 min-w-0 max-w-full self-center rounded-[20px]"
+      className="new-chat-workspace-controls relative isolate z-30 min-w-0 max-w-full self-center rounded-[20px] [--omni-glass-drop-shadow:0_0_#0000]"
     >
       <OmniGlassSurface borderRadius={20} className="-z-10" />
       {children}
@@ -2395,8 +2394,7 @@ function NewChatLandingContent({
   const [handoff] = useState(() => peekNewSessionHandoff(handoffToken));
   const queryClient = useQueryClient();
   const isMobileViewport = useIsMobileViewport();
-  const isCoarsePointer = useIsCoarsePointer();
-  const preventsKeyboardSubmit = isMobileViewport || isCoarsePointer;
+  const preventsKeyboardSubmit = isMobileViewport;
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
   // Single send-telemetry point (see handleCreate). Emitting there rather than
   // via the Start button's componentId covers Enter-key sends too, which never

@@ -83,11 +83,11 @@ describe("KeyboardShortcutsList composer rows", () => {
     expect(keysFor("New line in message")).toEqual(["↵"]);
   });
 
-  it("does not advertise inactive composer chords on touch-primary devices", () => {
+  it("does not advertise inactive composer chords in the mobile layout", () => {
     const matchMedia = window.matchMedia;
     vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
       ...matchMedia(query),
-      matches: query.includes("pointer: coarse"),
+      matches: query.includes("max-width"),
     }));
     render(<KeyboardShortcutsList />);
 
@@ -297,11 +297,11 @@ describe("KeyboardShortcutsList question rows", () => {
     expect(keysFor("Cancel pending question")).toEqual(["Esc"]);
   });
 
-  it("hides the question keys on touch-primary devices", () => {
+  it("hides the question keys in the mobile layout", () => {
     const matchMedia = window.matchMedia;
     vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
       ...matchMedia(query),
-      matches: query.includes("pointer: coarse"),
+      matches: query.includes("max-width"),
     }));
     render(<KeyboardShortcutsList />);
 
