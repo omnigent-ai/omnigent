@@ -27,6 +27,7 @@ from omnigent.tools.builtins import (
     MemorySearchTool,
     MemoryWriteTool,
     ReadSkillFileTool,
+    ReplyToCommentTool,
     SysAdviseModelsTool,
     SysAgentDownloadTool,
     SysAgentGetTool,
@@ -214,7 +215,7 @@ class ToolManager:
 
         Registered without spec opt-in so the agent can browse policy
         templates and add CEL or builtin policies to the current session
-        at runtime; ``tool_groups.policies: false`` drops the pair. The
+        at runtime; ``tool_groups.policies: false`` drops the group. The
         runner dispatches both tools via the Omnigent server's REST
         endpoints.
         """
@@ -605,7 +606,7 @@ class ToolManager:
 
         They proxy the owner-gated projects and session PATCH endpoints the
         sidebar uses, so they grant no access the caller lacks;
-        ``tool_groups.projects: false`` drops the pair.
+        ``tool_groups.projects: false`` drops the group.
         """
         if not self._spec.tool_groups.projects:
             return
@@ -637,11 +638,11 @@ class ToolManager:
 
     def _register_comment_tools(self) -> None:
         """
-        Auto-register ``list_comments`` and ``update_comment``.
+        Auto-register ``list_comments``, ``update_comment`` and ``reply_to_comment``.
 
-        Both tools are framework-owned and register without the spec
+        These tools are framework-owned and register without the spec
         opting in, so the agent can read and update review comments left
-        by the user; ``tool_groups.comments: false`` drops the pair. They
+        by the user; ``tool_groups.comments: false`` drops the group. They
         are session-scoped at invoke time via
         ``ToolContext.conversation_id`` (W1/W2 multi-user guard — the
         agent cannot query another session's comments by supplying a
@@ -651,6 +652,7 @@ class ToolManager:
             return
         self._tools[ListCommentsTool.name()] = ListCommentsTool()
         self._tools[UpdateCommentTool.name()] = UpdateCommentTool()
+        self._tools[ReplyToCommentTool.name()] = ReplyToCommentTool()
 
     def _register_browser_tools(self) -> None:
         """

@@ -363,3 +363,27 @@ async def test_comment_page_rejects_invalid_bounds(
         params={"include_pr_comments": "true", **params},
     )
     assert response.status_code == 422
+
+
+async def test_send_comments_includes_thread(
+    client: httpx.AsyncClient, session_id: str, db_uri: str
+) -> None:
+    from omnigent.server.routes.comments import _format_message
+
+    store = SqlAlchemyCommentStore(db_uri)
+    parent = store.add(session_id, "file.py", "Why this way?", 0, 1)
+    unchanged = _format_message([parent])
+    assert unchanged == (
+        "Please address the following review comments.\n\nFile: file.py\n"
+        "• (offset 0–1): Why this way?"
+    )
+    store.add_reply(parent.id, session_id, "Could you explain?", author_kind="user")
+    store.add_reply(parent.id, session_id, "It preserves order", author_kind="agent")
+    response = await client.post(
+        f"/v1/sessions/{session_id}/comments/send", json={"comment_ids": [parent.id]}
+    )
+    assert response.status_code == 200
+    message = response.json()["formatted_message"]
+    assert f"reply_to_comment(comment_id='{parent.id}'" in message
+    assert "User: Could you explain?" in message and "Agent: It preserves order" in message
+    assert message.index("User:") < message.index("Agent:")

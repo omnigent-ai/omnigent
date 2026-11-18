@@ -44,6 +44,7 @@ from sqlalchemy.orm import Session, aliased
 from omnigent.db.db_models import (
     SqlAccountToken,
     SqlComment,
+    SqlCommentReply,
     SqlHost,
     SqlPolicy,
     SqlSessionPermission,
@@ -256,6 +257,7 @@ def remap_identities(
             # uniqueness on these columns).
             for model, column in (
                 (SqlComment, SqlComment.created_by),
+                (SqlCommentReply, SqlCommentReply.created_by),
                 (SqlPolicy, SqlPolicy.created_by),
             ):
                 result = cast(

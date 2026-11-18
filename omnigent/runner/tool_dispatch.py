@@ -97,6 +97,7 @@ from omnigent.tools.builtins.os_env import (
     SysOsShellTool,
     SysOsWriteTool,
 )
+from omnigent.tools.builtins.reply_to_comment import ReplyToCommentTool
 from omnigent.tools.builtins.scheduled_tasks import (
     reminder_name,
     reminder_prompt,
@@ -453,6 +454,7 @@ _COMMENT_TOOLS = frozenset(
     {
         ListCommentsTool.name(),
         UpdateCommentTool.name(),
+        ReplyToCommentTool.name(),
     }
 )
 
@@ -686,6 +688,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
         for _cls in (
             ListCommentsTool,
             UpdateCommentTool,
+            ReplyToCommentTool,
             SysSessionListTool,
             SysSessionGetHistoryTool,
             SysSessionGetInfoTool,
@@ -5031,7 +5034,56 @@ async def _execute_comment_tool(
         status_filter = _optional_string(args.get("status"))
         if status_filter is not None:
             all_comments = [c for c in all_comments if c.get("status") == status_filter]
+        for comment in all_comments:
+            comment_id = _optional_string(comment.get("id"))
+            if comment_id is None:
+                continue
+            replies: list[_JsonObject] = []
+            cursor_params: dict[str, str | int] = {"limit": 100}
+            try:
+                while True:
+                    response = await server_client.get(
+                        f"{base}/{_route_identifier(comment_id, 'Comment')}/replies",
+                        params=cursor_params,
+                        timeout=30.0,
+                    )
+                    if response.status_code != 200:
+                        return json.dumps(
+                            {"error": f"list_comments replies returned {response.status_code}"}
+                        )
+                    page = response.json()
+                    replies.extend(page["replies"])
+                    cursor = page.get("next_cursor")
+                    if cursor is None:
+                        break
+                    cursor_params.update(
+                        after_created_at=cursor["created_at"], after_id=cursor["id"]
+                    )
+                comment["replies"] = [
+                    {key: reply[key] for key in ("author_kind", "body", "created_at")}
+                    for reply in replies[-20:]
+                ]
+            except Exception as exc:  # noqa: BLE001
+                return json.dumps({"error": f"list_comments replies failed: {exc}"})
         return json.dumps({"comments": all_comments})
+
+    if tool_name == ReplyToCommentTool.name():
+        comment_id = _optional_string(args.get("comment_id"))
+        body = _optional_string(args.get("body"))
+        if not comment_id or body is None:
+            return json.dumps({"error": "comment_id and body are required"})
+        try:
+            response = await server_client.post(
+                f"{base}/{_route_identifier(comment_id, 'Comment')}/replies/agent",
+                json={"body": body},
+                headers={ORCHESTRATION_SOURCE_HEADER: conversation_id},
+                timeout=30.0,
+            )
+            if response.status_code != 200:
+                return json.dumps({"error": f"reply_to_comment returned {response.status_code}"})
+            return json.dumps({"reply": response.json()})
+        except Exception as exc:  # noqa: BLE001
+            return json.dumps({"error": f"reply_to_comment failed: {exc}"})
 
     # update_comment
     comment_id = _optional_string(args.get("comment_id"))

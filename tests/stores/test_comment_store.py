@@ -189,7 +189,10 @@ def test_comment_pages_use_session_primary_key(store: SqlAlchemyCommentStore) ->
     assert cursor == comments[3].id
     assert store.list_page(conversation_id, limit=2, after_id=cursor) == (comments[4:], None)
     assert store.list_page(conversation_id, after_id=comments[-1].id) == ([], None)
-    assert len(queries) == 1
+    # One comment page plus one batched aggregate, independent of comment count.
+    assert len(queries) == 2
+    assert "count(*) OVER" in queries[1][0]
+    assert "comment_replies.body" not in queries[1][0]
     statement, parameters = queries[0]
     with store._engine.connect() as connection:
         assert len(connection.exec_driver_sql(statement, parameters).all()) == 3
@@ -925,3 +928,86 @@ def test_pr_anchor_persists_through_comment_lifecycle(store: SqlAlchemyCommentSt
     deleted = store.delete(comment.id, session_id)
     assert deleted is not None
     assert deleted.anchor_metadata == anchor
+
+
+def test_reply_pagination_cap_and_fingerprint(store: SqlAlchemyCommentStore) -> None:
+    """Replies preserve a stable cursor, obey the cap and invalidate comments."""
+    from omnigent.db.db_models import SqlCommentReply
+    from omnigent.stores.comment_store import MAX_REPLIES_PER_COMMENT, CommentReplyLimitError
+
+    conversation_id = "1" * 32
+    parent = store.add(conversation_id, "file.py", "Why?", 0, 1)
+    before = store.get_comments_fingerprints([conversation_id])[conversation_id]
+    replies = [
+        store.add_reply(parent.id, conversation_id, f"Reply {index}")
+        for index in range(MAX_REPLIES_PER_COMMENT)
+    ]
+    assert all(reply is not None for reply in replies)
+    # Force timestamp ties to exercise the ID tie-break in the actual storage query.
+    with store._session("seed_reply_timestamps") as session:
+        session.query(SqlCommentReply).filter_by(
+            workspace_id=0, conversation_id=conversation_id
+        ).update({"created_at": 7})
+    expected = sorted(
+        (reply for reply in replies if reply is not None), key=lambda reply: reply.id
+    )
+    page, cursor = store.list_replies(parent.id, conversation_id, limit=100)
+    assert [reply.id for reply in page] == [reply.id for reply in expected[:100]]
+    assert cursor == (7, page[-1].id)
+    tail, cursor = store.list_replies(
+        parent.id, conversation_id, limit=100, after_created_at=cursor[0], after_id=cursor[1]
+    )
+    assert [reply.id for reply in tail] == [reply.id for reply in expected[100:]]
+    assert cursor is None
+    assert [reply.id for reply in store.recent_replies(parent.id, conversation_id)] == [
+        reply.id for reply in expected[-20:]
+    ]
+    with pytest.raises(CommentReplyLimitError):
+        store.add_reply(parent.id, conversation_id, "One too many")
+    summary = store.list_for_conversation(conversation_id)[0]
+    assert summary.reply_count == 200
+    assert summary.last_reply is not None
+    assert summary.last_reply.created_at == 7 and summary.last_reply.author_kind == "user"
+    after_add = store.get_comments_fingerprints([conversation_id])[conversation_id]
+    assert after_add.count == before.count
+    assert after_add.last_updated_at > before.last_updated_at
+    assert store.delete_reply(parent.id, conversation_id, page[0].id)
+    assert not store.delete_reply(parent.id, conversation_id, page[0].id)
+    after_delete = store.get_comments_fingerprints([conversation_id])[conversation_id]
+    assert after_delete.last_updated_at > after_add.last_updated_at
+    assert store.list_for_conversation(conversation_id)[0].reply_count == 199
+
+
+@pytest.mark.parametrize("body", ["", " \n", "é" * 6001])
+def test_reply_body_bounds(store: SqlAlchemyCommentStore, body: str) -> None:
+    from omnigent.stores.comment_store import validate_reply_body
+
+    with pytest.raises(ValueError, match="12,000"):
+        validate_reply_body(body)
+    assert store.list_replies("1" * 32, "2" * 32) == ([], None)
+
+
+def test_reply_scoping_and_cleanup(store: SqlAlchemyCommentStore) -> None:
+    """Comment and bounded conversation cleanup leave other tenants intact."""
+    conversation_id = "2" * 32
+    first = store.add(conversation_id, "a.py", "First", 0, 1)
+    second = store.add(conversation_id, "b.py", "Second", 0, 1)
+    reply = store.add_reply(first.id, conversation_id, "Answer", author_kind="agent")
+    assert reply is not None and reply.author_kind == "agent" and reply.created_by is None
+    assert store.get_reply(first.id, "3" * 32, reply.id) is None
+    assert store.add_reply(first.id, "3" * 32, "Wrong session") is None
+    assert not store.delete_reply(second.id, conversation_id, reply.id)
+    with workspace_scope(7):
+        assert store.get_reply(first.id, conversation_id, reply.id) is None
+        tenant_parent = store.add(conversation_id, "c.py", "Tenant", 0, 1)
+        tenant_reply = store.add_reply(tenant_parent.id, conversation_id, "Keep")
+    store.delete(first.id, conversation_id)
+    assert store.list_replies(first.id, conversation_id) == ([], None)
+    # More than a cleanup page exercises continuation without a separate fixture.
+    for index in range(105):
+        store.add_reply(second.id, conversation_id, f"Answer {index}")
+    store.remove_conversation(conversation_id)
+    assert store.list_replies(second.id, conversation_id) == ([], None)
+    with workspace_scope(7):
+        assert tenant_reply is not None
+        assert store.get_reply(tenant_parent.id, conversation_id, tenant_reply.id) == tenant_reply

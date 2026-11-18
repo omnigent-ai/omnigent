@@ -1,6 +1,20 @@
 {
   "components": {
     "schemas": {
+      "AddCommentReplyRequest": {
+        "description": "A reply's plaintext body, validated by the store's byte bounds.",
+        "properties": {
+          "body": {
+            "title": "Body",
+            "type": "string"
+          }
+        },
+        "required": [
+          "body"
+        ],
+        "title": "AddCommentReplyRequest",
+        "type": "object"
+      },
       "AddCommentRequest": {
         "description": "Request body for `POST /sessions/{id}/comments`.",
         "properties": {
@@ -1807,10 +1821,26 @@
             "title": "Id",
             "type": "string"
           },
+          "last_reply": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CommentReplySummary"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "path": {
             "description": "File path relative to the workspace root, e.g. `\"src/App.tsx\"`.",
             "title": "Path",
             "type": "string"
+          },
+          "reply_count": {
+            "default": 0,
+            "format": "int64",
+            "title": "Reply Count",
+            "type": "integer"
           },
           "start_index": {
             "description": "0-based absolute character offset (inclusive) within the file where the anchor range begins.",
@@ -1871,6 +1901,118 @@
           "next_cursor"
         ],
         "title": "CommentPage",
+        "type": "object"
+      },
+      "CommentReply": {
+        "description": "One user or agent message in a comment thread; created_at is epoch \u00b5s.",
+        "properties": {
+          "author_kind": {
+            "title": "Author Kind",
+            "type": "string"
+          },
+          "body": {
+            "title": "Body",
+            "type": "string"
+          },
+          "comment_id": {
+            "title": "Comment Id",
+            "type": "string"
+          },
+          "conversation_id": {
+            "title": "Conversation Id",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "comment_id",
+          "conversation_id",
+          "author_kind",
+          "body",
+          "created_by",
+          "created_at"
+        ],
+        "title": "CommentReply",
+        "type": "object"
+      },
+      "CommentReplyPage": {
+        "description": "Oldest-first reply page.",
+        "properties": {
+          "next_cursor": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ReplyCursor"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "replies": {
+            "items": {
+              "$ref": "#/components/schemas/CommentReply"
+            },
+            "title": "Replies",
+            "type": "array"
+          }
+        },
+        "required": [
+          "replies",
+          "next_cursor"
+        ],
+        "title": "CommentReplyPage",
+        "type": "object"
+      },
+      "CommentReplySummary": {
+        "description": "Latest reply metadata for a collapsed comment, with no plaintext body.",
+        "properties": {
+          "author_kind": {
+            "title": "Author Kind",
+            "type": "string"
+          },
+          "created_at": {
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By"
+          }
+        },
+        "required": [
+          "author_kind",
+          "created_by",
+          "created_at"
+        ],
+        "title": "CommentReplySummary",
         "type": "object"
       },
       "CompactionCompletedEvent": {
@@ -7177,6 +7319,26 @@
         "title": "ReconnectLiveMCPServerRequest",
         "type": "object"
       },
+      "ReplyCursor": {
+        "description": "Exclusive keyset position, in epoch microseconds and reply ID.",
+        "properties": {
+          "created_at": {
+            "format": "int64",
+            "title": "Created At",
+            "type": "integer"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "created_at",
+          "id"
+        ],
+        "title": "ReplyCursor",
+        "type": "object"
+      },
       "ResetSessionModelOverrideRequest": {
         "additionalProperties": false,
         "description": "Reset a launch-time model selection only while that selection is current.",
@@ -8012,6 +8174,11 @@
           "comment_anchor_metadata": {
             "default": true,
             "title": "Comment Anchor Metadata",
+            "type": "boolean"
+          },
+          "comment_replies": {
+            "default": true,
+            "title": "Comment Replies",
             "type": "boolean"
           },
           "databricks_features": {
@@ -23765,6 +23932,291 @@
           }
         },
         "summary": "Update Comment",
+        "tags": [
+          "comments"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/comments/{comment_id}/replies": {
+      "get": {
+        "description": "Read an oldest-first thread page with LEVEL_READ access.",
+        "operationId": "list_comment_replies_v1_sessions__session_id__comments__comment_id__replies_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "comment_id",
+            "required": true,
+            "schema": {
+              "title": "Comment Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after_created_at",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After Created At"
+            }
+          },
+          {
+            "in": "query",
+            "name": "after_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "pattern": "^[0-9a-f]{32}$",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After Id"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommentReplyPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Comment Replies",
+        "tags": [
+          "comments"
+        ]
+      },
+      "post": {
+        "description": "Append a user reply with LEVEL_EDIT access; a full thread returns 409.",
+        "operationId": "add_comment_reply_v1_sessions__session_id__comments__comment_id__replies_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "comment_id",
+            "required": true,
+            "schema": {
+              "title": "Comment Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddCommentReplyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommentReply"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Add Comment Reply",
+        "tags": [
+          "comments"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/comments/{comment_id}/replies/agent": {
+      "post": {
+        "description": "Runner tool transport: require a verified runner bound to this session.\n\nRunner callbacks carry their human owner's credentials and source binding.\nAny editor may delete these unattributed replies, matching comments.",
+        "operationId": "add_agent_comment_reply_v1_sessions__session_id__comments__comment_id__replies_agent_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "comment_id",
+            "required": true,
+            "schema": {
+              "title": "Comment Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AddCommentReplyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommentReply"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Add Agent Comment Reply",
+        "tags": [
+          "comments"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/comments/{comment_id}/replies/{reply_id}": {
+      "delete": {
+        "description": "Delete one's reply with LEVEL_EDIT; unattributed replies allow any editor.\n\nThis mirrors comment deletion, including agent replies with created_by=None.",
+        "operationId": "delete_comment_reply_v1_sessions__session_id__comments__comment_id__replies__reply_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "comment_id",
+            "required": true,
+            "schema": {
+              "title": "Comment Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "reply_id",
+            "required": true,
+            "schema": {
+              "title": "Reply Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": {
+                    "type": "boolean"
+                  },
+                  "title": "Response Delete Comment Reply V1 Sessions  Session Id  Comments  Comment Id  Replies  Reply Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Comment Reply",
         "tags": [
           "comments"
         ]
