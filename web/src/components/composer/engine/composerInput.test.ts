@@ -102,10 +102,12 @@ describe("editing through a non-textarea surface", () => {
 
   it("replaces an explicit range", () => {
     const surface = createFakeComposerSurface("- item");
+    surface.setSelectionRange(0, 0);
 
-    insertComposerText(surface, "\n- ", 6, 6);
+    insertComposerText(surface, "list", 2, 6);
 
-    expect(surface.value).toBe("- item\n- ");
+    expect(surface.inserts).toEqual([{ text: "list", start: 2, end: 6 }]);
+    expect(surface.value).toBe("- list");
   });
 
   it("inserts a short paste through the surface and claims the event", () => {
