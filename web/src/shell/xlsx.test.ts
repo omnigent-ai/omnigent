@@ -95,7 +95,7 @@ const RELATIONSHIPS_NAMESPACE =
   "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
 
 /** A workbook whose sheets ``S1``, ``S2``, … are *sheets*, each at ``xl/worksheets/sheetN.xml``. */
-function workbookOf(sheets: Omit<ZipPart, "name">[]): Uint8Array {
+function workbookOf(sheets: Omit<ZipPart, "name">[], styles?: string): Uint8Array {
   const encoder = new TextEncoder();
   const numbers = sheets.map((_, index) => index + 1);
   const workbook = `<workbook xmlns="${MAIN_NAMESPACE}" xmlns:r="${RELATIONSHIPS_NAMESPACE}"><sheets>${numbers
@@ -110,6 +110,7 @@ function workbookOf(sheets: Omit<ZipPart, "name">[]): Uint8Array {
   return zipOf([
     { name: "xl/workbook.xml", data: encoder.encode(workbook) },
     { name: "xl/_rels/workbook.xml.rels", data: encoder.encode(relationships) },
+    ...(styles ? [{ name: "xl/styles.xml", data: encoder.encode(styles) }] : []),
     ...sheets.map((sheet, index) => ({ ...sheet, name: `xl/worksheets/sheet${index + 1}.xml` })),
   ]);
 }
@@ -157,6 +158,20 @@ describe("readWorkbook", () => {
     expect(sales.table?.columnTypes).toEqual(["text", "number", "number", "date", "text", "text"]);
     expect(sales.table?.totalRows).toBe(3);
     expect(sales.table?.description).toBe("Excel workbook");
+  });
+
+  it("uses the first cell format when a cell omits its style index", async () => {
+    const encoder = new TextEncoder();
+    const worksheet = `<worksheet xmlns="${MAIN_NAMESPACE}"><sheetData>
+      <row><c t="inlineStr"><is><t>date</t></is></c></row>
+      <row><c><v>45658</v></c></row>
+      <row><c s="0"><v>45658</v></c></row>
+    </sheetData></worksheet>`;
+    const styles = `<styleSheet xmlns="${MAIN_NAMESPACE}"><cellXfs count="1"><xf numFmtId="14"/></cellXfs></styleSheet>`;
+    const [sheet] = await readWorkbook(workbookOf([{ data: encoder.encode(worksheet) }], styles));
+
+    expect(sheet.table?.rows).toEqual([["2025-01-01"], ["2025-01-01"]]);
+    expect(sheet.table?.columnTypes).toEqual(["date"]);
   });
 
   it("keeps shared text with commas, accents and line breaks", async () => {

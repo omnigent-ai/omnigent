@@ -420,7 +420,7 @@ function cellText(
   if (type === "s") return sharedStrings[Number(value)] ?? "";
   if (type === "b") return value === "1" ? "TRUE" : "FALSE";
   if (type === "str" || type === "e" || type === "d") return value;
-  const style = dated.get(Number(cell.getAttribute("s") ?? -1));
+  const style = dated.get(Number(cell.getAttribute("s") ?? 0));
   if (style) {
     const serial = Number(value);
     if (Number.isFinite(serial) && typeof style === "object") return elapsedText(serial, style);
