@@ -3726,7 +3726,9 @@ async def test_runner_os_env_cold_shell_preserves_file_helper(
             file_environment.close.assert_not_called()
             shell_environment.read.assert_not_awaited()
             assert create.call_args_list[1] == call(
-                spec.os_env, additional_read_roots=[registry.codex_skills_dir(session_id)]
+                spec.os_env,
+                additional_read_roots=[registry.codex_skills_dir(session_id)],
+                model_access=None,
             )
         assert json.loads(await execute("sys_os_read", {"path": "note.txt"})) == {
             "content": "file"
