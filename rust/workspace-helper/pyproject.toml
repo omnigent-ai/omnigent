@@ -1,0 +1,29 @@
+# The omnigent-workspace-helper wheel: the helper executable, installed on
+# PATH, plus `omnigent_workspace_helper.find_binary()` to locate it. One wheel
+# per platform; the binary doesn't depend on the Python version.
+[build-system]
+requires = ["maturin>=1.9,<2"]
+build-backend = "maturin"
+
+[project]
+name = "omnigent-workspace-helper"
+version = "0.23.0.dev0"
+description = "The Omnigent workspace helper: a workspace's files, search and Git comparisons for the Omnigent host"
+readme = "README.md"
+requires-python = ">=3.12"
+license = "Apache-2.0"
+classifiers = [
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Rust",
+]
+
+[project.urls]
+Homepage = "https://github.com/omnigent-ai/omnigent"
+
+[tool.maturin]
+bindings = "bin"
+python-source = "python"
+module-name = "omnigent_workspace_helper"
+strip = true
+locked = true

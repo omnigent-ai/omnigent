@@ -37,6 +37,7 @@ _PYPROJECTS = [
     "sdks/python-client/pyproject.toml",
     "sdks/ui/pyproject.toml",
     "integrations/slack/pyproject.toml",
+    "rust/workspace-helper/pyproject.toml",
 ]
 # The runtime version constant is stamped/verified alongside the pyprojects.
 _VERSION_PY = "omnigent/version.py"
@@ -55,14 +56,15 @@ def repo_copy(tmp_path: Path) -> Path:
 
 def test_set_version_rewrites_every_location(repo_copy: Path) -> None:
     changed = update_versions.set_version(repo_copy, "9.9.9")
-    # Four pyprojects and omnigent/version.py.
-    assert len(changed) == 5
+    # Five pyprojects and omnigent/version.py.
+    assert len(changed) == 6
     # root: version line + three sibling pins (client, ui-sdk, slack);
-    # client/ui SDKs: version line + one pin; slack: version line only.
+    # client/ui SDKs: version line + one pin; slack and the helper: version line only.
     assert (repo_copy / "pyproject.toml").read_text().count("9.9.9") == 4
     assert (repo_copy / "sdks/python-client/pyproject.toml").read_text().count("9.9.9") == 2
     assert (repo_copy / "sdks/ui/pyproject.toml").read_text().count("9.9.9") == 2
     assert (repo_copy / "integrations/slack/pyproject.toml").read_text().count("9.9.9") == 1
+    assert (repo_copy / "rust/workspace-helper/pyproject.toml").read_text().count("9.9.9") == 1
     # The runtime constant is stamped too.
     assert 'VERSION = "9.9.9"' in (repo_copy / _VERSION_PY).read_text()
     # check() round-trips: all agree and pins are exact.

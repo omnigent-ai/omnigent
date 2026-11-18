@@ -1,8 +1,9 @@
 # Build the `omnigent` release distributions (core wheel with the web
 # UI bundled in, plus the `omnigent-client` and `omnigent-ui-sdk` SDK
-# wheels it depends on), run the readiness gates, and publish all three to
-# (Test)PyPI via OIDC Trusted Publishing. The three version-lock together,
-# so every release publishes all three at the same version. Self-contained:
+# wheels it depends on, and one `omnigent-workspace-helper` binary wheel per
+# platform), run the readiness gates, and publish them all to
+# (Test)PyPI via OIDC Trusted Publishing. They version-lock together,
+# so every release publishes all of them at the same version. Self-contained:
 # publishes straight from this repo on a GitHub-hosted runner for clean public
 # PyPI/npm access (never a mirror/proxy).
 #
@@ -14,7 +15,7 @@
 #      the identical version to PyPI, behind the protected `pypi` env.
 #
 # One-time setup (per index, pypi.org AND test.pypi.org): Trusted Publishers
-# for all three project names pointing at omnigent-ai/omnigent +
+# for all four project names pointing at omnigent-ai/omnigent +
 # release-omnigent.yml + the test-pypi/pypi environment (unclaimed names
 # reserved via a pending publisher); GitHub envs test-pypi (unprotected)
 # and pypi (required reviewer). Actions are SHA-pinned per repo convention.
@@ -40,6 +41,11 @@ on:
   pull_request:
     paths:
       - ".github/workflows/release-omnigent.yml"
+      - "rust/workspace-helper/pyproject.toml"
+      - "rust/workspace-helper/python/**"
+      - "scripts/build_workspace_helper_wheel.sh"
+      - "scripts/check_workspace_helper_wheel.py"
+      - "omnigent/onboarding/sandboxes/workspace_helper_wheels.py"
 
 permissions:
   contents: read
@@ -51,7 +57,123 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # One helper wheel per platform. Linux wheels build in the pypa image for
+  # their C library floor, and every wheel is installed and run on a machine
+  # of its own platform: the manylinux image itself checks the glibc 2.28 floor.
+  workspace-helper-wheels:
+    name: Workspace helper wheel (${{ matrix.platform }})
+    if: github.repository == 'omnigent-ai/omnigent'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        include:
+          - platform: manylinux_2_28_x86_64
+            runner: ubuntu-24.04
+            compatibility: manylinux_2_28
+            build-image: quay.io/pypa/manylinux_2_28_x86_64
+            smoke-image: quay.io/pypa/manylinux_2_28_x86_64
+            smoke-python: /opt/python/cp312-cp312/bin/python
+          - platform: manylinux_2_28_aarch64
+            runner: ubuntu-24.04-arm
+            compatibility: manylinux_2_28
+            build-image: quay.io/pypa/manylinux_2_28_aarch64
+            smoke-image: quay.io/pypa/manylinux_2_28_aarch64
+            smoke-python: /opt/python/cp312-cp312/bin/python
+          - platform: musllinux_1_2_x86_64
+            runner: ubuntu-24.04
+            compatibility: musllinux_1_2
+            build-image: quay.io/pypa/musllinux_1_2_x86_64
+            smoke-image: python:3.12-alpine
+            smoke-python: python3
+          - platform: musllinux_1_2_aarch64
+            runner: ubuntu-24.04-arm
+            compatibility: musllinux_1_2
+            build-image: quay.io/pypa/musllinux_1_2_aarch64
+            smoke-image: python:3.12-alpine
+            smoke-python: python3
+          - platform: macosx_arm64
+            runner: macos-14
+          - platform: macosx_x86_64
+            runner: macos-15-intel
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          # The build names the newest commit that changed the helper.
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: "3.12"
+
+      - name: Read the version
+        id: version
+        run: |
+          python - >> "$GITHUB_OUTPUT" <<'PY'
+          import tomllib
+
+          with open("rust/workspace-helper/pyproject.toml", "rb") as f:
+              print(f"version={tomllib.load(f)['project']['version']}")
+          PY
+          echo "commit=$(git log -1 --format=%H -- rust omnigent/api/workspace/v1alpha1)" >> "$GITHUB_OUTPUT"
+
+      - name: Build the wheel (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p wheel
+          docker run --rm -v "$PWD:/repo" -w /repo \
+            -e WORKSPACE_HELPER_BUILD_VERSION="${{ steps.version.outputs.version }}" \
+            -e WORKSPACE_HELPER_BUILD_COMMIT="${{ steps.version.outputs.commit }}" \
+            -e PYTHON=/opt/python/cp312-cp312/bin/python \
+            "${{ matrix.build-image }}" \
+            sh scripts/build_workspace_helper_wheel.sh wheel "${{ matrix.compatibility }}"
+
+      - name: Build the wheel (macOS)
+        if: runner.os == 'macOS'
+        env:
+          WORKSPACE_HELPER_BUILD_VERSION: ${{ steps.version.outputs.version }}
+          WORKSPACE_HELPER_BUILD_COMMIT: ${{ steps.version.outputs.commit }}
+        run: |
+          mkdir -p wheel
+          scripts/build_workspace_helper_wheel.sh wheel
+
+      - name: Check the wheel's tag and contents
+        run: |
+          ls -la wheel/
+          python scripts/check_workspace_helper_wheel.py contents wheel/*.whl \
+            --platform "${{ matrix.platform }}" --version "${{ steps.version.outputs.version }}"
+
+      - name: Install and run the wheel (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          docker run --rm -v "$PWD:/repo:ro" -w /repo "${{ matrix.smoke-image }}" sh -euc '
+            "${{ matrix.smoke-python }}" -m venv /tmp/smoke
+            /tmp/smoke/bin/python -m pip install --no-index wheel/*.whl
+            /tmp/smoke/bin/python scripts/check_workspace_helper_wheel.py installed \
+              --version "${{ steps.version.outputs.version }}"
+          '
+
+      - name: Install and run the wheel (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/python -m pip install --no-index wheel/*.whl
+          /tmp/smoke/bin/python scripts/check_workspace_helper_wheel.py installed \
+            --version "${{ steps.version.outputs.version }}"
+
+      - name: Upload the wheel
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: workspace-helper-${{ matrix.platform }}
+          path: wheel/*.whl
+          if-no-files-found: error
+
   build-and-publish:
+    needs: workspace-helper-wheels
     # Gated to this repository; inert in forks and mirrors.
     if: github.repository == 'omnigent-ai/omnigent'
     runs-on: ubuntu-24.04
@@ -87,7 +209,7 @@ jobs:
           pnpm install --frozen-lockfile --filter web
           pnpm --filter web run build # Vite outDir -> omnigent/server/static/web-ui
 
-      # 2. Tag-driven: the tag must match the version in all three pyprojects
+      # 2. Tag-driven: the tag must match the version in every pyproject
       #    and the core package's `==` sibling-SDK pins, so the lockstep
       #    contract holds. Skipped on a non-tag ref (nothing to compare).
       - name: Verify tag matches package versions
@@ -104,6 +226,7 @@ jobs:
               "pyproject.toml": ("omnigent-client", "omnigent-ui-sdk"),
               "sdks/python-client/pyproject.toml": ("omnigent",),
               "sdks/ui/pyproject.toml": ("omnigent-client",),
+              "rust/workspace-helper/pyproject.toml": (),
           }
           errors = []
           for path, sibling_pins in packages.items():
@@ -129,6 +252,20 @@ jobs:
           uv build --out-dir dist
           uv run --no-project --with build python scripts/build_subpackages.py \
             --out-dir dist omnigent-client omnigent-ui-sdk
+          ls -la dist/
+
+      # 3b. Add the helper wheels the matrix built, one per platform.
+      - name: Download the workspace helper wheels
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
+        with:
+          pattern: workspace-helper-*
+          path: dist
+          merge-multiple: true
+
+      - name: Check every platform has a helper wheel
+        run: |
+          version=$(uv run --no-project python -c 'import tomllib; print(tomllib.load(open("rust/workspace-helper/pyproject.toml", "rb"))["project"]["version"])')
+          uv run --no-project python scripts/check_workspace_helper_wheel.py complete dist --version "$version"
           ls -la dist/
 
       # 4. Metadata sanity check (long-description renders, fields valid).
@@ -157,12 +294,18 @@ jobs:
           PY
 
       # 6. GATE: the wheels install together and the CLI entry point imports,
-      #    resolving deps from public PyPI (catches proxy-only deps).
+      #    resolving deps from public PyPI (catches proxy-only deps). Of the
+      #    helper wheels, the installed omnigent picks the one this runner can
+      #    install, as it does for a sandbox host.
       - name: Smoke-install the built wheels
         run: |
           uv venv --python 3.12 /tmp/omnigent-smoke
-          uv pip install --python /tmp/omnigent-smoke/bin/python dist/*.whl
+          uv pip install --python /tmp/omnigent-smoke/bin/python dist/*-py3-none-any.whl
           /tmp/omnigent-smoke/bin/omnigent --version
+          helper=$(/tmp/omnigent-smoke/bin/python -m omnigent.onboarding.sandboxes.workspace_helper_wheels select dist)
+          uv pip install --python /tmp/omnigent-smoke/bin/python "dist/$helper"
+          version=$(/tmp/omnigent-smoke/bin/python -c 'import omnigent.version; print(omnigent.version.VERSION)')
+          /tmp/omnigent-smoke/bin/python scripts/check_workspace_helper_wheel.py installed --version "$version"
 
       # 7. Persist the built artifacts for inspection.
       - name: Upload built distributions

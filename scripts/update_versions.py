@@ -1,13 +1,14 @@
 """
 Bump the omnigent project version across all packages in lockstep.
 
-The four distributions in this repo release together at a single
+The five distributions in this repo release together at a single
 version:
 
 - ``omnigent``         — root ``pyproject.toml``
 - ``omnigent-client``  — ``sdks/python-client/pyproject.toml``
 - ``omnigent-ui-sdk``  — ``sdks/ui/pyproject.toml``
 - ``omnigent-slack``   — ``integrations/slack/pyproject.toml``
+- ``omnigent-workspace-helper`` — ``rust/workspace-helper/pyproject.toml``
 
 Each declares its own ``[project].version``. The first three ``==``-pin
 their siblings in ``[project].dependencies``; the root ``omnigent``
@@ -85,7 +86,7 @@ def packages(root: Path) -> list[Package]:
     Return the lockstep packages with their paths rooted at *root*.
 
     :param root: Repo root, e.g. ``Path("/repo")``.
-    :returns: The four :class:`Package` entries.
+    :returns: The five :class:`Package` entries.
     """
     return [
         Package(
@@ -112,6 +113,12 @@ def packages(root: Path) -> list[Package]:
         Package(
             "omnigent-slack",
             root / "integrations" / "slack" / "pyproject.toml",
+            (),
+        ),
+        # The helper binary's wheel; nothing pins it until the host depends on it.
+        Package(
+            "omnigent-workspace-helper",
+            root / "rust" / "workspace-helper" / "pyproject.toml",
             (),
         ),
     ]
