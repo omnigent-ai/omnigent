@@ -85,6 +85,10 @@ const BINDINGS = {
     // The physical key, because Option changes the character it types.
     chords: () => [{ mod: true, alt: true, code: "KeyR" }],
   },
+  "session.toggleUnread": {
+    label: "Mark current session unread or read",
+    chords: () => [{ mod: true, alt: true, code: "KeyU" }],
+  },
   "settings.open": {
     label: "Open Settings",
     // The desktop menu's Settings item owns ⌘, there; a browser keeps ⌘, for its own settings.

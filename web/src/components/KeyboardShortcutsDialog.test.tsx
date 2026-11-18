@@ -173,6 +173,7 @@ describe("KeyboardShortcutsDialog", () => {
     expect(screen.getByText("Open command palette")).toBeTruthy();
     expect(keysFor("Open Settings")).toEqual(["Ctrl", "Alt", ","]);
     expect(keysFor("Rename current session")).toEqual(["Ctrl", "Alt", "R"]);
+    expect(keysFor("Mark current session unread or read")).toEqual(["Ctrl", "Alt", "U"]);
     expect(screen.getByText("Show keyboard shortcuts")).toBeTruthy();
     expect(screen.getByText("Send message")).toBeTruthy();
     expect(keysFor("Open model picker")).toEqual(["Ctrl", "⇧", "M"]);

@@ -29,6 +29,7 @@ describe("shortcut registry", () => {
       "shortcuts.show",
       "session.new",
       "session.rename",
+      "session.toggleUnread",
       "settings.open",
       "history.back",
       "history.forward",
@@ -102,6 +103,21 @@ describe("shortcut registry", () => {
         mac,
       ),
     ).toBe(false);
+  });
+
+  it("toggles unread with the physical U key, including Option's dead key, but not AltGr", () => {
+    const unread = (init: Partial<KeyChordInput>, environment = other) =>
+      matchesShortcut(
+        press({ key: "u", code: "KeyU", ...init }),
+        "session.toggleUnread",
+        environment,
+      );
+    expect(unread({ key: "Dead", metaKey: true, altKey: true }, mac)).toBe(true);
+    expect(unread({ ctrlKey: true, altKey: true })).toBe(true);
+    expect(unread({ ctrlKey: true, altKey: true }, mac)).toBe(false);
+    expect(unread({ ctrlKey: true })).toBe(false);
+    expect(unread({ ctrlKey: true, altKey: true, shiftKey: true })).toBe(false);
+    expect(unread({ ctrlKey: true, altKey: true, altGraph: true })).toBe(false);
   });
 
   it("leaves Settings' chord to the desktop menu when there is one", () => {
