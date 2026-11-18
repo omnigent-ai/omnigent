@@ -169,6 +169,7 @@ def _all_clis_installed(monkeypatch: pytest.MonkeyPatch) -> None:
             return subprocess.CompletedProcess(args=argv, returncode=1, stdout="", stderr="")
         raise AssertionError(f"unexpected subprocess during readiness tests: {argv!r}")
 
+    monkeypatch.setattr(hi, "run_isolated", _stub_run)
     monkeypatch.setattr(hi.subprocess, "run", _stub_run)
     # Auth-aware native harnesses (now including Cursor native) check login state
     # in the picker map. Treat them as logged in when the test just needs
@@ -296,7 +297,7 @@ def test_pi_readiness_uses_selected_executable(
         assert argv == ["/test/selected/pi", "--version"]
         return subprocess.CompletedProcess(argv, 0, stdout=selected_version or "", stderr="")
 
-    monkeypatch.setattr(hi.subprocess, "run", version_probe)
+    monkeypatch.setattr(hi, "run_isolated", version_probe)
     assert _binary_availability_reason("pi") == expected
     assert hi.harness_cli_version_satisfies("pi") is (expected is True)
     version, _range = hi.harness_cli_version("pi")
@@ -975,14 +976,14 @@ def test_timed_out_version_probe_reports_cli_unresponsive_and_passes_launch_gate
 ) -> None:
     """A resolved CLI whose ``--version`` times out is neither outdated nor missing."""
     _all_clis_installed(monkeypatch)
-    answered_run = hi.subprocess.run
+    answered_run = hi.run_isolated
 
     def _hanging_version(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         if argv[1:] == ["--version"]:
             raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
         return answered_run(argv, **kwargs)
 
-    monkeypatch.setattr(hi.subprocess, "run", _hanging_version)
+    monkeypatch.setattr(hi, "run_isolated", _hanging_version)
     result = configured_harness_map()
     for harness in (
         "pi",
@@ -1023,14 +1024,14 @@ def test_unanswered_version_probe_still_requires_antigravity_credential(
     import omnigent.onboarding.gemini_auth as _ga
 
     _all_clis_installed(monkeypatch)
-    answered_run = hi.subprocess.run
+    answered_run = hi.run_isolated
 
     def _hanging_version(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
         if argv[1:] == ["--version"]:
             raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
         return answered_run(argv, **kwargs)
 
-    monkeypatch.setattr(hi.subprocess, "run", _hanging_version)
+    monkeypatch.setattr(hi, "run_isolated", _hanging_version)
     monkeypatch.setattr(_ga, "gemini_login_detected", lambda: False)
     assert configured_harness_map()["antigravity-native"] is False
     assert harness_is_configured("antigravity-native") is False
@@ -1044,7 +1045,7 @@ def test_claude_ready_via_managed_gateway_without_provider_or_cli_login(
 ) -> None:
     """Claude reads ready from its own managed-settings gateway alone.
 
-    The enterprise state (`isaac configure claude`): nothing in omnigent's
+    The enterprise state (a Claude setup): nothing in omnigent's
     config, no subscription login the probe can see, but Claude Code's managed
     settings pin a Unity Gateway + apiKeyHelper and the CLI applies them itself.
     This is the exact "Claude Code isn't configured on <host>" dead end — the

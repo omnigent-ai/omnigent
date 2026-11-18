@@ -41,9 +41,14 @@ interface HarnessCatalogRow {
   id?: string;
   label?: string;
   // Declared capability profile: ``integration_mode`` recognizes the
-  // generic-ACP family and ``effort`` names the reasoning-effort ladder, so
-  // neither needs vendor ids hardcoded here.
-  capabilities?: { integration_mode?: string | null; effort?: string | null } | null;
+  // generic-ACP family, ``effort`` names the reasoning-effort ladder, and
+  // ``workspace_file_mentions`` marks agents that open "@"-mentioned paths, so
+  // none of them needs vendor ids hardcoded here.
+  capabilities?: {
+    integration_mode?: string | null;
+    effort?: string | null;
+    workspace_file_mentions?: boolean | null;
+  } | null;
 }
 
 /** ``capabilities.integration_mode`` of every generic-ACP harness. */
@@ -65,6 +70,8 @@ export interface HarnessCatalog {
   acpHarnesses: ReadonlySet<string>;
   /** harness id → declared effort family (``anthropic``, ``openai``, …). */
   effortFamilies: Record<string, string>;
+  /** ids the server declares ``workspace_file_mentions`` for. */
+  fileMentionHarnesses: ReadonlySet<string>;
 }
 
 /** Pull each row's declared effort family; rows without one are skipped. */
@@ -85,10 +92,12 @@ export async function fetchHarnessCatalog(): Promise<HarnessCatalog> {
   const body = (await res.json()) as HarnessCatalogWire;
   const labels: Record<string, string> = { ...BRAIN_HARNESS_LABELS };
   const acpHarnesses = new Set<string>();
+  const fileMentionHarnesses = new Set<string>();
   for (const row of body.data ?? []) {
     if (typeof row.id !== "string") continue;
     if (typeof row.label === "string") labels[row.id] = row.label;
     if (row.capabilities?.integration_mode === ACP_INTEGRATION_MODE) acpHarnesses.add(row.id);
+    if (row.capabilities?.workspace_file_mentions === true) fileMentionHarnesses.add(row.id);
   }
   // The server keys setup_steps by every spelling (codex-native, opencode, …)
   // so the dialog resolves whatever harness the session declares.
@@ -99,6 +108,7 @@ export async function fetchHarnessCatalog(): Promise<HarnessCatalog> {
     setupSteps,
     acpHarnesses,
     effortFamilies: effortFamiliesFromCatalog(body.data ?? []),
+    fileMentionHarnesses,
   };
 }
 
@@ -191,6 +201,17 @@ const NO_ACP_HARNESSES: ReadonlySet<string> = new Set<string>();
  */
 export function useAcpHarnessIds(enabled = true): ReadonlySet<string> {
   return useHarnessCatalog((c) => c.acpHarnesses, NO_ACP_HARNESSES, enabled);
+}
+
+const NO_FILE_MENTION_HARNESSES: ReadonlySet<string> = new Set<string>();
+
+/**
+ * Catalog harness ids whose agent opens an "@"-mentioned workspace path
+ * (``capabilities.workspace_file_mentions``). Native wrappers aren't catalog
+ * rows; ``harnessSupportsFileMentions`` covers them via the native registry.
+ */
+export function useFileMentionHarnesses(): ReadonlySet<string> {
+  return useHarnessCatalog((c) => c.fileMentionHarnesses, NO_FILE_MENTION_HARNESSES);
 }
 
 const NO_EFFORT_FAMILIES: Record<string, string> = {};

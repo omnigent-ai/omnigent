@@ -1853,6 +1853,46 @@ describe("BlockStream — elicitation", () => {
     });
   });
 
+  it("marks only a card the server sends with is_blocking=false as non-blocking", () => {
+    const blockFor = (extra: Record<string, unknown>) => {
+      const event = parseEvent("response.elicitation_request", {
+        elicitation_id: "elic_async",
+        params: {
+          mode: "form",
+          message: "Codex needs input",
+          phase: "codex_request_user_input",
+          policy_name: "codex_native_request_user_input",
+          ...extra,
+        },
+      });
+      if (event === null) throw new Error("expected an elicitation request");
+      const card = reduce([event]).find((b): b is ElicitationBlock => b.type === "elicitation");
+      if (card === undefined) throw new Error("expected an elicitation card");
+      return card;
+    };
+
+    expect(blockFor({ is_blocking: false }).isBlocking).toBe(false);
+    expect(blockFor({})).not.toHaveProperty("isBlocking");
+    expect(blockFor({ is_blocking: true })).not.toHaveProperty("isBlocking");
+  });
+
+  it("keeps the task a workflow question is about on its card", () => {
+    const card = (params: Record<string, unknown>) => {
+      const event = parseEvent("response.elicitation_request", {
+        elicitation_id: "elicit_journal_1",
+        params: { mode: "form", message: "Waiting for you on Deploy", ...params },
+      });
+      if (event === null) throw new Error("expected an elicitation request");
+      return reduce([event]).find((b): b is ElicitationBlock => b.type === "elicitation");
+    };
+
+    expect(card({ phase: "workflow_request_input", journal_step: "deploy" })).toMatchObject({
+      phase: "workflow_request_input",
+      journalStep: "deploy",
+    });
+    expect(card({ phase: "workflow_request_input" })).not.toHaveProperty("journalStep");
+  });
+
   it("flushes pending text before an elicitation prompt", () => {
     const blocks = reduce([
       { type: "response_created", response: makeResponse({ responseId: "resp_plan" }) },

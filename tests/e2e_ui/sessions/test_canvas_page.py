@@ -15,12 +15,18 @@ from tests.e2e_ui.conftest import _build_hello_world_bundle
 
 
 def _stub_server_info(
-    page: Page, *, canvas: bool, usage: bool = False, session_pull_requests: bool = False
+    page: Page,
+    *,
+    canvas: bool,
+    usage: bool = False,
+    session_pull_requests: bool = False,
+    comment_anchor_metadata: bool = False,
 ) -> None:
     """Advertise one deterministic ``canvas`` release-feature value.
 
     :param session_pull_requests: Whether the server stores session PRs, so
         Canvas cards read them from the session list rather than each runner.
+    :param comment_anchor_metadata: Whether session comments preserve PR anchors.
     """
     body = json.dumps(
         {
@@ -32,6 +38,7 @@ def _stub_server_info(
             "harness_install_enabled": False,
             "installable_harnesses": [],
             "session_pull_requests": session_pull_requests,
+            "comment_anchor_metadata": comment_anchor_metadata,
         }
     )
     page.route(

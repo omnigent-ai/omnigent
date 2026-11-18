@@ -59,6 +59,7 @@ from omnigent.harnesses.opencode_native.client import (
     OPENCODE_MIN_VERSION,
 )
 from omnigent.inner import _proc
+from omnigent.inner._proc import run_isolated
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
 
 _logger = logging.getLogger(__name__)
@@ -1096,13 +1097,12 @@ def _harness_cli_version_string(
         if cached is not None and time.monotonic() < cached[1]:
             return cached[0]
     try:
-        completed = subprocess.run(
+        completed = run_isolated(
             [binary, "--version"],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=timeout,
-            check=False,
             cwd=probe_cwd,
         )
     except subprocess.TimeoutExpired:
@@ -1440,9 +1440,8 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
         if time.monotonic() < _LOGIN_PROBE_CACHE.get(cache_key, 0.0):
             return True
     try:
-        result = subprocess.run(
+        result = run_isolated(
             [binary, *spec.status_args],
-            check=False,
             timeout=timeout,
             # Concurrent probes must not change or restore a shared terminal's input mode.
             stdin=subprocess.DEVNULL,

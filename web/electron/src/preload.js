@@ -236,14 +236,14 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    */
   controlHost: (action) => ipcRenderer.invoke("omnigent:host-control", action),
   /**
-   * Desktop feature gates the server can't know about — currently
+   * Desktop feature gates the server can't know about: currently
    * `{ databricksInternalFeatures }` from macOS Managed Preferences, scoped
-   * to the window's server (true only on Databricks-managed servers).
+   * to the window's server (true only on managed servers).
    * Resolves null off a connected server.
    */
   getDesktopFeatures: () => ipcRenderer.invoke("omnigent:get-desktop-features"),
   /**
-   * Connect the user's Arca instance (Databricks-internal) to the window's
+   * Connect the user's Arca instance to the window's
    * server as a host, via `arca ssh`. Native consent is asked in the main
    * process. Resolves a `{ ok, error?, authError? }` result.
    */
@@ -259,14 +259,28 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
          */
         connectSshHost: (destination) => ipcRenderer.invoke("omnigent:ssh-connect", destination),
       }),
+  // Main checks a socket's owner before using it, which Windows can't report.
+  ...(process.platform === "win32"
+    ? {}
+    : {
+        /**
+         * Send one workspace API call to a session host's socket, named by the
+         * server with a token: on this machine, or over SSH. `sshTarget` is an
+         * alias main may ask the user to allow, then try and record, if the
+         * host has none yet.
+         * Resolves `{ status, headers, body }`.
+         * @param {{hostId: string, sshTarget?: string, socketPath: string, path: string, headers: Record<string, string>, body: Uint8Array}} request
+         */
+        workspaceSocketRequest: (request) =>
+          ipcRenderer.invoke("omnigent:workspace-socket-request", request),
+      }),
   /** Extend the local Arca instance with one of the main process's approved modes. */
   extendArca: (mode) => ipcRenderer.invoke("omnigent:arca-extend", mode),
   /**
-   * Renew this machine's dbcert (Databricks-internal); Arca Companion copies
-   * it to the user's Arcas and Arclets. Resolves a `{ ok, error? }` result.
+   * Renew this machine's dbcert. Resolves a `{ ok, error? }` result.
    */
   refreshDbcert: (options) => ipcRenderer.invoke("omnigent:dbcert-refresh", options),
-  /** Check the laptop's dbcert without starting sign-in. */
+  /** Check this machine's dbcert without starting sign-in. */
   checkDbcert: () => ipcRenderer.invoke("omnigent:dbcert-check"),
 
   /**
@@ -386,10 +400,21 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * @returns {Promise<{ ok: boolean, dataUrl?: string, error?: string }>}
    */
   browserScreenshot: (conversationId, opts) =>
-    ipcRenderer.invoke("omnigent:browser-screenshot", { conversationId, opts }),
+    ipcRenderer.invoke("omnigent:browser-screenshot", {
+      deadlineAt: opts?.deadlineAt,
+      conversationId,
+      opts,
+    }),
   /** Perform a fixed snapshot, click or type action in the conversation's view. */
   browserPerformAction: (conversationId, action, params, opts) =>
     ipcRenderer.invoke("omnigent:browser-perform-action", { conversationId, action, params, opts }),
+  // The agent browser tools' per-session tab records, kept in main (browserTabs.js).
+  browserTabs: (args) => ipcRenderer.invoke("omnigent:browser-tabs", args),
+  onBrowserTabsChanged: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("omnigent:browser-tabs-changed", listener);
+    return () => ipcRenderer.removeListener("omnigent:browser-tabs-changed", listener);
+  },
   /** @deprecated Until v0.21: main translates only recognized v0.18 action templates. */
   browserExecute: (conversationId, js, opts) =>
     ipcRenderer.invoke("omnigent:browser-execute", { conversationId, js, opts }),
@@ -398,8 +423,13 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * @param {string} conversationId
    * @param {string} [reason]
    */
-  browserClose: (conversationId, reason) =>
-    ipcRenderer.invoke("omnigent:browser-close", { conversationId, reason }),
+  browserClose: (conversationId, reason, opts) =>
+    ipcRenderer.invoke("omnigent:browser-close", {
+      conversationId,
+      reason,
+      deadlineAt: opts?.deadlineAt,
+      expectedNavs: opts?.expectedNavs,
+    }), // deadlineAt, expectedNavs
   /**
    * Subscribe to which conversation's browser view is currently attached to the
    * host window (`{conversationId}` or `{conversationId: null}` when detached).
@@ -426,6 +456,20 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   /** Enable native Ctrl+Tab forwarding only while this renderer supports it. */
   browserSetRecentSessionSwitchSupported: (supported) =>
     ipcRenderer.invoke("omnigent:browser-set-recent-session-switch-supported", { supported }),
+  /**
+   * Subscribe to page links Cmd/Ctrl- or middle-clicked in an embedded browser
+   * view (`{conversationId, url}`, where conversationId is the clicked view's id).
+   * @param {(payload: { conversationId: string, url: string }) => void} callback
+   * @returns {() => void}
+   */
+  onBrowserOpenTab: (callback) => {
+    const listener = (_event, payload) => callback(payload);
+    ipcRenderer.on("browser-open-tab", listener);
+    return () => ipcRenderer.removeListener("browser-open-tab", listener);
+  },
+  /** Route modifier-clicked page links to `onBrowserOpenTab` while supported. */
+  browserSetOpenTabSupported: (supported) =>
+    ipcRenderer.invoke("omnigent:browser-set-open-tab-supported", { supported }),
   /** Clear the native Ctrl+Tab latch when the renderer has no sessions to show. */
   browserCancelRecentSessionSwitch: () =>
     ipcRenderer.invoke("omnigent:browser-cancel-recent-session-switch"),
@@ -648,6 +692,8 @@ contextBridge.exposeInMainWorld("omnigentSetup", {
    *  `{ok, error?}`; output streams via onRunnerConnectLog.
    *  @param {string} url @param {"local"|"remote"} runner */
   connectRunner: (url, runner) => ipcRenderer.invoke("omnigent:connect-runner", url, runner),
+  /** Stop the in-flight connectRunner sign-in. Resolves whether one was running. */
+  cancelRunnerConnect: () => ipcRenderer.invoke("omnigent:cancel-runner-connect"),
   /** Subscribe to connectRunner output. Returns an unsubscribe function.
    *  @param {(line: string) => void} callback */
   onRunnerConnectLog: (callback) => {

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 import tempfile
 from collections.abc import Mapping
 from pathlib import Path
@@ -22,9 +24,55 @@ from omnigent._wrapper_labels import (
     UI_MODE_TERMINAL_VALUE,
     WRAPPER_LABEL_KEY,
 )
+from omnigent.process_logging import redact_log_text
 from tests._helpers.session import bundle_files, post_session_bundle
 
 NativeHarness = Literal["antigravity", "claude", "codex", "cursor", "goose", "kiro", "hermes"]
+
+_SENSITIVE_RESPONSE_KEY_PATTERN = re.compile(
+    r"authorization|token|secret|password|passwd|passphrase|credential|cookie"
+    r"|(?:api|private)[\s_.-]*key",
+    re.IGNORECASE,
+)
+_ENCODED_RESPONSE_ESCAPE_PATTERN = re.compile(r"\\(?:u[0-9a-f]{4}|x[0-9a-f]{2})", re.IGNORECASE)
+_MAX_DIAGNOSTIC_RESPONSE_BYTES = 16 * 1024
+
+
+def _redacted_response_text(response: httpx.Response) -> str:
+    if len(response.content) > _MAX_DIAGNOSTIC_RESPONSE_BYTES:
+        return "[Response body omitted: too large]"
+
+    def redact(value: Any) -> Any:
+        if isinstance(value, dict):
+            result = {}
+            for key, item in value.items():
+                safe_key = redact(key)
+                key_changed = safe_key != key
+                if key_changed:
+                    suffix = 1
+                    while safe_key in value or safe_key in result:
+                        safe_key = f"[REDACTED-{suffix}]"
+                        suffix += 1
+                result[safe_key] = "[REDACTED]" if key_changed else redact(item)
+            return result
+        if isinstance(value, list):
+            return [redact(item) for item in value]
+        if isinstance(value, str):
+            # Validation strings can echo arbitrary metadata, including containers.
+            if (
+                "input_value=" in value
+                or _SENSITIVE_RESPONSE_KEY_PATTERN.search(value)
+                or _ENCODED_RESPONSE_ESCAPE_PATTERN.search(value)
+            ):
+                return "[REDACTED]"
+            redacted = redact_log_text(value, include_whitespace_credentials=True)
+            return "[REDACTED]" if redacted != value else value
+        return value
+
+    try:
+        return json.dumps(redact(response.json()))
+    except (ValueError, RecursionError):
+        return "[Response body omitted: invalid or excessively nested JSON]"
 
 
 def create_native_session(
@@ -103,5 +151,12 @@ def create_native_session(
         headers=headers,
         timeout=30.0,
     )
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as error:
+        error.add_note(
+            "Native session create response (redacted, up to 2048 characters): "
+            + _redacted_response_text(response)[:2048]
+        )
+        raise
     return response.json()

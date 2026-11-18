@@ -300,3 +300,21 @@ export function nativePermissionOptions(harness: string | null | undefined) {
       return [];
   }
 }
+
+/** The named mode each harness starts in by default, e.g. Codex's "default". */
+export function nativeDefaultPermissionMode(harness: string | null | undefined): string | null {
+  switch (harness) {
+    case "claude-native":
+      return CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE;
+    case "codex-native":
+      return CODEX_NATIVE_DEFAULT_APPROVAL_MODE;
+    case "cursor-native":
+      return CURSOR_NATIVE_DEFAULT_EXEC_MODE;
+    case "antigravity-native":
+      return AGY_NATIVE_DEFAULT_SKIP_MODE;
+    case "devin-native":
+      return DEVIN_NATIVE_DEFAULT_PERMISSION_MODE;
+    default:
+      return null;
+  }
+}

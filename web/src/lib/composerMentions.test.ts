@@ -2,13 +2,16 @@ import { describe, expect, it } from "vitest";
 
 import {
   detectMentionAt,
+  recallFileMentions,
   recallSessionMentions,
   composerInlineMentions,
   expandMentionTokens,
   findMentionTokens,
+  harnessSupportsFileMentions,
   mentionTokenAtCaret,
   newFileMentionToken,
   presentMentions,
+  presentTaggedMentions,
   rankSessionMentions,
   readableSentText,
   replaceSentMentions,
@@ -137,6 +140,19 @@ describe("expanding composer text", () => {
     expect(presentMentions(mentions, ["only @auth here"]).map((m) => m.token)).toEqual(["@auth"]);
   });
 
+  it("keeps only the tagged files and sessions whose token is still present", () => {
+    const tagged = {
+      files: [{ path: "src/app.ts", isDir: false, token: "@src/app.ts" }],
+      sessions: [{ ...alpha, token: "@Alpha planning" }],
+    };
+    expect(presentTaggedMentions(tagged, ["check @Alpha planning"])).toEqual({
+      files: [],
+      sessions: [{ ...alpha, token: "@Alpha planning" }],
+    });
+    expect(presentTaggedMentions(tagged, ["nothing tagged"])).toBeUndefined();
+    expect(presentTaggedMentions(undefined, ["@src/app.ts"])).toBeUndefined();
+  });
+
   it("appends the hint once, only when a session is tagged", () => {
     expect(withSessionMentionHint("go ", true)).toBe(`go\n\n${SESSION_MENTION_HINT}`);
     expect(withSessionMentionHint("go", false)).toBe("go");
@@ -232,6 +248,38 @@ describe("detectMentionAt", () => {
   });
 });
 
+describe("recallFileMentions", () => {
+  it("turns relative file markers back into tokens and tags", () => {
+    expect(
+      recallFileMentions(
+        "check [Attached: src/app.ts] and [Attached file: docs/] lines [Attached: a.ts:3-9]",
+      ),
+    ).toEqual({
+      text: "check @src/app.ts and @docs/ lines @a.ts:3-9",
+      files: [
+        { path: "src/app.ts", isDir: false },
+        { path: "docs", isDir: true },
+        { path: "a.ts", isDir: false, lineRange: { start: 3, end: 9 } },
+      ],
+    });
+  });
+
+  it("gives a file a token no recalled session uses", () => {
+    expect(recallFileMentions("see [Attached: README.md]", ["@README.md"])).toEqual({
+      text: "see @README.md (file)",
+      files: [{ path: "README.md", isDir: false, token: "@README.md (file)" }],
+    });
+  });
+
+  it("drops upload markers and leaves session markers alone", () => {
+    const session = '[Session: "Fix CI" id=sess_1 subagent=no]';
+    expect(recallFileMentions(`[Attached: /tmp/up.png]see ${session}`)).toEqual({
+      text: `see ${session}`,
+      files: [],
+    });
+  });
+});
+
 describe("recallSessionMentions", () => {
   const plan = (id: string) => `[Session: "Plan" id=${id} subagent=no]`;
 
@@ -252,5 +300,24 @@ describe("recallSessionMentions", () => {
   it("leaves markers the user typed alone when there is no trailing hint", () => {
     const text = `why does ${plan("s_x")} look like this?`;
     expect(recallSessionMentions(text)).toEqual({ main: text, others: [], sessions: [] });
+  });
+});
+
+describe("harnessSupportsFileMentions", () => {
+  const declared = new Set(["claude-sdk"]);
+
+  it("covers native harnesses through the agent registry", () => {
+    expect(harnessSupportsFileMentions("claude-native", new Set())).toBe(true);
+    expect(harnessSupportsFileMentions("native-pi", new Set())).toBe(true);
+  });
+
+  it("covers other harnesses only when the server declares them", () => {
+    expect(harnessSupportsFileMentions("claude-sdk", declared)).toBe(true);
+    expect(harnessSupportsFileMentions("claude-sdk", new Set())).toBe(false);
+    expect(harnessSupportsFileMentions("openai-agents", declared)).toBe(false);
+  });
+
+  it("is false before the session's harness is known", () => {
+    expect(harnessSupportsFileMentions(null, declared)).toBe(false);
   });
 });

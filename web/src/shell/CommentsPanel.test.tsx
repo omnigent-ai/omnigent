@@ -197,6 +197,24 @@ describe("CommentsPanel read-only collaborator gating", () => {
     expect(screen.getByRole("button", { name: "Add Comment" })).toBeInTheDocument();
   });
 
+  it("does not add the comment on the Enter that confirms an IME candidate", () => {
+    const onAddComment = vi.fn();
+    renderGated({ canEdit: true, activeSelection: FRESH_SELECTION, handlers: { onAddComment } });
+    const box = screen.getByPlaceholderText("Add a comment…");
+    fireEvent.change(box, { target: { value: "漢字" } });
+
+    // Chrome flags the confirming Enter with keyCode 229; Safari sends a plain
+    // Enter before compositionend, so only the tracked composition catches it.
+    fireEvent.keyDown(box, { key: "Enter", keyCode: 229 });
+    fireEvent.compositionStart(box);
+    fireEvent.keyDown(box, { key: "Enter" });
+    fireEvent.compositionEnd(box);
+    expect(onAddComment).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(onAddComment).toHaveBeenCalledWith("漢字");
+  });
+
   it("hides per-comment Edit and Delete actions when read-only", () => {
     renderGated({ canEdit: false, comments: [makeComment("c1")] });
     expect(screen.queryByRole("button", { name: "Edit" })).toBeNull();

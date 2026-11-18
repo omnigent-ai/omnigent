@@ -392,3 +392,52 @@ describe("mobile sidebar drawer swipe to close", () => {
     expect(onClose).not.toHaveBeenCalled();
   });
 });
+
+// Opening the drawer by swipe leaves focus where it was; a still-focused chat
+// composer would keep the iOS soft keyboard up over the open drawer.
+describe("mobile sidebar drawer keyboard dismissal", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    document.body.querySelectorAll("textarea[data-test-composer]").forEach((el) => el.remove());
+  });
+
+  function focusComposer(): HTMLTextAreaElement {
+    const composer = document.createElement("textarea");
+    composer.dataset.testComposer = "";
+    document.body.appendChild(composer);
+    composer.focus();
+    return composer;
+  }
+
+  it("blurs a focused composer outside the drawer when the drawer opens", () => {
+    stubMobileLayout(true);
+    const { setOpen } = renderSidebar({ open: false });
+    const composer = focusComposer();
+    expect(composer).toHaveFocus();
+
+    setOpen(true);
+
+    expect(composer).not.toHaveFocus();
+  });
+
+  it("keeps the composer focused when the window narrows with the sidebar open", () => {
+    stubMobileLayout(false);
+    const { setOpen } = renderSidebar({ open: true });
+    const composer = focusComposer();
+
+    stubMobileLayout(true);
+    setOpen(true);
+
+    expect(composer).toHaveFocus();
+  });
+
+  it("keeps the composer focused when the drawer opens on the desktop layout", () => {
+    stubMobileLayout(false);
+    const { setOpen } = renderSidebar({ open: false });
+    const composer = focusComposer();
+
+    setOpen(true);
+
+    expect(composer).toHaveFocus();
+  });
+});

@@ -15,6 +15,7 @@ import {
   getScheduledTask,
   listScheduledTaskRuns,
   listScheduledTasks,
+  listSharedScheduledTasks,
   listAutomationFailures,
   runScheduledTaskNow,
   updateScheduledTask,
@@ -110,14 +111,74 @@ describe("listScheduledTasks", () => {
     fetchMock.mockResolvedValueOnce(mockResponse({}));
     await expect(listScheduledTasks()).resolves.toEqual([]);
   });
+
+  // Servers that predate task MCP services omit the key.
+  it.each([
+    ["absent", {}, []],
+    ["present", { mcp_services: ["github", "slack"] }, ["github", "slack"]],
+  ])("maps a task's MCP services (%s)", async (_, extra, mcpServices) => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ scheduled_tasks: [{ ...TASK_WIRE, ...extra }] }),
+    );
+    const [task] = await listScheduledTasks();
+    expect(task.mcpServices).toEqual(mcpServices);
+  });
 });
 
 describe("getScheduledTask", () => {
+  it.each([undefined, null, 2.5])("reads the saved cost limit (%s)", async (maxCostUsd) => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ ...TASK_WIRE, max_cost_usd: maxCostUsd }));
+    expect((await getScheduledTask("st_1")).maxCostUsd).toBe(maxCostUsd ?? null);
+  });
+
   it("GETs /v1/scheduled-tasks/{id} and encodes the id", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
     const task = await getScheduledTask("st 1");
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/scheduled-tasks/st%201");
     expect(task.id).toBe("st_1");
+    // Older servers return only the caller's own tasks.
+    expect(task).toMatchObject({ viewerRole: "owner", ownerDisplayName: null });
+  });
+
+  it("names the owner of a task shared with the caller", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ ...TASK_WIRE, viewer_role: "viewer", owner_display_name: "Alice" }),
+    );
+    expect(await getScheduledTask("st_1")).toMatchObject({
+      viewerRole: "viewer",
+      ownerUserId: "alice",
+      ownerDisplayName: "Alice",
+    });
+  });
+});
+
+describe("listSharedScheduledTasks", () => {
+  it("requests bounded pages and keeps a cursor after a short page", async () => {
+    const shared = { ...TASK_WIRE, viewer_role: "viewer", owner_display_name: "Alice" };
+    fetchMock.mockResolvedValueOnce(mockResponse({ scheduled_tasks: [], next_cursor: "st_0" }));
+    expect(await listSharedScheduledTasks(null)).toEqual({ tasks: [], nextCursor: "st_0" });
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/scheduled-tasks/shared?limit=50");
+
+    fetchMock.mockResolvedValueOnce(mockResponse({ scheduled_tasks: [shared], next_cursor: null }));
+    const page = await listSharedScheduledTasks("st_0");
+    expect(fetchMock.mock.calls[1][0]).toBe("/v1/scheduled-tasks/shared?limit=50&after=st_0");
+    expect(page.nextCursor).toBeNull();
+    expect(page.tasks.map((task) => [task.id, task.viewerRole, task.ownerDisplayName])).toEqual([
+      ["st_1", "viewer", "Alice"],
+    ]);
+  });
+
+  it("throws the server's error", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse(
+        { error: { code: "forbidden", message: "Agents cannot list" } },
+        { ok: false, status: 403 },
+      ),
+    );
+    await expect(listSharedScheduledTasks(null)).rejects.toMatchObject({
+      status: 403,
+      code: "forbidden",
+    });
   });
 });
 
@@ -149,7 +210,8 @@ describe("listScheduledTaskRuns", () => {
       firedAt: 1_700_000_005,
       finishedAt: 1_700_000_050,
       errorCode: null,
-      // An older server sends no session read state.
+      // An older server sends no failure detail or session read state.
+      errorDetail: null,
       conversationUpdatedAt: null,
       conversationStatus: null,
       viewerLastSeen: null,
@@ -159,19 +221,20 @@ describe("listScheduledTaskRuns", () => {
     });
   });
 
-  it("maps a run's session read state when the server sends it", async () => {
+  it("maps a run's failure detail and session read state when the server sends them", async () => {
     fetchMock.mockResolvedValueOnce(
       mockResponse({
         runs: [
           {
             id: "run_1",
             scheduled_task_id: "st_1",
-            status: "succeeded",
+            status: "failed",
             scheduled_at: 1_700_000_000,
             conversation_id: "conv_1",
             fired_at: 1_700_000_005,
             finished_at: 1_700_000_050,
-            error_code: null,
+            error_code: "sandbox_registration_timeout",
+            error_detail: "the sandbox did not register within 720 seconds",
             conversation_updated_at: 1_700_000_060,
             conversation_status: "idle",
             viewer_last_seen: 1_700_000_055,
@@ -184,6 +247,7 @@ describe("listScheduledTaskRuns", () => {
     );
     const [run] = await listScheduledTaskRuns("st_1");
     expect(run).toMatchObject({
+      errorDetail: "the sandbox did not register within 720 seconds",
       conversationUpdatedAt: 1_700_000_060,
       conversationStatus: "idle",
       viewerLastSeen: 1_700_000_055,
@@ -195,6 +259,20 @@ describe("listScheduledTaskRuns", () => {
 });
 
 describe("createScheduledTask", () => {
+  it.each([undefined, null, 2.5])("sends a cost limit only when set (%s)", async (maxCostUsd) => {
+    fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
+    await createScheduledTask({
+      name: "Nightly review",
+      prompt: "Review new issues",
+      rrule: "FREQ=DAILY",
+      agentId: "ag_1",
+      maxCostUsd,
+    });
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    if (maxCostUsd == null) expect(body).not.toHaveProperty("max_cost_usd");
+    else expect(body.max_cost_usd).toBe(maxCostUsd);
+  });
+
   it("POSTs required fields and omits unset optionals", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
     await createScheduledTask({
@@ -248,6 +326,26 @@ describe("createScheduledTask", () => {
     expect(JSON.stringify(analytics.mock.calls)).not.toContain("private");
   });
 
+  it("sends the browser tools mode header so the source copy keeps it", async () => {
+    const win = window as unknown as { omnigentDesktop?: unknown };
+    const before = win.omnigentDesktop;
+    win.omnigentDesktop = { browserTabs: () => undefined };
+    try {
+      fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
+      await createScheduledTask({
+        name: "n",
+        prompt: "p",
+        rrule: "FREQ=DAILY",
+        agentId: "agent",
+        sourceSessionId: "conv_1",
+      });
+      const [, init] = fetchMock.mock.calls[0];
+      expect(new Headers(init.headers).get("X-Omnigent-Browser-Agent-Tools")).toBe("on");
+    } finally {
+      win.omnigentDesktop = before;
+    }
+  });
+
   it("includes the host/workspace pair and timezone when provided", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
     await createScheduledTask({
@@ -276,9 +374,30 @@ describe("createScheduledTask", () => {
     expect(bodies[0].project_id).toBe("proj_1");
     expect(bodies[1]).not.toHaveProperty("project_id");
   });
+
+  it("sends picked MCP services and omits an empty pick", async () => {
+    fetchMock.mockResolvedValue(mockResponse(TASK_WIRE));
+    const base = { name: "n", prompt: "p", rrule: "FREQ=DAILY", agentId: "ag_1" };
+    await createScheduledTask({ ...base, mcpServices: ["github"] });
+    await createScheduledTask({ ...base, mcpServices: [] });
+    const bodies = fetchMock.mock.calls.map(([, init]) => JSON.parse(init.body));
+    expect(bodies[0].mcp_services).toEqual(["github"]);
+    expect(bodies[1]).not.toHaveProperty("mcp_services");
+  });
 });
 
 describe("updateScheduledTask", () => {
+  it.each([undefined, null, 2.5])(
+    "preserves, clears, or sets the cost limit (%s)",
+    async (maxCostUsd) => {
+      fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
+      await updateScheduledTask("st_1", { maxCostUsd });
+      expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual(
+        maxCostUsd === undefined ? {} : { max_cost_usd: maxCostUsd },
+      );
+    },
+  );
+
   it("PATCHes only the fields present in the input", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse({ ...TASK_WIRE, state: "paused" }));
     const updated = await updateScheduledTask("st_1", { state: "paused" });
@@ -296,6 +415,15 @@ describe("updateScheduledTask", () => {
     fetchMock.mockResolvedValueOnce(mockResponse({ ...TASK_WIRE, project_id: projectId }));
     await updateScheduledTask("st_1", { projectId });
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ project_id: projectId });
+  });
+
+  it.each([
+    ["replaces the MCP services", ["slack"]],
+    ["sends an explicit [] to turn them all off", []],
+  ])("%s", async (_, mcpServices) => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ ...TASK_WIRE, mcp_services: mcpServices }));
+    await updateScheduledTask("st_1", { mcpServices });
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ mcp_services: mcpServices });
   });
 });
 

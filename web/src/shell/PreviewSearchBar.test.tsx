@@ -116,6 +116,16 @@ describe("PreviewSearchBar", () => {
     expect(painted.has("md-preview-search")).toBe(false);
   });
 
+  it("stays on the current match on the Enter that confirms an IME candidate", async () => {
+    renderBar();
+    const input = await act(async () => type("the"));
+    expect(screen.getByText("1 / 2")).toBeDefined();
+    await act(async () => {
+      fireEvent.keyDown(input, { key: "Enter", keyCode: 229 });
+    });
+    expect(screen.getByText("1 / 2")).toBeDefined();
+  });
+
   it("advances to the next match on Enter and wraps around", async () => {
     renderBar();
     const input = await act(async () => type("the"));

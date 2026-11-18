@@ -2,15 +2,18 @@
 
 Failed turns surface their reason; authentication errors include a re-auth hint.
 Resume uses the same verdict. Empty turns warn and stay idle, as do clean turns.
+A turn whose start was missed reports running from its first item.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 
 from omnigent.harnesses.codex_egress import detect_certificate_failure
@@ -20,8 +23,10 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_state,
     read_certificate_failure,
     record_certificate_failure,
+    update_active_turn_id,
     write_bridge_state,
 )
+from omnigent.inner.databricks_executor import DatabricksAuthError
 from tests.harnesses.codex_native.forwarder._support import (
     _deliver_to_parent,
     _RecordingClient,
@@ -696,6 +701,160 @@ async def test_correlated_error_recovers_a_missed_turn_start(tmp_path: Path) -> 
     assert client.posts[0][1]["data"]["response_id"] == "codex_missed_start_turn"
 
 
+def _turn_event(
+    method: str, turn_id: str, item_type: str | None = None, *, thread_id: str = "thread_123"
+) -> dict:
+    if item_type is None:
+        return {"method": method, "params": {"threadId": thread_id, "turn": {"id": turn_id}}}
+    item = {"type": item_type, "id": f"{turn_id}_{item_type}"}
+    if item_type == "userMessage":
+        item["content"] = [{"type": "text", "text": "Review the change."}]
+    else:
+        item["text"] = "Reviewed."
+    return {
+        "method": method,
+        "params": {"threadId": thread_id, "turnId": turn_id, "item": item},
+    }
+
+
+@pytest.mark.parametrize(
+    ("active_turn_id", "events", "expected_running_turns"),
+    [
+        pytest.param(
+            "turn_123",
+            [
+                _turn_event("item/started", "turn_123", "userMessage"),
+                _turn_event("item/completed", "turn_123", "userMessage"),
+                _turn_event("item/completed", "turn_123", "agentMessage"),
+            ],
+            ["turn_123"],
+            id="missed-start",
+        ),
+        pytest.param(
+            "turn_123",
+            [
+                _turn_event("turn/started", "turn_123"),
+                _turn_event("item/completed", "turn_123", "userMessage"),
+            ],
+            ["turn_123"],
+            id="observed-start",
+        ),
+        pytest.param(
+            None,
+            [_turn_event("item/completed", "turn_old", "userMessage")],
+            [],
+            id="no-active-turn",
+        ),
+        pytest.param(
+            None,
+            [
+                _turn_event("item/started", "turn_123", "userMessage"),
+                {"active_turn_id": "turn_123"},
+                _turn_event("item/completed", "turn_123", "userMessage"),
+                _turn_event("item/completed", "turn_123", "agentMessage"),
+            ],
+            ["turn_123"],
+            id="turn-id-written-after-first-item",
+        ),
+        pytest.param(
+            None,
+            [
+                {
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "threadId": "thread_123",
+                        "turnId": "turn_123",
+                        "itemId": "turn_123_agentMessage",
+                        "delta": "Rev",
+                    },
+                },
+                _turn_event("item/completed", "turn_123", "agentMessage"),
+            ],
+            ["turn_123"],
+            id="start-recovered-from-delta",
+        ),
+        pytest.param(
+            "turn_124",
+            [_turn_event("item/completed", "turn_123", "agentMessage")],
+            [],
+            id="other-turn",
+        ),
+        pytest.param(
+            "turn_123",
+            [_turn_event("item/completed", "turn_123", "userMessage", thread_id="thread_side")],
+            [],
+            id="other-thread",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_first_item_reports_running_for_a_turn_whose_start_was_missed(
+    tmp_path: Path,
+    active_turn_id: str | None,
+    events: list[dict],
+    expected_running_turns: list[str],
+) -> None:
+    """A fresh thread subscribes after its first turn started; its first item reports running."""
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_x",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=active_turn_id,
+        ),
+    )
+    client = _RecordingClient()
+    forwarder_state = fwd._CodexForwarderState()
+    delta_coalescer = fwd._OutputTextDeltaCoalescer(
+        client,  # type: ignore[arg-type]
+        "conv_x",
+        flush_interval_seconds=60.0,
+        flush_char_threshold=100_000,
+    )
+    for event in events:
+        if "active_turn_id" in event:
+            active_turn_id = event["active_turn_id"]
+            update_active_turn_id(tmp_path, active_turn_id)
+            continue
+        await fwd._post_missed_turn_start(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            thread_id="thread_123",
+            event=event,
+            forwarder_state=forwarder_state,
+        )
+        await fwd._handle_event(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            event=event,
+            usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+            elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+            delta_coalescer=delta_coalescer,
+            expected_thread_id="thread_123",
+            forwarder_state=forwarder_state,
+        )
+    await delta_coalescer.close()
+
+    statuses = [body for _, body in client.posts if body["type"] == "external_session_status"]
+    assert [body["data"]["status"] for body in statuses] == ["running"] * len(
+        expected_running_turns
+    )
+    assert [body["data"]["response_id"] for body in statuses] == [
+        f"codex_{turn_id}" for turn_id in expected_running_turns
+    ]
+    if expected_running_turns:
+        assert client.posts[0][1]["type"] == "external_session_status"
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id == (
+        expected_running_turns[-1] if expected_running_turns else active_turn_id
+    )
+
+
 @pytest.mark.asyncio
 async def test_handle_event_deduplicates_error_then_terminal_boundary(tmp_path: Path) -> None:
     """A standalone error owns the terminal status for its turn."""
@@ -1088,7 +1247,9 @@ async def test_provider_token_command_failure_posts_without_codex_login_hint(
 
 
 @pytest.mark.asyncio
-async def test_post_turn_status_edge_clean_idle_has_no_output() -> None:
+async def test_post_turn_status_edge_clean_idle_has_no_output(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     """A normal idle edge (no error) posts status only — the success path."""
     client = _RecordingClient()
     edge = fwd._CodexTurnStatusEdge(status="idle", turn_id="turn_123", source="turn/completed")
@@ -1101,6 +1262,190 @@ async def test_post_turn_status_edge_clean_idle_has_no_output() -> None:
     assert data["status"] == "idle"
     assert "output" not in data
     assert "reauth_required" not in data
+    assert not any(
+        getattr(record, "event_name", None) == "codex_turn_status_publication_failed"
+        for record in caplog.records
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flush", ["compaction", "diff"])
+@pytest.mark.parametrize("turn_status", ["completed", "failed"])
+async def test_terminal_status_survives_flush_auth_failure(
+    tmp_path: Path, flush: str, turn_status: str
+) -> None:
+    """A pre-send output failure must not prevent the known terminal status post."""
+    _seed_active_turn(tmp_path, "turn_123")
+    state = fwd._CodexForwarderState()
+    if flush == "compaction":
+        state.compaction_status_posted = "in_progress"
+    else:
+        state.note_turn_diff("turn_123", "diff --git a/example.py b/example.py")
+    failure = DatabricksAuthError("credentials temporarily unavailable")
+    event = _turn_completed("turn_123", turn_status)
+    if turn_status == "failed":
+        event["params"]["turn"]["error"] = {"message": "native turn failed"}
+    posts: list[dict[str, Any]] = []
+    attempted_types: list[str] = []
+
+    class OutputAuthFailure(httpx.Auth):
+        def auth_flow(self, request: httpx.Request) -> Any:
+            body = json.loads(request.content)
+            attempted_types.append(body["type"])
+            if body["type"] != "external_session_status":
+                raise failure
+            yield request
+
+    def accept(request: httpx.Request) -> httpx.Response:
+        posts.append(json.loads(request.content))
+        return httpx.Response(200, json={"queued": False})
+
+    async with httpx.AsyncClient(
+        base_url="http://server.example.test",
+        auth=OutputAuthFailure(),
+        transport=httpx.MockTransport(accept),
+    ) as client:
+        with pytest.raises(DatabricksAuthError) as caught:
+            await _deliver_to_parent(
+                client,  # type: ignore[arg-type]
+                tmp_path,
+                state,
+                event,
+            )
+
+    assert caught.value is failure
+    expected = "idle" if turn_status == "completed" else "failed"
+    expected_data = {"status": expected, "response_id": "codex_turn_123"}
+    if turn_status == "failed":
+        expected_data["output"] = "native turn failed"
+    assert posts == [{"type": "external_session_status", "data": expected_data}]
+    assert attempted_types == [
+        "external_compaction_status" if flush == "compaction" else "external_conversation_item",
+        "external_session_status",
+    ]
+    bridge = read_bridge_state(tmp_path)
+    assert bridge is not None and bridge.active_turn_id is None
+    assert state.turn_failure_surfaced is (turn_status == "failed")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure_phase",
+    [
+        "before_status",
+        "status_post",
+        "after_status",
+        "stale",
+        "cancelled",
+        "cancelled_flush",
+        "both_posts",
+        "newer_turn",
+        "newer_turn_completed",
+    ],
+)
+async def test_terminal_status_publication_diagnostics(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure_phase: str,
+) -> None:
+    """A failed terminal publication names its edge without changing fault propagation."""
+    client = _RecordingClient()
+    active_turn = "newer_turn" if failure_phase == "stale" else "turn_123"
+    _seed_active_turn(tmp_path, active_turn)
+    cause = ValueError("private-cause-detail")
+    failure = (
+        asyncio.CancelledError("private-cancellation-detail")
+        if failure_phase in {"cancelled", "cancelled_flush"}
+        else DatabricksAuthError("private-auth-detail")
+    )
+
+    async def fail(*args: Any, **kwargs: Any) -> None:
+        if failure_phase in {"newer_turn", "newer_turn_completed"}:
+            update_active_turn_id(tmp_path, "newer_turn")
+            if failure_phase == "newer_turn_completed":
+                update_active_turn_id(tmp_path, None)
+        raise failure from cause
+
+    if failure_phase in {
+        "before_status",
+        "stale",
+        "cancelled_flush",
+        "both_posts",
+        "newer_turn",
+        "newer_turn_completed",
+    }:
+        monkeypatch.setattr(fwd, "_flush_turn_diff", fail)
+    elif failure_phase in {"status_post", "cancelled"}:
+        monkeypatch.setattr(client, "post", fail)
+    else:
+        monkeypatch.setattr(
+            fwd._CodexElicitationTaskTracker, "resolve_by_terminal_turn_event", fail
+        )
+
+    if failure_phase == "both_posts":
+
+        async def fail_status(*args: Any, **kwargs: Any) -> None:
+            raise RuntimeError("private-status-detail")
+
+        monkeypatch.setattr(client, "post", fail_status)
+
+    with pytest.raises(type(failure)) as caught:
+        await _deliver_to_parent(
+            client,
+            tmp_path,
+            fwd._CodexForwarderState(),
+            _turn_completed("turn_123", "completed"),
+        )
+
+    assert caught.value is failure
+    assert caught.value.__cause__ is cause
+    bridge = read_bridge_state(tmp_path)
+    assert bridge is not None
+    assert bridge.active_turn_id == (
+        "newer_turn" if failure_phase in {"stale", "newer_turn"} else None
+    )
+    assert client.posts == (
+        [_status_post({"status": "idle", "response_id": "codex_turn_123"})]
+        if failure_phase in {"before_status", "after_status"}
+        else []
+    )
+    records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "codex_turn_status_publication_failed"
+    ]
+    if failure_phase == "both_posts":
+        assert [r.attributes["delivery_phase"] for r in records] == [
+            "before_status",
+            "status_post",
+        ]
+        assert [r.attributes["exception_type"] for r in records] == [
+            "DatabricksAuthError",
+            "RuntimeError",
+        ]
+        return
+    if failure_phase not in {"before_status", "status_post", "newer_turn", "newer_turn_completed"}:
+        assert records == []
+        return
+    (record,) = records
+    assert record.levelno == logging.WARNING
+    assert record.session_id == "conv_x"
+    assert record.turn_id == "turn_123"
+    assert record.attributes == {
+        "intended_status": "idle",
+        "protocol_source": "turn/completed",
+        "delivery_phase": (
+            "before_status"
+            if failure_phase in {"newer_turn", "newer_turn_completed"}
+            else failure_phase
+        ),
+        "exception_type": "DatabricksAuthError",
+        "exception_cause_type": "ValueError",
+    }
+    assert record.exc_info is None
+    assert "private-" not in caplog.text
+    assert "private-" not in json.dumps(record.attributes)
 
 
 _CERTIFICATE_LINE = (

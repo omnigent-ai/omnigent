@@ -394,6 +394,198 @@ describe("ComposerMicButton", () => {
     },
   );
 
+  describe("restarts a take the browser ends on its own", () => {
+    let now: number;
+    beforeEach(() => {
+      now = 1_000_000;
+      vi.spyOn(Date, "now").mockImplementation(() => now);
+    });
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
+
+    /** Click the mic and let the recognizer report it started. */
+    function startTake(props: Partial<Parameters<typeof ComposerMicButton>[0]> = {}) {
+      const view = render(<ComposerMicButton onTranscript={vi.fn()} {...props} />);
+      const button = screen.getByRole("button", { name: "Voice dictation" });
+      fireEvent.click(button);
+      act(() => handlers.start?.({}));
+      return { ...view, button };
+    }
+
+    it("restarts after a pause and keeps listening as one take", () => {
+      const onTranscript = vi.fn();
+      const onVoiceStart = vi.fn();
+      const { button } = startTake({ onTranscript, onVoiceStart });
+
+      now += 2_000;
+      act(() => handlers.result?.(resultEvent("first phrase")));
+      now += 1_500;
+      act(() => handlers.end?.({}));
+
+      expect(startSpy).toHaveBeenCalledTimes(2);
+      expect(button).toHaveAttribute("aria-pressed", "true");
+
+      now += 100;
+      act(() => handlers.start?.({}));
+      now += 2_000;
+      act(() => handlers.result?.(resultEvent("second phrase")));
+
+      expect(onTranscript.mock.calls).toEqual([["first phrase"], ["second phrase"]]);
+      // A restart continues the take, so the Esc snapshot is taken only once.
+      expect(onVoiceStart).toHaveBeenCalledTimes(1);
+      expect(button).toHaveAttribute("aria-pressed", "true");
+    });
+
+    it("restarts through a no-speech timeout without surfacing an error", async () => {
+      const { button } = startTake();
+
+      now += 8_000;
+      act(() => handlers.error?.({ error: "no-speech" }));
+      expect(button).toHaveAttribute("aria-pressed", "true");
+      act(() => handlers.end?.({}));
+
+      expect(startSpy).toHaveBeenCalledTimes(2);
+      expect(button).toHaveAttribute("aria-pressed", "true");
+      expect(await hoverMicTooltip(button)).toHaveTextContent("Voice dictation");
+      expect(showToastMock).not.toHaveBeenCalled();
+    });
+
+    it("does not restart after the user stops", () => {
+      const { button } = startTake();
+
+      fireEvent.click(button);
+      act(() => handlers.end?.({}));
+
+      expect(startSpy).toHaveBeenCalledTimes(1);
+      expect(button).toHaveAttribute("aria-pressed", "false");
+    });
+
+    it("does not restart after an Esc discard", () => {
+      const onVoiceDiscard = vi.fn();
+      const { button } = startTake({ onVoiceDiscard });
+
+      act(() => {
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      });
+      act(() => handlers.end?.({}));
+
+      expect(onVoiceDiscard).toHaveBeenCalledTimes(1);
+      expect(startSpy).toHaveBeenCalledTimes(1);
+      expect(button).toHaveAttribute("aria-pressed", "false");
+    });
+
+    it("ends the take when the user stops while a restart is starting", () => {
+      const onVoiceStart = vi.fn();
+      const { button } = startTake({ onVoiceStart });
+      now += 3_000;
+      act(() => handlers.end?.({}));
+      expect(startSpy).toHaveBeenCalledTimes(2);
+
+      fireEvent.click(button);
+      // The restarted recognizer reports start after the stop, then ends.
+      act(() => handlers.start?.({}));
+      act(() => handlers.end?.({}));
+
+      expect(onVoiceStart).toHaveBeenCalledTimes(1);
+      expect(startSpy).toHaveBeenCalledTimes(2);
+      expect(button).toHaveAttribute("aria-pressed", "false");
+    });
+
+    it("does not restart once the composer is disabled", () => {
+      const { button, rerender } = startTake();
+
+      rerender(<ComposerMicButton onTranscript={vi.fn()} disabled />);
+      act(() => handlers.end?.({}));
+
+      expect(startSpy).toHaveBeenCalledTimes(1);
+      expect(button).toHaveAttribute("aria-pressed", "false");
+    });
+
+    it("stops after a minute without recognized speech", () => {
+      const { button } = startTake();
+      now += 5_000;
+      act(() => handlers.result?.(resultEvent("hello")));
+
+      now += 59_000;
+      act(() => handlers.end?.({}));
+      expect(startSpy).toHaveBeenCalledTimes(2);
+      act(() => handlers.start?.({}));
+
+      now += 1_000;
+      act(() => handlers.end?.({}));
+      expect(startSpy).toHaveBeenCalledTimes(2);
+      expect(button).toHaveAttribute("aria-pressed", "false");
+      expect(showToastMock).not.toHaveBeenCalled();
+    });
+
+    it("gives up with an error when the recognizer keeps ending immediately", () => {
+      const { button } = startTake();
+
+      for (let restart = 0; restart < 3; restart += 1) {
+        now += 200;
+        act(() => handlers.end?.({}));
+        act(() => handlers.start?.({}));
+      }
+
+      // Two quick restarts are tolerated; the third quick end ends the take.
+      expect(startSpy).toHaveBeenCalledTimes(3);
+      expect(button).toHaveAttribute("aria-pressed", "false");
+      expect(showToastMock).toHaveBeenCalledWith(
+        "Voice input stopped unexpectedly. Please try again.",
+      );
+    });
+
+    it("does not restart a take that never reported start", () => {
+      render(<ComposerMicButton onTranscript={vi.fn()} />);
+      const button = screen.getByRole("button", { name: "Voice dictation" });
+      fireEvent.click(button);
+
+      act(() => handlers.end?.({}));
+
+      expect(startSpy).toHaveBeenCalledTimes(1);
+      expect(button).toHaveAttribute("aria-pressed", "false");
+    });
+
+    it("ends the take when the stop lands before the restart reports start", () => {
+      const { button } = startTake();
+      now += 3_000;
+      act(() => handlers.end?.({}));
+      expect(startSpy).toHaveBeenCalledTimes(2);
+
+      fireEvent.click(button);
+      act(() => handlers.end?.({}));
+
+      expect(startSpy).toHaveBeenCalledTimes(2);
+      expect(button).toHaveAttribute("aria-pressed", "false");
+    });
+
+    it("does not restart while the page is hidden", () => {
+      const { button } = startTake();
+      const hidden = vi.spyOn(document, "hidden", "get").mockReturnValue(true);
+
+      now += 3_000;
+      act(() => handlers.end?.({}));
+
+      expect(startSpy).toHaveBeenCalledTimes(1);
+      expect(button).toHaveAttribute("aria-pressed", "false");
+      expect(showToastMock).not.toHaveBeenCalled();
+      hidden.mockRestore();
+    });
+
+    it("ends the take on a fatal error instead of restarting", () => {
+      const { button } = startTake();
+
+      now += 3_000;
+      act(() => handlers.error?.({ error: "audio-capture" }));
+      act(() => handlers.end?.({}));
+
+      expect(startSpy).toHaveBeenCalledTimes(1);
+      expect(button).toHaveAttribute("aria-pressed", "false");
+      expect(showToastMock).toHaveBeenCalledWith("Voice input isn't available on this device.");
+    });
+  });
+
   it("does not intercept Enter/Esc when not listening", () => {
     const onVoiceDiscard = vi.fn();
     render(<ComposerMicButton onTranscript={vi.fn()} onVoiceDiscard={onVoiceDiscard} />);

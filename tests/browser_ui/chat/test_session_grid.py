@@ -214,7 +214,7 @@ def test_session_grid_drag_persist_live_updates_and_close(
         # dnd-kit suppresses click propagation for 50 ms after a drop.
         grid_nav.get_by_role("link").dblclick(delay=75)
         rename = page.get_by_role("textbox", name="Rename grid")
-        page.get_by_role("heading", name="Grid · 2 sessions", exact=True).click()
+        page.get_by_role("heading", name="Grid session 0 + Grid session 1", exact=True).click()
         _move_cell(page, "grid-0", "grid-1")
         expect(grid_nav.get_by_role("link")).to_have_text("Grid session 1 + Grid session 0")
         _move_cell(page, "grid-0", "grid-1")
@@ -231,7 +231,7 @@ def test_session_grid_drag_persist_live_updates_and_close(
         grid_nav.get_by_role("link").click(button="right")
         page.get_by_role("menuitem", name="Rename", exact=True).click()
         rename.fill("Research monitor")
-        page.get_by_role("heading", name="Research grid · 2 sessions", exact=True).click()
+        page.get_by_role("heading", name="Research grid", exact=True).click()
         expect(grid_nav.get_by_role("link", name="Research monitor")).to_be_visible()
         # One grid-wide workspace follows clicks in any cell, keeping its width and tabs.
         for index in range(2):

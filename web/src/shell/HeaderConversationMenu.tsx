@@ -10,6 +10,7 @@ import {
   ArchiveIcon,
   ArchiveRestoreIcon,
   ChevronLeftIcon,
+  ClockPlusIcon,
   DownloadIcon,
   EllipsisIcon,
   FolderInputIcon,
@@ -54,19 +55,26 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { useIsMutating, useQueryClient } from "@tanstack/react-query";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isIndentedSibling } from "@/lib/sessionFamilies";
+import { isIndentedSibling, isSessionPinned } from "@/lib/sessionFamilies";
 import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
 import { exportSessionTranscript } from "@/lib/sessionsApi";
 import { triggerBrowserDownload } from "@/hooks/useFileContent";
 import {
-  PINNED_LABEL_KEY,
   type Conversation,
   useArchiveConversation,
   useMoveToProject,
   useRenameConversation,
   useStopAndDeleteConversation,
   useTogglePinnedConversation,
+  useAutomationsEnabled,
 } from "@/hooks/useConversations";
+import { CreateAutomationFromSessionDialog } from "@/components/scheduled/CreateAutomationFromSessionDialog";
+import { AutomationSourceDeleteNotice } from "@/components/scheduled/AutomationSourceDeleteNotice";
+import {
+  canCreateAutomationFromSession,
+  automationDeletedWith,
+  useDeleteSourceAutomations,
+} from "@/lib/automationFromSession";
 import { ProjectPicker } from "./ProjectPicker";
 import { markConversationUnread } from "@/hooks/useUnseenConversations";
 import { useOmnigentAnalytics } from "@/lib/analytics";
@@ -80,7 +88,7 @@ import { useNavigate } from "@/lib/routing";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showArchiveUndoToast } from "./archiveUndoToast";
 import { unpinWithUndo } from "./unpinUndoToast";
-import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
+import { useArchivePrompt } from "./ArchivePrompt";
 import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { conversationDisplayLabel } from "./sidebarNav";
@@ -138,7 +146,7 @@ export function HeaderConversationMenu({
   const rename = useRenameConversation();
   const moveToProject = useMoveToProject();
   const archive = useArchiveConversation();
-  const archiveWorktreePrompt = useArchiveWorktreePrompt();
+  const archivePrompt = useArchivePrompt();
   const deleteConversation = useStopAndDeleteConversation();
   const [menuOpen, setMenuOpen] = useState(false);
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
@@ -146,8 +154,20 @@ export function HeaderConversationMenu({
   const [renameTitle, setRenameTitle] = useState(conversation.title ?? "");
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [deleteBranch, setDeleteBranch] = useState(false);
+  const [automationOpen, setAutomationOpen] = useState(false);
+  const automationsEnabled = useAutomationsEnabled();
+  // This menu is only offered to the session's owner (see ChatHeader).
+  const canCreateAutomation = canCreateAutomationFromSession({
+    info,
+    automationsEnabled,
+    conversation,
+    isOwner: true,
+  });
+  const automationSourceOf = automationDeletedWith(info, conversation);
+  const deleteSourceAutomations = useDeleteSourceAutomations();
   const previousConversationId = useRef(conversation.id);
-  const isPinned = conversation.labels?.[PINNED_LABEL_KEY] != null;
+  const isPinned = isSessionPinned(conversation);
+  const canPin = !isIndentedSibling(conversation);
   const isArchived = conversation.archived === true;
   const canAddAgent = !isArchived && info !== "loading" && info.sibling_sessions;
   const addAgentPath = `/?sibling=${encodeURIComponent(conversation.id)}`;
@@ -176,6 +196,7 @@ export function HeaderConversationMenu({
     setRenameTitle(conversation.title ?? "");
     setDeleteOpen(false);
     setDeleteBranch(false);
+    setAutomationOpen(false);
   }, [conversation.id, conversation.title]);
 
   useEffect(() => {
@@ -224,10 +245,16 @@ export function HeaderConversationMenu({
     setRenameOpen(false);
   };
 
-  const confirmDelete = () => {
+  const confirmDelete = async () => {
     setDeleteOpen(false);
     setDeleteBranch(false);
-    navigate("/", { replace: true });
+    // "Delete both": the automation first, so no run starts from a missing session.
+    if (automationSourceOf === null) {
+      navigate("/", { replace: true });
+    } else if (!(await deleteSourceAutomations([automationSourceOf], [conversation.id]))) {
+      toast.error("Couldn't delete the automation, so the session was kept");
+      return;
+    }
     deleteConversation.mutate({
       id: conversation.id,
       deleteBranch: gitBranch !== null && deleteBranch,
@@ -254,7 +281,7 @@ export function HeaderConversationMenu({
       archive.mutate({ id: conversation.id, archived: false });
       return;
     }
-    archiveWorktreePrompt.requestArchive([conversation], (deleteWorktreeIds) =>
+    archivePrompt.requestArchive([conversation], (deleteWorktreeIds) =>
       archiveNow(deleteWorktreeIds.has(conversation.id)),
     );
   };
@@ -280,7 +307,9 @@ export function HeaderConversationMenu({
       : togglePinned.mutate({ id: conversation.id, pinned: true });
   // Desktop Session → Pin (⌥⌘P), Archive (⇧⌘A) and Fork (⌥⌘F) act on the session shown here.
   // Like the menu item, Pin waits out a pending pin write (from any row).
-  useDesktopCommand("toggle-pin-session", pinSaving ? null : togglePin, { active: isPinned });
+  useDesktopCommand("toggle-pin-session", pinSaving || !canPin ? null : togglePin, {
+    active: isPinned,
+  });
   useDesktopCommand("archive-session", archiveConversation, { active: isArchived });
   useDesktopCommand("fork-session", canFork && !forkDisabledReason ? onFork : null);
   const desktopShortcuts = supportsDesktopCommands();
@@ -303,18 +332,20 @@ export function HeaderConversationMenu({
       )}
       {/* Chat/Terminal renders its own trailing separator (null on other sessions). */}
       {viewItems}
-      <DropdownMenuItem
-        data-testid="header-pin-conversation"
-        className={itemClass}
-        disabled={pinSaving}
-        onSelect={togglePin}
-      >
-        {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
-        {isPinned ? "Unpin" : "Pin"}
-        {desktopShortcuts && (
-          <CompactShortcutKeys keys={PIN_SESSION_KEYS} className="ml-auto pl-4" />
-        )}
-      </DropdownMenuItem>
+      {canPin && (
+        <DropdownMenuItem
+          data-testid="header-pin-conversation"
+          className={itemClass}
+          disabled={pinSaving}
+          onSelect={togglePin}
+        >
+          {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
+          {isPinned ? "Unpin" : "Pin"}
+          {desktopShortcuts && (
+            <CompactShortcutKeys keys={PIN_SESSION_KEYS} className="ml-auto pl-4" />
+          )}
+        </DropdownMenuItem>
+      )}
       {canShare && (
         <DropdownMenuItem
           data-testid="header-share-conversation"
@@ -388,6 +419,16 @@ export function HeaderConversationMenu({
         <MailIcon className="size-3.5" />
         Mark as unread
       </DropdownMenuItem>
+      {canCreateAutomation && (
+        <DropdownMenuItem
+          data-testid="header-create-automation"
+          className={itemClass}
+          onSelect={() => setAutomationOpen(true)}
+        >
+          <ClockPlusIcon className="size-3.5" />
+          Create automation
+        </DropdownMenuItem>
+      )}
       {/* Move to project is also reachable on desktop via the breadcrumb's
           folder tag (HeaderProjectTag); on mobile the native shells hide the
           breadcrumb, so this menu is the sole entry point. */}
@@ -518,7 +559,14 @@ export function HeaderConversationMenu({
         </DropdownMenuContent>
       </DropdownMenu>
 
-      {archiveWorktreePrompt.dialog}
+      {archivePrompt.dialog}
+      {automationOpen && (
+        <CreateAutomationFromSessionDialog
+          conversation={conversation}
+          open
+          onOpenChange={setAutomationOpen}
+        />
+      )}
       <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
         <DialogContent>
           <form onSubmit={submitRename}>
@@ -568,12 +616,23 @@ export function HeaderConversationMenu({
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Delete conversation?</DialogTitle>
+            <DialogTitle>
+              {automationSourceOf !== null ? "Delete session and automation?" : "Delete session?"}
+            </DialogTitle>
             <DialogDescription>
               <span className="font-medium break-all">{label}</span> and all of its history will be
               removed. This cannot be undone.
             </DialogDescription>
           </DialogHeader>
+          {automationSourceOf !== null && (
+            <AutomationSourceDeleteNotice
+              taskId={automationSourceOf}
+              onNavigate={() => {
+                setDeleteOpen(false);
+                setDeleteBranch(false);
+              }}
+            />
+          )}
           {gitBranch !== null && (
             <div className="flex flex-col gap-2 rounded-md border border-destructive/40 bg-destructive/5 p-3">
               <p className="text-sm text-muted-foreground">
@@ -610,10 +669,10 @@ export function HeaderConversationMenu({
             <Button
               type="button"
               variant="destructive"
-              onClick={confirmDelete}
+              onClick={() => void confirmDelete()}
               disabled={deleteConversation.isPending}
             >
-              Delete
+              {automationSourceOf !== null ? "Delete both" : "Delete"}
             </Button>
           </DialogFooter>
         </DialogContent>

@@ -39,7 +39,6 @@ import {
   XIcon,
 } from "lucide-react";
 import { useChatStore } from "@/store/chatStore";
-import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 import type { BundledLanguage, ThemedToken } from "shiki";
 import { highlightCode } from "@/components/ai-elements/code-block";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
@@ -87,6 +86,7 @@ import { TruncatedBanner } from "./TruncatedBanner";
 import { useLightbox } from "@/components/ImageLightbox";
 import { getEmbedRoot } from "@/lib/host";
 import { hasCommandModifier } from "@/lib/hotkeys";
+import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { MarkdownTableOfContents } from "./MarkdownTableOfContents";
 import { VideoPlayer } from "@/components/VideoPlayer";
 import { isVideoFile } from "@/lib/video";
@@ -548,6 +548,8 @@ export interface CodeViewerProps {
    * itself can't anchor text-selection comments).
    */
   onRequestEditMode?: () => void;
+  /** Whether the session's agent opens an attached workspace path. */
+  attachToAgent?: boolean;
 }
 
 export function CodeViewer({
@@ -574,6 +576,7 @@ export function CodeViewer({
   tocOpen = false,
   onTocToggle,
   onRequestEditMode,
+  attachToAgent = false,
 }: CodeViewerProps) {
   const canEdit = useCanEdit(conversationId);
   const activeCommentId = activeSelection?.comment_id;
@@ -665,13 +668,12 @@ export function CodeViewer({
   }, [position, showMonaco, viewMode, fileQuery.data, rawLines]);
 
   // "Attach to agent" delivers a "[Attached: path:start-end]" marker the
-  // composer reads — only the native coding-agent harnesses act on it, so
-  // gate the button to them (same set as the "@"-mention feature).
-  const sessionHarness = useChatStore((s) => s.sessionHarness);
+  // composer reads - FileViewer passes ``attachToAgent`` only for sessions
+  // whose agent opens that path (same gate as the "@"-mention feature).
   // ``!!path`` mirrors the Monaco hook's guard: without it an empty path would
   // emit a malformed ``[Attached: :start-end]`` marker. ``path`` is typed
   // non-optional here, but the guard keeps the two surfaces in lockstep.
-  const canAttachToAgent = !!path && nativeCodingAgentForHarness(sessionHarness) !== undefined;
+  const canAttachToAgent = !!path && attachToAgent;
 
   // Kick off Shiki highlighting whenever content or language changes.
   useEffect(() => {
@@ -1059,6 +1061,7 @@ export function CodeViewer({
           activeSelection={activeSelection}
           onSetActiveSelection={onSetActiveSelection}
           pendingBodyRef={pendingBodyRef}
+          attachToAgent={attachToAgent}
         />
       </Suspense>
     );
@@ -1103,6 +1106,8 @@ export function CodeViewer({
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             onKeyDown={(e) => {
+              // IME composition keys (CJK input) confirm text, not find.
+              if (isImeCompositionKeyEvent(e)) return;
               if (e.key === "Enter" && matches.length > 0) {
                 e.preventDefault();
                 if (e.shiftKey) {

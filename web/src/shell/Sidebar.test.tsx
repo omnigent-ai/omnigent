@@ -1,8 +1,16 @@
+import {
+  addNestedSessionDraft,
+  updateNestedSessionDraft,
+  removeNestedSessionDraft,
+} from "@/lib/nestedSessionDrafts";
+import type { Session } from "@/lib/types";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
 import { SidebarDataProvider } from "@/hooks/useSidebarData";
+import { conversationPage } from "@/test/sidebarMockHelpers";
 import * as automationInboxHook from "@/hooks/useAutomationInbox";
+import * as proactiveInboxHook from "@/hooks/useProactiveInbox";
 import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
 import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
 // Integration tests for the Sidebar's session list. The search box no
@@ -36,6 +44,7 @@ import type * as PullRequestsModule from "@/hooks/usePullRequests";
 import {
   markConversationRead,
   markConversationSeen,
+  markConversationUnread,
   resetReadStateForTests,
   seedReadState,
 } from "@/hooks/useUnseenConversations";
@@ -48,7 +57,6 @@ import {
   writeProjectFolderCollapse,
   writeProjectFolderPageSize,
 } from "@/lib/projectFolderPaginationPreferences";
-import * as sessionsApi from "@/lib/sessionsApi";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { ExtensionCatalogProvider } from "@/extensions/ExtensionProvider";
 import type { ExtensionCatalogItem } from "@/extensions/types";
@@ -224,6 +232,9 @@ function conv(id: string, agentName: string, partial: Partial<Conversation> = {}
   };
 }
 
+// The server's latest-activity label: the sole source of the sidebar error badge.
+const ERROR_LABELS = { "omnigent.latest_activity_error": "error" };
+
 // Three distinct agent types, mirroring the user's report
 // (databricks_coding_agent / Claude Code / Codex).
 const THREE_TYPE_CONVERSATIONS = [
@@ -259,6 +270,9 @@ function mockConversations(convs: Conversation[]) {
   useConvMock.mockImplementation(() => result(convs));
 }
 
+/** Server info with automations on, which the Automations nav row requires. */
+const AUTOMATIONS_INFO: ServerInfo = { ...FALLBACK_SERVER_INFO, automations_enabled: true };
+
 function renderSidebar(
   open = true,
   initialEntry = "/",
@@ -286,7 +300,7 @@ function renderSidebar(
   );
   const result = render(tree());
   // Re-render the same tree, as a query does when the hook mocks return new data.
-  return { ...result, refresh: () => result.rerender(tree()) };
+  return { ...result, queryClient: qc, refresh: () => result.rerender(tree()) };
 }
 
 // Session scope lives in the Sessions heading's filter menu; pick an option to
@@ -1216,6 +1230,56 @@ describe("Sidebar session list", () => {
     },
   );
 
+  it("calls a capped suggestion count a floor, since the server stopped counting at it", () => {
+    const proactiveInbox = vi.spyOn(proactiveInboxHook, "useProactiveInbox");
+    const base = proactiveInbox.getMockImplementation()?.(true);
+    proactiveInbox.mockReturnValue({
+      ...(base as ReturnType<typeof proactiveInboxHook.useProactiveInbox>),
+      items: [],
+      unreadCount: 100,
+      unreadCountCapped: true,
+    });
+    try {
+      mockConversations([]);
+      renderSidebar();
+      const inbox = within(screen.getByTestId("inbox-button"));
+      expect(inbox.getByLabelText("At least 100 inbox items waiting")).toHaveTextContent("100+");
+      cleanup();
+
+      // Unchecked automations qualify the same label rather than replacing it.
+      const automationInbox = vi.spyOn(automationInboxHook, "useAutomationInbox");
+      automationInbox.mockReturnValue({
+        items: [],
+        hasNextPage: true,
+      } as unknown as ReturnType<typeof automationInboxHook.useAutomationInbox>);
+      try {
+        mockConversations([]);
+        renderSidebar();
+        expect(
+          within(screen.getByTestId("inbox-button")).getByLabelText(
+            "At least 100 inbox items waiting; more automations not yet checked",
+          ),
+        ).toHaveTextContent("100+");
+      } finally {
+        automationInbox.mockRestore();
+      }
+    } finally {
+      proactiveInbox.mockRestore();
+    }
+  });
+
+  it.each(["/", "/inbox"])("counts an unread session in the Inbox badge on %s", (route) => {
+    seedReadState([{ id: "conv_unread", viewer_last_seen: 199 }]);
+    mockConversations([conv("conv_unread", "Codex", { status: "idle", updated_at: 200 })]);
+    renderSidebar(true, route);
+
+    const row = screen.getByRole("link", { name: /conv_unread/ }).closest("li")!;
+    expect(within(row).getByRole("img", { name: "New messages" })).toBeInTheDocument();
+    expect(
+      within(screen.getByTestId("inbox-button")).getByLabelText("1 inbox item waiting"),
+    ).toHaveTextContent("1");
+  });
+
   it("lets the active Inbox row show through the count badge", () => {
     // On /inbox the row itself paints the translucent --sidebar-active wash.
     // The badge keeps the shared active foreground but stays transparent so
@@ -1250,6 +1314,25 @@ describe("Sidebar session list", () => {
     const usage = screen.getByTestId("usage-nav");
     expect(usage).toHaveAttribute("href", "/usage");
     expect(usage).toHaveClass("bg-[var(--sidebar-active)]");
+  });
+
+  it("hides Workflows navigation while the release feature is off", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar();
+
+    expect(screen.queryByTestId("workflows-nav")).toBeNull();
+  });
+
+  it("shows and highlights Workflows navigation when the release feature is on", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/workflows", undefined, {
+      ...FALLBACK_SERVER_INFO,
+      features: { workflows: true },
+    });
+
+    const workflows = screen.getByTestId("workflows-nav");
+    expect(workflows).toHaveAttribute("href", "/workflows");
+    expect(workflows).toHaveClass("bg-[var(--sidebar-active)]");
   });
 
   it("hides Canvas navigation while the release feature is off", () => {
@@ -1340,7 +1423,7 @@ describe("Sidebar session list", () => {
 
   it("renders the 'Automations' nav row directly under 'New session' and routes to /tasks", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
-    renderSidebar();
+    renderSidebar(true, "/", undefined, AUTOMATIONS_INFO);
 
     const scheduled = screen.getByTestId("scheduled-tasks-nav");
     // Full-width nav ROW (a link), labeled "Automations", pointing at /tasks —
@@ -1386,9 +1469,17 @@ describe("Sidebar session list", () => {
     );
   });
 
+  it("hides the 'Automations' nav row when automations are off for the caller", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/", undefined, { ...AUTOMATIONS_INFO, automations_enabled: false });
+
+    expect(screen.queryByTestId("scheduled-tasks-nav")).toBeNull();
+    expect(screen.getByTestId("new-chat-button")).toBeInTheDocument();
+  });
+
   it("marks the 'Automations' nav row active when on /tasks", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
-    renderSidebar(true, "/tasks");
+    renderSidebar(true, "/tasks", undefined, AUTOMATIONS_INFO);
 
     // Active/selected state uses the SAME shared active-highlight as the sibling
     // nav rows (New session / Inbox) — the `--sidebar-active` pill, not an
@@ -1423,7 +1514,7 @@ describe("Sidebar session list", () => {
 
   it("leaves the primary nav unchanged for an empty extension catalog", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
-    renderSidebar();
+    renderSidebar(true, "/", undefined, AUTOMATIONS_INFO);
 
     expect(screen.queryByTestId(/^extension-nav-/)).toBeNull();
     expect(screen.getByTestId("new-chat-button")).toBeInTheDocument();
@@ -1431,9 +1522,20 @@ describe("Sidebar session list", () => {
     expect(screen.getByTestId("inbox-button")).toBeInTheDocument();
   });
 
+  it("marks Workflows active (not New session) on a workflow's page", () => {
+    mockConversations(THREE_TYPE_CONVERSATIONS);
+    renderSidebar(true, "/workflows/1e7bf4052f44451895933c8413947d27", undefined, {
+      ...FALLBACK_SERVER_INFO,
+      features: { workflows: true },
+    });
+
+    expect(screen.getByTestId("workflows-nav")).toHaveClass("bg-[var(--sidebar-active)]");
+    expect(screen.getByTestId("new-chat-button")).not.toHaveClass("bg-[var(--sidebar-active)]");
+  });
+
   it("marks Automations active (not New session) on /tasks/:taskId (detail route)", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);
-    renderSidebar(true, "/tasks/task_abc123");
+    renderSidebar(true, "/tasks/task_abc123", undefined, AUTOMATIONS_INFO);
 
     // Automations is highlighted on the detail route — same pill as the list page.
     expect(screen.getByTestId("scheduled-tasks-nav").className).toContain(
@@ -1786,8 +1888,9 @@ describe("Sidebar failed session indicator", () => {
 
   it("replaces an unread dot with the error icon and keeps it after marking read", () => {
     const session = conv("conv_error", "Codex", {
-      status: "failed",
+      status: "idle",
       updated_at: 200,
+      labels: ERROR_LABELS,
     });
     seedReadState([{ id: session.id, viewer_last_seen: 199 }]);
     mockConversations([session]);
@@ -1808,8 +1911,9 @@ describe("Sidebar failed session indicator", () => {
 
   it("keeps the error icon on the active, already-read session", () => {
     const session = conv("conv_error", "Codex", {
-      status: "failed",
+      status: "idle",
       updated_at: 200,
+      labels: ERROR_LABELS,
     });
     seedReadState([{ id: session.id, viewer_last_seen: session.updated_at }]);
     mockConversations([session]);
@@ -1823,26 +1927,27 @@ describe("Sidebar failed session indicator", () => {
     );
   });
 
-  it("updates a mounted row when only the session status changes", () => {
+  it("updates a mounted row when only the error label changes", () => {
     // Stable project contexts keep unrelated context updates from bypassing
     // the row's render-field comparator.
     projectRowsRef.current = [];
     const session = conv("conv_error", "Codex", {
-      status: "failed",
+      status: "idle",
       updated_at: 200,
+      labels: ERROR_LABELS,
     });
     mockConversations([session]);
     const { refresh } = renderSessionSidebar();
     const row = screen.getByRole("link", { name: "conv_error" }).closest("li")!;
     expect(within(row).getByTestId("session-state-badge")).toHaveAttribute("data-state", "error");
 
-    mockConversations([{ ...session, status: "idle" }]);
+    mockConversations([{ ...session, labels: {} }]);
     refresh();
 
     expect(screen.getByRole("link", { name: "conv_error" }).closest("li")).toBe(row);
     expect(within(row).queryByTestId("session-state-badge")).toBeNull();
 
-    mockConversations([{ ...session, status: "failed" }]);
+    mockConversations([{ ...session, labels: ERROR_LABELS }]);
     refresh();
 
     expect(screen.getByRole("link", { name: "conv_error" }).closest("li")).toBe(row);
@@ -1853,7 +1958,7 @@ describe("Sidebar failed session indicator", () => {
     { status: "running" as const, pending: 0, expected: "running" },
     { status: "failed" as const, pending: 2, expected: "awaiting" },
   ])("lets $expected take precedence over a previous error", ({ status, pending, expected }) => {
-    const session = conv("conv_error", "Codex", { status: "failed" });
+    const session = conv("conv_error", "Codex", { status: "idle", labels: ERROR_LABELS });
     mockConversations([session]);
     const { refresh } = renderSessionSidebar();
     const row = screen.getByRole("link", { name: "conv_error" }).closest("li")!;
@@ -1873,10 +1978,11 @@ describe("Sidebar failed session indicator", () => {
     const wakingId = `conv_error_retry_${startup.status}_${startup.terminalPending}`;
     mockConversations([
       conv(wakingId, "Codex", {
-        status: "failed",
+        status: "idle",
         updated_at: 200,
+        labels: ERROR_LABELS,
       }),
-      conv("conv_other", "Codex", { status: "failed" }),
+      conv("conv_other", "Codex", { status: "idle", labels: ERROR_LABELS }),
     ]);
     seedReadState([{ id: wakingId, viewer_last_seen: 199 }]);
     useChatStore.setState({ conversationId: wakingId, ...startup });
@@ -1896,7 +2002,7 @@ describe("Sidebar failed session indicator", () => {
 
   it("shows the error icon on a pinned session", () => {
     seedPins(["conv_error"]);
-    mockConversations([conv("conv_error", "Codex", { status: "failed" })]);
+    mockConversations([conv("conv_error", "Codex", { status: "idle", labels: ERROR_LABELS })]);
     renderSidebar();
 
     const pinnedSection = screen.getByRole("button", { name: /^Pinned/ }).closest("section")!;
@@ -1917,9 +2023,9 @@ describe("Sidebar failed session indicator", () => {
       }
       mockConversations([
         conv(id, "Codex", {
-          status: state === "running" ? "running" : "failed",
+          status: state === "running" ? "running" : "idle",
           pending_elicitations_count: state === "awaiting" ? 1 : 0,
-          labels: pinned ? { omni_project: "Customer X" } : {},
+          labels: { ...(pinned ? { omni_project: "Customer X" } : {}), ...ERROR_LABELS },
         }),
       ]);
       if (state === "starting") {
@@ -1955,57 +2061,67 @@ describe("Sidebar failed session indicator", () => {
   });
 });
 
-describe("Sidebar idle latest-message error", () => {
-  beforeEach(() => {
-    vi.spyOn(sessionsApi, "fetchSessionItemsPage").mockResolvedValue({
-      items: [
-        {
-          id: "native_error",
-          response_id: "response1",
-          type: "message",
-          status: "completed",
-          role: "assistant",
-          content: [{ type: "output_text", text: "API Error: Request rejected (429)" }],
-        },
-      ],
-      hasMore: true,
+describe("Sidebar latest-activity error label", () => {
+  it("shows the icon for an unopened idle session and keeps it after marking read", () => {
+    const session = conv("conv_idle_error", "Claude Code", {
+      status: "idle",
+      updated_at: 200,
+      labels: ERROR_LABELS,
     });
-  });
-  afterEach(() => vi.mocked(sessionsApi.fetchSessionItemsPage).mockRestore());
-
-  it("shows the icon for an unopened idle session and keeps it after marking read", async () => {
-    const session = conv("conv_idle_error", "Claude Code", { status: "idle", updated_at: 200 });
     seedReadState([{ id: session.id, viewer_last_seen: 199 }]);
     mockConversations([session]);
     renderSidebar();
     const row = screen.getByRole("link", { name: /conv_idle_error/ }).closest("li")!;
-    const badge = await within(row).findByRole("img", { name: "Latest message is an error" });
+    const badge = within(row).getByRole("img", { name: "Latest message is an error" });
     expect(badge).toHaveAttribute("data-state", "error");
     expect(badge.querySelector("svg")).toHaveClass("text-destructive", "size-3.5");
     expect(within(row).getByText("(unread)")).toBeInTheDocument();
     act(() => markConversationSeen(session.id, session.updated_at));
     expect(within(row).queryByText("(unread)")).toBeNull();
     expect(within(row).getByRole("img", { name: "Latest message is an error" })).toBe(badge);
-    expect(sessionsApi.fetchSessionItemsPage).toHaveBeenCalledTimes(1);
   });
 
-  it("shows an idle message error on a collapsed project's marker", async () => {
+  it("shows a hidden folder row's error once Show more reveals it", () => {
+    projectsMock.push("Customer X");
+    const filed = Array.from({ length: PROJECT_FOLDER_PAGE_SIZE + 1 }, (_, i) =>
+      conv(`conv_filed_${i}`, "Claude Code", {
+        status: "idle",
+        updated_at: 100 - i,
+        labels: {
+          omni_project: "Customer X",
+          ...(i === PROJECT_FOLDER_PAGE_SIZE ? ERROR_LABELS : {}),
+        },
+      }),
+    );
+    mockConversations(filed);
+    renderSidebar();
+    fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
+    const hiddenId = filed.at(-1)!.id;
+    expect(screen.queryByRole("link", { name: hiddenId })).toBeNull();
+
+    const showMore = screen.getByRole("button", { name: /Show more/ });
+    expect(within(showMore).getByRole("img", { name: "Latest message is an error" })).toBeVisible();
+    fireEvent.click(showMore);
+    expect(showMore).not.toBeInTheDocument();
+    const row = screen.getByRole("link", { name: hiddenId }).closest("li")!;
+    expect(within(row).getByRole("img", { name: "Latest message is an error" })).toBeVisible();
+  });
+
+  it("shows a project's error on its collapsed marker and in the expanded row", () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_idle_error", "Claude Code", {
         status: "idle",
-        labels: { omni_project: "Customer X" },
+        labels: { omni_project: "Customer X", ...ERROR_LABELS },
       }),
     ]);
     renderSidebar();
     const header = screen.getByRole("button", { name: /^Customer X/ });
-    await within(header).findByRole("img", { name: "Latest message is an error" });
+    expect(within(header).getByRole("img", { name: "Latest message is an error" })).toBeVisible();
+
     fireEvent.click(header);
     const row = screen.getByRole("link", { name: "conv_idle_error" }).closest("li")!;
-    expect(
-      within(row).getByRole("img", { name: "Latest message is an error" }),
-    ).toBeInTheDocument();
-    expect(sessionsApi.fetchSessionItemsPage).toHaveBeenCalledTimes(1);
+    expect(within(row).getByRole("img", { name: "Latest message is an error" })).toBeVisible();
   });
 });
 
@@ -2058,78 +2174,247 @@ describe("Sidebar sections", () => {
     expect(screen.queryByText("conv_only_mine")).toBeNull();
   });
 
-  it.each([false, true])(
-    "moves personal pins out of their family until unpinned (project: %s)",
-    (inProject) => {
-      const family = { id: "family", representative_id: "conv_parent", pinned: false };
-      if (inProject) projectsMock.push("Customer X");
-      const projectLabels: Record<string, string> = inProject ? { omni_project: "Customer X" } : {};
-      mockConversations([
-        conv("conv_parent", "Claude Code", { family, labels: projectLabels }),
-        conv("conv_peer", "Codex", { family, labels: projectLabels }),
-        conv("conv_sibling", "Codex", {
-          family,
-          labels: { ...projectLabels, "omnigent.pinned": "1" },
-        }),
-      ]);
-      seedPins(["conv_sibling"]);
-      const { refresh } = renderSidebar();
-      if (inProject) fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
-
-      const link = screen.getByText("conv_parent").closest("a")!;
-      const surface = link.parentElement!;
-      const chevron = screen.getByRole("button", { name: "Collapse session family" });
-      expect(surface).toHaveClass("relative");
-      expect(surface).toContainElement(chevron);
-      expect(link).not.toContainElement(chevron);
-      const pinnedSection = screen.getByText("Pinned").closest("section")!;
-      expect(screen.getAllByText("conv_sibling")).toHaveLength(1);
-      expect(within(pinnedSection).getByText("conv_sibling").closest("li")).not.toHaveAttribute(
-        "data-sibling-session",
-      );
-      expect(
-        within(pinnedSection).queryByRole("button", { name: "Collapse session family" }),
-      ).toBeNull();
-
-      const setFamilyPinned = (pinned: boolean) => {
-        mockConversations([
-          conv("conv_parent", "Claude Code", {
-            family: { ...family, pinned },
-            labels: projectLabels,
-          }),
-          conv("conv_peer", "Codex", { family: { ...family, pinned }, labels: projectLabels }),
-          conv("conv_sibling", "Codex", {
-            family: { ...family, pinned },
-            labels: { ...projectLabels, "omnigent.pinned": "1" },
-          }),
-        ]);
-        seedPins(pinned ? ["conv_parent", "conv_sibling"] : ["conv_sibling"]);
-        refresh();
+  it.each([
+    "sessions",
+    "project",
+    "pinned",
+    "pinned-shared",
+    "source-off-page",
+    "pinned-local-backfill",
+    "pinned-bundled-backfill",
+    "project-local-backfill",
+    "pinned-legacy",
+  ])(
+    "expands a collapsed family for its draft in %s, replaces it in place, and removes cancelled drafts",
+    async (scope) => {
+      const family = {
+        id: "family",
+        representative_id: "conv_parent",
+        pinned: scope.startsWith("pinned") && scope !== "pinned-legacy",
       };
-      setFamilyPinned(true);
-      fireEvent.click(
-        within(pinnedSection).getByRole("button", { name: "Collapse session family" }),
-      );
-      expect(within(pinnedSection).getByText("conv_sibling")).toBeInTheDocument();
-      expect(within(pinnedSection).queryByText("conv_peer")).toBeNull();
-      setFamilyPinned(false);
-      expect(within(pinnedSection).getByText("conv_sibling").closest("li")).not.toHaveAttribute(
-        "data-sibling-session",
-      );
-      mockConversations([
-        conv("conv_parent", "Claude Code", { family, labels: projectLabels }),
-        conv("conv_peer", "Codex", { family, labels: projectLabels }),
-        conv("conv_sibling", "Codex", { family, labels: projectLabels }),
+      const labels: Record<string, string> = scope.startsWith("project")
+        ? { omni_project: "Example project" }
+        : {};
+      if (scope.startsWith("project")) projectsMock.push("Example project");
+      if (scope === "pinned-legacy") labels[PINNED_LABEL_KEY] = "1";
+      if (scope.startsWith("pinned")) seedPins(["conv_parent", "conv_peer", "created"]);
+      const members = [
+        conv("conv_parent", "Claude Code", { family, labels }),
+        conv("conv_peer", "Codex", { family, labels }),
+        ...(scope === "source-off-page" ? [conv("conv_other", "Codex", { family, labels })] : []),
+      ];
+      const load = (rows: Conversation[]) => {
+        mockConversations(rows);
+        if (scope === "pinned-shared") useConvMock.mockReturnValue(conversationPage([]));
+      };
+      load(members.filter((row) => scope !== "source-off-page" || row.id !== "conv_peer"));
+      const { queryClient, refresh } = renderSidebar();
+      if (scope === "pinned-shared") showSharedTab();
+      if (scope.startsWith("project"))
+        fireEvent.click(screen.getByRole("button", { name: /^Example project/ }));
+      fireEvent.click(screen.getByRole("button", { name: "Collapse session family" }));
+      if (scope.startsWith("project"))
+        fireEvent.click(screen.getByRole("button", { name: /^Example project/ }));
+      if (scope === "pinned-legacy")
+        fireEvent.click(screen.getByRole("button", { name: /^Pinned/ }));
+      const source = {
+        id: scope === "source-off-page" ? "conv_peer" : "conv_parent",
+        title: "conv_parent",
+        createdAt: 1,
+        labels,
+        permissionLevel: null,
+        family,
+      } as Session;
+      if (scope === "source-off-page") {
+        const fetch = vi
+          .spyOn(identity, "authenticatedFetch")
+          .mockImplementation(async () => new Response(JSON.stringify(members[1])));
+        onTestFinished(() => fetch.mockRestore());
+      }
+      act(() => addNestedSessionDraft(queryClient, "temp:nested", source));
+      const placeholder = await screen.findByText("New nested agent");
+      expect(placeholder.closest("li")).toHaveAttribute("data-sibling-session", "true");
+      expect(placeholder.closest("a")).toHaveAttribute("href", `/?sibling=${source.id}`);
+      expect(await screen.findByText("conv_peer")).toBeInTheDocument();
+      const rowNode = placeholder.closest("li");
+      expect(rowNode).toHaveClass("ml-6");
+      if (scope.endsWith("backfill")) {
+        const fetch = vi.spyOn(identity, "authenticatedFetch").mockResolvedValue(
+          new Response(
+            JSON.stringify(
+              conv("created", "Codex", {
+                family,
+                labels,
+                permission_level: 4,
+                title: "New task",
+              }),
+            ),
+          ),
+        );
+        onTestFinished(() => fetch.mockRestore());
+      }
+      if (scope === "project-local-backfill") {
+        load([...members, conv("temp:nested", "Codex", { title: null, provisional: true })]);
+        refresh();
+        expect(screen.getByText("New nested agent").closest("li")).toBe(rowNode);
+        expect(
+          within(screen.getByText("Example project").closest("section")!).getByText(
+            "New nested agent",
+          ),
+        ).toBeInTheDocument();
+      }
+      act(() => updateNestedSessionDraft(queryClient, "temp:nested", "created"));
+      if (scope.endsWith("backfill")) {
+        load([
+          ...members,
+          ...(scope.endsWith("local-backfill")
+            ? [conv("created", "Codex", { title: "Optimistic title" })]
+            : []),
+        ]);
+        refresh();
+        await waitFor(() =>
+          expect(queryClient.getQueryData(["conversation-backfill", "created"])).toMatchObject({
+            family,
+          }),
+        );
+        expect(queryClient.getQueryData(["nested-session-drafts"])).toEqual([
+          expect.objectContaining({ id: "created", created: true }),
+        ]);
+        expect(screen.getByText("New task").closest("li")).toBe(rowNode);
+        expect(rowNode).toHaveAttribute("data-sibling-session", "true");
+        expect(
+          within(
+            screen
+              .getByText(scope.startsWith("project") ? "Example project" : "Pinned")
+              .closest("section")!,
+          ).getByText("New task"),
+        ).toBeInTheDocument();
+      }
+      load([
+        ...members.filter((row) => scope !== "source-off-page" || row.id !== source.id),
+        conv("created", "Codex", { family, labels, title: "New task" }),
       ]);
-      seedPins([]);
       refresh();
-      expect(screen.queryByText("conv_sibling")).toBeNull();
-      fireEvent.click(screen.getByRole("button", { name: "Expand session family" }));
-      expect(screen.getAllByText("conv_sibling")).toHaveLength(1);
-      expect(screen.getByText("conv_sibling").closest("li")).toHaveAttribute(
+      await waitFor(() => expect(screen.queryByText("New nested agent")).toBeNull());
+      expect(screen.getByText("New task").closest("li")).toBe(rowNode);
+      await waitFor(() => expect(queryClient.getQueryData(["nested-session-drafts"])).toEqual([]));
+      if (scope === "source-off-page") expect(screen.queryByText("conv_peer")).toBeNull();
+      if (scope === "pinned-shared") {
+        load([...members, conv("created", "Codex", { family, title: "Renamed task" })]);
+        refresh();
+        expect(screen.getByText("Renamed task")).toBeInTheDocument();
+        expect(screen.queryByText("New task")).toBeNull();
+        load(members);
+        refresh();
+        expect(screen.queryByText("Renamed task")).toBeNull();
+      }
+      act(() => addNestedSessionDraft(queryClient, "temp:cancelled", source));
+      expect(await screen.findByText("New nested agent")).toBeInTheDocument();
+      act(() => removeNestedSessionDraft(queryClient, "temp:cancelled"));
+      await waitFor(() => expect(screen.queryByText("New nested agent")).toBeNull());
+    },
+  );
+
+  it.each(["deleted", "archived", "not-owned", "source-deleted"])(
+    "retires a draft confirmed %s before a list refresh",
+    async (reason) => {
+      const parent = conv("conv_parent", "Codex", {
+        family: { id: "family", representative_id: "conv_parent", pinned: false },
+      });
+      mockConversations([parent]);
+      const fetch = vi.spyOn(identity, "authenticatedFetch").mockImplementation(async () =>
+        reason === "deleted" || reason === "source-deleted"
+          ? new Response(null, { status: 404 })
+          : new Response(
+              JSON.stringify(
+                conv("deleted", "Codex", {
+                  family: parent.family,
+                  archived: reason === "archived",
+                  permission_level: reason === "not-owned" ? 1 : 4,
+                  owner: null,
+                }),
+              ),
+            ),
+      );
+      onTestFinished(() => fetch.mockRestore());
+      const { queryClient } = renderSidebar();
+      act(() =>
+        addNestedSessionDraft(queryClient, "temp:deleted", {
+          id: reason === "source-deleted" ? "missing-source" : parent.id,
+          createdAt: 1,
+          labels: {},
+          family: parent.family,
+        } as Session),
+      );
+      expect(queryClient.getQueryData(["nested-session-drafts"])).toHaveLength(1);
+      if (reason !== "source-deleted")
+        act(() => updateNestedSessionDraft(queryClient, "temp:deleted", "deleted"));
+      await waitFor(() => expect(queryClient.getQueryData(["nested-session-drafts"])).toEqual([]));
+      expect(fetch).toHaveBeenCalledWith(
+        expect.stringContaining(
+          `/v1/sessions/${reason === "source-deleted" ? "missing-source" : "deleted"}?`,
+        ),
+      );
+      expect(screen.queryByText("New nested agent")).toBeNull();
+    },
+  );
+
+  it.each([
+    { inProject: false, legacyRepresentative: false },
+    { inProject: true, legacyRepresentative: false },
+    { inProject: false, legacyRepresentative: true },
+  ])(
+    "keeps legacy pins grouped (project: $inProject, representative pin: $legacyRepresentative)",
+    ({ inProject, legacyRepresentative }) => {
+      const family = { id: "family", representative_id: "conv_parent", pinned: false };
+      if (inProject) projectsMock.push("Example project");
+      const labels: Record<string, string> = inProject ? { omni_project: "Example project" } : {};
+      const members = ["conv_parent", "conv_peer", "conv_nested"].map((id, index) =>
+        conv(id, "Claude Code", {
+          family,
+          created_at: index + 1,
+          labels: {
+            ...labels,
+            ...(id === "conv_nested" || (legacyRepresentative && id === "conv_parent")
+              ? { "omnigent.pinned": "1" }
+              : {}),
+          },
+        }),
+      );
+      mockConversations(members);
+      seedPins(["conv_nested", ...(legacyRepresentative ? ["conv_parent"] : [])]);
+      const { refresh } = renderSidebar();
+      if (inProject) fireEvent.click(screen.getByRole("button", { name: /^Example project/ }));
+      expect(screen.getAllByText("conv_nested")).toHaveLength(1);
+      if (legacyRepresentative) {
+        const pinned = screen.getByText("Pinned").closest("section")!;
+        for (const row of members) expect(within(pinned).getByText(row.id)).toBeInTheDocument();
+      }
+      expect(screen.getByText("conv_nested").closest("li")).toHaveAttribute(
         "data-sibling-session",
         "true",
       );
+      expect(
+        within(screen.getByText("conv_nested").closest("li")!).queryByTestId(
+          "quick-pin-conversation",
+        ),
+      ).toBeNull();
+      expect(
+        screen.getByRole("button", { name: "Collapse session family" }).closest("a"),
+      ).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Collapse session family" }));
+      expect(screen.queryByText("conv_nested")).toBeNull();
+      mockConversations(members.map((row) => ({ ...row, family: { ...family, pinned: true } })));
+      seedPins(["conv_parent", "conv_nested"]);
+      refresh();
+      const pinnedSection = screen.getByText("Pinned").closest("section")!;
+      expect(within(pinnedSection).getByText("conv_parent")).toBeInTheDocument();
+      expect(within(pinnedSection).queryByText("conv_nested")).toBeNull();
+      fireEvent.click(within(pinnedSection).getByRole("button", { name: "Expand session family" }));
+      for (const id of ["conv_parent", "conv_peer", "conv_nested"]) {
+        expect(screen.getAllByText(id)).toHaveLength(1);
+        expect(within(pinnedSection).getByText(id)).toBeInTheDocument();
+      }
     },
   );
 
@@ -2641,7 +2926,7 @@ describe("Sidebar project sections", () => {
     expect(screen.queryByText("conv_filed")).toBeNull();
   });
 
-  it("auto-expands the project folder holding the selected session", () => {
+  it("holds the selected session under its collapsed project folder", () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_filed", "Claude Code", { labels: { omni_project: "Customer X" } }),
@@ -2664,10 +2949,9 @@ describe("Sidebar project sections", () => {
       </QueryClientProvider>,
     );
 
-    // No click: the folder opens because its session is selected, and the row
-    // is visible under the project section.
+    // Selecting the session doesn't open the folder; its row stays listed under it.
     const header = screen.getByRole("button", { name: /^Customer X/ });
-    expect(header).toHaveAttribute("aria-expanded", "true");
+    expect(header).toHaveAttribute("aria-expanded", "false");
     const projectSection = screen.getByText("Customer X").closest("section")!;
     expect(within(projectSection).getByText("conv_filed")).toBeInTheDocument();
   });
@@ -2842,6 +3126,34 @@ describe("Sidebar project sections", () => {
     openProjectsMenu();
     fireEvent.click(screen.getByTestId("projects-select-sessions"));
     expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
+  });
+
+  it("bulk-deletes a folder session as its lists last fetched it", () => {
+    projectsMock.push("Alpha");
+    const fetched = (labels: Record<string, string>) => {
+      const row = conv("conv_a", "Claude Code", { labels: { omni_project: "Alpha", ...labels } });
+      mockConversations([row, conv("conv_loose", "Claude Code")]);
+      projectSessionsMock.current.Alpha = [row];
+    };
+    fetched({ "omnigent.scheduled_task_source": "st_1" });
+    const view = renderSidebar();
+    fireEvent.click(screen.getByRole("button", { name: /^Alpha/ }));
+    openProjectsMenu();
+    fireEvent.click(screen.getByTestId("projects-select-sessions"));
+    fireEvent.click(within(screen.getByText("Alpha").closest("section")!).getByText("conv_a"));
+
+    fireEvent.click(screen.getByTestId("bulk-delete"));
+    expect(
+      screen.getByRole("heading", { name: "Delete 1 session and 1 automation?" }),
+    ).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    // The automation is deleted, and the lists refetch the row without its label.
+    fetched({});
+    view.refresh();
+    fireEvent.click(screen.getByTestId("bulk-delete"));
+    expect(screen.getByRole("heading", { name: "Delete 1 session(s)?" })).toBeInTheDocument();
+    expect(screen.queryByTestId("bulk-automation-source-delete-notice")).toBeNull();
   });
 
   it("deletes a project (and all its sessions) from the folder kebab after confirming", async () => {
@@ -3184,9 +3496,10 @@ describe("Sidebar project Show more", () => {
   it("lists the open session when it sits past the first five", () => {
     projectsMock.push("Customer X");
     mockConversations(filedSessions(12));
+    localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify(["Customer X"]));
     renderOnSession("conv_filed_7");
 
-    // The folder auto-expands for the open session and grows a whole page to list it.
+    // The expanded folder grows a whole page to list the open session.
     expect(folderRowIds()).toEqual(filedIds(10));
     expect(screen.getByTestId("project-show-more")).toBeInTheDocument();
   });
@@ -3296,8 +3609,8 @@ describe("Sidebar collapsed project marker", () => {
     seedReadState([{ id: "conv_unread", viewer_last_seen: 199 }]);
     mockConversations([
       conv("conv_error", "Codex", {
-        labels: { omni_project: "Customer X" },
-        status: "failed",
+        labels: { omni_project: "Customer X", ...ERROR_LABELS },
+        status: "idle",
       }),
       conv("conv_unread", "Codex", {
         labels: { omni_project: "Customer X" },
@@ -3362,8 +3675,8 @@ describe("Sidebar collapsed project marker", () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_error", "Codex", {
-        labels: { omni_project: "Customer X" },
-        status: "failed",
+        labels: { omni_project: "Customer X", ...ERROR_LABELS },
+        status: "idle",
       }),
     ]);
     useChatStore.setState({ conversationId: "conv_error", ...startup });
@@ -3386,8 +3699,8 @@ describe("Sidebar collapsed project marker", () => {
     projectsMock.push("Customer X");
     mockConversations([
       conv("conv_error", "Codex", {
-        labels: { omni_project: "Customer X" },
-        status: "failed",
+        labels: { omni_project: "Customer X", ...ERROR_LABELS },
+        status: "idle",
       }),
       conv("conv_awaiting", "Codex", {
         labels: { omni_project: "Customer X" },
@@ -3752,6 +4065,22 @@ describe("Sidebar active-row auto-scroll", () => {
     vi.restoreAllMocks();
   });
 
+  it("leaves the open session out of the Inbox badge until it is marked unread", () => {
+    vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(() => {});
+    seedReadState([{ id: "conv_active", viewer_last_seen: 199 }]);
+    mockConversations([conv("conv_active", "Codex", { status: "idle", updated_at: 200 })]);
+
+    renderAtRoute("/c/conv_active");
+
+    const inbox = screen.getByTestId("inbox-button");
+    expect(within(inbox).queryByLabelText(/inbox items? waiting/)).toBeNull();
+    act(() => markConversationUnread("conv_active", 200));
+    expect(within(inbox).getByLabelText("1 inbox item waiting")).toHaveTextContent("1");
+    act(() => markConversationRead("conv_active", 200));
+    expect(within(inbox).queryByLabelText(/inbox items? waiting/)).toBeNull();
+    vi.restoreAllMocks();
+  });
+
   it("does not scroll any row when no conversation is active", () => {
     const scrollIntoView = vi.fn();
     vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(scrollIntoView);
@@ -3840,11 +4169,19 @@ it("caps Shared display independently of Mine while revealing cached rows", asyn
 });
 
 /** Render the sidebar with the sidebar_grouping_ui release flag on. */
-function renderGroupingSidebar() {
-  return renderSidebar(true, "/", undefined, {
-    ...FALLBACK_SERVER_INFO,
-    features: { ...FALLBACK_SERVER_INFO.features, sidebar_grouping_ui: true },
-  });
+function renderGroupingSidebar(config?: SidebarConfig) {
+  return renderSidebar(
+    true,
+    "/",
+    undefined,
+    {
+      ...FALLBACK_SERVER_INFO,
+      features: { ...FALLBACK_SERVER_INFO.features, sidebar_grouping_ui: true },
+    },
+    [],
+    vi.fn(),
+    config,
+  );
 }
 
 describe("Sidebar view options", () => {
@@ -4261,6 +4598,59 @@ describe("Sidebar view options", () => {
         .getAllByRole("link", { name: /^conv_/ })
         .map((link) => link.textContent),
     ).toEqual(["conv_done_new", "conv_done_old", "conv_running"]);
+  });
+
+  it("opens view submenus in place of the main menu on a mobile viewport", () => {
+    const mediaQuery = window.matchMedia("(max-width: 767.98px)");
+    const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      ...mediaQuery,
+      media: query,
+      matches: query === "(max-width: 767.98px)",
+    }));
+    try {
+      mockConversations([conv("conv_idle", "Codex", { status: "idle" })]);
+      renderGroupingSidebar();
+      const openMenu = () => {
+        fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+          button: 0,
+          ctrlKey: false,
+          pointerType: "mouse",
+        });
+        return screen.getByRole("menu");
+      };
+      const menu = openMenu();
+
+      fireEvent.click(within(menu).getByTestId("session-grouping-menu"));
+      expect(screen.getAllByRole("menu")).toEqual([menu]);
+      expect(within(menu).getByRole("menuitem", { name: "Back from Grouping" })).toHaveTextContent(
+        "Grouping",
+      );
+      expect(within(menu).getByRole("menuitemradio", { name: "Harness" })).toBeInTheDocument();
+      expect(within(menu).queryByTestId("session-ordering-menu")).toBeNull();
+
+      fireEvent.click(within(menu).getByTestId("session-filter-menu-back"));
+      expect(within(menu).queryByRole("menuitemradio")).toBeNull();
+      fireEvent.click(within(menu).getByTestId("session-show-menu"));
+      fireEvent.click(within(menu).getByTestId("session-show-branch"));
+      expect(within(menu).getByTestId("session-show-repo")).toBeInTheDocument();
+
+      fireEvent.click(within(menu).getByTestId("session-filter-menu-back"));
+      fireEvent.click(within(menu).getByTestId("session-ordering-menu"));
+      fireEvent.click(within(menu).getByRole("menuitemradio", { name: "Created" }));
+      expect(screen.queryByRole("menu")).toBeNull();
+      expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!)).toMatchObject({
+        ordering: "created",
+        show: ["branch"],
+      });
+      // Reopening starts from the main list, not the last submenu.
+      const reopened = openMenu();
+      fireEvent.click(within(reopened).getByTestId("session-grouping-menu"));
+      fireEvent.keyDown(reopened, { key: "Escape" });
+      expect(screen.queryByRole("menu")).toBeNull();
+      expect(within(openMenu()).getByTestId("session-grouping-menu")).toBeInTheDocument();
+    } finally {
+      matchMedia.mockRestore();
+    }
   });
 
   it.each(["default", "status", "created", "updated"])(
@@ -5118,6 +5508,161 @@ describe("sidebar_grouping_ui release flag", () => {
     const shared = screen.getByRole("button", { name: "Shared with me" }).closest("section")!;
     expect(within(shared).getByText("conv_shared_alpha")).toBeInTheDocument();
     expect(screen.queryByText("conv_owned")).toBeNull(); // in the collapsed Alpha folder
+  });
+
+  // Server-owned labels on the session an automation's run created.
+  const RUN_LABELS = {
+    "omnigent.scheduled_task_origin": "st_1",
+    "omnigent.scheduled_task_initial_run": "run_1",
+  };
+  const ALICE = "alice@example.com";
+  const SHARED_RUNS = [
+    // Alice filed her automation's runs into her own project.
+    conv("conv_shared_run", "Claude Code", {
+      owner: ALICE,
+      labels: { ...RUN_LABELS, omni_project: "Alpha" },
+    }),
+    conv("conv_shared_launch", "Claude Code", {
+      owner: ALICE,
+      labels: { "omnigent.scheduled_task_launch": "st_1" },
+    }),
+    // A fork keeps the origin but drops the initial run, so it's an ordinary share.
+    conv("conv_shared_fork", "Claude Code", {
+      owner: ALICE,
+      labels: { "omnigent.scheduled_task_origin": "st_1" },
+    }),
+    conv("conv_shared_other", "Claude Code", { owner: ALICE }),
+  ];
+  const automationFolder = () =>
+    screen.getByRole("button", { name: /^Omnigent Automation/ }).closest("section")!;
+  // Each scope serves only its own rows, as the server splits them.
+  const mockScopedConversations = (rows: Conversation[]) => {
+    mockConversations(rows);
+    const original = useConvMock.getMockImplementation()!;
+    useConvMock.mockImplementation((...args) =>
+      args[4] === "mine" || args[4] === "shared"
+        ? conversationPage(rows.filter((row) => Boolean(row.owner) === (args[4] === "shared")))
+        : original(...args),
+    );
+  };
+
+  it("files other users' automation runs in the viewer's Omnigent Automation folder", () => {
+    projectsMock.push("Alpha", "Omnigent Automation");
+    mockScopedConversations([
+      conv("conv_own_run", "Claude Code", {
+        labels: { ...RUN_LABELS, omni_project: "Omnigent Automation" },
+      }),
+      ...SHARED_RUNS,
+    ]);
+    renderGroupingSidebar();
+    selectSessionFilter("all");
+    fireEvent.click(screen.getByRole("button", { name: /^Omnigent Automation/ }));
+    fireEvent.click(screen.getByRole("button", { name: "Alpha" }));
+
+    const folder = automationFolder();
+    const alpha = screen.getByRole("button", { name: "Alpha" }).closest("section")!;
+    const shared = screen.getByRole("button", { name: "Shared with me" }).closest("section")!;
+    for (const id of ["conv_own_run", "conv_shared_run", "conv_shared_launch"]) {
+      expect(within(folder).getByText(id)).toBeInTheDocument();
+      expect(within(shared).queryByText(id)).toBeNull();
+    }
+    expect(within(alpha).queryByText("conv_shared_run")).toBeNull();
+    for (const id of ["conv_shared_fork", "conv_shared_other"]) {
+      expect(within(shared).getByText(id)).toBeInTheDocument();
+      expect(within(folder).queryByText(id)).toBeNull();
+    }
+    // A shared run stays on one line with the people icon; the viewer's own run has neither.
+    const sharedRow = within(folder).getByText("conv_shared_run").closest("li")!;
+    expect(within(sharedRow).queryByTestId("session-row-meta")).toBeNull();
+    expect(within(sharedRow).getByRole("img", { name: "Shared with you" })).toBeInTheDocument();
+    const ownRow = within(folder).getByText("conv_own_run").closest("li")!;
+    expect(within(ownRow).queryByTestId("session-row-meta")).toBeNull();
+    expect(within(ownRow).queryByRole("img", { name: /^Shared with/ })).toBeNull();
+    // Filing stays the owner's: a shared run offers no Move to project.
+    fireEvent.pointerDown(within(sharedRow).getByTestId("conversation-actions"), { button: 0 });
+    expect(
+      screen.queryByTestId("mark-unread-conversation") ??
+        screen.getByTestId("mark-read-conversation"),
+    ).toBeInTheDocument();
+    expect(screen.queryByTestId("move-to-project")).toBeNull();
+    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+
+    // My sessions files the shared runs there too, once each, and lists no other share.
+    selectSessionFilter("mine");
+    for (const id of ["conv_own_run", "conv_shared_run", "conv_shared_launch"]) {
+      expect(within(automationFolder()).getByText(id)).toBeInTheDocument();
+      expect(screen.getAllByText(id)).toHaveLength(1);
+    }
+    expect(screen.queryByText("conv_shared_fork")).toBeNull();
+    expect(screen.queryByText("conv_shared_other")).toBeNull();
+    // The Shared filter lists them all, flat.
+    showSharedTab();
+    for (const run of SHARED_RUNS) expect(screen.getByText(run.id)).toBeInTheDocument();
+  });
+
+  it("shows the folder where the viewer's project will go until they have it", () => {
+    projectsMock.push("Alpha", "Zeta");
+    mockScopedConversations(SHARED_RUNS);
+    const view = renderGroupingSidebar();
+    selectSessionFilter("all");
+    const folderNames = () =>
+      screen
+        .getAllByRole("button", { name: /^(Alpha|Zeta|Omnigent Automation)/ })
+        .map((button) => button.textContent);
+    expect(folderNames()).toEqual(["Alpha", "Omnigent Automation", "Zeta"]);
+    // Nothing to rename, delete or start a session in: it isn't a project yet.
+    expect(
+      screen.queryByRole("button", { name: "Project actions for Omnigent Automation" }),
+    ).toBeNull();
+    expect(screen.queryByRole("button", { name: "New session in Omnigent Automation" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /^Omnigent Automation/ }));
+    expect(within(automationFolder()).getByText("conv_shared_run")).toBeInTheDocument();
+
+    // The viewer's own first automation creates the project, which takes its place.
+    projectsMock.splice(1, 0, "Omnigent Automation");
+    view.refresh();
+    expect(folderNames()).toEqual(["Alpha", "Omnigent Automation", "Zeta"]);
+    expect(within(automationFolder()).getByText("conv_shared_run")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Project actions for Omnigent Automation" }),
+    ).toBeInTheDocument();
+
+    // My sessions shows it too, while a pinned run stays in Pinned.
+    projectsMock.splice(1, 1);
+    seedPins(["conv_shared_launch"]);
+    view.refresh();
+    selectSessionFilter("mine");
+    expect(folderNames()).toEqual(["Alpha", "Omnigent Automation", "Zeta"]);
+    expect(within(automationFolder()).getByText("conv_shared_run")).toBeInTheDocument();
+    const pinned = screen.getByText("Pinned").closest("section")!;
+    expect(within(pinned).getByText("conv_shared_launch")).toBeInTheDocument();
+    expect(screen.getAllByText("conv_shared_launch")).toHaveLength(1);
+
+    // Without a shared run to file, there is no placeholder.
+    mockScopedConversations([SHARED_RUNS[2]!, SHARED_RUNS[3]!]);
+    view.refresh();
+    expect(screen.queryByRole("button", { name: /^Omnigent Automation/ })).toBeNull();
+    selectSessionFilter("all");
+    expect(screen.queryByRole("button", { name: /^Omnigent Automation/ })).toBeNull();
+  });
+
+  it("files no shared runs on My sessions when it doesn't load shared sessions", () => {
+    projectsMock.push("Alpha");
+    mockScopedConversations(SHARED_RUNS);
+    const view = renderGroupingSidebar({ ...sidebarConfig, inboxIncludesShared: false });
+    selectSessionFilter("mine");
+    expect(screen.queryByRole("button", { name: /^Omnigent Automation/ })).toBeNull();
+    expect(screen.queryByText("conv_shared_run")).toBeNull();
+
+    // Nor from the folder's own page, and the shared scope stays unfetched.
+    projectsMock.push("Omnigent Automation");
+    projectSessionsMock.current["Omnigent Automation"] = [SHARED_RUNS[1]!];
+    view.refresh();
+    fireEvent.click(screen.getByRole("button", { name: /^Omnigent Automation/ }));
+    expect(within(automationFolder()).queryByText("conv_shared_launch")).toBeNull();
+    expect(automationFolder()).toHaveTextContent("No sessions");
+    const sharedScopeCalls = useConvMock.mock.calls.filter((args) => args[4] === "shared");
+    expect(sharedScopeCalls.some((args) => (args[2] as { enabled?: boolean }).enabled)).toBe(false);
   });
 });
 

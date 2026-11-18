@@ -28,7 +28,8 @@ Endpoints:
 - ``GET /mock/requests`` — return captured request bodies.
 - ``POST /mock/context_window`` — reject oversized ``/v1/messages`` prompts.
 - ``GET /gate/pending`` — check if any request is blocked on a gate.
-- ``POST /gate/release`` — release the oldest pending gate.
+- ``POST /gate/release`` — release the oldest pending gate, or with
+  ``?gate=<label>`` the oldest one whose response carries that ``gate`` label.
 - ``GET /stats`` — return ``{"request_count": N}``.
 
 Usage::
@@ -808,6 +809,8 @@ class QueuedResponse:
     :param native_items: Raw output items (e.g. ``web_search_call``)
         included alongside text in the response.
     :param block: If True, block until gate is released.
+    :param gate: Label that lets ``POST /gate/release?gate=<label>`` release
+        this blocked response ahead of older ones.
     :param stream: If True, stream text deltas before completed.
     :param error: If set, return an error response with this message.
     :param status_code: HTTP status code for error responses.
@@ -834,6 +837,7 @@ class QueuedResponse:
     tool_calls: list[dict[str, str]] | None = None
     native_items: list[dict] | None = None
     block: bool = False
+    gate: str | None = None
     stream: bool = False
     error: str | None = None
     status_code: int = 500
@@ -1593,6 +1597,7 @@ async def configure(request: Request) -> dict[str, object]:
                     tool_calls=entry.get("tool_calls"),
                     native_items=entry.get("native_items"),
                     block=entry.get("block", False),
+                    gate=entry.get("gate"),
                     stream=entry.get("stream", False),
                     error=entry.get("error"),
                     status_code=entry.get("status_code", 500),
@@ -1692,10 +1697,10 @@ async def gate_pending() -> dict[str, bool]:
 
 
 @app.post("/gate/release")
-async def gate_release() -> dict[str, bool]:
-    """Release the oldest pending gate."""
+async def gate_release(gate: str | None = None) -> dict[str, bool]:
+    """Release the oldest pending gate, or the oldest labelled *gate*."""
     for qr in _state.pending_gates:
-        if qr._pending.is_set() and not qr._gate.is_set():
+        if qr._pending.is_set() and not qr._gate.is_set() and gate in (None, qr.gate):
             qr._gate.set()
             return {"released": True}
     return {"released": False}

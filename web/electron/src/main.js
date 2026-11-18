@@ -51,6 +51,7 @@ const {
   createBrowserPermissionStore,
 } = require("./browserPermissions");
 const { createBrowserPermissionPrompt } = require("./browserPermissionPrompt");
+const { attachSecurityKeyNotice } = require("./browserSecurityKeyNotice");
 const {
   normalizeUrl,
   normalizeRecentServers,
@@ -77,6 +78,7 @@ const { registerServerAwayWatch, AWAY_BANNER_DELAY_MS } = require("./away_banner
 const { createReturnBanner } = require("./return_banner");
 const { createReconnectOverlay } = require("./reconnect_overlay");
 const { createBrowserViewRegistry } = require("./browserViewRegistry");
+const { registerBrowserTabsIpc } = require("./browserTabs");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { goBack, goForward, registerBrowserIpc } = require("./browserIpc");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
@@ -131,6 +133,10 @@ const {
   sanitizeDesktopCommandState,
 } = require("./desktopCommands");
 const omnigentCli = require("./omnigent_cli");
+const { workspaceSocketRequest } = require("./workspaceSocket");
+const { createWorkspaceSshForwards } = require("./workspaceSshForwards");
+const { createSshHostStore } = require("./sshHosts");
+const { createSshTargetChecks } = require("./sshTargets");
 
 const serverManager = require("./server_manager");
 const { diagnostics } = require("./diagnostics");
@@ -160,14 +166,13 @@ function serverSelectorV2EnvForced() {
   return process.env.OMNIGENT_SERVER_SELECTOR_V2 === "1";
 }
 
-/** V2 defaults on for MDM-enabled Databricks macOS users. */
+/** V2 defaults on for macOS users. */
 function serverSelectorV2Enabled() {
   // If enforced by the environment variable, enable.
   if (serverSelectorV2EnvForced()) {
     return true;
   }
   const savedPreference = loadSettings().server_selector_v2 ?? null;
-  const isDatabricksManaged = databricksInternalFeaturesEnabled();
 
   // Respect the user's preference.
   if (savedPreference !== null) {
@@ -175,17 +180,7 @@ function serverSelectorV2Enabled() {
   }
 
   // Enable on macOS only.
-  if (process.platform !== "darwin") {
-    return false;
-  }
-
-  // Enable on Databricks managed devices.
-  if (isDatabricksManaged) {
-    return true;
-  }
-
-  // Otherwise, disable.
-  return false;
+  return process.platform === "darwin";
 }
 
 /** Which setup page to load — the server selector when enabled. */
@@ -210,13 +205,13 @@ function serverSelectorV2DevUrl() {
 
 /**
  * Dev-only onboarding mock, driven by env vars so the wizard's four desktop
- * variants can be exercised in the real Electron shell without MDM / a real
- * server. Translates OMNIGENT_ONBOARDING_MOCK* into the `?mock=1&…` query the
+ * variants can be exercised in the real Electron shell without managed
+ * preferences or a real server. Translates OMNIGENT_ONBOARDING_MOCK* into the `?mock=1&…` query the
  * renderer's mockSetup.ts reads. Empty (no query) unless the mock is on, and
  * never active in a packaged build. See web/src/pages/onboarding/mockSetup.ts.
  *
  *   OMNIGENT_ONBOARDING_MOCK=1                 enable
- *   OMNIGENT_ONBOARDING_MOCK_MANAGED=url,url   MDM-preset servers
+ *   OMNIGENT_ONBOARDING_MOCK_MANAGED=url,url   managed preset servers
  *   OMNIGENT_ONBOARDING_MOCK_RECENTS=url,url   recent servers
  *   OMNIGENT_ONBOARDING_MOCK_INSTALLED=1       returning user
  *   OMNIGENT_ONBOARDING_MOCK_REMOTE_ENV=1      offer the remote environment
@@ -307,6 +302,10 @@ const ERR_BLOCKED_BY_CLIENT = -20;
  */
 const POPUP_PRELOAD = path.join(__dirname, "popup_preload.js");
 
+/** Reports embedded-browser WebAuthn requests; Windows draws its own WebAuthn dialog. */
+const BROWSER_VIEW_PRELOAD =
+  process.platform === "win32" ? undefined : path.join(__dirname, "browser_view_preload.js");
+
 /** Absolute path to the app icon (PNG works for the macOS dock at runtime). */
 const ICON_PNG = path.join(__dirname, "..", "icons", "icon.png");
 
@@ -325,32 +324,54 @@ function developerModeEnabled() {
   });
 }
 
-/** Read the current macOS MDM-provided server list without persisting it. */
+/** Read the current managed server list from macOS without persisting it. */
 function managedServerUrls() {
   return getManagedServerUrls({ platform: process.platform, getUserDefault });
 }
 
-/** Display names for the MDM-provided servers, keyed by server URL. */
+/** Display names for managed servers, keyed by server URL. */
 function managedServerNames() {
   return getManagedServerNames({ platform: process.platform, getUserDefault });
 }
 
 /**
- * Whether the MDM-managed Databricks-internal-features flag is set. Read from
- * macOS on every call (never persisted), so profile changes apply live.
+ * Whether the managed features flag is set. Read from macOS on
+ * every call (never persisted), so profile changes apply live.
  */
 function databricksInternalFeaturesEnabled() {
   return getDatabricksInternalFeaturesEnabled({ platform: process.platform, getUserDefault });
 }
 
 /**
- * The Arca connect console: a shell-owned modal that asks consent by showing
- * the exact command, then streams its live output (replaces the bare native
- * dialog — same trust model, full transparency). The flow also de-duplicates:
- * a repeat connect while one is in flight re-focuses the existing console and
- * shares its outcome, so a refreshed SPA can always get back to it.
+ * The Arca connect console: a modal owned by the shell that asks consent by
+ * showing the exact command, then streams its live output. A repeat connect
+ * while one is in flight re-focuses the console and shares its outcome.
  */
 const arcaIdentities = createArcaIdentityStore();
+// Hosts this desktop connected over SSH, and the connections that reach their workspace sockets.
+const sshHosts = createSshHostStore(() => path.join(app.getPath("userData"), "ssh-hosts.json"));
+const workspaceSshForwards = createWorkspaceSshForwards();
+const sshTargetChecks = createSshTargetChecks({ record: sshHosts.record });
+
+/**
+ * Ask, in a dialog the page can't draw over, before SSH runs with a destination
+ * the page suggested. Null when there is no window to ask in.
+ */
+async function approveSshTarget(win, serverUrl, alias) {
+  if (!win || win.isDestroyed()) return null;
+  const { response } = await dialog.showMessageBox(win, {
+    type: "question",
+    buttons: ["Not now", "Allow"],
+    defaultId: 0,
+    cancelId: 0,
+    message: `Read this session's files over SSH from "${alias}"?`,
+    detail:
+      `${new URL(serverUrl).host} says this session's host runs on the SSH destination "${alias}". ` +
+      "Omnigent would connect with your SSH config and keys, check that the host is there, and read files from it directly instead of through the server.\n\n" +
+      `Allow only if you recognize "${alias}".`,
+  });
+  return response === 1;
+}
 
 function startArcaHostConnect(serverUrl, deps) {
   const finish = arcaIdentities.begin(serverUrl);
@@ -462,8 +483,8 @@ function arcaAutoConnectFeatureEnabled() {
 
 /** Launch-time Arca auto-connect, behind the feature flag above. */
 const arcaAutoConnect = createArcaAutoConnect({
-  // Auto-connect needs arca itself: the MDM flag alone keeps the manual item
-  // (which explains what's missing) but shouldn't fail on every launch.
+  // Auto-connect needs arca itself: the managed flag alone keeps the manual
+  // item (which explains what's missing) but shouldn't fail on every launch.
   isEligible: (serverUrl) =>
     arcaAutoConnectFeatureEnabled() &&
     isDatabricksManagedServerUrl(serverUrl) &&
@@ -1931,11 +1952,11 @@ function rememberOnboardingRunner(serverUrl, runner) {
 const ONBOARDING_RUNNER_TTL_MS = 10 * 60 * 1000;
 
 /**
- * CLI command for desktop host enrollment on `serverUrl`. Databricks-internal
- * windows use `isaac omni` behind the same effective gate as Arca (MDM flag +
- * Databricks-managed HTTPS server); every other window keeps the configured /
- * auto-detected public Omnigent CLI. Returns null when the selected launcher
- * is unavailable.
+ * CLI command for desktop host enrollment on `serverUrl`. Managed
+ * windows use `isaac omni` behind the same effective gate as Arca (managed
+ * features flag + managed HTTPS server); every other window keeps the configured
+ * or auto-detected Omnigent CLI. Returns null when the selected launcher is
+ * unavailable.
  *
  * @param {string | null | undefined} serverUrl
  * @returns {string | {
@@ -2057,7 +2078,7 @@ function rememberServerName(serverUrl, rawName) {
 
 /**
  * The name to show for a server outside trust prompts: the organization's
- * (MDM) name, else the server's own beside its host, else its host.
+ * managed name, else the server's own beside its host, else its host.
  *
  * @param {string} serverUrl
  * @param {string | null} [serverName] A name just read from the server's
@@ -3142,7 +3163,11 @@ function newWindow() {
   const current = win?.webContents.getURL();
   // Cloning an ephemeral (multi-server) window keeps the clone
   // ephemeral, so Change Server… from it still won't touch saved settings.
-  createWindow(current, { ephemeral: win ? windows.get(win)?.ephemeral === true : false });
+  // The clone's server is its source's, not its /c/<id> URL (browserTabs.js keys tabs by it).
+  createWindow(current, {
+    ephemeral: win ? windows.get(win)?.ephemeral === true : false,
+    serverUrl: (win && windows.get(win)?.serverUrl) || undefined,
+  });
 }
 
 /**
@@ -4271,12 +4296,26 @@ function createBrowserRegistryForWindow(win) {
     registry.get(registry.activeConversationId())?.view.webContents === wc;
   const registry = createBrowserViewRegistry({
     WebContentsViewCtor: (opts) => {
+      if (BROWSER_VIEW_PRELOAD) opts.webPreferences.preload = BROWSER_VIEW_PRELOAD;
       // Install before construction: Electron otherwise auto-grants requests.
       const policy = hardenAgentPartition(opts.webPreferences.partition, win, canPrompt, () =>
         view.getBounds(),
       );
       const view = new WebContentsView(opts);
       policy.attach(view.webContents);
+      if (BROWSER_VIEW_PRELOAD) {
+        attachSecurityKeyNotice(view.webContents, {
+          canPrompt,
+          showPrompt: (options) =>
+            browserPermissionPrompt.show({
+              parent: win,
+              getAnchorBounds: () => view.getBounds(),
+              ...options,
+            }),
+          openExternal: (url) => shell.openExternal(url),
+          cookieImport: process.platform === "darwin",
+        });
+      }
       guardAgentPartitionRequests(opts.webPreferences.partition, registry);
       return view;
     },
@@ -4334,7 +4373,10 @@ function createBrowserRegistryForWindow(win) {
     },
   });
   win.webContents.on("did-start-navigation", (_event, _url, isInPlace, isMainFrame) => {
-    if (isMainFrame && !isInPlace) registry.setRecentSessionSwitchSupported(false);
+    if (isMainFrame && !isInPlace) {
+      registry.setRecentSessionSwitchSupported(false);
+      registry.setOpenTabSupported(false);
+    }
   });
   return registry;
 }
@@ -4357,8 +4399,8 @@ const WORKSPACE_PICKER_PAGE = path.join(__dirname, "..", "workspace-picker", "in
 /**
  * Show the searchable workspace picker (workspace-picker/index.html) as a modal
  * of `parent`, and resolve with the chosen workspace (or null if dismissed).
- * Used for account-scoped (SPOG) logins to choose which workspace to bridge the
- * account token to. Sibling in spirit to genie-one-desktop's WorkspacePicker.
+ * Used for account-scoped logins to choose which workspace to bridge the
+ * account token to.
  *
  * @param {Electron.BrowserWindow} parent
  * @param {Array<{workspaceId: string, name: string, fqdn: string}>} workspaces
@@ -4648,7 +4690,7 @@ function registerIpc() {
   // Setup page → capabilities that gate wizard chrome. `v2Forced` means the env
   // var pins the selector on, so "Switch to legacy" can't take effect and the
   // menu item is disabled. `connectedBefore` (returning user) reads the raw
-  // recents, which — unlike get-recent-servers — still count MDM presets.
+  // recents, which — unlike get-recent-servers — still count managed presets.
   ipcMain.handle("omnigent:get-setup-capabilities", (event) => {
     if (!isSetupPageSender(event)) {
       throw new Error("get-setup-capabilities is only available to the setup page");
@@ -4673,6 +4715,17 @@ function registerIpc() {
     return { remote: internal && arca.resolveArcaPath() !== null, bundledCli: internal };
   });
 
+  // In-flight onboarding runner connects, per setup window, so Cancel can stop one.
+  const runnerConnects = new Map();
+  ipcMain.handle("omnigent:cancel-runner-connect", (event) => {
+    if (!isSetupPageSender(event)) {
+      throw new Error("cancel-runner-connect is only available to the setup page");
+    }
+    const controller = runnerConnects.get(event.sender);
+    controller?.abort();
+    return controller !== undefined;
+  });
+
   // Setup page → connect the runner picked in onboarding to `url`, streaming
   // output, before the window opens the server. The Install click on this
   // bundled page is the user's consent, so no enrollment dialog here.
@@ -4682,10 +4735,33 @@ function registerIpc() {
     }
     if (runner !== "local" && runner !== "remote") throw new TypeError("unknown runner");
     if (typeof url !== "string") throw new TypeError("connect-runner requires a URL string");
-    const target = await resolveConnectTarget(url);
-    // Resolving can probe the network; don't start anything for a closed window.
-    if (event.sender.isDestroyed()) return { ok: false, canceled: true };
+    // One attempt per window; Cancel, a newer attempt, or closing the window aborts it.
+    runnerConnects.get(event.sender)?.abort();
+    const controller = new AbortController();
+    runnerConnects.set(event.sender, controller);
+    const abortOnClose = () => controller.abort();
+    event.sender.once("destroyed", abortOnClose);
+    try {
+      return await connectRunnerAttempt(event, url, runner, controller.signal);
+    } finally {
+      event.sender.removeListener("destroyed", abortOnClose);
+      if (runnerConnects.get(event.sender) === controller) runnerConnects.delete(event.sender);
+    }
+  });
+
+  async function connectRunnerAttempt(event, url, runner, signal) {
+    const canceled = { ok: false, canceled: true };
+    let target;
+    try {
+      target = await resolveConnectTarget(url, { signal });
+    } catch (error) {
+      if (signal.aborted) return canceled;
+      throw error;
+    }
+    // Resolving can probe the network; don't start anything for a stopped attempt.
+    if (signal.aborted || event.sender.isDestroyed()) return canceled;
     const log = (line) => {
+      if (signal.aborted) return;
       try {
         event.sender.send("omnigent:runner-connect-log", { line });
       } catch {
@@ -4697,6 +4773,7 @@ function registerIpc() {
         return { ok: false, error: "A remote environment isn't available for this server." };
       }
       const result = await connectOnboardingArca(target, log, event.sender);
+      if (signal.aborted) return canceled;
       if (result.ok) rememberOnboardingRunner(target, runner);
       return result;
     }
@@ -4713,7 +4790,9 @@ function registerIpc() {
     log("Signing in to the server if needed…");
     const auth = await serverManager.ensureServerAuth(cliCommand, target, {
       onLogin: () => log("If a browser window opens, finish signing in there."),
+      signal,
     });
+    if (auth.canceled || signal.aborted) return canceled;
     if (!auth.ok) {
       return {
         ok: false,
@@ -4726,12 +4805,14 @@ function registerIpc() {
     log("Signed in. Connecting this laptop to the server…");
     const result = await serverManager.ensureHostConnected(cliCommand, target);
     broadcastHostStatus();
+    // The host connect itself can't be stopped, but a stopped attempt isn't recorded.
+    if (signal.aborted) return canceled;
     if (result.ok) {
       log("Connected this laptop.");
       rememberOnboardingRunner(target, runner);
     }
     return { ok: result.ok, error: result.error };
-  });
+  }
 
   ipcMain.handle("omnigent:copy-setup-text", (event, text) => {
     if (!isSetupPageSender(event)) {
@@ -5335,12 +5416,9 @@ function registerIpc() {
     return result;
   });
 
-  // SPA → desktop feature gates the server can't know about, currently just
-  // the MDM-managed Databricks-internal flag (Arca). Scoped per window: the
-  // flag reads true only when the window's own server is Databricks-managed
-  // (a workspace mount or a Databricks App) — internal features must not
-  // light up against arbitrary self-hosted servers. Read fresh per call so
-  // applying/removing the profile takes effect without a restart.
+  // SPA → desktop feature gates. The managed features flag reads true only when
+  // the window's own server is managed, never on arbitrary self-hosted servers.
+  // Read fresh per call so profile changes apply without a restart.
   const canExtendArca = (event) =>
     databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(senderServerUrl(event));
 
@@ -5359,6 +5437,27 @@ function registerIpc() {
       // v10 values); the SPA hides the toolbar button everywhere else.
       chromeCookieImport: process.platform === "darwin",
     };
+  });
+
+  // SPA → a workspace API call on a session host's local socket. The socket and
+  // call shape are checked in workspaceSocket.js; the host checks the token.
+  ipcMain.handle("omnigent:workspace-socket-request", (event, request) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("workspace-socket-request is only available to a connected server page");
+    }
+    const serverUrl = senderServerUrl(event);
+    return workspaceSocketRequest(request, {
+      sshDestination: (hostId) => (serverUrl ? sshHosts.destination(serverUrl, hostId) : null),
+      verifySshTarget: serverUrl
+        ? (hostId, alias, proves) =>
+            sshTargetChecks.verify(serverUrl, hostId, alias, {
+              approve: () =>
+                approveSshTarget(BrowserWindow.fromWebContents(event.sender), serverUrl, alias),
+              proves,
+            })
+        : undefined,
+      forwards: workspaceSshForwards,
+    });
   });
 
   // SPA → connect a machine over SSH as a host. Requires the window's pinned origin
@@ -5391,19 +5490,29 @@ function registerIpc() {
         error: `${target} can't reach a server on this computer (${new URL(serverUrl).host}). Connect this window to a server ${target} can reach, or, if ${target} runs this server itself, run "omnigent host" there.`,
       };
     }
-    return sshConnectFlow.run(BrowserWindow.fromWebContents(event.sender), serverUrl, target);
+    const result = await sshConnectFlow.run(
+      BrowserWindow.fromWebContents(event.sender),
+      serverUrl,
+      target,
+    );
+    // Lets the file viewer read this host's workspace over SSH.
+    if (result?.ok && result.identity) {
+      try {
+        sshHosts.record(serverUrl, result.identity.hostId, target);
+      } catch (error) {
+        console.warn("[omnigent] couldn't record the SSH host:", error);
+      }
+    }
+    return result;
   });
 
-  // SPA → connect the user's Arca instance (Databricks-internal sandbox) to
-  // the window's server as a host, by running `isaac omni host --background`
-  // on the instance over `arca ssh`. Gated three ways: pinned-origin sender,
-  // the MDM flag re-checked HERE (the renderer is not trusted to have checked
-  // it), and user consent in the shell-owned connect console — which shows
-  // the exact command and streams its live output (arca_connect_window.js).
-  // A connect already in flight is re-surfaced (console focused, outcome
-  // shared), never refused; the runner itself enforces CONNECT_TIMEOUT_MS so
-  // a wedged command always settles. No local process outlives the connect:
-  // the enrolled host keeps its own outbound tunnel from the Arca box.
+  // SPA → connect the user's Arca instance to the window's server as a host,
+  // by running `isaac omni host --background` on the instance over `arca ssh`.
+  // Gated three ways: pinned-origin sender, the managed features flag re-checked
+  // HERE (the renderer is not trusted to have checked it), and user consent in
+  // the connect console (arca_connect_window.js), which shows the exact command.
+  // A connect already in flight is re-surfaced, never refused. The runner
+  // enforces CONNECT_TIMEOUT_MS so a wedged command always settles.
   ipcMain.handle("omnigent:arca-connect", async (event) => {
     if (!isPinnedOriginSender(event)) {
       throw new Error("arca-connect is only available to a connected server page");
@@ -5413,8 +5522,8 @@ function registerIpc() {
     }
     const serverUrl = senderServerUrl(event);
     if (!serverUrl) return { ok: false, error: "this window is not connected to a server" };
-    // Same scope as get-desktop-features, re-checked here: an Arca box may
-    // only be enrolled against a Databricks-managed server.
+    // Same scope as get-desktop-features, re-checked here: an Arca instance may
+    // only be enrolled against a managed server.
     if (!isDatabricksManagedServerUrl(serverUrl)) {
       return { ok: false, error: "Arca hosts can only connect to Databricks-managed servers." };
     }
@@ -5469,9 +5578,8 @@ function registerIpc() {
     }
   });
 
-  // SPA → renew this machine's dbcert from the expired-dbcert banner; Arca
-  // Companion then copies it to the user's boxes. Same gates as arca-extend.
-  // Clicks from several windows share one sign-in.
+  // SPA → renew this machine's dbcert from the expired-dbcert banner. Same
+  // gates as arca-extend. Clicks from several windows share one sign-in.
   let dbcertPreflight = null;
   let dbcertGeneration = 0;
   let dbcertRefresh = null;
@@ -5538,11 +5646,37 @@ function registerIpc() {
 
   // Embedded browser pane — the `omnigent:browser-*` surface lives in
   // browserIpc.js; the trust gate + per-window registry lookup are injected.
+  // Every window's view of each session's browser tabs, and the
+  // routing of a tab's calls to the one window with its page
+  // (browserTabs.js).
+  const windowShowsServer = (win) => {
+    const origin = windows.get(win)?.origin;
+    return !!origin && originOf(win.webContents.getURL()) === origin;
+  };
+  const browserTabs = registerBrowserTabsIpc({
+    ipcMain,
+    isPinnedOriginSender,
+    windows: () => windows,
+    windowForEvent: (event) => BrowserWindow.fromWebContents(event.sender),
+    // A window that navigated to a foreign page keeps its pinned origin.
+    showsServer: windowShowsServer,
+    // Tabs belong to a server, so two servers on one origin share none.
+    serverOf: (state) =>
+      (state.serverUrl && normalizeSavedServerUrl(state.serverUrl).replace(/\/+$/, "")) ||
+      state.origin,
+  });
   registerBrowserIpc({
     ipcMain,
     isPinnedOriginSender,
     getRegistryForEvent: browserRegistryForSender,
     getWindowForEvent: (event) => BrowserWindow.fromWebContents(event.sender),
+    showsServerForEvent: (event) => {
+      const win = BrowserWindow.fromWebContents(event.sender);
+      return !!win && windowShowsServer(win);
+    },
+    routeViewForEvent: browserTabs.route, // a tab's one page, in its window
+    whileOpeningView: browserTabs.whileOpening,
+    refuseCloseForEvent: browserTabs.refuseClose,
     getAgentContextForEvent: (event, opts) => {
       const win = BrowserWindow.fromWebContents(event.sender);
       const sourceHostId = typeof opts?.sourceHostId === "string" ? opts.sourceHostId : null;
@@ -6176,7 +6310,10 @@ if (!gotLock) {
     });
   });
 
-  app.on("will-quit", () => globalShortcut.unregisterAll());
+  app.on("will-quit", () => {
+    globalShortcut.unregisterAll();
+    workspaceSshForwards.closeAll();
+  });
   app.on("window-all-closed", () => {
     // macOS apps typically stay alive until Cmd-Q.
     if (process.platform !== "darwin") app.quit();
@@ -6211,6 +6348,8 @@ if (!gotLock) {
   app.on("quit", clearQuitForceExitTimer);
   app.on("before-quit", (event) => {
     quitConfirmation.quitStarted();
+    // Forced exits below skip will-quit, so SSH connections are torn down here first.
+    workspaceSshForwards.closeAll();
     if (quitCleanupDone) return;
     // A second quit (e.g. Cmd-Q again during the SIGKILL grace window) must not
     // re-enter shutdown() concurrently — just keep deferring until the first

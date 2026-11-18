@@ -36,6 +36,8 @@ reattach when the session moves to another host.
   tag, until the input box returns. `!` shell mode, the ctrl+r history search
   and a draft quoting a dialog's title keep the input box in use, so they do
   not count as hidden. A runner connected to an older server sends no alert.
+  Sending a Claude chat message or changing its settings returns an open
+  detailed transcript view to its input box with Ctrl+O before typing.
 - `split-panes`: behind `splittable_terminal_view_ui`, split the Terminal view
   into shell panes, resize them (each side stays within 25–75%), and close them.
 
@@ -80,7 +82,8 @@ with their own terminal retain the switcher.
   terminal stays open. Cmd/Ctrl+Shift+W closes the window.
 
 **After the session moves:** open the host badge, choose "Switch host…", pick
-another host, then look at both the terminal strip and the agent terminal.
+another host or a new sandbox, then look at both the terminal strip and the
+agent terminal.
 Sandbox-backed sessions, including Databricks Sandbox and Arclet, cannot switch
 hosts. Their "Switch host…" item is disabled; hover or focus it for the
 unsupported explanation.
@@ -192,6 +195,11 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   `tests/harnesses/claude_native/test_claude_native_bridge.py`
   (`-k input_box_shown`), and the labels in `web/src/pages/ChatPage.test.ts` and
   `web/src/components/SessionStateBadge.test.tsx`.
+  `tests/harnesses/claude_native/test_claude_native_copy_mode.py::test_message_leaves_detailed_transcript_before_pasting`
+  checks a web send through a real tmux pane with a synthetic Claude composer.
+  To verify with Claude Code, open Terminal, press Ctrl+O to show the detailed
+  transcript, then send a follow-up from Chat. It should appear once and the
+  terminal should return to its input box. Repeat with a model or effort change.
   For Claude's OSC
   working/blocked status with an attached or closed viewer and the flag-off
   fallback, use the [native working-status recipe](./native-harnesses.md#driving-it-with-the-repro-environment).

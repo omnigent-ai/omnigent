@@ -217,15 +217,17 @@ interface ElectronDesktopApi extends NativeShellApi {
   controlHost?: (action: HostControlAction) => Promise<HostActionResult>;
   /** Subscribe to host status-change pings (re-read on fire); returns an unsubscribe. */
   onHostStatusChanged?: (callback: () => void) => () => void;
-  /** Desktop feature gates (MDM-managed); absent on older shells. */
+  /** Desktop feature gates; absent on older shells. */
   getDesktopFeatures?: () => Promise<DesktopFeatures | null>;
   /** Connect the user's Arca instance to the window's server as a host. */
   connectArcaHost?: () => Promise<ArcaConnectResult>;
   /** Connect a machine the user reaches over SSH; absent on Windows and older shells. */
   connectSshHost?: (destination: string) => Promise<ArcaConnectResult>;
+  /** A workspace API call on a session host's local socket; absent on Windows and older shells. */
+  workspaceSocketRequest?: (request: WorkspaceSocketRequest) => Promise<WorkspaceSocketResponse>;
   /** Extend this machine's running Arca instance with an approved mode. */
   extendArca?: (mode: ArcaExtendMode) => Promise<ArcaExtendResult>;
-  /** Renew this machine's dbcert; Arca Companion copies it to the user's Arca and Arclets. */
+  /** Renew this machine's dbcert. */
   refreshDbcert?: (options?: DbcertRefreshOptions) => Promise<DbcertRefreshResult>;
   /** Check local credentials before an Arclet launch without starting sign-in. */
   checkDbcert?: () => Promise<DbcertStatusResult>;
@@ -450,15 +452,46 @@ export interface ArcaConnectResult extends HostActionResult {
   shownInConsole?: boolean;
 }
 
+/** One workspace API call for the desktop shell to send to a host's local socket. */
+export interface WorkspaceSocketRequest {
+  /** The session's host; the shell reaches it over SSH when this desktop connected it that way. */
+  hostId: string;
+  /** An SSH alias the shell may verify and record for `hostId` when it has none. */
+  sshTarget?: string;
+  /** The socket the server named for the session's host, on the host's machine. */
+  socketPath: string;
+  /** The call's path, e.g. `/omnigent.api.workspace.v1alpha1.WorkspaceService/ReadFile`. */
+  path: string;
+  headers: Record<string, string>;
+  body: Uint8Array;
+}
+
+/** The host's whole HTTP response to a {@link WorkspaceSocketRequest}. */
+export interface WorkspaceSocketResponse {
+  status: number;
+  headers: Record<string, string>;
+  body: Uint8Array;
+}
+
 /**
- * Desktop-shell feature gates the server can't know about, sourced from MDM
- * managed preferences. All fields optional: an older shell reports fewer.
+ * The desktop shell's way to call a host's local workspace socket, or null
+ * outside the shell, on Windows, and in shells too old to offer it.
+ */
+export function workspaceSocketBridge():
+  ((request: WorkspaceSocketRequest) => Promise<WorkspaceSocketResponse>) | null {
+  const electron = electronApi();
+  return electron?.workspaceSocketRequest ? electron.workspaceSocketRequest.bind(electron) : null;
+}
+
+/**
+ * Desktop-shell feature gates the server can't know about. All fields
+ * optional: an older shell reports fewer.
  */
 export interface DesktopFeatures {
   /**
-   * Databricks-internal features (e.g. the Arca host option) are enabled.
-   * Already scoped by the shell: true only when the MDM flag is set AND the
-   * window's server is Databricks-managed.
+   * Managed features (e.g. the Arca host option) are enabled.
+   * Already scoped by the shell: true only when the flag is set AND the
+   * window's server is a managed server.
    */
   databricksInternalFeatures?: boolean;
   /** This window may offer one-click Arca extension. */
@@ -485,7 +518,7 @@ export interface CliStatus {
   installCommand: string;
   /** Whether a just-submitted path was accepted (present on pick/set results). */
   accepted?: boolean;
-  /** MDM policy disables set/browse/reset of custom CLI paths. */
+  /** Policy disables set/browse/reset of custom CLI paths. */
   customizationDisabled?: boolean;
 }
 
@@ -596,7 +629,7 @@ export interface ServerPickerInfo {
   recentLabels?: Record<string, string>;
   /**
    * Server URLs supplied through macOS Managed Preferences. Optional because a
-   * newer server-served SPA can run inside a desktop shell that predates MDM.
+   * newer server-served SPA can run inside a desktop shell that predates this.
    */
   managedServers?: string[];
   /** Display names for managed servers, server URL → name. Absent on older shells. */
@@ -1396,7 +1429,7 @@ export async function controlHost(action: HostControlAction): Promise<HostAction
 }
 
 /**
- * Fetch the desktop shell's feature gates (MDM-managed). Resolves `null`
+ * Fetch the desktop shell's feature gates. Resolves `null`
  * outside the Electron shell or under a shell too old to expose them — callers
  * must treat null / a missing field as disabled.
  */
@@ -1417,10 +1450,9 @@ export function supportsArcaConnect(): boolean {
 }
 
 /**
- * Connect the user's Arca instance (Databricks-internal sandbox) to the
- * window's server as a host, via the desktop shell. The shell asks native
- * consent and runs `arca ssh` — resolving only once the remote host daemon
- * started (or failed). A no-op `{ ok: false }` outside the shell.
+ * Connect the user's Arca instance to the window's server as a host, via the
+ * desktop shell. The shell asks for native consent first and resolves once the
+ * remote host daemon starts or fails. A no-op `{ ok: false }` outside the shell.
  */
 export async function connectArcaHost(): Promise<ArcaConnectResult> {
   const electron = electronApi();
@@ -1498,7 +1530,7 @@ export async function checkDbcert(): Promise<DbcertStatusResult> {
   }
 }
 
-/** Renew the laptop's dbcert through the desktop shell, which runs `dbcert --force`. */
+/** Renew the laptop's dbcert through the desktop shell. */
 export async function refreshDbcert(options?: DbcertRefreshOptions): Promise<DbcertRefreshResult> {
   const bridge = electronApi()?.refreshDbcert;
   if (!bridge) return { ok: false, error: "dbcert refresh is unavailable in this app." };

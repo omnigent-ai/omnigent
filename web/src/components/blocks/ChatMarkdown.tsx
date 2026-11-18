@@ -28,10 +28,13 @@ import remarkBreaks from "remark-breaks";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
 import { MessageResponse } from "@/components/ai-elements/message";
 import {
+  sameServerSessionPath,
   shortFileCitationLabel,
   splitWorkspaceFileCitation,
   WORKSPACE_FILE_LINK_ATTR,
+  WORKSPACE_IMAGE_ATTR,
 } from "@/components/ai-elements/streamdown-security";
+import { WorkspaceMarkdownImage } from "./WorkspaceMarkdownImage";
 import { ZoomableImage } from "@/components/ImageLightbox";
 import {
   ContextMenu,
@@ -291,6 +294,37 @@ function PullRequestLinkLabel({ children }: { children: React.ReactNode }) {
 }
 
 /**
+ * The in-app chat path for an `omnigent://<host>/c/<id>` link to the server this
+ * page is on, or null. Links to other servers keep their deep-link href.
+ */
+function currentServerSessionPath(href: unknown): string | null {
+  if (typeof href !== "string" || typeof window === "undefined") return null;
+  return sameServerSessionPath(href, window.location);
+}
+
+/** A session link to this server, routed in the app like a session mention pill. */
+function ServerSessionLink({
+  path,
+  className,
+  children,
+  target: _target,
+  rel: _rel,
+  ...props
+}: React.ComponentPropsWithoutRef<"a"> & { path: string }) {
+  const linkClass = cn(STREAMDOWN_LINK_CLASS, className);
+  // Markdown also renders outside the router (stories, embeds); there the href navigates.
+  return useInRouterContext() ? (
+    <Link to={path} className={linkClass} data-streamdown="link" {...props}>
+      {children}
+    </Link>
+  ) : (
+    <a href={withBasePath(path)} className={linkClass} data-streamdown="link" {...props}>
+      {children}
+    </a>
+  );
+}
+
+/**
  * Anchor renderer for markdown links. A link to a workspace file, its href
  * parked on a fragment by `markWorkspaceFileLinks` and the real path moved to
  * `WORKSPACE_FILE_LINK_ATTR`, opens the FileViewer instead of navigating,
@@ -333,6 +367,14 @@ function WorkspaceFileLink({
           src={href}
           title={typeof children === "string" ? children : "Video recording"}
         />
+      );
+    }
+    const sessionPath = currentServerSessionPath(href);
+    if (sessionPath) {
+      return (
+        <ServerSessionLink path={sessionPath} className={className} title={title} {...props}>
+          {children}
+        </ServerSessionLink>
       );
     }
     // Rebase an app-internal link (e.g. an agent's `/clear` "the new chat"
@@ -517,8 +559,12 @@ function ZoomableMarkdownImage({
   src,
   alt,
   node: _node,
+  [WORKSPACE_IMAGE_ATTR]: workspacePath,
   ...props
-}: WithHastNode<React.ComponentProps<"img">>) {
+}: WithHastNode<React.ComponentProps<"img">> & { [WORKSPACE_IMAGE_ATTR]?: string }) {
+  if (workspacePath) {
+    return <WorkspaceMarkdownImage path={workspacePath} alt={alt ?? ""} />;
+  }
   const resolvedSrc = typeof src === "string" ? src : undefined;
   return <ZoomableImage {...props} src={resolvedSrc} alt={alt ?? ""} />;
 }

@@ -405,7 +405,7 @@ def relayed_terminal(
     """
     A pane whose TUI runs outside the pane's process tree, as a relaying launcher runs it.
 
-    isaac's fast launch leaves only a relay in the pane while Claude Code runs on a
+    A fast launch leaves only a relay in the pane while Claude Code runs on a
     pre-started worker's terminal; its session registry still names the process.
 
     :yields: The tmux socket path, the TUI's draw log, and a bridge directory whose

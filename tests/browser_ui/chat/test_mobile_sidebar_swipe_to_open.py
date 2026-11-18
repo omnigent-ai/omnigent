@@ -84,6 +84,9 @@ def test_swipe_right_opens_drawer(page: Page, chat_session_contract) -> None:
     chat = chat_session_contract
     chat.seed_sidebar_sessions([f"Swipe demo session {index:02d}" for index in range(1, 7)])
     cdp = _open_app(page, chat)
+    composer = page.get_by_label(_COMPOSER)
+    composer.focus()
+    expect(composer).to_be_focused()
 
     box = _drag(cdp, page, x=80, y=420, dx=200, steps=16, step_ms=30)
     # Slow enough to open by distance (past a third of the drawer), not as a flick.
@@ -91,6 +94,8 @@ def test_swipe_right_opens_drawer(page: Page, chat_session_contract) -> None:
     assert abs(box["left"] - expected_left) < 30, f"the drawer did not track the finger: {box}"
     _expect_drawer_open(page)
     expect(page.locator(_DRAWER).get_by_text("Swipe demo session 01")).to_be_visible()
+    # On iOS a still-focused composer keeps the soft keyboard up over the drawer.
+    expect(composer).not_to_be_focused()
     assert page.url == chat.url
 
     # The existing left swipe still closes it.

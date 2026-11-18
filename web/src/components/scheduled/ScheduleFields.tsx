@@ -7,12 +7,12 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
-  Command,
-  CommandEmpty,
-  CommandInput,
-  CommandItem,
-  CommandList,
-} from "@/components/ui/command";
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { ScheduleTimePicker } from "./ScheduleTimePicker";
 import { useScheduleEscape } from "./useScheduleEscape";
@@ -88,6 +88,7 @@ export function ScheduleFields({
   onRecurrenceSelect,
   recurrenceUnsupported = false,
   allowPastEnd = false,
+  embedded = false,
   children,
 }: {
   model: ScheduleModel;
@@ -102,6 +103,8 @@ export function ScheduleFields({
   onRecurrenceSelect?: () => void;
   recurrenceUnsupported?: boolean;
   allowPastEnd?: boolean;
+  /** Remove the outer cards when the fields already live in a menu surface. */
+  embedded?: boolean;
   children?: (fields: { recurrenceFields: ReactNode; endingFields: ReactNode }) => ReactNode;
 }) {
   const errorId = useId();
@@ -112,7 +115,19 @@ export function ScheduleFields({
   // Both editors save the same minute recurrence; saved rules reopen as Interval.
   const [customMinutes, setCustomMinutes] = useState(false);
   const [timezoneOpen, setTimezoneOpen] = useState(false);
+  const [timezoneSearch, setTimezoneSearch] = useState("");
   const zones = useMemo(() => commonTimezones(timezone), [timezone]);
+  const filteredZones = useMemo(() => {
+    const query = timezoneSearch.trim().toLocaleLowerCase();
+    if (query === "") return zones;
+    const displayQuery = query.replaceAll("_", " ");
+    return zones.filter((zone) => {
+      const normalizedZone = zone.toLocaleLowerCase();
+      return (
+        normalizedZone.includes(query) || normalizedZone.replaceAll("_", " ").includes(displayQuery)
+      );
+    });
+  }, [timezoneSearch, zones]);
   const [dateInput, setDateInput] = useState<{
     value: string;
     until: string;
@@ -141,6 +156,15 @@ export function ScheduleFields({
   let selectedFrequency: string = model.preset;
   if (minutely && !custom) selectedFrequency = "interval";
   if (recurrenceUnsupported) selectedFrequency = "";
+  const presetOptions = PRESETS.filter(
+    (preset) =>
+      anchoredScheduling ||
+      (preset.value !== "custom" && preset.value !== "interval") ||
+      (model.preset === "custom" && (preset.value === "custom" || minutely)),
+  ).map((preset) => ({
+    ...preset,
+    disabled: (preset.value === "custom" || preset.value === "interval") && !anchoredScheduling,
+  }));
 
   function changePreset(value: string) {
     setCustomMinutes(value === "custom");
@@ -213,8 +237,6 @@ export function ScheduleFields({
     if (model.end?.type === "until")
       changeEndDate(activeDateInput?.value ?? (until ? dateInTimezone(until, timezone) : ""), next);
     onTimezoneChange(next);
-    setTimezoneOpen(false);
-    onSelectOpenChange?.(false);
   }
 
   const intervalInput = (
@@ -244,19 +266,19 @@ export function ScheduleFields({
     />
   );
   const timezonePicker = (
-    <Popover
-      modal
+    <DropdownMenu
       open={timezoneOpen}
       onOpenChange={(open) => {
         setTimezoneOpen(open);
+        if (!open) setTimezoneSearch("");
         onSelectOpenChange?.(open);
       }}
     >
-      <PopoverTrigger asChild>
+      <DropdownMenuTrigger asChild>
         <Button
           variant="outline"
           className={cn(
-            "h-8 max-w-full min-w-0 shrink justify-between gap-2 border-0 bg-transparent px-0 font-normal text-muted-foreground shadow-none dark:bg-transparent",
+            "h-8 max-w-full min-w-0 shrink justify-between gap-2 border-0 bg-transparent px-2 font-normal text-muted-foreground shadow-none dark:bg-transparent",
             pickerTriggerClass,
           )}
           role="combobox"
@@ -267,56 +289,91 @@ export function ScheduleFields({
           <span className="truncate">{timezone.replaceAll("_", " ")}</span>
           <ChevronDownIcon className="size-3.5 shrink-0" />
         </Button>
-      </PopoverTrigger>
-      <PopoverContent align="end" className="menu-surface w-[min(22rem,calc(100vw-2rem))] p-0">
-        <Command label="Search timezones">
-          <CommandInput placeholder="Search timezones…" aria-label="Search timezones" />
-          <CommandList>
-            <CommandEmpty>No timezone found.</CommandEmpty>
-            {zones.map((zone) => (
-              <CommandItem
-                key={zone}
-                value={zone}
-                keywords={[zone.replaceAll("_", " ")]}
-                onSelect={() => changeTimezone(zone)}
-              >
+      </DropdownMenuTrigger>
+      <DropdownMenuContent
+        align="end"
+        className="max-h-[min(20rem,var(--radix-dropdown-menu-content-available-height))] w-[min(22rem,calc(100vw-2rem))]"
+      >
+        <div className="p-1" onKeyDown={(event) => event.stopPropagation()}>
+          <Input
+            aria-label="Search timezones"
+            placeholder="Search timezones…"
+            value={timezoneSearch}
+            onChange={(event) => setTimezoneSearch(event.target.value)}
+          />
+        </div>
+        {filteredZones.length === 0 ? (
+          <p className="px-1.5 py-2 text-sm text-muted-foreground">No timezone found.</p>
+        ) : (
+          <DropdownMenuRadioGroup value={timezone} onValueChange={changeTimezone}>
+            {filteredZones.map((zone) => (
+              <DropdownMenuRadioItem key={zone} value={zone}>
                 {zone.replaceAll("_", " ")}
-                <CheckIcon className={cn("ml-auto size-4", zone !== timezone && "invisible")} />
-              </CommandItem>
+              </DropdownMenuRadioItem>
             ))}
-          </CommandList>
-        </Command>
-      </PopoverContent>
-    </Popover>
+          </DropdownMenuRadioGroup>
+        )}
+      </DropdownMenuContent>
+    </DropdownMenu>
   );
   const recurrenceFields = (
     <div className="flex min-w-0 flex-col gap-2" data-testid="schedule-fields">
-      <div className="divide-y divide-border rounded-xl border border-border px-4">
-        <div
-          className="flex items-center justify-between gap-3 py-3"
-          data-testid="schedule-frequency-time-row"
-        >
-          <span>Repeat</span>
-          <ScheduleChoice
-            label="Frequency"
-            className={inlineChoiceClass}
-            testId="schedule-preset-trigger"
-            value={selectedFrequency}
-            placeholder="Choose frequency"
-            options={PRESETS.filter(
-              (preset) =>
-                anchoredScheduling ||
-                (preset.value !== "custom" && preset.value !== "interval") ||
-                (model.preset === "custom" && (preset.value === "custom" || minutely)),
-            ).map((preset) => ({
-              ...preset,
-              disabled:
-                (preset.value === "custom" || preset.value === "interval") && !anchoredScheduling,
-            }))}
-            onChange={changePreset}
-            onOpenChange={onSelectOpenChange}
-          />
-        </div>
+      <div
+        className={cn(
+          "divide-y divide-border px-3",
+          embedded && "[&>div:not(:first-child)]:px-2",
+          !embedded && "rounded-xl border border-border",
+        )}
+      >
+        {embedded ? (
+          <div
+            className="pb-2"
+            role="radiogroup"
+            aria-label="Frequency"
+            data-testid="schedule-preset-options"
+          >
+            {presetOptions.map((preset) => {
+              const selected = selectedFrequency === preset.value;
+              return (
+                <button
+                  key={preset.value}
+                  type="button"
+                  role="radio"
+                  aria-checked={selected}
+                  disabled={preset.disabled}
+                  data-testid={
+                    selected ? "schedule-preset-trigger" : `schedule-preset-option-${preset.value}`
+                  }
+                  className={cn(
+                    "flex min-h-8 w-full items-center rounded-lg px-2 text-left text-ui outline-none hover:bg-muted focus-visible:bg-muted disabled:pointer-events-none disabled:opacity-50",
+                    selected && "bg-muted",
+                  )}
+                  onClick={() => changePreset(preset.value)}
+                >
+                  <span>{preset.label}</span>
+                  <CheckIcon className={cn("ml-auto size-4", !selected && "invisible")} />
+                </button>
+              );
+            })}
+          </div>
+        ) : (
+          <div
+            className="flex items-center justify-between gap-3 py-3"
+            data-testid="schedule-frequency-time-row"
+          >
+            <span>Repeat</span>
+            <ScheduleChoice
+              label="Frequency"
+              className={inlineChoiceClass}
+              testId="schedule-preset-trigger"
+              value={selectedFrequency}
+              placeholder="Choose frequency"
+              options={presetOptions}
+              onChange={changePreset}
+              onOpenChange={onSelectOpenChange}
+            />
+          </div>
+        )}
         {custom && (
           <>
             <div className="flex items-center justify-between gap-3 py-3">
@@ -444,39 +501,52 @@ export function ScheduleFields({
           </div>
         )}
         {!(custom && minutely) && (
-          <div className="flex min-w-0 items-center justify-between gap-3 py-3">
-            <span className="shrink-0">{custom ? "Start time" : "Time"}</span>
-            <div className="flex min-w-0 flex-1 items-center justify-end gap-2">
-              {minutely && !custom && (
-                <div className="flex items-center gap-2">
-                  {intervalInput}
-                  <span className="text-muted-foreground">minutes</span>
-                </div>
+          <div className="space-y-0.5">
+            <div
+              className={cn(
+                "flex min-w-0 items-center justify-between gap-3",
+                minutely ? "py-2" : "pt-2",
               )}
-              {!minutely &&
-                (hourly ? (
-                  <MinuteInput
-                    showLabel
-                    model={model}
-                    onChange={onChange}
-                    errorId={error ? errorId : undefined}
-                  />
-                ) : (
-                  <ScheduleTimePicker
-                    model={model}
-                    onChange={onChange}
-                    errorId={error ? errorId : undefined}
-                  />
-                ))}
-              {!minutely && timezonePicker}
+            >
+              <span className="shrink-0">{custom ? "Start time" : "Time"}</span>
+              <div className="flex min-w-0 flex-1 items-center justify-end gap-2">
+                {minutely && !custom && (
+                  <div className="flex items-center gap-2">
+                    {intervalInput}
+                    <span className="text-muted-foreground">minutes</span>
+                  </div>
+                )}
+                {!minutely &&
+                  (hourly ? (
+                    <MinuteInput
+                      showLabel
+                      model={model}
+                      onChange={onChange}
+                      errorId={error ? errorId : undefined}
+                    />
+                  ) : (
+                    <ScheduleTimePicker
+                      model={model}
+                      onChange={onChange}
+                      errorId={error ? errorId : undefined}
+                      onOpenChange={onSelectOpenChange}
+                    />
+                  ))}
+              </div>
             </div>
+            {!minutely && (
+              <div className="flex min-w-0 items-center justify-between gap-3 pb-2">
+                <span className="shrink-0">Timezone</span>
+                <div className="flex min-w-0 flex-1 justify-end">{timezonePicker}</div>
+              </div>
+            )}
           </div>
         )}
       </div>
       {error && (
         <p
           id={errorId}
-          className="text-sm text-destructive"
+          className="px-5 pb-3 text-sm text-destructive"
           role="alert"
           data-testid="schedule-error"
         >
@@ -485,68 +555,108 @@ export function ScheduleFields({
       )}
     </div>
   );
+  const endingOptions: { value: string; label: string; disabled?: boolean }[] = [
+    { value: "never", label: "Never" },
+    { value: "until", label: "On date" },
+    ...(anchoredScheduling || model.end?.type === "count"
+      ? [{ value: "count", label: "After", disabled: !anchoredScheduling }]
+      : []),
+  ];
+  const endingDetails = (
+    <>
+      {model.end?.type === "until" && (
+        <>
+          <Input
+            type="date"
+            aria-label="End date"
+            aria-invalid={endingError ? true : undefined}
+            aria-describedby={endingError ? endingErrorId : undefined}
+            className="w-auto"
+            value={activeDateInput?.value ?? (until ? dateInTimezone(until, timezone) : "")}
+            onChange={(event) => changeEndDate(event.target.value, timezone)}
+          />
+          {minutely && timezonePicker}
+        </>
+      )}
+      {model.end?.type === "count" && (
+        <>
+          <Input
+            type="number"
+            aria-label="Occurrences"
+            aria-invalid={endingError ? true : undefined}
+            aria-describedby={endingError ? endingErrorId : undefined}
+            disabled={!anchoredScheduling}
+            min={2}
+            max={2147483647}
+            step={1}
+            className="w-24"
+            value={Number.isFinite(model.end.count) ? model.end.count : ""}
+            onChange={(event) =>
+              onChange({
+                ...model,
+                end: {
+                  type: "count",
+                  count: event.target.value === "" ? NaN : Number(event.target.value),
+                },
+              })
+            }
+          />
+          <span>occurrences</span>
+        </>
+      )}
+    </>
+  );
   const endingFields = (
     <div
-      className="space-y-2 rounded-xl border border-border px-4 py-3"
+      className={cn("space-y-2", !embedded && "rounded-xl border border-border px-4 py-3")}
       data-testid="schedule-ending-fields"
     >
-      <div className="flex flex-wrap items-center gap-2 text-muted-foreground">
-        <span className="mr-auto text-foreground">Ends</span>
-        <ScheduleChoice
-          className="border-0 bg-transparent text-muted-foreground shadow-none dark:bg-transparent"
-          label="Schedule ends"
-          value={model.end?.type ?? "never"}
-          options={[
-            { value: "never", label: "Never" },
-            { value: "until", label: "On date" },
-            ...(anchoredScheduling || model.end?.type === "count"
-              ? [{ value: "count", label: "After", disabled: !anchoredScheduling }]
-              : []),
-          ]}
-          onChange={changeEnd}
-          onOpenChange={onSelectOpenChange}
-        />
-        {model.end?.type === "until" && (
-          <>
-            <Input
-              type="date"
-              aria-label="End date"
-              aria-invalid={endingError ? true : undefined}
-              aria-describedby={endingError ? endingErrorId : undefined}
-              className="w-auto"
-              value={activeDateInput?.value ?? (until ? dateInTimezone(until, timezone) : "")}
-              onChange={(event) => changeEndDate(event.target.value, timezone)}
-            />
-            {minutely && timezonePicker}
-          </>
-        )}
-        {model.end?.type === "count" && (
-          <>
-            <Input
-              type="number"
-              aria-label="Occurrences"
-              aria-invalid={endingError ? true : undefined}
-              aria-describedby={endingError ? endingErrorId : undefined}
-              disabled={!anchoredScheduling}
-              min={2}
-              max={2147483647}
-              step={1}
-              className="w-24"
-              value={Number.isFinite(model.end.count) ? model.end.count : ""}
-              onChange={(event) =>
-                onChange({
-                  ...model,
-                  end: {
-                    type: "count",
-                    count: event.target.value === "" ? NaN : Number(event.target.value),
-                  },
-                })
-              }
-            />
-            <span>occurrences</span>
-          </>
-        )}
-      </div>
+      {embedded ? (
+        <>
+          <DropdownMenuRadioGroup
+            value={model.end?.type ?? "never"}
+            onValueChange={changeEnd}
+            aria-label="Schedule ends"
+          >
+            {endingOptions.map((option) => {
+              return (
+                <DropdownMenuRadioItem
+                  key={option.value}
+                  value={option.value}
+                  disabled={option.disabled}
+                  className="data-[state=checked]:bg-muted data-[state=checked]:font-medium"
+                  onSelect={(event) => {
+                    if (option.value !== "never") event.preventDefault();
+                  }}
+                >
+                  {option.label}
+                </DropdownMenuRadioItem>
+              );
+            })}
+          </DropdownMenuRadioGroup>
+          {model.end && (
+            <div
+              className="flex flex-wrap items-center justify-end gap-2 border-t border-border px-1.5 pt-2 text-muted-foreground"
+              onKeyDown={(event) => event.stopPropagation()}
+            >
+              {endingDetails}
+            </div>
+          )}
+        </>
+      ) : (
+        <div className="flex flex-wrap items-center gap-2 text-muted-foreground">
+          <span className="mr-auto text-foreground">Ends</span>
+          <ScheduleChoice
+            className="border-0 bg-transparent text-muted-foreground shadow-none dark:bg-transparent"
+            label="Schedule ends"
+            value={model.end?.type ?? "never"}
+            options={endingOptions}
+            onChange={changeEnd}
+            onOpenChange={onSelectOpenChange}
+          />
+          {endingDetails}
+        </div>
+      )}
       {model.end?.type === "count" && (
         <p className="text-sm text-muted-foreground">
           Counts scheduled occurrences since creation.

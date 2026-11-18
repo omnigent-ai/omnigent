@@ -373,7 +373,7 @@ def test_action_banner_follows_the_launch(
     banner = page.get_by_role("status").filter(has_text="Refresh your dbcert on your laptop.")
     expect(banner).to_be_visible(timeout=20_000)
 
-    # The dbcert arrives. Like the server, update the snapshot as well as the stream.
+    # The credential arrives. Like the server, update the snapshot as well as the stream.
     chat.update_session(sandbox_status={"stage": "provisioning", "provider": "arclet"})
     chat.emit(
         {

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Callable
 
 import httpx
 
@@ -12,6 +12,11 @@ from omnigent.util.dedicated_executor import DedicatedExecutor
 # Credential steps get their own threads so a backed-up default executor
 # cannot hold every authenticated request.
 _AUTH_EXECUTOR = DedicatedExecutor(max_workers=4, thread_name_prefix="threaded-auth")
+
+
+async def run_auth_step(fn: Callable[[], None]) -> None:
+    """Run blocking credential work *fn* on the dedicated auth threads."""
+    await _AUTH_EXECUTOR.run(fn)
 
 
 class ThreadedAuth(httpx.Auth):

@@ -9,6 +9,7 @@
 import { useCallback, useEffect, useLayoutEffect, useState } from "react";
 import { ChevronDownIcon, ChevronUpIcon, SearchIcon, XIcon } from "lucide-react";
 import type { ReactElement, RefObject } from "react";
+import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { clearPreviewHighlights, findTextRanges, paintPreviewHighlights } from "./previewSearch";
 
 interface PreviewSearchBarProps {
@@ -118,6 +119,8 @@ export function PreviewSearchBar({
         value={query}
         onChange={(e) => setQuery(e.target.value)}
         onKeyDown={(e) => {
+          // IME composition keys (CJK input) confirm text, not find.
+          if (isImeCompositionKeyEvent(e)) return;
           if (e.key === "Enter") {
             e.preventDefault();
             if (e.shiftKey) goPrev();
