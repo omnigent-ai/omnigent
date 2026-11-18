@@ -139,8 +139,10 @@ def test_pi_gateway_loads_enabled_claude_plugins_across_relaunch(
         return get_mock_requests(mock_llm_server_url, key=model)
 
     first = run_turn("/dp:review security please")
-    # Relaunch: the managed agent dir is rebuilt from the same Claude state.
-    second = run_turn("say hi")
+    # The mock ledger is cumulative, so the relaunch's own requests start after the first run.
+    relaunch_all = run_turn("say hi")
+    second = relaunch_all[len(first) :]
+    assert second, "the relaunch must reach the model"
 
     for request in first + second:
         system = "\n".join(

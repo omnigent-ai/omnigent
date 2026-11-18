@@ -205,6 +205,51 @@ def test_relaunch_drops_commands_of_removed_plugins(claude_dir: Path, tmp_path: 
     assert not (managed / PI_CLAUDE_PLUGIN_RESOURCES_DIR).exists()
 
 
+def test_symlinked_command_files_are_not_read(claude_dir: Path, tmp_path: Path) -> None:
+    """A command symlink, or a commands/ root that links out, cannot expose outside files."""
+    secret = tmp_path / "secret.md"
+    secret.write_text("SECRET_OUTSIDE_PLUGIN", encoding="utf-8")
+    root = _install(claude_dir, "dp@market", files={"commands/ok.md": "OK\n"})
+    (root / "commands" / "leak.md").symlink_to(secret)
+    managed = tmp_path / "managed"
+
+    add_claude_plugin_resources({}, managed)
+
+    prompts = managed / PI_CLAUDE_PLUGIN_RESOURCES_DIR / "prompts"
+    assert sorted(p.name for p in prompts.iterdir()) == ["dp:ok.md"]
+
+    outside = tmp_path / "outside-commands"
+    outside.mkdir()
+    (outside / "x.md").write_text("SECRET_OUTSIDE_PLUGIN", encoding="utf-8")
+    other = _install(claude_dir, "linked@market", files={"placeholder": ""})
+    (other / "commands").symlink_to(outside, target_is_directory=True)
+
+    add_claude_plugin_resources({}, managed)
+
+    assert not (prompts / "linked:x.md").exists()
+    assert "SECRET_OUTSIDE_PLUGIN" not in "".join(p.read_text() for p in prompts.iterdir())
+
+
+def test_unsafe_plugin_names_are_not_bridged(claude_dir: Path, tmp_path: Path) -> None:
+    """A plugin name becomes a filename, so names with separators or spaces are skipped."""
+    _install(claude_dir, "bad name@market", files={"commands/go.md": "X\n", **_skill("x")})
+
+    result = add_claude_plugin_resources({}, tmp_path / "managed")
+
+    assert result == {}
+
+
+def test_user_package_entry_decides_plugin_skills(claude_dir: Path, tmp_path: Path) -> None:
+    """A user package entry for the plugin with ``skills: []`` keeps its skills out."""
+    root = _install(claude_dir, "dp@market", files=_skill("review"))
+    settings = {"packages": [{"source": str(root), "skills": []}]}
+
+    result = add_claude_plugin_resources(settings, tmp_path / "managed")
+
+    assert "skills" not in result
+    assert result["packages"] == [{"source": str(root), "skills": []}]
+
+
 def test_native_provider_launch_writes_plugin_entries(claude_dir: Path, tmp_path: Path) -> None:
     """The ``omnigent pi`` terminal launch seeds the same managed settings as the gateway."""
     from omnigent.harnesses.pi_native.credentials import (

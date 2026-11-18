@@ -12,6 +12,7 @@ from __future__ import annotations
 import fnmatch
 import logging
 import os
+import re
 import shutil
 from collections.abc import Iterable, Mapping
 from dataclasses import replace
@@ -34,6 +35,9 @@ _Settings: TypeAlias = dict[str, object]
 PI_CLAUDE_PLUGIN_RESOURCES_DIR = "claude-plugins"
 _PLUGIN_ROOT_VARIABLE = "${CLAUDE_PLUGIN_ROOT}"
 MAX_PLUGIN_COMMANDS = 512
+_MAX_COMMAND_DEPTH = 8
+# A plugin name becomes part of a generated filename, so it must be one safe component.
+_PLUGIN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
 def _pi_manifest(root: Path) -> Mapping[str, object] | None:
@@ -55,20 +59,48 @@ def _enabled_plugins() -> list[tuple[str, Path, bool]]:
     return plugins
 
 
+def _command_files(
+    directory: Path, relative: tuple[str, ...] = ()
+) -> list[tuple[tuple[str, ...], Path]]:
+    """Markdown files under *directory* as ``(path parts, file)``, skipping symlinks."""
+    if len(relative) > _MAX_COMMAND_DEPTH:
+        return []
+    try:
+        entries = sorted(directory.iterdir())
+    except OSError as exc:
+        _logger.warning("Skipping unreadable Claude commands dir %s: %s", directory, exc)
+        return []
+    found: list[tuple[tuple[str, ...], Path]] = []
+    for entry in entries:
+        if entry.is_symlink():
+            continue
+        if entry.is_dir():
+            found.extend(_command_files(entry, (*relative, entry.name)))
+        elif entry.is_file() and entry.name.endswith(".md"):
+            found.append(((*relative, entry.stem), entry))
+    return found
+
+
 def _write_commands(name: str, root: Path, prompts_dir: Path) -> bool:
     """Write the plugin's ``commands/**/*.md`` as ``<name>:<command>.md`` prompt templates.
+
+    Files are read only when they resolve inside the plugin root, so a symlink cannot
+    expose content from elsewhere on the host.
 
     :returns: ``True`` when at least one prompt was written.
     """
     commands_dir = root / "commands"
-    if not commands_dir.is_dir():
+    if commands_dir.is_symlink() or not commands_dir.is_dir():
+        return False
+    base = root.resolve()
+    if not commands_dir.resolve().is_relative_to(base):
+        _logger.warning("Skipping Claude plugin %s: commands/ links outside the plugin", name)
         return False
     written = False
-    for source in sorted(commands_dir.rglob("*.md"))[:MAX_PLUGIN_COMMANDS]:
-        if not source.is_file():
+    for parts, source in _command_files(commands_dir)[:MAX_PLUGIN_COMMANDS]:
+        if not source.resolve().is_relative_to(base):
             continue
-        relative = source.relative_to(commands_dir).with_suffix("")
-        target = prompts_dir / f"{':'.join((name, *relative.parts))}.md"
+        target = prompts_dir / f"{':'.join((name, *parts))}.md"
         if target.exists():
             # Another marketplace's plugin with the same name already claimed this command.
             _logger.info("Skipping Claude command %s: name already provided", target.name)
@@ -150,10 +182,16 @@ def add_claude_plugin_resources(settings: _Settings, managed_dir: Path) -> _Sett
     packages: list[str] = []
     skills: list[str] = []
     has_commands = False
+    user_packages = settings.get("packages")
+    package_named, _ = _user_claims(user_packages if isinstance(user_packages, list) else [])
     for name, root, declares_pi in _enabled_plugins():
+        if not _PLUGIN_NAME.fullmatch(name):
+            _logger.warning("Not bridging Claude plugin with unsafe name %r", name)
+            continue
         if declares_pi:
             packages.append(str(root))
-        elif (root / "skills").is_dir():
+        elif (root / "skills").is_dir() and _resolved(str(root)) not in package_named:
+            # A user package entry for this plugin decides its skills, including none.
             skills.append(str(root / "skills"))
         if os.name != "nt":
             # ``:`` in the command name is not a legal filename on Windows.
