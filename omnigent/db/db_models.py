@@ -1292,7 +1292,32 @@ class SqlComment(OmnigentBase):
         CompressedText(max_stored_bytes=COMMENT_ANCHOR_MAX_STORED_BYTES), nullable=True
     )
 
-    __table_args__ = (CheckConstraint("status IN (1, 2)", name="ck_comments_status"),)
+    reply_count: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="0")
+    last_reply_author_kind: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    last_reply_created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_reply_created_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+
+    __table_args__ = (
+        CheckConstraint("status IN (1, 2)", name="ck_comments_status"),
+        CheckConstraint(
+            "reply_count >= 0 AND reply_count <= 32767", name="ck_comments_reply_count"
+        ),
+        CheckConstraint(
+            "last_reply_author_kind IS NULL OR last_reply_author_kind IN (1, 2)",
+            name="ck_comments_last_reply_author_kind",
+        ),
+        CheckConstraint(
+            "typeof(reply_count) = 'integer'", name="ck_comments_reply_count_integer"
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "last_reply_created_by IS NULL OR length(CAST(last_reply_created_by AS BLOB)) <= 512",
+            name="ck_comments_last_reply_created_by_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "last_reply_created_at IS NULL OR typeof(last_reply_created_at) = 'integer'",
+            name="ck_comments_last_reply_created_at_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
+    )
 
 
 COMMENT_REPLY_BODY_MAX_STORED_BYTES = 16_383

@@ -315,3 +315,13 @@ Deploy migration `4d8e2b7f1a63` before reply writers. This revision is the binar
 rollback floor: older binaries reject unknown revisions at startup. Stop writers
 and downgrade schema to `ffeec66eadb5` using the newer build before rolling back
 the binary. Downgrade drops replies, so export any needed data first.
+
+
+Comment rows also contain a transactional thread summary: reply_count SMALLINT
+NOT NULL DEFAULT 0, last_reply_author_kind nullable SMALLINT (user=1, agent=2),
+last_reply_created_by nullable VARCHAR(128), and last_reply_created_at nullable
+BIGINT epoch microseconds. The zero default supports existing rows and writers.
+Reply writers maintain these fields under the parent lock; deleting the latest
+reply uses one reverse thread-index read with LIMIT 1. Listings read the parent
+columns and cap checks read its count, without scanning the reply history. The
+summary contains no body. Identity remaps update both reply and summary authors.

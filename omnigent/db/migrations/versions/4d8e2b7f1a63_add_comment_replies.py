@@ -10,7 +10,10 @@ schema to ffeec66eadb5 with this build before starting an older binary. Downgrad
 drops all replies; export any needed data first.
 
 The body is an encryption-capable envelope, including framing and metadata,
-bounded to 16,383 stored bytes. No column defaults or foreign keys are added.
+bounded to 16,383 stored bytes. The new table has no defaults or foreign keys.
+Parent comments carry reply_count and latest-author metadata, maintained under
+the parent lock so listings and cap checks never scan a whole thread. The count
+on this existing table defaults to zero for legacy writers and rows.
 The primary-key prefix supports thread/conversation cleanup; the thread index
 supports (created_at, id) pagination. SQLite/D1 CHECKs enforce types and bounds.
 """
@@ -28,7 +31,60 @@ depends_on: tuple[str, ...] | None = None
 
 
 def upgrade() -> None:
-    """Create the reply table without touching existing comments."""
+    """Create replies and initialize summaries on existing comments."""
+    sqlite_family = op.get_bind().dialect.name in ("sqlite", "cloudflare_d1")
+    count_checks = [
+        sa.CheckConstraint(
+            "reply_count >= 0 AND reply_count <= 32767", name="ck_comments_reply_count"
+        )
+    ]
+    identity_checks = []
+    timestamp_checks = []
+    if sqlite_family:
+        count_checks.append(
+            sa.CheckConstraint(
+                "typeof(reply_count) = 'integer'", name="ck_comments_reply_count_integer"
+            )
+        )
+        identity_checks.append(
+            sa.CheckConstraint(
+                "last_reply_created_by IS NULL OR "
+                "length(CAST(last_reply_created_by AS BLOB)) <= 512",
+                name="ck_comments_last_reply_created_by_bytes",
+            )
+        )
+        timestamp_checks.append(
+            sa.CheckConstraint(
+                "last_reply_created_at IS NULL OR typeof(last_reply_created_at) = 'integer'",
+                name="ck_comments_last_reply_created_at_integer",
+            )
+        )
+    op.add_column(
+        "comments",
+        sa.Column(
+            "reply_count", sa.SmallInteger(), *count_checks, nullable=False, server_default="0"
+        ),
+    )
+    op.add_column(
+        "comments",
+        sa.Column(
+            "last_reply_author_kind",
+            sa.SmallInteger(),
+            sa.CheckConstraint(
+                "last_reply_author_kind IS NULL OR last_reply_author_kind IN (1, 2)",
+                name="ck_comments_last_reply_author_kind",
+            ),
+            nullable=True,
+        ),
+    )
+    op.add_column(
+        "comments",
+        sa.Column("last_reply_created_by", sa.String(128), *identity_checks, nullable=True),
+    )
+    op.add_column(
+        "comments",
+        sa.Column("last_reply_created_at", sa.BigInteger(), *timestamp_checks, nullable=True),
+    )
     constraints = [
         sa.CheckConstraint("author_kind IN (1, 2)", name="ck_comment_replies_author_kind")
     ]
@@ -88,3 +144,25 @@ def downgrade() -> None:
     """Drop replies after all reply writers have stopped."""
     op.drop_index("ix_comment_replies_thread", table_name="comment_replies")
     op.drop_table("comment_replies")
+    with op.batch_alter_table("comments") as batch:
+        for name in (
+            "ck_comments_reply_count",
+            "ck_comments_last_reply_author_kind",
+            *(
+                [
+                    "ck_comments_reply_count_integer",
+                    "ck_comments_last_reply_created_by_bytes",
+                    "ck_comments_last_reply_created_at_integer",
+                ]
+                if op.get_bind().dialect.name in ("sqlite", "cloudflare_d1")
+                else []
+            ),
+        ):
+            batch.drop_constraint(name, type_="check")
+        for name in (
+            "last_reply_created_at",
+            "last_reply_created_by",
+            "last_reply_author_kind",
+            "reply_count",
+        ):
+            batch.drop_column(name)

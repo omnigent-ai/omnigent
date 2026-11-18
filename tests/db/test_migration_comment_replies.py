@@ -7,7 +7,7 @@ import sqlalchemy as sa
 from alembic import command
 from sqlalchemy.exc import IntegrityError
 
-from omnigent.db.db_models import SqlCommentReply
+from omnigent.db.db_models import SqlComment, SqlCommentReply
 from omnigent.db.envelope import EnvelopedText, seal_text
 from omnigent.db.utils import _build_alembic_config
 
@@ -24,6 +24,7 @@ def test_comment_reply_schema(tmp_path: Path, source: str) -> None:
                 command.upgrade(config, "4d8e2b7f1a63")
         else:
             SqlCommentReply.__table__.create(engine)
+            SqlComment.__table__.create(engine)
         inspector = sa.inspect(engine)
         assert inspector.get_pk_constraint("comment_replies")["constrained_columns"] == [
             "workspace_id",
@@ -44,6 +45,39 @@ def test_comment_reply_schema(tmp_path: Path, source: str) -> None:
             "created_at",
             "id",
         ]
+        comments = sa.Table("comments", sa.MetaData(), autoload_with=engine)
+        legacy = {
+            "workspace_id": 0,
+            "conversation_id": b"c" * 16,
+            "id": b"p" * 16,
+            "path": "file.py",
+            "start_index": 0,
+            "end_index": 1,
+            "body": b"Question",
+            "status": 1,
+            "created_at": 1,
+            "updated_at": 1_000_000,
+        }
+        with engine.begin() as connection:
+            connection.execute(comments.insert().values(**legacy))
+            summary = connection.execute(
+                sa.select(
+                    comments.c.reply_count,
+                    comments.c.last_reply_author_kind,
+                    comments.c.last_reply_created_by,
+                    comments.c.last_reply_created_at,
+                )
+            ).one()
+            assert tuple(summary) == (0, None, None, None)
+        for fields in (
+            {"reply_count": -1},
+            {"reply_count": "bad"},
+            {"last_reply_author_kind": 3},
+            {"last_reply_created_by": "é" * 257},
+            {"last_reply_created_at": "yesterday"},
+        ):
+            with pytest.raises(IntegrityError), engine.begin() as connection:
+                connection.execute(comments.update().values(**fields))
         table = sa.Table("comment_replies", sa.MetaData(), autoload_with=engine)
         row = {
             "workspace_id": 0,
@@ -85,5 +119,11 @@ def test_comment_reply_schema(tmp_path: Path, source: str) -> None:
                 config.attributes["connection"] = connection
                 command.downgrade(config, "ffeec66eadb5")
             assert "comment_replies" not in sa.inspect(engine).get_table_names()
+            assert not {
+                "reply_count",
+                "last_reply_author_kind",
+                "last_reply_created_by",
+                "last_reply_created_at",
+            }.intersection(column["name"] for column in sa.inspect(engine).get_columns("comments"))
     finally:
         engine.dispose()
