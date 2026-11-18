@@ -336,7 +336,7 @@ from omnigent.stores.conversation_store import (
     NameAlreadyExistsError,
 )
 from omnigent.stores.file_store import FileStore
-from omnigent.stores.host_store import Host, HostStore
+from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.util.cost_plan import (
     COST_CONTROL_LABEL_NAMESPACE,
@@ -646,6 +646,34 @@ def _set_read_state(user_id: str | None, session_id: str, last_seen: int, unread
         unread_set = _read_explicit_unread.get(key)
         if unread_set is not None:
             unread_set.discard(session_id)
+
+
+def archive_teardown_is_elsewhere(
+    conv: Conversation, host_registry: Any | None, host_store: HostStore | None
+) -> bool:
+    """
+    Whether another replica holds the live host whose runner archiving must stop.
+
+    Archive teardown reaches a host-launched runner only over its host's tunnel,
+    so archiving here would hide the session while its runner keeps running.
+    Blocking: reads the host row.
+
+    :param conv: The session to archive.
+    :param host_registry: This replica's live host tunnels, or ``None``.
+    :param host_store: Host rows, for liveness, or ``None``.
+    :returns: ``True`` only on a sharded deployment whose live host is elsewhere.
+    """
+    from omnigent.server.routes._host_launch import _deployment_is_sharded
+
+    if not _deployment_is_sharded() or host_registry is None or host_store is None:
+        return False
+    if conv.host_id is None or conv.runner_id is None:
+        return False
+    if host_registry.get(conv.host_id) is not None:
+        return False
+    host = host_store.get_host(conv.host_id)
+    # An offline host has no runner to stop; archiving it here loses nothing.
+    return host is not None and host_is_live(host)
 
 
 def _prune_session_read_state(session_id: str) -> None:
@@ -13174,6 +13202,7 @@ __all__ = [
     "_wait_for_managed_runner_tunnel",
     "_wait_for_runner_client",
     "announce_hosts_changed",
+    "archive_teardown_is_elsewhere",
     "cancel_managed_launch_tasks",
     "prefetch_session_routing_catalogs",
 ]

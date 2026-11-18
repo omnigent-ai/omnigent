@@ -34,6 +34,7 @@ def test_sibling_composer_placement_and_survivor(
     for prompt in (
         "Research the API",
         "Implement the client",
+        "Draft the release note",
         "Still here after deletion",
         "Still here after fork deletion",
     ):
@@ -208,30 +209,31 @@ async def _drive(rig: ManagedReplicas) -> None:
                         f"{rig.a}/v1/sessions/{sibling_id}",
                         lambda row: row.get("family", {}).get("pinned") is True,
                     )
-                    # Pinned peers disappear immediately; Undo restores their family position.
-                    for archived_id in (fresh_id, source_id):
-                        row = page.locator(f'li[data-sidebar-session-id="{archived_id}"]')
-                        await row.hover()
-                        await row.get_by_test_id("conversation-actions").click()
-                        await page.get_by_test_id("archive-conversation").click()
-                        await expect(row).to_have_count(0)
-                        representative_id = sibling_id if archived_id == source_id else source_id
-                        await expect(
-                            page.locator(
-                                f'li[data-sidebar-session-id="{representative_id}"]'
-                            ).get_by_role("button", name="Collapse session family")
-                        ).to_be_visible()
-                        await (
-                            page.get_by_test_id("archive-undo-toast-item")
-                            .get_by_role("button", name="Undo")
-                            .click()
+                    # Archiving a member removes it from the family; Undo returns it standalone.
+                    archived_id = await add_agent(source_id, "Draft the release note")
+                    row = page.locator(f'li[data-sidebar-session-id="{archived_id}"]')
+                    await row.hover()
+                    await row.get_by_test_id("conversation-actions").click()
+                    await page.get_by_test_id("archive-conversation").click()
+                    await expect(row).to_have_count(0)
+                    await expect(
+                        page.locator(f'li[data-sidebar-session-id="{source_id}"]').get_by_role(
+                            "button", name="Collapse session family"
                         )
-                        await expect(row).to_have_count(1)
-                        await expect(
-                            page.locator(f'li[data-sidebar-session-id="{source_id}"]').get_by_role(
-                                "button", name="Collapse session family"
-                            )
-                        ).to_be_visible()
+                    ).to_be_visible()
+                    await (
+                        page.get_by_test_id("archive-undo-toast-item")
+                        .get_by_role("button", name="Undo")
+                        .click()
+                    )
+                    await expect(row).to_have_count(1)
+                    await expect(row).not_to_have_attribute("data-sibling-session", "true")
+                    restored = (await client.get(f"{rig.a}/v1/sessions/{archived_id}")).json()
+                    assert not restored.get("family")
+                    family = (await client.get(f"{rig.a}/v1/sessions/{source_id}")).json()
+                    assert family["family"]["representative_id"] == source_id
+                    # Return to the survivor the delete steps below message.
+                    await page.goto(f"{rig.ui}/c/{sibling_id}")
                     # Delete through the UI and prove the same-host sibling can still work.
                     row = page.locator(f'li[data-sidebar-session-id="{source_id}"]')
                     await row.hover()
