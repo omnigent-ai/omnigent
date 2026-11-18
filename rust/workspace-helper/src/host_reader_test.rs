@@ -45,16 +45,51 @@ fn realpath_follows_links_that_exist_and_keeps_missing_components() {
     symlink("/nowhere/target", root.join("broken")).unwrap();
     symlink("loop", root.join("loop")).unwrap();
 
-    assert_eq!(realpath(&root.join("link/file")), root.join("real/file"));
-    assert_eq!(realpath(&root.join("real/self")), root.join("real"));
-    assert_eq!(realpath(&root.join("missing/x")), root.join("missing/x"));
+    assert_eq!(
+        realpath(&root.join("link/file")),
+        Some(root.join("real/file"))
+    );
+    assert_eq!(realpath(&root.join("real/self")), Some(root.join("real")));
+    assert_eq!(
+        realpath(&root.join("missing/x")),
+        Some(root.join("missing/x"))
+    );
     // A broken link resolves to its target, as Python's does, even outside.
     assert_eq!(
         realpath(&root.join("broken")),
-        PathBuf::from("/nowhere/target")
+        Some(PathBuf::from("/nowhere/target"))
     );
-    // A loop ends instead of spinning.
-    assert!(realpath(&root.join("loop")).starts_with(&root));
+    // A loop never resolves, so it can't be opened as if it had.
+    assert_eq!(realpath(&root.join("loop")), None);
+}
+
+/// `chain-0 -> chain-1 -> ... -> chain-{length-1} -> target`, in `directory`.
+fn link_chain(directory: &Path, length: usize, target: &Path) {
+    for index in 0..length {
+        let next = if index + 1 == length {
+            target.to_path_buf()
+        } else {
+            PathBuf::from(format!("chain-{}", index + 1))
+        };
+        symlink(next, directory.join(format!("chain-{index}"))).unwrap();
+    }
+}
+
+#[test]
+fn realpath_gives_up_on_a_chain_longer_than_its_budget() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(directory.path()).unwrap();
+    fs::create_dir(root.join("inside")).unwrap();
+    link_chain(&root, MAX_SYMLINKS, &root.join("inside"));
+    assert_eq!(realpath(&root.join("chain-0")), Some(root.join("inside")));
+
+    let longer = tempfile::tempdir().unwrap();
+    let longer_root = fs::canonicalize(longer.path()).unwrap();
+    link_chain(&longer_root, MAX_SYMLINKS + 5, Path::new("/"));
+    // Stopping partway would leave a path inside the root that the kernel
+    // then follows the rest of the way out.
+    assert_eq!(realpath(&longer_root.join("chain-0")), None);
+    assert_eq!(realpath(&longer_root.join("chain-0/etc/hosts")), None);
 }
 
 #[test]

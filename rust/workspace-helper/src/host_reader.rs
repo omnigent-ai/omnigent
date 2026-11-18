@@ -75,8 +75,10 @@ fn validate(path: &str) -> Result<String, Status> {
 }
 
 /// `os.path.realpath(path, strict=False)`: follows every symlink that exists
-/// and keeps missing components as they are.
-fn realpath(path: &Path) -> PathBuf {
+/// and keeps missing components as they are. `None` after following
+/// [`MAX_SYMLINKS`] links: a longer chain or a loop never resolves, so no
+/// link it still holds can lead the open outside the root.
+fn realpath(path: &Path) -> Option<PathBuf> {
     let mut resolved = PathBuf::from("/");
     let mut pending: Vec<std::ffi::OsString> = path
         .components()
@@ -95,7 +97,8 @@ fn realpath(path: &Path) -> PathBuf {
         }
         let candidate = resolved.join(&name);
         match fs::read_link(&candidate) {
-            Ok(target) if followed < MAX_SYMLINKS => {
+            Ok(_) if followed == MAX_SYMLINKS => return None,
+            Ok(target) => {
                 followed += 1;
                 if target.is_absolute() {
                     resolved = PathBuf::from("/");
@@ -111,10 +114,10 @@ fn realpath(path: &Path) -> PathBuf {
                         }),
                 );
             }
-            _ => resolved = candidate,
+            Err(_) => resolved = candidate,
         }
     }
-    resolved
+    Some(resolved)
 }
 
 /// `_resolve_workspace_path`: the validated relative path and where it
@@ -125,7 +128,12 @@ pub fn resolve(workspace: &Workspace, path: &str) -> Result<(String, PathBuf), S
     if validated.is_empty() {
         return Ok((validated, root.to_path_buf()));
     }
-    let full = realpath(&root.join(&validated));
+    let full = realpath(&root.join(&validated)).ok_or_else(|| {
+        Status::invalid_argument(format!(
+            "Path {} goes through too many symlinks",
+            quoted(path)
+        ))
+    })?;
     if !full.starts_with(root) {
         return Err(Status::invalid_argument(format!(
             "Path {} escapes the workspace root",

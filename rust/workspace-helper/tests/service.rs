@@ -308,6 +308,97 @@ async fn list_directory_reports_single_child_directory_chains() {
     );
 }
 
+/// `{name}-0 -> {name}-1 -> ... -> target`, `length` links in `root`.
+fn link_chain(root: &std::path::Path, name: &str, length: usize, target: &std::path::Path) {
+    for index in 0..length {
+        let next = if index + 1 == length {
+            target.to_path_buf()
+        } else {
+            format!("{name}-{}", index + 1).into()
+        };
+        symlink(next, root.join(format!("{name}-{index}"))).unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn symlink_chains_that_lead_outside_are_refused_however_long() {
+    let outside = tempfile::tempdir().unwrap();
+    let outside_root = canonical(&outside);
+    write(&outside_root, "secret.txt", "secret needle");
+    let directory = tempfile::tempdir().unwrap();
+    let root = canonical(&directory);
+    write(&root, "inside.txt", "needle");
+    // Longer than any symlink budget, and short enough to resolve.
+    link_chain(&root, "long", 45, &outside_root);
+    link_chain(&root, "short", 3, &outside_root);
+    let mut helper = start().await;
+    helper.open(&root).await;
+
+    for chain in ["long-0", "short-0"] {
+        let read = helper
+            .client
+            .read_file(ReadFileRequest {
+                path: format!("{chain}/secret.txt"),
+                maximum_bytes: 0,
+            })
+            .await;
+        assert!(read.is_err(), "{chain}: read through the chain");
+        let listing = helper
+            .client
+            .list_directory(ListDirectoryRequest {
+                path: chain.into(),
+                ..Default::default()
+            })
+            .await;
+        assert!(listing.is_err(), "{chain}: listed through the chain");
+        let stat = helper
+            .client
+            .stat_path(StatPathRequest {
+                path: format!("{chain}/secret.txt"),
+            })
+            .await;
+        assert!(stat.is_err(), "{chain}: described through the chain");
+        let files = helper
+            .client
+            .search_files(SearchFilesRequest {
+                query: "secret".into(),
+                path: chain.into(),
+                ..Default::default()
+            })
+            .await;
+        assert!(files.is_err(), "{chain}: searched files through the chain");
+        let text = helper
+            .client
+            .search_text(SearchTextRequest {
+                query: "needle".into(),
+                include_directories: vec![chain.into()],
+                ..Default::default()
+            })
+            .await;
+        assert!(text.is_err(), "{chain}: searched text through the chain");
+    }
+
+    // A whole-workspace search never follows the chains out either.
+    let found = collect(
+        helper
+            .client
+            .search_text(SearchTextRequest {
+                query: "needle".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_inner(),
+    )
+    .await
+    .unwrap();
+    let paths: Vec<&str> = found
+        .iter()
+        .flat_map(|response| response.matches.iter().map(|found| found.path.as_str()))
+        .collect();
+    assert_eq!(paths, ["inside.txt"]);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn paths_may_not_leave_the_workspace() {
     let outside = tempfile::tempdir().unwrap();
