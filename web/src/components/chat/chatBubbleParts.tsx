@@ -43,7 +43,7 @@ import {
 import { Shimmer } from "@/components/ai-elements/shimmer";
 import { renderLocalReviewComment } from "./LocalReviewCommentPreview";
 import { omitIncompleteLocalReviewComment } from "@/lib/localReviewComments";
-import { DesignRequestBody } from "@/components/BrowserPane/designTools/LazyDesignRequestMessage";
+import { DesignRequestBody } from "@/components/BrowserPane/designTools/DesignRequestMessage";
 import {
   clipDesignRequest,
   parseDesignRequest,

@@ -2,16 +2,6 @@ import { act, render, screen } from "@testing-library/react";
 import { Component, type ReactNode } from "react";
 import { expect, it, vi } from "vitest";
 
-// The card's chunk can't load (a deploy replaced it, the network dropped) until it can.
-const card = vi.hoisted(() => ({ broken: true }));
-vi.mock("./DesignRequestMessage", () => ({
-  get DesignRequestBodyView() {
-    if (!card.broken) return () => <p>The card</p>;
-    throw new TypeError(
-      "Failed to fetch dynamically imported module: /assets/DesignRequestMessage.js",
-    );
-  },
-}));
 // The strip's chunk can't load until the network comes back.
 const strip = vi.hoisted(() => ({ broken: true, failsFor: "" }));
 vi.mock("./DesignOutboxStrip", () => ({
@@ -27,7 +17,6 @@ vi.mock("./DesignOutboxStrip", () => ({
     );
   },
 }));
-import { DesignRequestBody } from "./LazyDesignRequestMessage";
 import { DesignOutboxStrip } from "./LazyDesignOutboxStrip";
 import { CHUNK_RETRY_MS } from "./retryingChunk";
 import { setDesignRequestSessions } from "./core/designOutboxPresence";
@@ -42,34 +31,6 @@ class AppBoundary extends Component<{ children: ReactNode }, { failed: boolean }
     return this.state.failed ? <p>The app failed</p> : this.props.children;
   }
 }
-
-it("shows a design message's own words when its card can't load, and the card once it does", async () => {
-  vi.useFakeTimers();
-  try {
-    render(
-      <AppBoundary>
-        <DesignRequestBody
-          request={{
-            kind: "element",
-            request: "Make it red",
-            element: "p#blurb",
-            elementText: "Hi",
-          }}
-        />
-      </AppBoundary>,
-    );
-    await act(() => vi.advanceTimersByTimeAsync(20));
-    expect(screen.getByText("Make it red")).toBeTruthy();
-    // And what it was about.
-    expect(screen.getByText('p#blurb "Hi"')).toBeTruthy();
-    expect(screen.queryByText("The app failed")).toBeNull();
-    card.broken = false;
-    await act(() => vi.advanceTimersByTimeAsync(CHUNK_RETRY_MS));
-    expect(screen.getByText("The card")).toBeTruthy();
-  } finally {
-    vi.useRealTimers();
-  }
-});
 
 it("leaves the composer as it was when the outbox strip can't load, and shows it once it does", async () => {
   vi.useFakeTimers();

@@ -1,45 +1,31 @@
 import { render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
-import { DesignRequestBody } from "./LazyDesignRequestMessage";
+import { describe, expect, it } from "vitest";
+import { DesignRequestBody } from "./DesignRequestMessage";
 import { NO_SCREENSHOT_NOTE } from "./parseDesignRequest";
 
 describe("DesignRequestBody", () => {
-  it("shows the request, its subject and a missing screenshot's note while the card's chunk loads", async () => {
-    // A fresh module, whose card hasn't loaded for an earlier test.
-    vi.resetModules();
-    const { DesignRequestBody: FreshBody } = await import("./LazyDesignRequestMessage");
+  it("shows the request, what it was about and a missing screenshot's note", () => {
     const { rerender } = render(
-      <FreshBody
+      <DesignRequestBody
         request={{
           kind: "element",
           request: "Make it red",
           element: "p#blurb",
+          elementText: "Hi",
           noScreenshot: true,
         }}
       />,
     );
-    expect(screen.queryByTestId("design-request")).toBeNull();
-    expect(screen.getByText("Make it red")).toBeInTheDocument();
-    expect(screen.getByText("p#blurb")).toBeInTheDocument();
-    expect(screen.getByText(NO_SCREENSHOT_NOTE)).toBeInTheDocument();
-    const card = await screen.findByTestId("design-request");
-    expect(card).toHaveTextContent("p#blurb");
+    const card = screen.getByTestId("design-request");
+    expect(card).toHaveTextContent('p#blurb "Hi"');
+    expect(card).toHaveTextContent("Make it red");
     expect(card).toHaveTextContent(NO_SCREENSHOT_NOTE);
     rerender(
-      <FreshBody request={{ kind: "element", request: "Make it red", element: "p#blurb" }} />,
-    );
-    expect(screen.queryByText(NO_SCREENSHOT_NOTE)).toBeNull();
-  });
-
-  it("shows the request and what it was about", async () => {
-    render(
       <DesignRequestBody
-        request={{ kind: "element", request: "Make it red", element: "p#blurb", elementText: "Hi" }}
+        request={{ kind: "element", request: "Make it red", element: "p#blurb" }}
       />,
     );
-    await screen.findByTestId("design-request");
-    expect(screen.getByText('p#blurb "Hi"')).toBeInTheDocument();
-    expect(screen.getByText("Make it red")).toBeInTheDocument();
+    expect(screen.queryByText(NO_SCREENSHOT_NOTE)).toBeNull();
   });
 
   it("says which page a drawing was on", async () => {

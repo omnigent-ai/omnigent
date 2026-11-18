@@ -169,9 +169,10 @@ export function DesktopDesignTools({
     [],
   );
   const noticeRef = useRef(notice);
-  noticeRef.current = notice;
-  // A notice whose overlay couldn't open shows in the toolbar instead.
-  // Each its own object, so the same message again shows its full time.
+  useLayoutEffect(() => {
+    noticeRef.current = notice;
+  }, [notice]);
+  // A notice whose overlay couldn't open shows in the toolbar instead (an object, as above).
   const [unplaced, setUnplaced] = useState<{ text: string } | null>(null);
   const [toolbarRef, toolbarShown] = useShownRef();
   const room = useHasRoom(container, hasView);

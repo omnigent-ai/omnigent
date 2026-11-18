@@ -2,6 +2,7 @@
 // was about. It renders inside the ordinary user bubble; desktop design mode sends the same
 // format, so its messages get the card too.
 import { MousePointerClickIcon, PencilLineIcon, type LucideIcon } from "lucide-react";
+import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { DesignRequestContent, type DesignRequestCardProps } from "./DesignRequestContent";
 import type { DesignRequest } from "./parseDesignRequest";
 
@@ -21,5 +22,21 @@ export function DesignRequestBodyView({ request, words }: DesignRequestCardProps
         icon={<Icon className="mt-0.5 size-3.5 shrink-0" />}
       />
     </div>
+  );
+}
+
+/** A design-tool message's body in the chat; if the card fails, the same content plainly. */
+export function DesignRequestBody(props: DesignRequestCardProps) {
+  return (
+    <RenderErrorBoundary
+      name="the design request card"
+      fallback={
+        <div className="flex min-w-0 flex-col gap-1">
+          <DesignRequestContent {...props} />
+        </div>
+      }
+    >
+      <DesignRequestBodyView {...props} />
+    </RenderErrorBoundary>
   );
 }

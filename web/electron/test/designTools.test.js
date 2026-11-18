@@ -870,6 +870,27 @@ describe("design tools: capture", () => {
     assert.equal(painted, 1);
   });
 
+  it("answers nothing for an opening that ended while the page painted or answered", async () => {
+    const t = openTool();
+    t.open();
+    const paint = t.webContents.capturePage;
+    t.webContents.capturePage = async (rect) => {
+      // The page navigates mid-capture: the image may be the next document's.
+      t.webContents.emit("did-start-navigation", { isMainFrame: true, isSameDocument: false });
+      return paint(rect);
+    };
+    const refused = { ok: false, error: "the design tool isn't open on this page" };
+    assert.deepEqual(await t.ask("capture"), refused);
+    const u = openTool();
+    u.open();
+    const release = u.webContents.holdNext();
+    const hit = u.ask("hitTest", { x: 1, y: 1 });
+    await tick();
+    u.webContents.emit("did-start-navigation", { isMainFrame: true, isSameDocument: false });
+    release();
+    assert.deepEqual(await hit, refused);
+  });
+
   it("fails a capture the page never paints", async () => {
     const t = openTool({ opTimeoutMs: 20 });
     t.open();

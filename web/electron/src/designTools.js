@@ -535,6 +535,9 @@ function createDesignTools({
     // A notice outlives its page's navigations, so it can't read or scroll the next document.
     if (session.mode === "notice" && op !== "fit") return { ok: false, error: NOT_OPEN };
     const webContents = entry.view.webContents;
+    // An opening that ended while the page answered (it navigated, say) gets no answer.
+    const ifOpen = (answer) =>
+      views.get(entry) === session ? answer : { ok: false, error: NOT_OPEN };
     // Measured at the overlay's old zoom: the overlay follows the page's, and the app asks again.
     if (POSITIONED_OPS.has(op) && zoomMoved(session)) {
       fit(session);
@@ -548,10 +551,10 @@ function createDesignTools({
         return { ok: true };
       }
       case "capture":
-        return capture(entry, args);
+        return ifOpen(await capture(entry, args));
       case "hitTest": {
         if (!isFiniteNumber(args.x) || !isFiniteNumber(args.y)) return invalid();
-        return pageAnswer(await inWorld(webContents, hitTestScript(args.x, args.y)));
+        return ifOpen(pageAnswer(await inWorld(webContents, hitTestScript(args.x, args.y))));
       }
       case "scroll": {
         // The wheel turned over the tool: it scrolls what's under it, as the wheel would.

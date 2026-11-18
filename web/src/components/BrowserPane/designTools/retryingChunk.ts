@@ -10,11 +10,9 @@ export interface RetryingChunk<P> {
   missing: () => boolean;
   /** Calls `listener` when the chunk fails to load, and when a later try loads it. */
   subscribe: (listener: () => void) => () => void;
-  /** The chunk's component, kept up to date; `fallback` while the chunk can't load. */
+  /** The chunk's component, kept up to date; it renders nothing while the chunk can't load. */
   useComponent: () => ComponentType<P>;
 }
-
-const Nothing = () => null;
 
 /**
  * A component loaded in its own chunk, off the app's first paint. A chunk that can't load
@@ -23,13 +21,13 @@ const Nothing = () => null;
  */
 export function retryingChunk<P extends object>(
   load: () => Promise<ComponentType<P>>,
-  fallback: ComponentType<P> = Nothing,
 ): RetryingChunk<P> {
   let retryMs = CHUNK_RETRY_MS;
   let missing = false;
   // A try came due while nothing showed the chunk: the next subscriber makes it.
   let due = false;
   const listeners = new Set<() => void>();
+  const Nothing: ComponentType<P> = () => null;
   const changed = () => {
     for (const listener of [...listeners]) listener();
   };
@@ -60,7 +58,7 @@ export function retryingChunk<P extends object>(
         missing = true;
         changed();
         retryLater();
-        return { default: fallback };
+        return { default: Nothing };
       },
     ),
   );

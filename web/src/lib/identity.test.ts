@@ -331,6 +331,31 @@ describe("fetchSignedInUserId", () => {
 
     expect(await fetchSignedInUserId()).toBeUndefined();
   });
+
+  it.each<[string, () => void]>([
+    ["a request that never answers", () => fetchMock.mockReturnValueOnce(new Promise(() => {}))],
+    [
+      "a body that never arrives",
+      () =>
+        fetchMock.mockResolvedValueOnce({
+          ok: true,
+          status: 200,
+          json: () => new Promise(() => {}),
+        } as unknown as Response),
+    ],
+  ])("answers undefined once %s for too long", async (_label, hangOnce) => {
+    vi.useFakeTimers();
+    try {
+      hangOnce();
+      const { fetchSignedInUserId, SIGNED_IN_TIMEOUT_MS } = await import("./identity");
+      const asked = fetchSignedInUserId();
+      await vi.advanceTimersByTimeAsync(SIGNED_IN_TIMEOUT_MS);
+      expect(await asked).toBeUndefined();
+      expect(fetchMock.mock.calls.at(-1)?.[1]?.signal?.aborted).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("resolveIdentity base-path login redirect", () => {
