@@ -6874,7 +6874,12 @@ function NewChatLandingContent({
         void queryClient.refetchQueries({ queryKey: ["conversations"] });
         if (!serverOwnsInitialInput)
           setPendingInitialPrompt(data.id, { text: initialPrompt, skill, files });
-        if (!onProjectHome && onScreenRef.current && window.location.href === createLocation) {
+        // Only the full chat delivers a pending prompt, so the project home hands off to it.
+        if (
+          (!onProjectHome || !serverOwnsInitialInput) &&
+          onScreenRef.current &&
+          window.location.href === createLocation
+        ) {
           navigate(sessionLocation(data.id));
         }
       }
