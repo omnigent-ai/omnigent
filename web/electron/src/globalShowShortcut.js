@@ -350,15 +350,33 @@ function createGlobalShortcuts({ presses, ...deps }) {
       ? shortcuts[a].savedOn()
       : ids.indexOf(a) < ids.indexOf(b);
   for (const id of ids) {
-    shortcuts[id] = createGlobalShowShortcut({
+    const shortcut = createGlobalShowShortcut({
       ...deps,
       id,
       show: presses[id],
+      // Another shortcut's chord is off limits, unless this one already holds it ahead of them.
       claimedElsewhere: (accelerator) =>
-        others(id).some((other) => shortcuts[other].uses(accelerator)),
+        others(id).some(
+          (other) =>
+            shortcuts[other].uses(accelerator) &&
+            !(shortcuts[id].uses(accelerator) && comesBefore(id, other)),
+        ),
       outranked: (accelerator) =>
         others(id).some((other) => shortcuts[other].uses(accelerator) && comesBefore(other, id)),
     });
+    shortcuts[id] = {
+      ...shortcut,
+      // A chord this one frees can now go to a shortcut that lost it, without a restart.
+      async set(change, approve) {
+        const result = await shortcut.set(change, approve);
+        if (result.ok) {
+          for (const other of others(id)) {
+            if (shortcuts[other].current().error) shortcuts[other].apply();
+          }
+        }
+        return result;
+      },
+    };
   }
   return shortcuts;
 }

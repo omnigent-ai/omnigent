@@ -418,7 +418,14 @@ describe("createGlobalShortcuts", () => {
       isMac: true,
       presses: { show: () => {}, floatingComposer: () => {} },
     });
-    return { ...built, saved: () => stored, registered: () => [...live.values()] };
+    return {
+      ...built,
+      saved: () => stored,
+      rewrite: (next) => {
+        stored = structuredClone(next);
+      },
+      registered: () => [...live.values()],
+    };
   }
 
   it("keeps each shortcut under its own settings key", () => {
@@ -460,6 +467,52 @@ describe("createGlobalShortcuts", () => {
         assert.equal(s.saved().global_shortcut, undefined);
       });
     }
+  }
+
+  it("refuses a chord another shortcut has registered even after its setting changed", async () => {
+    const s = shortcuts();
+    s.floatingComposer.apply();
+    s.rewrite({ floating_composer_shortcut: { enabled: false, accelerator: "Alt+K" } });
+    let asked = false;
+    const result = await s.show.set(
+      { enabled: true, accelerator: "Shift+Command+Space" },
+      async () => (asked = true),
+    );
+    assert.match(result.error, /Another Omnigent shortcut/);
+    assert.equal(asked, false);
+  });
+
+  it("lets the shortcut that won a chord save it again, in another spelling or off", async () => {
+    const s = shortcuts({ global_shortcut: { enabled: true, accelerator: "Shift+Command+Space" } });
+    s.show.apply();
+    s.floatingComposer.apply();
+    const respelled = await s.show.set(
+      { enabled: true, accelerator: "CommandOrControl+Shift+Space" },
+      async () => true,
+    );
+    assert.equal(respelled.ok, true);
+    const off = await s.show.set(
+      { enabled: false, accelerator: "CommandOrControl+Shift+Space" },
+      async () => true,
+    );
+    assert.equal(off.ok, true);
+  });
+
+  for (const [how, change] of [
+    ["turns off", { enabled: false }],
+    ["moves to another chord", { enabled: true, accelerator: "Alt+K" }],
+  ]) {
+    it(`gives a freed chord to the shortcut that lost it when the winner ${how}`, async () => {
+      const s = shortcuts({
+        global_shortcut: { enabled: true, accelerator: "Shift+Command+Space" },
+      });
+      s.show.apply();
+      s.floatingComposer.apply();
+      assert.match(s.floatingComposer.current().error, /Another Omnigent shortcut/);
+      assert.equal((await s.show.set(change, async () => true)).ok, true);
+      assert.equal(s.floatingComposer.current().error, undefined);
+      assert.ok(s.registered().includes("CommandOrControl+Shift+Space"));
+    });
   }
 
   it("refuses a chord another shortcut took while the user was deciding", async () => {
