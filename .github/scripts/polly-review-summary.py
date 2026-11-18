@@ -667,7 +667,7 @@ def _markdown_context(
                 literal = line[start:end]
                 if any(marker in literal for marker in ("[", "<", "://", "www.", "@")):
                     protect_span(line_start + start, line_start + end, "inline destination code")
-            ambiguous_destination = False
+            ambiguous_destination = inline_ambiguous and destination_seen
             for word in re.finditer(r"\S+", line):
                 value = word[0]
                 if (

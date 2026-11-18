@@ -1003,7 +1003,16 @@ def _check_identity_and_work(table_variant: str, monkeypatch: pytest.MonkeyPatch
     ]
     + [
         pytest.param(form, "prose", "destination", False, False, id=form)
-        for form in ("multiline-label", "multiline-image", "multiline-title", "multiline-code")
+        for form in (
+            "multiline-label",
+            "multiline-image",
+            "multiline-title",
+            "multiline-code",
+            "multiline-relative-code",
+            "multiline-relative-image",
+            "multiline-fragment-code",
+            "multiline-custom-code",
+        )
     ]
     + [
         pytest.param("nested", "prose", "destination", True, False, id="nested-label-and-url"),
@@ -1013,7 +1022,14 @@ def _check_identity_and_work(table_variant: str, monkeypatch: pytest.MonkeyPatch
     ]
     + [
         pytest.param(form, "prose", "destination", True, True, id=f"{form}-short")
-        for form in ("link", "image", "autolink", "multiline-label")
+        for form in (
+            "link",
+            "image",
+            "autolink",
+            "multiline-label",
+            "multiline-relative-code",
+            "multiline-fragment-code",
+        )
     ],
 )
 def test_multipart_inline_destinations_keep_rendered_meaning(
@@ -1041,6 +1057,10 @@ def test_multipart_inline_destinations_keep_rendered_meaning(
         "multiline-image": f"![evidence\nlabel]({destination})",
         "multiline-title": f'[evidence]({destination}\n "proof title")',
         "multiline-code": f"`literal evidence\n[label]({destination})\nend`",
+        "multiline-relative-code": "`literal evidence\n[label](/docs)\nend`",
+        "multiline-relative-image": "`literal evidence\n![evidence](../proof.png)\nend`",
+        "multiline-fragment-code": "`literal evidence\n[label](#section)\nend`",
+        "multiline-custom-code": "`literal evidence\n[label](guide:proof)\nend`",
         "nested": "[evidence [nested]](https://example.test/proof(a(b)c))",
         "fence": f"```text\n[evidence]({destination})\n```\n\n",
         "long-label": f"[{'e' * 70000}]({destination})",
@@ -1093,6 +1113,10 @@ def test_multipart_inline_destinations_keep_rendered_meaning(
         "inline-code",
         "inline-bare-code",
         "multiline-code",
+        "multiline-relative-code",
+        "multiline-relative-image",
+        "multiline-fragment-code",
+        "multiline-custom-code",
         "fence",
     }:
         assert not expected
