@@ -1346,6 +1346,48 @@ def test_composer_growth_stays_bottom_pinned_every_frame(
     assert grown["distanceFromBottom"] <= TOLERANCE
 
 
+def test_phone_composer_growth_keeps_the_bottom_through_a_scroll_before_remeasure(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    chat = chat_session_contract
+    seed_long_transcript(chat, 20)
+    open_live(page, chat, PHONE)
+    # After a reload, rows measuring shorter than their estimates can clamp the
+    # scroll position, which releases StickToBottom's lock at the bottom; then
+    # only the composer growth pin holds it.
+    page.reload()
+    expect(page.get_by_text("Turn 20 response", exact=False).first).to_be_visible()
+    start = settled_geometry(page)
+    assert start["mobileOverlay"], start
+    assert start["distanceFromBottom"] <= TOLERANCE, start
+    # Until the overlay re-measures, a grown composer shortens the transcript's
+    # viewport. A scroll event read in that window (in practice the growth pin's
+    # own, a frame late) is not the reader leaving the bottom.
+    stale = page.evaluate(
+        """() => {
+          const ta = document.querySelector('textarea[aria-label="Message the agent"]');
+          const form = ta.closest('form');
+          const scroller = form.parentElement.querySelector('[role="log"] > div');
+          const surface = form.closest('[data-chat-surface]');
+          form.style.minHeight = `${form.getBoundingClientRect().height + 40}px`;
+          const stale = {
+            overlayHeight: Math.round(parseFloat(
+              getComputedStyle(surface).getPropertyValue('--session-composer-height')) || 0),
+            distanceFromBottom: Math.round(
+              scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop),
+          };
+          scroller.dispatchEvent(new Event('scroll'));
+          return stale;
+        }"""
+    )
+    assert stale["overlayHeight"] == pytest.approx(start["overlayHeight"], abs=TOLERANCE), stale
+    assert stale["distanceFromBottom"] > TOLERANCE, (start, stale)
+    grown = settled_geometry(page)
+    assert grown["overlayHeight"] == pytest.approx(start["overlayHeight"] + 40, abs=TOLERANCE)
+    assert grown["distanceFromBottom"] <= TOLERANCE, (start, grown)
+
+
 def _single_reply(chat: ChatSessionContract, words: int) -> None:
     seed_items(
         chat,

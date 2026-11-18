@@ -76,6 +76,31 @@ describe("ImportSessionsPanel", () => {
     expect(screen.queryByTestId("import-submit")).toBeNull();
   });
 
+  it("renders each row as its Settings catalog entry, in the recent-sessions mode", () => {
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_1", name: "mac-laptop", owner: "alice", status: "online" }],
+    } as unknown as ReturnType<typeof useHosts>);
+    renderPanel();
+    for (const id of [
+      "import-machine",
+      "import-mode",
+      "import-harness",
+      "import-recent-count",
+      "import-run",
+    ]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+    expect(document.querySelector('[data-settings-item="import-session-id"]')).toBeNull();
+  });
+
+  it("names the mode row as its catalog label, the same text the select shows", () => {
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_1", name: "mac-laptop", owner: "alice", status: "online" }],
+    } as unknown as ReturnType<typeof useHosts>);
+    renderPanel();
+    expect(screen.getByText("What to import")).toBeInTheDocument();
+  });
+
   it("keeps a large batch compact and points to the existing session list", async () => {
     useHostsMock.mockReturnValue({
       data: [{ host_id: "host_1", name: "mac-laptop", owner: "alice", status: "online" }],

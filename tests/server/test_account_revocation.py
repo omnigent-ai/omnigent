@@ -1554,7 +1554,7 @@ def test_automation_share_cannot_cross_registration(setup_app, monkeypatch, meth
 
 
 @pytest.mark.parametrize("setup_app", [True], indirect=True)
-@pytest.mark.parametrize("replaced_after", ["resolve_scheduled_task_access", "grant_delete"])
+@pytest.mark.parametrize("replaced_after", ["spelling_lookup", "grant_lookup", "grant_delete"])
 def test_a_failed_automation_revoke_restores_no_grant_to_a_replaced_account(
     setup_app, monkeypatch, replaced_after
 ):
@@ -1574,10 +1574,13 @@ def test_a_failed_automation_revoke_restores_no_grant_to_a_replaced_account(
 
     lookup = permissions.resolve_scheduled_task_access
     delete_grant = permissions.revoke_for_scheduled_task
+    lookups: list[object] = []
 
     def lookup_then_pause(*args, **kwargs):
         held = lookup(*args, **kwargs)
-        if replaced_after == "resolve_scheduled_task_access":
+        lookups.append(held)
+        # The DELETE's first lookup picks the spelling; its second finds the grant to delete.
+        if (replaced_after, len(lookups)) in {("spelling_lookup", 1), ("grant_lookup", 2)}:
             pause_once()
         return held
 
@@ -1593,7 +1596,10 @@ def test_a_failed_automation_revoke_restores_no_grant_to_a_replaced_account(
     response = _replace_alice_during(
         admin, reached, resume, "DELETE", f"/v1/scheduled-tasks/{task_id}/permissions/alice"
     )
-    assert response.status_code == 500, response.text
+    # Replaced before the grant lookup, the new account holds nothing to remove.
+    assert response.status_code == (204 if replaced_after == "spelling_lookup" else 500), (
+        response.text
+    )
     # The grant being restored was the deleted account's, not the new one's.
     assert permissions.list_for_scheduled_task(task_id) == ([], None)
 

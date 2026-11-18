@@ -26,7 +26,9 @@ MCP independent creation.
   another session". `sys_session_list` and `sys_session_get_info` expose
   `created_by_session_id` so managers can identify their workers across restarts;
   `sys_session_list` with `include_archived` also lists archived workers, each
-  marked `archived`.
+  marked `archived`. With `created_by_this_session`, the runner pages the global
+  `sessions` view itself and returns only the caller's workers in one call, up to
+  a scan limit; the `sub_agents` view is then empty.
 - `list-scope`: `sys_session_list`'s global `sessions` view lists only the
   caller's own sessions by default, like the sidebar's My view. Sessions other
   users shared with the caller appear only with `visibility: "shared"` (or

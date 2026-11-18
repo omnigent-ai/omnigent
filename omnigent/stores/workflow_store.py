@@ -237,6 +237,29 @@ class WorkflowStore:
             ).scalar_one_or_none()
             return None if row is None else self._workflows([row])[0]
 
+    def names(self, workflow_ids: Sequence[str], *, user_id: str | None) -> dict[str, str]:
+        """Name those of the workflows the owner has, by ID; one primary-key read each.
+
+        :param workflow_ids: Workflow IDs, e.g. those a page of runs follows.
+        :param user_id: The owner, or ``None`` in single-user mode.
+        """
+        wanted = list(dict.fromkeys(workflow_ids))
+        if not wanted:
+            return {}
+        with self._session("get_workflow_names") as session:
+            rows = session.execute(
+                _using(
+                    select(SqlWorkflow.id, SqlWorkflow.name).where(
+                        SqlWorkflow.workspace_id == current_workspace_id(),
+                        SqlWorkflow.id.in_(wanted),
+                        SqlWorkflow.user_id
+                        == (RESERVED_USER_LOCAL if user_id is None else user_id),
+                    ),
+                    "PRIMARY",
+                )
+            ).all()
+        return {row.id: row.name for row in rows}
+
     def list_page(
         self,
         *,

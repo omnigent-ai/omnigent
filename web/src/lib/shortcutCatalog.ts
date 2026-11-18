@@ -34,6 +34,7 @@ import {
   SHIFT_KEY,
   sidebarToggleShortcutKeys,
   SPLIT_TERMINAL_KEYS,
+  TOGGLE_UNREAD_KEYS,
   VIEW_MODE_TOGGLE_KEYS,
   workspaceTabShortcutKeys,
 } from "@/components/KeyboardShortcut";
@@ -71,6 +72,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { label: "Open command palette", keys: [MOD_KEY, "K"] },
       { label: "Find a session by name", keys: [MOD_KEY, ALT_KEY, "S"] },
       { label: "Rename current session", keys: [MOD_KEY, ALT_KEY, "R"] },
+      { label: "Mark current session unread or read", keys: [...TOGGLE_UNREAD_KEYS] },
       { label: "Open Settings", keys: settingsShortcutKeys(false) },
       { label: "Show keyboard shortcuts", keys: [MOD_KEY, "/"] },
     ],

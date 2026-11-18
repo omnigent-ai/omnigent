@@ -21,7 +21,7 @@ the header menu), and each place is a separate entry point.
   replaces it; leaving the composer without submitting removes the draft. Existing
   sessions cannot join a family; ordinary forks remain standalone and may reuse the source host.
 
-- `session-grid`: behind `grid_sessions_display_ui`, drag sidebar sessions into a
+- `session-grid`: with `grid_sessions_display_ui` (on by default), drag sidebar sessions into a
   conversation to split left/right or top/bottom with a hover preview. Up to four
   independent chats fit in two rows and two columns. Grids live at `/grid/<id>`
   and are saved only in this browser, scoped to server and user.
@@ -265,12 +265,16 @@ the header menu), and each place is a separate entry point.
   back. List scrolling, row taps, long-press reordering and horizontal scrollers
   keep their own touch handling.
 - `session-overview`: behind the `session_overview` release flag (off by
-  default), the desktop chat header shows the session cost as a `$x.xx` chip.
-  Clicking it shows or hides a **Session overview** card with the session cost
-  and per-model token usage, which then leave the desktop Agent info popover.
-  Windows at least 1280px wide with the workspace collapsed and chat in view
-  dock the card open beside chat; other layouts open it over chat. Mobile keeps
-  cost in Agent info.
+  default), the desktop chat header shows the session cost as a `$x.xx` chip
+  beside the right-panel toggle, styled as selected while the card shows.
+  Clicking it shows or hides a **Session overview** card
+  with the session cost, each model's cost and the total tokens, which then
+  leave the desktop Agent info popover. Windows at least 1280px wide with the
+  workspace collapsed and chat in view dock the card open beneath the chip;
+  closed there by hand, it stays closed on that device, including after a
+  reload, until the chip opens it again. Other layouts open it as a popover
+  from the chip. Mobile keeps cost in Agent
+  info.
   When the session has sub-agents, a **Sub-agents** list names each direct one
   with its cost, including its own sub-agents; an unpriced one shows no cost.
   A Claude sub-agent shows its Claude session's transcript estimate as `~$x.xx`. The
@@ -285,12 +289,13 @@ the header menu), and each place is a separate entry point.
   Server admins configure the available targets under Settings → Admin → General →
   **Nested agent destinations**.
 
-**Session grids (desktop only):** enable `OMNIGENT_FEATURES=grid_sessions_display_ui`, open a
+**Session grids (desktop only):** with `grid_sessions_display_ui` on (the default), open a
 session, and drag another sidebar row over it. Hover **Split left/right/top/bottom**
 to preview, then drop. Split a remaining full-width or full-height pane again
 to reach three or four panes. Alternatively, use a row's menu or right-click
 menu → **Open in grid** and choose the pane and direction. Each pane has its own
-transcript and composer; terminal-capable sessions have a Chat/Terminal switch in
+transcript and composer, whose action row shows the session's host, permission mode and
+harness; terminal-capable sessions have a Chat/Terminal switch in
 each cell header. The shortcut ⌘/Ctrl+Alt+\ switches
 only the active cell. Choices survive reloads and follow the session into full
 screen; drafts and terminal connections survive view changes. A managed session
@@ -314,7 +319,8 @@ its Rename menu action to edit it inline.
 Enter or blur saves; Escape cancels. Grid names persist locally. Click anywhere
 in a cell (or focus its controls) to activate it: its outline and inverted header
 identify the session shown in Workspace. ⌘/Ctrl+Alt+Shift+] / [ activate the
-next / previous cell and focus its terminal or composer. The grid header button
+next / previous cell and focus its terminal or composer. The grid header and window
+title show the grid's name or its sessions' titles. The grid header button
 (⌘/Ctrl+Alt+] in a browser tab, ⇧⌘B / Ctrl+Shift+B in the desktop app) toggles the shared panel, and ⌃1–9 (Alt+1–9 on Windows/Linux) shows the active cell's Nth fixed tab; it spans the full app height beside the grid header and cells. Its width
 is saved per grid and stays fixed when switching sessions; the header shrinks
 with the cells when the panel opens.
@@ -658,15 +664,17 @@ With Settings → General → **Open sub-agents in the Workspace panel** on, a
 plain click on a sub-agent (transcript link, composer indicator, Agents row or
 graph node) opens it as a tab in the same strip, marked with a bot icon, and
 reveals the panel; ancestors still open full screen. The tab's **Open full
-screen** link opens the sub-agent's own page. Claude Code and closed sub-agents
-are read-only there too. Closing a sub-agent tab only hides it; the sub-agent
-keeps running. Covered by `tests/e2e_ui/agents/test_subagent_side_panel.py`.
+screen** link opens the sub-agent's own page. Claude Code sub-agents and closed
+sub-agents other than Codex side chats are read-only there too. Closing a
+sub-agent tab only hides it; the sub-agent keeps running. Covered by
+`tests/e2e_ui/agents/test_subagent_side_panel.py`.
 While a side chat works, typing a follow-up turns Interrupt into Send, which
 queues or steers it as the main composer does; Escape still interrupts. Its queue
 strip offers edit, steer, reorder and delete, and Mod+Enter steers them all.
 Closing the side chat discards the follow-ups queued on that device. Other
 devices keep their tabs and queued work. Closing still stops the chat's running
-turn, as before; a sealed Codex side chat refuses further input. A chat-only
+turn, as before. A closed Codex side chat resumes on its next message or Resume,
+restoring its saved context if its native thread is gone. A chat-only
 side chat can also send messages from its direct URL without choosing a
 workspace. The side-chat composer opens the same `/` menu
 affordance as the main composer but with a narrower set — `/help` and the
@@ -745,8 +753,8 @@ plain `uv run pytest`, which starts a private server for the test.
   ordinary session routes retain native link dragging and expose no grid menus,
   drop targets, or saved-grid sidebar entries. Run with `--browser-ui-skip-build --video=on` after building.
   Layout combinations and malformed local storage have unit coverage in
-  `web/src/grid/gridLayout.test.ts`. For a real-server drive, enable
-  `grid_sessions_display_ui` on the isolated server. Also check a collapsed sidebar manually.
+  `web/src/grid/gridLayout.test.ts`. For a real-server drive, the
+  isolated server enables `grid_sessions_display_ui` by default. Also check a collapsed sidebar manually.
   Per-view render recovery, preserved neighboring drafts, usable cell controls
   and independent chat/terminal retry have component coverage in
   `web/src/grid/GridSessionPane.test.tsx`. To check manually, inject a render
