@@ -717,7 +717,9 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
             }[variant]
             lead = "Ordinary finding é🙂.\n" * (1 if short else 4500) + "\n"
             if variant.endswith("rationale"):
-                assessment_review = _REVIEW.replace("Guards the regression.", literal)
+                assessment_review = _REVIEW.replace("Guards the regression.", literal).replace(
+                    "::test_empty", "::test_empty[param]"
+                )
             elif variant == "code-span-raw-html":
                 lead = (
                     "<details><summary>Use `<summary>` tags</summary>\n\n"

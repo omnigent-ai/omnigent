@@ -342,7 +342,7 @@ def _disclosure_code_spans(line: str) -> list[tuple[int, int]]:
             start, closer = pairs[index]
             # Raw HTML and link syntax may consume backticks before inline parsing.
             preceding = line[previous_end:start]
-            if "<" in preceding or "]" in preceding:
+            if "<" in preceding or "](" in preceding or "][" in preceding:
                 break
             spans.append((start, runs[closer].end()))
             previous_end = runs[closer].end()
