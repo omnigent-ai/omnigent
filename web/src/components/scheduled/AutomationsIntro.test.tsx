@@ -23,12 +23,17 @@ const fullInfo: ServerInfo = {
   features: { session_orchestration: true },
 };
 
-function intro(info: ServerInfo | "loading" = fullInfo, basename = "", onClose = () => {}) {
+function intro(
+  info: ServerInfo | "loading" = fullInfo,
+  basename = "",
+  onClose = () => {},
+  openCount = 0,
+) {
   return (
     <MemoryRouter>
       <RoutingProvider value={basenamedRouting(basename)}>
         <CapabilitiesProvider info={info}>
-          <AutomationsIntro onClose={onClose} />
+          <AutomationsIntro onClose={onClose} openCount={openCount} />
         </CapabilitiesProvider>
       </RoutingProvider>
     </MemoryRouter>
@@ -76,6 +81,56 @@ describe("Automations first-visit introduction", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
     view.unmount();
     render(intro());
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("shows example automations on request without marking the guide seen", () => {
+    const view = render(intro());
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    fireEvent.click(screen.getByRole("button", { name: "See examples" }));
+    const examples = screen.getByRole("dialog", { name: "Example automations" });
+    const items = within(
+      within(examples).getByRole("list", { name: "Example automations" }),
+    ).getAllByRole("listitem");
+    expect(items.map((item) => within(item).getByRole("heading").textContent)).toEqual([
+      "Answer product questions",
+      "Triage new pages",
+      "Merge Dependabot updates",
+    ]);
+    // Schedules read the way the task list shows them.
+    expect(
+      items.map((item) => within(item).getByText(/^(Hourly|Every day at .+)$/).textContent),
+    ).toEqual(["Hourly", "Hourly", "Every day at 9:00 AM"]);
+    expect(items[0]).toHaveTextContent("Read the top-level messages posted in #product-questions");
+    expect(items[1]).toHaveTextContent("List the PagerDuty incidents on the Payments API service");
+    expect(items[2]).toHaveTextContent("opened by dependabot[bot]");
+    expect(within(examples).getByRole("heading", { name: "Example automations" })).toHaveFocus();
+    expect(localStorage.length).toBe(0);
+
+    fireEvent.click(screen.getByRole("button", { name: "Back" }));
+    expect(screen.getByText("2 of 4 · Watch for new work")).toBeVisible();
+    expect(screen.getByRole("button", { name: "See examples" })).toHaveFocus();
+
+    fireEvent.click(screen.getByRole("button", { name: "See examples" }));
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    view.unmount();
+    render(intro());
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("reopens at the first step after it was dismissed", () => {
+    const view = render(intro());
+    fireEvent.click(screen.getByRole("button", { name: "Next" }));
+    fireEvent.click(screen.getByRole("button", { name: "See examples" }));
+    fireEvent.click(screen.getByRole("button", { name: "Done" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    view.rerender(intro(fullInfo, "", () => {}, 1));
+    expect(screen.getByRole("dialog", { name: "Introducing Automations" })).toBeVisible();
+    expect(screen.getByText("1 of 4 · Run on a schedule")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Maybe later" }));
+    view.rerender(intro(fullInfo, "", () => {}, 1));
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 

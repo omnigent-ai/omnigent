@@ -1,9 +1,11 @@
-import { GitPullRequestIcon, Loader2Icon } from "lucide-react";
+import { ExternalLinkIcon, GitPullRequestIcon, Loader2Icon } from "lucide-react";
+import { useRef, useState } from "react";
 import { PullRequestStatusIcon } from "@/components/PullRequestStatusIcon";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import type { ComposerPullRequest } from "@/hooks/useComposerGitStatus";
 import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { gitProviderCopy } from "@/lib/gitProviders";
+import { followLinkWithPopupFallback, parseHttpUrl } from "@/lib/openLinkInApp";
 import {
   getPullRequestStatus,
   pullRequestStatusPresentation,
@@ -14,16 +16,73 @@ import { cn } from "@/lib/utils";
 export type ComposerPrState = "loading" | "ready" | "unknown";
 const NO_PULL_REQUESTS: readonly ComposerPullRequest[] = [];
 
+interface PreviewRow {
+  pr: ComposerPullRequest;
+  status: PullRequestStatus;
+  identity: string;
+  title: string;
+  href: string | undefined;
+}
+
+function previewRows(prs: readonly ComposerPullRequest[]): PreviewRow[] {
+  return prs.map((pr) => {
+    const copy = gitProviderCopy(pr.provider, undefined, pr.provider_display);
+    return {
+      pr,
+      status: getPullRequestStatus(pr),
+      identity: `${pr.repository} ${copy.prNumberPrefix}${pr.number}`.trim(),
+      title: pr.title?.trim() ?? "",
+      href: parseHttpUrl(pr.url)?.href,
+    };
+  });
+}
+
+/** Plain-text preview for assistive technology; the visible rows hold controls. */
+function previewDescription(rows: readonly PreviewRow[]): string {
+  const entries = rows.map(({ status, identity, title }) =>
+    [identity, pullRequestStatusPresentation(status).label, title].filter(Boolean).join(", "),
+  );
+  return `Pull requests: ${entries.join(". ")}`;
+}
+
+function OpenPullRequestLink({
+  href,
+  identity,
+  conversationId,
+}: {
+  href: string;
+  identity: string;
+  conversationId: string | undefined;
+}) {
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      onClick={(event) => followLinkWithPopupFallback(event, href, conversationId)}
+      data-testid="composer-pr-preview-open"
+      aria-label={`Open ${identity} in a new tab`}
+      title="Open in new tab"
+      className="relative z-10 shrink-0 rounded text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50"
+    >
+      <ExternalLinkIcon className="size-3.5" aria-hidden />
+    </a>
+  );
+}
+
 /**
  * PR chip for the composer workspace bar: the session's associated pull
  * request(s) as a link that opens the workspace rail's Pull Requests tab.
  * Shows ``#123`` for one PR or ``N PRs`` for several. Self-nulls when there is
- * no PR or no way to open the tab (e.g. the landing window).
+ * no PR or no way to open the tab (e.g. the landing window). Hovering previews
+ * each PR's status; clicking a row opens its details in the tab. The link beside
+ * its title opens it in a new browser tab.
  *
  * @param prCount - Number of PRs associated with the session.
  * @param prNumber - The primary PR's number, shown when ``prCount === 1``.
  * @param prNumberPrefix - Precedes ``prNumber``; ``#`` for GitHub, ``!`` for Azure DevOps.
- * @param onOpen - Opens the Pull Requests tab; ``null`` hides the link.
+ * @param onOpen - Opens the Pull Requests tab, optionally selecting a PR; ``null`` hides the link.
+ * @param conversationId - Lets PR links honor the in-app browser preference.
  */
 export function ComposerPrLink({
   state,
@@ -33,6 +92,7 @@ export function ComposerPrLink({
   prs = NO_PULL_REQUESTS,
   prStatus = null,
   onOpen,
+  conversationId,
   className,
 }: {
   state: ComposerPrState;
@@ -41,10 +101,14 @@ export function ComposerPrLink({
   prNumberPrefix?: string;
   prs?: readonly ComposerPullRequest[];
   prStatus?: PullRequestStatus | null;
-  onOpen: (() => void) | null;
+  onOpen: ((prUrl?: string) => void) | null;
+  conversationId?: string;
   className?: string;
 }) {
   const isCoarsePointer = useIsCoarsePointer();
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const previewRef = useRef<HTMLDivElement>(null);
   // Status belongs to a known PR; lookup and setup errors remain in the GitHub tab.
   if (prCount <= 0 || !onOpen) return null;
 
@@ -83,10 +147,23 @@ export function ComposerPrLink({
 
   const trigger = (
     <button
+      ref={triggerRef}
       type="button"
       data-testid="composer-pr-link"
       data-pr-status={status}
       onClick={() => onOpen()}
+      onKeyDown={(event) => {
+        if (event.key === "Tab" && !event.shiftKey && previewOpen) {
+          const firstRow = previewRef.current?.querySelector("button");
+          if (firstRow) {
+            event.preventDefault();
+            firstRow.focus();
+          }
+        }
+      }}
+      onBlur={(event) => {
+        if (previewRef.current?.contains(event.relatedTarget)) event.preventDefault();
+      }}
       aria-label={label}
       aria-description={prStatus ? presentation.label : undefined}
       title={showNativeHint ? openHint : undefined}
@@ -111,48 +188,101 @@ export function ComposerPrLink({
   );
 
   if (!showPreview) return trigger;
+  const rows = previewRows(prs);
 
   return (
     <TooltipProvider delayDuration={200}>
-      <Tooltip>
+      <Tooltip
+        open={previewOpen}
+        onOpenChange={(open) => {
+          if (!open && previewRef.current?.contains(document.activeElement)) {
+            triggerRef.current?.focus();
+          }
+          setPreviewOpen(open);
+        }}
+      >
         <TooltipTrigger asChild>{trigger}</TooltipTrigger>
+        {/* The label replaces Radix's hidden copy of the content, which would
+            otherwise duplicate each row's controls for assistive technology. */}
         <TooltipContent
+          ref={previewRef}
           data-testid="composer-pr-preview"
+          aria-label={previewDescription(rows)}
           side="top"
           sideOffset={4}
           align="start"
           collisionPadding={16}
+          onMouseDown={(event) => event.preventDefault()}
+          onEscapeKeyDown={() => triggerRef.current?.focus()}
+          onKeyDown={(event) => {
+            if (event.key !== "Tab") return;
+            const controls = event.currentTarget.querySelectorAll<HTMLElement>("button, a[href]");
+            const edge = event.shiftKey ? controls[0] : controls[controls.length - 1];
+            if (event.target === edge) {
+              if (event.shiftKey) event.preventDefault();
+              // Native Tab resumes from the trigger, beside the next composer control.
+              triggerRef.current?.focus();
+            }
+          }}
+          onBlur={(event) => {
+            if (
+              event.relatedTarget !== triggerRef.current &&
+              !event.currentTarget.contains(event.relatedTarget)
+            ) {
+              setPreviewOpen(false);
+            }
+          }}
           className="block w-96 max-w-[calc(100vw-2rem)] p-0 shadow-menu ring-1 ring-foreground/10"
         >
           <div className="border-b border-border/50 px-3 py-2 text-xs font-medium text-muted-foreground">
             Pull requests
           </div>
           <ul aria-label="Pull requests by status" className="max-h-80 overflow-y-auto p-1">
-            {prs.map((pr) => {
-              const rowStatus = getPullRequestStatus(pr);
+            {rows.map(({ pr, status: rowStatus, identity, title, href }) => {
               const rowPresentation = pullRequestStatusPresentation(rowStatus);
-              const copy = gitProviderCopy(pr.provider, undefined, pr.provider_display);
-              const identity = `${pr.repository} ${copy.prNumberPrefix}${pr.number}`.trim();
+              const openLink = href ? (
+                <OpenPullRequestLink
+                  href={href}
+                  identity={identity}
+                  conversationId={conversationId}
+                />
+              ) : null;
               return (
                 <li
                   key={pr.url}
                   data-pr-url={pr.url}
                   data-pr-status={rowStatus}
-                  className="flex items-start gap-2 rounded-md px-2 py-2"
+                  className="relative flex items-start gap-2 rounded-md px-2 py-2 hover:bg-muted/50"
                 >
                   <PullRequestStatusIcon status={rowStatus} className="mt-0.5 size-4 shrink-0" />
                   <div className="min-w-0 flex-1">
                     <div className="flex items-baseline justify-between gap-2">
-                      <span className="truncate text-xs text-muted-foreground" title={identity}>
-                        {identity}
+                      <span className="flex min-w-0 items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            triggerRef.current?.focus();
+                            setPreviewOpen(false);
+                            onOpen(pr.url);
+                          }}
+                          aria-label={`View ${identity} in the Pull Requests tab`}
+                          title={title || identity}
+                          className="truncate text-left text-xs text-muted-foreground after:absolute after:inset-0 after:cursor-pointer after:rounded-md after:content-[''] focus-visible:outline-none focus-visible:after:ring-2 focus-visible:after:ring-ring/50"
+                        >
+                          {identity}
+                        </button>
+                        {!title && openLink}
                       </span>
                       <span className={cn("shrink-0 text-xs", rowPresentation.className)}>
                         {rowPresentation.label}
                       </span>
                     </div>
-                    {pr.title?.trim() && (
-                      <div className="truncate text-ui font-medium" title={pr.title.trim()}>
-                        {pr.title.trim()}
+                    {title && (
+                      <div className="flex min-w-0 items-center gap-1">
+                        <span className="truncate text-ui font-medium" title={title}>
+                          {title}
+                        </span>
+                        {openLink}
                       </div>
                     )}
                   </div>

@@ -57,7 +57,7 @@ function ConfigChoices({ choices }: { choices: readonly ComposerConfigChoice[] }
           onCheckedChange={choice.onSelect ? () => choice.onSelect?.() : undefined}
           data-testid={choice.testId}
           title={choice.title}
-          className={choice.className}
+          className={cn("mobile-touch-target", choice.className)}
           {...choice.data}
         >
           {choice.label}
@@ -179,6 +179,7 @@ function ModelCatalogChoices({
       <div className="sticky -top-2 z-10 bg-popover py-1">
         <Input
           ref={searchRef}
+          className="mobile-touch-target"
           aria-label="Search models"
           placeholder="Search models…"
           value={query}
@@ -224,7 +225,7 @@ function ModelCatalogChoices({
                       event.preventDefault();
                       toggle(creator.id);
                     }}
-                    className="min-h-8 text-13 font-medium"
+                    className="mobile-touch-target min-h-8 text-13 font-medium"
                   >
                     <ChevronRightIcon
                       aria-hidden="true"

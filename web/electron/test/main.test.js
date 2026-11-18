@@ -158,6 +158,8 @@ function loadNavigationHarness({
   internalFeatures = false,
   cliPath = null,
   hostConnectResult = { ok: true },
+  sshConnectResult = { ok: true, shownInConsole: true },
+  serverAuthResult = { ok: true },
   managedServerNames = {},
   // A createWorkspaceNetwork() to run the real session module against.
   network = null,
@@ -168,6 +170,8 @@ function loadNavigationHarness({
   acceptedSessions = new Set(),
   deepLinks = null,
   localHostCli = { readLocalHostId: () => null, liveDaemonRecordFor: () => null },
+  clipboardWriteText = async () => {},
+  localHostNow = Date.now,
 } = {}) {
   const userData = fs.mkdtempSync(path.join(os.tmpdir(), "omnigent-navigation-test-"));
   if (savedServerUrl) {
@@ -250,7 +254,7 @@ function loadNavigationHarness({
   const bannerCalls = { show: [], hide: 0 };
   // The reconnect overlay's behavior is unit-tested in reconnect_overlay.test.js.
   const overlay = { hint: null, shows: [], hides: 0, raises: 0, cancel: null };
-  const browserRegistryCalls = { setActive: [], closeAll: [] };
+  const browserRegistryCalls = { setActive: [], closeAll: [], setOpenTabSupported: [] };
   let browserRegistryDeps;
   let browserIpcDeps;
   const permissionPromptCalls = { show: [], dismiss: [] };
@@ -279,6 +283,9 @@ function loadNavigationHarness({
       // away watch, workspace bounce): keep them all, like a real emitter.
       if (!listeners.has(eventName)) listeners.set(eventName, []);
       listeners.get(eventName).push(listener);
+    },
+    prependListener(eventName, listener) {
+      listeners.set(eventName, [listener, ...(listeners.get(eventName) ?? [])]);
     },
     emit(eventName, ...args) {
       for (const listener of listeners.get(eventName) ?? []) listener({}, ...args);
@@ -417,7 +424,7 @@ function loadNavigationHarness({
       },
       { isSupported: () => notificationsSupported },
     ),
-    clipboard: { writeText: () => {} },
+    clipboard: { writeText: (text) => clipboardWriteText(text) },
     dialog: {},
     ipcMain: { handle: (name, fn) => ipc.set(name, fn), on: (name, fn) => ipc.set(name, fn) },
     nativeImage: { createFromPath: () => ({ isEmpty: () => true }) },
@@ -436,7 +443,7 @@ function loadNavigationHarness({
       createSshConnectFlow: () => ({
         run: async (_parentWin, sshServerUrl, destination) => {
           calls.sshConnects.push({ serverUrl: sshServerUrl, destination });
-          return { ok: true, shownInConsole: true };
+          return sshConnectResult;
         },
       }),
     },
@@ -626,6 +633,10 @@ function loadNavigationHarness({
             return {
               closeAll: (reason) => browserRegistryCalls.closeAll.push(reason),
               setActive: (conversationId) => browserRegistryCalls.setActive.push(conversationId),
+              setRecentSessionSwitchSupported: () => {},
+              setOpenTabSupported: (supported) =>
+                browserRegistryCalls.setOpenTabSupported.push(supported),
+              activeConversationId: () => null,
             };
           },
         },
@@ -647,8 +658,11 @@ function loadNavigationHarness({
     },
     "./hostIdentity": {
       ...require("../src/hostIdentity"),
-      isHostThisMachine: (context) =>
-        require("../src/hostIdentity").isHostThisMachine(context, localHostCli),
+      createHostThisMachineChecker: () =>
+        require("../src/hostIdentity").createHostThisMachineChecker({
+          cli: localHostCli,
+          now: localHostNow,
+        }),
     },
     "./omnigent_cli": {
       isExecutableFile: () => false,
@@ -661,8 +675,10 @@ function loadNavigationHarness({
     "./server_manager": {
       shutdown: async () => {},
       onChange: () => {},
-      ensureServerAuth: async () => ({ ok: true }),
-      ensureHostConnected: async () => hostConnectResult,
+      ensureServerAuth: async (...args) =>
+        typeof serverAuthResult === "function" ? serverAuthResult(...args) : serverAuthResult,
+      ensureHostConnected: async (...args) =>
+        typeof hostConnectResult === "function" ? hostConnectResult(...args) : hostConnectResult,
       restartHost: async () => ({ ok: true }),
       disconnectHost: async () => ({ ok: true }),
       startLocalServer: async () => ({ ok: false }),
@@ -690,7 +706,8 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { handleDeepLink, buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, cancelReconnect };";
+    "\nmodule.exports.sshHosts = sshHosts;" +
+    "\nmodule.exports.testApi = { handleDeepLink, buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, setBlockedHintDelayMs: (ms) => { blockedHintDelayMs = ms; }, blockedHintDelayMs: () => blockedHintDelayMs, setServerResponseTimeoutMs: (ms) => { serverResponseTimeoutMs = ms; }, serverResponseTimeoutMs: () => serverResponseTimeoutMs, cancelReconnect };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -706,7 +723,8 @@ function loadNavigationHarness({
     module,
     process: {
       ...process,
-      platform: platform ?? (internalFeatures ? "darwin" : process.platform),
+      // Pinned so the default selector page does not depend on the test machine.
+      platform: platform ?? (internalFeatures ? "darwin" : "linux"),
       env: { ...process.env, OMNIGENT_SERVER_SELECTOR_V2: "", ...env },
     },
     require: (specifier) => {
@@ -732,6 +750,7 @@ function loadNavigationHarness({
 
   return {
     api,
+    sshHosts: module.exports.sshHosts,
     calls,
     overlay,
     bannerCalls,
@@ -806,7 +825,7 @@ describe("Arca extend IPC", () => {
         canExtendArca: true,
         canRefreshDbcert: true,
         arcaPreviewRecovery: true,
-        // Internal-feature fixtures simulate macOS on every test host.
+        // Managed-feature fixtures simulate macOS on every test host.
         chromeCookieImport: true,
       },
     );
@@ -837,7 +856,7 @@ describe("Arca extend IPC", () => {
     assert.deepEqual(h.calls.arcaExtends, []);
   });
 
-  it("rejects Arca extension on a local server even with internal features", async (t) => {
+  it("rejects Arca extension on a local server even with managed features", async (t) => {
     const h = loadNavigationHarness({ serverUrl: "http://localhost:6767", internalFeatures: true });
     t.after(h.cleanup);
     h.api.registerIpc();
@@ -1061,7 +1080,7 @@ describe("dbcert refresh IPC", () => {
 
   for (const [what, options] of [
     ["a local server", { serverUrl: "http://localhost:6767", internalFeatures: true }],
-    ["a machine without Databricks-internal features", { serverUrl }],
+    ["a machine without managed features", { serverUrl }],
   ]) {
     it(`refuses ${what}`, async (t) => {
       const h = loadNavigationHarness(options);
@@ -1241,7 +1260,7 @@ describe("Arca auto-connect wiring", () => {
       );
     const failed = { ok: false, errorKind: "timeout", error: "timed out" };
 
-    it("prepares sign-in before connecting to the identical SPOG workspace", async (t) => {
+    it("prepares sign-in before connecting to the identical workspace", async (t) => {
       const spog = "https://account.databricks.com/omnigent?o=123";
       let prepared = false;
       const h = harness(t, {
@@ -1328,7 +1347,7 @@ describe("Arca auto-connect wiring", () => {
       assert.equal(saved(h).arca_auto_connect, true);
     });
 
-    it("does not share sign-in or host success across SPOG workspace selectors", async (t) => {
+    it("does not share sign-in or host success across workspace selectors", async (t) => {
       const firstTarget = "https://account.databricks.com/omnigent?o=123";
       const secondTarget = "https://account.databricks.com/omnigent?o=456";
       const authenticated = new Set();
@@ -1504,7 +1523,7 @@ describe("Arca auto-connect wiring", () => {
     assert.deepEqual(h.calls.arcaConnects, []);
   });
 
-  it("skips servers that aren't Databricks-managed", async (t) => {
+  it("skips servers that aren't managed", async (t) => {
     const local = "http://localhost:6767";
     const h = loadNavigationHarness({ serverUrl: local, arcaPath });
     t.after(h.cleanup);
@@ -1930,6 +1949,8 @@ describe("Databricks auth mode wiring", () => {
         });
         t.after(h.cleanup);
         h.api.setReconnectDelaysMs(retries);
+        // Show the blocked-network hint right away so its wording can be asserted.
+        h.api.setBlockedHintDelayMs(0);
         if (failure) {
           // oxlint-disable-next-line no-await-in-loop
           await assert.rejects(h.api.loadServerUrl(h.win, workspace));
@@ -2498,67 +2519,122 @@ describe("browser permission wiring", () => {
     assert.equal(ses.check(h.webContents, "fullscreen", serverUrl), false);
   });
 
-  it("installs isolated consent handlers before construction and only prompts for the visible pane", async () => {
-    const h = loadNavigationHarness({ registerFallbacks: false, realBrowserRegistry: true });
+  for (const [platform, cookieImport] of [
+    ["linux", false],
+    ["darwin", true],
+  ]) {
+    it(`installs isolated consent handlers before construction and only prompts for the visible pane on ${platform}`, async () => {
+      const h = loadNavigationHarness({
+        registerFallbacks: false,
+        realBrowserRegistry: true,
+        platform,
+      });
+      try {
+        const sessions = new Map();
+        const prompts = h.permissionPromptCalls.show;
+        h.win.isVisible = () => true;
+        h.win.isMinimized = () => false;
+        h.electron.dialog.showMessageBox = () => assert.fail("must not use the OS alert");
+        h.electron.session.fromPartition = (partition) => {
+          if (!sessions.has(partition)) {
+            const ses = {
+              setPermissionRequestHandler: (handler) => (ses.request = handler),
+              setPermissionCheckHandler: (handler) => (ses.check = handler),
+              webRequest: {
+                onBeforeRequest() {},
+                onBeforeSendHeaders() {},
+                onHeadersReceived() {},
+              },
+            };
+            sessions.set(partition, ses);
+          }
+          return sessions.get(partition);
+        };
+        h.electron.createWebContentsView = function (opts) {
+          const ses = sessions.get(opts.webPreferences.partition);
+          assert.equal(typeof ses.request, "function");
+          assert.equal(typeof ses.check, "function");
+          assert.equal(path.basename(opts.webPreferences.preload), "browser_view_preload.js");
+          const wc = new EventEmitter();
+          let url = "about:blank";
+          Object.assign(wc, {
+            ipc: new EventEmitter(),
+            mainFrame: {},
+            session: ses,
+            getURL: () => url,
+            isDestroyed: () => false,
+            setWindowOpenHandler() {},
+            loadURL: (value) => (url = value),
+          });
+          return { webContents: wc, setVisible() {}, setBounds() {}, getBounds: () => ({}) };
+        };
+        const registry = h.api.createBrowserRegistryForWindow(h.win);
+        const a = registry.openOrNavigate("a", "https://login.example").entry.view.webContents;
+        const b = registry.openOrNavigate("b", "https://login.example").entry.view.webContents;
+        assert.notEqual(a.session, b.session);
+        const check = (wc) =>
+          wc.session.check(wc, "loopback-network", wc.getURL(), { isMainFrame: true });
+        assert.equal(check(a), false, "detached panes cannot prompt");
+        registry.setActive("a");
+        registry.setSuppressed(true);
+        assert.equal(check(a), false, "overlaid panes cannot prompt");
+        registry.setSuppressed(false);
+        assert.equal(check(b), false, "background conversations cannot prompt");
+        await new Promise(setImmediate);
+        assert.equal(prompts.length, 0);
+        assert.equal(check(a), false);
+        await new Promise(setImmediate);
+        assert.equal(prompts.length, 1);
+        assert.equal(prompts[0].parent, h.win);
+        assert.equal(prompts[0].origin, "https://login.example");
+        assert.equal(prompts[0].reload, true);
+        assert.equal(check(b), false, "Deny is shared across conversations");
+        const dismissals = h.permissionPromptCalls.dismiss.length;
+        registry.setSuppressed(true);
+        registry.setActive("b");
+        assert.equal(h.permissionPromptCalls.dismiss.length, dismissals + 2);
+        registry.setSuppressed(false);
+        registry.setActive("a");
+        a.ipc.emit("omnigent:browser-webauthn-pending", { senderFrame: a.mainFrame }, true);
+        await until(() => prompts.length === 2, "a waiting security-key request shows the notice");
+        assert.equal(prompts[1].kind, "security-key");
+        assert.equal(prompts[1].parent, h.win);
+        assert.equal(prompts[1].origin, "https://login.example");
+        assert.equal(prompts[1].cookieImport, cookieImport);
+        assert.equal(h.electron.session.defaultSession.request, undefined);
+        assert.equal(h.electron.session.defaultSession.check, undefined);
+      } finally {
+        h.cleanup();
+      }
+    });
+  }
+
+  it("leaves WebAuthn in Windows Browser tabs to the system dialog", () => {
+    const h = loadNavigationHarness({
+      registerFallbacks: false,
+      realBrowserRegistry: true,
+      platform: "win32",
+    });
     try {
-      const sessions = new Map();
-      const prompts = h.permissionPromptCalls.show;
-      h.win.isVisible = () => true;
-      h.win.isMinimized = () => false;
-      h.electron.dialog.showMessageBox = () => assert.fail("must not use the OS alert");
-      h.electron.session.fromPartition = (partition) => {
-        if (!sessions.has(partition)) {
-          const ses = {
-            setPermissionRequestHandler: (handler) => (ses.request = handler),
-            setPermissionCheckHandler: (handler) => (ses.check = handler),
-            webRequest: { onBeforeRequest() {}, onBeforeSendHeaders() {}, onHeadersReceived() {} },
-          };
-          sessions.set(partition, ses);
-        }
-        return sessions.get(partition);
-      };
-      h.electron.createWebContentsView = function (opts) {
-        const ses = sessions.get(opts.webPreferences.partition);
-        assert.equal(typeof ses.request, "function");
-        assert.equal(typeof ses.check, "function");
-        const wc = new EventEmitter();
-        let url = "about:blank";
-        Object.assign(wc, {
-          session: ses,
-          getURL: () => url,
-          isDestroyed: () => false,
+      h.electron.session.fromPartition = () => ({
+        setPermissionRequestHandler() {},
+        setPermissionCheckHandler() {},
+        webRequest: { onBeforeRequest() {}, onBeforeSendHeaders() {}, onHeadersReceived() {} },
+      });
+      const preloads = [];
+      h.electron.createWebContentsView = (opts) => {
+        preloads.push(opts.webPreferences.preload);
+        const wc = Object.assign(new EventEmitter(), {
+          ipc: new EventEmitter(),
           setWindowOpenHandler() {},
-          loadURL: (value) => (url = value),
+          loadURL() {},
         });
         return { webContents: wc, setVisible() {}, setBounds() {}, getBounds: () => ({}) };
       };
       const registry = h.api.createBrowserRegistryForWindow(h.win);
-      const a = registry.openOrNavigate("a", "https://login.example").entry.view.webContents;
-      const b = registry.openOrNavigate("b", "https://login.example").entry.view.webContents;
-      assert.notEqual(a.session, b.session);
-      const check = (wc) =>
-        wc.session.check(wc, "loopback-network", wc.getURL(), { isMainFrame: true });
-      assert.equal(check(a), false, "detached panes cannot prompt");
-      registry.setActive("a");
-      registry.setSuppressed(true);
-      assert.equal(check(a), false, "overlaid panes cannot prompt");
-      registry.setSuppressed(false);
-      assert.equal(check(b), false, "background conversations cannot prompt");
-      await new Promise(setImmediate);
-      assert.equal(prompts.length, 0);
-      assert.equal(check(a), false);
-      await new Promise(setImmediate);
-      assert.equal(prompts.length, 1);
-      assert.equal(prompts[0].parent, h.win);
-      assert.equal(prompts[0].origin, "https://login.example");
-      assert.equal(prompts[0].reload, true);
-      assert.equal(check(b), false, "Deny is shared across conversations");
-      const dismissals = h.permissionPromptCalls.dismiss.length;
-      registry.setSuppressed(true);
-      registry.setActive("b");
-      assert.equal(h.permissionPromptCalls.dismiss.length, dismissals + 2);
-      assert.equal(h.electron.session.defaultSession.request, undefined);
-      assert.equal(h.electron.session.defaultSession.check, undefined);
+      const tab = registry.openOrNavigate("browser-tab:conv:t1", "https://login.example/").entry;
+      assert.deepEqual(preloads, [undefined]);
+      assert.equal(tab.view.webContents.ipc.listenerCount("omnigent:browser-webauthn-pending"), 0);
     } finally {
       h.cleanup();
     }
@@ -2600,6 +2676,8 @@ describe("browser permission wiring", () => {
         partitions.push(opts.webPreferences.partition);
         const wc = Object.assign(new EventEmitter(), {
           id: nextId++,
+          ipc: new EventEmitter(),
+          mainFrame: {},
           setWindowOpenHandler() {},
           loadURL() {},
         });
@@ -2727,6 +2805,30 @@ describe("setup clipboard IPC wiring", () => {
       /ipcMain\.handle\("omnigent:copy-setup-text",[\s\S]{0,200}!isSetupPageSender\(event\)[\s\S]{0,300}clipboard\.writeText\(text\)/,
     );
   });
+
+  it("settles the copy only after the asynchronous clipboard write", async (t) => {
+    const written = [];
+    let failureMessage = null;
+    const h = loadNavigationHarness({
+      clipboardWriteText: async (text) => {
+        await new Promise((resolve) => {
+          setImmediate(resolve);
+        });
+        if (failureMessage) throw new Error(failureMessage);
+        written.push(text);
+      },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const copy = h.ipc.get("omnigent:copy-setup-text");
+    const event = { sender: h.webContents, senderFrame: { url: `file://${h.api.SETUP_PAGE}` } };
+
+    await copy(event, "https://host.example/ml/omnigents");
+    assert.deepEqual(written, ["https://host.example/ml/omnigents"]);
+
+    failureMessage = "clipboard unavailable";
+    await assert.rejects(copy(event, "https://other.example"), /clipboard unavailable/);
+  });
 });
 
 describe("macOS activation wiring", () => {
@@ -2775,7 +2877,7 @@ describe("managed server preference wiring", () => {
     const handler = liveCode.slice(start, end);
     assert.match(
       handler,
-      /hostCliCommand\(target\)[\s\S]{0,500}serverManager\.ensureServerAuth\(cliCommand, target,[\s\S]{0,300}serverManager\.ensureHostConnected\(cliCommand, target\)/,
+      /hostCliCommand\(target\)[\s\S]*serverManager\.ensureServerAuth\(cliCommand, target,[\s\S]*serverManager\.ensureHostConnected\(cliCommand, target\)/,
     );
   });
 
@@ -2855,8 +2957,8 @@ describe("managed server preference wiring", () => {
   });
 });
 
-describe("Databricks-internal local-host CLI wiring", () => {
-  it("selects isaac omni only behind the internal flag and Databricks server gate", () => {
+describe("managed local-host CLI wiring", () => {
+  it("selects isaac omni only behind the managed features flag and managed server gate", () => {
     assert.match(
       liveCode,
       /function hostCliCommand\(serverUrl\)[\s\S]{0,300}databricksInternalFeaturesEnabled\(\)[\s\S]{0,120}isDatabricksManagedServerUrl\(serverUrl\)[\s\S]{0,300}prefixArgs:\s*\["omni"\]/,
@@ -3070,25 +3172,30 @@ describe("server selector default", () => {
   const devUrl = "http://localhost:5174/server-selector-v2.html";
 
   for (const [name, options, settings, v2] of [
-    ["new internal macOS install", { internalFeatures: true }, null, true],
+    ["new macOS install with managed features", { internalFeatures: true }, null, true],
     [
-      "existing internal macOS install",
+      "existing macOS install with managed features",
       { internalFeatures: true },
       { recent_servers: ["https://team.example.com/"] },
       true,
     ],
-    ["new public macOS install", {}, null, false],
-    ["existing public macOS install", {}, { recent_servers: ["https://team.example.com/"] }, false],
+    ["new public macOS install", {}, null, true],
+    ["existing public macOS install", {}, { recent_servers: ["https://team.example.com/"] }, true],
     [
-      "MDM server presets without internal features",
+      "managed server presets without managed features",
       { managedServers: ["https://team.example.com/"] },
       null,
-      false,
+      true,
     ],
     ["Linux install", { platform: "linux", internalFeatures: true }, null, false],
     ["Windows install", { platform: "win32", internalFeatures: true }, null, false],
-    ["unpackaged internal macOS build", { isPackaged: false, internalFeatures: true }, null, true],
-    ["unpackaged public macOS build", { isPackaged: false }, null, false],
+    [
+      "unpackaged macOS build with managed features",
+      { isPackaged: false, internalFeatures: true },
+      null,
+      true,
+    ],
+    ["unpackaged public macOS build", { isPackaged: false }, null, true],
     ["null selector preference", { internalFeatures: true }, { server_selector_v2: null }, true],
     [
       "explicit V2 preference outside the default rollout",
@@ -3131,7 +3238,7 @@ describe("server selector default", () => {
     });
   }
 
-  it("falls back to bundled V2 when the internal macOS dev server is unavailable", async () => {
+  it("falls back to bundled V2 when the macOS dev server with managed features is unavailable", async () => {
     const h = loadNavigationHarness({
       internalFeatures: true,
       env: { OMNIGENT_SERVER_SELECTOR_V2_DEV_URL: devUrl },
@@ -3266,6 +3373,19 @@ describe("browser view detach on main-frame navigation (src/main.js)", () => {
     // re-signed-in SPA. A re-mounted BrowserPane re-attaches via
     // browser-set-active, so detaching on the SPA commit is safe.
     assert.deepEqual(harness.browserRegistryCalls.setActive, [null, null]);
+    harness.cleanup();
+  });
+
+  it("withdraws modifier-click tab support when the shell starts a new document", () => {
+    const harness = loadNavigationHarness({ registerFallbacks: false });
+    harness.api.createWindow("https://host.example/ml/omnigents");
+
+    harness.emit("did-start-navigation", "https://host.example/ml/omnigents#c/1", true, true);
+    harness.emit("did-start-navigation", "https://frame.example/", false, false);
+    assert.deepEqual(harness.browserRegistryCalls.setOpenTabSupported, []);
+
+    harness.emit("did-start-navigation", "https://host.example/login.html", false, true);
+    assert.deepEqual(harness.browserRegistryCalls.setOpenTabSupported, [false]);
     harness.cleanup();
   });
 });
@@ -3411,7 +3531,7 @@ describe("recent-server startup wiring (src/main.js)", () => {
     }
   });
 
-  it("counts MDM presets toward the setup page's returning-user signal", () => {
+  it("counts managed presets toward the setup page's returning-user signal", () => {
     // Raw recents, NOT managed-excluded: a preset-only history is still returning.
     assert.match(
       liveCode,
@@ -3822,6 +3942,7 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     );
     // Only network failures use the minute-long retries.
     assert.equal(h.api.reconnectSlowDelayMs(), 60_000);
+    assert.equal(h.api.blockedHintDelayMs(), 30_000);
   });
 
   const setupEvent = (h) => ({
@@ -3851,6 +3972,26 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     assert.deepEqual(h.calls.loadFile, [], "the page stays underneath; setup never loads");
     assert.equal(h.overlay.hint, null);
     assert.ok(h.calls.auth.every((call) => call[2].interactive === false));
+  });
+
+  it("reconnects behind the overlay when the workspace never responds", async (t) => {
+    let loads = 0;
+    const h = browserHarness(t, [25], {
+      loadURL: () => (loads++ === 0 ? new Promise(() => {}) : Promise.resolve()),
+    });
+    h.api.setServerResponseTimeoutMs(20);
+    await assert.rejects(h.api.loadServerUrl(h.win, workspace, undefined, { loadUrl: page }), {
+      code: "ERR_TIMED_OUT",
+    });
+    assert.equal(h.overlay.hint, "Check your network connection.");
+    assert.equal(h.calls.loading.at(-1).action, "hide");
+    await until(
+      () => h.calls.loadURL.length === 2 && h.api.windows.get(h.win).origin === origin,
+      "the reopened page",
+    );
+    assert.deepEqual(h.calls.loadURL, [[page], [page]]);
+    assert.deepEqual(h.calls.loadFile, []);
+    assert.equal(h.overlay.hint, null);
   });
 
   it("keeps the overlay up when a background session retry fails", async (t) => {
@@ -3950,25 +4091,85 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     assert.equal(h.overlay.hint, null);
   });
 
+  const unreachable = "Check your network connection.";
+  const blocked = "Databricks blocked this network. Connect from a network the workspace allows.";
   for (const event of ["resume", "unlock-screen"]) {
-    it(`starts the fast retries over on ${event}`, async (t) => {
+    // [renewal failure, overlay hint before the wake, overlay hints shown from the wake on]
+    for (const [failure, hint, sinceWake] of [
+      [() => new TypeError("fetch failed"), unreachable, [unreachable, unreachable]],
+      // Refusals after wake wait again before saying the network is blocked.
+      [
+        () => Object.assign(new Error("HTTP 403"), { errorCode: "IP_ACL_BLOCKED" }),
+        blocked,
+        ["", "", blocked],
+      ],
+    ]) {
+      it(`starts the fast retries over on ${event} after "${failure().message}"`, async (t) => {
+        const h = browserHarness(t, [20], {
+          ensureSession: async () => {
+            throw failure();
+          },
+        });
+        h.api.setReconnectSlowDelayMs(60_000);
+        h.api.setBlockedHintDelayMs(300);
+        await assert.rejects(h.api.loadServerUrl(h.win, workspace));
+        await until(() => h.calls.auth.length === 2, "the fast retry");
+        await until(() => h.overlay.hint === hint, "the hint before the wake");
+        // The next retry is a minute away.
+        assert.equal(h.calls.auth.length, 2);
+        const wakeShows = h.overlay.shows.length;
+        h.powerMonitor.emit(event);
+        assert.equal(h.overlay.hint, sinceWake[0]);
+        await until(() => h.calls.auth.length === 3, `a fast retry after ${event}`);
+        // The fast retry falls within any restarted wait; the hint returns once it ends.
+        await until(
+          () => h.overlay.shows.length >= wakeShows + sinceWake.length,
+          "the overlay after the retry",
+        );
+        assert.deepEqual(h.overlay.shows.slice(wakeShows), sinceWake);
+        assert.deepEqual(h.calls.loadFile, []);
+      });
+    }
+
+    it(`restarts a blocked-network wait still running on ${event}`, async (t) => {
       const h = browserHarness(t, [20], {
         ensureSession: async () => {
-          throw new TypeError("fetch failed");
+          throw Object.assign(new Error("HTTP 403"), { errorCode: "IP_ACL_BLOCKED" });
         },
       });
       h.api.setReconnectSlowDelayMs(60_000);
+      h.api.setBlockedHintDelayMs(600);
       await assert.rejects(h.api.loadServerUrl(h.win, workspace));
       await until(() => h.calls.auth.length === 2, "the fast retry");
-      // The next retry is a minute away.
-      await wait(60);
-      assert.equal(h.calls.auth.length, 2);
+      await wait(300);
+      assert.equal(h.overlay.hint, "");
+      const wokeAt = Date.now();
       h.powerMonitor.emit(event);
-      await until(() => h.calls.auth.length === 3, `a fast retry after ${event}`);
-      assert.equal(h.overlay.hint, "Check your network connection.");
-      assert.deepEqual(h.calls.loadFile, []);
+      await until(() => h.overlay.hint === blocked, "the hint after the restarted wait");
+      // Not at the first refusal's deadline, about 300 ms after the wake.
+      assert.ok(Date.now() - wokeAt >= 590, `hint ${Date.now() - wokeAt} ms after ${event}`);
     });
   }
+
+  it("waits again for the blocked-network hint after an unreachable retry", async (t) => {
+    const failures = [
+      Object.assign(new Error("HTTP 403"), { errorCode: "IP_ACL_BLOCKED" }),
+      new TypeError("fetch failed"),
+      Object.assign(new Error("HTTP 403"), { errorCode: "IP_ACL_BLOCKED" }),
+    ];
+    // The unreachable stretch outlasts the first blocked wait.
+    const h = browserHarness(t, [10, 200, 60_000], {
+      ensureSession: async () => {
+        throw failures.shift();
+      },
+    });
+    h.api.setBlockedHintDelayMs(100);
+    await assert.rejects(h.api.loadServerUrl(h.win, workspace));
+    await until(() => h.calls.auth.length === 3, "the second blocked retry");
+    await until(() => h.overlay.hint === blocked, "the blocked-network hint");
+    assert.deepEqual(h.overlay.shows, ["", unreachable, "", blocked]);
+    h.api.cancelReconnect(h.win);
+  });
 
   it("returns a failed deep link to its conversation", async (t) => {
     let first = true;
@@ -3985,35 +4186,62 @@ describe("Databricks reconnect overlay (src/main.js)", () => {
     assert.equal(h.overlay.hint, null);
   });
 
-  it("stops on Cancel, Change Server, a new connection, or closing the window", async (t) => {
-    const cancelled = browserHarness(t, [40]);
-    const changed = browserHarness(t, [40]);
-    const connected = browserHarness(t, [40], {
-      expandWorkspace: async () => "http://127.0.0.1:1/",
+  // [failure, session renewal, start the reconnect, hint when stopped, Cancel's final message]
+  for (const [failure, ensureSession, start, hint, finalMessage] of [
+    [
+      "an unreachable page",
+      undefined,
+      (h, url) => failLoad(h, url),
+      unreachable,
+      "Couldn't reach Databricks. Check your network connection, then click Connect.",
+    ],
+    // Stopping during the blocked-network wait keeps its hint from showing later.
+    [
+      "an IP access list refusal",
+      async () => {
+        throw Object.assign(new Error("HTTP 403"), { errorCode: "IP_ACL_BLOCKED" });
+      },
+      (h) => h.api.loadServerUrl(h.win, workspace).catch(() => {}),
+      "",
+      "Databricks blocked this network. Connect from a network the workspace allows, then click Connect.",
+    ],
+  ]) {
+    it(`stops on Cancel, Change Server, a new connection, or closing the window after ${failure}`, async (t) => {
+      const cancelled = browserHarness(t, [40], { ensureSession });
+      const changed = browserHarness(t, [40], { ensureSession });
+      const connected = browserHarness(t, [40], {
+        expandWorkspace: async () => "http://127.0.0.1:1/",
+        ensureSession,
+      });
+      const closed = browserHarness(t, [40], { ensureSession });
+      const all = [cancelled, changed, connected, closed];
+      for (const h of all) h.api.setBlockedHintDelayMs(300);
+      closed.api.createWindow(workspace);
+      connected.api.registerIpc();
+      await wait(10);
+      const closedLoads = [...closed.calls.loadURL];
+      for (const h of [cancelled, changed, connected]) start(h, page);
+      start(closed, workspace);
+      await wait(10);
+      for (const h of all) assert.equal(h.overlay.hint, hint);
+      cancelled.overlay.cancel();
+      changed.api.loadSetupPage(changed.win);
+      void connected.ipc.get("omnigent:set-server-url")(
+        setupEvent(connected),
+        "http://127.0.0.1:1/",
+      );
+      closed.emitWindow("closed");
+      // Past both the next retry and the blocked-network wait.
+      await wait(350);
+      for (const h of all) assert.equal(h.overlay.hint, null);
+      for (const h of [cancelled, changed]) assert.deepEqual(h.calls.loadURL, []);
+      assert.deepEqual(connected.calls.loadURL, [["http://127.0.0.1:1/"]]);
+      // Only the window's own initial load ran, if its session allowed it.
+      assert.deepEqual(closed.calls.loadURL, closedLoads);
+      // Cancel shows the final message.
+      assert.deepEqual(setupParams(cancelled), { error: finalMessage, url: workspace });
     });
-    const closed = browserHarness(t, [40]);
-    closed.api.createWindow(workspace);
-    connected.api.registerIpc();
-    await wait(10);
-    for (const h of [cancelled, changed, connected]) failLoad(h);
-    failLoad(closed, workspace);
-    await wait(10);
-    cancelled.overlay.cancel();
-    changed.api.loadSetupPage(changed.win);
-    void connected.ipc.get("omnigent:set-server-url")(setupEvent(connected), "http://127.0.0.1:1/");
-    closed.emitWindow("closed");
-    await wait(70);
-    for (const h of [cancelled, changed, connected, closed]) assert.equal(h.overlay.hint, null);
-    for (const h of [cancelled, changed]) assert.deepEqual(h.calls.loadURL, []);
-    assert.deepEqual(connected.calls.loadURL, [["http://127.0.0.1:1/"]]);
-    // Only the window's own initial load ran.
-    assert.deepEqual(closed.calls.loadURL, [[workspace]]);
-    // Cancel shows the final message.
-    assert.deepEqual(setupParams(cancelled), {
-      error: "Couldn't reach Databricks. Check your network connection, then click Connect.",
-      url: workspace,
-    });
-  });
+  }
 
   it("does not retry credential failures", async (t) => {
     const h = browserHarness(t, [25], {
@@ -4101,17 +4329,23 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
     ["the workspace redirects to login", loginRedirect],
   ]) {
     it(`reconnects by itself when the VPN returns after ${trigger} off the VPN`, async (t) => {
-      const { h, network } = await connected(t, [30, 30, 30]);
+      const { h, network } = await connected(t, Array(6).fill(40));
+      h.api.setBlockedHintDelayMs(100);
       h.emit("did-navigate", `${workspace}/c/456`, 200, "OK");
       network.verdict = "blocked";
       drop(h, network);
       await until(() => h.overlay.hint !== null, "the reconnecting overlay");
-      // The conversation stays underneath, no longer trusted.
-      assert.equal(h.overlay.hint, `${blocked}.`);
+      // The conversation stays underneath, no longer trusted, behind a hint-less overlay.
+      assert.equal(h.overlay.shows[0], "");
       assert.equal(h.api.windows.get(h.win).origin, null);
       assert.deepEqual(h.calls.loadFile, []);
-      // Connect, the blocked renewal, then one blocked background retry.
-      await until(() => network.sessionCreates === 3, "a blocked retry");
+      // Connect, the blocked renewal, then blocked background retries outlasting the wait.
+      // The first refusal's wait holds across them, so the hint comes during the fast retries.
+      await until(() => h.overlay.hint === `${blocked}.`, "the blocked-network hint");
+      assert.ok(
+        network.sessionCreates >= 3 && network.sessionCreates < 8,
+        `${network.sessionCreates} session-creates before the hint`,
+      );
       network.verdict = "allow";
       await until(() => h.calls.loadURL.length === 2, "the reconnect");
       // Back on the page the user was on; setup never showed.
@@ -4131,6 +4365,7 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
   it("keeps retrying off the VPN after the fast retries run out, then reconnects", async (t) => {
     const { h, network } = await connected(t, [20]);
     h.api.setReconnectSlowDelayMs(20);
+    h.api.setBlockedHintDelayMs(20);
     h.emit("did-navigate", `${workspace}/c/456`, 200, "OK");
     network.verdict = "blocked";
     network.removeCookie();
@@ -4145,6 +4380,32 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
     assert.equal(h.overlay.hint, null);
     assert.deepEqual(h.calls.loadFile, []);
     assert.equal(network.browserSignIns, 0);
+  });
+
+  it("shows the blocked-network hint when the wait ends, between retries", async (t) => {
+    const { h, network } = await connected(t, [60_000]);
+    h.api.setBlockedHintDelayMs(30);
+    network.verdict = "blocked";
+    network.removeCookie();
+    await until(() => h.overlay.hint !== null, "the reconnecting overlay");
+    assert.equal(h.overlay.hint, "");
+    await until(() => h.overlay.hint === `${blocked}.`, "the blocked-network hint");
+    // Connect and the blocked renewal only: the next retry is a minute away.
+    assert.equal(network.sessionCreates, 2);
+    h.api.cancelReconnect(h.win);
+  });
+
+  it("drops the pending blocked-network hint once the reconnect succeeds", async (t) => {
+    const { h, network } = await connected(t, [20]);
+    h.api.setBlockedHintDelayMs(400);
+    network.verdict = "blocked";
+    network.removeCookie();
+    await until(() => h.overlay.hint !== null, "the reconnecting overlay");
+    network.verdict = "allow";
+    await until(() => h.calls.loadURL.length === 2, "the reconnect");
+    await wait(450);
+    assert.equal(h.overlay.hint, null);
+    assert.deepEqual(h.overlay.shows, [""]);
   });
 
   it("keeps retrying when Connect is clicked off the VPN, then reconnects", async (t) => {
@@ -4165,11 +4426,15 @@ describe("VPN drop and reconnect against faked workspace responses (src/main.js)
       requestId: "connect",
     });
     assert.equal(result.reconnecting, true);
-    // Connect off the VPN puts the overlay over the setup page and restarts the loop.
+    // Connect off the VPN puts the overlay over the setup page and restarts the loop,
+    // saying right away that the network is blocked.
     assert.equal(h.overlay.hint, `${blocked}.`);
+    const sinceConnect = h.overlay.shows.length - 1;
     assert.equal(h.calls.loadFile.length, 1);
     // The loop restarted: another blocked background attempt follows Connect.
     await until(() => network.sessionCreates === 4, "a blocked retry after Connect");
+    await until(() => h.overlay.shows.length > sinceConnect + 1, "the retry's overlay");
+    assert.deepEqual(new Set(h.overlay.shows.slice(sinceConnect)), new Set([`${blocked}.`]));
 
     network.verdict = "allow";
     await until(() => h.calls.loadURL.length === 2, "the reconnect");
@@ -4321,7 +4586,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
         canExtendArca: true,
         canRefreshDbcert: true,
         arcaPreviewRecovery: true,
-        // Internal-feature fixtures simulate macOS on every test host.
+        // Managed-feature fixtures simulate macOS on every test host.
         chromeCookieImport: true,
       },
     );
@@ -4376,6 +4641,11 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     assert.equal(eligible(context), false);
     const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
     assert.match(hint(event, "http://localhost"), /New session > Host > Run on Arca/);
+    assert.match(
+      hint(event, "https://spog.dev.localhost:23090/one"),
+      /New session > Host > Run on Arca/,
+    );
+    assert.equal(hint(event, "http://lvh.me"), null, "public aliases get no Arca hint");
     await h.api.startArcaHostConnect(serverUrl).promise;
     assert.equal(eligible(context), true);
     assert.equal(hint(event, "http://localhost"), null);
@@ -4739,13 +5009,15 @@ describe("onboarding runner IPC", () => {
   // A setup-page sender that can be closed mid-request.
   function setupSender() {
     let destroyed = false;
+    const events = new EventEmitter();
     return {
       send() {},
-      once() {},
-      removeListener() {},
+      once: (name, listener) => events.once(name, listener),
+      removeListener: (name, listener) => events.removeListener(name, listener),
       isDestroyed: () => destroyed,
       destroy: () => {
         destroyed = true;
+        events.emit("destroyed");
       },
     };
   }
@@ -4775,7 +5047,7 @@ describe("onboarding runner IPC", () => {
     );
   });
 
-  it("offers no remote environment without the internal flag, and refuses to connect one", async (t) => {
+  it("offers no remote environment without the managed features flag, and refuses to connect one", async (t) => {
     const h = harness(t);
     const event = { sender: setupSender(), senderFrame: setupFrame(h) };
     assert.deepEqual(plain(h.ipc.get("omnigent:get-runner-options")(event, server)), {
@@ -4792,10 +5064,161 @@ describe("onboarding runner IPC", () => {
     const event = { sender: setupSender(), senderFrame: setupFrame(h) };
     const result = await h.ipc.get("omnigent:connect-runner")(event, server, "local");
     assert.equal(result.ok, false);
-    assert.match(result.error, /omnigent CLI was not found/);
+    assert.equal(result.errorMessage, "The omnigent CLI was not found.");
+    assert.equal(result.errorAction, "Install it or set its path.");
+    assert.equal(result.error, `${result.errorMessage} ${result.errorAction}`);
   });
 
-  // Remote runs on a managed server behind the internal flag; local uses a laptop CLI.
+  it("Cancel stops a pending laptop sign-in without connecting the host", async (t) => {
+    let signal;
+    let hostConnected = false;
+    const h = harness(t, {
+      cliPath: "/usr/local/bin/omnigent",
+      hostConnectResult: () => {
+        hostConnected = true;
+        return { ok: true };
+      },
+      serverAuthResult: (_cli, _url, options) => {
+        ({ signal } = options);
+        return new Promise((resolve) => {
+          signal.addEventListener("abort", () => resolve({ ok: false, canceled: true }));
+        });
+      },
+    });
+    const sender = setupSender();
+    const event = { sender, senderFrame: setupFrame(h) };
+    const connecting = h.ipc.get("omnigent:connect-runner")(event, server, "local");
+    await until(() => signal !== undefined, "sign-in started");
+
+    assert.equal(await h.ipc.get("omnigent:cancel-runner-connect")(event), true);
+
+    assert.deepEqual(plain(await connecting), { ok: false, canceled: true });
+    assert.equal(signal.aborted, true);
+    assert.equal(hostConnected, false);
+    // Nothing left to cancel once it has finished.
+    assert.equal(await h.ipc.get("omnigent:cancel-runner-connect")(event), false);
+    assert.throws(
+      () => h.ipc.get("omnigent:cancel-runner-connect")({ sender, senderFrame: { url: server } }),
+      /only available to the setup page/,
+    );
+  });
+
+  it("Cancel right after the request starts stops it before it signs in or connects the host", async (t) => {
+    let authCalls = 0;
+    let hostConnected = false;
+    const h = harness(t, {
+      cliPath: "/usr/local/bin/omnigent",
+      hostConnectResult: () => {
+        hostConnected = true;
+        return { ok: true };
+      },
+      serverAuthResult: () => {
+        authCalls += 1;
+        return { ok: true };
+      },
+    });
+    const event = { sender: setupSender(), senderFrame: setupFrame(h) };
+    const connecting = h.ipc.get("omnigent:connect-runner")(event, server, "local");
+
+    // Before the target resolves: the attempt is already registered.
+    assert.equal(h.ipc.get("omnigent:cancel-runner-connect")(event), true);
+
+    assert.deepEqual(plain(await connecting), { ok: false, canceled: true });
+    assert.equal(authCalls, 0);
+    assert.equal(hostConnected, false);
+  });
+
+  it("closing the window stops a pending sign-in without connecting the host", async (t) => {
+    let signal;
+    let hostConnected = false;
+    const h = harness(t, {
+      cliPath: "/usr/local/bin/omnigent",
+      hostConnectResult: () => {
+        hostConnected = true;
+        return { ok: true };
+      },
+      serverAuthResult: (_cli, _url, options) => {
+        ({ signal } = options);
+        return new Promise((resolve) => {
+          signal.addEventListener("abort", () => resolve({ ok: false, canceled: true }));
+        });
+      },
+    });
+    const sender = setupSender();
+    const connecting = h.ipc.get("omnigent:connect-runner")(
+      { sender, senderFrame: setupFrame(h) },
+      server,
+      "local",
+    );
+    await until(() => signal !== undefined, "sign-in started");
+
+    sender.destroy();
+
+    assert.deepEqual(plain(await connecting), { ok: false, canceled: true });
+    assert.equal(signal.aborted, true);
+    assert.equal(hostConnected, false);
+  });
+
+  it("a newer attempt stops the previous one from the same window", async (t) => {
+    const signals = [];
+    const h = harness(t, {
+      cliPath: "/usr/local/bin/omnigent",
+      serverAuthResult: (_cli, _url, options) => {
+        signals.push(options.signal);
+        if (signals.length > 1) return { ok: true };
+        return new Promise((resolve) => {
+          options.signal.addEventListener("abort", () => resolve({ ok: false, canceled: true }));
+        });
+      },
+    });
+    const event = { sender: setupSender(), senderFrame: setupFrame(h) };
+    const first = h.ipc.get("omnigent:connect-runner")(event, server, "local");
+    await until(() => signals.length === 1, "first sign-in started");
+
+    const second = await h.ipc.get("omnigent:connect-runner")(event, server, "local");
+
+    assert.deepEqual(plain(await first), { ok: false, canceled: true });
+    assert.equal(signals[0].aborted, true);
+    assert.equal(second.ok, true);
+  });
+
+  it("a cancel that lands during the host connect isn't recorded as a connected laptop", async (t) => {
+    let cancel;
+    const h = harness(t, {
+      cliPath: "/usr/local/bin/omnigent",
+      hostConnectResult: () => {
+        cancel();
+        return { ok: true };
+      },
+    });
+    const event = { sender: setupSender(), senderFrame: setupFrame(h) };
+    cancel = () => h.ipc.get("omnigent:cancel-runner-connect")(event);
+
+    const result = await h.ipc.get("omnigent:connect-runner")(event, server, "local");
+
+    assert.deepEqual(plain(result), { ok: false, canceled: true });
+    const saved = fs.existsSync(h.settingsPath)
+      ? JSON.parse(fs.readFileSync(h.settingsPath, "utf8"))
+      : {};
+    assert.equal(saved.onboarding_runner, undefined);
+  });
+
+  it("passes separate authentication message and action fields to the setup page", async (t) => {
+    const errorMessage = "Sign-in to https://host.example/ml/omnigents didn't complete.";
+    const errorAction = "Finish signing in and try again.";
+    const legacyError = `${errorMessage} ${errorAction}`;
+    const h = harness(t, {
+      cliPath: "/usr/local/bin/omnigent",
+      serverAuthResult: { ok: false, error: legacyError, errorMessage, errorAction },
+    });
+    const event = { sender: setupSender(), senderFrame: setupFrame(h) };
+
+    const result = await h.ipc.get("omnigent:connect-runner")(event, server, "local");
+
+    assert.deepEqual(plain(result), { ok: false, error: legacyError, errorMessage, errorAction });
+  });
+
+  // Remote runs on a managed server behind the managed features flag; local uses a laptop CLI.
   const managedServer = "https://workspace.cloud.databricks.com/omnigent";
   const connectCases = [
     [
@@ -4926,10 +5349,134 @@ it("dismisses native loading feedback when the server document fails", async (t)
     },
   });
   t.after(h.cleanup);
+  let stops = 0;
+  h.webContents.stop = () => {
+    stops++;
+  };
+  h.api.setServerResponseTimeoutMs(20);
   await assert.rejects(h.api.loadServerUrl(h.win, "https://example.com/"), /connection lost/);
   const shown = h.calls.loading.find((call) => call.action === "show");
   assert.equal(shown.label, "Opening Omnigent…");
   assert.deepEqual(h.calls.loading.at(-1), { action: "hide", attempt: shown.attempt });
+  await wait(40);
+  assert.equal(stops, 0);
+  assert.deepEqual(h.calls.loadFile, []);
+});
+
+describe("server response deadline (src/main.js)", () => {
+  const server = "http://127.0.0.1:6767";
+
+  function stalledHarness(t, loadServer) {
+    const h = loadNavigationHarness({ serverUrl: server, loadServer });
+    t.after(h.cleanup);
+    h.stops = 0;
+    h.webContents.stop = () => {
+      h.stops++;
+    };
+    h.api.setServerResponseTimeoutMs(20);
+    return h;
+  }
+
+  it("gives the server 30s to respond", (t) => {
+    const h = loadNavigationHarness();
+    t.after(h.cleanup);
+    assert.equal(h.api.serverResponseTimeoutMs(), 30_000);
+  });
+
+  it("returns to setup with a timeout when the server accepts but never responds", async (t) => {
+    const events = [];
+    t.mock.method(require("../src/diagnostics").diagnostics, "record", (...args) =>
+      events.push(args),
+    );
+    const h = stalledHarness(t, () => new Promise(() => {}));
+    await assert.rejects(h.api.loadServerUrl(h.win, server), { code: "ERR_TIMED_OUT" });
+    await wait(0);
+    assert.equal(h.stops, 1);
+    assert.equal(h.calls.loadFile.length, 1);
+    const params = new URLSearchParams(h.calls.loadFile[0][1].search);
+    assert.deepEqual(
+      [params.get("error"), params.get("url")],
+      ["ERR_TIMED_OUT (-7)", `${server}/`],
+    );
+    const shown = h.calls.loading.find((call) => call.action === "show");
+    assert.equal(shown.label, "Opening Omnigent…");
+    assert.deepEqual(h.calls.loading.at(-1), { action: "hide", attempt: shown.attempt });
+    const recorded = (name) =>
+      events.filter(([event]) => event === name).map(([, fields]) => fields);
+    assert.deepEqual(
+      recorded("navigation_failed").map(({ origin, code }) => [origin, code]),
+      [[server, "net_7"]],
+    );
+    assert.deepEqual(
+      recorded("connection_result").map(({ outcome, code }) => [outcome, code]),
+      [["failed", "ERR_TIMED_OUT"]],
+    );
+  });
+
+  it("keeps loading a server document that responded before the deadline", async (t) => {
+    let finishLoad;
+    const h = stalledHarness(t, (url) => {
+      h.emit("did-navigate", url, 200, "OK");
+      return new Promise((resolve) => {
+        finishLoad = resolve;
+      });
+    });
+    const pending = h.api.loadServerUrl(h.win, server);
+    await wait(60);
+    assert.equal(h.stops, 0);
+    assert.deepEqual(h.calls.loadFile, []);
+    finishLoad();
+    assert.equal(await pending, server);
+    assert.equal(h.calls.loading.at(-1).action, "hide");
+  });
+
+  it("stops a superseded load at once without returning to setup", async (t) => {
+    let stalled;
+    const reachedLoad = new Promise((resolve) => {
+      stalled = resolve;
+    });
+    const h = stalledHarness(t, () => {
+      stalled();
+      return new Promise(() => {});
+    });
+    const pending = h.api.loadServerUrl(h.win, server);
+    await reachedLoad;
+    // A newer attempt that has not navigated yet, e.g. still signing in.
+    h.api.pinWindow(h.win, "https://other.example");
+    assert.equal(h.stops, 1);
+    await assert.rejects(pending, { name: "AbortError" });
+    await wait(40);
+    assert.equal(h.stops, 1);
+    assert.deepEqual(h.calls.loadFile, []);
+  });
+
+  const setupError = (h) => new URLSearchParams(h.calls.loadFile[0][1].search).get("error");
+
+  it("keeps a failed load's own error and setup fallback", async (t) => {
+    const h = stalledHarness(t, async (url) => {
+      h.emit("did-fail-load", -102, "ERR_CONNECTION_REFUSED", url, true);
+      await wait(0);
+      throw Object.assign(new Error("ERR_CONNECTION_REFUSED (-102)"), {
+        code: "ERR_CONNECTION_REFUSED",
+      });
+    });
+    await assert.rejects(h.api.loadServerUrl(h.win, server), { code: "ERR_CONNECTION_REFUSED" });
+    await wait(40);
+    assert.equal(h.stops, 0);
+    assert.equal(h.calls.loadFile.length, 1);
+    assert.equal(setupError(h), "ERR_CONNECTION_REFUSED (-102)");
+  });
+
+  it("leaves an HTTP error page to the setup fallback without stopping it", async (t) => {
+    const h = stalledHarness(t, async (url) => {
+      h.emit("did-navigate", url, 500, "Internal Server Error");
+    });
+    await assert.rejects(h.api.loadServerUrl(h.win, server), { name: "AbortError" });
+    await wait(40);
+    assert.equal(h.stops, 0);
+    assert.equal(h.calls.loadFile.length, 1);
+    assert.equal(setupError(h), "500 Internal Server Error");
+  });
 });
 
 describe("OIDC system-browser sign-in wiring", () => {
@@ -5461,6 +6008,36 @@ describe("SSH connect IPC", () => {
     assert.deepEqual(h.calls.sshConnects, [{ serverUrl: server, destination: "devbox" }]);
   });
 
+  it("records the host a connect reached, for that server only", async (t) => {
+    const hostId = "0123456789abcdef0123456789abcdef";
+    const h = sshHarness(t, {
+      sshConnectResult: { ok: true, shownInConsole: true, identity: { hostId } },
+    });
+
+    assert.equal((await h.ipc.get("omnigent:ssh-connect")(fromServer(h), "devbox")).ok, true);
+
+    assert.equal(h.sshHosts.destination(server, hostId), "devbox");
+    assert.equal(h.sshHosts.destination("https://elsewhere.example/", hostId), null);
+  });
+
+  it("records nothing for a connect that failed", async (t) => {
+    const hostId = "0123456789abcdef0123456789abcdef";
+    const h = sshHarness(t, { sshConnectResult: { ok: false, error: "Permission denied" } });
+
+    await h.ipc.get("omnigent:ssh-connect")(fromServer(h), "devbox");
+
+    assert.equal(h.sshHosts.destination(server, hostId), null);
+  });
+
+  it("records nothing for a connect that reached no host identity", async (t) => {
+    const hostId = "0123456789abcdef0123456789abcdef";
+    const h = sshHarness(t, { sshConnectResult: { ok: true, shownInConsole: true } });
+
+    await h.ipc.get("omnigent:ssh-connect")(fromServer(h), "devbox");
+
+    assert.equal(h.sshHosts.destination(server, hostId), null);
+  });
+
   it("refuses on Windows before opening anything", async (t) => {
     const h = sshHarness(t, { platform: "win32" });
 
@@ -5474,12 +6051,16 @@ describe("SSH connect IPC", () => {
     assert.deepEqual(h.calls.sshConnects, []);
   });
 
-  // Run on Arca replaces SSH connect where it is offered: the internal flag on a managed server.
+  // Run on Arca replaces SSH connect where it is offered: the managed features flag on a managed server.
   const managed = "https://workspace.cloud.databricks.com/omnigent";
   const arcaCases = {
-    "an internal laptop on a Databricks server, which offers Run on Arca": [managed, true, false],
+    "a laptop with managed features on a managed server, which offers Run on Arca": [
+      managed,
+      true,
+      false,
+    ],
     "any other laptop on a Databricks server": [managed, false, true],
-    "an internal laptop on a self-hosted server": [server, true, true],
+    "a laptop with managed features on a self-hosted server": [server, true, true],
   };
   for (const [label, [serverUrl, internalFeatures, connects]] of Object.entries(arcaCases)) {
     it(`${connects ? "connects" : "refuses"} for ${label}`, async (t) => {
@@ -5548,9 +6129,11 @@ describe("main-owned local host eligibility", () => {
 
   it("ignores page-supplied eligibility and requires enrollment plus the protocol marker", (t) => {
     let live = true;
+    let now = 0;
     const serverUrl = "https://server.example";
     const h = loadNavigationHarness({
       serverUrl,
+      localHostNow: () => now,
       localHostCli: {
         readLocalHostId: () => "local",
         liveDaemonRecordFor: (target) => {
@@ -5583,10 +6166,57 @@ describe("main-owned local host eligibility", () => {
       false,
     );
     live = false;
+    now = 1000;
     assert.equal(
       context({ sourceHostId: "local", sessionHostProtocol: 1, hostIsThisMachine: true })
         .hostIsThisMachine,
       false,
     );
+  });
+});
+
+describe("Close menu item", () => {
+  const server = "https://host.example";
+
+  it("closes a hung page's window directly, and hands Close back once it recovers", (t) => {
+    const h = loadNavigationHarness({ serverUrl: server, savedServerUrl: server });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    h.api.createWindow();
+    h.setUrl(server);
+    let closes = 0;
+    h.win.close = () => {
+      closes++;
+    };
+    h.electron.BrowserWindow.getFocusedWindow = () => h.win;
+    const pageEvent = { sender: h.webContents, senderFrame: { url: server } };
+    h.ipc.get("omnigent:set-desktop-command-state")(pageEvent, { commands: ["close"] });
+    h.api.buildMenu();
+    const sentCloses = () =>
+      h.calls.progress.filter((message) => message.channel === "omnigent:desktop-command").length;
+    const clickClose = () => h.calls.appMenu.getMenuItemById("close").click();
+
+    h.emit("unresponsive");
+    clickClose();
+    assert.equal(closes, 1);
+    assert.equal(sentCloses(), 0);
+
+    h.emit("responsive");
+    clickClose();
+    assert.equal(sentCloses(), 1);
+    assert.equal(closes, 1);
+  });
+});
+
+describe("New Window keeps its source's server (src/main.js)", () => {
+  it("gives a window cloned on a conversation the source's server, not the conversation's URL", (t) => {
+    const h = loadNavigationHarness();
+    t.after(h.cleanup);
+    h.api.createWindow("https://host.example/ml/omnigents");
+    h.setUrl("https://host.example/ml/omnigents/c/conv_1");
+    h.electron.BrowserWindow.getFocusedWindow = () => h.win;
+    h.api.buildMenu();
+    h.calls.appMenu.getMenuItemById("new_window").click();
+    assert.equal(h.api.windows.get(h.win).serverUrl, "https://host.example/ml/omnigents");
   });
 });

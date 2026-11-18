@@ -31,12 +31,14 @@ import {
   useAddDefaultPolicy,
   useUpdateDefaultPolicy,
   useDeleteDefaultPolicy,
+  PoliciesForbiddenError,
   type DefaultPolicy,
 } from "@/hooks/useDefaultPolicies";
 import { usePolicyRegistry, type PolicyRegistryEntry } from "@/hooks/usePolicies";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { isSingleUserMode } from "@/lib/capabilities";
 import { coercePolicyParams } from "@/lib/policyParams";
 
@@ -425,12 +427,17 @@ function AddDefaultPolicyDialog({
 
 export function PoliciesPage() {
   const info = useServerInfo();
+  const capabilitiesLoading = info === "loading" || isBootFallbackInfo(info);
   // Explicit single-user local runtime: no auth endpoints exist, so skip the
   // admin probe. A multi-user header-auth deploy (same accounts_enabled:false
   // / login_url:null shape) is NOT single-user and keeps its admin gate.
   const isSingleUser = isSingleUserMode(info);
   const [meIsAdmin, setMeIsAdmin] = useState<boolean | null>(null);
-  const { data: policies = [], refetch } = useDefaultPolicies();
+  const { data: policies = [], refetch, error } = useDefaultPolicies();
+  // The backend may restrict listing global policies (HTTP 403). Treat that
+  // like the non-admin case and hide the section rather than surfacing a raw
+  // fetch error.
+  const policiesForbidden = error instanceof PoliciesForbiddenError;
   const { data: registry = [] } = usePolicyRegistry();
   const updatePolicy = useUpdateDefaultPolicy();
   const deletePolicy = useDeleteDefaultPolicy();
@@ -449,13 +456,13 @@ export function PoliciesPage() {
   // too, unlike the accounts-only `/auth/me`). Skipped in single-user mode
   // because no auth endpoints exist and the backend skips admin enforcement.
   useEffect(() => {
-    if (isSingleUser) return;
+    if (isSingleUser || capabilitiesLoading) return;
     void (async () => {
       const userId = await resolveIdentity();
       if (userId === null) return;
       setMeIsAdmin(getCurrentIsAdmin());
     })();
-  }, [isSingleUser]);
+  }, [isSingleUser, capabilitiesLoading]);
 
   if (!isSingleUser && meIsAdmin === null) {
     return (
@@ -465,7 +472,7 @@ export function PoliciesPage() {
     );
   }
 
-  if (!isSingleUser && meIsAdmin === false) {
+  if (policiesForbidden || (!isSingleUser && meIsAdmin === false)) {
     return (
       <PageScroll
         maxWidthClassName="max-w-4xl"
@@ -501,8 +508,8 @@ export function PoliciesPage() {
       <div className="mb-6 flex items-center justify-between">
         <div>
           <h1 className="settings-page-title text-2xl font-medium">Global Policies</h1>
-          <p className="mt-1 text-ui text-muted-foreground max-md:hidden">
-            Global policies applied to all sessions.
+          <p className="mt-1 text-sm text-muted-foreground max-md:hidden">
+            Policies applied to all sessions.
           </p>
         </div>
         <Button onClick={() => setAddOpen(true)}>

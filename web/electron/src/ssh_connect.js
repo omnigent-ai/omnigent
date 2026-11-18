@@ -552,6 +552,10 @@ function createSshSession(options) {
     cancelLocal: (port) => control("cancel", ["-L", `localhost:${port}:127.0.0.1:${port}`]),
     holdRemote: (port) => control("forward", ["-R", `${port}:${HELD_PORT_TARGET}`]),
     releaseRemote: (port) => control("cancel", ["-R", `${port}:${HELD_PORT_TARGET}`]),
+    forwardSocket: (localPath, remotePath) =>
+      control("forward", ["-L", `${localPath}:${remotePath}`]),
+    cancelSocket: (localPath, remotePath) =>
+      control("cancel", ["-L", `${localPath}:${remotePath}`]),
 
     /** End the shared connection, killing it if it doesn't exit in time. */
     async close() {
@@ -609,7 +613,7 @@ async function signIn(ctx) {
   const holds = await Promise.all(busy.map((port) => session.holdRemote(port)));
   const held = busy.filter((_, index) => holds[index].code === 0);
   // Take the port the CLI should pick before it starts: tools that forward new
-  // remote listeners to this computer (Arca Companion, VS Code) would grab it first.
+  // remote listeners to this computer (VS Code, for example) would grab it first.
   let forwarded =
     expected !== null && (await session.forwardLocal(expected)).code === 0 ? expected : null;
   if (ctx.isCanceled()) return canceledResult();

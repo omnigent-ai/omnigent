@@ -12,7 +12,7 @@ import { useSessionImportStore } from "@/store/sessionImport";
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
 vi.mock("@/lib/sessionsApi", () => ({ importLocalSessions: vi.fn() }));
 vi.mock("./HostLabel", () => ({
-  HostLabel: ({ host }: { host: { name: string } }) => <span>{host.name}</span>,
+  HostLabel: ({ host }: { host: { name: string } }) => host.name,
 }));
 // Radix Select uses a portal + pointer events jsdom can't drive; a native
 // <select> keeps the option list assertable.
@@ -74,6 +74,23 @@ describe("ImportSessionsPanel", () => {
     renderPanel();
     expect(screen.getByTestId("import-no-hosts")).toBeInTheDocument();
     expect(screen.queryByTestId("import-submit")).toBeNull();
+  });
+
+  it("renders each row as its Settings catalog entry, in the recent-sessions mode", () => {
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_1", name: "mac-laptop", owner: "alice", status: "online" }],
+    } as unknown as ReturnType<typeof useHosts>);
+    renderPanel();
+    for (const id of [
+      "import-machine",
+      "import-mode",
+      "import-harness",
+      "import-recent-count",
+      "import-run",
+    ]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+    expect(document.querySelector('[data-settings-item="import-session-id"]')).toBeNull();
   });
 
   it("keeps a large batch compact and points to the existing session list", async () => {
@@ -138,6 +155,29 @@ describe("ImportSessionsPanel", () => {
     importLocalSessionsMock.mockClear();
     fireEvent.click(screen.getByTestId("import-retry"));
     await waitFor(() => expect(importLocalSessionsMock).toHaveBeenCalledTimes(1));
+  });
+
+  it("keeps imported progress visible when the import stops early", async () => {
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_1", name: "mac-laptop", owner: "alice", status: "online" }],
+    } as unknown as ReturnType<typeof useHosts>);
+    importLocalSessionsMock.mockImplementation(async (_host, _source, _limit, onSession) => {
+      onSession?.({ id: "c1", title: "First session" });
+      onSession?.({ id: "c2", title: "Second session" });
+      throw new Error(
+        "The import stopped before it could finish. 2 sessions were imported. " +
+          "Import again to pick up the rest.",
+      );
+    });
+
+    renderPanel();
+    fireEvent.click(screen.getByTestId("import-submit"));
+
+    await waitFor(() => expect(screen.getByTestId("import-error")).toBeInTheDocument());
+    expect(screen.getByTestId("import-error")).toHaveTextContent("2 sessions were imported");
+    expect(screen.getByText("Imported 2 before the import stopped.")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "View sessions" })).toHaveAttribute("href", "/");
+    expect(screen.queryByTestId("import-result")).toBeNull();
   });
 
   it("keeps an in-flight import running and shows its progress after a remount", async () => {

@@ -36,6 +36,9 @@ permissions:
   contents: write
   pull-requests: write
 
+env:
+  OMNIGENT_CI_PIPELINE: vscode-release-pr
+
 jobs:
   release-pr:
     if: github.repository == 'omnigent-ai/omnigent'
@@ -170,6 +173,7 @@ jobs:
         env:
           LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
           GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
+          PYTHONPATH: ${{ github.workspace }}
           DRAFTER_MODEL: ${{ vars.OMNIGENT_CI_FAST_ANTHROPIC_MODEL }}
           VERSION: ${{ inputs.version }}
         run: |
@@ -183,6 +187,7 @@ jobs:
             exit 0
           fi
           echo "::add-mask::${LLM_API_KEY}"
+          python3 -m dev.ci_usage validate
           python3 - "$VERSION" <<'PY'
           import json, os, re, pathlib, sys, urllib.request
 
@@ -207,8 +212,8 @@ jobs:
               f"Write the CHANGELOG bullets for version {version} now."
           )
 
-          url = os.environ["GATEWAY_BASE_URL"].rstrip("/") + "/chat/completions"
-          payload = json.dumps({
+          from dev.ci_usage import chat_request
+          payload = {
               "model": os.environ["DRAFTER_MODEL"],
               "max_tokens": 1024,
               "temperature": 0,
@@ -216,11 +221,8 @@ jobs:
                   {"role": "system", "content": system},
                   {"role": "user", "content": user},
               ],
-          }).encode()
-          req = urllib.request.Request(url, data=payload, method="POST", headers={
-              "Content-Type": "application/json",
-              "Authorization": "Bearer " + os.environ["LLM_API_KEY"].strip(),
-          })
+          }
+          req = chat_request(os.environ["GATEWAY_BASE_URL"], os.environ["LLM_API_KEY"], payload)
           try:
               with urllib.request.urlopen(req, timeout=90) as resp:
                   data = json.loads(resp.read().decode())

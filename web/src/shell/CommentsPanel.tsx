@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { useResizableCommentsPanel } from "@/hooks/useResizableCommentsPanel";
 import { getCurrentAuthorId } from "@/lib/identity";
+import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { cn } from "@/lib/utils";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
@@ -44,6 +45,10 @@ export interface CommentsPanelProps {
   onClickComment: (comment: Comment) => void;
   /** When false, "Address All" is disabled (no agent registered). */
   canAddress: boolean;
+  /** Draft comments "Address All" sends, including other files'. Defaults to `comments.length`. */
+  addressCount?: number;
+  /** Files those drafts come from. Defaults to 1. */
+  addressFileCount?: number;
   addressPending: boolean;
   /**
    * When false, the add-comment form and all edit/delete buttons are hidden
@@ -81,6 +86,8 @@ export function CommentsPanel({
   onDeleteComment,
   onClickComment,
   canAddress,
+  addressCount = comments.length,
+  addressFileCount = 1,
   addressPending,
   canEdit = true,
   pendingBodyRef,
@@ -91,6 +98,9 @@ export function CommentsPanel({
   const [body, setBody] = useState("");
   const [tab, setTab] = useState<Tab>("open");
   const addCommentTextareaRef = useRef<HTMLTextAreaElement>(null);
+  // Safari confirms an IME candidate with an Enter that isn't flagged as
+  // composing, so track composition like the chat composer does.
+  const isComposingRef = useRef(false);
   const selectedCardRef = useRef<HTMLDivElement>(null);
   const autoRouteRef = useRef<{ selection: ActiveSelection; tab: Tab } | null>(null);
   const { width, containerRef, isDesktop, handleProps } = useResizableCommentsPanel();
@@ -161,6 +171,11 @@ export function CommentsPanel({
       : comment.status === "draft" &&
         activeSelectionStart === comment.start_index &&
         activeSelectionEnd === comment.end_index;
+  // This panel lists only the open file's drafts, so name the wider scope when there is one.
+  const addressesOtherFiles = addressCount > comments.length;
+  const addressScope =
+    `Sends ${addressCount} draft comment${addressCount === 1 ? "" : "s"} ` +
+    `from ${addressFileCount} file${addressFileCount === 1 ? "" : "s"}`;
 
   return (
     <div
@@ -179,17 +194,35 @@ export function CommentsPanel({
       <div className="flex h-11 shrink-0 items-center justify-between px-3 border-b border-border">
         <span className="text-sm font-semibold">Comments</span>
         {tab === "open" && (
-          <Button
-            type="button"
-            variant="outline"
-            size="xs"
-            className="rounded-full px-3 gap-1.5"
-            disabled={!canAddress || comments.length === 0 || addressPending}
-            onClick={onAddressAll}
-          >
-            <WandSparklesIcon className="size-3.5" />
-            Address All
-          </Button>
+          <TooltipProvider>
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="xs"
+                  className="rounded-full px-3 gap-1.5"
+                  disabled={!canAddress || addressCount === 0 || addressPending}
+                  onClick={onAddressAll}
+                >
+                  <WandSparklesIcon className="size-3.5" />
+                  {addressesOtherFiles ? (
+                    `Address All (${addressCount})`
+                  ) : (
+                    <>
+                      Address All
+                      {addressCount > 0 && (
+                        <span className="rounded-full bg-muted px-1.5 text-[10px] tabular-nums">
+                          {addressCount}
+                        </span>
+                      )}
+                    </>
+                  )}
+                </Button>
+              </TooltipTrigger>
+              {addressesOtherFiles && <TooltipContent>{addressScope}</TooltipContent>}
+            </Tooltip>
+          </TooltipProvider>
         )}
       </div>
 
@@ -254,7 +287,14 @@ export function CommentsPanel({
                   setBody(e.target.value);
                   if (pendingBodyRef) pendingBodyRef.current = e.target.value;
                 }}
+                onCompositionStart={() => {
+                  isComposingRef.current = true;
+                }}
+                onCompositionEnd={() => {
+                  isComposingRef.current = false;
+                }}
                 onKeyDown={(e) => {
+                  if (isImeCompositionKeyEvent(e, isComposingRef.current)) return;
                   if (e.key === "Enter" && !e.shiftKey && body.trim()) {
                     e.preventDefault();
                     onAddComment(body.trim());
@@ -470,7 +510,7 @@ function CommentCard({
             <button
               type="button"
               aria-expanded={expanded}
-              className="cursor-pointer text-[10px] font-medium text-blue-600 hover:underline dark:text-blue-400"
+              className="cursor-pointer text-[10px] font-medium text-link hover:underline"
               onClick={(e) => {
                 e.stopPropagation();
                 setExpanded((v) => !v);

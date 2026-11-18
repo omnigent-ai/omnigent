@@ -1,6 +1,11 @@
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { TRANSCRIPT_SCROLLBAR_DRAG_EVENT, TranscriptScrollbar } from "./TranscriptScrollbar";
+import {
+  reanchorOvershoot,
+  splitThumbMove,
+  TRANSCRIPT_SCROLLBAR_DRAG_EVENT,
+  TranscriptScrollbar,
+} from "./TranscriptScrollbar";
 
 /**
  * Build a scrollable transcript container the scrollbar can attach to.
@@ -8,11 +13,38 @@ import { TRANSCRIPT_SCROLLBAR_DRAG_EVENT, TranscriptScrollbar } from "./Transcri
  */
 function makeScroller({ clientHeight = 800, scrollHeight = 3000 } = {}) {
   const el = document.createElement("div");
+  const metrics = { scrollHeight, scrollTop: 0 };
   Object.defineProperty(el, "clientHeight", { value: clientHeight });
-  Object.defineProperty(el, "scrollHeight", { value: scrollHeight });
-  el.scrollTop = 0;
-  return { el, stopScroll: vi.fn() };
+  Object.defineProperty(el, "scrollHeight", { get: () => metrics.scrollHeight });
+  // Like a browser, scrollTop stays within the scroll range.
+  Object.defineProperty(el, "scrollTop", {
+    get: () => metrics.scrollTop,
+    set: (value: number) => {
+      metrics.scrollTop = Math.min(Math.max(0, value), metrics.scrollHeight - clientHeight);
+    },
+  });
+  return { el, metrics, stopScroll: vi.fn() };
 }
+
+/** Render a scrollbar and grab its thumb at `clientY`, recording drag directions. */
+function grabThumb(scroller: ReturnType<typeof makeScroller>, clientY: number) {
+  render(<TranscriptScrollbar scroller={scroller} />);
+  const thumb = screen.getByTestId("transcript-scrollbar-thumb");
+  // jsdom has no pointer capture; stub the API the handlers call.
+  thumb.setPointerCapture = vi.fn();
+  thumb.hasPointerCapture = vi.fn().mockReturnValue(true);
+  thumb.releasePointerCapture = vi.fn();
+  const directions: string[] = [];
+  scroller.el.addEventListener(TRANSCRIPT_SCROLLBAR_DRAG_EVENT, (event) => {
+    directions.push((event as CustomEvent<{ direction: string }>).detail.direction);
+  });
+  fireEvent.pointerDown(thumb, { pointerId: 1, clientY });
+  const moveTo = (y: number) => fireEvent.pointerMove(thumb, { pointerId: 1, clientY: y });
+  return { directions, moveTo };
+}
+
+// 800px pane over a 3000px document: track 724, thumb 193, travel 531, range 2200.
+const SCROLL_PER_PX = 2200 / 531;
 
 afterEach(cleanup);
 
@@ -124,5 +156,84 @@ describe("TranscriptScrollbar thumb", () => {
     const settled = scroller.el.scrollTop;
     fireEvent.pointerMove(thumb, { pointerId: 1, pointerType: "touch", clientY: 300 });
     expect(scroller.el.scrollTop).toBe(settled);
+  });
+
+  it("waits for the pointer to come back after a drag past the top", () => {
+    const scroller = makeScroller();
+    scroller.el.scrollTop = 100 * SCROLL_PER_PX;
+    const { directions, moveTo } = grabThumb(scroller, 300);
+    // 100px reaches the top; the next 50px are past it.
+    moveTo(150);
+    expect(scroller.el.scrollTop).toBe(0);
+    // Coming back, the thumb stays put until the pointer is where it held the thumb.
+    moveTo(190);
+    expect(scroller.el.scrollTop).toBe(0);
+    moveTo(210);
+    expect(scroller.el.scrollTop).toBeCloseTo(10 * SCROLL_PER_PX, 5);
+    // The history loader still hears every move, overshoot included.
+    expect(directions).toEqual(["up", "down", "down"]);
+  });
+
+  it("waits for the pointer to come back after a drag past the bottom", () => {
+    const scroller = makeScroller();
+    scroller.el.scrollTop = 2200 - 20 * SCROLL_PER_PX;
+    const { directions, moveTo } = grabThumb(scroller, 500);
+    moveTo(580);
+    expect(scroller.el.scrollTop).toBe(2200);
+    moveTo(530);
+    expect(scroller.el.scrollTop).toBe(2200);
+    moveTo(500);
+    expect(scroller.el.scrollTop).toBeCloseTo(2200 - 20 * SCROLL_PER_PX, 5);
+    expect(directions).toEqual(["down", "up", "up"]);
+  });
+
+  it("keeps the pointer's overshoot measured from the thumb when a history page lands", () => {
+    const scroller = makeScroller();
+    const { directions, moveTo } = grabThumb(scroller, 300);
+    moveTo(200);
+    expect(scroller.el.scrollTop).toBe(0);
+    // Dragging up at the top fetched an older page; the transcript holds the
+    // reader by moving scrollTop down by the page's height.
+    scroller.metrics.scrollHeight = 4000;
+    scroller.el.scrollTop = 1000;
+    // max 3200; track 724, thumb round(724 * 800 / 4000) = 145, travel 579.
+    const scrollPerPx = 3200 / 579;
+    const heldThumbOffset = 1000 / scrollPerPx;
+    // Dragging further up scrolls on from the hold instead of jumping to the top.
+    moveTo(190);
+    const continued = 1000 - 10 * scrollPerPx;
+    expect(scroller.el.scrollTop).toBeCloseTo(continued, 5);
+    // The thumb moved down without the pointer, so the way back waits for
+    // the pointer to reach it: 100px of overshoot plus the thumb's move.
+    const owed = 100 + heldThumbOffset;
+    moveTo(190 + owed - 1);
+    expect(scroller.el.scrollTop).toBeCloseTo(continued, 5);
+    moveTo(190 + owed + 20);
+    expect(scroller.el.scrollTop).toBeCloseTo(continued + 20 * scrollPerPx, 5);
+    expect(directions).toEqual(["up", "up", "down", "down"]);
+  });
+});
+
+describe("thumb drag overshoot", () => {
+  it("pays overshoot back only with moves toward the thumb", () => {
+    expect(splitThumbMove(0, 12)).toEqual({ overshootPx: 0, scrollPx: 12 });
+    expect(splitThumbMove(-30, -5)).toEqual({ overshootPx: -30, scrollPx: -5 });
+    expect(splitThumbMove(-30, 10)).toEqual({ overshootPx: -20, scrollPx: 0 });
+    expect(splitThumbMove(-30, 30)).toEqual({ overshootPx: 0, scrollPx: 0 });
+    expect(splitThumbMove(-30, 45)).toEqual({ overshootPx: 0, scrollPx: 15 });
+    expect(splitThumbMove(25, -40)).toEqual({ overshootPx: 0, scrollPx: -15 });
+  });
+
+  it("measures overshoot from wherever the thumb was moved to", () => {
+    // Pointer above the top; a hold moves the thumb 40px further from it.
+    expect(reanchorOvershoot(-30, 40)).toBe(-70);
+    // Pointer below the bottom; the thumb moves 10px toward it.
+    expect(reanchorOvershoot(30, 10)).toBe(20);
+    // The thumb reached or passed the pointer: nothing is owed.
+    expect(reanchorOvershoot(30, 30)).toBe(0);
+    expect(reanchorOvershoot(30, 45)).toBe(0);
+    expect(reanchorOvershoot(-30, -50)).toBe(0);
+    // Without overshoot, a hold leaves the drag scrolling by its own moves.
+    expect(reanchorOvershoot(0, 120)).toBe(0);
   });
 });

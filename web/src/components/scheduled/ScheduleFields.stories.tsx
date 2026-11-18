@@ -42,7 +42,7 @@ export const HourlyMinute: Story = {
   ),
 };
 
-export const WeeklyTimePickerOpen: Story = {
+export const WeeklyDayPickerOpen: Story = {
   render: () => (
     <ScheduleExample
       initialModel={{
@@ -55,7 +55,7 @@ export const WeeklyTimePickerOpen: Story = {
     />
   ),
   play: async ({ canvasElement }) => {
-    await userEvent.click(within(canvasElement).getByTestId("schedule-time-picker-trigger"));
+    await userEvent.click(within(canvasElement).getByRole("button", { name: "Days of the week" }));
   },
 };
 

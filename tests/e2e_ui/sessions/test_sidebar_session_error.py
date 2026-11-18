@@ -7,9 +7,10 @@ from typing import Literal
 
 import httpx
 import pytest
-from playwright.sync_api import Locator, Page, expect
+from playwright.sync_api import Locator, Page, Request, expect
 
 from omnigent.entities import ErrorData, NewConversationItem
+from omnigent.stores.conversation_store.activity_error import LATEST_ACTIVITY_ERROR_LABEL_KEY
 from tests.e2e_ui.conftest import seed_committed_items, seed_committed_turn
 
 _ERROR_MESSAGE = "API Error: Request rejected (429): Exceeded input tokens per minute rate limit."
@@ -143,6 +144,7 @@ def test_live_native_failure_flags_an_unopened_session(
         reply="Ready for the next task.",
         response_id=_ERROR_RESPONSE_ID,
     )
+    reads = _item_reads(page, session_id)
     page.goto(base_url)
     row = _row(page, session_id)
     expect(row).to_be_visible(timeout=30_000)
@@ -152,6 +154,7 @@ def test_live_native_failure_flags_an_unopened_session(
     expect(row.locator('[data-state="running"]')).to_be_visible(timeout=15_000)
     _publish_status(base_url, session_id, "failed")
     expect(_error_badge(row)).to_be_visible(timeout=15_000)
+    assert reads == []
 
     row.locator(f'a[href="/c/{session_id}"]').click()
     page.mouse.move(0, 0)
@@ -285,4 +288,129 @@ def test_idle_structured_error_flags_an_unopened_session(
     expect(headline).to_be_visible(timeout=15_000)
     expect(_error_badge(row).locator("svg")).to_have_css(
         "color", headline.evaluate("element => getComputedStyle(element).color")
+    )
+
+
+def _item_reads(page: Page, session_id: str) -> list[str]:
+    """Record every item-list request the page makes for one session."""
+    reads: list[str] = []
+
+    def _on_request(request: Request) -> None:
+        if f"/v1/sessions/{session_id}/items" in request.url:
+            reads.append(request.url)
+
+    page.on("request", _on_request)
+    return reads
+
+
+@pytest.mark.parametrize("disconnect_after_error", [False, True])
+def test_labelled_session_badges_from_the_list_without_reading_items(
+    page: Page,
+    seeded_session: tuple[str, str],
+    disconnect_after_error: bool,
+) -> None:
+    """The server's latest-activity label drives the badge with no item reads."""
+    base_url, session_id = seeded_session
+    seed_committed_turn(
+        session_id,
+        prompt="Please continue.",
+        reply=_ERROR_MESSAGE,
+        response_id=_ERROR_RESPONSE_ID,
+    )
+    if disconnect_after_error:
+        seed_committed_items(
+            session_id,
+            [
+                NewConversationItem(
+                    type="error",
+                    response_id=_ERROR_RESPONSE_ID,
+                    data=ErrorData(
+                        source="execution", code="runner_disconnected", message="Disconnected"
+                    ),
+                )
+            ],
+        )
+    snapshot = httpx.get(f"{base_url}/v1/sessions/{session_id}?include_items=false", timeout=10.0)
+    snapshot.raise_for_status()
+    assert snapshot.json()["labels"][LATEST_ACTIVITY_ERROR_LABEL_KEY] == "error"
+
+    reads = _item_reads(page, session_id)
+    page.goto(base_url)
+    row = _row(page, session_id)
+    expect(_error_badge(row)).to_be_visible(timeout=30_000)
+
+    # Newer activity arrives on the updates stream and clears the badge.
+    seed_committed_turn(
+        session_id,
+        prompt="Please try again.",
+        reply="Recovered successfully.",
+        response_id="resp_sidebar_label_recovered",
+    )
+    expect(_error_badge(row)).to_have_count(0, timeout=30_000)
+    assert reads == []
+
+
+@pytest.mark.parametrize("stale_error_label", [False, True])
+def test_open_session_badge_uses_live_events_before_sidebar_updates(
+    page: Page,
+    seeded_session: tuple[str, str],
+    stale_error_label: bool,
+) -> None:
+    """Live errors appear and recovery clears even with the row stream silenced."""
+    from tests.e2e_ui.chat.test_failure_error_card import (
+        _install_error_stream,
+        _push_error_event,
+    )
+
+    base_url, session_id = seeded_session
+    seed_committed_turn(
+        session_id,
+        prompt="Please continue.",
+        reply=_ERROR_MESSAGE if stale_error_label else "Ready for the next task.",
+        response_id=_ERROR_RESPONSE_ID,
+    )
+    _install_error_stream(page, session_id)
+    page.route_web_socket(re.compile(r"/v1/sessions/updates"), lambda ws: None)
+    page.goto(f"{base_url}/c/{session_id}")
+    expect(page.get_by_role("textbox", name="Message the agent")).to_be_visible(timeout=30_000)
+    row = _row(page, session_id)
+    page.wait_for_function("window.__errorStreamController !== undefined")
+    if not stale_error_label:
+        expect(_error_badge(row)).to_have_count(0)
+        _push_error_event(
+            page,
+            {
+                "source": "execution",
+                "error": {"code": "rate_limit_exceeded", "message": _ERROR_MESSAGE},
+            },
+        )
+    expect(_error_badge(row)).to_be_visible(timeout=15_000)
+
+    page.evaluate(
+        """sessionId => {
+          for (const [event, data] of [
+            ["response.created", {id: "resp_live_recovery", status: "in_progress", output: []}],
+            ["response.output_text.delta", {delta: "Recovered successfully."}],
+            ["response.completed", {id: "resp_live_recovery", status: "completed", output: [
+              {type: "message", role: "assistant", content: [
+                {type: "output_text", text: "Recovered successfully."}
+              ]}
+            ]}],
+            ["session.status", {conversation_id: sessionId, status: "idle",
+                                response_id: "resp_live_recovery"}]
+          ]) {
+            const frame = `event: ${event}\\ndata: ${JSON.stringify(data)}\\n\\n`;
+            window.__errorStreamController.enqueue(new TextEncoder().encode(frame));
+          }
+        }""",
+        session_id,
+    )
+    expect(page.get_by_text("Recovered successfully.", exact=True)).to_be_visible(timeout=15_000)
+    expect(_error_badge(row)).to_have_count(0, timeout=15_000)
+    expect(row.locator('[data-testid="session-state-badge"]')).to_have_count(0, timeout=15_000)
+    # No server write occurred: the stale label really is still unchanged.
+    snapshot = httpx.get(f"{base_url}/v1/sessions/{session_id}?include_items=false", timeout=10.0)
+    snapshot.raise_for_status()
+    assert snapshot.json()["labels"].get(LATEST_ACTIVITY_ERROR_LABEL_KEY, "") == (
+        "error" if stale_error_label else ""
     )

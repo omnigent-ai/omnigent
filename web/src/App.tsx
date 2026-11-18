@@ -7,7 +7,7 @@ import { PageLoading } from "@/components/PageLoading";
 import { Spinner } from "@/components/ui/spinner";
 import { ChunkLoadErrorBoundary } from "@/components/ChunkLoadErrorBoundary";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
-import { useLocation, useNavigate } from "@/lib/routing";
+import { Outlet, useLocation, useNavigate } from "@/lib/routing";
 import { isFeatureEnabled, type FeatureKey } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
@@ -19,8 +19,8 @@ import { ExtensionPageRoute } from "@/extensions/ExtensionPageRoute";
 // kept mounted across a param change (ChatPage across `/` ↔ `/c/:id`) still emits
 // one view per destination under the same id.
 //
-// SettingsPage opts out (stays unwrapped): its id is param-derived
-// (`settings.<section>`), so it calls useOmnigentPageView itself.
+// SettingsPage and TasksPage own their page-view IDs because their section
+// depends on route/query parameters.
 function withPageView<P extends object>(id: string, Component: ComponentType<P>): ComponentType<P> {
   return function WithPageView(props: P) {
     useOmnigentPageView(id);
@@ -57,10 +57,7 @@ const InboxPage = withPageView(
 // The shell owns the board so selecting a conversation never unmounts it.
 const CanvasLandingPage = withPageView("canvas", () => null);
 const GridPage = withPageView("grid", () => null);
-const TasksPage = withPageView(
-  "tasks",
-  lazy(() => import("@/pages/TasksPage").then((m) => ({ default: m.TasksPage }))),
-);
+const TasksPage = lazy(() => import("@/pages/TasksPage").then((m) => ({ default: m.TasksPage })));
 const UsagePage = withPageView(
   "usage",
   lazy(() => import("@/pages/UsagePage").then((m) => ({ default: m.UsagePage }))),
@@ -68,6 +65,14 @@ const UsagePage = withPageView(
 const TaskDetailPage = withPageView(
   "tasks.detail",
   lazy(() => import("@/pages/TaskDetailPage").then((m) => ({ default: m.TaskDetailPage }))),
+);
+const WorkflowsPage = withPageView(
+  "workflows",
+  lazy(() => import("@/pages/WorkflowsPage").then((m) => ({ default: m.WorkflowsPage }))),
+);
+const WorkflowDetailPage = withPageView(
+  "workflows.detail",
+  lazy(() => import("@/pages/WorkflowDetailPage").then((m) => ({ default: m.WorkflowDetailPage }))),
 );
 const SettingsPage = lazy(() =>
   import("@/pages/SettingsPage").then((m) => ({ default: m.SettingsPage })),
@@ -209,16 +214,44 @@ function AppRoutes({ basename }: AppProps) {
               </FeatureGatedPage>
             }
           />
-          <Route path={`${prefix}/tasks`} element={<TasksPage />} />
           <Route
-            path={`${prefix}/tasks/templates`}
-            element={<TasksPage key="templates" templatesOnly />}
+            element={
+              info === "loading" ? (
+                <PageLoading />
+              ) : info.automations_enabled === false ? (
+                <NotFoundPage />
+              ) : (
+                <Outlet />
+              )
+            }
+          >
+            <Route path={`${prefix}/tasks`} element={<TasksPage />} />
+            <Route
+              path={`${prefix}/tasks/templates`}
+              element={<TasksPage key="templates" templatesOnly />}
+            />
+            <Route
+              path={`${prefix}/tasks/:taskId`}
+              element={
+                <FeatureGatedPage feature="automations_v2">
+                  <TaskDetailPage />
+                </FeatureGatedPage>
+              }
+            />
+          </Route>
+          <Route
+            path={`${prefix}/workflows`}
+            element={
+              <FeatureGatedPage feature="workflows">
+                <WorkflowsPage />
+              </FeatureGatedPage>
+            }
           />
           <Route
-            path={`${prefix}/tasks/:taskId`}
+            path={`${prefix}/workflows/:workflowId`}
             element={
-              <FeatureGatedPage feature="automations_v2">
-                <TaskDetailPage />
+              <FeatureGatedPage feature="workflows">
+                <WorkflowDetailPage />
               </FeatureGatedPage>
             }
           />

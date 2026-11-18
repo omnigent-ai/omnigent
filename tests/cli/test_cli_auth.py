@@ -13,6 +13,15 @@ import time
 import pytest
 
 
+def _routing_headers(*args, **kwargs) -> dict[str, str]:
+    """Return ``databricks_request_headers`` minus its always-present User-Agent."""
+    from omnigent.cli_auth import databricks_request_headers
+
+    headers = databricks_request_headers(*args, **kwargs)
+    assert headers.pop("User-Agent").startswith("omnigent-")
+    return headers
+
+
 @pytest.fixture()
 def token_dir(tmp_path, monkeypatch):
     """Redirect the token file to a temp directory.
@@ -299,22 +308,26 @@ def test_databricks_request_headers_org_only(token_dir) -> None:
     (equivalently to ``?o=``). A record with no org id (single-workspace
     host) yields no header, so those callers are unaffected.
     """
-    from omnigent.cli_auth import databricks_request_headers, store_databricks_auth
+    from omnigent.cli_auth import store_databricks_auth
 
+    # Compare routing headers only; _routing_headers drops the always-present User-Agent.
     store_databricks_auth(
-        server_url="https://acme.databricks.com/api/2.0/omnigent",
-        workspace_host="https://acme.databricks.com",
+        server_url="https://acme.example.com/api/2.0/omnigent",
+        workspace_host="https://acme.example.com",
         org_id="2850744067564480",
     )
-    assert databricks_request_headers("https://acme.databricks.com/api/2.0/omnigent") == {
-        "X-Databricks-Org-Id": "2850744067564480"
+    assert _routing_headers("https://acme.example.com/api/2.0/omnigent") == {
+        "X-Databricks-Org-Id": "2850744067564480",
+        "X-Databricks-Omnigent-Slice-Key": "client_key",
     }
 
     store_databricks_auth(
-        server_url="https://single.databricks.com/api/2.0/omnigent",
-        workspace_host="https://single.databricks.com",
+        server_url="https://single.example.com/api/2.0/omnigent",
+        workspace_host="https://single.example.com",
     )
-    assert databricks_request_headers("https://single.databricks.com/api/2.0/omnigent") == {}
+    assert _routing_headers("https://single.example.com/api/2.0/omnigent") == {
+        "X-Databricks-Omnigent-Slice-Key": "client_key",
+    }
 
 
 def test_databricks_request_headers_explicit_org_wins(token_dir) -> None:
@@ -349,7 +362,8 @@ def test_store_databricks_org_id_preserves_session_token(token_dir) -> None:
     assert load_databricks_org_id(server) == "123"
 
 
-def test_pinned_org_id_wins_over_stored_record(token_dir, monkeypatch) -> None:
+@pytest.mark.parametrize("selected_org", [None, "111"])
+def test_pinned_org_id_wins_over_stored_record(token_dir, monkeypatch, selected_org) -> None:
     """A daemon pinned to one workspace ignores later ``?o=`` launches' records."""
     from omnigent.cli_auth import (
         PINNED_DATABRICKS_ORG_ENV_VAR,
@@ -361,11 +375,11 @@ def test_pinned_org_id_wins_over_stored_record(token_dir, monkeypatch) -> None:
 
     server = "https://example.databricks.com/api/2.0/omnigent"
     store_databricks_org_id(server, "222")
-    pin_databricks_org_id(server, "111")
+    pin_databricks_org_id(server, selected_org)
 
-    assert load_databricks_org_id(server) == "111"
-    assert load_databricks_org_id(f"{server}/") == "111"
-    assert databricks_request_headers(server)["X-Databricks-Org-Id"] == "111"
+    assert load_databricks_org_id(server) == selected_org
+    assert load_databricks_org_id(f"{server}/") == selected_org
+    assert databricks_request_headers(server).get("X-Databricks-Org-Id") == selected_org
 
     monkeypatch.delenv(PINNED_DATABRICKS_ORG_ENV_VAR)
     assert load_databricks_org_id(server) == "222"
@@ -452,7 +466,7 @@ def test_databricks_request_headers_pairs_bearer_and_org(token_dir) -> None:
     header. A missing token or selector is omitted, so single-workspace and
     local-unauthenticated callers are unaffected.
     """
-    from omnigent.cli_auth import databricks_request_headers, store_databricks_auth
+    from omnigent.cli_auth import store_databricks_auth
 
     store_databricks_auth(
         server_url="https://acme.databricks.com/api/2.0/omnigent",
@@ -461,14 +475,18 @@ def test_databricks_request_headers_pairs_bearer_and_org(token_dir) -> None:
     )
     recorded = "https://acme.databricks.com/api/2.0/omnigent"
     # Bearer + org travel together.
-    assert databricks_request_headers(recorded, bearer_token="tok") == {
+    assert _routing_headers(recorded, bearer_token="tok") == {
         "Authorization": "Bearer tok",
         "X-Databricks-Org-Id": "2850744067564480",
+        "X-Databricks-Omnigent-Slice-Key": "client_key",
     }
     # Recorded selector but no token (local/unauth): org still rides, no bearer.
-    assert databricks_request_headers(recorded) == {"X-Databricks-Org-Id": "2850744067564480"}
+    assert _routing_headers(recorded) == {
+        "X-Databricks-Org-Id": "2850744067564480",
+        "X-Databricks-Omnigent-Slice-Key": "client_key",
+    }
     # No record (unknown server): bearer only, no routing header.
-    assert databricks_request_headers("https://other.example.com", bearer_token="tok") == {
+    assert _routing_headers("https://other.example.com", bearer_token="tok") == {
         "Authorization": "Bearer tok"
     }
 
@@ -484,8 +502,8 @@ def test_databricks_request_headers_slice_key(token_dir) -> None:
     from omnigent.cli_auth import databricks_request_headers, store_databricks_auth
 
     # Unsharded server: the slice key is DROPPED even though it was passed.
-    assert databricks_request_headers("https://other.example.com", host_id="host_abc123") == {}
-    assert databricks_request_headers("http://127.0.0.1:6767", host_id="host_abc123") == {}
+    assert _routing_headers("https://other.example.com", host_id="host_abc123") == {}
+    assert _routing_headers("http://127.0.0.1:6767", host_id="host_abc123") == {}
 
     # Workspace API mount: the key rides, alongside the bearer and ?o= selector.
     store_databricks_auth(
@@ -494,30 +512,31 @@ def test_databricks_request_headers_slice_key(token_dir) -> None:
         org_id="2850744067564480",
     )
     recorded = "https://acme.databricks.com/api/2.0/omnigent"
-    assert databricks_request_headers(recorded, bearer_token="tok", host_id="host_abc123") == {
+    assert _routing_headers(recorded, bearer_token="tok", host_id="host_abc123") == {
         "Authorization": "Bearer tok",
         "X-Databricks-Org-Id": "2850744067564480",
         "X-Databricks-Omnigent-Slice-Key": "host_abc123",
     }
 
-    # Omitted (default) → no slice-key header even on the workspace mount.
-    assert "X-Databricks-Omnigent-Slice-Key" not in databricks_request_headers(recorded)
+    # Omitted (default) → the machine's own key; "" opts out for a keyless host.
+    assert databricks_request_headers(recorded)["X-Databricks-Omnigent-Slice-Key"] == "client_key"
+    unkeyed = databricks_request_headers(recorded, host_id="")
+    assert "X-Databricks-Omnigent-Slice-Key" not in unkeyed
 
 
 def test_oss_host_routing_opt_in(token_dir, monkeypatch: pytest.MonkeyPatch) -> None:
     """An OSS host and its spawned runner send the same routing key when enabled."""
-    from omnigent.cli_auth import databricks_request_headers
     from omnigent.host.identity import HostIdentity
     from omnigent.runner.identity import RUNNER_SLICE_KEY_ENV_VAR
 
     server = "http://localhost:8000"
     monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
-    assert databricks_request_headers(server, host_id="host_explicit") == {
+    assert _routing_headers(server, host_id="host_explicit") == {
         "X-Databricks-Omnigent-Slice-Key": "host_explicit"
     }
     monkeypatch.setenv(RUNNER_SLICE_KEY_ENV_VAR, "host_runner")
-    assert databricks_request_headers(server) == {"X-Databricks-Omnigent-Slice-Key": "host_runner"}
-    assert databricks_request_headers(server, host_id="host_explicit") == {
+    assert _routing_headers(server) == {"X-Databricks-Omnigent-Slice-Key": "host_runner"}
+    assert _routing_headers(server, host_id="host_explicit") == {
         "X-Databricks-Omnigent-Slice-Key": "host_explicit"
     }
     monkeypatch.delenv(RUNNER_SLICE_KEY_ENV_VAR)
@@ -525,11 +544,11 @@ def test_oss_host_routing_opt_in(token_dir, monkeypatch: pytest.MonkeyPatch) -> 
         "omnigent.host.identity.load_host_identity_if_present",
         lambda: HostIdentity(host_id="host_saved", name="saved-host"),
     )
-    assert databricks_request_headers(server) == {"X-Databricks-Omnigent-Slice-Key": "host_saved"}
+    assert _routing_headers(server) == {"X-Databricks-Omnigent-Slice-Key": "host_saved"}
     monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "true")
-    assert databricks_request_headers(server, host_id="host_explicit") == {}
+    assert _routing_headers(server, host_id="host_explicit") == {}
     monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "0")
-    assert databricks_request_headers(server, host_id="host_explicit") == {}
+    assert _routing_headers(server, host_id="host_explicit") == {}
 
 
 def test_databricks_request_headers_runner_env_default(
@@ -542,7 +561,7 @@ def test_databricks_request_headers_runner_env_default(
     traffic (transcript posts, uploads, policy checks) keys by host_id and
     spreads across replicas instead of piling onto the single workspace-key pod.
     An explicit host_id still wins, the env is honoured only on the workspace
-    mount, and CLI / daemon callers (no such env) are unaffected.
+    mount, and CLI / daemon callers (no such env) fall back to the machine's key.
     """
     from omnigent.cli_auth import databricks_request_headers, store_databricks_auth
     from omnigent.runner.identity import RUNNER_SLICE_KEY_ENV_VAR
@@ -553,9 +572,9 @@ def test_databricks_request_headers_runner_env_default(
     )
     mount = "https://acme.databricks.com/api/2.0/omnigent"
 
-    # No env, no explicit host_id → no key (CLI / daemon unaffected).
+    # No env, no explicit host_id → the machine's own key.
     monkeypatch.delenv(RUNNER_SLICE_KEY_ENV_VAR, raising=False)
-    assert "X-Databricks-Omnigent-Slice-Key" not in databricks_request_headers(mount)
+    assert databricks_request_headers(mount)["X-Databricks-Omnigent-Slice-Key"] == "client_key"
 
     # Runner env set → the key defaults to it.
     monkeypatch.setenv(RUNNER_SLICE_KEY_ENV_VAR, "host_runner")
@@ -570,7 +589,7 @@ def test_databricks_request_headers_runner_env_default(
     )
 
     # Gated: even with the env set, an unsharded server emits nothing.
-    assert databricks_request_headers("http://127.0.0.1:6767") == {}
+    assert _routing_headers("http://127.0.0.1:6767") == {}
 
 
 def test_databricks_request_headers_slice_key_kill_switch(
@@ -621,7 +640,7 @@ def test_databricks_request_headers_folds_extra_headers(token_dir, monkeypatch) 
     caller that hand-rolls a bare bearer misses them. Malformed / unset input is
     a no-op (prod-safe).
     """
-    from omnigent.cli_auth import databricks_request_headers, store_databricks_auth
+    from omnigent.cli_auth import store_databricks_auth
 
     store_databricks_auth(
         server_url="https://acme.databricks.com/api/2.0/omnigent",
@@ -634,25 +653,66 @@ def test_databricks_request_headers_folds_extra_headers(token_dir, monkeypatch) 
         '{"x-databricks-route-hint": "instance-abc"}',
     )
     # Extra header travels alongside the bearer + ?o= routing header.
-    assert databricks_request_headers(recorded, bearer_token="tok") == {
+    assert _routing_headers(recorded, bearer_token="tok") == {
         "Authorization": "Bearer tok",
         "X-Databricks-Org-Id": "2850744067564480",
+        "X-Databricks-Omnigent-Slice-Key": "client_key",
         "x-databricks-route-hint": "instance-abc",
     }
     # It rides even for an unknown server with no token (routing-only request).
-    assert databricks_request_headers("https://other.example.com") == {
+    assert _routing_headers("https://other.example.com") == {
         "x-databricks-route-hint": "instance-abc",
     }
     # Malformed JSON is ignored (no crash) so a bad value can't break requests.
     monkeypatch.setenv("OMNIGENT_DATABRICKS_EXTRA_HEADERS", "not-json")
-    assert databricks_request_headers("https://other.example.com", bearer_token="tok") == {
+    assert _routing_headers("https://other.example.com", bearer_token="tok") == {
         "Authorization": "Bearer tok",
     }
     # Unset (prod default) is a no-op.
     monkeypatch.delenv("OMNIGENT_DATABRICKS_EXTRA_HEADERS", raising=False)
-    assert databricks_request_headers("https://other.example.com", bearer_token="tok") == {
+    assert _routing_headers("https://other.example.com", bearer_token="tok") == {
         "Authorization": "Bearer tok",
     }
+
+
+@pytest.mark.parametrize("ua_key", ["User-Agent", "user-agent", "USER-AGENT"])
+async def test_extra_user_agent_never_replaces_component_identity(
+    ua_key: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A configured User-Agent in any casing cannot displace the component UA.
+
+    Checked on the builder and on the request ``open_server_client`` sends, so
+    exactly one User-Agent reaches the wire and it names this component.
+    """
+    import json
+
+    import httpx
+
+    from omnigent.cli_auth import databricks_request_headers, open_server_client
+    from omnigent.telemetry.request_headers import CLIENT_COMPONENT_ENV_VAR, client_user_agent
+
+    monkeypatch.setenv(CLIENT_COMPONENT_ENV_VAR, "runner")
+    runner_ua = client_user_agent()
+    monkeypatch.setenv(
+        "OMNIGENT_DATABRICKS_EXTRA_HEADERS",
+        json.dumps({ua_key: "caller-agent/1.0", "x-databricks-route-hint": "instance-abc"}),
+    )
+    url = "https://other.example.com"
+
+    built = databricks_request_headers(url)
+    assert [k for k in built if k.lower() == "user-agent"] == ["User-Agent"]
+    assert built["User-Agent"] == runner_ua
+    assert built["x-databricks-route-hint"] == "instance-abc"
+
+    sent: list[list[str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append(request.headers.get_list("User-Agent"))
+        return httpx.Response(200)
+
+    async with open_server_client(url, transport=httpx.MockTransport(handler)) as client:
+        await client.get(f"{url}/health")
+    assert sent == [[runner_ua]]
 
 
 def test_load_token_returns_none_for_databricks_record(token_dir) -> None:
@@ -797,9 +857,10 @@ def test_refresh_stored_token_renews_and_rotates(token_dir, monkeypatch) -> None
 
     posted: dict[str, object] = {}
 
-    def _fake_post(url, *, data=None, timeout=None):
+    def _fake_post(url, *, data=None, headers=None, timeout=None):
         posted["url"] = url
         posted["data"] = data
+        posted["user_agent"] = (headers or {}).get("User-Agent")
         return httpx.Response(
             200,
             json={
@@ -815,6 +876,7 @@ def test_refresh_stored_token_renews_and_rotates(token_dir, monkeypatch) -> None
     assert refresh_stored_token("http://localhost:6767") == "fresh"
     assert posted["url"] == "http://localhost:6767/oauth/token"
     assert posted["data"] == {"grant_type": "refresh_token", "refresh_token": "refresh-1"}
+    assert str(posted["user_agent"]).startswith("omnigent-")
     # Rotated pair persisted; the fresh token now loads normally.
     data = json.loads((token_dir / "auth_tokens.json").read_text())
     entry = data["http://localhost:6767"]
@@ -848,7 +910,7 @@ def test_refresh_stored_token_refused_leaves_entry(token_dir, monkeypatch) -> No
         refresh_token="refresh-1",
     )
 
-    def _fake_post(url, *, data=None, timeout=None):
+    def _fake_post(url, *, data=None, headers=None, timeout=None):
         return httpx.Response(
             400, json={"error": "invalid_grant"}, request=httpx.Request("POST", url)
         )
@@ -881,7 +943,7 @@ def test_refresh_404_on_loopback_is_quiet(token_dir, monkeypatch, caplog) -> Non
         refresh_token="refresh-1",
     )
 
-    def _fake_post(url, *, data=None, timeout=None):
+    def _fake_post(url, *, data=None, headers=None, timeout=None):
         return httpx.Response(404, request=httpx.Request("POST", url))
 
     monkeypatch.setattr(httpx, "post", _fake_post)
@@ -917,7 +979,7 @@ def test_refresh_404_on_remote_warns_without_relogin_advice(
         refresh_token="refresh-1",
     )
 
-    def _fake_post(u, *, data=None, timeout=None):
+    def _fake_post(u, *, data=None, headers=None, timeout=None):
         return httpx.Response(404, request=httpx.Request("POST", u))
 
     monkeypatch.setattr(httpx, "post", _fake_post)
@@ -960,7 +1022,7 @@ def test_refresh_refusal_log_redacts_url_credentials(token_dir, monkeypatch, cap
         refresh_token="refresh-1",
     )
 
-    def _fake_post(u, *, data=None, timeout=None):
+    def _fake_post(u, *, data=None, headers=None, timeout=None):
         return httpx.Response(403, json={"error": "denied"}, request=httpx.Request("POST", u))
 
     monkeypatch.setattr(httpx, "post", _fake_post)

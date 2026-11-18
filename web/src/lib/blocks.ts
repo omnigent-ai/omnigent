@@ -13,8 +13,15 @@ import type { NativePermissionDelivery } from "./nativePermissionDelivery";
 import { capitalizeAgentName } from "./agentLabels";
 import { agentRootName } from "./forkHarness";
 import { nativeCodingAgentForAgentName } from "./nativeCodingAgents";
+import { WORKFLOW_QUESTION_PHASE } from "./sessionJournal";
 import type { RoutingDecisionExtras } from "./routingDecision";
-import type { AgyPermission, CodexPersistMode, RememberScope, Response } from "./types";
+import type {
+  AgyPermission,
+  CodexPersistMode,
+  FileEditRequest,
+  RememberScope,
+  Response,
+} from "./types";
 
 /**
  * Metadata attached to every stream block.
@@ -304,6 +311,13 @@ export interface SlashCommandBlock {
   output: string | null;
 }
 
+/** Hide the internal native-wrapper namespace added to bundled skills. */
+export function slashCommandDisplayName(name: string): string {
+  const separator = name.indexOf(":");
+  if (separator < 0 || !nativeCodingAgentForAgentName(name.slice(0, separator))) return name;
+  return name.slice(separator + 1) || name;
+}
+
 /**
  * Reconstruct the literal composer text a skill invocation came from,
  * e.g. `/review-pr 123 focus on auth`. A skill's `slash_command`
@@ -313,7 +327,8 @@ export interface SlashCommandBlock {
  * Skill indicator.
  */
 export function slashCommandEchoText(name: string, args: string): string {
-  return args ? `/${name} ${args}` : `/${name}`;
+  const displayName = slashCommandDisplayName(name);
+  return args ? `/${displayName} ${args}` : `/${displayName}`;
 }
 
 /**
@@ -621,6 +636,8 @@ export interface ElicitationBlock {
   type: "elicitation";
   ctx: BlockContext;
   elicitationId: string;
+  /** False when the agent keeps working while the card waits, e.g. a Codex async question. */
+  isBlocking?: false;
   /**
    * Session whose resolve endpoint should receive the verdict.
    * Present when a child/sub-agent prompt is mirrored into an
@@ -678,6 +695,8 @@ export interface ElicitationBlock {
    * elicitation.
    */
   askUserQuestion?: Record<string, unknown> | null;
+  /** For a workflow question, the ID of the plan step it's about. */
+  journalStep?: string;
   /**
    * Full ExitPlanMode tool_input (untruncated) — present when the
    * gated tool is Claude's built-in ExitPlanMode. ApprovalCard
@@ -685,6 +704,8 @@ export interface ElicitationBlock {
    * Optional/null for every other elicitation.
    */
   exitPlanMode?: Record<string, unknown> | null;
+  /** Claude-native file-edit prompts only: the full tool call, so the card can show a diff. */
+  fileEdit?: FileEditRequest | null;
   /**
    * Structured Codex command-approval payload. Present for
    * codex-native command approvals so the card can show command,
@@ -695,6 +716,7 @@ export interface ElicitationBlock {
     cwd: string | null;
     reason: string | null;
     execPolicyAmendment: string[] | null;
+    requestFingerprint?: string | null;
   } | null;
   /**
    * Claude-native edit-tool prompts only: when true, the card renders
@@ -756,7 +778,37 @@ export type AnyBlock =
   | PolicyDeniedBlock
   | ResponseEndBlock;
 
-/** Whether a pending card answers `sessionId`'s own prompt, not a mirrored sub-agent's. */
+/** Whether a block is a pending card that parks the agent's turn until it is answered. */
+export function isPendingBlockingElicitation(block: AnyBlock): boolean {
+  return block.type === "elicitation" && block.status === "pending" && block.isBlocking !== false;
+}
+
+/**
+ * The plan step a workflow question is about, when it's `sessionId`'s own
+ * question rather than a mirrored sub-agent's; null for any other prompt.
+ */
+export function workflowQuestionStep(
+  question: { phase: string; journalStep?: string; targetSessionId?: string | null },
+  sessionId: string | null,
+): string | null {
+  if (question.phase !== WORKFLOW_QUESTION_PHASE || !question.journalStep) return null;
+  const own = question.targetSessionId == null || question.targetSessionId === sessionId;
+  return own ? question.journalStep : null;
+}
+
+/** `sessionId`'s pending workflow questions, as `[step ID, elicitation ID]`, oldest first. */
+export function pendingWorkflowQuestions(
+  blocks: readonly AnyBlock[],
+  sessionId: string | null,
+): [string, string][] {
+  return blocks.flatMap((block): [string, string][] => {
+    if (block.type !== "elicitation" || block.status !== "pending") return [];
+    const step = workflowQuestionStep(block, sessionId);
+    return step === null ? [] : [[step, block.elicitationId]];
+  });
+}
+
+/** Whether a pending blocking card answers `sessionId`'s own prompt, not a mirrored sub-agent's. */
 export function hasPendingOwnElicitation(
   blocks: readonly AnyBlock[],
   sessionId: string | null,
@@ -764,7 +816,7 @@ export function hasPendingOwnElicitation(
   return blocks.some(
     (b) =>
       b.type === "elicitation" &&
-      b.status === "pending" &&
+      isPendingBlockingElicitation(b) &&
       (b.targetSessionId == null || b.targetSessionId === sessionId),
   );
 }

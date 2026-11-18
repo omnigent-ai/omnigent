@@ -25,6 +25,9 @@ RUNNER_HOST_OWNS_GLOBAL_CLEANUP_ENV_VAR = "OMNIGENT_RUNNER_HOST_OWNS_GLOBAL_CLEA
 # Some platforms (notably native Windows) do not define SIGUSR1; keep
 # imports working there and let callers skip adopt signaling.
 RUNNER_ADOPT_SIGNAL: signal.Signals | None = getattr(signal, "SIGUSR1", None)
+# Signal the host sends its runners when its terminal hangs up: finish
+# in-flight work before exiting on orphaning. ``None`` where undefined.
+RUNNER_FINISH_WORK_SIGNAL: signal.Signals | None = getattr(signal, "SIGUSR2", None)
 RUNNER_WORKSPACE_ENV_VAR = "OMNIGENT_RUNNER_WORKSPACE"
 RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR = "OMNIGENT_RUNNER_TUNNEL_BINDING_TOKEN"
 # Exit code of a runner whose tunnel the server refused on credentials before
@@ -47,9 +50,16 @@ RUNNER_SLICE_KEY_ENV_VAR = "OMNIGENT_RUNNER_SLICE_KEY"
 # can start harness-specific prewarms before session init arrives. Absent
 # for CLI-local runners and hosts that predate the stamp.
 RUNNER_LAUNCH_HARNESS_ENV_VAR = "OMNIGENT_RUNNER_LAUNCH_HARNESS"
+# JSON harness families whose saved MCP preferences apply to this runner launch.
+RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR = (
+    "OMNIGENT_RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES"
+)
 # JSON-encoded ordered shell inventory discovered by the host daemon. The
 # runner uses this exact snapshot for native wrapper terminal declarations.
 RUNNER_INTERACTIVE_SHELLS_ENV_VAR = "OMNIGENT_RUNNER_INTERACTIVE_SHELLS"
+# Comma-separated names of the variables the launching CLI forwarded to this
+# runner, so env filters further down admit them to harness processes.
+RUNNER_SESSION_ENV_NAMES_ENV_VAR = "OMNIGENT_RUNNER_SESSION_ENV_NAMES"
 RUNNER_TUNNEL_TOKEN_HEADER = "X-Omnigent-Runner-Tunnel-Token"
 # Sentinel ``Origin`` header that the project's own non-browser WebSocket
 # clients (runner -> server tunnel, host/daemon -> server tunnel,
@@ -94,6 +104,25 @@ RUNNER_AUTH_SECRET_ENV_VARS: frozenset[str] = frozenset(
         RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     }
 )
+
+
+def runner_mcp_disabled_servers_active_harnesses(
+    env: Mapping[str, str] | None = None,
+) -> list[str] | None:
+    """Decode the server-owned launch activation; old or malformed stamps apply nothing."""
+    source = os.environ if env is None else env
+    raw = source.get(RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR)
+    if raw is None:
+        return None
+    try:
+        decoded = json.loads(raw)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(decoded, list) or not all(isinstance(item, str) for item in decoded):
+        return None
+    from omnigent.mcp_disabled_servers import HARNESS_EXECUTORS
+
+    return [harness for harness in HARNESS_EXECUTORS if harness in decoded]
 
 
 def touch_connect_marker(env: Mapping[str, str] | None = None) -> None:

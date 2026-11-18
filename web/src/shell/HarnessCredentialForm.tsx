@@ -28,7 +28,7 @@ import {
   type StoreCredentialResult,
   type StoreCredentialInput,
 } from "@/hooks/useHosts";
-import { harnessCredentialAdoptFamilies } from "@/lib/harnessSetup";
+import { harnessCredentialAdoptFamilies, MIN_TMUX_VERSION } from "@/lib/harnessSetup";
 
 export function HarnessCredentialForm({
   harness,
@@ -84,7 +84,12 @@ export function HarnessCredentialForm({
         // "ready" then would contradict the still-yellow dot. Only close the
         // form when the harness actually turned ready, so a not-ready result
         // keeps the options visible to try another.
-        const ready = result.configured_harnesses[harness] === true;
+        const availability = result.configured_harnesses[harness];
+        const ready = availability === true;
+        // The host reports "tmux-unavailable" only for an otherwise ready native
+        // harness, so the credential worked and tmux is what's left. Close the
+        // form and let the parent show the tmux step.
+        const onlyTmuxMissing = availability === "tmux-unavailable";
         // Clear the secret fields so a saved value doesn't linger in the input
         // (the form stays open on a not-ready result to try another option).
         setApiKey("");
@@ -92,6 +97,11 @@ export function HarnessCredentialForm({
         setGatewayKey("");
         if (ready) {
           showToast(`${display} is ready on ${host.name}.`);
+          onDone(result);
+        } else if (onlyTmuxMissing) {
+          showToast(
+            `Saved. ${display} still needs tmux ${MIN_TMUX_VERSION} or newer on ${host.name}.`,
+          );
           onDone(result);
         } else {
           showToast(

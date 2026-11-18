@@ -96,6 +96,7 @@ def record_restore_observation(*, pane: str, surface: str | None) -> None:
         "an overlay": "overlay",
         "the prompt-history search": "history_search",
         "a draft taller than the terminal": "scrolled_draft",
+        "the detailed transcript view": "detailed_transcript",
     }.get(surface, "other")
     fields.setdefault("restore_first_surface", label)
     fields["restore_last_surface"] = label
@@ -110,7 +111,7 @@ def record_restore_observation(*, pane: str, surface: str | None) -> None:
 
 @_best_effort
 def record_restore_action(
-    action: Literal["escape", "shell_clear", "scrolled_draft_clear"],
+    action: Literal["escape", "shell_clear", "scrolled_draft_clear", "transcript_toggle"],
 ) -> None:
     trace = _prompt_delivery_trace.get()
     if trace is not None:

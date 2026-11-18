@@ -58,6 +58,7 @@ from omnigent.native.native_policy_hook import (
     evaluation_response_to_hook_output,
     fail_closed_hook_output,
     hook_payload_to_evaluation_request,
+    is_loopback_url,
     policy_hook_reauth,
     post_evaluate_with_retry,
     read_relay_policy_config,
@@ -306,6 +307,7 @@ def _request_web_approval(
     """
     if deadline is None:
         deadline = time.monotonic() + _PERMISSION_RETRY_WINDOW_S
+    trust_env = not is_loopback_url(url)
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= _PERMISSION_DEADLINE_MARGIN_S:
@@ -324,7 +326,11 @@ def _request_web_approval(
             connect=connect_timeout_s,
         )
         try:
-            with httpx.Client(headers=headers, timeout=timeout) as client:
+            with httpx.Client(
+                headers=headers,
+                timeout=timeout,
+                trust_env=trust_env,
+            ) as client:
                 resp = client.post(url, json=body)
                 resp.raise_for_status()
         except httpx.TimeoutException as exc:

@@ -47,6 +47,7 @@ from omnigent.inner.seatbelt_sandbox import (
     _interpreter_install_root,
     _per_user_dyld_cache_subpath,
     _quote,
+    _resolve_grant,
     _resolve_root,
     _symlink_hop_literals,
 )
@@ -222,6 +223,24 @@ def test_resolve_explicit_cwd_allow_hidden_overrides_default() -> None:
     )
     policy = backend.resolve(spec, Path.cwd())
     assert policy.cwd_allow_hidden == [".cache", ".npmrc"]
+
+
+@pytest.mark.parametrize(
+    ("allow_hidden", "warns"), [([".git"], True), (["*"], True), (None, False)]
+)
+def test_resolve_warns_when_cwd_allow_hidden_exposes_git(
+    allow_hidden: list[str] | None, warns: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Exposing ``.git`` to the agent is logged; the default allowlist is silent."""
+    if sys.platform != "darwin":
+        pytest.skip("seatbelt resolver requires macOS host")
+    spec = OSEnvSpec(
+        type="caller_process",
+        sandbox=OSEnvSandboxSpec(type="darwin_seatbelt", cwd_allow_hidden=allow_hidden),
+    )
+    with caplog.at_level("WARNING", logger="omnigent.inner.seatbelt_sandbox"):
+        _make_backend().resolve(spec, Path.cwd())
+    assert any(".git" in record.message for record in caplog.records) is warns
 
 
 def test_resolve_env_passthrough_propagates_to_policy() -> None:
@@ -573,16 +592,21 @@ def test_profile_emits_extra_read_roots(tmp_path: Path) -> None:
     assert expected in profile
 
 
+@pytest.mark.parametrize("broker_socket", [False, True])
 def test_profile_network_section_for_allow_network_true_no_egress(
     tmp_path: Path,
+    broker_socket: bool,
 ) -> None:
     """
-    ``allow_network=True`` and no egress rules → ``(allow network*)``
-    is emitted so the helper sees the host's full network stack.
+    A broker socket keeps direct networking denied even with allow_network enabled.
     """
+    socket_path = str(tmp_path / "broker.sock")
     policy = _make_policy(tmp_path, allow_network=True)
+    policy.tcp_egress_socket_path = socket_path if broker_socket else None
     profile = _build_profile(policy, tmp_path.resolve(strict=False))
-    assert "(allow network*)" in profile
+    assert ("(allow network*)" in profile) is not broker_socket
+    if broker_socket:
+        assert f'(path-literal "{socket_path}")' in profile
 
 
 def test_profile_network_section_for_allow_network_false_no_egress(
@@ -2689,3 +2713,36 @@ def test_run_launcher_spawn_wrap_private_tmpdir_boots_under_seatbelt(
         "Target ran but didn't reach the scratch-write marker; "
         f"stdout={result.stdout!r} stderr={result.stderr!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Grant containment (pure path resolution; runs on any platform)
+# ---------------------------------------------------------------------------
+
+
+def test_seatbelt_grant_through_symlink_out_of_cwd_is_rejected(tmp_path: Path) -> None:
+    cwd = (tmp_path / "ws").resolve()
+    cwd.mkdir()
+    outside = (tmp_path / "outside").resolve()
+    outside.mkdir()
+    (cwd / "linked").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="outside its working directory"):
+        _resolve_grant(cwd, "linked/secret")
+
+
+def test_seatbelt_mask_through_symlink_out_of_cwd_still_resolves(tmp_path: Path) -> None:
+    """Masks only deny access, so a symlink that leaves cwd must not fail resolution."""
+    cwd = (tmp_path / "ws").resolve()
+    cwd.mkdir()
+    outside = (tmp_path / "outside").resolve()
+    outside.mkdir()
+    (cwd / "linked").symlink_to(outside, target_is_directory=True)
+    assert _resolve_root(cwd, "linked/secret") == outside / "secret"
+
+
+def test_seatbelt_grant_inside_cwd_resolves_through_contained_symlink(tmp_path: Path) -> None:
+    cwd = (tmp_path / "ws").resolve()
+    target = cwd / "target"
+    target.mkdir(parents=True)
+    (cwd / "linked").symlink_to(target, target_is_directory=True)
+    assert _resolve_grant(cwd, "linked/secret") == target / "secret"

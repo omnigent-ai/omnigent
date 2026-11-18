@@ -1,16 +1,16 @@
 // Tests for the pure helpers in src/omnigent_cli.js, run with `node --test`
-// (no extra deps). The spawning functions need a real binary and are covered by
+// (no extra deps). Most spawning functions need a real binary and are covered by
 // the manual verification flow; here we test path resolution order, server-URL
-// matching, and status parsing — the logic that decides "is this machine
-// connected to server X?" and "which omnigent binary do we run?".
+// matching, status parsing, and runCli's failure classification — the logic that
+// decides "is this machine connected to server X?" and "which omnigent binary do we run?".
 
 const { describe, it, mock, afterEach } = require("node:test");
 const assert = require("node:assert/strict");
+const { execFileSync } = require("child_process");
 const fs = require("fs");
 const http = require("http");
 const os = require("os");
 const path = require("path");
-const { spawnSync } = require("child_process");
 
 const {
   normalizeServerUrl,
@@ -21,19 +21,22 @@ const {
   candidatePaths,
   resolveCliPath,
   cliCommandParts,
+  runCli,
   parseJsonLoose,
   matchesServer,
   parseDaemonRecord,
   daemonServerUrl,
   getHostConnectionFast,
   probeServerAuth,
+  probeHostTunnel,
+  hostRoutingEnabled,
   localHostId,
   readLocalHostId,
   liveDaemonRecordFor,
 } = require("../src/omnigent_cli");
 
 describe("cliCommandParts", () => {
-  it("keeps public CLI paths bare and adds fixed isaac argv without a shell", () => {
+  it("keeps plain CLI paths bare and adds fixed isaac argv without a shell", () => {
     assert.deepEqual(cliCommandParts("/bin/omnigent"), {
       executable: "/bin/omnigent",
       prefixArgs: [],
@@ -57,6 +60,98 @@ describe("cliCommandParts", () => {
     assert.throws(() => cliCommandParts(null));
     assert.throws(() => cliCommandParts({ executable: "", prefixArgs: ["omni"] }));
     assert.throws(() => cliCommandParts({ executable: "/bin/isaac", prefixArgs: "omni" }));
+  });
+});
+
+describe("runCli", () => {
+  const nodeScript = (source) => ({ executable: process.execPath, prefixArgs: ["-e", source] });
+
+  it("resolves a clean exit with its output and no failure", async () => {
+    assert.deepEqual(await runCli(nodeScript('process.stdout.write("hi")'), []), {
+      code: 0,
+      stdout: "hi",
+      stderr: "",
+    });
+  });
+
+  it("keeps the exit code and adds the process-level failure", async () => {
+    const res = await runCli(nodeScript('console.error("SECRET"); process.exit(4)'), []);
+    assert.equal(res.code, 4);
+    assert.deepEqual(res.failure, { kind: "exited", exitCode: 4 });
+  });
+
+  it(
+    "keeps the timeout diagnosis when the child answers the kill with an exit code",
+    { skip: process.platform === "win32" && "POSIX signals", timeout: 10000 },
+    async () => {
+      const trapsSigterm = path.join(__dirname, "fixtures", "traps-sigterm.sh");
+      const res = await runCli({ executable: "/bin/sh", prefixArgs: [trapsSigterm] }, [], {
+        timeoutMs: 1000,
+      });
+      assert.equal(res.code, 7);
+      assert.deepEqual(res.failure, { kind: "timed-out", exitCode: 7 });
+    },
+  );
+
+  it("kills the child when its signal aborts", { timeout: 10000 }, async () => {
+    const readyFile = path.join(os.tmpdir(), `runcli-ready-${process.pid}-${Date.now()}`);
+    const controller = new AbortController();
+    const pending = runCli(
+      nodeScript(
+        'require("fs").writeFileSync(process.argv[1], String(process.pid)); setTimeout(() => {}, 60000);',
+      ),
+      [readyFile],
+      { signal: controller.signal },
+    );
+    try {
+      await new Promise((resolve, reject) => {
+        const deadline = Date.now() + 5000;
+        const timer = setInterval(() => {
+          if (fs.existsSync(readyFile)) {
+            clearInterval(timer);
+            resolve();
+          } else if (Date.now() > deadline) {
+            clearInterval(timer);
+            reject(new Error("the child never started"));
+          }
+        }, 25);
+      });
+      const started = Date.now();
+      controller.abort();
+      const res = await pending;
+      assert.notEqual(res.code, 0);
+      const pid = Number(fs.readFileSync(readyFile, "utf8"));
+      // An unreaped zombie still answers signal 0, so ask `ps` for the process state.
+      const state = (() => {
+        try {
+          return execFileSync("ps", ["-o", "stat=", "-p", String(pid)])
+            .toString()
+            .trim();
+        } catch {
+          return "";
+        }
+      })();
+      assert.ok(state === "" || state.startsWith("Z"), `the child is still running (${state})`);
+      assert.ok(Date.now() - started < 5000, "the abort ended the run before its 60s sleep");
+    } finally {
+      // A child that never reported ready must not outlive a failed test.
+      controller.abort();
+      fs.rmSync(readyFile, { force: true });
+    }
+  });
+
+  it("does not mistake execFile's maxBuffer kill for a timeout", async () => {
+    // 2 MiB of stdout overflows execFile's default 1 MiB maxBuffer.
+    const res = await runCli(nodeScript('process.stdout.write("x".repeat(2 * 1024 * 1024))'), []);
+    assert.equal(res.code, 1);
+    assert.deepEqual(res.failure, { kind: "failed" });
+  });
+
+  it("still reports code 1 for a spawn failure, now classified", async () => {
+    const missing = path.join(os.tmpdir(), "omnigent-no-such-cli", "omnigent");
+    const res = await runCli(missing, ["--version"]);
+    assert.equal(res.code, 1);
+    assert.deepEqual(res.failure, { kind: "cli-not-found", errorCode: "ENOENT" });
   });
 });
 
@@ -145,11 +240,15 @@ describe("localServerHealthy", () => {
     assert.equal(await localServerHealthy(), null);
   });
 
-  it("is null for a stale pidfile (dead pid)", async () => {
-    // A just-exited child's pid is dead (reuse within the test is negligible).
-    const { pid } = spawnSync(process.execPath, ["-e", ""]);
+  it("is null for a stale pidfile (dead pid)", async (t) => {
+    const pid = 123456;
+    const fetch = t.mock.method(globalThis, "fetch", async () => ({ ok: true }));
+    t.mock.method(process, "kill", () => {
+      throw Object.assign(new Error("ESRCH"), { code: "ESRCH" });
+    });
     withPidfile(`${pid}\n6767\n`);
     assert.equal(await localServerHealthy(), null);
+    assert.equal(fetch.mock.callCount(), 0);
   });
 
   it("is null when the pid is alive but nothing serves the port", async () => {
@@ -471,6 +570,21 @@ describe("probeServerAuth — /v1/me auth gate", () => {
     assert.deepEqual(await probeServerAuth(url), { authed: false, reachable: true });
   });
 
+  it("ends early, reporting unreachable, when its signal aborts", { timeout: 3000 }, async () => {
+    mock.method(fs, "readFileSync", () => "{}");
+    mock.method(globalThis, "fetch", (_target, init) => {
+      return new Promise((_resolve, reject) => {
+        init.signal.addEventListener("abort", () => reject(new Error("aborted")));
+      });
+    });
+    const controller = new AbortController();
+
+    const pending = probeServerAuth("https://app.example.com", { signal: controller.signal });
+    controller.abort();
+
+    assert.deepEqual(await pending, { authed: false, reachable: false });
+  });
+
   it("returns unreachable (never authed) when fetch throws", async () => {
     mock.method(fs, "readFileSync", () => "{}");
     mock.method(globalThis, "fetch", async () => {
@@ -530,7 +644,12 @@ describe("liveDaemonRecordFor", () => {
   afterEach(() => mock.restoreAll());
 
   it("skips a dead matching record before a live record", async () => {
-    const dead = spawnSync(process.execPath, ["-e", ""]).pid;
+    const dead = process.pid + 1;
+    mock.method(process, "kill", (pid) => {
+      if (pid === dead) throw Object.assign(new Error("ESRCH"), { code: "ESRCH" });
+      assert.equal(pid, process.pid);
+      return true;
+    });
     const records = [dead, process.pid].map((pid) => ({
       pid,
       target: "https://server.example",
@@ -589,5 +708,63 @@ describe("localHostId", () => {
     // prefixed form would make "this machine" unmatchable in the host list.
     assert.equal(localHostId(), "abc123");
     assert.equal(localHostId(), "abc123");
+  });
+});
+
+describe("probeHostTunnel slice key", () => {
+  const HOST_ID = "0f50e4dd924d941d15ae083645926dc3";
+  const WORKSPACE = "https://example.cloud.databricks.com/api/2.0/omnigent";
+  const prevSetting = process.env.OMNIGENT_HOST_SLICE_KEY_ENABLED;
+  afterEach(() => {
+    mock.restoreAll();
+    if (prevSetting === undefined) delete process.env.OMNIGENT_HOST_SLICE_KEY_ENABLED;
+    else process.env.OMNIGENT_HOST_SLICE_KEY_ENABLED = prevSetting;
+  });
+
+  // A stored live token for `serverUrl`, and a fetch that reports the host online.
+  function probeWithToken(serverUrl) {
+    mock.method(fs, "readFileSync", () =>
+      JSON.stringify({ [serverUrl]: { token: "tok", expires_at: Date.now() / 1000 + 3600 } }),
+    );
+    return mock.method(globalThis, "fetch", async () => ({
+      ok: true,
+      json: async () => ({ status: "online" }),
+    }));
+  }
+
+  const sliceKey = (fetch, call = 0) =>
+    fetch.mock.calls[call].arguments[1].headers["X-Databricks-Omnigent-Slice-Key"];
+
+  it("keys the probe by host on the workspace mount", async () => {
+    delete process.env.OMNIGENT_HOST_SLICE_KEY_ENABLED;
+    const fetch = probeWithToken(WORKSPACE);
+    assert.equal((await probeHostTunnel(WORKSPACE, HOST_ID)).status, "online");
+    assert.equal(sliceKey(fetch), HOST_ID);
+  });
+
+  it("sends no key to other servers unless opted in", async () => {
+    delete process.env.OMNIGENT_HOST_SLICE_KEY_ENABLED;
+    const server = "https://omnigent.example.com";
+    const fetch = probeWithToken(server);
+    await probeHostTunnel(server, HOST_ID);
+    assert.equal(sliceKey(fetch), undefined);
+    process.env.OMNIGENT_HOST_SLICE_KEY_ENABLED = "1";
+    await probeHostTunnel(server, HOST_ID);
+    assert.equal(sliceKey(fetch, 1), HOST_ID);
+  });
+
+  it("sends no key on the workspace mount when disabled", async () => {
+    process.env.OMNIGENT_HOST_SLICE_KEY_ENABLED = "0";
+    const fetch = probeWithToken(WORKSPACE);
+    await probeHostTunnel(WORKSPACE, HOST_ID);
+    assert.equal(sliceKey(fetch), undefined);
+  });
+
+  it("matches the workspace mount the way the Python CLI does", () => {
+    delete process.env.OMNIGENT_HOST_SLICE_KEY_ENABLED;
+    assert.equal(hostRoutingEnabled(`${WORKSPACE}/`), true);
+    assert.equal(hostRoutingEnabled(`${WORKSPACE}?o=123`), true);
+    assert.equal(hostRoutingEnabled("https://example.cloud.databricks.com/omnigent"), false);
+    assert.equal(hostRoutingEnabled("not a url"), false);
   });
 });

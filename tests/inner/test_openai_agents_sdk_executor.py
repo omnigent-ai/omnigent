@@ -2166,14 +2166,24 @@ def test_get_openai_client_api_key_no_env_defaults_to_openai(monkeypatch):
     assert captured["base_url"] is None
 
 
-def test_get_openai_client_no_profile_honors_env_vars(monkeypatch):
+@pytest.mark.parametrize(
+    "base_url,tagged",
+    [
+        ("https://env-host.example.com/v1", False),
+        ("https://dbc-1.cloud.databricks.com/ai-gateway/openai/v1", True),
+    ],
+)
+def test_get_openai_client_no_profile_honors_env_vars(monkeypatch, base_url, tagged):
     """Without an explicit profile, the env-var branch still works.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     """
+    import json
+
     from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
 
-    monkeypatch.setenv("OPENAI_BASE_URL", "https://env-host.example.com/v1")
+    monkeypatch.setenv("OMNIGENT_CI_CONTEXT", '{"pipeline":"polly-review","run_id":"123"}')
+    monkeypatch.setenv("OPENAI_BASE_URL", base_url)
     monkeypatch.setenv("OPENAI_API_KEY", "env-key")
 
     captured: dict[str, str] = {}
@@ -2187,9 +2197,68 @@ def test_get_openai_client_no_profile_honors_env_vars(monkeypatch):
     with patch.object(_openai_mod, "AsyncOpenAI", _StubAsyncOpenAI, create=True):
         _get_openai_async_client(profile=None)
 
-    assert captured["base_url"] == "https://env-host.example.com/v1"
+    assert captured["base_url"] == base_url
+    headers = captured["default_headers"]
+    assert bool(headers) == tagged
+    if tagged:
+        assert json.loads(headers["Databricks-Ai-Gateway-Request-Tags"])["run_id"] == "123"
     assert captured["api_key"] == "env-key"
     assert "http_client" not in captured
+
+
+@pytest.mark.parametrize(
+    "base_url,context,tagged",
+    [
+        ("https://dbc-1.cloud.databricks.com/ai-gateway/codex/v1", None, False),
+        ("https://dbc-1.cloud.databricks.com/ai-gateway/codex/v1", "valid", True),
+        ("https://dbc-1.cloud.databricks.com/ai-gateway/codex/v1", "not-json", False),
+        ("https://api.openai.com/v1", "valid", False),
+    ],
+)
+def test_ci_headers_preserve_real_sdk_request(monkeypatch, base_url, context, tagged):
+    """Adding CI metadata preserves the real SDK's auth, defaults, URL, and JSON."""
+    import json
+
+    from openai import AsyncOpenAI
+
+    from omnigent.databricks_ai_gateway import CI_CONTEXT_ENV, REQUEST_TAGS_HEADER
+    from omnigent.inner.openai_agents_sdk_executor import _get_openai_async_client
+    from omnigent.spec.types import RetryPolicy
+
+    monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
+    monkeypatch.delenv(CI_CONTEXT_ENV, raising=False)
+    tags = {"pipeline": "polly-review", "run_id": "123"}
+    if context:
+        monkeypatch.setenv(CI_CONTEXT_ENV, json.dumps(tags) if context == "valid" else context)
+    requests: list[httpx.Request] = []
+
+    def receive(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json={"id": "response-1", "object": "response", "output": []})
+
+    async def send(client: AsyncOpenAI) -> None:
+        # Copy only the transport; preserve the factory's SDK header configuration.
+        async with client:
+            async with client.with_options(
+                http_client=httpx.AsyncClient(transport=httpx.MockTransport(receive))
+            ) as offline:
+                await offline.responses.create(model="test-model", input="Hello")
+
+    _run(send(AsyncOpenAI(api_key="test-key", base_url=base_url, **RetryPolicy().openai.kwargs())))
+    _run(send(_get_openai_async_client(api_key="test-key", base_url_override=base_url)))
+    before, after = requests
+    assert before.url == after.url
+    assert before.method == after.method == "POST"
+    assert before.content == after.content
+    assert before.headers["authorization"] == after.headers["authorization"] == "Bearer test-key"
+    assert before.headers["content-type"] == after.headers["content-type"] == "application/json"
+    ignored = {"idempotency-key", REQUEST_TAGS_HEADER.lower()}
+    assert {key: value for key, value in before.headers.items() if key not in ignored} == {
+        key: value for key, value in after.headers.items() if key not in ignored
+    }
+    assert (REQUEST_TAGS_HEADER in after.headers) == tagged
+    if tagged:
+        assert json.loads(after.headers[REQUEST_TAGS_HEADER]) == tags
 
 
 def test_get_openai_client_model_service_without_provider_fails_loudly(monkeypatch):

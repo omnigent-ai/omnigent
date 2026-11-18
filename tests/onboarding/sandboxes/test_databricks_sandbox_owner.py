@@ -62,6 +62,9 @@ class _FakeConfig:
     def authenticate(self) -> dict[str, str]:
         return self._headers()
 
+    def with_user_agent_extra(self, key: str, value: str) -> _FakeConfig:
+        return self
+
 
 class _FakeWorkspaceClient:
     def __init__(self, *, config: _FakeConfig) -> None:

@@ -35,7 +35,7 @@ describe("sessionFilterPreferences", () => {
   });
 
   it('ignores a stored "shared" on a single-user server', () => {
-    // A loopback-only server drops "Shared sessions" from the menu, so honoring
+    // A loopback-only server drops "Shared with me" from the menu, so honoring
     // it would show an empty list the viewer has no control to leave.
     writeSessionFilter("shared");
     expect(readSessionFilter(false)).toBe("mine");

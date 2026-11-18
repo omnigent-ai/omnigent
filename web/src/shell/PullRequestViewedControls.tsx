@@ -1,0 +1,80 @@
+// Viewed-file controls for the pull request Changes tab: the per-file "Viewed"
+// checkbox in each file's header, and the progress and "Hide viewed" row in the toolbar.
+// The Changes tab renders them only while viewed state is available.
+
+import type { RefObject } from "react";
+import { Badge } from "@/components/ui/badge";
+import { Checkbox } from "@/components/ui/checkbox";
+import { Progress } from "@/components/ui/progress";
+
+/** The "Viewed" checkbox in a file's header, with a badge when the file changed since it was viewed. */
+export function PullRequestViewedToggle({
+  path,
+  viewed,
+  changed,
+  onToggle,
+}: {
+  path: string;
+  viewed: boolean;
+  changed: boolean;
+  onToggle: () => void;
+}) {
+  return (
+    <div className="flex shrink-0 flex-col items-end gap-0.5">
+      <label className="flex cursor-pointer items-center gap-1.5 px-1 text-xs text-muted-foreground">
+        <Checkbox checked={viewed} onCheckedChange={onToggle} aria-label={`Viewed ${path}`} />
+        Viewed
+      </label>
+      {changed && (
+        <Badge variant="outline" className="text-xs">
+          Changed since viewed
+        </Badge>
+      )}
+    </div>
+  );
+}
+
+/** The toolbar's viewed count, a thin bar, and the "Hide viewed" toggle. */
+export function PullRequestViewedProgress({
+  viewedCount,
+  totalCount,
+  partial,
+  mobile,
+  hideViewed,
+  onHideViewedChange,
+  rowRef,
+}: {
+  viewedCount: number;
+  totalCount: number;
+  /** The changed-file list is truncated, so the total is a lower bound. */
+  partial: boolean;
+  /** Mobile shows the count only. */
+  mobile: boolean;
+  hideViewed: boolean;
+  onHideViewedChange: (hide: boolean) => void;
+  /** Lets the Changes tab find the "Hide viewed" box to focus. */
+  rowRef: RefObject<HTMLDivElement | null>;
+}) {
+  return (
+    <div
+      ref={rowRef}
+      className="flex items-center gap-2 whitespace-nowrap text-xs text-muted-foreground"
+    >
+      <span>{`${viewedCount} / ${totalCount} files viewed${partial ? " (partial)" : ""}`}</span>
+      {!mobile && (
+        <Progress
+          aria-label="Files viewed"
+          value={totalCount > 0 ? (viewedCount / totalCount) * 100 : 0}
+          className="w-16"
+        />
+      )}
+      <label className="flex items-center gap-1.5 px-1">
+        <Checkbox
+          checked={hideViewed}
+          onCheckedChange={(checked) => onHideViewedChange(checked === true)}
+        />
+        Hide viewed
+      </label>
+    </div>
+  );
+}

@@ -28,6 +28,25 @@ describe("SetupTerminalStep", () => {
     expect(await screen.findByText("Server ready")).toBeInTheDocument();
   });
 
+  it("shows the error and its existing recovery action on separate lines", async () => {
+    const errorMessage = "Sign-in to https://team.example.com/ didn't complete.";
+    const errorAction = "Finish signing in and try again.";
+    const onRun = vi.fn().mockResolvedValue({
+      ok: false,
+      error: `${errorMessage} ${errorAction}`,
+      errorMessage,
+      errorAction,
+    });
+    render(<SetupTerminalStep onRun={onRun} onBack={vi.fn()} />);
+
+    expect(await screen.findByRole("alert")).toBeInTheDocument();
+    expect(screen.getByText(errorMessage)).toHaveClass("text-destructive");
+    expect(screen.queryByText(`${errorMessage} ${errorAction}`)).toBeNull();
+    const actionLine = screen.getByText(errorAction);
+    expect(actionLine).toHaveClass("text-cyan-700");
+    expect(actionLine.querySelector("span")).toHaveAttribute("aria-hidden", "true");
+  });
+
   it("installs first when onInstallCli is present, then runs the action", async () => {
     const calls: string[] = [];
     const onInstallCli = vi.fn(async () => {
@@ -187,6 +206,41 @@ describe("SetupTerminalStep", () => {
     expect(bar()).toBe("35%");
     rerender(<SetupTerminalStep {...props} connection={{ phase: "connecting" }} />);
     expect(bar()).toBe("70%");
+  });
+
+  it("offers Cancel while the action is still running, and not once it has finished", async () => {
+    const onCancel = vi.fn();
+    let finish: (v: { ok: boolean }) => void = () => {};
+    const onRun = vi.fn(
+      () =>
+        new Promise<{ ok: boolean }>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    render(<SetupTerminalStep onRun={onRun} onBack={vi.fn()} onCancel={onCancel} />);
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(onCancel).toHaveBeenCalledOnce();
+    await act(async () => finish({ ok: false }));
+    expect(screen.queryByRole("button", { name: "Cancel" })).not.toBeInTheDocument();
+  });
+
+  it("leaves the server connect's own Cancel alone", () => {
+    const onCancel = vi.fn();
+    const onCancelConnect = vi.fn();
+    render(
+      <SetupTerminalStep
+        onRun={() => new Promise(() => {})}
+        onBack={vi.fn()}
+        onCancel={onCancel}
+        onCancelConnect={onCancelConnect}
+        connection={{ phase: "connecting" }}
+      />,
+    );
+    const buttons = screen.getAllByRole("button", { name: /cancel/i });
+    expect(buttons).toHaveLength(1);
+    fireEvent.click(buttons[0]);
+    expect(onCancelConnect).toHaveBeenCalledOnce();
+    expect(onCancel).not.toHaveBeenCalled();
   });
 
   it("fires onBack from Back on the failure screen", async () => {

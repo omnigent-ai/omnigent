@@ -67,6 +67,7 @@ updates:
     directories:
       - "/.github/actions/setup-harness-cli/locks/*"
       - "/.github/actions/e2e-run/claude-billing-notice"
+      - "/.github/actions/setup-opencode-e2e"
     schedule:
       interval: monthly
     open-pull-requests-limit: 0

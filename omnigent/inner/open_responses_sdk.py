@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
 import pydantic
 
+from omnigent.databricks_ai_gateway import gateway_request_tag_headers
 from omnigent.llms.adapters._content import redact_inline_data_uris
 from omnigent.models import model_catalog
 from omnigent.spec.types import RetryPolicy
@@ -129,6 +130,7 @@ def _get_openai_client(
     if os.environ.get("OPENAI_BASE_URL"):
         return OpenAI(
             base_url=os.environ["OPENAI_BASE_URL"],
+            default_headers=gateway_request_tag_headers(os.environ["OPENAI_BASE_URL"]),
             # Some OpenAI-compatible endpoints (Databricks model serving)
             # don't validate the API key client-side; the SDK still
             # requires a non-empty value, so we supply this documented
@@ -148,6 +150,7 @@ def _get_openai_client(
     if creds is not None:
         return OpenAI(
             base_url=_databricks_openai_base_url(creds.host),
+            default_headers=gateway_request_tag_headers(_databricks_openai_base_url(creds.host)),
             api_key=creds.token,
             **retry_kwargs,
         )

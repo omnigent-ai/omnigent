@@ -56,6 +56,7 @@ import yaml
 from omnigent.host.identity import HOST_TOKEN_ENV_VAR as _HOST_TOKEN_ENV_VAR
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.host.identity_env import in_managed_sandbox
+from omnigent.telemetry.request_headers import client_identity_headers
 
 _TIMEOUT_S = 15.0
 
@@ -98,7 +99,7 @@ def _fetch(server: str, host_id: str, host_token: str) -> dict | None:
     try:
         resp = httpx.get(
             _credential_url(server, host_id),
-            headers={MANAGED_HOST_TOKEN_HEADER: host_token},
+            headers={**client_identity_headers(), MANAGED_HOST_TOKEN_HEADER: host_token},
             timeout=_TIMEOUT_S,
         )
     except httpx.HTTPError:

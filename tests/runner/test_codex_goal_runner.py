@@ -248,17 +248,24 @@ async def test_request_maps_generic_exception_to_safe_detail(
 
 
 @pytest.mark.parametrize(
-    ("method", "stage", "error", "empty"),
+    ("method", "stage", "error", "require_live", "status_code"),
     [
-        ("thread/goal/get", "connect", ConnectionRefusedError(), True),
-        ("thread/goal/get", "connect", FileNotFoundError(), True),
-        ("thread/goal/get", "connect", RuntimeError("handshake failed"), False),
-        ("thread/goal/get", "request", ConnectionRefusedError(), False),
-        ("thread/goal/set", "connect", ConnectionRefusedError(), False),
+        ("thread/goal/get", "connect", ConnectionRefusedError(), False, 200),
+        ("thread/goal/get", "connect", FileNotFoundError(), False, 200),
+        ("thread/goal/get", "connect", ConnectionRefusedError(), True, 503),
+        ("thread/goal/get", "connect", FileNotFoundError(), True, 503),
+        ("thread/goal/get", "connect", RuntimeError("handshake failed"), False, 503),
+        ("thread/goal/get", "request", ConnectionRefusedError(), False, 503),
+        ("thread/goal/set", "connect", ConnectionRefusedError(), False, 503),
     ],
 )
 async def test_inactive_bridge_only_changes_read_connection_refusal(
-    monkeypatch: pytest.MonkeyPatch, method: str, stage: str, error: Exception, empty: bool
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    stage: str,
+    error: Exception,
+    require_live: bool,
+    status_code: int,
 ) -> None:
     fake_client = _FakeCodexClient(
         connect_exc=error if stage == "connect" else None,
@@ -271,13 +278,16 @@ async def test_inactive_bridge_only_changes_read_connection_refusal(
     )
     runner = _make_runner(bridge_is_inactive=lambda _conv_id, _state: True)
 
-    result = await runner._request("conv_1", action="read", method=method, params={})
+    result = await runner._request(
+        "conv_1", action="read", method=method, params={}, require_live=require_live
+    )
 
-    if empty:
-        assert result == {"goal": None}
+    if status_code == 200:
+        assert result == {"goal": None, "available": False}
     else:
         assert isinstance(result, JSONResponse)
-        assert result.status_code == 503
+        assert result.status_code == status_code
+        assert _json_response(result)["error"] == "codex_native_goal_failed"
     assert len(fake_client.request_calls) == (1 if stage == "request" else 0)
     assert fake_client.closed
 
@@ -304,7 +314,91 @@ async def test_get_allows_absent_goal() -> None:
 
     response = await runner.get("conv_1")
 
-    assert _json_response(response) == {"goal": None}
+    assert _json_response(response) == {"goal": None, "available": True}
+
+
+@pytest.mark.parametrize("require_live", [False, True])
+async def test_get_preserves_unavailable_reads(
+    monkeypatch: pytest.MonkeyPatch, require_live: bool
+) -> None:
+    fake_client = _FakeCodexClient(response={"result": {"goal": None, "available": False}})
+    monkeypatch.setitem(
+        sys.modules,
+        "omnigent.harnesses.codex_native.app_server",
+        SimpleNamespace(client_for_transport=lambda *_args, **_kwargs: fake_client),
+    )
+    runner = _make_runner()
+
+    response = await runner.get("conv_1", require_live=require_live)
+
+    assert fake_client.connect_calls == 1
+    assert fake_client.request_calls == [("thread/goal/get", {"threadId": "thread_1"})]
+    assert fake_client.closed is True
+    if require_live:
+        assert response.status_code == 503
+        assert _json_response(response) == {
+            "error": "codex_native_goal_failed",
+            "detail": "Codex-native goal read requires a live Codex bridge.",
+        }
+    else:
+        assert response.status_code == 200
+        assert _json_response(response) == {"goal": None, "available": False}
+
+
+async def test_get_marks_a_native_goal_available(upstream_goal: dict[str, object]) -> None:
+    runner = _make_runner()
+    runner._request = AsyncMock(return_value={"goal": upstream_goal})  # type: ignore[method-assign]
+
+    response = await runner.get("conv_1")
+
+    assert _json_response(response) == {
+        "goal": CodexGoalRunner._goal_to_api(upstream_goal),
+        "available": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("payload", "detail"),
+    [
+        ({}, "invalid goal object"),
+        ({"available": True}, "invalid goal object"),
+        ({"available": False}, "invalid goal object"),
+    ]
+    + [
+        ({"goal": None, "available": value}, "invalid availability")
+        for value in (None, 0, 1, "true", "false", [], {})
+    ],
+)
+async def test_get_rejects_malformed_read_envelopes(
+    payload: dict[str, object], detail: str
+) -> None:
+    runner = _make_runner()
+    runner._request = AsyncMock(return_value=payload)  # type: ignore[method-assign]
+
+    response = await runner.get("conv_1")
+
+    assert response.status_code == 503
+    assert _json_response(response) == {
+        "error": "codex_native_goal_failed",
+        "detail": f"Codex-native goal read returned {detail}.",
+    }
+
+
+async def test_get_rejects_an_unavailable_native_goal(
+    upstream_goal: dict[str, object],
+) -> None:
+    runner = _make_runner()
+    runner._request = AsyncMock(  # type: ignore[method-assign]
+        return_value={"goal": upstream_goal, "available": False}
+    )
+
+    response = await runner.get("conv_1")
+
+    assert response.status_code == 503
+    assert _json_response(response) == {
+        "error": "codex_native_goal_failed",
+        "detail": "Codex-native goal read returned invalid availability.",
+    }
 
 
 @pytest.mark.asyncio
@@ -438,8 +532,8 @@ async def test_handle_event_rejects_non_codex_session() -> None:
     }
 
 
-@pytest.mark.asyncio
-async def test_handle_event_goal_get_and_clear_delegate() -> None:
+@pytest.mark.parametrize("require_live", [False, True])
+async def test_handle_event_goal_get_and_clear_delegate(require_live: bool) -> None:
     runner = _make_runner()
     runner.get = AsyncMock(return_value=JSONResponse({"goal": None}))  # type: ignore[method-assign]
     runner.clear = AsyncMock(return_value=JSONResponse({"cleared": True}))  # type: ignore[method-assign]
@@ -447,7 +541,7 @@ async def test_handle_event_goal_get_and_clear_delegate() -> None:
     get_response = await runner.handle_event(
         "conv_1",
         "goal_get",
-        {},
+        {"require_live": True} if require_live else {},
         session_harness_name=lambda _conv_id: CODEX_NATIVE_CODING_AGENT.harness,
     )
     clear_response = await runner.handle_event(
@@ -461,7 +555,7 @@ async def test_handle_event_goal_get_and_clear_delegate() -> None:
     assert isinstance(clear_response, JSONResponse)
     assert _json_response(get_response) == {"goal": None}
     assert _json_response(clear_response) == {"cleared": True}
-    runner.get.assert_awaited_once_with("conv_1")
+    runner.get.assert_awaited_once_with("conv_1", require_live=require_live)
     runner.clear.assert_awaited_once_with("conv_1")
 
 

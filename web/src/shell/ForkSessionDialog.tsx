@@ -7,6 +7,8 @@ import {
   useSyncExternalStore,
   type ReactNode,
 } from "react";
+import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { managedSandboxHostId } from "@/lib/managedSandboxHost";
 import { useNavigate } from "@/lib/routing";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -44,10 +46,7 @@ import {
 import { SANDBOX_PROFILES_QUERY_KEY } from "@/lib/sandboxProfilesApi";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
-import {
-  SESSION_ACTIONS_LOADING,
-  workspaceRecoveryDisabledReason,
-} from "@/lib/sessionCapabilities";
+import { SESSION_ACTIONS_LOADING } from "@/lib/sessionCapabilities";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { fetchSessionRepositoryBranches, forkSession, launchRunner } from "@/lib/sessionsApi";
 import { useAvailableAgents, prefetchAvailableAgentDetails } from "@/hooks/useAvailableAgents";
@@ -55,7 +54,7 @@ import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { partitionAgentsByKind } from "@/lib/agentGrouping";
 import { useSessionAgent } from "@/hooks/useAgents";
 import { useSession } from "@/hooks/useSession";
-import type { Session } from "@/lib/types";
+import type { NativeModelOption, Session } from "@/lib/types";
 import { useHosts, useHostModelOptions, type Host } from "@/hooks/useHosts";
 import {
   nativeAgentHasCapability,
@@ -80,12 +79,12 @@ import {
   type NativeHarnessMode,
 } from "@/lib/nativeHarnessModes";
 import {
-  CLAUDE_NATIVE_EFFORTS,
   DescribedSelect,
   EFFORT_SELECT_NONE,
   MODEL_SELECT_DEFAULT,
   RoutingModelSelect,
   defaultModelLabel,
+  nativeEffortOptions,
   nativeModelLabel,
 } from "@/components/HarnessConfigControls";
 import { useDirectorySessions } from "@/hooks/useDirectorySessions";
@@ -95,7 +94,6 @@ import { agentRootName, forkTargetCarriesHistory, harnessFamily } from "@/lib/fo
 import { checkHostDirectory, hostDirectoryMissing } from "@/hooks/useHostFilesystem";
 import { getCliServerUrl } from "@/lib/host";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { randomUUID } from "@/lib/randomUUID";
 import { sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
 import { sandboxHostChoice, sandboxHostChoiceProvider } from "@/lib/hostPreferences";
 import type { LastSandboxRepo } from "@/lib/repoPreferences";
@@ -141,8 +139,6 @@ const SAME_AS_SOURCE = "__same__";
 // on the dropdown content rather than plain inheritance.
 const FORK_SELECT_ITEM_SM = "[&_[data-slot=select-item]]:text-sm";
 
-const NO_HOSTS: Host[] = [];
-
 /** Form fields that can block submit, mapped to the control a blocked click focuses. */
 type ForkField = "host" | "directory" | "sandboxRepo" | "sandboxProfile";
 const FORK_FIELD_IDS: Record<ForkField, string> = {
@@ -173,16 +169,18 @@ function sandboxRepositoryHint(count: number): string {
  * Compact host label for the Select item — mirrors NewChatDialog's
  * HostOption (which is private to that module).
  */
-function HostLabel({ host }: { host: Host }) {
+export function HostLabel({ host }: { host: Host }) {
   const isOnline = host.status === "online";
   return (
     <span className="flex items-center gap-2">
-      {host.name.toLowerCase().includes("cloud") ? (
+      {host.sandbox_provider || host.name.toLowerCase().includes("cloud") ? (
         <MonitorCloudIcon className="size-4 text-muted-foreground" />
       ) : (
         <MonitorIcon className="size-4 text-muted-foreground" />
       )}
-      <span className="font-mono text-sm">{host.name}</span>
+      <span className={host.sandbox_provider ? "text-sm" : "font-mono text-sm"}>
+        {host.sandbox_provider ? "Same sandbox" : host.name}
+      </span>
       <span
         className={`inline-flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider ${
           isOnline ? "text-green-600" : "text-muted-foreground"
@@ -274,11 +272,12 @@ export interface ForkRunConfigValue {
  * permission/approval/mode pickers seed from the source only on a same-AGENT
  * fork (`sameAgentAsSource`); otherwise each seeds the target's default. See
  * the parent for how those two flags are derived from the backend's
- * `copy_model_settings` / `copy_terminal_launch_args` gates.
+ * `copy_model_settings` / `copy_terminal_launch_args` gates. The Run workflow
+ * dialog passes no source, so every picker starts on its default there.
  *
- * Emission is opt-in per control: a field is sent ONLY when the user actually
- * changed that control (see `touched`). An untouched control omits its field,
- * so the fork request carries nothing for it and the server's own
+ * Emission is opt-in per control: a field is sent when the user changes that
+ * control; choosing a model also settles its effort. An untouched control omits
+ * its field, so the fork request carries nothing for it and the server's own
  * inherit / reset-by-family path decides — which is exactly the seeded meaning.
  * This is what keeps the section honest against the async model catalog: a
  * submit before the catalog resolves can't emit a spurious `model_override`.
@@ -295,15 +294,22 @@ export interface ForkRunConfigValue {
  *   backend carries only on a same-agent fork.
  * @param selectedHostId - Host whose model catalog feeds the model picker; null
  *   leaves it on Default until a host is chosen.
+ * @param modelCatalog - Models to offer instead of the host's, e.g. a new
+ *   sandbox's; omitted to list the selected host's.
+ * @param remembered - Settings to start on in place of the source's, e.g. the
+ *   last ones used for a new session. With it, every shown control reports its
+ *   value, changed or not: a new session has no source to inherit from.
  * @param onChange - Reports the ready-to-send value on every change.
  */
-function ForkRunConfig({
+export function ForkRunConfig({
   targetHarness,
   targetAgent,
   sourceSession,
   sameFamilyAsSource,
   sameAgentAsSource,
   selectedHostId,
+  modelCatalog,
+  remembered,
   onChange,
 }: {
   targetHarness: string | null;
@@ -312,8 +318,11 @@ function ForkRunConfig({
   sameFamilyAsSource: boolean;
   sameAgentAsSource: boolean;
   selectedHostId: string | null;
+  modelCatalog?: { options: NativeModelOption[]; loading: boolean };
+  remembered?: ForkRunConfigValue;
   onChange: (value: ForkRunConfigValue) => void;
 }) {
+  const reportAll = remembered !== undefined;
   const hasPermission = nativeAgentHasCapability(targetAgent, "permissionMode");
   const hasApproval = nativeAgentHasCapability(targetAgent, "approvalMode");
   const hasCursor = nativeAgentHasCapability(targetAgent, "cursorMode");
@@ -328,19 +337,20 @@ function ForkRunConfig({
   // native harnesses that expose a picker resolve a catalog; others pass a
   // harmless unused harness key with the query disabled.
   const catalogHarness = showModel && targetHarness ? targetHarness : "claude-native";
-  const { data: hostModelOptions, isLoading: modelsLoading } = useHostModelOptions(
+  const hostCatalog = useHostModelOptions(
     selectedHostId,
     catalogHarness,
-    showModel && selectedHostId !== null,
+    showModel && selectedHostId !== null && modelCatalog === undefined,
   );
+  const catalogOptions = modelCatalog?.options ?? hostCatalog.data;
+  const modelsLoading = modelCatalog?.loading ?? hostCatalog.isLoading;
   const modelOptions = useMemo(
     () =>
-      (hostModelOptions ?? []).map((option) => ({
-        id: option.id,
+      (catalogOptions ?? []).map((option) => ({
+        ...option,
         displayName: option.displayName ?? option.id,
-        isDefault: option.isDefault,
       })),
-    [hostModelOptions],
+    [catalogOptions],
   );
   const modelSelectOptions = useMemo(
     () => modelOptions.map((m) => ({ id: m.id, label: nativeModelLabel(m) })),
@@ -354,19 +364,42 @@ function ForkRunConfig({
     // Seed the source's model only once the catalog confirms it: a model id
     // absent from the loaded options has no Select item to land on and would
     // blank the trigger. Until the catalog resolves, Default holds.
-    const picked = sameFamilyAsSource ? sourceSession?.modelOverride : null;
+    const picked = remembered
+      ? remembered.modelOverride
+      : sameFamilyAsSource
+        ? sourceSession?.modelOverride
+        : null;
     return picked && modelOptions.some((m) => m.id === picked) ? picked : MODEL_SELECT_DEFAULT;
-  }, [sameFamilyAsSource, sourceSession, modelOptions]);
+  }, [remembered, sameFamilyAsSource, sourceSession, modelOptions]);
+  const [model, setModel] = useState(seededModel);
+  const effortOptions = useMemo(
+    () =>
+      nativeEffortOptions(
+        targetHarness,
+        modelOptions,
+        model === MODEL_SELECT_DEFAULT ? null : model,
+      ) ?? [],
+    [targetHarness, modelOptions, model],
+  );
+  const showEffort = effortOptions.length > 0;
   const seededEffort = useMemo(() => {
     // Seed only an effort the picker can display; a source value outside the
-    // offered vocabulary (e.g. "minimal") falls back to Default rather than
-    // leaving the Select on an empty, unselectable value.
-    const effort = sameFamilyAsSource ? sourceSession?.reasoningEffort : null;
-    return effort && CLAUDE_NATIVE_EFFORTS.some((e) => e.value === effort)
-      ? effort
-      : EFFORT_SELECT_NONE;
-  }, [sameFamilyAsSource, sourceSession]);
+    // selected model's vocabulary falls back to Default.
+    const effort = remembered
+      ? remembered.reasoningEffort
+      : sameFamilyAsSource
+        ? sourceSession?.reasoningEffort
+        : null;
+    return effort && effortOptions.some((e) => e.value === effort) ? effort : EFFORT_SELECT_NONE;
+  }, [remembered, sameFamilyAsSource, sourceSession, effortOptions]);
   const seededPermission = useMemo(() => {
+    if (remembered) {
+      // Only a mode the picker still offers.
+      const mode = claudePermissionModeFromSession(remembered);
+      return mode && CLAUDE_NATIVE_PERMISSION_MODES.some((m) => m.value === mode)
+        ? mode
+        : CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE;
+    }
     // Permission mode rides terminal_launch_args, which the backend copies
     // ONLY on a same-AGENT fork (copy_terminal_launch_args = not switching).
     // Seed on the same rule (not harness equality) so the displayed mode can't
@@ -377,11 +410,15 @@ function ForkRunConfig({
       );
     }
     return CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE;
-  }, [sameAgentAsSource, sourceSession]);
+  }, [remembered, sameAgentAsSource, sourceSession]);
   const seededModeValue = useMemo(() => {
     // Same as permission: launch args carry over only on a same-agent fork, so
     // seed the mode from the source only then; otherwise the harness's default.
-    const source = sameAgentAsSource ? (sourceSession?.terminalLaunchArgs ?? []) : [];
+    const source = remembered
+      ? (remembered.terminalLaunchArgs ?? [])
+      : sameAgentAsSource
+        ? (sourceSession?.terminalLaunchArgs ?? [])
+        : [];
     const table: NativeHarnessMode[] = hasApproval
       ? CODEX_NATIVE_APPROVAL_MODES
       : hasCursor
@@ -398,11 +435,11 @@ function ForkRunConfig({
     // same-agent fork of a bypass-armed codex source seeds the bypass option.
     // (The source label is still dropped server-side; re-selecting here is the
     // explicit opt-in that re-arms it — never automatic.)
-    if (
-      isCodex &&
-      sameAgentAsSource &&
-      sourceSession?.labels?.["omnigent.codex_native.bypass_sandbox"] === "1"
-    ) {
+    const bypassed = remembered
+      ? remembered.codexBypassSandbox === true
+      : sameAgentAsSource &&
+        sourceSession?.labels?.["omnigent.codex_native.bypass_sandbox"] === "1";
+    if (isCodex && bypassed) {
       return CODEX_NATIVE_BYPASS_APPROVAL_VALUE;
     }
     // Match the source's launch args against the mode table (longest args first
@@ -411,15 +448,17 @@ function ForkRunConfig({
       .sort((a, b) => b.args.length - a.args.length)
       .find((m) => m.args.length > 0 && m.args.every((arg) => source.includes(arg)));
     return match?.value ?? dflt;
-  }, [isCodex, sameAgentAsSource, sourceSession, hasApproval, hasCursor, hasAgySkip]);
+  }, [remembered, isCodex, sameAgentAsSource, sourceSession, hasApproval, hasCursor, hasAgySkip]);
 
-  const [model, setModel] = useState(seededModel);
   const [effort, setEffort] = useState(seededEffort);
+  const selectedEffort = effortOptions.some((option) => option.value === effort)
+    ? effort
+    : EFFORT_SELECT_NONE;
   const [permission, setPermission] = useState(seededPermission);
   const [mode, setMode] = useState(seededModeValue);
 
-  // Which controls the user has actually changed. An UNTOUCHED control omits
-  // its field from the emitted config, so the fork request never carries it
+  // Which controls the user has chosen (a model pick also settles effort).
+  // An UNTOUCHED control omits its field, so the fork request never carries it
   // and the server's inherit / reset-by-family path decides — which is exactly
   // the seeded meaning (same-harness → inherit the source; switch → the
   // target's default). This is what makes the section safe against the async
@@ -436,8 +475,19 @@ function ForkRunConfig({
     mode: false,
   });
   const changeModel = (v: string) => {
-    setTouched((t) => ({ ...t, model: true }));
+    const nextEfforts = nativeEffortOptions(
+      targetHarness,
+      modelOptions,
+      v === MODEL_SELECT_DEFAULT ? null : v,
+    );
+    // Settle effort too, so a clone cannot inherit an effort the new model rejects.
+    setTouched((t) => ({ ...t, model: true, effort: true }));
     setModel(v);
+    setEffort(
+      nextEfforts?.some((option) => option.value === selectedEffort)
+        ? selectedEffort
+        : EFFORT_SELECT_NONE,
+    );
   };
   const changeEffort = (v: string) => {
     setTouched((t) => ({ ...t, effort: true }));
@@ -474,20 +524,20 @@ function ForkRunConfig({
   // for a fork that sent no run-config at all.
   useEffect(() => {
     const value: ForkRunConfigValue = {};
-    if (showModel && touched.model) {
+    if (showModel && (touched.model || reportAll)) {
       value.modelOverride = model === MODEL_SELECT_DEFAULT ? "default" : model;
     }
+    if (touched.effort || (showEffort && reportAll)) {
+      value.reasoningEffort = selectedEffort === EFFORT_SELECT_NONE ? "default" : selectedEffort;
+    }
     if (hasPermission) {
-      if (touched.effort) {
-        value.reasoningEffort = effort === EFFORT_SELECT_NONE ? "default" : effort;
-      }
-      if (touched.permission) {
+      if (touched.permission || reportAll) {
         value.terminalLaunchArgs =
           permission === CLAUDE_NATIVE_DEFAULT_PERMISSION_MODE
             ? []
             : ["--permission-mode", permission];
       }
-    } else if (hasApproval && touched.mode) {
+    } else if (hasApproval && (touched.mode || reportAll)) {
       if (isCodex && mode === CODEX_NATIVE_BYPASS_APPROVAL_VALUE) {
         // Bypass is a LABEL, not launch args: clear any preset flags and set
         // the dedicated opt-in the server turns into the bypass label.
@@ -497,24 +547,26 @@ function ForkRunConfig({
         value.terminalLaunchArgs =
           CODEX_NATIVE_APPROVAL_MODES.find((m) => m.value === mode)?.args ?? [];
       }
-    } else if (hasCursor && touched.mode) {
+    } else if (hasCursor && (touched.mode || reportAll)) {
       value.terminalLaunchArgs = CURSOR_NATIVE_EXEC_MODES.find((m) => m.value === mode)?.args ?? [];
-    } else if (hasAgySkip && touched.mode) {
+    } else if (hasAgySkip && (touched.mode || reportAll)) {
       value.terminalLaunchArgs = AGY_NATIVE_SKIP_MODES.find((m) => m.value === mode)?.args ?? [];
     }
     onChange(value);
   }, [
     showModel,
+    showEffort,
     hasPermission,
     hasApproval,
     hasCursor,
     hasAgySkip,
     isCodex,
     model,
-    effort,
+    selectedEffort,
     permission,
     mode,
     touched,
+    reportAll,
     onChange,
   ]);
 
@@ -545,53 +597,55 @@ function ForkRunConfig({
             )}
             {!modelsLoading && modelOptions.length === 0 && (
               <div className="px-2.5 py-1 text-sm text-muted-foreground">
-                {selectedHostId === null ? "Select a host to list models" : "Models unavailable"}
+                {selectedHostId === null && modelCatalog === undefined
+                  ? "Select a host to list models"
+                  : "Models unavailable"}
               </div>
             )}
           </RoutingModelSelect>
         </ForkConfigRow>
       )}
 
-      {hasPermission && (
-        <>
-          <ForkConfigRow label="Effort">
-            <Select
-              value={effort}
-              onValueChange={changeEffort}
-              componentId="fork_session.config.effort"
-              valueHasNoPii
+      {showEffort && (
+        <ForkConfigRow label="Effort">
+          <Select
+            value={selectedEffort}
+            onValueChange={changeEffort}
+            componentId="fork_session.config.effort"
+            valueHasNoPii
+          >
+            <SelectTrigger
+              className="w-full cursor-pointer text-sm"
+              data-testid="fork-session-config-effort"
+              aria-label="Reasoning effort"
             >
-              <SelectTrigger
-                className="w-full cursor-pointer text-sm"
-                data-testid="fork-session-config-effort"
-                aria-label="Reasoning effort"
-              >
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent position="popper" align="start" className={FORK_SELECT_ITEM_SM}>
-                <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
-                {CLAUDE_NATIVE_EFFORTS.map((e) => (
-                  <SelectItem key={e.value} value={e.value}>
-                    {e.label}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </ForkConfigRow>
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent position="popper" align="start" className={FORK_SELECT_ITEM_SM}>
+              <SelectItem value={EFFORT_SELECT_NONE}>Default</SelectItem>
+              {effortOptions.map((e) => (
+                <SelectItem key={e.value} value={e.value}>
+                  {e.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </ForkConfigRow>
+      )}
 
-          <ForkConfigRow label="Permissions">
-            <DescribedSelect
-              value={permission}
-              onValueChange={changePermission}
-              options={CLAUDE_NATIVE_PERMISSION_MODES}
-              testId="fork-session-config-permission"
-              ariaLabel="Permissions"
-              triggerClassName="text-sm"
-              contentClassName={FORK_SELECT_ITEM_SM}
-              componentId="fork_session.config.permission"
-            />
-          </ForkConfigRow>
-        </>
+      {hasPermission && (
+        <ForkConfigRow label="Permissions">
+          <DescribedSelect
+            value={permission}
+            onValueChange={changePermission}
+            options={CLAUDE_NATIVE_PERMISSION_MODES}
+            testId="fork-session-config-permission"
+            ariaLabel="Permissions"
+            triggerClassName="text-sm"
+            contentClassName={FORK_SELECT_ITEM_SM}
+            componentId="fork_session.config.permission"
+          />
+        </ForkConfigRow>
       )}
 
       {hasApproval && (
@@ -750,18 +804,12 @@ function ForkRunConfig({
  * @param onClose - Closes the host dialog (Cancel, and after a
  *   successful fork).
  */
-export function ForkSessionForm(
-  props: Omit<Parameters<typeof SupportedForkSessionForm>[0], "sandboxOnlyProvider">,
-) {
-  const { forkDisabledReason, forkSandboxProvider } = useSessionActionRestrictions(
-    props.sourceSessionId,
-    { hostId: props.sourceHostId },
-  );
-  const disabledReason =
-    forkDisabledReason ??
-    (props.workspaceRecovery ? workspaceRecoveryDisabledReason(forkSandboxProvider) : undefined);
-  if (disabledReason) {
-    const loading = disabledReason === SESSION_ACTIONS_LOADING;
+export function ForkSessionForm(props: Parameters<typeof SupportedForkSessionForm>[0]) {
+  const { forkDisabledReason } = useSessionActionRestrictions(props.sourceSessionId, {
+    hostId: props.sourceHostId,
+  });
+  if (forkDisabledReason) {
+    const loading = forkDisabledReason === SESSION_ACTIONS_LOADING;
     return (
       <>
         <p
@@ -769,14 +817,14 @@ export function ForkSessionForm(
           className="text-sm text-muted-foreground"
           data-testid="fork-session-unavailable"
         >
-          {disabledReason}
+          {forkDisabledReason}
         </p>
         <DialogFooter>
           <Button variant="ghost" onClick={props.onClose}>
             Cancel
           </Button>
           {!loading && (
-            <DisabledActionTooltip reason={disabledReason} label="Clone session">
+            <DisabledActionTooltip reason={forkDisabledReason} label="Clone session">
               <Button data-testid="fork-session-submit" disabled>
                 {props.workspaceRecovery
                   ? "Continue"
@@ -790,7 +838,7 @@ export function ForkSessionForm(
       </>
     );
   }
-  return <SupportedForkSessionForm {...props} sandboxOnlyProvider={forkSandboxProvider} />;
+  return <SupportedForkSessionForm {...props} />;
 }
 
 function SupportedForkSessionForm({
@@ -801,7 +849,6 @@ function SupportedForkSessionForm({
   sourceGitBranch,
   upToResponseId,
   workspaceRecovery = false,
-  sandboxOnlyProvider,
   visible,
   onClose,
 }: {
@@ -812,8 +859,6 @@ function SupportedForkSessionForm({
   sourceGitBranch?: string | null;
   upToResponseId?: string | null;
   workspaceRecovery?: boolean;
-  /** The only target offered: a fresh sandbox from this provider. */
-  sandboxOnlyProvider?: string;
   visible: boolean;
   onClose: () => void;
 }) {
@@ -831,6 +876,9 @@ function SupportedForkSessionForm({
   // Name is optional — left blank, the server derives "Fork of <source
   // title>" (shown as the input's placeholder). So the field starts empty.
   const [title, setTitle] = useState("");
+  // Safari confirms an IME candidate with an Enter that isn't flagged as
+  // composing, so track composition like the chat composer does.
+  const isComposingRef = useRef(false);
   const [agentChoice, setAgentChoice] = useState<string>(SAME_AS_SOURCE);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -877,11 +925,10 @@ function SupportedForkSessionForm({
   const [showErrors, setShowErrors] = useState(false);
   const [focusField, setFocusField] = useState<ForkField | null>(null);
 
-  // A coding source ran in a working directory, so the fork needs a host +
-  // directory to start; a sandbox-only fork always picks its sandbox. Others
-  // fork with just name + agent (no directory to pick).
-  const sandboxOnly = sandboxOnlyProvider !== undefined;
-  const isCodingSource = workspaceRecovery || Boolean(sourceWorkspace) || sandboxOnly;
+  // A coding source ran in a working directory; only then does the fork
+  // need a host + directory to start. A non-coding source forks with just
+  // name + agent (no directory to pick).
+  const isCodingSource = workspaceRecovery || Boolean(sourceWorkspace);
 
   // Host/dir/worktree state — only meaningful for a coding source.
   const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
@@ -912,32 +959,53 @@ function SupportedForkSessionForm({
   const { data: agents } = useAvailableAgents({ enabled: true });
   const { data: sourceAgent } = useSessionAgent(sourceSessionId);
 
+  const info = useServerInfo();
+  const reusableSourceHostId =
+    info !== "loading" && info.sibling_sessions ? sourceHostId : undefined;
   // Hosts for the picker — only for a coding source (a non-coding fork
-  // never shows the host field). A sandbox-only fork offers none.
-  const { data: fetchedHosts } = useHosts({ enabled: isCodingSource && !sandboxOnly });
-  const hosts = sandboxOnly ? NO_HOSTS : fetchedHosts;
+  // never shows the host field). Reuse the source sandbox only when the server
+  // advertises the shared-sandbox lifecycle that makes it safe.
+  const { data: hosts } = useHosts({
+    enabled: isCodingSource,
+    sourceHostId: reusableSourceHostId,
+  });
   const allHosts = hosts ?? [];
   const onlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "online"), [hosts]);
   const offlineHosts = useMemo(() => (hosts ?? []).filter((h) => h.status === "offline"), [hosts]);
   const sourceHostOnline = onlineHosts.some((h) => h.host_id === sourceHostId);
+  // Pickers omit sandbox hosts, so read the source's provider from the full
+  // list (the query the action-restrictions lookup already shares).
+  const { data: hostsWithSandboxes, isLoading: sourceHostLoading } = useHosts({
+    includeSandbox: true,
+    enabled: isCodingSource && Boolean(sourceHostId),
+  });
+  const sourceSandboxProvider =
+    hostsWithSandboxes?.find((h) => h.host_id === sourceHostId)?.sandbox_provider ?? null;
   const serverUrl = getCliServerUrl();
 
   // Gates the sandbox rows in the host picker: only servers whose sandbox
   // config can actually serve a managed launch advertise it. "loading"
   // fails closed (rows hidden) until the boot probe resolves. Same gate
   // NewChatDialog uses for its own sandbox option.
-  const info = useServerInfo();
   const managedSandboxesEnabled =
     !workspaceRecovery && info !== "loading" && info.managed_sandboxes_enabled;
   // One picker row per configured provider; a single-provider server
-  // yields exactly one, as does a sandbox-only fork.
-  const sandboxProviderRows = useMemo(() => {
-    if (info === "loading") return [];
-    const offered = sandboxProviderOptions(info);
-    return sandboxOnlyProvider === undefined
-      ? offered
-      : offered.filter((provider) => provider === sandboxOnlyProvider);
-  }, [info, sandboxOnlyProvider]);
+  // yields exactly one.
+  const sandboxProviderRows = useMemo(
+    () => (info !== "loading" ? sandboxProviderOptions(info) : []),
+    [info],
+  );
+  // The picker row for a fresh sandbox from the source's own provider, when
+  // the server offers it. `null` is the single default-provider row.
+  const sourceProviderRow = useMemo((): string | null | undefined => {
+    if (sourceSandboxProvider === null || info === "loading") return undefined;
+    if (sandboxProviderRows.includes(sourceSandboxProvider)) return sourceSandboxProvider;
+    const defaultRowIsSource =
+      sandboxProviderRows.length === 1 &&
+      sandboxProviderRows[0] === null &&
+      info.sandbox_provider === sourceSandboxProvider;
+    return defaultRowIsSource ? null : undefined;
+  }, [info, sandboxProviderRows, sourceSandboxProvider]);
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
 
@@ -1079,17 +1147,21 @@ function SupportedForkSessionForm({
   const sameFamilyAsSource = !switching || (sourceFamily !== null && sourceFamily === targetFamily);
   const sameAgentAsSource = !switching;
 
-  // Default the host = source host (when online) else the first online
-  // host, once hosts have loaded. Only fills an empty slot so an explicit
-  // pick is never overridden. A clone defaults to reproducing the source,
-  // so a sandbox is not the default while any host is online — it costs a
-  // fresh provision, and the user asks for it explicitly. But with no host
-  // online a sandbox-only deployment has nothing to reproduce the source
-  // on, so default to the sandbox rather than strand the picker empty and
-  // unsubmittable.
+  // Default destination: a clone reproduces its source, so a sandbox source
+  // gets a fresh sandbox from its own provider and any other source its own
+  // host. Otherwise prefer an online host, since a sandbox costs a fresh
+  // provision; with none online, fall back to a sandbox so the picker isn't
+  // stranded. Only fills an empty slot, so an explicit pick always wins.
   useEffect(() => {
     if (!isCodingSource || sandboxSelected || selectedHostId !== null) return;
-    if (sourceHostId && sourceHostOnline) {
+    // The source's provider and the offered providers decide a sandbox
+    // source's default; a connected host chosen first would stick.
+    if (sourceHostId && sourceHostLoading) return;
+    if (sourceSandboxProvider !== null && !workspaceRecovery && info === "loading") return;
+    if (managedSandboxesEnabled && sourceProviderRow !== undefined) {
+      setSandboxSelected(true);
+      setSandboxProvider(sourceProviderRow);
+    } else if (sourceHostId && sourceHostOnline) {
       setSelectedHostId(sourceHostId);
     } else if (onlineHosts.length > 0) {
       setSelectedHostId(onlineHosts[0].host_id);
@@ -1103,6 +1175,11 @@ function SupportedForkSessionForm({
     selectedHostId,
     sourceHostId,
     sourceHostOnline,
+    sourceHostLoading,
+    sourceSandboxProvider,
+    workspaceRecovery,
+    info,
+    sourceProviderRow,
     onlineHosts,
     managedSandboxesEnabled,
     sandboxProviderRows,
@@ -1542,6 +1619,7 @@ function SupportedForkSessionForm({
       // Empty title → omit so the server derives "Fork of <source title>".
       // The run-config section (native targets only) reports its ready-to-send
       // value; an empty object (non-native target) sends no run overrides.
+      const sandboxHostId = sandboxSelected ? await managedSandboxHostId(info) : undefined;
       const fork = await forkSession(sourceSessionId, {
         title: trimmed === "" ? undefined : trimmed,
         agentId: switching ? agentChoice : undefined,
@@ -1562,9 +1640,7 @@ function SupportedForkSessionForm({
               ...sandboxWorkspaceFields,
               // The new sandbox host's id; keys the fork and its requests
               // until the host binds (see NewChatDialog's managed create).
-              ...(info !== "loading" && info.request_managed_sandbox_host_id
-                ? { hostId: randomUUID().replace(/-/g, "") }
-                : {}),
+              ...(sandboxHostId ? { hostId: sandboxHostId } : {}),
             }
           : undefined,
       });
@@ -1824,44 +1900,32 @@ function SupportedForkSessionForm({
                     ))}
                   </SelectContent>
                 </Select>
-                {/* A sandbox is a usable target, so connecting a host is a
-                    collapsed, optional step rather than a "no hosts connected"
-                    banner. A sandbox-only fork can't use one, so it says why. */}
-                {sandboxOnlyProvider !== undefined ? (
-                  <p
-                    className="text-sm text-muted-foreground"
-                    data-testid="fork-session-sandbox-only-hint"
-                  >
-                    This session can only be cloned onto a new{" "}
-                    {sandboxOptionLabel(sandboxOnlyProvider)}.
-                  </p>
-                ) : (
-                  <>
-                    <button
-                      type="button"
-                      onClick={() => setShowConnect((v) => !v)}
-                      className="flex cursor-pointer items-center gap-1 self-start text-sm text-muted-foreground transition hover:text-foreground"
-                      data-testid="fork-session-connect-host-toggle"
-                    >
-                      {showConnect ? (
-                        <ChevronUpIcon className="size-3.5" />
-                      ) : (
-                        <ChevronDownIcon className="size-3.5" />
-                      )}
-                      {onlineHosts.length === 0
-                        ? "Connect a host from your terminal"
-                        : "Connect another host from your terminal"}
-                    </button>
-                    {showConnect && (
-                      <ConnectHostInstructions
-                        serverUrl={serverUrl}
-                        onSshConnected={(hostId) => {
-                          setShowConnect(false);
-                          selectHost(hostId);
-                        }}
-                      />
-                    )}
-                  </>
+                {/* A sandbox is a usable target, so no dead-end even with no
+                    host online: offer connecting one as a collapsed, optional
+                    step rather than an alarming "no hosts connected" banner. */}
+                <button
+                  type="button"
+                  onClick={() => setShowConnect((v) => !v)}
+                  className="flex cursor-pointer items-center gap-1 self-start text-sm text-muted-foreground transition hover:text-foreground"
+                  data-testid="fork-session-connect-host-toggle"
+                >
+                  {showConnect ? (
+                    <ChevronUpIcon className="size-3.5" />
+                  ) : (
+                    <ChevronDownIcon className="size-3.5" />
+                  )}
+                  {onlineHosts.length === 0
+                    ? "Connect a host from your terminal"
+                    : "Connect another host from your terminal"}
+                </button>
+                {showConnect && (
+                  <ConnectHostInstructions
+                    serverUrl={serverUrl}
+                    onSshConnected={(hostId) => {
+                      setShowConnect(false);
+                      selectHost(hostId);
+                    }}
+                  />
                 )}
               </>
             )}
@@ -2130,7 +2194,14 @@ function SupportedForkSessionForm({
                   type="text"
                   value={title}
                   onChange={(e) => setTitle(e.target.value)}
+                  onCompositionStart={() => {
+                    isComposingRef.current = true;
+                  }}
+                  onCompositionEnd={() => {
+                    isComposingRef.current = false;
+                  }}
                   onKeyDown={(e) => {
+                    if (isImeCompositionKeyEvent(e, isComposingRef.current)) return;
                     if (e.key === "Enter" && !busy) handleFork();
                   }}
                   placeholder={namePlaceholder}

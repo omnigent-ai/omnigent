@@ -13,6 +13,8 @@ from urllib.parse import parse_qs, urlparse
 import pytest
 from playwright.sync_api import Locator, Page, Route, WebSocketRoute, expect
 
+from tests.e2e_ui.sessions._sidebar_helpers import enable_grouping_ui
+
 _RUNNING = f"{1:032x}"
 _AWAITING = f"{2:032x}"
 _IDLE = f"{3:032x}"
@@ -71,23 +73,11 @@ def _serve_sessions(route: Route) -> None:
     )
 
 
-def _enable_grouping_ui(page: Page, enabled: bool = True) -> None:
-    """Advertise the ``sidebar_grouping_ui`` release flag on the live server's info."""
-
-    def serve_info(route: Route) -> None:
-        response = route.fetch()
-        info = response.json()
-        info["features"] = {**info.get("features", {}), "sidebar_grouping_ui": enabled}
-        route.fulfill(response=response, json=info)
-
-    page.route("**/v1/info", serve_info)
-
-
 @pytest.fixture
 def stubbed_sidebar(page: Page, request: pytest.FixtureRequest) -> str:
     """Open the home page with the stubbed session list; return the base URL."""
     base_url = request.config.getoption("--ui-base-url") or request.getfixturevalue("live_server")
-    _enable_grouping_ui(page)
+    enable_grouping_ui(page)
     page.route_web_socket("**/v1/sessions/updates*", lambda _socket: None)
     page.route("**/v1/sessions?*", _serve_sessions)
     page.goto(base_url)
@@ -98,6 +88,11 @@ def stubbed_sidebar(page: Page, request: pytest.FixtureRequest) -> str:
 def _open_view_submenu(page: Page, submenu_test_id: str) -> None:
     page.get_by_test_id("session-filter").press("ArrowDown")
     page.get_by_test_id(submenu_test_id).click()
+
+
+def _assert_inside_viewport(items: Locator, width: int) -> None:
+    for box in (item.bounding_box() for item in items.all()):
+        assert box and box["x"] >= 0 and box["x"] + box["width"] <= width, box
 
 
 def _section_header(page: Page, title: str) -> Locator:
@@ -116,7 +111,10 @@ def test_harness_grouping_persists_across_reload(
     if width < 768:
         page.get_by_role("button", name="Open sidebar", exact=True).click()
     _open_view_submenu(page, "session-grouping-menu")
-    page.get_by_role("menuitemradio", name="Harness", exact=True).click()
+    harness = page.get_by_role("menuitemradio", name="Harness", exact=True)
+    expect(harness).to_be_visible()
+    _assert_inside_viewport(page.get_by_role("menuitemradio"), width)
+    harness.click()
     page.keyboard.press("Escape")
     claude = page.locator("section").filter(has=_section_header(page, "Claude Code"))
     codex = page.locator("section").filter(has=_section_header(page, "Codex"))
@@ -289,7 +287,7 @@ def test_tooltip_fetches_repo_and_pr_only_when_opened(
 
     # Register every route BEFORE navigating, so an eager fetch during mount is
     # counted — otherwise the empty-request assertion can't detect it.
-    _enable_grouping_ui(page)
+    enable_grouping_ui(page)
     page.route_web_socket("**/v1/sessions/updates*", lambda _socket: None)
     page.route("**/v1/sessions?*", _serve_sessions)
     page.route("**/v1/sessions/*/resources/github*", serve_github)
@@ -372,7 +370,7 @@ def test_created_ordering_persists_and_flag_off_uses_updated(
     page.keyboard.press("Escape")
     page.reload()
     expect(links).to_have_text(["Idle session", "Awaiting session", "Running session"])
-    _enable_grouping_ui(page, enabled=False)
+    enable_grouping_ui(page, enabled=False)
     requests.clear()
     page.reload()
     expect(links).to_have_text(["Idle session", "Running session", "Awaiting session"])
