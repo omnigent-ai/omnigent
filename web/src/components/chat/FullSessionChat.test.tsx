@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -103,6 +103,22 @@ describe("FullSessionChat sandbox launch", () => {
       "Sandbox launch failed",
     );
     expect(screen.queryByTestId("runner-starting-indicator")).toBeNull();
+  });
+
+  it("says what a launch waiting on the user needs until it's dismissed", () => {
+    const details = "Sign in on your laptop to continue.";
+    seedSession({ sandboxStatus: { stage: "action_required", error: null, details } });
+    renderChat();
+
+    expect(screen.getByTestId("runner-starting-indicator")).toHaveTextContent(
+      "Provisioning sandbox…",
+    );
+    expect(screen.getByText(details)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "Dismiss" }));
+    expect(screen.queryByText(details)).toBeNull();
+    expect(conversationRegistry.peek(SESSION)?.getState().sandboxActionDismissed).toBe(details);
+    expect(screen.getByTestId("runner-starting-indicator")).toBeInTheDocument();
   });
 
   it("shows the launch stage, not Working, while a send waits on the sandbox", () => {

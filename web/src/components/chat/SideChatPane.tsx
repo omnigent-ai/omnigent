@@ -70,7 +70,7 @@ import {
   useChatStore,
 } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
-import { RunnerStartingIndicator } from "@/pages/ChatIndicators";
+import { RunnerStartingIndicator, SandboxActionBanner } from "@/pages/ChatIndicators";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { shouldQueueSend } from "@/lib/messageQueue";
@@ -643,6 +643,13 @@ export function SideChatPane({
             </div>
           )}
         </div>
+        {launch !== null && (
+          // A full session's composer is hidden when read-only, so the banner keeps its own gap.
+          <SandboxActionBanner
+            conversationId={childId}
+            className={cn("mx-3 shrink-0", readOnly && "mb-3")}
+          />
+        )}
         {!readOnly && !starting && (
           <SelectionPopup
             containerRef={transcriptRef}
