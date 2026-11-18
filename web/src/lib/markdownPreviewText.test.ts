@@ -101,6 +101,12 @@ describe("markdownPreviewText", () => {
     expect(markdownPreviewText(`${privateUse}1${privateUse} and \`x\``)).toBe("1 and x");
   });
 
+  it("reads only the start of a long source", () => {
+    const preview = markdownPreviewText(`${"word ".repeat(400)}\n\n**Details:** sentinel`);
+    expect(preview.startsWith("word word")).toBe(true);
+    expect(preview).not.toContain("sentinel");
+  });
+
   it("is empty when no text remains", () => {
     expect(markdownPreviewText("")).toBe("");
     expect(markdownPreviewText("---\n\n  \n-\n")).toBe("");

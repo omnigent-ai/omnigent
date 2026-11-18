@@ -1182,6 +1182,9 @@ describe("TasksPanel", () => {
       "- Fixes its cause",
       "",
       "**Outputs:** a passing run.",
+      "",
+      // Details past the preview's cutoff, which only the history shows.
+      `**Details:** ${"Check the logs. ".repeat(130)}Then run the sentinel-check command.`,
     ].join("\n");
     const preview =
       "Inputs: the flaky test's name. What it does: Reruns it · Fixes its cause · Outputs: a passing run.";
@@ -1206,7 +1209,10 @@ describe("TasksPanel", () => {
     fireEvent.focus(screen.getAllByTestId("tasks-progress-segment")[1]);
     const card = await screen.findByTestId("tasks-progress-card");
     expect(card).toHaveTextContent(preview);
-    for (const element of [ready, waiting, card]) expect(element.textContent).not.toContain("**");
+    for (const element of [ready, waiting, card]) {
+      expect(element.textContent).not.toContain("**");
+      expect(element.textContent).not.toContain("sentinel-check");
+    }
 
     // The row shows only the start of the goal, so its history shows all of it.
     fireEvent.click(within(waiting).getByTestId("tasks-row-history"));
@@ -1216,6 +1222,7 @@ describe("TasksPanel", () => {
         .getAllByRole("listitem")
         .map((item) => item.textContent),
     ).toEqual(["Reruns it", "Fixes its cause"]);
+    expect(within(waiting).getByText(/Then run the sentinel-check command\.$/)).toBeInTheDocument();
   });
 
   it("leaves a goal with no text out of a task's card, rather than an empty line", async () => {
