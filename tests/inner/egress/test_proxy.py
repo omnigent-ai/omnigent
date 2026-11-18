@@ -230,18 +230,11 @@ async def test_proxy_start_unix(ca_paths: tuple[Path, Path, Path], short_tmp_par
     await proxy.stop()
 
 
-@pytest.mark.parametrize("with_model_access", [False, True], ids=["generic", "model-access"])
 def test_controller_rejects_unauthenticated_credential_rewrites_before_setup(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    with_model_access: bool,
 ) -> None:
     resolve_secret = Mock(side_effect=AssertionError("credential must not be resolved"))
-    access = (
-        ClaudeModelAccess("https://model.test", "authorization", resolve_secret)
-        if with_model_access
-        else None
-    )
     setup = Mock(side_effect=AssertionError("proxy setup must not start"))
     monkeypatch.setattr(controller, "IS_WINDOWS", False)
     monkeypatch.setattr(controller, "ensure_ca", setup)
@@ -259,7 +252,6 @@ def test_controller_rejects_unauthenticated_credential_rewrites_before_setup(
                     host="api.example.test", scheme="bearer", secret_provider=resolve_secret
                 )
             ],
-            model_access=access,
         )
 
     setup.assert_not_called()

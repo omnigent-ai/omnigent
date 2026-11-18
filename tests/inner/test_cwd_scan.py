@@ -422,6 +422,7 @@ def test_overflow_error_raises_with_actionable_message(tmp_path: Path) -> None:
         f"warn / unlimited escape hatches. Got: {msg!r}"
     )
     assert "more)" in msg
+    assert "(partially scanned" in msg
     assert msg.count("(not scanned") + msg.count("(partially scanned") <= 10
 
 

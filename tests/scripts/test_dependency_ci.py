@@ -690,6 +690,19 @@ def test_workflows_connect_selection_to_jobs():
     assert "test_each_cli_execution_path_inherits_the_sandbox" in cli_test["run"]
     assert "test_bound_host_proc_does_not_expose_synthetic_parent" in cli_test["run"]
     assert "len(cases) != 17 or skipped" in cli_test["run"]
+    seatbelt_job = jobs["seatbelt-containment"]
+    assert seatbelt_job["needs"] == "scope"
+    assert seatbelt_job["runs-on"] == "macos-15"
+    assert "needs.scope.outputs.backend == 'true'" in seatbelt_job["if"]
+    seatbelt_test = next(
+        step
+        for step in seatbelt_job["steps"]
+        if step.get("name") == "Test Seatbelt process, hardlink, and Keychain boundaries"
+    )
+    assert "test_sibling_cannot_read_process_arguments" in seatbelt_test["run"]
+    assert "test_seatbelt_denies_new_hardlink_from_readonly_source" in seatbelt_test["run"]
+    assert "test_real_callback_cannot_read_parent_keychain" in seatbelt_test["run"]
+    assert "len(cases) != 4 or skipped" in seatbelt_test["run"]
     for name in ("pytest", "stores-postgres", "stores-cockroachdb", "stores-mysql"):
         assert jobs[name]["needs"] == "scope"
         output = "backend" if name == "pytest" else "database"

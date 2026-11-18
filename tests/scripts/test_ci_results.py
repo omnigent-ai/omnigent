@@ -15,6 +15,7 @@ SCRIPT = ROOT / ".github/scripts/ci/require_results.py"
 CI_JOBS = (
     "pytest",
     "claude-containment",
+    "seatbelt-containment",
     "stores-postgres",
     "stores-cockroachdb",
     "stores-mysql",
@@ -100,7 +101,7 @@ def test_selected_consumer_must_succeed(suite, job, result):
         (
             "ci",
             {"database": "false", "backend": "true", "omnidev": "false", "sidecar": "false"},
-            ("pytest", "claude-containment"),
+            ("pytest", "claude-containment", "seatbelt-containment"),
         ),
         ("ui", {"ui": "full"}, UI_JOBS),
         ("ui", {"ui": "dependency"}, UI_JOBS),
