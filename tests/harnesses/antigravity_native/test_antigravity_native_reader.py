@@ -5476,3 +5476,122 @@ async def test_subagent_idle_check_failure_keeps_mirroring(
 
     monkeypatch.setattr(reader, "get_all_cascade_trajectories", _raise)
     assert await reader._subagent_cascade_is_idle(4242, "child-aaa") is False
+
+
+async def test_settings_model_mirror_emits_and_dedupes_with_user_input(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Isolated settings.json changes mirror immediately and dedupe against USER_INPUT."""
+    from omnigent.harnesses.antigravity_native import bridge as agy_bridge
+
+    bridge_dir = tmp_path / "bridge"
+    settings_path = agy_bridge.agy_settings_path(bridge_dir)
+    settings_path.parent.mkdir(parents=True, exist_ok=True)
+    settings_path.write_text('{"model": "Gemini 3.8 Flash (High)"}', encoding="utf-8")
+
+    sink = _PostSink()
+    monkeypatch.setattr(reader, "post_session_event_with_retry", sink)
+    state = reader._ReaderState(seen=set(), interacted=set(), port=4242)
+    state.model_catalog = {
+        "models": {
+            "gemini-3.8-flash-high": {
+                "model": "MODEL_GEMINI_3_8_FLASH_HIGH",
+                "displayName": "Gemini 3.8 Flash (High)",
+            }
+        }
+    }
+
+    async with httpx.AsyncClient() as client:
+        await reader._maybe_emit_settings_model_change(
+            bridge_dir, client=client, session_id="conv_1", state=state
+        )
+        # Re-polling the same settings.json value is a no-op.
+        await reader._maybe_emit_settings_model_change(
+            bridge_dir, client=client, session_id="conv_1", state=state
+        )
+        # A USER_INPUT on the same display name dedupes cleanly.
+        await reader._maybe_emit_model_change(
+            {
+                "type": reader._TYPE_USER_INPUT,
+                "stepIndex": 1,
+                "userInput": {
+                    "userConfig": {"plannerConfig": {"planModel": "MODEL_GEMINI_3_8_FLASH_HIGH"}}
+                },
+            },
+            client=client,
+            session_id="conv_1",
+            state=state,
+        )
+        # Terminal `/model claude-sonnet-4-6` updates settings.json while idle -> emits new model.
+        settings_path.write_text('{"model": "Claude Sonnet 4.6 (Thinking)"}', encoding="utf-8")
+        await reader._maybe_emit_settings_model_change(
+            bridge_dir, client=client, session_id="conv_1", state=state
+        )
+        # If RPC reports another model (e.g. --model launch) while settings.json stays
+        # unchanged, re-polling settings.json must NOT ping-pong back to the old file value.
+        await reader._maybe_emit_model_change(
+            {
+                "type": reader._TYPE_USER_INPUT,
+                "stepIndex": 2,
+                "userInput": {
+                    "userConfig": {"plannerConfig": {"planModel": "MODEL_GEMINI_3_8_FLASH_HIGH"}}
+                },
+            },
+            client=client,
+            session_id="conv_1",
+            state=state,
+        )
+        await reader._maybe_emit_settings_model_change(
+            bridge_dir, client=client, session_id="conv_1", state=state
+        )
+
+    model_events = [
+        data["model"]
+        for event_type, data in sink.posts
+        if event_type == reader._EXTERNAL_MODEL_CHANGE
+    ]
+    assert model_events == [
+        "Gemini 3.8 Flash (High)",
+        "Claude Sonnet 4.6 (Thinking)",
+        "Gemini 3.8 Flash (High)",
+    ]
+
+
+async def test_watch_for_rotation_survives_on_tick_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An exception inside on_tick must not kill rotation detection."""
+    monkeypatch.setattr(reader, "_sleep", _no_sleep)
+    monkeypatch.setattr(
+        reader,
+        "get_all_cascade_trajectories",
+        lambda _port: {
+            "trajectorySummaries": {
+                "old-cascade": {
+                    "trajectoryType": reader._TRAJECTORY_TYPE_CASCADE,
+                    "status": "CASCADE_RUN_STATUS_IDLE",
+                    "lastModifiedTime": "2026-01-01T00:00:00Z",
+                },
+                "new-cascade": {
+                    "trajectoryType": reader._TRAJECTORY_TYPE_CASCADE,
+                    "status": "CASCADE_RUN_STATUS_RUNNING",
+                    "lastModifiedTime": "2026-01-01T00:01:00Z",
+                },
+            }
+        },
+    )
+    rotated: list[str] = []
+
+    async def _boom() -> None:
+        raise RuntimeError("transient settings read error")
+
+    await reader._watch_for_rotation(
+        port=4242,
+        bound_cascade_id="old-cascade",
+        interval_s=0.0,
+        skip_cascade_ids=frozenset(),
+        on_rotation=rotated.append,
+        on_tick=_boom,
+    )
+    assert rotated == ["new-cascade"]

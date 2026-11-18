@@ -4,6 +4,7 @@ import type { NativeModelOption } from "@/lib/types";
 import {
   compactModelTriggerLabel,
   defaultModelLabel,
+  findModelLabelOption,
   formatModelEffortStatusLabel,
   formatStatusEffortLabel,
   formatStatusModelLabel,
@@ -179,6 +180,20 @@ describe("catalog model labels", () => {
     expect(defaultModelLabel([{ id: "opus" }])).toBe("Default");
     expect(formatStatusModelLabel(null)).toBeNull();
     expect(formatStatusModelLabel("  ")).toBeNull();
+  });
+
+  it("matches Antigravity display names back to their catalog slug", () => {
+    const rows = [
+      { id: "gemini-3.8-flash-high", displayName: "Gemini 3.8 Flash (High)" },
+      { id: "claude-sonnet-4-6", displayName: "Claude Sonnet 4.6 (Thinking)" },
+    ];
+    expect(findModelLabelOption(rows, "Claude Sonnet 4.6 (Thinking)")?.id).toBe(
+      "claude-sonnet-4-6",
+    );
+    expect(findModelLabelOption(rows, "claude sonnet 4.6 (thinking)")?.id).toBe(
+      "claude-sonnet-4-6",
+    );
+    expect(formatStatusModelLabel("claude-sonnet-4-6", rows)).toBe("Claude Sonnet 4.6 (Thinking)");
   });
 });
 

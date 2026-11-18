@@ -110,6 +110,7 @@ export function composerHarnessLabel(
 ): string | null {
   const nativeSubagent = nativeCodingAgentForSubagentWrapper(wrapper);
   if (nativeSubagent) return nativeSubagent.displayName;
+  if (modelPickerKind === "antigravity") return "Antigravity";
   if (modelPickerKind === "claude") return "Claude";
   if (modelPickerKind === "codex") return "Codex";
   if (modelPickerKind === "cursor") return "Cursor";

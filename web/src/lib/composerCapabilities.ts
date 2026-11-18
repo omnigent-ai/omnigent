@@ -21,7 +21,16 @@ const PI_NATIVE_EFFORT_LEVELS = [
 ] as const;
 
 export type NativeModelPickerKind =
-  "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi" | "devin" | "acp" | "configured";
+  | "antigravity"
+  | "claude"
+  | "codex"
+  | "cursor"
+  | "kiro"
+  | "opencode"
+  | "pi"
+  | "devin"
+  | "acp"
+  | "configured";
 
 /** Preserve inherited effort; clear an explicit choice that the new model cannot use. */
 export function effortAfterModelChange(
@@ -31,14 +40,14 @@ export function effortAfterModelChange(
   return effort !== null && supportedEfforts.includes(effort) ? effort : null;
 }
 
-/** Claude/Codex reports win over requests that the runner may not have applied. */
+/** Reported harness models win over requests that the runner may not have applied. */
 export function selectedModelForPicker(
   kind: NativeModelPickerKind | null,
   options: readonly NativeModelOption[],
   requestedModel: string | null,
   reportedModel: string | null,
 ): string | null {
-  if (kind === "claude" || kind === "codex") {
+  if (kind === "claude" || kind === "codex" || kind === "antigravity") {
     const model = reportedModel || requestedModel;
     return model ? (findModelLabelOption(options, model)?.id ?? model) : null;
   }
@@ -119,6 +128,10 @@ export function modelPickerKindForConv(
   modelOptions: readonly NativeModelOption[] = [],
 ): NativeModelPickerKind | null {
   switch (effectiveWrapperLabel(conv)) {
+    case "antigravity-native-ui":
+      // Antigravity exposes live models via `agy models`, switches non-interactively
+      // via `/model <slug>`, and mirrors active changes from isolated settings.json.
+      return "antigravity";
     case "claude-code-native-ui":
       return "claude";
     case "codex-native-ui":

@@ -70,3 +70,64 @@ it("shows and changes the given session, not the active conversation", async () 
   fireEvent.click(screen.getByTestId("composer-agent-effort-high"));
   await waitFor(() => expect(setEffort).toHaveBeenCalledWith("high", "cell"));
 });
+
+it("renders and switches Antigravity live models and reflects terminal /model mirrors", async () => {
+  const agyOptions = [
+    { id: "gemini-3.8-flash-high", displayName: "Gemini 3.8 Flash (High)" },
+    { id: "claude-sonnet-4-6", displayName: "Claude Sonnet 4.6 (Thinking)" },
+    { id: "gemini-3.8-flash-low", displayName: "Gemini 3.8 Flash (Low)" },
+  ];
+  conversationRegistry.acquire("agy_cell").setState({
+    sessionHarness: "antigravity-native",
+    nativeVendorOwnsModel: true,
+    llmModel: "Gemini 3.8 Flash (High)",
+    sessionModelOverride: null,
+  });
+  const store = useChatStore.getState();
+  const setModel = vi.spyOn(store, "setModel").mockResolvedValue();
+
+  render(
+    <TooltipProvider>
+      <SessionHarnessPicker
+        sessionId="agy_cell"
+        busy={false}
+        busyRef={{ current: false }}
+        setBusy={() => {}}
+        agentName="antigravity-native-ui"
+        harnessLabel="Antigravity"
+        showModels
+        showEffort={false}
+        effortLevels={[]}
+        modelPickerKind="antigravity"
+        supportsModelReset={false}
+        codexModelOptions={agyOptions}
+        modelLabelOptions={agyOptions}
+        modelLabelHostId={null}
+        costRoutingEligible={false}
+        modelPickWakesSession={false}
+        disabled={false}
+      />
+    </TooltipProvider>,
+  );
+
+  expect(screen.getByTestId("composer-config-gear")).toHaveTextContent("Gemini 3.8 Flash (High)");
+  fireEvent.keyDown(screen.getByTestId("composer-config-gear"), { key: "ArrowDown" });
+  fireEvent.click(screen.getByTestId("composer-agent-edit"));
+  fireEvent.click(screen.getByTestId("composer-agent-model-claude-sonnet-4-6"));
+  await waitFor(() =>
+    expect(setModel).toHaveBeenCalledWith("claude-sonnet-4-6", {
+      expectConfirmation: false,
+      sessionId: "agy_cell",
+    }),
+  );
+
+  // Terminal `/model gemini-3.8-flash-low` updates llmModel while sessionModelOverride
+  // still holds the earlier web pick; the reported model wins on the trigger.
+  act(() =>
+    conversationRegistry.peek("agy_cell")!.setState({
+      sessionModelOverride: "claude-sonnet-4-6",
+      llmModel: "Gemini 3.8 Flash (Low)",
+    }),
+  );
+  expect(screen.getByTestId("composer-config-gear")).toHaveTextContent("Gemini 3.8 Flash (Low)");
+});

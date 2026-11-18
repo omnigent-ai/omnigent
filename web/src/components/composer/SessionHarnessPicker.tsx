@@ -676,6 +676,7 @@ function useResolvedComposerModel(
   // ``model_options`` field. Claude's rows are the aliases pinned to the
   // launch-time Databricks catalog; Codex carries richer effort metadata.
   const usesServerModelOptions =
+    modelPickerKind === "antigravity" ||
     modelPickerKind === "claude" ||
     modelPickerKind === "codex" ||
     modelPickerKind === "cursor" ||
@@ -709,15 +710,19 @@ function useResolvedComposerModel(
   );
   const effectiveModel = sessionModelSeeded
     ? (sessionModelOverride ?? llmModel)
-    : nativeVendorOwnsModel
-      ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
-        ? sessionModelOverride
-        : modelPickerKind === "opencode" || modelPickerKind === "pi" || modelPickerKind === "devin"
-          ? (sessionModelOverride ?? llmModel)
-          : null
-      : isReportedModelPicker
-        ? llmModel
-        : (sessionModelOverride ?? llmModel);
+    : modelPickerKind === "antigravity"
+      ? (llmModel ?? sessionModelOverride)
+      : nativeVendorOwnsModel
+        ? modelPickerKind === "cursor" || modelPickerKind === "kiro"
+          ? sessionModelOverride
+          : modelPickerKind === "opencode" ||
+              modelPickerKind === "pi" ||
+              modelPickerKind === "devin"
+            ? (sessionModelOverride ?? llmModel)
+            : null
+        : isReportedModelPicker
+          ? llmModel
+          : (sessionModelOverride ?? llmModel);
   const {
     label: modelLabel,
     loading: modelLabelLoading,
