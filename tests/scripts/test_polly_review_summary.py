@@ -364,6 +364,161 @@ def test_split_review_rejects_nonprogress_on_escaped_pipe_whitespace() -> None:
             "unsafe-fence-whitespace-tildes",
         ),
         (None, 0, "", False, "run", None, None, False, False, None, None, "nested-list"),
+        (None, 0, "", False, "run", None, None, False, False, None, None, "container-blockquote"),
+        (
+            None,
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            None,
+            None,
+            "container-list-continuation",
+        ),
+        (
+            None,
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            None,
+            None,
+            "container-attributed-details",
+        ),
+        (
+            None,
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            None,
+            None,
+            "container-lazy-blockquote",
+        ),
+        (
+            None,
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            None,
+            None,
+            "container-ordered-continuation",
+        ),
+        (
+            None,
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            None,
+            None,
+            "container-multiline-details",
+        ),
+        (
+            None,
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            None,
+            None,
+            "short-container-blockquote",
+        ),
+        (
+            None,
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            None,
+            None,
+            "short-container-list-continuation",
+        ),
+        (
+            None,
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            None,
+            None,
+            "short-container-attributed-details",
+        ),
+        (
+            None,
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            None,
+            None,
+            "container-bounded-blockquote",
+        ),
+        (
+            None,
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            None,
+            None,
+            "fenced-container-literal",
+        ),
+        (
+            None,
+            0,
+            "",
+            False,
+            "run",
+            None,
+            None,
+            False,
+            False,
+            None,
+            None,
+            "container-empty-list-continuation",
+        ),
     ],
     ids=[
         "many-rows",
@@ -403,6 +558,18 @@ def test_split_review_rejects_nonprogress_on_escaped_pipe_whitespace() -> None:
         "unsafe-fence-whitespace-backticks",
         "unsafe-fence-whitespace-tildes",
         "nested-list",
+        "container-blockquote",
+        "container-list-continuation",
+        "container-attributed-details",
+        "container-lazy-blockquote",
+        "container-ordered-continuation",
+        "container-multiline-details",
+        "short-container-blockquote",
+        "short-container-list-continuation",
+        "short-container-attributed-details",
+        "container-bounded-blockquote",
+        "fenced-container-literal",
+        "container-empty-list-continuation",
     ],
 )
 def test_long_review_parts_preserve_all_assessments_and_markdown_context(
@@ -421,6 +588,175 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    if table_variant and table_variant.startswith(
+        ("container-", "short-container-", "fenced-container-")
+    ):
+        from html.parser import HTMLParser
+
+        from markdown_it import MarkdownIt
+
+        short = table_variant.startswith("short-")
+        variant = table_variant.removeprefix("short-")
+        if variant in {"container-blockquote", "container-bounded-blockquote"}:
+            lead = "> Finding " + "x" * (10 if short or "bounded" in variant else 130000) + "\n\n"
+        elif variant == "container-lazy-blockquote":
+            lead = "> Finding start\n" + "continued paragraph text\n" * 4000 + "\n"
+        elif variant in {
+            "container-list-continuation",
+            "container-ordered-continuation",
+            "container-empty-list-continuation",
+        }:
+            ordered = variant == "container-ordered-continuation"
+            lead = "7) Finding start\n\n" if ordered else "- Finding start\n"
+            if variant == "container-empty-list-continuation":
+                lead = "-\n"
+            lead += ("   " if ordered else "  ") + "continued paragraph text\n"
+            lead += (("   " if ordered else "  ") + "continued paragraph text\n") * (
+                0 if short else 3999
+            )
+        elif variant == "fenced-container-literal":
+            lead = (
+                "```text\n"
+                + "> Finding\n- item\n  continuation\n<details open>\n</details>\n" * 2000
+                + "```\n\n"
+            )
+        else:
+            opening = (
+                '<details\n  class="logs">'
+                if variant == "container-multiline-details"
+                else "<details open>"
+            )
+            lead = (
+                opening
+                + "\n<summary>Logs</summary>\n\n"
+                + "Log line.\n" * (2 if short else 8000)
+                + "\n</details>\n\n"
+            )
+        if variant == "container-bounded-blockquote":
+            lead += "Ordinary finding outside the quote.\n" * 4000
+        review = lead + _HELPERS["compose_review"](
+            _REVIEW, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+        )
+        parser = MarkdownIt("commonmark").enable("table")
+
+        def containers(tokens: list) -> list:
+            stack, content = [], []
+            for token in tokens:
+                if token.type in {
+                    "blockquote_open",
+                    "bullet_list_open",
+                    "ordered_list_open",
+                    "list_item_open",
+                }:
+                    stack.append((token.type, token.attrs))
+                elif token.type in {
+                    "blockquote_close",
+                    "bullet_list_close",
+                    "ordered_list_close",
+                    "list_item_close",
+                }:
+                    stack.pop()
+                elif token.type == "inline" and stack:
+                    content.append((tuple(stack), token.content))
+            return content
+
+        class DisclosureContext(HTMLParser):
+            depth = 0
+
+            def handle_starttag(self, tag: str, attrs: list) -> None:
+                if tag == "details":
+                    self.depth += 1
+                elif tag == "sub":
+                    assert self.depth == 0, "Publication footer is inside a disclosure"
+
+            def handle_endtag(self, tag: str) -> None:
+                if tag == "details":
+                    assert self.depth > 0, "A rendered comment has an unmatched disclosure closer"
+                    self.depth -= 1
+
+        original = parser.parse(review)
+        expected = containers(original)
+        assert bool(expected) == ("blockquote" in variant or "continuation" in variant)
+        assert sum(token.type == "table_open" for token in original) == 1
+        assert _HELPERS["COMMENT_BYTE_LIMIT"] == 60000
+        assert (len(review.encode("utf-8")) < 60000) == short
+        review_path, receipt, posts = _prepare_publication(
+            tmp_path, monkeypatch, head_sha="a" * 40, run_url="https://example.test/run"
+        )
+        try:
+            comments = _published_comments(review, review_path, receipt)
+        except ValueError as error:
+            assert not short and variant not in {
+                "container-bounded-blockquote",
+                "fenced-container-literal",
+            }
+            assert str(error) in {
+                "Polly review Markdown container cannot fit within comment capacity.",
+                "Polly review noncanonical details are not supported in multipart comments.",
+            }
+            assert not posts and not receipt.exists()
+            assert sorted(path.name for path in tmp_path.iterdir()) == ["review.md"]
+            return
+        assert posts == [*comments[1:], comments[0]]
+        assert receipt.read_text() == "a" * 40 + "\n"
+        assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
+        if short:
+            assert len(comments) == 1
+            assert comments[0].split("Polly AI Review\n\n", 1)[1].rsplit("\n---\n", 1)[0] == review
+        else:
+            assert 1 < len(comments) <= _HELPERS["MAX_REVIEW_PARTS"]
+        rendered = [parser.parse(comment) for comment in comments]
+        assert [item for tokens in rendered for item in containers(tokens)] == expected, (
+            "Multipart publication changed independently parsed quote/list structure"
+        )
+        for tokens in rendered:
+            disclosure = DisclosureContext()
+            for token in tokens:
+                if token.type == "html_block":
+                    disclosure.feed(token.content)
+                for child in token.children or []:
+                    if child.type == "html_inline":
+                        disclosure.feed(child.content)
+                if token.type in {"fence", "code_block"}:
+                    assert "<sub>Automated review by Polly" not in token.content
+                    assert "tests/test_parser.py::test_empty" not in token.content
+            assert disclosure.depth == 0, "A rendered comment leaves a disclosure open"
+        assert sum(token.type == "table_open" for tokens in rendered for token in tokens) == 1
+        row = next(line for line in _REVIEW.splitlines() if line.startswith("| tests/"))
+        assert sum(comment.count(row) for comment in comments) == 1
+        if variant == "container-bounded-blockquote":
+            assert (
+                sum(comment.count("Ordinary finding outside the quote.\n") for comment in comments)
+                == 4000
+            )
+        if variant == "fenced-container-literal":
+            remaining_code = "".join(token.content for token in original if token.type == "fence")
+            for tokens in rendered:
+                for token in tokens:
+                    if token.type == "fence":
+                        fragment = token.content
+                        if not remaining_code.startswith(fragment):
+                            assert fragment.endswith("\n")
+                            fragment = fragment[:-1]
+                        assert remaining_code.startswith(fragment)
+                        remaining_code = remaining_code[len(fragment) :]
+            assert not remaining_code
+            remaining = review
+            for number, comment in enumerate(comments):
+                _, marker, fragment = comment.partition("part 1 appears.\n\n")
+                assert marker
+                fragment, separator, footer = fragment.rpartition("\n\n---\n")
+                assert separator and footer.startswith("<sub>Automated review by Polly")
+                if number and not remaining.startswith(fragment):
+                    assert fragment.startswith("```text\n")
+                    fragment = fragment.removeprefix("```text\n")
+                if not remaining.startswith(fragment):
+                    assert fragment.endswith("\n```\n")
+                    fragment = fragment.removesuffix("\n```\n")
+                assert remaining.startswith(fragment)
+                remaining = remaining[len(fragment) :]
+            assert not remaining
+        return
     if table_variant == "nested-list":
         from markdown_it import MarkdownIt
 

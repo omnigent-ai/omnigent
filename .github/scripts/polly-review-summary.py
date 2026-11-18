@@ -332,7 +332,8 @@ def _markdown_context(
     Disclosure balancing supports lowercase <details>/</details> without attributes
     at the first nonblank position; <summary> may share an opening line.
     Multipart preflight rejects nested lists and container-prefixed or indented
-    fences outside active fences.
+    fences outside active fences, and keeps ordinary list/quote blocks indivisible.
+    Other disclosure forms fail closed before multipart publication.
     Inline-code formatting across fragments is not balanced.
     """
     details = 0
@@ -343,7 +344,10 @@ def _markdown_context(
     nested_list = False
     previous = ""
     offset = previous_start = 0
-    container_marker = re.compile(r">|[-+*](?=[ \t])|[0-9]{1,9}[.)](?=[ \t])")
+    container_start = None
+    container_blank = False
+    container_marker = re.compile(r">|[-+*](?=[ \t\r]|$)|[0-9]{1,9}[.)](?=[ \t\r]|$)")
+    disclosure_tag = re.compile(r"</?details(?=[ \t\f\r/>]|$)", re.IGNORECASE)
 
     def protect_span(start: int, end: int, kind: str) -> None:
         if protected_spans is None:
@@ -404,6 +408,20 @@ def _markdown_context(
             if indentation:
                 marker = container_marker.match(line, indentation)
                 nested_list |= marker is not None and marker[0] != ">"
+            blank = not line.strip(" \t\r")
+            if (
+                container_start is not None
+                and container_blank
+                and not blank
+                and not indentation
+                and not container
+            ):
+                protect_span(container_start, line_start, "Markdown container")
+                container_start = None
+            if container and container_start is None:
+                container_start = line_start
+            # Retain lazy/indented continuations until an unambiguous block boundary.
+            container_blank = blank
         opening = re.match(
             r"^[ \t]*(`{3,}|~{3,})" if protected_spans is not None else r"^ {0,3}(`{3,}|~{3,})",
             line,
@@ -426,6 +444,18 @@ def _markdown_context(
             continue
         if protected_spans is not None:
             protect_literals(line, line_start)
+            tags = list(disclosure_tag.finditer(line))
+            if tags and (
+                not line.lstrip().startswith(("<details>", "</details>"))
+                or any(
+                    tag[0] not in {"<details", "</details"}
+                    or line[tag.end() : tag.end() + 1] != ">"
+                    for tag in tags
+                )
+            ):
+                raise ValueError(
+                    "Polly review noncanonical details are not supported in multipart comments."
+                )
         if line.lstrip().startswith(("<details>", "</details>")):
             for tag in re.findall(r"</?details>", line):
                 details = max(0, details + (1 if tag == "<details>" else -1))
@@ -452,6 +482,8 @@ def _markdown_context(
             assessment_table = False
         previous = line
         previous_start = line_start
+    if container_start is not None:
+        protect_span(container_start, len(text), "Markdown container")
     if nested_list:
         raise ValueError("Polly review nested lists are not supported in multipart comments.")
     prefix = "<details>\n<summary>Review continued</summary>\n\n" * details
