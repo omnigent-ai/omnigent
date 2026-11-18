@@ -29,6 +29,12 @@ or copy-on-write clones; repository uv installs use `link-mode = "copy"`.
 The launcher starts its trusted Python probe with `-I`, so dependencies needed
 at startup must be installed in the runtime environment. `PYTHONPATH` and the
 user site are not searched by that probe.
+The probe accepts only the known `distutils-precedence.pth` and coverage startup
+lines and inspected setuptools editable finders. Other executable `.pth` lines,
+including `import _virtualenv`, fail closed before the CLI starts. Rebuild the
+runtime with a standard virtual environment and copy-mode dependencies if an
+installed package adds an unsupported startup hook. This applies to every
+sandboxed launcher using the shared runtime check.
 
 The automatic skill overlay exposes only bundled skills and their supporting
 files. It excludes the original bundle's credentials-bearing root configuration

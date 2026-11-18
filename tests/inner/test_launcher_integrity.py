@@ -582,6 +582,10 @@ def test_unsupported_pth_startup_form_fails_closed(tmp_path: Path) -> None:
         sb._isolated_launcher_import_roots(str(interpreter))
     assert not marker.exists()
 
+    (packages / "dynamic.pth").write_text("import _virtualenv\n")
+    with pytest.raises(OSError, match=r"unsupported \.pth startup form"):
+        sb._isolated_launcher_import_roots(str(interpreter))
+
 
 @pytest.mark.parametrize("config_location", ["adjacent", "venv-root"])
 def test_isolated_pth_roots_follow_cpython_venv_config_layout(
