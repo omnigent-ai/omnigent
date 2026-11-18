@@ -190,7 +190,7 @@ def _assert_layer_aligned(page: Page, textarea: Locator, tmp_path: Path, name: s
 
     Two steps: a plain-text clone of the layer (same box, styles and scroll)
     renders pixel-identical to the textarea's own glyphs, and every character of
-    the styled layer sits within a tenth of a pixel of the clone's.
+    the styled layer sits within 0.15px of the clone's.
     """
     layer = textarea.locator("xpath=..").locator(_LAYER)
     expect(layer).to_be_visible()
@@ -242,6 +242,8 @@ def _assert_layer_aligned(page: Page, textarea: Locator, tmp_path: Path, name: s
         layer.after(clone);
         clone.scrollTop = layer.scrollTop;
     }""")
+    slanted = layer.locator("[data-slanted]")
+    slanted_count = slanted.count()
     page.add_style_tag(content=_PROBE_CSS)
     try:
         offsets = textarea.evaluate(_CHARACTER_OFFSETS_JS)
@@ -252,10 +254,13 @@ def _assert_layer_aligned(page: Page, textarea: Locator, tmp_path: Path, name: s
             delete document.documentElement.dataset.alignProbe;
             textarea.parentElement.querySelector('[data-align-clone]')?.remove();
         }""")
+    # Hiding the layer drops its slanted italics; they return once it's laid out again.
+    expect(slanted).to_have_count(slanted_count)
     print(f"Composer layer alignment ({name}): {offsets}")
     assert offsets["styledLength"] == offsets["total"], offsets
     assert offsets["compared"] > 0, offsets
-    assert offsets["worst"] <= 0.1, (name, offsets)
+    # A line of many styled spans can gather a few 1/64px fragment snaps.
+    assert offsets["worst"] <= 0.15, (name, offsets)
     diff = ImageChops.difference(clone_pixels, textarea_pixels)
     if diff.getbbox() is not None:
         clone_pixels.save(tmp_path / f"{name}-clone.png")
@@ -323,6 +328,13 @@ def _type_lines(page: Page, lines: list[str]) -> None:
 
 def _next_frame(page: Page) -> None:
     page.evaluate("() => new Promise(resolve => requestAnimationFrame(() => resolve(null)))")
+
+
+def _settle_transitions(page: Page) -> None:
+    """Wait out CSS transitions, such as the card easing its shape as a draft grows."""
+    page.wait_for_function(
+        "() => !document.getAnimations().some((animation) => animation instanceof CSSTransition)"
+    )
 
 
 _MARKER_STATES_JS = """layer => Array.from(layer.querySelectorAll('[data-md]'))
@@ -520,9 +532,15 @@ def test_session_composer_styles_markdown_and_sends_it_unchanged(
     card.screenshot(path=tmp_path / f"composer-markdown-{theme}.png", animations="disabled")
     # Pixels agree: the hidden `**` paint nothing, and the same `**` paint when revealed.
     bold = _FORMATTED_DRAFT.index("**this**")
-    hidden_pixels = _glyph_pixels(_region(page, composer, bold, bold + 2))
+
+    def marker_ink() -> int:
+        region = _region(page, composer, bold, bold + 2)
+        # The neighboring faux-bold stroke can bleed a pixel across the clip's edge.
+        return _glyph_pixels(region.crop((1, 0, region.width - 1, region.height)))
+
+    hidden_pixels = marker_ink()
     _move_caret(composer, bold + 4)
-    revealed_pixels = _glyph_pixels(_region(page, composer, bold, bold + 2))
+    revealed_pixels = marker_ink()
     assert hidden_pixels == 0 and revealed_pixels > 20, (hidden_pixels, revealed_pixels)
     assert _shown_markers(layer) == ["**", "**"]
     # Inside a span, or right beside its markers, shows that span's markers.
@@ -626,6 +644,7 @@ def test_highlight_layer_stays_aligned_while_wrapping_and_scrolling(
     expect(composer).to_be_visible(timeout=30_000)
     composer.fill(_ALIGNMENT_DRAFT)
     expect(composer).to_have_value(_ALIGNMENT_DRAFT)
+    _settle_transitions(page)
     pair = _layout_pair(composer)
     # The draft must exceed the height cap, so both halves really scroll.
     assert pair["textarea"]["scrollHeight"] > pair["textarea"]["client"][1] * 3, pair
@@ -865,8 +884,12 @@ def test_large_markdown_draft_keeps_typing_responsive(
         settle = "() => new Promise(r => requestAnimationFrame(() => setTimeout(r, 50)))"
         page.evaluate(settle)
         page.evaluate("() => { window.__keyTimes = []; }")
+        # One press per painted frame, as key repeat does: a burst would time
+        # the input queue's backlog instead of each press.
+        painted = "() => new Promise(r => requestAnimationFrame(() => setTimeout(r, 0)))"
         for _ in range(30):
             page.keyboard.press("ArrowDown")
+            page.evaluate(painted)
         page.evaluate(settle)
         arrow_keys[label] = page.evaluate(_KEY_TIMES)
         assert arrow_keys[label]["count"] == 30, arrow_keys
@@ -1118,6 +1141,7 @@ def test_italics_are_slanted_without_moving_a_glyph(
     )
     composer.fill(draft)
     expect(composer).to_have_value(draft)
+    _settle_transitions(page)
     layer = composer.locator("xpath=..").locator(_LAYER)
     expect(layer.locator("[data-slanted]").first).to_be_attached()
     _assert_layer_aligned(page, composer, tmp_path, f"slant-{theme}")
@@ -1667,6 +1691,7 @@ def test_block_quote_wears_the_reply_quote_look(
     composer = page.get_by_role("textbox", name="Message the agent", exact=True)
     expect(composer).to_be_visible(timeout=30_000)
     composer.fill(_QUOTE_DRAFT)
+    _settle_transitions(page)
     layer = composer.locator("xpath=..").locator(_LAYER)
     _move_caret(composer, len(_QUOTE_DRAFT))
     _assert_quote_block(page, composer)
@@ -1682,9 +1707,8 @@ def test_block_quote_wears_the_reply_quote_look(
     # A selection across the quote's lines paints over its glyphs, still aligned.
     start, end = _QUOTE_DRAFT.index("quoted line with"), _QUOTE_DRAFT.index("lazy") + 4
     unselected = _region(page, composer, start, end)
-    composer.evaluate("(t, [s, e]) => t.setSelectionRange(s, e)", [start, end])
-    expect(composer).to_have_js_property("selectionEnd", end)
-    _next_frame(page)
+    _move_caret(composer, start, end)
+    expect(composer).to_be_focused()
     _assert_selection_visible(unselected, _region(page, composer, start, end))
     card.screenshot(path=tmp_path / f"composer-quote-selection-{theme}.png", animations="disabled")
 
@@ -1696,6 +1720,7 @@ def test_block_quote_wears_the_reply_quote_look(
     composer = page.get_by_role("textbox", name="Message the agent", exact=True)
     composer.fill(_QUOTE_DRAFT)
     expect(composer).to_have_value(_QUOTE_DRAFT)
+    _settle_transitions(page)
     _move_caret(composer, len(_QUOTE_DRAFT))
     block = _assert_quote_block(page, composer)
     reply = block["reply"]
@@ -1736,6 +1761,7 @@ def test_right_to_left_italics_fall_back_without_drift(
         ]
     )
     composer.fill(draft)
+    _settle_transitions(page)
     layer = composer.locator("xpath=..").locator(_LAYER)
     expect(layer.locator("[data-slanted]").first).to_be_attached()
     _assert_layer_aligned(page, composer, tmp_path, f"rtl-{theme}")
