@@ -848,6 +848,7 @@ def test_large_markdown_draft_keeps_typing_responsive(
     caret_moves = {}
     arrow_keys = {}
     page.evaluate(_WATCH_KEYS)
+    cdp = page.context.new_cdp_session(page)
     for label, line in (
         ("plain", "line {i} with em strong code and snake case {i}"),
         ("markdown", "line {i} with _em_ **strong** `code` snake_case_{i}"),
@@ -885,11 +886,14 @@ def test_large_markdown_draft_keeps_typing_responsive(
         page.evaluate(settle)
         page.evaluate("() => { window.__keyTimes = []; }")
         # One press per painted frame, as key repeat does: a burst would time
-        # the input queue's backlog instead of each press.
-        painted = "() => new Promise(r => requestAnimationFrame(() => setTimeout(r, 0)))"
+        # the input queue's backlog instead of each press. Raw CDP calls: with
+        # tracing on, each Playwright action snapshots the DOM mid-frame.
+        painted = "new Promise(r => requestAnimationFrame(() => setTimeout(r, 0)))"
+        arrow_down = {"key": "ArrowDown", "code": "ArrowDown", "windowsVirtualKeyCode": 40}
         for _ in range(30):
-            page.keyboard.press("ArrowDown")
-            page.evaluate(painted)
+            cdp.send("Input.dispatchKeyEvent", {"type": "rawKeyDown", **arrow_down})
+            cdp.send("Input.dispatchKeyEvent", {"type": "keyUp", **arrow_down})
+            cdp.send("Runtime.evaluate", {"expression": painted, "awaitPromise": True})
         page.evaluate(settle)
         arrow_keys[label] = page.evaluate(_KEY_TIMES)
         assert arrow_keys[label]["count"] == 30, arrow_keys
