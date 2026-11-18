@@ -250,6 +250,40 @@ def test_user_package_entry_decides_plugin_skills(claude_dir: Path, tmp_path: Pa
     assert result["packages"] == [{"source": str(root), "skills": []}]
 
 
+def test_overlong_generated_command_name_is_skipped(claude_dir: Path, tmp_path: Path) -> None:
+    """An over-long generated command name is skipped without failing preparation."""
+    long_part = "a" * 128
+    _install(
+        claude_dir,
+        "demo@market",
+        files={
+            f"commands/{long_part}/{long_part}.md": "LONG\n",
+            "commands/ok.md": "OK\n",
+        },
+    )
+    managed = tmp_path / "managed"
+
+    result = add_claude_plugin_resources({}, managed)
+
+    prompts = managed / PI_CLAUDE_PLUGIN_RESOURCES_DIR / "prompts"
+    assert result["prompts"] == [str(prompts)]
+    assert [p.name for p in prompts.iterdir()] == ["demo:ok.md"]
+
+
+def test_pi_manifest_plugin_is_not_added_twice(claude_dir: Path, tmp_path: Path) -> None:
+    """A plugin the user already lists as a Pi package is not listed again."""
+    root = _install(
+        claude_dir,
+        "ext@market",
+        files={"package.json": json.dumps({"name": "ext", "pi": {"extensions": ["./x.js"]}})},
+    )
+    settings = {"packages": [str(root)]}
+
+    result = add_claude_plugin_resources(settings, tmp_path / "managed")
+
+    assert result["packages"] == [str(root)]
+
+
 def test_native_provider_launch_writes_plugin_entries(claude_dir: Path, tmp_path: Path) -> None:
     """The ``omnigent pi`` terminal launch seeds the same managed settings as the gateway."""
     from omnigent.harnesses.pi_native.credentials import (

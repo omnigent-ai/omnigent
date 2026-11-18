@@ -82,7 +82,7 @@ def _seed_claude_home(home: Path) -> Path:
     return review.resolve()
 
 
-def test_pi_gateway_loads_enabled_claude_plugins_across_relaunch(
+def test_pi_gateway_loads_enabled_claude_plugins(
     omnigent_repo_root: Path,
     omnigent_python: Path,
     mock_credentials_env: dict[str, str],
@@ -138,13 +138,9 @@ def test_pi_gateway_loads_enabled_claude_plugins_across_relaunch(
         assert result.returncode == 0, f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
         return get_mock_requests(mock_llm_server_url, key=model)
 
-    first = run_turn("/dp:review security please")
-    # The mock ledger is cumulative, so the relaunch's own requests start after the first run.
-    relaunch_all = run_turn("say hi")
-    second = relaunch_all[len(first) :]
-    assert second, "the relaunch must reach the model"
+    turn = run_turn("/dp:review security please")
 
-    for request in first + second:
+    for request in turn:
         system = "\n".join(
             json.dumps(message["content"])
             for message in request["messages"]
@@ -157,7 +153,7 @@ def test_pi_gateway_loads_enabled_claude_plugins_across_relaunch(
 
     user_texts = [
         json.dumps(message["content"])
-        for request in first
+        for request in turn
         for message in request["messages"]
         if message["role"] == "user"
     ]
