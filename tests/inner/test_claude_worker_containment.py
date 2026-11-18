@@ -36,6 +36,7 @@ from omnigent.inner.egress.certs import HostCertCache
 from omnigent.inner.egress.proxy import EgressProxy
 from omnigent.inner.sandbox import SandboxPolicy
 from tests._helpers.live_server import terminate_process
+from tests._helpers.polling import poll_until
 from tests._helpers.stdio_jsonrpc import read_json_line
 
 
@@ -334,6 +335,98 @@ print(json.dumps(result))
     finally:
         prepared.close()
         listener.close()
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="Linux bound host procfs")
+def test_bound_host_proc_does_not_expose_synthetic_parent(
+    real_worker_spec: OSEnvSpec,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A visible parent PID must not expose its root, environment, or descriptors."""
+    private = tmp_path / "parent-private"
+    private.write_text("parent-file-canary")
+    ready = tmp_path / "parent-ready"
+    parent = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import os, signal, sys\n"
+            "descriptor = os.open(sys.argv[1], os.O_RDONLY)\n"
+            "with open(sys.argv[2], 'w') as ready: ready.write(str(descriptor))\n"
+            "signal.pause()\n",
+            str(private),
+            str(ready),
+        ],
+        env={"PATH": os.environ["PATH"], "PROC_TEST_CANARY": "parent-env-canary"},
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        poll_until(
+            lambda: ready.exists() or parent.poll() is not None, timeout_s=5, interval_s=0.05
+        )
+        assert ready.exists(), (
+            parent.stderr.read().decode()
+            if parent.poll() is not None and parent.stderr
+            else "synthetic parent did not become ready"
+        )
+        assert parent.poll() is None
+        descriptor = int(ready.read_text())
+        parent_proc = Path(f"/proc/{parent.pid}")
+        root_alias = parent_proc / "root" / private.relative_to("/")
+        env_alias = parent_proc / "environ"
+        descriptor_alias = parent_proc / "fd" / str(descriptor)
+        assert root_alias.read_text() == "parent-file-canary"
+        assert b"PROC_TEST_CANARY=parent-env-canary" in env_alias.read_bytes()
+        assert descriptor_alias.read_text() == "parent-file-canary"
+        parent_comm = (parent_proc / "comm").read_text().strip()
+
+        monkeypatch.setattr("omnigent.inner.bwrap_sandbox._should_bind_host_proc", lambda: True)
+        workspace = Path(real_worker_spec.cwd or "")
+        worker_env = {"PATH": os.environ["PATH"], "HOME": str(tmp_path / "claude-state")}
+        probe = f"""
+import json, pathlib
+result = {{'comm': pathlib.Path({str(parent_proc / "comm")!r}).read_text().strip()}}
+for name, path in [
+    ('root', {str(root_alias)!r}),
+    ('environ', {str(env_alias)!r}),
+    ('descriptor', {str(descriptor_alias)!r}),
+]:
+    try:
+        pathlib.Path(path).read_bytes()
+        result[name] = 'exposed'
+    except OSError:
+        result[name] = 'blocked'
+print(json.dumps(result))
+"""
+        prepared = claude.prepare_claude_cli_path(
+            sys.executable, real_worker_spec, worker_env=worker_env
+        )
+        assert prepared.cli_path is not None
+        try:
+            result = subprocess.run(
+                [prepared.cli_path, "-c", probe],
+                cwd=workspace,
+                env={**os.environ, **worker_env},
+                capture_output=True,
+                text=True,
+                timeout=20,
+            )
+            assert result.returncode == 0, result.stderr
+            assert json.loads(result.stdout) == {
+                "comm": parent_comm,
+                "root": "blocked",
+                "environ": "blocked",
+                "descriptor": "blocked",
+            }
+        finally:
+            prepared.close()
+    finally:
+        terminate_process(parent, timeout_s=5)
+        if parent.stderr:
+            parent.stderr.close()
 
 
 def test_filtered_worker_networking_preserves_policy_credentials_and_gateway_thinking(
