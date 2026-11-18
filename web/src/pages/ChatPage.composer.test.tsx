@@ -450,9 +450,9 @@ describe("Composer Escape interrupt", () => {
     render(<Composer {...props} />);
     fireEvent.change(textarea(), { target: { value: "/help " } });
     fireEvent.keyDown(textarea(), { key: "Enter" });
-    //Page-wide Escape shortcuts (approval decline, question reject) defer to escape owners.
+    // Page-wide Escape shortcuts (approval decline, question reject) defer to escape owners.
     const help = screen.getByText(/\/help — Show available slash commands/);
-    expect(help.closest("[data-escape-owner")).not.toBeNull();
+    expect(help.closest("[data-escape-owner]")).not.toBeNull();
 
     textarea().blur();
     fireEvent.keyDown(document.body, { key: "Escape" });
