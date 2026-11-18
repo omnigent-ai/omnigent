@@ -195,16 +195,6 @@ describe("CodeMirrorComposerInput change events", () => {
     expect([target().selectionStart, target().selectionEnd]).toEqual([16, 16]);
   });
 
-  it("restores the controlled value when a parent rejects an edit", async () => {
-    const onChange = vi.fn();
-    const { target } = mount({ value: "draft", onChange });
-    act(() => insertComposerText(target(), "x", 5, 5));
-    expect(onChange).toHaveBeenCalledTimes(1);
-
-    // The parent ignores the edit and doesn't re-render, so the editor reconciles on its own.
-    await waitFor(() => expect(target().value).toBe("draft"));
-  });
-
   it("keeps an edit the parent accepts", async () => {
     const box: { target: ComposerTextTarget | null } = { target: null };
     function Harness() {

@@ -348,13 +348,6 @@ function CodeMirrorComposer({
                 (transaction) => transaction.isUserEvent("undo") || transaction.isUserEvent("redo"),
               );
               latest.current.onChange?.({ ...event(), fromHistory });
-              // A parent that rejects the edit may not re-render. Reconcile once the parent's
-              // update, if any, has committed, as a textarea does after an event.
-              queueMicrotask(() => {
-                const parentValue = latest.current.value;
-                if (parentValue !== undefined && viewRef.current)
-                  syncControlledValue(viewRef.current, parentValue);
-              });
             }
             if (update.docChanged || update.selectionSet) latest.current.onSelect?.(event());
             if (update.docChanged || update.geometryChanged) markOverflow(update.view);
@@ -387,11 +380,12 @@ function CodeMirrorComposer({
   // React re-attaches the surface when the forwarded ref changes, as for a textarea.
   useImperativeHandle(forwardedRef, () => surfaceRef.current!, []);
 
-  // Runs on every render, so an edit the parent rejected reverts even when the value didn't change.
+  // Reconciles when `value` changes, not on every render: a render that lands before a pending
+  // keystroke would otherwise revert it.
   useLayoutEffect(() => {
     const view = viewRef.current;
     if (view && value !== undefined) syncControlledValue(view, value);
-  });
+  }, [value]);
 
   // One key for every prop that becomes an editor or content attribute.
   const attributeKey = JSON.stringify([
