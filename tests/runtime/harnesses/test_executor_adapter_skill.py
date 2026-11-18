@@ -154,8 +154,8 @@ def _tool(name: str, args: dict[str, object], call_id: str) -> list[ExecutorEven
     ]
 
 
-async def _run(events: list[ExecutorEvent]) -> None:
-    """Run one adapter turn over *events*."""
+async def _run(events: list[ExecutorEvent], **request_fields: object) -> None:
+    """Run one adapter turn over *events*; *request_fields* extend the request."""
     executor = MockExecutor()
     executor.enqueue_events(events)
     adapter = ExecutorAdapter(executor_factory=lambda: executor)
@@ -165,7 +165,8 @@ async def _run(events: list[ExecutorEvent]) -> None:
         cancelled=asyncio.Event(),
     )
     try:
-        await adapter.run_turn(CreateResponseRequest(model="test-agent", input="hi"), ctx)
+        request = CreateResponseRequest(model="test-agent", input="hi", **request_fields)
+        await adapter.run_turn(request, ctx)
     finally:
         await adapter.on_shutdown()
 
@@ -302,3 +303,102 @@ async def test_malformed_skill_call_exports_no_argument_content(
         for value in (span.attributes or {}).values():
             assert "private task details" not in str(value)
     assert telemetry._active_skill_var.get() is None
+
+
+_UNSET = None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("request_fields", "terminal", "expected"),
+    [
+        pytest.param(
+            {},
+            TurnComplete(response="", usage={"model": "gpt-5.5-2026-09", "input_tokens": 3}),
+            {
+                "gen_ai.request.model": _UNSET,
+                "llm.model_name": "test-agent",
+                "gen_ai.response.model": "gpt-5.5-2026-09",
+                "omnigent.model.source": "observed",
+                "omnigent.reasoning_effort.requested": _UNSET,
+                "omnigent.reasoning_effort": _UNSET,
+            },
+            id="default-model-observed",
+        ),
+        pytest.param(
+            {},
+            TurnComplete(response=""),
+            {
+                "gen_ai.request.model": _UNSET,
+                "gen_ai.response.model": _UNSET,
+                "omnigent.model.source": _UNSET,
+            },
+            id="model-unknowable",
+        ),
+        pytest.param(
+            {"model_override": "openai/gpt-5.4-mini", "reasoning": {"effort": "High"}},
+            TurnComplete(response=""),
+            {
+                "gen_ai.request.model": "gpt-5.4-mini",
+                "gen_ai.response.model": "gpt-5.4-mini",
+                "omnigent.model.source": "requested",
+                "omnigent.reasoning_effort.requested": "High",
+                "omnigent.reasoning_effort": "high",
+                "omnigent.reasoning_effort.source": "requested",
+            },
+            id="requested",
+        ),
+        pytest.param(
+            {"model_override": "openai/gpt-5.4-mini", "reasoning": {"effort": "High"}},
+            TurnComplete(
+                response="", usage={"model": "gpt-5.5-2026-09"}, reasoning_effort="medium"
+            ),
+            {
+                "gen_ai.request.model": "gpt-5.4-mini",
+                "gen_ai.response.model": "gpt-5.5-2026-09",
+                "omnigent.model.source": "observed",
+                "omnigent.reasoning_effort.requested": "High",
+                "omnigent.reasoning_effort": "medium",
+                "omnigent.reasoning_effort.source": "observed",
+            },
+            id="observed-replaces-requested",
+        ),
+        pytest.param(
+            {"reasoning": {"effort": "default"}},
+            TurnComplete(response="", reasoning_effort="medium"),
+            {
+                "omnigent.reasoning_effort.requested": "default",
+                "omnigent.reasoning_effort": "medium",
+                "omnigent.reasoning_effort.source": "observed",
+            },
+            id="default-effort-observed",
+        ),
+        pytest.param(
+            {"reasoning": {"effort": "default"}},
+            TurnComplete(response=""),
+            {
+                "omnigent.reasoning_effort.requested": "default",
+                "omnigent.reasoning_effort": _UNSET,
+            },
+            id="default-effort-unreported",
+        ),
+    ],
+)
+async def test_agent_span_records_the_model_and_effort_the_turn_ran_with(
+    exporter: InMemorySpanExporter,
+    monkeypatch: pytest.MonkeyPatch,
+    request_fields: dict[str, object],
+    terminal: TurnComplete,
+    expected: dict[str, str | None],
+) -> None:
+    """A default model or effort is recorded as what ran, or left unset when unknown.
+
+    The agent name stays ``llm.model_name`` but is never a requested model.
+    """
+    monkeypatch.setenv("OMNIGENT_TELEMETRY_ENABLED", "true")
+
+    await _run([terminal], **request_fields)
+
+    (agent,) = [s for s in exporter.get_finished_spans() if s.name == "agent:test-agent"]
+    attributes = dict(agent.attributes or {})
+    assert {key: attributes.get(key) for key in expected} == expected

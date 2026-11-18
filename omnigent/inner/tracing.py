@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any, TypeAlias
 
 if TYPE_CHECKING:
@@ -72,6 +73,7 @@ _GEN_AI_OP_NAME = "gen_ai.operation.name"
 _GEN_AI_AGENT_NAME = "gen_ai.agent.name"
 _GEN_AI_PROVIDER_NAME = "gen_ai.provider.name"
 _GEN_AI_REQUEST_MODEL = "gen_ai.request.model"
+_GEN_AI_RESPONSE_MODEL = "gen_ai.response.model"
 _GEN_AI_TOOL_NAME = "gen_ai.tool.name"
 _TOOL_NAME = "tool.name"
 
@@ -82,6 +84,19 @@ _ERROR_MESSAGE = "error.message"
 # Skill name on a Skill / load_skill tool span. Structural, not payload, so it is
 # stamped regardless of content capture.
 _SKILL_NAME = "omnigent.skill.name"
+
+# What an agent turn actually ran with. gen_ai.response.model is the model; each
+# source says where a value came from: the harness reported it (observed) or
+# only the request is known (requested).
+TURN_MODEL_SOURCE = "omnigent.model.source"
+TURN_REASONING_EFFORT_REQUESTED = "omnigent.reasoning_effort.requested"
+TURN_REASONING_EFFORT = "omnigent.reasoning_effort"
+TURN_REASONING_EFFORT_SOURCE = "omnigent.reasoning_effort.source"
+SOURCE_OBSERVED = "observed"
+SOURCE_REQUESTED = "requested"
+
+# start_agent_span's default: the requested model is the recorded model.
+_SAME_AS_MODEL = object()
 
 # ---------------------------------------------------------------------------
 # Global enable/disable
@@ -153,8 +168,19 @@ class TracingContext:
         agent_name: str,
         user_message: str,
         model: str | None = None,
+        *,
+        request_model: str | object | None = _SAME_AS_MODEL,
     ) -> Span:
-        """Begin the root AGENT span for a turn."""
+        """
+        Begin the root AGENT span for a turn.
+
+        :param agent_name: The agent's name, e.g. ``"coder"``.
+        :param user_message: The turn's user message, recorded with content capture.
+        :param model: Recorded as ``llm.model_name`` (and its provider prefix as
+            ``gen_ai.provider.name``).
+        :param request_model: The model the turn asked for, as
+            ``gen_ai.request.model``; ``None`` records none. Defaults to *model*.
+        """
         from opentelemetry import trace
 
         parent = self._current_span
@@ -174,11 +200,12 @@ class TracingContext:
             attrs["session.id"] = self.session_id
         if model:
             attrs[_LLM_MODEL_NAME] = model
-            provider, model_name = parse_provider_name(model)
+            provider, _ = parse_provider_name(model)
             if provider:
                 attrs[_GEN_AI_PROVIDER_NAME] = provider
-            if model_name:
-                attrs[_GEN_AI_REQUEST_MODEL] = model_name
+        requested = model if request_model is _SAME_AS_MODEL else request_model
+        if isinstance(requested, str) and (model_name := parse_provider_name(requested)[1]):
+            attrs[_GEN_AI_REQUEST_MODEL] = model_name
         if parent_ended and parent is not None:
             ctx = parent.get_span_context()
             if ctx is not None:
@@ -311,6 +338,83 @@ class TracingContext:
         span.end()
         if span is self._current_span:
             self._current_span = parent_span
+
+    def set_turn_model(self, span: Span | None, model: str | None, source: str) -> None:
+        """
+        Stamp the model a turn ran with as ``gen_ai.response.model``.
+
+        :param span: The turn's AGENT span.
+        :param model: Model id, e.g. ``"claude-opus-4-8[1m]"``; ignored when empty.
+        :param source: One of :data:`SOURCE_OBSERVED`, :data:`SOURCE_REQUESTED`.
+        """
+        if span is None or not model:
+            return
+        span.set_attribute(_GEN_AI_RESPONSE_MODEL, model)
+        span.set_attribute(TURN_MODEL_SOURCE, source)
+
+    def set_turn_reasoning_effort(
+        self, span: Span | None, effort: str | None, source: str
+    ) -> None:
+        """
+        Stamp the reasoning effort a turn ran at, when it is a known level.
+
+        :param span: The turn's AGENT span.
+        :param effort: Effort level, e.g. ``"high"``. Anything outside the
+            shared effort ladder (empty, or a clear alias such as ``"default"``)
+            names no level and is not stamped.
+        :param source: Where the value came from, as for :meth:`set_turn_model`.
+        """
+        from omnigent.util.reasoning_effort import EFFORT_VALUES
+
+        level = effort.strip().lower() if isinstance(effort, str) else ""
+        if span is None or level not in EFFORT_VALUES:
+            return
+        span.set_attribute(TURN_REASONING_EFFORT, level)
+        span.set_attribute(TURN_REASONING_EFFORT_SOURCE, source)
+
+    def set_requested_turn_settings(
+        self,
+        span: Span | None,
+        *,
+        requested_model: str | None,
+        requested_effort: str | None,
+    ) -> None:
+        """
+        Stamp the model and effort a turn asked for as it starts.
+
+        An observed value at turn end replaces either.
+
+        :param span: The turn's AGENT span.
+        :param requested_model: The turn's model override, or ``None``.
+        :param requested_effort: The effort the turn asked for, as given, or ``None``.
+        """
+        if requested_model:
+            # Spelled like gen_ai.request.model, without a provider prefix.
+            self.set_turn_model(span, parse_provider_name(requested_model)[1], SOURCE_REQUESTED)
+        if span is not None and requested_effort:
+            span.set_attribute(TURN_REASONING_EFFORT_REQUESTED, requested_effort)
+        self.set_turn_reasoning_effort(span, requested_effort, SOURCE_REQUESTED)
+
+    def set_observed_turn_settings(
+        self,
+        span: Span | None,
+        *,
+        usage: Mapping[str, Any] | None,
+        reasoning_effort: str | None,
+    ) -> None:
+        """
+        Stamp what the harness reported running at turn end, over the request.
+
+        :param span: The turn's AGENT span.
+        :param usage: The turn's provider usage; its ``"model"`` key is the
+            model that served the turn, e.g. ``{"model": "gpt-5.5", ...}``.
+        :param reasoning_effort: The effort the harness applied, e.g. its own
+            default when the turn asked for none.
+        """
+        model = usage.get("model") if usage is not None else None
+        if isinstance(model, str):
+            self.set_turn_model(span, model, SOURCE_OBSERVED)
+        self.set_turn_reasoning_effort(span, reasoning_effort, SOURCE_OBSERVED)
 
     def set_skill_name(self, span: Span | None, skill_name: str) -> None:
         """Stamp ``omnigent.skill.name`` on a Skill / load_skill tool span."""
