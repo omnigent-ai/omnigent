@@ -991,6 +991,7 @@ async def _archive_stop(
     delete_worktree: bool = False,
     host_store: HostStore | None = None,
     sandbox_config: ManagedSandboxDeployment | None = None,
+    archive_generation: str | None = None,
 ) -> None:
     """
     Stop an archived session and tear down its host-launched runner.
@@ -1026,6 +1027,9 @@ async def _archive_stop(
     :param sandbox_config: The deployment's managed-sandbox config; when the
         host's provider opts in (``stop_on_archive``), the session's sandbox is
         stopped last.
+    :param archive_generation: The scheduling archive's ``ARCHIVED_AT_LABEL_KEY``
+        value, so a timer a newer archive superseded never ends that archive's
+        Undo window; ``None`` uses the row's current archive.
     """
     # Resolve through the facade so a test's monkeypatch is honored here.
     from omnigent.server.routes import sessions as _facade
@@ -1063,7 +1067,11 @@ async def _archive_stop(
             functools.partial(
                 conversation_store.leave_session_family,
                 session_id,
-                archive_generation=conv.labels.get(ARCHIVED_AT_LABEL_KEY, ""),
+                archive_generation=(
+                    archive_generation
+                    if archive_generation is not None
+                    else conv.labels.get(ARCHIVED_AT_LABEL_KEY, "")
+                ),
             )
         )
     except Exception:  # noqa: BLE001
@@ -1206,6 +1214,7 @@ def _spawn_archive_stop(
     host_store: HostStore | None = None,
     sandbox_config: ManagedSandboxDeployment | None = None,
     after_turn: bool = False,
+    archive_generation: str | None = None,
 ) -> None:
     """
     Defer :func:`_archive_stop` past the undo grace, as a retained task.
@@ -1240,6 +1249,7 @@ def _spawn_archive_stop(
         the grace, lives only in this replica's memory: if the replica restarts
         first, the archived session's runner keeps running until its idle
         timeout or a later stop.
+    :param archive_generation: Forwarded to :func:`_archive_stop`.
     """
     # Replace any pending stop from an earlier archive of this session.
     _cancel_pending_archive_stop(session_id)
@@ -1263,6 +1273,7 @@ def _spawn_archive_stop(
             delete_worktree=delete_worktree,
             host_store=host_store,
             sandbox_config=sandbox_config,
+            archive_generation=archive_generation,
         )
 
     task = asyncio.create_task(_stop_after_grace())

@@ -287,9 +287,7 @@ from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.comment_store import CommentStore
 from omnigent.stores.conversation_store import (
-    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY as _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
-)
-from omnigent.stores.conversation_store import (
+    ARCHIVED_AT_LABEL_KEY,
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
@@ -299,6 +297,9 @@ from omnigent.stores.conversation_store import (
     ConversationNotFoundError,
     pinned_label_key,
     runner_seen_is_fresh,
+)
+from omnigent.stores.conversation_store import (
+    CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY as _CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
 )
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.permission_store import PermissionStore, read_all_grants
@@ -4670,10 +4671,13 @@ def register_core_routes(
             )
             if not filed:
                 raise _session_not_found()
+        archive_generation: str | None = None
         if body.archived is not None:
-            await asyncio.to_thread(
+            archived_conv = await asyncio.to_thread(
                 conversation_store.update_conversation, session_id, archived=body.archived
             )
+            if archived_conv is not None and body.archived:
+                archive_generation = archived_conv.labels.get(ARCHIVED_AT_LABEL_KEY, "")
         # Archiving hides the session from the default view (and its unread
         # dot), so drop its per-user read-state to bound in-memory growth.
         # Only on archive→true; unarchiving leaves it pruned (reads as seen).
@@ -4695,6 +4699,7 @@ def register_core_routes(
                 sandbox_config=getattr(request.app.state, "sandbox_config", None),
                 after_turn=normalize_uuid(request.headers.get(ORCHESTRATION_SOURCE_HEADER))
                 == lifecycle_id,
+                archive_generation=archive_generation,
             )
         elif body.archived is False:
             # Cancel local teardown immediately; the deferred flag check handles

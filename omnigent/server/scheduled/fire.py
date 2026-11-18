@@ -1176,7 +1176,8 @@ async def archive_idle_launched_sessions(
                 archive_teardown_is_elsewhere, member, deps.host_registry, deps.host_store
             ):
                 continue
-            if not await asyncio.to_thread(store.archive_if_idle, member.id, cutoff):
+            generation = await asyncio.to_thread(store.archive_if_idle, member.id, cutoff)
+            if generation is None:
                 continue
             _prune_session_read_state(member.id)
             _spawn_archive_stop(
@@ -1186,6 +1187,7 @@ async def archive_idle_launched_sessions(
                 deps.host_registry,
                 host_store=deps.host_store,
                 sandbox_config=deps.sandbox_config,
+                archive_generation=generation,
             )
         except Exception:
             _logger.exception(

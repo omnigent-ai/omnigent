@@ -10563,6 +10563,53 @@ def test_archived_sibling_leaves_its_family_after_the_undo_window(
     assert store.get_conversation(rearchived).family_id is None
 
 
+def test_split_database_family_leave_holds_the_archive_until_membership_commits(
+    tmp_path, monkeypatch
+) -> None:
+    import threading
+
+    from omnigent.stores.conversation_store import ARCHIVED_AT_LABEL_KEY, family_pinned_label_key
+
+    store = SqlAlchemyConversationStore(
+        f"sqlite:///{tmp_path / 'metadata.db'}", f"sqlite:///{tmp_path / 'messages.db'}"
+    )
+    source = store.create_conversation(conversation_id="1" * 32)
+    member = store.create_conversation(conversation_id="2" * 32)
+    store.add_new_sibling(source.id, member.id, user_id="alice")
+    store.set_family_pin(source.id, "123", user_id="alice")
+    store.update_conversation(member.id, archived=True)
+    generation = store.get_conversation(member.id).labels[ARCHIVED_AT_LABEL_KEY]
+
+    # Pause the leave after its archive check; an unarchive in that gap must wait for it.
+    real_check = SqlAlchemyConversationStore._archive_is_current
+    unarchived = threading.Event()
+    unarchive_thread: list[threading.Thread] = []
+
+    def check_then_race(labels_session, session_id, archive_generation):
+        current = real_check(labels_session, session_id, archive_generation)
+        thread = threading.Thread(
+            target=lambda: (
+                store.update_conversation(member.id, archived=False),
+                unarchived.set(),
+            )
+        )
+        thread.start()
+        unarchive_thread.append(thread)
+        assert not unarchived.wait(0.5)
+        return current
+
+    monkeypatch.setattr(
+        SqlAlchemyConversationStore, "_archive_is_current", staticmethod(check_then_race)
+    )
+    store.leave_session_family(member.id, archive_generation=generation)
+    unarchive_thread[0].join(timeout=30)
+    assert unarchived.is_set()
+    # The leave committed with its pin cleanup before the unarchive ran.
+    left = store.get_conversation(member.id)
+    assert left.family_id is None and not left.archived
+    assert family_pinned_label_key("alice") not in left.labels
+
+
 def test_family_leave_follows_a_concurrent_rekey_and_idle_archive_is_conditional(
     conversation_store, monkeypatch
 ) -> None:

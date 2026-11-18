@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import functools
 import json
 import logging
 import uuid
@@ -2173,78 +2175,104 @@ class SqlAlchemyConversationStore(ConversationStore):
         for _ in range(_FAMILY_LEAVE_ATTEMPTS):
             if family_id is None:
                 return
-
-            def write(session: Session, locked_family_id: str = family_id) -> str | None:
-                self._lock_session_family(session, locked_family_id)
-                current = session.get(
-                    SqlConversationMetadata,
-                    (current_workspace_id(), session_id),
-                    with_for_update=True,
+            with contextlib.ExitStack() as lifecycle:
+                outcome = run_write_transaction(
+                    self._session_immediate,
+                    "leave_session_family",
+                    functools.partial(
+                        self._leave_family_write,
+                        session_id=session_id,
+                        family_id=family_id,
+                        archive_generation=archive_generation,
+                        lifecycle=lifecycle,
+                    ),
                 )
-                if current is None or current.family_id is None:
-                    return None
-                if current.family_id != locked_family_id:
-                    # Another leave re-keyed the family before this lock; follow it.
-                    return current.family_id
-                if archive_generation is not None and not self._archive_is_current(
-                    session, session_id, archive_generation
-                ):
-                    return None
-                remaining = [
-                    member
-                    for member in self._family_member_ids(session, locked_family_id)
-                    if member != session_id
-                ]
-                current.family_id = None
-                if session_id == locked_family_id and remaining:
-                    self._lock_session_family(session, remaining[0])
-                    session.execute(
-                        update(SqlConversationMetadata)
-                        .where(
-                            SqlConversationMetadata.workspace_id == current_workspace_id(),
-                            SqlConversationMetadata.id.in_(remaining),
-                        )
-                        .values(family_id=remaining[0])
-                    )
-                return ""
-
-            outcome = run_write_transaction(self._session_immediate, "leave_session_family", write)
-            if outcome == "":
-                break
+            if outcome is None or outcome == "":
+                return
             family_id = outcome
+        raise OmnigentError("Session family changed", code=ErrorCode.CONFLICT)
+
+    def _leave_family_write(
+        self,
+        session: Session,
+        *,
+        session_id: str,
+        family_id: str,
+        archive_generation: str | None,
+        lifecycle: contextlib.ExitStack,
+    ) -> str | None:
+        """
+        Leave *family_id* under its lock; the departure's lifecycle writes share one transaction.
+
+        The conversation-database transaction opens after the family lock, matching
+        sibling creation's lock order, and commits after membership, so neither an
+        unarchive nor a newer family's pin can slip between the check and the commit.
+
+        :returns: ``""`` when the session left, ``None`` when nothing changed, or
+            the family's new id when a concurrent re-key moved it.
+        """
+        self._lock_session_family(session, family_id)
+        current = session.get(
+            SqlConversationMetadata, (current_workspace_id(), session_id), with_for_update=True
+        )
+        if current is None or current.family_id is None:
+            return None
+        if current.family_id != family_id:
+            # Another leave re-keyed the family before this lock; follow it.
+            return current.family_id
+        if self._conv_engine is self._engine:
+            labels_session = session
         else:
-            raise OmnigentError("Session family changed", code=ErrorCode.CONFLICT)
-
-        # Membership commits first, so a failed label cleanup never leaves a member unpinned.
-        def clear_pins(session: Session) -> None:
-            # A primary-key range, so only this session's family pin rows are examined.
+            labels_session = lifecycle.enter_context(
+                self._conv_session_immediate("leave_session_family_lifecycle")
+            )
+        if archive_generation is not None and not self._archive_is_current(
+            labels_session, session_id, archive_generation
+        ):
+            return None
+        remaining = [
+            member
+            for member in self._family_member_ids(session, family_id)
+            if member != session_id
+        ]
+        current.family_id = None
+        if session_id == family_id and remaining:
+            self._lock_session_family(session, remaining[0])
             session.execute(
-                delete(SqlConversationLabel).where(
-                    SqlConversationLabel.workspace_id == current_workspace_id(),
-                    SqlConversationLabel.conversation_id == session_id,
-                    SqlConversationLabel.key >= FAMILY_PIN_LABEL_PREFIX,
-                    SqlConversationLabel.key < _FAMILY_PIN_LABEL_PREFIX_END,
+                update(SqlConversationMetadata)
+                .where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id.in_(remaining),
                 )
+                .values(family_id=remaining[0])
             )
+        # A primary-key range, so only this session's family pin rows are examined.
+        labels_session.execute(
+            delete(SqlConversationLabel).where(
+                SqlConversationLabel.workspace_id == current_workspace_id(),
+                SqlConversationLabel.conversation_id == session_id,
+                SqlConversationLabel.key >= FAMILY_PIN_LABEL_PREFIX,
+                SqlConversationLabel.key < _FAMILY_PIN_LABEL_PREFIX_END,
+            )
+        )
+        return ""
 
-        run_write_transaction(self._conv_session_immediate, "clear_family_pins", clear_pins)
-
-    def _archive_is_current(self, session: Session, session_id: str, generation: str) -> bool:
+    @staticmethod
+    def _archive_is_current(labels_session: Session, session_id: str, generation: str) -> bool:
         """Lock *session_id*'s row and check it is still in the archive *generation* names."""
-        with self._profile_label_session(session) as labels_session:
-            row = labels_session.get(
-                SqlConversation, (current_workspace_id(), session_id), with_for_update=True
-            )
-            label = labels_session.get(
-                SqlConversationLabel, (current_workspace_id(), session_id, ARCHIVED_AT_LABEL_KEY)
-            )
-            return (
-                row is not None
-                and bool(row.archived)
-                and (label.value if label is not None else "") == generation
-            )
+        row = labels_session.get(
+            SqlConversation, (current_workspace_id(), session_id), with_for_update=True
+        )
+        label = labels_session.get(
+            SqlConversationLabel, (current_workspace_id(), session_id, ARCHIVED_AT_LABEL_KEY)
+        )
+        return (
+            row is not None
+            and bool(row.archived)
+            and (label.value if label is not None else "") == generation
+        )
 
-    def archive_if_idle(self, conversation_id: str, idle_before: int) -> bool:
+    def archive_if_idle(self, conversation_id: str, idle_before: int) -> str | None:
         """
         Archive a session only if it has had no activity since ``idle_before``.
 
@@ -2254,11 +2282,12 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         :param conversation_id: The session to archive, e.g. ``"9f2c..."``.
         :param idle_before: Unix epoch seconds; a later ``updated_at`` skips it.
-        :returns: ``True`` when this call archived the session.
+        :returns: The archive's generation (its ``ARCHIVED_AT_LABEL_KEY`` value)
+            when this call archived the session, else ``None``.
         """
         now = now_epoch()
 
-        def write(session: Session) -> bool:
+        def write(session: Session) -> str | None:
             result = session.execute(
                 update(SqlConversation)
                 .where(
@@ -2270,9 +2299,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .values(archived=True, updated_at=now)
             )
             if not cast(_RowCountResult, result).rowcount:
-                return False
+                return None
             _upsert_labels(session, conversation_id, {ARCHIVED_AT_LABEL_KEY: str(now)}, now)
-            return True
+            return str(now)
 
         return run_write_transaction(self._conv_session_immediate, "archive_idle_session", write)
 

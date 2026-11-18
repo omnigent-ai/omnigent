@@ -1604,8 +1604,8 @@ class ConversationStore(ABC):
         """Remove a session from its sibling family; archive teardown calls this."""
         raise NotImplementedError
 
-    def archive_if_idle(self, conversation_id: str, idle_before: int) -> bool:
-        """Archive a session only if it has had no activity since ``idle_before``."""
+    def archive_if_idle(self, conversation_id: str, idle_before: int) -> str | None:
+        """Archive a session idle since ``idle_before``; returns its archive generation."""
         raise NotImplementedError
 
     def get_session_family(self, session_id: str) -> list[Conversation]:

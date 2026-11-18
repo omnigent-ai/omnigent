@@ -606,6 +606,25 @@ async def test_archived_sibling_leaves_its_family_when_teardown_runs(
         await _drain_detached_stops()
     assert conv_store.get_conversation(sibling["id"]).family_id == source["id"]
 
+    # A timer from a superseded archive (not cancelled, e.g. on another replica)
+    # never ends the newer archive's Undo window.
+    with patch.object(_sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 30.0):
+        archived = await client.patch(f"/v1/sessions/{sibling['id']}", json={"archived": True})
+        superseded = archived.json()["labels"]["omnigent.archived_at"]
+        await client.patch(f"/v1/sessions/{sibling['id']}", json={"archived": False})
+        await client.patch(f"/v1/sessions/{sibling['id']}", json={"archived": True})
+        conv_store.set_labels(sibling["id"], {"omnigent.archived_at": str(int(superseded) + 5)})
+        await _sessions_orchestration._archive_stop(
+            sibling["id"],
+            conv_store,
+            runner_router=None,
+            host_registry=None,
+            archive_generation=superseded,
+        )
+        assert conv_store.get_conversation(sibling["id"]).family_id == source["id"]
+        await client.patch(f"/v1/sessions/{sibling['id']}", json={"archived": False})
+        await _drain_detached_stops()
+
     await client.patch(f"/v1/sessions/{sibling['id']}", json={"archived": True})
     await _drain_detached_stops()
     assert conv_store.get_conversation(sibling["id"]).family_id is None
