@@ -8,6 +8,7 @@ import json
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
+from unittest.mock import DEFAULT, AsyncMock
 
 import click
 import httpx
@@ -1332,6 +1333,69 @@ def test_supervise_forwarder_continues_after_event_handler_failure(
 
     assert handled == ["turn_after"]
     assert "Codex forwarder event handling failed" in caplog.text
+
+
+@pytest.mark.parametrize("status_publish_fails", [False, True])
+def test_supervise_forwarder_reports_running_from_first_live_item_of_missed_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    status_publish_fails: bool,
+) -> None:
+    """First-item recovery is best effort and never consumes the original live item."""
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_1")
+    user_message = _user_message_item("item_1", "Review the change.")
+    item_params = {"threadId": "thread_123", "turnId": "turn_1", "item": user_message}
+    events = [
+        {"method": "item/started", "params": item_params},
+        {"method": "item/completed", "params": item_params},
+    ]
+    fake_client = _FakeCodexAppServerClient(events=events)
+    posted: list[dict[str, Any]] = []
+    handle_event = AsyncMock(wraps=codex_native_forwarder._handle_event)
+    monkeypatch.setattr(codex_native_forwarder, "_handle_event", handle_event)
+    status_poster = AsyncMock(
+        wraps=codex_native_forwarder._post_turn_status_edge,
+        side_effect=[RuntimeError("credential resolution failed"), DEFAULT]
+        if status_publish_fails
+        else None,
+    )
+    monkeypatch.setattr(codex_native_forwarder, "_post_turn_status_edge", status_poster)
+
+    asyncio.run(
+        codex_native_forwarder.supervise_forwarder(
+            base_url="http://127.0.0.1:1",
+            headers={},
+            session_id="conv_123",
+            bridge_dir=tmp_path,
+            app_server_url=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            client=fake_client,  # type: ignore[arg-type]
+            ap_transport=httpx.MockTransport(_capture_handler(posted)),
+        )
+    )
+
+    assert [call.kwargs["event"]["method"] for call in handle_event.await_args_list] == [
+        "item/started",
+        "item/completed",
+    ]
+    for call, event in zip(handle_event.await_args_list, events, strict=True):
+        assert call.kwargs["event"] is event
+        assert call.kwargs["event"]["params"]["item"] is user_message
+    assert user_message == _user_message_item("item_1", "Review the change.")
+    assert [body["data"] for body in posted if body["type"] == "external_conversation_item"] == [
+        {
+            "item_type": "message",
+            "item_data": {
+                "role": "user",
+                "content": [{"type": "input_text", "text": "Review the change."}],
+            },
+            "response_id": "codex_turn_1",
+            "source_id": "thread_123:turn_1:item_1",
+        }
+    ]
+    statuses = [body["data"] for body in posted if body["type"] == "external_session_status"]
+    assert status_poster.await_count == (2 if status_publish_fails else 1)
+    assert statuses == [_expected_status_data("running", "turn_1")]
 
 
 def test_codex_discover_thread_and_forward_writes_routing_summary_on_timeout(
