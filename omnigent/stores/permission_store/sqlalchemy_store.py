@@ -574,31 +574,38 @@ def delete_grants_on_workflows(
     """Delete up to *batch_size* grants on *workflow_ids* in the caller's transaction.
 
     For deleting workflows a bounded batch at a time: their grants go first, so none
-    outlives its workflow. Walks the primary key.
+    outlives its workflow. Each workflow's grants are read along its primary-key
+    prefix, limited to the room left in the batch, so a batch scans ``O(batch_size)``
+    rows however many other grants the workspace holds.
 
     :returns: The number of grants deleted; ``0`` once the workflows have none.
     """
-    keys = session.execute(
-        select(SqlWorkflowShare.workflow_id, SqlWorkflowShare.user_id)
-        .where(
-            SqlWorkflowShare.workspace_id == current_workspace_id(),
-            SqlWorkflowShare.workflow_id.in_(sorted(workflow_ids)),
+    deleted = 0
+    for workflow_id in sorted(workflow_ids):
+        room = batch_size - deleted
+        if room <= 0:
+            break
+        user_ids = list(
+            session.execute(
+                select(SqlWorkflowShare.user_id)
+                .where(
+                    SqlWorkflowShare.workspace_id == current_workspace_id(),
+                    SqlWorkflowShare.workflow_id == workflow_id,
+                )
+                .order_by(SqlWorkflowShare.user_id)
+                .limit(room)
+            ).scalars()
         )
-        .order_by(SqlWorkflowShare.workflow_id, SqlWorkflowShare.user_id)
-        .limit(batch_size)
-    ).all()
-    grantees: dict[str, list[str]] = {}
-    for workflow_id, user_id in keys:
-        grantees.setdefault(workflow_id, []).append(user_id)
-    for workflow_id, user_ids in grantees.items():
-        session.execute(
-            delete(SqlWorkflowShare).where(
-                SqlWorkflowShare.workspace_id == current_workspace_id(),
-                SqlWorkflowShare.workflow_id == workflow_id,
-                SqlWorkflowShare.user_id.in_(user_ids),
+        if user_ids:
+            session.execute(
+                delete(SqlWorkflowShare).where(
+                    SqlWorkflowShare.workspace_id == current_workspace_id(),
+                    SqlWorkflowShare.workflow_id == workflow_id,
+                    SqlWorkflowShare.user_id.in_(user_ids),
+                )
             )
-        )
-    return len(keys)
+            deleted += len(user_ids)
+    return deleted
 
 
 def _to_workflow_permission(row: SqlWorkflowShare) -> WorkflowPermission:
