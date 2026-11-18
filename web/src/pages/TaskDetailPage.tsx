@@ -15,7 +15,7 @@
  * an invented summary line.
  */
 
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   CalendarOffIcon,
   ChevronDownIcon,
@@ -36,6 +36,7 @@ import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/component
 import { showToast } from "@/components/ui/toast";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
+import { RunPullRequests } from "@/components/scheduled/RunPullRequests";
 import {
   automationOwnerName,
   isSharedWithViewer,
@@ -65,6 +66,7 @@ import {
   useRunScheduledTaskNow,
   useScheduledTask,
   scheduledTaskRunsKey,
+  useScheduledTaskRunPullRequests,
   useScheduledTaskRuns,
   useScheduledTaskRunSteps,
   useUpdateScheduledTask,
@@ -103,7 +105,11 @@ import {
 } from "@/lib/capabilities";
 import { canShareAutomation } from "@/lib/permissionsApi";
 import { ScheduledTaskApiError } from "@/lib/scheduledTasksApi";
-import type { ScheduledTaskRun, ScheduledTaskRunSteps } from "@/lib/scheduledTasksApi";
+import type {
+  ScheduledTaskRun,
+  ScheduledTaskRunPullRequest,
+  ScheduledTaskRunSteps,
+} from "@/lib/scheduledTasksApi";
 import {
   latestStatusText,
   stepProgress,
@@ -155,6 +161,12 @@ function TaskDetail({ taskId }: { taskId: string }) {
   const runStepsEnabled =
     isFeatureEnabled(info, "workflows") && !(task != null && isSharedWithViewer(task));
   const runSteps = useScheduledTaskRunSteps(taskId, runs, runStepsEnabled);
+  // PRs are session content too, so a viewer gets none.
+  const runPullRequestsEnabled =
+    info !== "loading" &&
+    info.scheduled_task_run_pull_requests === true &&
+    !(task != null && isSharedWithViewer(task));
+  const runPullRequests = useScheduledTaskRunPullRequests(taskId, runs, runPullRequestsEnabled);
 
   const updateMutation = useUpdateScheduledTask();
   const deleteMutation = useDeleteScheduledTask();
@@ -737,6 +749,9 @@ function TaskDetail({ taskId }: { taskId: string }) {
               now={now}
               highlighted={run.id === highlightedRunId}
               steps={runStepsEnabled ? runSteps.get(run.id) : undefined}
+              pullRequests={
+                runPullRequestsEnabled ? runPullRequests.get(run.id)?.pullRequests : undefined
+              }
             />
           ))}
         </ul>
@@ -877,12 +892,15 @@ function RunRow({
   now,
   highlighted,
   steps,
+  pullRequests,
 }: {
   run: ScheduledTaskRun;
   now: Date;
   highlighted: boolean;
   /** The run's latest plan, independent of the automation's current prompt. */
   steps?: ScheduledTaskRunSteps;
+  /** The PRs the run created or worked on. */
+  pullRequests?: readonly ScheduledTaskRunPullRequest[];
 }) {
   const timestamp = formatRunTimestamp(run.firedAt ?? run.scheduledAt, now);
   // A workflow run's tasks, as the workflow's page shows them.
@@ -899,6 +917,26 @@ function RunRow({
   const statusText = useMemo(() => (steps ? latestStatusText(steps.statuses) : null), [steps]);
   const sessionId = run.conversationId;
   const showTasks = progress.length > 0 && sessionId != null;
+  const showPullRequests = (pullRequests?.length ?? 0) > 0;
+  // The PR summary and task buttons are controls of their own, so they sit over
+  // the row's link rather than in it.
+  const overlaid = showTasks || showPullRequests;
+  // The run's first line leaves room for the PR summary over its right end.
+  const summaryRef = useRef<HTMLSpanElement>(null);
+  const [summaryWidth, setSummaryWidth] = useState(0);
+  useLayoutEffect(() => {
+    const element = summaryRef.current;
+    if (!element) {
+      setSummaryWidth(0);
+      return;
+    }
+    const measure = () => setSummaryWidth(element.getBoundingClientRect().width);
+    measure();
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [showPullRequests]);
   const [graphOpen, setGraphOpen] = useState(false);
   // The saved workflow the run's plan follows, when the Workflows page can open it.
   const workflowId = isFeatureEnabled(useServerInfo(), "workflows")
@@ -939,7 +977,10 @@ function RunRow({
         <RunStatusIcon run={run} unread={unread} showSessionActivity={showSessionActivity} />
       </span>
       <span className="flex min-w-0 flex-1 flex-col">
-        <span className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+        <span
+          className="flex flex-wrap items-baseline gap-x-2 gap-y-1"
+          style={summaryWidth ? { paddingRight: summaryWidth } : undefined}
+        >
           <span className="text-sm font-normal">{timestamp ?? "—"}</span>
           {duration && (
             <span className="text-xs text-muted-foreground" data-testid="run-duration">
@@ -1021,8 +1062,10 @@ function RunRow({
       className={cn(
         "relative rounded-lg",
         highlighted && "animate-message-highlight",
-        // The row's timeline sits under its link, so the whole row lights up, once.
-        showTasks && "transition-colors hover:bg-muted has-[a:focus-visible]:bg-muted",
+        // The row's timeline, PRs and buttons sit over or under its link, so the whole
+        // row lights up, once.
+        overlaid &&
+          "transition-colors hover:bg-muted has-[a:focus-visible]:bg-muted has-[button:focus-visible]:bg-muted",
       )}
       style={highlighted ? { animationDuration: `${RUN_HIGHLIGHT_DURATION_MS}ms` } : undefined}
     >
@@ -1033,7 +1076,9 @@ function RunRow({
           className={cn(
             commonClassName,
             "cursor-pointer focus-visible:outline-none",
-            showTasks ? buttonPadding : "transition-colors hover:bg-muted focus-visible:bg-muted",
+            showTasks
+              ? buttonPadding
+              : !overlaid && "transition-colors hover:bg-muted focus-visible:bg-muted",
           )}
         >
           {body}
@@ -1042,30 +1087,39 @@ function RunRow({
         <div className={commonClassName}>{body}</div>
       )}
       {showTasks && (
-        <>
-          <RunTimeline
-            sessionId={sessionId}
-            progress={progress}
-            menuActionFor={taskMenus}
-            className="pr-3 pb-2.5 pl-10"
-          />
-          <div className="absolute top-1.5 right-2 z-10 flex items-center gap-0.5">
-            {control && steps?.planId && (
-              <RunPlanButton
-                sessionId={sessionId}
-                runId={steps.planId}
-                planName={steps?.planName ?? null}
-                control={control}
-                refreshKeys={refreshKeys}
+        <RunTimeline
+          sessionId={sessionId}
+          progress={progress}
+          menuActionFor={taskMenus}
+          className="pr-3 pb-2.5 pl-10"
+        />
+      )}
+      {overlaid && (
+        <div className="absolute top-1.5 right-2 z-10 flex items-center gap-0.5">
+          {showPullRequests && pullRequests && (
+            <span ref={summaryRef} className="flex h-7 min-w-0 items-center pr-2 pl-3">
+              <RunPullRequests pullRequests={pullRequests} nowMs={now.getTime()} />
+            </span>
+          )}
+          {showTasks && (
+            <>
+              {control && steps?.planId && (
+                <RunPlanButton
+                  sessionId={sessionId}
+                  runId={steps.planId}
+                  planName={steps?.planName ?? null}
+                  control={control}
+                  refreshKeys={refreshKeys}
+                />
+              )}
+              {workflowId && <RunWorkflowButton workflowId={workflowId} />}
+              <RunGraphButton
+                runName={`the ${timestamp ?? ""} run`}
+                onClick={() => setGraphOpen(true)}
               />
-            )}
-            {workflowId && <RunWorkflowButton workflowId={workflowId} />}
-            <RunGraphButton
-              runName={`the ${timestamp ?? ""} run`}
-              onClick={() => setGraphOpen(true)}
-            />
-          </div>
-        </>
+            </>
+          )}
+        </div>
       )}
       {graphOpen && showTasks && steps && (
         <WorkflowGraphOverlay

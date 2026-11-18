@@ -42,6 +42,7 @@ import type * as SavedWorkflowsModule from "@/hooks/useSavedWorkflows";
 import type {
   ScheduledTask,
   ScheduledTaskRun,
+  ScheduledTaskRunPullRequest,
   ScheduledTaskRunSteps,
 } from "@/lib/scheduledTasksApi";
 import { conversation, conversationPage } from "@/test/sidebarMockHelpers";
@@ -62,6 +63,7 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
   useScheduledTask: vi.fn(),
   useScheduledTaskRuns: vi.fn(),
   useScheduledTaskRunSteps: vi.fn(() => new Map()),
+  useScheduledTaskRunPullRequests: vi.fn(() => new Map()),
   useUpdateScheduledTask: vi.fn(),
   useDeleteScheduledTask: vi.fn(),
   useRunScheduledTaskNow: vi.fn(),
@@ -2130,5 +2132,125 @@ describe("runs of a saved workflow", () => {
     );
     fireEvent.click(within(row).getByTestId("run-graph-button"));
     expect(screen.getByTestId("workflow-graph-overlay")).toHaveAttribute("data-title", "Triage");
+  });
+});
+
+describe("run pull requests", () => {
+  // `useNow` is mocked to this instant.
+  const NOW_S = Date.parse("2026-07-27T12:00:00Z") / 1000;
+  const pr = (number: number, overrides: Partial<ScheduledTaskRunPullRequest> = {}) =>
+    ({
+      url: `https://github.com/example/repo/pull/${number}`,
+      provider: "github",
+      repository: "example/repo",
+      number,
+      title: `Change ${number}`,
+      relationship: "worked_on",
+      state: "OPEN",
+      is_draft: false,
+      state_checked_at: NOW_S - 60,
+      ...overrides,
+    }) satisfies ScheduledTaskRunPullRequest;
+
+  const renderWithRunPullRequests = (enabled = true) =>
+    render(
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_run_pull_requests: enabled }}
+      >
+        {pageTree()}
+      </CapabilitiesProvider>,
+    );
+
+  beforeEach(() => {
+    vi.mocked(hooks.useScheduledTaskRunPullRequests).mockReturnValue(
+      new Map([
+        [
+          "run_1",
+          {
+            runId: "run_1",
+            pullRequests: [
+              pr(1, { relationship: "created", state: "MERGED" }),
+              pr(2, { state: "CLOSED" }),
+              pr(3, { is_draft: true }),
+            ],
+          },
+        ],
+        [
+          "run_2",
+          {
+            runId: "run_2",
+            pullRequests: [pr(4, { state_checked_at: NOW_S - 7200 }), pr(5, { state: null })],
+          },
+        ],
+      ]),
+    );
+  });
+
+  it("sums up each run's PRs on its first line and lists them when clicked", () => {
+    setTask(task());
+    setRuns([
+      run({ id: "run_1", conversationId: "conv_1" }),
+      run({ id: "run_2", conversationId: "conv_2" }),
+      run({ id: "run_3", conversationId: "conv_3" }),
+    ]);
+    renderWithRunPullRequests();
+
+    expect(hooks.useScheduledTaskRunPullRequests).toHaveBeenLastCalledWith(
+      "st_1",
+      expect.any(Array),
+      true,
+    );
+    const [first, second, third] = screen.getAllByTestId("task-detail-run");
+    const summary = within(first!).getByTestId("run-pull-requests");
+    expect(summary).toHaveTextContent("PRs: 1 draft, 1 merged, 1 closed");
+    expect(summary.tagName).toBe("BUTTON");
+    // A control of its own, so it sits outside the row's link to its session.
+    expect(within(first!).getByTestId("run-open")).not.toContainElement(summary);
+    expect(within(second!).getByTestId("run-pull-requests")).toHaveTextContent(
+      "PRs: 1 open, 1 unknown",
+    );
+    expect(within(third!).queryByTestId("run-pull-requests")).toBeNull();
+
+    fireEvent.click(summary);
+    const list = screen.getByTestId("run-pull-request-list");
+    const rows = within(list).getAllByTestId("run-pull-request");
+    expect(rows.map((row) => row.dataset.prStatus)).toEqual(["merged", "closed", "draft"]);
+    const [merged, closed] = rows;
+    expect(merged).toHaveAttribute("data-pr-relationship", "created");
+    const link = within(merged!).getByRole("link");
+    expect(link).toHaveAttribute("href", "https://github.com/example/repo/pull/1");
+    expect(link).toHaveAttribute("target", "_blank");
+    expect(link).toHaveAccessibleName(
+      "example/repo #1 · Merged · Change 1 · Opened by this run (opens in a new tab)",
+    );
+    expect(closed).toHaveTextContent("Closed without merging");
+
+    fireEvent.click(within(second!).getByTestId("run-pull-requests"));
+    const [stale] = within(screen.getByTestId("run-pull-request-list")).getAllByTestId(
+      "run-pull-request",
+    );
+    expect(stale).toHaveTextContent("Open · as of 2h ago");
+  });
+
+  it("asks for no PRs from a server without the route, or for a viewer", () => {
+    setRuns([run({ id: "run_1", conversationId: "conv_1" })]);
+    setTask(task());
+    const { unmount } = renderWithRunPullRequests(false);
+    expect(hooks.useScheduledTaskRunPullRequests).toHaveBeenLastCalledWith(
+      "st_1",
+      expect.any(Array),
+      false,
+    );
+    expect(screen.queryByTestId("run-pull-requests")).toBeNull();
+    unmount();
+
+    setTask(task({ viewerRole: "viewer" }));
+    renderWithRunPullRequests();
+    expect(hooks.useScheduledTaskRunPullRequests).toHaveBeenLastCalledWith(
+      "st_1",
+      expect.any(Array),
+      false,
+    );
+    expect(screen.queryByTestId("run-pull-requests")).toBeNull();
   });
 });

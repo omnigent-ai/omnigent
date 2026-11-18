@@ -16,6 +16,7 @@ import { MessagesSquareIcon, TriangleAlertIcon } from "lucide-react";
 import { toast } from "sonner";
 import { useIsMutating, useQueryClient } from "@tanstack/react-query";
 import { getCurrentAuthorId } from "@/lib/identity";
+import { cn } from "@/lib/utils";
 import {
   type Bubble,
   type BubbleCache,
@@ -277,6 +278,8 @@ export function SideChatPane({
   onStart,
   readOnly: restoredReadOnly = false,
   fullSession = false,
+  evenComposerPadding = false,
+  transcriptTopInset,
   gridComposer,
 }: {
   childId: string;
@@ -286,6 +289,10 @@ export function SideChatPane({
   readOnly?: boolean;
   /** Display an existing session with its complete history and scoped composer. */
   fullSession?: boolean;
+  /** Space below the composer matches its sides, for a pane that frames it on all edges. */
+  evenComposerPadding?: boolean;
+  /** Extra room above the transcript, as a CSS length, for a header laid over it. */
+  transcriptTopInset?: string;
   /**
    * A grid cell's composer: one row tall, with the cell session's controls. It sends
    * the session's shared draft (tags, review comments) as the full-screen composer does.
@@ -546,6 +553,9 @@ export function SideChatPane({
         <div
           ref={transcriptRef}
           className="flex min-h-0 flex-1 flex-col overflow-y-auto px-3 py-4"
+          style={
+            transcriptTopInset ? { paddingTop: `calc(1rem + ${transcriptTopInset})` } : undefined
+          }
           onScroll={(event) => {
             const node = event.currentTarget;
             followTail.current = node.scrollHeight - node.scrollTop - node.clientHeight < 64;
@@ -632,7 +642,7 @@ export function SideChatPane({
           />
         )}
         {(!fullSession || !readOnly) && (
-          <div className="shrink-0 px-3 pt-3 pb-5">
+          <div className={cn("shrink-0 px-3 pt-3", evenComposerPadding ? "pb-3" : "pb-5")}>
             {readOnly ? (
               <p className="rounded-md border border-border bg-muted/40 px-3 py-2 text-center text-sm text-muted-foreground">
                 This side chat has ended and can’t be continued.

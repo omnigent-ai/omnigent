@@ -73,7 +73,7 @@ export function AdminGeneralPage() {
   if (!nestedAgentsEnabled && !advisorAvailable) return null;
   return (
     <PageScroll maxWidthClassName="max-w-4xl" contentClassName="px-4 md:px-8" extraBottom="2.5rem">
-      <h1 className="settings-page-title text-2xl font-medium">Admin settings</h1>
+      <h1 className="text-2xl font-medium">Admin settings</h1>
       <p className="mt-1 mb-6 text-sm text-muted-foreground">Server-wide settings for all users.</p>
       {!canManage ? (
         <p className="text-ui text-muted-foreground">

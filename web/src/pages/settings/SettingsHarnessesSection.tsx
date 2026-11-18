@@ -215,7 +215,7 @@ export const SettingsHarnessesSection = () => {
         <>
           <SettingsItem entry={HARNESSES_GRID_ENTRY}>
             <div className="flex flex-wrap items-center justify-between gap-4 pb-6">
-              <h1 className="settings-page-title text-2xl font-medium">Harnesses</h1>
+              <h1 className="text-2xl font-medium">Harnesses</h1>
               <HostSelect
                 hosts={sortedHosts}
                 selected={selectedHost}
@@ -737,7 +737,7 @@ function HarnessDetail({
         <div className="flex min-w-0 items-center gap-3">
           <HarnessIcon entry={entry} />
           <div className="flex min-w-0 flex-col">
-            <h1 className="settings-page-title truncate text-2xl font-medium">{entry.name}</h1>
+            <h1 className="truncate text-2xl font-medium">{entry.name}</h1>
             <HarnessStatusText
               status={status}
               enhanced={canSetup}
