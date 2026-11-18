@@ -339,12 +339,10 @@ describe("design outbox", () => {
       opts?.onError?.("Network down");
     });
     const id = queueDesignRequest({ tabId: TAB, label: "Annotate", text: "Native" });
-    await flush();
-    expect(statusOf(id)).toBe("failed");
+    await vi.waitFor(() => expect(statusOf(id)).toBe("failed"));
     // The outbox's own hash finishes last: the receipt it held now counts.
     release();
-    await flush();
-    expect(statusOf(id)).toBe("sent");
+    await vi.waitFor(() => expect(statusOf(id)).toBe("sent"));
   });
 
   it("counts a stalled send the runner took while it ran as sent, leaving its turn running", async () => {

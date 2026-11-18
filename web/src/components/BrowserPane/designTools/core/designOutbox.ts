@@ -77,6 +77,11 @@ export const RESTORE_RETRY_MS = 5_000;
 const RESTORE_RETRY_MAX_MS = 300_000;
 
 const DENIED = "A policy blocked this request, so it wasn't sent.";
+/** How long the server's word that a request's owner is signed in lets it go. */
+export const OWNER_CHECK_MS = 5_000;
+const ACCOUNT_CHANGED =
+  "Another account is signed in now, so this wasn't sent. Sign back in as the account " +
+  "that made it to Retry, or Remove it.";
 // Brought back after a reload: never sent on its own, so it needs a Retry. The reload may
 // have beaten saving "sending", so one saved as waiting may have gone too.
 const RESTORED =
@@ -100,6 +105,12 @@ const running = new Map<string, AbortController>();
 const pendingIds = new Map<string, string>();
 // Requests heard to have arrived while their send still ran: its failure then doesn't count.
 const arrived = new Set<string>();
+// Who each request belongs to, fixed when it's made (or first saved, or restored): another
+// account signing in meanwhile mustn't save or send it as theirs.
+const owners = new Map<string, string>();
+// When the server last confirmed a request's owner is still the one signed in.
+const ownerConfirmedAt = new Map<string, number>();
+const confirmingOwner = new Set<string>();
 // Receipts matching no request yet: a pending id can arrive before its hash is worked out.
 const unmatched = new Set<string>();
 const UNMATCHED_MAX = 100;
@@ -290,9 +301,34 @@ export function processDesignOutbox(): void {
     const next = own.find((request) => request.status === "waiting");
     if (!next) continue;
     const agentId = readyAgent(conversationId);
-    if (!agentId) continue;
+    if (!agentId || !ownerSignedIn(next)) continue;
     void send(next, agentId);
   }
+}
+
+/**
+ * Whether `request`'s owner was just confirmed still signed in, so it may go now (cookies
+ * may name another account after a sign-in in another window). If not, asks the server.
+ */
+function ownerSignedIn(request: DesignRequest): boolean {
+  const owner = owners.get(request.id);
+  if (owner === undefined) return true;
+  const confirmedAt = ownerConfirmedAt.get(request.id);
+  if (confirmedAt !== undefined && Date.now() - confirmedAt < OWNER_CHECK_MS) return true;
+  if (confirmingOwner.has(request.id)) return false;
+  confirmingOwner.add(request.id);
+  void fetchSignedInUserId().then((signedIn) => {
+    confirmingOwner.delete(request.id);
+    if (signedIn === owner) {
+      ownerConfirmedAt.set(request.id, Date.now());
+      schedule();
+    } else if (signedIn === undefined) {
+      setTimeout(schedule, OWNER_CHECK_MS);
+    } else {
+      update(request.id, { status: "failed", error: ACCOUNT_CHANGED, delivery: "refused" });
+    }
+  });
+  return false;
 }
 
 function schedule(): void {
@@ -326,6 +362,8 @@ export function queueDesignRequest({
     files,
     status: "waiting",
   };
+  const owner = getCurrentUserId();
+  if (owner !== null) owners.set(id, owner);
   notePendingId(request);
   useDesignOutbox.setState((state) => ({ requests: [...state.requests, request] }));
   schedule();
@@ -350,6 +388,8 @@ export function forget(id: string): void {
     running.get(id)?.abort();
     arrived.delete(id);
     attempts.delete(id);
+    owners.delete(id);
+    ownerConfirmedAt.delete(id);
     for (const [pendingId, requestId] of pendingIds) {
       if (requestId === id) pendingIds.delete(pendingId);
     }
@@ -384,9 +424,6 @@ useDesignOutbox.subscribe(({ requests }) =>
 // once its write succeeded; one whose save failed is tried again on the next change.
 const savedAs = new Map<string, string>();
 const saving = new Map<string, string>();
-// Who each request belongs to, fixed at its first save: a later account change in this
-// page mustn't re-save it as the new user's.
-const owners = new Map<string, string>();
 // Requests removed here whose saved copy isn't deleted yet: a failed delete is tried
 // again, so a removed request can't come back (and send itself) on the next page.
 const deleting = new Map<string, "pending" | "failed">();
@@ -609,6 +646,8 @@ export function resetDesignOutbox(): void {
   awaitingUser = null;
   savedAs.clear();
   owners.clear();
+  ownerConfirmedAt.clear();
+  confirmingOwner.clear();
   saving.clear();
   deleting.clear();
   if (deleteTimer !== null) clearTimeout(deleteTimer);

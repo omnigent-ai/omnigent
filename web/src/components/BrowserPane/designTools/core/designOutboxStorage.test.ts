@@ -35,6 +35,7 @@ import {
   queueDesignRequest,
   resetDesignOutbox,
   restoreSavedDesignRequests,
+  retryDesignRequest,
   useDesignOutbox,
 } from "./designOutbox";
 import { noteSavedDesignRequests } from "./designOutboxPresence";
@@ -546,6 +547,37 @@ describe("design outbox storage", () => {
     failOnce.mockRestore();
     await vi.advanceTimersByTimeAsync(RESTORE_RETRY_MS);
     await vi.waitFor(() => expect(ids()).toEqual(["saved"]));
+  });
+
+  it("sends a waiting request only while the account that made it is still signed in", async () => {
+    const send = vi.fn(async () => {});
+    // Another window signed in as Bob; this one's cached user is still Alice.
+    identity.signedIn = "bob";
+    const id = queueDesignRequest({ tabId: TAB, label: "Annotate", text: "Alice's" });
+    await designOutboxSaved();
+    // The session gets ready for it: still not sent as Bob.
+    useChatStore.setState({
+      conversationId: SESSION,
+      boundAgentId: "agent_1",
+      status: "idle",
+      sessionStatus: "idle",
+      queuedMessages: [],
+      send,
+    });
+    const status = () => useDesignOutbox.getState().requests.find((r) => r.id === id);
+    await vi.waitFor(() =>
+      expect(status()).toMatchObject({
+        status: "failed",
+        delivery: "refused",
+        error: expect.stringContaining("Another account is signed in"),
+      }),
+    );
+    expect(send).not.toHaveBeenCalled();
+    // Alice again: a Retry sends it.
+    identity.signedIn = undefined;
+    retryDesignRequest(id);
+    await vi.waitFor(() => expect(status()?.status).not.toBe("failed"));
+    expect(status()?.error).toBeUndefined();
   });
 
   it("keeps saving a request as its first owner's after the account changes", async () => {

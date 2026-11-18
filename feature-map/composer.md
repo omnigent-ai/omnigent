@@ -320,8 +320,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `browser-pointer-queue`: desktop Design-mode instructions (older shells) follow
   the same queue and always-steer preference, keeping their element screenshots.
   Annotate/Draw requests skip the queue: they wait in their own outbox, saved in
-  the browser, send once the session is idle, and show Retry/Remove above the
-  composer.
+  the browser, send once the session is idle and its account is still the one
+  signed in, and show Retry/Remove above the composer (a side chat's too).
 - `pi-compact`: `/compact` follows the normal queue/Always steer preference.
   Send now interrupts the turn and compacts. During compaction, queued messages
   wait in the web queue; immediate sends are retained by the Pi integration.
