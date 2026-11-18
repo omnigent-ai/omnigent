@@ -10477,15 +10477,9 @@ async def test_family_limit_cleans_up_rejected_creation(
 
 
 @pytest.mark.parametrize("split_database", [False, True])
-def test_archived_sibling_leaves_its_family_after_the_undo_window(
-    tmp_path, split_database
-) -> None:
-    import time
-
+def test_archiving_a_sibling_leaves_its_family(tmp_path, split_database, monkeypatch) -> None:
     from omnigent.errors import OmnigentError
     from omnigent.stores.conversation_store import (
-        ARCHIVED_AT_LABEL_KEY,
-        ARCHIVED_FAMILY_LEAVE_AFTER_S,
         MAX_SESSION_FAMILY_MEMBERS,
         family_pinned_label_key,
     )
@@ -10501,22 +10495,17 @@ def test_archived_sibling_leaves_its_family_after_the_undo_window(
         store.add_new_sibling(source.id, member.id, user_id="alice")
     store.set_family_pin(source.id, "123", user_id="alice")
 
-    # Archive alone keeps membership, so an Undo returns the session to its family.
-    store.update_conversation(members[0].id, archived=True)
-    assert store.update_conversation(members[0].id, archived=False).family_id == source.id
-
-    # Teardown's leave frees the slot; a later unarchive is standalone and can start a family.
-    store.update_conversation(members[0].id, archived=True)
-    store.leave_session_family(members[0].id)
+    # Archive frees the slot at once; unarchiving returns the session standalone.
+    archived = store.update_conversation(members[0].id, archived=True)
+    assert archived.family_id is None
+    assert pin_key not in archived.labels
     restored = store.update_conversation(members[0].id, archived=False)
     assert restored.family_id is None
-    assert pin_key not in restored.labels
     store.add_new_sibling(members[0].id, store.create_conversation().id, user_id="alice")
     assert len(store.get_session_family(members[0].id)) == 2
 
-    # Leaving the session whose id keys the family moves the rest to a member's id.
+    # Archiving the session whose id keys the family moves the rest to a member's id.
     store.update_conversation(source.id, archived=True)
-    store.leave_session_family(source.id)
     remaining = store.get_session_family(members[1].id)
     assert source.id not in {member.id for member in remaining}
     new_family_ids = {member.family_id for member in remaining}
@@ -10531,129 +10520,26 @@ def test_archived_sibling_leaves_its_family_after_the_undo_window(
         follow_up.id,
     ]
 
-    # A full family reclaims an archive whose leave never ran, but not one still in its window,
-    # including the session that keys the family, reclaimed from another active member.
+    # A failed leave keeps the archive; a full family reclaims it, even when it keys the family.
     key_session, anchor = members[1].id, members[2].id
     assert store.get_conversation(anchor).family_id == key_session
     for _ in range(MAX_SESSION_FAMILY_MEMBERS - len(remaining)):
         store.add_new_sibling(anchor, store.create_conversation().id, user_id="alice")
-    store.update_conversation(key_session, archived=True)
-    with pytest.raises(OmnigentError, match=f"up to {MAX_SESSION_FAMILY_MEMBERS}"):
-        store.add_new_sibling(anchor, store.create_conversation().id, user_id="alice")
-    overdue = int(time.time()) - ARCHIVED_FAMILY_LEAVE_AFTER_S - 1
-    store.set_labels(key_session, {ARCHIVED_AT_LABEL_KEY: str(overdue)})
+    real_leave = store.leave_session_family
+
+    def fail_leave(session_id):
+        raise RuntimeError("metadata database unavailable")
+
+    monkeypatch.setattr(store, "leave_session_family", fail_leave)
+    assert store.update_conversation(key_session, archived=True).archived
+    monkeypatch.setattr(store, "leave_session_family", real_leave)
+    assert store.get_conversation(key_session).family_id == key_session
     store.add_new_sibling(anchor, store.create_conversation().id, user_id="alice")
     assert store.get_conversation(key_session).family_id is None
     assert store.get_conversation(anchor).family_id != key_session
     assert len(store.get_session_family(anchor)) == MAX_SESSION_FAMILY_MEMBERS
-
-    # A leave authorized by an older archive never detaches a newer one inside its window.
-    rearchived = remaining[-1].id
-    store.update_conversation(rearchived, archived=True)
-    old_generation = store.get_conversation(rearchived).labels[ARCHIVED_AT_LABEL_KEY]
-    store.update_conversation(rearchived, archived=False)
-    store.leave_session_family(rearchived, archive_generation=old_generation)
-    assert store.get_conversation(rearchived).family_id is not None
-    store.update_conversation(rearchived, archived=True)
-    store.set_labels(rearchived, {ARCHIVED_AT_LABEL_KEY: str(int(old_generation) + 1)})
-    store.leave_session_family(rearchived, archive_generation=old_generation)
-    assert store.get_conversation(rearchived).family_id is not None
-    current_generation = store.get_conversation(rearchived).labels[ARCHIVED_AT_LABEL_KEY]
-    store.leave_session_family(rearchived, archive_generation=current_generation)
-    assert store.get_conversation(rearchived).family_id is None
-
-
-def test_split_database_family_leave_holds_the_archive_until_membership_commits(
-    tmp_path, monkeypatch
-) -> None:
-    import threading
-
-    from omnigent.db import current_query_name
-    from omnigent.stores.conversation_store import ARCHIVED_AT_LABEL_KEY, family_pinned_label_key
-
-    store = SqlAlchemyConversationStore(
-        f"sqlite:///{tmp_path / 'metadata.db'}", f"sqlite:///{tmp_path / 'messages.db'}"
-    )
-    source = store.create_conversation(conversation_id="1" * 32)
-    member = store.create_conversation(conversation_id="2" * 32)
-    store.add_new_sibling(source.id, member.id, user_id="alice")
-    store.set_family_pin(source.id, "123", user_id="alice")
-    store.update_conversation(member.id, archived=True)
-    generation = store.get_conversation(member.id).labels[ARCHIVED_AT_LABEL_KEY]
-
-    # Pause the leave after its archive check; an unarchive in that gap must wait for it.
-    real_check = SqlAlchemyConversationStore._archive_is_current
-    unarchived = threading.Event()
-    unarchive_thread: list[threading.Thread] = []
-
-    def check_then_race(labels_session, session_id, archive_generation):
-        current = real_check(labels_session, session_id, archive_generation)
-        thread = threading.Thread(
-            target=lambda: (
-                store.update_conversation(member.id, archived=False),
-                unarchived.set(),
-            )
-        )
-        thread.start()
-        unarchive_thread.append(thread)
-        assert not unarchived.wait(0.5)
-        return current
-
-    monkeypatch.setattr(
-        SqlAlchemyConversationStore, "_archive_is_current", staticmethod(check_then_race)
-    )
-    store.leave_session_family(member.id, archive_generation=generation)
-    unarchive_thread[0].join(timeout=30)
-    assert unarchived.is_set()
-    # The leave committed with its pin cleanup before the unarchive ran.
-    left = store.get_conversation(member.id)
-    assert left.family_id is None and not left.archived
-    assert family_pinned_label_key("alice") not in left.labels
-    assert current_query_name() is None
-
-
-def test_split_database_family_leave_retries_inside_one_lifecycle(tmp_path, monkeypatch) -> None:
-    from omnigent.db import current_query_name
-    from omnigent.stores.conversation_store import (
-        ARCHIVED_AT_LABEL_KEY,
-        family_pinned_label_key,
-        sqlalchemy_store,
-    )
-
-    store = SqlAlchemyConversationStore(
-        f"sqlite:///{tmp_path / 'metadata.db'}", f"sqlite:///{tmp_path / 'messages.db'}"
-    )
-    source = store.create_conversation(conversation_id="1" * 32)
-    member = store.create_conversation(conversation_id="2" * 32)
-    store.add_new_sibling(source.id, member.id, user_id="alice")
-    store.set_family_pin(source.id, "123", user_id="alice")
-    store.update_conversation(member.id, archived=True)
-    generation = store.get_conversation(member.id).labels[ARCHIVED_AT_LABEL_KEY]
-
-    # The first membership attempt fails after its callback opened the lifecycle transaction.
-    real_run = sqlalchemy_store.run_write_transaction
-    attempts = []
-
-    def fail_first_leave(session_maker, operation_name, callback, *args, **kwargs):
-        if operation_name == "leave_session_family" and not attempts:
-            attempts.append(operation_name)
-            with pytest.raises(RuntimeError), session_maker(operation_name) as session:
-                callback(session)
-                raise RuntimeError("retryable metadata conflict")
-        return real_run(session_maker, operation_name, callback, *args, **kwargs)
-
-    monkeypatch.setattr(sqlalchemy_store, "run_write_transaction", fail_first_leave)
-    store.leave_session_family(member.id, archive_generation=generation)
-    monkeypatch.undo()
-
-    assert attempts
-    left = store.get_conversation(member.id)
-    assert left.family_id is None
-    assert family_pinned_label_key("alice") not in left.labels
-    assert store.get_conversation(source.id).labels[family_pinned_label_key("alice")] == "123"
-    # No lock outlives the leave: a conversation write proceeds at once.
-    store.update_conversation(member.id, archived=False)
-    assert current_query_name() is None
+    with pytest.raises(OmnigentError, match=f"up to {MAX_SESSION_FAMILY_MEMBERS}"):
+        store.add_new_sibling(anchor, store.create_conversation().id, user_id="alice")
 
 
 def test_family_leave_follows_a_concurrent_rekey_and_idle_archive_is_conditional(

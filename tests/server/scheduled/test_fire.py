@@ -5238,10 +5238,7 @@ async def test_trigger_run_archives_only_its_idle_launched_siblings(tmp_path, mo
     from sqlalchemy import update
 
     from omnigent.db.db_models import SqlConversation
-    from omnigent.stores.conversation_store import (
-        ARCHIVED_AT_LABEL_KEY,
-        SCHEDULED_TASK_LAUNCH_LABEL_KEY,
-    )
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_LAUNCH_LABEL_KEY
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 
     store = SqlAlchemyConversationStore(f"sqlite:///{tmp_path / 'chat.db'}")
@@ -5252,7 +5249,6 @@ async def test_trigger_run_archives_only_its_idle_launched_siblings(tmp_path, mo
         "resumed",
         "elsewhere",
         "half_archived",
-        "rearchived",
         "owner_added",
         "other",
     )
@@ -5270,25 +5266,19 @@ async def test_trigger_run_archives_only_its_idle_launched_siblings(tmp_path, mo
             .where(SqlConversation.id.notin_([sessions["active"].id, sessions["resumed"].id]))
             .values(updated_at=stale)
         )
-        # An archive whose deferred family leave never ran (no recent archive time).
+        # An archive whose family leave failed part way.
         connection.execute(
             update(SqlConversation)
             .where(SqlConversation.id == sessions["half_archived"].id)
             .values(archived=True)
         )
-    # Re-archived since the snapshot below was read: its fresh Undo window must hold.
-    store.update_conversation(sessions["rearchived"].id, archived=True)
     real_families = store.get_session_families
 
     def stale_snapshot(family_ids):
         # "resumed" looked idle when read, then got activity before the archive write.
-        # "rearchived" was read during an older, overdue archive.
         def as_read(member):
             if member.id == sessions["resumed"].id:
                 return replace(member, updated_at=stale)
-            if member.id == sessions["rearchived"].id:
-                labels = {**member.labels, ARCHIVED_AT_LABEL_KEY: str(stale)}
-                return replace(member, labels=labels)
             return member
 
         return {
@@ -5320,19 +5310,10 @@ async def test_trigger_run_archives_only_its_idle_launched_siblings(tmp_path, mo
 
     assert stopped == [sessions["idle"].id]
     archived = {name for name, s in sessions.items() if store.get_conversation(s.id).archived}
-    assert archived == {"idle", "half_archived", "rearchived"}
+    assert archived == {"idle", "half_archived"}
     assert not store.get_conversation(monitor.id).archived
-    # The new archive leaves its family when teardown runs; the overdue one is repaired now.
+    # Archived members leave the family, including one a failed leave left behind.
     family = {member.id for member in real_families([monitor.id])[monitor.id]}
     assert family == {monitor.id} | {
-        sessions[name].id
-        for name in (
-            "idle",
-            "active",
-            "resumed",
-            "elsewhere",
-            "rearchived",
-            "owner_added",
-            "other",
-        )
+        sessions[name].id for name in ("active", "resumed", "elsewhere", "owner_added", "other")
     }

@@ -65,7 +65,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import functools
 import logging
 import time
 import uuid
@@ -165,7 +164,6 @@ from omnigent.server.session_mcp_selection import (
     session_mcp_label_keys,
 )
 from omnigent.stores.conversation_store import (
-    ARCHIVED_AT_LABEL_KEY,
     CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY,
     SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
     SCHEDULED_TASK_LAUNCH_LABEL_KEY,
@@ -173,7 +171,6 @@ from omnigent.stores.conversation_store import (
     SCHEDULED_TASK_RUN_LABEL_KEY,
     SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
     ConversationNotFoundError,
-    archived_family_leave_is_due,
 )
 
 if TYPE_CHECKING:
@@ -1129,8 +1126,8 @@ async def archive_idle_launched_sessions(
 
     They are that session's siblings, so this reads one bounded family. Only
     members carrying this automation's launch label are archived, never the
-    session itself or nested agents the owner added. Archived members whose
-    deferred family leave never ran are detached. Never raises.
+    session itself or nested agents the owner added. Archived members still in
+    the family, from a leave that failed part way, are detached. Never raises.
 
     :param deps: The fire's stores and lifecycle handles.
     :param task: The automation being fired.
@@ -1156,15 +1153,8 @@ async def archive_idle_launched_sessions(
             if member.id == conv.id:
                 continue
             if member.archived:
-                # An archive whose deferred family leave never ran still holds a slot.
-                if archived_family_leave_is_due(member, int(time.time())):
-                    await asyncio.to_thread(
-                        functools.partial(
-                            store.leave_session_family,
-                            member.id,
-                            archive_generation=member.labels.get(ARCHIVED_AT_LABEL_KEY, ""),
-                        )
-                    )
+                # An archive whose family leave failed part way still holds a slot.
+                await asyncio.to_thread(store.leave_session_family, member.id)
                 continue
             if (
                 member.updated_at > cutoff
@@ -1176,8 +1166,7 @@ async def archive_idle_launched_sessions(
                 archive_teardown_is_elsewhere, member, deps.host_registry, deps.host_store
             ):
                 continue
-            generation = await asyncio.to_thread(store.archive_if_idle, member.id, cutoff)
-            if generation is None:
+            if not await asyncio.to_thread(store.archive_if_idle, member.id, cutoff):
                 continue
             _prune_session_read_state(member.id)
             _spawn_archive_stop(
@@ -1187,7 +1176,6 @@ async def archive_idle_launched_sessions(
                 deps.host_registry,
                 host_store=deps.host_store,
                 sandbox_config=deps.sandbox_config,
-                archive_generation=generation,
             )
         except Exception:
             _logger.exception(

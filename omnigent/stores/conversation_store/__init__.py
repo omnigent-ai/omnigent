@@ -207,17 +207,6 @@ _LABEL_SWAP_ATTEMPTS = 5
 CREATED_BY_SESSION_LABEL_KEY = "omnigent.created_by_session_id"
 FAMILY_PIN_LABEL_PREFIX = "omnigent.family_pinned."
 MAX_SESSION_FAMILY_MEMBERS = 100
-# An archived member leaves its family after the archive Undo window; repairs of
-# interrupted leaves wait this long so they never undercut an Undo.
-ARCHIVED_FAMILY_LEAVE_AFTER_S = 60
-
-
-def archived_family_leave_is_due(conversation: Conversation, now: int) -> bool:
-    """Whether an archived family member should have left its family by *now*."""
-    if not conversation.archived or conversation.family_id is None:
-        return False
-    archived_at = conversation.labels.get(ARCHIVED_AT_LABEL_KEY, "")
-    return not archived_at.isdigit() or int(archived_at) <= now - ARCHIVED_FAMILY_LEAVE_AFTER_S
 
 
 def family_pinned_label_key(user_id: str | None) -> str:
@@ -1598,14 +1587,12 @@ class ConversationStore(ABC):
         """Assign a freshly created session to its source's family before launch."""
         raise NotImplementedError
 
-    def leave_session_family(
-        self, session_id: str, *, archive_generation: str | None = None
-    ) -> None:
-        """Remove a session from its sibling family; archive teardown calls this."""
+    def leave_session_family(self, session_id: str) -> None:
+        """Remove a session from its sibling family; archiving calls this."""
         raise NotImplementedError
 
-    def archive_if_idle(self, conversation_id: str, idle_before: int) -> str | None:
-        """Archive a session idle since ``idle_before``; returns its archive generation."""
+    def archive_if_idle(self, conversation_id: str, idle_before: int) -> bool:
+        """Archive a session only if it has had no activity since ``idle_before``."""
         raise NotImplementedError
 
     def get_session_family(self, session_id: str) -> list[Conversation]:

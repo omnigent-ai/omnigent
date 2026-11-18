@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import functools
 import hashlib
 import json
 import math
@@ -443,7 +442,6 @@ from omnigent.spec.types import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
-    ARCHIVED_AT_LABEL_KEY,
     CREATED_BY_SESSION_LABEL_KEY,
     PINNED_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
@@ -991,7 +989,6 @@ async def _archive_stop(
     delete_worktree: bool = False,
     host_store: HostStore | None = None,
     sandbox_config: ManagedSandboxDeployment | None = None,
-    archive_generation: str | None = None,
 ) -> None:
     """
     Stop an archived session and tear down its host-launched runner.
@@ -1027,9 +1024,6 @@ async def _archive_stop(
     :param sandbox_config: The deployment's managed-sandbox config; when the
         host's provider opts in (``stop_on_archive``), the session's sandbox is
         stopped last.
-    :param archive_generation: The scheduling archive's ``ARCHIVED_AT_LABEL_KEY``
-        value, so a timer a newer archive superseded never ends that archive's
-        Undo window; ``None`` uses the row's current archive.
     """
     # Resolve through the facade so a test's monkeypatch is honored here.
     from omnigent.server.routes import sessions as _facade
@@ -1061,26 +1055,6 @@ async def _archive_stop(
     # possibly on another replica) — it's live again, so leave its runner alone.
     if conv is None or not conv.archived:
         return
-    # Past the Undo window an archived session leaves its family, freeing its slot.
-    try:
-        await asyncio.to_thread(
-            functools.partial(
-                conversation_store.leave_session_family,
-                session_id,
-                archive_generation=(
-                    archive_generation
-                    if archive_generation is not None
-                    else conv.labels.get(ARCHIVED_AT_LABEL_KEY, "")
-                ),
-            )
-        )
-    except Exception:  # noqa: BLE001
-        _logger.warning(
-            "Archived session %s could not leave its family; a later repair detaches it",
-            session_id,
-            exc_info=True,
-            extra={"session_id": session_id},
-        )
     # Past the point of no return: unregister so a late cancel (an Undo racing
     # this teardown) can't interrupt it mid-stop and strand the intentional-
     # stop marker below, which would exclude the session from child recovery.
@@ -1214,7 +1188,6 @@ def _spawn_archive_stop(
     host_store: HostStore | None = None,
     sandbox_config: ManagedSandboxDeployment | None = None,
     after_turn: bool = False,
-    archive_generation: str | None = None,
 ) -> None:
     """
     Defer :func:`_archive_stop` past the undo grace, as a retained task.
@@ -1249,7 +1222,6 @@ def _spawn_archive_stop(
         the grace, lives only in this replica's memory: if the replica restarts
         first, the archived session's runner keeps running until its idle
         timeout or a later stop.
-    :param archive_generation: Forwarded to :func:`_archive_stop`.
     """
     # Replace any pending stop from an earlier archive of this session.
     _cancel_pending_archive_stop(session_id)
@@ -1273,7 +1245,6 @@ def _spawn_archive_stop(
             delete_worktree=delete_worktree,
             host_store=host_store,
             sandbox_config=sandbox_config,
-            archive_generation=archive_generation,
         )
 
     task = asyncio.create_task(_stop_after_grace())
