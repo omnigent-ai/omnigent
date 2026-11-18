@@ -1,15 +1,5 @@
-// How QuickPick ranks client-ranked items against a query. Each match falls in one
-// tier, and tiers order results before anything else:
-//
-//   1. exact label           "new tab" → "New tab"
-//   2. label word prefix      "theme" → "Select theme…"
-//   3. label substring        "ings" → "Open settings"
-//   4. keyword or description "theme" → "Appearance" (keyword "theme")
-//   5. fuzzy                  "nt" → "New tab"
-//
-// Within a tier, match quality (see `compareCandidateMatches`) orders rows; callers
-// break remaining ties. With `words` fuzzy matching, each piece must begin a word,
-// so "theme" never finds "Show the comments column".
+// Ranks items by tier (exact label, label word prefix, label substring, keyword or
+// description, fuzzy), then by match quality. Each piece of a `words` match must begin a word.
 
 import {
   compareCandidateMatches,
@@ -104,12 +94,13 @@ function labelTier(match: CandidateMatch, tokenCount: number): MatchTier {
   return MatchTier.labelSubstring;
 }
 
-/** The item's tier and score for `tokens`, or null when some token matches nothing. */
+/** The item's tier and score for `tokens`, or null without tokens or when some token matches nothing. */
 export function matchItem(
   tokens: readonly QueryToken[],
   item: QuickPickItem<unknown>,
   fuzzyMatching: FuzzyMatching = "fuzzy",
 ): ItemMatch | null {
+  if (tokens.length === 0) return null;
   const fields = fieldsFor(item);
   const label = matchCandidate(tokens, fields.label);
   if (label) return { tier: labelTier(label, tokens.length), candidate: label };

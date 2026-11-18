@@ -3,15 +3,18 @@ import type { ReactNode } from "react";
 import type { MatchHighlight } from "./HighlightedText";
 import type { MatchRange } from "./match";
 
-/** One selectable result. `value` is whatever the consumer acts on when accepted. */
+/**
+ * One selectable result. `value` is whatever the consumer acts on when accepted.
+ * Treat items as immutable once shown: ranking caches each item's searchable text.
+ */
 export interface QuickPickItem<Value = unknown> {
   /** Stable across loads; used for selection and React keys. */
   id: string;
-  label: string;
+  readonly label: string;
   /** Muted second line, such as where a search matched. */
-  description?: string;
+  readonly description?: string;
   /** Hidden terms that also match the query, such as synonyms. */
-  keywords?: readonly string[];
+  readonly keywords?: readonly string[];
   /** Section heading label; items sharing one appear together in source order. */
   group?: string;
   icon?: ReactNode;

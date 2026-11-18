@@ -51,6 +51,10 @@ describe("matchItem", () => {
     expect(matchItem(tokenizeQuery("new zebra"), item("New tab"))).toBeNull();
   });
 
+  it("returns null for an empty token list instead of ranking every item as a prefix", () => {
+    expect(matchItem([], item("New tab"))).toBeNull();
+  });
+
   it("highlights a description match under its own key", () => {
     const match = matchItem(tokenizeQuery("path"), item("Open", [], "a/path/here"))!;
     expect(match.candidate.ranges).toEqual({ description: [{ start: 2, end: 6 }] });
