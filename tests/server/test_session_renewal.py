@@ -15,7 +15,6 @@ logout / attribute tests go through the real accounts and OIDC routers.
 
 from __future__ import annotations
 
-import os
 import secrets
 import time
 from collections.abc import Iterator
@@ -39,6 +38,12 @@ from omnigent.server.auth import (
 )
 from omnigent.server.browser_session_store import BrowserSessionRevocationStore
 from omnigent.server.oidc import OIDCConfig, hmac_digest, mint_session_cookie
+from tests._helpers.auth_config import (
+    accounts_signing_key_from_env,
+    session_auth_config,
+    set_accounts_env,
+    set_github_oidc_env,
+)
 from tests.server.test_accounts import _build_accounts_app, _login
 
 _SECRET = bytes.fromhex("5e" * 32)
@@ -76,33 +81,13 @@ def _clear_ambient_auth_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def _config(
     source: str, origin: str, *, max_hours: int = 720, init_admin_password: str | None = None
 ) -> AccountsConfig | OIDCConfig:
-    if source == "accounts":
-        return AccountsConfig(
-            cookie_secret=_SECRET,
-            session_ttl_hours=_TTL_HOURS,
-            base_url=origin,
-            init_admin_password=init_admin_password,
-            invite_ttl_seconds=3600,
-            magic_ttl_seconds=600,
-            session_max_lifetime_hours=max_hours,
-        )
-    return OIDCConfig(
-        issuer="https://idp.example.com",
-        client_id="cid",
-        client_secret="client-secret",
-        redirect_uri=f"{origin}/auth/callback",
-        cookie_secret=_SECRET,
-        scopes="openid email profile",
-        session_ttl_hours=_TTL_HOURS,
-        logout_redirect_uri=None,
-        allowed_domains=None,
-        provider_type="oidc",
-        authorization_endpoint="https://idp.example.com/authorize",
-        token_endpoint="https://idp.example.com/token",
-        jwks_uri="https://idp.example.com/jwks",
-        userinfo_endpoint=None,
-        allow_invites=False,
-        session_max_lifetime_hours=max_hours,
+    return session_auth_config(
+        source,
+        origin,
+        signing_key=_SECRET,
+        ttl_hours=_TTL_HOURS,
+        max_hours=max_hours,
+        init_admin_password=init_admin_password,
     )
 
 
@@ -478,7 +463,7 @@ def test_accounts_renewed_cookie_matches_login_cookie(
         )
         assert login.status_code == 200, login.text
         login_header = _session_set_cookies(login, name)[0]
-        secret = bytes.fromhex(os.environ["OMNIGENT_ACCOUNTS_COOKIE_SECRET"])
+        secret = accounts_signing_key_from_env()
         login_claims = _decode(_parse_set_cookie(login_header)[1], secret)
 
         aged = _session_jwt(
@@ -666,7 +651,7 @@ def test_accounts_logout_ends_renewed_session(
     ):
         name = _cookie_name(origin)
         _login(client, "admin", "admin-pw-12345")
-        secret = bytes.fromhex(os.environ["OMNIGENT_ACCOUNTS_COOKIE_SECRET"])
+        secret = accounts_signing_key_from_env()
         login_claims = _decode(client.cookies[name], secret)
         aged = _session_jwt(
             remaining=600,
@@ -886,19 +871,11 @@ def test_login_cookie_stamps_auth_time_and_fresh_sid(monkeypatch: pytest.MonkeyP
 
 
 def _accounts_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("OMNIGENT_ACCOUNTS_COOKIE_SECRET", secrets.token_hex(32))
-    monkeypatch.setenv("OMNIGENT_ACCOUNTS_BASE_URL", _HTTP)
-    monkeypatch.delenv("OMNIGENT_ACCOUNTS_SESSION_TTL_HOURS", raising=False)
+    set_accounts_env(monkeypatch, base_url=_HTTP, signing_key_hex=secrets.token_hex(32))
 
 
 def _oidc_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    # GitHub skips discovery, so from_env needs no network.
-    monkeypatch.setenv("OMNIGENT_OIDC_ISSUER", "https://github.com")
-    monkeypatch.setenv("OMNIGENT_OIDC_CLIENT_ID", "cid")
-    monkeypatch.setenv("OMNIGENT_OIDC_CLIENT_SECRET", "client-secret")
-    monkeypatch.setenv("OMNIGENT_OIDC_REDIRECT_URI", f"{_HTTP}/auth/callback")
-    monkeypatch.setenv("OMNIGENT_OIDC_COOKIE_SECRET", secrets.token_hex(32))
-    monkeypatch.delenv("OMNIGENT_OIDC_SESSION_TTL_HOURS", raising=False)
+    set_github_oidc_env(monkeypatch, base_url=_HTTP, signing_key_hex=secrets.token_hex(32))
 
 
 _CONFIG_SOURCES = [
@@ -1401,7 +1378,7 @@ def test_accounts_logout_keeps_session_when_store_fails_and_retry_succeeds(
         name = _cookie_name(origin)
         _login(client, "admin", "admin-pw-12345")
         token = client.cookies[name]
-        sid = _decode(token, bytes.fromhex(os.environ["OMNIGENT_ACCOUNTS_COOKIE_SECRET"]))["sid"]
+        sid = _decode(token, accounts_signing_key_from_env())["sid"]
 
         failed = client.post("/auth/logout", headers=_cookie(name, token))
 

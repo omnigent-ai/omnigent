@@ -29,6 +29,7 @@ import httpx
 import jwt
 import pytest
 
+from tests._helpers.auth_config import apply_accounts_server_env
 from tests._helpers.compat import apply_server_env, compat_server_cwd, server_executable
 from tests._helpers.live_server import find_free_port
 
@@ -63,14 +64,14 @@ def _run_server(tmp_path: Path, port: int, log_name: str) -> Iterator[str]:
     log_path = tmp_path / log_name
 
     env = {**os.environ}
-    env["OMNIGENT_AUTH_PROVIDER"] = "accounts"
-    env["OMNIGENT_ACCOUNTS_COOKIE_SECRET"] = _COOKIE_SECRET_HEX
-    env["OMNIGENT_ACCOUNTS_BASE_URL"] = base_url
-    env["OMNIGENT_ACCOUNTS_INIT_ADMIN_USERNAME"] = _ADMIN_USERNAME
-    env["OMNIGENT_ACCOUNTS_INIT_ADMIN_PASSWORD"] = _ADMIN_PASSWORD
-    env["OMNIGENT_ACCOUNTS_SESSION_TTL_HOURS"] = str(_TTL_SECONDS // 3600)
-    for name in ("OMNIGENT_OIDC_ISSUER", "OMNIGENT_ACCOUNTS_SESSION_MAX_LIFETIME_HOURS"):
-        env.pop(name, None)
+    apply_accounts_server_env(
+        env,
+        base_url=base_url,
+        signing_key_hex=_COOKIE_SECRET_HEX,
+        admin_username=_ADMIN_USERNAME,
+        admin_password=_ADMIN_PASSWORD,
+        ttl_hours=_TTL_SECONDS // 3600,
+    )
     apply_server_env(env, _REPO_ROOT)
 
     log_handle = open(log_path, "w")  # noqa: SIM115 -- handle lives for the subprocess
