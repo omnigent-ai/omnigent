@@ -1295,6 +1295,70 @@ class SqlComment(OmnigentBase):
     __table_args__ = (CheckConstraint("status IN (1, 2)", name="ck_comments_status"),)
 
 
+COMMENT_REPLY_BODY_MAX_STORED_BYTES = 16_383
+
+
+class SqlCommentReply(OmnigentBase):
+    """A bounded, opaque message nested under a file comment; no database FKs.
+
+    Callers supply every column, including workspace_id. The thread index
+    supports oldest-first keyset pages; the primary key supports cleanup.
+    created_at is epoch microseconds; author_kind uses COMMENT_REPLY_AUTHOR_KIND.
+    """
+
+    __tablename__ = "comment_replies"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    conversation_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    comment_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    author_kind: Mapped[int] = mapped_column(SmallInteger)
+    body: Mapped[str] = mapped_column(EnvelopedText(COMMENT_REPLY_BODY_MAX_STORED_BYTES))
+    created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[int] = mapped_column(BigInteger)
+
+    __table_args__ = (
+        CheckConstraint("author_kind IN (1, 2)", name="ck_comment_replies_author_kind"),
+        CheckConstraint(
+            "typeof(workspace_id) = 'integer'",
+            name="ck_comment_replies_workspace_id_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "typeof(conversation_id) = 'blob' AND length(conversation_id) = 16",
+            name="ck_comment_replies_conversation_id_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "typeof(comment_id) = 'blob' AND length(comment_id) = 16",
+            name="ck_comment_replies_comment_id_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "typeof(id) = 'blob' AND length(id) = 16",
+            name="ck_comment_replies_id_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "typeof(body) = 'blob' AND length(body) <= 16383",
+            name="ck_comment_replies_body_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "created_by IS NULL OR (typeof(created_by) = 'text' "
+            "AND length(CAST(created_by AS BLOB)) <= 512)",
+            name="ck_comment_replies_created_by_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+        CheckConstraint(
+            "typeof(created_at) = 'integer'",
+            name="ck_comment_replies_created_at_integer",
+        ).ddl_if(callable_=_on_sqlite_family),
+        Index(
+            "ix_comment_replies_thread",
+            "workspace_id",
+            "conversation_id",
+            "comment_id",
+            "created_at",
+            "id",
+        ),
+    )
+
+
 def policy_name_cksum(name: str) -> bytes:
     """Return the sha256 digest of a policy name.
 

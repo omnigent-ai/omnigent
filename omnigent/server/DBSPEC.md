@@ -293,3 +293,25 @@ order "desc":  ORDER BY sort_col DESC LIMIT :limit + 1
 
 Fetch `limit + 1` rows. If more than `limit` returned, set `has_more = true`
 and discard the extra row. `first_id` / `last_id` taken from the returned page.
+
+
+## comment_replies
+
+One message per file-comment thread, scoped by the primary key
+`(workspace_id, conversation_id, comment_id, id)`. The three IDs are Uuid16;
+workspace_id is BIGINT. No foreign keys or column defaults. Writers provide
+workspace_id explicitly. `author_kind` is SMALLINT (`user=1`, `agent=2`),
+`body` is EnvelopedText with a 16,383-byte cap including encryption metadata,
+`created_by` is nullable VARCHAR(128), at most 512 UTF-8 bytes, and `created_at`
+is BIGINT epoch microseconds. SQLite/D1 CHECKs enforce the integer workspace
+and timestamp, 16-byte binary IDs, author codes and payload/identity bounds.
+
+`ix_comment_replies_thread (workspace_id, conversation_id, comment_id, created_at, id)`
+serves oldest-first keyset pagination; the primary-key prefix serves bounded
+cleanup when a thread or conversation is deleted. Application cleanup owns
+these cascades.
+
+Deploy migration `4d8e2b7f1a63` before reply writers. This revision is the binary
+rollback floor: older binaries reject unknown revisions at startup. Stop writers
+and downgrade schema to `ffeec66eadb5` using the newer build before rolling back
+the binary. Downgrade drops replies, so export any needed data first.
