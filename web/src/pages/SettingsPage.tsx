@@ -2787,42 +2787,44 @@ function UpdatesSection() {
         <div className="flex max-w-2xl flex-col gap-6">
           <SettingsGroup title="Preferences" testId="settings-group-update-preferences">
             <SettingsItem entry={UPDATE_MODE_ENTRY}>
-              <label className="flex flex-col gap-2">
-                <span
-                  id={settingsLabelId(UPDATE_MODE_ENTRY)}
-                  className="text-ui font-normal md:font-medium"
-                >
-                  {UPDATE_MODE_ENTRY.label}
-                </span>
+              <div className="flex flex-col gap-2">
+                <label className="flex flex-col gap-2">
+                  <span
+                    id={settingsLabelId(UPDATE_MODE_ENTRY)}
+                    className="text-ui font-normal md:font-medium"
+                  >
+                    {UPDATE_MODE_ENTRY.label}
+                  </span>
+                  <Select
+                    value={config.mode}
+                    onValueChange={(value) => void persistConfig({ mode: value as UpdateMode })}
+                    disabled={saving}
+                    componentId="settings.updates.mode"
+                    valueHasNoPii
+                  >
+                    <SelectTrigger
+                      {...settingsControlProps(UPDATE_MODE_ENTRY)}
+                      className="w-full max-w-md"
+                      data-testid="update-mode-select"
+                    >
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent {...settingsOverlayProps(UPDATE_MODE_ENTRY)}>
+                      {(Object.keys(UPDATE_MODE_LABELS) as UpdateMode[]).map((mode) => (
+                        <SelectItem key={mode} value={mode}>
+                          {UPDATE_MODE_LABELS[mode]}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </label>
                 <span
                   id={settingsDescriptionId(UPDATE_MODE_ENTRY)}
                   className="text-sm text-muted-foreground"
                 >
                   {UPDATE_MODE_ENTRY.description}
                 </span>
-                <Select
-                  value={config.mode}
-                  onValueChange={(value) => void persistConfig({ mode: value as UpdateMode })}
-                  disabled={saving}
-                  componentId="settings.updates.mode"
-                  valueHasNoPii
-                >
-                  <SelectTrigger
-                    {...settingsControlProps(UPDATE_MODE_ENTRY)}
-                    className="w-full max-w-md"
-                    data-testid="update-mode-select"
-                  >
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent {...settingsOverlayProps(UPDATE_MODE_ENTRY)}>
-                    {(Object.keys(UPDATE_MODE_LABELS) as UpdateMode[]).map((mode) => (
-                      <SelectItem key={mode} value={mode}>
-                        {UPDATE_MODE_LABELS[mode]}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </label>
+              </div>
             </SettingsItem>
 
             <div className="mt-4 border-t border-border pt-4">
