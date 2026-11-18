@@ -14,7 +14,9 @@ import { FullscreenIcon } from "@/components/ai-elements/MermaidBlock";
 import { GraphZoomControls } from "@/components/GraphZoomControls";
 import { Button } from "@/components/ui/button";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
+import { StepDescription } from "@/components/workflows/StepDescription";
 import { getEmbedRoot } from "@/lib/host";
+import { markdownPreviewText } from "@/lib/markdownPreviewText";
 import { failedUpstream, type StepProgress, type StepState } from "@/lib/sessionJournal";
 import { cn } from "@/lib/utils";
 import {
@@ -121,7 +123,7 @@ function StepNode({ id, data }: NodeProps<Node<StepNodeData>>) {
               ) : (
                 data.goal && (
                   <p className="mt-0.5 line-clamp-2 text-xs leading-snug text-muted-foreground">
-                    {data.goal}
+                    {markdownPreviewText(data.goal)}
                   </p>
                 )
               )}
@@ -160,7 +162,7 @@ function StepNode({ id, data }: NodeProps<Node<StepNodeData>>) {
                 Step {data.number} of {graph.total}
               </span>
               <span className="break-words font-medium">{data.name}</span>
-              {data.goal && <span className="break-words text-muted-foreground">{data.goal}</span>}
+              {data.goal && <StepDescription text={data.goal} />}
             </>
           )}
         </HoverCardContent>
