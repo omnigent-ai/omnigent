@@ -289,7 +289,7 @@ function AddDefaultPolicyDialog({
                     {prop?.type === "boolean" ? (
                       <select
                         data-settings-row-field="value"
-                        aria-label={`Parameter ${fieldLabel}`}
+                        aria-label={`Parameter ${key}`}
                         value={
                           factoryParams[key] ??
                           (prop?.default !== undefined ? String(prop.default) : "")
@@ -308,7 +308,7 @@ function AddDefaultPolicyDialog({
                     ) : prop?.type === "string" && prop.enum ? (
                       <select
                         data-settings-row-field="value"
-                        aria-label={`Parameter ${fieldLabel}`}
+                        aria-label={`Parameter ${key}`}
                         value={
                           factoryParams[key] ??
                           (prop?.default !== undefined
@@ -366,7 +366,7 @@ function AddDefaultPolicyDialog({
                             <ModelValueCombobox
                               inputProps={{
                                 ...settingsControlProps(POLICIES_ADD_ENTRY, "parameterValues", {
-                                  runtime: fieldLabel,
+                                  runtime: key,
                                 }),
                               }}
                               options={prop.items.enum}
@@ -387,7 +387,7 @@ function AddDefaultPolicyDialog({
                     ) : (
                       <input
                         data-settings-row-field="value"
-                        aria-label={`Parameter ${fieldLabel}`}
+                        aria-label={`Parameter ${key}`}
                         type={
                           prop?.type === "integer" || prop?.type === "number" ? "number" : "text"
                         }

@@ -209,6 +209,7 @@ describe("PoliciesPage Settings rows", () => {
       document.querySelector('[data-settings-region="policies-list:policies"]'),
     ).not.toBeNull();
     const card = screen.getByText("block_canada").closest("[data-settings-region-row]");
+    expect(card).toBeInTheDocument();
     expect(card?.querySelector('[data-settings-row-action="toggle"]')).not.toBeNull();
     expect(card?.querySelector('[data-settings-row-action="remove"]')).not.toBeNull();
   });
@@ -301,6 +302,7 @@ describe("PoliciesPage actions", () => {
     fireEvent.click(within(dialog).getByText("Budget Guard"));
 
     const combo = within(dialog).getByPlaceholderText("Select or type a value…");
+    expect(combo).toHaveAccessibleName("Parameter values: expensive_models");
     fireEvent.focus(combo);
     fireEvent.mouseDown(within(dialog).getByRole("button", { name: "opus" }));
     fireEvent.mouseDown(within(dialog).getByRole("button", { name: "haiku" }));

@@ -27,7 +27,10 @@ export function ModelValueCombobox({
   onToggle: (value: string) => void;
   placeholder?: string;
   /** Attributes for the text field, such as its Settings name. */
-  inputProps?: InputHTMLAttributes<HTMLInputElement>;
+  inputProps?: Omit<
+    InputHTMLAttributes<HTMLInputElement>,
+    "value" | "onChange" | "onFocus" | "onKeyDown" | "type" | "className"
+  >;
 }) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");

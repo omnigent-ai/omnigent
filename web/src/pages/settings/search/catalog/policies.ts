@@ -16,7 +16,7 @@ export const POLICIES_ADD_ENTRY = settingsEntry({
   },
   // A list parameter's values, named after the parameter, such as "Parameter values: pii_types".
   nameTemplates: { parameterValues: { before: "Parameter values: " } },
-  // The server's policies to choose from, then the chosen one's name and parameters.
+  // "choosing" lists the server's policies; "configuring" shows the chosen one's name and parameters.
   presence: {
     filter: { overlay: "add", states: ["choosing"] },
     change: { overlay: "add", states: ["configuring"] },
@@ -40,7 +40,7 @@ export const POLICIES_LIST_ENTRY = settingsEntry({
   description: "The policies applied to every session, and whether each one is on.",
   keywords: ["policies", "guardrails", "rules", "enable", "disable", "remove", "all sessions"],
   parts: { refresh: "Refresh" },
-  // Each policy's own switch and Remove, and the confirmation Remove opens.
+  // The toggle is data-named: its aria-label is the policy's name.
   regions: {
     policies: {
       rowActions: { toggle: { dataName: true }, remove: "Remove policy" },
