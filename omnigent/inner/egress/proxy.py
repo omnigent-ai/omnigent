@@ -59,6 +59,20 @@ logger = logging.getLogger(__name__)
 
 RequestBodyTransform = Callable[[str, str, int, str, bytes], bytes]
 
+
+@dataclass(frozen=True)
+class HostScopedRequestBodyTransform:
+    """Apply a trusted body transform only to one destination host."""
+
+    host: str
+    transform: RequestBodyTransform
+
+    def __call__(self, method: str, host: str, port: int, path: str, body: bytes) -> bytes:
+        if host.lower() != self.host.lower():
+            return body
+        return self.transform(method, host, port, path, body)
+
+
 _CONNECT_RESPONSE = b"HTTP/1.1 200 Connection Established\r\n\r\n"
 _HTTP2_PREFACE_FIRST_LINE = b"PRI * HTTP/2.0\r\n"
 _BUF_SIZE = 65536
@@ -818,7 +832,13 @@ class EgressProxy:
     def _allows_http2_passthrough(self, host: str) -> bool:
         """Return whether opaque HTTP/2 relay is safe for *host*."""
         return (
-            self._request_body_transform is None
+            (
+                self._request_body_transform is None
+                or (
+                    isinstance(self._request_body_transform, HostScopedRequestBodyTransform)
+                    and host.lower() != self._request_body_transform.host.lower()
+                )
+            )
             and self._allows_unrestricted_host(host)
             and host.lower() not in self._cred_by_host
         )

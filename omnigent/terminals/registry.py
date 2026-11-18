@@ -236,9 +236,9 @@ class TerminalRegistry:
         # Protects both ``_by_conversation`` and ``_instance_locks``.
         self._lock = threading.Lock()
         self.environment_resolver: Callable[[str, OSEnvSpec], OSEnvironment] | None = None
-        self.model_access_resolver: Callable[[str], Awaitable[ClaudeModelAccess | None]] | None = (
-            None
-        )
+        self.model_access_resolver: (
+            Callable[[str, Path], Awaitable[ClaudeModelAccess | None]] | None
+        ) = None
 
     def conversation_link_for_id(self, conversation_id: str) -> str:
         """
@@ -327,7 +327,9 @@ class TerminalRegistry:
         model_access = None
         if environment_spec.sandbox is None or environment_spec.sandbox.type != "none":
             if self.model_access_resolver is not None:
-                model_access = await self.model_access_resolver(conversation_id)
+                model_access = await self.model_access_resolver(
+                    conversation_id, Path(environment_spec.cwd or ".").resolve(strict=False)
+                )
             elif model_access_factory is not None:
                 model_access = await asyncio.to_thread(model_access_factory)
         if model_access is not None and environment_spec.sandbox is None:

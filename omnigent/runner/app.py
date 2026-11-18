@@ -8676,7 +8676,7 @@ def create_runner_app(
         entry = await _resolve_session_spec_entry(session_id)
         return _unwrap_spec_entry(entry)
 
-    async def _terminal_model_access(session_id: str) -> ClaudeModelAccess | None:
+    async def _terminal_model_access(session_id: str, cwd: Path) -> ClaudeModelAccess | None:
         from omnigent.runtime.workflow import claude_terminal_model_access
 
         entry = await _resolve_session_spec_entry(session_id)
@@ -8687,6 +8687,7 @@ def create_runner_app(
                 spec,
                 bundle_dir=_resolved_spec_workdir(entry),
                 effective_harness=_session_harness_name(session_id),
+                cwd=cwd,
             )
             if spec is not None
             else None

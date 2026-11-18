@@ -734,6 +734,7 @@ class _ClaudeRelay(_SignerRelay):
 def resolve_claude_model_access(
     env: Mapping[str, str],
     *,
+    cwd: Path | None = None,
     credential: Callable[[], str] | None = None,
     source_paths: tuple[Path, ...] = (),
     source_env_names: frozenset[str] = frozenset(),
@@ -745,6 +746,8 @@ def resolve_claude_model_access(
             raise ValueError("sandboxed Claude model relay requires an Anthropic-compatible API")
     base_url = env.get("ANTHROPIC_BASE_URL") or "https://api.anthropic.com"
     config_dir = Path(env.get("CLAUDE_CONFIG_DIR") or (Path.home() / ".claude"))
+    # Claude resolves relative config paths from its cwd without expanding '~'.
+    config_dir = Path(os.path.abspath((cwd or Path.cwd()) / config_dir))
     private_paths = (
         config_dir,
         config_dir / ".credentials.json",

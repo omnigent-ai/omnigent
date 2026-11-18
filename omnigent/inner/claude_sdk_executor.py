@@ -2101,6 +2101,7 @@ def prepare_claude_cli_path(
             raise ValueError("invalid Claude credential environment metadata")
         model_access = model_access or resolve_claude_model_access(
             parent_env,
+            cwd=cwd,
             databricks_profile=databricks_profile,
             source_env_names=frozenset(credential_env_names),
         )

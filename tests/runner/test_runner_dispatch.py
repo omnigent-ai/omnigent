@@ -3349,6 +3349,46 @@ async def test_runner_os_env_surrogate_path_is_httpx_transport_safe(
 
 
 @pytest.mark.asyncio
+async def test_claude_callback_uses_selected_workspace_for_model_credentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from unittest.mock import AsyncMock, Mock
+
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+    from omnigent.runtime import workflow
+
+    workspace = tmp_path / "selected"
+    workspace.mkdir()
+    configured = tmp_path / "configured"
+    configured.mkdir()
+    access = Mock()
+    resolve_access = Mock(return_value=access)
+    monkeypatch.setattr(workflow, "claude_terminal_model_access", resolve_access)
+    environment = Mock()
+    environment.read = AsyncMock(return_value={"content": "ok"})
+    create_environment = Mock(return_value=environment)
+    monkeypatch.setattr("omnigent.inner.os_env.create_os_environment", create_environment)
+    spec = AgentSpec(
+        spec_version=1,
+        executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+        os_env=OSEnvSpec(cwd=str(configured), sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+    )
+
+    result = await _execute_os_env_tool(
+        "sys_os_read",
+        {"path": "notes.txt"},
+        agent_spec=spec,
+        runner_workspace=workspace,
+    )
+
+    assert json.loads(result) == {"content": "ok"}
+    assert resolve_access.call_args.kwargs["cwd"] == workspace
+    assert create_environment.call_args.args[0].cwd == str(workspace)
+    assert create_environment.call_args.kwargs["model_access"] is access
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("shared_copy_on_write", [True, False], ids=["shared-cow", "fork"])
 async def test_runner_os_env_dispatch_preserves_shared_and_fork_ownership(
     monkeypatch: pytest.MonkeyPatch,

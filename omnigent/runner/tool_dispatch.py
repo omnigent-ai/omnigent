@@ -8367,6 +8367,7 @@ async def _execute_os_env_tool(
                 agent_spec,
                 bundle_dir=bundle_dir,
                 effective_harness=effective_harness,
+                cwd=Path(effective_spec.cwd or os.getcwd()).resolve(strict=False),
             )
             if model_access is None:
                 raise ValueError(

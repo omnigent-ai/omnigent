@@ -862,8 +862,17 @@ def test_real_cli_completes_streamed_inference_with_parent_owned_auth(
             "oauth": "CLAUDE_CODE_OAUTH_TOKEN",
         }[auth_kind]
     ] = "parent-only-cli-secret"
+    if auth_kind == "api_key":
+        # Claude resolves a relative config directory from its workspace.
+        env["CLAUDE_CONFIG_DIR"] = "../claude-state"
     prepared = claude.prepare_claude_cli_path(real_claude_cli, real_worker_spec, worker_env=env)
     try:
+        if auth_kind == "api_key":
+            assert prepared.model_access is not None
+            assert prepared.sandbox is not None
+            assert Path(real_worker_spec.cwd or "").parent / "claude-state" in (
+                prepared.sandbox.credential_source_paths or []
+            )
         result = subprocess.run(
             [
                 prepared.cli_path,

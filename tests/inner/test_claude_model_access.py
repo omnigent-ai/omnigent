@@ -588,6 +588,85 @@ def test_actual_oauth_files_cannot_alias_a_worker_grant(
         access.protect_sources(policy, workspace)
 
 
+@pytest.mark.parametrize("entrypoint", ["cli_callback", "terminal", "terminal_override"])
+def test_relative_config_dir_provenance_uses_session_cwd(
+    oauth_paths: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, entrypoint: str
+) -> None:
+    from omnigent.inner import claude_sdk_executor as claude
+    from omnigent.runtime import workflow
+
+    config, workspace = oauth_paths
+    parent = workspace.parent / "daemon" / "cwd"
+    parent.mkdir(parents=True)
+    monkeypatch.chdir(parent)
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+    for name in tuple(os.environ):
+        if name.startswith(("CLAUDE_", "ANTHROPIC_", "HARNESS_")):
+            monkeypatch.delenv(name)
+    env = {"CLAUDE_CONFIG_DIR": os.path.relpath(config, workspace)}
+    # Parent settings must not replace the session's credential provenance.
+    settings = {"env": {"ANTHROPIC_AUTH_TOKEN": "session-only-key"}}
+    (config / "settings.json").write_text(json.dumps(settings))
+    parent_config = parent / env["CLAUDE_CONFIG_DIR"]
+    parent_config.mkdir(parents=True)
+    (parent_config / "settings.json").write_text(
+        json.dumps({"env": {"ANTHROPIC_AUTH_TOKEN": "wrong-parent-key"}})
+    )
+    policy = SandboxPolicy("linux_bwrap", True, [workspace], [workspace], [], False)
+    if entrypoint == "cli_callback":
+        env["ANTHROPIC_AUTH_TOKEN"] = "session-only-key"
+        monkeypatch.setattr(claude, "resolve_sandbox", lambda *_: policy)
+        backend = Mock()
+        backend.wrap_launcher_argv.side_effect = lambda argv, *args, **kwargs: ["bwrap", *argv]
+        monkeypatch.setattr(claude, "get_backend", lambda _: backend)
+        proxy = Mock(
+            relay_port=34567,
+            socket_path=workspace / "relay.sock",
+            ca_bundle_path=workspace / "ca.pem",
+        )
+        start_proxy = Mock(return_value=proxy)
+        monkeypatch.setattr(claude, "start_egress_proxy", start_proxy)
+        launcher = workspace / "launcher"
+        launcher.touch()
+        launch = Mock(return_value=str(launcher))
+        monkeypatch.setattr(claude, "create_exec_launcher", launch)
+        spec = OSEnvSpec(cwd=".", sandbox=OSEnvSandboxSpec(type="linux_bwrap"))
+        prepared = claude.prepare_claude_cli_path("/bin/claude", spec, worker_env=dict(env))
+        try:
+            access = prepared.model_access
+            assert access is not None
+            assert prepared.sandbox is not None
+            assert config in (prepared.sandbox.credential_source_paths or [])
+        finally:
+            prepared.close()
+        start_proxy.reset_mock()
+        launch.reset_mock()
+        policy.read_roots.append(config)
+        with pytest.raises(ValueError, match="outside sandbox"):
+            claude.prepare_claude_cli_path("/bin/claude", spec, worker_env=dict(env))
+        start_proxy.assert_not_called()
+        launch.assert_not_called()
+    else:
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", env["CLAUDE_CONFIG_DIR"])
+        monkeypatch.setattr(workflow, "_build_claude_sdk_spawn_env", lambda _: {})
+        spec = AgentSpec(
+            spec_version=1,
+            executor=ExecutorSpec(type="omnigent", config={"harness": "claude-sdk"}),
+            os_env=OSEnvSpec(cwd=str(parent) if entrypoint == "terminal_override" else "."),
+        )
+        access = workflow.claude_terminal_model_access(
+            spec, cwd=workspace if entrypoint == "terminal_override" else None
+        )
+        assert access is not None
+        protected = access.protect_sources(policy, workspace)
+        assert config in (protected.credential_source_paths or [])
+        policy.read_roots.append(config)
+        with pytest.raises(ValueError, match="outside sandbox"):
+            access.protect_sources(policy, workspace)
+    assert config in access.source_paths
+    assert access.credential() == "session-only-key"
+
+
 def test_private_oauth_symlink_is_protected_and_atomic_rotation_works(
     oauth_paths: tuple[Path, Path],
 ) -> None:
@@ -922,7 +1001,7 @@ async def test_terminal_inherits_automatic_model_access_only_when_sandboxed(
             with pytest.raises(RuntimeError, match="terminal model access rejected"):
                 await launch
             launch_process.assert_not_awaited()
-            resolver.assert_awaited_once_with("conversation")
+            resolver.assert_awaited_once_with("conversation", workspace)
             factory.assert_not_called()
             return
         instance = await launch
@@ -943,7 +1022,7 @@ async def test_terminal_inherits_automatic_model_access_only_when_sandboxed(
             factory.assert_called_once_with()
             resolver.assert_not_called()
         else:
-            resolver.assert_awaited_once_with("conversation")
+            resolver.assert_awaited_once_with("conversation", workspace)
             factory.assert_not_called()
         if sandbox_type is None:
             assert environment_spec.sandbox is None
@@ -1088,27 +1167,27 @@ def test_provider_env_refs_include_local_named_auth_under_managed_overlay(
     assert "OMNIGENT_LOCAL_CREDENTIAL" not in env
 
 
-def test_host_oauth_file_is_reread_without_exposing_refresh_token(tmp_path: Path) -> None:
-    source = tmp_path / ".credentials.json"
+@pytest.mark.parametrize("config_path", ["absolute", "relative", "literal_tilde"])
+def test_host_oauth_file_is_reread_without_exposing_refresh_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config_path: str
+) -> None:
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config = workspace / "~" / "state" if config_path == "literal_tilde" else tmp_path / "state"
+    config.mkdir(parents=True)
+    source = config / ".credentials.json"
+    monkeypatch.chdir(parent)
 
-    def update(token: str) -> None:
-        source.write_text(
-            json.dumps(
-                {
-                    "claudeAiOauth": {
-                        "accessToken": token,
-                        "refreshToken": "parent-only-refresh",
-                        "expiresAt": (time.time() + 300) * 1000,
-                    }
-                }
-            )
-        )
-
-    update("initial")
-    access = resolve_claude_model_access({"CLAUDE_CONFIG_DIR": str(tmp_path)})
+    _write_oauth(source, "initial")
+    configured = str(config) if config_path == "absolute" else os.path.relpath(config, workspace)
+    access = resolve_claude_model_access({"CLAUDE_CONFIG_DIR": configured}, cwd=workspace)
+    assert config in access.source_paths
     assert access.oauth
     assert access.credential() == "initial"
-    update("renewed")
+    monkeypatch.chdir(workspace)
+    _write_oauth(source, "renewed")
     assert access.credential() == "renewed"
     env: dict[str, str] = {}
     access.worker_environment(env, tmp_path / "worker")

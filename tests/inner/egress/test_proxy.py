@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from omnigent.inner.claude_gateway_shim import gateway_body_transform
 from omnigent.inner.claude_model_access import ClaudeModelAccess
 from omnigent.inner.credential_proxy import (
     CODEX_GATEWAY_TOKEN_ENV,
@@ -33,7 +34,7 @@ from omnigent.inner.datamodel import (
 from omnigent.inner.egress import controller
 from omnigent.inner.egress.ca import ensure_ca, ensure_ca_bundle
 from omnigent.inner.egress.certs import HostCertCache
-from omnigent.inner.egress.proxy import EgressProxy
+from omnigent.inner.egress.proxy import EgressProxy, RequestBodyTransform
 from omnigent.inner.egress.rules import parse_rules
 from omnigent.inner.sandbox import SandboxPolicy
 from omnigent.spec.parser import _parse_credential_proxy
@@ -1581,11 +1582,16 @@ async def test_compatibility_body_patch_preserves_framing_and_policy(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("use_upstream_proxy", [False, True], ids=["direct", "upstream-proxy"])
+@pytest.mark.parametrize(
+    "use_upstream_proxy,model_relay",
+    [(False, False), (True, False), (False, True)],
+    ids=["direct", "upstream-proxy", "model-relay"],
+)
 async def test_connect_relays_http2_for_unrestricted_host(
     ca_paths: tuple[Path, Path, Path],
     monkeypatch: pytest.MonkeyPatch,
     use_upstream_proxy: bool,
+    model_relay: bool,
 ) -> None:
     cert_path, key_path, bundle_path = ca_paths
     host = "agent.example.com"
@@ -1615,12 +1621,15 @@ async def test_connect_relays_http2_for_unrestricted_host(
     upstream_port = upstream.sockets[0].getsockname()[1]
     if use_upstream_proxy:
         monkeypatch.setenv("https_proxy", f"http://127.0.0.1:{upstream_port}")
-    proxy = EgressProxy(
+    access = ClaudeModelAccess("https://model.example.com", "x-api-key", lambda: "secret")
+    factory = access.create_proxy if model_relay else EgressProxy
+    proxy = factory(
         parse_rules([f"* {host}/**"]),
         cert_path,
         key_path,
         upstream_ca_bundle=bundle_path,
         block_private_destinations=False,
+        request_body_transform=gateway_body_transform(access.base_url) if model_relay else None,
     )
     proxy_port = await proxy.start_tcp()
     monkeypatch.setattr(asyncio.get_event_loop(), "getaddrinfo", _resolve_to_loopback())
@@ -1657,24 +1666,43 @@ async def test_connect_relays_http2_for_unrestricted_host(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "proxy_kind", ["generic", "gateway-transform", "model-relay", "unknown-transform"]
+)
 async def test_connect_advertises_http2_only_for_safe_passthrough(
     ca_paths: tuple[Path, Path, Path],
+    proxy_kind: str,
 ) -> None:
     cert_path, key_path, bundle_path = ca_paths
     unrestricted_host = "unrestricted.example.com"
     restricted_host = "restricted.example.com"
     credential_host = "credential.example.com"
-    proxy = EgressProxy(
+    model_host = "model.example.com"
+    access = ClaudeModelAccess(f"https://{model_host}/anthropic", "x-api-key", lambda: "secret")
+    factory = access.create_proxy if proxy_kind == "model-relay" else EgressProxy
+    transform: RequestBodyTransform | None = None
+    if proxy_kind in ("gateway-transform", "model-relay"):
+        transform = gateway_body_transform(access.base_url)
+    elif proxy_kind == "unknown-transform":
+
+        def passthrough(_method: str, _host: str, _port: int, _path: str, body: bytes) -> bytes:
+            return body
+
+        transform = passthrough
+    proxy = factory(
         parse_rules(
             [
                 f"* {unrestricted_host}/**",
                 f"POST {restricted_host}/allowed/**",
                 f"* {credential_host}/**",
+                f"* {model_host}/**",
             ]
         ),
         cert_path,
         key_path,
+        upstream_ca_bundle=bundle_path,
         block_private_destinations=False,
+        request_body_transform=transform,
         credential_rewrites=[
             CredentialRewriteRule(
                 host=credential_host,
@@ -1688,9 +1716,10 @@ async def test_connect_advertises_http2_only_for_safe_passthrough(
 
     try:
         for host, expected in (
-            (unrestricted_host, "h2"),
+            (unrestricted_host, "http/1.1" if proxy_kind == "unknown-transform" else "h2"),
             (restricted_host, "http/1.1"),
             (credential_host, "http/1.1"),
+            (model_host, "h2" if proxy_kind == "generic" else "http/1.1"),
         ):
             selected = await asyncio.wait_for(
                 asyncio.to_thread(
@@ -1702,7 +1731,7 @@ async def test_connect_advertises_http2_only_for_safe_passthrough(
                 ),
                 timeout=15,
             )
-            assert selected == expected
+            assert selected == expected, host
     finally:
         await proxy.stop()
 

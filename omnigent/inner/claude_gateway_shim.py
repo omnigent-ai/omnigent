@@ -48,7 +48,7 @@ from omnigent.databricks_ai_gateway import (
 from omnigent.telemetry.surface import harness_client_surface
 from omnigent.util.uvicorn_server import NoSignalServer
 
-from .egress.proxy import RequestBodyTransform
+from .egress.proxy import HostScopedRequestBodyTransform, RequestBodyTransform
 
 logger = logging.getLogger(__name__)
 
@@ -147,17 +147,12 @@ def gateway_body_transform(base_url: str) -> RequestBodyTransform:
     upstream_port = upstream.port or (443 if upstream.scheme == "https" else 80)
     messages_path = upstream.path.rstrip("/") + "/v1/messages"
 
-    def transform(method: str, host: str, port: int, path: str, body: bytes) -> bytes:
-        if (
-            method == "POST"
-            and host.lower() == upstream.hostname
-            and port == upstream_port
-            and path.split("?", 1)[0] == messages_path
-        ):
+    def transform(method: str, _host: str, port: int, path: str, body: bytes) -> bytes:
+        if method == "POST" and port == upstream_port and path.split("?", 1)[0] == messages_path:
             return restore_thinking_display(body)
         return body
 
-    return transform
+    return HostScopedRequestBodyTransform(upstream.hostname or "", transform)
 
 
 class ClaudeGatewayShim:
