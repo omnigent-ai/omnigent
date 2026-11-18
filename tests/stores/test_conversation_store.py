@@ -10656,6 +10656,7 @@ def test_family_membership_is_independent_of_labels(conversation_store) -> None:
 @pytest.mark.parametrize("split_database", [False, True])
 def test_move_sessions_between_nests(tmp_path, split_database, monkeypatch):
     from omnigent.errors import OmnigentError
+    from omnigent.server.session_families import project_families
     from omnigent.stores.conversation_store import (
         SIDE_CHAT_LABEL_KEY,
         family_pinned_label_key,
@@ -10704,6 +10705,23 @@ def test_move_sessions_between_nests(tmp_path, split_database, monkeypatch):
     store.set_session_nest(moved.id, None, user_id="alice")
     saved = store.get_conversation(moved.id)
     assert saved.family_id is None and saved.project_id == "a" * 32
+    assert saved.labels[pinned_label_key("alice")] == "234"
+    younger_peer = store.create_conversation()
+    store.add_new_sibling(other.id, younger_peer.id, user_id="alice")
+    _spread_created_at(store, [younger_peer.id, other.id, moved.id])
+    store.set_session_nest(moved.id, other.id, user_id="alice")
+    rows, families = project_families(
+        store, None, [store.get_conversation(moved.id)], "alice", expand=True
+    )
+    assert {row.id for row in rows} == {moved.id, other.id, younger_peer.id}
+    for row in rows:
+        assert families[row.id].representative_id == moved.id
+        assert families[row.id].pinned is False
+        assert families[row.id].pinned_at is None
+    assert store.get_conversation(moved.id).labels[pinned_label_key("alice")] == "234"
+    store.set_session_nest(moved.id, None, user_id="alice")
+    saved = store.get_conversation(moved.id)
+    assert saved.family_id is None
     assert saved.labels[pinned_label_key("alice")] == "234"
     store.set_session_nest(source.id, None, user_id="alice")
     assert store.get_conversation(source.id).family_id is None
@@ -10764,9 +10782,9 @@ def test_failed_split_database_nest_move_restores_membership(
     label_failure_active = not interleave
 
     @contextmanager
-    def fail_labels(session, *, read_only=False):
+    def fail_labels(session, *, read_only=False, operation: str | None = None):
         nonlocal failed
-        with original(session, read_only=read_only) as labels_session:
+        with original(session, read_only=read_only, operation=operation) as labels_session:
             yield labels_session
             if not read_only and label_failure_active and (persistent or not failed):
                 failed = True

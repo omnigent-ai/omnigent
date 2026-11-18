@@ -2138,7 +2138,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 if peer_id is not None:
                     peer = session.get(SqlConversationMetadata, (current_workspace_id(), peer_id))
                     assert peer is not None
-                    with self._profile_label_session(session) as labels_session:
+                    with self._profile_label_session(
+                        session, operation="repair_pending_nest_labels"
+                    ) as labels_session:
                         self._copy_family_labels(
                             labels_session,
                             [session_id],
@@ -2215,7 +2217,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             if source_meta is None or target_meta is None:
                 raise ConversationNotFoundError(source_id if source_meta is None else session_id)
-            with self._profile_label_session(session) as labels_session:
+            with self._profile_label_session(
+                session, operation="create_sibling_membership"
+            ) as labels_session:
                 source_row = labels_session.get(
                     SqlConversation, (current_workspace_id(), source_id), with_for_update=True
                 )
@@ -2275,7 +2279,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                 initial_source = self._family_label_source(session, family_lock)
                 initialize_labels = initial_source is not None
-                with self._profile_label_session(session) as labels_session:
+                with self._profile_label_session(
+                    session, operation="copy_sibling_labels"
+                ) as labels_session:
                     self._copy_family_labels(
                         labels_session,
                         members if initialize_labels else [session_id],
@@ -2334,7 +2340,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             family_lock: SqlPreference | None,
         ) -> None:
             nonlocal labels_copied
-            with self._profile_label_session(session) as labels_session:
+            with self._profile_label_session(
+                session, operation="copy_session_nest_labels"
+            ) as labels_session:
                 if source_meta is None:
                     labels_session.execute(
                         delete(SqlConversationLabel).where(
@@ -2370,7 +2378,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 raise OmnigentError(
                     "Session family changed; retry the move", code=ErrorCode.CONFLICT
                 )
-            with self._profile_label_session(session, read_only=True) as labels_session:
+            with self._profile_label_session(
+                session, read_only=True, operation="move_session_nest"
+            ) as labels_session:
                 for key in (session_id, source_id):
                     if key is None:
                         continue
@@ -2492,7 +2502,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         def write(session: Session) -> None:
             self._lock_session_family(session, family_id)
             ids = self._family_member_ids(session, family_id)
-            with self._profile_label_session(session) as labels_session:
+            with self._profile_label_session(
+                session, operation="pin_session_family"
+            ) as labels_session:
                 self._require_family_representative(labels_session, ids, session_id, family_id)
                 if value:
                     for member_id in ids:
@@ -2601,7 +2613,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         def write(session: Session) -> bool:
             self._lock_session_family(session, family_id)
             ids = family_members(session)
-            with self._profile_label_session(session) as labels_session:
+            with self._profile_label_session(
+                session, operation="move_session_family"
+            ) as labels_session:
                 if ids:
                     self._require_family_representative(
                         labels_session, ids, conversation_id, family_id
@@ -2627,7 +2641,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                 self._lock_session_family(session, family_id)
                 ids = family_members(session)
                 if ids:
-                    with self._profile_label_session(session) as labels_session:
+                    with self._profile_label_session(
+                        session, operation="clear_family_project_labels"
+                    ) as labels_session:
                         clear_legacy_labels(labels_session, ids)
 
             run_write_transaction(
@@ -6121,13 +6137,20 @@ class SqlAlchemyConversationStore(ConversationStore):
 
     @contextmanager
     def _profile_label_session(
-        self, metadata_session: Session, *, read_only: bool = False
+        self,
+        metadata_session: Session,
+        *,
+        read_only: bool = False,
+        operation: str | None = None,
     ) -> Iterator[Session]:
         if self._conv_engine is self._engine:
             yield metadata_session
         else:
             session_maker = self._conv_session if read_only else self._conv_session_immediate
-            operation = "check_profile_host_affinity" if read_only else "accept_sandbox_profile"
+            if operation is None:
+                operation = (
+                    "check_profile_host_affinity" if read_only else "accept_sandbox_profile"
+                )
             with session_maker(operation) as session:
                 yield session
 

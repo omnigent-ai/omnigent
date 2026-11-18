@@ -28,9 +28,9 @@ The first seven items transcribe the whiteboard with the subsequent clarificatio
    restores its position. The original source wins same-second creation ties,
    followed by session ID for deterministic ordering.
    When every member is archived, the oldest retained member represents the family.
-3. Pinning the representative pins the family. Pinning another member creates
-   an individual shortcut, temporarily removing it from the nest until unpinned.
-   Family pins survive promotion and include future members; unpinning the family preserves individual pins.
+3. Pinning the representative pins the family; nested members have no individual
+   pin action. Personal pins are retained for detachment and do not override the
+   family's pin state. Family pins survive promotion and include future members.
 4. Owners can move an existing independent session into another nest or remove
    one member from its nest. Custom ordering moves the whole family and preserves its position when the
    representative changes. Status grouping uses the highest-priority member status.
@@ -53,8 +53,7 @@ Additional requirements:
   users who want copied history use ordinary Fork.
 - Siblings have a curved decorative elbow beside their indentation. They never
   appear in the right Agents panel. Expand/collapse has a separate accessible
-  button; individual pinned shortcuts appear once, flat in Pinned, even when the
-  family is also pinned. During deletion, remaining peers stay grouped while
+  button. During deletion, remaining peers stay grouped while
   representative metadata refreshes.
 - Every sibling starts private, including when the source has readers or the
   deployment defaults to public sharing. Family membership grants no access.
@@ -73,6 +72,9 @@ Additional requirements:
 - Admins choose where **Add nested agent** may run: only the clicked session's host;
   that host or a fresh managed sandbox; or any available host (the default).
   The UI uses these plain labels and does not expose family/sibling terminology.
+  Under either restricted policy, standalone sessions must have a host before
+  joining or forming a nest; a rejected move leaves membership unchanged.
+  Detachment remains available.
 
 ## Implementation
 
@@ -183,7 +185,8 @@ fresh compute; it cannot recover uncommitted files from a destroyed filesystem.
 - Deleting A leaves B's host, credentials and workspace intact; B can send a
   successful next turn. An archived or unrelated same-host peer also retains it.
 - Pin/unpin and representative promotion preserve family and individual intent.
-  Moving the representative files every member; an individual move is refused.
+  Moving the representative to a project files every member; an individual
+  member's project move is refused.
 - Forking a member onto its current host produces a standalone session.
 - Read-only sharing permits owner orchestration; edit-sharing rejects it.
   Siblings remain private on deployments with public defaults. Shared viewers

@@ -91,6 +91,11 @@ def require_sibling_destination(
     elif destinations is not SiblingSessionDestinations.ANY_HOST and (
         host_id is None or host_id != source_host_id
     ):
+        if source_host_id is None:
+            raise OmnigentError(
+                "Start this session on a host before using nested agents under server policy",
+                code=ErrorCode.FORBIDDEN,
+            )
         allowed = (
             "the current host"
             if destinations is SiblingSessionDestinations.CURRENT_HOST

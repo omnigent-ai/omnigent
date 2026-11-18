@@ -3123,3 +3123,103 @@ async def test_owner_can_move_independent_sessions_between_nests(auth_client, pe
     assert detached.status_code == 200, detached.text
     assert detached.json().get("family") is None
     assert store.get_conversation(target["id"]).family_id is None
+
+
+@pytest.mark.parametrize("policy", ["current_host", "current_host_or_new_sandbox"])
+@pytest.mark.parametrize("hostless_member", ["source", "target"])
+async def test_nest_join_requires_launchable_hosts_under_restricted_policy(
+    auth_client, auth_app, peers, db_uri, monkeypatch, policy, hostless_member
+):
+    from omnigent.host.frames import HostLaunchRunnerFrame, HostStatFrame, decode_host_frame
+    from omnigent.server.sharing_settings import SiblingSessionDestinations
+    from tests.server.integration.test_sessions_permissions import _register_online_host
+
+    source, target, _ = peers
+    store = SqlAlchemyConversationStore(db_uri)
+    members = {"source": source, "target": target}
+    hosts = {name: uuid4().hex for name in members}
+    for name, member in members.items():
+        _register_online_host(auth_app, hosts[name], "alice")
+        auth_app.state.host_store.upsert_on_connect(hosts[name], name, "alice")
+        if name != hostless_member:
+            store.set_host_id(member["id"], hosts[name], workspace=f"/{name}")
+    unbound_id = members[hostless_member]["id"]
+    store.clear_runner_id(unbound_id)
+    auth_app.state.sibling_session_destinations = lambda: SiblingSessionDestinations(policy)
+    previous = {name: store.get_conversation(member["id"]) for name, member in members.items()}
+
+    refused = await auth_client.patch(
+        f"/v1/sessions/{target['id']}", json={"nest_source_id": source["id"]}
+    )
+    assert refused.status_code == 403, refused.text
+    assert "Start this session on a host" in refused.text
+    for name, member in members.items():
+        saved = store.get_conversation(member["id"])
+        assert saved.family_id is None
+        assert (saved.host_id, saved.runner_id, saved.agent_id) == (
+            previous[name].host_id,
+            previous[name].runner_id,
+            previous[name].agent_id,
+        )
+
+    launches = []
+
+    def answer_host(connection, payload):
+        frame = decode_host_frame(payload)
+        if isinstance(frame, HostStatFrame):
+            connection.pending_stats[frame.request_id].set_result(
+                {"status": "ok", "exists": True, "type": "directory", "canonical_path": frame.path}
+            )
+        elif isinstance(frame, HostLaunchRunnerFrame):
+            launches.append(frame)
+            connection.pending_launches[frame.request_id].set_result({"status": "launched"})
+        else:
+            pytest.fail(f"Unexpected host frame: {frame}")
+
+    monkeypatch.setattr(auth_app.state.host_registry, "send_text", answer_host)
+    launched = await auth_client.post(
+        f"/v1/hosts/{hosts[hostless_member]}/runners",
+        json={"session_id": unbound_id, "workspace": f"/{hostless_member}"},
+    )
+    assert launched.status_code == 200, launched.text
+    bound = {name: store.get_conversation(member["id"]) for name, member in members.items()}
+    joined = await auth_client.patch(
+        f"/v1/sessions/{target['id']}", json={"nest_source_id": source["id"]}
+    )
+    assert joined.status_code == 200, joined.text
+    for name, member in members.items():
+        saved = store.get_conversation(member["id"])
+        assert saved.family_id == source["id"]
+        assert (saved.host_id, saved.runner_id, saved.agent_id) == (
+            bound[name].host_id,
+            bound[name].runner_id,
+            bound[name].agent_id,
+        )
+
+    store.clear_runner_id(unbound_id)
+    other_member = "target" if hostless_member == "source" else "source"
+    refused = await auth_client.post(
+        f"/v1/hosts/{hosts[other_member]}/runners",
+        json={"session_id": unbound_id, "workspace": "/other"},
+    )
+    assert refused.status_code == 403, refused.text
+    assert len(launches) == 1
+    relaunched = await auth_client.post(
+        f"/v1/hosts/{hosts[hostless_member]}/runners",
+        json={"session_id": unbound_id, "workspace": f"/{hostless_member}"},
+    )
+    assert relaunched.status_code == 200, relaunched.text
+    assert len(launches) == 2
+    store.clear_host_binding(unbound_id)
+    detached = await auth_client.patch(f"/v1/sessions/{unbound_id}", json={"nest_source_id": None})
+    assert detached.status_code == 200, detached.text
+    assert store.get_conversation(unbound_id).family_id is None
+    existing_member_id = members[other_member]["id"]
+    store.clear_host_binding(existing_member_id)
+    store.set_host_id(unbound_id, hosts[hostless_member], workspace=f"/{hostless_member}")
+    rejoined = await auth_client.patch(
+        f"/v1/sessions/{unbound_id}", json={"nest_source_id": existing_member_id}
+    )
+    assert rejoined.status_code == 200, rejoined.text
+    assert store.get_conversation(unbound_id).family_id == source["id"]
+    assert store.get_conversation(existing_member_id).host_id is None

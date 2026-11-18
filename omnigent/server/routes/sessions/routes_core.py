@@ -4377,6 +4377,7 @@ def register_core_routes(
                     if owned is None:
                         raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
         if set_nest:
+            from omnigent.server.session_families import require_sibling_destination
             from omnigent.server.session_orchestration import require_owned_session
 
             if user_id is None or permission_store is None:
@@ -4388,13 +4389,21 @@ def register_core_routes(
             for identifier in (session_id, body.nest_source_id):
                 if identifier is None:
                     continue
-                await asyncio.to_thread(
+                member = await asyncio.to_thread(
                     require_owned_session,
                     identifier,
                     user_id,
                     conversation_store,
                     permission_store,
                 )
+                if body.nest_source_id is not None and member.family_id is None:
+                    await asyncio.to_thread(
+                        require_sibling_destination,
+                        request,
+                        member.host_id,
+                        host_id=member.host_id,
+                        host_type="external",
+                    )
             await asyncio.to_thread(
                 conversation_store.set_session_nest,
                 session_id,

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import json
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -11,6 +12,7 @@ import pytest
 from sqlalchemy import Engine, event
 
 from omnigent.db import current_query_name, query_name_scope
+from omnigent.db.db_models import SqlPreference, current_workspace_id
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
@@ -26,8 +28,10 @@ _APPLICATION_STORE_PATHS = [
 
 
 @contextmanager
-def _capture_application_query_names(*engines: Engine) -> Iterator[list[str | None]]:
-    """Capture names visible while application DML executes on ``engines``."""
+def _capture_application_query_names(
+    *engines: Engine, include_commits: bool = False
+) -> Iterator[list[str | None]]:
+    """Capture names visible during application DML and optional commits."""
     query_names: list[str | None] = []
 
     def capture_query_name(
@@ -42,14 +46,21 @@ def _capture_application_query_names(*engines: Engine) -> Iterator[list[str | No
         if command in {"SELECT", "INSERT", "UPDATE", "DELETE"}:
             query_names.append(current_query_name())
 
+    def capture_commit_name(_connection: object) -> None:
+        query_names.append(current_query_name())
+
     unique_engines = list(dict.fromkeys(engines))
     for engine in unique_engines:
         event.listen(engine, "before_cursor_execute", capture_query_name)
+        if include_commits:
+            event.listen(engine, "commit", capture_commit_name)
     try:
         yield query_names
     finally:
         for engine in unique_engines:
             event.remove(engine, "before_cursor_execute", capture_query_name)
+            if include_commits:
+                event.remove(engine, "commit", capture_commit_name)
 
 
 def test_query_name_scope_restores_nested_and_failed_scopes() -> None:
@@ -183,3 +194,46 @@ def test_conversation_store_names_create_and_get_queries(
             "omnigent.conversation_store.select_conversation_metadata_by_id",
             "omnigent.conversation_store.select_conversation_labels",
         ]
+
+
+def test_conversation_store_names_split_database_nest_operations(
+    split_db_conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Nest operations retain semantic names through the separate label commit."""
+    store = split_db_conversation_store
+    source = store.create_conversation()
+    sibling = store.create_conversation()
+    moved = store.create_conversation()
+
+    with _capture_application_query_names(store._conv_engine, include_commits=True) as query_names:
+        store.add_new_sibling(source.id, sibling.id, user_id=None)
+        store.set_session_nest(moved.id, source.id, user_id=None)
+        store.set_family_pin(source.id, "123", user_id=None)
+        store.set_conversation_project(source.id, "1" * 32)
+        with store._session_immediate("seed_pending_nest_labels") as session:
+            session.add(
+                SqlPreference(
+                    workspace_id=current_workspace_id(),
+                    user_id="__session_nest_repairs__",
+                    key=moved.id,
+                    value=json.dumps({"family_id": source.id, "user_id": None}),
+                )
+            )
+        store._repair_pending_nest_labels(moved.id)
+        store.set_session_nest(moved.id, None, user_id=None)
+
+    assert set(query_names) == {
+        f"omnigent.conversation_store.{operation}"
+        for operation in (
+            "select_conversation_by_id",
+            "select_conversation_labels",
+            "create_sibling_membership",
+            "copy_sibling_labels",
+            "move_session_nest",
+            "copy_session_nest_labels",
+            "pin_session_family",
+            "move_session_family",
+            "clear_family_project_labels",
+            "repair_pending_nest_labels",
+        )
+    }
