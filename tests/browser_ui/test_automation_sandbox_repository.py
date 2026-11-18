@@ -75,9 +75,7 @@ def test_automation_sandbox_repository(
                 "config": (request.post_data_json or {}).get("config", {}),
             }
 
-        contract.json(
-            "/v1/projects/automation-project", update_project_config, method="PATCH"
-        )
+        contract.json("/v1/projects/automation-project", update_project_config, method="PATCH")
         tasks: list[dict[str, Any]] = []
         contract.json("/v1/scheduled-tasks", lambda _: {"scheduled_tasks": tasks})
 
