@@ -985,6 +985,7 @@ def _check_identity_and_work(table_variant: str, monkeypatch: pytest.MonkeyPatch
         "escaped-label",
         "quoted-definition",
         "list-definition",
+        "midline-definition",
         "short",
         "fenced-literal",
         "inline-control",
@@ -1024,6 +1025,18 @@ def test_multipart_reference_dependencies_are_refused(
         )
     padding = "Ordinary finding.\n" * (1 if form == "short" else 4500) + "\n"
     lead = use + "\n" + padding + definition if form == "forward" else definition + padding + use
+    if form == "midline-definition":
+        calibration = (
+            "x" * 130000
+            + "\n\n"
+            + _HELPERS["compose_review"](
+                _REVIEW, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+            )
+        )
+        calibrated = _rendered_comments(calibration)[0]
+        first_fragment = calibrated.split("part 1 appears.\n\n", 1)[1].rsplit("\n\n---\n", 1)[0]
+        assert first_fragment == "x" * len(first_fragment)
+        lead = first_fragment + definition + use + "\n" + padding
     review = (
         lead
         + "\n"
@@ -1034,7 +1047,7 @@ def test_multipart_reference_dependencies_are_refused(
     original = parser.parse(review)
     expected = (
         []
-        if form == "fenced-literal"
+        if form in {"fenced-literal", "midline-definition"}
         else [("link_open", "https://example.test/direct")]
         if form == "inline-control"
         else [("image" if form == "image" else "link_open", destination)]
@@ -1043,6 +1056,10 @@ def test_multipart_reference_dependencies_are_refused(
     assert sum(token.type == "table_open" for token in original) == 1
     assert _HELPERS["COMMENT_BYTE_LIMIT"] == 60000
     assert (len(review.encode("utf-8")) < 60000) == (form == "short")
+    if form == "midline-definition":
+        assert _resolved_destinations(parser.parse(review[len(first_fragment) :])) == [
+            ("link_open", destination)
+        ], "The calibrated cut would manufacture a resolved reference without final preflight"
     if form not in {"short", "fenced-literal", "inline-control"}:
         _check_context_refusal(
             review,
