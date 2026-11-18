@@ -7,6 +7,7 @@ import logging
 import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
+from dataclasses import asdict, fields, replace
 from itertools import batched
 from pathlib import PureWindowsPath
 from typing import Any, Literal, Protocol, cast
@@ -89,6 +90,7 @@ from omnigent.db.utils import (
 from omnigent.entities import (
     Conversation,
     ConversationItem,
+    MessageData,
     NewConversationItem,
     PagedList,
     parse_item_data,
@@ -97,6 +99,12 @@ from omnigent.errors import ErrorCode, OmnigentError, StaleCursorError
 from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.native.session_todos import validate_session_todos
 from omnigent.session_import.models import IMPORT_SOURCE_LABEL_KEY
+from omnigent.session_recovery import (
+    RECOVERY_LABEL_PREFIX,
+    RECOVERY_NOTICE,
+    SessionRecovery,
+    reject_recovery_labels,
+)
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
     _INSTANCE_SCOPED_LABEL_KEYS,
@@ -172,6 +180,9 @@ _logger = logging.getLogger(__name__)
 _DELETE_METADATA_BATCH_SIZE = 100
 _DELETE_LABEL_BATCH_SIZE = 100
 _FAMILY_READ_BATCH_SIZE = 10
+_RECOVERY_LABEL_KEYS = tuple(
+    RECOVERY_LABEL_PREFIX + field.name for field in fields(SessionRecovery)
+)
 
 _SESSION_TODOS_STATE_KEY = "_omnigent_native_plan_snapshot_v1"
 _RUNNER_BINDING_LIMIT = 200
@@ -390,6 +401,7 @@ def _to_conversation(
         ),
         pending_elicitation_count=meta.pending_elicitation_count if meta else None,
         runner_last_seen=meta.runner_last_seen if meta else None,
+        next_position=row.next_position,
         background_work_running=meta.background_work_running if meta else None,
         blocked_on=meta.blocked_on if meta else None,
         project_id=meta.project_id if meta else None,
@@ -571,6 +583,7 @@ def _prepare_label_updates(updates: dict[str, str]) -> dict[str, str]:
     reject_profile_labels(updates)
     if any(key.startswith(FAMILY_PIN_LABEL_PREFIX) for key in updates):
         raise OmnigentError("Session family labels are server-owned", code=ErrorCode.INVALID_INPUT)
+    reject_recovery_labels(updates)
     # Clamp by characters, matching PostgreSQL ``VARCHAR(n)`` semantics.
     return {key: value[:LABEL_VALUE_MAX_LEN] for key, value in updates.items()}
 
@@ -721,7 +734,7 @@ def _fetch_labels(
         if keys is not None:
             statement = statement.where(SqlConversationLabel.key.in_(keys))
         rows = session.execute(statement).tuples().all()
-    return dict(rows)
+    return {key: value for key, value in rows if not key.startswith(RECOVERY_LABEL_PREFIX)}
 
 
 def _fetch_labels_bulk(
@@ -762,8 +775,51 @@ def _fetch_labels_bulk(
     rows = session.execute(statement).all()
     out: dict[str, dict[str, str]] = {}
     for conv_id, key, value in rows:
-        out.setdefault(conv_id, {})[key] = value
+        if not key.startswith(RECOVERY_LABEL_PREFIX):
+            out.setdefault(conv_id, {})[key] = value
     return out
+
+
+def _read_session_recovery(session: Session, conversation_id: str) -> SessionRecovery | None:
+    rows = session.execute(
+        select(SqlConversationLabel.key, SqlConversationLabel.value).where(
+            SqlConversationLabel.workspace_id == current_workspace_id(),
+            SqlConversationLabel.conversation_id == conversation_id,
+            SqlConversationLabel.key.in_(_RECOVERY_LABEL_KEYS),
+        )
+    ).all()
+    if not rows:
+        return None
+    try:
+        return SessionRecovery(
+            **{key.removeprefix(RECOVERY_LABEL_PREFIX): json.loads(value) for key, value in rows}
+        )
+    except (TypeError, ValueError):
+        # These keys could be user-authored before recovery reserved the prefix.
+        return None
+
+
+def _write_session_recovery(
+    session: Session, conversation_id: str, recovery: SessionRecovery | None
+) -> None:
+    """Caller holds the conversation lock; all fields share its input transaction."""
+    if recovery is None:
+        session.execute(
+            delete(SqlConversationLabel).where(
+                SqlConversationLabel.workspace_id == current_workspace_id(),
+                SqlConversationLabel.conversation_id == conversation_id,
+                SqlConversationLabel.key.in_(_RECOVERY_LABEL_KEYS),
+            )
+        )
+        return
+    # Each field fits an existing label; never truncate recovery identity or state.
+    updates = {
+        RECOVERY_LABEL_PREFIX + key: json.dumps(value, ensure_ascii=False)
+        for key, value in asdict(recovery).items()
+    }
+    if any(len(value) > LABEL_VALUE_MAX_LEN for value in updates.values()):
+        raise ValueError("Session recovery field exceeds label storage limit")
+    _upsert_prepared_labels(session, conversation_id, updates, now_epoch())
 
 
 def _fetch_search_snippets(
@@ -1811,6 +1867,13 @@ class SqlAlchemyConversationStore(ConversationStore):
         stable_updates = dict(updates)
 
         def write(session: Session) -> None:
+            if stable_updates.get("omnigent.closed") == "true":
+                self._lock_conversation(session, conversation_id)
+                recovery = _read_session_recovery(session, conversation_id)
+                if recovery is not None:
+                    _write_session_recovery(
+                        session, conversation_id, replace(recovery, phase="stopped")
+                    )
             _upsert_labels(session, conversation_id, stable_updates, stamp)
 
         run_write_transaction(self._conv_session_immediate, "set_labels", write)
@@ -2851,6 +2914,93 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             return set(rows)
 
+    supports_session_recovery = True
+
+    def get_session_interruption_time(self, conversation_id: str) -> int | None:
+        """Read the interruption error's write time without loading conversation data."""
+        with self._conv_session("get_session_interruption_time") as session:
+            row = session.execute(
+                select(SqlConversationLabel.value, SqlConversationLabel.updated_at).where(
+                    SqlConversationLabel.workspace_id == current_workspace_id(),
+                    SqlConversationLabel.conversation_id == conversation_id,
+                    SqlConversationLabel.key == "omnigent.last_task_error_code",
+                )
+            ).one_or_none()
+        if row is None or row.value not in {"runner_disconnected", "runner_interrupted"}:
+            return None
+        return row.updated_at
+
+    def get_session_recovery(self, conversation_id: str) -> SessionRecovery | None:
+        with self._conv_session("get_session_recovery") as session:
+            return _read_session_recovery(session, conversation_id)
+
+    def replace_session_recovery(
+        self,
+        conversation_id: str,
+        expected: SessionRecovery | None,
+        recovery: SessionRecovery | None,
+        *,
+        expected_conversation: Conversation | None = None,
+    ) -> bool:
+        def write(session: Session) -> bool:
+            self._lock_conversation(session, conversation_id)
+            conversation = session.get(SqlConversation, (current_workspace_id(), conversation_id))
+            if conversation is None or conversation.archived:
+                return False
+            if (
+                expected_conversation is not None
+                and conversation.next_position != expected_conversation.next_position
+            ):
+                return False
+            actual = _read_session_recovery(session, conversation_id)
+            if actual != expected:
+                return False
+            _write_session_recovery(session, conversation_id, recovery)
+            return True
+
+        return run_write_transaction(
+            self._conv_session_immediate, "replace_session_recovery", write
+        )
+
+    def admit_session_recovery(self, conversation_id: str, expected: SessionRecovery) -> bool:
+        """Order turn admission against binding changes and accepted input."""
+        if expected.phase != "dispatching":
+            return False
+
+        def check_binding(meta_session: Session) -> bool:
+            meta = meta_session.get(
+                SqlConversationMetadata,
+                (current_workspace_id(), conversation_id),
+                with_for_update=True,
+            )
+            if (
+                meta is None
+                or meta.host_id != expected.host_id
+                or meta.runner_id != expected.runner_id
+                or meta.pending_elicitation_count
+                or meta.live_status == encode_session_live_status("waiting")
+            ):
+                return False
+
+            def check_input(session: Session) -> bool:
+                self._lock_conversation(session, conversation_id)
+                row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
+                return (
+                    row is not None
+                    and not row.archived
+                    and _read_session_recovery(session, conversation_id) == expected
+                )
+
+            if self._conv_engine is self._engine:
+                return check_input(meta_session)
+            return run_write_transaction(
+                self._conv_session_immediate, "admit_session_recovery_input", check_input
+            )
+
+        return run_write_transaction(
+            self._session_immediate, "admit_session_recovery", check_binding
+        )
+
     def list_host_conversation_ids(
         self,
         host_id: str,
@@ -3228,10 +3378,36 @@ class SqlAlchemyConversationStore(ConversationStore):
         # FOR UPDATE lock while it round-trips. strip_nul_bytes runs here so a
         # Postgres text column never sees a NUL (tool output can embed one, e.g.
         # reading a binary file), which would abort the whole INSERT.
+        recovery_candidates: dict[int, NewConversationItem] = {}
+        interruption_notices: set[int] = set()
+        for index, item in enumerate(items):
+            if isinstance(item.data, MessageData) and not item.data.user_authored:
+                from omnigent.inner.executor import is_interruption_marker
+
+                if is_interruption_marker({"role": item.data.role, "content": item.data.content}):
+                    interruption_notices.add(index)
+            if (
+                isinstance(item.data, MessageData)
+                and item.data.role == "user"
+                and not item.data.is_meta
+                and not item.data.user_authored
+                and len(item.data.content) == 1
+                and item.data.content[0].get("type") == "input_text"
+                and isinstance(text := item.data.content[0].get("text"), str)
+                and text.startswith(f"{RECOVERY_NOTICE}\n")
+                and text[len(RECOVERY_NOTICE) :].strip()
+            ):
+                recovery_candidates[index] = item.model_copy(
+                    update={"data": item.data.model_copy(update={"is_meta": True})}
+                )
+        # Native echoes omit the submitted input ID. Prepare both forms so the
+        # locked recovery claim can decide without an encryption RPC under lock.
         raw_jsons = [
-            strip_nul_bytes(json.dumps(item.data.model_dump(exclude_none=True))) for item in items
+            strip_nul_bytes(json.dumps(item.data.model_dump(exclude_none=True)))
+            for item in [*items, *recovery_candidates.values()]
         ]
         encoded_data = self._encode_item_data_batch(raw_jsons)
+        recovery_encoded = dict(zip(recovery_candidates, encoded_data[len(items) :], strict=True))
         workspace_id = current_workspace_id()
         # Precompute per-item row values (sans position) BEFORE the write
         # transaction so a CockroachDB 40001 replay reuses the same generated
@@ -3239,7 +3415,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         # stable id doubles as the row id so an idempotent re-post targets the
         # same primary key (see the dedup probe inside ``write``).
         prepared_rows: list[tuple[NewConversationItem, dict[str, object], str | None]] = []
-        for item, data in zip(items, encoded_data, strict=True):
+        for item, data in zip(items, encoded_data[: len(items)], strict=True):
             search = self._item_search_text(item)
             if item.response_id == PENDING_INPUT_RESPONSE_ID and search is not None:
                 search = ""
@@ -3323,6 +3499,41 @@ class SqlAlchemyConversationStore(ConversationStore):
                         for item in items
                         if item.stable_id is not None
                     ]
+
+            has_new_input = any(
+                item.stable_id not in existing_by_id
+                and isinstance(item.data, MessageData)
+                and item.data.role == "user"
+                and not item.data.is_meta
+                for item in items
+            )
+            recovery = _read_session_recovery(session, conversation_id) if has_new_input else None
+            append_rows = []
+            seen_stable_ids: set[str] = set(existing_by_id)
+            for index, (item, prepared, search) in enumerate(prepared_rows):
+                if item.stable_id is None or item.stable_id not in seen_stable_ids:
+                    if (
+                        recovery is not None
+                        and recovery.phase in {"dispatching", "submitted", "failed", "stopped"}
+                        and recovery.attempt_id
+                        and index in recovery_candidates
+                    ):
+                        item = recovery_candidates[index]
+                        prepared = {**prepared, "data": recovery_encoded[index]}
+                    elif (
+                        isinstance(item.data, MessageData)
+                        and item.data.role == "user"
+                        and not item.data.is_meta
+                        and recovery is not None
+                        and index not in interruption_notices
+                        and (item.data.user_authored or item.response_id != recovery.response_id)
+                    ):
+                        # A native turn's delayed input echo must retain its lifecycle fence.
+                        _write_session_recovery(session, conversation_id, None)
+                        recovery = None
+                    if item.stable_id is not None:
+                        seen_stable_ids.add(item.stable_id)
+                append_rows.append((item, prepared, search))
 
             replacements: dict[str, tuple[int, int]] = {}
             for item, prepared, _ in prepared_rows:
@@ -3411,7 +3622,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             row_values: list[dict[str, object]] = []
             fresh_items: list[tuple[int, NewConversationItem]] = []
             batch_stable: dict[str, ConversationItem] = {}
-            for item, prepared, search in prepared_rows:
+            for item, prepared, search in append_rows:
                 if item.stable_id is not None:
                     if item.stable_id in existing_by_id:
                         persisted.append(deduped_by_id[item.stable_id])
@@ -3687,6 +3898,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param conversation_id: The conversation to update.
         :param key: The label key to remove, e.g. ``"omni_project"``.
         """
+        reject_recovery_labels([key])
 
         _prepare_label_updates({key: ""})
 
@@ -4753,9 +4965,21 @@ class SqlAlchemyConversationStore(ConversationStore):
                             SqlConversationLabel.key == ARCHIVED_AT_LABEL_KEY,
                         )
                     )
+                if archived:
+                    recovery = _read_session_recovery(ap_sess, conversation_id)
+                    if recovery is not None:
+                        _write_session_recovery(
+                            ap_sess, conversation_id, replace(recovery, phase="stopped")
+                        )
                 row.archived = archived
                 ap_changed = True
             if label_updates:
+                if label_updates.get("omnigent.closed") == "true":
+                    recovery = _read_session_recovery(ap_sess, conversation_id)
+                    if recovery is not None:
+                        _write_session_recovery(
+                            ap_sess, conversation_id, replace(recovery, phase="stopped")
+                        )
                 _upsert_labels(ap_sess, conversation_id, label_updates, now)
                 ap_changed = True
             if ap_changed:

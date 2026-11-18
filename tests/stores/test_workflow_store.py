@@ -250,6 +250,18 @@ def test_a_description_keeps_its_proposal_until_written_otherwise(store: Workflo
         planning_session_id="d" * 32,
     )
     assert moved is not None and moved.description_source == newer
+    # Keeping the description over a later proposal records that proposal instead.
+    declined = "e" * 32
+    kept_over = store.update(
+        saved.id,
+        user_id=ALICE,
+        description="From the new chat.",
+        expected_description="From the new chat.",
+        description_source=declined,
+    )
+    assert kept_over is not None and kept_over.description == "From the new chat."
+    assert kept_over.description_source == declined
+    assert store.get(saved.id, user_id=ALICE) == kept_over
 
 
 def test_invalid_or_oversized_workflows_are_refused(store: WorkflowStore) -> None:

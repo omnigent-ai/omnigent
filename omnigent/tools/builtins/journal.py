@@ -175,8 +175,9 @@ class SysJournalWritePlanTool(Tool):
                     "maxLength": PLAN_DESCRIPTION_MAX_CHARS,
                     "description": (
                         "Only in a workflow page's planning chat: the workflow's description "
-                        "for this proposal, what it does and what a run needs. Save plan "
-                        "stores it with the steps."
+                        "for this proposal, in the current description's wording, changed "
+                        "only where the plan needs it. The user reviews a change before Save "
+                        "plan stores it."
                     ),
                 },
             },

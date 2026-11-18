@@ -356,6 +356,8 @@ if TYPE_CHECKING:
     from concurrent.futures import Future
 
     from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
+    from omnigent.server.host_session_recovery import HostSessionRecoverer
+    from omnigent.session_recovery import SessionRecovery
 
 
 def _codex_plan_mode_enabled(mode: str) -> bool:
@@ -5379,6 +5381,8 @@ def reconcile_orphaned_running_status(
     session_id: str,
     conversation_store: ConversationStore,
     stale_before: int,
+    *,
+    host_session_recoverer: HostSessionRecoverer | None = None,
 ) -> bool:
     """
     Settle a session that reads ``running`` but whose runner is
@@ -5404,8 +5408,24 @@ def reconcile_orphaned_running_status(
     :param stale_before: Runner stamps at or after this epoch are fresh.
     :returns: Whether this call performed the transition.
     """
+    interrupted = (
+        conversation_store.get_conversation(session_id)
+        if host_session_recoverer is not None
+        else None
+    )
     if not conversation_store.settle_orphaned_live_status(session_id, stale_before):
         return False
+    if interrupted is not None and host_session_recoverer is not None:
+        host_session_recoverer.record_interruption(interrupted)
+        if host_session_recoverer.enabled(interrupted.host_id):
+            recovery = conversation_store.get_session_recovery(session_id)
+            if (
+                recovery is not None
+                and recovery.host_id == interrupted.host_id
+                and recovery.runner_id == interrupted.runner_id
+                and recovery.phase in {"pending", "launching", "dispatching", "submitted"}
+            ):
+                return True
     _publish_status(
         session_id,
         "idle",
@@ -6574,6 +6594,8 @@ async def _launch_runner_on_host_impl(
     host_conn: HostConnection,
     *,
     replace_move_claim: bool = False,
+    recovery: SessionRecovery | None = None,
+    recovery_allowed: Callable[[], bool] | None = None,
 ) -> _HostLaunchAttempt:
     """
     Ask a host to spawn a runner for a session and capture the result.
@@ -6631,10 +6653,23 @@ async def _launch_runner_on_host_impl(
             # waiting on this lock, doesn't take it for its result.
             return _move_in_progress_attempt(fresh.runner_id or "")
         last = _relaunch_last_attempt.get(conv.id)
+        # Recovery can rotate the binding without launching it. Ordinary input
+        # needs its own admission after that recovery is cancelled.
+        retry_cancelled_recovery = (
+            recovery is None
+            and last is not None
+            and last.runner_id == fresh.runner_id
+            and last.error_code == "recovery_cancelled"
+        )
         # A waiter may already have read the active flight's replacement binding.
-        if last is not None and last is not previous_attempt and last.runner_id == fresh.runner_id:
+        if (
+            not retry_cancelled_recovery
+            and last is not None
+            and last is not previous_attempt
+            and last.runner_id == fresh.runner_id
+        ):
             return last
-        if fresh.runner_id and fresh.runner_id != conv.runner_id:
+        if not retry_cancelled_recovery and fresh.runner_id and fresh.runner_id != conv.runner_id:
             if last is not None and last.runner_id == fresh.runner_id:
                 return last
             return _HostLaunchAttempt(runner_id=fresh.runner_id)
@@ -6644,6 +6679,8 @@ async def _launch_runner_on_host_impl(
             host_registry,
             host_conn,
             replace_move_claim=replace_move_claim,
+            recovery=recovery,
+            recovery_allowed=recovery_allowed,
         )
         # Re-insert so the plain dict's insertion order is newest-last, then
         # evict from the front once past the cap.
@@ -6675,8 +6712,12 @@ async def _launch_runner_on_host_locked(
     host_conn: HostConnection,
     *,
     replace_move_claim: bool = False,
+    recovery: SessionRecovery | None = None,
+    recovery_allowed: Callable[[], bool] | None = None,
 ) -> _HostLaunchAttempt:
     """The launch round-trip proper; runs under the conversation's lock."""
+    from dataclasses import replace
+
     from omnigent.host.frames import HostLaunchRunnerFrame, encode_host_frame
     from omnigent.runner.identity import token_bound_runner_id
     from omnigent.scheduled_context import current_scheduled_run
@@ -6686,11 +6727,32 @@ async def _launch_runner_on_host_locked(
         # The session is moving onto a new sandbox; that launch starts its runner.
         return _move_in_progress_attempt(conv.runner_id or "")
     await host_registry.admit_launch(host_conn, conv.id)
+    if recovery is not None and (
+        recovery_allowed is None
+        or not await asyncio.to_thread(recovery_allowed)
+        or await asyncio.to_thread(conversation_store.get_session_recovery, conv.id) != recovery
+    ):
+        return _HostLaunchAttempt(
+            runner_id=conv.runner_id or "",
+            error_code="recovery_cancelled",
+            error="Recovery was superseded before runner launch",
+        )
     superseded_runner_id = conv.runner_id
     reap_superseded = await _owns_host_runner(conv, conversation_store)
     binding_token = secrets.token_urlsafe(32)
     new_runner_id = token_bound_runner_id(binding_token)
 
+    if recovery is not None:
+        launching = replace(recovery, launch_runner_id=new_runner_id)
+        if not await asyncio.to_thread(
+            conversation_store.replace_session_recovery, conv.id, recovery, launching
+        ):
+            return _HostLaunchAttempt(
+                runner_id=conv.runner_id or "",
+                error_code="recovery_cancelled",
+                error="Recovery was superseded before runner launch",
+            )
+        recovery = launching
     try:
         # Only while the runner is still the one this launch read, so a claim a
         # move took meanwhile isn't overwritten. The host may have changed: an
@@ -6707,6 +6769,20 @@ async def _launch_runner_on_host_locked(
             error_code="session_binding_changed",
             error="the session's host or runner changed before the runner could start",
         )
+    if recovery:
+        rebound_recovery = replace(recovery, runner_id=new_runner_id)
+        if not await asyncio.to_thread(
+            conversation_store.replace_session_recovery,
+            conv.id,
+            recovery,
+            rebound_recovery,
+        ):
+            return _HostLaunchAttempt(
+                runner_id=new_runner_id,
+                error_code="recovery_cancelled",
+                error="Recovery was superseded before runner launch",
+            )
+        recovery = rebound_recovery
     if bound_conv.runner_last_seen is not None:
         # The new token has not reached the host, so this stamp can only
         # belong to the previous runner. Clear it before launching.
@@ -6768,8 +6844,20 @@ async def _launch_runner_on_host_locked(
                 # Only the binding we just replaced: an unbound session's old
                 # runner may now serve its /clear or /switch successor.
                 superseded_runner_ids=(superseded_runner_id,) if superseded_runner_id else (),
+                recovery=recovery is not None,
             )
         )
+        if recovery is not None and (
+            recovery_allowed is None
+            or not await asyncio.to_thread(recovery_allowed)
+            or await asyncio.to_thread(conversation_store.get_session_recovery, conv.id)
+            != recovery
+        ):
+            return _HostLaunchAttempt(
+                runner_id=new_runner_id,
+                error_code="recovery_cancelled",
+                error="Recovery was superseded before runner launch",
+            )
         for enqueue_attempt in range(2):
             launch_future: asyncio.Future[HostLaunchResult] = (
                 asyncio.get_running_loop().create_future()
@@ -6781,8 +6869,10 @@ async def _launch_runner_on_host_locked(
                 host_conn.pending_launches.pop(request_id, None)
                 launch_future.cancel()
                 replacement = host_registry.get(host_conn.host_id)
+                # A replacement must request recovery under its own capability and policy.
                 if (
-                    enqueue_attempt == 0
+                    recovery is None
+                    and enqueue_attempt == 0
                     and replacement is not None
                     and replacement is not host_conn
                 ):
@@ -11291,6 +11381,9 @@ def _reject_server_reserved_label_seed(
         raise OmnigentError(
             "Sandbox profile labels are server-owned", code=ErrorCode.INVALID_INPUT
         )
+    from omnigent.session_recovery import reject_recovery_labels
+
+    reject_recovery_labels(labels)
     from omnigent.mcp_selection import MCP_SELECTION_PREFIX
 
     if any(key.startswith(MCP_SELECTION_PREFIX) for key in labels):
