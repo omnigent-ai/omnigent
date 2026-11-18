@@ -23,7 +23,7 @@ from tests.e2e._host_login_workspace import USER_EMAIL, HostLoginWorkspace, writ
 pytestmark = [
     pytest.mark.skipif(not shutil.which("openssl"), reason="openssl required for the test CA"),
     pytest.mark.timeout(240),
-    pytest.mark.min_runner_version("0.21.0"),
+    pytest.mark.min_runner_version("0.23.0"),
 ]
 
 _LAUNCH_LINE = re.compile(r"Launched runner (\S+) for workspace")
