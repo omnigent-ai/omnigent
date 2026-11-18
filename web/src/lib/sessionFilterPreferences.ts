@@ -1,5 +1,5 @@
 // Persisted, per-device preference for which slice the sidebar's session list
-// shows ("All sessions" / "My sessions" / "Shared sessions" / "Archived
+// shows ("All sessions" / "My sessions" / "Shared with me" / "Archived
 // sessions").
 //
 // The sidebar keeps its live React state as the source of truth; these helpers
@@ -34,7 +34,7 @@ const SESSION_FILTERS = new Set<string>(["all", "mine", "shared", "archived"]);
  * the menu can't show.
  *
  * `multiUser` mirrors the sidebar's own gate: a loopback-only server has one
- * user, so "Shared sessions" is dropped from the menu there. A "shared" value
+ * user, so "Shared with me" is dropped from the menu there. A "shared" value
  * stored against a multi-user server therefore falls back to the default
  * rather than scoping the list to a slice with no menu entry to leave it by.
  */

@@ -5,9 +5,11 @@ import sys
 from typing import Any
 
 from omnigent_bot_core.omnigent import OmnigentClientPool
+from omnigent_bot_core.user_agent import set_bot_user_agent
 from slack_bolt.adapter.socket_mode.aiohttp import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 
+from omnigent_slack import __version__
 from omnigent_slack.approvals import (
     ACTION_APPROVE,
     ACTION_DENY,
@@ -27,6 +29,7 @@ from omnigent_slack.webauth import WebAuthServer
 
 
 async def run() -> None:
+    set_bot_user_agent("omnigent-slack", __version__)
     # Config comes from real environment variables only — mirroring `omni
     # server` (the core CLI loads no .env). Whatever populates the environment
     # (your shell, `uv run`, the Docker/Databricks deploy) is the single source

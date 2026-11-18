@@ -20,6 +20,7 @@ import pytest
 from omnigent.inner.sandbox import (
     HOST_SANDBOX_BACKEND_ENV,
     SandboxPolicy,
+    _launcher_inline_source,
     create_exec_launcher,
     run_launcher,
 )
@@ -172,7 +173,10 @@ def test_run_launcher_propagates_target_returncode(caplog) -> None:
     assert any("[omnigent-sandbox] target exited rc=7" in m for m in messages), messages
 
 
-def test_exec_launcher_wrapper_subprocess_emits_markers_to_stderr() -> None:
+@pytest.mark.parametrize("without_site_packages", [False, True])
+def test_exec_launcher_wrapper_subprocess_emits_markers_to_stderr(
+    without_site_packages: bool,
+) -> None:
     """
     The generated wrapper script must configure logging so
     ``run_launcher``'s INFO records reach stderr when invoked as a
@@ -181,8 +185,19 @@ def test_exec_launcher_wrapper_subprocess_emits_markers_to_stderr() -> None:
     """
     wrapper_path = create_exec_launcher(sys.executable, _noop_policy())
     try:
+        launcher = (
+            [
+                sys.executable,
+                "-S",
+                "-P",
+                "-c",
+                _launcher_inline_source(sys.executable, _noop_policy()),
+            ]
+            if without_site_packages
+            else [wrapper_path]
+        )
         result = subprocess.run(
-            [wrapper_path, "-c", "pass"],
+            [*launcher, "-c", "pass"],
             capture_output=True,
             text=True,
             timeout=30,

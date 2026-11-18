@@ -128,6 +128,7 @@ from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .sandbox import (
     SandboxBackend,
     SandboxPolicy,
+    _check_relative_grant_containment,
     register_backend,
 )
 
@@ -171,7 +172,7 @@ _UNSAFE_WIDEN_ANCESTORS: frozenset[str] = frozenset(
     }
 )
 
-# M7 (security): dotfile basenames that commonly carry credentials.
+# Dotfile basenames that may carry credentials or executable Git configuration.
 # When an operator places one of these in ``cwd_allow_hidden``, emit a
 # warning so the choice is visible in logs and the operator can audit
 # whether the agent actually needs it. Not a hard block — some agents
@@ -196,6 +197,7 @@ _SENSITIVE_HIDDEN_NAMES: frozenset[str] = frozenset(
         ".gcloud",
         ".config",
         ".databrickscfg",
+        ".git",
     }
 )
 
@@ -390,17 +392,17 @@ class SeatbeltSandboxBackend(SandboxBackend):
 
         read_roots: list[Path] | None = None
         if sandbox_spec.read_paths is not None:
-            read_roots = [_resolve_root(cwd, root) for root in sandbox_spec.read_paths]
+            read_roots = [_resolve_grant(cwd, root) for root in sandbox_spec.read_paths]
 
         # Seatbelt-specific default mirroring bwrap: cwd is RO unless
         # the spec opts in. Empty default honours the "no surprise
         # writes" contract — agents that need an editable project
         # tree opt in via ``write_paths: ["."]``.
-        write_roots = [_resolve_root(cwd, grant.path) for grant in sandbox_spec.write_path_specs]
+        write_roots = [_resolve_grant(cwd, grant.path) for grant in sandbox_spec.write_path_specs]
 
         write_files: list[Path] = []
         if sandbox_spec.write_files is not None:
-            write_files.extend(_resolve_root(cwd, path) for path in sandbox_spec.write_files)
+            write_files.extend(_resolve_grant(cwd, path) for path in sandbox_spec.write_files)
 
         cwd_allow_hidden = (
             list(sandbox_spec.cwd_allow_hidden)
@@ -414,7 +416,13 @@ class SeatbeltSandboxBackend(SandboxBackend):
         # in logs for audit. Spec entries that match the canonical
         # default ``.venv`` are silent.
         for name in cwd_allow_hidden:
-            if name in _SENSITIVE_HIDDEN_NAMES:
+            if name == ".git":
+                _LOGGER.warning(
+                    "darwin_seatbelt: cwd_allow_hidden grants the agent access "
+                    "to .git in sandbox roots; Git configuration can change "
+                    "host Git behavior. Audit whether the agent needs it."
+                )
+            elif name in _SENSITIVE_HIDDEN_NAMES:
                 _LOGGER.warning(
                     "darwin_seatbelt: cwd_allow_hidden grants the agent "
                     "access to %r under cwd; this dotfile commonly "
@@ -422,6 +430,12 @@ class SeatbeltSandboxBackend(SandboxBackend):
                     "actually needs it.",
                     name,
                 )
+        if "*" in cwd_allow_hidden:
+            _LOGGER.warning(
+                "darwin_seatbelt: cwd_allow_hidden grants the agent access to "
+                "all hidden entries in sandbox roots, including .git; audit whether "
+                "the agent actually needs it."
+            )
 
         mask_paths = (
             [_resolve_root(cwd, path) for path in sandbox_spec.mask_paths]
@@ -448,6 +462,7 @@ class SeatbeltSandboxBackend(SandboxBackend):
             ),
             credential_proxy=sandbox_spec.credential_proxy,
             git_ssh=sandbox_spec.git_ssh,
+            tcp_egress=sandbox_spec.tcp_egress,
         )
 
     def wrap_launcher_argv(
@@ -531,7 +546,27 @@ class SeatbeltSandboxBackend(SandboxBackend):
             interpreter would require widening the sandbox to an
             unsafe ancestor (see :func:`_ensure_executable_visible`).
         """
+        if policy.tcp_egress and policy.tcp_egress_socket_path is None:
+            raise ValueError("tcp_egress requires its parent broker before sandbox launch")
         del chdir  # See docstring — Seatbelt has no --chdir analog.
+        profile_path = _write_profile_to_tempfile(self._profile(argv, policy, cwd, target))
+        return [_SANDBOX_EXEC_PATH, "-f", profile_path, *argv]
+
+    def launch_fingerprint(
+        self,
+        argv: list[str],
+        policy: SandboxPolicy,
+        cwd: Path,
+        chdir: Path | None = None,
+    ) -> object:
+        """Return the SBPL profile a launch would load; it embeds the dotfile mask scan."""
+        del chdir
+        return self._profile(argv, policy, cwd, None)
+
+    def _profile(
+        self, argv: list[str], policy: SandboxPolicy, cwd: Path, target: str | None
+    ) -> str:
+        """Build the SBPL profile for :meth:`wrap_launcher_argv`."""
         cwd_resolved = cwd.resolve(strict=False)
         extra_read_paths = _ensure_executable_visible(
             argv, cwd_resolved, policy_read_roots=policy.read_roots or []
@@ -572,8 +607,7 @@ class SeatbeltSandboxBackend(SandboxBackend):
                 "spawn time with an opaque error; this check fails loud "
                 "with the spec keys you can tune."
             )
-        profile_path = _write_profile_to_tempfile(profile)
-        return [_SANDBOX_EXEC_PATH, "-f", profile_path, *argv]
+        return profile
 
     def activate(self, policy: SandboxPolicy) -> None:
         """
@@ -1103,8 +1137,10 @@ def _build_profile(
             "(allow network-outbound (remote unix-socket "
             f"(path-literal {_quote(canonical_socket)})))"
         )
-    elif policy.git_ssh_socket_path is not None:
-        lines.append(";; Git SSH active — only its parent Unix socket is reachable")
+    elif policy.git_ssh_socket_path is not None or policy.tcp_egress_socket_path is not None:
+        lines.append(
+            ";; parent-owned network brokers active — only their Unix sockets are reachable"
+        )
     elif policy.allow_network:
         lines.append(";; allow_network=true — host network shared")
         lines.append("(allow network*)")
@@ -1115,6 +1151,11 @@ def _build_profile(
         git_socket = str(Path(policy.git_ssh_socket_path).resolve(strict=False))
         lines.append(
             f"(allow network-outbound (remote unix-socket (path-literal {_quote(git_socket)})))"
+        )
+    if policy.tcp_egress_socket_path is not None:
+        tcp_socket = str(Path(policy.tcp_egress_socket_path).resolve(strict=False))
+        lines.append(
+            f"(allow network-outbound (remote unix-socket (path-literal {_quote(tcp_socket)})))"
         )
 
     # ----------------------------------------------------------------
@@ -1988,6 +2029,19 @@ def _resolve_root(cwd: Path, root: str) -> Path:
             root,
             str(resolved),
         )
+    return resolved
+
+
+def _resolve_grant(cwd: Path, root: str) -> Path:
+    """
+    Resolve a read or write grant against *cwd* and reject a relative
+    grant whose target leaves *cwd* through a symlink.
+
+    Mask paths use :func:`_resolve_root` directly: a mask only denies
+    access, so a symlink there must not block the launch.
+    """
+    resolved = _resolve_root(cwd, root)
+    _check_relative_grant_containment(cwd, root)
     return resolved
 
 

@@ -3,6 +3,7 @@ from collections.abc import AsyncIterator
 
 import httpx
 import omnigent_bot_core.omnigent as omnigent_module
+import omnigent_bot_core.user_agent as user_agent_module
 import pytest
 import respx
 from omnigent_bot_core.omnigent import (
@@ -127,6 +128,27 @@ def test_extract_assistant_text_from_stream_item() -> None:
         )
         == "done"
     )
+
+
+@pytest.mark.parametrize(
+    ("distribution", "expected_prefix"),
+    [(None, "omnigent-bot-core/"), ("omnigent-discord", "omnigent-discord/")],
+)
+@respx.mock
+async def test_client_identifies_as_the_running_bot(
+    monkeypatch: pytest.MonkeyPatch, distribution: str | None, expected_prefix: str
+) -> None:
+    monkeypatch.setattr(user_agent_module, "_headers", user_agent_module._headers)
+    if distribution is not None:
+        user_agent_module.set_bot_user_agent(distribution, "0.0.0")
+    route = respx.get("http://omnigent.test/v1/me").mock(return_value=httpx.Response(200, json={}))
+    client = OmnigentClient("http://omnigent.test")
+    try:
+        await client._client.get("/v1/me")
+    finally:
+        await client.aclose()
+
+    assert route.calls.last.request.headers["User-Agent"].startswith(expected_prefix)
 
 
 @respx.mock

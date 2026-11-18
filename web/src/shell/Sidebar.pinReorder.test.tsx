@@ -41,6 +41,7 @@ vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }
 import { useConversations } from "@/hooks/useConversations";
 import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
+import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "./sidebarNav";
 
 const ROW_HEIGHT = 30;
 
@@ -57,22 +58,41 @@ function stubRowRects() {
   });
 }
 
+// The Pinned zone reaches 12px below its last pin, over the dragged row (never a target).
+function stubPinZoneRect(pinnedRows: number) {
+  const rowRect = vi.mocked(Element.prototype.getBoundingClientRect).getMockImplementation()!;
+  vi.mocked(Element.prototype.getBoundingClientRect).mockImplementation(function (this: Element) {
+    if (this.matches('[data-testid="sidebar-pin-drop-zone"]')) {
+      return new DOMRect(0, 0, 200, pinnedRows * ROW_HEIGHT + 12);
+    }
+    return rowRect.call(this);
+  });
+}
+
 function rowCenter(id: string) {
   const rows = [...document.querySelectorAll("li[data-sidebar-session-id]")];
   const index = rows.findIndex((row) => row.getAttribute("data-sidebar-session-id") === id);
   return { clientX: 50, clientY: index * ROW_HEIGHT + ROW_HEIGHT / 2 };
 }
 
-async function dropOnto(sourceId: string, targetId: string, { expectTarget = true } = {}) {
-  const source = screen.getByRole("link", { name: sourceId }).closest("li")!;
+async function dropOnto(
+  sourceId: string,
+  targetId: string,
+  { expectTarget = true, whileOver = () => {}, offsetY = 0 } = {},
+) {
+  const sources = document.querySelectorAll(`li[data-sidebar-session-id="${sourceId}"]`);
+  expect(sources).toHaveLength(1);
+  const source = sources[0];
   const start = rowCenter(sourceId);
-  const target = rowCenter(targetId);
+  const center = rowCenter(targetId);
+  const target = { ...center, clientY: center.clientY + offsetY };
   fireEvent.mouseDown(source, { button: 0, ...start });
   fireEvent.mouseMove(document, { clientX: start.clientX, clientY: start.clientY - 10 });
   await act(async () => {
     fireEvent.mouseMove(document, target);
   });
   expect(screen.queryByTestId("pin-order-insertion") !== null).toBe(expectTarget);
+  whileOver();
   await act(async () => {
     fireEvent.mouseUp(document, target);
   });
@@ -93,6 +113,7 @@ beforeEach(() => {
 afterEach(async () => {
   fireEvent.mouseUp(document);
   cleanup();
+  localStorage.clear();
   await new Promise((resolve) => {
     setTimeout(resolve, 50);
   });
@@ -102,6 +123,9 @@ afterEach(async () => {
 
 describe("dropping an unpinned session onto a pinned row", () => {
   it("pins it into that slot and renumbers the existing pins", async () => {
+    const family = { id: "family", representative_id: "conv_b", pinned: true, pinned_at: "1000" };
+    mocks.pinned[1].family = family;
+    mocks.pinned.push(conv("conv_peer", { family }));
     mocks.pinFn.mockResolvedValue({});
     renderSidebar();
 
@@ -115,6 +139,107 @@ describe("dropping an unpinned session onto a pinned row", () => {
     await waitFor(() =>
       expect(mocks.reorderPins).toHaveBeenCalledExactlyOnceWith([{ id: "conv_b", pinnedAt: 1002 }]),
     );
+    await dropOnto("conv_a", "conv_peer", { expectTarget: false });
+    await dropOnto("conv_peer", "conv_a", { expectTarget: false });
+    expect(mocks.pinFn).toHaveBeenCalledOnce();
+    expect(mocks.reorderPins).toHaveBeenCalledOnce();
+  });
+
+  it("pins it below the last pinned row when dropped on that row's lower half", async () => {
+    mocks.pinned[1].labels = { "omnigent.pinned": "2000" };
+    mocks.pinFn.mockResolvedValue({});
+    renderSidebar();
+
+    await dropOnto("conv_c", "conv_b", {
+      offsetY: ROW_HEIGHT / 4,
+      whileOver: () => {
+        const line = screen.getByTestId("pin-order-insertion");
+        expect(screen.getByRole("link", { name: "conv_b" }).closest("li")).toContainElement(line);
+        expect(line).toHaveAttribute("style", "bottom: 0px;");
+      },
+    });
+
+    await waitFor(() =>
+      expect(mocks.pinFn).toHaveBeenCalledExactlyOnceWith({
+        id: "conv_c",
+        pinned: true,
+        pinnedAt: 2001,
+      }),
+    );
+    expect(mocks.reorderPins).not.toHaveBeenCalled();
+  });
+
+  it("pins it after the last pin when released in the gap below it, even ahead of the clock", async () => {
+    const last = Date.now() + 60_000;
+    mocks.pinned[1].labels = { "omnigent.pinned": String(last) };
+    mocks.pinFn.mockResolvedValue({});
+    stubPinZoneRect(2);
+    renderSidebar();
+
+    await dropOnto("conv_c", "conv_b", { expectTarget: false, offsetY: ROW_HEIGHT / 2 + 6 });
+
+    await waitFor(() =>
+      expect(mocks.pinFn).toHaveBeenCalledExactlyOnceWith({
+        id: "conv_c",
+        pinned: true,
+        pinnedAt: last + 1,
+      }),
+    );
+    expect(mocks.reorderPins).not.toHaveBeenCalled();
+  });
+
+  it("pins it below a pinned family shown without its representative", async () => {
+    mocks.pinned[1].labels = { "omnigent.pinned": "2000" };
+    const family = { id: "family", representative_id: "parent", pinned: true, pinned_at: "3000" };
+    mocks.pinned.push(conv("conv_member", { family }));
+    mocks.pinFn.mockResolvedValue({});
+    stubPinZoneRect(3);
+    renderSidebar();
+
+    await dropOnto("conv_c", "conv_member", { expectTarget: false, offsetY: ROW_HEIGHT / 2 + 6 });
+
+    await waitFor(() =>
+      expect(mocks.pinFn).toHaveBeenCalledExactlyOnceWith({
+        id: "conv_c",
+        pinned: true,
+        pinnedAt: 3001,
+      }),
+    );
+    expect(mocks.reorderPins).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])(
+    "does not reorder a nested member with a legacy pin (family pinned: %s)",
+    async (pinned) => {
+      const family = { id: "family", representative_id: "conv_b", pinned, pinned_at: "500" };
+      mocks.pinned = mocks.pinned.map((row) => ({ ...row, family }));
+      renderSidebar();
+      await dropOnto("conv_a", "conv_b", { expectTarget: false });
+      expect(mocks.reorderPins).not.toHaveBeenCalled();
+      expect(mocks.pinFn).not.toHaveBeenCalled();
+    },
+  );
+
+  it("does not drag a nested member whose representative is outside the loaded window", async () => {
+    mocks.pinned[1].labels = { "omnigent.pinned": "2000" };
+    // A not-yet-migrated pin shown without its pinned family's representative.
+    const family = { id: "family", representative_id: "parent", pinned: true, pinned_at: "500" };
+    localStorage.setItem(PINNED_CONVERSATION_IDS_STORAGE_KEY, JSON.stringify(["conv_c"]));
+    vi.mocked(useConversations).mockImplementation(() =>
+      conversationPage([conv("conv_c", { family }), conv("conv_d")]),
+    );
+    renderSidebar();
+
+    const member = screen.getByText("conv_c").closest("li")!;
+    fireEvent.mouseEnter(member);
+    expect(member.querySelector('[data-testid="quick-pin-conversation"]')).toBeNull();
+    await dropOnto("conv_c", "conv_b", {
+      offsetY: ROW_HEIGHT / 4,
+      expectTarget: false,
+    });
+
+    expect(mocks.reorderPins).not.toHaveBeenCalled();
+    expect(mocks.pinFn).not.toHaveBeenCalled();
   });
 
   it("leaves the existing pins alone when the new pin is rejected (e.g. at the pin cap)", async () => {
@@ -157,12 +282,19 @@ describe("dropping an unpinned session onto a pinned row", () => {
   it("offers no pinned-row reordering when the server can't store pins", async () => {
     mocks.filterHonored = false;
     mocks.pinFn.mockResolvedValue({});
+    localStorage.setItem(PINNED_CONVERSATION_IDS_STORAGE_KEY, JSON.stringify(["conv_d"]));
+    stubPinZoneRect(3);
     renderSidebar();
 
     await dropOnto("conv_b", "conv_a", { expectTarget: false });
-
-    expect(mocks.reorderPins).not.toHaveBeenCalled();
     expect(mocks.pinFn).not.toHaveBeenCalled();
+    // Released below the label-less local pin, it pins through the plain toggle.
+    await dropOnto("conv_c", "conv_d", { expectTarget: false, offsetY: ROW_HEIGHT / 2 + 6 });
+
+    await waitFor(() =>
+      expect(mocks.pinFn).toHaveBeenCalledExactlyOnceWith({ id: "conv_c", pinned: true }),
+    );
+    expect(mocks.reorderPins).not.toHaveBeenCalled();
   });
 
   it("disables the other rows' pin buttons while a pin is saving", async () => {
@@ -195,6 +327,16 @@ describe("dropping an unpinned session onto a pinned row", () => {
 
 describe("unpinning from a sidebar row", () => {
   const row = (id: string) => screen.getByRole("link", { name: id }).closest("li")!;
+
+  it("hides pin and unpin controls on a nested member with an existing personal pin", () => {
+    const family = { id: "conv_b", representative_id: "conv_b", pinned: true, pinned_at: "2000" };
+    mocks.pinned = mocks.pinned.map((session) => ({ ...session, family }));
+    renderSidebar();
+    expect(row("conv_a").querySelector('[data-testid="quick-pin-conversation"]')).toBeNull();
+    fireEvent.contextMenu(screen.getByRole("link", { name: "conv_a" }));
+    expect(screen.queryByTestId("pin-conversation")).toBeNull();
+    expect(mocks.pinFn).not.toHaveBeenCalled();
+  });
 
   // Sonner keeps toasts in module state across mounts.
   afterEach(() => {
@@ -237,5 +379,176 @@ describe("unpinning from a sidebar row", () => {
       expect(mocks.pinFn).toHaveBeenLastCalledWith({ id: "conv_a", pinned: true, pinnedAt: 1000 }),
     );
     await waitFor(() => expect(pill).not.toBeInTheDocument());
+  });
+});
+
+describe("Custom session order", () => {
+  const rowOrder = () =>
+    [...document.querySelectorAll("li[data-sidebar-session-id]")].map((row) =>
+      row.getAttribute("data-sidebar-session-id"),
+    );
+  const saved = () => JSON.parse(localStorage.getItem("omnigent:sidebar-view") ?? "{}");
+  const link = (id: string) => screen.getByRole("link", { name: id });
+  const renderGrouping = () => renderSidebar({ features: { sidebar_grouping_ui: true } });
+  const listRows = (...extra: ReturnType<typeof conv>[]) =>
+    vi
+      .mocked(useConversations)
+      .mockImplementation(() =>
+        conversationPage([
+          conv("conv_c", { created_at: 3, updated_at: 10 }),
+          conv("conv_d", { created_at: 2, updated_at: 30, status: "running" }),
+          conv("conv_e", { created_at: 1, updated_at: 20 }),
+          ...extra,
+        ]),
+      );
+
+  beforeEach(() => {
+    mocks.pinned = [];
+    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ ordering: "created" }));
+    listRows();
+  });
+  afterEach(() => {
+    localStorage.clear();
+  });
+  // The pinned-style line marks the slot: above the target when dragging up, below when down.
+  const expectLine = (id: string, edge: "top" | "bottom") => {
+    const line = screen.getByTestId("session-order-insertion");
+    expect(link(id).closest("li")).toContainElement(line);
+    expect(line).toHaveAttribute("style", `${edge}: 0px;`);
+  };
+
+  it.each([false, true])(
+    "moves whole families by drag and menu (collapsed: %s)",
+    async (collapsed) => {
+      const family = { id: "conv_c", representative_id: "conv_c", pinned: false };
+      vi.mocked(useConversations).mockImplementation(() =>
+        conversationPage([
+          conv("conv_c", { created_at: 1, updated_at: 10, family }),
+          conv("conv_peer", { created_at: 2, updated_at: 20, family }),
+          conv("conv_d", { created_at: 3, updated_at: 30 }),
+        ]),
+      );
+      localStorage.setItem(
+        "omnigent:sidebar-view",
+        JSON.stringify({
+          ordering: "custom",
+          custom: { base: "created", since: 100, ids: ["conv_c", "conv_peer", "conv_d"] },
+        }),
+      );
+      renderGrouping();
+      if (collapsed)
+        fireEvent.click(screen.getByRole("button", { name: "Collapse session family" }));
+      const familyRows = collapsed ? ["conv_c"] : ["conv_c", "conv_peer"];
+
+      await dropOnto("conv_c", "conv_d", { expectTarget: false });
+      expect(rowOrder()).toEqual(["conv_d", ...familyRows]);
+      // dnd-kit retains its document click guard for 50 ms after a drag.
+      await act(async () => {
+        await new Promise((resolve) => {
+          setTimeout(resolve, 50);
+        });
+      });
+      fireEvent.pointerDown(
+        link("conv_c").closest("li")!.querySelector('[data-testid="conversation-actions"]')!,
+        { button: 0 },
+      );
+      expect(screen.getByTestId("move-session-up")).not.toHaveAttribute("aria-disabled", "true");
+      fireEvent.click(screen.getByTestId("move-session-up"));
+      expect(saved().custom.ids).toEqual(["conv_c", "conv_d"]);
+      expect(rowOrder()).toEqual([...familyRows, "conv_d"]);
+      fireEvent.contextMenu(link("conv_c"));
+      fireEvent.click(screen.getByTestId("move-session-down"));
+      expect(rowOrder()).toEqual(["conv_d", ...familyRows]);
+      expect(saved().custom.ids).toEqual(["conv_d", "conv_c"]);
+
+      cleanup();
+      renderGrouping();
+      expect(rowOrder()).toEqual(["conv_d", "conv_c", "conv_peer"]);
+      fireEvent.contextMenu(link("conv_peer"));
+      expect(screen.queryByTestId("move-session-up")).toBeNull();
+      expect(screen.queryByTestId("move-session-down")).toBeNull();
+    },
+  );
+
+  it("starts from the order on screen on drop, not hover, and never follows the row's link", async () => {
+    renderGrouping();
+    expect(rowOrder()).toEqual(["conv_c", "conv_d", "conv_e"]);
+
+    await dropOnto("conv_e", "conv_c", {
+      expectTarget: false,
+      whileOver: () => {
+        expect(rowOrder()).toEqual(["conv_c", "conv_d", "conv_e"]);
+        expectLine("conv_c", "top");
+      },
+    });
+
+    expect(rowOrder()).toEqual(["conv_e", "conv_c", "conv_d"]);
+    expect(saved()).toMatchObject({
+      ordering: "custom",
+      custom: { base: "created", since: 30, ids: ["conv_e", "conv_c", "conv_d"] },
+    });
+    // dnd-kit hides the drag's trailing click from React; only the next press may navigate.
+    const row = link("conv_e").closest("li")!;
+    expect(fireEvent.click(row, { detail: 1 })).toBe(false);
+    fireEvent.pointerDown(row);
+    expect(fireEvent.click(row, { detail: 1 })).toBe(true);
+  });
+
+  it("only takes drops from the dragged session's own group, including onto shared rows", async () => {
+    localStorage.setItem(
+      "omnigent:sidebar-view",
+      JSON.stringify({ grouping: "status", ordering: "created" }),
+    );
+    localStorage.setItem("omnigent:session-filter", "all");
+    listRows(conv("conv_f", { created_at: 0, updated_at: 0, owner: "other@example.com" }));
+    renderGrouping();
+    expect(rowOrder()).toEqual(["conv_d", "conv_c", "conv_e", "conv_f"]);
+    // A shared row holds a place in the order but can't be moved itself.
+    fireEvent.contextMenu(link("conv_f"));
+    expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+    expect(screen.queryByTestId("move-session-up")).toBeNull();
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
+
+    await dropOnto("conv_e", "conv_d", {
+      expectTarget: false,
+      whileOver: () => expect(screen.queryByTestId("session-order-insertion")).toBeNull(),
+    });
+    expect(rowOrder()).toEqual(["conv_d", "conv_c", "conv_e", "conv_f"]);
+    expect(saved().ordering).toBe("created");
+
+    await dropOnto("conv_e", "conv_c", { expectTarget: false });
+    expect(rowOrder()).toEqual(["conv_d", "conv_e", "conv_c", "conv_f"]);
+    await dropOnto("conv_c", "conv_f", {
+      expectTarget: false,
+      whileOver: () => expectLine("conv_f", "bottom"),
+    });
+    expect(rowOrder()).toEqual(["conv_d", "conv_e", "conv_f", "conv_c"]);
+  });
+
+  it.each([
+    [
+      "row menu",
+      (id: string) =>
+        fireEvent.pointerDown(
+          link(id).closest("li")!.querySelector('[data-testid="conversation-actions"]')!,
+          { button: 0 },
+        ),
+    ],
+    ["right-click menu", (id: string) => fireEvent.contextMenu(link(id))],
+  ])("moves a session down and up from its %s", (_menu, openMenu) => {
+    // A just-created row has no server id yet, so it is never a Move target.
+    listRows(conv("temp:new", { created_at: 99, updated_at: 99, provisional: true }));
+    renderGrouping();
+
+    openMenu("conv_c");
+    expect(screen.getByTestId("move-session-up")).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(screen.getByTestId("move-session-down"));
+    expect(rowOrder()).toEqual(["conv_d", "conv_c", "conv_e"]);
+
+    openMenu("conv_e");
+    expect(screen.getByTestId("move-session-down")).toHaveAttribute("aria-disabled", "true");
+    fireEvent.click(screen.getByTestId("move-session-up"));
+    expect(rowOrder()).toEqual(["conv_d", "conv_e", "conv_c"]);
+    expect(saved().custom.ids).toEqual(["conv_d", "conv_e", "conv_c"]);
   });
 });

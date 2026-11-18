@@ -11,6 +11,7 @@ import { describe, expect, it } from "vitest";
 import type {
   ElicitationRequest,
   SessionAgentChangedEvent,
+  SessionBackgroundTasksEvent,
   SessionCodexApprovalModeEvent,
   SessionCollaborationModeEvent,
   SessionChangedFilesInvalidatedEvent,
@@ -839,6 +840,38 @@ describe("response.elicitation_request (FLAT envelope)", () => {
     expect(ev.allowAllEdits).toBe(false);
   });
 
+  it.each([
+    {
+      label: "a well-formed hint",
+      hint: { tool_name: "Edit", tool_input: { file_path: "/a.py" } },
+      expected: { toolName: "Edit", toolInput: { file_path: "/a.py" } },
+    },
+    { label: "a hint without a tool name", hint: { tool_input: {} }, expected: null },
+    {
+      label: "a hint whose input is not an object",
+      hint: { tool_name: "Edit", tool_input: [] },
+      expected: null,
+    },
+    { label: "no hint", hint: undefined, expected: null },
+  ])("parses file_edit from $label", ({ hint, expected }) => {
+    const out = parse("response.elicitation_request", {
+      type: "response.elicitation_request",
+      elicitation_id: "elicit_file_edit",
+      params: {
+        mode: "form",
+        message: "Claude wants to call **Edit**",
+        phase: "pre_tool_use",
+        policy_name: "claude_native_permission",
+        content_preview: "Edit({})",
+        requestedSchema: {},
+        file_edit: hint,
+      },
+    });
+
+    expect(out).toHaveLength(1);
+    expect((out[0] as ElicitationRequest).fileEdit).toEqual(expected);
+  });
+
   it("lifts the remember_scope hint with a host for WebFetch prompts", () => {
     // The server stamps ``remember_scope`` on non-edit tool
     // PermissionRequests so the card can offer "Approve & don't ask
@@ -1618,6 +1651,32 @@ describe("session.codex_approval_mode (FLAT envelope)", () => {
   });
 });
 
+describe("session.background_tasks (FLAT envelope)", () => {
+  it("lifts the count and each task's command", () => {
+    const events = parse("session.background_tasks", {
+      conversation_id: "conv_abc",
+      background_task_count: 1,
+      background_tasks: [{ id: "proc_0", command: "npm run dev" }],
+    });
+    expect(events).toEqual([
+      {
+        type: "session_background_tasks",
+        conversationId: "conv_abc",
+        backgroundTaskCount: 1,
+        backgroundTasks: [{ id: "proc_0", command: "npm run dev" }],
+      } satisfies SessionBackgroundTasksEvent,
+    ]);
+  });
+
+  it.each([
+    ["no conversation_id", { background_task_count: 1 }],
+    ["no count", { conversation_id: "conv_abc" }],
+    ["a negative count", { conversation_id: "conv_abc", background_task_count: -1 }],
+  ])("rejects %s", (_case, data) => {
+    expect(parse("session.background_tasks", data)).toEqual([]);
+  });
+});
+
 describe("session.agent_changed (FLAT envelope)", () => {
   it("lifts conversation_id, agent_id, and agent_name", () => {
     const events = parse("session.agent_changed", {
@@ -1766,6 +1825,30 @@ describe("session.presence (FLAT envelope)", () => {
         viewers: "nobody",
       }),
     ).toEqual([]);
+  });
+});
+
+describe("session.journal.appended (FLAT envelope)", () => {
+  it("carries the session and the new entry", () => {
+    const entry = { id: "e1", position: 1, kind: "note", content: { body: "hi" } };
+    const out = parse("session.journal.appended", {
+      type: "session.journal.appended",
+      conversation_id: "conv_abc",
+      entry,
+    });
+    expect(out).toEqual([{ type: "session_journal_appended", conversationId: "conv_abc", entry }]);
+  });
+
+  it("rejects an event without a usable entry", () => {
+    for (const entry of [undefined, [], { id: "e1" }, { position: 1 }]) {
+      expect(
+        parse("session.journal.appended", {
+          type: "session.journal.appended",
+          conversation_id: "conv_abc",
+          entry,
+        }),
+      ).toEqual([]);
+    }
   });
 });
 

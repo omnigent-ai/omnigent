@@ -26,6 +26,8 @@ from omnigent_discord.approvals import (
 from omnigent_discord.elicitation import ElicitationController, ElicitationTurnState
 from omnigent_discord.models import ChannelKey, DiscordTurn
 
+from tests._helpers.polling import poll_until_async
+
 SERVER = "https://omnigent.example.com"
 KEY = ChannelKey(channel_id="500", guild_id="900")
 LOGGER = logging.getLogger("test")
@@ -238,7 +240,7 @@ async def test_no_answer_in_time_declines_and_says_it_timed_out() -> None:
     controller = _controller(ElicitationCoordinator(0.01), channel, timeout=0.01)
     state, turn = ElicitationTurnState(), _turn(channel)
     await controller.start(client, turn, BINARY, state)
-    await asyncio.sleep(0.05)
+    await poll_until_async(lambda: client.resolved, timeout_s=5)
     await controller.on_resolved(turn, "el_1", state)
     assert client.resolved[0]["accepted"] is False
     assert _card(channel).embed.title.endswith(ElicitationOutcome.TIMED_OUT.value)
@@ -294,7 +296,7 @@ async def test_timed_out_decline_that_also_failed_is_re_declined() -> None:
     controller = _controller(coordinator, channel, timeout=0.01)
     state, turn = ElicitationTurnState(), _turn(channel)
     await controller.start(client, turn, BINARY, state)
-    await asyncio.sleep(0.05)
+    await poll_until_async(lambda: state.pending["el_1"].delivery_failed, timeout_s=5)
     client.resolve_error = None
     await controller.finish_pending(client, turn, state)
     assert client.resolved and client.resolved[-1]["accepted"] is False

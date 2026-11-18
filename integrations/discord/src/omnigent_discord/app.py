@@ -15,7 +15,9 @@ from typing import Any
 import discord
 from discord import app_commands
 from omnigent_bot_core.omnigent import OmnigentClientPool
+from omnigent_bot_core.user_agent import set_bot_user_agent
 
+from omnigent_discord import __version__
 from omnigent_discord.auth_manager import AuthManager
 from omnigent_discord.config import ConfigError, Settings, load_settings
 from omnigent_discord.notifications import DiscordNotifier
@@ -190,7 +192,7 @@ def register_commands(
     ) -> None:
         # Without a handler discord.py logs the traceback and leaves the user
         # staring at a spinner, so always close the interaction with something.
-        logging.getLogger(__name__).exception(
+        logging.getLogger(__name__).error(
             "Unhandled /%s command error", COMMAND_NAME, exc_info=error
         )
         message = "Something went wrong running that command. Please try again."
@@ -229,6 +231,7 @@ async def run() -> None:
     (your shell, ``uv run``, the container deploy) is the single source of
     truth. See integrations/discord/README.
     """
+    set_bot_user_agent("omnigent-discord", __version__)
     # A missing/invalid config raises ConfigError with an operator-friendly,
     # pre-formatted message. Print it plainly and exit non-zero — no traceback,
     # no logging setup (which hasn't run yet). SystemExit(2) is the conventional

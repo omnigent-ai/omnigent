@@ -20,6 +20,7 @@ from omnigent.inner.datamodel import (
     GitSshBinding,
     OSEnvSandboxSpec,
     OSEnvSpec,
+    TcpEgressRoute,
 )
 from omnigent.inner.os_env import _build_credential_proxy_parent_env
 from omnigent.inner.sandbox import resolve_sandbox
@@ -147,6 +148,19 @@ def test_harness_preserves_git_ssh_binding(
         known_hosts_file=str(tmp_path / "known_hosts"),
     )
     sandbox = OSEnvSandboxSpec(type="linux_bwrap", git_ssh=[binding])
+    assert decode_sandbox(sandbox) == sandbox
+
+
+def test_harness_preserves_tcp_egress_route(
+    decode_sandbox: Callable[[OSEnvSandboxSpec], OSEnvSandboxSpec],
+) -> None:
+    route = TcpEgressRoute(
+        name="analytics_db",
+        host="db.example.test",
+        port=5432,
+        allowed_cidrs=("10.42.0.0/16",),
+    )
+    sandbox = OSEnvSandboxSpec(type="linux_bwrap", tcp_egress=[route])
     assert decode_sandbox(sandbox) == sandbox
 
 

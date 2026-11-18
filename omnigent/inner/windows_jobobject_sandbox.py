@@ -43,6 +43,7 @@ from .sandbox import (
     ContainmentHandle,
     SandboxBackend,
     SandboxPolicy,
+    _resolve_grant_root,
     register_backend,
 )
 
@@ -175,6 +176,17 @@ class WindowsJobObjectSandboxBackend(SandboxBackend):
 
     type_name = "windows_jobobject"
 
+    def launch_fingerprint(
+        self,
+        argv: list[str],
+        policy: SandboxPolicy,
+        cwd: Path,
+        chdir: Path | None = None,
+    ) -> object:
+        """Job containment derives no launch-time masks from the filesystem."""
+        del argv, policy, cwd, chdir
+        return ()
+
     def resolve(self, spec: OSEnvSpec, cwd: Path) -> SandboxPolicy:
         """
         Build a :class:`SandboxPolicy` for the Job Object backend.
@@ -204,9 +216,11 @@ class WindowsJobObjectSandboxBackend(SandboxBackend):
 
         read_roots: list[Path] | None = None
         if sandbox_spec.read_paths is not None:
-            read_roots = [(cwd / r).resolve() for r in sandbox_spec.read_paths]
-        write_roots = [(cwd / grant.path).resolve() for grant in sandbox_spec.write_path_specs]
-        write_files = [(cwd / f).resolve() for f in (sandbox_spec.write_files or [])]
+            read_roots = [_resolve_grant_root(cwd, r) for r in sandbox_spec.read_paths]
+        write_roots = [
+            _resolve_grant_root(cwd, grant.path) for grant in sandbox_spec.write_path_specs
+        ]
+        write_files = [_resolve_grant_root(cwd, f) for f in (sandbox_spec.write_files or [])]
 
         return SandboxPolicy(
             backend_type=self.type_name,

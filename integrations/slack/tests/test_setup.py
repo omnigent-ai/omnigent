@@ -415,11 +415,11 @@ async def test_setup_shows_login_in_modal_and_advances_on_approval(tmp_path: Pat
         assert authorize_body["client_id"] == "Slack-Omnigent-Acme Corp"
 
         # The background poll approves and advances the SAME modal (views_update).
-        for _ in range(50):
-            if len(client.updated_views) >= 2:
-                break
-            await asyncio.sleep(0.05)
+        login_tasks = tuple(auth._login_tasks)
+        assert len(login_tasks) == 1
+        await asyncio.wait_for(asyncio.gather(*login_tasks), timeout=30.0)
     finally:
+        await auth.shutdown()
         await pool.aclose_all()
 
     advanced = client.updated_views[-1]
@@ -1535,11 +1535,12 @@ async def test_setup_defaults_are_resolved_after_the_user_logs_in(tmp_path: Path
 
     try:
         await flow._begin_setup(client, team_id="T1", user_id="U1", view_id="V1")
-        for _ in range(50):
-            if len(client.updated_views) >= 2:
-                break
-            await asyncio.sleep(0.05)
+        # Join login before closing the pool used by its post-auth continuation.
+        login_tasks = tuple(auth._login_tasks)
+        assert len(login_tasks) == 1
+        await asyncio.wait_for(asyncio.gather(*login_tasks), timeout=30.0)
     finally:
+        await auth.shutdown()
         await pool.aclose_all()
 
     view = _last_update(client)

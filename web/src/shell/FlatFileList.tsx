@@ -1,3 +1,5 @@
+import { useState, type ReactNode } from "react";
+import { ChevronDown, ChevronRight, GitBranch } from "lucide-react";
 import { RunnerOfflineError, type WorkspaceChangedFile } from "@/hooks/useWorkspaceChangedFiles";
 import { RunnerAsleepHint } from "./RunnerAsleepHint";
 import { cn } from "@/lib/utils";
@@ -66,6 +68,19 @@ export function compareChangedFiles(sort: ChangedSort) {
   };
 }
 
+export function groupChangedFiles(files: WorkspaceChangedFile[], sort: ChangedSort) {
+  const groups = new Map<string, WorkspaceChangedFile[]>();
+  for (const file of files) {
+    const root = file.repository_root ?? "";
+    const group = groups.get(root) ?? [];
+    group.push(file);
+    groups.set(root, group);
+  }
+  return [...groups]
+    .sort(([left], [right]) => (left === "" ? 1 : right === "" ? -1 : left.localeCompare(right)))
+    .map(([root, groupFiles]) => ({ root, files: groupFiles.sort(compareChangedFiles(sort)) }));
+}
+
 function normalizeSearchQuery(query: string): string {
   return query.trim().toLowerCase();
 }
@@ -83,8 +98,12 @@ function FileListItem({
 }) {
   const { handlers, tooltip } = useCursorTooltip(file.path);
   const reveal = useRevealMenu(isDeleted ? null : file.path);
-  const slash = file.path.lastIndexOf("/");
-  const dir = slash > 0 ? file.path.slice(0, slash) : "";
+  const displayPath =
+    file.repository_root && file.path.startsWith(`${file.repository_root}/`)
+      ? file.path.slice(file.repository_root.length + 1)
+      : file.path;
+  const slash = displayPath.lastIndexOf("/");
+  const dir = slash > 0 ? displayPath.slice(0, slash) : "";
   const hasDownload = !isDeleted && Boolean(conversationId);
 
   return (
@@ -98,12 +117,9 @@ function FileListItem({
       >
         <button
           type="button"
-          className={cn(
-            "flex min-w-0 flex-1 items-baseline gap-1.5 text-left",
-            isDeleted ? "cursor-default" : "cursor-pointer",
-          )}
-          onClick={() => !isDeleted && onFileSelect(file.path)}
-          disabled={isDeleted}
+          className="flex min-w-0 flex-1 cursor-pointer items-baseline gap-1.5 text-left"
+          onClick={() => onFileSelect(file.path)}
+          aria-label={file.path}
         >
           <WorkspaceFileIcon path={file.path} className="self-center" />
           <span className={cn("truncate text-ui", isDeleted && "line-through")} {...handlers}>
@@ -176,6 +192,39 @@ function FileListItem({
   );
 }
 
+function RepositoryFileGroup({
+  root,
+  children,
+  count,
+}: {
+  root: string;
+  children: ReactNode;
+  count: number;
+}) {
+  const [collapsed, setCollapsed] = useState(false);
+  const name = root || "Other files";
+  const Chevron = collapsed ? ChevronRight : ChevronDown;
+  return (
+    <li>
+      <div role="group" aria-label={name}>
+        <button
+          type="button"
+          className="flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-left text-ui hover:bg-muted"
+          aria-expanded={!collapsed}
+          aria-label={`${name}, ${count} changed files`}
+          onClick={() => setCollapsed(!collapsed)}
+        >
+          <Chevron className="size-3.5 shrink-0" />
+          {root && <GitBranch className="size-3.5 shrink-0 text-muted-foreground" />}
+          <span className="min-w-0 flex-1 truncate">{name}</span>
+          <span className="text-muted-foreground text-sm">{count}</span>
+        </button>
+        {!collapsed && <ul className="flex flex-col gap-0.5">{children}</ul>}
+      </div>
+    </li>
+  );
+}
+
 export function FlatFileList({
   files,
   isLoading,
@@ -233,14 +282,14 @@ export function FlatFileList({
   const visibleFiles = files.filter(
     (f) => showHidden || !f.path.split("/").some((seg) => seg.startsWith(".")),
   );
-  const sorted = visibleFiles
-    .filter(
-      (f) =>
-        normalizedSearchQuery.length === 0 ||
-        f.name.toLowerCase().includes(normalizedSearchQuery) ||
-        f.path.toLowerCase().includes(normalizedSearchQuery),
-    )
-    .sort(compareChangedFiles(sort));
+  const matchingFiles = visibleFiles.filter(
+    (f) =>
+      normalizedSearchQuery.length === 0 ||
+      f.name.toLowerCase().includes(normalizedSearchQuery) ||
+      f.path.toLowerCase().includes(normalizedSearchQuery),
+  );
+  const groups = groupChangedFiles(matchingFiles, sort);
+  const grouped = files.some((file) => file.repository_root);
   const hiddenCount = files.length - visibleFiles.length;
   if (visibleFiles.length === 0) {
     return (
@@ -256,7 +305,7 @@ export function FlatFileList({
       </p>
     );
   }
-  if (sorted.length === 0) {
+  if (matchingFiles.length === 0) {
     return (
       <p className="px-2 py-1 text-muted-foreground text-sm">
         No changed files match "{searchQuery.trim()}"
@@ -279,16 +328,26 @@ export function FlatFileList({
       )}
       <TooltipProvider>
         <ul className="flex flex-col gap-0.5">
-          {sorted.map((file) => {
-            const isDeleted = file.status === "deleted";
-            return (
+          {groups.map(({ root, files: groupFiles }) => {
+            const rows = groupFiles.map((file) => (
               <FileListItem
                 key={file.path}
                 file={file}
-                isDeleted={isDeleted}
+                isDeleted={file.status === "deleted"}
                 onFileSelect={onFileSelect}
                 conversationId={conversationId}
               />
+            ));
+            return grouped ? (
+              <RepositoryFileGroup
+                key={`${conversationId}/${root}`}
+                root={root}
+                count={groupFiles.length}
+              >
+                {rows}
+              </RepositoryFileGroup>
+            ) : (
+              rows
             );
           })}
         </ul>

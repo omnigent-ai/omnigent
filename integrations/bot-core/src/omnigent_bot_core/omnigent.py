@@ -41,6 +41,7 @@ from omnigent_bot_core.events import (
     iter_sse_events,
     session_status,
 )
+from omnigent_bot_core.user_agent import user_agent_headers
 
 __all__ = [
     "AuthRequiredError",
@@ -307,6 +308,7 @@ class OmnigentClient:
         self._client = httpx.AsyncClient(
             base_url=base_url.rstrip("/"),
             timeout=httpx.Timeout(timeout),
+            headers=user_agent_headers(),
         )
         self._runner_launch_timeout_seconds = runner_launch_timeout_seconds
         self._auth = auth

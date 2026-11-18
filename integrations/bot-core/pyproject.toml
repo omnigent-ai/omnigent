@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "omnigent-bot-core"
-version = "0.20.0.dev0"
+version = "0.24.0.dev0"
 description = "Shared Omnigent client for the chat-bot integrations."
 readme = "README.md"
 requires-python = ">=3.12"

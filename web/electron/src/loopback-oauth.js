@@ -173,4 +173,4 @@ async function runLoopbackAuthorization({
   });
 }
 
-module.exports = { LOOPBACK_TIMEOUT_MS, base64url, makePkce, runLoopbackAuthorization };
+module.exports = { LOOPBACK_TIMEOUT_MS, base64url, escapeHtml, makePkce, runLoopbackAuthorization };

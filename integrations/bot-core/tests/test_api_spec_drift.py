@@ -16,7 +16,7 @@ that document, so:
   fails with a precise message — instead of the bot 404-ing silently against a
   deployed server.
 - If a field the client reads off a response schema disappears
-  (``SessionResponse.harness``, ``PaginatedList.data``), a test fails.
+  (``SessionResponse.harness``, ``AgentList.data``), a test fails.
 - If an endpoint the client treats as INTERNAL suddenly appears in the public
   schema, a test fails — a nudge to reclassify it deliberately.
 

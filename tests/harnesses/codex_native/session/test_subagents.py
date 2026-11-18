@@ -17,6 +17,10 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_state,
     write_bridge_state,
 )
+from tests.harnesses.codex_native.forwarder._support import (
+    _posted_cumulative_tokens,
+    _usage_event,
+)
 from tests.harnesses.codex_native.session._support import (
     _elicitation_tracker,
     _FakeCodexAppServerClient,
@@ -440,6 +444,264 @@ def test_forwarder_registers_subagent_activity_before_child_events(
     assert statuses == ["running", "idle", "running", "failed"]
     assert read_bridge_state(tmp_path) == parent_state
     assert list(workspace.iterdir()) == []
+
+
+def _child_turn_events(
+    *, child_thread_id: str = "thread_child", turn_id: str = "turn_after", text: str
+) -> list[dict[str, Any]]:
+    """Build one child turn: its start, one reply, and its completion."""
+    return [
+        {
+            "method": "turn/started",
+            "params": {"threadId": child_thread_id, "turn": {"id": turn_id}},
+        },
+        _child_agent_message_event(
+            child_thread_id=child_thread_id, turn_id=turn_id, item_id=f"{turn_id}_msg", text=text
+        ),
+        {
+            "method": "turn/completed",
+            "params": {"threadId": child_thread_id, "turn": {"id": turn_id}},
+        },
+    ]
+
+
+def _run_forwarder(
+    tmp_path: Path,
+    codex_client: _FakeCodexAppServerClient,
+    posted: list[tuple[str, dict[str, Any]]],
+) -> None:
+    """Run ``supervise_forwarder`` for ``thread_parent`` over the client's events."""
+
+    async def run() -> None:
+        await codex_native_forwarder.supervise_forwarder(
+            base_url="http://127.0.0.1:8000",
+            headers={},
+            session_id="conv_parent",
+            bridge_dir=tmp_path,
+            app_server_url=str(tmp_path / "app-server.sock"),
+            thread_id="thread_parent",
+            client=codex_client,  # type: ignore[arg-type]
+            ap_transport=httpx.MockTransport(_make_omnigent_handler(posted)),
+        )
+
+    asyncio.run(run())
+
+
+def _child_statuses(posted: list[tuple[str, dict[str, Any]]]) -> list[str]:
+    """Return the session statuses posted to ``conv_child``, in order."""
+    return [
+        body["data"]["status"]
+        for path, body in posted
+        if path == "/v1/sessions/conv_child/events"
+        and body.get("type") == "external_session_status"
+    ]
+
+
+def test_forwarder_reattaches_subagent_spawned_before_a_restart(tmp_path: Path) -> None:
+    """
+    A relaunched forwarder routes an earlier sub-agent's new work to its session.
+
+    Nothing maps a sub-agent spawned before a runner relaunch, and the parent
+    sending it new work emits no spawn item. Codex's spawn metadata links the
+    thread back to the parent, so the child keeps its session and the history
+    an earlier forwarder mirrored is not replayed.
+    """
+    posted: list[tuple[str, dict[str, Any]]] = []
+    codex_client = _PerThreadFakeCodexClient(
+        thread_responses={"thread_child": _child_resume_response(text="mirrored before")}
+    )
+    codex_client.events = [
+        *_child_turn_events(text="after restart"),
+        *_child_turn_events(turn_id="turn_again", text="again"),
+    ]
+
+    _run_forwarder(tmp_path, codex_client, posted)
+
+    registrations = _registration_posts(posted, "conv_parent")
+    assert [registration["data"] for registration in registrations] == [
+        {
+            "thread_id": "thread_child",
+            "agent_nickname": "Euclid",
+            "agent_role": "explorer",
+            "parent_thread_id": "thread_parent",
+        }
+    ]
+    assert [
+        post["data"]["item_data"]["content"][0]["text"]
+        for post in _transcript_posts(posted, "conv_child")
+    ] == ["after restart", "again"]
+    assert _child_statuses(posted) == ["running", "idle", "running", "idle"]
+    assert [
+        request
+        for request in codex_client.requests
+        if request == ("thread/read", {"threadId": "thread_child", "includeTurns": False})
+    ] == [("thread/read", {"threadId": "thread_child", "includeTurns": False})]
+
+
+def test_forwarder_reattaches_a_nested_subagent_through_its_spawn_chain(
+    tmp_path: Path,
+) -> None:
+    """A sub-agent of an unregistered sub-agent is linked to the parent through it."""
+    posted: list[tuple[str, dict[str, Any]]] = []
+    codex_client = _PerThreadFakeCodexClient(
+        thread_responses={
+            "thread_grandchild": _child_resume_response(
+                child_thread_id="thread_grandchild", parent_thread_id="thread_child"
+            ),
+            "thread_child": _child_resume_response(),
+        }
+    )
+    codex_client.events = _child_turn_events(child_thread_id="thread_grandchild", text="nested")
+
+    _run_forwarder(tmp_path, codex_client, posted)
+
+    registrations = _registration_posts(posted, "conv_parent")
+    assert [registration["data"]["thread_id"] for registration in registrations] == [
+        "thread_grandchild"
+    ]
+    assert registrations[0]["data"]["parent_thread_id"] == "thread_child"
+    assert [
+        post["data"]["item_data"]["content"][0]["text"]
+        for post in _transcript_posts(posted, "conv_child")
+    ] == ["nested"]
+
+
+def test_forwarder_keeps_ignoring_threads_outside_its_spawn_tree(tmp_path: Path) -> None:
+    """A thread another thread spawned stays ignored, and is looked up only once."""
+    posted: list[tuple[str, dict[str, Any]]] = []
+    codex_client = _PerThreadFakeCodexClient(
+        thread_responses={
+            "thread_other": _child_resume_response(
+                child_thread_id="thread_other", parent_thread_id="thread_elsewhere"
+            ),
+            "thread_elsewhere": {"result": {"thread": {"id": "thread_elsewhere"}}},
+        }
+    )
+    codex_client.events = [
+        *_child_turn_events(child_thread_id="thread_other", text="not ours"),
+        *_child_turn_events(
+            child_thread_id="thread_other", turn_id="turn_again", text="still not"
+        ),
+    ]
+
+    _run_forwarder(tmp_path, codex_client, posted)
+
+    assert _registration_posts(posted, "conv_parent") == []
+    assert _transcript_posts(posted, "conv_child") == []
+    assert [
+        request
+        for request in codex_client.requests
+        if request[1].get("threadId") in {"thread_other", "thread_elsewhere"}
+    ] == [
+        ("thread/read", {"threadId": "thread_other", "includeTurns": False}),
+        ("thread/read", {"threadId": "thread_elsewhere", "includeTurns": False}),
+    ]
+
+
+def test_forwarder_still_backfills_a_spawn_whose_events_precede_its_spawn_item(
+    tmp_path: Path,
+) -> None:
+    """
+    A sub-agent announced on this connection is routed early but keeps its backfill.
+
+    Its first events can arrive before the parent's spawn item names it. They
+    are delivered live, and the spawn item still replays the history the live
+    stream missed.
+    """
+    posted: list[tuple[str, dict[str, Any]]] = []
+    codex_client = _PerThreadFakeCodexClient(
+        thread_responses={"thread_child": _child_resume_response(text="backfilled")}
+    )
+    codex_client.events = [
+        {
+            "method": "thread/started",
+            "params": {
+                "thread": {
+                    "id": "thread_child",
+                    "source": {
+                        "subAgent": {"thread_spawn": {"parent_thread_id": "thread_parent"}}
+                    },
+                }
+            },
+        },
+        *_child_turn_events(text="live"),
+        _collab_item_completed_event(),
+    ]
+
+    _run_forwarder(tmp_path, codex_client, posted)
+
+    # The live lane and the inline backfill post concurrently.
+    assert sorted(
+        post["data"]["item_data"]["content"][0]["text"]
+        for post in _transcript_posts(posted, "conv_child")
+    ) == ["backfilled", "live"]
+    assert ("thread/resume", {"threadId": "thread_child"}) in codex_client.requests
+
+
+def test_forwarder_child_usage_excludes_inherited_totals_across_restart(
+    tmp_path: Path,
+) -> None:
+    """A forked child posts only its own usage, including after a forwarder restart.
+
+    Codex 0.149 seeds a forked child with the parent's totals and repeats them in
+    the child's later frames. A restarted forwarder never sees the seed, so it
+    must reuse the inherited totals recorded in the bridge directory.
+    """
+    posted: list[tuple[str, dict[str, Any]]] = []
+
+    async def run(events: list[dict[str, Any]]) -> None:
+        codex_client = _PerThreadFakeCodexClient(
+            thread_responses={"thread_child": _child_resume_response()}
+        )
+        codex_client.events = events
+        await codex_native_forwarder.supervise_forwarder(
+            base_url="http://127.0.0.1:8000",
+            headers={},
+            session_id="conv_parent",
+            bridge_dir=tmp_path,
+            app_server_url=str(tmp_path / "app-server.sock"),
+            thread_id="thread_parent",
+            client=codex_client,  # type: ignore[arg-type]
+            ap_transport=httpx.MockTransport(_make_omnigent_handler(posted)),
+        )
+
+    asyncio.run(
+        run(
+            [
+                _usage_event("thread_parent", (2500, 1000, 110), (1500, 1000, 10)),
+                _collab_item_started_event(),
+                _usage_event(
+                    "thread_child", (2500, 1000, 110), (1500, 1000, 10), "turn_thread_parent"
+                ),
+                _usage_event("thread_parent", (4500, 2000, 160), (2000, 1000, 50)),
+                _usage_event("thread_child", (2800, 1000, 140), (300, 0, 30)),
+            ]
+        )
+    )
+    # The restarted forwarder re-registers the child, as an interrupted-turn
+    # replay does, and the resumed child reports its full Codex totals again.
+    asyncio.run(
+        run(
+            [
+                _usage_event("thread_parent", (4500, 2000, 160), (2000, 1000, 50)),
+                _collab_item_completed_event(),
+                _usage_event("thread_child", (2800, 1000, 140), (300, 0, 30)),
+                _usage_event("thread_child", (3500, 1300, 180), (700, 300, 40)),
+            ]
+        )
+    )
+
+    assert _posted_cumulative_tokens(posted, "conv_child") == [
+        (0, 0, 0),
+        (300, 0, 30),
+        (300, 0, 30),
+        (1000, 300, 70),
+    ]
+    assert _posted_cumulative_tokens(posted, "conv_parent") == [
+        (2500, 1000, 110),
+        (4500, 2000, 160),
+        (4500, 2000, 160),
+    ]
 
 
 def test_forwarder_does_not_double_write_stable_id_item_delivered_twice(

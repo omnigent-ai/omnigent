@@ -3,30 +3,11 @@ import { describe, expect, it } from "vitest";
 import {
   applyCodexApprovalSelection,
   codexApprovalSelectionValue,
-  codexCreateApprovalOptions,
 } from "@/lib/codexApprovalOptions";
 import {
   CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
   CODEX_NATIVE_DEFAULT_APPROVAL_MODE,
 } from "@/lib/nativeHarnessModes";
-
-describe("codexCreateApprovalOptions", () => {
-  it("includes the bypass entry as the 4th create-time option", () => {
-    const values = codexCreateApprovalOptions().map((o) => o.value);
-    expect(values).toEqual([
-      "default",
-      "full-access",
-      "read-only",
-      CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
-    ]);
-  });
-
-  it("exposes only { value, label } (no CLI args leak into the picker)", () => {
-    for (const option of codexCreateApprovalOptions()) {
-      expect(Object.keys(option).sort()).toEqual(["label", "value"]);
-    }
-  });
-});
 
 describe("codexApprovalSelectionValue", () => {
   it("shows the approval preset when bypass is off", () => {

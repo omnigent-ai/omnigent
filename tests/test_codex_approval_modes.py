@@ -139,6 +139,21 @@ def test_preset_from_thread_settings_none_for_unmapped() -> None:
     assert codex_permission_preset_from_thread_settings({}) is None
 
 
+@pytest.mark.parametrize("sandbox_type", [{}, []])
+def test_preset_from_thread_settings_ignores_non_string_sandbox_type(sandbox_type: object) -> None:
+    """An unsupported sandbox type leaves the remaining preset signals usable."""
+    assert (
+        codex_permission_preset_from_thread_settings({"sandboxPolicy": {"type": sandbox_type}})
+        is None
+    )
+    assert (
+        codex_permission_preset_from_thread_settings(
+            {"sandboxPolicy": {"type": sandbox_type}, "approvalPolicy": "on-request"}
+        )
+        == "ask-for-approval"
+    )
+
+
 def test_parse_profile_popup_all_four_rows() -> None:
     """The profile-popup variant parses all four rows, stripping `` (current)``."""
     assert codex_permissions_menu(_PROFILE_POPUP) == {

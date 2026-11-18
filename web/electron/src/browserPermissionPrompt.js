@@ -4,7 +4,13 @@ const { pathToFileURL } = require("node:url");
 
 const PROMPT_WIDTH = 380;
 const PROMPT_HEIGHT = 250;
-const CHOICES = new Set(["allow-once", "always-allow", "deny", "dismiss"]);
+const CHOICES = {
+  permission: new Set(["allow-once", "always-allow", "deny", "dismiss", "failed"]),
+  "security-key": new Set(["open-in-browser", "dismiss", "failed"]),
+};
+// A security-key notice the app closes is "suppressed" so it can return; only Dismiss or
+// Escape is final.
+const appClosedChoice = (kind) => (kind === "security-key" ? "suppressed" : "dismiss");
 
 function promptBounds(content, anchor) {
   const width = Math.min(PROMPT_WIDTH, content.width);
@@ -17,7 +23,7 @@ function promptBounds(content, anchor) {
   };
 }
 
-/** A trusted child window keeps consent outside both the site and server SPA. */
+/** A trusted child window keeps pane prompts outside both the site and server SPA. */
 function createBrowserPermissionPrompt({ BrowserWindow, ipcMain, promptPage, preloadPath }) {
   const pageUrl = pathToFileURL(promptPage).href;
   const prompts = new Map();
@@ -37,13 +43,50 @@ function createBrowserPermissionPrompt({ BrowserWindow, ipcMain, promptPage, pre
   }
 
   function dismiss(parent) {
-    prompts.get(parent)?.finish("dismiss");
+    const current = prompts.get(parent);
+    current?.finish(appClosedChoice(current.kind));
   }
 
-  function show({ parent, origin, reload, getAnchorBounds, signal }) {
+  function show({
+    parent,
+    getAnchorBounds,
+    signal,
+    kind = "permission",
+    origin,
+    reload,
+    cookieImport,
+  }) {
     if (!parent || parent.isDestroyed() || signal.aborted) return Promise.resolve("dismiss");
-    dismiss(parent);
-    return new Promise((resolve) => {
+    if (kind === "security-key" && parent.webContents.isLoadingMainFrame?.()) {
+      return new Promise((resolve) => {
+        const finish = (choice) => {
+          parent.webContents.removeListener("did-stop-loading", ready);
+          parent.removeListener("closed", aborted);
+          signal.removeEventListener("abort", aborted);
+          resolve(choice);
+        };
+        const ready = () => finish("suppressed");
+        const aborted = () => finish("dismiss");
+        parent.webContents.once("did-stop-loading", ready);
+        parent.once("closed", aborted);
+        signal.addEventListener("abort", aborted, { once: true });
+      });
+    }
+    const current = prompts.get(parent);
+    // The advisory security-key notice yields to a permission decision; "suppressed" asks it
+    // to retry once that decision is made.
+    if (kind === "security-key" && current?.kind === "permission") {
+      return new Promise((resolve) => {
+        const abort = () => resolve("dismiss");
+        signal.addEventListener("abort", abort, { once: true });
+        void current.result.then(() => {
+          signal.removeEventListener("abort", abort);
+          resolve("suppressed");
+        });
+      });
+    }
+    current?.finish(appClosedChoice(current.kind));
+    const result = new Promise((resolve) => {
       const popup = new BrowserWindow({
         parent,
         frame: false,
@@ -71,20 +114,23 @@ function createBrowserPermissionPrompt({ BrowserWindow, ipcMain, promptPage, pre
       if (process.platform === "darwin") popup.excludedFromShownWindowsMenu = true;
       let finished = false;
       const close = () => finish("dismiss");
+      const hidden = () => finish(appClosedChoice(kind));
+      const failed = () => finish(kind === "security-key" ? "failed" : "dismiss");
       const position = () => {
         if (!parent.isDestroyed() && !popup.isDestroyed()) {
           popup.setBounds(promptBounds(parent.getContentBounds(), getAnchorBounds()));
         }
       };
       const onNavigation = (_event, _url, isInPlace, isMainFrame) => {
-        if (isMainFrame && !isInPlace) close();
+        if (isMainFrame && !isInPlace) hidden();
       };
       function finish(choice) {
         if (finished) return;
         finished = true;
         if (prompts.get(parent)?.window === popup) prompts.delete(parent);
         signal.removeEventListener("abort", close);
-        for (const event of ["closed", "hide", "minimize"]) parent.removeListener(event, close);
+        parent.removeListener("closed", close);
+        for (const event of ["hide", "minimize"]) parent.removeListener(event, hidden);
         for (const event of ["move", "resize"]) parent.removeListener(event, position);
         if (!parent.webContents.isDestroyed()) {
           parent.webContents.removeListener("did-start-navigation", onNavigation);
@@ -92,14 +138,20 @@ function createBrowserPermissionPrompt({ BrowserWindow, ipcMain, promptPage, pre
         if (!popup.isDestroyed()) popup.destroy();
         resolve(choice);
       }
-      prompts.set(parent, { window: popup, origin, reload, finish });
+      const info =
+        kind === "security-key"
+          ? { kind, origin, cookieImport: Boolean(cookieImport) }
+          : { kind, origin, reload: Boolean(reload) };
+      prompts.set(parent, { window: popup, kind, info, finish });
       signal.addEventListener("abort", close, { once: true });
-      for (const event of ["closed", "hide", "minimize"]) parent.on(event, close);
+      parent.on("closed", close);
+      for (const event of ["hide", "minimize"]) parent.on(event, hidden);
       for (const event of ["move", "resize"]) parent.on(event, position);
       parent.webContents.on("did-start-navigation", onNavigation);
       popup.on("closed", close);
-      popup.on("blur", close);
-      popup.webContents.on("render-process-gone", close);
+      // Keep advisory notices open when focus leaves the popup.
+      if (kind === "permission") popup.on("blur", close);
+      popup.webContents.on("render-process-gone", failed);
       popup.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
       popup.webContents.on("will-navigate", (event) => event.preventDefault());
       popup.webContents.on("will-frame-navigate", (event) => event.preventDefault());
@@ -110,19 +162,18 @@ function createBrowserPermissionPrompt({ BrowserWindow, ipcMain, promptPage, pre
         position();
         popup.show();
       });
-      void popup.loadFile(promptPage).catch(close);
+      void popup.loadFile(promptPage).catch(failed);
     });
+    if (prompts.has(parent)) prompts.get(parent).result = result;
+    return result;
   }
 
   function registerIpc() {
-    ipcMain.handle("omnigent:browser-permission-info", (event) => {
-      const { origin, reload } = forSender(event);
-      return { origin, reload };
-    });
+    ipcMain.handle("omnigent:browser-permission-info", (event) => forSender(event).info);
     ipcMain.handle("omnigent:browser-permission-choose", (event, choice) => {
       const request = forSender(event);
-      if (!CHOICES.has(choice)) throw new Error("Invalid permission choice");
-      request.finish(choice);
+      if (!CHOICES[request.kind].has(choice)) throw new Error("Invalid permission choice");
+      request.finish(choice === "failed" && request.kind === "permission" ? "dismiss" : choice);
     });
   }
 

@@ -1,4 +1,4 @@
-"""Offline native-host failures persist through the real API and browser."""
+"""Offline native-host refusals leave the real API and browser unconsumed."""
 
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ def _wait_until(predicate: Callable[[], bool], *, timeout: float = 30.0) -> None
         pytest.param(None, None, id="production-reconnect-grace", marks=pytest.mark.nightly),
     ],
 )
-def test_offline_native_host_preserves_failed_turn_and_retry(
+def test_offline_native_host_refuses_input_and_keeps_reconnect_action(
     page: Page,
     built_spa: None,
     mock_llm_server_url: str,
@@ -46,7 +46,7 @@ def test_offline_native_host_preserves_failed_turn_and_retry(
     runner_grace_s: float | None,
     host_grace_s: float | None,
 ) -> None:
-    """A stopped host yields actionable copy after grace, preserving input and retry.
+    """A stopped host refuses input after grace and keeps host recovery available.
 
     PR coverage uses short real waits; nightly retains the production budgets.
     """
@@ -144,12 +144,14 @@ def test_offline_native_host_preserves_failed_turn_and_retry(
             },
         )
         elapsed = time.monotonic() - started
-        assert response.status_code == 202, response.text
-        assert response.json()["queued"] is True
+        assert response.status_code == 503, response.text
+        error = response.json()["error"]
+        assert error["code"] == "runner_unavailable"
+        assert error["message"].startswith("The host for this session is offline.")
+        assert " host` (or reconnect it) and send the message again." in error["message"]
+        assert "will be sent" not in error["message"]
         expected_host_grace_s = 30.0 if host_grace_s is None else host_grace_s
-        expected_runner_grace_s = 10.0 if runner_grace_s is None else runner_grace_s
-        expected_waits = [("bound_runner", expected_runner_grace_s)] if runner_bound else []
-        expected_waits.append(("host_reconnect", expected_host_grace_s))
+        expected_waits = [("host_reconnect", expected_host_grace_s)]
         observed = [json.loads(line) for line in wait_trace.read_text().splitlines()]
         assert [(wait["name"], wait["timeout_s"]) for wait in observed] == expected_waits
         # Allow millisecond timer rounding when comparing expiry with monotonic time.
@@ -163,31 +165,45 @@ def test_offline_native_host_preserves_failed_turn_and_retry(
         assert minimum_elapsed <= elapsed < 90.0
 
         items = client.get(f"/v1/sessions/{session_id}/items").json()["data"]
-        errors = [item for item in items if item["type"] == "error"]
-        users = [item for item in items if item.get("role") == "user"]
-        assert len(users) == 1
-        assert users[0]["content"] == [{"type": "input_text", "text": marker}]
-        [error] = errors
-        assert error["code"] == "runner_failed_to_start"
-        assert error["message"].startswith("The host for this session is offline.")
-        assert " host` (or reconnect it) and send the message again." in error["message"]
-        assert "failed to start" not in error["message"]
-        assert f"Host {host_id} is offline; failing the send for session {session_id}" in (
+        assert not [item for item in items if item["type"] in {"message", "error"}]
+        snapshot = client.get(f"/v1/sessions/{session_id}").json()
+        assert snapshot["status"] != "failed"
+        assert not snapshot.get("pending_inputs")
+        assert f"Host {host_id} is offline; refusing the send for session {session_id}" in (
             stack.log_path("server").read_text()
         )
 
         page.goto(f"{stack.base_url}/c/{session_id}")
-        pill = page.get_by_test_id("error-pill")
-        expect(pill).to_be_visible(timeout=30_000)
-        expect(page.get_by_role("log").get_by_text(marker, exact=True)).to_be_visible()
-        expect(pill.get_by_role("button", name="Resume session")).to_be_visible()
-        pill.locator("button[aria-expanded]").click()
-        expect(page.get_by_test_id("error-message-content")).to_have_text(error["message"])
+        expect(page.get_by_test_id("composer-host-select")).to_be_visible(timeout=30_000)
+        expect(page.get_by_test_id("error-pill")).to_have_count(0)
+        expect(page.get_by_role("log").get_by_text(marker, exact=True)).to_have_count(0)
         page.reload()
-        expect(pill).to_be_visible(timeout=30_000)
-        expect(page.get_by_role("log").get_by_text(marker, exact=True)).to_be_visible()
-        pill.locator("button[aria-expanded]").click()
-        expect(page.get_by_test_id("error-message-content")).to_have_text(error["message"])
+        expect(page.get_by_test_id("composer-host-select")).to_be_visible(timeout=30_000)
+        expect(page.get_by_test_id("error-pill")).to_have_count(0)
+        expect(page.get_by_role("log").get_by_text(marker, exact=True)).to_have_count(0)
+
+        held = page.request.post(
+            f"{stack.base_url}/v1/sessions/{session_id}/events",
+            headers={"x-omnigent-hold-when-host-offline": "on"},
+            data={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": marker}]},
+            },
+            timeout=100_000,
+        )
+        assert held.status == 503, held.text()
+        assert held.json()["error"] == {
+            "code": "host_offline",
+            "message": (
+                "The host for this session is offline. "
+                "Your message will be sent when it reconnects."
+            ),
+        }
+        page.get_by_test_id("composer-host-select").click()
+        page.get_by_role("menuitem", name="Reconnect host", exact=True).click()
+        dialog = page.get_by_test_id("reconnect-session-dialog")
+        expect(dialog).to_be_visible()
+        expect(dialog.get_by_test_id("reconnect-session-command")).to_contain_text(" host")
 
         output = Path(request.config.getoption("--output"))
         output.mkdir(parents=True, exist_ok=True)
@@ -197,17 +213,12 @@ def test_offline_native_host_preserves_failed_turn_and_retry(
             full_page=True,
         )
 
-        with page.expect_response(
-            lambda result: (
-                result.request.method == "POST"
-                and result.url.endswith(f"/v1/sessions/{session_id}/events")
-                and result.request.post_data_json.get("type") == "retry_session"
-            ),
-            timeout=100_000,
-        ) as retry:
-            pill.get_by_role("button", name="Resume session").click()
-        assert retry.value.status == 503
-        expect(page.get_by_test_id("error-reconnecting")).not_to_be_visible(timeout=15_000)
-        expect(pill).to_be_visible()
+        retry = client.post(
+            f"/v1/sessions/{session_id}/events", json={"type": "retry_session", "data": {}}
+        )
+        assert retry.status_code == 503, retry.text
         after_retry = client.get(f"/v1/sessions/{session_id}/items").json()["data"]
         assert [item["id"] for item in after_retry] == [item["id"] for item in items]
+        snapshot = client.get(f"/v1/sessions/{session_id}").json()
+        assert snapshot["status"] != "failed"
+        assert not snapshot.get("pending_inputs")
