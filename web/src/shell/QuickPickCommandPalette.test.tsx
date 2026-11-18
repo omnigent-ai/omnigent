@@ -12,6 +12,7 @@ import {
 } from "@/store/paletteCommands";
 
 import { QuickPickCommandPalette } from "./QuickPickCommandPalette";
+import type * as ConversationsModule from "@/hooks/useConversations";
 
 // Behavior specific to the QuickPick palette; CommandPalette.quickPick.test.tsx runs
 // every shared CommandPalette case against it.
@@ -26,7 +27,8 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
 }));
 const useConversations = vi.fn();
 const useSessionSearch = vi.fn((..._args: unknown[]): unknown => ({ isFetching: false }));
-vi.mock("@/hooks/useConversations", () => ({
+vi.mock("@/hooks/useConversations", async (importOriginal) => ({
+  ...(await importOriginal<typeof ConversationsModule>()),
   useConversations: (...args: unknown[]) => useConversations(...args),
   useSessionSearch: (...args: unknown[]) => useSessionSearch(...args),
   useProjects: () => ({ data: [] }),
