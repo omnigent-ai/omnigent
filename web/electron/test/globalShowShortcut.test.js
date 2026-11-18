@@ -2,7 +2,12 @@ const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 
-const { acceleratorLabel, createGlobalShowShortcut } = require("../src/globalShowShortcut");
+const {
+  GLOBAL_SHORTCUTS,
+  acceleratorLabel,
+  createGlobalShortcuts,
+  createGlobalShowShortcut,
+} = require("../src/globalShowShortcut");
 
 /**
  * A settings store and a fake GlobalShortcut. `refused` chords make register
@@ -385,6 +390,81 @@ describe("recording a chord", () => {
     contents.emit("destroyed");
     assert.equal(await closed, null);
     assert.equal(contents.listenerCount("before-input-event"), 0);
+  });
+});
+
+describe("createGlobalShortcuts", () => {
+  /** Both shortcuts over one settings store and one fake GlobalShortcut. */
+  function shortcuts(settings = {}) {
+    let stored = structuredClone(settings);
+    const live = new Set();
+    const built = createGlobalShortcuts({
+      globalShortcut: {
+        register: (accelerator) => {
+          live.add(accelerator);
+          return true;
+        },
+        unregister: (accelerator) => live.delete(accelerator),
+      },
+      loadSettings: () => structuredClone(stored),
+      saveSettings: (next) => {
+        stored = structuredClone(next);
+      },
+      isMac: true,
+      presses: { show: () => {}, floatingComposer: () => {} },
+    });
+    return { ...built, saved: () => stored, registered: () => [...live] };
+  }
+
+  it("keeps each shortcut under its own settings key", () => {
+    const keys = Object.values(GLOBAL_SHORTCUTS).map((definition) => definition.settingKey);
+    assert.equal(new Set(keys).size, keys.length);
+    assert.equal(GLOBAL_SHORTCUTS.show.settingKey, "global_shortcut");
+    assert.throws(
+      () => createGlobalShowShortcut({ id: "unknown", show: () => {} }),
+      /Unknown global shortcut/,
+    );
+  });
+
+  it("saving one shortcut leaves the other's setting as it was", async () => {
+    const show = { enabled: true, accelerator: "Command+Shift+K" };
+    const s = shortcuts({ global_shortcut: show });
+    assert.deepEqual(s.floatingComposer.current(), {
+      enabled: true,
+      accelerator: "CommandOrControl+Shift+Space",
+    });
+    assert.equal((await s.floatingComposer.set({ enabled: false })).ok, true);
+    assert.deepEqual(s.saved().global_shortcut, show);
+    assert.deepEqual(s.saved().floating_composer_shortcut, {
+      enabled: false,
+      accelerator: "CommandOrControl+Shift+Space",
+    });
+    assert.deepEqual(s.show.current(), show);
+  });
+
+  it("refuses a chord another shortcut holds, before asking and without saving", async () => {
+    const s = shortcuts();
+    s.floatingComposer.apply();
+    let asked = false;
+    const result = await s.show.set(
+      { enabled: true, accelerator: "CommandOrControl+Shift+Space" },
+      async () => (asked = true),
+    );
+    assert.equal(result.ok, false);
+    assert.match(result.error, /Another Omnigent shortcut/);
+    assert.equal(asked, false);
+    assert.equal(s.saved().global_shortcut, undefined);
+  });
+
+  it("lets a chord the user saved win over another shortcut's default", () => {
+    const s = shortcuts({
+      global_shortcut: { enabled: true, accelerator: "CommandOrControl+Shift+Space" },
+    });
+    s.show.apply();
+    s.floatingComposer.apply();
+    assert.deepEqual(s.registered(), ["CommandOrControl+Shift+Space"]);
+    assert.match(s.floatingComposer.current().error, /Another Omnigent shortcut/);
+    assert.equal(s.show.current().error, undefined);
   });
 });
 

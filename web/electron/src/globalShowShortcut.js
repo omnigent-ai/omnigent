@@ -1,13 +1,29 @@
 "use strict";
 
-// Optional system-wide shortcut that brings the app to the front from any app.
-// Off by default. The chord stays in settings.json while the shortcut is off.
+// The shell's system-wide shortcuts, such as the optional one that brings the app to the
+// front from any app. A chord stays in settings.json while its shortcut is off.
 
-/** settings.json key: `{ enabled, accelerator }`. */
-const GLOBAL_SHORTCUT_SETTING = "global_shortcut";
-const DEFAULT_ACCELERATOR = "Alt+Space";
+/**
+ * Every system-wide shortcut, by id. Callers name a shortcut by id, never by its settings.json
+ * key, so two shortcuts can't overwrite each other's `{ enabled, accelerator }`.
+ */
+const GLOBAL_SHORTCUTS = Object.freeze({
+  show: Object.freeze({
+    settingKey: "global_shortcut",
+    defaultAccelerator: "Alt+Space",
+    defaultEnabled: false,
+  }),
+  floatingComposer: Object.freeze({
+    settingKey: "floating_composer_shortcut",
+    defaultAccelerator: "CommandOrControl+Shift+Space",
+    defaultEnabled: true,
+  }),
+});
 const UNAVAILABLE_ERROR =
   "Couldn't use that shortcut. It may be invalid or already in use by another app.";
+const CLAIMED_ERROR = "Another Omnigent shortcut already uses that chord. Choose a different one.";
+const NOT_WORKING_ERROR =
+  "This shortcut isn't working. Another app may be using it, so choose a different one.";
 const SAVE_ERROR = "Couldn't save the shortcut. Try again.";
 
 const NAMED_KEYS = new Map([
@@ -55,29 +71,52 @@ function acceleratorFromInput(input, isMac) {
 
 /**
  * @param {{
+ *   id?: keyof typeof GLOBAL_SHORTCUTS,
  *   globalShortcut: Electron.GlobalShortcut,
  *   loadSettings: () => Record<string, unknown>,
  *   saveSettings: (settings: Record<string, unknown>) => void,
  *   show: () => void,
  *   isMac: boolean,
- * }} deps
+ *   claimedElsewhere?: (accelerator: string) => boolean,
+ * }} deps `claimedElsewhere` says whether another of the shell's shortcuts holds a chord.
  */
-function createGlobalShowShortcut({ globalShortcut, loadSettings, saveSettings, show, isMac }) {
+function createGlobalShowShortcut({
+  id = "show",
+  globalShortcut,
+  loadSettings,
+  saveSettings,
+  show,
+  isMac,
+  claimedElsewhere = () => false,
+}) {
+  const definition = GLOBAL_SHORTCUTS[id];
+  if (!definition) throw new Error(`Unknown global shortcut: ${id}`);
   /** @type {string | null} */
   let registeredAccelerator = null;
-  // The saved shortcut is on, but its chord didn't register at launch (another app may hold it).
-  let launchRegistrationFailed = false;
+  // Why the saved shortcut is on but its chord didn't register at launch, else null.
+  /** @type {string | null} */
+  let launchError = null;
 
   /** @returns {{ enabled: boolean, accelerator: string }} */
   function saved() {
-    const stored = loadSettings()[GLOBAL_SHORTCUT_SETTING];
+    const stored = loadSettings()[definition.settingKey];
     return {
-      enabled: stored?.enabled === true,
+      enabled: typeof stored?.enabled === "boolean" ? stored.enabled : definition.defaultEnabled,
       accelerator:
         typeof stored?.accelerator === "string" && stored.accelerator !== ""
           ? stored.accelerator
-          : DEFAULT_ACCELERATOR,
+          : definition.defaultAccelerator,
     };
+  }
+
+  /**
+   * Whether this shortcut holds `accelerator`: registered now, or saved as on. An unsaved
+   * default claims nothing, so a chord the user chose elsewhere wins over it.
+   */
+  function claims(accelerator) {
+    if (registeredAccelerator === accelerator) return true;
+    const stored = loadSettings()[definition.settingKey];
+    return stored?.enabled === true && stored.accelerator === accelerator;
   }
 
   /**
@@ -87,11 +126,8 @@ function createGlobalShowShortcut({ globalShortcut, loadSettings, saveSettings, 
    */
   function current() {
     const setting = saved();
-    if (!launchRegistrationFailed || !setting.enabled) return setting;
-    return {
-      ...setting,
-      error: "This shortcut isn't working. Another app may be using it, so choose a different one.",
-    };
+    if (launchError === null || !setting.enabled) return setting;
+    return { ...setting, error: launchError };
   }
 
   function unregister() {
@@ -119,7 +155,9 @@ function createGlobalShowShortcut({ globalShortcut, loadSettings, saveSettings, 
   function apply() {
     unregister();
     const { enabled, accelerator } = saved();
-    launchRegistrationFailed = enabled && !register(accelerator);
+    if (!enabled) launchError = null;
+    else if (claimedElsewhere(accelerator)) launchError = CLAIMED_ERROR;
+    else launchError = register(accelerator) ? null : NOT_WORKING_ERROR;
   }
 
   /**
@@ -140,6 +178,7 @@ function createGlobalShowShortcut({ globalShortcut, loadSettings, saveSettings, 
     if (typeof change?.accelerator !== "string") return turnOff();
     const on = change.enabled === true;
     const { accelerator } = change;
+    if (claimedElsewhere(accelerator)) return { ok: false, error: CLAIMED_ERROR };
     const needsApproval = accelerator !== registeredAccelerator;
     if (needsApproval && !(await approve?.(accelerator))) {
       return { ok: false, error: "The shortcut wasn't changed." };
@@ -158,7 +197,7 @@ function createGlobalShowShortcut({ globalShortcut, loadSettings, saveSettings, 
     if (previous !== null && (previous !== accelerator || !on)) unregister();
     if (on) registeredAccelerator = accelerator;
     else if (candidate) globalShortcut.unregister(accelerator);
-    launchRegistrationFailed = false;
+    launchError = null;
     return { ok: true, setting };
   }
 
@@ -170,7 +209,7 @@ function createGlobalShowShortcut({ globalShortcut, loadSettings, saveSettings, 
     const setting = { enabled: false, accelerator: saved().accelerator };
     if (!store(setting)) return { ok: false, error: SAVE_ERROR };
     unregister();
-    launchRegistrationFailed = false;
+    launchError = null;
     return { ok: true, setting };
   }
 
@@ -178,7 +217,7 @@ function createGlobalShowShortcut({ globalShortcut, loadSettings, saveSettings, 
   function store(setting) {
     try {
       const settings = loadSettings();
-      settings[GLOBAL_SHORTCUT_SETTING] = setting;
+      settings[definition.settingKey] = setting;
       saveSettings(settings);
       return true;
     } catch (err) {
@@ -241,7 +280,31 @@ function createGlobalShowShortcut({ globalShortcut, loadSettings, saveSettings, 
     stopRecording?.();
   }
 
-  return { current, apply, set, record, cancelRecording };
+  return { current, apply, set, record, cancelRecording, claims };
+}
+
+/**
+ * The shell's shortcuts by id, each pressing its own action, built together so none can take
+ * a chord another holds.
+ *
+ * @param {Omit<Parameters<typeof createGlobalShowShortcut>[0], "id" | "show" | "claimedElsewhere">
+ *   & { presses: Partial<Record<keyof typeof GLOBAL_SHORTCUTS, () => void>> }} deps
+ */
+function createGlobalShortcuts({ presses, ...deps }) {
+  /** @type {Record<string, ReturnType<typeof createGlobalShowShortcut>>} */
+  const shortcuts = {};
+  for (const [id, show] of Object.entries(presses)) {
+    shortcuts[id] = createGlobalShowShortcut({
+      ...deps,
+      id,
+      show,
+      claimedElsewhere: (accelerator) =>
+        Object.entries(shortcuts).some(
+          ([other, shortcut]) => other !== id && shortcut.claims(accelerator),
+        ),
+    });
+  }
+  return shortcuts;
 }
 
 /** The chord as the user reads it: ⌃⌥⇧⌘ glyphs on macOS, `Ctrl+Alt+Space` elsewhere. */
@@ -251,4 +314,9 @@ function acceleratorLabel(accelerator, isMac) {
   return parts.map((part) => (part === "Control" ? "Ctrl" : part)).join("+");
 }
 
-module.exports = { acceleratorLabel, createGlobalShowShortcut };
+module.exports = {
+  GLOBAL_SHORTCUTS,
+  acceleratorLabel,
+  createGlobalShortcuts,
+  createGlobalShowShortcut,
+};
