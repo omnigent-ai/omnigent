@@ -284,6 +284,41 @@ class AccountMergeFacet(Protocol):
         ...
 
 
+@dataclass(frozen=True)
+class PullRequestStatus:
+    """A PR's title, state and draft flag from one lookup.
+
+    :ivar title: The stripped, non-empty title, or ``None``.
+    :ivar state: ``"OPEN"``, ``"MERGED"`` or ``"CLOSED"``, or ``None`` when the
+        forge's answer had a title but no state it recognizes.
+    :ivar is_draft: Whether the PR is a draft.
+    """
+
+    title: str | None
+    state: str | None
+    is_draft: bool
+
+
+@runtime_checkable
+class PullRequestStatusFacet(Protocol):
+    """Optional lookup of a PR's state along with its title.
+
+    When a provider has it, title refreshes use it instead of
+    :meth:`PullRequestFacet.pr_title`, so the server learns every tracked PR's
+    state, not only the selected one's.
+    """
+
+    def pr_status(
+        self, root: str, reference: PullRequestRef, deadline: float
+    ) -> tuple[PullRequestStatus | None, bool]:
+        """Look up one PR's title, state and draft flag, giving up at ``deadline``. Never raises.
+
+        :returns: ``(status, timed_out)``, as :meth:`PullRequestFacet.pr_title` returns
+            ``(title, timed_out)``; ``status`` is ``None`` when the lookup failed.
+        """
+        ...
+
+
 @runtime_checkable
 class CommitCompareFacet(Protocol):
     """Optional changes after one PR commit, up to the head, beside :class:`CommitsFacet`.

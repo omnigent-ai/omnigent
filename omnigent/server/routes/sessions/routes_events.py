@@ -1321,6 +1321,42 @@ def register_events_routes(
 
     pull_request_store = server_prs.open_store(conversation_store)
 
+    async def _end_run_pull_request_turn(
+        app: Any, session_id: str, labels: Mapping[str, str]
+    ) -> None:
+        """End the run's PR attribution because a person wrote to the session.
+
+        Also for a session the automation created, whose run label stays for its
+        journal. A prompt still being dispatched keeps its run unless that run
+        finished or its pending stamp went stale, as when clearing the label.
+        """
+        run_id = labels.get(SCHEDULED_TASK_RUN_LABEL_KEY)
+        if not run_id or pull_request_store is None:
+            return
+        run_finished = False
+        if SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX + run_id in labels:
+            scheduled_store = getattr(getattr(app, "state", None), "scheduled_task_store", None)
+            run = (
+                await asyncio.to_thread(scheduled_store.get_run, run_id)
+                if scheduled_store is not None
+                else None
+            )
+            run_finished = run is not None and run.status not in {
+                "scheduled",
+                "starting",
+                "running",
+            }
+        try:
+            await asyncio.to_thread(
+                pull_request_store.end_run_turn, session_id, run_id, run_finished=run_finished
+            )
+        except Exception:  # PR attribution must not block the message.
+            _logger.warning(
+                "Could not end a run's pull request attribution",
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+
     async def _store_reported_pull_requests(session_id: str, body: SessionEventInput) -> None:
         """Merge the PRs a runner discovered; the runner retries until this succeeds."""
         if pull_request_store is None:
@@ -1487,18 +1523,21 @@ def register_events_routes(
             )
         start_fire_stage("input_validation", session_id=session_id)
         peer_message = body.type == "session_message"
-        interactive_run_id = (
-            conv.labels.get(SCHEDULED_TASK_RUN_LABEL_KEY)
-            if isinstance(request, Request)
+        # A person writing to the session, not an agent, workflow or runner.
+        human_input = (
+            isinstance(request, Request)
             and not peer_message
             and body.workflow_run_id is None
             and not request.headers.get(ORCHESTRATION_SOURCE_HEADER)
             and not request.headers.get(RUNNER_TUNNEL_TOKEN_HEADER)
-            and not conv.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY)
             and (
                 (body.type == "message" and body.data.get("role", "user") == "user")
                 or body.type == _SLASH_COMMAND_TYPE
             )
+        )
+        interactive_run_id = (
+            conv.labels.get(SCHEDULED_TASK_RUN_LABEL_KEY)
+            if human_input and not conv.labels.get(SCHEDULED_TASK_ORIGIN_LABEL_KEY)
             else None
         )
         if peer_message:
@@ -2627,6 +2666,13 @@ def register_events_routes(
             )
             return {"queued": False, "item_id": item_id}
         if body.type == _EXTERNAL_CONVERSATION_ITEM_TYPE:
+
+            async def _direct_input() -> None:
+                # Typed in a native terminal; read the label as the item lands.
+                current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+                labels = current.labels if current is not None else conv.labels if conv else {}
+                await _end_run_pull_request_turn(getattr(request, "app", None), session_id, labels)
+
             item_id = await _persist_external_conversation_item(
                 session_id,
                 conv,
@@ -2635,6 +2681,7 @@ def register_events_routes(
                 created_by=created_by,
                 background_title_coordinator=background_title_coordinator,
                 enabled=background_session_titles_enabled(request.headers),
+                on_direct_input=_direct_input,
             )
             return {"queued": False, "item_id": item_id}
         if body.type == _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE:
@@ -3873,6 +3920,8 @@ def register_events_routes(
         if refreshed_conv is None:
             raise _session_not_found()
         conv = refreshed_conv
+        if human_input:
+            await _end_run_pull_request_turn(request.app, session_id, conv.labels)
         # A human's next turn ends attribution from an earlier continuation.
         # Leave a newer fire or a prompt still being dispatched untouched.
         pending_run_finished = False
