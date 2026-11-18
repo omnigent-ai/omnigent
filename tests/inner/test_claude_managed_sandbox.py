@@ -29,11 +29,6 @@ _MANAGED_FILES = (
 )
 
 
-@pytest.fixture(autouse=True)
-def isolated_managed_preferences(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(claude_model_access, "_claude_managed_preferences_paths", lambda: ())
-
-
 @pytest.fixture
 def isolated_managed_discovery(
     monkeypatch: pytest.MonkeyPatch,

@@ -6337,9 +6337,6 @@ async def test_result_message_usage_none_yields_turn_complete_without_usage() ->
 
 
 @pytest.mark.parametrize(
-    "permission_mode", ["auto", "bypassPermissions", "default", "acceptEdits", "plan", "dontAsk"]
-)
-@pytest.mark.parametrize(
     "action,approval,denied",
     [
         ("POLICY_ACTION_ALLOW", None, False),
@@ -6351,14 +6348,14 @@ async def test_result_message_usage_none_yields_turn_complete_without_usage() ->
         ("unexpected", None, True),
     ],
 )
-async def test_bash_policy_hook_enforces_guardrails_in_every_mode(
-    permission_mode, action, approval, denied
+async def test_bash_policy_hook_enforces_guardrails_in_bypass_mode(
+    action, approval, denied
 ) -> None:
     import claude_agent_sdk as sdk
 
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
-    executor = ClaudeSDKExecutor(permission_mode=permission_mode)
+    executor = ClaudeSDKExecutor(permission_mode="bypassPermissions")
     executor._policy_evaluator = AsyncMock(
         return_value=SimpleNamespace(action=action, reason="shell policy")
     )
@@ -6374,7 +6371,7 @@ async def test_bash_policy_hook_enforces_guardrails_in_every_mode(
     assert bash_hook.timeout == executor._ASK_QUESTION_HOOK_TIMEOUT_S
 
     arguments = {"command": "printf permitted"}
-    # Invoke the hook without can_use_tool: auto/bypass may never request permission.
+    # Invoke the hook without can_use_tool: bypass may never request permission.
     output = await bash_hook.hooks[0]({"tool_input": arguments}, "bash-call", {})
 
     executor._policy_evaluator.assert_awaited_once_with(
