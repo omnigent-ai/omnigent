@@ -1,4 +1,8 @@
-import type { ClipboardEvent } from "react";
+import {
+  isComposerTextarea,
+  type ComposerPasteEvent,
+  type ComposerTextTarget,
+} from "@/components/composer/engine/composerInput";
 import { createTextFieldMirror } from "@/lib/textFieldMirror";
 
 /**
@@ -7,11 +11,17 @@ import { createTextFieldMirror } from "@/lib/textFieldMirror";
  * covers environments without them.
  */
 export function insertComposerText(
-  textarea: HTMLTextAreaElement,
+  target: ComposerTextTarget,
   text: string,
-  start = textarea.selectionStart,
-  end = textarea.selectionEnd,
+  start = target.selectionStart,
+  end = target.selectionEnd,
 ) {
+  if (!isComposerTextarea(target)) {
+    target.insertText(text, start, end);
+    target.revealCaret();
+    return;
+  }
+  const textarea = target;
   textarea.setSelectionRange(start, end);
   const inserted =
     typeof document.execCommand === "function" &&
@@ -59,7 +69,7 @@ const MAX_INSERTED_PASTE_LINES = 100;
  * dictation or snippet tool restores the clipboard right after its paste; the
  * event's own data is read before that. Returns false when the paste stays native.
  */
-export function insertPastedText(event: ClipboardEvent<HTMLTextAreaElement>): boolean {
+export function insertPastedText(event: ComposerPasteEvent): boolean {
   const text = event.clipboardData.getData("text/plain").replace(/\r\n?/g, "\n");
   if (!text || text.split("\n", MAX_INSERTED_PASTE_LINES + 1).length > MAX_INSERTED_PASTE_LINES) {
     return false;

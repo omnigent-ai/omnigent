@@ -87,6 +87,7 @@ function composerCard({
     >
       <textarea
         aria-label="Message the agent"
+        data-composer-input=""
         defaultValue={text}
         data-has-draft={hasDraft ? "true" : undefined}
       />

@@ -193,6 +193,7 @@ vi.mock("@/components/chat/SideChatPane", () => ({
       <>
         <textarea
           aria-label="Message"
+          data-composer-input=""
           disabled={fixture.composerDisabled}
           onKeyDown={(event) => {
             if (event.key === "Tab" && event.shiftKey && gridComposer?.cyclePermissionMode?.())
