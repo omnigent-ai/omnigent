@@ -91,8 +91,10 @@ describe("describeWorkflowRun", () => {
     const launching = { ...run({}), sandboxLaunching: true };
     expect(isWorkflowRunWorking(launching)).toBe(true);
     expect(describeWorkflowRun(launching)).toEqual({ kind: "running", label: "0 of 5 done" });
-    // A failed launch fails the session instead.
-    expect(describeWorkflowRun(run({}, "failed")).kind).toBe("failed");
+    // A failed launch ends the launch and fails the session.
+    const failed = { ...launching, sandboxLaunching: false, sessionStatus: "failed" as const };
+    expect(isWorkflowRunWorking(failed)).toBe(false);
+    expect(describeWorkflowRun(failed).label).toBe("Session failed · 0 of 5 done");
     expect(isWorkflowRunWorking({ ...launching, isCurrent: false })).toBe(false);
   });
 

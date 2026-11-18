@@ -32,6 +32,7 @@ import { ApiError, getSession, sendUserMessage } from "@/lib/sessionsApi";
 import { taskActionMessage } from "@/lib/workflow";
 import type * as SessionsApi from "@/lib/sessionsApi";
 import { useChatStore } from "@/store/chatStore";
+import { conversationRegistry } from "@/store/conversationRegistry";
 import { openTasksTab } from "@/store/sessionTasksActions";
 import type * as TasksActions from "@/store/sessionTasksActions";
 import type { WorkflowStep } from "@/lib/workflowGraphLayout";
@@ -1431,6 +1432,18 @@ describe("WorkflowDetailPage", () => {
     expect(within(row).getByTestId("workflow-run-state")).toHaveTextContent("0 of 2 done");
     expect(within(row).getByRole("button", { name: "Stop" })).toBeInTheDocument();
     expect(within(row).queryByTestId("plan-continue")).toBeNull();
+
+    // A failed launch streamed here ends the run's launch before the run list refreshes.
+    try {
+      act(() =>
+        conversationRegistry
+          .acquire(session)
+          .setState({ sandboxStatus: { stage: "failed", error: "No capacity" } }),
+      );
+      expect(row).toHaveAttribute("data-run-state", "stopped");
+    } finally {
+      act(() => conversationRegistry.clear());
+    }
 
     mockRuns([{ ...launching, sandboxLaunching: false, sessionStatus: "failed" }]);
     rerender(<WorkflowDetailPage />);
