@@ -5179,12 +5179,24 @@ export function ConversationMenuItems({
             setView(target);
           }}
         >
+          {target === "projects" ? (
+            <FolderIcon aria-hidden className="size-3.5" />
+          ) : (
+            <ListChevronsUpDownIcon aria-hidden className="size-3.5" />
+          )}
           {target === "projects" ? "Projects" : "Nests"}
           <ChevronRightIcon className="ml-auto size-3.5" />
         </C.Item>
       ) : (
         <C.Sub key={target}>
-          <C.SubTrigger>{target === "projects" ? "Projects" : "Nests"}</C.SubTrigger>
+          <C.SubTrigger>
+            {target === "projects" ? (
+              <FolderIcon aria-hidden className="size-3.5" />
+            ) : (
+              <ListChevronsUpDownIcon aria-hidden className="size-3.5" />
+            )}
+            {target === "projects" ? "Projects" : "Nests"}
+          </C.SubTrigger>
           <C.SubContent className="min-w-56">{picker(target)}</C.SubContent>
         </C.Sub>
       ),
