@@ -11,6 +11,7 @@
 		B10000000000000000000002 /* AppRootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000002 /* AppRootView.swift */; };
 		B10000000000000000000003 /* ConnectView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000003 /* ConnectView.swift */; };
 		B10000000000000000000004 /* DesignTokens.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000004 /* DesignTokens.swift */; };
+		B1000000000000000000002A /* WelcomeBlobBackground.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000000000000000000002A /* WelcomeBlobBackground.swift */; };
 		B10000000000000000000005 /* SettingsStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000005 /* SettingsStore.swift */; };
 		B10000000000000000000006 /* ServerURL.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000006 /* ServerURL.swift */; };
 		B10000000000000000000014 /* DeepLink.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000014 /* DeepLink.swift */; };
@@ -101,6 +102,7 @@
 		A10000000000000000000002 /* AppRootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppRootView.swift; sourceTree = "<group>"; };
 		A10000000000000000000003 /* ConnectView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectView.swift; sourceTree = "<group>"; };
 		A10000000000000000000004 /* DesignTokens.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesignTokens.swift; sourceTree = "<group>"; };
+		A1000000000000000000002A /* WelcomeBlobBackground.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WelcomeBlobBackground.swift; sourceTree = "<group>"; };
 		A10000000000000000000005 /* SettingsStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsStore.swift; sourceTree = "<group>"; };
 		A10000000000000000000006 /* ServerURL.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerURL.swift; sourceTree = "<group>"; };
 		A10000000000000000000014 /* DeepLink.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeepLink.swift; sourceTree = "<group>"; };
@@ -227,6 +229,7 @@
 				A10000000000000000000002 /* AppRootView.swift */,
 				A10000000000000000000003 /* ConnectView.swift */,
 				A10000000000000000000004 /* DesignTokens.swift */,
+				A1000000000000000000002A /* WelcomeBlobBackground.swift */,
 				A10000000000000000000005 /* SettingsStore.swift */,
 				A10000000000000000000006 /* ServerURL.swift */,
 				A10000000000000000000014 /* DeepLink.swift */,
@@ -455,6 +458,7 @@
 				B10000000000000000000002 /* AppRootView.swift in Sources */,
 				B10000000000000000000003 /* ConnectView.swift in Sources */,
 				B10000000000000000000004 /* DesignTokens.swift in Sources */,
+				B1000000000000000000002A /* WelcomeBlobBackground.swift in Sources */,
 				B10000000000000000000005 /* SettingsStore.swift in Sources */,
 				B10000000000000000000006 /* ServerURL.swift in Sources */,
 				B10000000000000000000014 /* DeepLink.swift in Sources */,
