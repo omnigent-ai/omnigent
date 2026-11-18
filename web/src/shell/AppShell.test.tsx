@@ -3122,57 +3122,103 @@ describe("Session overview", () => {
     if (workspace === "open") await waitFor(() => expect(railOpenState()).toBe("open"));
   }
 
-  const overview = () => screen.queryByRole("complementary", { name: "Session overview" });
+  const docked = () => screen.queryByRole("complementary", { name: "Session overview" });
+  const popover = () => screen.queryByRole("dialog", { name: "Session overview" });
 
   it("adds nothing with the flag off", async () => {
     setWideViewport(true);
     await renderOverviewShell(false, "collapsed");
 
     expect(screen.queryByTestId("header-session-cost")).toBeNull();
-    expect(overview()).toBeNull();
+    expect(docked()).toBeNull();
   });
 
-  it("docks beside chat in a wide window and keeps each placement's choice", async () => {
+  it("docks beside the right-panel toggle and keeps each placement's choice", async () => {
     setWideViewport(true);
     await renderOverviewShell(true, "collapsed");
     const chip = () => screen.getByTestId("header-session-cost");
+    const header = document.querySelector<HTMLElement>("header.chat-header")!;
 
-    expect(chip()).toHaveAttribute("aria-pressed", "true");
-    expect(overview()).toBeInTheDocument();
-    expect(screen.getByRole("main")).not.toContainElement(overview());
+    const headerButtons = within(header).getAllByRole("button");
+    expect(headerButtons.at(-2)).toBe(chip());
+    expect(headerButtons.at(-1)).toHaveAccessibleName("Expand right panel");
+    expect(chip()).toHaveAttribute("aria-expanded", "true");
+    expect(docked()).toBeInTheDocument();
+    expect(screen.getByRole("main")).not.toContainElement(docked());
     fireEvent.click(chip());
-    expect(chip()).toHaveAttribute("aria-pressed", "false");
-    expect(overview()).toBeNull();
+    expect(chip()).toHaveAttribute("aria-expanded", "false");
+    expect(docked()).toBeNull();
 
-    // The open workspace switches to the overlay, which starts hidden.
+    // The open workspace switches to the popover, which starts hidden.
     fireEvent.click(screen.getByRole("button", { name: "Expand right panel" }));
     await waitFor(() => expect(railOpenState()).toBe("open"));
-    expect(overview()).toBeNull();
+    expect(popover()).toBeNull();
     fireEvent.click(chip());
-    expect(screen.getByRole("main")).toContainElement(overview());
+    expect(popover()).toBeInTheDocument();
+    expect(docked()).toBeNull();
 
     // Collapsing it docks again, keeping the docked card hidden.
     fireEvent.click(screen.getByRole("button", { name: "Collapse right panel" }));
     await waitFor(() => expect(railOpenState()).toBe("closed"));
-    expect(chip()).toHaveAttribute("aria-pressed", "false");
-    expect(overview()).toBeNull();
+    expect(chip()).toHaveAttribute("aria-expanded", "false");
+    expect(docked()).toBeNull();
+    expect(popover()).toBeNull();
+
+    // A reload keeps the hand-closed card closed, and reopening it is remembered too.
+    cleanup();
+    await renderOverviewShell(true, "collapsed");
+    expect(docked()).toBeNull();
+    fireEvent.click(chip());
+    expect(docked()).toBeInTheDocument();
+    cleanup();
+    await renderOverviewShell(true, "collapsed");
+    expect(docked()).toBeInTheDocument();
+  });
+
+  it("toggles the docked card when its choice can't be stored", async () => {
+    setWideViewport(true);
+    const key = "omnigent:session-overview-docked";
+    localStorage.setItem(key, "closed");
+    // Fail only this key's writes and removals; the shell stores other preferences too.
+    for (const method of ["setItem", "removeItem"] as const) {
+      const original = Storage.prototype[method];
+      const failing = vi.spyOn(Storage.prototype, method).mockImplementation(function (
+        this: Storage,
+        ...args: [string, string]
+      ) {
+        if (args[0] === key) throw new DOMException("Storage is full", "QuotaExceededError");
+        return original.apply(this, args);
+      });
+      onTestFinished(() => failing.mockRestore());
+    }
+    await renderOverviewShell(true, "collapsed");
+    const chip = () => screen.getByTestId("header-session-cost");
+
+    expect(docked()).toBeNull();
+    fireEvent.click(chip());
+    expect(docked()).toBeInTheDocument();
+    fireEvent.click(within(docked()!).getByRole("button", { name: "Hide session overview" }));
+    expect(docked()).toBeNull();
+    expect(localStorage.getItem(key)).toBe("closed");
   });
 
   it.each([
     ["a narrow window", false, "collapsed"],
     ["an open workspace", true, "open"],
-  ] as const)("starts hidden with %s and opens over chat", async (_, wide, workspace) => {
+  ] as const)("starts hidden with %s and opens as a popover", async (_, wide, workspace) => {
     setWideViewport(wide);
     await renderOverviewShell(true, workspace);
 
-    const toggle = screen.getByTestId("header-session-cost");
-    expect(toggle).toHaveAttribute("aria-pressed", "false");
-    expect(overview()).toBeNull();
-    fireEvent.click(toggle);
-    expect(toggle).toHaveAttribute("aria-pressed", "true");
-    expect(screen.getByRole("main")).toContainElement(overview());
-    fireEvent.click(screen.getByRole("button", { name: "Hide session overview" }));
-    expect(overview()).toBeNull();
+    const chip = screen.getByTestId("header-session-cost");
+    expect(chip).toHaveAttribute("aria-expanded", "false");
+    expect(popover()).toBeNull();
+    fireEvent.click(chip);
+    expect(chip).toHaveAttribute("aria-expanded", "true");
+    expect(popover()).toBeInTheDocument();
+    expect(docked()).toBeNull();
+    fireEvent.click(within(popover()!).getByRole("button", { name: "Hide session overview" }));
+    expect(popover()).toBeNull();
+    expect(chip).toHaveAttribute("aria-expanded", "false");
   });
 });
 

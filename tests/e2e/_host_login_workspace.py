@@ -21,6 +21,10 @@ ACCESS_TOKEN = "local-onboarding-access-token"
 MOUNT = "/api/2.0/omnigent"
 
 
+def write_pat_profile(path: Path, workspace_url: str, token: str) -> None:
+    path.write_text(f"[local-test]\nhost = {workspace_url}\nauth_type = pat\ntoken = {token}\n")
+
+
 class HostLoginWorkspace(AbstractContextManager):
     """Serve mock OAuth over TLS and forward authenticated traffic to a real server."""
 
@@ -56,6 +60,11 @@ class HostLoginWorkspace(AbstractContextManager):
         self.authorizations = 0
         self.token_exchanges = 0
         self.authenticated_requests: list[str] = []
+        self.edge_log: list[dict[str, object]] = []
+        self.accepted_tokens = {ACCESS_TOKEN}
+        self.revocations = 0
+        self._next_token = ACCESS_TOKEN
+        self._lock = threading.Lock()
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), _WorkspaceHandler)
         self.server.daemon_threads = True
         self.server.workspace = self
@@ -66,6 +75,40 @@ class HostLoginWorkspace(AbstractContextManager):
         self.url = f"https://127.0.0.1:{self.server.server_port}"
         self.server_url = self.url + MOUNT
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def seed_login(self, home: Path) -> None:
+        """Store a login for this edge and a matching ``local-test`` PAT profile under ``home``."""
+        data = home / ".omnigent"
+        data.mkdir(parents=True)
+        login = {
+            "auth_type": "databricks",
+            "workspace_host": self.url,
+            "org_id": WORKSPACE_ID,
+            "user_id": USER_EMAIL,
+        }
+        (data / "auth_tokens.json").write_text(json.dumps({self.server_url: login}))
+        write_pat_profile(home / ".databrickscfg", self.url, ACCESS_TOKEN)
+
+    def revoke_issued_tokens(self) -> None:
+        """Reject every access token issued so far; later grants mint new accepted tokens."""
+        with self._lock:
+            self.revocations += 1
+            self.accepted_tokens.clear()
+            self._next_token = f"{ACCESS_TOKEN}-{self.revocations}"
+
+    def issue_token(self) -> str:
+        with self._lock:
+            self.accepted_tokens.add(self._next_token)
+            return self._next_token
+
+    def accepts(self, authorization: str | None) -> bool:
+        scheme, _, token = (authorization or "").partition(" ")
+        with self._lock:
+            return scheme == "Bearer" and token in self.accepted_tokens
+
+    def record(self, method: str, path: str, status: int | str) -> None:
+        with self._lock:
+            self.edge_log.append({"method": method, "path": path, "status": status})
 
     def __enter__(self) -> HostLoginWorkspace:
         self.thread.start()
@@ -121,23 +164,23 @@ class _WorkspaceHandler(BaseHTTPRequestHandler):
             params = urlencode({"code": "local-code", "state": query["state"][0], "iss": issuer})
             self._json(302, {}, Location=f"{callback}?{params}")
         elif path.startswith(MOUNT):
-            if self.headers.get("Authorization") != f"Bearer {ACCESS_TOKEN}":
-                self._json(401, {}, **{"WWW-Authenticate": 'Bearer realm="DatabricksRealm"'})
-            else:
-                self._forward()
+            self._authorize_and_forward("GET", b"")
         elif path.startswith("/api/"):
             self._json(200, {"userName": USER_EMAIL, "id": "1"})
         else:
             self._json(404, {})
 
     def do_POST(self) -> None:
-        self.rfile.read(int(self.headers.get("Content-Length", "0")))
-        if urlsplit(self.path).path == "/oidc/v1/token":
+        body = self._request_body()
+        path = urlsplit(self.path).path
+        if path.startswith(MOUNT):
+            self._authorize_and_forward("POST", body)
+        elif path == "/oidc/v1/token":
             self.workspace.token_exchanges += 1
             self._json(
                 200,
                 {
-                    "access_token": ACCESS_TOKEN,
+                    "access_token": self.workspace.issue_token(),
                     "token_type": "Bearer",
                     "expires_in": 3600,
                     "refresh_token": "local-refresh-token",
@@ -147,7 +190,22 @@ class _WorkspaceHandler(BaseHTTPRequestHandler):
         else:
             self._json(404, {})
 
-    def _forward(self) -> None:
+    def do_PATCH(self) -> None:
+        self._authorize_and_forward("PATCH", self._request_body())
+
+    def _request_body(self) -> bytes:
+        return self.rfile.read(int(self.headers.get("Content-Length", "0")))
+
+    def _authorize_and_forward(self, method: str, body: bytes) -> None:
+        if not urlsplit(self.path).path.startswith(MOUNT):
+            self._json(404, {})
+        elif not self.workspace.accepts(self.headers.get("Authorization")):
+            self.workspace.record(method, self.path, 401)
+            self._json(401, {}, **{"WWW-Authenticate": 'Bearer realm="DatabricksRealm"'})
+        else:
+            self._forward(method, body)
+
+    def _forward(self, method: str = "GET", body: bytes = b"") -> None:
         self.workspace.authenticated_requests.append(self.path)
         relative = self.path.removeprefix(MOUNT)
         headers = {
@@ -157,6 +215,7 @@ class _WorkspaceHandler(BaseHTTPRequestHandler):
         }
         headers["X-Forwarded-Email"] = USER_EMAIL
         if self.headers.get("Upgrade", "").lower() == "websocket":
+            self.workspace.record(method, self.path, "relayed")
             upstream = urlsplit(self.workspace.upstream_url)
             with socket.create_connection(
                 (upstream.hostname, upstream.port), timeout=10
@@ -175,8 +234,11 @@ class _WorkspaceHandler(BaseHTTPRequestHandler):
                         destination = tunnel if source is self.connection else self.connection
                         destination.sendall(data)
         else:
-            with httpx.Client(trust_env=False) as client:
-                response = client.get(self.workspace.upstream_url + relative, headers=headers)
+            with httpx.Client(trust_env=False, timeout=120) as client:
+                response = client.request(
+                    method, self.workspace.upstream_url + relative, headers=headers, content=body
+                )
+            self.workspace.record(method, self.path, response.status_code)
             self.send_response(response.status_code)
             self.send_header(
                 "Content-Type", response.headers.get("Content-Type", "application/json")

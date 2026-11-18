@@ -68,6 +68,25 @@ def test_creation_telemetry_records_kind(task, caplog, kind):
     assert event.attributes["kind"] == kind
 
 
+@pytest.mark.parametrize(
+    "services,expected",
+    [
+        ((), ""),
+        (("slack", "github"), "github,slack"),
+        (("jira", "Private Name", "jira"), "jira,other"),
+        (("github\n",), "other"),
+    ],
+)
+def test_creation_telemetry_records_mcp_services(task, caplog, services, expected):
+    caplog.set_level(logging.INFO)
+    task.mcp_services = services
+    telemetry.log_task_created(task, owner="alice@example.com", source="agent", template=None)
+    [event] = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "scheduled_task_created"
+    ]
+    assert event.attributes["mcp_services"] == expected
+
+
 def test_creation_telemetry_tolerates_logging_failure(task, monkeypatch):
     log = Mock(side_effect=RuntimeError("logging sink unavailable"))
     monkeypatch.setattr(telemetry._logger, "info", log)

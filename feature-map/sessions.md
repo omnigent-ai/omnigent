@@ -21,7 +21,7 @@ the header menu), and each place is a separate entry point.
   replaces it; leaving the composer without submitting removes the draft. Existing
   sessions cannot join a family; ordinary forks remain standalone and may reuse the source host.
 
-- `session-grid`: behind `grid_sessions_display_ui`, drag sidebar sessions into a
+- `session-grid`: with `grid_sessions_display_ui` (on by default), drag sidebar sessions into a
   conversation to split left/right or top/bottom with a hover preview. Up to four
   independent chats fit in two rows and two columns. Grids live at `/grid/<id>`
   and are saved only in this browser, scoped to server and user.
@@ -265,12 +265,16 @@ the header menu), and each place is a separate entry point.
   back. List scrolling, row taps, long-press reordering and horizontal scrollers
   keep their own touch handling.
 - `session-overview`: behind the `session_overview` release flag (off by
-  default), the desktop chat header shows the session cost as a `$x.xx` chip.
-  Clicking it shows or hides a **Session overview** card with the session cost
-  and per-model token usage, which then leave the desktop Agent info popover.
-  Windows at least 1280px wide with the workspace collapsed and chat in view
-  dock the card open beside chat; other layouts open it over chat. Mobile keeps
-  cost in Agent info.
+  default), the desktop chat header shows the session cost as a `$x.xx` chip
+  beside the right-panel toggle, styled as selected while the card shows.
+  Clicking it shows or hides a **Session overview** card
+  with the session cost, each model's cost and the total tokens, which then
+  leave the desktop Agent info popover. Windows at least 1280px wide with the
+  workspace collapsed and chat in view dock the card open beneath the chip;
+  closed there by hand, it stays closed on that device, including after a
+  reload, until the chip opens it again. Other layouts open it as a popover
+  from the chip. Mobile keeps cost in Agent
+  info.
   When the session has sub-agents, a **Sub-agents** list names each direct one
   with its cost, including its own sub-agents; an unpriced one shows no cost.
   A Claude sub-agent shows its Claude session's transcript estimate as `~$x.xx`. The
@@ -285,7 +289,7 @@ the header menu), and each place is a separate entry point.
   Server admins configure the available targets under Settings → Admin → General →
   **Nested agent destinations**.
 
-**Session grids (desktop only):** enable `OMNIGENT_FEATURES=grid_sessions_display_ui`, open a
+**Session grids (desktop only):** with `grid_sessions_display_ui` on (the default), open a
 session, and drag another sidebar row over it. Hover **Split left/right/top/bottom**
 to preview, then drop. Split a remaining full-width or full-height pane again
 to reach three or four panes. Alternatively, use a row's menu or right-click
@@ -749,8 +753,8 @@ plain `uv run pytest`, which starts a private server for the test.
   ordinary session routes retain native link dragging and expose no grid menus,
   drop targets, or saved-grid sidebar entries. Run with `--browser-ui-skip-build --video=on` after building.
   Layout combinations and malformed local storage have unit coverage in
-  `web/src/grid/gridLayout.test.ts`. For a real-server drive, enable
-  `grid_sessions_display_ui` on the isolated server. Also check a collapsed sidebar manually.
+  `web/src/grid/gridLayout.test.ts`. For a real-server drive, the
+  isolated server enables `grid_sessions_display_ui` by default. Also check a collapsed sidebar manually.
   Per-view render recovery, preserved neighboring drafts, usable cell controls
   and independent chat/terminal retry have component coverage in
   `web/src/grid/GridSessionPane.test.tsx`. To check manually, inject a render

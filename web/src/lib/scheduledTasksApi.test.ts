@@ -126,6 +126,11 @@ describe("listScheduledTasks", () => {
 });
 
 describe("getScheduledTask", () => {
+  it.each([undefined, null, 2.5])("reads the saved cost limit (%s)", async (maxCostUsd) => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ ...TASK_WIRE, max_cost_usd: maxCostUsd }));
+    expect((await getScheduledTask("st_1")).maxCostUsd).toBe(maxCostUsd ?? null);
+  });
+
   it("GETs /v1/scheduled-tasks/{id} and encodes the id", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
     const task = await getScheduledTask("st 1");
@@ -254,6 +259,20 @@ describe("listScheduledTaskRuns", () => {
 });
 
 describe("createScheduledTask", () => {
+  it.each([undefined, null, 2.5])("sends a cost limit only when set (%s)", async (maxCostUsd) => {
+    fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
+    await createScheduledTask({
+      name: "Nightly review",
+      prompt: "Review new issues",
+      rrule: "FREQ=DAILY",
+      agentId: "ag_1",
+      maxCostUsd,
+    });
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    if (maxCostUsd == null) expect(body).not.toHaveProperty("max_cost_usd");
+    else expect(body.max_cost_usd).toBe(maxCostUsd);
+  });
+
   it("POSTs required fields and omits unset optionals", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
     await createScheduledTask({
@@ -368,6 +387,17 @@ describe("createScheduledTask", () => {
 });
 
 describe("updateScheduledTask", () => {
+  it.each([undefined, null, 2.5])(
+    "preserves, clears, or sets the cost limit (%s)",
+    async (maxCostUsd) => {
+      fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
+      await updateScheduledTask("st_1", { maxCostUsd });
+      expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual(
+        maxCostUsd === undefined ? {} : { max_cost_usd: maxCostUsd },
+      );
+    },
+  );
+
   it("PATCHes only the fields present in the input", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse({ ...TASK_WIRE, state: "paused" }));
     const updated = await updateScheduledTask("st_1", { state: "paused" });

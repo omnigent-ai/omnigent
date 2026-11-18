@@ -690,6 +690,11 @@ function TaskDetail({ taskId }: { taskId: string }) {
                 />
               )}
             <ConfigField label="Timezone" value={task.timezone} testId="task-detail-timezone" />
+            <ConfigField
+              label="Cost limit per run"
+              value={task.maxCostUsd == null ? "No limit" : formatSessionCostUsd(task.maxCostUsd)}
+              testId="task-detail-cost-limit"
+            />
           </dl>
           {task.sessionMode === "continue" && task.sessionId && (
             <p className="mt-3 text-xs text-muted-foreground">

@@ -3,27 +3,39 @@
 
 import type { SettingsSectionId } from "@/shell/settingsNav";
 
+import { ACCOUNT_SETTINGS } from "./account";
+import { ARCHIVED_SETTINGS } from "./archived";
+import { CLI_SETTINGS } from "./cli";
+import { CUSTOM_AGENTS_SETTINGS } from "./customAgents";
+import { GIT_SETTINGS } from "./git";
+import { HARNESS_SETTINGS } from "./harnesses";
 import { IMPORT_SETTINGS } from "./import";
+import { INTEGRATION_SETTINGS } from "./integrations";
+import { MCP_SETTINGS } from "./mcp";
+import { MEMBERS_SETTINGS } from "./members";
+import { POLICIES_SETTINGS } from "./policies";
+import { SHARING_SETTINGS } from "./sharing";
 import type { SettingsEntry } from "./types";
+import { UPDATES_SETTINGS } from "./updates";
 
 export const SECTION_CATALOGS: Readonly<Record<SettingsSectionId, readonly SettingsEntry[]>> = {
   appearance: [],
-  harnesses: [],
-  "custom-agents": [],
+  harnesses: HARNESS_SETTINGS,
+  "custom-agents": CUSTOM_AGENTS_SETTINGS,
   general: [],
-  git: [],
-  integrations: [],
-  mcp: [],
+  git: GIT_SETTINGS,
+  integrations: INTEGRATION_SETTINGS,
+  mcp: MCP_SETTINGS,
   shortcuts: [],
   import: IMPORT_SETTINGS,
-  account: [],
+  account: ACCOUNT_SETTINGS,
   admin: [],
-  members: [],
-  policies: [],
-  sharing: [],
-  archived: [],
-  cli: [],
-  updates: [],
+  members: MEMBERS_SETTINGS,
+  policies: POLICIES_SETTINGS,
+  sharing: SHARING_SETTINGS,
+  archived: ARCHIVED_SETTINGS,
+  cli: CLI_SETTINGS,
+  updates: UPDATES_SETTINGS,
 };
 
 export const SETTINGS_ENTRIES: readonly SettingsEntry[] = Object.values(SECTION_CATALOGS).flat();

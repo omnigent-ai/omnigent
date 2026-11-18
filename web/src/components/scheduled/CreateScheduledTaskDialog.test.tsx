@@ -531,6 +531,53 @@ function scheduledTask(overrides: Partial<ScheduledTasksApiModule.ScheduledTask>
   } satisfies ScheduledTasksApiModule.ScheduledTask;
 }
 
+describe("cost limit", () => {
+  it.each(["", "2.5"])("creates with an optional cost limit (%s)", async (value) => {
+    renderDialog();
+    const field = screen.getByLabelText("Cost limit per run (USD)");
+    expect(field).toHaveValue("");
+    fireEvent.change(screen.getByLabelText("Automation title"), { target: { value: "Review" } });
+    fireEvent.change(screen.getByRole("textbox", { name: "Instructions" }), {
+      target: { value: "Review new issues" },
+    });
+    fireEvent.change(field, { target: { value } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(mutateAsync).toHaveBeenCalledTimes(1));
+    const input = mutateAsync.mock.calls[0][0];
+    if (value === "") expect(input).not.toHaveProperty("maxCostUsd");
+    else expect(input.maxCostUsd).toBe(2.5);
+  });
+
+  it.each(["5", "2.5", ""])("preserves, changes, or clears a saved limit (%s)", async (value) => {
+    render(
+      <CreateScheduledTaskDialog
+        open
+        onOpenChange={vi.fn()}
+        editingTask={scheduledTask({ maxCostUsd: 5 })}
+      />,
+    );
+    const field = screen.getByLabelText("Cost limit per run (USD)");
+    expect(field).toHaveValue("5");
+    fireEvent.change(field, { target: { value } });
+    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
+    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
+    const input = updateMutateAsync.mock.calls[0][0].input;
+    if (value === "5") expect(input).not.toHaveProperty("maxCostUsd");
+    else expect(input.maxCostUsd).toBe(value === "" ? null : 2.5);
+  });
+
+  it.each(["0", "-1", "1e", "1e309", "invalid"])("rejects an invalid cost limit (%s)", (value) => {
+    render(<CreateScheduledTaskDialog open onOpenChange={vi.fn()} editingTask={scheduledTask()} />);
+    const submit = screen.getByTestId("create-scheduled-task-submit");
+    expect(submit).toBeEnabled();
+    fireEvent.change(screen.getByLabelText("Cost limit per run (USD)"), { target: { value } });
+    expect(submit).toBeDisabled();
+    expect(screen.getByRole("alert")).toHaveTextContent("Enter a cost limit greater than zero");
+    fireEvent.change(screen.getByLabelText("Cost limit per run (USD)"), { target: { value: "" } });
+    expect(submit).toBeEnabled();
+  });
+});
+
 describe("onCreated", () => {
   function fillRequiredFields() {
     fireEvent.change(screen.getByLabelText("Automation title"), {

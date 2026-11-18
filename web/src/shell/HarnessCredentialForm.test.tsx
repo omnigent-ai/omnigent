@@ -9,6 +9,8 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type { Host } from "@/hooks/useHosts";
+import { harnessFixOwner } from "@/pages/settings/search/catalog/harnesses";
+import { SettingsOverlayOwner } from "@/pages/settings/search/settingsOwnership";
 import { HarnessCredentialForm } from "./HarnessCredentialForm";
 
 const mutateMock = vi.fn();
@@ -358,3 +360,37 @@ describe("HarnessCredentialForm", () => {
 function countOrDividers(container: HTMLElement): number {
   return Array.from(container.querySelectorAll("div")).filter((d) => d.textContent === "or").length;
 }
+
+describe("HarnessCredentialForm as a Settings overlay", () => {
+  it("names its controls as parts of the fix dialog's opener, and keeps its names elsewhere", () => {
+    const { unmount } = render(
+      <SettingsOverlayOwner entry={harnessFixOwner("codex-native", "fixAction")} opener="fixAction">
+        <HarnessCredentialForm harness="codex" host={HOST} command={null} onDone={vi.fn()} />
+      </SettingsOverlayOwner>,
+    );
+
+    expect(screen.getByLabelText("API key")).toHaveAttribute(
+      "data-settings-control",
+      "harness-codex-native-detail:apiKey",
+    );
+    expect(screen.getByLabelText("Gateway base URL")).toHaveAttribute(
+      "data-settings-control",
+      "harness-codex-native-detail:gatewayUrl",
+    );
+    expect(screen.getByLabelText("Gateway API key")).toHaveAttribute(
+      "data-settings-control",
+      "harness-codex-native-detail:gatewayKey",
+    );
+    const saves = screen.getAllByRole("button", { name: /^Save/ });
+    expect(saves.map((save) => save.getAttribute("data-settings-control"))).toEqual([
+      "harness-codex-native-detail:saveKey",
+      "harness-codex-native-detail:saveGateway",
+    ]);
+    unmount();
+
+    render(<HarnessCredentialForm harness="codex" host={HOST} command={null} onDone={vi.fn()} />);
+    const bare = document.querySelector('input[placeholder="Paste an API key"]');
+    expect(bare).not.toHaveAttribute("aria-label");
+    expect(bare).not.toHaveAttribute("data-settings-control");
+  });
+});
