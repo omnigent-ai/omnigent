@@ -174,6 +174,21 @@ def test_server_background_spawns(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "log: ~/.omnigent/logs/server/server-ab12.log" in result.output
 
 
+def test_server_background_rejects_a_memory_backend_it_would_ignore(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The detached server is spawned without the flag; it reads the global config instead."""
+    spawned: list[bool] = []
+    monkeypatch.setattr("omnigent.cli.ensure_local_omnigent_server", lambda: spawned.append(True))
+
+    result = CliRunner().invoke(cli, ["server", "--background", "--memory-backend", "hindsight"])
+
+    assert result.exit_code == 2, result.output
+    assert "--memory-backend can't be combined with --background" in result.output
+    assert "memory.backend" in result.output
+    assert spawned == []
+
+
 def test_server_background_with_base_path_sets_env_before_spawning(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

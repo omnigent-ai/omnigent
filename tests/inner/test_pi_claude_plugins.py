@@ -86,7 +86,7 @@ def test_enabled_plugin_skills_and_namespaced_commands(claude_dir: Path, tmp_pat
 
     result = add_claude_plugin_resources({}, managed)
 
-    assert result["skills"] == [str(root / "skills")]
+    assert result["skills"] == [str(root / "skills" / "code-review")]
     prompts = managed / PI_CLAUDE_PLUGIN_RESOURCES_DIR / "prompts"
     assert result["prompts"] == [str(prompts)]
     assert sorted(p.name for p in prompts.iterdir()) == ["dp:review.md", "dp:sub:deep.md"]
@@ -141,19 +141,23 @@ def test_pi_manifest_plugin_loads_as_package_and_keeps_commands(
         tmp_path / "managed" / PI_CLAUDE_PLUGIN_RESOURCES_DIR / "prompts" / "ext:go.md"
     ).exists()
 
+    # A package the user already lists is not listed twice.
+    listed = add_claude_plugin_resources({"packages": [str(root)]}, tmp_path / "again")
+    assert listed["packages"] == [str(root)]
+
 
 def test_user_choices_are_preserved_without_duplicates(claude_dir: Path, tmp_path: Path) -> None:
     """A path the user names or excludes is not added again; user entries stay in order."""
     root = _install(claude_dir, "dp@market", files=_skill("review"))
-    skills_dir = str(root / "skills")
+    skill_dir = str(root / "skills" / "review")
     settings = {
-        "skills": ["/user/skills", skills_dir],
+        "skills": ["/user/skills", skill_dir],
         "packages": [{"source": str(root)}],
     }
 
     result = add_claude_plugin_resources(settings, tmp_path / "managed")
 
-    assert result["skills"] == ["/user/skills", skills_dir]
+    assert result["skills"] == ["/user/skills", skill_dir]
     assert result["packages"] == [{"source": str(root)}]
 
 
@@ -163,8 +167,70 @@ def test_user_exclusions_block_plugin_entries(claude_dir: Path, tmp_path: Path) 
     excluded = {"skills": [f"-{root / 'skills'}"]}
     assert add_claude_plugin_resources(excluded, tmp_path / "a")["skills"] == excluded["skills"]
 
-    glob = {"skills": [f"!{root.parent}/*/skills"]}
+    glob = {"skills": [f"!{root}/skills/*"]}
     assert add_claude_plugin_resources(glob, tmp_path / "b")["skills"] == glob["skills"]
+
+
+def test_relative_user_entries_do_not_match_the_process_cwd(
+    claude_dir: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A relative entry is Pi's to resolve; it must not claim a same-named path under cwd."""
+    root = _install(claude_dir, "dp@market", files=_skill("review"))
+    monkeypatch.chdir(root)
+
+    result = add_claude_plugin_resources({"skills": ["skills/review"]}, tmp_path / "managed")
+
+    assert result["skills"] == ["skills/review", str(root / "skills" / "review")]
+
+
+def test_user_exclusions_block_individual_commands(claude_dir: Path, tmp_path: Path) -> None:
+    """Exclusions match the original command files, not only the generated copies."""
+    root = _install(
+        claude_dir,
+        "dp@market",
+        files={
+            "commands/go.md": "GO\n",
+            "commands/keep.md": "KEEP\n",
+            "commands/sub/x.md": "SUB\n",
+        },
+    )
+    settings = {"prompts": [f"-{root / 'commands' / 'go.md'}", f"!{root}/commands/sub/*"]}
+    managed = tmp_path / "managed"
+
+    add_claude_plugin_resources(settings, managed)
+
+    prompts = managed / PI_CLAUDE_PLUGIN_RESOURCES_DIR / "prompts"
+    assert [p.name for p in prompts.iterdir()] == ["dp:keep.md"]
+
+
+def test_unresolvable_user_paths_do_not_abort_preparation(
+    claude_dir: Path, tmp_path: Path
+) -> None:
+    """Symlink loops and NUL bytes in user settings leave the other entries working."""
+    root = _install(claude_dir, "dp@market", files=_skill("review"))
+    loop_a, loop_b = tmp_path / "loop-a", tmp_path / "loop-b"
+    loop_a.symlink_to(loop_b)
+    loop_b.symlink_to(loop_a)
+    settings = {
+        "skills": [str(loop_a), "bad\0path"],
+        "packages": [str(loop_a), "bad\0package"],
+    }
+
+    result = add_claude_plugin_resources(settings, tmp_path / "managed")
+
+    assert result["skills"] == [str(loop_a), "bad\0path", str(root / "skills" / "review")]
+    assert result["packages"] == [str(loop_a), "bad\0package"]
+
+
+def test_unresolvable_user_paths_leave_settings_unchanged_without_plugins(
+    claude_dir: Path, tmp_path: Path
+) -> None:
+    """With no plugins enabled, unusable user entries are returned exactly as written."""
+    settings = {"skills": ["bad\0path"], "prompts": ["bad\0prompt"]}
+
+    result = add_claude_plugin_resources(settings, tmp_path / "managed")
+
+    assert result == settings
 
 
 def test_non_list_user_setting_is_left_alone(claude_dir: Path, tmp_path: Path) -> None:
@@ -270,20 +336,6 @@ def test_overlong_generated_command_name_is_skipped(claude_dir: Path, tmp_path: 
     assert [p.name for p in prompts.iterdir()] == ["demo:ok.md"]
 
 
-def test_pi_manifest_plugin_is_not_added_twice(claude_dir: Path, tmp_path: Path) -> None:
-    """A plugin the user already lists as a Pi package is not listed again."""
-    root = _install(
-        claude_dir,
-        "ext@market",
-        files={"package.json": json.dumps({"name": "ext", "pi": {"extensions": ["./x.js"]}})},
-    )
-    settings = {"packages": [str(root)]}
-
-    result = add_claude_plugin_resources(settings, tmp_path / "managed")
-
-    assert result["packages"] == [str(root)]
-
-
 def test_native_provider_launch_writes_plugin_entries(claude_dir: Path, tmp_path: Path) -> None:
     """The ``omnigent pi`` terminal launch seeds the same managed settings as the gateway."""
     from omnigent.harnesses.pi_native.credentials import (
@@ -305,4 +357,4 @@ def test_native_provider_launch_writes_plugin_entries(claude_dir: Path, tmp_path
     pi_native_provider_launch(agent_dir, provider, global_agent_dir=tmp_path / "global")
 
     written = json.loads((agent_dir / "settings.json").read_text(encoding="utf-8"))
-    assert written["skills"] == [str(root / "skills")]
+    assert written["skills"] == [str(root / "skills" / "review")]

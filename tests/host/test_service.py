@@ -267,6 +267,7 @@ def test_wrapper_launched_service_survives_interpreter_cache_cleanup(
         pytest.param(
             "wrapper 'omni", 0o755, "Cannot parse OMNIGENT_WRAPPER_COMMAND", id="bad-quote"
         ),
+        pytest.param("wrapper omni\r", 0o755, "carriage return", id="carriage-return"),
     ],
 )
 @pytest.mark.parametrize("existing_definition", [False, True], ids=["fresh", "existing"])
@@ -340,13 +341,14 @@ def test_wrapper_command_keeps_quoted_words(
         assert Path(command[0]).is_symlink()
 
 
-def test_systemd_unit_escapes_specifiers_and_literal_dollars() -> None:
+def test_systemd_unit_escapes_specifiers_dollars_and_newlines() -> None:
     unit = service._systemd_unit(
         command=["/opt/%literal/$tools/python", "--server", "https://example.com/%h/$target"],
-        environment={"CONFIG": "$HOME/%h"},
+        environment={"CONFIG": "$HOME/%h", "HEADERS": "first: 1\nsecond: C:\\new"},
     ).decode()
 
     assert 'Environment="CONFIG=$HOME/%%h"' in unit
+    assert 'Environment="HEADERS=first: 1\\nsecond: C:\\\\new"' in unit.splitlines()
     assert (
         'ExecStart="/opt/%%literal/$tools/python" "--server" "https://example.com/%%h/$$target"'
     ) in unit
@@ -365,8 +367,12 @@ def test_service_persists_explicit_host_credentials_privately(
             "HOME": str(tmp_path),
             "OMNIGENT_CONFIG_HOME": str(tmp_path / "config"),
             "OMNIGENT_DATA_DIR": str(tmp_path / "state"),
-            "OMNIGENT_RUNNER_ENV_PASSTHROUGH": "MY_GATEWAY_TOKEN",
+            "OMNIGENT_RUNNER_ENV_PASSTHROUGH": "MY_GATEWAY_TOKEN,ANTHROPIC_CUSTOM_HEADERS",
             "MY_GATEWAY_TOKEN": "synthetic-provider-key",
+            "ANTHROPIC_CUSTOM_HEADERS": (
+                "x-databricks-use-coding-agent-mode: true\n"
+                "Databricks-Custom-Coding-Agent: claude-code"
+            ),
             "UNRELATED_SHELL_SECRET": "unrelated-secret",
         },
     )
@@ -382,8 +388,17 @@ def test_service_persists_explicit_host_credentials_privately(
         assert plistlib.loads(contents)["EnvironmentVariables"]["MY_GATEWAY_TOKEN"] == (
             "synthetic-provider-key"
         )
+        assert plistlib.loads(contents)["EnvironmentVariables"]["ANTHROPIC_CUSTOM_HEADERS"] == (
+            "x-databricks-use-coding-agent-mode: true\nDatabricks-Custom-Coding-Agent: claude-code"
+        )
     else:
         assert b'Environment="MY_GATEWAY_TOKEN=synthetic-provider-key"' in contents
+        unit_lines = [line for line in contents.decode().splitlines() if line]
+        assert all(line.startswith("[") or "=" in line for line in unit_lines), unit_lines
+        assert (
+            'Environment="ANTHROPIC_CUSTOM_HEADERS=x-databricks-use-coding-agent-mode: true'
+            '\\nDatabricks-Custom-Coding-Agent: claude-code"'
+        ) in unit_lines
     assert b"unrelated-secret" not in contents
     assert installed.path.stat().st_mode & 0o777 == 0o600
 

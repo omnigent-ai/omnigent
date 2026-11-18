@@ -1345,6 +1345,7 @@ def create_runner_app(
     *,
     process_manager: HarnessProcessManager | None = None,
     spec_resolver: SpecResolver | None = None,
+    spec_workdir_cleanup: Callable[[str], Awaitable[None]] | None = None,
     server_client: httpx.AsyncClient,
     mcp_reattach_client_factory: Callable[[], httpx.AsyncClient] | None = None,
     terminal_registry: TerminalRegistry | None = None,
@@ -1364,6 +1365,9 @@ def create_runner_app(
         For in-process: wraps the server's agent cache.
         For out-of-process: wraps HTTP fetch to GET /v1/agents/{id}/contents.
         ``None`` → runner falls back to body-supplied hints (test path).
+    :param spec_workdir_cleanup: Async callback ``(session_id) -> None`` that
+        removes a session's extracted bundle directories. Called on session
+        delete, after the session's resources have been released.
     :param server_client: httpx.AsyncClient pointed at the AP
         server's public API. Used by the runner for
         elicitation/approval forwarding.
@@ -4157,6 +4161,8 @@ def create_runner_app(
 
         _session_spec_cache.pop(session_id, None)
         _session_root_spec_cache.pop(session_id, None)
+        if spec_workdir_cleanup is not None:
+            await spec_workdir_cleanup(session_id)
         _session_harness_overrides.pop(session_id, None)
         _session_skills_cache.pop(session_id, None)
         _session_cursor_model_names.pop(session_id, None)
@@ -6681,12 +6687,20 @@ def create_runner_app(
             validate_copy_on_write_harness,
         )
 
-        stream_spec = _unwrap_resolved_spec(_session_spec_cache.get(conv_id))
+        stream_spec_entry = _session_spec_cache.get(conv_id) or _session_root_spec_cache.get(
+            conv_id
+        )
+        stream_spec = _unwrap_resolved_spec(stream_spec_entry)
         if stream_spec is None and _ds_agent_id and spec_resolver is not None:
+            generation = _session_cache_generation(conv_id)
             try:
-                stream_spec = _unwrap_resolved_spec(await spec_resolver(_ds_agent_id, conv_id))
+                resolved = await spec_resolver(_ds_agent_id, conv_id)
             except (OmnigentError, httpx.HTTPError, RuntimeError):
-                stream_spec = None
+                resolved = None
+            stream_spec = _unwrap_resolved_spec(resolved)
+            # Keep the extraction for later turns; each resolution holds a bundle directory.
+            if resolved is not None and _session_cache_generation_is_current(conv_id, generation):
+                _session_root_spec_cache[conv_id] = resolved
         if has_copy_on_write(
             getattr(stream_spec, "os_env", None)
         ) or resource_registry.uses_copy_on_write(conv_id):
@@ -7360,7 +7374,9 @@ def create_runner_app(
                                     if (
                                         not _is_spec_local
                                         and not is_mcp
-                                        and not should_dispatch_locally(tool_name)
+                                        and not should_dispatch_locally(
+                                            tool_name, _spec_for_dispatch_hint
+                                        )
                                     ):
                                         (
                                             _spec_for_dispatch_hint_entry,
@@ -7378,7 +7394,9 @@ def create_runner_app(
                                         tool_name,
                                         dispatch=dispatch,
                                         is_mcp=is_mcp,
-                                        is_runner_builtin=should_dispatch_locally(tool_name),
+                                        is_runner_builtin=should_dispatch_locally(
+                                            tool_name, _spec_for_dispatch_hint
+                                        ),
                                         is_spec_local=_is_spec_local,
                                     )
                                     if _should_dispatch and _response_id:
@@ -7420,6 +7438,7 @@ def create_runner_app(
                                         _agent_id_for_dispatch = cast(
                                             str | None, body.get("agent_id")
                                         )
+                                        _caller_user_id = body.get("caller_user_id")
                                         _dispatch_mcp = ProxyMcpManager(
                                             conv_id,
                                             server_client,
@@ -7458,6 +7477,11 @@ def create_runner_app(
                                                         conv_id
                                                     ),
                                                     wake_on_async_result=_wake_on_async_result,
+                                                    caller_user_id=(
+                                                        _caller_user_id
+                                                        if isinstance(_caller_user_id, str)
+                                                        else None
+                                                    ),
                                                 )
                                             )
                                         )
@@ -7785,6 +7809,54 @@ def create_runner_app(
             body.get("model_override") if isinstance(body, dict) else None,
             extra={"session_id": conversation_id},
         )
+        if body_type == "codex_side_chat_resume":
+            from websockets.exceptions import WebSocketException
+
+            from omnigent.harnesses.codex_native import side_chat
+
+            child_session_id = body.get("codex_side_session_id")
+            if not isinstance(child_session_id, str) or not child_session_id.strip():
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_request",
+                        "detail": "Missing side-chat session id.",
+                    },
+                )
+            try:
+                bridge_dir = await _codex_native_bridge_dir_for_session(conversation_id)
+                await side_chat.resume_side_chat(bridge_dir, child_session_id)
+            except side_chat.SideChatValidationError:
+                return JSONResponse(
+                    status_code=400,
+                    content={
+                        "error": "invalid_request",
+                        "detail": "This session is not a side chat of the active Codex parent.",
+                    },
+                )
+            except (
+                RuntimeError,
+                OSError,
+                httpx.HTTPError,
+                TimeoutError,
+                ValueError,
+                WebSocketException,
+            ):
+                _logger.warning(
+                    "Codex side-chat resume failed: conv=%s child=%s",
+                    conversation_id,
+                    child_session_id,
+                    exc_info=True,
+                    extra={"session_id": conversation_id},
+                )
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "codex_side_chat_unavailable",
+                        "detail": "The Codex side chat could not be resumed; try again.",
+                    },
+                )
+            return JSONResponse(status_code=200, content={"resumed": True})
         _side_thread_id = body.get("codex_side_thread_id") if isinstance(body, dict) else None
         if _side_thread_id:
             # Side-chat controls use the parent's bridge but target the child's

@@ -47,10 +47,10 @@ to customize.
   Instructions for the task session, and Advanced's summary shows One task session.
   The choice is saved in the prompt, survives switching integrations, and isn't
   offered on edit. Archiving the task session makes the next match start a new one.
-  With a workflow chosen, One task session is disabled and a note says each match
-  runs the workflow in a new session. Saving a workflow trigger that used one task
-  session from the trigger form switches it to a session for each match; one that
-  opens as its prompt text can't be saved until the workflow is removed.
+  With a workflow chosen, One task session is disabled, since each match runs the
+  workflow in a new session. Saving a workflow trigger that used one task session
+  from the trigger form switches it to a session for each match; one that opens as
+  its prompt text can't be saved until the workflow is removed.
 - `prompt-editing`: the rendered template prompt is never shown or editable; there is
   no System prompt, Preview prompt, or Edit as prompt. A trigger saves its form state
   as a one-line `<!-- omnigent-trigger v1 {...} -->` header above the rendered prompt.

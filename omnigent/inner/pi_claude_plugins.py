@@ -3,8 +3,8 @@
 Pi loads skills, packages and prompt templates from its settings, so the managed
 ``settings.json`` gains entries for the plugins Claude Code has enabled. Commands
 become generated prompt templates because Claude's ``${CLAUDE_PLUGIN_ROOT}`` must
-be substituted. Entries are only appended; a path the user already names, or
-excludes, is left alone.
+be substituted. Entries are only appended. Anything the user's own Pi settings name
+or exclude, including through an enclosing directory or a glob, is left alone.
 """
 
 from __future__ import annotations
@@ -14,8 +14,9 @@ import logging
 import os
 import re
 import shutil
-from collections.abc import Iterable, Mapping
-from dataclasses import replace
+from collections import deque
+from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TypeAlias
 
@@ -30,17 +31,86 @@ from omnigent.spec.skill_sources import (
 _logger = logging.getLogger(__name__)
 
 _Settings: TypeAlias = dict[str, object]
+_WalkedFile: TypeAlias = tuple[tuple[str, ...], Path]
 
 # Directory under the managed agent dir holding generated command prompts.
 PI_CLAUDE_PLUGIN_RESOURCES_DIR = "claude-plugins"
 _PLUGIN_ROOT_VARIABLE = "${CLAUDE_PLUGIN_ROOT}"
 MAX_PLUGIN_COMMANDS = 512
 MAX_COMMAND_BYTES = 256 * 1024
-_MAX_COMMAND_DEPTH = 8
+_MAX_WALK_DIRS = 256
+_MAX_WALK_DEPTH = 8
 # Generated names must fit a common filesystem's single-component limit.
 _MAX_FILENAME_BYTES = 255
 # A plugin name becomes part of a generated filename, so it must be one safe component.
 _PLUGIN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+# Errors from resolving a path that a user or plugin controls: symlink loops and NUL bytes.
+_PATH_ERRORS = (OSError, RuntimeError, ValueError)
+
+
+@dataclass(frozen=True)
+class _Claims:
+    """What one of the user's Pi resource arrays already decided.
+
+    :param named: Resolved paths the user lists, as include (``+``), exclude (``-``)
+        or plain entries. Any of them means the user decided that path.
+    :param patterns: ``!`` glob exclusions the user wrote.
+    """
+
+    named: frozenset[str]
+    patterns: tuple[str, ...]
+
+    def decides(self, path: Path, base: Path) -> bool:
+        """Whether the user named *path* or an enclosing directory below *base*, or matched a glob.
+
+        :param path: A resolved path.
+        :param base: The outermost directory whose ancestors are still checked.
+        """
+        for candidate in (path, *path.parents):
+            if str(candidate) in self.named:
+                return True
+            if candidate == base:
+                break
+        text = str(path)
+        return any(fnmatch.fnmatchcase(text, pattern) for pattern in self.patterns)
+
+
+def _safe_resolve(path: str) -> str | None:
+    """Resolved path text, or ``None`` when the path cannot be resolved."""
+    try:
+        return str(Path(path).expanduser().resolve())
+    except _PATH_ERRORS:
+        return None
+
+
+def _entry_source(entry: object) -> str | None:
+    """The source string of a Pi resource entry, which may be an object form."""
+    source = entry.get("source") if isinstance(entry, dict) else entry
+    return source if isinstance(source, str) and source else None
+
+
+def _claims(entries: object) -> _Claims:
+    """Claims from a user's resource array; a value that is not a list claims nothing."""
+    if not isinstance(entries, list):
+        return _Claims(frozenset(), ())
+    named: set[str] = set()
+    patterns: list[str] = []
+    for entry in entries:
+        source = _entry_source(entry)
+        if source is None:
+            continue
+        if source.startswith("!"):
+            patterns.append(source[1:])
+            continue
+        # Relative user entries resolve from Pi's agent dir, which the caller already
+        # relocated to absolute paths; resolving them here would use the process cwd.
+        listed = Path(source.lstrip("+-")).expanduser()
+        if not listed.is_absolute():
+            continue
+        resolved = _safe_resolve(str(listed))
+        if resolved is not None:
+            named.add(resolved)
+    return _Claims(frozenset(named), tuple(patterns))
 
 
 def _pi_manifest(root: Path) -> Mapping[str, object] | None:
@@ -51,7 +121,12 @@ def _pi_manifest(root: Path) -> Mapping[str, object] | None:
 
 
 def _enabled_plugins() -> list[tuple[str, Path, bool]]:
-    """Enabled user-scope Claude plugins as ``(name, install root, declares Pi)``."""
+    """Enabled Claude plugins as ``(name, install root, declares Pi)``.
+
+    Installation records are read the way the MCP inventory reads them: the first
+    usable install path per plugin, whatever its Claude scope. Only user-level
+    enablement is read; project-level ``enabledPlugins`` are not.
+    """
     ctx = replace(
         skill_source_context_from_env(roots=(), harness="claude-native"),
         is_native=True,
@@ -62,35 +137,42 @@ def _enabled_plugins() -> list[tuple[str, Path, bool]]:
     return plugins
 
 
-def _command_files(
-    directory: Path,
-    found: list[tuple[tuple[str, ...], Path]],
-    relative: tuple[str, ...] = (),
-) -> None:
-    """Collect Markdown files under *directory* into *found*, skipping symlinks.
+def _bounded_files(root: Path, wanted: Callable[[str], bool]) -> list[_WalkedFile]:
+    """Files under *root* whose name satisfies *wanted*, as ``(relative dirs, file)``.
 
-    Stops once :data:`MAX_PLUGIN_COMMANDS` files are collected, so a huge tree is not walked.
+    Symlinks are never followed. The walk stops after :data:`_MAX_WALK_DIRS`
+    directories, at :data:`_MAX_WALK_DEPTH` levels, or after :data:`MAX_PLUGIN_COMMANDS`
+    matches, so a large or looping tree cannot delay every launch.
     """
-    if len(relative) > _MAX_COMMAND_DEPTH:
-        return
-    try:
-        entries = sorted(directory.iterdir())
-    except OSError as exc:
-        _logger.warning("Skipping unreadable Claude commands dir %s: %s", directory, exc)
-        return
-    for entry in entries:
-        if len(found) >= MAX_PLUGIN_COMMANDS:
-            return
-        if entry.is_symlink():
+    found: list[_WalkedFile] = []
+    queue: deque[tuple[tuple[str, ...], Path]] = deque([((), root)])
+    visited = 0
+    while queue and visited < _MAX_WALK_DIRS and len(found) < MAX_PLUGIN_COMMANDS:
+        relative, directory = queue.popleft()
+        visited += 1
+        try:
+            entries = sorted(directory.iterdir())
+        except OSError as exc:
+            _logger.warning("Skipping unreadable Claude plugin dir %s: %s", directory, exc)
             continue
-        if entry.is_dir():
-            _command_files(entry, found, (*relative, entry.name))
-        elif entry.is_file() and entry.name.endswith(".md"):
-            found.append(((*relative, entry.stem), entry))
+        for entry in entries:
+            if entry.is_symlink():
+                continue
+            if entry.is_dir():
+                if len(relative) < _MAX_WALK_DEPTH:
+                    queue.append(((*relative, entry.name), entry))
+            elif entry.is_file() and wanted(entry.name):
+                found.append((relative, entry))
+    return found
 
 
 def _write_command(
-    name: str, root: Path, parts: tuple[str, ...], source: Path, prompts_dir: Path
+    name: str,
+    root: Path,
+    parts: tuple[str, ...],
+    source: Path,
+    prompts_dir: Path,
+    claims: _Claims,
 ) -> bool:
     """Write one command prompt; returns ``False`` when it is skipped."""
     command = ":".join((name, *parts))
@@ -98,10 +180,12 @@ def _write_command(
         _logger.warning("Skipping Claude command %s: generated name is too long", command)
         return False
     try:
-        if not source.resolve().is_relative_to(root.resolve()):
+        base = root.resolve()
+        resolved = source.resolve()
+        if not resolved.is_relative_to(base) or claims.decides(resolved, base):
             return False
         if source.stat().st_size > MAX_COMMAND_BYTES:
-            _logger.warning("Skipping Claude command %s: file is too large", source)
+            _logger.warning("Skipping Claude command %s: file is too large", command)
             return False
         target = prompts_dir / f"{command}.md"
         if target.exists():
@@ -111,17 +195,18 @@ def _write_command(
         body = source.read_text(encoding="utf-8")
         prompts_dir.mkdir(parents=True, exist_ok=True)
         target.write_text(body.replace(_PLUGIN_ROOT_VARIABLE, str(root)), encoding="utf-8")
-    except (OSError, UnicodeDecodeError) as exc:
+    except _PATH_ERRORS as exc:
         _logger.warning("Skipping Claude command %s: %s", command, exc)
         return False
     return True
 
 
-def _write_commands(name: str, root: Path, prompts_dir: Path) -> bool:
+def _write_commands(name: str, root: Path, prompts_dir: Path, claims: _Claims) -> bool:
     """Write the plugin's ``commands/**/*.md`` as ``<name>:<command>.md`` prompt templates.
 
-    Files are read only when they resolve inside the plugin root, so a symlink cannot
-    expose content from elsewhere on the host.
+    Commands the user's ``prompts`` setting names or excludes are not written. Files are
+    read only when they resolve inside the plugin root, so a symlink cannot expose
+    content from elsewhere on the host.
 
     :returns: ``True`` when at least one prompt was written.
     """
@@ -131,37 +216,35 @@ def _write_commands(name: str, root: Path, prompts_dir: Path) -> bool:
     if not commands_dir.resolve().is_relative_to(root.resolve()):
         _logger.warning("Skipping Claude plugin %s: commands/ links outside the plugin", name)
         return False
-    found: list[tuple[tuple[str, ...], Path]] = []
-    _command_files(commands_dir, found)
     written = False
-    for parts, source in found:
-        written |= _write_command(name, root, parts, source, prompts_dir)
+    for relative, source in _bounded_files(commands_dir, lambda n: n.endswith(".md")):
+        parts = (*relative, source.stem)
+        written |= _write_command(name, root, parts, source, prompts_dir, claims)
     return written
 
 
-def _entry_source(entry: object) -> str | None:
-    """The source string of a Pi resource entry, which may be an object form."""
-    source = entry.get("source") if isinstance(entry, dict) else entry
-    return source if isinstance(source, str) and source else None
+def _skill_dirs(skills_dir: Path, base: Path, claims: _Claims) -> list[str]:
+    """Skill directories (those holding ``SKILL.md``) the user has not decided against.
 
-
-def _user_claims(entries: list[object]) -> tuple[set[str], list[str]]:
-    """Paths the user names (include or exclude) and the glob exclusions they wrote."""
-    named: set[str] = set()
-    patterns: list[str] = []
-    for entry in entries:
-        source = _entry_source(entry)
-        if source is None:
+    Each skill directory is added on its own, so a user exclusion of one skill does
+    not depend on how Pi treats exclusions inside a directory entry.
+    """
+    if skills_dir.is_symlink() or not skills_dir.is_dir():
+        return []
+    try:
+        if not skills_dir.resolve().is_relative_to(base):
+            return []
+    except _PATH_ERRORS:
+        return []
+    directories: list[str] = []
+    for _, skill_md in _bounded_files(skills_dir, lambda n: n == "SKILL.md"):
+        resolved = _safe_resolve(str(skill_md.parent))
+        if resolved is None:
             continue
-        if source[0] == "!":
-            patterns.append(source[1:])
-        else:
-            named.add(_resolved(source.lstrip("+-")))
-    return named, patterns
-
-
-def _resolved(path: str) -> str:
-    return str(Path(path).expanduser().resolve())
+        skill_dir = Path(resolved)
+        if not claims.decides(skill_dir, base):
+            directories.append(resolved)
+    return directories
 
 
 def _append_unclaimed(existing: object, additions: Iterable[str]) -> list[object] | None:
@@ -176,12 +259,16 @@ def _append_unclaimed(existing: object, additions: Iterable[str]) -> list[object
     else:
         _logger.warning("Not adding Claude plugin resources: Pi setting is not a list")
         return None
-    named, patterns = _user_claims(current)
+    claims = _claims(current)
+    seen: set[str] = set()
     for addition in additions:
-        resolved = _resolved(addition)
-        if resolved in named or any(fnmatch.fnmatchcase(resolved, p) for p in patterns):
+        resolved = _safe_resolve(addition)
+        if resolved is None or resolved in seen:
             continue
-        named.add(resolved)
+        path = Path(resolved)
+        if claims.decides(path, Path(path.anchor)):
+            continue
+        seen.add(resolved)
         current.append(addition)
     return current
 
@@ -191,8 +278,8 @@ def add_claude_plugin_resources(settings: _Settings, managed_dir: Path) -> _Sett
 
     Plugins whose ``package.json`` declares a ``pi`` manifest load through Pi's
     package mechanism, which also governs their skills. Other plugins contribute
-    their ``skills/`` directory. Commands are written under *managed_dir* and
-    regenerated on every call, so disabled or removed plugins leave nothing behind.
+    each skill directory. Commands are written under *managed_dir* and regenerated
+    on every call, so disabled or removed plugins leave nothing behind.
 
     :param settings: The managed settings after user relocation, before overlays.
     :param managed_dir: The managed agent dir the settings are written into.
@@ -202,29 +289,35 @@ def add_claude_plugin_resources(settings: _Settings, managed_dir: Path) -> _Sett
     shutil.rmtree(generated, ignore_errors=True)
     if not resolve_feature_flags().enabled(Feature.PI_CLAUDE_PLUGINS):
         return settings
+    try:
+        plugins = _enabled_plugins()
+    except _PATH_ERRORS:
+        _logger.exception("Not adding Claude plugin resources to the Pi agent dir")
+        return settings
+    claims = {kind: _claims(settings.get(kind)) for kind in ("packages", "skills", "prompts")}
     packages: list[str] = []
     skills: list[str] = []
     has_commands = False
-    user_packages = settings.get("packages")
-    package_named, _ = _user_claims(user_packages if isinstance(user_packages, list) else [])
-    try:
-        for name, root, declares_pi in _enabled_plugins():
+    for name, root, declares_pi in plugins:
+        try:
             if not _PLUGIN_NAME.fullmatch(name):
                 _logger.warning("Not bridging Claude plugin with unsafe name %r", name)
                 continue
             if declares_pi:
-                packages.append(str(root))
-            elif (root / "skills").is_dir() and _resolved(str(root)) not in package_named:
+                if not claims["packages"].decides(root, root):
+                    packages.append(str(root))
+            elif not claims["packages"].decides(root, root):
                 # A user package entry for this plugin decides its skills, including none.
-                skills.append(str(root / "skills"))
+                skills.extend(_skill_dirs(root / "skills", root, claims["skills"]))
             if os.name != "nt":
                 # ``:`` in the command name is not a legal filename on Windows.
-                has_commands |= _write_commands(name, root, generated / "prompts")
+                has_commands |= _write_commands(
+                    name, root, generated / "prompts", claims["prompts"]
+                )
             elif (root / "commands").is_dir():
                 _logger.info("Not bridging Claude plugin commands on Windows: %s", name)
-    except OSError:
-        _logger.exception("Not adding Claude plugin resources to the Pi agent dir")
-        return settings
+        except _PATH_ERRORS:
+            _logger.warning("Skipping Claude plugin %s: unusable path", name, exc_info=True)
     additions: dict[str, list[str]] = {"packages": packages, "skills": skills}
     if has_commands:
         additions["prompts"] = [str(generated / "prompts")]
