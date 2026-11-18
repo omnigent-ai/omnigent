@@ -5,6 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { SandboxStatus } from "@/lib/types";
 import type * as ChatStoreModule from "@/store/chatStore";
+import { useChatStore } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { FullSessionChat } from "./FullSessionChat";
 
@@ -24,6 +25,7 @@ vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: () => true }));
 
 const SESSION = "c".repeat(32);
 const FIRST_MESSAGE = "Help me design the reusable workflow.";
+const initialStoreState = useChatStore.getState();
 
 function seedSession({
   sandboxStatus,
@@ -59,9 +61,30 @@ beforeEach(() => conversationRegistry.clear());
 afterEach(() => {
   cleanup();
   conversationRegistry.clear();
+  useChatStore.setState(initialStoreState);
 });
 
 describe("FullSessionChat sandbox launch", () => {
+  it("shows its own session's launch, not the open session's", () => {
+    const openSessionAsks = "Sign in on your laptop to continue.";
+    // The session open on the page is launching too, and waits on the user.
+    useChatStore.setState({
+      conversationId: "d".repeat(32),
+      sandboxStatus: { stage: "action_required", error: null, details: openSessionAsks },
+    });
+    seedSession({ sandboxStatus: { stage: "cloning", error: null } });
+    renderChat();
+
+    expect(screen.getByTestId("runner-starting-indicator")).toHaveTextContent(
+      "Cloning repository…",
+    );
+    expect(screen.queryByText(openSessionAsks)).toBeNull();
+
+    act(() => conversationRegistry.acquire(SESSION).setState({ sandboxStatus: null }));
+    expect(screen.queryByTestId("runner-starting-indicator")).toBeNull();
+    expect(screen.queryByText(openSessionAsks)).toBeNull();
+  });
+
   it("shows the launch stage below the first message while the sandbox starts", () => {
     seedSession({ sandboxStatus: { stage: "provisioning", error: null } });
     renderChat();
