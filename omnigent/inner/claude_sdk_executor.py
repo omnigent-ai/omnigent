@@ -2292,6 +2292,9 @@ def prepare_tight_cli_process(
     # tests that assert ``stderr_is_clean``).
     if sys.platform != "linux":
         return unwrapped
+    if shutil.which("bwrap") is None:
+        logger.warning("Could not apply default local CLI sandbox: bwrap is unavailable")
+        return unwrapped
 
     spec = OSEnvSpec(
         type="caller_process",
@@ -2303,25 +2306,17 @@ def prepare_tight_cli_process(
         ),
     )
     resolved_cwd = _resolve_sandbox_cwd(cwd)
-    try:
-        sandbox = resolve_sandbox(spec, resolved_cwd)
-    except (OSError, NotImplementedError) as exc:
-        logger.warning(
-            "Could not apply default local CLI sandbox; continuing without it: %s",
-            exc,
-        )
-        return unwrapped
-    else:
-        if not sandbox.active:
-            return unwrapped
-        sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
-        sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
-        launcher = create_exec_launcher(real_cli_path, sandbox)
-        return PreparedClaudeCli(
-            cli_path=launcher,
-            enable_native_tools=False,
-            sandbox=sandbox,
-        )
+    sandbox = resolve_sandbox(spec, resolved_cwd)
+    if not sandbox.active:
+        raise OSError("Default Claude CLI sandbox resolved to an inactive policy")
+    sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
+    sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
+    launcher = create_exec_launcher(real_cli_path, sandbox)
+    return PreparedClaudeCli(
+        cli_path=launcher,
+        enable_native_tools=False,
+        sandbox=sandbox,
+    )
 
 
 def _claude_managed_config_dirs() -> list[pathlib.Path]:

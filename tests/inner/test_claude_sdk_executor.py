@@ -5257,6 +5257,7 @@ def test_launcher_integrity_failure_stops_default_and_explicit_cli(monkeypatch) 
     from omnigent.inner import claude_sdk_executor as claude
 
     monkeypatch.setattr(claude.sys, "platform", "linux")
+    monkeypatch.setattr(claude.shutil, "which", lambda _: "/usr/bin/bwrap")
     monkeypatch.setattr(claude, "resolve_sandbox", lambda *_: _active_policy())
     backend = Mock()
     backend.wrap_launcher_argv.return_value = ["sandboxed", "/usr/bin/claude"]
@@ -5275,7 +5276,9 @@ def test_default_cli_process_falls_back_only_when_backend_is_unavailable(monkeyp
     from omnigent.inner import claude_sdk_executor as claude
 
     monkeypatch.setattr(claude.sys, "platform", "linux")
-    monkeypatch.setattr(claude, "resolve_sandbox", Mock(side_effect=OSError("bwrap unavailable")))
+    monkeypatch.setattr(claude.shutil, "which", lambda _: None)
+    resolver = Mock()
+    monkeypatch.setattr(claude, "resolve_sandbox", resolver)
     launcher = Mock()
     monkeypatch.setattr(claude, "create_exec_launcher", launcher)
 
@@ -5283,6 +5286,21 @@ def test_default_cli_process_falls_back_only_when_backend_is_unavailable(monkeyp
     assert optional.cli_path == "/usr/bin/claude"
     assert not optional.enable_native_tools
     assert not optional.sandboxed
+    resolver.assert_not_called()
+    launcher.assert_not_called()
+
+
+def test_default_cli_process_rejects_resolution_failure_when_backend_exists(monkeypatch) -> None:
+    from omnigent.inner import claude_sdk_executor as claude
+
+    monkeypatch.setattr(claude.sys, "platform", "linux")
+    monkeypatch.setattr(claude.shutil, "which", lambda _: "/usr/bin/bwrap")
+    monkeypatch.setattr(claude, "resolve_sandbox", Mock(side_effect=OSError("invalid policy")))
+    launcher = Mock()
+    monkeypatch.setattr(claude, "create_exec_launcher", launcher)
+
+    with pytest.raises(OSError, match="invalid policy"):
+        claude.prepare_tight_cli_process("/usr/bin/claude", cwd="/tmp/work")
     launcher.assert_not_called()
 
 
