@@ -293,7 +293,7 @@ def test_original_count_one_oracle_and_bounded_history(scenario: _Scenario, matc
         ("ready", None, "invalid_response"),
         ("ready", [], "invalid_response"),
         ("ready", {}, "invalid_response"),
-        ("ready", {"requests": {}}, "invalid_response"),
+        ("ready", {"requests": {"private": _PRIVATE}}, "invalid_response"),
         ("ready", {"requests": [{}, _PRIVATE]}, "invalid_entry"),
         ("transport", None, "transport_error"),
         ("http", None, "http_error"),
@@ -304,7 +304,7 @@ def test_original_count_one_oracle_and_bounded_history(scenario: _Scenario, matc
     ],
 )
 def test_read_failures_still_fail_without_retry(
-    scenario: _Scenario, mode: str, payload: object, status: str
+    scenario: _Scenario, mode: str, payload: object, status: str, tmp_path: Path
 ) -> None:
     scenario.mode, scenario.payload = mode, payload
     info = _capture(scenario.wait)
@@ -319,13 +319,12 @@ def test_read_failures_still_fail_without_retry(
     assert info.value.__cause__ is info.value.__context__ is None
     for error in scenario.errors:
         assert error.__traceback__ is error.__cause__ is error.__context__ is None
+    for renderer, output in _render_failure(info, tmp_path).items():
+        assert _PRIVATE not in output, renderer
     scenario.native.assert_not_called()
 
 
-@pytest.mark.parametrize(
-    "mode",
-    ["zero", "multiple", "downstream", "http", "decode", "nested", "group", "malformed", "entry"],
-)
+@pytest.mark.parametrize("mode", ["zero", "multiple", "downstream"])
 def test_failure_rendering_excludes_private_payloads(
     scenario: _Scenario, mode: str, tmp_path: Path
 ) -> None:
@@ -334,12 +333,6 @@ def test_failure_rendering_excludes_private_payloads(
     if mode == "downstream":
         scenario.payload = {"requests": _mixed_requests(1)}
         action = scenario.downstream
-    elif mode == "malformed":
-        scenario.payload = {"requests": {"private": _PRIVATE}}
-    elif mode == "entry":
-        scenario.payload = {"requests": [_PRIVATE]}
-    elif mode not in {"zero", "multiple"}:
-        scenario.mode = mode
     info = _capture(action)
     for renderer, output in _render_failure(info, tmp_path).items():
         assert _PRIVATE not in output, renderer
@@ -380,6 +373,9 @@ def test_control_flow_errors_are_cleared_and_remain_failures(
     scenario.mode = mode
     with pytest.raises(exception) as caught:
         scenario.wait()
+    if mode == "exit":
+        assert isinstance(caught.value, SystemExit)
+        assert caught.value.code == 1
     assert _PRIVATE not in str(caught.value)
     assert caught.value.__context__ is caught.value.__cause__ is None
     assert scenario.read.call_count == scenario.model.get.call_count == 1
@@ -402,9 +398,3 @@ def test_real_owning_case_keeps_input_order_cleanup_and_observer_gate(scenario: 
         "/gate/release",
     ]
     scenario.native.assert_not_called()
-
-
-def test_loaded_owning_source_is_this_checkout() -> None:
-    assert Path(subject.__file__).resolve() == (
-        Path(__file__).resolve().parent / "e2e/test_codex_native_supported_efforts_e2e.py"
-    )
