@@ -997,7 +997,11 @@ class CursorExecutor(Executor):
                 Path(__file__).with_name("cursor_policy_gate_hook.py").resolve(strict=True)
             )
             interpreter = Path(sys.executable).resolve(strict=True)
-            if hook_source.is_relative_to(workspace) or interpreter.is_relative_to(workspace):
+            # Cursor's tools write the workspace, so nothing the hook runs may be in it.
+            if hook_source.is_relative_to(workspace) or any(
+                path.is_relative_to(workspace) or workspace.is_relative_to(path)
+                for path in _policy_hook_runtime_paths()
+            ):
                 raise RuntimeError("Cursor policy hook code must be outside the workspace")
             hook_script = private_home / "cursor_policy_gate_hook.py"
             shutil.copyfile(hook_source, hook_script)
@@ -1015,12 +1019,24 @@ class CursorExecutor(Executor):
                 finally:
                     handlers.discard(task)
 
-            server = await asyncio.start_unix_server(
-                serve,
-                path=str(socket_path),
-                limit=_POLICY_REQUEST_MAX_BYTES + 1,
-            )
-            socket_path.chmod(0o600)
+            # A socket address is limited to about 100 bytes, which a long home
+            # exceeds. Bind by name from inside the directory instead.
+            listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                async with _bridge_spawn_cwd_lock():
+                    previous_cwd = os.getcwd()
+                    os.chdir(private_home)
+                    try:
+                        listener.bind(socket_path.name)
+                    finally:
+                        os.chdir(previous_cwd)
+                socket_path.chmod(0o600)
+                server = await asyncio.start_unix_server(
+                    serve, sock=listener, limit=_POLICY_REQUEST_MAX_BYTES + 1
+                )
+            except BaseException:
+                listener.close()
+                raise
             config_dir = private_home / ".cursor"
             config_dir.mkdir(mode=0o700)
             config = {

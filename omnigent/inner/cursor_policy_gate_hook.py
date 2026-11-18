@@ -7,6 +7,7 @@ request to the harness, which holds the current turn's policy evaluator.
 from __future__ import annotations
 
 import json
+import os
 import socket
 import sys
 
@@ -34,9 +35,11 @@ def _evaluate(socket_path: str | None) -> dict[str, str]:
         if not isinstance(tool_name, str) or not tool_name or not isinstance(tool_input, dict):
             return _deny("Malformed Cursor tool request")
         request = {"name": tool_name, "arguments": tool_input}
+        # The path can exceed a socket address's length; connect by name from its directory.
+        os.chdir(os.path.dirname(socket_path))
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
             client.settimeout(_HOOK_APPROVAL_TIMEOUT_S)
-            client.connect(socket_path)
+            client.connect(os.path.basename(socket_path))
             client.sendall((json.dumps(request) + "\n").encode("utf-8"))
             with client.makefile("rb") as response_stream:
                 raw_response = response_stream.readline(_MAX_RESPONSE_BYTES + 1)

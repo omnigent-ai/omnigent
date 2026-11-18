@@ -126,6 +126,44 @@ async def test_hook_gates_native_tools_before_execution(
 
 @requires_policy_gate
 @pytest.mark.asyncio
+async def test_gate_works_under_a_home_too_long_for_a_socket_address(
+    home_and_workspace: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home, workspace = home_and_workspace
+    long_home = home / ("h" * 120)
+    long_home.mkdir(mode=0o700)
+    monkeypatch.setenv("HOME", str(long_home))
+    executor = CursorExecutor(cwd=str(workspace), api_key="test-key")
+
+    async def allow(_phase: str, _data: dict[str, object]) -> object:
+        return _verdict("POLICY_ACTION_ALLOW")
+
+    executor._policy_evaluator = allow
+    launch_cwd = os.getcwd()
+    gate = await executor._start_policy_gate(str(workspace))
+    try:
+        assert len(str(gate.home / "policy.sock")) > 108
+        assert os.getcwd() == launch_cwd
+        assert await _ask_hook(gate.home) == {"permission": "allow"}
+    finally:
+        await gate.close()
+
+
+@requires_policy_gate
+@pytest.mark.asyncio
+async def test_workspace_holding_the_hooks_python_is_rejected(
+    home_and_workspace: tuple[Path, Path],
+) -> None:
+    """Cursor's tools write the workspace, so it cannot hold what the hook imports."""
+    home, _ = home_and_workspace
+    executor = CursorExecutor(cwd=str(_STDLIB), api_key="test-key")
+    with pytest.raises(RuntimeError, match="outside the workspace"):
+        await executor._start_policy_gate(str(_STDLIB))
+    assert not list(home.glob(".omnigent-cursor-*"))
+
+
+@requires_policy_gate
+@pytest.mark.asyncio
 async def test_hook_waits_for_interactive_approval(
     home_and_workspace: tuple[Path, Path],
 ) -> None:
