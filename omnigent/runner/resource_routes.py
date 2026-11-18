@@ -498,6 +498,15 @@ def register_resource_routes(
                 )
 
             elif terminal_name == "antigravity":
+
+                async def _antigravity_ensure_build(
+                    ctx: NativeLaunchContext,
+                ) -> NativeLaunchContext:
+                    return dataclasses.replace(
+                        ctx, agent_spec=await _resolve_session_agent_spec_or_none(session_id)
+                    )
+
+                _ensure_build = _antigravity_ensure_build
                 _ensure_is_owned = _is_runner_owned_antigravity_terminal
                 _ensure_conflict = (
                     "Existing antigravity terminal is not a runner-owned agy TUI "

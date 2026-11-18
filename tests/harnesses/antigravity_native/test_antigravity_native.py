@@ -681,6 +681,10 @@ async def test_launch_and_record_isolates_gemini_dir_and_wires_relay(
     )
     assert iso_settings["showFeedbackSurvey"] is False
     assert user_settings.read_text(encoding="utf-8") == '{"model":"gemini-3-pro"}'
+    iso_rule = iso_gemini / "config" / "rules" / "omnigent_instructions.md"
+    assert iso_rule.is_file()
+    assert iso_rule.read_text(encoding="utf-8").startswith("---\ntrigger: always_on\n")
+    assert not (real_home / ".gemini" / "config" / "rules" / "omnigent_instructions.md").exists()
 
 
 # ---------------------------------------------------------------------------

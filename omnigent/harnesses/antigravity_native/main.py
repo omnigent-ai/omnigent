@@ -108,6 +108,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
     update_conversation_id,
     write_bridge_state,
     write_mcp_config,
+    write_startup_instructions_rule,
     write_tmux_target,
 )
 from omnigent.harnesses.antigravity_native.launch import (
@@ -1016,6 +1017,13 @@ async def _launch_and_record(
             trusted_workspace=Path.cwd().resolve(),
         ),
     }
+    from omnigent.runtime.prompt import build_native_startup_instructions
+
+    await asyncio.to_thread(
+        write_startup_instructions_rule,
+        bridge_dir,
+        build_native_startup_instructions(None),
+    )
     # agy's feedback survey shares its "esc to cancel" footer with the running-turn
     # marker, so a web turn injected into this CLI-launched session while the survey
     # is up would be silently lost (#1494). Disable it in the isolated dir agy reads

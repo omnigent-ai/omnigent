@@ -36,6 +36,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
     write_bridge_state,
     write_mcp_bridge_config,
     write_mcp_config,
+    write_startup_instructions_rule,
     write_tmux_target,
 )
 from omnigent.process_logging import data_dir
@@ -2455,6 +2456,95 @@ def test_seed_isolated_agy_home_skill_links_never_mutate_real_home(
     seed_isolated_agy_home(bridge_dir)
 
     assert sorted(p.name for p in real_shared.iterdir()) == []
+
+
+def test_write_startup_instructions_rule_writes_and_clears(tmp_path: Path) -> None:
+    """Startup instructions land as an always_on rule and clear when absent."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    written = write_startup_instructions_rule(bridge_dir, "Follow project style.")
+    expected = agy_gemini_dir(bridge_dir) / "config" / "rules" / "omnigent_instructions.md"
+    assert written == expected
+    assert expected.read_text(encoding="utf-8") == (
+        "---\n"
+        "trigger: always_on\n"
+        "description: Omnigent agent instructions and long-term memory guidance\n"
+        "---\n\n"
+        "Follow project style.\n"
+    )
+
+    assert write_startup_instructions_rule(bridge_dir, "   ") is None
+    assert not expected.exists()
+
+
+def test_write_startup_instructions_rule_preserves_symlinked_rules_dir(tmp_path: Path) -> None:
+    """Materializes a symlinked rules dir before writing so real ~/.gemini stays untouched."""
+    real_rules = tmp_path / "real-gemini" / "config" / "rules"
+    real_rules.mkdir(parents=True)
+    user_rule = real_rules / "user.md"
+    user_rule.write_text("---\ntrigger: always_on\n---\n\nUser rule.\n", encoding="utf-8")
+
+    bridge_dir = tmp_path / "bridge"
+    iso_config = agy_gemini_dir(bridge_dir) / "config"
+    iso_config.mkdir(parents=True)
+    iso_rules = iso_config / "rules"
+    iso_rules.symlink_to(real_rules, target_is_directory=True)
+
+    written = write_startup_instructions_rule(bridge_dir, "Omnigent memory note.")
+    assert written == iso_rules / "omnigent_instructions.md"
+    assert not iso_rules.is_symlink()
+    assert (iso_rules / "user.md").read_text(encoding="utf-8") == user_rule.read_text(
+        encoding="utf-8"
+    )
+    assert "Omnigent memory note." in written.read_text(encoding="utf-8")
+    # Real ~/.gemini/config/rules is untouched.
+    assert sorted(p.name for p in real_rules.iterdir()) == ["user.md"]
+
+
+def test_write_startup_instructions_rule_edge_cases(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Handles broken symlinks, regular-file collisions, symlink clears, and oversized bodies."""
+    # 1) Clearing while config/rules is still symlinked never touches real home.
+    real_rules = tmp_path / "real-rules"
+    real_rules.mkdir()
+    real_file = real_rules / "omnigent_instructions.md"
+    real_file.write_text("user-owned", encoding="utf-8")
+    b1 = tmp_path / "b1"
+    iso1_cfg = agy_gemini_dir(b1) / "config"
+    iso1_cfg.mkdir(parents=True)
+    (iso1_cfg / "rules").symlink_to(real_rules, target_is_directory=True)
+    assert write_startup_instructions_rule(b1, None) is None
+    assert real_file.read_text(encoding="utf-8") == "user-owned"
+
+    # 2) Broken symlink at config/rules is replaced cleanly.
+    b2 = tmp_path / "b2"
+    iso2_cfg = agy_gemini_dir(b2) / "config"
+    iso2_cfg.mkdir(parents=True)
+    (iso2_cfg / "rules").symlink_to(tmp_path / "missing-target", target_is_directory=True)
+    written = write_startup_instructions_rule(b2, "Recovered.")
+    assert written is not None and "Recovered." in written.read_text(encoding="utf-8")
+
+    # 3) Existing regular file at config/rules fails soft (returns None, logs warning).
+    b3 = tmp_path / "b3"
+    iso3_cfg = agy_gemini_dir(b3) / "config"
+    iso3_cfg.mkdir(parents=True)
+    (iso3_cfg / "rules").write_text("not a dir", encoding="utf-8")
+    with caplog.at_level(logging.WARNING, logger=_mod.__name__):
+        assert write_startup_instructions_rule(b3, "Cannot write here.") is None
+    assert any(
+        "Could not write Antigravity startup instructions" in r.message for r in caplog.records
+    )
+
+    # 4) Oversized body logs a truncation warning but still writes.
+    b4 = tmp_path / "b4"
+    b4.mkdir()
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger=_mod.__name__):
+        big = write_startup_instructions_rule(b4, "x" * 24_050)
+    assert big is not None and big.is_file()
+    assert any("exceed agy's" in r.message for r in caplog.records)
 
 
 def test_agy_home_dir_is_under_bridge_dir(tmp_path: Path) -> None:

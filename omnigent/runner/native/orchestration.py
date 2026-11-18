@@ -6991,6 +6991,7 @@ async def _auto_create_antigravity_terminal(
     *,
     server_client: httpx.AsyncClient | None = None,
     ensure_comment_relay: _EnsureCommentRelay | None = None,
+    agent_spec: AgentSpec | ResolvedSpec | None = None,
 ) -> SessionResourceView:
     """
     Auto-create the native Antigravity (agy) terminal for a session.
@@ -7060,6 +7061,7 @@ async def _auto_create_antigravity_terminal(
         seed_isolated_agy_home,
         write_bridge_state,
         write_mcp_config,
+        write_startup_instructions_rule,
         write_tmux_target,
     )
     from omnigent.harnesses.antigravity_native.launch import build_agy_launch
@@ -7168,6 +7170,14 @@ async def _auto_create_antigravity_terminal(
             trusted_workspace=workspace,
         ),
     }
+    startup_instructions = await _native_startup_instructions(
+        agent_spec, server_client, session_id, workspace=workspace
+    )
+    await asyncio.to_thread(
+        write_startup_instructions_rule,
+        bridge_dir,
+        startup_instructions,
+    )
     # agy's periodic feedback survey shares its "esc to cancel" footer with the
     # running-turn marker, so a web turn injected while it is up is misread as an
     # active turn and lost (#1494). Disable it before launch. agy now runs under
@@ -10873,6 +10883,7 @@ async def _launch_antigravity(ctx: NativeLaunchContext) -> SessionResourceView:
         ctx.publish_event,
         server_client=ctx.server_client,
         ensure_comment_relay=ctx.ensure_comment_relay,
+        agent_spec=ctx.agent_spec,
     )
 
 

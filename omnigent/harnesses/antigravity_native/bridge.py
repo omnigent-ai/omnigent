@@ -369,6 +369,9 @@ _MCP_CONFIG_DIR = "config"
 _MCP_CONFIG_FILE = "mcp_config.json"
 _BRIDGE_CONFIG_FILE = "bridge.json"
 _MCP_SERVER_NAME = "omnigent"
+_AGY_RULES_DIR = "rules"
+_AGY_OMNIGENT_INSTRUCTIONS_FILE = "omnigent_instructions.md"
+_AGY_MAX_RULE_BYTES = 24_000
 # agy auto-approves a relay tool when it is named in the server's ``enabledTools``
 # allowlist (agy's per-server MCP schema; mirrors cursor's ``autoApprove``).
 # Omnigent's own TOOL_CALL policy + elicitation gate still applies on the server
@@ -999,6 +1002,85 @@ def _seed_isolated_agy_workspace_trust(iso_gemini: Path, workspace: Path) -> Non
     tmp = settings_path.with_suffix(settings_path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(tmp, settings_path)
+
+
+def _materialize_symlinked_dir(path: Path) -> None:
+    """Replace a directory symlink with a real dir linking each entry inside its target."""
+    target = path.resolve()
+    path.unlink()
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if not target.is_dir():
+        return
+    with contextlib.suppress(OSError):
+        for entry in target.iterdir():
+            if entry.name == _AGY_OMNIGENT_INSTRUCTIONS_FILE:
+                continue
+            link = path / entry.name
+            with contextlib.suppress(OSError, RuntimeError):
+                link.symlink_to(entry.resolve(), target_is_directory=entry.is_dir())
+
+
+def write_startup_instructions_rule(bridge_dir: Path, instructions: str | None) -> Path | None:
+    """Write Omnigent startup instructions as an always-on rule in the isolated Gemini dir.
+
+    Targets ``<bridge_dir>/agy-home/.gemini/config/rules/omnigent_instructions.md``
+    with ``trigger: always_on`` frontmatter so agy injects them into its system
+    prompt without mutating the workspace or real ``~/.gemini``. Best-effort:
+    filesystem errors are logged and return ``None`` rather than aborting launch.
+    """
+    rules_dir = agy_gemini_dir(bridge_dir) / _MCP_CONFIG_DIR / _AGY_RULES_DIR
+    rule_path = rules_dir / _AGY_OMNIGENT_INSTRUCTIONS_FILE
+    body = instructions.strip() if isinstance(instructions, str) else ""
+    if not body:
+        if not rules_dir.is_symlink():
+            with contextlib.suppress(OSError):
+                rule_path.unlink(missing_ok=True)
+        return None
+
+    body_bytes = len(body.encode("utf-8"))
+    if body_bytes > _AGY_MAX_RULE_BYTES:
+        _logger.warning(
+            "Antigravity startup instructions (%d bytes) exceed agy's %d-byte rule cap; "
+            "tail guidance may be truncated",
+            body_bytes,
+            _AGY_MAX_RULE_BYTES,
+        )
+
+    content = (
+        "---\n"
+        "trigger: always_on\n"
+        "description: Omnigent agent instructions and long-term memory guidance\n"
+        "---\n\n"
+        f"{body}\n"
+    )
+    try:
+        if rules_dir.is_symlink():
+            _materialize_symlinked_dir(rules_dir)
+        else:
+            rules_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f"{_AGY_OMNIGENT_INSTRUCTIONS_FILE}.", dir=str(rules_dir)
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(tmp_name, 0o600)
+            os.replace(tmp_name, rule_path)
+        finally:
+            with contextlib.suppress(OSError):
+                if os.path.exists(tmp_name):
+                    os.unlink(tmp_name)
+    except (OSError, RuntimeError):
+        _logger.warning(
+            "Could not write Antigravity startup instructions rule at %s",
+            rule_path,
+            exc_info=True,
+        )
+        return None
+    return rule_path
 
 
 # Serializes bridge-state writes in this process, so a guarded conversation-id update

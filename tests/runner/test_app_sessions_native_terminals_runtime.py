@@ -3687,12 +3687,27 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
             )
 
     try:
+        from omnigent.spec.types import AgentSpec, ExecutorSpec
+
+        async def _fake_memory_guidance(*_args: Any, **_kwargs: Any) -> str:
+            return "MEMORY GUIDANCE"
+
+        monkeypatch.setattr(
+            "omnigent.runner.native.orchestration.memory_startup_guidance",
+            _fake_memory_guidance,
+        )
         await _auto_create_antigravity_terminal(
             session_id,
             cast(SessionResourceRegistry, _FakeResourceRegistry()),
             lambda _sid, _event: None,
             server_client=cast(httpx.AsyncClient, _SnapshotServerClient()),
             ensure_comment_relay=_recording_relay,
+            agent_spec=AgentSpec(
+                spec_version=1,
+                name="custom_agy",
+                instructions="Always check edge cases.",
+                executor=ExecutorSpec(),
+            ),
         )
         await asyncio.sleep(0)
     finally:
@@ -3740,6 +3755,81 @@ async def test_auto_create_antigravity_wires_omnigent_mcp_relay(
     workspace_key = str((tmp_path / "workspace").resolve())
     assert workspace_key in settings_data.get("trustedWorkspaces", [])
     assert settings_data.get("showFeedbackSurvey") is False
+
+    # 5) Composed startup instructions (authored + image + memory) land as an
+    #    always_on rule under the isolated Gemini dir.
+    rule_path = iso_gemini / "config" / "rules" / "omnigent_instructions.md"
+    assert rule_path.is_file()
+    rule_text = rule_path.read_text(encoding="utf-8")
+    assert rule_text.startswith("---\ntrigger: always_on\n")
+    assert "Always check edge cases." in rule_text
+    assert "MEMORY GUIDANCE" in rule_text
+
+
+@pytest.mark.asyncio
+async def test_ensure_native_terminal_antigravity_resolves_agent_spec(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """POST /resources/terminals ensure path passes resolved agent_spec to antigravity launch."""
+    from omnigent.runner.native import orchestration as orch_mod
+    from omnigent.spec.types import AgentSpec, ExecutorSpec
+
+    session_id = "conv_agy_ensure_spec"
+    resolved_spec = AgentSpec(
+        spec_version=1,
+        name="custom_agy",
+        instructions="Ensure path keeps spec.",
+        executor=ExecutorSpec(),
+    )
+    seen_specs: list[Any] = []
+
+    async def _fake_auto_create(
+        sid: str,
+        *_args: Any,
+        agent_spec: Any = None,
+        **_kwargs: Any,
+    ) -> SessionResourceView:
+        seen_specs.append(agent_spec)
+        return SessionResourceView(
+            id="terminal_antigravity_main",
+            type="terminal",
+            session_id=sid,
+            name="Antigravity",
+        )
+
+    monkeypatch.setattr(orch_mod, "_auto_create_antigravity_terminal", _fake_auto_create)
+
+    async def _resolver(agent_id: str, sid: str | None = None) -> AgentSpec:
+        del agent_id, sid
+        return resolved_spec
+
+    class _SessionClient(NullServerClient):
+        async def get(self, url: str, **_kwargs: Any) -> httpx.Response:
+            if url == f"/v1/sessions/{session_id}":
+                return httpx.Response(
+                    200,
+                    json={"id": session_id, "agent_id": "custom_agy"},
+                    request=httpx.Request("GET", url),
+                )
+            return await super().get(url, **_kwargs)
+
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=_SessionClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/resources/terminals",
+            json={
+                "terminal": "antigravity",
+                "session_key": "main",
+                "ensure_native_terminal": True,
+            },
+        )
+    assert resp.status_code == 200
+    assert seen_specs == [resolved_spec]
 
 
 @pytest.mark.asyncio
