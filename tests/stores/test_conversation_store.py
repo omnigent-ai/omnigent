@@ -10567,6 +10567,48 @@ def test_failed_family_membership_preserves_source_pin(
     assert not store.list_conversations(pinned=True, pinned_owner="alice").data
 
 
+@pytest.mark.parametrize("store_name", ["conversation_store", "split_db_conversation_store"])
+def test_move_one_session_between_nests(request, store_name, monkeypatch):
+    from omnigent.errors import OmnigentError
+    from omnigent.stores.conversation_store import family_pinned_label_key
+
+    store = request.getfixturevalue(store_name)
+    clock = [100]
+    monkeypatch.setattr(
+        "omnigent.stores.conversation_store.sqlalchemy_store.now_epoch", lambda: clock[0]
+    )
+    moved = store.create_conversation(host_id="b" * 32, runner_id="c" * 32, workspace="/workspace")
+    clock[0] = 200
+    head = store.create_conversation()
+    peer = store.create_conversation()
+    store.add_new_sibling(head.id, peer.id, user_id="owner")
+    store.set_conversation_project(head.id, "a" * 32)
+    store.set_family_pin(head.id, "123", user_id="owner")
+    store.set_session_nest(moved.id, head.id, user_id="owner")
+    saved = store.get_conversation(moved.id)
+    assert saved.family_id == head.id and saved.project_id == "a" * 32
+    assert saved.labels[family_pinned_label_key("owner")] == "123"
+    assert (saved.host_id, saved.runner_id, saved.root_conversation_id) == (
+        moved.host_id,
+        moved.runner_id,
+        moved.root_conversation_id,
+    )
+    assert store.get_session_family(moved.id)[0].id == head.id
+    other = store.create_conversation()
+    store.set_session_nest(moved.id, other.id, user_id="owner")
+    assert {row.id for row in store.get_session_family(head.id)} == {head.id, peer.id}
+    assert family_pinned_label_key("owner") not in store.get_conversation(moved.id).labels
+    store.set_session_nest(other.id, None, user_id="owner")
+    assert store.get_conversation(other.id).family_id is None
+    fresh = store.create_conversation()
+    store.set_session_nest(fresh.id, other.id, user_id="owner")
+    assert store.get_conversation(fresh.id).family_id != store.get_conversation(moved.id).family_id
+    child = store.create_conversation(parent_conversation_id=head.id)
+    with pytest.raises(OmnigentError):
+        store.set_session_nest(child.id, head.id, user_id="owner")
+    assert store.get_conversation(child.id).family_id is None
+
+
 @pytest.mark.parametrize("split_database", [False, True])
 def test_failed_family_project_move_preserves_legacy_membership(
     tmp_path, monkeypatch, split_database

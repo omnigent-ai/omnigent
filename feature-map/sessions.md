@@ -18,8 +18,11 @@ the header menu), and each place is a separate entry point.
   session remains bound. The representative pins/moves the entire family; nested members have no pin
   action, and legacy individual pins keep their place inside the nest.
   Opening Add nested agent shows a draft row in the family until creation
-  replaces it; leaving the composer without submitting removes the draft. Existing
-  sessions cannot join a family; ordinary forks remain standalone and may reuse the source host.
+  replaces it; leaving the composer without submitting removes the draft. Owned active sessions can move into an existing nest by dragging onto its center
+  or choosing **Move session → Nests** in the sidebar menu. Choose a searchable
+  destination, or **Remove from nest** to detach just that session. Dragging a
+  nested member shows a floating **Remove from nest** target without shifting rows.
+  Ordinary forks remain standalone and may reuse the source host.
 
 - `session-grid`: with `grid_sessions_display_ui` (on by default), drag sidebar sessions into a
   conversation to split left/right or top/bottom with a hover preview. Up to four
@@ -104,7 +107,7 @@ the header menu), and each place is a separate entry point.
   on each run that started a session: a run that succeeds while the page is open
   is marked unread, and opening its session from the run row clears it there and
   in the sidebar.
-- `project`: Add to project (Move session once filed) puts a session in a
+- `project`: **Move session → Projects** in the sidebar (Add to project in the header) puts a session in a
   project folder from the row menu, the header menu, or the header's folder tag.
   Agents file sessions the same way with `sys_session_update` (see
   [session orchestration](session-orchestration.md)).

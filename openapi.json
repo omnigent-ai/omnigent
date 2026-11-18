@@ -8305,6 +8305,11 @@
             "title": "Session Move Source Checks",
             "type": "boolean"
           },
+          "session_nest_moves": {
+            "default": false,
+            "title": "Session Nest Moves",
+            "type": "boolean"
+          },
           "session_organize_source_checks": {
             "default": false,
             "title": "Session Organize Source Checks",
@@ -16031,6 +16036,17 @@
             ],
             "description": "Per-session LLM model override, e.g. `\"claude-opus-4-7\"`. The value is forwarded as-is to the executor at turn start; the server does not enumerate valid models. Clear aliases such as `\"default\"`, `\"off\"`, or `\"reset\"` remove the override (matching the REPL's `/model` semantics). `None` leaves unchanged.",
             "title": "Model Override"
+          },
+          "nest_source_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Nest Source Id"
           },
           "permission_mode": {
             "anyOf": [

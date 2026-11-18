@@ -3664,6 +3664,11 @@ def register_core_routes(
         # resolved (strictest requested) level gates them all with no redundant
         # second permission-store read.
         set_project = "project_id" in body.model_fields_set
+        set_nest = "nest_source_id" in body.model_fields_set
+        if set_nest and body.model_fields_set != {"nest_source_id"}:
+            raise OmnigentError(
+                "Move a session separately from other updates", code=ErrorCode.INVALID_INPUT
+            )
         set_launch_args = (
             body.terminal_launch_args is not None
             or body.permission_mode is not None
@@ -3676,7 +3681,7 @@ def register_core_routes(
         }
         if pin_only:
             required_level = LEVEL_READ
-        elif body.archived is not None or set_project or set_launch_args:
+        elif body.archived is not None or set_project or set_nest or set_launch_args:
             required_level = LEVEL_OWNER
         elif set_share_workspace:
             required_level = LEVEL_MANAGE
@@ -4370,6 +4375,31 @@ def register_core_routes(
                     )
                     if owned is None:
                         raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        if set_nest:
+            from omnigent.server.session_orchestration import require_owned_session
+
+            if user_id is None or permission_store is None:
+                raise OmnigentError("Moving sessions requires an owner", code=ErrorCode.FORBIDDEN)
+            if body.nest_source_id is not None and not request.app.state.feature_flags.enabled(
+                Feature.SIBLING_SESSIONS
+            ):
+                raise OmnigentError("Nested agents are disabled", code=ErrorCode.FORBIDDEN)
+            for participant_id in dict.fromkeys([session_id, body.nest_source_id]):
+                if participant_id is None:
+                    continue
+                await asyncio.to_thread(
+                    require_owned_session,
+                    participant_id,
+                    user_id,
+                    conversation_store,
+                    permission_store,
+                )
+            await asyncio.to_thread(
+                conversation_store.set_session_nest,
+                session_id,
+                body.nest_source_id,
+                user_id=user_id,
+            )
         update_result = await asyncio.to_thread(
             conversation_store.update_conversation_with_changes,
             session_id,

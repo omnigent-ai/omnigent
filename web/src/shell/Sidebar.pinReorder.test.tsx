@@ -15,6 +15,7 @@ const mocks = vi.hoisted(() => ({
   filterHonored: true,
   pinFn: vi.fn(),
   reorderPins: vi.fn(),
+  moveNest: vi.fn(),
 }));
 
 vi.mock("@/hooks/useConversations", async () => {
@@ -34,6 +35,7 @@ vi.mock("@/hooks/useConversations", async () => {
         mutationFn: (vars: unknown) => mocks.pinFn(vars),
       }),
     useReorderPinnedConversations: () => ({ mutate: mocks.reorderPins }),
+    useMoveToNest: () => ({ mutate: mocks.moveNest, isPending: false }),
   };
 });
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
@@ -42,6 +44,7 @@ import { useConversations } from "@/hooks/useConversations";
 import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
 import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "./sidebarNav";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 
 const ROW_HEIGHT = 30;
 
@@ -119,6 +122,47 @@ afterEach(async () => {
   });
   vi.restoreAllMocks();
   vi.clearAllMocks();
+});
+
+it("joins a nest by dropping on its center and detaches through a floating target", async () => {
+  const family = { id: "conv_d", representative_id: "conv_d", pinned: false };
+  const otherFamily = { id: "conv_other", representative_id: "conv_other", pinned: false };
+  const destination = conv("conv_d", { family });
+  vi.mocked(useConversations).mockReturnValue(
+    conversationPage([
+      conv("conv_c"),
+      destination,
+      conv("conv_other", { family: otherFamily }),
+      conv("conv_member", { family: otherFamily }),
+    ]),
+  );
+  const rowRect = vi.mocked(Element.prototype.getBoundingClientRect).getMockImplementation()!;
+  vi.mocked(Element.prototype.getBoundingClientRect).mockImplementation(function (this: Element) {
+    if (this.matches('[data-testid="detach-nest-target"]'))
+      return rowRect.call(document.querySelector('li[data-sidebar-session-id="conv_d"]')!);
+    return rowRect.call(this);
+  });
+  renderSidebar({
+    info: { ...FALLBACK_SERVER_INFO, sibling_sessions: true, session_nest_moves: true },
+  });
+  await dropOnto("conv_c", "conv_d", { expectTarget: false });
+  expect(mocks.moveNest).toHaveBeenCalledWith({ id: "conv_c", destination });
+  const member = document.querySelector('li[data-sidebar-session-id="conv_member"]')!;
+  const rowsBefore = [...document.querySelectorAll("li[data-sidebar-session-id]")];
+  const start = rowCenter("conv_member");
+  fireEvent.mouseDown(member, { button: 0, ...start });
+  fireEvent.mouseMove(document, { clientX: start.clientX, clientY: start.clientY - 10 });
+  const target = await screen.findByTestId("detach-nest-target");
+  expect(target).toHaveStyle({ position: "fixed" });
+  expect([...document.querySelectorAll("li[data-sidebar-session-id]")]).toEqual(rowsBefore);
+  const drop = rowCenter("conv_d");
+  await act(async () => {
+    fireEvent.mouseMove(document, drop);
+  });
+  await act(async () => {
+    fireEvent.mouseUp(document, drop);
+  });
+  expect(mocks.moveNest).toHaveBeenLastCalledWith({ id: "conv_member", destination: null });
 });
 
 describe("dropping an unpinned session onto a pinned row", () => {

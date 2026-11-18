@@ -34,6 +34,8 @@ import {
   useRenameProject,
   useUpdateProjectConfig,
   useMoveToProject,
+  useMoveToNest,
+  withMoveTombstone,
   useRenameConversation,
   useStopAndDeleteConversation,
   useStopSession,
@@ -2996,6 +2998,69 @@ describe("fetchProjectSessionIds", () => {
       visibility: "all",
       include_archived: "true",
     });
+  });
+});
+
+describe("useMoveToNest", () => {
+  it.each([false, true])(
+    "keeps membership stable until a move settles (detach=%s)",
+    async (detach) => {
+      const family = { id: "nest", representative_id: "head", pinned: false };
+      const row = conversation({ id: "moved", family: detach ? family : null });
+      const destination = detach
+        ? null
+        : conversation({ id: "head", family, project_id: "project" });
+      const updated = {
+        ...row,
+        family: destination?.family ?? null,
+        project_id: destination?.project_id ?? null,
+      };
+      let resolve!: (value: Response) => void;
+      fetchMock.mockReturnValue(
+        new Promise<Response>((done) => {
+          resolve = done;
+        }),
+      );
+      const queryClient = new QueryClient();
+      const key = ["conversations", "", false];
+      queryClient.setQueryData(key, infinitePage([row]));
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      const { result } = renderHook(() => useMoveToNest(), { wrapper });
+      result.current.mutate({ id: row.id, destination });
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+      expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
+        nest_source_id: destination?.id ?? null,
+      });
+      expect(
+        queryClient.getQueryData<ConversationsInfiniteData>(key)?.pages[0].data[0],
+      ).toMatchObject(updated);
+      expect(withMoveTombstone(row)).toMatchObject(updated);
+      resolve(mockResponse(updated));
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      expect(withMoveTombstone(row)).toEqual(row);
+    },
+  );
+
+  it("restores the row if the server rejects the move", async () => {
+    const row = conversation({
+      id: "moved",
+      family: { id: "nest", representative_id: "head", pinned: false },
+    });
+    fetchMock.mockResolvedValue(
+      mockResponse({ detail: "Move rejected" }, { ok: false, status: 409 }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const key = ["conversations", "", false];
+    const original = infinitePage([row]);
+    queryClient.setQueryData(key, original);
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useMoveToNest(), { wrapper });
+    result.current.mutate({ id: row.id, destination: null });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(queryClient.getQueryData(key)).toEqual(original);
+    expect(withMoveTombstone(row)).toEqual(row);
   });
 });
 
