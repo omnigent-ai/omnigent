@@ -460,6 +460,34 @@ describe("design outbox storage", () => {
     expect(unloadAsks()).toBe(false);
   });
 
+  it("still saves when the browser refuses this tab's lock", async () => {
+    const held = installLocks();
+    const { request } = navigator.locks;
+    Object.defineProperty(navigator.locks, "request", {
+      configurable: true,
+      value: (...args: Parameters<typeof request>) =>
+        typeof args[1] === "object" && args[1].ifAvailable
+          ? Promise.reject(new DOMException("Locks are unavailable", "SecurityError"))
+          : request(...args),
+    });
+    vi.resetModules();
+    const fresh = await import("./designOutboxStorage");
+    await fresh.saveRequest(
+      {
+        id: "refused_lock",
+        tabId: TAB,
+        conversationId: SESSION,
+        label: "Draw",
+        text: "Saved anyway",
+        files: [],
+        status: "waiting",
+      },
+      "alice",
+    );
+    expect(await savedIds()).toContain("refused_lock");
+    expect(held.size).toBe(0);
+  });
+
   it("lets only one of two tabs starting together take a saved request, and splits a duplicated tab's id", async () => {
     installLocks();
     await putRecord(record({ id: "orphan", page: "closed_tab" }));

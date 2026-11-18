@@ -82,10 +82,13 @@ function takeTabLock(): Promise<void> {
       const name = tabLockPrefix() + tab;
       // oxlint-disable-next-line no-await-in-loop -- try one id at a time
       const taken = await new Promise<boolean>((settled) => {
-        void navigator.locks.request(name, { ifAvailable: true }, (lock) => {
-          settled(lock !== null);
-          return lock ? new Promise<never>(() => {}) : undefined;
-        });
+        navigator.locks
+          .request(name, { ifAvailable: true }, (lock) => {
+            settled(lock !== null);
+            return lock ? new Promise<never>(() => {}) : undefined;
+          })
+          // Locks refused here (an opaque origin, say): keep this id, as without Web Locks.
+          .catch(() => settled(true));
       });
       if (taken) return;
       tab = newTabId();

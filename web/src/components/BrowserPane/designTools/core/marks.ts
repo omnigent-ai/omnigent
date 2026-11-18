@@ -2,6 +2,9 @@
 // the screenshot, so what's sent is drawn exactly as it was shown.
 import type { Shape } from "./designToolsStore";
 
+const BLACK = "#000000";
+const WHITE = "#ffffff";
+
 // Drawn into the screenshot, so they're fixed rather than themed.
 export const MARK_COLORS = [
   { name: "Red", value: "#e5484d" },
@@ -9,12 +12,10 @@ export const MARK_COLORS = [
   { name: "Yellow", value: "#ffc53d" },
   { name: "Green", value: "#30a46c" },
   { name: "Blue", value: "#3b8ff5" },
-  { name: "Black", value: "#000000" },
-  { name: "White", value: "#ffffff" },
+  { name: "Black", value: BLACK },
+  { name: "White", value: WHITE },
 ] as const;
 const TEXT_FONT = "600 18px system-ui, sans-serif";
-const BLACK = MARK_COLORS[5].value;
-const WHITE = MARK_COLORS[6].value;
 
 export function drawShape(context: CanvasRenderingContext2D, shape: Shape): void {
   const [start, ...rest] = shape.points;

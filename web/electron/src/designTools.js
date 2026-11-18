@@ -561,7 +561,7 @@ function createDesignTools({
         const { x, y, dx, dy } = args;
         if (![x, y, dx, dy].every(isFiniteNumber)) return invalid();
         const zoom = zoomOf(entry);
-        // Ctrl+wheel zooms.
+        // With its modifiers, so Ctrl+wheel still zooms the page.
         const modifiers = asModifiers(args.modifiers);
         webContents.sendInputEvent({
           type: "mouseWheel",

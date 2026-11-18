@@ -266,7 +266,7 @@ describe("design tools: the overlay", () => {
     assert.equal(overlay.visible, true);
     assert.equal(overlay.webContents.getZoomFactor(), 1.5);
     assert.equal(overlay.webContents.isFocused(), true);
-    // It opens nothing and goes nowhere.
+    // It has the app's origin, so it may neither open windows nor navigate away.
     assert.deepEqual(overlay.webContents.openHandler(), { action: "deny" });
     let prevented = false;
     overlay.webContents.emit("will-navigate", { preventDefault: () => (prevented = true) });
