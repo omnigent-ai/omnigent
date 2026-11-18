@@ -175,8 +175,16 @@ export function ConnectionIndicator({
  * renders that bubble immediately, so the empty state never shows
  * there).
  */
-export function RunnerStartingIndicator({ variant }: { variant: "hero" | "row" }) {
-  const sandboxStatus = useChatStore((s) => s.sandboxStatus);
+export function RunnerStartingIndicator({
+  variant,
+  status,
+}: {
+  variant: "hero" | "row";
+  /** A pane showing another session passes that session's launch; defaults to the open session's. */
+  status?: SandboxStatus | null;
+}) {
+  const openSessionStatus = useChatStore((s) => s.sandboxStatus);
+  const sandboxStatus = status === undefined ? openSessionStatus : status;
   if (sandboxStatus?.stage === "failed") {
     return <SandboxFailedIndicator status={sandboxStatus} />;
   }
