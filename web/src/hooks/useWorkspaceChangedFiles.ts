@@ -23,7 +23,7 @@ import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useSession } from "@/hooks/useSession";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { authenticatedFetch } from "@/lib/identity";
-import { listDirectoryViaWorkspaceApi } from "@/lib/workspaceApi";
+import { listDirectoryViaWorkspaceApi, searchFilesViaWorkspaceApi } from "@/lib/workspaceApi";
 import { isTempConvId } from "@/lib/tempConversationId";
 import { useChatStore } from "@/store/chatStore";
 
@@ -602,6 +602,26 @@ async function fetchWorkspaceFileSearch(
   location: string,
   signal?: AbortSignal,
 ): Promise<WorkspaceFileSearchResult> {
+  // The workspace API only searches inside the workspace.
+  if (!browseLocationBase(location)) {
+    const viaApi = await searchFilesViaWorkspaceApi(
+      conversationId,
+      query,
+      { path: location, include, exclude, limit: 500 },
+      signal,
+    );
+    if (viaApi) {
+      return {
+        files: mapFilesystemEntries(
+          { object: "list", data: viaApi.data, has_more: viaApi.hasMore },
+          location,
+        ),
+        truncated: viaApi.truncated,
+        hasMore: viaApi.hasMore,
+        unavailable: false,
+      };
+    }
+  }
   const params = new URLSearchParams({ limit: "500" });
   if (query) params.set("q", query);
   if (include) params.set("include", include);

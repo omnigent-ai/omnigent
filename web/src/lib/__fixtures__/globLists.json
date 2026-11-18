@@ -1,0 +1,12 @@
+{
+  "cases": [
+    { "raw": "", "patterns": [] },
+    { "raw": " , ,", "patterns": [] },
+    { "raw": "*.ts", "patterns": ["*.ts"] },
+    { "raw": "*.ts, src/**", "patterns": ["*.ts", "src/**"] },
+    { "raw": "*.{js,ts}, src/**", "patterns": ["*.{js,ts}", "src/**"] },
+    { "raw": "a{b,{c,d}},e", "patterns": ["a{b,{c,d}}", "e"] },
+    { "raw": "}a,b{,c", "patterns": ["}a", "b{,c"] },
+    { "raw": "  spaced  ,\ttabbed\t", "patterns": ["spaced", "tabbed"] }
+  ]
+}

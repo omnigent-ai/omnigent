@@ -2232,6 +2232,22 @@ async def test_content_search_live_workspace(
     assert not (workspace / "injected").exists()
 
 
+@pytest.mark.parametrize(
+    "case",
+    json.loads(
+        (
+            Path(__file__).resolve().parents[2] / "web/src/lib/__fixtures__/globLists.json"
+        ).read_text(encoding="utf-8")
+    )["cases"],
+    ids=lambda case: repr(case["raw"]),
+)
+def test_split_glob_list_matches_the_web_client(case: dict[str, Any]) -> None:
+    """The web client splits globs for the workspace API as REST does here."""
+    from omnigent.runner.environment_filesystem import split_glob_list
+
+    assert split_glob_list(case["raw"]) == case["patterns"]
+
+
 # The web panel's Whole word cases, shared with its unit test, run through real ripgrep.
 _WHOLE_WORD_FIXTURE = json.loads(
     (
