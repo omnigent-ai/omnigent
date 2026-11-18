@@ -2212,7 +2212,8 @@ describe("Sidebar sections", () => {
       const family = {
         id: "family",
         representative_id: "conv_parent",
-        pinned: scope.startsWith("pinned") && scope !== "pinned-legacy",
+        pinned: scope.startsWith("pinned"),
+        pinned_at: scope.startsWith("pinned") ? "1" : null,
       };
       const labels: Record<string, string> = scope.startsWith("project")
         ? { omni_project: "Example project" }
@@ -2388,7 +2389,12 @@ describe("Sidebar sections", () => {
   ])(
     "keeps legacy pins grouped (project: $inProject, representative pin: $legacyRepresentative)",
     ({ inProject, legacyRepresentative }) => {
-      const family = { id: "family", representative_id: "conv_parent", pinned: false };
+      const family = {
+        id: "family",
+        representative_id: "conv_parent",
+        pinned: legacyRepresentative,
+        pinned_at: legacyRepresentative ? "1" : null,
+      };
       if (inProject) projectsMock.push("Example project");
       const labels: Record<string, string> = inProject ? { omni_project: "Example project" } : {};
       const members = ["conv_parent", "conv_peer", "conv_nested"].map((id, index) =>
