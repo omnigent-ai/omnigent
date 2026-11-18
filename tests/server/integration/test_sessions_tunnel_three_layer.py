@@ -41,6 +41,7 @@ import threading
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -2574,6 +2575,25 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
     session_id = response.json()["session_id"]
     runner_id = f"runner-host-offline-{scenario}"
     host_id = "0123456789abcdef0123456789abcdef"
+    hold_now = 0.0
+    within_grace_recheck = asyncio.Event()
+    if local_host_return:
+        # Control hold deadlines while the tunnel and event loop keep real timers.
+        hold_loop = SimpleNamespace(time=lambda: hold_now)
+        monkeypatch.setattr(
+            server_app,
+            "asyncio",
+            SimpleNamespace(**(vars(asyncio) | {"get_running_loop": lambda: hold_loop})),
+        )
+        registry = ap_app.state.tunnel_registry
+        wait_for_runner = registry.wait_for_runner
+
+        async def observe_hold_recheck(waiting_runner_id: str, *, timeout_s: float) -> Any:
+            if waiting_runner_id == runner_id and hold_now == grace / 2:
+                within_grace_recheck.set()
+            return await wait_for_runner(waiting_runner_id, timeout_s=timeout_s)
+
+        monkeypatch.setattr(registry, "wait_for_runner", observe_hold_recheck)
     store = get_conversation_store()
     store.replace_runner_id(session_id, runner_id)
     store.set_host_id(session_id, host_id, workspace="/tmp/host-offline")
@@ -2870,8 +2890,14 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
                             relaunch_finished.set()
 
                 host_task = asyncio.create_task(serve_host())
-            await asyncio.sleep(grace / 2)
+            if local_host_return:
+                hold_now = grace / 2
+                await asyncio.wait_for(within_grace_recheck.wait(), timeout=budget(5.0))
+            else:
+                await asyncio.sleep(grace / 2)
             assert sessions_module._session_status_cache.get(session_id) == "running"
+            if local_host_return:
+                hold_now = grace
         if scenario in ("reconnect", "unreadable", "host_flaps_reconnect", "host_back_unreadable"):
             reconnect = await _connect_runner_tunnel(ap_app, runner_id)
             await _send_hello_and_wait(
