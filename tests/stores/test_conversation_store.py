@@ -10765,6 +10765,7 @@ def test_move_sessions_between_nests(tmp_path, split_database, monkeypatch):
     ]
     + [
         (True, "interrupted_unpinned"),
+        (True, "interrupted_unpinned_then_sibling"),
         (False, "interrupted_initial"),
         (False, "interrupted_initial_without_peers"),
         (False, "interrupted_initial_without_source"),
@@ -10775,7 +10776,7 @@ def test_move_sessions_between_nests(tmp_path, split_database, monkeypatch):
 def test_failed_split_database_nest_move_restores_membership(
     tmp_path, monkeypatch, detach, failure
 ):
-    from omnigent.db.db_models import SqlConversationMetadata, current_workspace_id
+    from omnigent.db.db_models import SqlConversationMetadata, SqlPreference, current_workspace_id
     from omnigent.stores.conversation_store import (
         family_pinned_label_key,
         pinned_label_key,
@@ -10795,7 +10796,7 @@ def test_failed_split_database_nest_move_restores_membership(
     moved = store.create_conversation(conversation_id="2" * 32)
     store.add_new_sibling(source.id, moved.id, user_id="alice")
     store.set_family_pin(source.id, "123", user_id="alice")
-    if failure != "interrupted_unpinned":
+    if not failure.startswith("interrupted_unpinned"):
         store.set_labels(moved.id, {pinned_label_key("alice"): "234"})
     destination = store.create_conversation(
         conversation_id="3" * 32,
@@ -10848,7 +10849,7 @@ def test_failed_split_database_nest_move_restores_membership(
             assert saved.labels[family_pinned_label_key("alice")] == "123"
     if interrupted:
         sibling = None
-        if failure == "interrupted_then_sibling":
+        if failure in ("interrupted_then_sibling", "interrupted_unpinned_then_sibling"):
             sibling = store.create_conversation(conversation_id="0" * 32)
             failed_read_repair = False
 
@@ -10865,6 +10866,14 @@ def test_failed_split_database_nest_move_restores_membership(
                 patch.setattr(store, "_profile_label_session", fail_first_repair)
                 store.add_new_sibling(moved.id, sibling.id, user_id="alice")
             assert failed_read_repair
+            with store._session("test_setup") as session:
+                assert (
+                    session.get(
+                        SqlPreference,
+                        (current_workspace_id(), "__session_nest_repairs__", moved.id),
+                    )
+                    is None
+                )
         if failure == "interrupted_then_family_change":
             store.set_family_pin(destination.id, "789", user_id="alice")
             store.set_conversation_project(destination.id, "b" * 32)
@@ -10888,8 +10897,10 @@ def test_failed_split_database_nest_move_restores_membership(
         if detach:
             page = store.list_conversations(pinned=True, pinned_owner="alice")
             pinned_rows = {row.id: row for row in page.data}
-            if failure == "interrupted_unpinned":
+            if failure.startswith("interrupted_unpinned"):
                 assert moved.id not in pinned_rows
+                if sibling is not None:
+                    assert sibling.id not in pinned_rows
                 saved = store.get_conversation(moved.id)
             else:
                 saved = pinned_rows[moved.id]
@@ -10897,8 +10908,11 @@ def test_failed_split_database_nest_move_restores_membership(
             saved = store.get_conversations([moved.id])[moved.id]
         else:
             saved = store.get_conversation(moved.id)
-        assert saved.family_id == (None if detach else destination.id)
-        if failure == "interrupted_unpinned":
+        expected_family_id = (
+            moved.id if detach and sibling is not None else (None if detach else destination.id)
+        )
+        assert saved.family_id == expected_family_id
+        if failure.startswith("interrupted_unpinned"):
             assert pinned_label_key("alice") not in saved.labels
         else:
             assert saved.labels[pinned_label_key("alice")] == "234"
@@ -10920,7 +10934,7 @@ def test_failed_split_database_nest_move_restores_membership(
             assert saved.project_id == (None if detach else "a" * 32)
             if sibling is not None:
                 sibling_saved = store.get_conversation(sibling.id)
-                assert sibling_saved.family_id == destination.id
+                assert sibling_saved.family_id == expected_family_id
                 assert family_pinned_label_key("alice") not in sibling_saved.labels
         return
     if persistent:
@@ -10943,6 +10957,9 @@ def test_failed_split_database_nest_move_restores_membership(
 
 @pytest.mark.parametrize("split_database", [False, True])
 def test_sibling_admission_rechecks_a_stale_source(tmp_path, monkeypatch, split_database):
+    from omnigent.db.db_models import SqlConversationMetadata, SqlPreference, current_workspace_id
+    from omnigent.errors import OmnigentError
+
     store = SqlAlchemyConversationStore(
         f"sqlite:///{tmp_path / 'metadata.db'}",
         f"sqlite:///{tmp_path / 'messages.db'}" if split_database else None,
@@ -10962,6 +10979,36 @@ def test_sibling_admission_rechecks_a_stale_source(tmp_path, monkeypatch, split_
         first.id,
         second.id,
     }
+    if split_database:
+        store.set_session_nest(source.id, None, user_id="alice")
+        candidate = store.create_conversation()
+        choose_family = store._new_family_id
+        repair_key = (current_workspace_id(), "__session_nest_repairs__", source.id)
+
+        def choose_then_queue_detach_repair(current_source):
+            family_id = choose_family(current_source)
+            with store._session_immediate("test_setup") as session:
+                session.add(
+                    SqlPreference(
+                        workspace_id=repair_key[0],
+                        user_id=repair_key[1],
+                        key=repair_key[2],
+                        value=json.dumps({"family_id": None, "user_id": "alice", "labels": {}}),
+                    )
+                )
+            return family_id
+
+        with monkeypatch.context() as patch:
+            patch.setattr(store, "_new_family_id", choose_then_queue_detach_repair)
+            with pytest.raises(OmnigentError, match="nest labels changed"):
+                store.add_new_sibling(source.id, candidate.id, user_id="alice")
+        with store._session("test_setup") as session:
+            assert session.get(SqlPreference, repair_key) is not None
+            for session_id in (source.id, candidate.id):
+                metadata = session.get(
+                    SqlConversationMetadata, (current_workspace_id(), session_id)
+                )
+                assert metadata.family_id is None
 
 
 @pytest.mark.parametrize("fresh_family_id", [False, True])

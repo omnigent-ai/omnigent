@@ -2396,6 +2396,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         source = self.get_conversation(source_id)
         if source is None:
             raise ConversationNotFoundError(source_id)
+        self._repair_pending_nest_labels(source_id)
         family_id = self._new_family_id(source)
 
         def write(session: Session) -> None:
@@ -2411,6 +2412,20 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             if source_meta is None or target_meta is None:
                 raise ConversationNotFoundError(source_id if source_meta is None else session_id)
+            if self._conv_engine is not self._engine and source_meta.family_id is None:
+                # A fresh snapshot sees detach intents committed before the metadata lock.
+                with self._nest_repair_session(
+                    "check_sibling_source_nest_labels"
+                ) as pending_session:
+                    pending = pending_session.get(
+                        SqlPreference,
+                        (current_workspace_id(), "__session_nest_repairs__", source_id),
+                    )
+                if pending is not None and json.loads(pending.value)["family_id"] is None:
+                    raise OmnigentError(
+                        "Session nest labels changed; retry sibling creation",
+                        code=ErrorCode.CONFLICT,
+                    )
             with self._profile_label_session(
                 session, operation="create_sibling_membership"
             ) as labels_session:
