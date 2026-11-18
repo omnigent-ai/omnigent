@@ -370,7 +370,23 @@ class HostSessionRecoverer:
         if recovery is not None and recovery.phase == "launching" and online:
             await self._continue(connection, conv, recovery)
             return
-        if online or conv.runner_id in live_runners or runner_seen_is_fresh(conv.runner_last_seen):
+        if online or runner_seen_is_fresh(conv.runner_last_seen):
+            return
+        if (
+            recovery is not None
+            and recovery.phase in {"pending", "launching", "submitted"}
+            and (
+                now_epoch() - recovery.interrupted_at > RECOVERY_MAX_AGE_S
+                or (
+                    recovery.attempts >= MAX_RECOVERY_ATTEMPTS and recovery.retry_at <= now_epoch()
+                )
+            )
+        ):
+            await self._fail(
+                conv, recovery, "Automatic session recovery exhausted its retry budget."
+            )
+            return
+        if conv.runner_id in live_runners:
             return
         if recovery is None or recovery.phase == "active":
             await asyncio.to_thread(self.record_interruption, conv)

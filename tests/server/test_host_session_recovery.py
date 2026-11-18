@@ -519,6 +519,41 @@ async def test_persisted_running_session_does_not_receive_a_fresh_deadline(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("in_inventory", [False, True])
+async def test_unresponsive_recovered_process_cannot_hold_failure_forever(
+    recovery: Any, monkeypatch: pytest.MonkeyPatch, in_inventory: bool
+) -> None:
+    from omnigent.server.routes._sessions.helpers import reconcile_orphaned_running_status
+
+    await recovery.service.recover(recovery.connection, [])
+    state = recovery.store.get_session_recovery(recovery.conv.id)
+    assert state.phase == "submitted"
+    recovery.online.clear()
+    recovery.store.clear_runner_liveness("new")
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._query_host_runner_status",
+        AsyncMock(return_value="alive"),
+    )
+    assert reconcile_orphaned_running_status(
+        recovery.conv.id,
+        recovery.store,
+        recovery.clock[0],
+        host_session_recoverer=recovery.service,
+    )
+    assert recovery.store.get_session_recovery(recovery.conv.id).phase == "pending"
+    inventory = ["new"] if in_inventory else []
+    await recovery.service.recover(recovery.connection, inventory)
+    recovery.publish_status.assert_not_called()
+    recovery.clock[0] += RECOVERY_MAX_AGE_S + 1
+    await recovery.service.recover(recovery.connection, inventory)
+    assert recovery.store.get_session_recovery(recovery.conv.id).phase == "failed"
+    recovery.launch.assert_awaited_once()
+    recovery.initializer.initialize.assert_awaited_once()
+    assert recovery.publish_status.call_args.args[1] == "failed"
+    assert recovery.publish_status.call_args.args[2].code == "session_recovery_failed"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("already_online", [False, True])
 @pytest.mark.parametrize("expired", [False, True])
 async def test_continuation_deadline_also_applies_to_a_successful_final_launch(
