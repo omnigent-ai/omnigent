@@ -5,8 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-import shutil
 import ssl
+import subprocess
 import sys
 import time
 import venv
@@ -1236,24 +1236,19 @@ def auth_runtime(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Path,
     from omnigent.inner.model_auth import _TrustedExecutable
 
     runtime = tmp_path / "auth-venv"
-    # Linux CI's shared Python can be world-writable; keep its binary private.
-    venv.EnvBuilder(with_pip=False, symlinks=sys.platform != "linux").create(runtime)
+    system_python = Path(f"/usr/bin/python{sys.version_info.major}.{sys.version_info.minor}")
+    if sys.platform == "linux" and system_python.is_file():
+        # CI's Python toolcache can be world-writable; use the system runtime.
+        subprocess.run(
+            [str(system_python), "-m", "venv", "--without-pip", "--copies", str(runtime)],
+            check=True,
+        )
+    else:
+        venv.EnvBuilder(with_pip=False, symlinks=sys.platform != "linux").create(runtime)
     interpreter = runtime / "bin/python"
     if sys.platform == "linux":
         interpreter.unlink()
         interpreter.symlink_to(f"python{sys.version_info.major}.{sys.version_info.minor}")
-        # CI's base Python can be world-writable; the venv metadata needs a trusted copy.
-        base_executable = tmp_path / "trusted-base-python"
-        shutil.copy2(sys._base_executable, base_executable)
-        base_executable.chmod(0o500)
-        config = runtime / "pyvenv.cfg"
-        config.write_text(
-            "\n".join(
-                f"executable = {base_executable}" if line.startswith("executable = ") else line
-                for line in config.read_text().splitlines()
-            )
-            + "\n"
-        )
     packages = (
         runtime
         / "lib"
