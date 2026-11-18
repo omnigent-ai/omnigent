@@ -1433,6 +1433,21 @@ def test_databricks_auth_pins_the_trusted_executable_before_worker_start(
     env = {"MODEL_ALIAS": "Bearer parent-bearer"}
     assert access.worker_environment(env, tmp_path / "worker") == "parent-bearer"
     assert "MODEL_ALIAS" not in env
+    mint.reset_mock()
+
+    async def prepare_from_async_startup() -> dict[str, str]:
+        worker_env = {"MODEL_ALIAS": "Bearer parent-bearer"}
+        assert (
+            await asyncio.to_thread(
+                access.worker_environment, worker_env, tmp_path / "async-worker"
+            )
+            == "parent-bearer"
+        )
+        return worker_env
+
+    async_env = asyncio.run(prepare_from_async_startup())
+    assert "MODEL_ALIAS" not in async_env
+    assert async_env["ANTHROPIC_AUTH_TOKEN"] == access.placeholder
     assert access.auth_executable is not None
     assert access.auth_executable.path == executable.path
     assert access.auth_executable.interpreter == interpreter

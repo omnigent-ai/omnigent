@@ -13,14 +13,17 @@ elsewhere.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import shutil
+import threading
 import uuid
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -31,6 +34,33 @@ from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 
 _TEST_HARNESS_NAME = "executor_adapter_fixture"
 _TEST_HARNESS_MODULE = "tests.runtime.harnesses._test_executor_adapter_harness"
+
+
+async def test_threaded_executor_factory_cancellation_closes_completed_startup() -> None:
+    """A cancelled first turn must reap a proxy-owning executor built on a thread."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    started = threading.Event()
+    release = threading.Event()
+    executor = AsyncMock(spec=Executor)
+
+    def build_executor() -> Executor:
+        started.set()
+        assert release.wait(timeout=5)
+        return executor
+
+    adapter = ExecutorAdapter(executor_factory=build_executor, executor_factory_on_thread=True)
+    startup = asyncio.create_task(adapter._ensure_executor_for_turn())
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        startup.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await startup
+        executor.close.assert_awaited_once()
+        assert adapter._executor is None
+    finally:
+        release.set()
 
 
 def _start_turn_body() -> dict[str, Any]:

@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     from omnigent.terminals.program_status import ProgramStatusReader
 
 from . import _proc
+from ._subprocess_lifecycle import await_cleanup_task
 from .agent_env import strip_desktop_session_env
 from .claude_gateway_shim import gateway_body_transform
 from .claude_model_access import ClaudeModelAccess
@@ -1828,7 +1829,16 @@ class TerminalInstance:
         if sandbox_for_launcher is not None and sandbox_for_launcher.active:
             env = strip_desktop_session_env(env)
             if self.egress_rules or self.model_access is not None:
-                sandbox_for_launcher = self._bootstrap_egress_proxy(sandbox_for_launcher, env)
+                bootstrap_task = asyncio.create_task(
+                    asyncio.to_thread(self._bootstrap_egress_proxy, sandbox_for_launcher, env)
+                )
+                try:
+                    sandbox_for_launcher = await asyncio.shield(bootstrap_task)
+                except BaseException:
+                    # Launch cleanup must wait until the proxy has finished starting.
+                    with contextlib.suppress(BaseException):
+                        await await_cleanup_task(bootstrap_task)
+                    raise
             if sandbox_for_launcher.git_ssh:
                 sandbox_for_launcher = self._bootstrap_git_ssh(sandbox_for_launcher, env)
             if sandbox_for_launcher.tcp_egress:

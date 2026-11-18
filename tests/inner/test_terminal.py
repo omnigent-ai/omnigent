@@ -3914,6 +3914,78 @@ async def test_terminal_model_relay_honors_private_opt_in_without_egress_rules(
         await instance.close()
 
 
+async def test_terminal_profile_credential_resolves_during_async_launch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, terminal_proxy_ca: None
+) -> None:
+    """The terminal starts its signer after minting a parent-only profile credential."""
+    credential = "parent-only-key"
+    access = ClaudeModelAccess(
+        "https://model.test",
+        "authorization",
+        lambda: asyncio.run(asyncio.sleep(0, result=credential)),
+    )
+    instance = TerminalInstance(
+        "shell",
+        "main",
+        tmp_path / "terminal/tmux.sock",
+        tmp_path / "terminal",
+        env={"MODEL_ALIAS": credential},
+        sandbox_policy=SandboxPolicy("linux_bwrap", True, [tmp_path], [tmp_path], [], False),
+        model_access=access,
+    )
+    spawn = AsyncMock(return_value=_SuccessfulProcess())
+    monkeypatch.setattr(terminal_mod.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(
+        terminal_mod, "create_exec_launcher", lambda *_args, **_kwargs: "/test/launcher"
+    )
+    monkeypatch.setattr(instance, "_tmux_base_cmd", lambda path_env=None: ["tmux"])
+    try:
+        await instance.launch(cwd=tmp_path)
+        environment = spawn.call_args.kwargs["env"]
+        assert environment["ANTHROPIC_AUTH_TOKEN"] == access.placeholder
+        assert credential not in str(environment)
+        assert instance._egress_handle is not None
+    finally:
+        instance.running = False
+        await instance.close()
+
+
+async def test_terminal_cancel_waits_for_egress_bootstrap_before_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancellation cannot leave a proxy starting after its owner has cleaned up."""
+    started = threading.Event()
+    release = threading.Event()
+    events: list[str] = []
+    instance = TerminalInstance(
+        "shell",
+        "main",
+        tmp_path / "terminal/tmux.sock",
+        tmp_path / "terminal",
+        sandbox_policy=SandboxPolicy("linux_bwrap", True, [tmp_path], [tmp_path], [], False),
+        egress_rules=["POST model.test/v1/messages"],
+    )
+
+    def bootstrap(policy: SandboxPolicy, env: dict[str, str]) -> SandboxPolicy:
+        started.set()
+        assert release.wait(timeout=5)
+        events.append("started")
+        return policy
+
+    monkeypatch.setattr(instance, "_bootstrap_egress_proxy", bootstrap)
+    monkeypatch.setattr(instance, "_stop_network_brokers", lambda: events.append("stopped"))
+    launch = asyncio.create_task(instance.launch(cwd=tmp_path))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        launch.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await launch
+        assert events == ["started", "stopped"]
+    finally:
+        release.set()
+
+
 async def test_terminal_model_relay_restores_thinking_only_for_selected_gateway(
     tmp_path: Path,
     terminal_proxy_ca: None,
