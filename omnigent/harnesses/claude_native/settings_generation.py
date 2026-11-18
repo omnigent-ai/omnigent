@@ -336,24 +336,25 @@ def _release(fd: int | None) -> None:
 
 
 def _live_request_incarnation(path: Path) -> tuple[bool, str | None]:
-    """Read the binding from the same inode whose live sender lock was checked."""
+    """Read the binding from the same inode whose sender ownership was checked."""
     try:
         fd = _open_lock(path)
     except FileNotFoundError:
         return False, None
     try:
         assert fcntl is not None
+        live = True
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             pass
         else:
-            return False, None
+            live = False
         binding = os.pread(fd, 33, 0)
         if len(binding) != 32:
-            return True, None
+            return live, None
         incarnation = binding.decode("ascii", errors="replace")
-        return True, incarnation if _GENERATION.fullmatch(incarnation) else None
+        return live, incarnation if _GENERATION.fullmatch(incarnation) else None
     finally:
         _release(fd)
 
@@ -746,10 +747,10 @@ def _reject_expired_dispatch(
     generation: str,
     lifecycle: _ClaudeSettingsLifecycle,
     admission_epoch: str,
-) -> None:
-    """Release only this live request's verified exposure after definite rejection."""
+) -> bool:
+    """Release verified exposure only when the actual receiver rejects admission."""
     if lifecycle.session_id is None or lifecycle.bridge_identity is None:
-        return
+        return False
     baseline = settings_generation_path(bridge_dir, generation)
     paths = {
         "request": baseline.with_suffix(".request.lock"),
@@ -761,20 +762,22 @@ def _reject_expired_dispatch(
         owner_fds["bridge"] = _open_bridge(bridge_dir)
         for name, path in paths.items():
             owner_fds[name] = _open_lock(path)
-        if _live_request_incarnation(paths["request"]) != (True, admission_epoch):
-            return
+        live, request_epoch = _live_request_incarnation(paths["request"])
+        if request_epoch != admission_epoch or (live and admission_epoch == lifecycle.epoch):
+            return False
         observed = os.pread(owner_fds["dispatch"], 4097, 0)
         if observed != _dispatch_binding(lifecycle, admission_epoch, **owner_fds):
-            return
+            return False
         if (
             _fd_identity(owner_fds["bridge"]) != lifecycle.bridge_identity
             or not _lifecycle_matches_bridge(bridge_dir, lifecycle)
             or not all(_file_matches_fd(path, owner_fds[name]) for name, path in paths.items())
         ):
-            return
+            return False
         paths["dispatch"].unlink()
+        return True
     except (OSError, ValueError):
-        return
+        return False
     finally:
         for fd in owner_fds.values():
             _release(fd)
@@ -789,7 +792,16 @@ def acquire_claude_settings_request(bridge_dir: Path, generation: str) -> Claude
             raise ClaudeSettingsRequestExpired()
         live, admission_epoch = _live_request_incarnation(baseline.with_suffix(".request.lock"))
         if not live or not baseline.is_file():
+            rejected = (
+                not live
+                and admission_epoch is not None
+                and _reject_expired_dispatch(bridge_dir, generation, lifecycle, admission_epoch)
+            )
             _retire_unused(bridge_dir, generation)
+            if rejected:
+                _complete_bridge_deletion(
+                    bridge_dir, lifecycle.incarnation, admission_epoch=lifecycle.epoch
+                )
             raise ClaudeSettingsRequestExpired()
         if admission_epoch is None:
             raise ClaudeSettingsRequestExpired()

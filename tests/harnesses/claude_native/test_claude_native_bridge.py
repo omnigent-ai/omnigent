@@ -6196,6 +6196,154 @@ def test_claude_settings_admission_preserves_unbound_live_requests(
 
 
 @pytest.mark.parametrize(
+    ("reactivate", "delete"),
+    [(False, False), (False, True), (True, False), (True, True)],
+    ids=["active", "deleting", "reactivated", "reactivated-deleting"],
+)
+@pytest.mark.parametrize("owner", ["unowned", "admission", "terminal"])
+def test_claude_settings_receiver_rejection_retires_released_dispatch(
+    tmp_path: Path, reactivate: bool, delete: bool, owner: str
+) -> None:
+    """A definite receiver rejection releases exposure without retiring other readers."""
+    from omnigent.harnesses.claude_native.settings_generation import (
+        ClaudeSettingsRequest,
+        acquire_claude_settings_request,
+        has_live_claude_settings_owners,
+        prune_unused_claude_settings,
+        request_claude_bridge_deletion,
+    )
+
+    bridge_dir = prepare_bridge_dir("conv_delayed", workspace=tmp_path)
+    with ClaudeSettingsRequest.create(bridge_dir) as request, ExitStack() as owners:
+        augment_claude_args((), bridge_dir=bridge_dir, settings_request=request)
+        baseline = request.settings_path(bridge_dir)
+        dispatch = baseline.with_suffix(".dispatch.owner")
+        if owner != "unowned":
+            admitted = owners.enter_context(
+                acquire_claude_settings_request(bridge_dir, request.generation)
+            )
+            if owner == "terminal":
+                callbacks = []
+                admitted.attach(SimpleNamespace(add_resource_cleanup=callbacks.append))
+                owners.callback(callbacks[0])
+                admitted.close()
+        request.mark_dispatched()
+        if reactivate:
+            request_claude_bridge_deletion(bridge_dir, "conv_delayed")
+            prepare_bridge_dir("conv_delayed", workspace=tmp_path)
+        if delete:
+            request_claude_bridge_deletion(bridge_dir, "conv_delayed")
+        config = (bridge_dir / "bridge.json").read_bytes()
+        request.close()
+        snapshot = {
+            path.name: (path.stat().st_ino, path.read_bytes())
+            for path in bridge_dir.glob(f"claude-settings-{request.generation}*")
+        }
+        assert bridge_dir.stat().st_mode & 0o777 == 0o700
+        assert all(
+            path.stat().st_mode & 0o777 == 0o600
+            for path in bridge_dir.glob(f"claude-settings-{request.generation}*")
+        )
+        assert has_live_claude_settings_owners(bridge_dir)
+        assert prune_unused_claude_settings(bridge_dir) == 0
+        assert dispatch.exists() and baseline.exists()
+
+        with pytest.raises(ValueError, match="expired"):
+            acquire_claude_settings_request(bridge_dir, request.generation)
+
+        assert not dispatch.exists()
+        if owner != "unowned":
+            assert {
+                path.name: (path.stat().st_ino, path.read_bytes())
+                for path in bridge_dir.glob(f"claude-settings-{request.generation}*")
+            } == {name: value for name, value in snapshot.items() if name != dispatch.name}
+            assert has_live_claude_settings_owners(bridge_dir)
+        owners.close()
+        if bridge_dir.exists():
+            prune_unused_claude_settings(bridge_dir)
+        if delete:
+            assert not bridge_dir.exists()
+        else:
+            assert (bridge_dir / "bridge.json").read_bytes() == config
+            assert not list(bridge_dir.glob(f"claude-settings-{request.generation}*"))
+            assert not has_live_claude_settings_owners(bridge_dir)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "legacy-lifecycle",
+        "empty-dispatch",
+        "malformed-dispatch",
+        "future-dispatch",
+        "replaced-dispatch",
+        "symlink-dispatch",
+        "replaced-request",
+        "replaced-lease",
+        "new-session",
+        "recreated-bridge",
+    ],
+)
+def test_claude_settings_receiver_rejection_preserves_uncertain_released_dispatch(
+    tmp_path: Path, fault: str
+) -> None:
+    """A receiver cannot release legacy, damaged or replacement ownership identities."""
+    from omnigent.harnesses.claude_native.settings_generation import (
+        ClaudeSettingsRequest,
+        acquire_claude_settings_request,
+        has_live_claude_settings_owners,
+        prune_unused_claude_settings,
+    )
+
+    bridge_dir = prepare_bridge_dir("conv_uncertain", workspace=tmp_path)
+    with ClaudeSettingsRequest.create(bridge_dir) as request:
+        augment_claude_args((), bridge_dir=bridge_dir, settings_request=request)
+        request.mark_dispatched()
+        baseline = request.settings_path(bridge_dir)
+        dispatch = baseline.with_suffix(".dispatch.owner")
+        if fault == "legacy-lifecycle":
+            lifecycle = bridge_dir / ".claude-settings-lifecycle.json"
+            incarnation = json.loads(lifecycle.read_bytes())["incarnation"]
+            lifecycle.write_text(json.dumps({"schema": 1, "incarnation": incarnation}))
+        elif fault in {"empty-dispatch", "malformed-dispatch"}:
+            dispatch.write_bytes(b"" if fault == "empty-dispatch" else b'{"schema":')
+        elif fault == "future-dispatch":
+            binding = json.loads(dispatch.read_bytes())
+            binding["schema"] = 2
+            dispatch.write_text(json.dumps(binding, sort_keys=True, ensure_ascii=True))
+        elif fault in {"replaced-dispatch", "symlink-dispatch"}:
+            original = tmp_path / "original-dispatch"
+            dispatch.rename(original)
+            if fault == "symlink-dispatch":
+                dispatch.symlink_to(original)
+            else:
+                dispatch.write_bytes(original.read_bytes())
+        elif fault in {"replaced-request", "replaced-lease"}:
+            path = baseline.with_suffix(
+                ".request.lock" if fault == "replaced-request" else ".lease.lock"
+            )
+            path.rename(tmp_path / "original-lock")
+            path.write_bytes(b"replacement-owned")
+        elif fault == "new-session":
+            prepare_bridge_dir("conv_other", bridge_id="conv_uncertain", workspace=tmp_path)
+        elif fault == "recreated-bridge":
+            original = tmp_path / "original-bridge"
+            bridge_dir.rename(original)
+            shutil.copytree(original, bridge_dir)
+        request.close()
+        snapshot = {
+            path.name: (path.lstat().st_ino, path.read_bytes()) for path in bridge_dir.iterdir()
+        }
+        assert prune_unused_claude_settings(bridge_dir) == 0
+        with pytest.raises(ValueError, match="expired"):
+            acquire_claude_settings_request(bridge_dir, request.generation)
+        assert {
+            path.name: (path.lstat().st_ino, path.read_bytes()) for path in bridge_dir.iterdir()
+        } == snapshot
+        assert has_live_claude_settings_owners(bridge_dir)
+
+
+@pytest.mark.parametrize(
     "owner",
     [
         "dispatch",
