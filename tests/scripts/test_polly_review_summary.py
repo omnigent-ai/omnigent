@@ -873,6 +873,20 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         ("", "```", "invalid-info-unsafe-cut"),
         ("", "```", "invalid-info-oversized"),
         ("~~~", "~~~", "tilde-info-backtick"),
+        ("```", "\u00a0", "closing-literal"),
+        ("~~~", "\u00a0", "closing-literal"),
+        ("```", "\f", "closing-literal"),
+        ("~~~", "\f", "closing-literal"),
+        ("```", " \t", "closing-ascii"),
+        ("~~~", " \t", "closing-ascii"),
+        ("```", " \t", "closing-crlf"),
+        ("~~~", " \t", "closing-crlf"),
+        ("```", "\u00a0", "closing-tail-cut"),
+        ("~~~", "\u00a0", "closing-tail-cut"),
+        ("```", "\u00a0", "closing-near-tail"),
+        ("~~~", "\u00a0", "closing-near-tail"),
+        ("```", "\u00a0", "closing-oversized-tail"),
+        ("~~~", "\u00a0", "closing-oversized-tail"),
     ],
     ids=[
         "backticks",
@@ -907,6 +921,20 @@ def test_long_review_parts_preserve_all_assessments_and_markdown_context(
         "invalid-backtick-info-unsafe-cut",
         "invalid-backtick-info-oversized",
         "tilde-info-backtick",
+        "closing-nbsp-backticks",
+        "closing-nbsp-tildes",
+        "closing-formfeed-backticks",
+        "closing-formfeed-tildes",
+        "closing-ascii-backticks",
+        "closing-ascii-tildes",
+        "closing-crlf-backticks",
+        "closing-crlf-tildes",
+        "closing-calibrated-tail-backticks",
+        "closing-calibrated-tail-tildes",
+        "closing-near-nbsp-backticks",
+        "closing-near-nbsp-tildes",
+        "closing-oversized-tail-backticks",
+        "closing-oversized-tail-tildes",
     ],
 )
 def test_fence_continuations_preserve_literal_content_and_footer_context(
@@ -916,7 +944,7 @@ def test_fence_continuations_preserve_literal_content_and_footer_context(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    if shape.startswith(("outside-", "invalid-info-")):
+    if shape.startswith(("outside-", "invalid-info-", "closing-")):
         from markdown_it import MarkdownIt
 
         def content_of(comment: str) -> str:
@@ -934,6 +962,117 @@ def test_fence_continuations_preserve_literal_content_and_footer_context(
         composed = _HELPERS["compose_review"](
             _REVIEW, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
         )
+        if shape.startswith("closing-"):
+            newline = "\r\n" if shape == "closing-crlf" else "\n"
+            opening = fence + "text" + newline
+            code = "x" * 70000 + newline
+            if shape == "closing-tail-cut":
+                calibration = _HELPERS["review_comments"](
+                    opening + "x" * 130000 + "\n" + fence + "\nAfter.\n\n" + composed,
+                    **metadata,
+                )
+                capacity = max(
+                    len(
+                        content_of(comment).removeprefix(opening).removesuffix("\n" + fence + "\n")
+                    )
+                    for comment in calibration
+                )
+                line = fence + " " * (capacity - len(fence)) + literal
+                raw_cut = _HELPERS["split_review"](line, capacity, split_once=True)[0]
+                assert len(raw_cut) == capacity and literal not in raw_cut
+                assert raw_cut.startswith(fence) and not raw_cut[len(fence) :].strip(" \t")
+                code += line + newline
+            elif shape == "closing-oversized-tail":
+                code += fence + " " * 130000 + literal + newline
+            elif shape == "closing-near-tail":
+                code += fence + literal + " " * 130000 + "a" + newline
+            elif shape == "closing-literal":
+                code += fence + literal + newline
+            code += "y" * 70000 + newline
+            tail = literal if shape in {"closing-ascii", "closing-crlf"} else ""
+            review = opening + code + fence + tail + newline + "After.\n\n" + composed
+            parser = MarkdownIt("commonmark").enable("table")
+            original = parser.parse(review)
+            original_code = [token.content for token in original if token.type == "fence"]
+            assert original_code == [code.replace("\r\n", "\n")]
+            assert sum(token.type == "table_open" for token in original) == 1
+            if shape == "closing-crlf":
+                comments = _HELPERS["review_comments"](review, **metadata)
+            else:
+                review_path, receipt, posts = _prepare_publication(
+                    tmp_path,
+                    monkeypatch,
+                    head_sha=metadata["head_sha"],
+                    run_url=metadata["run_url"],
+                )
+                try:
+                    comments = _published_comments(review, review_path, receipt)
+                except ValueError as error:
+                    assert shape in {"closing-tail-cut", "closing-oversized-tail"}
+                    assert (
+                        str(error)
+                        == "Polly review literal fence run cannot fit within comment capacity."
+                    )
+                    assert not posts and not receipt.exists()
+                    assert not list(tmp_path.glob("comment*.md"))
+                    return
+                assert posts == [*comments[1:], comments[0]]
+                assert receipt.read_text() == metadata["head_sha"] + "\n"
+            assert shape not in {"closing-tail-cut", "closing-oversized-tail"}
+            assert _HELPERS["COMMENT_BYTE_LIMIT"] == 60000
+            assert 1 < len(comments) <= _HELPERS["MAX_REVIEW_PARTS"]
+            assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
+            rendered = [parser.parse(comment) for comment in comments]
+            for tokens in rendered:
+                for token in tokens:
+                    if token.type in {"fence", "code_block"}:
+                        assert "<sub>Automated review by Polly" not in token.content, (
+                            "Publication footer is inside independently rendered code"
+                        )
+                        assert "After." not in token.content
+                        assert "tests/test_parser.py::test_empty" not in token.content
+            remaining = review
+            remaining_code = original_code[0]
+            reconstructed = ""
+            table_count = 0
+            for number, (comment, tokens) in enumerate(zip(comments, rendered, strict=True)):
+                for token in tokens:
+                    if token.type == "fence":
+                        fragment = token.content
+                        if not remaining_code.startswith(fragment):
+                            assert fragment.endswith("\n")
+                            fragment = fragment[:-1]
+                        assert remaining_code.startswith(fragment)
+                        remaining_code = remaining_code[len(fragment) :]
+                table_count += sum(token.type == "table_open" for token in tokens)
+                if any(token.type == "table_open" for token in tokens):
+                    assert [
+                        token.content
+                        for index, token in enumerate(tokens)
+                        if token.type == "inline" and tokens[index - 1].type == "th_open"
+                    ] == [
+                        "Test / case",
+                        "Behavior protected",
+                        "Layer",
+                        "Needed?",
+                        "Action / rationale",
+                    ]
+                fragment = content_of(comment)
+                if number and not remaining.startswith(fragment) and fragment.startswith(opening):
+                    fragment = fragment[len(opening) :]
+                if not remaining.startswith(fragment):
+                    suffix = "\n" + fence + "\n"
+                    assert fragment.endswith(suffix)
+                    fragment = fragment[: -len(suffix)]
+                assert remaining.startswith(fragment)
+                remaining = remaining[len(fragment) :]
+                reconstructed += fragment
+            assert not remaining_code
+            assert not remaining and reconstructed == review
+            assert table_count == 1
+            assert sum(comment.count("After.") for comment in comments) == 1
+            assert sum(comment.count("<!-- polly-reviewed-sha:") for comment in comments) == 1
+            return
         if shape.startswith("invalid-info-"):
             row = next(line for line in _REVIEW.splitlines() if line.startswith("| tests/"))
             rows = [

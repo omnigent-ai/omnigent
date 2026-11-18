@@ -360,7 +360,7 @@ def _markdown_context(
             end = literal.end(1)
             if active_fence:
                 if re.fullmatch(r" {0,3}", line[start : literal.start(1)]):
-                    following = re.search(r"\S", line[end:])
+                    following = re.search(r"[^ \t]", line[end:])
                     end += following.end() if following else len(line) - end
             else:
                 # Opening fences allow trailing info, so retain the left non-opening context.
@@ -375,7 +375,7 @@ def _markdown_context(
         line_start = offset
         offset += len(line) + 1
         if fence:
-            if re.fullmatch(rf" {{0,3}}{re.escape(fence[0])}{{{len(fence)},}}\s*", line):
+            if re.fullmatch(rf" {{0,3}}{re.escape(fence[0])}{{{len(fence)},}}[ \t]*\r?", line):
                 protect_span(line_start, min(offset, len(text)), "fence delimiter")
                 fence = ""
             elif protected_spans is not None:
