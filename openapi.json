@@ -16942,7 +16942,7 @@
                 "type": "null"
               }
             ],
-            "description": "What the step achieves, at most 300 characters, or `None`.",
+            "description": "The step's description in Markdown, e.g. what it reads, does and produces, or `None`.",
             "title": "Goal"
           },
           "id": {

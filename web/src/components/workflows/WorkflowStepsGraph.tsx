@@ -14,7 +14,9 @@ import { FullscreenIcon } from "@/components/ai-elements/MermaidBlock";
 import { GraphZoomControls } from "@/components/GraphZoomControls";
 import { Button } from "@/components/ui/button";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
+import { StepDescription } from "@/components/workflows/StepDescription";
 import { getEmbedRoot } from "@/lib/host";
+import { markdownPreviewText } from "@/lib/markdownPreviewText";
 import { failedUpstream, type StepProgress, type StepState } from "@/lib/sessionJournal";
 import { cn } from "@/lib/utils";
 import {
@@ -89,6 +91,7 @@ function StepNode({ id, data }: NodeProps<Node<StepNodeData>>) {
   const [cardOpen, setCardOpen] = useState(false);
   // The card steps aside while the node's menu is open.
   const [menuOpen, setMenuOpen] = useState(false);
+  const goalPreview = data.goal ? markdownPreviewText(data.goal) : "";
   return (
     <>
       <Handle type="target" position={Position.Top} className={HANDLE_CLASS} />
@@ -117,9 +120,9 @@ function StepNode({ id, data }: NodeProps<Node<StepNodeData>>) {
                   <CantStart failedNames={data.failedNames} />
                 </p>
               ) : (
-                data.goal && (
+                goalPreview && (
                   <p className="mt-0.5 line-clamp-2 text-xs leading-snug text-muted-foreground">
-                    {data.goal}
+                    {goalPreview}
                   </p>
                 )
               )}
@@ -161,7 +164,7 @@ function StepNode({ id, data }: NodeProps<Node<StepNodeData>>) {
                 Step {data.number} of {graph.total}
               </span>
               <span className="font-medium">{data.name}</span>
-              {data.goal && <span className="text-muted-foreground">{data.goal}</span>}
+              {data.goal && <StepDescription text={data.goal} />}
             </>
           )}
         </HoverCardContent>
