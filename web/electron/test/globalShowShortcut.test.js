@@ -455,7 +455,14 @@ describe("createGlobalShortcuts", () => {
         stored = structuredClone(next);
       },
       registered: () => [...live.values()].map(({ accelerator }) => accelerator),
-      press: (accelerator) => live.get(electronChord(accelerator)).press(),
+      press: (accelerator) => {
+        const entry = live.get(electronChord(accelerator));
+        assert.ok(
+          entry,
+          `${accelerator} isn't registered; registered: ${[...live.values()].map((e) => e.accelerator)}`,
+        );
+        entry.press();
+      },
       pressed,
     };
   }
@@ -599,11 +606,11 @@ describe("createGlobalShortcuts", () => {
     });
   }
 
-  it("gives a chord both saved on to the first shortcut in the table, in either order", () => {
-    for (const order of [
-      ["show", "floatingComposer"],
-      ["floatingComposer", "show"],
-    ]) {
+  for (const order of [
+    ["show", "floatingComposer"],
+    ["floatingComposer", "show"],
+  ]) {
+    it(`gives a chord both saved on to the first shortcut in the table (${order.join(" first, ")} last)`, () => {
       const s = shortcuts({
         global_shortcut: { enabled: true, accelerator: "Alt+K" },
         floating_composer_shortcut: { enabled: true, accelerator: "Alt+k" },
@@ -612,8 +619,8 @@ describe("createGlobalShortcuts", () => {
       assert.deepEqual(s.registered(), ["Alt+K"]);
       assert.equal(s.show.current().error, undefined);
       assert.match(s.floatingComposer.current().error, /Another Omnigent shortcut/);
-    }
-  });
+    });
+  }
 });
 
 describe("chordKey", () => {
@@ -625,6 +632,9 @@ describe("chordKey", () => {
     assert.equal(chordKey("Ctrl+Alt+K", false), "control+alt+k");
     assert.equal(chordKey("Alt+Return", true), chordKey("Option+Enter", true));
     assert.equal(chordKey("Shift+Esc", true), chordKey("Shift+Escape", true));
+    // Off macOS too, Electron reads Command and Super as the same (Win/Super) modifier.
+    assert.equal(chordKey("Command+Shift+Space", false), chordKey("Super+Shift+Space", false));
+    assert.equal(chordKey("Cmd+K", false), chordKey("Meta+K", false));
     assert.notEqual(chordKey("Super+K", false), chordKey("Control+K", false));
   });
 });

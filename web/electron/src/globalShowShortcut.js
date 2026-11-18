@@ -72,7 +72,8 @@ function chordKey(accelerator, isMac) {
     parts.map((part) => {
       const name = MODIFIER_ALIASES.get(part) ?? part;
       if (name === "commandorcontrol" || name === "cmdorctrl") return isMac ? "command" : "control";
-      return isMac && name === "super" ? "command" : name;
+      // Electron reads Command and Super as one modifier everywhere: ⌘ on macOS, Win/Super elsewhere.
+      return name === "super" ? "command" : name;
     }),
   );
   const ordered = MODIFIER_ORDER.filter((name) => modifiers.has(name));
