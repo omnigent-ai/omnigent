@@ -23,6 +23,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Conversation } from "@/hooks/useConversations";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
 import { OPEN_SUBAGENTS_IN_PANEL_STORAGE_KEY } from "@/lib/subagentPanelPreferences";
+import { fetchDatabricksStatus } from "@/lib/databricksIntegration";
+import { fetchGithubStatus } from "@/lib/githubIntegration";
 import {
   useProjectFolderCollapse,
   useProjectFolderPageSize,
@@ -31,6 +33,8 @@ import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/ses
 import * as host from "@/lib/host";
 import * as adminView from "@/lib/adminView";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
+import { UPDATE_MODE_ENTRY } from "@/pages/settings/search/catalog/updates";
+import { settingsDescriptionId } from "@/pages/settings/search/settingsControl";
 import { UI_FONT_SIZE_MOBILE_QUERY } from "@/lib/uiFontPreferences";
 import {
   CODE_BLOCK_WORD_WRAP_STORAGE_KEY,
@@ -54,6 +58,7 @@ const mocks = vi.hoisted(() => ({
   accountsEnabled: true,
   importSessionsPanel: vi.fn(() => null),
   enabledConnections: [] as string[],
+  archiveWorktreeCleanup: false,
   // login_url: non-null for any sign-in mode (accounts OR OIDC), null in
   // header mode. Gates the Account section.
   loginUrl: "/login" as string | null,
@@ -101,9 +106,25 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
           admin_view: mocks.adminViewSupported,
           sibling_sessions: mocks.nestedAgents,
           enabled_connections: mocks.enabledConnections,
+          archive_worktree_cleanup: mocks.archiveWorktreeCleanup,
           session_title_instructions: mocks.sessionTitleInstructions,
           proactive_agent_available: mocks.advisorAvailable,
         },
+}));
+vi.mock("@/lib/githubIntegration", () => ({
+  fetchGithubStatus: vi.fn(async () => ({ connected: false, login: null, install_url: null })),
+  beginGithubConnect: vi.fn(),
+  disconnectGithub: vi.fn(),
+}));
+vi.mock("@/lib/databricksIntegration", () => ({
+  fetchDatabricksStatus: vi.fn(async () => ({
+    enabled: true,
+    connected: false,
+    workspace_host: null,
+    databricks_user: null,
+  })),
+  beginDatabricksConnect: vi.fn(),
+  disconnectDatabricks: vi.fn(),
 }));
 vi.mock("@/components/SessionTitleInstructionsControl", () => ({
   SessionTitleInstructionsControl: () => <div data-testid="mock-session-title-instructions" />,
@@ -205,13 +226,17 @@ vi.mock("@/components/ui/select", async () => {
   }) => {
     const kids = Children.toArray(children);
     const trigger = kids.find((c) => isValidElement(c) && c.type === SelectTrigger);
-    const testId =
+    const triggerProps: Record<string, unknown> =
       isValidElement(trigger) && trigger.props && typeof trigger.props === "object"
-        ? (trigger.props as Record<string, unknown>)["data-testid"]
-        : undefined;
+        ? (trigger.props as Record<string, unknown>)
+        : {};
+    const stringProp = (name: string) =>
+      typeof triggerProps[name] === "string" ? triggerProps[name] : undefined;
     return (
       <select
-        data-testid={typeof testId === "string" ? testId : undefined}
+        data-testid={stringProp("data-testid")}
+        aria-label={stringProp("aria-label")}
+        aria-labelledby={stringProp("aria-labelledby")}
         value={value}
         disabled={disabled}
         onChange={(e) => onValueChange(e.target.value)}
@@ -307,6 +332,7 @@ beforeEach(() => {
   mocks.authenticatedFetch.mockReset();
   mocks.importSessionsPanel.mockClear();
   mocks.enabledConnections = [];
+  mocks.archiveWorktreeCleanup = false;
   mocks.loginUrl = "/login";
   mocks.me = { id: "alice", is_admin: false };
   mocks.effectiveAdmin = undefined;
@@ -1661,6 +1687,23 @@ describe("SettingsPage", () => {
     });
   });
 
+  it("renders each Updates row from its Settings catalog entry", async () => {
+    installUpdateBridge();
+
+    renderPage("/settings/updates");
+    expect(await screen.findByRole("heading", { name: "Updates" })).toBeInTheDocument();
+
+    for (const id of ["update-mode", "install-updates-on-quit", "check-for-updates"]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+    expect(document.getElementById(settingsDescriptionId(UPDATE_MODE_ENTRY))).toHaveTextContent(
+      UPDATE_MODE_ENTRY.description,
+    );
+    expect(
+      screen.getByRole("switch", { name: "Install downloaded updates on next quit" }),
+    ).toBeInTheDocument();
+  });
+
   it("surfaces manual update-check failures in Settings", async () => {
     const { bridge, emitStatus } = installUpdateBridge();
     vi.mocked(bridge.check).mockRejectedValueOnce(new Error("Cannot find latest.yml: 404"));
@@ -1779,6 +1822,123 @@ describe("SettingsPage", () => {
     fireEvent.change(input, { target: { value: "" } });
     expect(input.value).toBe("");
     expect(localStorage.getItem("omnigent:default-base-branch")).toBeNull();
+  });
+
+  it("renders the Archived sessions rows from their Settings catalog entries", () => {
+    mocks.conversations = [conv("conv_archived", { archived: true, title: "Old chat" })];
+    renderPage("/settings/archived");
+
+    expect(document.querySelector('[data-settings-item="archived-sessions"]')).not.toBeNull();
+    expect(
+      document.querySelector('[data-settings-control="archived-sessions:select"]'),
+    ).not.toBeNull();
+    expect(
+      screen.getByRole("combobox", { name: "Mark archived sessions as expired after" }),
+    ).toBeInTheDocument();
+    const row = screen.getByTestId("archived-row");
+    expect(row.querySelector('[data-settings-row-action="delete"]')).not.toBeNull();
+    expect(row.querySelector('[data-settings-row-action="unarchive"]')).not.toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Select" }));
+    expect(screen.getByRole("button", { name: "Exit selection mode" })).toBeInTheDocument();
+  });
+
+  it("renders the Account rows and the password dialog from their Settings catalog entries", async () => {
+    renderPage("/settings/account");
+    await screen.findByRole("button", { name: "Sign out" });
+    expect(document.querySelector('[data-settings-item="account-sign-out"]')).not.toBeNull();
+    expect(
+      document.querySelector('[data-settings-control="account-password:change"]'),
+    ).not.toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Change password" }));
+    expect(screen.getByPlaceholderText("Current password")).toHaveAccessibleName(
+      "Current password",
+    );
+    expect(screen.getByPlaceholderText("New password")).toHaveAccessibleName("New password");
+    expect(screen.getByPlaceholderText("Confirm new password")).toHaveAccessibleName(
+      "Confirm new password",
+    );
+    expect(
+      document.querySelector('[data-settings-control="account-password:currentPassword"]'),
+    ).not.toBeNull();
+    expect(
+      document.querySelector('[data-settings-control="account-password:submit"]'),
+    ).not.toBeNull();
+  });
+
+  it("renders the Git rows from their Settings catalog entries", () => {
+    renderPage("/settings/git");
+    for (const id of ["always-use-worktree", "default-base-branch"]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+    expect(
+      document
+        .querySelector('[data-settings-control="default-base-branch:"]')
+        ?.getAttribute("aria-labelledby"),
+    ).toBe("settings-default-base-branch-label");
+    expect(
+      screen.getByRole("switch", { name: "Always use a random worktree" }),
+    ).toHaveAccessibleDescription(
+      "Use a fresh, randomly named worktree for new sessions in Git workspaces. Project settings override this default.",
+    );
+    expect(screen.getByRole("textbox", { name: "Default base branch" })).toBeInTheDocument();
+  });
+
+  it("renders the delete-worktrees row only when the server enables worktree cleanup", () => {
+    renderPage("/settings/git");
+    expect(document.querySelector('[data-settings-item="delete-worktrees-on-archive"]')).toBeNull();
+
+    cleanup();
+    mocks.archiveWorktreeCleanup = true;
+    renderPage("/settings/git");
+    expect(
+      document.querySelector('[data-settings-item="delete-worktrees-on-archive"]'),
+    ).not.toBeNull();
+    expect(
+      document
+        .querySelector('[data-settings-control="delete-worktrees-on-archive:"]')
+        ?.getAttribute("aria-labelledby"),
+    ).toBe("settings-delete-worktrees-on-archive-label");
+  });
+
+  it("renders the Sandbox Integrations rows from their Settings catalog entries", async () => {
+    mocks.enabledConnections = ["github", "databricks"];
+    renderPage("/settings/integrations");
+    expect(await screen.findByTestId("github-connect")).toBeInTheDocument();
+    expect(await screen.findByTestId("databricks-workspace")).toBeInTheDocument();
+    for (const id of ["github-connection", "databricks-connection"]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+    expect(
+      document.querySelector('[data-settings-control="databricks-connection:workspace"]'),
+    ).not.toBeNull();
+    expect(screen.getByRole("textbox", { name: "Databricks workspace host" })).toBeInTheDocument();
+  });
+
+  it("keeps the GitHub and Databricks rows on the page while their status is checking", () => {
+    mocks.enabledConnections = ["github", "databricks"];
+    renderPage("/settings/integrations");
+    for (const id of ["github-connection", "databricks-connection"]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+  });
+
+  it("keeps the integration rows on the page when their status can't be read", async () => {
+    mocks.enabledConnections = ["github", "databricks"];
+    vi.mocked(fetchGithubStatus).mockRejectedValueOnce(new Error("offline"));
+    vi.mocked(fetchDatabricksStatus).mockRejectedValueOnce(new Error("offline"));
+    renderPage("/settings/integrations");
+    expect(
+      await screen.findByText("GitHub status is unavailable.", { selector: "p" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByText("Databricks status is unavailable.", { selector: "p" }),
+    ).toBeInTheDocument();
+    expect(
+      document.querySelector('[data-settings-item="github-connection"]')?.textContent,
+    ).toContain("GitHub status is unavailable.");
+    expect(
+      document.querySelector('[data-settings-item="databricks-connection"]')?.textContent,
+    ).toContain("Databricks status is unavailable.");
   });
 
   it("lists archived sessions and unarchives on click", () => {

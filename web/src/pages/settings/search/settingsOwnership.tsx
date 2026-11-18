@@ -92,6 +92,12 @@ export function SettingsContent({
   );
 }
 
+/**
+ * A `title` for an owned control that adds no tooltip. The wrapper otherwise sets the tooltip to
+ * the control's name, which would show Settings a hover its shared control never had.
+ */
+export const SETTINGS_NO_TOOLTIP = { title: "" } as const;
+
 /** Props for a dialog's or popover's content, linking it to the part that opens it. */
 export function settingsOverlayProps(
   entry: SettingsEntry,
