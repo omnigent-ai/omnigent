@@ -23,6 +23,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
 
     assert flags.enabled_features == frozenset(
         {
+            Feature.AUTOMATIONS,
             Feature.AUTOMATIONS_V2,
             Feature.CLAUDE_OSC_STATUS,
             Feature.CODEX_PLAN_AT_LAUNCH,
@@ -31,6 +32,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
             Feature.SESSION_ORCHESTRATION,
             Feature.SIBLING_SESSIONS,
             Feature.SIDEBAR_GROUPING_UI,
+            Feature.USER_INBOX,
         }
     )
     assert flags.frontend_dict() == {
@@ -52,6 +54,8 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "session_orchestration": True,
         "sibling_sessions": True,
         "codex_plan_at_launch": True,
+        "workspace_direct_access": False,
+        "workspace_api_server_access": False,
     }
 
 
@@ -61,6 +65,7 @@ def test_resolves_comma_separated_enabled_set() -> None:
     assert flags.enabled(Feature.USAGE_PAGE)
     assert flags.enabled(Feature.HARNESS_INSTALL)
     assert flags.enabled_names() == (
+        "automations",
         "automations_v2",
         "claude_osc_status",
         "codex_plan_at_launch",
@@ -71,6 +76,7 @@ def test_resolves_comma_separated_enabled_set() -> None:
         "sibling_sessions",
         "sidebar_grouping_ui",
         "usage_page",
+        "user_inbox",
     )
 
 
@@ -85,6 +91,7 @@ def test_resolves_comma_separated_enabled_set() -> None:
 @pytest.mark.parametrize(
     "feature",
     [
+        "automations",
         "automations_v2",
         "claude_osc_status",
         "peer_session_messaging",
@@ -92,6 +99,7 @@ def test_resolves_comma_separated_enabled_set() -> None:
         "session_orchestration",
         "sibling_sessions",
         "sidebar_grouping_ui",
+        "user_inbox",
     ],
 )
 def test_explicit_disable_wins_and_preserves_other_features(override: str, feature: str) -> None:
@@ -99,6 +107,7 @@ def test_explicit_disable_wins_and_preserves_other_features(override: str, featu
     flags = resolve_feature_flags({FEATURES_ENV_VAR: f"usage_page,{features}"})
 
     assert set(flags.enabled_names()) == {
+        "automations",
         "automations_v2",
         "claude_osc_status",
         "codex_plan_at_launch",
@@ -108,6 +117,7 @@ def test_explicit_disable_wins_and_preserves_other_features(override: str, featu
         "sibling_sessions",
         "sidebar_grouping_ui",
         "usage_page",
+        "user_inbox",
     } - {feature}
 
 
@@ -116,6 +126,7 @@ def test_default_off_features_can_also_be_explicitly_disabled(feature: str) -> N
     flags = resolve_feature_flags({FEATURES_ENV_VAR: f"{feature},-{feature}"})
 
     assert flags.enabled_names() == (
+        "automations",
         "automations_v2",
         "claude_osc_status",
         "codex_plan_at_launch",
@@ -124,6 +135,7 @@ def test_default_off_features_can_also_be_explicitly_disabled(feature: str) -> N
         "session_orchestration",
         "sibling_sessions",
         "sidebar_grouping_ui",
+        "user_inbox",
     )
 
 
@@ -155,6 +167,7 @@ def test_canvas_is_a_frontend_visible_feature() -> None:
     assert flags.enabled(Feature.CANVAS)
     assert flags.frontend_dict()["canvas"] is True
     assert flags.enabled_names() == (
+        "automations",
         "automations_v2",
         "canvas",
         "claude_osc_status",
@@ -164,6 +177,7 @@ def test_canvas_is_a_frontend_visible_feature() -> None:
         "session_orchestration",
         "sibling_sessions",
         "sidebar_grouping_ui",
+        "user_inbox",
     )
 
 
@@ -180,7 +194,9 @@ def test_sibling_sessions_explicit_enable_preserves_default_features() -> None:
     assert flags.frontend_dict()["sibling_sessions"] is True
 
 
-@pytest.mark.parametrize("feature", [Feature.CLAUDE_OSC_STATUS, Feature.PEER_SESSION_MESSAGING])
+@pytest.mark.parametrize(
+    "feature", [Feature.AUTOMATIONS, Feature.CLAUDE_OSC_STATUS, Feature.PEER_SESSION_MESSAGING]
+)
 def test_backend_features_are_not_frontend_visible(feature: Feature) -> None:
     flags = resolve_feature_flags({FEATURES_ENV_VAR: feature.value})
 
@@ -276,3 +292,9 @@ def test_mcp_harness_feature_mapping_is_complete():
     from omnigent.server.feature_flags import MCP_DISABLED_SERVERS_HARNESS_FEATURES
 
     assert MCP_DISABLED_SERVERS_HARNESS_FEATURES.keys() == HARNESS_EXECUTORS.keys()
+
+
+def test_memory_is_opt_in_and_backend_only() -> None:
+    assert not resolve_feature_flags({}).enabled(Feature.MEMORY)
+    assert resolve_feature_flags({FEATURES_ENV_VAR: "memory"}).enabled(Feature.MEMORY)
+    assert "memory" not in resolve_feature_flags({FEATURES_ENV_VAR: "memory"}).frontend_dict()

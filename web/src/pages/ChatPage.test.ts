@@ -130,21 +130,22 @@ describe("Composer structural read-only reasons", () => {
     ).toBe("Claude Code sub-agents are read-only");
   });
 
-  it("gives a sealed codex /side child its own reason, not the generic one", () => {
-    // Server seals a dead side chat with omnigent.closed; the "Side chat"
-    // nickname distinguishes it from an ordinary closed codex sub-agent.
-    expect(
-      readOnlyReasonForSessionLabels(
-        {
-          labels: {
-            "omnigent.closed": "true",
-            "omnigent.wrapper": "codex-native-ui-subagent",
-            "omnigent.codex_native.agent_nickname": "Side chat",
-          },
-        },
-        null,
-      ),
-    ).toBe("This side chat has ended and can't receive new messages");
+  it.each(
+    [undefined, "false", "true"].flatMap((support) =>
+      [true, false].map((live) => ({ support, live })),
+    ),
+  )("gates closed codex /side recovery (live: $live, support: $support)", ({ live, support }) => {
+    const session = {
+      labels: {
+        "omnigent.closed": "true",
+        "omnigent.wrapper": "codex-native-ui-subagent",
+        "omnigent.codex_native.agent_nickname": "Side chat",
+        ...(support === undefined ? {} : { "omnigent.codex_native.side_chat_resume": support }),
+      },
+    };
+    expect(readOnlyReasonForSessionLabels(live ? session : null, live ? null : session)).toBe(
+      support === "true" ? null : "This sub-agent session is closed",
+    );
   });
 
   it("keeps the generic closed reason for a non-side-chat codex sub-agent", () => {

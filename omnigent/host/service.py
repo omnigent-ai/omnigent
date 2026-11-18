@@ -109,8 +109,11 @@ def _clean_environment(environment: Mapping[str, str]) -> dict[str, str]:
     for key, value in environment.items():
         if not _ENV_NAME_RE.fullmatch(key):
             raise HostServiceError(f"Cannot persist invalid environment variable name {key!r}.")
-        if "\x00" in value or "\n" in value or "\r" in value:
-            raise HostServiceError(f"Cannot persist multiline environment variable {key!r}.")
+        # launchd plists turn a carriage return into a newline; NUL cannot reach a process env.
+        if "\x00" in value or "\r" in value:
+            raise HostServiceError(
+                f"Cannot persist environment variable {key!r} containing NUL or a carriage return."
+            )
         cleaned[key] = value
     return dict(sorted(cleaned.items()))
 
@@ -141,7 +144,9 @@ def _launchd_payload(
 
 def _systemd_quote(value: str, *, escape_dollar: bool = False) -> str:
     """Quote one systemd unit value without invoking a shell."""
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    escaped = (
+        value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n").replace("%", "%%")
+    )
     if escape_dollar:
         escaped = escaped.replace("$", "$$")
     return f'"{escaped}"'

@@ -78,6 +78,7 @@ RUNNER_LOG_TAIL_HEADING = "--- runner log tail ---"
 # feature simply omits the token (older hosts send no ``capabilities`` at all).
 # The runner intercepts codex ``/side`` and forks an ephemeral side-chat thread:
 CAP_CODEX_SIDE_CHAT = "codex_side_chat"
+CAP_CODEX_SIDE_CHAT_RESUME = "codex_side_chat_resume"
 # The runner starts a codex-native session whose collaboration-mode label is
 # ``plan`` (armed on the New Session screen) in Codex Plan mode:
 CAP_CODEX_PLAN_AT_LAUNCH = "codex_plan_at_launch"
@@ -100,10 +101,14 @@ CAP_WORKTREE_CREATE_BUDGET = "worktree_create_budget"
 CAP_CLONE_REPOSITORY = "clone_repository"
 # The host answers ``host.workspace_call`` (the workspace API through the server).
 CAP_WORKSPACE_API = "workspace_api"
+# The host's runners accept session messages up to ``SESSION_MESSAGE_MAX_CHARS``
+# (32,000) instead of 8,000, so automations can send long instructions:
+CAP_LONG_SESSION_MESSAGES = "long_session_messages"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
     CAP_CODEX_SIDE_CHAT,
+    CAP_CODEX_SIDE_CHAT_RESUME,
     CAP_CODEX_PLAN_AT_LAUNCH,
     CAP_FILESYSTEM_ATTACHMENTS,
     CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
@@ -121,6 +126,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_HARNESS_ACCOUNTS,
     CAP_HARNESS_LOGIN,
     CAP_CLONE_REPOSITORY,
+    CAP_LONG_SESSION_MESSAGES,
 ]
 # The workspace API needs the optional `omnigent[workspace-api]` extra.
 if importlib.util.find_spec("connectrpc") is not None:

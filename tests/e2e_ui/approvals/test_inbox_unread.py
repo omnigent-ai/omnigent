@@ -1,6 +1,7 @@
 """E2E: live agent replies appear in the Inbox as unread rows.
 
 Verifies the tabs filter them, the selected tab persists across reloads, a
+long reply's hover card stays inside a short window and scrolls to its end, a
 reply typed into the row reaches the agent and its answer re-lights the row,
 and "Mark as read" and "Open session" both clear the row.
 """
@@ -12,12 +13,20 @@ import time
 import uuid
 
 import httpx
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Locator, Page, expect
 
 from tests.e2e_ui.conftest import configure_mock_llm
 
 _UNREAD_ROW = '[data-testid="inbox-unread"]'
 _FIRST_REPLY = "Refactor finished: 3 files changed, all tests green."
+_FIRST_REPLY_END = "End of the refactor report."
+_FIRST_REPLY_FULL = "\n\n".join(
+    [
+        _FIRST_REPLY,
+        *(f"Step {n}: checked module {n} and its tests." for n in range(1, 31)),
+        _FIRST_REPLY_END,
+    ]
+)
 _SECOND_REPLY = "Follow-up done: added the missing migration."
 _ANSWER_TO_INBOX_REPLY = "Re-ran the suite: 214 passed."
 _TURN_TIMEOUT_MS = 60_000
@@ -45,6 +54,33 @@ def _wait_for_next_second() -> None:
     time.sleep(1.1)
 
 
+def _assert_full_reply_card_fits_window(page: Page, row: Locator) -> None:
+    """Hover the cut preview and check the whole reply can be read inside the window.
+
+    :param page: Inbox page with ``row`` expanded.
+    :param row: Unread row whose latest reply is longer than its preview.
+    """
+    preview = row.locator('[data-slot="hover-card-trigger"]')
+    box = preview.bounding_box()
+    assert box is not None
+    viewport = page.viewport_size
+    assert viewport is not None
+    # Centre the preview so neither side has room for the card's 60vh cap.
+    page.set_viewport_size(
+        {"width": viewport["width"], "height": round(2 * box["y"] + box["height"])}
+    )
+    preview.hover()
+    card = page.locator('[data-slot="hover-card-content"]')
+    expect(card).to_contain_text(_FIRST_REPLY_END)
+    expect(card).to_be_in_viewport(ratio=1)
+    card.hover()
+    page.mouse.wheel(0, 10_000)
+    expect(card.get_by_text(_FIRST_REPLY_END)).to_be_in_viewport(ratio=1)
+    page.mouse.move(0, 0)
+    expect(card).to_be_hidden()
+    page.set_viewport_size(viewport)
+
+
 def test_unseen_reply_surfaces_in_inbox_until_read(
     page: Page,
     seeded_session: tuple[str, str],
@@ -57,7 +93,7 @@ def test_unseen_reply_surfaces_in_inbox_until_read(
     reply_marker = f"inbox-unread-{uuid.uuid4().hex[:8]}"
     # Several copies per marker so a title-generation call matching the same
     # prompt can't drain the queue before the agent's turn.
-    configure_mock_llm(mock_llm_server_url, [{"text": _FIRST_REPLY}] * 3, match=first_marker)
+    configure_mock_llm(mock_llm_server_url, [{"text": _FIRST_REPLY_FULL}] * 3, match=first_marker)
     configure_mock_llm(mock_llm_server_url, [{"text": _SECOND_REPLY}] * 3, match=second_marker)
     configure_mock_llm(
         mock_llm_server_url, [{"text": _ANSWER_TO_INBOX_REPLY}] * 3, match=reply_marker
@@ -84,6 +120,7 @@ def test_unseen_reply_surfaces_in_inbox_until_read(
 
     row.locator("button[aria-expanded]").click()
     expect(row).to_have_attribute("data-expanded", "true")
+    _assert_full_reply_card_fits_window(page, row)
     row.get_by_role("button", name="Mark as read").click()
     expect(row).to_have_count(0)
     expect(page.get_by_text("You’re all caught up")).to_be_visible()

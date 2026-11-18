@@ -24,6 +24,7 @@ from collections.abc import Callable
 
 from omnigent.spec.types import SkillSpec
 from omnigent.tools.base import Tool
+from omnigent.tools.browser_agent_tools import ADVANCED_BROWSER_TOOL_NAMES
 from omnigent.tools.builtins.advise_models import SysAdviseModelsTool
 from omnigent.tools.builtins.agents import (
     SysAgentDownloadTool,
@@ -49,6 +50,13 @@ from omnigent.tools.builtins.load_skill import (
     format_skill_content,
     format_skill_meta_text,
     list_skill_resources,
+)
+from omnigent.tools.builtins.memory import (
+    MemoryDeleteTool,
+    MemoryGetTool,
+    MemoryListTool,
+    MemorySearchTool,
+    MemoryWriteTool,
 )
 from omnigent.tools.builtins.nimble_extract import NimbleExtractTool
 from omnigent.tools.builtins.nimble_research import NimbleResearchTool
@@ -83,6 +91,7 @@ from omnigent.tools.builtins.timer import (
     SysTimerSetTool,
 )
 from omnigent.tools.builtins.update_comment import UpdateCommentTool
+from omnigent.tools.builtins.user_inbox import SysUserInboxListTool, SysUserInboxPostTool
 from omnigent.tools.builtins.web_read import WebReadTool
 from omnigent.tools.builtins.web_search import WebSearchTool
 
@@ -91,6 +100,11 @@ __all__ = [
     "INSTANTIABLE_BUILTINS",
     "ListCommentsTool",
     "LoadSkillTool",
+    "MemoryDeleteTool",
+    "MemoryGetTool",
+    "MemoryListTool",
+    "MemorySearchTool",
+    "MemoryWriteTool",
     "NimbleExtractTool",
     "NimbleResearchTool",
     "ReadSkillFileTool",
@@ -125,6 +139,8 @@ __all__ = [
     "SysSessionUpdateTool",
     "SysTimerCancelTool",
     "SysTimerSetTool",
+    "SysUserInboxListTool",
+    "SysUserInboxPostTool",
     "UpdateCommentTool",
     "WebReadTool",
     "WebSearchTool",
@@ -316,6 +332,7 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "browser_click": None,
     "browser_type": None,
     "browser_screenshot": None,
+    **dict.fromkeys(sorted(ADVANCED_BROWSER_TOOL_NAMES)),
     "ui_open_file": None,
 }
 

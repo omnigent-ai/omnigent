@@ -21,6 +21,11 @@ from omnigent.tools.base import Tool, ToolContext, is_valid_tool_name
 from omnigent.tools.builtins import (
     ListCommentsTool,
     LoadSkillTool,
+    MemoryDeleteTool,
+    MemoryGetTool,
+    MemoryListTool,
+    MemorySearchTool,
+    MemoryWriteTool,
     ReadSkillFileTool,
     SysAdviseModelsTool,
     SysAgentDownloadTool,
@@ -49,6 +54,8 @@ from omnigent.tools.builtins import (
     SysSessionUpdateTool,
     SysTimerCancelTool,
     SysTimerSetTool,
+    SysUserInboxListTool,
+    SysUserInboxPostTool,
     UpdateCommentTool,
     any_skill_has_resources,
     get_builtin_tool,
@@ -197,6 +204,8 @@ class ToolManager:
         self._register_policy_tools()
         self._register_scheduled_task_tools()
         self._register_journal_tools()
+        self._register_user_inbox_tools()
+        self._register_memory_tools()
         self._register_browser_tools()
 
     def _register_policy_tools(self) -> None:
@@ -251,6 +260,36 @@ class ToolManager:
 
         for tool_class in JOURNAL_TOOLS:
             self._tools[tool_class.name()] = tool_class()
+
+    def _register_user_inbox_tools(self) -> None:
+        """Register the owner-Inbox tools for agents that opt in."""
+        if not self._spec.tool_groups.user_inbox:
+            return
+        for tool in (SysUserInboxPostTool(), SysUserInboxListTool()):
+            self._tools[tool.name()] = tool
+
+    def _register_memory_tools(self) -> None:
+        """
+        Auto-register the long-term memory builtins.
+
+        Registered without spec opt-in so every agent can save and recall memory
+        across sessions; ``tool_groups.memory: false`` drops all five, and
+        ``memory_search`` is left out when the server's backend cannot search.
+        The runner dispatches them via the Omnigent server's ``/v1/memory`` REST
+        endpoints.
+        """
+        if not self._spec.tool_groups.memory:
+            return
+        tools: list[Tool] = [
+            MemoryGetTool(),
+            MemoryListTool(),
+            MemoryWriteTool(),
+            MemoryDeleteTool(),
+        ]
+        if self._spec.memory_search_available:
+            tools.insert(0, MemorySearchTool())
+        for tool in tools:
+            self._tools[tool.name()] = tool
 
     def _register_async_inbox_tools(self) -> None:
         """
@@ -645,6 +684,11 @@ class ToolManager:
             BrowserScreenshotTool,
         ):
             self._tools[_cls.name()] = _cls()
+        # The advanced browser tools, and click / type with their trusted-input options.
+        # Imported here: the tool classes build on this module's registry.
+        from omnigent.tools.builtins.browser_advanced import register_browser_agent_tools
+
+        register_browser_agent_tools(self._tools)
 
     def _register_os_env_tools(self, *, schema_only: bool = False) -> None:
         """

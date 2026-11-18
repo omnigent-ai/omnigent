@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
 import threading
 import uuid
 from collections.abc import Callable, Iterator
@@ -31,13 +32,16 @@ from omnigent.entities import (
     ResourceEventData,
 )
 from omnigent.errors import StaleCursorError
-from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL
 from omnigent.session_import import (
     IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
     IMPORT_SOURCE_LABEL_KEY,
 )
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
-from omnigent.stores.conversation_store import ConversationUpdateResult
+from omnigent.stores.conversation_store import (
+    SCHEDULED_TASK_RUN_LABEL_KEY,
+    ConversationUpdateResult,
+)
 from omnigent.stores.conversation_store.activity_error import (
     LATEST_ACTIVITY_ERROR_LABEL_KEY,
     LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY,
@@ -46,6 +50,17 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+_SEARCHER = "searcher@example.com"
+
+
+def _grant_search_access(db_uri: str, *conversation_ids: str) -> None:
+    """Grant ``_SEARCHER`` read access so content search can return these conversations."""
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    for conversation_id in conversation_ids:
+        permissions.grant(_SEARCHER, conversation_id, LEVEL_READ)
+
 
 # ── CRUD ──────────────────────────────────────────────
 
@@ -220,10 +235,12 @@ def test_overlapping_run_attempts_preserve_the_last_sent_run(
 def test_fork_drops_the_automation_run_label(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """A fork serves no automation run, so its journal entries are not the run's."""
+    """A fork serves no automation run, so its journal entries are not the run's,
+    and the automation doesn't share the sessions it launches."""
     from omnigent.stores.conversation_store import (
         SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
         SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+        SCHEDULED_TASK_LAUNCH_LABEL_KEY,
         SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX,
         SCHEDULED_TASK_RUN_LABEL_KEY,
     )
@@ -235,6 +252,7 @@ def test_fork_drops_the_automation_run_label(
             SCHEDULED_TASK_RUN_LABEL_KEY: "0123456789abcdef0123456789abcdef",
             SCHEDULED_TASK_ACTIVITY_LABEL_KEY: "older-run",
             SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY: "older-run",
+            SCHEDULED_TASK_LAUNCH_LABEL_KEY: "st_1",
         },
     )
     conversation_store.update_scheduled_run_label(source.id, "1" * 32, action="begin")
@@ -244,6 +262,7 @@ def test_fork_drops_the_automation_run_label(
     assert SCHEDULED_TASK_RUN_LABEL_KEY not in fork.labels
     assert SCHEDULED_TASK_ACTIVITY_LABEL_KEY not in fork.labels
     assert SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY not in fork.labels
+    assert SCHEDULED_TASK_LAUNCH_LABEL_KEY not in fork.labels
     assert not any(key.startswith(SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX) for key in fork.labels)
 
 
@@ -599,7 +618,9 @@ def test_get_session_activity(
     conversation_store.set_session_live_status(a.id, "waiting")
     conversation_store.set_runner_id(a.id, "runner_activity")
     conversation_store.set_pending_elicitation_count(a.id, 2)
-    conversation_store.set_labels(a.id, {"omnigent.ui": "terminal"})
+    conversation_store.set_labels(
+        a.id, {"omnigent.ui": "terminal", SCHEDULED_TASK_RUN_LABEL_KEY: "run_current"}
+    )
     conversation_store.set_session_usage(a.id, {"total_cost_usd": cost})
     child = conversation_store.create_conversation(
         kind="sub_agent", title="child", parent_conversation_id=a.id
@@ -621,8 +642,11 @@ def test_get_session_activity(
         event.remove(conversation_store._engine, "before_cursor_execute", record_query)
 
     reads = [statement for statement in statements if statement.startswith("select")]
-    assert len(reads) == 2
-    assert all("conversation_labels" not in statement for statement in reads)
+    # Only the current-run label is read, never the session's full label set.
+    assert len(reads) == 3
+    label_reads = [statement for statement in reads if "conversation_labels" in statement]
+    assert len(label_reads) == 1
+    assert re.search(r"\bkey\W* = ", label_reads[0])
 
     assert set(result) == {a.id, b.id, child.id}
     assert result[a.id].updated_at == conversation_store.get_conversation(a.id).updated_at  # type: ignore[union-attr]
@@ -637,6 +661,8 @@ def test_get_session_activity(
     assert result[b.id].total_cost_usd is None
     assert result[a.id].archived is False
     assert result[b.id].archived is True
+    assert result[a.id].current_run_id == "run_current"
+    assert result[b.id].current_run_id is None
     assert conversation_store.get_session_activity([]) == {}
 
 
@@ -1378,7 +1404,10 @@ def test_append_tool_output_with_nul_bytes(
 
     # The meaningful, NUL-adjacent token is still searchable, proving
     # sanitization dropped only the NUL and left real tokens indexed.
-    results = conversation_store.search("marker_unique_token", conversation_id=conv.id)
+    _grant_search_access(db_uri, conv.id)
+    results = conversation_store.search(
+        "marker_unique_token", conversation_id=conv.id, accessible_by=_SEARCHER
+    )
     assert [r.id for r in results] == [item_id]
 
 
@@ -2025,8 +2054,9 @@ def test_list_items_small_page_stays_single_statement(
 # ── Conversation ID / response ID lookups ────────────
 
 
-def test_search(conversation_store: SqlAlchemyConversationStore) -> None:
+def test_search(conversation_store: SqlAlchemyConversationStore, db_uri: str) -> None:
     conv = conversation_store.create_conversation()
+    _grant_search_access(db_uri, conv.id)
     conversation_store.append(
         conv.id,
         [
@@ -2049,21 +2079,23 @@ def test_search(conversation_store: SqlAlchemyConversationStore) -> None:
             ),
         ],
     )
-    results = conversation_store.search("Paris")
+    results = conversation_store.search("Paris", accessible_by=_SEARCHER)
     assert len(results) == 1
     assert results[0].type == "message"
 
-    results = conversation_store.search("sunny")
+    results = conversation_store.search("sunny", accessible_by=_SEARCHER)
     assert len(results) == 1
 
-    assert conversation_store.search("nonexistent") == []
+    assert conversation_store.search("nonexistent", accessible_by=_SEARCHER) == []
 
 
 def test_search_scoped_to_conversation(
     conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
 ) -> None:
     conv1 = conversation_store.create_conversation()
     conv2 = conversation_store.create_conversation()
+    _grant_search_access(db_uri, conv1.id, conv2.id)
     conversation_store.append(
         conv1.id,
         [
@@ -2091,18 +2123,26 @@ def test_search_scoped_to_conversation(
         ],
     )
     # Unscoped: both match "hello"
-    assert len(conversation_store.search("hello")) == 2
+    assert len(conversation_store.search("hello", accessible_by=_SEARCHER)) == 2
 
     # Scoped: only one per conversation
-    assert len(conversation_store.search("hello", conversation_id=conv1.id)) == 1
-    assert len(conversation_store.search("hello", conversation_id=conv2.id)) == 1
+    assert (
+        len(conversation_store.search("hello", conversation_id=conv1.id, accessible_by=_SEARCHER))
+        == 1
+    )
+    assert (
+        len(conversation_store.search("hello", conversation_id=conv2.id, accessible_by=_SEARCHER))
+        == 1
+    )
 
 
 def test_search_function_call_item(
     conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
 ) -> None:
     """FTS indexes function_call items by name and arguments."""
     conv = conversation_store.create_conversation()
+    _grant_search_access(db_uri, conv.id)
     conversation_store.append(
         conv.id,
         [
@@ -2118,9 +2158,9 @@ def test_search_function_call_item(
             ),
         ],
     )
-    assert len(conversation_store.search("get_weather")) == 1
-    assert len(conversation_store.search("Tokyo")) == 1
-    assert conversation_store.search("nonexistent") == []
+    assert len(conversation_store.search("get_weather", accessible_by=_SEARCHER)) == 1
+    assert len(conversation_store.search("Tokyo", accessible_by=_SEARCHER)) == 1
+    assert conversation_store.search("nonexistent", accessible_by=_SEARCHER) == []
 
 
 def test_list_conversations_search_query_matches_content(
@@ -5534,8 +5574,24 @@ def test_fork_marks_source_workspace_failures_as_notices(
     }
     assert LATEST_ACTIVITY_ERROR_LABEL_KEY not in fork.labels
     assert LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY not in fork.labels
-    assert len(conversation_store.search("source_workspace_missing", conversation_id=fork.id)) == 2
-    assert conversation_store.search("source_workspace_missing", conversation_id=source.id) == []
+    _grant_search_access(db_uri, fork.id, source.id)
+    assert (
+        len(
+            conversation_store.search(
+                "source_workspace_missing", conversation_id=fork.id, accessible_by=_SEARCHER
+            )
+        )
+        == 2
+    )
+    assert conversation_store.search(
+        "Workspace", conversation_id=source.id, accessible_by=_SEARCHER
+    )
+    assert (
+        conversation_store.search(
+            "source_workspace_missing", conversation_id=source.id, accessible_by=_SEARCHER
+        )
+        == []
+    )
 
     [new_failure] = conversation_store.append(fork.id, [missing])
     assert conversation_store.list_items(fork.id).data[-1] == new_failure

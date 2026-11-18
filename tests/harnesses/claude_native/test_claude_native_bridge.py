@@ -41,7 +41,6 @@ from omnigent.harnesses.claude_native.bridge import (
     _LOGIN_GUIDANCE,
     _TURN_END_SCAN_BYTES,
     BackgroundAgentsAfterTurnReader,
-    _build_tools,
     _claude_prompt_rendered,
     _escape_slash_command_text,
     _escape_unsupported_slash_command,
@@ -77,12 +76,6 @@ from omnigent.harnesses.claude_native.bridge import (
     start_tool_relay,
     stop_hook_seen_since,
     write_tmux_target,
-)
-from omnigent.inner.datamodel import (
-    CredentialProxyEntry,
-    CredentialProxySpec,
-    CredentialSourceSpec,
-    OSEnvSandboxSpec,
 )
 from omnigent.inner.native_attachments import materialize_attachment
 from omnigent.native import native_cost_popup, policy_allow_cache
@@ -412,144 +405,29 @@ def test_prepare_bridge_dir_refuses_symlinked_ancestor(
     assert not (attacker_dir / "bridge.json").exists()
 
 
-def test_prepare_bridge_dir_persists_and_applies_resolved_sandbox(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_serve_mcp_offers_only_relay_tools(tmp_path: Path) -> None:
     """
-    A resolved sandbox reaches both the bridge config and its sys_os_* tools.
+    The bridge serves no ``sys_os_*`` tools of its own.
 
-    ``enforce_sandbox``/``force_sandbox`` resolves a real sandbox onto the
-    session's ``os_env.sandbox`` upstream (``runner/app.py``'s
-    ``_apply_sandbox_override_from_start_data``), but that decision used to
-    have no path into the claude-native bridge: ``prepare_bridge_dir``
-    never wrote it to the config file, and ``_build_tools`` unconditionally
-    hardcoded ``OSEnvSandboxSpec(type="none")`` regardless of the policy.
-    A server operator configuring ``force_sandbox`` for claude-native
-    sessions got silent unenforced host access. This locks in the fix:
-    the resolved sandbox must survive the config round-trip and actually
-    reach the ``OSEnvSpec`` that builds the ``sys_os_*`` tools.
-
-    ``create_os_environment`` is patched at the boundary (same pattern as
-    ``test_executor_factory_decodes_os_env_json`` in
-    ``tests/inner/test_codex_harness.py``) rather than resolving a real
-    backend, so this is a platform-independent test of the config plumbing
-    — ``linux_bwrap`` and ``darwin_seatbelt`` only resolve on their own OS
-    and would otherwise fail this test on CI's Linux runners.
+    Claude's PreToolUse policy hook skips ``mcp__omnigent__*`` tools because
+    the relay gates them, so a bridge-local ``sys_os_shell`` would run with no
+    Omnigent policy check. Only the tools the relay advertises are listed or
+    callable.
     """
-    resolved_sandbox = OSEnvSandboxSpec(type="linux_bwrap", allow_network=False)
-
-    bridge_dir = prepare_bridge_dir(
-        "conv_sandboxed",
-        workspace=tmp_path,
-        sandbox=resolved_sandbox,
-    )
-    config = json.loads((bridge_dir / "bridge.json").read_text(encoding="utf-8"))
-    assert config["sandbox"]["type"] == "linux_bwrap"
-    assert config["sandbox"]["allow_network"] is False
-
-    captured: dict[str, Any] = {}
-
-    def _fake_create_os_environment(spec: Any) -> None:
-        captured["spec"] = spec
-        return
-
-    monkeypatch.setattr(
-        "omnigent.inner.os_env.create_os_environment",
-        _fake_create_os_environment,
-    )
-    _build_tools(config)
-
-    sandbox = captured["spec"].sandbox
-    assert sandbox.type == "linux_bwrap"
-    assert sandbox.allow_network is False
-
-
-def test_prepare_bridge_dir_without_sandbox_builds_unsandboxed_tools(
-    tmp_path: Path,
-) -> None:
-    """
-    No resolved sandbox preserves the prior unsandboxed default.
-
-    Sessions with nothing to carry (e.g. the ``omnigent claude`` CLI's own
-    synthesized wrapper spec, which intentionally declares
-    ``os_env.sandbox.type: none``) must keep working exactly as before —
-    this is the fallback the fix above must not disturb.
-    """
-    bridge_dir = prepare_bridge_dir("conv_unsandboxed", workspace=tmp_path)
+    bridge_dir = prepare_bridge_dir("conv_relay_only", workspace=tmp_path)
     config = json.loads((bridge_dir / "bridge.json").read_text(encoding="utf-8"))
     assert "sandbox" not in config
 
-    tools, close_tools = _build_tools(config)
-    try:
-        os_env = tools["sys_os_shell"]._os_env
-        assert os_env is not None
-        assert os_env.sandbox.backend_type == "none"
-        assert os_env.sandbox.active is False
-    finally:
-        close_tools()
+    listed = claude_native_bridge._handle_mcp_request("tools/list", {}, bridge_dir)
+    assert listed == {"tools": []}
 
-
-def test_prepare_bridge_dir_drops_credential_proxy_instead_of_corrupting_it(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """
-    A sandbox with a real ``credential_proxy`` never corrupts the round-trip.
-
-    ``dataclasses.asdict`` flattens the nested ``CredentialProxySpec`` to a
-    plain dict, and a naive ``OSEnvSandboxSpec(**payload)`` on read has no
-    way to tell that dict apart from a real one — it gets assigned straight
-    through, so any sandboxed code that later dereferences ``.entries`` /
-    ``.databricks`` on it crashes with ``AttributeError: 'dict' object has
-    no attribute ...``. ``credential_proxy`` is resolved parent-side only
-    and was never meant to cross this boundary in the first place (see
-    ``SandboxPolicy.to_jsonable``'s identical exclusion) — this locks in
-    that it is dropped, not corrupted: the bridge config never carries it,
-    and the rebuilt spec cleanly has it unset rather than a stray dict.
-
-    ``create_os_environment`` is patched at the boundary (see
-    ``test_prepare_bridge_dir_persists_and_applies_resolved_sandbox`` above)
-    so this is platform-independent — the sandbox type only needs to be
-    *something* non-``"none"``, not a backend real for the CI host's OS.
-    """
-    sandbox = OSEnvSandboxSpec(
-        type="linux_bwrap",
-        credential_proxy=CredentialProxySpec(
-            entries=[
-                CredentialProxyEntry(
-                    host="github.com",
-                    scheme="bearer",
-                    source=CredentialSourceSpec(kind="env", env="GH_TOKEN"),
-                )
-            ],
-        ),
+    called = claude_native_bridge._handle_mcp_request(
+        "tools/call",
+        {"name": "sys_os_shell", "arguments": {"command": "id"}},
+        bridge_dir,
     )
-
-    bridge_dir = prepare_bridge_dir(
-        "conv_credproxy",
-        workspace=tmp_path,
-        sandbox=sandbox,
-    )
-    config = json.loads((bridge_dir / "bridge.json").read_text(encoding="utf-8"))
-    assert "credential_proxy" not in config["sandbox"]
-    assert config["sandbox"]["type"] == "linux_bwrap"
-
-    captured: dict[str, Any] = {}
-
-    def _fake_create_os_environment(spec: Any) -> None:
-        captured["spec"] = spec
-        return
-
-    monkeypatch.setattr(
-        "omnigent.inner.os_env.create_os_environment",
-        _fake_create_os_environment,
-    )
-    _build_tools(config)
-
-    sandbox_rebuilt = captured["spec"].sandbox
-    assert sandbox_rebuilt.type == "linux_bwrap"
-    assert sandbox_rebuilt.credential_proxy is None
+    assert called["isError"] is True
+    assert json.loads(called["content"][0]["text"]) == {"error": "unknown tool: 'sys_os_shell'"}
 
 
 def test_ensure_secure_dir_succeeds_without_getuid(
@@ -4673,8 +4551,10 @@ def test_augment_claude_args_disables_auto_mode_setup_offer(
         ((), None),
         (("--permission-mode", "default"), "default"),
         (("--permission-mode", "auto"), "auto"),
+        (("--permission-mode", "plan"), "plan"),
+        (("--permission-mode", "dontAsk"), "dontAsk"),
     ],
-    ids=["none", "default", "auto"],
+    ids=["none", "default", "auto", "plan", "dont-ask"],
 )
 def test_augment_claude_args_allows_reading_session_attachments(
     launch_args: tuple[str, ...],
@@ -4703,7 +4583,11 @@ def test_augment_claude_args_allows_reading_session_attachments(
 
     permissions = settings.get("permissions", {})
     assert permissions.get("defaultMode") == default_mode
-    assert permissions.get("allow") == [f"Read(/{attachment.parent.as_posix()}/**)"]
+    assert permissions.get("allow") == [
+        f"Read(/{attachment.parent.as_posix()}/**)",
+        "mcp__omnigent__sys_scheduled_task_create",
+        "mcp__omnigent__sys_scheduled_task_update",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -4726,7 +4610,13 @@ def test_augment_claude_args_omits_attachment_rule_for_pattern_cache_path(
         )
     )
 
-    assert settings.get("permissions") == expected_permissions
+    assert settings.get("permissions") == {
+        **(expected_permissions or {}),
+        "allow": [
+            "mcp__omnigent__sys_scheduled_task_create",
+            "mcp__omnigent__sys_scheduled_task_update",
+        ],
+    }
 
 
 @pytest.mark.parametrize(
@@ -8435,7 +8325,7 @@ def test_serve_mcp_answers_while_relay_call_is_blocked(
     )
     server_thread = threading.Thread(
         target=claude_native_bridge._stdio_jsonrpc_loop,
-        args=({}, threading.Lock(), bridge_dir),
+        args=(threading.Lock(), bridge_dir),
         daemon=True,
     )
     server_thread.start()
@@ -8513,10 +8403,9 @@ def test_serve_mcp_rejects_at_concurrency_cap_and_keeps_serving(
     def _handle_mcp_request(
         method: str,
         params: object,
-        tools: dict[str, object],
         request_bridge_dir: Path,
     ) -> dict[str, object]:
-        del method, params, tools, request_bridge_dir
+        del method, params, request_bridge_dir
         if not blocked_call_started.is_set():
             blocked_call_started.set()
             release_blocked_call.wait(timeout=10.0)
@@ -8532,7 +8421,7 @@ def test_serve_mcp_rejects_at_concurrency_cap_and_keeps_serving(
     )
     server_thread = threading.Thread(
         target=claude_native_bridge._stdio_jsonrpc_loop,
-        args=({}, threading.Lock(), bridge_dir),
+        args=(threading.Lock(), bridge_dir),
         daemon=True,
     )
     server_thread.start()
@@ -8606,7 +8495,7 @@ def test_serve_mcp_rejects_when_request_thread_cannot_start(
     )
     server_thread = real_thread(
         target=claude_native_bridge._stdio_jsonrpc_loop,
-        args=({}, threading.Lock(), bridge_dir),
+        args=(threading.Lock(), bridge_dir),
         daemon=True,
     )
     server_thread.start()
@@ -10242,15 +10131,20 @@ def test_ensure_trusted_creates_config_when_missing(
     A fresh host (no ``~/.claude.json``) gets both first-run gates set.
 
     This is the core workspace-trust case: an ``omnigent host`` machine that
-    has never run Claude interactively. Both the global onboarding gate
-    and the per-workspace trust gate must be pre-accepted so Claude does
-    not block on its TUI prompts.
+    has never run Claude interactively. The global onboarding gate and the
+    workspace and added-directory trust gates must be pre-accepted so Claude
+    does not block on its TUI prompts.
     """
     config_path = _redirect_home(monkeypatch, tmp_path / "home")
     workspace = tmp_path / "worktrees" / "feature-x"
     workspace.mkdir(parents=True)
+    added_dir = tmp_path / "bridge" / "agent-skills"
+    added_dir.mkdir(parents=True)
+    (tmp_path / "bridge-link").symlink_to(tmp_path / "bridge", target_is_directory=True)
 
-    ensure_claude_workspace_trusted(workspace)
+    ensure_claude_workspace_trusted(
+        workspace, added_dirs=(tmp_path / "bridge-link" / "agent-skills",)
+    )
 
     data = json.loads(config_path.read_text())
     # Global onboarding gate — without this Claude shows the theme/login
@@ -10262,6 +10156,9 @@ def test_ensure_trusted_creates_config_when_missing(
     # Per-directory trust gate, keyed by the RESOLVED absolute path —
     # without this Claude shows "Do you trust the files in this folder?".
     assert data["projects"][str(workspace.resolve())]["hasTrustDialogAccepted"] is True
+    # Without this Claude 2.1.326+ asks "Adding a new directory", and Escape exits.
+    assert data["projects"][str(added_dir.resolve())]["hasTrustDialogAccepted"] is True
+    assert str(tmp_path / "bridge-link" / "agent-skills") not in data["projects"]
 
 
 def test_ensure_trusted_declines_auto_default_question_for_onboarded_user(
@@ -10351,16 +10248,21 @@ def test_ensure_trusted_idempotent_does_not_rewrite(
     config_path = _redirect_home(monkeypatch, tmp_path / "home")
     workspace = tmp_path / "worktrees" / "feature-z"
     workspace.mkdir(parents=True)
+    added_dir = tmp_path / "bridge" / "agent-skills"
+    added_dir.mkdir(parents=True)
     already = {
         "hasCompletedOnboarding": True,
         "hasSeenAutoDefaultNudge": True,
-        "projects": {str(workspace.resolve()): {"hasTrustDialogAccepted": True}},
+        "projects": {
+            str(workspace.resolve()): {"hasTrustDialogAccepted": True},
+            str(added_dir.resolve()): {"hasTrustDialogAccepted": True},
+        },
     }
     # Compact, no indentation — distinct from the helper's indent=2 output.
     config_path.write_text(json.dumps(already, separators=(",", ":")))
     before = config_path.read_bytes()
 
-    ensure_claude_workspace_trusted(workspace)
+    ensure_claude_workspace_trusted(workspace, added_dirs=(added_dir,))
 
     # Byte-identical → the helper detected no change and never wrote.
     assert config_path.read_bytes() == before

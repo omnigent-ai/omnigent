@@ -19,6 +19,34 @@ export const WAITING_FOR_YOU = "Waiting for you";
 /** The phase of a workflow question's prompt, which already marks its own task waiting. */
 export const WORKFLOW_QUESTION_PHASE = "workflow_request_input";
 
+/** What an agent last wrote about its work: a step's status and the few words it gave. */
+export interface StatusText {
+  status: StepStatus;
+  text: string;
+}
+
+/**
+ * The newest status text among *statuses*: the words the agent gave for the
+ * status it wrote last, e.g. "Opened 2 PRs". A status without text, such as
+ * `started`, doesn't count. `null` when no status has any.
+ *
+ * @param statuses - Status entries, e.g. each step's newest from a run's plan.
+ */
+export function latestStatusText(statuses: readonly JournalEntry[]): StatusText | null {
+  let newest: JournalEntry | null = null;
+  let found: StatusText | null = null;
+  for (const entry of statuses) {
+    const status = statusOf(entry);
+    const text = textOf(entry)?.trim();
+    if (entry.kind !== "status" || !status || !text) continue;
+    if (newest === null || entry.position > newest.position) {
+      newest = entry;
+      found = { status, text };
+    }
+  }
+  return found;
+}
+
 /** One plan step, as a plan entry's content lists it. */
 export interface JournalPlanStep {
   id: string;
@@ -72,6 +100,29 @@ export async function fetchJournalPage(
   return (await response.json()) as JournalPage;
 }
 
+/**
+ * Where an entry sits in the session's journal, from the entry just before it: positions run
+ * 0, 1, 2, … without gaps.
+ *
+ * @returns The entry's position, or null when the journal doesn't hold it.
+ */
+export async function fetchJournalEntryPosition(
+  conversationId: string,
+  entryId: string,
+  signal?: AbortSignal,
+): Promise<number | null> {
+  const params = new URLSearchParams({ order: "desc", after: entryId, limit: "1" });
+  const response = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(conversationId)}/journal?${params}`,
+    { signal },
+  );
+  if (response.status === 400 && (await response.clone().text()).includes("stale_cursor"))
+    return null;
+  if (!response.ok) throw new Error(`Couldn't place the journal entry (${response.status})`);
+  const page = (await response.json()) as JournalPage;
+  return page.data.length > 0 ? page.data[0].position + 1 : 0;
+}
+
 /** Entries in position order, without duplicates; later copies of an entry win. */
 export function mergeJournalEntries(...lists: readonly JournalEntry[][]): JournalEntry[] {
   const byId = new Map<string, JournalEntry>();
@@ -101,6 +152,12 @@ export function planName(entry: JournalEntry | null): string | null {
   return typeof name === "string" && name.trim() ? name : null;
 }
 
+/** The workflow description a planning chat proposed with this plan, or null. */
+export function planDescription(entry: JournalEntry): string | null {
+  const description = entry.content.description;
+  return typeof description === "string" && description.trim() ? description : null;
+}
+
 /** The label a step's status shows. A started step runs only while the session works. */
 export function stepStatusLabel(
   status: StepStatus,
@@ -124,6 +181,32 @@ export function isFirstPlan(entry: JournalEntry): boolean {
 /** The newest plan among the entries, which are in position order. */
 export function currentPlan(entries: readonly JournalEntry[]): JournalEntry | null {
   return entries.findLast((entry) => entry.kind === "plan") ?? null;
+}
+
+/** The current graph's revision, preserved across saves that only change plan metadata. */
+export function planGraphRevision(entries: readonly JournalEntry[]): string | number | undefined {
+  const plan = currentPlan(entries);
+  if (!plan) return undefined;
+  const recorded = plan.content.graph_revision;
+  if (typeof recorded === "string" || typeof recorded === "number") return recorded;
+  const graphKey = (entry: JournalEntry) => {
+    const graph = planSteps(entry).map((step) => [step.id, [...step.depends_on].sort()] as const);
+    graph.sort(([left], [right]) => left.localeCompare(right));
+    return JSON.stringify(graph);
+  };
+  const key = graphKey(plan);
+  let position = plan.position;
+  let previousPosition = plan.position;
+  for (let index = entries.indexOf(plan) - 1; index >= 0; index -= 1) {
+    const entry = entries[index];
+    if (entry.position !== previousPosition - 1) break;
+    previousPosition = entry.position;
+    if (entry.kind === "plan_status") break;
+    if (entry.kind !== "plan") continue;
+    if (graphKey(entry) !== key) break;
+    position = entry.position;
+  }
+  return position;
 }
 
 /**
@@ -290,6 +373,44 @@ export function planTally(progress: readonly StepProgress[]): Record<StepState, 
   return tally;
 }
 
+/** Completed final steps supersede older statuses; newer plans or statuses can add unfinished work. */
+export function isPlanComplete(
+  progress: readonly StepProgress[],
+  planRevision?: string | number,
+): boolean {
+  const dependencies = new Set(progress.flatMap((item) => item.step.depends_on));
+  const finalSteps = progress.filter((item) => !dependencies.has(item.step.id));
+  const byId = new Map(progress.map((item) => [item.step.id, item]));
+  return (
+    finalSteps.length > 0 &&
+    finalSteps.every((finalStep) => {
+      if (finalStep.state !== "done") return false;
+      const finalStatus = finalStep.status;
+      const graphChangedAfterCompletion =
+        finalStatus !== null &&
+        (typeof planRevision === "number"
+          ? planRevision > finalStatus.position
+          : planRevision !== undefined && planRevision !== finalStatus.content.graph_revision);
+      const pending = [...finalStep.step.depends_on];
+      const seen = new Set<string>();
+      for (let id = pending.pop(); id !== undefined; id = pending.pop()) {
+        if (seen.has(id)) continue;
+        seen.add(id);
+        const upstream = byId.get(id);
+        if (!upstream) continue;
+        if (
+          upstream.state !== "done" &&
+          (graphChangedAfterCompletion ||
+            (upstream.status && finalStatus && upstream.status.position > finalStatus.position))
+        )
+          return false;
+        pending.push(...upstream.step.depends_on);
+      }
+      return true;
+    })
+  );
+}
+
 /** How many tasks are finished: done or failed, since a failed task's work is over too. */
 export function finishedTaskCount(progress: readonly StepProgress[]): number {
   return progress.filter((item) => item.state === "done" || item.state === "failed").length;
@@ -377,8 +498,14 @@ export function pausedLabel(
   progress: readonly StepProgress[],
   entries: readonly JournalEntry[],
   sessionWorking: boolean,
+  planRevision = planGraphRevision(entries),
 ): PausedLabel | null {
-  if (sessionWorking || progress.some((item) => item.state === "needs_input")) return null;
+  if (
+    sessionWorking ||
+    (planRevision !== undefined && isPlanComplete(progress, planRevision)) ||
+    progress.some((item) => item.state === "needs_input")
+  )
+    return null;
   const runnable = progress.some(
     (item) =>
       item.state === "ready" ||
@@ -395,12 +522,20 @@ export function pausedLabel(
  * the list ended ("All done", or "Finished, 1 failed").
  *
  * @param paused - What an idle list says, from {@link pausedLabel}.
+ * @param planRevision - Graph revision ID or legacy position, to recognize new prerequisites.
  */
 export function taskPreviewText(
   progress: readonly StepProgress[],
   paused: PausedLabel | null = null,
+  planRevision?: string | number,
 ): string | null {
   if (progress.length === 0) return null;
+  const failedCount = progress.filter((item) => item.state === "failed").length;
+  const finished = failedCount === 0 ? "All done" : `Finished, ${failedCount} failed`;
+  const livePrompt = progress.some(
+    (item) => item.state === "needs_input" && item.status && statusOf(item.status) === "started",
+  );
+  if (!livePrompt && isPlanComplete(progress, planRevision)) return finished;
   const order: StepState[] = ["needs_input", "running", "stopped", "ready", "waiting"];
   for (const state of order) {
     const item = progress.find((candidate) => candidate.state === state);
@@ -416,6 +551,5 @@ export function taskPreviewText(
     }
     return paused ? `${paused} · Next: ${item.step.name}` : `Next: ${item.step.name}`;
   }
-  const failed = progress.filter((item) => item.state === "failed").length;
-  return failed === 0 ? "All done" : `Finished, ${failed} failed`;
+  return finished;
 }
