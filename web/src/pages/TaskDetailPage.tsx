@@ -449,10 +449,9 @@ function TaskDetail({ taskId }: { taskId: string }) {
   }
 
   function handleClone() {
-    const original = task!;
-    cloneMutation.mutate(original.id, {
+    cloneMutation.mutate(task!.id, {
       onSuccess: (clone) => {
-        showToast(cloneCreatedMessage(original));
+        showToast(cloneCreatedMessage(clone));
         navigate(`/tasks/${encodeURIComponent(clone.id)}`);
       },
       onError: (err) => showToast(cloneFailedMessage(err)),

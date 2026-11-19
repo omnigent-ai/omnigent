@@ -661,11 +661,12 @@ export async function cloneScheduledTask(id: string): Promise<ScheduledTask> {
   return taskFromWire(await readJsonOrThrow<ScheduledTaskWire>(res));
 }
 
-/** The toast after cloning *original*: what the copy is, and what's left to do. */
-export function cloneCreatedMessage(original: Pick<ScheduledTask, "state">): string {
-  return original.state === "paused"
-    ? "Automation cloned. The copy is paused like the original."
-    : "Automation cloned. Pause or delete the original so they don't both run.";
+/** The toast after a clone: what the copy is, and what's left to do. */
+export function cloneCreatedMessage(clone: Pick<ScheduledTask, "state" | "nextRunAt">): string {
+  if (clone.state === "paused") return "Automation cloned. The copy is paused like the original.";
+  // An active copy is always armed, so no next run means a finite schedule ran out.
+  if (clone.nextRunAt === null) return "Automation cloned. Its schedule has no runs left.";
+  return "Automation cloned. Pause or delete the original so they don't both run.";
 }
 
 /** The toast when a clone fails, with the server's reason when it gave one. */

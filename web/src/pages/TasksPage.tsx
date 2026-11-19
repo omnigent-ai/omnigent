@@ -285,7 +285,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   function handleClone(task: ScheduledTask) {
     cloneMutation.mutate(task.id, {
       onSuccess: (clone) => {
-        showToast(cloneCreatedMessage(task));
+        showToast(cloneCreatedMessage(clone));
         // Without detail pages the copy stays here, on the refreshed list.
         if (isFeatureEnabled(info, "automations_v2")) {
           navigate(`/tasks/${encodeURIComponent(clone.id)}`);

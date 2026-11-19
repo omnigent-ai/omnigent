@@ -815,7 +815,11 @@ describe("cloning from the row menu", () => {
     expect(cloneMutate).toHaveBeenCalledWith("st_1", expect.any(Object));
     expect(showToast).not.toHaveBeenCalled();
 
-    act(() => cloneMutate.mock.calls[0][1].onSuccess(task({ id: "st_2" })));
+    act(() =>
+      cloneMutate.mock.calls[0][1].onSuccess(
+        task({ id: "st_2", nextRunAt: "2026-11-20T09:00:00+00:00" }),
+      ),
+    );
     expect(showToast).toHaveBeenCalledExactlyOnceWith(
       "Automation cloned. Pause or delete the original so they don't both run.",
     );

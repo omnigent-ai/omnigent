@@ -1110,7 +1110,15 @@ def create_scheduled_tasks_router(
         and none of the original's runs. A continued session isn't carried over: the
         clone's first run starts its own. A paused original gives a paused clone; an
         active one keeps running until its owner pauses or deletes it.
+
+        Needs the database scheduler: the legacy timer re-anchors an interval
+        schedule whenever it arms one, so it can't run the clone on the original's days.
         """
+        if not getattr(request.app.state, "scheduled_task_dispatch_enabled", False):
+            raise OmnigentError(
+                "Cloning an automation needs automations_v2, which this server does not enable",
+                code=ErrorCode.INVALID_INPUT,
+            )
         owner = _owner(request)
         task = _require_owned(scheduled_task_id, None if owner == RESERVED_USER_LOCAL else owner)
         if task.kind != "automation":

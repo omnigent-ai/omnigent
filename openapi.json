@@ -21392,7 +21392,7 @@
     },
     "/v1/scheduled-tasks/{scheduled_task_id}/clone": {
       "post": {
-        "description": "Create a new automation with an owned automation's settings and schedule.\n\nThe clone gets a new ID, which on some deployments is what lets it be shared,\nand none of the original's runs. A continued session isn't carried over: the\nclone's first run starts its own. A paused original gives a paused clone; an\nactive one keeps running until its owner pauses or deletes it.",
+        "description": "Create a new automation with an owned automation's settings and schedule.\n\nThe clone gets a new ID, which on some deployments is what lets it be shared,\nand none of the original's runs. A continued session isn't carried over: the\nclone's first run starts its own. A paused original gives a paused clone; an\nactive one keeps running until its owner pauses or deletes it.\n\nNeeds the database scheduler: the legacy timer re-anchors an interval\nschedule whenever it arms one, so it can't run the clone on the original's days.",
         "operationId": "clone_scheduled_task_v1_scheduled_tasks__scheduled_task_id__clone_post",
         "parameters": [
           {

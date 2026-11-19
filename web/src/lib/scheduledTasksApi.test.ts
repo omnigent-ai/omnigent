@@ -466,10 +466,23 @@ describe("cloneScheduledTask", () => {
   });
 
   it.each([
-    ["active", "Automation cloned. Pause or delete the original so they don't both run."],
-    ["paused", "Automation cloned. The copy is paused like the original."],
-  ] as const)("tells the owner what's left after cloning an %s automation", (state, text) => {
-    expect(cloneCreatedMessage({ state })).toBe(text);
+    [
+      "an armed copy",
+      { state: "active", nextRunAt: "2026-11-20T09:00:00Z" },
+      "Automation cloned. Pause or delete the original so they don't both run.",
+    ],
+    [
+      "a paused copy",
+      { state: "paused", nextRunAt: null },
+      "Automation cloned. The copy is paused like the original.",
+    ],
+    [
+      "a copy whose schedule ran out",
+      { state: "active", nextRunAt: null },
+      "Automation cloned. Its schedule has no runs left.",
+    ],
+  ] as const)("tells the owner what's left after %s", (_label, clone, text) => {
+    expect(cloneCreatedMessage(clone)).toBe(text);
   });
 });
 
