@@ -108,6 +108,9 @@ describe("splitPullRequestRefs", () => {
     "origin/main#1",
     "upstream/main#12",
     "24/7#1234",
+    "feature/login#12",
+    "docs/README#3",
+    "acme-/app#12",
     "src/schema.graphql#1234",
     "cache/build.tsbuildinfo#1234",
   ])("leaves %j as text", (text) => {

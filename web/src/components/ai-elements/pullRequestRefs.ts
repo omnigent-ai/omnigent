@@ -21,14 +21,17 @@ export const PULL_REQUEST_REF =
   /(^|[^\w&/#.-])(?:([A-Za-z0-9][A-Za-z0-9-]{0,38})\/([A-Za-z0-9._-]{1,100}))?#(\d+)(?!\w)/g;
 const BARE_NUMBER = /^[1-9]\d{3,9}$/;
 const EXPLICIT_NUMBER = /^[1-9]\d{0,9}$/;
-const GITHUB_OWNER = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}$/;
+// GitHub owners can't end in `-`.
+const GITHUB_OWNER = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/;
 const GITHUB_REPO = /^[A-Za-z0-9._-]{1,100}$/;
 // `docs/setup.md#3` and `assets/logo.png#3` are file paths; an extensionless `src/foo#12`
 // still links. This also leaves dotted repos like `vercel/next.js#1` as text; a wrong link
 // is worse than none.
 const FILE_EXTENSION = /[^.]\.[A-Za-z0-9]+$/;
-// Prose (`and/or#1`, `24/7#1`) and git refs (`origin/main#1`) that read as `owner/repo`.
-const NON_OWNER = /^(\d+|origin|upstream|and|or)$/i;
+// Prose (`and/or#1`, `24/7#1`), git refs (`origin/main#1`, `feature/login#1`) and
+// paths (`docs/README#1`) that read as `owner/repo`.
+const NON_OWNER =
+  /^(\d+|origin|upstream|and|or|src|lib|docs?|tests?|feature|fix|bugfix|hotfix|release|chore)$/i;
 
 /** Repo for bare references when the session's repo is unknown; null leaves them as text. */
 const FALLBACK_PULL_REQUEST_REPO: string | null = null;
