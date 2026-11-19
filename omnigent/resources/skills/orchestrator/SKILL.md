@@ -59,13 +59,39 @@ The worker executes its assignment; it does not inherit your orchestrator role.
 Link the returned session with `sys_session_link_ticket`, then set the ticket
 to `in_progress`. Record who is doing what in a ticket comment.
 
+## Keep work moving
+
+While accepted work is ready, running, or waiting on an external result, keep
+one background check scheduled about every two minutes. Arm it before yielding
+after delegation; don't wait for a worker to miss a report. Handle ticket
+updates and worker reports promptly between checks.
+
+- When available, use `sys_timer_set` with `seconds: 120`, `repeat: true`, and
+  a note identifying this project and what to check. Otherwise use a native
+  background task whose completion wakes this session, such as Claude's Bash
+  `sleep 120` with `run_in_background: true`, and re-arm after each check.
+  Keep the returned handle and confirm scheduling succeeded. Don't block the
+  foreground or assume a detached shell will wake you. If no reliable wake-up
+  tool is available, explain that limitation instead of promising monitoring.
+- On each wake, refresh the board with `sys_ticket_list` and inspect relevant
+  tickets with `sys_ticket_get`. Check assigned workers with
+  `sys_session_get_info`, reading `sys_session_get_history` when needed. Look
+  for questions, errors, idle workers with unfinished tickets, completed work
+  awaiting verification, and newly unblocked work without a worker. Check
+  linked PRs or external jobs when the ticket depends on them.
+- Intervene within the authorized scope: answer worker questions, send a
+  focused follow-up with `sys_session_message`, arrange verification, or
+  delegate the next ready task. Reuse live workers; don't duplicate their
+  work. Two minutes without new output alone does not mean a worker is stuck.
+- Reuse the existing monitor rather than adding one per update or ticket.
+  Stay quiet when nothing changed; don't post heartbeat comments. Cancel it
+  when work is done, the human pauses/stops, or only human action remains.
+  Use `sys_timer_cancel` or the background task's original cancellation handle.
+  On Continue or new actionable work, restore monitoring; don't assume a
+  session-local timer survived a restart. An empty new project needs no timer.
+
 ## Follow through
 
-- Read ticket updates and worker reports. Inspect worker history/status with
-  `sys_session_get_history` / `sys_session_get_info` as needed; send decisions
-  and follow-ups with `sys_session_message`. Reuse live workers, and do not
-  duplicate work already running. Arrange a background check when awaiting a
-  worker that has not reported back.
 - Verify the result against the ticket's outcome. A worker ending is not
   completion. Mark `done` only when the work is finished, with a
   `completion_summary`; otherwise keep it open or in progress and arrange the
