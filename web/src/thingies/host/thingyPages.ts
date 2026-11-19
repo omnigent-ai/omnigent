@@ -7,8 +7,8 @@
 // (`useRebasePath`) and resolve it against `window.location.origin`.
 
 /**
- * The viewer's prompt followed by a note that names the thingy, so the session's `sys_thingy_*`
- * tools reach its records.
+ * The viewer's prompt followed by a note that names the thingy and points to the thingy skill,
+ * so the session's `sys_thingy_*` tools reach its records.
  */
 export function composeThingyContextPrompt(
   prompt: string,
@@ -18,22 +18,13 @@ export function composeThingyContextPrompt(
     prompt.trim(),
     "",
     "---",
-    `Omnigent added this note because the session was started from the thingy ${JSON.stringify(app.name)} (thingy_id ${app.id}).`,
-    `- Call sys_thingy_describe for thingy_id ${app.id} before reading or writing its records: it returns the thingy's guide, collection schemas, actions and rules. The sys_thingy_record_* tools read and write records; a write that breaks a rule fails with CONSTRAINT_VIOLATION.`,
+    `Omnigent added this note because the session was started from the thingy ${JSON.stringify(app.name)} (thingy_id ${app.id}). To work with its records, load the thingy skill and follow it.`,
   ].join("\n");
 }
 
 /** A thingy's own page. New sessions started from it return under it. */
 export function thingyBoardPath(appId: string): string {
   return `/thingy/${encodeURIComponent(appId)}`;
-}
-
-/** The query parameter that opens a thingy full screen without leaving the current page. */
-export const THINGY_OPEN_PARAM = "thingy_open";
-
-/** The path that opens the thingy full screen (see `useOpenThingyFromUrl`). */
-export function thingyOpenPath(appId: string): string {
-  return `/?${THINGY_OPEN_PARAM}=${encodeURIComponent(appId)}`;
 }
 
 /**

@@ -2,6 +2,8 @@ import { type ReactNode, useEffect } from "react";
 import { Loader2Icon, PanelsTopLeftIcon, TriangleAlertIcon } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 
+import { Button } from "@/components/ui/button";
+
 import { getThingy, getThingyThingySessionStatus } from "@/thingies/api/thingyApi";
 import { THINGIES_KEY } from "./thingyQueries";
 
@@ -17,10 +19,12 @@ function StateBlock({
   icon,
   title,
   children,
+  action,
 }: {
   icon: ReactNode;
   title: string;
   children?: ReactNode;
+  action?: ReactNode;
 }) {
   return (
     <div
@@ -30,6 +34,7 @@ function StateBlock({
       {icon}
       <p className="text-ui font-medium">{title}</p>
       {children && <p className="max-w-sm text-sm text-muted-foreground">{children}</p>}
+      {action && <div className="mt-2">{action}</div>}
     </div>
   );
 }
@@ -43,6 +48,7 @@ export function ThingyBuildingState({
   thingyId,
   canPublish,
   besideSession,
+  onOpenSession,
   onPublished,
 }: {
   thingyId: string;
@@ -50,6 +56,8 @@ export function ThingyBuildingState({
   canPublish: boolean;
   /** Whether it is shown beside a session, rather than beside New session. */
   besideSession: boolean;
+  /** Set while it fills the screen: shows the session that builds it. */
+  onOpenSession?: () => void;
   onPublished: () => void;
 }) {
   const session = useQuery({
@@ -90,16 +98,24 @@ export function ThingyBuildingState({
       </StateBlock>
     );
   }
+  const openSession = onOpenSession && (
+    <Button variant="outline" componentId="thingies.building.open_session" onClick={onOpenSession}>
+      Open session
+    </Button>
+  );
   return (
     <StateBlock
       icon={<PanelsTopLeftIcon className="size-8 text-muted-foreground/50" />}
       title="Nothing published yet"
+      action={canPublish ? openSession : undefined}
     >
       {!canPublish
         ? "The thingy’s owner hasn’t published a version yet."
-        : besideSession
-          ? "Tell this session what it should build."
-          : "Start the session beside it and describe what it should build."}
+        : onOpenSession
+          ? "Open its session and tell it what to build."
+          : besideSession
+            ? "Tell this session what it should build."
+            : "Describe what it should build in the message beside it, then send it."}
     </StateBlock>
   );
 }

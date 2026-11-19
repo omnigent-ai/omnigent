@@ -105,7 +105,11 @@ export interface OmnigentCollection<T extends JsonValue = JsonValue> {
     options: OmnigentConditionalOptions,
   ) => Promise<OmnigentDocument<T>>;
   delete: (id: string, options: OmnigentConditionalOptions) => Promise<OmnigentDeletedDocument>;
-  /** Polls the first page and reports each snapshot, starting with `loading`. */
+  /**
+   * Polls the first page every `intervalMs` and calls `listener` with each snapshot, starting with
+   * `loading`: `collection.watch((snapshot) => render(snapshot.items), { intervalMs: 2000 })`.
+   * It is not an async iterator.
+   */
   watch: (
     listener: (snapshot: OmnigentWatchSnapshot<T>) => void,
     options?: OmnigentWatchOptions,
@@ -118,6 +122,11 @@ export interface OmnigentClientContext {
   /** `id` is a stable opaque principal ID; store it rather than `displayName`, which can change. */
   viewer: { id: string; displayName: string };
   permissions: { writeData: boolean; publish: boolean };
+  /**
+   * True in a template preview, where data lives in memory, nothing is saved and actions are off.
+   * Show sample content and skip sign-in, saving and access notices there.
+   */
+  preview: boolean;
 }
 
 export interface OmnigentSessions {
@@ -166,15 +175,25 @@ export interface OmnigentNavigation {
   ) => Promise<{ opened: true }>;
 }
 
-/** What `agent.request` resolves with. */
+/**
+ * What `agent.request` resolves with. Follow the action with `receipt.watch(listener)`, the same
+ * as `client.agent.watch(listener, { actionIds: [receipt.actionId] })`.
+ */
 export interface OmnigentActionReceipt {
-  /** The action's entry in the thingy's ledger; follow it with `agent.watch`. */
+  /** The action's entry in the thingy's ledger. */
   actionId: string;
+  /** The same as `actionId`. */
+  id: string;
   /**
    * `sent` to the viewer's thingy session, `starting` while they start one beside the thingy, or
    * `merged` when the same action with the same params was still open: `actionId` is that one.
    */
   delivery: "sent" | "starting" | "merged";
+  /** Follows this action; see `OmnigentAgent.watch`. */
+  watch: (
+    listener: (snapshot: OmnigentActionWatchSnapshot) => void,
+    options?: { intervalMs?: number },
+  ) => OmnigentActionWatch;
 }
 
 /**
@@ -203,9 +222,18 @@ export interface OmnigentActionProgress {
   sessionIds: string[];
 }
 
+/**
+ * One report of `agent.watch`. `status` is the watch's own state, not an action's: read each
+ * action's status from `items` (or `action`).
+ */
 export interface OmnigentActionWatchSnapshot {
+  /** `loading` before the first read, then `live`; `reconnecting` or `stale` after failed reads. */
   status: OmnigentWatchStatus;
+  /** One entry per watched action (or the viewer's recent actions when none were given). */
   items: OmnigentActionProgress[];
+  /** When exactly one action is watched: its entry, or null until it is read. Otherwise null. */
+  action: OmnigentActionProgress | null;
+  /** Time of the last successful read (ISO 8601), or null before the first one. */
   updatedAt: string | null;
   error: OmnigentError | null;
 }
@@ -233,8 +261,19 @@ export interface OmnigentAgent {
     options?: OmnigentCallOptions,
   ) => Promise<{ items: OmnigentActionProgress[] }>;
   /**
-   * Polls progress and reports each snapshot, starting with `loading`. Without `actionIds` it
-   * follows the viewer's recent actions, so a reloaded thingy shows them again.
+   * Polls progress every `intervalMs` (default 3000) and calls `listener` with each snapshot,
+   * starting with `loading`. It is not an async iterator. Without `actionIds` it follows the
+   * viewer's recent actions, so a reloaded thingy shows them again. Example:
+   *
+   *     const receipt = await client.agent.request("refresh", {});
+   *     const watch = client.agent.watch((snapshot) => {
+   *       const progress = snapshot.action; // or snapshot.items[0]
+   *       if (progress && !["pending", "queued", "running", "needs_input"].includes(progress.status)) {
+   *         watch.dispose(); // done, failed, cancelled, finished_unreported or interrupted
+   *       }
+   *     }, { actionIds: [receipt.actionId] });
+   *
+   * `watch(actionId, listener)`, `watch(listener, actionId)` and `watch(receipt, listener)` work too.
    */
   watch: (
     listener: (snapshot: OmnigentActionWatchSnapshot) => void,
@@ -281,6 +320,8 @@ export interface OmnigentError extends Error {
   readonly retryable: boolean;
   /** For mutations: the idempotency key to pass back when retrying an unknown outcome. */
   readonly operationId?: string;
+  /** The server's request ID, for logs and support; keep it out of messages shown to people. */
+  readonly requestId?: string;
 }
 
 export interface OmnigentSdk {

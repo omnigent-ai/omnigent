@@ -1,22 +1,34 @@
 // Thingies in a session's side panel: a tab for each thingy shown beside the session, a New
 // thingy tab that builds one in that session, and the thingy beside New session. The panel keeps
-// which tab is selected; thingy code asks for a tab through `requestThingyRailTab`.
-import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
-import { MaximizeIcon, MessageSquareIcon, PanelsTopLeftIcon, XIcon } from "lucide-react";
+// which tab is selected (saved per session, like its other tabs); thingy code asks for a tab
+// through `requestThingyRailTab`. A thingy filling the screen is named in the page's URL, so
+// reloading, sharing or going Forward opens it the same way. Phones have no side panel, so a
+// thingy there covers the session instead.
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { createPortal } from "react-dom";
+import { MaximizeIcon, MinimizeIcon, PanelsTopLeftIcon, XIcon } from "lucide-react";
+import { useQueryClient } from "@tanstack/react-query";
 
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { Button } from "@/components/ui/button";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import { useLocation, useNavigate, useRebasePath } from "@/lib/routing";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { useLocation, useNavigate, useRebasePath, useReplaceSearchParams } from "@/lib/routing";
+import { readSessionWorkspaceState, saveSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { isTempConvId } from "@/lib/tempConversationId";
 import {
+  THINGY_FULL_SCREEN_PARAM,
   clearThingyRailRequest,
   requestThingyRailTab,
+  setFullScreenThingy,
   setThingyNewSessionTabMaximized,
   useThingyRailRequest,
 } from "@/lib/thingyRailTabs";
 import { cn } from "@/lib/utils";
+import { MobilePanelDrawer, useMobilePanelHeaderTarget } from "@/shell/MobilePanelDrawer";
 import { SidebarOpenButton } from "@/shell/SidebarOpenButton";
+import { scrollTabIntoView } from "@/shell/WorkspaceTabsScroller";
 import { type Thingy, type ThingyContent, createThingy } from "@/thingies/api/thingyApi";
 import { composeThingyBuildPrompt, thingyNameFrom } from "@/thingies/host/thingyBuild";
 import { THINGY_START_PARAM } from "@/thingies/host/thingyPages";
@@ -26,23 +38,29 @@ import {
   thingyRailKey,
 } from "@/thingies/host/thingySession";
 import { ThingyDescribeForm } from "./ThingyDescribeForm";
-import { ThingyErrorNotice } from "./ThingyErrorNotice";
 import { ThingyTemplatesSection } from "./ThingyTemplateGallery";
 import { ThingyActions, ThingyName, ThingyPinButton } from "./ThingyToolbar";
+import { ThingyUnavailable } from "./ThingyUnavailable";
 import { ThingyView } from "./ThingyView";
-import { setThingyDraft, useHasThingyDraft } from "./thingyDrafts";
+import {
+  setThingyDraft,
+  setThingyDraftText,
+  thingyDraftText,
+  useHasThingyDraft,
+} from "./thingyDrafts";
 import { useThingyNavigate } from "./thingyNavigation";
 import {
   invalidateThingies,
   useLinkedThingiesSync,
-  useSessionThingies,
+  useSessionThingiesQuery,
   useShowThingyInSession,
   useThingiesEnabled,
   useThingy,
 } from "./thingyQueries";
-import { useQueryClient } from "@tanstack/react-query";
+import { leaveThingyStart } from "./useAdoptStartedThingySession";
 
 export const THINGY_DRAFT_KEY = "thingy-draft";
+const DRAFT_LABEL = "New thingy";
 
 export interface ThingyRailTab {
   /** Unique within the panel, for example `thingy:<id>`. */
@@ -71,10 +89,19 @@ export interface ThingyRailTabState {
   newItems: ThingyRailNewItem[];
   /** The selected tab's key while it still exists, else null. */
   selected: string | null;
+  /**
+   * Whether the session's thingies are still loading, so a saved thingy tab can't be judged gone
+   * yet.
+   */
+  loading: boolean;
   select: (key: string) => void;
   close: (key: string) => void;
   /** Whether the viewer can close the tabs. */
   canClose: boolean;
+  /** On a phone: whether the selected thingy covers the session. */
+  mobileOpen: boolean;
+  /** On a phone: shows the session again. */
+  closeMobile: () => void;
   render: (key: string, view: ThingyTabView) => ReactNode;
 }
 
@@ -91,12 +118,15 @@ function ThingyRailPane({
   view,
   sessionId,
   onDeleted,
+  onOpenSession,
 }: {
   thingy: Thingy;
   view: ThingyTabView;
   /** The session it is shown beside; none beside New session. */
   sessionId?: string;
   onDeleted: () => void;
+  /** Leaves full screen to show the session. */
+  onOpenSession?: () => void;
 }) {
   const queryClient = useQueryClient();
   const [content, setContent] = useState<ThingyContent | undefined>(undefined);
@@ -107,6 +137,8 @@ function ThingyRailPane({
       onReloadThingy={() => invalidateThingies(queryClient)}
       onContentLoaded={setContent}
       toolbarTarget={view.toolbar}
+      fullScreen={view.fullScreen}
+      onOpenSession={onOpenSession}
       renderToolbar={(commentsButton) => (
         <>
           <span className="flex min-w-0 flex-1 items-center">
@@ -127,7 +159,7 @@ function ThingyRailPane({
 }
 
 /** Builds a new thingy in this session from a description, or makes one from a template. */
-function ThingyDraftPane({ sessionId }: { sessionId: string }) {
+function ThingyDraftPane({ sessionId, view }: { sessionId: string; view: ThingyTabView }) {
   const navigate = useThingyNavigate();
   const showInSession = useShowThingyInSession();
   // Replaces this tab with the thingy's own.
@@ -140,7 +172,7 @@ function ThingyDraftPane({ sessionId }: { sessionId: string }) {
   const build = async (description: string) => {
     const thingy = await createThingy(thingyNameFrom(description));
     await show(thingy);
-    await openThingySession(thingy, `${composeThingyBuildPrompt(thingy)}${description}`, navigate, {
+    await openThingySession(thingy, composeThingyBuildPrompt(thingy, description), navigate, {
       deliver: true,
       reveal: false,
       railSessionId: sessionId,
@@ -149,16 +181,27 @@ function ThingyDraftPane({ sessionId }: { sessionId: string }) {
   };
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-6 overflow-y-auto p-4">
+      {/* Full screen hides the tab strip, so the bar names the tab. */}
+      {view.toolbar &&
+        createPortal(
+          <span className="flex min-w-0 items-center gap-1.5 text-ui font-medium">
+            <PanelsTopLeftIcon className="size-4 shrink-0 text-muted-foreground" />
+            {DRAFT_LABEL}
+          </span>,
+          view.toolbar,
+        )}
       <ThingyDescribeForm
-        heading="New thingy"
-        explanation="Describe what it shows, what data it uses and what people do with it. This session builds it here, and its buttons send their work back to this session."
+        heading={DRAFT_LABEL}
+        explanation="Say what it shows, what data it uses and what people do with it. This session builds it here, and its buttons send their work back to this session."
         onBuild={build}
         onCancel={() => setThingyDraft(sessionId, false)}
         errorTitle="Couldn’t start building the thingy"
+        initialDescription={thingyDraftText(sessionId)}
+        onDescriptionChange={(text) => setThingyDraftText(sessionId, text)}
       />
       {/* The description above is how this tab starts a blank one. */}
       <ThingyTemplatesSection
-        minCardWidth={160}
+        minCardWidth={view.fullScreen ? 240 : 160}
         withoutBlank
         onCreated={async (thingy) => {
           await show(thingy);
@@ -167,6 +210,49 @@ function ThingyDraftPane({ sessionId }: { sessionId: string }) {
       />
     </div>
   );
+}
+
+// The order each session's tabs were last shown in. The server lists a re-shown thingy last;
+// keeping the order the viewer saw stops its tab from jumping to the end.
+const tabOrders = new Map<string, readonly string[]>();
+
+/** Forgets the tab orders; for tests. */
+export function resetThingyTabOrders(): void {
+  tabOrders.clear();
+}
+
+function inShownOrder(sessionId: string, thingies: Thingy[] | undefined): Thingy[] | undefined {
+  if (thingies === undefined) return undefined;
+  const previous = tabOrders.get(sessionId) ?? [];
+  const byId = new Map(thingies.map((thingy) => [thingy.id, thingy]));
+  const kept = previous.filter((id) => byId.has(id));
+  const added = thingies.map((thingy) => thingy.id).filter((id) => !kept.includes(id));
+  const ordered = [...kept, ...added];
+  tabOrders.set(sessionId, ordered);
+  return ordered.map((id) => byId.get(id)!);
+}
+
+/** The tab to show when `key` goes: the one after it, else the one before it. */
+function neighborOf(
+  keys: readonly string[],
+  key: string,
+  remaining: readonly string[],
+): string | null {
+  const index = keys.indexOf(key);
+  if (index < 0) return null;
+  const candidates = [...keys.slice(index + 1), ...keys.slice(0, index).reverse()];
+  return candidates.find((candidate) => remaining.includes(candidate)) ?? null;
+}
+
+function savedThingyTab(conversationId: string): string | null {
+  return readSessionWorkspaceState(conversationId).selectedThingyKey ?? null;
+}
+
+interface Chosen {
+  conversationId: string;
+  key: string | null;
+  /** On a phone: whether the chosen thingy covers the session. */
+  mobileOpen: boolean;
 }
 
 /**
@@ -183,6 +269,8 @@ export function useThingyRailTabState(
     onReveal,
     maximized = false,
     onMaximizedChange,
+    mobile = false,
+    routed = true,
   }: {
     readOnly: boolean;
     /** Whether the panel shows its thingy tab mode now. */
@@ -195,34 +283,100 @@ export function useThingyRailTabState(
     maximized?: boolean;
     /** Puts the panel in or out of full screen, leaving the sidebar open with `keepSidebar`. */
     onMaximizedChange?: (maximized: boolean, options?: { keepSidebar?: boolean }) => void;
+    /** A phone, which has no side panel: a thingy covers the session instead. */
+    mobile?: boolean;
+    /** Whether this is the page's own panel, which names its full screen thingy in the URL. */
+    routed?: boolean;
   },
 ): ThingyRailTabState {
   useLinkedThingiesSync();
   const enabled = useThingiesEnabled();
   const queryClient = useQueryClient();
   const showInSession = useShowThingyInSession();
-  const thingies = useSessionThingies(conversationId, !isTempConvId(conversationId));
+  const { thingies: listed, settled } = useSessionThingiesQuery(
+    conversationId,
+    !isTempConvId(conversationId),
+  );
+  const thingies = useMemo(() => inShownOrder(conversationId, listed), [conversationId, listed]);
   const draft = useHasThingyDraft(conversationId) && enabled;
   const tabs = useMemo<ThingyRailTab[]>(() => {
     if (thingies === undefined && !draft) return NO_TABS;
     return [
       ...(thingies ?? []).map((thingy) => ({ key: thingyRailKey(thingy.id), label: thingy.name })),
-      ...(draft ? [{ key: THINGY_DRAFT_KEY, label: "New thingy" }] : []),
+      ...(draft ? [{ key: THINGY_DRAFT_KEY, label: DRAFT_LABEL }] : []),
     ];
   }, [draft, thingies]);
-  const [chosen, setChosen] = useState<{ conversationId: string; key: string } | null>(null);
+  // Until the server says whether it has thingies, a saved thingy tab may still come back.
+  const loading = useServerInfo() === "loading" || (enabled && !settled);
+
+  // The panel isn't keyed by session, so a switch reads the next session's saved tab at once.
+  const [chosenState, setChosen] = useState<Chosen>(() => ({
+    conversationId,
+    key: savedThingyTab(conversationId),
+    mobileOpen: false,
+  }));
+  let chosen = chosenState;
+  if (chosen.conversationId !== conversationId) {
+    chosen = { conversationId, key: savedThingyTab(conversationId), mobileOpen: false };
+    setChosen(chosen);
+  }
+  const choose = useCallback(
+    (key: string | null, mobileOpen = false) => {
+      setChosen({ conversationId, key, mobileOpen });
+      saveSessionWorkspaceState(conversationId, { selectedThingyKey: key });
+    },
+    [conversationId],
+  );
+  // When the chosen thingy goes (deleted, or no longer shared or shown here), the tab next to it
+  // takes its place in the same render, so the panel never falls back to another kind of tab.
+  const lastTabsRef = useRef<{ conversationId: string; keys: string[] } | null>(null);
+  const tabKeys = tabs.map((tab) => tab.key);
+  const last = lastTabsRef.current;
+  const gone =
+    chosen.key !== null &&
+    !tabKeys.includes(chosen.key) &&
+    !loading &&
+    last?.conversationId === conversationId &&
+    last.keys.includes(chosen.key);
   const selected =
-    chosen !== null &&
-    chosen.conversationId === conversationId &&
-    tabs.some((tab) => tab.key === chosen.key)
+    chosen.key !== null && tabKeys.includes(chosen.key)
       ? chosen.key
-      : null;
+      : gone && chosen.key !== null
+        ? neighborOf(last.keys, chosen.key, tabKeys)
+        : null;
+  // A thingy that filled the screen gives the screen back to the session when it goes.
+  const mobileOpen = mobile && chosen.mobileOpen && selected !== null && !gone;
+
   const onShowRef = useRef(onShow);
   onShowRef.current = onShow;
   const onRevealRef = useRef(onReveal);
   onRevealRef.current = onReveal;
   const onMaximizedChangeRef = useRef(onMaximizedChange);
   onMaximizedChangeRef.current = onMaximizedChange;
+  const fullScreen = selected !== null && !gone && (mobile ? mobileOpen : maximized && showing);
+  const fullScreenRef = useRef(fullScreen);
+  fullScreenRef.current = fullScreen;
+  // Whether the panel fills the screen for its thingy tabs, even once the selected one is gone.
+  const panelFullScreenRef = useRef(false);
+  panelFullScreenRef.current = mobile ? chosen.mobileOpen : maximized && showing;
+  const closeMobile = useCallback(() => {
+    // A request still kept would show the thingy again.
+    clearThingyRailRequest();
+    setChosen((current) => ({ ...current, mobileOpen: false }));
+  }, []);
+  // The panel toggles full screen, so a second leave before it re-renders would enter it again.
+  const leftFullScreenRef = useRef(false);
+  useEffect(() => {
+    leftFullScreenRef.current = false;
+  }, [maximized]);
+  const leaveFullScreen = useCallback(() => {
+    if (mobile) {
+      closeMobile();
+    } else if (!leftFullScreenRef.current) {
+      leftFullScreenRef.current = true;
+      onMaximizedChangeRef.current?.(false);
+    }
+  }, [mobile, closeMobile]);
 
   const requested = useThingyRailRequest((state) => state.requested);
   const attemptsRef = useRef<{ request: unknown; count: number; maximized: boolean }>({
@@ -237,11 +391,11 @@ export function useThingyRailTabState(
       attemptsRef.current = { request: requested, count: 0, maximized: false };
     // Full screen is asked for once: leaving it afterwards is the viewer's choice.
     if (maximized) attemptsRef.current.maximized = true;
-    const shown =
-      showing &&
-      chosen?.conversationId === conversationId &&
-      chosen.key === requested.key &&
-      (!requested.maximize || attemptsRef.current.maximized);
+    const onTab = chosen.conversationId === conversationId && chosen.key === requested.key;
+    // A phone shows a requested thingy over the session, its only way to show one.
+    const shown = mobile
+      ? onTab && chosen.mobileOpen
+      : showing && onTab && (!requested.maximize || attemptsRef.current.maximized);
     if (attemptsRef.current.count >= MAX_SHOW_ATTEMPTS) {
       clearThingyRailRequest();
       return undefined;
@@ -251,13 +405,17 @@ export function useThingyRailTabState(
       return () => clearTimeout(timer);
     }
     attemptsRef.current.count += 1;
-    setChosen({ conversationId, key: requested.key });
+    if (mobile) {
+      choose(requested.key, true);
+      return undefined;
+    }
+    choose(requested.key);
     onShowRef.current();
     onRevealRef.current?.();
     if (requested.maximize && !attemptsRef.current.maximized)
       onMaximizedChangeRef.current?.(true, { keepSidebar: requested.keepSidebar });
     return undefined;
-  }, [requested, conversationId, tabs, showing, chosen, maximized]);
+  }, [requested, conversationId, tabs, showing, chosen, maximized, mobile, choose]);
 
   // Thingy code takes its tab out of full screen when it hands the session something to see,
   // such as a quote in the composer.
@@ -265,8 +423,64 @@ export function useThingyRailTabState(
   useEffect(() => {
     if (exitFullScreen === null || exitFullScreen.conversationId !== conversationId) return;
     useThingyRailRequest.setState({ exitFullScreen: null });
-    if (maximized && showing) onMaximizedChangeRef.current?.(false);
-  }, [exitFullScreen, conversationId, maximized, showing]);
+    if (fullScreenRef.current) leaveFullScreen();
+  }, [exitFullScreen, conversationId, leaveFullScreen]);
+
+  // Saves the tab that took a gone thingy's place, and leaves its full screen.
+  useEffect(() => {
+    if (!loading) lastTabsRef.current = { conversationId, keys: tabs.map((tab) => tab.key) };
+    if (!gone) return;
+    if (panelFullScreenRef.current) leaveFullScreen();
+    choose(selected);
+  }, [tabs, loading, conversationId, gone, selected, choose, leaveFullScreen]);
+
+  // The URL names the thingy filling the screen: a link, reload or Forward to it opens it so.
+  const location = useLocation();
+  const replaceSearchParams = useReplaceSearchParams();
+  const urlThingy = routed
+    ? new URLSearchParams(location.search).get(THINGY_FULL_SCREEN_PARAM)
+    : null;
+  const fullScreenThingyId = fullScreen && selected !== null ? thingyIdFromRailKey(selected) : null;
+  const handledUrlRef = useRef<string | null>(null);
+  const keepSidebar = (location.state as { keepSidebar?: boolean } | null)?.keepSidebar === true;
+  useEffect(() => {
+    if (urlThingy === null) {
+      handledUrlRef.current = null;
+      return;
+    }
+    const marker = `${location.key}\n${urlThingy}`;
+    if (handledUrlRef.current === marker) return;
+    handledUrlRef.current = marker;
+    if (fullScreenThingyId === urlThingy) return;
+    requestThingyRailTab(conversationId, thingyRailKey(urlThingy), { maximize: true, keepSidebar });
+  }, [urlThingy, location.key, conversationId, fullScreenThingyId, keepSidebar]);
+  // Entering or leaving full screen updates the URL in place; the history entry stays the same.
+  const shownFullScreenRef = useRef<string | null>(null);
+  useEffect(() => {
+    const previous = shownFullScreenRef.current;
+    shownFullScreenRef.current = fullScreenThingyId;
+    if (!routed || previous === fullScreenThingyId) return;
+    const params = new URLSearchParams(location.search);
+    const current = params.get(THINGY_FULL_SCREEN_PARAM);
+    if (fullScreenThingyId !== null && current !== fullScreenThingyId) {
+      params.set(THINGY_FULL_SCREEN_PARAM, fullScreenThingyId);
+      replaceSearchParams(params);
+    } else if (fullScreenThingyId === null && previous !== null && current === previous) {
+      params.delete(THINGY_FULL_SCREEN_PARAM);
+      replaceSearchParams(params);
+    }
+    // Only a change of the full screen thingy writes the URL.
+  }, [fullScreenThingyId]); // eslint-disable-line react-hooks/exhaustive-deps
+  // The sidebar marks the thingy filling the screen.
+  useEffect(() => {
+    if (routed) setFullScreenThingy(fullScreenThingyId);
+  }, [routed, fullScreenThingyId]);
+  useEffect(
+    () => () => {
+      if (routed) setFullScreenThingy(null);
+    },
+    [routed],
+  );
 
   const byKey = useMemo(
     () => new Map((thingies ?? []).map((thingy) => [thingyRailKey(thingy.id), thingy])),
@@ -294,15 +508,26 @@ export function useThingyRailTabState(
     tabs,
     newItems,
     selected,
+    loading,
     select: (key) => {
       // The viewer's own choice ends any request still being kept.
       clearThingyRailRequest();
-      setChosen({ conversationId, key });
-      onShowRef.current();
+      choose(key, mobile);
+      if (!mobile) onShowRef.current();
     },
     close: (key) => {
       clearThingyRailRequest();
-      if (selected === key) setChosen(null);
+      if (selected === key) {
+        // The tab next to it takes its place, as browser tabs do.
+        const keys = tabs.map((tab) => tab.key);
+        const next = neighborOf(
+          keys,
+          key,
+          keys.filter((other) => other !== key),
+        );
+        if (next === null && fullScreen) leaveFullScreen();
+        choose(next, mobileOpen && next !== null);
+      }
       if (key === THINGY_DRAFT_KEY) {
         setThingyDraft(conversationId, false);
         return;
@@ -312,8 +537,11 @@ export function useThingyRailTabState(
         showInSession.mutate({ thingyId, sessionId: conversationId, shown: false });
     },
     canClose: !readOnly,
+    mobileOpen,
+    closeMobile,
     render: (key, view) => {
-      if (key === THINGY_DRAFT_KEY) return <ThingyDraftPane sessionId={conversationId} />;
+      if (key === THINGY_DRAFT_KEY)
+        return <ThingyDraftPane sessionId={conversationId} view={view} />;
       const thingy = byKey.get(key);
       return thingy ? (
         <ThingyRailPane
@@ -321,7 +549,12 @@ export function useThingyRailTabState(
           thingy={thingy}
           view={view}
           sessionId={conversationId}
-          onDeleted={() => invalidateThingies(queryClient)}
+          onOpenSession={view.fullScreen ? leaveFullScreen : undefined}
+          onDeleted={() => {
+            // Deleting it from full screen shows the session, docked, with the tab next to it.
+            if (panelFullScreenRef.current) leaveFullScreen();
+            invalidateThingies(queryClient);
+          }}
         />
       ) : null;
     },
@@ -346,10 +579,12 @@ export function ThingyRailTabStrip({
 }) {
   const activeRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
-    if (active) activeRef.current?.scrollIntoView?.({ block: "nearest", inline: "nearest" });
+    // Moves only the strip, not the page, to show the tab.
+    if (active) scrollTabIntoView(activeRef.current);
   }, [active, state.selected]);
+  if (state.tabs.length === 0) return null;
   return (
-    <>
+    <div role="tablist" aria-label="Thingies" className="flex items-center gap-0.5">
       {state.tabs.map(({ key, label }) => {
         const isActive = active && state.selected === key;
         return (
@@ -389,7 +624,43 @@ export function ThingyRailTabStrip({
           </div>
         );
       })}
+    </div>
+  );
+}
+
+/** A phone's thingy: it covers the session, with its controls in the drawer's header. */
+function ThingyMobileBody({ state }: { state: ThingyRailTabState }) {
+  const header = useMobilePanelHeaderTarget();
+  const [slot, setSlot] = useState<HTMLElement | null>(null);
+  if (state.selected === null) return null;
+  return (
+    <>
+      {header?.title &&
+        createPortal(
+          <div
+            ref={setSlot}
+            data-mobile-panel-title
+            className="flex min-w-0 max-w-[calc(100vw-5rem)] items-center gap-1"
+          />,
+          header.title,
+        )}
+      {state.render(state.selected, { fullScreen: true, toolbar: slot })}
     </>
+  );
+}
+
+/** On a phone, the requested thingy over the session; Close shows the session again. */
+export function ThingyMobileDrawer({ state }: { state: ThingyRailTabState }) {
+  const label = state.tabs.find((tab) => tab.key === state.selected)?.label ?? "Thingy";
+  return (
+    <MobilePanelDrawer
+      open={state.mobileOpen}
+      title={label}
+      onClose={state.closeMobile}
+      testId="thingy-panel-drawer"
+    >
+      <ThingyMobileBody state={state} />
+    </MobilePanelDrawer>
   );
 }
 
@@ -411,31 +682,48 @@ export function ThingyFullScreenSlot({
       {!sidebarOpen && onOpenSidebar && (
         <SidebarOpenButton onOpenSidebar={onOpenSidebar} componentId="thingies.open_sidebar" />
       )}
+      {/* Inset like the thingy's content below it, and clear of the sidebar button. */}
       <div
         ref={onToolbar}
         data-testid="thingy-toolbar-slot"
-        className="flex min-w-0 flex-1 items-center gap-1"
+        className="ml-2 flex min-w-0 flex-1 items-center gap-1"
       />
     </>
   );
 }
 
 /** The thingy New session starts from; it loads the thingy and shows it like a session's tab. */
-function ThingyNewSessionPane({ thingyId, view }: { thingyId: string; view: ThingyTabView }) {
-  const thingy = useThingy(thingyId);
-  const navigate = useNavigate();
+function ThingyNewSessionPane({
+  thingyId,
+  view,
+  onOpenSession,
+  onDeleted,
+}: {
+  thingyId: string;
+  view: ThingyTabView;
+  onOpenSession?: () => void;
+  onDeleted: () => void;
+}) {
+  const thingy = useThingy(thingyId, { watch: true });
   if (thingy.isPending) return null;
   if (thingy.isError) {
     return (
-      <ThingyErrorNotice
+      <ThingyUnavailable
         className="m-3"
-        title="Couldn’t open the thingy"
+        thingyId={thingyId}
         error={thingy.error}
         onRetry={() => void thingy.refetch()}
       />
     );
   }
-  return <ThingyRailPane thingy={thingy.data} view={view} onDeleted={() => navigate("/thingy")} />;
+  return (
+    <ThingyRailPane
+      thingy={thingy.data}
+      view={view}
+      onOpenSession={view.fullScreen ? onOpenSession : undefined}
+      onDeleted={onDeleted}
+    />
+  );
 }
 
 /** The thingy a New session starts from, named by `thingy_start` in New session's URL. */
@@ -448,32 +736,128 @@ export function useThingyStartId(): string | null {
   return enabled && atLanding ? new URLSearchParams(search).get(THINGY_START_PARAM) : null;
 }
 
+const PANEL_ICON_BUTTON =
+  "flex size-6 shrink-0 text-muted-foreground hover:text-foreground mobile-touch-target";
+
 /**
  * The thingy beside New session, when New session was opened from it: docked on the right like a
- * session's side panel, or filling the screen, with the same full screen toggle.
+ * session's side panel, or filling the screen, with the same full screen toggle. Phones show it
+ * only full screen; after Open session a chip above New session brings it back.
  */
 export function ThingyNewSessionPanel({
   active,
   sidebarOpen,
   onOpenSidebar,
+  onSidebarOpenChange,
 }: {
   /** Whether New session shows (no session is open). */
   active: boolean;
   sidebarOpen?: boolean;
   onOpenSidebar?: (peek?: boolean) => void;
+  /** Closes the sidebar for full screen and opens it again after, as the side panel does. */
+  onSidebarOpenChange?: (open: boolean) => void;
 }) {
   const thingyId = useThingyStartId();
-  const thingy = useThingy(active ? thingyId : null);
+  const thingy = useThingy(active ? thingyId : null, { watch: true });
   const maximized = useThingyRailRequest((state) => state.newSessionMaximized);
   const [toolbar, setToolbar] = useState<HTMLElement | null>(null);
+  const mobile = useIsMobileViewport();
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const location = useLocation();
+  const replaceSearchParams = useReplaceSearchParams();
   const shown = active && thingyId !== null;
   // Full screen lasts while the thingy shows; the next New session starts docked unless thingy
   // code asks again before it opens.
   useEffect(() => {
     if (!shown) setThingyNewSessionTabMaximized(false);
   }, [shown]);
+
+  // The URL names the thingy while it fills the screen, as on a session's page: a reload or
+  // Forward opens it so again.
+  const params = new URLSearchParams(location.search);
+  const urlThingy = params.get(THINGY_FULL_SCREEN_PARAM);
+  const handledUrlRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!shown || urlThingy === null || urlThingy !== thingyId) return;
+    const marker = `${location.key}\n${urlThingy}`;
+    if (handledUrlRef.current === marker) return;
+    handledUrlRef.current = marker;
+    setThingyNewSessionTabMaximized(true);
+  }, [shown, urlThingy, thingyId, location.key]);
+  const setFullScreen = (next: boolean) => {
+    setThingyNewSessionTabMaximized(next);
+    if (thingyId === null || next === (urlThingy === thingyId)) return;
+    const nextParams = new URLSearchParams(location.search);
+    if (next) nextParams.set(THINGY_FULL_SCREEN_PARAM, thingyId);
+    else nextParams.delete(THINGY_FULL_SCREEN_PARAM);
+    replaceSearchParams(nextParams);
+  };
+  // Thingy code can leave full screen too (a quote sent to the composer); the URL follows.
+  const fullScreenId = shown && maximized ? thingyId : null;
+  const wasFullScreenRef = useRef(false);
+  useEffect(() => {
+    const was = wasFullScreenRef.current;
+    wasFullScreenRef.current = fullScreenId !== null;
+    if (!was || fullScreenId !== null || !shown || urlThingy === null) return;
+    const nextParams = new URLSearchParams(location.search);
+    nextParams.delete(THINGY_FULL_SCREEN_PARAM);
+    replaceSearchParams(nextParams);
+    // Only leaving full screen writes the URL here.
+  }, [fullScreenId]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Like the side panel's full screen, this one closes the sidebar and opens it again after,
+  // unless the thingy was opened from the sidebar.
+  const keepSidebar = (location.state as { keepSidebar?: boolean } | null)?.keepSidebar === true;
+  const sidebarStashRef = useRef<boolean | null>(null);
+  const sidebarOpenRef = useRef(sidebarOpen);
+  sidebarOpenRef.current = sidebarOpen;
+  const onSidebarOpenChangeRef = useRef(onSidebarOpenChange);
+  onSidebarOpenChangeRef.current = onSidebarOpenChange;
+  useEffect(() => {
+    if (fullScreenId !== null) {
+      if (sidebarStashRef.current !== null || keepSidebar || mobile) return;
+      sidebarStashRef.current = sidebarOpenRef.current ?? true;
+      onSidebarOpenChangeRef.current?.(false);
+    } else if (sidebarStashRef.current !== null) {
+      const reopen = sidebarStashRef.current;
+      sidebarStashRef.current = null;
+      if (reopen) onSidebarOpenChangeRef.current?.(true);
+    }
+  }, [fullScreenId, keepSidebar, mobile]);
+
   if (!shown) return null;
   const label = thingy.data?.name ?? "Thingy";
+  const close = () => {
+    const nextParams = new URLSearchParams(location.search);
+    nextParams.delete(THINGY_START_PARAM);
+    nextParams.delete(THINGY_FULL_SCREEN_PARAM);
+    leaveThingyStart(thingyId, queryClient);
+    replaceSearchParams(nextParams);
+  };
+  const onDeleted = () => {
+    leaveThingyStart(thingyId, queryClient);
+    // Back must not reopen New session for the deleted thingy.
+    navigate("/thingy", { replace: true });
+  };
+  if (!maximized && mobile) {
+    // A phone has no room beside New session: a chip brings the thingy back over it.
+    return (
+      <div className="pointer-events-none absolute inset-x-0 top-[calc(var(--omnigent-header-height,3rem)+0.5rem)] z-30 flex justify-center px-4">
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          componentId="thingies.new_session.show"
+          className="pointer-events-auto max-w-full gap-1.5 rounded-full bg-card shadow-sm mobile-touch-target"
+          onClick={() => setFullScreen(true)}
+        >
+          <PanelsTopLeftIcon className="size-4 shrink-0" />
+          <span className="truncate">Show {label}</span>
+        </Button>
+      </div>
+    );
+  }
   return (
     <aside
       aria-label={label}
@@ -481,8 +865,7 @@ export function ThingyNewSessionPanel({
       data-maximized={maximized || undefined}
       className={cn(
         "relative z-40 min-h-0 flex-col overflow-hidden bg-card",
-        // Full screen covers New session, as a full screen side panel covers its session; phones
-        // show the thingy only then.
+        // Full screen covers New session, as a full screen side panel covers its session.
         maximized
           ? "absolute inset-0 flex"
           : "hidden border-l border-border md:flex md:w-[min(560px,45%)] md:shrink-0",
@@ -505,27 +888,47 @@ export function ThingyNewSessionPanel({
             <span className="max-w-[24ch] truncate">{label}</span>
           </div>
         )}
-        <Tooltip>
-          <TooltipTrigger asChild>
-            <Button
-              type="button"
-              variant="ghost"
-              size="icon-xs"
-              aria-label={maximized ? "Open session" : "Full screen"}
-              className="ml-auto flex size-6 shrink-0 text-muted-foreground hover:text-foreground"
-              onClick={() => setThingyNewSessionTabMaximized(!maximized)}
-            >
-              {maximized ? (
-                <MessageSquareIcon className="size-4" />
-              ) : (
-                <MaximizeIcon className="size-4" />
-              )}
-            </Button>
-          </TooltipTrigger>
-          <TooltipContent side="bottom">
-            {maximized ? "Open session" : "Full screen"}
-          </TooltipContent>
-        </Tooltip>
+        <div className="ml-auto flex shrink-0 items-center gap-1 pl-1">
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon-xs"
+                aria-label={maximized ? "Open session" : "Full screen"}
+                className={PANEL_ICON_BUTTON}
+                onClick={() => setFullScreen(!maximized)}
+              >
+                {maximized ? (
+                  <MinimizeIcon className="size-4" />
+                ) : (
+                  <MaximizeIcon className="size-4" />
+                )}
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent side="bottom">
+              {maximized ? "Open session" : "Full screen"}
+            </TooltipContent>
+          </Tooltip>
+          {!maximized && (
+            <Tooltip>
+              <TooltipTrigger asChild>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="icon-xs"
+                  aria-label={`Close ${label}`}
+                  className={PANEL_ICON_BUTTON}
+                  componentId="thingies.new_session.close"
+                  onClick={close}
+                >
+                  <XIcon className="size-4" />
+                </Button>
+              </TooltipTrigger>
+              <TooltipContent side="bottom">Close</TooltipContent>
+            </Tooltip>
+          )}
+        </div>
       </div>
       <RenderErrorBoundary name="this thingy" resetKey={thingyId}>
         <div className="flex min-h-0 flex-1 flex-col">
@@ -533,6 +936,8 @@ export function ThingyNewSessionPanel({
             key={thingyId}
             thingyId={thingyId}
             view={{ fullScreen: maximized, toolbar: maximized ? toolbar : null }}
+            onOpenSession={() => setFullScreen(false)}
+            onDeleted={onDeleted}
           />
         </div>
       </RenderErrorBoundary>

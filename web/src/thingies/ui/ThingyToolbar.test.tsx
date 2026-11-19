@@ -35,14 +35,14 @@ describe("the thingy's name", () => {
     vi.mocked(renameThingy).mockResolvedValue({ ...BOARD, name: "Release board" });
     renderWithThingies(<ThingyName thingy={BOARD} />);
 
-    fireEvent.click(screen.getByRole("button", { name: "Launch board" }));
+    fireEvent.click(screen.getByRole("button", { name: "Rename Launch board" }));
     let field = screen.getByRole("textbox", { name: "Thingy name" });
     fireEvent.change(field, { target: { value: "Nope" } });
     fireEvent.keyDown(field, { key: "Escape" });
-    expect(screen.getByRole("button", { name: "Launch board" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Rename Launch board" })).toBeInTheDocument();
     expect(renameThingy).not.toHaveBeenCalled();
 
-    fireEvent.click(screen.getByRole("button", { name: "Launch board" }));
+    fireEvent.click(screen.getByRole("button", { name: "Rename Launch board" }));
     field = screen.getByRole("textbox", { name: "Thingy name" });
     fireEvent.change(field, { target: { value: "  Release board  " } });
     fireEvent.keyDown(field, { key: "Enter" });
@@ -53,11 +53,11 @@ describe("the thingy's name", () => {
   it("saves on leaving the field, and keeps an unchanged name without a request", async () => {
     vi.mocked(renameThingy).mockRejectedValue(new Error("Name taken."));
     renderWithThingies(<ThingyName thingy={BOARD} />);
-    fireEvent.click(screen.getByRole("button", { name: "Launch board" }));
+    fireEvent.click(screen.getByRole("button", { name: "Rename Launch board" }));
     fireEvent.blur(screen.getByRole("textbox", { name: "Thingy name" }));
     expect(renameThingy).not.toHaveBeenCalled();
 
-    fireEvent.click(screen.getByRole("button", { name: "Launch board" }));
+    fireEvent.click(screen.getByRole("button", { name: "Rename Launch board" }));
     const field = screen.getByRole("textbox", { name: "Thingy name" });
     fireEvent.change(field, { target: { value: "Other" } });
     fireEvent.blur(field);
@@ -83,10 +83,10 @@ describe("Pin", () => {
     await waitFor(() => expect(pin).toBeEnabled());
     fireEvent.click(pin);
     await waitFor(() => expect(pinThingy).toHaveBeenCalledWith("board", true));
-    expect(await screen.findByRole("button", { name: "Unpin from sidebar" })).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
+    const unpin = await screen.findByRole("button", { name: "Unpin from sidebar" });
+    expect(unpin).toHaveAttribute("aria-pressed", "true");
+    // A filled pin, not a crossed-out one, shows it is pinned.
+    expect(unpin.querySelector("svg")).toHaveClass("fill-current");
   });
 });
 
@@ -107,7 +107,25 @@ describe("Share and the ⋯ menu", () => {
     expect(await screen.findByRole("menuitem", { name: "Delete thingy" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("menuitem", { name: "Thingy details" }));
     const details = await screen.findByRole("dialog", { name: "Thingy details" });
-    expect(within(details).getByText("rev-1")).toBeInTheDocument();
+    // Names, not internal IDs: the viewer owns it, and its link is what people open.
+    expect(within(details).queryByText("rev-1")).toBeNull();
+    expect(within(details).getByText("Published")).toBeInTheDocument();
+    expect(within(details).getByText("You")).toBeInTheDocument();
+    expect(within(details).getByText(/\/thingy\/board$/)).toBeInTheDocument();
+    expect(within(details).getByRole("button", { name: "Copy link" })).toBeInTheDocument();
+  });
+
+  it("names someone else as the owner", async () => {
+    renderWithThingies(
+      <ThingyActions
+        thingy={{ ...VIEW_ONLY, viewer_id: "bob@example.com" }}
+        onDeleted={vi.fn()}
+        shareInMenu={false}
+      />,
+    );
+    openMenu();
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Thingy details" }));
+    const details = await screen.findByRole("dialog", { name: "Thingy details" });
     expect(within(details).getByText("owner@example.com")).toBeInTheDocument();
   });
 

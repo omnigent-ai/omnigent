@@ -16,10 +16,13 @@ export function DeleteThingyDialog({
   thingy,
   onClose,
   onDeleted,
+  onCloseAutoFocus,
 }: {
   thingy: Pick<Thingy, "id" | "name">;
   onClose: () => void;
   onDeleted?: () => void;
+  /** Where focus goes once the dialog closes; Radix's default is the element that opened it. */
+  onCloseAutoFocus?: (event: Event) => void;
 }) {
   const deleteThingy = useDeleteThingy();
   return (
@@ -29,12 +32,13 @@ export function DeleteThingyDialog({
         if (!open && !deleteThingy.isPending) onClose();
       }}
     >
-      <DialogContent>
+      <DialogContent onCloseAutoFocus={onCloseAutoFocus}>
         <DialogHeader>
           <DialogTitle>Delete thingy?</DialogTitle>
           <DialogDescription>
-            <span className="font-medium break-all">{thingy.name}</span>, its data and its versions
-            will be deleted for everyone it is shared with. Sessions that worked on it are kept.
+            “<span className="font-semibold break-all text-foreground">{thingy.name}</span>”, its
+            data and its versions will be deleted for everyone it is shared with. Sessions that
+            worked on it are kept.
           </DialogDescription>
         </DialogHeader>
         {deleteThingy.isError && (

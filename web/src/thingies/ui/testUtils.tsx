@@ -47,7 +47,8 @@ export function renderWithThingies(
     path = "/",
     route,
     queryClient = new QueryClient({
-      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+      // Queries that retry on their own do it at once here.
+      defaultOptions: { queries: { retry: false, retryDelay: 0 }, mutations: { retry: false } },
     }),
   }: {
     info?: ServerInfo | "loading";

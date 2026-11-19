@@ -6,6 +6,7 @@ import { type QueryClient, useMutation, useQuery, useQueryClient } from "@tansta
 
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
+import { ApiError } from "@/lib/sessionsApi";
 import {
   type Thingy,
   type ThingyShelf,
@@ -36,6 +37,22 @@ export function sessionThingiesKey(sessionId: string) {
 
 // An agent can add a thingy to its session while the side panel is open.
 const SESSION_THINGIES_POLL_MS = 30_000;
+// How often an open thingy checks that the viewer can still open it, and at what access.
+const THINGY_POLL_MS = 30_000;
+const MAX_RETRIES = 3;
+
+/** Retries a failed thingy fetch, except when the thingy is gone, which another try won't fix. */
+function retryThingyQuery(failureCount: number, error: unknown): boolean {
+  return failureCount < MAX_RETRIES && !isThingyUnavailable(error);
+}
+
+/**
+ * Whether a thingy request failed because the viewer can't open the thingy: it was deleted, or
+ * it is no longer shared with them. The server answers both with 404, so they can't be told apart.
+ */
+export function isThingyUnavailable(error: unknown): boolean {
+  return error instanceof ApiError && (error.status === 404 || error.status === 403);
+}
 
 /** Whether the server has thingies. */
 export function useThingiesEnabled(): boolean {
@@ -44,22 +61,33 @@ export function useThingiesEnabled(): boolean {
 
 /** The thingies the viewer owns. */
 export function useThingies() {
-  return useQuery({ queryKey: THINGY_LIST_KEY, queryFn: ({ signal }) => listThingies(signal) });
-}
-
-/** Thingies other people share with the viewer or their groups. */
-export function useSharedThingies() {
   return useQuery({
-    queryKey: SHARED_THINGIES_KEY,
-    queryFn: ({ signal }) => listSharedThingies(signal),
+    queryKey: THINGY_LIST_KEY,
+    queryFn: ({ signal }) => listThingies(signal),
   });
 }
 
-export function useThingy(thingyId: string | null) {
+/** Thingies other people share with the viewer or their groups. */
+export function useSharedThingies(enabled = true) {
+  return useQuery({
+    queryKey: SHARED_THINGIES_KEY,
+    queryFn: ({ signal }) => listSharedThingies(signal),
+    enabled,
+  });
+}
+
+/**
+ * One thingy. An open one checks again on focus and every so often, so a change to the viewer's
+ * access (or the thingy's deletion) reaches the view.
+ */
+export function useThingy(thingyId: string | null, { watch = false }: { watch?: boolean } = {}) {
   return useQuery({
     queryKey: thingyKey(thingyId ?? ""),
     queryFn: ({ signal }) => getThingy(thingyId!, signal),
     enabled: thingyId !== null,
+    retry: retryThingyQuery,
+    refetchOnWindowFocus: watch,
+    refetchInterval: watch ? THINGY_POLL_MS : false,
   });
 }
 
@@ -74,17 +102,31 @@ export function useThingyShelf() {
   });
 }
 
-/** The thingies shown beside a session; undefined until loaded or while thingies are off. */
-export function useSessionThingies(sessionId: string, enabled = true): Thingy[] | undefined {
+/**
+ * The thingies shown beside a session (undefined until loaded or while thingies are off), and
+ * whether the first answer is in: a panel waits for it before deciding a saved tab is gone.
+ */
+export function useSessionThingiesQuery(
+  sessionId: string,
+  enabled = true,
+): { thingies: Thingy[] | undefined; settled: boolean } {
   const thingiesEnabled = useThingiesEnabled();
-  const { data } = useQuery({
+  const on = thingiesEnabled && enabled;
+  const { data, isPending } = useQuery({
     queryKey: sessionThingiesKey(sessionId),
     queryFn: ({ signal }) => getSessionThingies(sessionId, signal),
-    enabled: thingiesEnabled && enabled,
+    enabled: on,
     refetchInterval: SESSION_THINGIES_POLL_MS,
+    // Back on the page, the tabs catch up with changes made elsewhere (a rename, a lost share).
+    refetchOnWindowFocus: true,
     staleTime: 10_000,
   });
-  return thingiesEnabled && enabled ? data : undefined;
+  return { thingies: on ? data : undefined, settled: !on || !isPending };
+}
+
+/** The thingies shown beside a session; undefined until loaded or while thingies are off. */
+export function useSessionThingies(sessionId: string, enabled = true): Thingy[] | undefined {
+  return useSessionThingiesQuery(sessionId, enabled).thingies;
 }
 
 /**

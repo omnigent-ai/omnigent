@@ -119,9 +119,10 @@ describe("New thingy", () => {
     fireEvent.click(screen.getByRole("button", { name: "Blank" }));
     const naming = await screen.findByRole("dialog", { name: "Name your thingy" });
     fireEvent.change(within(naming).getByRole("textbox", { name: "Name" }), {
-      target: { value: "x".repeat(101) },
+      target: { value: "x".repeat(121) },
     });
-    expect(within(naming).getByText("Use at most 100 characters.")).toBeInTheDocument();
+    // The server's limit; typing stops there, so only a pasted name can pass it.
+    expect(within(naming).getByText("Use at most 120 characters.")).toBeInTheDocument();
     expect(within(naming).getByRole("button", { name: "Create" })).toBeDisabled();
   });
 });

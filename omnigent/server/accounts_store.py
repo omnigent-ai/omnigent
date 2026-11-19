@@ -11,7 +11,7 @@ import logging
 import time
 import uuid
 from collections.abc import Callable
-from typing import cast
+from typing import Protocol, cast
 
 from sqlalchemy import and_, delete, exists, or_, select, update
 from sqlalchemy.engine import CursorResult
@@ -68,6 +68,17 @@ from omnigent.stores.permission_store.sqlalchemy_store import (
 )
 
 _logger = logging.getLogger(__name__)
+
+
+class DeletedAccountResources(Protocol):
+    """An account's resources kept outside this database (its thingies)."""
+
+    def delete_owned(self, user_id: str) -> None:
+        """Delete everything *user_id* owns there."""
+
+    def owns_any(self, user_id: str) -> bool:
+        """Whether anything *user_id* owns is left there."""
+
 
 _HIDDEN_LIST_USERS = frozenset({RESERVED_USER_PUBLIC, RESERVED_USER_LOCAL})
 
@@ -248,6 +259,14 @@ class SqlAlchemyAccountStore:
             immediate=True,
         )
         self._supports_for_update = self._engine.dialect.name != "sqlite"
+        self._thingies: DeletedAccountResources | None = None
+
+    def attach_thingies(self, thingies: DeletedAccountResources) -> None:
+        """Delete a deleted account's thingies too, which live outside this database.
+
+        :param thingies: Usually :class:`omnigent.thingies.accounts.DeletedAccountThingies`.
+        """
+        self._thingies = thingies
 
     # ── User credentials (extends rows in the `users` table) ──────
 
@@ -275,8 +294,8 @@ class SqlAlchemyAccountStore:
         :returns: The created :class:`Account`.
         :raises ValueError: If a user with this id already exists.
         :raises OmnigentError: ``CONFLICT`` while a deleted account's automation or
-            workflow or thingy grants, workflows or Inbox items under this name remain;
-            retrying can succeed.
+            workflow or thingy grants, workflows, Inbox items or thingies under this name
+            remain; retrying can succeed.
         """
         now = int(time.time())
         # Finish any held-grant cleanup a deletion left, so the name inherits nothing.
@@ -291,6 +310,7 @@ class SqlAlchemyAccountStore:
         )
         self._delete_deleted_workflows(user_id)
         self._delete_deleted_inbox_items(user_id)
+        self._delete_deleted_thingies(user_id)
 
         def write(session: Session) -> Account:
             existing = lock_account(session, user_id)
@@ -319,6 +339,15 @@ class SqlAlchemyAccountStore:
             if existing is not None and self._owned_inbox_item_ids(session, user_id, limit=1):
                 raise OmnigentError(
                     "A deleted account's Inbox items are still being removed. Try again.",
+                    code=ErrorCode.CONFLICT,
+                )
+            if (
+                existing is not None
+                and self._thingies is not None
+                and self._thingies.owns_any(user_id)
+            ):
+                raise OmnigentError(
+                    "A deleted account's thingies are still being removed. Try again.",
                     code=ErrorCode.CONFLICT,
                 )
             row = existing or SqlUser(id=user_id)
@@ -529,7 +558,8 @@ class SqlAlchemyAccountStore:
         one transaction, a partial failure rolls back the whole delete
         rather than leaving authority behind. After it commits, the
         scheduled task grants the user held, those on their tasks, saved
-        workflows and Inbox items are deleted in bounded batches.
+        workflows and Inbox items are deleted in bounded batches, and then their
+        thingies when :meth:`attach_thingies` was called.
         Re-registration finishes any interrupted workflow or Inbox cleanup
         before reusing the username.
 
@@ -609,7 +639,25 @@ class SqlAlchemyAccountStore:
                 self._delete_deleted_inbox_items(user_id)
             except Exception:
                 _logger.exception("Inbox cleanup deferred for a deleted account")
+            try:
+                self._delete_deleted_thingies(user_id)
+            except Exception:
+                _logger.exception("Thingy cleanup deferred for a deleted account")
         return deleted
+
+    def _delete_deleted_thingies(self, user_id: str) -> None:
+        """Delete a tombstoned account's thingies and shelf, which live in the thingy store.
+
+        Checks the tombstone first, so late cleanup never deletes a re-registered
+        account's new thingies.
+        """
+        if self._thingies is None:
+            return
+        with self._session("select_user_by_id") as session:
+            row = session.get(SqlUser, (current_workspace_id(), user_id))
+            tombstoned = row is not None and row.deleted_at is not None
+        if tombstoned:
+            self._thingies.delete_owned(user_id)
 
     def _owned_workflow_ids(
         self, session: Session, user_id: str, *, limit: int, lock: bool = False

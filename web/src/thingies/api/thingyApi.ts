@@ -325,6 +325,11 @@ export interface ThingyActionRecord {
   state: "queued" | "running" | "done" | "failed" | "cancelled";
   /** The request joined an earlier, still open request for the same action and params. */
   merged: boolean;
+  /**
+   * Whether the entry has been handed to a session. A merged request that was not (its New
+   * session was never started) needs its message sent again. Older servers omit it (false).
+   */
+  delivered: boolean;
 }
 
 /**
@@ -378,6 +383,7 @@ export async function requestThingyAction(
     params: isRecord(value.params) ? value.params : {},
     state: (value.state as ThingyActionRecord["state"]) ?? "queued",
     merged: body.merged === true,
+    delivered: body.delivered === true,
   };
 }
 

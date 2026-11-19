@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -151,7 +152,16 @@ async def test_requests_need_an_identity_and_a_json_body(client: httpx.AsyncClie
     assert info["thingies"] is True and info["thingy_sharing"] is True
 
 
-async def test_an_owner_builds_publishes_and_uses_a_thingy(client: httpx.AsyncClient) -> None:
+def _own_session(stores: SimpleNamespace, owner: str = ALICE) -> str:
+    session = stores.conversations.create_conversation()
+    stores.permissions.grant(owner, session.id, LEVEL_OWNER)
+    return session.id
+
+
+async def test_an_owner_builds_publishes_and_uses_a_thingy(
+    client: httpx.AsyncClient, stores: SimpleNamespace
+) -> None:
+    own, other = _own_session(stores), _own_session(stores)
     thingy = await _published(client, actions=[_ACTION])
     base = f"/v1/thingies/{thingy['id']}"
     assert thingy["browse_url"] == f"/thingy/{thingy['id']}"
@@ -191,14 +201,10 @@ async def test_an_owner_builds_publishes_and_uses_a_thingy(client: httpx.AsyncCl
     assert [item["id"] for item in progress["items"]] == [action["id"]]
     assert progress["items"][0]["status"] == "pending"
 
-    session = await client.put(f"{base}/session", json={"session_id": "s_1"}, headers=_as(ALICE))
-    assert session.json()["session_id"] == "s_1"
+    session = await client.put(f"{base}/session", json={"session_id": own}, headers=_as(ALICE))
+    assert session.json()["session_id"] == own
     status = (await client.get(f"{base}/session/status", headers=_as(ALICE))).json()
-    assert status == {
-        "session_id": "s_1",
-        "status": "unavailable",
-        "reason": "session_unavailable",
-    }
+    assert status == {"session_id": own, "status": "idle", "reason": None}
 
     comment = await client.post(
         f"{base}/comments",
@@ -213,10 +219,14 @@ async def test_an_owner_builds_publishes_and_uses_a_thingy(client: httpx.AsyncCl
 
     pinned = await client.put(f"{base}/pin", json={"pinned": True}, headers=_as(ALICE))
     assert pinned.json() == {"pinned": [{"id": thingy["id"], "name": "Board"}], "has_owned": True}
-    linked = await client.put(f"{base}/sessions/S_one", json={"linked": True}, headers=_as(ALICE))
+    linked = await client.put(
+        f"{base}/sessions/{other}", json={"linked": True}, headers=_as(ALICE)
+    )
     assert [item["id"] for item in linked.json()["items"]] == [thingy["id"]]
-    shown = await client.get("/v1/thingies/sessions/S_one", headers=_as(ALICE))
+    shown = await client.get(f"/v1/thingies/sessions/{other}", headers=_as(ALICE))
     assert [item["id"] for item in shown.json()["items"]] == [thingy["id"]]
+    # Showing it beside a session also made that the thingy session.
+    assert (await client.get(f"{base}/session", headers=_as(ALICE))).json()["session_id"] == other
 
     renamed = await client.patch(base, json={"name": "Launch"}, headers=_as(ALICE))
     assert renamed.json()["name"] == "Launch"
@@ -367,12 +377,29 @@ async def test_an_agent_writes_only_from_a_private_session(
     created = await client.post("/v1/thingies", json={"name": "From agent"}, headers=agent)
     assert created.status_code == 201, created.text
 
-    stores.permissions.grant(BOB, session.id, LEVEL_EDIT)
-    refused = await client.post("/v1/thingies", json={"name": "Again"}, headers=agent)
-    assert refused.status_code == 403
-    # Reads stay open to the agent.
     listed = await client.get("/v1/thingies", headers=agent)
     assert [item["name"] for item in listed.json()["items"]] == ["From agent"]
+    thingy_id = created.json()["id"]
+
+    # Once Bob can edit the session, he could ask Alice's agent to do anything: reads of
+    # her thingies are refused as well as writes.
+    stores.permissions.grant(BOB, session.id, LEVEL_EDIT)
+    for method, path in (
+        ("POST", "/v1/thingies"),
+        ("GET", "/v1/thingies"),
+        ("GET", f"/v1/thingies/{thingy_id}"),
+        ("GET", f"/v1/thingies/{thingy_id}/describe"),
+        ("GET", f"/v1/thingies/{thingy_id}/comments"),
+        ("GET", f"/v1/thingies/{thingy_id}/actions"),
+        ("GET", "/v1/thingies/shared"),
+    ):
+        refused = await client.request(
+            method, path, json={"name": "Again"} if method == "POST" else None, headers=agent
+        )
+        assert refused.status_code == 403, (method, path, refused.text)
+        assert refused.json()["error"]["code"] == "PERMISSION_DENIED"
+    # Alice herself, outside the agent, still reads them.
+    assert (await client.get(f"/v1/thingies/{thingy_id}", headers=_as(ALICE))).status_code == 200
 
 
 async def test_deleting_a_thingy_deletes_who_it_was_shared_with(
@@ -386,3 +413,199 @@ async def test_deleting_a_thingy_deletes_who_it_was_shared_with(
     )
     await client.delete(f"/v1/thingies/{thingy['id']}", headers=_as(ALICE))
     assert stores.permissions.list_for_thingy(thingy["id"]) == ([], None)
+
+
+async def test_a_revoked_viewers_shelf_drops_the_thingy_and_its_new_name(
+    client: httpx.AsyncClient,
+) -> None:
+    thingy = await _published(client)
+    base = f"/v1/thingies/{thingy['id']}"
+    await client.put(f"{base}/permissions", json={"user_id": BOB, "level": 1}, headers=_as(ALICE))
+    pinned = await client.put(f"{base}/pin", json={"pinned": True}, headers=_as(BOB))
+    assert pinned.json()["pinned"] == [{"id": thingy["id"], "name": "Board"}]
+
+    await client.delete(f"{base}/permissions/{BOB}", headers=_as(ALICE))
+    await client.patch(base, json={"name": "Synthetic secret plan"}, headers=_as(ALICE))
+    shelf = await client.get("/v1/thingies/shelf", headers=_as(BOB))
+    assert shelf.json() == {"pinned": [], "has_owned": False}
+    assert "Synthetic secret plan" not in shelf.text
+
+
+@pytest.mark.parametrize(
+    ("body", "message"),
+    [
+        ({"user_id": BOB, "level": 4}, "Can view (1), Can edit (2) or Can manage (3)"),
+        ({"user_id": BOB, "level": "1"}, "level"),
+        ({"user_id": BOB, "level": 1.0}, "level"),
+        ({"user_id": BOB}, "level"),
+        ({"user_id": "  ", "level": 1}, "Name a user or group"),
+        ({"user_id": " Alice@Example.COM ", "level": 1}, "owner cannot be granted"),
+    ],
+)
+async def test_refused_grants_say_why_in_the_thingy_error_shape(
+    client: httpx.AsyncClient, body: dict, message: str
+) -> None:
+    thingy = await _published(client)
+    response = await client.put(
+        f"/v1/thingies/{thingy['id']}/permissions", json=body, headers=_as(ALICE)
+    )
+    assert response.status_code == 400, response.text
+    error = response.json()["error"]
+    assert error["code"] == "INVALID_ARGUMENT"
+    assert message in error["message"] and error["message"] != "Invalid request"
+    assert "request_id" in error
+
+
+async def test_sharing_errors_use_the_thingy_codes(client: httpx.AsyncClient) -> None:
+    thingy = await _published(client)
+    base = f"/v1/thingies/{thingy['id']}"
+    await client.put(f"{base}/permissions", json={"user_id": BOB, "level": 1}, headers=_as(ALICE))
+    refused = await client.get(f"{base}/permissions", headers=_as(BOB))
+    assert refused.status_code == 403
+    assert refused.json()["error"]["code"] == "PERMISSION_DENIED"
+    agent = await client.get(
+        f"{base}/permissions", headers=_as(ALICE, **{ORCHESTRATION_SOURCE_HEADER: "a" * 32})
+    )
+    assert agent.status_code == 403 and agent.json()["error"]["code"] == "PERMISSION_DENIED"
+
+
+async def test_grantee_ids_are_trimmed_and_one_person_keeps_one_grant(
+    client: httpx.AsyncClient, stores: SimpleNamespace
+) -> None:
+    thingy = await _published(client)
+    base = f"/v1/thingies/{thingy['id']}"
+    spaced = await client.put(
+        f"{base}/permissions", json={"user_id": f"  {BOB} ", "level": 1}, headers=_as(ALICE)
+    )
+    assert spaced.status_code == 200, spaced.text
+    assert spaced.json()["user_id"] == BOB
+    assert stores.permissions.get_user(f"  {BOB} ") is None
+    upper = await client.put(
+        f"{base}/permissions", json={"user_id": BOB.upper(), "level": 2}, headers=_as(ALICE)
+    )
+    assert upper.json()["user_id"] == BOB and upper.json()["level"] == 2
+    grants, _ = stores.permissions.list_for_thingy(thingy["id"])
+    assert [(grant.user_id, grant.level) for grant in grants] == [(BOB, 2)]
+
+
+async def test_a_grant_racing_the_thingys_deletion_leaves_no_grant(
+    client: httpx.AsyncClient, stores: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    thingy = await _published(client)
+    original = stores.permissions.grant_for_thingy
+
+    def deleted_meanwhile(*args: Any, **kwargs: Any) -> Any:
+        # The thingy and its grants go just before this grant commits.
+        stores.thingies.delete(thingy["id"])
+        stores.permissions.delete_for_thingy(thingy["id"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(stores.permissions, "grant_for_thingy", deleted_meanwhile)
+    response = await client.put(
+        f"/v1/thingies/{thingy['id']}/permissions",
+        json={"user_id": BOB, "level": 1},
+        headers=_as(ALICE),
+    )
+    assert response.status_code == 404
+    assert stores.permissions.list_for_thingy(thingy["id"]) == ([], None)
+
+
+async def test_a_thingy_is_shown_only_beside_a_session_its_viewer_can_read(
+    client: httpx.AsyncClient, stores: SimpleNamespace
+) -> None:
+    thingy = await _published(client)
+    base = f"/v1/thingies/{thingy['id']}"
+    bobs = _own_session(stores, BOB)
+    made_up = "0" * 32
+    for session_id in (bobs, made_up):
+        linked = await client.put(
+            f"{base}/sessions/{session_id}", json={"linked": True}, headers=_as(ALICE)
+        )
+        assert linked.status_code == 404, linked.text
+        registered = await client.put(
+            f"{base}/session", json={"session_id": session_id}, headers=_as(ALICE)
+        )
+        assert registered.status_code == 404, registered.text
+    assert (await client.get(f"{base}/session", headers=_as(ALICE))).json()["session_id"] is None
+    # A session shared with her works.
+    stores.permissions.grant(ALICE, bobs, LEVEL_EDIT)
+    linked = await client.put(f"{base}/sessions/{bobs}", json={"linked": True}, headers=_as(ALICE))
+    assert linked.status_code == 200, linked.text
+
+
+async def test_viewers_read_only_the_published_revision(client: httpx.AsyncClient) -> None:
+    thingy = await _published(client)
+    base = f"/v1/thingies/{thingy['id']}"
+    draft = await client.post(
+        f"{base}/revisions",
+        json={
+            "html": "<p>Synthetic draft</p>",
+            "sdk_version": 1,
+            "capabilities": [],
+            "collections": {},
+        },
+        headers=_as(ALICE),
+    )
+    await client.put(f"{base}/permissions", json={"user_id": BOB, "level": 1}, headers=_as(ALICE))
+    hidden = await client.get(f"{base}/revisions/{draft.json()['id']}", headers=_as(BOB))
+    assert hidden.status_code == 404 and "Synthetic draft" not in hidden.text
+    published = await client.get(
+        f"{base}/revisions/{thingy['published_revision']}", headers=_as(BOB)
+    )
+    assert published.status_code == 200
+    own = await client.get(f"{base}/revisions/{draft.json()['id']}", headers=_as(ALICE))
+    assert own.json()["html"] == "<p>Synthetic draft</p>"
+
+
+async def test_an_unpublished_thingy_describes_how_to_build_it(client: httpx.AsyncClient) -> None:
+    created = await client.post("/v1/thingies", json={"name": "New"}, headers=_as(ALICE))
+    described = await client.get(
+        f"/v1/thingies/{created.json()['id']}/describe", headers=_as(ALICE)
+    )
+    assert described.status_code == 200, described.text
+    body = described.json()
+    assert body["published_revision"] is None
+    assert body["next_steps"].startswith("Nothing is published yet")
+
+
+async def test_store_conflicts_carry_their_reason_and_busy_ones_are_retryable() -> None:
+    from omnigent.server.thingies import thingy_failure
+    from omnigent.stores.thingy_store import Conflict
+
+    stale = thingy_failure(
+        Conflict("changed", reason="version_mismatch", current_version="v2"), "req-9"
+    )
+    assert stale.status_code == 409
+    assert json.loads(bytes(stale.body))["error"] == {
+        "code": "CONFLICT",
+        "message": "changed",
+        "request_id": "req-9",
+        "details": {"reason": "version_mismatch", "current_version": "v2"},
+    }
+    busy = thingy_failure(Conflict("busy", reason="busy"), "req-10")
+    assert busy.status_code == 503 and busy.headers["retry-after"] == "1"
+    error = json.loads(bytes(busy.body))["error"]
+    assert error["code"] == "UNAVAILABLE"
+    assert error["details"] == {"reason": "busy", "retryable": True}
+
+
+async def test_the_app_has_account_deletion_remove_thingies(
+    stores: SimpleNamespace, tmp_path: Path
+) -> None:
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+    from omnigent.thingies.accounts import DeletedAccountThingies
+
+    accounts = SqlAlchemyAccountStore(stores.db_uri)
+    artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    create_app(
+        agent_store=SqlAlchemyAgentStore(stores.db_uri),
+        file_store=SqlAlchemyFileStore(stores.db_uri),
+        conversation_store=stores.conversations,
+        artifact_store=artifacts,
+        agent_cache=AgentCache(artifact_store=artifacts, cache_dir=tmp_path / "cache"),
+        permission_store=stores.permissions,
+        auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+        account_store=accounts,
+        thingy_store=stores.thingies,
+    )
+    assert isinstance(accounts._thingies, DeletedAccountThingies)

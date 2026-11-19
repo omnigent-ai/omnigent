@@ -2,9 +2,9 @@
 
 The runner has no thingy store, so each tool calls the server's ``/v1/thingies``
 routes as the session's owner, naming the calling session in the orchestration
-header so the server can refuse a write from a shared session. Record tools go
-through the same data bridge the sandboxed frame uses (``POST .../rpc``), against
-the thingy's published revision. Results come back as the routes' JSON.
+header so the server can refuse a call from a shared session. ``sys_thingy_records``
+goes through the same data bridge the sandboxed frame uses (``POST .../rpc``),
+against the thingy's published revision. Results come back as the routes' JSON.
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ from urllib.parse import quote
 import httpx
 
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
-from omnigent.tools.builtins.thingies import THINGY_TOOL_NAMES
+from omnigent.tools.builtins.thingies import THINGY_RECORD_OPS, THINGY_TOOL_NAMES
 
 __all__ = ["THINGY_TOOL_NAMES", "execute_thingy_tool"]
 
@@ -33,13 +33,6 @@ _UNROUTED_NOT_FOUND_BODIES = (
     {"error": {"code": "not_found", "message": "Not found"}},
 )
 _UNSUPPORTED = "this Omnigent server has no thingies"
-_RECORD_METHODS = {
-    "sys_thingy_record_get": "data.v1.get",
-    "sys_thingy_record_list": "data.v1.list",
-    "sys_thingy_record_create": "data.v1.create",
-    "sys_thingy_record_replace": "data.v1.replace",
-    "sys_thingy_record_delete": "data.v1.delete",
-}
 
 
 class _ToolError(Exception):
@@ -128,24 +121,23 @@ class _Server:
 
 
 async def _record(
-    server: _Server, tool_name: str, args: dict[str, Any], thingy_id: str, call_id: str | None
+    server: _Server, args: dict[str, Any], thingy_id: str, call_id: str | None
 ) -> Any:
+    op = args.get("op")
+    if op not in THINGY_RECORD_OPS:
+        raise _ToolError(f"invalid_input: op must be one of {', '.join(THINGY_RECORD_OPS)}")
     params = {
         key: value
         for key, value in args.items()
         if key in {"collection", "id", "value", "if_version", "limit", "cursor"}
     }
-    if tool_name in {
-        "sys_thingy_record_create",
-        "sys_thingy_record_replace",
-        "sys_thingy_record_delete",
-    }:
+    if op in {"create", "replace", "delete"}:
         params["operation_id"] = _operation_id(args, call_id)
     path = f"/{thingy_id}"
     revision = (await server.call("GET", path)).get("published_revision")
     if not isinstance(revision, str):
         raise _ToolError("This thingy has not been published; publish a revision first")
-    request = {"protocol": 1, "method": _RECORD_METHODS[tool_name], "params": params}
+    request = {"protocol": 1, "method": THINGY_RECORD_OPS[op], "params": params}
     for attempt in range(2):
         try:
             answer = await server.call(
@@ -160,7 +152,9 @@ async def _record(
                 revision = details["published_revision"]
                 continue
             raise
-        return answer.get("result") if isinstance(answer, dict) else answer
+        result = answer.get("result") if isinstance(answer, dict) else answer
+        # Always an object, so a missing record reads the same in every harness.
+        return {"record": result} if op == "get" else result
     raise AssertionError("unreachable")
 
 
@@ -227,8 +221,8 @@ async def _run(
     if tool_name == "sys_thingy_publish":
         body = {"revision_id": args.get("revision_id"), "if_version": args.get("if_version")}
         return await server.call("POST", f"{path}/publish", body=body)
-    if tool_name in _RECORD_METHODS:
-        return await _record(server, tool_name, args, thingy_id, call_id)
+    if tool_name == "sys_thingy_records":
+        return await _record(server, args, thingy_id, call_id)
     raise _ToolError(f"unknown thingy tool {tool_name}")
 
 

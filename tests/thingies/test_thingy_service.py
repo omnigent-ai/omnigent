@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -657,7 +658,7 @@ def test_describe_returns_the_guide_and_rules_without_the_source(thingies: Fixtu
     assert described["collections"]["cards"]["required"] == ["title", "column"]
     assert described["thingy"]["browse_url"] == f"/thingy/{app['id']}"
     assert "html" not in described
-    assert "sys_thingy_record_" in described["notes"]
+    assert "thingy skill" in described["next_steps"]
 
 
 # --- Thingy actions and thingy sessions -------------------------------------------------------
@@ -911,6 +912,9 @@ def test_session_links_show_readable_thingies_and_route_actions(thingies: Fixtur
     owner.link_session(first["id"], session, {"linked": True})
     linked = owner.link_session(second["id"], session, {"linked": True})
     assert [item["id"] for item in linked["items"]] == [first["id"], second["id"]]
+    # Showing one again keeps the order.
+    again = owner.link_session(first["id"], session, {"linked": True})
+    assert [item["id"] for item in again["items"]] == [first["id"], second["id"]]
     # The session it is shown in also gets the actions requested from the thingy's page.
     assert owner.get_thingy_session(first["id"])["session_id"] == session
     assert owner.session_thingies("other")["items"] == []
@@ -999,3 +1003,104 @@ def test_shared_lists_only_other_peoples_readable_thingies(thingies: Fixture) ->
     assert items[0]["permissions"]["manage"] is False
     assert unshared["id"] not in {item["id"] for item in items}
     assert owner.shared() == {"items": []}
+
+
+# --- Bug bash regressions ------------------------------------------------------------------------
+
+
+def test_a_pinned_thingy_the_viewer_lost_access_to_leaves_their_shelf(thingies: Fixture) -> None:
+    owner = thingies.service()
+    app = owner.create("Board")
+    thingies.access.share(app, 2, READ)
+    viewer = thingies.service(2)
+    viewer.pin(app["id"], {"pinned": True})
+    kept = viewer.pin(owner.create("Other")["id"], {"pinned": False})
+    assert kept["pinned"] == [{"id": app["id"], "name": "Board"}]
+
+    thingies.access.forget(app["id"])
+    owner.rename(app["id"], {"name": "Synthetic secret plan"})
+    # Neither the thingy nor its new name reaches them.
+    assert viewer.shelf()["pinned"] == []
+    # The next save of their shelf drops the dead pin.
+    mine = viewer.create("Mine")
+    viewer.pin(mine["id"], {"pinned": True})
+    thingies.access.share(app, 2, READ)
+    assert [pin["id"] for pin in viewer.shelf()["pinned"]] == [mine["id"]]
+
+
+def test_only_publishers_read_unpublished_revisions(thingies: Fixture) -> None:
+    owner = thingies.service()
+    app = publish_board(owner)
+    draft = make_revision(owner, app, CARDS)
+    thingies.access.share(app, 2, READ)
+    thingies.access.share(app, 3, EDIT)
+    viewer, editor = thingies.service(2), thingies.service(3)
+
+    assert viewer.get_revision(app["id"])["revision_id"] == app["published_revision"]
+    assert (
+        viewer.get_revision(app["id"], app["published_revision"])["revision_id"]
+        == app["published_revision"]
+    )
+    with pytest.raises(NotFound):
+        viewer.get_revision(app["id"], draft["id"])
+    assert editor.get_revision(app["id"], draft["id"])["revision_id"] == draft["id"]
+
+
+def test_describe_answers_for_an_unpublished_thingy_and_points_to_the_skill(
+    thingies: Fixture,
+) -> None:
+    service = thingies.service()
+    new = service.create("Not built yet")
+    unpublished = service.describe(new["id"])
+    assert unpublished["thingy"]["name"] == "Not built yet"
+    assert unpublished["published_revision"] is None
+    assert unpublished["collections"] == {} and unpublished["actions"] == []
+    assert unpublished["next_steps"].startswith("Nothing is published yet")
+    assert "thingy skill" in unpublished["next_steps"]
+
+    published = service.describe(publish_actions_board(service)["id"])
+    assert "Nothing is published" not in published["next_steps"]
+    assert published["actions"][0]["name"] == "run_card"
+
+
+def test_schema_errors_name_the_keyword_and_the_field(thingies: Fixture) -> None:
+    service = thingies.service()
+    app = service.create("Board")
+    with pytest.raises(InvalidInput) as refused:
+        make_revision(
+            service,
+            app,
+            {
+                "cards": {
+                    "type": "object",
+                    "properties": {"due": {"type": "string", "format": "date"}},
+                }
+            },
+        )
+    message = str(refused.value)
+    assert "Unsupported schema keyword: format." in message
+    assert "minLength" in message and "additionalProperties" in message
+
+    board = publish_board(service)
+    with pytest.raises(InvalidInput) as mismatch:
+        rpc(service, board, "create", value={"title": 7}, operation_id="bad-1")
+    assert "at value.title" in str(mismatch.value)
+    assert mismatch.value.details == {
+        "path": ["title"],
+        "reason": "7 is not of type 'string'",
+        "schema_keyword": "type",
+    }
+
+
+def test_concurrent_writes_to_a_ruled_collection_all_land(thingies: Fixture) -> None:
+    service = thingies.service()
+    app = publish_ruled_board(service, [{**WIP_LIMIT, "max": 100}])
+
+    def create(number: int) -> dict:
+        return card(thingies.service(), app, f"c{number}", "doing")
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        created = list(pool.map(create, range(12)))
+    assert sorted(item["id"] for item in created) == sorted(f"c{n}" for n in range(12))
+    listed = rpc(service, app, "list", limit=100)["items"]
+    assert len(listed) == 12

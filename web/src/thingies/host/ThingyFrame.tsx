@@ -32,6 +32,8 @@ import {
   thingySessionUrl,
 } from "./thingyPages";
 import { createPreviewRpc } from "./previewRpc";
+import type { ThingyGestureGate } from "./thingyGestureGate";
+import { createThingyGestureGate } from "./thingyGestureGate";
 import {
   quoteInThingySession,
   requestThingyAction,
@@ -83,13 +85,16 @@ const LEADING_DOCTYPE = /^\s*<!doctype[^>]*>/i;
 /**
  * The frame's document: the CSP meta tag and the SDK bootstrap ahead of the thingy's HTML, after
  * its doctype so the page keeps standards mode. A policy applies only to content after it, so
- * both come first.
+ * both come first. DNS prefetching is off too, since CSP does not cover it.
+ *
+ * Known limit: CSP cannot stop the frame from navigating itself, which sends one request. The
+ * host notices the new document, closes its port and stops the frame after a few loads.
  */
 export function buildThingyFrameDocument(html: string, bootstrapScript: string): string {
   const doctype = LEADING_DOCTYPE.exec(html)?.[0].trim() ?? "<!DOCTYPE html>";
   const body = html.replace(LEADING_DOCTYPE, "");
   const policy = THINGY_CONTENT_SECURITY_POLICY.replace(/"/g, "&quot;");
-  return `${doctype}<meta http-equiv="Content-Security-Policy" content="${policy}"><script>${bootstrapScript}</script>\n${body}`;
+  return `${doctype}<meta http-equiv="Content-Security-Policy" content="${policy}"><meta http-equiv="x-dns-prefetch-control" content="off"><script>${bootstrapScript}</script>\n${body}`;
 }
 
 const KNOWN_CAPABILITIES: ReadonlySet<string> = new Set<ThingyCapability>([
@@ -124,10 +129,25 @@ function isHelloFor(data: unknown, frameId: string, nonce: string): boolean {
   );
 }
 
-/** Whether the viewer just clicked inside the page; browsers without the API rely on pop-up blocking. */
-function hasUserActivation(): boolean {
-  const activation = (navigator as { userActivation?: { isActive: boolean } }).userActivation;
-  return !activation || activation.isActive;
+// The selection popup's buttons sit centered above the point; keep them over the frame.
+const POPUP_HALF_WIDTH = 160;
+const POPUP_HEIGHT = 40;
+
+/** Where the selection popup goes: above the selection, kept within the frame's area. */
+export function selectionPopupPosition(
+  area: { left: number; top: number; right: number; bottom: number },
+  rect: ThingySelection["rect"],
+): { x: number; y: number } {
+  const clamp = (value: number, min: number, max: number) =>
+    min > max ? (min + max) / 2 : Math.min(Math.max(value, min), max);
+  return {
+    x: clamp(
+      area.left + rect.x + rect.width / 2,
+      area.left + POPUP_HALF_WIDTH,
+      area.right - POPUP_HALF_WIDTH,
+    ),
+    y: clamp(area.top + rect.y, area.top + POPUP_HEIGHT, area.bottom),
+  };
 }
 
 export interface ThingyFrameProps {
@@ -220,55 +240,75 @@ export function ThingyFrame({
     [],
   );
 
+  // Actions and navigation need a gesture inside the thingy (see `thingyGestureGate`).
+  const frameHostRef = useRef<HTMLDivElement>(null);
+  const gateRef = useRef<ThingyGestureGate | null>(null);
+  useEffect(() => {
+    const frameHost = frameHostRef.current;
+    if (!frameHost) {
+      return undefined;
+    }
+    const gate = createThingyGestureGate({ frameHost });
+    gateRef.current = gate;
+    return () => {
+      gate.dispose();
+      gateRef.current = null;
+    };
+  }, []);
+  const claimGesture = useCallback(() => gateRef.current?.claim() ?? false, []);
+
   const navigate = useNavigate();
   const rebasePath = useRebasePath();
   const navigationRef = useRef({ navigate, rebasePath });
   navigationRef.current = { navigate, rebasePath };
   const goTo = useCallback((path: string) => navigationRef.current.navigate(path), []);
 
-  const openPage = useCallback((request: ThingyPageRequest) => {
-    // Without a click inside the thingy, the frame cannot open or replace pages.
-    if (!hasUserActivation()) {
-      return false;
-    }
-    const current = { id: latestRef.current.app.id, name: latestRef.current.app.name };
-    let path: string;
-    switch (request.kind) {
-      case "newSession": {
-        const prompt = request.prompt ? composeThingyContextPrompt(request.prompt, current) : "";
-        path =
-          request.display === "panel"
-            ? thingyBoardNewSessionUrl(current.id, prompt)
-            : thingyNewSessionUrl(prompt);
-        break;
+  const openPage = useCallback(
+    (request: ThingyPageRequest) => {
+      // Without a click inside the thingy, the frame cannot open or replace pages.
+      if (!claimGesture()) {
+        return false;
       }
-      case "newAutomation":
-        path = thingyNewAutomationUrl({
-          name: request.name,
-          prompt: composeThingyContextPrompt(request.prompt, current),
-          schedule: request.schedule,
-        });
-        break;
-      case "openSession":
-        path = thingySessionUrl(request.sessionId);
-        if (request.display === "panel") {
-          // The session opens with this thingy in its side panel.
-          requestThingyRailTab(request.sessionId, thingyRailKey(current.id));
+      const current = { id: latestRef.current.app.id, name: latestRef.current.app.name };
+      let path: string;
+      switch (request.kind) {
+        case "newSession": {
+          const prompt = request.prompt ? composeThingyContextPrompt(request.prompt, current) : "";
+          path =
+            request.display === "panel"
+              ? thingyBoardNewSessionUrl(current.id, prompt)
+              : thingyNewSessionUrl(prompt);
+          break;
         }
-        break;
-    }
-    if (request.display === "tab") {
-      const url = new URL(navigationRef.current.rebasePath(path), window.location.origin);
-      window.open(url.href, "_blank", "noopener,noreferrer");
-    } else {
-      navigationRef.current.navigate(path);
-    }
-    return true;
-  }, []);
+        case "newAutomation":
+          path = thingyNewAutomationUrl({
+            name: request.name,
+            prompt: composeThingyContextPrompt(request.prompt, current),
+            schedule: request.schedule,
+          });
+          break;
+        case "openSession":
+          path = thingySessionUrl(request.sessionId);
+          if (request.display === "panel") {
+            // The session opens with this thingy in its side panel.
+            requestThingyRailTab(request.sessionId, thingyRailKey(current.id));
+          }
+          break;
+      }
+      if (request.display === "tab") {
+        const url = new URL(navigationRef.current.rebasePath(path), window.location.origin);
+        window.open(url.href, "_blank", "noopener,noreferrer");
+      } else {
+        navigationRef.current.navigate(path);
+      }
+      return true;
+    },
+    [claimGesture],
+  );
 
   const requestAction = useCallback(
     async (request: ThingyActionRequest) => {
-      if (!hasUserActivation()) {
+      if (!claimGesture()) {
         throw new BridgeError(
           "PERMISSION_DENIED",
           "Omnigent runs an action only right after a click in the thingy.",
@@ -276,11 +316,17 @@ export function ThingyFrame({
       }
       return requestThingyAction(latestRef.current.app, request, goTo, latestRef.current.sessionId);
     },
-    [goTo],
+    [claimGesture, goTo],
   );
 
   const [selection, setSelection] = useState<ThingySelection | null>(null);
-  const frameAreaRef = useRef<HTMLDivElement>(null);
+  // Only a selection made in the thingy (focus is in it) gets the popup, so the frame cannot show
+  // it over Omnigent while the viewer works elsewhere.
+  const showSelection = useCallback((next: ThingySelection | null) => {
+    if (next === null || gateRef.current?.frameFocused()) {
+      setSelection(next);
+    }
+  }, []);
   // A click anywhere in the page, including the popup's own buttons after they act, ends it.
   useEffect(() => {
     if (selection === null) {
@@ -311,14 +357,11 @@ export function ThingyFrame({
     [goTo, selection],
   );
   const popupPosition = useMemo(() => {
-    const area = frameAreaRef.current?.getBoundingClientRect();
+    const area = frameHostRef.current?.getBoundingClientRect();
     if (selection === null || !area) {
       return null;
     }
-    return {
-      x: area.left + selection.rect.x + selection.rect.width / 2,
-      y: area.top + selection.rect.y,
-    };
+    return selectionPopupPosition(area, selection.rect);
   }, [selection]);
 
   const actionProgress = useCallback(async (actionIds: string[], signal: AbortSignal) => {
@@ -364,16 +407,19 @@ export function ThingyFrame({
         app: { id: latest.app.id, name: latest.app.name },
         revisionId: latest.content.revision_id,
         // Prefer the stable principal ID; fall back to the viewer's name for servers without it.
-        viewer: {
-          id: latest.app.viewer_principal_id ?? latest.app.viewer_id,
-          displayName: latest.app.viewer_id,
-        },
+        viewer: preview
+          ? { id: "preview", displayName: "Preview" }
+          : {
+              id: latest.app.viewer_principal_id ?? latest.app.viewer_id,
+              displayName: latest.app.viewer_id,
+            },
         capabilities: grantedCapabilities(latest.content),
         permissions: {
           writeData: latest.app.permissions.write_data,
           publish: latest.app.permissions.publish,
         },
         colorScheme: latest.colorScheme === "dark" ? "dark" : "light",
+        ...(preview ? { preview: true } : {}),
       };
       const channel = new MessageChannel();
       bridgeRef.current = startThingyBridge({
@@ -398,7 +444,7 @@ export function ThingyFrame({
         requestAction: preview ? undefined : requestAction,
         // A preview has no actions to follow.
         actionProgress: preview ? async () => [] : actionProgress,
-        onSelection: preview ? undefined : setSelection,
+        onSelection: preview ? undefined : showSelection,
         listSessions: preview ? undefined : listSessions,
         onRevisionChanged: () => latestRef.current.onRevisionChanged(),
         onClosed: (reason) => {
@@ -423,6 +469,7 @@ export function ThingyFrame({
       preview,
       previewRpc,
       requestAction,
+      showSelection,
     ],
   );
 
@@ -504,7 +551,7 @@ export function ThingyFrame({
 
   const title = `Thingy: ${app.name}`;
   return (
-    <div ref={frameAreaRef} className="relative flex min-h-[480px] flex-1 flex-col">
+    <div className="relative flex min-h-[480px] flex-1 flex-col">
       {popupPosition && (
         <SelectionPopupActions
           position={popupPosition}
@@ -523,36 +570,39 @@ export function ThingyFrame({
           </AlertDescription>
         </Alert>
       )}
-      {closedReason !== "navigated" &&
-        (HostFrame ? (
-          <HostFrame
-            key={mount.nonce}
-            htmlContent={htmlContent}
-            contentSecurityPolicy={THINGY_CONTENT_SECURITY_POLICY}
-            title={title}
-            onMessage={handleFrameMessage}
-            onLoad={handleFrameLoad}
-          />
-        ) : (
-          <iframe
-            key={mount.nonce}
-            ref={iframeRef}
-            id={mount.frameId}
-            title={title}
-            sandbox={THINGY_FRAME_SANDBOX}
-            allow=""
-            referrerPolicy="no-referrer"
-            srcDoc={htmlContent}
-            onLoad={(event) => {
-              const frameWindow = event.currentTarget.contentWindow;
-              if (frameWindow) {
-                handleFrameLoad(frameWindow);
-              }
-            }}
-            // The thingy themes itself from `client.ui.colorScheme`.
-            className="min-h-0 w-full flex-1 border-0 bg-background"
-          />
-        ))}
+      {/* Focus moves here after an action or navigation, so the next one needs a new click. */}
+      <div ref={frameHostRef} tabIndex={-1} className="flex min-h-0 flex-1 flex-col outline-none">
+        {closedReason !== "navigated" &&
+          (HostFrame ? (
+            <HostFrame
+              key={mount.nonce}
+              htmlContent={htmlContent}
+              contentSecurityPolicy={THINGY_CONTENT_SECURITY_POLICY}
+              title={title}
+              onMessage={handleFrameMessage}
+              onLoad={handleFrameLoad}
+            />
+          ) : (
+            <iframe
+              key={mount.nonce}
+              ref={iframeRef}
+              id={mount.frameId}
+              title={title}
+              sandbox={THINGY_FRAME_SANDBOX}
+              allow=""
+              referrerPolicy="no-referrer"
+              srcDoc={htmlContent}
+              onLoad={(event) => {
+                const frameWindow = event.currentTarget.contentWindow;
+                if (frameWindow) {
+                  handleFrameLoad(frameWindow);
+                }
+              }}
+              // The thingy themes itself from `client.ui.colorScheme`.
+              className="min-h-0 w-full flex-1 border-0 bg-background"
+            />
+          ))}
+      </div>
       <Dialog
         open={confirmation !== null}
         onOpenChange={(open) => !open && settleConfirmation(false)}

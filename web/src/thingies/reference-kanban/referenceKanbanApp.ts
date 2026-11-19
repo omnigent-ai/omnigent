@@ -220,6 +220,8 @@ const SCRIPT = `
   var tempSeq = 0;
   var columnSeq = 0;
   var anyChange = false;
+  var preview = false;
+  var previewSeeded = false;
   var editing = {};
   var columnNodes = {};
   var cardNodes = {};
@@ -634,8 +636,10 @@ const SCRIPT = `
     // The thingy header's session toggle opens the session doing the work, so cards offer no Open session.
     var actions = [];
     if (interactive && canRunSessions()) {
-      var busy = Boolean(pending && !pending.error) || isOpenAction(action);
-      actions.push(el('button', { type: 'button', text: busy ? 'Running…' : run || pending || action ? 'Run again in a session' : 'Run in a session', disabled: busy, 'data-focus-key': 'run:' + item.id, on: { click: function () { runInSession(item.id); } } }));
+      // A run that never reached a session (its New session was left) can be sent again.
+      var undelivered = pending ? pending.delivery === 'starting' : Boolean(action) && action.status === 'pending';
+      var busy = !undelivered && (Boolean(pending && !pending.error) || isOpenAction(action));
+      actions.push(el('button', { type: 'button', text: busy ? 'Running…' : undelivered ? 'Open New session again' : run || pending || action ? 'Run again in a session' : 'Run in a session', disabled: busy, 'data-focus-key': 'run:' + item.id, on: { click: function () { runInSession(item.id); } } }));
     }
     if (actions.length) children.push(el('div', { class: 'run-actions' }, actions));
     return children.length ? el('div', { class: 'run', 'aria-live': 'polite' }, children) : null;
@@ -739,8 +743,10 @@ const SCRIPT = `
 
   // ---- Saving
 
+  // base is the server copy the local edits started from, so a rebase can tell which fields
+  // this tab changed.
   function newRec(id, value, version) {
-    return { id: id, value: value, version: version, superseded: [], status: 'saved', temp: false, createdHere: false, deleted: false, discarded: false, inFlight: false, dirty: false, label: '', message: '', errorKind: null, lastRequest: null, retryKey: null, savedAt: 0 };
+    return { id: id, value: value, base: clone(value), version: version, superseded: [], status: 'saved', temp: false, createdHere: false, deleted: false, discarded: false, inFlight: false, dirty: false, label: '', message: '', errorKind: null, lastRequest: null, retryKey: null, savedAt: 0 };
   }
 
   function ensureRec(id) {
@@ -818,6 +824,7 @@ const SCRIPT = `
     } else if (rec.version) {
       rec.superseded.push(rec.version);
     }
+    if (request.value) rec.base = clone(request.value);
     rec.version = result.version;
     if (rec.dirty) {
       pump(rec);
@@ -883,6 +890,26 @@ const SCRIPT = `
     scheduleRender();
   }
 
+  // The newest server copy with only the fields this tab changed (local against its base)
+  // applied, so someone else's edits to other fields survive.
+  // A missing field and an empty one are the same to the editor (legacy cards have no notes).
+  function sameField(a, b) {
+    function norm(value) { return value === undefined || value === '' || (Array.isArray(value) && !value.length) ? null : value; }
+    return JSON.stringify(norm(a)) === JSON.stringify(norm(b));
+  }
+
+  function rebase(rec, latest) {
+    var merged = clone(latest);
+    var keys = Object.keys(rec.base || {}).concat(Object.keys(rec.value));
+    keys.forEach(function (key) {
+      var mine = rec.value[key];
+      if (sameField(mine, (rec.base || {})[key])) return;
+      if (mine === undefined) delete merged[key];
+      else merged[key] = clone(mine);
+    });
+    return merged;
+  }
+
   // Rebases the local change on the newest server copy and saves it again.
   function keepMine(id) {
     var rec = local[id];
@@ -899,6 +926,8 @@ const SCRIPT = `
         failed(rec, { kind: rec.deleted ? 'delete' : 'replace' }, { name: 'OmnigentError', code: 'NOT_FOUND' });
         return;
       }
+      if (!rec.deleted) rec.value = rebase(rec, doc.value);
+      rec.base = clone(doc.value);
       rec.version = doc.version;
       rec.dirty = true;
       pump(rec);
@@ -1075,7 +1104,7 @@ const SCRIPT = `
 
   function renderStatus() {
     var status = document.getElementById('status');
-    var labels = { loading: 'Loading', live: 'Live', reconnecting: 'Reconnecting', stale: 'Out of date' };
+    var labels = { loading: 'Loading', live: preview ? 'Preview' : 'Live', reconnecting: 'Reconnecting', stale: 'Out of date' };
     status.textContent = labels[watchStatus] || watchStatus;
     status.setAttribute('data-status', watchStatus);
     var saving = 0;
@@ -1088,6 +1117,10 @@ const SCRIPT = `
     if (failedCount) {
       sync.setAttribute('data-state', 'error');
       sync.replaceChildren(document.createTextNode(failedCount + (failedCount === 1 ? ' change' : ' changes') + ' not saved'));
+    } else if (preview) {
+      // Nothing in a preview is saved, so it shows no saving state.
+      sync.setAttribute('data-state', 'idle');
+      sync.replaceChildren();
     } else if (saving) {
       sync.setAttribute('data-state', 'saving');
       sync.replaceChildren(el('span', { class: 'spinner', 'aria-hidden': 'true' }), document.createTextNode('Saving ' + saving + (saving === 1 ? ' change…' : ' changes…')));
@@ -1622,6 +1655,11 @@ const SCRIPT = `
     }
     if (snapshot.status !== 'loading') {
       serverDocs = snapshot.items.filter(isCard);
+      // A template preview starts with its sample cards in memory, so it shows what the board does.
+      if (preview && !previewSeeded && snapshot.status === 'live' && serverDocs.length === 0) {
+        previewSeeded = true;
+        addSamples();
+      }
       document.getElementById('truncated').textContent = snapshot.nextCursor ? 'Showing the first ' + snapshot.items.length + ' cards.' : '';
       reconcile();
     }
@@ -1632,7 +1670,8 @@ const SCRIPT = `
     function (connected) {
       client = connected;
       document.body.setAttribute('data-theme', client.ui.colorScheme);
-      document.getElementById('viewer').textContent = 'Signed in as ' + client.context.viewer.displayName;
+      preview = client.context.preview === true;
+      document.getElementById('viewer').textContent = preview ? 'Preview with sample cards' : 'Signed in as ' + client.context.viewer.displayName;
       canWrite = client.hasCapability('data.write') && client.context.permissions.writeData;
       canEdit = canWrite && client.context.permissions.publish === true;
       document.getElementById('hint').hidden = !canWrite;

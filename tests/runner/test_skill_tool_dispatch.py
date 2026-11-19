@@ -79,6 +79,29 @@ async def test_framework_skills_load_only_when_server_and_tool_group_enable_them
                 assert "not found" in result
 
 
+@pytest.mark.parametrize("workflows_enabled", [False, True])
+@pytest.mark.parametrize("thingies", [False, True])
+def test_the_thingy_skill_loads_exactly_when_the_thingy_tools_are_offered(
+    tmp_path: Path, isolated_home: Path, workflows_enabled: bool, thingies: bool
+) -> None:
+    from omnigent.automations_availability import without_thingy_tools
+
+    spec = AgentSpec(spec_version=1, skills_filter="none")
+    if not thingies:
+        spec = without_thingy_tools(spec)
+    loaded = _execute_skill_tool(
+        "load_skill",
+        {"name": "thingy"},
+        agent_spec=spec,
+        runner_workspace=tmp_path,
+        workflows_enabled=workflows_enabled,
+    )
+    if thingies:
+        assert "# Thingies" in loaded and "client.agent.watch" in loaded
+    else:
+        assert "not found" in loaded
+
+
 @pytest.mark.parametrize("name", ["example", "workflow"])
 def test_read_skill_file_resolves_host_scope_skill(
     tmp_path: Path,

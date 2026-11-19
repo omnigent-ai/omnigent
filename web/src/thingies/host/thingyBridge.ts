@@ -497,6 +497,8 @@ export function toSdkResult(method: ThingyMethod, result: unknown): unknown {
   }
 }
 
+const REQUEST_ID = /^[A-Za-z0-9_.:-]{1,128}$/;
+
 const STATUS_CODES: Record<number, ThingyErrorCode> = {
   400: "INVALID_ARGUMENT",
   401: "UNAUTHENTICATED",
@@ -542,10 +544,13 @@ export function toWireError(error: unknown): ThingyWireError {
     } else {
       code = STATUS_CODES[error.status] ?? (error.status >= 500 ? "UNAVAILABLE" : "INTERNAL");
     }
-    const suffix = error.requestId ? ` (request ${error.requestId})` : "";
+    // The request ID is for support and logs, so it travels beside the message, not in it.
     return {
       code,
-      message: `${error.message}${suffix}`.slice(0, MAX_ERROR_MESSAGE_LENGTH),
+      message: error.message.slice(0, MAX_ERROR_MESSAGE_LENGTH),
+      ...(error.requestId && REQUEST_ID.test(error.requestId)
+        ? { requestId: error.requestId }
+        : {}),
     };
   }
   if (error instanceof TypeError) {

@@ -4,8 +4,8 @@ Every route answers 404 before reading its body unless the server enables the
 ``thingies`` release feature and has a thingy store. Each request builds a
 :class:`~omnigent.thingies.service.ThingyService` for the caller, who in
 single-user mode is the local user. Agents reach these routes through the
-runner's ``sys_thingy_*`` tools as the session's owner; an agent's write from a
-session shared with edit access is refused, as for workflow saves.
+runner's ``sys_thingy_*`` tools as the session's owner; an agent's call, read or
+write, from a session shared with edit access is refused, as for memory.
 
 Errors use the thingy error shape the web app and the sandboxed frame read:
 ``{"error": {"code", "message", "request_id", "details"?}}`` with codes such as
@@ -24,7 +24,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.routing import APIRoute
 from starlette.responses import JSONResponse, Response
 
-from omnigent.errors import OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags
 from omnigent.server.permissions import check_session_access
@@ -55,6 +55,16 @@ MAX_RPC_BYTES = 64 * 1024
 # ``GET /thingies/{id}/revisions/published``: revision IDs are hex, so this never names one.
 PUBLISHED_REVISION = "published"
 _NO_STORE = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
+# The thingy codes for the server's general error codes, so every /v1/thingies route,
+# sharing included, answers in one vocabulary.
+_OMNIGENT_CODES = {
+    ErrorCode.FORBIDDEN: "PERMISSION_DENIED",
+    ErrorCode.INVALID_INPUT: "INVALID_ARGUMENT",
+    ErrorCode.UNAUTHORIZED: "UNAUTHENTICATED",
+    ErrorCode.NOT_FOUND: "NOT_FOUND",
+    ErrorCode.CONFLICT: "CONFLICT",
+    ErrorCode.ALREADY_EXISTS: "CONFLICT",
+}
 _THINGY_ERRORS = (
     ThingyError,
     NotFound,
@@ -71,16 +81,46 @@ def thingies_enabled(state: Any) -> bool:
     return getattr(state, "feature_flags", FeatureFlags()).enabled(Feature.THINGIES)
 
 
+def _validation_message(error: RequestValidationError) -> tuple[str, dict]:
+    """A readable message for a request body that fails its schema, and the details."""
+    problems = []
+    for item in error.errors():
+        where = ".".join(str(part) for part in item.get("loc", ()) if part != "body")
+        problems.append({"field": where or None, "message": str(item.get("msg", "Invalid"))})
+    if not problems:
+        return "The request body is invalid", {}
+    first = problems[0]
+    message = f"{first['field']}: {first['message']}" if first["field"] else first["message"]
+    return f"Invalid request: {message}", {"errors": problems}
+
+
 def thingy_failure(error: Exception, request_id: str | None = None) -> JSONResponse:
     """The thingy error response for *error*."""
+    details = getattr(error, "details", None)
+    details = dict(details) if isinstance(details, dict) else None
+    headers = dict(_NO_STORE)
     if isinstance(error, ThingyError):
         code, message, status = error.code, str(error), error.status
+    elif isinstance(error, OmnigentError):
+        code = _OMNIGENT_CODES.get(str(error.code), str(error.code).upper())
+        message, status = error.message, error.http_status
     elif isinstance(error, ConstraintViolation):
         code, message, status = "CONSTRAINT_VIOLATION", str(error), 409
     elif isinstance(error, NotFound):
         code, message, status = "NOT_FOUND", str(error), 404
+    elif isinstance(error, Conflict) and error.reason == "busy":
+        # Other writers held the thingy's rule guard; the write changed nothing and is safe
+        # to retry with the same operation ID.
+        code, message, status = "UNAVAILABLE", str(error), 503
+        details = {**(details or {}), "reason": "busy", "retryable": True}
+        headers["Retry-After"] = "1"
     elif isinstance(error, Conflict):
         code, message, status = "CONFLICT", str(error), 409
+        details = details or {"reason": error.reason, "current_version": error.current_version}
+    elif isinstance(error, RequestValidationError):
+        message, validation = _validation_message(error)
+        code, status = "INVALID_ARGUMENT", 400
+        details = {**(details or {}), **validation} or None
     elif isinstance(error, InvalidInput):
         code, message, status = "INVALID_ARGUMENT", str(error), 400
     elif isinstance(error, CapacityExceeded):
@@ -92,12 +132,11 @@ def thingy_failure(error: Exception, request_id: str | None = None) -> JSONRespo
             409,
         )
     else:
-        code, message, status = "INVALID_ARGUMENT", "Invalid request", 400
+        code, message, status = "INVALID_ARGUMENT", "The request is invalid", 400
     payload: dict[str, Any] = {"code": code, "message": message, "request_id": request_id}
-    details = getattr(error, "details", None)
-    if isinstance(details, dict):
+    if details:
         payload["details"] = details
-    return JSONResponse({"error": payload}, status_code=status, headers=_NO_STORE)
+    return JSONResponse({"error": payload}, status_code=status, headers=headers)
 
 
 async def _body(request: Request, limit: int = MAX_HTTP_BODY_BYTES) -> dict:
@@ -132,10 +171,17 @@ class _ThingyRoute(APIRoute):
                 response = await original(request)
             except _THINGY_ERRORS as exc:
                 return thingy_failure(exc, getattr(request.state, "thingy_request_id", None))
+            except OmnigentError as exc:
+                if exc.http_status >= 500:
+                    raise  # The server's own handler logs those.
+                return thingy_failure(exc, getattr(request.state, "thingy_request_id", None))
             except HTTPException as exc:
+                detail = exc.detail if isinstance(exc.detail, str) and exc.detail else None
                 return thingy_failure(
                     ThingyError(
-                        "INVALID_ARGUMENT", "Invalid request content or origin", exc.status_code
+                        "PERMISSION_DENIED" if exc.status_code == 403 else "INVALID_ARGUMENT",
+                        detail or "Invalid request content or origin",
+                        exc.status_code,
                     )
                 )
             response.headers.update(_NO_STORE)
@@ -159,7 +205,7 @@ def create_thingies_router(
     :param conversation_store: Reads the sessions doing a thingy's actions.
     :param auth_provider: Identifies the caller; ``None`` in single-user mode.
     :param permission_store: Checks which sessions the caller may read, refuses an
-        agent's write from a shared session, and names grantees; ``None`` skips those.
+        agent's call from a shared session, and names grantees; ``None`` skips those.
     """
     router = APIRouter(route_class=_ThingyRoute)
 
@@ -190,19 +236,19 @@ def create_thingies_router(
             return {user_id: user_id for user_id in user_ids}
         return display_names_or_ids(permission_store, user_ids)
 
-    async def run(
-        request: Request, operation: Callable[[ThingyService], Any], *, write: bool = False
-    ) -> Any:
+    async def run(request: Request, operation: Callable[[ThingyService], Any]) -> Any:
         viewer = _viewer(request)
 
         def call() -> Any:
-            if write:
-                require_named_source_private(
-                    request,
-                    None if auth_provider is None else viewer.user_id,
-                    conversation_store,
-                    permission_store,
-                )
+            # An agent's call, read or write, must come from the caller's own private
+            # session: a collaborator on a shared session must not read the owner's
+            # thingies through the owner's agent, as with memory.
+            require_named_source_private(
+                request,
+                None if auth_provider is None else viewer.user_id,
+                conversation_store,
+                permission_store,
+            )
             service = ThingyService(
                 thingy_store,
                 thingy_access,
@@ -226,7 +272,7 @@ def create_thingies_router(
     async def create_thingy(request: Request) -> Response:
         """Create a private thingy from ``{"name"}``; answers the thingy with 201."""
         body = await _body(request)
-        result = await run(request, lambda service: service.create(body.get("name")), write=True)
+        result = await run(request, lambda service: service.create(body.get("name")))
         return _json(result, 201)
 
     # Before ``/thingies/{app_id}``, which would otherwise match these.
@@ -269,13 +315,13 @@ def create_thingies_router(
     async def rename_thingy(app_id: str, request: Request) -> Response:
         """Rename a thingy for everyone with ``{"name"}``; needs publish permission."""
         body = await _body(request)
-        return _json(await run(request, lambda service: service.rename(app_id, body), write=True))
+        return _json(await run(request, lambda service: service.rename(app_id, body)))
 
     @router.delete("/thingies/{app_id}")
     async def delete_thingy(app_id: str, request: Request) -> Response:
         """Delete a thingy for everyone; needs manage permission."""
         require_trusted_origin(request)
-        return _json(await run(request, lambda service: service.delete(app_id), write=True))
+        return _json(await run(request, lambda service: service.delete(app_id)))
 
     @router.get("/thingies/{app_id}/session/status")
     async def thingy_session_status(app_id: str, request: Request) -> Response:
@@ -286,9 +332,7 @@ def create_thingies_router(
     async def create_revision(app_id: str, request: Request) -> Response:
         """Upload an immutable revision; answers ``{"id"}`` with 201."""
         body = await _body(request)
-        result = await run(
-            request, lambda service: service.create_revision(app_id, body), write=True
-        )
+        result = await run(request, lambda service: service.create_revision(app_id, body))
         return _json(result, 201)
 
     @router.get("/thingies/{app_id}/revisions/{revision_id}")
@@ -307,7 +351,7 @@ def create_thingies_router(
     async def publish(app_id: str, request: Request) -> Response:
         """Publish ``{"revision_id", "if_version"}``; answers the thingy."""
         body = await _body(request)
-        return _json(await run(request, lambda service: service.publish(app_id, body), write=True))
+        return _json(await run(request, lambda service: service.publish(app_id, body)))
 
     @router.get("/thingies/{app_id}/comments")
     async def list_comments(app_id: str, request: Request) -> Response:
@@ -319,9 +363,7 @@ def create_thingies_router(
     async def create_comment(app_id: str, request: Request) -> Response:
         """Add ``{"body", "anchor", "operation_id"}``; answers the comment with 201."""
         body = await _body(request)
-        result = await run(
-            request, lambda service: service.create_comment(app_id, body), write=True
-        )
+        result = await run(request, lambda service: service.create_comment(app_id, body))
         return _json(result, 201)
 
     @router.patch("/thingies/{app_id}/comments/{comment_id}")
@@ -329,11 +371,7 @@ def create_thingies_router(
         """Change a comment's ``body`` (its author) or ``status``."""
         body = await _body(request)
         return _json(
-            await run(
-                request,
-                lambda service: service.update_comment(app_id, comment_id, body),
-                write=True,
-            )
+            await run(request, lambda service: service.update_comment(app_id, comment_id, body))
         )
 
     @router.delete("/thingies/{app_id}/comments/{comment_id}")
@@ -341,9 +379,7 @@ def create_thingies_router(
         """Delete a comment: its author, or someone who manages the thingy."""
         require_trusted_origin(request)
         return _json(
-            await run(
-                request, lambda service: service.delete_comment(app_id, comment_id), write=True
-            )
+            await run(request, lambda service: service.delete_comment(app_id, comment_id))
         )
 
     @router.get("/thingies/{app_id}/session")
@@ -390,9 +426,7 @@ def create_thingies_router(
         body = await _body(request, MAX_RPC_BYTES)
         return _json(
             await run(
-                request,
-                lambda service: service.update_action(app_id, {**body, "id": action_id}),
-                write=True,
+                request, lambda service: service.update_action(app_id, {**body, "id": action_id})
             )
         )
 
@@ -425,9 +459,7 @@ def create_thingies_router(
             raise InvalidInput("RPC method must be a string")
         params = body.get("params", {})
         result = await run(
-            request,
-            lambda service: service.rpc(app_id, body.get("revision_id"), method, params),
-            write=method not in {"data.v1.get", "data.v1.list"},
+            request, lambda service: service.rpc(app_id, body.get("revision_id"), method, params)
         )
         encoded = canonical_bytes({"result": result})
         if len(encoded) > MAX_RPC_BYTES:

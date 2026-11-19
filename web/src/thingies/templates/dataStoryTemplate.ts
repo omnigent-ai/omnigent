@@ -188,6 +188,8 @@ const SCRIPT = `
   var canWrite = false;
   var canRefresh = false;
   var seeded = false;
+  var seeding = false;
+  var preview = false;
   var doc = null;
   var data = null;
   var refreshAction = null;
@@ -334,7 +336,9 @@ const SCRIPT = `
     box.replaceChildren();
     if (pending && Date.now() - pending.at > PENDING_MS) pending = null;
     button.hidden = !canRefresh;
-    button.disabled = !canRefresh || Boolean(pending) || refreshOpen();
+    // A refresh that never reached a session (its New session was left) can be sent again.
+    var undelivered = (pending && pending.starting) || (!pending && refreshAction && refreshAction.status === 'pending');
+    button.disabled = !canRefresh || ((Boolean(pending) || refreshOpen()) && !undelivered);
     var open = Boolean(pending) || refreshOpen();
     if (open) box.appendChild(el('span', { class: 'spinner', 'aria-hidden': 'true' }));
     if (pending) {
@@ -355,8 +359,9 @@ const SCRIPT = `
     pending = { at: Date.now(), text: 'Sending to your thingy session' + String.fromCharCode(8230) };
     renderRefresh();
     client.agent.request('refresh', {}).then(function (receipt) {
-      var text = receipt && receipt.delivery === 'starting' ? 'Start your thingy session below this page to refresh.' : 'Sent to your thingy session.';
-      pending = { at: Date.now(), text: text };
+      var starting = Boolean(receipt && receipt.delivery === 'starting');
+      var text = starting ? 'Start your thingy session below this page to refresh.' : 'Sent to your thingy session.';
+      pending = { at: Date.now(), text: text, starting: starting };
       if (actionWatch) actionWatch.refresh();
       renderRefresh();
     }, function (error) {
@@ -723,13 +728,29 @@ const SCRIPT = `
       if (item && item.value && typeof item.value.capturedAt === 'string' && Array.isArray(item.value.series) && (!best || item.value.capturedAt > best.value.capturedAt)) best = item;
     });
     if (!best) {
-      $('loading').hidden = true;
-      $('empty').hidden = false;
       if (snapshot.status === 'live' && canWrite && !seeded) {
         seeded = true;
-        snapshots.create(sampleSnapshot(), { id: 'sample-synthetic', idempotencyKey: 'seed-sample-synthetic' }).then(null, function (error) {
+        seeding = true;
+        var sample = sampleSnapshot();
+        // Show the sample as soon as it is saved, not at the next poll.
+        snapshots.create(sample, { id: 'sample-synthetic', idempotencyKey: 'seed-sample-synthetic' }).then(function (created) {
+          seeding = false;
+          if (!doc && created && typeof created.id === 'string') {
+            onSnapshots({ status: 'live', items: [{ id: created.id, version: created.version, value: created.value || sample }] });
+          }
+        }, function (error) {
+          seeding = false;
+          if (!doc) {
+            $('loading').hidden = true;
+            $('empty').hidden = false;
+          }
           if (!error || error.code !== 'CONFLICT') notice('Could not add the sample data: ' + (error && error.message ? error.message : String(error)), 'error');
         });
+      }
+      // While the sample is being added, the loading state stays instead of a brief empty one.
+      if (!seeding) {
+        $('loading').hidden = true;
+        $('empty').hidden = false;
       }
       return;
     }
@@ -761,7 +782,10 @@ const SCRIPT = `
     document.body.setAttribute('data-theme', client.ui.colorScheme);
     canWrite = client.hasCapability('data.write') && client.context.permissions.writeData;
     canRefresh = canWrite && client.context.permissions.publish === true && Boolean(client.agent);
-    if (!canWrite) notice('You can read this story. Ask the thingy owner for edit access to refresh it.');
+    preview = client.context.preview === true;
+    // A template preview shows its sample without access notices.
+    if (preview) notice('');
+    else if (!canWrite) notice('You can read this story. Ask the thingy owner for edit access to refresh it.');
     else if (!canRefresh) notice('Refreshing runs in your thingy session, which needs Can edit thingy access. Ask the thingy owner for it.');
     $('refresh').addEventListener('click', startRefresh);
     renderRefresh();

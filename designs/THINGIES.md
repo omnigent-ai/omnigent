@@ -29,6 +29,11 @@ comments.
   (`/v1/thingies/{id}/permissions`, the same shape as workflow sharing).
 - **Agents** get `sys_thingy_*` builtin tools from the runner, which call those routes as the
   session's owner (like the journal tools), so no extra credentials or MCP server are needed.
+  An agent's call from a session shared with edit access is refused, reads included, so a
+  collaborator cannot read the owner's thingies through the owner's agent. The tools'
+  descriptions stay short; how to work as a thingy session, build a page and use the SDK is in
+  the `thingy` framework skill (`omnigent/resources/skills/thingy/SKILL.md`), which agents get
+  with the tools.
 - **Web**: the Thingy list and New thingy dialog, a thingy tab in a session's side panel
   (docked, or full screen with only the thingy and an Open session button), the thingy beside
   New session when there is no session yet, pinned thingies under Thingy in the sidebar,
@@ -57,6 +62,10 @@ the defaults.
 | Can view (`LEVEL_READ`) | yes | | | |
 | Can edit (`LEVEL_EDIT`) | yes | yes | yes | |
 | Can manage (`LEVEL_MANAGE`), owner | yes | yes | yes | yes |
+
+Only those who may publish read unpublished revisions. Deleting an account deletes the thingies
+it owns, with their grants and its shelf, and its username cannot be registered again until
+they are gone, as for workflows.
 
 The frame's write and action controls follow these: the SDK disables controls marked
 `data-omnigent-requires="write"` or `"action"` for viewers without that access.

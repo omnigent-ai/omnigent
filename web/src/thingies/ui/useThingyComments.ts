@@ -5,6 +5,7 @@ import { useCallback, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 
 import type { Comment } from "@/hooks/useComments";
+import { randomUUID } from "@/lib/randomUUID";
 import type { ActiveSelection, CommentsPanelProps } from "@/shell/CommentsPanel";
 import {
   type Thingy,
@@ -28,7 +29,7 @@ export function thingyCommentsMessage(
   comments: readonly ThingyComment[],
 ): string {
   const lines = [
-    `Address these comments on the thingy ${JSON.stringify(thingy.name)} (thingy_id ${thingy.id}). Change its page with thingy_revision_create and thingy_publish, or its records, as each asks. They are already marked addressed; thingy_comment_list has them all.`,
+    `Load the thingy skill and follow it. Address these comments on the thingy ${JSON.stringify(thingy.name)} (thingy_id ${thingy.id}). Change its page with sys_thingy_revision_create and sys_thingy_publish, or its records, as each asks. They are already marked addressed; sys_thingy_comment_list has them all.`,
     "",
   ];
   comments.forEach((comment, index) => {
@@ -47,11 +48,20 @@ export function thingyCommentsMessage(
 // have none, so each gets its own position and a pending selection one no comment has.
 const PENDING_POSITION = -1;
 
-function toPanelComment(thingyId: string, comment: ThingyComment, position: number): Comment {
+/**
+ * A thingy comment as the panel's. The viewer's own comments carry no author, which the panel
+ * reads as "You" and lets them edit or delete; in single-user mode every comment is theirs.
+ */
+function toPanelComment(
+  thingy: Pick<Thingy, "id" | "viewer_id">,
+  comment: ThingyComment,
+  position: number,
+): Comment {
+  const own = comment.createdBy === thingy.viewer_id;
   return {
     id: comment.id,
     conversation_id: "",
-    path: `thingy:${thingyId}`,
+    path: `thingy:${thingy.id}`,
     start_index: position,
     end_index: position,
     body: comment.body,
@@ -59,7 +69,7 @@ function toPanelComment(thingyId: string, comment: ThingyComment, position: numb
     created_at: comment.createdAt,
     updated_at: comment.updatedAt,
     anchor_content: comment.anchor.text,
-    created_by: comment.createdBy || null,
+    created_by: own ? null : comment.createdBy || null,
   };
 }
 
@@ -76,6 +86,7 @@ export type ThingyCommentsPanelProps = Pick<
   | "canAddress"
   | "addressPending"
   | "canEdit"
+  | "readOnlyMessage"
 >;
 
 export interface ThingyComments {
@@ -127,7 +138,7 @@ export function useThingyComments(
     [items],
   );
   const toPanel = (item: ThingyComment) =>
-    toPanelComment(thingyId, item, positions.get(item.id) ?? 0);
+    toPanelComment(thingy, item, positions.get(item.id) ?? 0);
 
   const startComment = useCallback((selection: ThingySelection) => {
     setPending({
@@ -175,9 +186,7 @@ export function useThingyComments(
         const anchor = pending;
         if (anchor === null) return;
         setPending(null);
-        void run(() =>
-          createThingyComment(thingyId, { body, anchor, operationId: crypto.randomUUID() }),
-        );
+        void run(() => createThingyComment(thingyId, { body, anchor, operationId: randomUUID() }));
       },
       onAddressAll: () => {
         if (address === undefined || drafts.length === 0) return;
@@ -198,6 +207,7 @@ export function useThingyComments(
       canAddress: address !== undefined,
       addressPending: addressing,
       canEdit: canComment,
+      readOnlyMessage: "You can read the comments on this thingy but not add any.",
     },
   };
 }

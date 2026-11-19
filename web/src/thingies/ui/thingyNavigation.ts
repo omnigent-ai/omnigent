@@ -2,7 +2,10 @@
 // so the shell (and a live session) stays mounted.
 import { useCallback } from "react";
 
+import { withBasePath } from "@/lib/basePath";
+import { getOmnigentTransformShareLink } from "@/lib/host";
 import { useNavigate } from "@/lib/routing";
+import { thingyBoardPath } from "@/thingies/host/thingyPages";
 import type { ThingyNavigate } from "@/thingies/host/thingySession";
 
 /** The app path of a same-origin URL, or the path itself. */
@@ -25,4 +28,14 @@ export function useThingyNavigate({ replace = false }: { replace?: boolean } = {
 export function thingyErrorMessage(error: unknown): string {
   if (error instanceof Error && error.message) return error.message;
   return typeof error === "string" && error ? error : "Something went wrong.";
+}
+
+/**
+ * The absolute URL that opens a thingy, like a session's share link: through the host's link
+ * transform in the embed, else this page's origin and base path.
+ */
+export function thingyLink(thingyId: string, rebasePath: (path: string) => string): string {
+  const path = rebasePath(thingyBoardPath(thingyId));
+  const transform = getOmnigentTransformShareLink();
+  return transform ? transform(path) : `${window.location.origin}${withBasePath(path)}`;
 }

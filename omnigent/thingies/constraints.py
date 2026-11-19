@@ -30,7 +30,9 @@ import contextlib
 import hashlib
 import json
 import math
+import random
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -56,7 +58,11 @@ MAX_PLAN_OPERATIONS = 50
 # Guard state, including an in-flight change, must fit in one store document.
 MAX_GUARD_BYTES = 30 * 1024
 EPOCH_WRITES = 100
-GUARD_ATTEMPTS = 8
+# Tries at taking the guard; between lost races a writer waits a random, growing time, so a
+# burst of writers spreads out instead of colliding again (under 5 s in total).
+GUARD_ATTEMPTS = 16
+GUARD_BACKOFF_S = 0.01
+GUARD_BACKOFF_MAX_S = 0.4
 _ON_DELETE = ("restrict", "cascade", "unset")
 _IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _EPOCH = re.compile(r"^e[0-9]{6}$")
@@ -76,6 +82,11 @@ class ConstraintViolation(Conflict):
             "kind": rule["kind"],
             "collection": rule["collection"],
         }
+
+
+def _back_off(attempt: int) -> None:
+    """Wait after the *attempt*-th lost race for the guard, with full jitter."""
+    time.sleep(random.uniform(0, min(GUARD_BACKOFF_MAX_S, GUARD_BACKOFF_S * 2**attempt)))
 
 
 def _canonical(value: Any) -> bytes:
@@ -253,6 +264,7 @@ class ConstraintGuard:
         if_version: str | None,
         operation_id: str,
     ) -> dict:
+        lost = 0
         for _ in range(GUARD_ATTEMPTS):
             epoch, state = self._current()
             current = state.value
@@ -302,9 +314,13 @@ class ConstraintGuard:
                     self.actor,
                 )
             except Conflict:
+                lost += 1
+                _back_off(lost)
                 continue
             return self._run(epoch, started)
-        raise Conflict("Other changes to this thingy are in progress; try again", reason="busy")
+        raise Conflict(
+            "Other changes to this thingy kept it busy; try again in a moment", reason="busy"
+        )
 
     # -- planning -------------------------------------------------------------
 

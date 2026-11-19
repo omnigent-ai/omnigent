@@ -281,7 +281,7 @@ import {
 } from "@/lib/sidebarViewPreferences";
 import { ExtensionPrimaryNavigation } from "@/extensions/ExtensionPrimaryNavigation";
 import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
-import { ThingySidebarNav } from "@/thingies/ui/ThingySidebarNav";
+import { ThingySidebarNav, useFullScreenThingyId } from "@/thingies/ui/ThingySidebarNav";
 import { useViewerId } from "@/hooks/useViewerId";
 import { useExtensions } from "@/extensions/ExtensionProvider";
 import { extensionPathParts, resolveExtensionPageFromPath } from "@/extensions/catalog";
@@ -969,7 +969,7 @@ function SidebarImpl({
 
   // Which top-level nav button to highlight for the current route.
   const {
-    isNewChatPage,
+    isNewChatPage: isNewChatRoute,
     isInboxPage,
     isCanvasPage,
     isTasksPage,
@@ -980,6 +980,9 @@ function SidebarImpl({
     newSessionProjectName,
     projectHomeName,
   } = useActiveNavItem();
+  // A thingy filling the screen beside New session is what the sidebar marks, not New session.
+  const fullScreenThingyId = useFullScreenThingyId();
+  const isNewChatPage = isNewChatRoute && fullScreenThingyId === null;
   const navigate = useNavigate();
   const projectKanban = useProjectKanbanEnabled();
   const openProjectHome = useStableCallback((projectName: string) => {

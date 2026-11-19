@@ -220,7 +220,7 @@ describe("thingy session", () => {
     expect(opened.pathname).toBe("/");
     expect(opened.searchParams.get("thingy_start")).toBe("app-1");
     expect(opened.searchParams.get("prompt")).toContain(
-      'This is my thingy session for the thingy "Team board"',
+      'This is my thingy session for "Team board"',
     );
   });
 
@@ -280,10 +280,10 @@ describe("thingy session", () => {
     expect(await (await delivered).json()).toEqual({ session_id: "s_1" });
   });
 
-  it("joins a request that is still open instead of sending it again", async () => {
+  it("joins a request that is still open in a session instead of sending it again", async () => {
     server.use(
       rest.post(`${API}/app-1/actions`, (_req, res, ctx) =>
-        res(ctx.json({ ...ENTRY, merged: true })),
+        res(ctx.json({ ...ENTRY, merged: true, delivered: true })),
       ),
       rest.get(`${API}/app-1/session`, (_req, res, ctx) =>
         res(ctx.json({ session_id: "s_1", version: "v" })),
@@ -299,6 +299,32 @@ describe("thingy session", () => {
     expect(receipt).toEqual({ actionId: "act1", delivery: "merged" });
     expect(sendUserMessage).not.toHaveBeenCalled();
     expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it("sends a merged request again when the open one never reached a session", async () => {
+    server.use(
+      rest.post(`${API}/app-1/actions`, (_req, res, ctx) =>
+        res(ctx.json({ ...ENTRY, merged: true })),
+      ),
+      rest.get(`${API}/app-1/session`, (_req, res, ctx) =>
+        res(ctx.json({ session_id: null, version: null })),
+      ),
+    );
+
+    const receipt = await requestThingyAction(
+      EDITOR,
+      { action: "run_card", params: { cardId: "c1" } },
+      navigate,
+    );
+
+    expect(receipt).toEqual({ actionId: "act1", delivery: "starting" });
+    // New session opens again with the action, so starting it delivers the open entry.
+    const prompt = parse(navigate.mock.calls[0][0]).searchParams.get("prompt") ?? "";
+    expect(
+      prompt.endsWith(
+        'Thingy action\n{"action_id":"act1","action":"run_card","params":{"cardId":"c1"}}',
+      ),
+    ).toBe(true);
   });
 
   it("starts the thingy session when the viewer has none, and shows the thingy beside it once started", async () => {
@@ -327,10 +353,10 @@ describe("thingy session", () => {
     expect(opened.pathname).toBe("/");
     expect(opened.searchParams.get("thingy_start")).toBe("app-1");
     const prompt = opened.searchParams.get("prompt") ?? "";
-    expect(
-      prompt.startsWith('This is my thingy session for the thingy "Team board" (thingy_id app-1).'),
-    ).toBe(true);
-    expect(prompt).toContain("sys_thingy_action_update");
+    expect(prompt.startsWith("Load the thingy skill and follow it.")).toBe(true);
+    expect(prompt).toContain('This is my thingy session for "Team board" (thingy_id app-1):');
+    // A short note: the session reads how to coordinate from the thingy skill.
+    expect(prompt.split("\n\n")[0].length).toBeLessThan(300);
     expect(
       prompt.endsWith(
         'Thingy action\n{"action_id":"act1","action":"run_card","params":{"cardId":"c1"}}',

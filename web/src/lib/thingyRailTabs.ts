@@ -17,13 +17,41 @@ interface ThingyRailState {
   exitFullScreen: { conversationId: string } | null;
   /** Whether the thingy beside New session fills the screen. */
   newSessionMaximized: boolean;
+  /** The thingy filling the screen now, in a session's side panel or beside New session. */
+  fullScreenThingyId: string | null;
 }
 
 export const useThingyRailRequest = create<ThingyRailState>(() => ({
   requested: null,
   exitFullScreen: null,
   newSessionMaximized: false,
+  fullScreenThingyId: null,
 }));
+
+/**
+ * The query parameter naming the thingy that fills the screen, on a session's page or New
+ * session's. It makes the view a link: reloading, sharing or going Forward to it opens the thingy
+ * full screen again.
+ */
+export const THINGY_FULL_SCREEN_PARAM = "thingy";
+
+/** `path` with `thingyId` filling the screen, keeping its other query parameters. */
+export function withThingyFullScreen(path: string, thingyId: string): string {
+  const hashAt = path.indexOf("#");
+  const hash = hashAt < 0 ? "" : path.slice(hashAt);
+  const withoutHash = hashAt < 0 ? path : path.slice(0, hashAt);
+  const queryAt = withoutHash.indexOf("?");
+  const pathname = queryAt < 0 ? withoutHash : withoutHash.slice(0, queryAt);
+  const params = new URLSearchParams(queryAt < 0 ? "" : withoutHash.slice(queryAt + 1));
+  params.set(THINGY_FULL_SCREEN_PARAM, thingyId);
+  return `${pathname}?${params.toString()}${hash}`;
+}
+
+/** Tells the sidebar which thingy fills the screen, or that none does. */
+export function setFullScreenThingy(thingyId: string | null): void {
+  if (useThingyRailRequest.getState().fullScreenThingyId !== thingyId)
+    useThingyRailRequest.setState({ fullScreenThingyId: thingyId });
+}
 
 /**
  * Shows the tab `key` in the side panel of `conversationId`, opening the panel, and in full
@@ -62,5 +90,6 @@ export function resetThingyRailRequests(): void {
     requested: null,
     exitFullScreen: null,
     newSessionMaximized: false,
+    fullScreenThingyId: null,
   });
 }

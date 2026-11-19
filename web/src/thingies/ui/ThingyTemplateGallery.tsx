@@ -21,7 +21,9 @@ import {
   type ThingyContent,
   createThingy,
   createThingyRevision,
+  deleteThingy,
   publishThingyRevision,
+  renameThingy,
 } from "@/thingies/api/thingyApi";
 import { ThingyFrame } from "@/thingies/host/ThingyFrame";
 import { THINGY_SDK_VERSION } from "@/thingies/sdk/thingyProtocol";
@@ -32,7 +34,11 @@ import {
 } from "@/thingies/templates/thingyTemplates";
 import { ThingyErrorNotice } from "./ThingyErrorNotice";
 
-export const MAX_THINGY_NAME_LENGTH = 100;
+/** The longest name the server takes. */
+export const MAX_THINGY_NAME_LENGTH = 120;
+
+/** What the blank template's name field starts with. */
+const UNTITLED_THINGY = "Untitled thingy";
 
 const TEMPLATE_ICONS: Record<ThingyTemplate["id"], LucideIcon> = {
   kanban: Columns3Icon,
@@ -81,7 +87,7 @@ function TemplateThumbnail({ template }: { template: ThingyTemplate }) {
     return (
       <div
         aria-hidden
-        className="flex items-center justify-center rounded-xl bg-muted text-muted-foreground"
+        className="flex items-center justify-center rounded-xl border border-border bg-muted text-muted-foreground"
         style={{ height: THUMBNAIL_HEIGHT }}
       >
         <Icon className="size-8" />
@@ -105,6 +111,16 @@ function TemplateThumbnail({ template }: { template: ThingyTemplate }) {
   );
 }
 
+/** The steps a create from a template has finished. */
+interface CreateProgress {
+  templateId: ThingyTemplate["id"];
+  thingy: Thingy;
+  /** The template's page, once uploaded. */
+  revisionId?: string;
+  /** Whether the thingy is complete (published, for a template with a page). */
+  done: boolean;
+}
+
 export interface ThingyTemplateGalleryProps {
   /** Runs once the thingy exists (and a template with a page has published it). */
   onCreated: (thingy: Thingy, template: ThingyTemplate) => void | Promise<void>;
@@ -124,13 +140,24 @@ export function ThingyTemplateGallery({
   const [name, setName] = useState("");
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<unknown>(undefined);
+  // How far a failed create got, so Create again continues from the failed step instead of
+  // making another thingy, and Cancel deletes the half-made one.
+  const [progress, setProgress] = useState<CreateProgress | null>(null);
   const nameFieldId = useId();
 
   const chooseTemplate = (template: ThingyTemplate) => {
     setPreviewing(null);
-    setName(template.name);
+    setName(template.revision ? template.name : UNTITLED_THINGY);
     setCreateError(undefined);
+    setProgress(null);
     setNaming(template);
+  };
+
+  const closeNaming = () => {
+    // A thingy left half-made by a failed create goes again.
+    if (progress !== null && !progress.done) void deleteThingy(progress.thingy.id).catch(() => {});
+    setProgress(null);
+    setNaming(null);
   };
 
   const trimmedName = name.trim();
@@ -140,14 +167,28 @@ export function ThingyTemplateGallery({
     if (naming === null || !trimmedName || nameTooLong || creating) return;
     setCreating(true);
     setCreateError(undefined);
+    let step: CreateProgress | null = progress?.templateId === naming.id ? progress : null;
     try {
-      const thingy = await createThingy(trimmedName);
-      if (naming.revision) {
-        const revision = await createThingyRevision(thingy.id, naming.revision);
-        await publishThingyRevision(thingy.id, revision.id, thingy.version);
+      if (step === null) {
+        step = { templateId: naming.id, thingy: await createThingy(trimmedName), done: false };
+        setProgress(step);
+      } else if (step.thingy.name !== trimmedName) {
+        step = { ...step, thingy: await renameThingy(step.thingy.id, trimmedName) };
+        setProgress(step);
       }
+      const { thingy } = step;
+      if (naming.revision) {
+        const revisionId =
+          step.revisionId ?? (await createThingyRevision(thingy.id, naming.revision)).id;
+        step = { ...step, revisionId };
+        setProgress(step);
+        await publishThingyRevision(thingy.id, revisionId, thingy.version);
+      }
+      step = { ...step, done: true };
+      setProgress(step);
       rememberThingyTemplate(thingy.id, naming.id);
       await onCreated(thingy, naming);
+      setProgress(null);
       setNaming(null);
     } catch (error) {
       setCreateError(error);
@@ -204,7 +245,8 @@ export function ThingyTemplateGallery({
                 <DialogDescription>{previewing.description}</DialogDescription>
               </DialogHeader>
               <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-y-auto px-6 py-4">
-                <div className="flex flex-col gap-1.5">
+                {/* Phones put the live preview first, where it gets the room. */}
+                <div className="flex flex-col gap-1.5 max-sm:order-last">
                   <span className="text-sm font-medium">What it shows</span>
                   <ul
                     className="m-0 flex list-none flex-wrap gap-1.5 p-0"
@@ -223,7 +265,7 @@ export function ThingyTemplateGallery({
                 <div className="overflow-hidden rounded-xl border border-border">
                   <TemplatePreview template={previewing} height={480} />
                 </div>
-                <p className="text-sm text-muted-foreground">
+                <p className="text-sm text-muted-foreground max-sm:order-1">
                   This preview runs with sample data. Nothing you change here is saved.
                 </p>
               </div>
@@ -246,7 +288,7 @@ export function ThingyTemplateGallery({
       <Dialog
         open={naming !== null}
         onOpenChange={(open) => {
-          if (!open && !creating) setNaming(null);
+          if (!open && !creating) closeNaming();
         }}
       >
         <DialogContent className="sm:max-w-md">
@@ -266,7 +308,10 @@ export function ThingyTemplateGallery({
                 id={nameFieldId}
                 value={name}
                 autoFocus
+                maxLength={MAX_THINGY_NAME_LENGTH}
                 aria-invalid={nameTooLong || undefined}
+                // The suggested name is replaced by typing, as a file name in a save dialog.
+                onFocus={(event) => event.currentTarget.select()}
                 onChange={(event) => setName(event.target.value)}
               />
               {nameTooLong && (
@@ -279,12 +324,7 @@ export function ThingyTemplateGallery({
               <ThingyErrorNotice title="Couldn’t create the thingy" error={createError} />
             )}
             <DialogFooter className="border-t-0 bg-transparent">
-              <Button
-                type="button"
-                variant="outline"
-                disabled={creating}
-                onClick={() => setNaming(null)}
-              >
+              <Button type="button" variant="outline" disabled={creating} onClick={closeNaming}>
                 Cancel
               </Button>
               <Button

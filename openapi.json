@@ -15299,6 +15299,97 @@
         "title": "TerminalCommandData",
         "type": "object"
       },
+      "ThingyGrantRequest": {
+        "description": "Body of `PUT /v1/thingies/{id}/permissions`.",
+        "properties": {
+          "ensure_minimum": {
+            "default": false,
+            "description": "Keep a higher existing grant instead of lowering it.",
+            "title": "Ensure Minimum",
+            "type": "boolean"
+          },
+          "level": {
+            "description": "`1` (Can view), `2` (Can edit) or `3` (Can manage), as an integer.",
+            "format": "int64",
+            "title": "Level",
+            "type": "integer"
+          },
+          "user_id": {
+            "description": "The user or group to share with, e.g. `\"alice@example.com\"`; surrounding whitespace is ignored.",
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "level"
+        ],
+        "title": "ThingyGrantRequest",
+        "type": "object"
+      },
+      "ThingyPermissionList": {
+        "description": "One page of a thingy's grants, ordered by `user_id`.",
+        "properties": {
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "permissions": {
+            "items": {
+              "$ref": "#/components/schemas/ThingyPermissionObject"
+            },
+            "title": "Permissions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "permissions",
+          "next_cursor"
+        ],
+        "title": "ThingyPermissionList",
+        "type": "object"
+      },
+      "ThingyPermissionObject": {
+        "description": "One grant on a thingy.",
+        "properties": {
+          "display_name": {
+            "description": "The grantee's name for display; the ID when the server has no other name.",
+            "title": "Display Name",
+            "type": "string"
+          },
+          "level": {
+            "description": "`1` (Can view), `2` (Can edit) or `3` (Can manage).",
+            "format": "int64",
+            "title": "Level",
+            "type": "integer"
+          },
+          "thingy_id": {
+            "description": "The thingy.",
+            "title": "Thingy Id",
+            "type": "string"
+          },
+          "user_id": {
+            "description": "The grantee's canonical ID, e.g. `\"alice@example.com\"`.",
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "thingy_id",
+          "level",
+          "display_name"
+        ],
+        "title": "ThingyPermissionObject",
+        "type": "object"
+      },
       "ToolOutputDeltaEvent": {
         "description": "Incremental output from an in-progress function call.",
         "properties": {
@@ -28738,6 +28829,1279 @@
         "summary": "Get Skills",
         "tags": [
           "skills"
+        ]
+      }
+    },
+    "/v1/thingies": {
+      "get": {
+        "description": "The caller's own thingies: `{\"items\": [thingy, ...]}`.",
+        "operationId": "list_thingies_v1_thingies_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Thingies",
+        "tags": [
+          "thingies"
+        ]
+      },
+      "post": {
+        "description": "Create a private thingy from `{\"name\"}`; answers the thingy with 201.",
+        "operationId": "create_thingy_v1_thingies_post",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Create Thingy",
+        "tags": [
+          "thingies"
+        ]
+      }
+    },
+    "/v1/thingies/sessions/{session_id}": {
+      "get": {
+        "description": "The thingies shown beside one of the caller's sessions.",
+        "operationId": "session_thingies_v1_thingies_sessions__session_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Session Thingies",
+        "tags": [
+          "thingies"
+        ]
+      }
+    },
+    "/v1/thingies/shared": {
+      "get": {
+        "description": "Other people's thingies shared with the caller, each with `shared_via`\n(`\"user\"` or `\"group\"`) and `owner_email` (the owner's display name).",
+        "operationId": "shared_thingies_v1_thingies_shared_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Shared Thingies",
+        "tags": [
+          "thingies"
+        ]
+      }
+    },
+    "/v1/thingies/shelf": {
+      "get": {
+        "description": "`{\"pinned\": [{\"id\", \"name\"}], \"has_owned\"}` for the sidebar.",
+        "operationId": "shelf_v1_thingies_shelf_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Shelf",
+        "tags": [
+          "thingies"
+        ]
+      }
+    },
+    "/v1/thingies/{app_id}": {
+      "delete": {
+        "description": "Delete a thingy for everyone; needs manage permission.",
+        "operationId": "delete_thingy_v1_thingies__app_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Thingy",
+        "tags": [
+          "thingies"
+        ]
+      },
+      "get": {
+        "description": "One thingy with the caller's `permissions`.",
+        "operationId": "get_thingy_v1_thingies__app_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Thingy",
+        "tags": [
+          "thingies"
+        ]
+      },
+      "patch": {
+        "description": "Rename a thingy for everyone with `{\"name\"}`; needs publish permission.",
+        "operationId": "rename_thingy_v1_thingies__app_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rename Thingy",
+        "tags": [
+          "thingies"
+        ]
+      }
+    },
+    "/v1/thingies/{app_id}/actions": {
+      "get": {
+        "description": "A page of the action ledger: `{\"items\", \"next_cursor\"}`.",
+        "operationId": "list_actions_v1_thingies__app_id__actions_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Actions",
+        "tags": [
+          "thingies"
+        ]
+      },
+      "post": {
+        "description": "Queue `{\"action\", \"params\", \"operation_id\"}`; 201, or 200 when it joined an\nopen request for the same action (`\"merged\": true`).",
+        "operationId": "request_action_v1_thingies__app_id__actions_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Request Action",
+        "tags": [
+          "thingies"
+        ]
+      }
+    },
+    "/v1/thingies/{app_id}/actions/progress": {
+      "get": {
+        "description": "Progress of `?ids=a,b`, or of the caller's open actions without ids.",
+        "operationId": "action_progress_v1_thingies__app_id__actions_progress_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Action Progress",
+        "tags": [
+          "thingies"
+        ]
+      }
+    },
+    "/v1/thingies/{app_id}/actions/{action_id}": {
+      "patch": {
+        "description": "Record `state`, `summary` or `session_id` with `if_version` and\n`operation_id`.",
+        "operationId": "update_action_v1_thingies__app_id__actions__action_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "action_id",
+            "required": true,
+            "schema": {
+              "title": "Action Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Action",
+        "tags": [
+          "thingies"
+        ]
+      }
+    },
+    "/v1/thingies/{app_id}/actions/{action_id}/delivery": {
+      "post": {
+        "description": "Record that the web app posted the action into `{\"session_id\"}`.",
+        "operationId": "record_delivery_v1_thingies__app_id__actions__action_id__delivery_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "action_id",
+            "required": true,
+            "schema": {
+              "title": "Action Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Record Delivery",
+        "tags": [
+          "thingies"
+        ]
+      }
+    },
+    "/v1/thingies/{app_id}/comments": {
+      "get": {
+        "description": "`{\"items\": [comment, ...], \"can_comment\"}`, optionally `?status=`.",
+        "operationId": "list_comments_v1_thingies__app_id__comments_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Comments",
+        "tags": [
+          "thingies"
+        ]
+      },
+      "post": {
+        "description": "Add `{\"body\", \"anchor\", \"operation_id\"}`; answers the comment with 201.",
+        "operationId": "create_comment_v1_thingies__app_id__comments_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Comment",
+        "tags": [
+          "thingies"
+        ]
+      }
+    },
+    "/v1/thingies/{app_id}/comments/{comment_id}": {
+      "delete": {
+        "description": "Delete a comment: its author, or someone who manages the thingy.",
+        "operationId": "delete_comment_v1_thingies__app_id__comments__comment_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "comment_id",
+            "required": true,
+            "schema": {
+              "title": "Comment Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Comment",
+        "tags": [
+          "thingies"
+        ]
+      },
+      "patch": {
+        "description": "Change a comment's `body` (its author) or `status`.",
+        "operationId": "update_comment_v1_thingies__app_id__comments__comment_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "comment_id",
+            "required": true,
+            "schema": {
+              "title": "Comment Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Comment",
+        "tags": [
+          "thingies"
+        ]
+      }
+    },
+    "/v1/thingies/{app_id}/content": {
+      "get": {
+        "description": "The published revision's HTML and the capabilities granted to the caller.",
+        "operationId": "content_v1_thingies__app_id__content_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Content",
+        "tags": [
+          "thingies"
+        ]
+      }
+    },
+    "/v1/thingies/{app_id}/describe": {
+      "get": {
+        "description": "What an agent reads before working with the records: the published revision's\nguide, collection schemas, constraints and actions, without its HTML.",
+        "operationId": "describe_v1_thingies__app_id__describe_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Describe",
+        "tags": [
+          "thingies"
+        ]
+      }
+    },
+    "/v1/thingies/{app_id}/pin": {
+      "put": {
+        "description": "Pin or unpin a readable thingy with `{\"pinned\": bool}`; answers the shelf.",
+        "operationId": "pin_v1_thingies__app_id__pin_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Pin",
+        "tags": [
+          "thingies"
+        ]
+      }
+    },
+    "/v1/thingies/{app_id}/publish": {
+      "post": {
+        "description": "Publish `{\"revision_id\", \"if_version\"}`; answers the thingy.",
+        "operationId": "publish_v1_thingies__app_id__publish_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Publish",
+        "tags": [
+          "thingies"
+        ]
+      }
+    },
+    "/v1/thingies/{app_id}/revisions": {
+      "post": {
+        "description": "Upload an immutable revision; answers `{\"id\"}` with 201.",
+        "operationId": "create_revision_v1_thingies__app_id__revisions_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Revision",
+        "tags": [
+          "thingies"
+        ]
+      }
+    },
+    "/v1/thingies/{app_id}/revisions/{revision_id}": {
+      "get": {
+        "description": "A revision's HTML and configuration; `published` names the published one.",
+        "operationId": "get_revision_v1_thingies__app_id__revisions__revision_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "revision_id",
+            "required": true,
+            "schema": {
+              "title": "Revision Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Revision",
+        "tags": [
+          "thingies"
+        ]
+      }
+    },
+    "/v1/thingies/{app_id}/rpc": {
+      "post": {
+        "description": "The sandboxed frame's data bridge: `{\"protocol\": 1, \"request_id\", \"revision_id\", \"method\", \"params\"}` answers `{\"result\"}`.",
+        "operationId": "rpc_v1_thingies__app_id__rpc_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Rpc",
+        "tags": [
+          "thingies"
+        ]
+      }
+    },
+    "/v1/thingies/{app_id}/session": {
+      "get": {
+        "description": "The caller's thingy session: `{\"session_id\", \"version\"}`.",
+        "operationId": "get_thingy_session_v1_thingies__app_id__session_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Thingy Session",
+        "tags": [
+          "thingies"
+        ]
+      },
+      "put": {
+        "description": "Register `{\"session_id\"}` as the caller's thingy session.",
+        "operationId": "set_thingy_session_v1_thingies__app_id__session_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Thingy Session",
+        "tags": [
+          "thingies"
+        ]
+      }
+    },
+    "/v1/thingies/{app_id}/session/status": {
+      "get": {
+        "description": "Whether the caller's thingy session and the sessions it started are working.",
+        "operationId": "thingy_session_status_v1_thingies__app_id__session_status_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Thingy Session Status",
+        "tags": [
+          "thingies"
+        ]
+      }
+    },
+    "/v1/thingies/{app_id}/sessions/{session_id}": {
+      "put": {
+        "description": "Show a thingy beside a session (`{\"linked\": bool}`); answers its thingies.",
+        "operationId": "link_session_v1_thingies__app_id__sessions__session_id__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "title": "App Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Link Session",
+        "tags": [
+          "thingies"
+        ]
+      }
+    },
+    "/v1/thingies/{thingy_id}/permissions": {
+      "get": {
+        "description": "List the grants on a thingy the caller manages. The owner holds no grant.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 for an agent, a server that cannot keep thingy grants or a caller who cannot manage it; the thingy 404 otherwise.",
+        "operationId": "list_thingy_permissions_v1_thingies__thingy_id__permissions_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thingy_id",
+            "required": true,
+            "schema": {
+              "title": "Thingy Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor: user_id to start after",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Cursor: user_id to start after",
+              "title": "After"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ThingyPermissionList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Thingy Permissions",
+        "tags": [
+          "thingies"
+        ]
+      },
+      "put": {
+        "description": "Share a thingy with a user or group at Can view, Can edit or Can manage.\n\nReplaces an existing grant, or keeps a higher one with `ensure_minimum`.\nAuto-creates the grantee user if they don't exist yet.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 for an agent, the sharing policy, a server that cannot share thingies or a caller who cannot manage it; 400 for an empty or over-long ID, the owner, `__public__` or the local user.",
+        "operationId": "grant_thingy_permission_v1_thingies__thingy_id__permissions_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thingy_id",
+            "required": true,
+            "schema": {
+              "title": "Thingy Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ThingyGrantRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ThingyPermissionObject"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Grant Thingy Permission",
+        "tags": [
+          "thingies"
+        ]
+      }
+    },
+    "/v1/thingies/{thingy_id}/permissions/{target_user_id}": {
+      "delete": {
+        "description": "Stop sharing a thingy with a user or group. Idempotent: 204 when they hold none.\n\n**Raises**\n\n- `OmnigentError` \u2014 403 for an agent, a server that cannot keep thingy grants or a caller who cannot manage it; the thingy 404 otherwise.",
+        "operationId": "revoke_thingy_permission_v1_thingies__thingy_id__permissions__target_user_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "thingy_id",
+            "required": true,
+            "schema": {
+              "title": "Thingy Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "target_user_id",
+            "required": true,
+            "schema": {
+              "title": "Target User Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revoke Thingy Permission",
+        "tags": [
+          "thingies"
         ]
       }
     },

@@ -12,6 +12,7 @@ another implementation to ``create_app(thingy_access=...)``.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -22,6 +23,8 @@ from omnigent.stores.thingy_store import Thingy, ThingyStore
 SharedVia = Literal["user", "group"]
 # The most shared thingies a viewer's list reads.
 MAX_SHARED_THINGIES = 200
+# Grant pages read to fill that list, bounding the work when many grants are dead.
+MAX_SHARED_THINGY_PAGES = 10
 
 
 @dataclass(frozen=True)
@@ -80,6 +83,15 @@ class ThingyAccess(ABC):
     def permissions(self, viewer_id: str, thingy: Thingy) -> ThingyPermissions:
         """What *viewer_id* may do with *thingy*; :data:`NO_ACCESS` hides it."""
 
+    def permissions_many(
+        self, viewer_id: str, thingies: Sequence[Thingy]
+    ) -> dict[str, ThingyPermissions]:
+        """:meth:`permissions` for several thingies, keyed by ID.
+
+        The default asks one at a time; an implementation can batch its lookups.
+        """
+        return {thingy.id: self.permissions(viewer_id, thingy) for thingy in thingies}
+
     @abstractmethod
     def shared_with(self, viewer_id: str) -> list[SharedThingy]:
         """Other people's thingies *viewer_id* can read, at most :data:`MAX_SHARED_THINGIES`.
@@ -109,41 +121,56 @@ class PermissionStoreThingyAccess(ThingyAccess):
         return store if store is not None and store.supports_thingy_grants else None
 
     def permissions(self, viewer_id: str, thingy: Thingy) -> ThingyPermissions:
-        if viewer_id == thingy.owner_id:
-            return FULL_ACCESS
+        return self.permissions_many(viewer_id, [thingy])[thingy.id]
+
+    def permissions_many(
+        self, viewer_id: str, thingies: Sequence[Thingy]
+    ) -> dict[str, ThingyPermissions]:
+        result = {thingy.id: FULL_ACCESS for thingy in thingies if thingy.owner_id == viewer_id}
+        others = [thingy for thingy in thingies if thingy.id not in result]
         grants = self._grants()
-        if grants is None or viewer_id == RESERVED_USER_LOCAL:
-            return NO_ACCESS
+        if not others or grants is None or viewer_id == RESERVED_USER_LOCAL:
+            return {**result, **{thingy.id: NO_ACCESS for thingy in others}}
         # A deleted owner's thingies stop being shared at once.
-        if grants.deleted_accounts([thingy.owner_id]):
-            return NO_ACCESS
-        level = grants.resolve_thingy_access(grants.caller_principals(viewer_id), thingy.id)
-        return permissions_for_level(level)
+        deleted = grants.deleted_accounts(sorted({thingy.owner_id for thingy in others}))
+        principals = grants.caller_principals(viewer_id)
+        for thingy in others:
+            if thingy.owner_id in deleted:
+                result[thingy.id] = NO_ACCESS
+            else:
+                level = grants.resolve_thingy_access(principals, thingy.id)
+                result[thingy.id] = permissions_for_level(level)
+        return result
 
     def shared_with(self, viewer_id: str) -> list[SharedThingy]:
         grants = self._grants()
         if grants is None or viewer_id == RESERVED_USER_LOCAL:
             return []
         principals = grants.caller_principals(viewer_id)
-        ids: list[str] = []
+        shared: list[SharedThingy] = []
         cursor: str | None = None
-        while len(ids) < MAX_SHARED_THINGIES:
-            page, cursor = grants.list_thingies_shared_with(
+        # Grants whose thingy is gone (a grant that raced its deletion) are skipped and
+        # dropped, so they never take a live thingy's place under the limit.
+        for _ in range(MAX_SHARED_THINGY_PAGES):
+            ids, cursor = grants.list_thingies_shared_with(
                 principals, limit=MAX_SHARED_THINGIES_PAGE_SIZE, after_thingy_id=cursor
             )
-            ids.extend(page)
+            found = self._store.get_many(ids)
+            for thingy_id in ids:
+                if thingy_id not in found:
+                    grants.delete_for_thingy(thingy_id)
+            owners = sorted({thingy.owner_id for thingy in found.values()})
+            deleted = grants.deleted_accounts(owners) if owners else set()
+            for thingy_id in ids:
+                thingy = found.get(thingy_id)
+                if thingy is None or thingy.owner_id == viewer_id or thingy.owner_id in deleted:
+                    continue
+                direct = grants.resolve_thingy_access([viewer_id], thingy_id) is not None
+                shared.append(SharedThingy(thingy, "user" if direct else "group"))
+                if len(shared) >= MAX_SHARED_THINGIES:
+                    return shared
             if cursor is None:
                 break
-        found = self._store.get_many(ids[:MAX_SHARED_THINGIES])
-        owners = sorted({thingy.owner_id for thingy in found.values()})
-        deleted = grants.deleted_accounts(owners) if owners else set()
-        shared = []
-        for thingy_id in ids[:MAX_SHARED_THINGIES]:
-            thingy = found.get(thingy_id)
-            if thingy is None or thingy.owner_id == viewer_id or thingy.owner_id in deleted:
-                continue
-            direct = grants.resolve_thingy_access([viewer_id], thingy_id) is not None
-            shared.append(SharedThingy(thingy, "user" if direct else "group"))
         return shared
 
     def forget(self, thingy_id: str) -> None:

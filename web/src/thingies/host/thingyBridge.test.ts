@@ -289,6 +289,31 @@ describe("startThingyBridge", () => {
     );
   });
 
+  it("keeps the request ID out of the message the thingy shows", async () => {
+    const callRpc = vi.fn<CallRpc>().mockRejectedValue(
+      new ThingyApiError({
+        status: 400,
+        code: "CONSTRAINT_VIOLATION",
+        message: "In progress holds at most 5 cards.",
+        requestId: "18161a30-aaaa",
+      }),
+    );
+    const { port } = start({ callRpc });
+
+    port.fromFrame(request("r1", "data.v1.get", { collection: "cards", id: "c1" }));
+
+    await waitFor(() =>
+      expect(port.responseFor("r1")).toMatchObject({
+        ok: false,
+        error: {
+          code: "CONSTRAINT_VIOLATION",
+          message: "In progress holds at most 5 cards.",
+          requestId: "18161a30-aaaa",
+        },
+      }),
+    );
+  });
+
   it.each([
     { label: "declines", confirmed: false, expectedCalls: 0 },
     { label: "allows", confirmed: true, expectedCalls: 1 },

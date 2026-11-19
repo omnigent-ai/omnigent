@@ -1,47 +1,81 @@
-// Building a new thingy from a description: its session gets the description with instructions to
-// build and publish it.
+// Building a new thingy from a description: its session gets a short note to build and publish
+// it, then the description. The detailed guidance is in the `thingy` skill.
 
-import { composeThingySessionPrompt } from "./thingySession";
 import type { Thingy } from "../api/thingyApi";
 
 const LEADING_REQUEST =
-  /^\s*(please\s+)?(build|create|make|design|i\s+want|i\s+need|give\s+me)(\s+me)?\s+((a|an|the)\s+)?/i;
+  /^\s*(?:(?:please|hi|hey)[\s,]+)*(?:(?:can|could|would)\s+you\s+)?(?:build|create|make|design|i\s+want|i\s+need|i'd\s+like|i\s+would\s+like|give\s+me)(?:\s+me)?(?:\s+(?:a|an|the))?\s+/i;
+// Where a name stops: a sentence end, an ellipsis, a colon or semicolon, or a comma.
+const CLAUSE_END = /(?:\.{3}|…|[.!?:;,])(?=\s|$)/g;
+// A dot that ends an abbreviation ("e.g.", "etc.") or an initial ("U.S."), not a sentence.
+const ABBREVIATION =
+  /(?:^|[\s(])(?:e\.g|i\.e|etc|vs|approx|incl|cf|esp|dr|mr|mrs|ms|st|no)\.$|(?:^|[\s.])[a-z]\.$/i;
+const TRAILING_STOP_WORDS =
+  /\s+(?:a|an|the|and|or|for|my|our|your|with|of|to|from|in|on|by|at|that|which|as)$/i;
+const TRAILING_PUNCTUATION = /[\s.,;:!?…\-–—'"]+$/;
+const URL_START = /^(?:[a-z][a-z0-9+.-]*:\/\/|www\.)/i;
+// The server allows longer names; a derived one only has to read well in the list and tabs.
 const MAX_DERIVED_NAME = 60;
+// A comma ends the name only after this much text, so "Hi, a board" is not cut to "Hi".
+const MIN_CLAUSE_BEFORE_COMMA = 12;
 
-/** A short name from the first sentence of a description; the session can rename it later. */
+function firstClause(text: string): string {
+  for (const match of text.matchAll(CLAUSE_END)) {
+    const end = match.index;
+    const mark = match[0];
+    if (mark === "." && ABBREVIATION.test(text.slice(0, end + 1))) {
+      continue;
+    }
+    if (mark === "," && end < MIN_CLAUSE_BEFORE_COMMA) {
+      continue;
+    }
+    return text.slice(0, end);
+  }
+  return text;
+}
+
+/** A short name from the start of a description; the session can rename it later. */
 export function thingyNameFrom(description: string): string {
-  const sentence = description.trim().split(/\n|[.!?:;,](?:\s|$)/)[0] ?? "";
-  const words = sentence
-    .replace(LEADING_REQUEST, "")
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean)
-    .slice(0, 6)
-    .join(" ");
-  const name = words ? words.charAt(0).toUpperCase() + words.slice(1) : "";
-  return (name || "New thingy").slice(0, MAX_DERIVED_NAME);
+  const firstLine = description.trim().split("\n")[0] ?? "";
+  let name = firstClause(firstLine.replace(LEADING_REQUEST, ""))
+    .replace(/\s+/g, " ")
+    .replace(TRAILING_PUNCTUATION, "")
+    .trim();
+  if (name.length > MAX_DERIVED_NAME) {
+    // Stop at the last whole word that fits, without a dangling "for" or "and".
+    const cut = name.slice(0, MAX_DERIVED_NAME + 1);
+    const lastSpace = cut.lastIndexOf(" ");
+    name = lastSpace > 0 ? cut.slice(0, lastSpace) : cut.slice(0, MAX_DERIVED_NAME);
+    let previous: string;
+    do {
+      previous = name;
+      name = name.replace(TRAILING_STOP_WORDS, "").replace(TRAILING_PUNCTUATION, "");
+    } while (name !== previous);
+  }
+  if (!/[\p{L}\p{N}]/u.test(name)) {
+    return "New thingy";
+  }
+  return URL_START.test(name) ? name : name.charAt(0).toUpperCase() + name.slice(1);
 }
 
-/** Instructions for a thingy session to build a new, unpublished thingy from the viewer's description. */
-export function thingyBuildInstructions(): string {
-  return [
-    "This thingy is new and has nothing published yet. Build it from my description below:",
-    "- Write one self-contained HTML page that uses the Omnigent SDK (window.omnigent.connect(); the sys_thingy_revision_create tool describes it). Declare its collections, actions, rules and guide, upload it with sys_thingy_revision_create and publish it with sys_thingy_publish.",
-    '- The page runs in a sandboxed frame that silently blocks forms, alert/confirm/prompt, localStorage and cookies, new windows and the network. Use type="button" buttons with click handlers and handle Enter with keydown instead of a form\'s submit, confirm inline instead of with confirm(), and keep state in memory or in records.',
-    "- Seed clearly labeled synthetic sample data on first load so it works right away. Do not use real data unless I give it to you.",
-    "- Data reads and writes often take a second or more. Show a spinner or a pending state on every action, from the click until the call returns (an added item shows as Adding… at once), and show failures with a retry.",
-    "- For actions that run in a session, follow client.agent.watch and keep a spinner only while the status is pending, queued, running or needs_input. done, failed, cancelled, finished_unreported and interrupted mean it ended, even when the session never reported, so stop the spinner and offer a retry after interrupted.",
-    "- Put data-omnigent-ref and data-omnigent-label on each record's elements, so a selection names the exact record.",
-    '- Others may see it read-only. Put data-omnigent-requires="write" on every control that changes records and data-omnigent-requires="action" on every control that requests an action; the SDK disables them for viewers without that access and shows why.',
-    "- Once you know what it is, give it a short name with sys_thingy_rename.",
-    "- Then tell me what you built and what I could ask for next.",
-    "",
-    "My description:",
-    "",
-  ].join("\n");
+/** How the session prompts name a thingy, so its sys_thingy_* tools reach it. */
+export function thingyPromptLabel(app: Pick<Thingy, "id" | "name">): string {
+  return `${JSON.stringify(app.name)} (thingy_id ${app.id})`;
 }
 
-/** What a new thingy's session reads before the viewer's description. */
-export function composeThingyBuildPrompt(app: Pick<Thingy, "id" | "name">): string {
-  return `${composeThingySessionPrompt(app)}\n\n${thingyBuildInstructions()}`;
+/**
+ * The message that starts a new thingy's session: a short note naming the thingy, then the
+ * viewer's description. The `thingy` skill carries how to build one. Without a description (a
+ * blank thingy), the viewer types it below the note.
+ */
+export function composeThingyBuildPrompt(
+  app: Pick<Thingy, "id" | "name">,
+  description = "",
+): string {
+  const note = [
+    "Load the thingy skill and follow it.",
+    `Please build my new thingy ${thingyPromptLabel(app)} from my description below, and publish it.`,
+    "This is also my thingy session, where I'll send its actions and change requests.",
+  ].join(" ");
+  return `${note}\n\n${description.trim()}`;
 }

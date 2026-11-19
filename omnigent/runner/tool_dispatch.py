@@ -10690,7 +10690,8 @@ def _execute_skill_tool(
     :param agent_spec: The session's AgentSpec.
     :param runner_workspace: The runner's workspace path for
         host-scope skill discovery.
-    :param workflows_enabled: Whether the server enables workflow skills.
+    :param workflows_enabled: Whether the server enables workflow skills; the
+        others, such as ``thingy``, follow the spec's tool groups.
     :returns: Tool output string.
     """
     from omnigent.spec.skill_sources import framework_skills
@@ -10712,7 +10713,9 @@ def _execute_skill_tool(
         agent_root=runner_workspace,
         skills_filter=skills_filter,
         fallback_skills=(
-            framework_skills(agent_spec) if workflows_enabled and agent_spec is not None else []
+            framework_skills(agent_spec, workflows=workflows_enabled)
+            if agent_spec is not None and getattr(agent_spec, "tool_groups", None) is not None
+            else []
         ),
     )
     tool: Tool = load_tool if tool_name == "load_skill" else ReadSkillFileTool(load_tool.skills)

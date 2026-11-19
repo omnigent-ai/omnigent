@@ -203,11 +203,17 @@ def derive_progress(
         return ActionProgress(
             "interrupted", "runner_offline" if offline else "no_activity", tuple(ids)
         )
-    # The posted message itself can update the session in the second it is delivered.
-    acted = [state for state in states if state.updated_at > delivery.delivered_at + 1]
-    failed = [state for state in acted if state.status == "failed"]
+    # A session that failed at or after the delivery failed on this action, even in the same
+    # second: posting the message marks a session working, so an older failure would not
+    # still show. Other activity counts only after that second, which the post itself fills.
+    failed = [
+        state
+        for state in states
+        if state.status == "failed" and state.updated_at >= delivery.delivered_at
+    ]
     if failed:
         return ActionProgress("interrupted", failed[0].error_code or "session_failed", tuple(ids))
+    acted = [state for state in states if state.updated_at > delivery.delivered_at + 1]
     if acted:
         return ActionProgress("finished_unreported", None, tuple(ids))
     if earlier_open:

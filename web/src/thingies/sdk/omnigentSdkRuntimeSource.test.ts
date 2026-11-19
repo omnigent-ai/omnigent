@@ -80,13 +80,18 @@ const CONTEXT: ThingyInitContext = {
  * the window the script talks to and plays the host's side of the handshake.
  */
 function loadRuntime(
-  dom: { document?: Document; MutationObserver?: typeof MutationObserver } = {},
+  dom: {
+    document?: Document;
+    MutationObserver?: typeof MutationObserver;
+    globals?: Record<string, unknown>;
+  } = {},
 ) {
   const listeners = new Set<(event: WindowMessage) => void>();
   const parentPosted: unknown[] = [];
   const parent: FakeFrameWindow["parent"] = { postMessage: (data) => parentPosted.push(data) };
   parent.parent = parent;
   const frameWindow: FakeFrameWindow = {
+    ...dom.globals,
     parent,
     addEventListener: (_type, listener) => listeners.add(listener),
     removeEventListener: (_type, listener) => listeners.delete(listener),
@@ -125,10 +130,14 @@ function loadRuntime(
     hostPort.postMessage({ v: 1, kind: "init", context });
     return hostPort;
   };
-  return { sdk, parent, parentPosted, deliver, connectHost };
+  return { sdk, frameWindow, parent, parentPosted, deliver, connectHost };
 }
 
 type Runtime = ReturnType<typeof loadRuntime>;
+
+// Uploaded apps call the SDK from untyped JavaScript; Reflect.apply calls it the same way.
+const callUntyped = (method: (...args: never[]) => unknown, target: unknown, args: unknown[]) =>
+  Reflect.apply(method, target, args);
 
 async function connected(runtime: Runtime, context?: ThingyInitContext) {
   const hostPort = runtime.connectHost(context);
@@ -160,6 +169,23 @@ function lastRequestId(hostPort: FakePort): string {
 
 // The injected SDK source is evaluated and fed host messages; each case asserts what it computes.
 describe("omnigent SDK runtime", () => {
+  it("removes WebRTC, which the frame's CSP does not cover, before the thingy's script runs", () => {
+    const FakePeerConnection = function FakePeerConnection() {};
+    const { frameWindow } = loadRuntime({
+      globals: {
+        RTCPeerConnection: FakePeerConnection,
+        webkitRTCPeerConnection: FakePeerConnection,
+      },
+    });
+    const globals = frameWindow as unknown as Record<string, unknown>;
+
+    expect(globals.RTCPeerConnection).toBeUndefined();
+    expect(globals.webkitRTCPeerConnection).toBeUndefined();
+    // The thingy cannot put it back.
+    expect(Reflect.set(globals, "RTCPeerConnection", FakePeerConnection)).toBe(false);
+    expect(globals.RTCPeerConnection).toBeUndefined();
+  });
+
   describe("connect", () => {
     it("greets the host and resolves with the context from a trusted connect", async () => {
       const runtime = loadRuntime();
@@ -174,6 +200,7 @@ describe("omnigent SDK runtime", () => {
         revisionId: "rev-1",
         viewer: { id: "1001", displayName: "viewer@example.com" },
         permissions: { writeData: true, publish: false },
+        preview: false,
       });
       expect(client.capabilities).toEqual(["data.read", "data.write"]);
       expect(client.ui.colorScheme).toBe("dark");
@@ -277,7 +304,9 @@ describe("omnigent SDK runtime", () => {
         ok: true,
         result: { actionId: "a1", delivery: "sent" },
       });
-      await expect(action).resolves.toEqual({ actionId: "a1", delivery: "sent" });
+      const receipt = await action;
+      expect(receipt).toMatchObject({ actionId: "a1", id: "a1", delivery: "sent" });
+      expect(typeof receipt.watch).toBe("function");
 
       const automation = client.navigation.newAutomation({
         name: "Daily",
@@ -339,6 +368,24 @@ describe("omnigent SDK runtime", () => {
       });
     });
 
+    it("exposes the server's request ID on the error, apart from its message", async () => {
+      const runtime = loadRuntime();
+      const { hostPort, client } = await connected(runtime);
+
+      const result = client.data.collection("cards").get("c1");
+      respond(hostPort, {
+        id: lastRequestId(hostPort),
+        ok: false,
+        error: { code: "NOT_FOUND", message: "No such card", requestId: "req-1" },
+      });
+
+      await expect(result).rejects.toMatchObject({
+        code: "NOT_FOUND",
+        message: "No such card",
+        requestId: "req-1",
+      });
+    });
+
     it("cancels and rejects CANCELLED when the caller aborts", async () => {
       const runtime = loadRuntime();
       const { hostPort, client } = await connected(runtime);
@@ -386,10 +433,6 @@ describe("omnigent SDK runtime", () => {
   });
 
   describe("input integrity", () => {
-    // Uploaded apps call the SDK from untyped JavaScript; Reflect.apply calls it the same way.
-    const callUntyped = (method: (...args: never[]) => unknown, target: unknown, args: unknown[]) =>
-      Reflect.apply(method, target, args);
-
     it.each([
       { label: "NaN", value: { order: Number.NaN } },
       { label: "Infinity", value: { order: Number.POSITIVE_INFINITY } },
@@ -601,6 +644,80 @@ describe("omnigent SDK runtime", () => {
       watch.dispose();
       await vi.advanceTimersByTimeAsync(60_000);
       expect(progressRequests()).toHaveLength(2);
+    });
+
+    interface WatchedAction {
+      status: string;
+      action: unknown;
+    }
+    const ITEM = { id: "a1", status: "done", reason: null, summary: "Done", sessionId: null };
+
+    it.each([
+      [
+        "watch(listener, { actionIds })",
+        (c: OmnigentClient, l: (snapshot: WatchedAction) => void) =>
+          c.agent.watch(l, { actionIds: ["a1"] }),
+      ],
+      [
+        "watch(actionId, listener)",
+        (c: OmnigentClient, l: (snapshot: WatchedAction) => void) =>
+          callUntyped(c.agent.watch, c.agent, ["a1", l]),
+      ],
+      [
+        "watch(listener, actionId)",
+        (c: OmnigentClient, l: (snapshot: WatchedAction) => void) =>
+          callUntyped(c.agent.watch, c.agent, [l, "a1"]),
+      ],
+      [
+        "watch(receipt, listener)",
+        (c: OmnigentClient, l: (snapshot: WatchedAction) => void) =>
+          callUntyped(c.agent.watch, c.agent, [{ actionId: "a1", delivery: "sent" }, l]),
+      ],
+      [
+        "watch(listener, { actionId })",
+        (c: OmnigentClient, l: (snapshot: WatchedAction) => void) =>
+          callUntyped(c.agent.watch, c.agent, [l, { actionId: "a1" }]),
+      ],
+    ])("follows one action with %s, with that action on the snapshot", async (_form, start) => {
+      const updates: WatchedAction[] = [];
+      const watch = start(client, (snapshot) => updates.push(snapshot)) as { dispose: () => void };
+
+      expect(lastFrameMessage(hostPort)).toMatchObject({
+        method: "agent.v1.progress",
+        params: { actionIds: ["a1"] },
+      });
+      respond(hostPort, { id: lastRequestId(hostPort), ok: true, result: { items: [ITEM] } });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(updates.map((update) => update.status)).toEqual(["loading", "live"]);
+      expect(updates[1].action).toEqual(ITEM);
+      watch.dispose();
+    });
+
+    it("follows the action a receipt names through receipt.watch", async () => {
+      const request = client.agent.request("run_card", {});
+      respond(hostPort, {
+        id: lastRequestId(hostPort),
+        ok: true,
+        result: { actionId: "a1", delivery: "sent" },
+      });
+      const receipt = await request;
+
+      const watch = receipt.watch(() => undefined);
+
+      expect(lastFrameMessage(hostPort)).toMatchObject({
+        method: "agent.v1.progress",
+        params: { actionIds: ["a1"] },
+      });
+      watch.dispose();
+    });
+
+    it("explains the call and snapshot shape when watch is used without a listener", () => {
+      expect(() => callUntyped(client.agent.watch, client.agent, ["a1"])).toThrow(
+        /client\.agent\.watch\(function \(snapshot\).*actionIds.*items holds one/,
+      );
+      expect(() =>
+        callUntyped(client.data.collection("cards").watch, client.data.collection("cards"), []),
+      ).toThrow(/collection\.watch\(function \(snapshot\)/);
     });
   });
 });

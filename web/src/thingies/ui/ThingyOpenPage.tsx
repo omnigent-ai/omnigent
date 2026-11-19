@@ -2,15 +2,20 @@
  * A thingy's link (`/thingy/:thingyId`): opens the thingy filling the screen in the viewer's
  * thingy session, or beside New session when they have none, so leaving full screen shows the
  * session behind it. A pinned sidebar row opens it here too and keeps the sidebar open.
+ *
+ * The page replaces itself with where the thingy opens, and that URL names the thingy filling
+ * the screen (`?thingy=`), so Back returns to the page before the link and Forward opens the
+ * thingy full screen again.
  */
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Loader2Icon } from "lucide-react";
 
 import { PageScroll } from "@/components/PageScroll";
-import { Link, useLocation, useParams } from "@/lib/routing";
+import { Link, useLocation, useNavigate, useParams } from "@/lib/routing";
+import { withThingyFullScreen } from "@/lib/thingyRailTabs";
 import { openThingyFullScreen } from "@/thingies/host/thingySession";
-import { ThingyErrorNotice } from "./ThingyErrorNotice";
-import { useThingyNavigate } from "./thingyNavigation";
+import { ThingyUnavailable } from "./ThingyUnavailable";
+import { appPathFromUrl } from "./thingyNavigation";
 import { useThingy } from "./thingyQueries";
 
 /** Link state a pinned sidebar row passes, so full screen leaves the sidebar open. */
@@ -23,7 +28,15 @@ export function ThingyOpenPage() {
   const location = useLocation();
   const keepSidebar = (location.state as ThingyOpenState | null)?.keepSidebar === true;
   const thingy = useThingy(thingyId);
-  const go = useThingyNavigate({ replace: true });
+  const navigate = useNavigate();
+  const go = useCallback(
+    (url: string) =>
+      navigate(withThingyFullScreen(appPathFromUrl(url), thingyId), {
+        replace: true,
+        state: keepSidebar ? { keepSidebar } : undefined,
+      }),
+    [navigate, thingyId, keepSidebar],
+  );
   const [openError, setOpenError] = useState<unknown>(undefined);
   const [attempt, setAttempt] = useState(0);
 
@@ -32,10 +45,10 @@ export function ThingyOpenPage() {
     if (data === undefined) return undefined;
     let cancelled = false;
     setOpenError(undefined);
-    const navigate = (url: string) => {
+    const open = (url: string) => {
       if (!cancelled) go(url);
     };
-    openThingyFullScreen(data, navigate, { keepSidebar }).catch((error: unknown) => {
+    openThingyFullScreen(data, open, { keepSidebar }).catch((error: unknown) => {
       if (!cancelled) setOpenError(error);
     });
     return () => {
@@ -53,22 +66,17 @@ export function ThingyOpenPage() {
     );
   }
   return (
-    <PageScroll contentClassName="px-4 md:px-6">
+    <PageScroll maxWidthClassName="max-w-4xl" contentClassName="px-4 md:px-8">
       <nav aria-label="Breadcrumb" className="mb-4 text-ui text-muted-foreground">
         <Link to="/thingy" className="hover:text-foreground">
           Thingy
         </Link>
       </nav>
-      <ThingyErrorNotice
-        title="Couldn’t open the thingy"
+      <ThingyUnavailable
+        thingyId={thingyId}
         error={error}
         onRetry={() => (thingy.isError ? void thingy.refetch() : setAttempt((n) => n + 1))}
       />
-      <p className="mt-4 text-ui text-muted-foreground">
-        <Link to="/thingy" className="underline underline-offset-3 hover:text-foreground">
-          Back to your thingies
-        </Link>
-      </p>
     </PageScroll>
   );
 }

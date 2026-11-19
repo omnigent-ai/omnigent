@@ -1033,7 +1033,7 @@ describe("PermissionsModal", () => {
             wrapper: createSharingWrapper("restricted_read_only"),
           },
         );
-        fireEvent.click(await screen.findByRole("button", { name: "Revoke" }));
+        fireEvent.click(await screen.findByRole("button", { name: "Revoke access for bob" }));
         await waitFor(() => expect(revokeMock).toHaveBeenCalledWith("conv_abc", "bob"));
         await chooseGeneralAccess("No access");
         await waitFor(() => expect(revokeMock).toHaveBeenCalledWith("conv_abc", "__public__"));
@@ -1546,7 +1546,7 @@ describe("PermissionsModal", () => {
         expect(screen.getByRole("button", { name: "Open in mobile app" })).toBeDisabled();
         expect(screen.getByRole("combobox", { name: "Permission level for bob" })).toBeDisabled();
         if (sessionError) expect(screen.getByText(sessionError.message)).toBeInTheDocument();
-        fireEvent.click(screen.getByRole("button", { name: "Revoke" }));
+        fireEvent.click(screen.getByRole("button", { name: "Revoke access for bob" }));
         await waitFor(() => expect(revokeMock).toHaveBeenCalledWith("conv_abc", "bob"));
         await chooseGeneralAccess("No access");
         await waitFor(() => expect(revokeMock).toHaveBeenCalledWith("conv_abc", "__public__"));
@@ -2094,7 +2094,9 @@ describe("PermissionsModal", () => {
       expect(listThingyMock).toHaveBeenCalledWith(thingy.id);
       expect(listMock).not.toHaveBeenCalled();
       expect(screen.queryByText("General access")).toBeNull();
-      expect(screen.queryByRole("button", { name: /copy link/i })).toBeNull();
+      // Its link opens the thingy for the people it is shared with; there is no session link.
+      expect(screen.getByRole("button", { name: "Copy link" })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Open in mobile app" })).toBeNull();
       expect(
         screen.getByRole("combobox", { name: "Permission level for bob@example.com" }),
       ).toHaveTextContent("Can edit");
@@ -2118,11 +2120,70 @@ describe("PermissionsModal", () => {
       await waitFor(() =>
         expect(grantShareMock).toHaveBeenCalledWith(thingyTarget, "bob@example.com", 1),
       );
-      fireEvent.click(screen.getByRole("button", { name: /revoke/i }));
+      fireEvent.click(screen.getByRole("button", { name: "Revoke access for Bob" }));
       await waitFor(() =>
         expect(revokeShareMock).toHaveBeenCalledWith(thingyTarget, "bob@example.com"),
       );
       expect(grantMock).not.toHaveBeenCalled();
+    });
+
+    it("names the owner and asks before a manager gives up their own access", async () => {
+      const managed = { ...thingy, owner_id: "alice@example.com", viewer_id: "bob@example.com" };
+      listThingyMock.mockResolvedValue(grantList([grantee("bob@example.com", 3, "Bob")]));
+      revokeShareMock.mockResolvedValue(undefined);
+      const onOpenChange = vi.fn();
+      render(<PermissionsModal thingy={managed} open onOpenChange={onOpenChange} />, {
+        wrapper: createInfoWrapper({ features: { thingies: true } }),
+      });
+
+      expect(await screen.findByText("alice@example.com")).toBeInTheDocument();
+      expect(screen.getByText("Owner")).toBeInTheDocument();
+      expect(
+        screen.queryByRole("button", { name: "Revoke access for alice@example.com" }),
+      ).toBeNull();
+      // The full level fits its column.
+      expect(
+        screen.getByRole("combobox", { name: "Permission level for bob@example.com" }),
+      ).toHaveClass("w-32");
+
+      fireEvent.click(screen.getByRole("button", { name: "Revoke access for Bob" }));
+      expect(revokeShareMock).not.toHaveBeenCalled();
+      const confirm = screen.getByRole("alertdialog", { name: "Change your own access" });
+      fireEvent.click(within(confirm).getByRole("button", { name: "Remove my access" }));
+      await waitFor(() =>
+        expect(revokeShareMock).toHaveBeenCalledWith(thingyTarget, "bob@example.com"),
+      );
+      await waitFor(() => expect(onOpenChange).toHaveBeenCalledWith(false));
+    });
+
+    it("warns instead of lowering a grant from the add form", async () => {
+      listThingyMock.mockResolvedValue(grantList([grantee("bob@example.com", 3, "Bob")]));
+      render(<PermissionsModal thingy={thingy} open onOpenChange={() => {}} />, {
+        wrapper: createInfoWrapper({ features: { thingies: true } }),
+      });
+      await screen.findByText("Bob");
+      fireEvent.change(screen.getByPlaceholderText("alice@example.com"), {
+        target: { value: "bob@example.com" },
+      });
+      fireEvent.click(screen.getByRole("button", { name: /grant/i }));
+      expect(
+        await screen.findByText("Bob already has Can manage. Change it in the list above."),
+      ).toBeInTheDocument();
+      expect(grantShareMock).not.toHaveBeenCalled();
+    });
+
+    it("still lists and removes grants while sharing is off", async () => {
+      listThingyMock.mockResolvedValue(grantList([grantee("bob@example.com", 2, "Bob")]));
+      revokeShareMock.mockResolvedValue(undefined);
+      render(<PermissionsModal thingy={thingy} open onOpenChange={() => {}} />, {
+        wrapper: createInfoWrapper({ features: { thingies: true }, sharing_mode: "off" }),
+      });
+      expect(await screen.findByText("Bob")).toBeInTheDocument();
+      expect(screen.queryByPlaceholderText("alice@example.com")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Revoke access for Bob" }));
+      await waitFor(() =>
+        expect(revokeShareMock).toHaveBeenCalledWith(thingyTarget, "bob@example.com"),
+      );
     });
 
     it("offers only Can view where the server allows read-only sharing", async () => {

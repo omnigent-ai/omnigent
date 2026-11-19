@@ -24,6 +24,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Any
 
 __all__ = [
     "MAX_FILE_BYTES",
@@ -80,9 +81,17 @@ class Conflict(StoreError):
 
 
 class InvalidInput(StoreError):
-    """The request is malformed, out of bounds, or names another scope."""
+    """The request is malformed, out of bounds, or names another scope.
+
+    ``details`` is machine-readable context the API returns with the error, e.g.
+    which field of a record failed its schema.
+    """
 
     code = "INVALID_INPUT"
+
+    def __init__(self, message: str, *, details: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.details = details
 
 
 class CapacityExceeded(StoreError):
@@ -163,7 +172,8 @@ class ThingyFiles(ABC):
         Readers never see a partly written file.
 
         :raises Conflict: When the file already exists.
-        :raises NotFound: When its parent directory does not exist.
+        :raises NotFound: When its parent directory does not exist, or the thingy
+            whose scope this is was deleted.
         :raises CapacityExceeded: When the encoded value exceeds :data:`MAX_FILE_BYTES`.
         """
 
@@ -179,7 +189,11 @@ class ThingyFiles(ABC):
 
     @abstractmethod
     def mkdirs(self, path: str) -> None:
-        """Create a directory and its missing ancestors; idempotent."""
+        """Create a directory and its missing ancestors within the scope; idempotent.
+
+        :raises NotFound: When the thingy whose scope this is was deleted; a
+            thingy's scope is never created again once it is gone.
+        """
 
 
 class ThingyStore(ABC):
@@ -228,6 +242,9 @@ class ThingyStore(ABC):
     def delete(self, thingy_id: str) -> bool:
         """Delete a thingy with every file in its scope.
 
+        Writes and renames racing it fail (``NotFound``, or ``None`` from
+        :meth:`rename`) rather than leave files of the deleted thingy behind.
+
         :returns: ``True`` when it existed.
         """
 
@@ -238,3 +255,7 @@ class ThingyStore(ABC):
     @abstractmethod
     def user_files(self, user_id: str) -> ThingyFiles:
         """One user's own file scope, for their shelf."""
+
+    @abstractmethod
+    def delete_user_files(self, user_id: str) -> None:
+        """Delete every file in one user's scope, as when their account is deleted."""

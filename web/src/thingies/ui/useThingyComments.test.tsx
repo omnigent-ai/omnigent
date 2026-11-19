@@ -55,7 +55,7 @@ describe("thingy comments", () => {
       ]),
     ).toBe(
       [
-        'Address these comments on the thingy "Launch board" (thingy_id board). Change its page with thingy_revision_create and thingy_publish, or its records, as each asks. They are already marked addressed; thingy_comment_list has them all.',
+        'Load the thingy skill and follow it. Address these comments on the thingy "Launch board" (thingy_id board). Change its page with sys_thingy_revision_create and sys_thingy_publish, or its records, as each asks. They are already marked addressed; sys_thingy_comment_list has them all.',
         "",
         '1. On "Ship it" (Card, ref card-1), lee@example.com wrote:',
         "   Body of c1",
@@ -112,5 +112,21 @@ describe("thingy comments", () => {
     );
     expect(address).toHaveBeenCalledWith(expect.stringContaining("Body of c1"));
     expect(address.mock.calls[0][0]).not.toContain("Body of c2");
+  });
+
+  it("leaves the viewer's own comments theirs to edit or delete, as in single-user mode", async () => {
+    const local = thingyFixture({ id: "board", owner_id: "local", viewer_id: "local" });
+    vi.mocked(listThingyComments).mockResolvedValue({
+      items: [comment("mine", { createdBy: "local" }), comment("theirs")],
+      canComment: true,
+    });
+    const { result } = renderHook(() => useThingyComments(local, undefined), { wrapper });
+    await waitFor(() => expect(result.current.draftCount).toBe(2));
+    // The panel reads no author as the viewer ("You"), whose comments it lets them change.
+    expect(result.current.panel.comments.map((item) => item.created_by)).toEqual([
+      null,
+      "lee@example.com",
+    ]);
+    expect(result.current.panel.readOnlyMessage).toMatch(/thingy/);
   });
 });

@@ -7,6 +7,7 @@ import {
   resetThingyRailRequests,
   setThingyNewSessionTabMaximized,
   useThingyRailRequest,
+  withThingyFullScreen,
 } from "./thingyRailTabs";
 
 afterEach(resetThingyRailRequests);
@@ -34,5 +35,12 @@ describe("thingy rail requests", () => {
     });
     exitThingyRailFullScreen(null);
     expect(useThingyRailRequest.getState().newSessionMaximized).toBe(false);
+  });
+
+  it("names the thingy filling the screen in a path, keeping its query and hash", () => {
+    expect(withThingyFullScreen("/c/conv_1", "a")).toBe("/c/conv_1?thingy=a");
+    expect(withThingyFullScreen("/?prompt=x%3Fy&thingy_start=a#end", "a")).toBe(
+      "/?prompt=x%3Fy&thingy_start=a&thingy=a#end",
+    );
   });
 });

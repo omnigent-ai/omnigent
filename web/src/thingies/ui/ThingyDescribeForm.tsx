@@ -2,13 +2,19 @@
 // dialog, the create page and a session's New thingy tab show it, each building it its own way.
 import { type ReactNode, useId, useState } from "react";
 
-import { CompactShortcutKeys, ENTER_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
+import {
+  ARIA_MOD_KEY,
+  CompactShortcutKeys,
+  ENTER_KEY,
+  MOD_KEY,
+} from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
+import { cn } from "@/lib/utils";
 import { ThingyErrorNotice } from "./ThingyErrorNotice";
 
 export const THINGY_DESCRIPTION_PLACEHOLDER =
-  "What it shows, what data it uses, and what people do with it";
+  "e.g. A tracker of open incidents with owner and severity";
 
 export const THINGY_SUGGESTIONS = [
   "A weekly KPI story from a table",
@@ -26,6 +32,11 @@ export interface ThingyDescribeFormProps {
   /** Shows Cancel, which calls it. */
   onCancel?: () => void;
   errorTitle: string;
+  /** The description to start with, such as one typed before a reload. */
+  initialDescription?: string;
+  onDescriptionChange?: (description: string) => void;
+  /** Caps how tall the description grows, where the form shares a dialog with the templates. */
+  compact?: boolean;
 }
 
 export function ThingyDescribeForm({
@@ -34,8 +45,15 @@ export function ThingyDescribeForm({
   onBuild,
   onCancel,
   errorTitle,
+  initialDescription = "",
+  onDescriptionChange,
+  compact = false,
 }: ThingyDescribeFormProps) {
-  const [description, setDescription] = useState("");
+  const [description, setDescriptionState] = useState(initialDescription);
+  const setDescription = (next: string) => {
+    setDescriptionState(next);
+    onDescriptionChange?.(next);
+  };
   const [building, setBuilding] = useState(false);
   const [error, setError] = useState<unknown>(undefined);
   const headingId = useId();
@@ -78,7 +96,7 @@ export function ThingyDescribeForm({
         placeholder={THINGY_DESCRIPTION_PLACEHOLDER}
         disabled={building}
         componentId="thingies.describe.description"
-        className="max-h-72 min-h-24 resize-none"
+        className={cn("min-h-24 resize-none", compact ? "max-h-48" : "max-h-72")}
         onChange={(event) => setDescription(event.target.value)}
         onKeyDown={(event) => {
           if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
@@ -103,8 +121,10 @@ export function ThingyDescribeForm({
         ))}
       </div>
       <div className="flex items-center gap-2">
-        <span className="flex min-w-0 flex-1 items-center gap-1 text-sm text-muted-foreground">
+        {/* A keyboard hint, so touch screens leave it out. */}
+        <span className="flex min-w-0 flex-1 items-center gap-1 text-sm text-muted-foreground max-md:invisible pointer-coarse:invisible">
           <CompactShortcutKeys keys={[MOD_KEY, ENTER_KEY]} />
+          <span className="sr-only">{ARIA_MOD_KEY === "Meta" ? "Command" : "Control"}+Enter</span>
           to build
         </span>
         {onCancel && (

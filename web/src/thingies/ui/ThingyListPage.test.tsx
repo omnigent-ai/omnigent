@@ -1,9 +1,15 @@
 import { fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { deleteThingy, listSharedThingies, listThingies } from "@/thingies/api/thingyApi";
+import {
+  deleteThingy,
+  getThingyShelf,
+  listSharedThingies,
+  listThingies,
+  pinThingy,
+} from "@/thingies/api/thingyApi";
 import { ThingyListPage } from "./ThingyListPage";
-import { renderWithThingies, thingyFixture } from "./testUtils";
+import { THINGIES_INFO, renderWithThingies, thingyFixture } from "./testUtils";
 import type * as ThingyApiModule from "@/thingies/api/thingyApi";
 
 vi.mock("@/thingies/api/thingyApi", async (importOriginal) => ({
@@ -11,6 +17,8 @@ vi.mock("@/thingies/api/thingyApi", async (importOriginal) => ({
   listThingies: vi.fn(),
   listSharedThingies: vi.fn(),
   deleteThingy: vi.fn(),
+  getThingyShelf: vi.fn(),
+  pinThingy: vi.fn(),
 }));
 // The template thumbnails run real thingies; their frame has its own tests.
 vi.mock("@/thingies/host/ThingyFrame", () => ({ ThingyFrame: () => null }));
@@ -24,6 +32,7 @@ const DRAFT = thingyFixture({
 });
 
 beforeEach(() => {
+  vi.mocked(getThingyShelf).mockResolvedValue({ pinned: [], hasOwned: true });
   vi.mocked(listThingies).mockResolvedValue([BOARD, DRAFT]);
   vi.mocked(listSharedThingies).mockResolvedValue([
     {
@@ -50,10 +59,21 @@ describe("Thingy page", () => {
       within(shared).getByText("Shared by lee@example.com with a group you’re in"),
     ).toBeInTheDocument();
     expect(within(shared).getByText("Shared by someone")).toBeInTheDocument();
-    // Only a thingy's managers delete it, and nobody deletes from the shared list.
-    expect(screen.getByRole("button", { name: "Actions for Launch board" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Actions for Reading list" })).toBeNull();
+    // Newest first: the server lists them oldest first.
+    expect(
+      within(yours)
+        .getAllByRole("button", { name: /^Open / })
+        .map((button) => button.getAttribute("aria-label")),
+    ).toEqual(["Open Reading list", "Open Launch board"]);
+    expect(within(yours).getByText("Published")).toBeInTheDocument();
+    // Only a thingy's managers delete it, and nobody changes the shared list's.
     expect(screen.queryByRole("button", { name: "Actions for Team tracker" })).toBeNull();
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Actions for Reading list" }), {
+      button: 0,
+    });
+    expect(await screen.findByRole("menuitem", { name: "Rename" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Delete thingy" })).toBeNull();
+    fireEvent.keyDown(screen.getByRole("menu"), { key: "Escape" });
 
     fireEvent.click(within(yours).getByRole("button", { name: "Open Launch board" }));
     expect(screen.getByLabelText("location")).toHaveTextContent("/thingy/board");
@@ -107,5 +127,40 @@ describe("Thingy page", () => {
     expect(alert).toHaveTextContent("The server is unavailable.");
     fireEvent.click(within(alert).getByRole("button", { name: "Retry" }));
     expect(await screen.findByRole("button", { name: "Open Launch board" })).toBeInTheDocument();
+  });
+
+  it("pins a thingy from its row", async () => {
+    vi.mocked(pinThingy).mockResolvedValue({
+      pinned: [{ id: "board", name: "Launch board" }],
+      hasOwned: true,
+    });
+    renderWithThingies(<ThingyListPage />, { path: "/thingy" });
+
+    const menu = await screen.findByRole("button", { name: "Actions for Launch board" });
+    await waitFor(() => expect(getThingyShelf).toHaveBeenCalled());
+    fireEvent.pointerDown(menu, { button: 0 });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Pin to sidebar" }));
+    await waitFor(() => expect(pinThingy).toHaveBeenCalledWith("board", true));
+    expect(await screen.findByText("Published · Pinned to sidebar")).toBeInTheDocument();
+  });
+
+  it("leaves out Shared with you where nothing can be shared", async () => {
+    renderWithThingies(<ThingyListPage />, {
+      path: "/thingy",
+      info: { ...THINGIES_INFO, single_user: true },
+    });
+    await screen.findByTestId("thingies-list");
+    expect(screen.queryByRole("heading", { name: "Shared with you" })).toBeNull();
+    expect(listSharedThingies).not.toHaveBeenCalled();
+  });
+
+  it("gives focus back to New when New thingy closes", async () => {
+    renderWithThingies(<ThingyListPage />, { path: "/thingy" });
+    const newButton = await screen.findByTestId("new-thingy-button");
+    fireEvent.click(newButton);
+    const dialog = await screen.findByRole("dialog", { name: "New thingy" });
+    fireEvent.click(within(dialog).getByRole("button", { name: "Cancel" }));
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    expect(newButton).toHaveFocus();
   });
 });

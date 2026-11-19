@@ -1212,7 +1212,8 @@ defaults off; enable it with `OMNIGENT_FEATURES=thingies` on the server.
 Disabling `browser` also
 drops the embedded-browser guidance from the composed system prompt, and
 disabling `journal` also drops the `/workflow` and `/save-workflow` skills (see
-[Session journal](session-journal.md)). The block is read the same way from a
+[Session journal](session-journal.md)), and disabling `thingies` drops the
+agent-facing `thingy` skill. The block is read the same way from a
 `config.yaml` bundle and a single-file agent YAML.
 
 The `memory` group is the long-term memory tools. It applies only when the server

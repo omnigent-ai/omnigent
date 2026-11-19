@@ -15,6 +15,7 @@ import {
 
 import type { ThingyActionRequest, ThingySelection } from "./thingyBridge";
 import { BridgeError } from "./thingyBridge";
+import { thingyPromptLabel } from "./thingyBuild";
 import {
   composeThingyContextPrompt,
   thingyBoardNewSessionUrl,
@@ -120,17 +121,15 @@ export async function openThingyFullScreen(
   );
 }
 
-/** The instructions that make a new session the thingy's coordinator, before its first request. */
+/**
+ * The note that makes a new session the thingy's coordinator, before its first request. How to
+ * coordinate is in the `thingy` skill, so the note stays short.
+ */
 export function composeThingySessionPrompt(app: Pick<Thingy, "id" | "name">): string {
   return [
-    `This is my thingy session for the thingy ${JSON.stringify(app.name)} (thingy_id ${app.id}). I will send every action and change request for this thingy here.`,
-    "- Start by calling sys_thingy_describe (its guide, actions and rules) and sys_thingy_action_list (its action ledger).",
-    '- Action requests arrive as messages starting with "Thingy action" and a JSON object with action_id, action and params. For each one, set it running with sys_thingy_action_update, carry it out as its description in sys_thingy_describe says, then set it done or failed with a short Markdown summary. Take the current version from sys_thingy_action_list before each update.',
-    "- Stay free to take the next request: hand long or independent work to a child session (sys_session_create) with the action_id and these reporting rules, and record its session ID on the action. Run actions that touch the same records one at a time. If a request repeats one that is still queued or running, mark it done and say it was merged.",
-    "- The ledger, not this conversation, records what is done; after a restart or compaction, read it again.",
-    "- Read and change records with the sys_thingy_record_* tools; a write that breaks one of the thingy's rules fails with CONSTRAINT_VIOLATION.",
-    "- To change the thingy itself, read sys_thingy_revision_get, upload a new revision with sys_thingy_revision_create (collection schemas cannot change; add a collection if you need one) and publish it with sys_thingy_publish using the current version from sys_thingy_get. Keep a pending state on every action, since data calls often take a second or more. Do not edit or delete records unless I ask.",
-  ].join("\n");
+    "Load the thingy skill and follow it.",
+    `This is my thingy session for ${thingyPromptLabel(app)}: I'll send its actions and change requests here.`,
+  ].join(" ");
 }
 
 /** The message that hands one ledger entry to the thingy session. */
@@ -281,15 +280,13 @@ export async function requestThingyAction(
     ...request,
     operationId: randomUUID(),
   });
-  if (entry.merged) {
-    // The same request is still open, so nothing is sent again.
-    await openThingySession(app, "", navigate, {
-      deliver: false,
-      reveal: false,
-      railSessionId,
-    });
-    return { actionId: entry.id, delivery: "merged" };
+  if (entry.delivered) {
+    // The same request is still open in a session (or this is a retry of one that reached it),
+    // so nothing is sent again.
+    return { actionId: entry.id, delivery: entry.merged ? "merged" : "sent" };
   }
+  // A new entry, or an open one that never reached a session (for example its New session was
+  // abandoned): send its message, so the session that starts or gets it can carry it out.
   // The session works without the viewer watching; the page marks where it can be opened instead.
   const delivery = await openThingySession(app, thingyActionMessage(entry), navigate, {
     deliver: true,

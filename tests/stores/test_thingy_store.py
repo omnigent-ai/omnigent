@@ -165,3 +165,94 @@ def test_metadata_with_the_wrong_shape_is_corrupt(store: LocalThingyStore, tmp_p
     metadata.write_text(json.dumps({"kind": "other", "id": thingy.id}))
     with pytest.raises(CorruptData):
         store.get(thingy.id)
+
+
+def test_writes_after_a_deletion_fail_and_never_bring_its_files_back(
+    store: LocalThingyStore, tmp_path: Path
+) -> None:
+    thingy = store.create(ALICE, "Board")
+    files = store.thingy_files(thingy.id)
+    files.mkdirs("data/cards")
+    assert store.delete(thingy.id) is True
+
+    with pytest.raises(NotFound, match="Thingy not found"):
+        files.mkdirs("data/cards/c1")
+    with pytest.raises(NotFound, match="Thingy not found"):
+        files.create_json("data/cards/x.json", {"a": 1})
+    assert store.rename(thingy.id, "Renamed") is None
+    assert not (tmp_path / "thingies" / "thingies" / thingy.id).exists()
+
+
+def test_deletion_racing_renames_and_writes_leaves_nothing_behind(
+    store: LocalThingyStore, tmp_path: Path
+) -> None:
+    root = tmp_path / "thingies" / "thingies"
+    for trial in range(8):
+        thingy = store.create(ALICE, "Board")
+        files = store.thingy_files(thingy.id)
+        start = threading.Barrier(21)
+        failures: list[BaseException] = []
+
+        def rename(
+            number: int, thingy_id: str = thingy.id, barrier=start, failures=failures
+        ) -> None:
+            barrier.wait()
+            try:
+                store.rename(thingy_id, f"Name {number}")
+            except BaseException as exc:
+                failures.append(exc)
+
+        def write(number: int, scope=files, barrier=start, failures=failures) -> None:
+            barrier.wait()
+            try:
+                scope.mkdirs(f"data/cards/c{number}")
+                scope.create_json(f"data/cards/c{number}/00000001.json", {"n": number})
+            except NotFound:
+                pass  # Deleted first: refused, as it should be.
+            except BaseException as exc:
+                failures.append(exc)
+
+        threads = [threading.Thread(target=rename, args=(n,)) for n in range(10)]
+        threads += [threading.Thread(target=write, args=(n,)) for n in range(10)]
+        for thread in threads:
+            thread.start()
+        start.wait()
+        store.delete(thingy.id)
+        for thread in threads:
+            thread.join()
+        assert failures == [], (trial, failures)
+        assert not (root / thingy.id).exists(), trial
+        assert store.get(thingy.id) is None
+
+
+def test_reopening_removes_what_an_interrupted_deletion_left(tmp_path: Path) -> None:
+    location = tmp_path / "thingies"
+    store = LocalThingyStore(str(location))
+    kept = store.create(ALICE, "Board")
+    (location / ".trash" / "leftover" / "files").mkdir(parents=True)
+    orphan = location / "thingies" / ("a" * 32)
+    (orphan / "files" / "data").mkdir(parents=True)
+    fresh = location / "thingies" / ("b" * 32)
+    (fresh / "files").mkdir(parents=True)
+    old = 1_000_000_000
+    os.utime(orphan, (old, old))
+
+    LocalThingyStore(str(location))
+    assert not (location / ".trash" / "leftover").exists()
+    assert not orphan.exists()
+    # Maybe a create still in progress, and live thingies, are left alone.
+    assert fresh.exists()
+    assert (location / "thingies" / kept.id / "thingy.json").exists()
+
+
+def test_deleting_a_users_files_empties_their_scope(store: LocalThingyStore) -> None:
+    files = store.user_files(ALICE)
+    files.mkdirs("shelf/pins")
+    files.create_json("shelf/pins/all.json", {"items": []})
+    store.user_files(BOB).mkdirs("shelf")
+
+    store.delete_user_files(ALICE)
+    store.delete_user_files(ALICE)
+    with pytest.raises(NotFound):
+        files.list_paths("shelf")
+    assert store.user_files(BOB).list_paths("shelf") == []

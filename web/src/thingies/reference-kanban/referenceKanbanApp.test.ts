@@ -194,6 +194,8 @@ interface BoardOptions {
   navigation?: boolean;
   /** Whether the viewer can edit the thingy, which running actions needs. */
   publish?: boolean;
+  /** A template preview, whose data lives in memory. */
+  preview?: boolean;
 }
 
 async function startBoard({
@@ -202,6 +204,7 @@ async function startBoard({
   items,
   navigation = true,
   publish = true,
+  preview = false,
 }: BoardOptions = {}) {
   const cards = new FakeCards();
   const runs = new FakeRuns();
@@ -232,6 +235,7 @@ async function startBoard({
     context: {
       viewer: { id: "1001", displayName: "viewer@example.com" },
       permissions: { writeData, publish },
+      preview,
     },
     hasCapability: (name: string) => capability && name === "data.write",
     ui: { colorScheme: "light" },
@@ -524,6 +528,25 @@ describe("reference Kanban app", () => {
       expect(screen.getByRole("status")).toHaveTextContent("Live");
     });
 
+    it("starts a template preview with its sample cards and no sign-in or saving text", async () => {
+      const { cards } = await startBoard({ preview: true, publish: false });
+
+      cards.emit([]);
+
+      await waitFor(() => expect(cards.creates).toHaveLength(3));
+      cards.creates.forEach((call, index) =>
+        call.resolve({ id: `sample-${index}`, version: "v1" }),
+      );
+      await waitFor(() =>
+        expect(
+          screen.getByRole("heading", { name: /Sample: draft the onboarding checklist/ }),
+        ).toBeVisible(),
+      );
+      expect(screen.getByRole("status")).toHaveTextContent("Preview");
+      expect(screen.queryByText(/Signed in as/)).not.toBeInTheDocument();
+      expect(screen.queryByText("All changes saved")).not.toBeInTheDocument();
+    });
+
     it("shows the added card as adding before the server answers, then settles it", async () => {
       const { cards } = await startBoard({ items: [] });
       await userEvent.click(await screen.findByRole("button", { name: "Add a card to Backlog" }));
@@ -565,7 +588,29 @@ describe("reference Kanban app", () => {
       nth(cards.gets, 0).resolve(cardDoc("c1", { title: "Fix login" }, "v7"));
 
       await waitFor(() => expect(cards.replaces).toHaveLength(2));
-      expect(nth(cards.replaces, 1).args[1]).toEqual(nth(cards.replaces, 0).args[1]);
+      expect(nth(cards.replaces, 1).args[1]).toMatchObject({ title: "Fix sign-in" });
+      expect(nth(cards.replaces, 1).args[2]).toEqual({ ifVersion: "v7" });
+    });
+
+    it("keeps the other person's changes to fields this tab did not change", async () => {
+      const { cards } = await startBoard({ items: ERROR_ITEMS });
+      await saveRename("Fix sign-in");
+      nth(cards.replaces, 0).reject(new FakeOmnigentError("CONFLICT", "conflict"));
+
+      await userEvent.click(await screen.findByRole("button", { name: "Keep my change" }));
+      nth(cards.gets, 0).resolve(
+        cardDoc("c1", { title: "Fix login", owner: "Sam", notes: "Their notes" }, "v7"),
+      );
+
+      await waitFor(() => expect(cards.replaces).toHaveLength(2));
+      expect(nth(cards.replaces, 1).args[1]).toEqual({
+        title: "Fix sign-in",
+        owner: "Sam",
+        notes: "Their notes",
+        column: "todo",
+        order: 1,
+        checklist: [],
+      });
       expect(nth(cards.replaces, 1).args[2]).toEqual({ ifVersion: "v7" });
     });
 
@@ -790,6 +835,12 @@ describe("reference Kanban runs in a session", () => {
         "Start your thingy session beside the board to run this card.",
       ),
     ).toBeVisible();
+
+    // Left without starting it, the run can open New session again.
+    await userEvent.click(
+      within(cardItem("Fix login")).getByRole("button", { name: "Open New session again" }),
+    );
+    expect(agent.request).toHaveBeenCalledTimes(2);
   });
 
   it("shows why the thingy session did not get the card", async () => {

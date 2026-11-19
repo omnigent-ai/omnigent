@@ -109,6 +109,8 @@ function invalidateAfterShareChange(qc: QueryClient, target: ShareTarget): void 
   void qc.invalidateQueries({ queryKey: permissionsKey(target) });
   // The server shares an automation's continued session at once.
   if (target.kind === "automation") invalidateSessionGrants(qc);
+  // A change can be the viewer's own access, which every open view of the thingy shows.
+  if (target.kind === "thingy") void qc.invalidateQueries({ queryKey: ["thingies"] });
   void qc.invalidateQueries({ queryKey: ["conversations"] });
   void qc.invalidateQueries({ queryKey: ["project-sessions"] });
   void qc.invalidateQueries({ queryKey: PINNED_CONVERSATIONS_KEY });

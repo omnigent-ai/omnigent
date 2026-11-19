@@ -14,7 +14,7 @@ import re
 
 from fastapi import APIRouter, Query, Request
 from fastapi.responses import Response
-from pydantic import BaseModel
+from pydantic import BaseModel, StrictBool, StrictInt, StrictStr
 
 from omnigent.db.account_authority import target_account_scope
 from omnigent.debug_logging import add_audit_attrs
@@ -26,7 +26,6 @@ from omnigent.server.routes.scheduled_task_permissions import (
     display_names_or_ids,
     request_from_agent,
 )
-from omnigent.server.schemas import GrantPermissionRequest
 from omnigent.server.session_sharing import (
     THINGY_GRANT_LEVELS,
     is_reserved_grantee,
@@ -62,6 +61,22 @@ class ThingyPermissionObject(BaseModel):
     display_name: str
 
 
+class ThingyGrantRequest(BaseModel):
+    """
+    Body of ``PUT /v1/thingies/{id}/permissions``.
+
+    :param user_id: The user or group to share with, e.g. ``"alice@example.com"``;
+        surrounding whitespace is ignored.
+    :param level: ``1`` (Can view), ``2`` (Can edit) or ``3`` (Can manage), as an
+        integer.
+    :param ensure_minimum: Keep a higher existing grant instead of lowering it.
+    """
+
+    user_id: StrictStr
+    level: StrictInt
+    ensure_minimum: StrictBool = False
+
+
 class ThingyPermissionList(BaseModel):
     """One page of a thingy's grants, ordered by ``user_id``."""
 
@@ -86,6 +101,27 @@ def _grantee_to_remove(store: PermissionStore, thingy_id: str, user_id: str) -> 
         )
         return user_id
     return grantee
+
+
+def _existing_spelling(store: PermissionStore, thingy_id: str, grantee: str) -> str:
+    """The ID the thingy already holds a grant under for *grantee* in another letter case.
+
+    So re-sharing with ``Bob@Example.com`` changes ``bob@example.com``'s grant rather
+    than add a second row for the same person.
+    """
+    folded = grantee.casefold()
+    cursor: str | None = None
+    while True:
+        grants, cursor = store.list_for_thingy(
+            thingy_id, limit=MAX_GRANTS_PAGE_SIZE, after_user_id=cursor
+        )
+        for grant in grants:
+            if grant.user_id == grantee:
+                return grantee
+            if grant.user_id.casefold() == folded:
+                return grant.user_id
+        if cursor is None:
+            return grantee
 
 
 def _permission_object(grant: ThingyPermission, names: dict[str, str]) -> ThingyPermissionObject:
@@ -161,7 +197,7 @@ def register_thingy_permissions_routes(
 
     @router.put("/thingies/{thingy_id}/permissions", response_model=ThingyPermissionObject)
     async def grant_thingy_permission(
-        request: Request, thingy_id: str, body: GrantPermissionRequest
+        request: Request, thingy_id: str, body: ThingyGrantRequest
     ) -> ThingyPermissionObject:
         """Share a thingy with a user or group at Can view, Can edit or Can manage.
 
@@ -174,15 +210,17 @@ def register_thingy_permissions_routes(
         """
         store = require_sharing(request)
         thingy = await asyncio.to_thread(load_manageable, request, thingy_id)
-        if not body.user_id.strip():
+        # IDs come from people typing them; whitespace around one is never part of it.
+        user_id = body.user_id.strip()
+        if not user_id:
             raise OmnigentError(
                 "Name a user or group to share the thingy with", code=ErrorCode.INVALID_INPUT
             )
         # Before any write: ensure_user would otherwise fail or leave a user row.
-        require_grantee_id_fits(body.user_id)
+        require_grantee_id_fits(user_id)
         if body.level not in THINGY_GRANT_LEVELS:
             raise OmnigentError(
-                "Thingies are shared at Can view, Can edit or Can manage",
+                "Thingies are shared at Can view (1), Can edit (2) or Can manage (3)",
                 code=ErrorCode.INVALID_INPUT,
             )
         # A thingy has no working directory, so a restricted mode only limits the level.
@@ -193,9 +231,11 @@ def register_thingy_permissions_routes(
             load_workspace=lambda: None,
         )
         [(grantee, level)] = await asyncio.to_thread(
-            store.validate_grants, [(body.user_id, body.level)]
+            store.validate_grants, [(user_id, body.level)]
         )
-        if grantee == thingy.owner_id:
+        grantee = grantee.strip()
+        # In any letter case: the owner already has every permission.
+        if grantee.casefold() == thingy.owner_id.casefold():
             raise OmnigentError(
                 "A thingy's owner cannot be granted access to it", code=ErrorCode.INVALID_INPUT
             )
@@ -205,6 +245,7 @@ def register_thingy_permissions_routes(
                 "Thingies cannot be shared publicly or with the local user; name a user or group",
                 code=ErrorCode.INVALID_INPUT,
             )
+        grantee = await asyncio.to_thread(_existing_spelling, store, thingy.id, grantee)
         target = await asyncio.to_thread(store.get_user, grantee)
         with target_account_scope(grantee, target.account_generation if target else None):
             await asyncio.to_thread(store.ensure_user, grantee)
@@ -213,6 +254,11 @@ def register_thingy_permissions_routes(
                     grantee, thingy.id, level, ensure_minimum=body.ensure_minimum
                 )
             )
+        # A deletion that ran meanwhile already forgot the thingy's grants; drop this one
+        # too, so no grant outlives its thingy.
+        if await asyncio.to_thread(thingy_store.get, thingy.id) is None:
+            await asyncio.to_thread(store.delete_for_thingy, thingy.id)
+            raise NotFound("Thingy not found")
         add_audit_attrs(target_user_id=grantee, level=grant.level)
         # The grant is committed, so a failed name lookup must not fail the request.
         names = await asyncio.to_thread(display_names_or_ids, store, [grant.user_id])

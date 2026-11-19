@@ -95,3 +95,42 @@ def test_without_a_permission_store_thingies_stay_private(tmp_path: Path) -> Non
     assert access.permissions(BOB, thingy) == NO_ACCESS
     assert access.shared_with(BOB) == []
     access.forget(thingy.id)
+
+
+def test_grants_left_by_a_deleted_thingy_do_not_count_against_the_shared_list(
+    setup: tuple[LocalThingyStore, _GroupStore], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.thingies import access as access_module
+
+    store, grants = setup
+    access = PermissionStoreThingyAccess(store, grants)
+    monkeypatch.setattr(access_module, "MAX_SHARED_THINGIES", 2)
+    # Thingy IDs are random, so whether the dead grants sort first varies; make enough of them.
+    dead = [store.create(ALICE, f"Gone {n}") for n in range(4)]
+    live = [store.create(ALICE, f"Live {n}") for n in range(2)]
+    for thingy in [*dead, *live]:
+        grants.grant_for_thingy(CAROL, thingy.id, LEVEL_READ)
+    for thingy in dead:
+        # As if a grant raced the deletion and landed after it.
+        store.delete(thingy.id)
+
+    shared = {item.thingy.id for item in access.shared_with(CAROL)}
+    assert shared == {thingy.id for thingy in live}
+    # The dead grants are dropped on the way.
+    for thingy in dead:
+        assert grants.list_for_thingy(thingy.id) == ([], None)
+
+
+def test_permissions_for_several_thingies_match_one_at_a_time(
+    setup: tuple[LocalThingyStore, _GroupStore],
+) -> None:
+    store, grants = setup
+    access = PermissionStoreThingyAccess(store, grants)
+    own, shared, private = (store.create(owner, "x") for owner in (CAROL, ALICE, ALICE))
+    grants.grant_for_thingy(CAROL, shared.id, LEVEL_EDIT)
+    thingies = [own, shared, private]
+    expected = {thingy.id: access.permissions(CAROL, thingy) for thingy in thingies}
+    assert access.permissions_many(CAROL, thingies) == expected
+    assert expected[own.id] == FULL_ACCESS and expected[private.id] == NO_ACCESS
+    grants.deleted = frozenset({ALICE})
+    assert access.permissions_many(CAROL, thingies)[shared.id] == NO_ACCESS

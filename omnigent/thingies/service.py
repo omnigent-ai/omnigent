@@ -33,7 +33,7 @@ from typing import Any, cast
 import jsonschema
 
 from omnigent.stores.thingy_store import MAX_THINGY_NAME_CHARS, Thingy, ThingyFiles, ThingyStore
-from omnigent.thingies.access import ThingyAccess, ThingyPermissions
+from omnigent.thingies.access import NO_ACCESS, ThingyAccess, ThingyPermissions
 from omnigent.thingies.actions import (
     validate_actions,
     validate_request,
@@ -113,6 +113,16 @@ MAX_OPEN_ACTIONS = 10
 # New session it opened) is no longer open.
 UNDELIVERED_TTL_S = 30 * 60
 MAX_PROGRESS_IDS = 20
+# What ``describe`` tells an agent to do next; the ``thingy`` skill has the details.
+_NEXT_STEPS = (
+    "Load the thingy skill and follow it: it says how to handle 'Thingy action' messages, "
+    "read and change records with sys_thingy_records, and change or publish this thingy."
+)
+_NEXT_STEPS_UNPUBLISHED = (
+    "Nothing is published yet. Load the thingy skill and follow it to build this thingy: "
+    "upload a page with sys_thingy_revision_create, then publish it with sys_thingy_publish "
+    "(if_version null)."
+)
 
 
 class ThingyError(Exception):
@@ -195,10 +205,17 @@ def _validate_schema(schema: Any, depth: int = 0, counter: list[int] | None = No
     # Remote references and regex/combinator evaluation are deliberately left out.
     counter = [0] if counter is None else counter
     counter[0] += 1
-    if depth > 12 or counter[0] > 256 or not isinstance(schema, dict):
+    if not isinstance(schema, dict):
+        raise InvalidInput("A schema must be a JSON object")
+    if depth > 12 or counter[0] > 256:
         raise InvalidInput("Collection schema is too complex")
-    if set(schema) - _SCHEMA_KEYS:
-        raise InvalidInput("Collection schema contains unsupported keywords")
+    unsupported = sorted(set(schema) - _SCHEMA_KEYS)
+    if unsupported:
+        # Name both, so a caller drops only what is refused and keeps its other checks.
+        raise InvalidInput(
+            f"Unsupported schema keyword{'s' if len(unsupported) > 1 else ''}: "
+            f"{', '.join(unsupported)[:300]}. Supported: {', '.join(sorted(_SCHEMA_KEYS))}"
+        )
     properties = schema.get("properties", {})
     if not isinstance(properties, dict):
         raise InvalidInput("Schema properties must be an object")
@@ -212,6 +229,17 @@ def _validate_schema(schema: Any, depth: int = 0, counter: list[int] | None = No
         jsonschema.Draft202012Validator.check_schema(schema)
     except jsonschema.SchemaError as exc:
         raise InvalidInput("Invalid collection schema") from exc
+
+
+def _schema_mismatch(collection: str, error: jsonschema.ValidationError) -> InvalidInput:
+    """Which field of a record breaks its collection's schema, and why."""
+    path = [part if isinstance(part, int) else str(part)[:64] for part in error.absolute_path]
+    where = "".join(f"[{part}]" if isinstance(part, int) else f".{part}" for part in path)
+    reason = error.message[:200]
+    return InvalidInput(
+        f"The record does not match the {collection} schema at value{where}: {reason}",
+        details={"path": path, "reason": reason, "schema_keyword": error.validator},
+    )
 
 
 def _frontend_input(
@@ -442,26 +470,42 @@ class ThingyService:
         )
         return current, pins
 
+    def _readable_pins(self, pins: list[dict]) -> dict[str, Thingy]:
+        """The pinned thingies the viewer can still read, keyed by ID.
+
+        A thingy deleted, or no longer shared with them, since they pinned it drops out,
+        and so does its name.
+        """
+        ids = [pin["id"] for pin in pins if isinstance(pin.get("id"), str)]
+        found = self.store.get_many(ids)
+        permissions = self.access.permissions_many(self.viewer.user_id, list(found.values()))
+        return {
+            app_id: thingy
+            for app_id, thingy in found.items()
+            if permissions.get(app_id, NO_ACCESS).read
+        }
+
     def shelf(self) -> dict:
         """The viewer's pinned thingies, and whether they own any, for the sidebar."""
         _, pins = self._pins()
-        ids = [pin.get("id") for pin in pins if isinstance(pin.get("id"), str)]
-        current = self.store.get_many(ids)
+        readable = self._readable_pins(pins)
+        ids = [pin["id"] for pin in pins if pin.get("id") in readable]
         return {
-            # Current names; thingies deleted since they were pinned drop out.
-            "pinned": [
-                {"id": app_id, "name": current[app_id].name} for app_id in ids if app_id in current
-            ],
+            "pinned": [{"id": app_id, "name": readable[app_id].name} for app_id in ids],
             "has_owned": bool(self.store.list_owned(self.viewer.user_id)),
         }
 
     def pin(self, app_id: str, body: dict) -> dict:
-        """Pins or unpins a thingy the viewer can read, whoever owns it."""
+        """Pins or unpins a thingy the viewer can read, whoever owns it.
+
+        Saving the shelf also drops pins the viewer can no longer read.
+        """
         pinned = body.get("pinned")
         if not isinstance(pinned, bool):
             raise InvalidInput("pinned must be true or false")
         current, pins = self._pins()
-        others = [pin for pin in pins if pin.get("id") != app_id]
+        readable = self._readable_pins(pins)
+        others = [pin for pin in pins if pin.get("id") != app_id and pin.get("id") in readable]
         if pinned:
             thingy, _ = self._resolve(app_id)
             others.append({"id": app_id, "name": thingy.name})
@@ -485,11 +529,21 @@ class ThingyService:
             items.append(self._app(thingy, permissions))
         return {"session_id": session_id, "items": items}
 
+    def _require_session(self, session_id: str) -> None:
+        """Refuses a session the viewer cannot read, or one that is gone or archived.
+
+        Without a session reader (tests, or a server without sessions) any well-formed
+        ID is taken.
+        """
+        if self.sessions is not None and not self.sessions.available(session_id):
+            raise NotFound("Session not found")
+
     def link_session(self, app_id: str, session_id: str, body: dict) -> dict:
         """Shows a thingy beside one of the viewer's sessions, or stops showing it there.
 
         Showing it there also makes that session the viewer's thingy session when they
-        may register one, so actions requested from the thingy's own page reach it.
+        may register one, so actions requested from the thingy's own page reach it. Only
+        a session the viewer can read can show it.
         """
         session_id = _session_id(session_id)
         linked = body.get("linked")
@@ -498,21 +552,22 @@ class ThingyService:
         key = self._session_key(session_id)
         current = self._shelf.get("sessions", key)
         ids = current.value.get("thingies") if current is not None else None
-        others = (
-            [value for value in ids if isinstance(value, str) and value != app_id]
-            if isinstance(ids, list)
-            else []
-        )
+        shown = [value for value in ids if isinstance(value, str)] if isinstance(ids, list) else []
         if linked:
-            _, permissions = self._resolve(app_id)
-            others.append(app_id)
-            if len(others) > MAX_SESSION_THINGIES:
+            thingy, permissions = self._resolve(app_id)
+            self._require_session(session_id)
+            # Showing it again keeps its place, so the session's tabs do not reorder.
+            if app_id not in shown:
+                shown.append(app_id)
+            if len(shown) > MAX_SESSION_THINGIES:
                 raise CapacityExceeded(
                     f"A session can show at most {MAX_SESSION_THINGIES} thingies"
                 )
             if permissions.publish:
-                self.set_thingy_session(app_id, {"session_id": session_id})
-        self._save_shelf("sessions", key, current, {"session_id": session_id, "thingies": others})
+                self._register_thingy_session(thingy, session_id)
+        else:
+            shown = [value for value in shown if value != app_id]
+        self._save_shelf("sessions", key, current, {"session_id": session_id, "thingies": shown})
         return self.session_thingies(session_id)
 
     # -- comments ---------------------------------------------------------------------
@@ -727,6 +782,17 @@ class ThingyService:
         publication = self._publication(thingy)
         if publication is None:
             raise NotFound("This thingy has not been published")
+        return (
+            thingy,
+            permissions,
+            self._published(thingy, publication, requested_revision),
+            publication,
+        )
+
+    def _published(
+        self, thingy: Thingy, publication: dict, requested_revision: str | None = None
+    ) -> dict:
+        """The published revision, checked against its publication."""
         revision_id = publication["value"]["revision_id"]
         if requested_revision is not None and requested_revision != revision_id:
             raise FrontendRevisionChanged(revision_id)
@@ -736,7 +802,7 @@ class ThingyService:
         approved = publication["value"].get("approved_capabilities", [])
         if not isinstance(approved, list) or any(not isinstance(item, str) for item in approved):
             raise CorruptData("Published capabilities are invalid")
-        return thingy, permissions, revision, publication
+        return revision
 
     def content(self, app_id: str) -> dict:
         _, permissions, revision, publication = self._active(app_id)
@@ -758,7 +824,12 @@ class ThingyService:
         if revision_id is None:
             _, _, revision, _ = self._active(app_id)
         else:
-            thingy, _ = self._resolve(app_id)
+            thingy, permissions = self._resolve(app_id)
+            publication = self._publication(thingy)
+            published = publication["value"]["revision_id"] if publication else None
+            # Unpublished revisions are drafts: only those who may publish read them.
+            if revision_id != published and not permissions.publish:
+                raise NotFound("Revision not found")
             revision = self._frontend(thingy, revision_id)
         return {
             "revision_id": revision["id"],
@@ -772,22 +843,23 @@ class ThingyService:
         }
 
     def describe(self, app_id: str) -> dict:
-        """What an agent needs before working with a thingy's records, without its source."""
-        thingy, permissions, revision, _ = self._active(app_id)
+        """What an agent needs before working on a thingy, without its source.
+
+        Also for a thingy with nothing published yet, whose session starts by building
+        it; ``next_steps`` says so. The how-to lives in the ``thingy`` framework skill.
+        """
+        thingy, permissions = self._resolve(app_id)
+        publication = self._publication(thingy)
+        revision = self._published(thingy, publication) if publication is not None else {}
         app = self._app(thingy, permissions)
         return {
             "thingy": {key: app[key] for key in ("id", "name", "browse_url", "permissions")},
-            "published_revision": revision["id"],
+            "published_revision": revision.get("id"),
             "guide": revision.get("guide"),
-            "collections": revision["collections"],
+            "collections": revision.get("collections", {}),
             "constraints": revision.get("constraints", []),
             "actions": revision.get("actions", []),
-            "notes": (
-                "Records must match their collection schema. A write that would break a "
-                "constraint fails with CONSTRAINT_VIOLATION and details naming the rule; "
-                "existing data that already breaks a rule can still be edited toward it. Use "
-                "sys_thingy_record_* with a stable operation_id per change."
-            ),
+            "next_steps": _NEXT_STEPS_UNPUBLISHED if publication is None else _NEXT_STEPS,
         }
 
     # -- thingy sessions and the action ledger ---------------------------------------
@@ -818,9 +890,14 @@ class ThingyService:
         return {"session_id": session_id, "version": record.version}
 
     def set_thingy_session(self, app_id: str, body: dict) -> dict:
+        """Registers one of the sessions the viewer can read as their thingy session."""
         thingy, permissions = self._resolve(app_id)
         self._require(permissions, "publish")
         session_id = _session_id(body.get("session_id"))
+        self._require_session(session_id)
+        return self._register_thingy_session(thingy, session_id)
+
+    def _register_thingy_session(self, thingy: Thingy, session_id: str) -> dict:
         store = self._sessions(thingy)
         record_id = self.viewer.key
         operation_id = "session-" + _digest([record_id, session_id])
@@ -916,6 +993,8 @@ class ThingyService:
         open_records = self._open_records(viewer)
         progress = self._progress(thingy, open_records)
         # Asking again for an action that is still open joins it instead of running it twice.
+        # One never delivered (the viewer left the New session it opened) says so, so the
+        # web app can hand it to a session again rather than wait for it.
         for record in open_records:
             known = progress.get(str(record.get("id")))
             if (
@@ -924,7 +1003,11 @@ class ThingyService:
                 and known["progress"].status in OPEN_STATUSES
                 and known["document"].id != record_id
             ):
-                return {**known["document"].to_dict(), "merged": True}
+                return {
+                    **known["document"].to_dict(),
+                    "merged": True,
+                    "delivered": delivery_of(record) is not None,
+                }
         value = {
             "action": name,
             "params": params,
@@ -946,7 +1029,14 @@ class ThingyService:
             ]
             record = {"id": document.id, "digest": digest, "requested_at": int(time.time())}
             self._save_viewer(thingy, viewer, [*still_open, record], "open-" + operation_id)
-        return {**document.to_dict(), "merged": False}
+            delivered = False
+        else:
+            # A retry of this request: report the delivery its first attempt recorded.
+            delivered = any(
+                record.get("id") == document.id and delivery_of(record) is not None
+                for record in open_records
+            )
+        return {**document.to_dict(), "merged": False, "delivered": delivered}
 
     def record_delivery(self, app_id: str, action_id: str, body: dict) -> dict:
         """Records that the web app posted the viewer's action into their thingy session."""
@@ -1070,10 +1160,11 @@ class ThingyService:
         if method in {"data.v1.create", "data.v1.replace"}:
             if "value" not in params:
                 raise InvalidInput("Document value is required")
-            try:
-                jsonschema.Draft202012Validator(schema).validate(params["value"])
-            except jsonschema.ValidationError as exc:
-                raise InvalidInput("Document does not match its collection schema") from exc
+            error = jsonschema.exceptions.best_match(
+                jsonschema.Draft202012Validator(schema).iter_errors(params["value"])
+            )
+            if error is not None:
+                raise _schema_mismatch(collection, error)
         files = self._files(thingy)
         store = ImmutableDocumentStore(files, "data", limits=_DATA_STORE_LIMITS)
         rules = revision.get("constraints", [])

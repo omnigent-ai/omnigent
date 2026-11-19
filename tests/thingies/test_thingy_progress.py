@@ -316,10 +316,17 @@ def test_deliveries_go_only_to_the_callers_own_thingy_session_and_unreadable_ses
 ) -> None:
     conversations = FakeConversations()
     conversations.add("s_thingy", status="running", updated=NOW)
+    conversations.add("s_someone_else", status="running", updated=NOW)
+    hidden = {"s_someone_else"}
     service = progress_service(
-        thingies, conversations, readable=lambda session_id: session_id != "s_thingy"
+        thingies, conversations, readable=lambda session_id: session_id not in hidden
     )
     app = publish_actions_board(service)
+    # Only a session the viewer can read becomes their thingy session.
+    with pytest.raises(NotFound):
+        service.set_thingy_session(app["id"], {"session_id": "s_someone_else"})
+    with pytest.raises(NotFound):
+        service.set_thingy_session(app["id"], {"session_id": "s_made_up"})
     service.set_thingy_session(app["id"], {"session_id": "s_thingy"})
     action = service.request_action(
         app["id"], {"action": "run_card", "params": {"cardId": "c1"}, "operation_id": "r1"}
@@ -330,6 +337,8 @@ def test_deliveries_go_only_to_the_callers_own_thingy_session_and_unreadable_ses
     with pytest.raises(NotFound):
         service.record_delivery(app["id"], "f" * 32, {"session_id": "s_thingy"})
     service.record_delivery(app["id"], action["id"], {"session_id": "s_thingy"})
+    # Access to the session lost since: its state stays private.
+    hidden.add("s_thingy")
     assert status(service, app, action["id"]) == ("interrupted", "session_unavailable")
 
 
@@ -496,3 +505,74 @@ def test_the_reader_follows_a_real_conversation_store(db_uri: str) -> None:
     assert not reader.available(parent.id)
     assert not SessionStateReader(store, lambda _session_id: False).available(child.id)
     assert not reader.available("0" * 32)
+
+
+def test_a_thingy_session_that_fails_on_delivery_reports_its_failure_at_once(
+    thingies: Fixture, clock: dict
+) -> None:
+    conversations = FakeConversations()
+    conversations.add("s_thingy", seen=None)
+    service = progress_service(thingies, conversations)
+    app = publish_actions_board(service)
+    service.set_thingy_session(app["id"], {"session_id": "s_thingy"})
+    action_id = request_and_deliver(service, app, "c1")
+
+    # The runner failed to start in the same second the message was posted.
+    conversations.set(
+        "s_thingy",
+        status="failed",
+        updated=NOW,
+        labels={
+            "omnigent.last_task_error_code": "runner_failed_to_start",
+            "omnigent.last_task_error_message": "The runner could not start.",
+        },
+    )
+    assert status(service, app, action_id) == ("interrupted", "runner_failed_to_start")
+    conversations.set("s_thingy", labels={})
+    assert status(service, app, action_id) == ("interrupted", "session_failed")
+
+
+def test_a_repeat_of_an_undelivered_action_says_it_was_never_delivered(
+    thingies: Fixture, clock: dict
+) -> None:
+    conversations = FakeConversations()
+    conversations.add("s_thingy")
+    service = progress_service(thingies, conversations)
+    app = publish_actions_board(service)
+    params = {"cardId": "c1"}
+    first = service.request_action(
+        app["id"], {"action": "run_card", "params": params, "operation_id": "r1"}
+    )
+    assert first["merged"] is False and first["delivered"] is False
+    # The viewer left the New session it opened; asking again joins the open request and
+    # says it still needs handing to a session.
+    repeat = service.request_action(
+        app["id"], {"action": "run_card", "params": params, "operation_id": "r2"}
+    )
+    assert (repeat["id"], repeat["merged"], repeat["delivered"]) == (first["id"], True, False)
+
+    service.set_thingy_session(app["id"], {"session_id": "s_thingy"})
+    service.record_delivery(app["id"], first["id"], {"session_id": "s_thingy"})
+    delivered = service.request_action(
+        app["id"], {"action": "run_card", "params": params, "operation_id": "r3"}
+    )
+    assert (delivered["id"], delivered["merged"], delivered["delivered"]) == (
+        first["id"],
+        True,
+        True,
+    )
+    # The viewer can also cancel an action that waits.
+    cancelled = service.update_action(
+        app["id"],
+        {
+            "id": first["id"],
+            "if_version": delivered["version"],
+            "operation_id": "cancel-1",
+            "state": "cancelled",
+        },
+    )
+    assert cancelled["value"]["state"] == "cancelled"
+    fresh = service.request_action(
+        app["id"], {"action": "run_card", "params": params, "operation_id": "r4"}
+    )
+    assert fresh["merged"] is False and fresh["id"] != first["id"]

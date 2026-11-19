@@ -6,7 +6,6 @@ import {
   thingyBoardPath,
   thingyNewAutomationUrl,
   thingyNewSessionUrl,
-  thingyOpenPath,
   thingySessionUrl,
 } from "./thingyPages";
 
@@ -17,12 +16,12 @@ function parse(path: string): URL {
 }
 
 describe("thingy pages", () => {
-  it("appends a note naming the thingy and its describe tool", () => {
+  it("appends a note naming the thingy and the thingy skill", () => {
     const prompt = composeThingyContextPrompt("  Summarize the card  ", APP);
 
     expect(prompt.startsWith("Summarize the card\n\n---\n")).toBe(true);
     expect(prompt).toContain('"Team \\"board\\"" (thingy_id app-1)');
-    expect(prompt).toContain("Call sys_thingy_describe for thingy_id app-1");
+    expect(prompt).toContain("load the thingy skill");
     expect(prompt).not.toMatch(/token|Authorization|mcp/i);
   });
 
@@ -64,8 +63,7 @@ describe("thingy pages", () => {
     expect(url.searchParams.has("return_to")).toBe(false);
   });
 
-  it("encodes the thingy in its page and full screen paths", () => {
+  it("encodes the thingy in its page path", () => {
     expect(thingyBoardPath("app/1")).toBe("/thingy/app%2F1");
-    expect(parse(thingyOpenPath("app/1")).searchParams.get("thingy_open")).toBe("app/1");
   });
 });

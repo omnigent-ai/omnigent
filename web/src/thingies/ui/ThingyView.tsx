@@ -23,6 +23,12 @@ function thingyContentKey(thingyId: string, revision: string) {
   return [...THINGIES_KEY, "content", thingyId, revision] as const;
 }
 
+function permissionsKey({ permissions }: Thingy): string {
+  return [permissions.read, permissions.write_data, permissions.publish, permissions.manage]
+    .map(Number)
+    .join("");
+}
+
 function PublishedThingy({
   thingy,
   revision,
@@ -99,7 +105,8 @@ function PublishedThingy({
         </div>
       )}
       <ThingyFrame
-        key={content.data.revision_id}
+        // A change to the viewer's access starts the page again, with what it may do now.
+        key={`${content.data.revision_id}:${permissionsKey(thingy)}`}
         app={thingy}
         content={content.data}
         onRevisionChanged={onRevisionChanged}
@@ -121,6 +128,10 @@ export interface ThingyViewProps {
   /** Where the controls go instead of above the thingy: the side panel's bar in full screen. */
   toolbarTarget: HTMLElement | null;
   onContentLoaded?: (content: ThingyContent) => void;
+  /** Whether it fills the screen, with its session out of sight. */
+  fullScreen?: boolean;
+  /** Shows the session it is shown with, leaving full screen. */
+  onOpenSession?: () => void;
 }
 
 export function ThingyView({
@@ -130,6 +141,8 @@ export function ThingyView({
   renderToolbar,
   toolbarTarget,
   onContentLoaded,
+  fullScreen = false,
+  onOpenSession,
 }: ThingyViewProps) {
   const navigate = useThingyNavigate();
   const queryClient = useQueryClient();
@@ -161,7 +174,7 @@ export function ThingyView({
         <div
           role="toolbar"
           aria-label={`${thingy.name} controls`}
-          className="flex shrink-0 items-center gap-1 border-b border-border px-3 py-1.5"
+          className="flex shrink-0 items-center gap-1 border-b border-border px-4 py-1.5"
         >
           {controls}
         </div>
@@ -191,6 +204,7 @@ export function ThingyView({
               thingyId={thingy.id}
               canPublish={thingy.permissions.publish}
               besideSession={sessionId !== undefined}
+              onOpenSession={fullScreen ? onOpenSession : undefined}
               onPublished={onReloadThingy}
             />
           )}

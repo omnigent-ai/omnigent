@@ -1,15 +1,29 @@
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, useNavigate } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { resetThingyRailRequests, useThingyRailRequest } from "@/lib/thingyRailTabs";
+import { deleteThingy, getThingy, getThingyThingySession } from "@/thingies/api/thingyApi";
 import { adoptStartedThingySession } from "@/thingies/host/thingySession";
-import { useAdoptStartedThingySession } from "./useAdoptStartedThingySession";
+import {
+  rememberUnbuiltThingy,
+  resetThingyStarts,
+  useAdoptStartedThingySession,
+} from "./useAdoptStartedThingySession";
+import { thingyFixture } from "./testUtils";
+import type * as ThingyApiModule from "@/thingies/api/thingyApi";
 import type * as ThingySessionModule from "@/thingies/host/thingySession";
 
 vi.mock("@/thingies/host/thingySession", async (importOriginal) => ({
   ...(await importOriginal<typeof ThingySessionModule>()),
   adoptStartedThingySession: vi.fn(async () => true),
+}));
+vi.mock("@/thingies/api/thingyApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof ThingyApiModule>()),
+  getThingy: vi.fn(),
+  getThingyThingySession: vi.fn(),
+  deleteThingy: vi.fn(),
 }));
 
 function Shell() {
@@ -32,14 +46,17 @@ function Shell() {
 
 function renderShell() {
   render(
-    <MemoryRouter initialEntries={["/?prompt=Build&thingy_start=board"]}>
-      <Shell />
-    </MemoryRouter>,
+    <QueryClientProvider client={new QueryClient()}>
+      <MemoryRouter initialEntries={["/?prompt=Build&thingy_start=board"]}>
+        <Shell />
+      </MemoryRouter>
+    </QueryClientProvider>,
   );
 }
 
 afterEach(() => {
   resetThingyRailRequests();
+  resetThingyStarts();
   vi.clearAllMocks();
 });
 
@@ -64,5 +81,33 @@ describe("a session started beside a thingy", () => {
     fireEvent.click(screen.getByRole("button", { name: "Elsewhere" }));
     fireEvent.click(screen.getByRole("button", { name: "Created" }));
     expect(adoptStartedThingySession).not.toHaveBeenCalled();
+  });
+
+  it("deletes a thingy Build made when New session is left without sending it", async () => {
+    vi.mocked(getThingy).mockResolvedValue(
+      thingyFixture({ id: "board", published_revision: null }),
+    );
+    vi.mocked(getThingyThingySession).mockResolvedValue(null);
+    vi.mocked(deleteThingy).mockResolvedValue(undefined);
+    rememberUnbuiltThingy("board");
+    renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "Elsewhere" }));
+    await waitFor(() => expect(deleteThingy).toHaveBeenCalledWith("board"));
+  });
+
+  it("keeps a thingy that has a version or a session, or that a session started from", async () => {
+    vi.mocked(getThingy).mockResolvedValue(thingyFixture({ id: "board" }));
+    rememberUnbuiltThingy("board");
+    renderShell();
+    fireEvent.click(screen.getByRole("button", { name: "Elsewhere" }));
+    await waitFor(() => expect(getThingy).toHaveBeenCalledWith("board"));
+    expect(deleteThingy).not.toHaveBeenCalled();
+
+    resetThingyStarts();
+    rememberUnbuiltThingy("board");
+    renderShell();
+    fireEvent.click(screen.getAllByRole("button", { name: "Created" }).at(-1)!);
+    await waitFor(() => expect(adoptStartedThingySession).toHaveBeenCalled());
+    expect(deleteThingy).not.toHaveBeenCalled();
   });
 });

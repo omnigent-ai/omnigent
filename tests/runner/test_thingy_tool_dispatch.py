@@ -43,7 +43,7 @@ def _registered(spec: AgentSpec) -> set[str]:
 
 
 def test_agents_get_the_thingy_tools_unless_their_spec_or_server_turns_them_off() -> None:
-    assert len(THINGY_TOOL_NAMES) == 17
+    assert len(THINGY_TOOL_NAMES) == 13
     assert all(name.startswith("sys_thingy_") for name in THINGY_TOOL_NAMES)
     # Native harnesses see only the relay's names, so the tools must be listed there.
     assert (
@@ -112,10 +112,13 @@ async def test_the_runner_keeps_the_tools_only_when_the_server_turns_thingies_on
 async def server(db_uri: str, tmp_path: Path) -> AsyncIterator[httpx.AsyncClient]:
     """The real app in single-user mode, with thingies on."""
     artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
+    conversations = SqlAlchemyConversationStore(db_uri)
+    # The calling session, which a new thingy is shown beside.
+    conversations.create_conversation(conversation_id=SESSION)
     app = create_app(
         agent_store=SqlAlchemyAgentStore(db_uri),
         file_store=SqlAlchemyFileStore(db_uri),
-        conversation_store=SqlAlchemyConversationStore(db_uri),
+        conversation_store=conversations,
         artifact_store=artifacts,
         agent_cache=AgentCache(artifact_store=artifacts, cache_dir=tmp_path / "cache"),
         feature_flags=resolve_feature_flags({"OMNIGENT_FEATURES": "thingies"}),
@@ -156,7 +159,7 @@ async def test_an_agent_builds_a_thingy_and_works_with_its_records_and_actions(
         actions=[{"name": "run_card", "description": "Work on a card."}],
     )
     unpublished = await _call(
-        server, "sys_thingy_record_list", thingy_id=thingy_id, collection="cards"
+        server, "sys_thingy_records", thingy_id=thingy_id, op="list", collection="cards"
     )
     assert "not been published" in unpublished["error"]
     published = await _call(
@@ -175,25 +178,28 @@ async def test_an_agent_builds_a_thingy_and_works_with_its_records_and_actions(
     # A retried call with the same call ID is applied once.
     first = await _call(
         server,
-        "sys_thingy_record_create",
+        "sys_thingy_records",
         "call-1",
         thingy_id=thingy_id,
+        op="create",
         collection="cards",
         value={"title": "Ship"},
     )
     again = await _call(
         server,
-        "sys_thingy_record_create",
+        "sys_thingy_records",
         "call-1",
         thingy_id=thingy_id,
+        op="create",
         collection="cards",
         value={"title": "Ship"},
     )
     assert again == first
     replaced = await _call(
         server,
-        "sys_thingy_record_replace",
+        "sys_thingy_records",
         thingy_id=thingy_id,
+        op="replace",
         collection="cards",
         id=first["id"],
         value={"title": "Shipped"},
@@ -202,8 +208,9 @@ async def test_an_agent_builds_a_thingy_and_works_with_its_records_and_actions(
     )
     stale = await _call(
         server,
-        "sys_thingy_record_replace",
+        "sys_thingy_records",
         thingy_id=thingy_id,
+        op="replace",
         collection="cards",
         id=first["id"],
         value={"title": "Stale"},
@@ -211,16 +218,32 @@ async def test_an_agent_builds_a_thingy_and_works_with_its_records_and_actions(
         operation_id="stale-card",
     )
     assert stale["error"]["code"] == "CONFLICT"
-    listed = await _call(server, "sys_thingy_record_list", thingy_id=thingy_id, collection="cards")
+    listed = await _call(
+        server, "sys_thingy_records", thingy_id=thingy_id, op="list", collection="cards"
+    )
     assert listed["items"] == [replaced]
     fetched = await _call(
-        server, "sys_thingy_record_get", thingy_id=thingy_id, collection="cards", id=first["id"]
+        server,
+        "sys_thingy_records",
+        thingy_id=thingy_id,
+        op="get",
+        collection="cards",
+        id=first["id"],
     )
-    assert fetched == replaced
+    assert fetched == {"record": replaced}
+    missing = await _call(
+        server, "sys_thingy_records", thingy_id=thingy_id, op="get", collection="cards", id="nope"
+    )
+    assert missing == {"record": None}
+    bad_op = await _call(
+        server, "sys_thingy_records", thingy_id=thingy_id, op="upsert", collection="cards"
+    )
+    assert "op must be one of" in bad_op["error"]
     deleted = await _call(
         server,
-        "sys_thingy_record_delete",
+        "sys_thingy_records",
         thingy_id=thingy_id,
+        op="delete",
         collection="cards",
         id=first["id"],
         if_version=replaced["version"],
@@ -306,7 +329,9 @@ async def test_record_calls_follow_a_publish_made_meanwhile(server: httpx.AsyncC
         return response
 
     server.request = publish_after_reading  # type: ignore[method-assign]
-    page = await _call(server, "sys_thingy_record_list", thingy_id=thingy_id, collection="cards")
+    page = await _call(
+        server, "sys_thingy_records", thingy_id=thingy_id, op="list", collection="cards"
+    )
     assert published_second
     assert page == {"items": [], "next_cursor": None}
 

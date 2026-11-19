@@ -7,7 +7,6 @@ import {
   GlobeIcon,
   Loader2Icon,
   MaximizeIcon,
-  MessageSquareIcon,
   MessagesSquareIcon,
   MinimizeIcon,
   PlusIcon,
@@ -112,6 +111,7 @@ import {
 import { Button } from "../components/ui/button";
 import {
   ThingyFullScreenSlot,
+  ThingyMobileDrawer,
   type ThingyRailNewItem,
   ThingyRailTabStrip,
   useThingyRailTabState,
@@ -996,6 +996,9 @@ function WorkspacePanelImpl({
       if (next && options?.keepSidebar && onMaximizeKeepingSidebar) onMaximizeKeepingSidebar();
       else onToggleMaximized();
     },
+    // Phones have no rail: a requested thingy covers the session in its own drawer.
+    mobile: isMobile,
+    routed: !contained,
   });
   const activeView = resolveWorkspaceActiveView(
     {
@@ -1484,7 +1487,8 @@ function WorkspacePanelImpl({
     if (
       ((rightRailTab === "browser" && browsers.selected === null) ||
         (rightRailTab === "sidechat" && sideChats.selected === null) ||
-        (rightRailTab === "thingy" && thingyRail.selected === null)) &&
+        // A saved thingy tab waits for the session's thingies before it counts as gone.
+        (rightRailTab === "thingy" && thingyRail.selected === null && !thingyRail.loading)) &&
       selectedFilePath === null &&
       selectedTerminalKey === null
     ) {
@@ -1495,6 +1499,7 @@ function WorkspacePanelImpl({
     browsers.selected,
     sideChats.selected,
     thingyRail.selected,
+    thingyRail.loading,
     selectedFilePath,
     selectedTerminalKey,
     browserFallbackTab,
@@ -1815,6 +1820,8 @@ function WorkspacePanelImpl({
       className={cn(
         "workspace-panel-motion @container/rail relative z-40 hidden md:flex md:min-h-0 md:flex-col md:overflow-hidden md:border-l md:border-border md:bg-card",
         maximized ? "md:absolute md:inset-0" : "md:shrink-0",
+        // A full screen thingy meets the window's edge with the sidebar closed.
+        thingyFullScreen && !sidebarOpen && "md:border-l-0",
         contained &&
           "flex min-h-0 flex-col overflow-hidden border-l border-border bg-card shrink-0",
         contained && maximized && "absolute inset-0",
@@ -2126,10 +2133,7 @@ function WorkspacePanelImpl({
                 size="icon-xs"
                 className="flex size-6 text-muted-foreground hover:text-foreground"
               >
-                {thingyFullScreen ? (
-                  // Leaving a full screen thingy shows the session.
-                  <MessageSquareIcon className="size-4" />
-                ) : maximized ? (
+                {maximized ? (
                   <MinimizeIcon className="size-4" />
                 ) : (
                   <MaximizeIcon className="size-4" />
@@ -2300,6 +2304,7 @@ function WorkspacePanelImpl({
   return (
     <>
       {rail}
+      {isMobile && <ThingyMobileDrawer state={thingyRail} />}
       {/* The rail is `hidden` on phones, so the drawer renders beside it. A
         portal to the body would escape the embed's scoped styles. */}
       {isMobile && (

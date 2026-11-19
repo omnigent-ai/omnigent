@@ -184,6 +184,8 @@ export function isWellFormedErrorCode(value: unknown): value is string {
 export interface ThingyWireError {
   code: ThingyWireErrorCode;
   message: string;
+  /** The server's request ID, for support; not part of the message a thingy shows. */
+  requestId?: string;
 }
 
 /** Context the host sends once per port. Contains no credentials, URLs, or routing parameters. */
@@ -197,6 +199,8 @@ export interface ThingyInitContext {
   capabilities: ThingyCapability[];
   permissions: { writeData: boolean; publish: boolean };
   colorScheme: "light" | "dark";
+  /** A template preview: data lives in memory and actions are off. Older hosts omit it. */
+  preview?: boolean;
 }
 
 export interface ThingyInitMessage {

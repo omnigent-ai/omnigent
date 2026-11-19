@@ -63,10 +63,14 @@ def validate_request(actions: list[dict], name: Any, params: Any) -> tuple[str, 
         raise InvalidInput("Action params must be an object")
     schema = declared.get("params")
     if schema is not None:
-        try:
-            jsonschema.Draft202012Validator(schema).validate(params)
-        except jsonschema.ValidationError as exc:
-            raise InvalidInput(f"Params do not match action {name}") from exc
+        error = jsonschema.exceptions.best_match(
+            jsonschema.Draft202012Validator(schema).iter_errors(params)
+        )
+        if error is not None:
+            where = "".join(f"[{part!r}]" for part in error.absolute_path)
+            raise InvalidInput(
+                f"Params do not match action {name} at params{where}: {error.message[:200]}"
+            )
     return name, params
 
 

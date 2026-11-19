@@ -222,6 +222,7 @@ from omnigent.stores.user_settings_store import (
     session_owner_title_instructions,
 )
 from omnigent.thingies.access import PermissionStoreThingyAccess, ThingyAccess
+from omnigent.thingies.accounts import DeletedAccountThingies
 from omnigent.tools.builtins.session_message import SESSION_MESSAGE_MAX_CHARS
 from omnigent.util.event_loop_watchdog import monitor_event_loop
 
@@ -4603,10 +4604,18 @@ def create_app(
             tags=["scheduled_tasks"],
         )
     if thingy_store is not None:
+        resolved_thingy_access = thingy_access or PermissionStoreThingyAccess(
+            thingy_store, permission_store
+        )
+        # Deleting an account deletes its thingies, which live outside the database.
+        if account_store is not None and hasattr(account_store, "attach_thingies"):
+            account_store.attach_thingies(
+                DeletedAccountThingies(thingy_store, resolved_thingy_access)
+            )
         app.include_router(
             thingies.create_thingies_router(
                 thingy_store,
-                thingy_access or PermissionStoreThingyAccess(thingy_store, permission_store),
+                resolved_thingy_access,
                 conversation_store=conversation_store,
                 auth_provider=auth_provider,
                 permission_store=permission_store,

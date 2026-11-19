@@ -18,9 +18,16 @@ import {
   linkThingyToSession,
 } from "@/thingies/api/thingyApi";
 import { openThingySession } from "@/thingies/host/thingySession";
-import { ThingyNewSessionPanel, ThingyRailTabStrip, useThingyRailTabState } from "./ThingyRailTabs";
+import {
+  ThingyMobileDrawer,
+  ThingyNewSessionPanel,
+  ThingyRailTabStrip,
+  resetThingyTabOrders,
+  useThingyRailTabState,
+} from "./ThingyRailTabs";
 import { renderWithThingies, thingyFixture } from "./testUtils";
-import { useThingyDrafts } from "./thingyDrafts";
+import { resetThingyDrafts } from "./thingyDrafts";
+import { resetThingyStarts } from "./useAdoptStartedThingySession";
 import type * as ThingySessionModule from "@/thingies/host/thingySession";
 import type * as ThingyApiModule from "@/thingies/api/thingyApi";
 
@@ -68,12 +75,14 @@ function Rail({
   readOnly = false,
   onShow = showTab,
   onReveal,
+  mobile = false,
 }: {
   conversationId: string;
   readOnly?: boolean;
   /** Returns false to leave the panel on another tab, as a session's restore can. */
   onShow?: () => boolean | void;
   onReveal?: () => void;
+  mobile?: boolean;
 }) {
   const [showing, setShowing] = useState(false);
   const [maximized, setMaximized] = useState(false);
@@ -91,6 +100,7 @@ function Rail({
       setMaximized(next);
       setKeptSidebar(Boolean(options?.keepSidebar));
     },
+    mobile,
   });
   return (
     <div>
@@ -108,14 +118,18 @@ function Rail({
           </li>
         ))}
       </ul>
-      <section aria-label="content">
-        {state.selected
-          ? state.render(state.selected, {
-              fullScreen: maximized,
-              toolbar: maximized ? toolbar : null,
-            })
-          : "none"}
-      </section>
+      {mobile ? (
+        <ThingyMobileDrawer state={state} />
+      ) : (
+        <section aria-label="content">
+          {state.selected
+            ? state.render(state.selected, {
+                fullScreen: maximized,
+                toolbar: maximized ? toolbar : null,
+              })
+            : "none"}
+        </section>
+      )}
     </div>
   );
 }
@@ -128,12 +142,15 @@ beforeEach(() => {
 
 afterEach(() => {
   resetThingyRailRequests();
-  useThingyDrafts.setState({ sessions: new Set() });
+  resetThingyDrafts();
+  resetThingyStarts();
+  resetThingyTabOrders();
+  localStorage.clear();
   vi.clearAllMocks();
 });
 
 describe("thingy tabs in a session's side panel", () => {
-  it("lists the session's thingies, shows the selected one, and closing one stops showing it there", async () => {
+  it("lists the session's thingies, shows the selected one, and closing it shows the tab next to it", async () => {
     const onShow = vi.fn();
     renderWithThingies(<Rail conversationId="conv_1" onShow={onShow} />);
 
@@ -144,7 +161,8 @@ describe("thingy tabs in a session's side panel", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Close Report" }));
     await waitFor(() => expect(linkThingyToSession).toHaveBeenCalledWith("2", "conv_1", false));
-    expect(screen.getByRole("region", { name: "content" })).toHaveTextContent("none");
+    // The tab before it takes its place, not another kind of tab.
+    expect(screen.getByRole("region", { name: "content" })).toHaveTextContent("shows Board");
     // The server's answer replaces the session's list.
     await waitFor(() => expect(screen.queryByRole("tab", { name: "Report" })).toBeNull());
   });
@@ -202,6 +220,76 @@ describe("thingy tabs in a session's side panel", () => {
     act(() => exitThingyRailFullScreen("conv_1"));
     expect(screen.getByLabelText("full screen")).toHaveTextContent("no");
     expect(screen.getByRole("region", { name: "content" })).toHaveTextContent("shows Board");
+  });
+
+  it("remembers the session's selected tab", async () => {
+    const { unmount } = renderWithThingies(<Rail conversationId="conv_1" />);
+    fireEvent.click(await screen.findByRole("tab", { name: "Report" }));
+    unmount();
+
+    renderWithThingies(<Rail conversationId="conv_1" />);
+    await waitFor(() =>
+      expect(screen.getByRole("tab", { name: "Report" })).toHaveAttribute("aria-selected", "true"),
+    );
+  });
+
+  it("shows the next tab when the selected thingy goes, leaving full screen", async () => {
+    const { queryClient } = renderWithThingies(<Rail conversationId="conv_1" />);
+    await screen.findByRole("tab", { name: "Board" });
+    act(() => requestThingyRailTab("conv_1", "thingy:1", { maximize: true }));
+    expect(screen.getByLabelText("full screen")).toHaveTextContent("yes");
+
+    // Deleted, or no longer shared or shown here.
+    act(() => queryClient.setQueryData(["thingies", "session", "conv_1"], [REPORT]));
+    await waitFor(() =>
+      expect(screen.getByRole("region", { name: "content" })).toHaveTextContent("shows Report"),
+    );
+    expect(screen.getByLabelText("full screen")).toHaveTextContent("no");
+  });
+
+  it("keeps the tab order when a thingy is shown again", async () => {
+    const { queryClient } = renderWithThingies(<Rail conversationId="conv_1" />);
+    await screen.findByRole("tab", { name: "Board" });
+    // The server lists a thingy shown again last.
+    act(() => queryClient.setQueryData(["thingies", "session", "conv_1"], [REPORT, BOARD]));
+    expect(screen.getAllByRole("tab").map((tab) => tab.textContent)).toEqual(["Board", "Report"]);
+  });
+
+  it("opens the thingy the URL names full screen, and drops the name on leaving it", async () => {
+    renderWithThingies(<Rail conversationId="conv_1" />, { path: "/c/conv_1?thingy=2" });
+    await waitFor(() => expect(screen.getByLabelText("full screen")).toHaveTextContent("yes"));
+    expect(screen.getByRole("region", { name: "content" })).toHaveTextContent("shows Report");
+
+    act(() => exitThingyRailFullScreen("conv_1"));
+    await waitFor(() =>
+      expect(screen.getByLabelText("location")).toHaveTextContent(/^\/c\/conv_1$/),
+    );
+  });
+
+  it("names the thingy in the URL while it fills the screen", async () => {
+    renderWithThingies(<Rail conversationId="conv_1" />, { path: "/c/conv_1" });
+    await screen.findByRole("tab", { name: "Board" });
+    act(() => requestThingyRailTab("conv_1", "thingy:1", { maximize: true }));
+    await waitFor(() =>
+      expect(screen.getByLabelText("location")).toHaveTextContent("/c/conv_1?thingy=1"),
+    );
+    expect(useThingyRailRequest.getState().fullScreenThingyId).toBe("1");
+  });
+
+  it("covers the session with a requested thingy on a phone", async () => {
+    renderWithThingies(<Rail conversationId="conv_1" mobile />);
+    await screen.findByRole("tab", { name: "Board" });
+    act(() => requestThingyRailTab("conv_1", "thingy:1", { maximize: true }));
+    const drawer = await screen.findByTestId("thingy-panel-drawer");
+    await waitFor(() => expect(drawer).toHaveAttribute("data-state", "open"));
+    expect(within(drawer).getByText("shows Board")).toBeInTheDocument();
+    // Its controls sit in the drawer's header, beside Close.
+    expect(within(drawer).getByRole("banner")).toContainElement(
+      within(drawer).getByTestId("thingy-controls"),
+    );
+
+    fireEvent.click(within(drawer).getByRole("button", { name: "Close" }));
+    expect(drawer).toHaveAttribute("data-state", "closed");
   });
 
   it("offers no New thingy or close buttons to viewers who can't edit the session", async () => {
@@ -305,5 +393,34 @@ describe("the thingy beside New session", () => {
     renderWithThingies(<ThingyNewSessionPanel active={false} />, { path: "/?thingy_start=1" });
     expect(screen.queryByTestId("thingy-new-session-panel")).toBeNull();
     expect(getThingy).not.toHaveBeenCalled();
+  });
+
+  it("names the thingy in the URL in full screen, and closes back to a plain New session", async () => {
+    vi.mocked(getThingy).mockResolvedValue(BOARD);
+    renderWithThingies(<ThingyNewSessionPanel active />, { path: "/?thingy_start=1" });
+    const panel = await screen.findByRole("complementary", { name: "Board" });
+
+    fireEvent.click(within(panel).getByRole("button", { name: "Full screen" }));
+    expect(screen.getByLabelText("location")).toHaveTextContent("/?thingy_start=1&thingy=1");
+    fireEvent.click(within(panel).getByRole("button", { name: "Open session" }));
+    expect(screen.getByLabelText("location")).toHaveTextContent(/^\/\?thingy_start=1$/);
+
+    fireEvent.click(within(panel).getByRole("button", { name: "Close Board" }));
+    expect(screen.getByLabelText("location")).toHaveTextContent(/^\/$/);
+    expect(screen.queryByTestId("thingy-new-session-panel")).toBeNull();
+  });
+
+  it("closes the sidebar for full screen and opens it again after", async () => {
+    vi.mocked(getThingy).mockResolvedValue(BOARD);
+    const onSidebarOpenChange = vi.fn();
+    renderWithThingies(
+      <ThingyNewSessionPanel active sidebarOpen onSidebarOpenChange={onSidebarOpenChange} />,
+      { path: "/?thingy_start=1" },
+    );
+    const panel = await screen.findByRole("complementary", { name: "Board" });
+    fireEvent.click(within(panel).getByRole("button", { name: "Full screen" }));
+    expect(onSidebarOpenChange).toHaveBeenLastCalledWith(false);
+    fireEvent.click(within(panel).getByRole("button", { name: "Open session" }));
+    expect(onSidebarOpenChange).toHaveBeenLastCalledWith(true);
   });
 });

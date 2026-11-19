@@ -1,4 +1,4 @@
-import { act, fireEvent, render } from "@testing-library/react";
+import { act, fireEvent, render, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -6,6 +6,7 @@ import {
   THINGY_CONTENT_SECURITY_POLICY,
   ThingyFrame,
   buildThingyFrameDocument,
+  selectionPopupPosition,
 } from "./ThingyFrame";
 import type { Thingy, ThingyContent } from "../api/thingyApi";
 import { THINGY_CONNECT_MESSAGE_TYPE, THINGY_HELLO_MESSAGE_TYPE } from "../sdk/thingyProtocol";
@@ -97,6 +98,28 @@ describe("buildThingyFrameDocument", () => {
   });
 });
 
+describe("selectionPopupPosition", () => {
+  const AREA = { left: 100, top: 50, right: 900, bottom: 650 };
+
+  it("centers the popup above the selection", () => {
+    expect(selectionPopupPosition(AREA, { x: 300, y: 200, width: 100, height: 20 })).toEqual({
+      x: 450,
+      y: 250,
+    });
+  });
+
+  it("keeps a rectangle the frame reports anywhere within the frame's area", () => {
+    expect(selectionPopupPosition(AREA, { x: -5_000, y: 99_999, width: 10, height: 10 })).toEqual({
+      x: 260,
+      y: 650,
+    });
+    expect(selectionPopupPosition(AREA, { x: 9_000, y: -400, width: 10, height: 10 })).toEqual({
+      x: 740,
+      y: 90,
+    });
+  });
+});
+
 describe("ThingyFrame", () => {
   it("runs the thingy in a scripts-only sandbox", () => {
     const { frame } = renderFrame();
@@ -138,6 +161,73 @@ describe("ThingyFrame", () => {
     // One port per document: a second hello gets nothing.
     greet(frameWindow, { type: THINGY_HELLO_MESSAGE_TYPE, frameId, nonce });
     expect(posted).toHaveBeenCalledTimes(1);
+  });
+
+  describe("actions", () => {
+    beforeEach(() => {
+      // The page has transient activation, as after any click in Omnigent.
+      Object.defineProperty(navigator, "userActivation", {
+        value: { isActive: true },
+        configurable: true,
+      });
+    });
+    afterEach(() => {
+      Reflect.deleteProperty(navigator, "userActivation");
+    });
+
+    function connectFrame() {
+      const view = renderFrame();
+      const frameWindow = view.frame().contentWindow as Window;
+      vi.spyOn(frameWindow, "postMessage").mockImplementation(() => {});
+      greet(frameWindow, { type: THINGY_HELLO_MESSAGE_TYPE, ...mountOf(view.frame()) });
+      const port = FakeMessageChannel.created[0].port1;
+      const onMessage = port.addEventListener.mock.calls[0][1] as (event: MessageEvent) => void;
+      const requestAction = async (id: string) => {
+        act(() => {
+          onMessage(
+            new MessageEvent("message", {
+              data: {
+                v: 1,
+                kind: "request",
+                id,
+                method: "agent.v1.request",
+                params: { action: "run_card", params: {} },
+                deadlineMs: 5_000,
+              },
+            }),
+          );
+        });
+        let response: { error?: { message: string } } | undefined;
+        await waitFor(() => {
+          response = port.postMessage.mock.calls
+            .map(
+              ([message]) => message as { kind: string; id: string; error?: { message: string } },
+            )
+            .find((message) => message.kind === "response" && message.id === id);
+          expect(response).toBeDefined();
+        });
+        return response?.error?.message ?? "";
+      };
+      return { ...view, requestAction };
+    }
+
+    it("refuses an action when the activation came from the host page alone", async () => {
+      const { requestAction, getByText } = connectFrame();
+      render(<button type="button">Composer</button>);
+
+      fireEvent.pointerDown(getByText("Composer"));
+
+      expect(await requestAction("r1")).toContain("only right after a click in the thingy");
+    });
+
+    it("takes one action per click inside the thingy", async () => {
+      const { requestAction, frame } = connectFrame();
+
+      act(() => frame().focus());
+      // Past the gesture check, the viewer's access decides (this viewer cannot edit the thingy).
+      expect(await requestAction("r1")).toContain("needs Can edit thingy access");
+      expect(await requestAction("r2")).toContain("only right after a click in the thingy");
+    });
   });
 
   it("gives a reloaded or navigated frame a fresh document and nonce", () => {

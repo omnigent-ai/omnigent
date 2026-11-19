@@ -18,6 +18,15 @@ import {
 
 export const OMNIGENT_SDK_RUNTIME_SOURCE = `(function (config) {
   'use strict';
+  // WebRTC opens connections the frame's CSP does not cover, so its constructors go before the
+  // thingy's script runs. Best effort: a nested about:blank frame the thingy creates has its own.
+  ['RTCPeerConnection', 'webkitRTCPeerConnection', 'mozRTCPeerConnection', 'RTCIceTransport'].forEach(function (name) {
+    try {
+      Object.defineProperty(window, name, { value: undefined, writable: false, configurable: false });
+    } catch (error) {
+      // A browser without it, or one that does not allow redefining it.
+    }
+  });
   var LIMITS = config.limits;
   var PROTOCOL = config.protocol;
   var METHOD_CAPABILITY = config.methodCapability;
@@ -137,7 +146,11 @@ export const OMNIGENT_SDK_RUNTIME_SOURCE = `(function (config) {
       var code = typeof error.code === 'string' ? error.code : 'INTERNAL';
       var message = typeof error.message === 'string' ? error.message : 'Request failed';
       var retryable = !entry.mutating && RETRYABLE_CODES.indexOf(code) !== -1;
-      entry.reject(new OmnigentError(code, message, retryable, entry.operationId));
+      var failure = new OmnigentError(code, message, retryable, entry.operationId);
+      if (typeof error.requestId === 'string') {
+        failure.requestId = error.requestId;
+      }
+      entry.reject(failure);
     }
   }
 
@@ -431,10 +444,16 @@ export const OMNIGENT_SDK_RUNTIME_SOURCE = `(function (config) {
         });
       },
       watch: function (listener, options) {
-        if (typeof listener !== 'function') {
-          throw new OmnigentError('INVALID_ARGUMENT', 'watch needs a listener function');
+        // watch(options, listener) is a common guess; the order is unambiguous.
+        if (typeof listener !== 'function' && typeof options === 'function') {
+          var swapped = listener;
+          listener = options;
+          options = swapped;
         }
-        options = options || {};
+        if (typeof listener !== 'function') {
+          throw new OmnigentError('INVALID_ARGUMENT', 'collection.watch needs a listener function. ' + COLLECTION_WATCH_USAGE);
+        }
+        options = options && typeof options === 'object' ? options : {};
         var intervalMs = clamp(options.intervalMs, 2000, LIMITS.minWatchIntervalMs, LIMITS.maxWatchIntervalMs);
         var limit = clamp(options.limit, LIMITS.maxListLimit, 1, LIMITS.maxListLimit);
         var active = true;
@@ -522,20 +541,101 @@ export const OMNIGENT_SDK_RUNTIME_SOURCE = `(function (config) {
     return Object.freeze(collection);
   }
 
+  var COLLECTION_WATCH_USAGE = 'Call collection.watch(function (snapshot) { ... }, { intervalMs: 2000 }); it returns { dispose }. ' +
+    'Each snapshot is { status, items, nextCursor, updatedAt, error }: status is loading, live, reconnecting or stale, ' +
+    'and items holds the first page of records as { id, version, value, createdAt, updatedAt, createdBy, updatedBy }.';
+  var ACTION_WATCH_USAGE = 'Call client.agent.watch(function (snapshot) { ... }, { actionIds: [receipt.actionId] }), ' +
+    'or receipt.watch(function (snapshot) { ... }) on what agent.request resolves with; it returns { refresh, dispose }. ' +
+    'Each snapshot is { status, items, action, updatedAt, error }: status is the watch state (loading, live, reconnecting or stale), ' +
+    'items holds one { id, status, reason, summary, sessionId } per action, and action is that item when one action is watched. ' +
+    'An action status is pending, queued, running or needs_input while it runs, and done, failed, cancelled, finished_unreported or interrupted once it ended.';
+
+  function actionIdOf(value) {
+    if (typeof value === 'string' && value !== '') {
+      return value;
+    }
+    if (value && typeof value === 'object' && !Array.isArray(value)) {
+      if (typeof value.actionId === 'string') {
+        return value.actionId;
+      }
+      if (typeof value.action_id === 'string') {
+        return value.action_id;
+      }
+    }
+    return null;
+  }
+  function actionIdsOf(value) {
+    var one = actionIdOf(value);
+    if (one !== null) {
+      return [one];
+    }
+    if (Array.isArray(value)) {
+      var ids = value.map(actionIdOf);
+      return ids.every(function (id) { return id !== null; }) ? ids : null;
+    }
+    return null;
+  }
+  // The documented form is watch(listener, { actionIds }). The forms pages often guess are
+  // unambiguous, so they work too: watch(actionId, listener), watch(listener, actionId),
+  // watch(receipt, listener), and { actionId } or a single string in the options.
+  function actionWatchArguments(first, second, third) {
+    var listener;
+    var target;
+    var options;
+    if (typeof first === 'function') {
+      listener = first;
+      target = second;
+      options = third;
+    } else if (typeof second === 'function') {
+      listener = second;
+      target = first;
+      options = third;
+    } else {
+      throw new OmnigentError('INVALID_ARGUMENT', 'agent.watch needs a listener function; it is not an async iterator. ' + ACTION_WATCH_USAGE);
+    }
+    options = options && typeof options === 'object' ? options : {};
+    var ids = null;
+    if (target !== undefined && target !== null) {
+      ids = actionIdsOf(target);
+      if (ids === null) {
+        if (typeof target !== 'object' || Array.isArray(target)) {
+          throw new OmnigentError('INVALID_ARGUMENT', 'agent.watch got an action ID it cannot read. ' + ACTION_WATCH_USAGE);
+        }
+        options = Object.assign({}, target, options);
+      }
+    }
+    if (ids === null) {
+      var given = options.actionIds !== undefined ? options.actionIds : options.actionId;
+      ids = given === undefined ? [] : actionIdsOf(given);
+      if (ids === null) {
+        throw new OmnigentError('INVALID_ARGUMENT', 'agent.watch options.actionIds must be a list of action IDs. ' + ACTION_WATCH_USAGE);
+      }
+    }
+    return { listener: listener, options: { actionIds: ids, intervalMs: options.intervalMs } };
+  }
+
   // Polls action progress, which Omnigent derives from the sessions doing the work.
   function watchActions(listener, options) {
-    if (typeof listener !== 'function') {
-      throw new OmnigentError('INVALID_ARGUMENT', 'watch needs a listener function');
-    }
     var intervalMs = clamp(options.intervalMs, 3000, LIMITS.minWatchIntervalMs, LIMITS.maxWatchIntervalMs);
-    var actionIds = Array.isArray(options.actionIds) ? options.actionIds.slice() : [];
+    var actionIds = options.actionIds.slice();
     var active = true;
     var failures = 0;
     var timer = null;
     var controller = null;
     var snapshot = { status: 'loading', items: [], updatedAt: null, error: null };
+    function watchedAction(items) {
+      if (actionIds.length !== 1) {
+        return null;
+      }
+      for (var i = 0; i < items.length; i += 1) {
+        if (items[i] && items[i].id === actionIds[0]) {
+          return items[i];
+        }
+      }
+      return null;
+    }
     function emit() {
-      var frozen = Object.freeze(Object.assign({}, snapshot));
+      var frozen = Object.freeze(Object.assign({}, snapshot, { action: watchedAction(snapshot.items) }));
       try {
         listener(frozen);
       } catch (error) {
@@ -645,6 +745,7 @@ export const OMNIGENT_SDK_RUNTIME_SOURCE = `(function (config) {
     write: 'You can view this thingy but not change it.',
     writeCapability: 'This thingy cannot change its records.',
     action: 'Running actions needs Can edit access to this thingy.',
+    previewAction: 'Actions run once you use this template.',
   };
   var DISABLEABLE = ['BUTTON', 'SELECT', 'FIELDSET', 'OPTGROUP', 'OPTION'];
   var TYPED_INPUTS = ['text', 'search', 'email', 'url', 'tel', 'password', 'number', 'date', 'time', 'datetime-local', 'month', 'week'];
@@ -661,6 +762,9 @@ export const OMNIGENT_SDK_RUNTIME_SOURCE = `(function (config) {
       return (context.capabilities || []).indexOf('data.write') === -1 ? BLOCKED_REASONS.writeCapability : null;
     }
     if (requirement === 'action') {
+      if (context.preview === true) {
+        return BLOCKED_REASONS.previewAction;
+      }
       return context.permissions && context.permissions.publish ? null : BLOCKED_REASONS.action;
     }
     return null;
@@ -781,6 +885,7 @@ export const OMNIGENT_SDK_RUNTIME_SOURCE = `(function (config) {
           writeData: Boolean(context.permissions.writeData),
           publish: Boolean(context.permissions.publish),
         }),
+        preview: context.preview === true,
       }),
       capabilities: capabilities,
       hasCapability: hasCapability,
@@ -821,13 +926,27 @@ export const OMNIGENT_SDK_RUNTIME_SOURCE = `(function (config) {
       }),
       agent: Object.freeze({
         request: function (action, params, options) {
-          return call('agent.v1.request', { action: action, params: params || {} }, options);
+          return call('agent.v1.request', { action: action, params: params || {} }, options).then(function (receipt) {
+            if (!receipt || typeof receipt.actionId !== 'string') {
+              return receipt;
+            }
+            var actionId = receipt.actionId;
+            // The receipt can follow its own action: receipt.watch(listener).
+            return Object.freeze(Object.assign({}, receipt, {
+              id: actionId,
+              watch: function (listener, watchOptions) {
+                var watched = actionWatchArguments(listener, watchOptions);
+                return watchActions(watched.listener, { actionIds: [actionId], intervalMs: watched.options.intervalMs });
+              },
+            }));
+          });
         },
         progress: function (actionIds, options) {
           return call('agent.v1.progress', { actionIds: actionIds || [] }, options);
         },
-        watch: function (listener, options) {
-          return watchActions(listener, options || {});
+        watch: function (first, second, third) {
+          var watched = actionWatchArguments(first, second, third);
+          return watchActions(watched.listener, watched.options);
         },
       }),
       ui: Object.freeze({
