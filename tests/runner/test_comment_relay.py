@@ -733,7 +733,7 @@ class _ReapableStubResourceRegistry(_StubResourceRegistry):
         super().__init__(tmp_path)
         self.terminal_registry = TerminalRegistry()  # type: ignore[assignment]
 
-    async def close_terminal(self, session_id: str, terminal_id: str) -> bool:
+    async def close_terminal(self, session_id: str, terminal_id: str, **_kwargs: object) -> bool:
         """The stub launched no pane, so there is nothing to close."""
         del session_id, terminal_id
         return True

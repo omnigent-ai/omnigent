@@ -2588,11 +2588,15 @@ class SessionResourceRegistry:
         self,
         session_id: str,
         terminal_id: str,
+        *,
+        expected: TerminalInstance | None = None,
     ) -> bool:
         """Close a terminal resource by id.
 
         :param session_id: Session/conversation identifier.
         :param terminal_id: Opaque terminal resource id.
+        :param expected: When given, close only this exact pane: one moved to
+            another session or replaced meanwhile is left alone.
         :returns: ``True`` if a terminal was closed.
         """
         if self._terminal_registry is None:
@@ -2631,6 +2635,7 @@ class SessionResourceRegistry:
                     session_id,
                     entry.terminal_name,
                     entry.session_key,
+                    expected=expected,
                 )
                 if closed:
                     # A replacement launched during the close keeps its own role,

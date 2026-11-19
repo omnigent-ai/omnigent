@@ -1226,6 +1226,131 @@ async def test_a_transferred_pane_keeps_the_sign_in_state_it_started_with(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("moved_during", ["checks", "close"])
+async def test_a_pane_moved_to_a_successor_during_reconnect_is_left_running_there(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, moved_during: str
+) -> None:
+    """A /clear or fork taking the pane while Reconnect checks it keeps the successor whole.
+
+    Moved during the preflight checks, or once the close is decided but before it
+    runs. Reconnect closes and relaunches nothing for the superseded session, and
+    the transcript forwarder and tool relay the successor inherited keep running.
+    """
+    conv_id = "bab2c3d4e5f60718293a4b5c6d7e8f90"
+    successor_id = "bbb2c3d4e5f60718293a4b5c6d7e8f90"
+    checking, release = _hold_restart_attach_check(monkeypatch)
+    app, closes, relaunched, statuses = await _open_claude_native_session_before_sign_in(
+        monkeypatch, tmp_path, conv_id
+    )
+    resources = app.state.session_resource_registry
+    terminals = resources.terminal_registry
+    pane = terminals.get(conv_id, "claude", "main")
+    statuses["linear"] = "connected"
+    if moved_during == "close":
+        release.set()
+        close_terminal = resources.close_terminal
+
+        async def _moved_as_it_closes(session_id: str, terminal_id: str, **kwargs: Any) -> bool:
+            await resources.transfer_terminal(session_id, successor_id, terminal_id)
+            return await close_terminal(session_id, terminal_id, **kwargs)
+
+        monkeypatch.setattr(resources, "close_terminal", _moved_as_it_closes)
+
+    async def _launch_cli_pane(**kwargs: Any) -> SessionResourceView:
+        return SessionResourceView(
+            id="terminal_claude_main", type="terminal", session_id=conv_id, name="claude"
+        )
+
+    monkeypatch.setattr(resources, "launch_required_terminal", _launch_cli_pane)
+    relay_file = claude_native_bridge.bridge_dir_for_bridge_id(conv_id) / "tool_relay.json"
+    forwarder = asyncio.create_task(asyncio.Event().wait())
+
+    try:
+        async with _runner_client(app) as client:
+            # ``omnigent claude`` attaching starts the pane's tool relay.
+            launched = await client.post(
+                f"/v1/sessions/{conv_id}/resources/terminals",
+                json={"terminal": "claude", "session_key": "main", "bridge_inject_dir": True},
+            )
+            assert launched.status_code == 200, launched.text
+            relay_url = json.loads(relay_file.read_text())["url"]
+            native_runtime._AUTO_FORWARDER_TASKS[conv_id] = forwarder
+            reconnect = asyncio.create_task(
+                client.post(
+                    f"/v1/sessions/{conv_id}/live-mcp-servers/reconnect", json={"name": "linear"}
+                )
+            )
+            if moved_during == "checks":
+                await poll_until_async(checking.is_set, timeout_s=5)
+                # A /clear typed in the terminal hands the pane to the session it starts.
+                moved = await client.post(
+                    f"/v1/sessions/{conv_id}/resources/terminals/terminal_claude_main/transfer",
+                    json={"target_session_id": successor_id},
+                )
+                assert moved.status_code == 200, moved.text
+                release.set()
+            reconnected = await asyncio.wait_for(reconnect, timeout=5)
+
+        assert reconnected.status_code == 200, reconnected.text
+        assert reconnected.json() == {
+            "running": False,
+            "servers": [],
+            "reconnect_error": runner_app._CLAUDE_MOVED_AWAY,
+        }
+        assert (closes, relaunched) == ([], [])
+        assert terminals.get(successor_id, "claude", "main") is pane
+        assert terminals.get(conv_id, "claude", "main") is None
+        assert native_runtime._AUTO_FORWARDER_TASKS.get(conv_id) is forwarder
+        assert not forwarder.done()
+        assert json.loads(relay_file.read_text())["url"] == relay_url
+    finally:
+        release.set()
+        forwarder.cancel()
+        native_runtime._AUTO_FORWARDER_TASKS.pop(conv_id, None)
+
+
+@pytest.mark.asyncio
+async def test_a_transfer_sent_once_reconnect_is_closing_the_pane_finds_nothing_to_move(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A /clear or fork arriving after Reconnect committed to its close moves no closing pane."""
+    conv_id = "bcb2c3d4e5f60718293a4b5c6d7e8f90"
+    successor_id = "bdb2c3d4e5f60718293a4b5c6d7e8f90"
+    app, closes, relaunched, statuses = await _open_claude_native_session_before_sign_in(
+        monkeypatch, tmp_path, conv_id
+    )
+    terminals = app.state.session_resource_registry.terminal_registry
+    statuses["linear"] = "connected"
+    closing, close_gate = asyncio.Event(), asyncio.Event()
+
+    async def _stalled_close() -> None:
+        closing.set()
+        await close_gate.wait()
+        closes.append(conv_id)
+
+    terminals.get(conv_id, "claude", "main").close = _stalled_close  # type: ignore[method-assign]
+
+    async with _runner_client(app) as client:
+        reconnect = asyncio.create_task(
+            client.post(
+                f"/v1/sessions/{conv_id}/live-mcp-servers/reconnect", json={"name": "linear"}
+            )
+        )
+        await asyncio.wait_for(closing.wait(), timeout=5)
+        moved = await client.post(
+            f"/v1/sessions/{conv_id}/resources/terminals/terminal_claude_main/transfer",
+            json={"target_session_id": successor_id},
+        )
+        close_gate.set()
+        reconnected = await asyncio.wait_for(reconnect, timeout=5)
+
+    assert moved.status_code == 404, moved.text
+    assert reconnected.json() == {"running": True, "partial": True, "servers": []}
+    assert (closes, relaunched) == ([conv_id], [conv_id])
+    assert terminals.get(successor_id, "claude", "main") is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("output_age_s", "restarted"),
     [(10.0, False), (20.0, True)],
