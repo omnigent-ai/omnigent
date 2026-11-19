@@ -367,9 +367,11 @@ export function hasOpenCodeFence(text: string): boolean {
 
 const StreamingTextContext = createContext(false);
 
-/** Whether the markdown being rendered is still streaming in. */
-export function useIsStreamingText(): boolean {
-  return useContext(StreamingTextContext);
+const StreamingMarkdownContext = createContext<string | null>(null);
+
+/** The markdown streamed in so far, or ``null`` when the text is not streaming. */
+export function useStreamingMarkdown(): string | null {
+  return useContext(StreamingMarkdownContext);
 }
 
 // Streamdown marks a block's open fence only while `isAnimating`, which also
@@ -789,6 +791,8 @@ export const MessageResponse = memo(
       [components],
     );
 
+    const streamingMarkdown =
+      isStreaming && typeof props.children === "string" ? props.children : null;
     const messageControls = useMemo(() => getChatCodeControls(controls), [controls]);
     const mermaidOptions = useMemo(() => mermaidOptionsForTheme(themeMode), [themeMode]);
     let rehypePlugins = SECURE_STREAMDOWN_REHYPE_PLUGINS;
@@ -802,27 +806,29 @@ export const MessageResponse = memo(
         <ShellCommandContext.Provider value={shellAction}>
           <LocalReviewCommentRendererContext.Provider value={renderLocalReviewComment}>
             <StreamingTextContext.Provider value={isStreaming}>
-              {/* Streamdown is memoized and its comparator ignores the mermaid prop,
+              <StreamingMarkdownContext.Provider value={streamingMarkdown}>
+                {/* Streamdown is memoized and its comparator ignores the mermaid prop,
               so remount on theme change to recolor already-rendered diagrams. */}
-              <Streamdown
-                key={themeMode}
-                // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
-                className={cn(
-                  "message-markdown size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
-                  className,
-                )}
-                plugins={STREAMDOWN_PLUGINS}
-                // Let links open on a plain click (and cmd/ctrl-click in a new tab)
-                // instead of Streamdown's default "Open external link?" modal.
-                linkSafety={CHAT_LINK_SAFETY}
-                {...props}
-                BlockComponent={StreamingTextBlock}
-                components={messageComponents}
-                controls={messageControls}
-                mermaid={mermaidOptions}
-                // Block remote image fetches that can exfiltrate data through URLs.
-                rehypePlugins={rehypePlugins}
-              />
+                <Streamdown
+                  key={themeMode}
+                  // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.
+                  className={cn(
+                    "message-markdown size-full wrap-anywhere [&>*:first-child]:mt-0 [&>*:last-child]:mb-0",
+                    className,
+                  )}
+                  plugins={STREAMDOWN_PLUGINS}
+                  // Let links open on a plain click (and cmd/ctrl-click in a new tab)
+                  // instead of Streamdown's default "Open external link?" modal.
+                  linkSafety={CHAT_LINK_SAFETY}
+                  {...props}
+                  BlockComponent={StreamingTextBlock}
+                  components={messageComponents}
+                  controls={messageControls}
+                  mermaid={mermaidOptions}
+                  // Block remote image fetches that can exfiltrate data through URLs.
+                  rehypePlugins={rehypePlugins}
+                />
+              </StreamingMarkdownContext.Provider>
             </StreamingTextContext.Provider>
           </LocalReviewCommentRendererContext.Provider>
         </ShellCommandContext.Provider>

@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { parseSessionIdReferenceTitle, remarkSessionIdReferences } from "./sessionIdReferences";
+import {
+  parseSessionIdReferenceTitle,
+  remarkSessionIdReferences,
+  streamedTextEndsWithId,
+} from "./sessionIdReferences";
 
 const ID = "e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9";
 const TITLE = `omnigent-session-id:${ID}`;
@@ -90,6 +94,17 @@ describe("remarkSessionIdReferences", () => {
     expect(marked(paragraph({ type: "text", value: "Open " }, code))[1]).toMatchObject({
       title: `${TITLE}:end`,
     });
+  });
+
+  it.each([
+    [`Open ${ID}`, true],
+    [`Open \`${ID}`, true],
+    [`Open **${ID}**.`, true],
+    [`Open \`${ID}\``, false],
+    [`Open ${ID} `, false],
+    [`Open ${ID}\n\nThen`, false],
+  ])("knows whether streamed %j may still extend the id", (markdown, extendable) => {
+    expect(streamedTextEndsWithId(markdown, ID)).toBe(extendable);
   });
 
   it("leaves link text, partial inline code and fenced code alone", () => {

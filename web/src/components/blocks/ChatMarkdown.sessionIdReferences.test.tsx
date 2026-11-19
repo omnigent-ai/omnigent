@@ -160,7 +160,8 @@ describe("bare session ids in chat", () => {
     expect(screen.queryByTestId("mention-pill")).not.toBeInTheDocument();
     expect(fetchMock).not.toHaveBeenCalled();
 
-    rerender(markdownTree(`Open ${WORKER}`, client, false));
+    // A finished paragraph's id resolves while later paragraphs still stream.
+    rerender(markdownTree(`Open ${WORKER}\n\nThen ask it`, client, true));
     expect((await screen.findByTestId("mention-pill")).textContent).toBe("@Build worker");
   });
 

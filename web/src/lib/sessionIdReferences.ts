@@ -7,11 +7,18 @@ export const SESSION_ID_REFERENCE_HREF = "#session-id";
 // A whitespace-delimited word that is the server's session id form (32 lowercase
 // hex chars), optionally wrapped in brackets, quotes or emphasis or followed by punctuation.
 // Paths, URLs, query values, file names and longer tokens are not references.
-const SESSION_ID_WORD_RE = /^([([{"'“‘*_~]*)([0-9a-f]{32})([)\]}"'”’*_~.,;:!?]*)$/;
+const CLOSING_PUNCTUATION = `)\\]}"'”’*_~.,;:!?`;
+const SESSION_ID_WORD_RE = new RegExp(`^([([{"'“‘*_~]*)([0-9a-f]{32})([${CLOSING_PUNCTUATION}]*)$`);
 const EXACT_SESSION_ID_RE = /^[0-9a-f]{32}$/;
+const TRAILING_CLOSING_PUNCTUATION_RE = new RegExp(`[${CLOSING_PUNCTUATION}]+$`);
 
 // Marks the id that ends a parsed block, which may still be growing while text streams in.
 const TRAILING_SUFFIX = ":end";
+
+/** Whether streamed text ends in `id`, so more characters could still extend that word. */
+export function streamedTextEndsWithId(markdown: string, id: string): boolean {
+  return markdown.replace(TRAILING_CLOSING_PUNCTUATION_RE, "").endsWith(id);
+}
 
 interface MarkdownNode {
   type: string;
