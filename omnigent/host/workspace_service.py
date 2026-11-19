@@ -63,6 +63,8 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     ReadFileResponse,
     ReadLinkTextRequest,
     ReadLinkTextResponse,
+    ResolveRepositoryContextRequest,
+    ResolveRepositoryContextResponse,
     ResolveWorkingCopyBaseRequest,
     ResolveWorkingCopyBaseResponse,
     SearchFilesRequest,
@@ -73,7 +75,7 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     StatPathResponse,
 )
 from omnigent.host.frames import HostWorkspaceCallFrame, HostWorkspaceReplyFrame
-from omnigent.host.workspace_git import comparison, working_copy
+from omnigent.host.workspace_git import comparison, context, working_copy
 from omnigent.host.workspace_methods import WORKSPACE_METHODS
 from omnigent.host.workspace_search import search_files, search_text
 from omnigent.host.workspace_tokens import new_token_key, verify_token
@@ -122,6 +124,7 @@ _SERVED: dict[str, _Served] = {
     "ReadBaseFile": _Served(tool="git"),
     "ListRepositoryRefs": _Served(tool="git"),
     "ListBranchCommits": _Served(features=("branch_commits",), tool="git"),
+    "ResolveRepositoryContext": _Served(tool="git"),
 }
 
 
@@ -259,6 +262,15 @@ class WorkspaceService(WorkspaceServiceMethods):
     ) -> ListBranchCommitsResponse:
         reader = await _read(self._reader_for, ctx)
         return await comparison.list_branch_commits(reader.root, request)
+
+    async def resolve_repository_context(
+        self,
+        request: ResolveRepositoryContextRequest,
+        ctx: RequestContext[ResolveRepositoryContextRequest, ResolveRepositoryContextResponse]
+        | None,
+    ) -> ResolveRepositoryContextResponse:
+        reader = await _read(self._reader_for, ctx)
+        return await context.resolve_repository_context(reader.root, request)
 
     async def search_files(
         self,

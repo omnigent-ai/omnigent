@@ -1242,6 +1242,7 @@ async def test_workspace_direct_access_is_owner_only(
         "ReadBaseFile",
         "ListRepositoryRefs",
         "ListBranchCommits",
+        "ResolveRepositoryContext",
     ],
 )
 async def test_workspace_api_follows_the_file_read_gate(

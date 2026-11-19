@@ -575,7 +575,11 @@ async def test_base_reads_match_file_reads_and_changes_list_on_every_route(
         "GIT_COMMITTER_NAME": "Dev",
         "GIT_COMMITTER_EMAIL": "dev@example.com",
     }
-    for argv in (["init", "-q"], ["add", "notes.md", "big.txt", "src"], ["commit", "-qm", "c"]):
+    for argv in (
+        ["init", "-qb", "main"],
+        ["add", "notes.md", "big.txt", "src"],
+        ["commit", "-qm", "c"],
+    ):
         subprocess.run(["git", "-C", str(root), *argv], check=True, env=env)
     (root / "src" / "main.py").write_text("print('changed')\n")
     client = client_for(root)
@@ -604,6 +608,8 @@ async def test_base_reads_match_file_reads_and_changes_list_on_every_route(
     assert modified.status == CHANGE_STATUS_MODIFIED
     assert modified.base_object and modified.HasField("working")
     assert listed.refs and not listed.truncated
+    context = await client.resolve_repository_context(ResolveRepositoryContextRequest())
+    assert context.branch == "main" and context.head_sha == head
     assert b"".join(m.data for m in base) == b"".join(m.data for m in disk)
     assert base[0].metadata.size == disk[0].metadata.size
     assert base[0].metadata.encoding == disk[0].metadata.encoding
@@ -631,6 +637,7 @@ async def test_capabilities_list_the_served_methods(tmp_path: Path, client_for: 
         "ListRepositoryRefs",
         "ListBranchCommits",
         "branch_commits",
+        "ResolveRepositoryContext",
     }
 
 
@@ -646,7 +653,7 @@ async def test_capabilities_leave_out_methods_whose_tool_is_missing(
     assert set(response.capabilities) == {"ListDirectory", "ReadFile", "StatPath", "ReadLinkText"}
 
 
-async def test_methods_not_served_yet_answer_unimplemented(
+async def test_a_search_mode_not_served_answers_unimplemented(
     tmp_path: Path, client_for: ClientFor
 ) -> None:
     """A client that skips GetCapabilities still gets a code it can fall back on."""
@@ -654,10 +661,8 @@ async def test_methods_not_served_yet_answer_unimplemented(
 
     with pytest.raises(ConnectError) as fuzzy:
         await client.search_files(SearchFilesRequest(query="main"))  # fuzzy, the default
-    with pytest.raises(ConnectError) as context:
-        await client.resolve_repository_context(ResolveRepositoryContextRequest())
 
-    assert fuzzy.value.code == context.value.code == Code.UNIMPLEMENTED
+    assert fuzzy.value.code == Code.UNIMPLEMENTED
 
 
 @PROTOCOLS

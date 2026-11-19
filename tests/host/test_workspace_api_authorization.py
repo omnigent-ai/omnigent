@@ -40,6 +40,7 @@ _CALLS: dict[str, dict[str, object]] = {
     "ReadBaseFile": {"commit": "a" * 40, "path": "a.txt", "object": "b" * 40},
     "ListRepositoryRefs": {},
     "ListBranchCommits": {},
+    "ResolveRepositoryContext": {},
 }
 _STREAMING = {"SearchText", "ReadBaseFile"}
 
