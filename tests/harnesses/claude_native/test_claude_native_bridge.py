@@ -4227,6 +4227,24 @@ def test_augment_claude_args_injects_mcp_and_hooks(tmp_path: Path) -> None:
     assert "--disallowedTools" not in args
 
 
+def test_augment_claude_args_omits_mcp_under_managed_sideload_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Managed sideload policy must not make the native harness fail at startup."""
+    from omnigent.onboarding import ambient
+
+    monkeypatch.setattr(ambient, "claude_sideload_flags_disabled", lambda: True)
+
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+    )
+
+    assert "--mcp-config" not in args
+    assert "--settings" in args
+
+
 def test_generated_claude_subprocesses_pin_runner_tmpdir(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

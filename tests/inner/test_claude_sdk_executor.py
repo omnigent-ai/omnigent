@@ -2822,6 +2822,21 @@ class TestBundlePluginGating(unittest.TestCase):
             )
             self.assertTrue((bundle / ".claude-plugin" / "plugin.json").exists())
 
+    def test_managed_sideload_policy_suppresses_bundle_plugin(self):
+        # Claude Code exits before the first turn if a managed policy disables
+        # sideload flags and the SDK receives a local plugin.
+        with tempfile.TemporaryDirectory() as tmp:
+            bundle = Path(tmp)
+            skill_dir = bundle / "skills" / "demo"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text("# demo\n")
+            with patch(
+                "omnigent.onboarding.ambient.claude_sideload_flags_disabled",
+                return_value=True,
+            ):
+                self.assertEqual(self._plugins_for_bundle(bundle), [])
+            self.assertFalse((bundle / ".claude-plugin" / "plugin.json").exists())
+
 
 # ---------------------------------------------------------------------------
 # Tests: hermetic (skills=none) launch opts out of claude.ai connectors
