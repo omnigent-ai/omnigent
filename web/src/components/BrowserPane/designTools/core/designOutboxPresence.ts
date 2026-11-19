@@ -40,7 +40,7 @@ export function noteSavedDesignRequests(saved: boolean): void {
     try {
       localStorage.removeItem(SAVED_HINT_KEY);
     } catch {
-      // Storage blocked: the same.
+      // Storage blocked: no hint either way, so the next page looks for the database itself.
     }
   }
 }

@@ -520,7 +520,12 @@ describe("design tools: the overlay", () => {
     assert.equal(t.webContents.captured, undefined);
     assert.deepEqual(t.webContents.inputs, []);
     assert.deepEqual(await t.ask("fit", { notice: { width: 100, height: 30 } }), { ok: true });
+    // Nor measure it, DevTools open or not: the page's view bounds place it.
+    t.webContents.isDevToolsOpened = () => true;
+    t.webContents.emit("devtools-opened");
     c.mock.timers.tick(250);
+    await tick();
+    assert.deepEqual(t.webContents.codes, []);
     assert.equal(t.tools.isOpen(t.entry), true);
     // Its page destroyed: it ends then, and its zoom check never asks the gone page.
     t.webContents.isDestroyed = () => true;

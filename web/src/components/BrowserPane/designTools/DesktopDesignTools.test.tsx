@@ -496,6 +496,32 @@ describe("DesktopDesignTools: Annotate", () => {
     expect(overlays.opened[0]!.close).toHaveBeenCalled();
   });
 
+  it("moves its card over the element once a long request makes it too tall to fit under", async () => {
+    const shell = fakeShell();
+    const overlays = fakeOverlays();
+    const low = { ...HIT, rect: { x: 20, y: 560, width: 100, height: 20 } };
+    shell.page.mockImplementation(async () => JSON.stringify(low));
+    renderTools();
+    await open("Annotate an element");
+    // jsdom lays nothing out: the card is as tall as a few lines of request make it.
+    let cardHeight = 120;
+    const { HTMLFormElement: OverlayForm } = overlays.opened[0]!.win as unknown as typeof window;
+    Object.defineProperty(OverlayForm.prototype, "offsetHeight", {
+      configurable: true,
+      get: () => cardHeight,
+    });
+    fireEvent.click(overlays.view().getByTestId("annotate-layer"), { clientX: 30, clientY: 570 });
+    await settle();
+    const card = overlays.view().getByRole("form", { name: "Annotate" });
+    expect(card.style.top).toBe("590px");
+    cardHeight = 206;
+    fireEvent.change(overlays.view().getByLabelText("What should change?"), {
+      target: { value: "Make it green\nand bigger\nand bolder\nand rounder" },
+    });
+    await settle();
+    expect(card.style.top).toBe("344px");
+  });
+
   it("outlines and names the element under the pointer before it's picked", async () => {
     const shell = fakeShell();
     const overlays = fakeOverlays();

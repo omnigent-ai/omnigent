@@ -223,7 +223,8 @@ function createDesignTools({
 
   /** Measure `session`'s page area again, and lay the overlay over it if it moved. */
   async function remeasure(session) {
-    if (session.measuring) return;
+    // A notice outlives its page's navigations: it never runs script in the next document.
+    if (session.measuring || session.mode === "notice") return;
     session.measuring = true;
     try {
       const area = await pageArea(session.entry.view.webContents);

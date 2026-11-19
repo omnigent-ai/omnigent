@@ -1,7 +1,13 @@
 // The design tools' layers over a Browser tab's page: Annotate (pick an element, ask for a
 // change) and Draw (mark up the page, send a screenshot). They draw over `rect` in the
 // overlay document they render in, and turn the pointer and keys into core's actions.
-import { useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import {
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -111,6 +117,14 @@ export function AnnotateLayer({ tabId, rect, onNotice }: LayerProps) {
   const hovering = useRef(false);
   const nextPoint = useRef<{ x: number; y: number } | null>(null);
   const [hover, setHover] = useState<Hit | null>(null);
+  const cardRef = useRef<HTMLFormElement | null>(null);
+  const [cardHeight, setCardHeight] = useState<number | undefined>(undefined);
+  // Placed by its real height: the field grows as the request does, and wraps to the width.
+  const frameWidth = rect?.width;
+  useLayoutEffect(() => {
+    const height = cardRef.current?.offsetHeight;
+    if (height) setCardHeight(height);
+  }, [picked, request, frameWidth]);
 
   // One hit test at a time, each at the latest point the pointer moved to.
   const updateHover = async (event: ReactPointerEvent<HTMLDivElement>) => {
@@ -153,7 +167,7 @@ export function AnnotateLayer({ tabId, rect, onNotice }: LayerProps) {
 
   if (!rect) return null;
   const shown = picked ?? hover;
-  const card = picked ? cardPosition(picked.rect, rect) : null;
+  const card = picked ? cardPosition(picked.rect, rect, cardHeight) : null;
   return (
     <>
       <div
@@ -171,6 +185,7 @@ export function AnnotateLayer({ tabId, rect, onNotice }: LayerProps) {
       {!picked && <PickHint rect={rect} onClose={() => closeTool(tabId)} />}
       {picked && card && (
         <RequestCard
+          cardRef={cardRef}
           style={{ left: rect.left + card.left, top: rect.top + card.top, width: card.width }}
           sendDisabled={sendCommand.blocked !== undefined}
           onCancel={() => closeTool(tabId)}

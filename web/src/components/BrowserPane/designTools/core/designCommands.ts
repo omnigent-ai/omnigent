@@ -14,6 +14,11 @@ export type CommandResult = { ok: true } | { ok: false; error: string };
 export function runCommand(command: DesignCommand): CommandResult {
   const { blocked } = command;
   if (blocked) return { ok: false, error: blocked };
-  command.run()?.catch((error: unknown) => console.error("A design command failed", error));
+  const failed = (error: unknown) => console.error("A design command failed", error);
+  try {
+    command.run()?.catch(failed);
+  } catch (error) {
+    failed(error);
+  }
   return { ok: true };
 }

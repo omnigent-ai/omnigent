@@ -11,7 +11,7 @@ import {
   XIcon,
   type LucideIcon,
 } from "lucide-react";
-import { useEffect, useState, type CSSProperties, type ReactNode } from "react";
+import { useEffect, useState, type CSSProperties, type ReactNode, type Ref } from "react";
 import { Button } from "@/components/ui/button";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { cn } from "@/lib/utils";
@@ -60,20 +60,24 @@ const CARD_HEIGHT = 120;
 const CARD_GAP = 10;
 const CARD_MARGIN = 8;
 
-/** Where the request card goes, and how wide: beside the picked element, inside the frame. */
+/**
+ * Where the request card goes, and how wide: beside the picked element, inside the frame.
+ * `height` is the card's own, measured: its field grows with the request.
+ */
 export function cardPosition(
   element: CssRect,
   frame: { width: number; height: number },
+  height = CARD_HEIGHT,
 ): { left: number; top: number; width: number } {
   // Narrower than usual in a narrow frame, so all of it stays on the page.
   const width = Math.max(0, Math.min(CARD_WIDTH, frame.width - 2 * CARD_MARGIN));
   const clampX = (x: number) =>
     Math.max(CARD_MARGIN, Math.min(x, frame.width - width - CARD_MARGIN));
   const clampY = (y: number) =>
-    Math.max(CARD_MARGIN, Math.min(y, frame.height - CARD_HEIGHT - CARD_MARGIN));
+    Math.max(CARD_MARGIN, Math.min(y, frame.height - height - CARD_MARGIN));
   const below = element.y + element.height + CARD_GAP;
-  const above = element.y - CARD_GAP - CARD_HEIGHT;
-  if (below + CARD_HEIGHT <= frame.height) return { left: clampX(element.x), top: below, width };
+  const above = element.y - CARD_GAP - height;
+  if (below + height <= frame.height) return { left: clampX(element.x), top: below, width };
   if (above >= 0) return { left: clampX(element.x), top: above, width };
   const right = element.x + element.width + CARD_GAP;
   const fitsRight = right + width <= frame.width - CARD_MARGIN;
@@ -212,12 +216,14 @@ export const REQUEST_FIELD_CLASS =
 
 /** Annotate's request card: the field, Cancel and the round Send. */
 export function RequestCard({
+  cardRef,
   style,
   field,
   sendDisabled,
   onCancel,
   onSubmit,
 }: {
+  cardRef?: Ref<HTMLFormElement>;
   style: CSSProperties;
   field: ReactNode;
   sendDisabled: boolean;
@@ -226,6 +232,7 @@ export function RequestCard({
 }) {
   return (
     <form
+      ref={cardRef}
       aria-label="Annotate"
       className={cn(
         LAYER_Z,

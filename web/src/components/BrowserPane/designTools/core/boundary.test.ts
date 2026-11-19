@@ -24,7 +24,11 @@ describe("design tools core", () => {
   it.each(Object.entries(sources))("%s imports nothing platform-specific", (_file, source) => {
     for (const path of imports(source)) {
       expect(path.startsWith("../"), path).toBe(false);
-      expect(PLATFORM_ONLY, path).not.toContain(path);
+      // Their subpaths too (`react-dom/client`, `@/lib/host/...`).
+      const platformOnly = PLATFORM_ONLY.filter(
+        (name) => path === name || path.startsWith(`${name}/`),
+      );
+      expect(platformOnly, path).toEqual([]);
     }
     expect(source).not.toMatch(/omnigentDesktop/);
     // The page's operations are typed: how one is done in a page is its platform's.

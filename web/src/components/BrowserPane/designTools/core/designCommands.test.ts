@@ -10,4 +10,17 @@ describe("design commands", () => {
     expect(runCommand({ run })).toEqual({ ok: true });
     expect(run).toHaveBeenCalledTimes(1);
   });
+
+  it("logs a command that fails, thrown or rejected, and still answers", async () => {
+    const logged = vi.spyOn(console, "error").mockImplementation(() => {});
+    const thrown = () => {
+      throw new Error("undo broke");
+    };
+    expect(runCommand({ run: thrown })).toEqual({ ok: true });
+    expect(runCommand({ run: () => Promise.reject(new Error("send broke")) })).toEqual({
+      ok: true,
+    });
+    await vi.waitFor(() => expect(logged).toHaveBeenCalledTimes(2));
+    logged.mockRestore();
+  });
 });

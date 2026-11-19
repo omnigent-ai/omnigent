@@ -33,6 +33,16 @@ describe("cardPosition", () => {
     expect(right).toEqual({ left: 270, top: 8, width: 320 });
   });
 
+  it("keeps a card grown by a long request, its Send and Cancel too, on the page", () => {
+    const element = { x: 20, y: 400, width: 100, height: 20 };
+    // Room under it for the usual card, not for one a few lines taller: over it instead.
+    expect(cardPosition(element, frame).top).toBe(430);
+    expect(cardPosition(element, frame, 206).top).toBe(184);
+    // Too tall for over or under: beside it, its bottom still inside the frame.
+    const tall = cardPosition({ x: 20, y: 200, width: 100, height: 300 }, frame, 206);
+    expect(tall.top + 206).toBeLessThanOrEqual(frame.height - 8);
+  });
+
   it("keeps it inside the page's right edge", () => {
     expect(cardPosition({ x: 700, y: 40, width: 50, height: 20 }, frame).left).toBe(472);
   });
