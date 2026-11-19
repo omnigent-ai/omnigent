@@ -34,6 +34,7 @@ import {
   isMacPlatform,
   isTextEntry,
 } from "@/lib/hotkeys";
+import { composerTargetOf } from "@/components/composer/engine/composerInput";
 import type { AnyBlock, ElicitationBlock } from "@/lib/blocks";
 import { matchesShortcut, shortcutKeys } from "@/lib/shortcuts/registry";
 import { useChatStore } from "@/store/chatStore";
@@ -124,6 +125,9 @@ export function isDraftingTarget(target: EventTarget | null): boolean {
   // Complete send intent (text OR attachments OR mentions), as declared by
   // the field itself — a bare value check can't see non-text drafts.
   if (target.dataset.hasDraft === "true") return true;
+  // A composer input of any engine, textarea included.
+  const composer = composerTargetOf(target);
+  if (composer) return composer.value.length > 0;
   if (target instanceof HTMLTextAreaElement) return target.value.length > 0;
   if (target instanceof HTMLInputElement) {
     // Only text-like inputs carry a typed draft; a checkbox/radio value is a

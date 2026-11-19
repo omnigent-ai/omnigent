@@ -22,8 +22,8 @@ import signal
 import sys
 import threading
 import time
-from collections.abc import AsyncIterator, Callable, Generator
-from pathlib import Path
+from collections.abc import AsyncIterator, Callable, Generator, Iterator
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from tempfile import mkdtemp
 from typing import TYPE_CHECKING, cast
 
@@ -50,6 +50,7 @@ if TYPE_CHECKING:
     from types import FrameType, TracebackType
 
     from omnigent.inner.databricks_executor import _ReusedDatabricksTokenSource
+    from omnigent.inner.datamodel import OSEnvSandboxSpec
     from omnigent.runner.native import ResolvedSpec
     from omnigent.runner.transports.ws_tunnel.serve import _ASGIApp
     from omnigent.spec.types import AgentSpec
@@ -116,6 +117,43 @@ def _apply_host_interactive_shells(spec: AgentSpec) -> None:
     spec.terminals = native_shell_terminal_specs(shells)
 
 
+def _apply_host_sandbox_grants(spec: AgentSpec) -> None:
+    """Add the host's ``runner.sandbox_grants`` to every sandbox the spec declares.
+
+    Environments without a sandbox stay unsandboxed, and a grant kind the host does
+    not list is left as authored (``None`` stays ``None``).
+    """
+    read_paths, write_paths = _load_runner_sandbox_grants_from_config()
+    if not read_paths and not write_paths:
+        return
+    for sandbox in _spec_sandboxes(spec):
+        # Sandboxes can be shared between environments, so skip paths already granted.
+        if read_paths:
+            current_reads = sandbox.read_paths or []
+            sandbox.read_paths = [
+                *current_reads,
+                *(path for path in read_paths if path not in current_reads),
+            ]
+        current_writes = {grant.path for grant in sandbox.write_path_specs}
+        added_writes = [path for path in write_paths if path not in current_writes]
+        if added_writes:
+            # Marked so an authored grant for the same resolved path keeps its mode.
+            sandbox.write_paths = [*(sandbox.write_paths or []), *added_writes]
+            sandbox.host_write_paths = [*(sandbox.host_write_paths or []), *added_writes]
+
+
+def _spec_sandboxes(spec: AgentSpec) -> Iterator[OSEnvSandboxSpec]:
+    """Yield the sandboxes of an agent, its terminals, and all nested agents."""
+    from omnigent.inner.datamodel import OSEnvSpec
+
+    terminals = (spec.terminals or {}).values()
+    for environment in [spec.os_env, *(terminal.os_env for terminal in terminals)]:
+        if isinstance(environment, OSEnvSpec) and environment.sandbox is not None:
+            yield environment.sandbox
+    for sub_agent in spec.sub_agents:
+        yield from _spec_sandboxes(sub_agent)
+
+
 def _set_runner_auth_factory(factory: Callable[[], str | None] | None) -> None:
     """Set the runner-process auth factory singleton.
 
@@ -160,6 +198,33 @@ def _runner_config_path() -> Path:
     return Path.home() / ".omnigent" / "config.yaml"
 
 
+def _runner_config_section() -> dict[str, object]:
+    """Return the ``runner`` mapping from the global config file.
+
+    :returns: The ``runner`` mapping, or ``{}`` when the file, a top-level
+        mapping, or the ``runner`` key is missing.
+    :raises RuntimeError: If the file cannot be read or parsed, or
+        ``runner`` is not a mapping.
+    """
+    import yaml
+
+    path = _runner_config_path()
+    if not path.exists():
+        return {}
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        raise RuntimeError(f"failed to read runner config from {path}: {exc}") from exc
+    if not isinstance(raw, dict):
+        return {}
+    runner_cfg = raw.get("runner")
+    if runner_cfg is None:
+        return {}
+    if not isinstance(runner_cfg, dict):
+        raise RuntimeError("runner config must be a mapping")
+    return runner_cfg
+
+
 def _load_runner_idle_timeout_s_from_config() -> float:
     """Load the runner inactivity timeout from config.
 
@@ -173,23 +238,7 @@ def _load_runner_idle_timeout_s_from_config() -> float:
         the watchdog.
     :raises RuntimeError: If ``runner.idle_timeout_s`` is invalid.
     """
-    import yaml
-
-    path = _runner_config_path()
-    if not path.exists():
-        return float(_DEFAULT_RUNNER_IDLE_TIMEOUT_S)
-    try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except (OSError, yaml.YAMLError) as exc:
-        raise RuntimeError(f"failed to read runner config from {path}: {exc}") from exc
-    if not isinstance(raw, dict):
-        return float(_DEFAULT_RUNNER_IDLE_TIMEOUT_S)
-    runner_cfg = raw.get("runner")
-    if runner_cfg is None:
-        return float(_DEFAULT_RUNNER_IDLE_TIMEOUT_S)
-    if not isinstance(runner_cfg, dict):
-        raise RuntimeError("runner config must be a mapping")
-    raw_timeout = runner_cfg.get("idle_timeout_s")
+    raw_timeout = _runner_config_section().get("idle_timeout_s")
     if raw_timeout is None:
         return float(_DEFAULT_RUNNER_IDLE_TIMEOUT_S)
     if isinstance(raw_timeout, bool) or not isinstance(raw_timeout, (int, float)):
@@ -225,28 +274,56 @@ def _runner_threadpool_max_workers() -> int:
             )
         return workers
 
-    import yaml
-
-    path = _runner_config_path()
-    if not path.exists():
-        return _DEFAULT_RUNNER_THREADPOOL_MAX_WORKERS
-    try:
-        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
-    except (OSError, yaml.YAMLError) as exc:
-        raise RuntimeError(f"failed to read runner config from {path}: {exc}") from exc
-    if not isinstance(raw, dict):
-        return _DEFAULT_RUNNER_THREADPOOL_MAX_WORKERS
-    runner_cfg = raw.get("runner")
-    if runner_cfg is None:
-        return _DEFAULT_RUNNER_THREADPOOL_MAX_WORKERS
-    if not isinstance(runner_cfg, dict):
-        raise RuntimeError("runner config must be a mapping")
-    raw_workers = runner_cfg.get("threadpool_max_workers")
+    raw_workers = _runner_config_section().get("threadpool_max_workers")
     if raw_workers is None:
         return _DEFAULT_RUNNER_THREADPOOL_MAX_WORKERS
     if isinstance(raw_workers, bool) or not isinstance(raw_workers, int) or raw_workers < 1:
         raise RuntimeError("runner.threadpool_max_workers must be a positive integer")
     return raw_workers
+
+
+def _load_runner_sandbox_grants_from_config() -> tuple[list[str], list[str]]:
+    """Load the host's extra sandbox grants from ``runner.sandbox_grants``.
+
+    Uploaded bundles cannot grant host paths, so the trusted host lists them in its
+    own config instead. Every entry must be an absolute path; ``~`` is rejected, and
+    on Windows the path needs a drive or UNC share.
+
+    :returns: ``(read_paths, write_paths)``, each deduplicated in config order and
+        empty when not configured, e.g. ``(["/srv/example/repo/.git"], [])``.
+    :raises RuntimeError: If ``runner.sandbox_grants`` is not a mapping, has an
+        unknown key, or a field is not a list of absolute path strings.
+    """
+    raw_grants = _runner_config_section().get("sandbox_grants")
+    if raw_grants is None:
+        return [], []
+    if not isinstance(raw_grants, dict):
+        raise RuntimeError("runner.sandbox_grants must be a mapping")
+    for key in raw_grants:
+        if key not in ("read_paths", "write_paths"):
+            raise RuntimeError(
+                f"runner.sandbox_grants.{key} is not supported; expected read_paths or write_paths"
+            )
+    return (
+        _runner_sandbox_grant_paths("read_paths", raw_grants.get("read_paths")),
+        _runner_sandbox_grant_paths("write_paths", raw_grants.get("write_paths")),
+    )
+
+
+def _runner_sandbox_grant_paths(field: str, raw_paths: object) -> list[str]:
+    """Validate one ``runner.sandbox_grants`` field as a list of absolute paths."""
+    if raw_paths is None:
+        return []
+    if not isinstance(raw_paths, list):
+        raise RuntimeError(f"runner.sandbox_grants.{field} must be a list of absolute paths")
+    # On Windows, Python 3.12's os.path.isabs also accepts drive-less paths like \data.
+    host_path_type = PureWindowsPath if IS_WINDOWS else PurePosixPath
+    for path in raw_paths:
+        if not isinstance(path, str) or not host_path_type(path).is_absolute():
+            raise RuntimeError(
+                f"runner.sandbox_grants.{field} entries must be absolute paths; got {path!r}"
+            )
+    return list(dict.fromkeys(raw_paths))
 
 
 def _runner_last_activity(
@@ -1595,6 +1672,8 @@ def _load_agent_spec_bundle(
         elif resp.headers.get(MEMORY_SEARCH_HEADER) != "1":
             spec = without_memory_search(spec)
         _apply_host_interactive_shells(spec)
+        # After the shells hook so replaced native-wrapper terminals get the grants too.
+        _apply_host_sandbox_grants(spec)
     except Exception:
         shutil.rmtree(dest, ignore_errors=True)
         raise

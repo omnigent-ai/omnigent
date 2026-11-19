@@ -1,4 +1,6 @@
+import type { ReactElement } from "react";
 import { fireEvent, render, screen } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const supportsBrowser = vi.fn(() => true);
@@ -20,6 +22,11 @@ import {
   writeBrowserAgentToolsEnabled,
 } from "./preferences";
 import { browserAgentToolsOffError } from "./relayGate";
+
+/** The controls read the router's location, so each render sits inside one. */
+function renderInRouter(ui: ReactElement) {
+  return render(<MemoryRouter>{ui}</MemoryRouter>);
+}
 
 beforeEach(() => {
   window.localStorage.clear();
@@ -132,7 +139,7 @@ describe("browserAgentToolsOffError", () => {
 
 describe("BrowserAgentToolsSettingsGroup", () => {
   it("starts on and toggles the stored preference", () => {
-    render(<BrowserAgentToolsSettingsGroup />);
+    renderInRouter(<BrowserAgentToolsSettingsGroup />);
     const toggle = screen.getByRole("switch", { name: "Advanced browser tools for agents" });
     expect(toggle).toHaveAttribute("aria-checked", "true");
     fireEvent.click(toggle);
@@ -148,7 +155,7 @@ describe("BrowserAgentToolsSettingsGroup", () => {
       throw new Error("quota");
     });
     try {
-      render(<BrowserAgentToolsSettingsGroup />);
+      renderInRouter(<BrowserAgentToolsSettingsGroup />);
       const toggle = screen.getByRole("switch", { name: "Advanced browser tools for agents" });
       fireEvent.click(toggle);
       expect(toggle).toHaveAttribute("aria-checked", "true");
@@ -160,14 +167,14 @@ describe("BrowserAgentToolsSettingsGroup", () => {
 
   it("renders nothing outside the desktop app", () => {
     supportsBrowser.mockReturnValue(false);
-    const { container } = render(<BrowserAgentToolsSettingsGroup />);
+    const { container } = renderInRouter(<BrowserAgentToolsSettingsGroup />);
     expect(container).toBeEmptyDOMElement();
   });
 
   it("can't be turned on in a desktop app without the tools, and says to update it", () => {
     writeBrowserAgentToolsEnabled(true);
     Object.assign(window, { omnigentDesktop: { browserPerformAction: vi.fn() } });
-    render(<BrowserAgentToolsSettingsGroup />);
+    renderInRouter(<BrowserAgentToolsSettingsGroup />);
     const toggle = screen.getByRole("switch", { name: "Advanced browser tools for agents" });
     expect(toggle).toHaveAttribute("aria-checked", "false");
     expect(toggle).toBeDisabled();
@@ -178,7 +185,7 @@ describe("BrowserAgentToolsSettingsGroup", () => {
     const browserTabs = vi.fn(async () => ({ ok: true }));
     Object.assign(window, { omnigentDesktop: { browserTabs } });
     writeBrowserAgentToolsEnabled(true);
-    render(<BrowserAgentToolsSettingsGroup />);
+    renderInRouter(<BrowserAgentToolsSettingsGroup />);
     fireEvent.click(screen.getByRole("switch", { name: "Advanced browser tools for agents" }));
     expect(browserTabs).toHaveBeenCalledWith({ op: "reset" });
   });

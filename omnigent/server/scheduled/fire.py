@@ -80,7 +80,7 @@ from fastapi import HTTPException
 from sqlalchemy.exc import IntegrityError
 from starlette.datastructures import Headers
 
-from omnigent.db.account_authority import account_authority_scope
+from omnigent.db.account_authority import account_authority_scope, account_checks_enabled
 from omnigent.db.db_models import workspace_scope
 from omnigent.debug_logging import set_current_session_id
 from omnigent.entities import Conversation, ScheduledTask, ScheduledTaskRun
@@ -1030,6 +1030,11 @@ async def _disable_for_deleted_owner(
         task.user_id,
     )
     await asyncio.to_thread(deps.scheduled_task_store.update, task.id, state="deleted")
+    scheduler = getattr(deps.app_state, "scheduled_task_scheduler", None)
+    if scheduler is not None and not getattr(
+        deps.app_state, "scheduled_task_dispatch_enabled", False
+    ):
+        scheduler.remove(task.id)
     await delete_task_grants(deps.permission_store, task.id)
     await recorder.finish(
         "failed",
@@ -1602,7 +1607,12 @@ async def _owner_is_deleted(deps: FireDeps, task: ScheduledTask) -> bool:
     if task.user_id is None or deps.permission_store is None:
         return False
     owner = await asyncio.to_thread(deps.permission_store.get_user, task.user_id)
-    return owner is None or owner.account_generation != task.account_generation
+    if owner is None:
+        return True
+    # External auth does not capture a generation; accounts mode stays strict.
+    if task.account_generation is None and not account_checks_enabled():
+        return False
+    return owner.account_generation != task.account_generation
 
 
 async def _resolve_effective_task(deps: FireDeps, task: ScheduledTask) -> ScheduledTask:

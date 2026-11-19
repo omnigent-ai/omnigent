@@ -68,6 +68,7 @@ export type FeatureKey =
   | "automations_v2"
   | "splittable_terminal_view_ui"
   | "sidebar_windowed_rows"
+  | "chat_composer_codemirror"
   | "session_orchestration"
   | "workflows"
   | "session_overview"
@@ -93,6 +94,7 @@ export interface ServerInfo {
   /** The server enforces the browser's Admin view cookie; absent on older servers. */
   admin_view?: boolean;
   sibling_sessions?: boolean;
+  session_nest_moves?: boolean;
   session_bundle_workspaces?: boolean;
   sibling_session_destinations?: SiblingSessionDestinations;
   accounts_enabled: boolean;
@@ -265,6 +267,12 @@ export interface ServerInfo {
    */
   session_search_scope?: boolean;
   /**
+   * True when the server keeps the ``omnigent.muted`` label per viewer. Older
+   * servers would store it as a label every collaborator sees, so the client
+   * offers Mute only when this is set. Fails to ``false``.
+   */
+  session_mute?: boolean;
+  /**
    * True when scheduled tasks accept ``session_mode`` and ``session_id``.
    * Older servers reject the fields, so the automation dialog hides its
    * Session control there. Fails to ``false``.
@@ -354,6 +362,12 @@ export interface ServerInfo {
    * Run a workflow offers; absent on older servers (off).
    */
   workflows?: boolean;
+  /**
+   * Owners can share saved workflows (``/v1/workflows/{id}/permissions``), and
+   * ``/v1/workflows/shared`` lists those shared with the viewer; absent on older
+   * servers (off).
+   */
+  workflow_sharing?: boolean;
   /**
    * True when the server stores each user's session title instructions
    * (``/v1/settings/session-title-instructions``); absent on older servers (off).
@@ -533,6 +547,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   archive_worktree_cleanup: false,
   automations_enabled: true,
   session_search_scope: false,
+  session_mute: false,
   scheduled_task_session_modes: false,
   session_create_permission_modes: false,
   session_create_workflow_id: false,
@@ -676,6 +691,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
         const harnessInstallEnabled = data.harness_install_enabled === true;
         cachedServerInfo = {
           sibling_sessions: data.sibling_sessions === true,
+          session_nest_moves: data.session_nest_moves === true,
           sibling_session_destinations: parseSiblingSessionDestinations(
             data.sibling_session_destinations,
           ),
@@ -723,6 +739,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
           automations_enabled: data.automations_enabled !== false,
           session_search_scope: data.session_search_scope === true,
+          session_mute: data.session_mute === true,
           scheduled_task_session_modes: data.scheduled_task_session_modes === true,
           session_create_permission_modes: data.session_create_permission_modes === true,
           session_create_workflow_id: data.session_create_workflow_id === true,
@@ -758,6 +775,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_pull_requests: data.session_pull_requests === true,
           session_journal: data.session_journal === true,
           workflows: data.workflows === true,
+          workflow_sharing: data.workflow_sharing === true,
           session_title_instructions: data.session_title_instructions === true,
           admin_view: data.admin_view === true,
           comment_anchor_metadata: data.comment_anchor_metadata === true,

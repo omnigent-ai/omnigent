@@ -18,8 +18,12 @@ the header menu), and each place is a separate entry point.
   session remains bound. The representative pins/moves the entire family; nested members have no pin
   action, and legacy individual pins keep their place inside the nest.
   Opening Add nested agent shows a draft row in the family until creation
-  replaces it; leaving the composer without submitting removes the draft. Existing
-  sessions cannot join a family; ordinary forks remain standalone and may reuse the source host.
+  replaces it; leaving the composer without submitting removes the draft. Owned active sessions can move into an existing nest by dragging onto its center
+  or choosing **Move session → Nests** in the sidebar menu. Choose a searchable
+  destination, or **Remove from nest** to detach just that session. Dragging a
+  nested member into the session list above or below a nest removes it; a floating
+  **Remove from nest** target is also available without shifting rows.
+  Ordinary forks remain standalone and may reuse the source host.
 
 - `session-grid`: with `grid_sessions_display_ui` (on by default), drag sidebar sessions into a
   conversation to split left/right or top/bottom with a hover preview. Up to four
@@ -104,7 +108,7 @@ the header menu), and each place is a separate entry point.
   on each run that started a session: a run that succeeds while the page is open
   is marked unread, and opening its session from the run row clears it there and
   in the sidebar.
-- `project`: Add to project (Move session once filed) puts a session in a
+- `project`: **Move session → Projects** in the sidebar (Add to project in the header) puts a session in a
   project folder from the row menu, the header menu, or the header's folder tag.
   Agents file sessions the same way with `sys_session_update` (see
   [session orchestration](session-orchestration.md)).
@@ -360,13 +364,37 @@ then continue from Chat or Terminal.
 
 **Sidebar row:** hover a row and open its menu, or right-click the row. Both
 offer pin, fork, rename, mark as unread or read, create automation (when
-automations are on), add to project (or move session), archive or unarchive,
+automations are on), Move session, archive or unarchive,
 and delete. Create automation opens the New automation dialog for the session;
 saving files its copy in the automation's project and opens the automation. The
 dialog and the automation's page link the session it starts from under Starts
 from. Deleting a session an automation runs from asks to Delete both, and leaves
 the automation's page for the automations list. With automations off for the
 caller, the session is deleted alone and its automation pauses at its next run.
+
+**Move session:** choose **Projects** or **Nests**, each with its own search.
+Nests also offers **Remove from nest**. Drag onto a nest row's center to join;
+drop a nested session into the session list above or below a nest to remove it.
+Other rows retain pin/custom ordering. Removal targets appear over the sidebar
+footer, keeping session rows in place and available as drop targets.
+
+**Mute a session:** in the sidebar row menu (three-dot or right-click) or the
+project Kanban card menu, choose Mute. In the sidebar, the title dims;
+an idle row shows a muted bell in its trailing status slot, while active status
+indicators and unsent drafts take priority. A muted
+session sends no browser or desktop notifications, shows no unread dot in the
+sidebar, Kanban board, or Canvas, counts toward no app badge, and stays out of
+the Unread status group, the Kanban Unread lane, and the Inbox's Unread list.
+It can still be marked read, but not unread: the menus hide Mark as unread,
+bulk Mark as unread skips it, the unread shortcut declines, and its Kanban card
+can't be dragged into Unread. Its approvals
+and questions still appear under Awaiting response. The mute is yours alone:
+collaborators on a shared session are unaffected, and a fork starts unmuted.
+Choose Unmute to undo. The item appears only on servers that advertise
+`session_mute` in `/v1/info`.
+Failed output from a muted automation session is also hidden from Unread;
+its failure remains visible on the automation card and in run history.
+Automation failures that never created a session keep their separate Inbox cards.
 
 **Project folder:** right-click its header or open its three-dot menu, then
 choose Rename project. Start typing as soon as the dialog opens. Delete project
@@ -882,6 +910,10 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_header_move_to_project.py::test_header_folder_tag_moves_session_into_existing_project`.
   Repeat from the header menu's Add to project by hand and expect the row to
   regroup under that project.
+- **`siblings`, moving existing sessions:** use an owned active session and nest.
+  Drag into the nest, then onto **Remove from nest** in the footer. Repeat through
+  the sidebar kebab and right-click **Move session → Nests**, search by a nest or
+  member title, and reload to confirm membership. **Projects** retains its own search.
 - **Right-click menu:**
   `tests/e2e_ui/sessions/test_sidebar_context_menu.py::test_right_click_opens_session_actions_menu`
 - **`project-rename`, project header right-click and three-dot menus:**

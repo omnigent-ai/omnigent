@@ -36,6 +36,7 @@ import {
 } from "@/components/ai-elements/streamdown-security";
 import { WorkspaceMarkdownImage } from "./WorkspaceMarkdownImage";
 import { ZoomableImage } from "@/components/ImageLightbox";
+import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
 import {
   ContextMenu,
   ContextMenuContent,
@@ -696,7 +697,7 @@ const FILE_PATH_AWARE_COMPONENTS = {
 };
 
 function LeadingCommandToken({ children }: WithHastNode<React.ComponentPropsWithoutRef<"kbd">>) {
-  return <span className="text-brand-accent">{children}</span>;
+  return <span className={COMMAND_TOKEN_CLASS}>{children}</span>;
 }
 
 const LEADING_COMMAND_COMPONENTS = { ...FILE_PATH_AWARE_COMPONENTS, kbd: LeadingCommandToken };

@@ -1,7 +1,13 @@
-import { useEffect, useId, useRef, type ReactNode, type RefObject, type UIEvent } from "react";
+import { useEffect, useId, useRef, type ReactNode, type RefObject } from "react";
 import { TerminalIcon } from "lucide-react";
 import { create } from "zustand";
 import { matchSlashCommandInvocation } from "@/components/SlashCommandMenu";
+import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
+import type {
+  ComposerInputEvent,
+  ComposerTextTarget,
+  ComposerTokenAt,
+} from "@/components/composer/engine/composerInput";
 import {
   ComposerMirror,
   MIRRORED_TEXTAREA_CLASS,
@@ -132,7 +138,7 @@ export function renderComposerHighlight(
   return (
     <>
       {split.before}
-      <span className="text-brand-accent">{split.token}</span>
+      <span className={COMMAND_TOKEN_CLASS}>{split.token}</span>
       {renderMentionTokens(split.after, mentionTokens)}
     </>
   );
@@ -149,7 +155,9 @@ export interface UseComposerHighlightOptions {
   /** Inline @mention tokens the mirror paints as pills; empty where none apply. */
   mentionTokens: readonly string[];
   /** The textarea the mirror is pinned to. */
-  textareaRef: RefObject<HTMLTextAreaElement | null>;
+  textareaRef: RefObject<ComposerTextTarget | null>;
+  /** The input node, when an engine switch can replace it. */
+  textareaNode?: ComposerTextTarget | null;
 }
 
 export interface ComposerHighlight {
@@ -157,7 +165,9 @@ export interface ComposerHighlight {
   /** Spread onto the composer textarea (merge `className` with the caller's). */
   input: {
     className: string | undefined;
-    onScroll: (event: UIEvent<HTMLTextAreaElement>) => void;
+    /** The same token for the CodeMirror engine, which paints it itself. */
+    commandToken: ComposerTokenAt | null;
+    onScroll: (event: ComposerInputEvent) => void;
     "aria-describedby": string | undefined;
     "data-slash-command": "true" | undefined;
     "data-shell-command": "true" | undefined;
@@ -182,6 +192,7 @@ export function useComposerHighlight({
   classifyValue,
   mentionTokens,
   textareaRef,
+  textareaNode = null,
 }: UseComposerHighlightOptions): ComposerHighlight {
   const mirrorRef = useRef<HTMLDivElement>(null);
   const hintId = useId();
@@ -190,11 +201,12 @@ export function useComposerHighlight({
     : null;
   const shell = split?.kind === "shell";
   const mirrorActive = split !== null || findMentionTokens(value, mentionTokens).length > 0;
-  useComposerMirrorAlignment(mirrorRef, textareaRef, mirrorActive);
+  useComposerMirrorAlignment(mirrorRef, textareaRef, mirrorActive, textareaNode);
   return {
     kind: split?.kind ?? null,
     input: {
       className: mirrorActive ? MIRRORED_TEXTAREA_CLASS : undefined,
+      commandToken: split ? { token: split.token, start: split.before.length } : null,
       onScroll: (event) => {
         if (mirrorRef.current) mirrorRef.current.scrollTop = event.currentTarget.scrollTop;
       },

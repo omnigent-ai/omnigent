@@ -11,6 +11,7 @@ export const ALWAYS_USE_WORKTREE_ENTRY = settingsEntry({
 
 export const DELETE_WORKTREES_ON_ARCHIVE_ENTRY = settingsEntry({
   id: "delete-worktrees-on-archive",
+  available: (availability) => availability.archiveWorktreeCleanup,
   section: "git",
   label: "Delete worktrees for archived sessions",
   description:
