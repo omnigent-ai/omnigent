@@ -17,10 +17,10 @@ coding, and browser-style navigation is something every new user already knows.
 - **Navigation stays in the current tab.** Choosing a file in the tree, a
   commit in the Commits list or a pull request in the list changes what this
   tab shows.
-  A middle click, an Option-click in the Files tree, or **Open in new tab** in
-  a file's menu opens a new tab instead; ⌘-click (Ctrl-click off macOS) is
-  planned to do the same. A link to something already open in
-  another tab selects that tab rather than opening a duplicate.
+  ⌘-click (Ctrl-click off macOS) or a middle click in a file tree, or **Open in
+  new tab** in a file's menu, opens a new tab instead. A link to something
+  already open in another tab selects that tab rather than opening a
+  duplicate.
 - **One back and forward history per session, across tabs.** Unlike a browser,
   history isn't kept per tab. Back and Forward walk every step in order, both
   within a tab and from one tab to another. When an agent's link opens a file
@@ -34,8 +34,9 @@ coding, and browser-style navigation is something every new user already knows.
 
 New in v2:
 
-- **Files**: the workspace tree, with a file editor beside it. Images, PDFs and
-  other binary files open in the existing file viewer. Below a certain width
+- **Files**: the workspace tree, with a file editor beside it. Markdown files
+  open in the existing file viewer, with its rich preview and edit modes, as do
+  images, PDFs and other binary files. Below a certain width
   the tree opens as a popover from the toolbar.
 - **Diffs**: the working copy's changes as a review, including rendered
   Markdown diffs. Rendered Markdown is sanitized before it reaches the page, as
@@ -44,9 +45,7 @@ New in v2:
 - **Pull Requests**: the session's pull requests and a page for each one.
 
 Existing pages, which come along unchanged as tabs: terminals, the browser,
-side chats, agents, tasks and text search. Markdown files in Files open as
-text in the editor at first; the existing rich Markdown preview and its edit
-modes are planned there.
+side chats, agents, tasks and text search.
 
 ## Links
 
@@ -106,7 +105,7 @@ Back returns you to the pull request where you left it, and Forward goes to the
 file again.
 
 **Reading around a change.** In a Files tab you pick `README.md` in the tree,
-then `src/parser.ts`; the tab steps from one to the other. You Option-click
+then `src/parser.ts`; the tab steps from one to the other. You ⌘-click
 `src/lexer.ts`, which opens in a new tab and leaves `src/parser.ts` where it
 was. Back walks the same steps in reverse: to `src/parser.ts` in the first tab,
 then to `README.md`.
