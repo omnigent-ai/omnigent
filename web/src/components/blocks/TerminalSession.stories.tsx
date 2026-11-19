@@ -1,22 +1,36 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { Terminal } from "@xterm/xterm";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
+import { TerminalLinkProvider } from "./TerminalLinkProvider";
+import { TerminalBidi } from "./TerminalBidi";
 import { loadWebglRenderer, rtlCharacterJoinRanges } from "./TerminalSession";
 
 function RtlTerminalPreview({ joined, renderer }: { joined: boolean; renderer: "dom" | "webgl" }) {
   const container = useRef<HTMLDivElement>(null);
+  const [selection, setSelection] = useState("");
+  const [activatedLink, setActivatedLink] = useState("");
   useEffect(() => {
     const term = new Terminal({
-      cols: 68,
+      cols: 60,
       rows: 9,
       fontSize: 18,
       fontFamily: "monospace",
       allowProposedApi: true,
       theme: { background: "#101214", foreground: "#eeeeee" },
     });
+    term.registerLinkProvider(
+      new TerminalLinkProvider(term, (_event, uri) => setActivatedLink(uri)),
+    );
     term.open(container.current!);
     if (joined) term.registerCharacterJoiner(rtlCharacterJoinRanges);
-    const webgl = renderer === "webgl" ? loadWebglRenderer(term) : null;
+    let webgl = renderer === "webgl" ? loadWebglRenderer(term) : null;
+    const bidi = joined
+      ? new TerminalBidi(term, () => {
+          webgl?.dispose();
+          webgl = null;
+        })
+      : null;
+    const selectionChanged = term.onSelectionChange(() => setSelection(term.getSelection()));
     term.write(
       [
         "\x1b[?25l$ printf 'example output'",
@@ -26,15 +40,28 @@ function RtlTerminalPreview({ joined, renderer }: { joined: boolean; renderer: "
         "می\u200cروم خانه",
         "שָׁלוֹם עוֹלָם",
         "שלום 123 עולם!",
+        "שלום https://example.com עולם",
         "git push origin feature/example",
       ].join("\r\n"),
     );
     return () => {
+      selectionChanged.dispose();
+      bidi?.dispose();
       webgl?.dispose();
       term.dispose();
     };
   }, [joined, renderer]);
-  return <div ref={container} className="overflow-hidden rounded border bg-[#101214] p-3" />;
+  return (
+    <div>
+      <div ref={container} className="overflow-hidden rounded border bg-[#101214] p-3" />
+      <output aria-label="Activated terminal link" className="block min-h-6">
+        {activatedLink}
+      </output>
+      <output aria-label="Selected terminal text" className="block min-h-6 font-mono" dir="auto">
+        {selection}
+      </output>
+    </div>
+  );
 }
 
 const meta = {
@@ -48,7 +75,7 @@ const meta = {
         <RtlTerminalPreview joined={false} renderer={renderer} />
       </div>
       <div>
-        <h3 className="mb-2">Joined RTL phrases</h3>
+        <h3 className="mb-2">Automatic paragraph direction</h3>
         <RtlTerminalPreview joined renderer={renderer} />
       </div>
     </div>

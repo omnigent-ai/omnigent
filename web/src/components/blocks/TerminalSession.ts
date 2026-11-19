@@ -22,6 +22,7 @@ import { terminalSurfaceColors } from "@/lib/terminalPalette";
 import { splitWorkspaceFileCitation } from "@/components/ai-elements/streamdown-security";
 import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
 import { CodexTerminalPalette, codexTerminalTheme } from "./CodexTerminalPalette";
+import { TerminalBidi } from "./TerminalBidi";
 import { TerminalLinkProvider } from "./TerminalLinkProvider";
 import { parseTmuxRepliesMessage, suppressRepliesTmuxSends } from "./TerminalQueryReplies";
 
@@ -659,7 +660,8 @@ export class TerminalSession {
   private readonly term: Terminal;
   private readonly fit: FitAddon;
   /** WebGL renderer addon, or ``null`` when WebGL is unavailable. */
-  private readonly webgl: WebglAddon | null;
+  private webgl: WebglAddon | null;
+  private readonly bidi: TerminalBidi;
   private readonly ws: WebSocket;
   private readonly listenerCtl: AbortController;
   private readonly resizeObserver: ResizeObserver;
@@ -770,6 +772,11 @@ export class TerminalSession {
     // Load the GPU renderer after open() (it needs the mounted canvas).
     // Falls back to the DOM renderer when WebGL is unavailable.
     this.webgl = loadWebglRenderer(this.term);
+    this.bidi = new TerminalBidi(this.term, () => {
+      this.webgl?.dispose();
+      this.webgl = null;
+      this.sendResize();
+    });
     try {
       this.fit.fit();
     } catch (err) {
@@ -1097,6 +1104,7 @@ export class TerminalSession {
     }
     // Dispose the WebGL renderer before the terminal so its canvas and
     // GL context are released while the terminal still owns them.
+    this.bidi.dispose();
     this.webgl?.dispose();
     this.term.dispose();
   }

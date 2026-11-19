@@ -82,7 +82,7 @@ export const MessageContent = ({ children, className, ...props }: MessageContent
       "group-[.is-user]:ml-auto group-[.is-user]:overflow-hidden group-[.is-user]:rounded-2xl group-[.is-user]:bg-muted group-[.is-user]:px-3 group-[.is-user]:py-2 group-[.is-user]:text-foreground group-[.is-user]:ring-1 group-[.is-user]:ring-border/60",
       // Tighter than the user bubble's gap-2 so muted single-line tool
       // ("See N steps") / reasoning rows don't look orphaned between prose.
-      "group-[.is-assistant]:gap-1.5 group-[.is-assistant]:text-foreground",
+      "group-[.is-assistant]:w-full group-[.is-assistant]:gap-1.5 group-[.is-assistant]:text-foreground",
       className,
     )}
     {...props}

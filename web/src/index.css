@@ -1825,6 +1825,14 @@ html[data-electron-mac] .breadcrumb-folder {
   }
 }
 
+/* Paragraph direction also controls alignment within the full response width. */
+.message-markdown :is(p, h1, h2, h3, h4, h5, h6, li, blockquote) {
+  text-align: start;
+}
+.xterm-bidi .xterm-rows > div {
+  text-align: start;
+}
+
 /* Keep mixed-direction prose readable without reordering code and URL tokens. */
 .message-markdown :is(code, pre) {
   direction: ltr;
@@ -3012,4 +3020,9 @@ main[data-shell-header="hidden"] .extension-view-host {
 
 main[data-shell-header="hidden"] .extension-view-status {
   top: 0;
+}
+
+/* Selected DOM spans already carry the selection color in their visual positions. */
+.xterm-bidi .xterm-selection {
+  display: none;
 }
