@@ -30,10 +30,15 @@ from sqlalchemy import Select, select, update
 from sqlalchemy.orm import Session
 
 from omnigent.db import compression
-from omnigent.db.db_models import SqlConversationMetadata, current_workspace_id
+from omnigent.db.db_models import (
+    SqlConversationLabel,
+    SqlConversationMetadata,
+    current_workspace_id,
+)
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
+    now_epoch,
     now_epoch_us,
     run_write_transaction,
 )
@@ -103,11 +108,18 @@ class StoredPullRequest(PullRequestReport):
     :ivar state: ``"OPEN"``, ``"CLOSED"`` or ``"MERGED"``, or ``None`` until fetched.
     :ivar is_draft: Whether the PR was a draft at that fetch.
     :ivar state_checked_at: Epoch seconds of that fetch's request, or ``None``.
+    :ivar run_id: The scheduled-task run whose turn the session was in when the
+        server first stored the PR, or ``None``.
+    :ivar run_recorded: Whether the server recorded ``run_id`` when it first stored
+        the PR, so ``None`` there means the PR was first seen outside any run.
+        False for a PR the user linked and for PRs stored before runs were recorded.
     """
 
     state: str | None = None
     is_draft: bool = False
     state_checked_at: float | None = None
+    run_id: str | None = None
+    run_recorded: bool = False
 
 
 @dataclass(frozen=True)
@@ -184,6 +196,9 @@ class _Document:
     prs: tuple[StoredPullRequest, ...] = ()
     # Oldest first.
     unlinked: tuple[_Unlink, ...] = ()
+    # The run whose turn a person interrupted by writing to the session; PRs first
+    # seen after that are not the run's, even while its label stays on the session.
+    ended_run_id: str | None = None
 
 
 _DOCUMENT = TypeAdapter(_Document)
@@ -261,8 +276,14 @@ def _display_order(prs: Iterable[StoredPullRequest]) -> tuple[StoredPullRequest,
     return tuple(sorted(prs, key=key))
 
 
-def _new_entry(report: PullRequestReport) -> StoredPullRequest:
-    return StoredPullRequest(**{**asdict(report), "title": _clean_title(report.title)})
+def _new_entry(
+    report: PullRequestReport, run_id: str | None = None, *, run_recorded: bool = False
+) -> StoredPullRequest:
+    return StoredPullRequest(
+        **{**asdict(report), "title": _clean_title(report.title)},
+        run_id=run_id,
+        run_recorded=run_recorded,
+    )
 
 
 def _merge(
@@ -292,12 +313,17 @@ def _merge(
 
 
 def _add(
-    document: _Document, entries: dict[str, StoredPullRequest], report: PullRequestReport
+    document: _Document,
+    entries: dict[str, StoredPullRequest],
+    report: PullRequestReport,
+    run_id: str | None = None,
+    *,
+    run_recorded: bool = False,
 ) -> bool:
     """Add a new member if the session has room for it; ``entries`` is updated in place."""
     if len(entries) >= MAX_PRS_PER_SESSION:
         return False
-    candidate = {**entries, report.url: _new_entry(report)}
+    candidate = {**entries, report.url: _new_entry(report, run_id, run_recorded=run_recorded)}
     membership = _membership(replace(document, prs=_display_order(candidate.values())))
     if not _fits(membership, _MAX_MEMBERSHIP_BYTES):
         return False
@@ -306,14 +332,25 @@ def _add(
 
 
 def _merge_reports(
-    document: _Document, reports: Sequence[PullRequestReport], requested_at: float | None
+    document: _Document,
+    reports: Sequence[PullRequestReport],
+    requested_at: float | None,
+    run_id: str | None = None,
 ) -> _Document:
+    """Merge reports; a newly added PR records ``run_id``, the run it was first seen in.
+
+    A run whose turn a person interrupted (``document.ended_run_id``) records none.
+    """
+    if run_id is not None and run_id == document.ended_run_id:
+        run_id = None
     unlinked = {unlink.url for unlink in document.unlinked}
     entries = {pr.url: pr for pr in document.prs}
     for report in reports:
         if report.url in entries:
             entries[report.url] = _merge(entries[report.url], report, requested_at)
-        elif report.url not in unlinked and not _add(document, entries, report):
+        elif report.url not in unlinked and not _add(
+            document, entries, report, run_id, run_recorded=True
+        ):
             _logger.debug("A session's pull request list is full; ignoring a reported PR")
     return replace(document, prs=_display_order(entries.values()))
 
@@ -486,6 +523,25 @@ class SessionPullRequestStore:
             synced=stored.synced,
         )
 
+    def read_many(self, conversation_ids: Sequence[str]) -> dict[str, SessionPullRequests]:
+        """Return each session's linked PRs in one query, as :meth:`read` returns one session's.
+
+        :param conversation_ids: Sessions to read; ones without a metadata row are absent.
+        """
+        if not conversation_ids:
+            return {}
+        stmt = self._rows(list(dict.fromkeys(conversation_ids)))
+        with self._session("list_many_session_pull_requests") as session:
+            rows = session.execute(stmt).all()
+        result: dict[str, SessionPullRequests] = {}
+        for row in rows:
+            try:
+                result[row.id] = _result(_decode(row.pull_requests))
+            except UnreadablePullRequestsError:
+                _logger.warning("Unreadable session pull request document", exc_info=True)
+                result[row.id] = SessionPullRequests(entries=[], synced=False)
+        return result
+
     def summaries(self, conversation_ids: Sequence[str]) -> dict[str, SessionSummary]:
         """Return each session's first linked PR and whether it is synced, in one query.
 
@@ -514,7 +570,7 @@ class SessionPullRequestStore:
         conversation_id: str,
         reports: Sequence[PullRequestReport],
         *,
-        fetched: FetchedState | None = None,
+        fetched: FetchedState | Sequence[FetchedState] | None = None,
         requested_at: float | None = None,
         complete: bool = False,
     ) -> SessionPullRequests | None:
@@ -524,7 +580,7 @@ class SessionPullRequestStore:
 
         :param conversation_id: The session, e.g. ``"conv_abc123"``.
         :param reports: PRs as the runner's or host's registry describes them.
-        :param fetched: The state the host fetched for one of the session's PRs, if any.
+        :param fetched: The states the host fetched for the session's PRs, if any.
         :param requested_at: Epoch seconds the server sent the request the report
             answers, or ``None`` for a report the runner pushed. Orders fetches:
             one older than the newest seen is ignored.
@@ -534,32 +590,121 @@ class SessionPullRequestStore:
         :raises UnreadablePullRequestsError: The stored document cannot be read.
         """
         unique = list({report.url: report for report in reports}.values())
-        accepted: tuple[tuple[int, str, str], float] | None = None
-        if fetched is not None and requested_at is not None and fetched.state in _STATES:
-            key = (current_workspace_id(), conversation_id, fetched.url)
-            if requested_at >= self._watermarks.get(key):
-                accepted = (key, requested_at)
+        fetches = [fetched] if isinstance(fetched, FetchedState) else list(fetched or ())
+        # Only a fetch the server requested is ordered; each against its own PR's fetches.
+        checked_at = requested_at if requested_at is not None else 0.0
+        accepted: list[tuple[FetchedState, tuple[int, str, str]]] = []
+        for fetch in {fetch.url: fetch for fetch in fetches}.values():
+            key = (current_workspace_id(), conversation_id, fetch.url)
+            if (
+                requested_at is not None
+                and fetch.state in _STATES
+                and checked_at >= self._watermarks.get(key)
+            ):
+                accepted.append((fetch, key))
         synced_at = time.time()
 
+        # Read outside the write transaction; a report racing a new run's start may
+        # name either run, as the session's turn changes hands then too.
+        run_id = self._current_run_id(conversation_id) if unique else None
+
         def change(document: _Document) -> _Document:
-            updated = _merge_reports(document, unique, requested_at) if unique else document
+            updated = (
+                _merge_reports(document, unique, requested_at, run_id) if unique else document
+            )
             if complete and updated.synced_at is None:
                 updated = replace(updated, synced_at=synced_at)
-            if accepted is not None and fetched is not None:
-                entry = next((pr for pr in updated.prs if pr.url == fetched.url), None)
-                checked_at = accepted[1]
+            for fetch, _ in accepted:
+                entry = next((pr for pr in updated.prs if pr.url == fetch.url), None)
                 if (
                     entry is not None
-                    and entry.number == fetched.number
+                    and entry.number == fetch.number
                     and (entry.state_checked_at is None or checked_at >= entry.state_checked_at)
                 ):
-                    updated = _apply_fetch(updated, fetched, checked_at)
+                    updated = _apply_fetch(updated, fetch, checked_at)
             return updated
 
         result = self._update("apply_session_pull_request_report", conversation_id, change)
-        if accepted is not None:
-            self._watermarks.advance(*accepted)
+        for _, key in accepted:
+            self._watermarks.advance(key, checked_at)
         return result
+
+    def _current_run_id(self, conversation_id: str) -> str | None:
+        """The scheduled-task run the session's current turn belongs to, if any.
+
+        The run label is set when a run delivers its prompt and cleared when the
+        user writes to the session, so chat between runs belongs to no run.
+        """
+        from omnigent.stores.conversation_store import SCHEDULED_TASK_RUN_LABEL_KEY
+
+        stmt = select(SqlConversationLabel.value).where(
+            SqlConversationLabel.workspace_id == current_workspace_id(),
+            SqlConversationLabel.conversation_id == conversation_id,
+            SqlConversationLabel.key == SCHEDULED_TASK_RUN_LABEL_KEY,
+        )
+        with self._session("get_session_current_run") as session:
+            value = session.execute(stmt.limit(1)).scalar_one_or_none()
+        return value if isinstance(value, str) and value else None
+
+    def end_run_turn(
+        self, conversation_id: str, run_id: str, *, run_finished: bool = False
+    ) -> bool:
+        """Record that a person wrote to the session during ``run_id``'s turn.
+
+        PRs first stored after this record no run until another run starts. Writes
+        at most once per run. A prompt still being dispatched keeps its run: like
+        :meth:`ConversationStore.clear_scheduled_run_label`, a pending stamp for
+        ``run_id`` blocks this unless its run finished or the stamp is stale.
+
+        :param conversation_id: The session, e.g. ``"conv_abc123"``.
+        :param run_id: The run the session's label names.
+        :param run_finished: Whether ``run_id`` reached a terminal state.
+        :returns: Whether the turn ended.
+        :raises UnreadablePullRequestsError: The stored document cannot be read.
+        """
+        from omnigent.server.scheduled.run_reconciler import STALE_RUN_MAX_AGE_SECONDS
+        from omnigent.stores.conversation_store import SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX
+
+        if not run_finished:
+            stmt = select(SqlConversationLabel.updated_at).where(
+                SqlConversationLabel.workspace_id == current_workspace_id(),
+                SqlConversationLabel.conversation_id == conversation_id,
+                SqlConversationLabel.key == SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX + run_id,
+            )
+            with self._session("get_session_pending_run") as session:
+                stamped_at = session.execute(stmt.limit(1)).scalar_one_or_none()
+            if stamped_at is not None and stamped_at > now_epoch() - STALE_RUN_MAX_AGE_SECONDS:
+                return False
+        self._update(
+            "end_session_pull_request_run_turn",
+            conversation_id,
+            lambda document: replace(document, ended_run_id=run_id),
+        )
+        return True
+
+    def initial_run_ids(self, conversation_ids: Sequence[str]) -> dict[str, str]:
+        """Return the run that created each session, for the sessions a run created.
+
+        Reads only the initial-run label, at most one row per session.
+
+        :param conversation_ids: Sessions to look up; an empty list reads nothing.
+        """
+        if not conversation_ids:
+            return {}
+        from omnigent.stores.conversation_store import SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY
+
+        stmt = select(SqlConversationLabel.conversation_id, SqlConversationLabel.value).where(
+            SqlConversationLabel.workspace_id == current_workspace_id(),
+            SqlConversationLabel.conversation_id.in_(list(dict.fromkeys(conversation_ids))),
+            SqlConversationLabel.key == SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+        )
+        with self._session("list_session_initial_runs") as session:
+            rows = session.execute(stmt).all()
+        return {
+            conversation_id: value
+            for conversation_id, value in rows
+            if isinstance(value, str) and value
+        }
 
     def check_room(self, conversation_id: str, url: str) -> None:
         """Fail before a host links a PR the session has no room for.

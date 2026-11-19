@@ -122,10 +122,24 @@ export function continuePlanMessage(planName: string | null): string {
   return `Continue ${plan} from where you left off, and work through the tasks that are left.\n\n${RESUME_WORKFLOW_WORK}`;
 }
 
+const STOP_PLAN_INSTRUCTIONS =
+  "Stop all background tasks, subagents, and other Omnigent sessions working on this workflow run. Tell each worker to stop its own background tasks, agents, and Omnigent sessions recursively, verify their shutdown, and report back before it stops. Cancel background commands through their original task/terminal handles and wait for their exit results. A missing handle or an empty process list in another sandbox is not proof of shutdown. Cancel this run's timers and queued follow-ups that could restart the work. Keep this main session available while you coordinate and verify that the work has stopped; report anything you could not stop or verify. Preserve completed results and record the worker/session IDs and what remains so the workflow can resume. Leave unfinished steps that were started as started, not done or failed. Do not ask for confirmation or resume the workflow until I explicitly tell you to continue.";
+
 /** Keep the main agent available to stop delegated work and record how to resume it. */
 export function stopPlanMessage(planName: string | null): string {
   const plan = planName ? `the plan "${planName}"` : "the plan";
-  return `Stop ${plan} now. Stop all background tasks, subagents, and other Omnigent sessions working on this workflow run. Tell each worker to stop its own background tasks, agents, and Omnigent sessions recursively, verify their shutdown, and report back before it stops. Cancel background commands through their original task/terminal handles and wait for their exit results. A missing handle or an empty process list in another sandbox is not proof of shutdown. Cancel this run's timers and queued follow-ups that could restart the work. Keep this main session available while you coordinate and verify that the work has stopped; report anything you could not stop or verify. Preserve completed results and record the worker/session IDs and what remains so the workflow can resume. Leave unfinished steps that were started as started, not done or failed. Do not ask for confirmation or resume the workflow until I explicitly tell you to continue.`;
+  return `Stop ${plan} now. ${STOP_PLAN_INSTRUCTIONS}`;
+}
+
+const STOP_PLAN_OPENING = /^Stop the plan(?: "[\s\S]*")? now\. $/;
+
+/** Whether *text* is a {@link stopPlanMessage}, whatever plan it names. */
+export function isStopPlanMessage(text: string): boolean {
+  const trimmed = text.trim();
+  return (
+    trimmed.endsWith(STOP_PLAN_INSTRUCTIONS) &&
+    STOP_PLAN_OPENING.test(trimmed.slice(0, -STOP_PLAN_INSTRUCTIONS.length))
+  );
 }
 
 /**
@@ -163,7 +177,8 @@ export function editWorkflowPlanPrompt(workflow: {
     `Workflow description: ${workflow.description}`,
     "This is a planning conversation. Load the existing workflow with sys_workflow_load. Explore context if useful, but do not execute the workflow or make changes to the project.",
     "Use sys_journal_write_plan to publish the proposed steps, and write a new plan whenever I ask for revisions. Keep step IDs stable. Do not set workflow_id on this journal plan: this conversation is for planning, not an execution run.",
-    "Set description on every plan you publish: what the workflow does and what a run needs, written for the proposed steps. Save plan stores it as the workflow description, so keep the inputs and constraints from the current description that still apply.",
+    "Write each step's goal for me first, in plain language and short Markdown bullets, as the save-workflow skill's Step descriptions section shows: **Inputs:** (what it reads and from where, such as a Slack channel, a PR or another MCP server), **What it does:** (a few bullets) and **Outputs:** (what it produces, such as a PR link or a report). Put the exact commands, paths and flags a run needs after them, under **Details:**. A run works from the same goal, so keep those details.",
+    "Set description on every plan you publish. Keep the current description's wording: change only what the proposed steps make inaccurate, add only what a run needs that it leaves out, and repeat it unchanged when it still fits. I review a changed description before Save plan applies it.",
     "The workflow already exists. Do not call sys_workflow_save or create another workflow. I will use Save plan on the workflow page to apply the proposal.",
     hasSavedPlan
       ? "Read the saved plan and use it as the starting point. Ask what edits I want and wait for my answer before proposing or publishing changes. Preserve steps I haven't asked to change, and iterate with me on my requested edits."

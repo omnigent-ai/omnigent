@@ -82,7 +82,11 @@ def test_pi_incomplete_cost_does_not_become_a_resume_baseline(
         )
 
 
-def test_subagent_cost_estimates_stay_display_only(db_uri: str) -> None:
+@pytest.mark.parametrize("hide_cost", [False, True])
+def test_subagent_cost_estimates_stay_display_only(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, hide_cost: bool
+) -> None:
+    monkeypatch.setenv("OMNIGENT_HIDE_COST", "1" if hide_cost else "0")
     store = SqlAlchemyConversationStore(db_uri)
     parent = store.create_conversation(title="claude", agent_id=_AGENT_ID)
     child = store.create_conversation(
@@ -102,11 +106,31 @@ def test_subagent_cost_estimates_stay_display_only(db_uri: str) -> None:
     assert usage["subagent_costs_usd"] == {child.id: 0.4, _OTHER_CHILD: 0.1}
     # The parent's bill already includes the child's spend; nothing adds it again.
     assert usage["total_cost_usd"] == 1.0
+    assert usage["policy_cost_usd"] == 1.2
     assert load_session_usage(parent.id, store)["total_cost_usd"] == 1.0
     tree = store.list_spawn_tree_usage(parent.id, limit=10).data
     costs = {cost.id: cost for cost in _agent_costs(tree, parent.id)}
-    assert (costs[parent.id].cost_usd, costs[parent.id].estimated_cost_usd) == (1.0, None)
-    assert (costs[child.id].cost_usd, costs[child.id].estimated_cost_usd) == (None, 0.4)
+    assert (costs[parent.id].cost_usd, costs[parent.id].estimated_cost_usd) == (
+        None if hide_cost else 1.0,
+        None,
+    )
+    assert (costs[child.id].cost_usd, costs[child.id].estimated_cost_usd) == (
+        None,
+        None if hide_cost else 0.4,
+    )
+
+    _persist_native_cumulative_usage(child.id, {"cumulative_cost_usd": 0.3}, store)
+    tree = store.list_spawn_tree_usage(parent.id, limit=10).data
+    costs = {cost.id: cost for cost in _agent_costs(tree, parent.id)}
+    assert (costs[child.id].cost_usd, costs[child.id].estimated_cost_usd) == (
+        None if hide_cost else 0.3,
+        None,
+    )
+    assert _usage(store, parent.id) == usage
+    assert _usage(store, child.id)["total_cost_usd"] == 0.3
+    totals = load_session_usage(parent.id, store)
+    assert totals["total_cost_usd"] == 1.3
+    assert totals["policy_cost_usd"] == 1.5
 
 
 @pytest.mark.parametrize(

@@ -49,6 +49,8 @@ export function conversationHooksMock() {
       fetchNextPage: vi.fn(),
     }),
     useMoveToProject: () => ({ mutate: vi.fn() }),
+    useMoveToNest: () => ({ mutate: vi.fn(), isPending: false }),
+    useSessionSearch: () => ({ data: undefined, isFetching: false }),
     useDeleteProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
     useRenameProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
     useCreateProject: () => ({ mutate: vi.fn(), isPending: false, isError: false }),

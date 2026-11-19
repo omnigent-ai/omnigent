@@ -3959,6 +3959,7 @@ def test_read_transcript_items_since_drops_recently_added_cli_builtins(
         ("effort", "high"),
         ("clear", ""),
         ("compact", ""),
+        ("goal", "all tests pass"),
         ("model", "claude-opus-4-7"),
         ("ultrareview", ""),
     ],
@@ -3968,7 +3969,7 @@ def test_read_transcript_items_since_surfaces_cli_commands_with_kind_command(
 ) -> None:
     """
     Surfaced CLI built-ins (``/effort``, ``/clear``, ``/compact``,
-    ``/model``, ``/ultrareview``) emit a ``slash_command`` item with
+    ``/goal``, ``/model``, ``/ultrareview``) emit a ``slash_command`` item with
     ``kind="command"`` — the renderer uses that to switch the prefix
     label from "Skill" to "Command".
 

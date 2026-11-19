@@ -48,10 +48,11 @@ Reuse relevant research already completed in the session. Refresh the affected
 sources when changes to the request or new evidence warrant it.
 
 Turn those findings into concrete step goals, dependencies and completion
-criteria. Keep useful source references with the relevant steps so a later run
-can use them without access to this planning conversation. If an essential
-source is unavailable, identify that gap and draft the parts you can support;
-do not hide an unknown procedure behind a future "explore the SOP" step.
+criteria. Keep useful source references in the relevant steps' Details (see
+Step descriptions) so a later run can use them without access to this planning
+conversation. If an essential source is unavailable, identify that gap and
+draft the parts you can support; do not hide an unknown procedure behind a
+future "explore the SOP" step.
 
 Include discovery in the saved plan only when its result must be obtained for
 each run, such as selecting current PRs, finding today's failures or resolving
@@ -95,13 +96,54 @@ agreement.
   of in several steps side by side. If the plan you're saving ends in several
   steps, add one.
 
+## Step descriptions
+
+A step's `goal`, in `sys_journal_write_plan` and `sys_workflow_save`, is its
+description. People read it on the step's card and in the Tasks tab while they
+review the plan, and a run's agent works from the same text. Write it for a
+person first, in plain language and short Markdown bullets, with these parts
+in this order:
+
+- **Inputs:** what the step reads and where it comes from, such as a Slack
+  channel, a pull request, a file or another MCP server's tool.
+- **What it does:** two to four short bullets.
+- **Outputs:** what it produces, such as a PR link, a report or a file. This
+  is what done means for the step.
+- **Details:** the exact commands, paths, flags and checks the run needs, and
+  the sources they come from. They come last, but keep them: a run has only
+  the saved steps and the workflow's description.
+
+In the first three parts, name things the way the user would and avoid jargon;
+leave tool names, flags and IDs to Details. Separate the parts with blank
+lines and keep each one short. For a long procedure, point to its file or
+runbook in Details instead of copying it. For example, one step's `goal`:
+
+```markdown
+**Inputs:** the pull request named in the run's request, and its CI checks on GitHub.
+
+**What it does:**
+- Reads the logs of each failing check.
+- Fixes the cause on the PR's branch and pushes the fix.
+- Reruns a check that failed for an unrelated reason, at most twice.
+
+**Outputs:** the PR with passing checks, and a one-line note on each fix.
+
+**Details:**
+- List the checks with `gh pr checks <number> --json name,state,link`.
+- Rerun a failed job with `gh run rerun <run-id> --failed`.
+- Push with `git push --force-with-lease`; never push to the default branch.
+```
+
+When you save a session's plan, rewrite goals that don't follow this form.
+
 ## Make it generic
 
 - A detail that would differ next run comes out of the steps: the repo, the
   PR, the module or file, a ticket, a date. Name steps for the kind of work
   ("Fix the failing tests"), not this run's instance ("Fix
   test_upload_retry").
-- A detail that stays the same stays: commands, conventions, checks.
+- A detail that stays the same stays, in the step's Details: commands,
+  conventions, checks.
 - If the user wants it exact, keep the specifics.
 
 ## Description
@@ -112,6 +154,11 @@ tests in the current repository. Use its test configuration unless a suite
 is specified." Separate required inputs from optional overrides, and name
 any authorization needed for external actions. The running agent should
 look up missing details and apply documented defaults before asking.
+
+When the workflow already has a description, as in a planning chat, keep
+the user's wording and structure rather than rewriting it into the form
+above. Change only what the plan makes inaccurate, add only what a run needs
+that it leaves out, and publish it unchanged when it still fits.
 
 ## Save
 

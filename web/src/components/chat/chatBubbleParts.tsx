@@ -88,6 +88,7 @@ import { QueryClientContext } from "@tanstack/react-query";
 import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
 import { useChatStore, withoutFailedInputs, type PendingUserMessage } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
+import { supersedePlanStop } from "@/store/planStops";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import {
   ConversationScopeContext,
@@ -1035,7 +1036,7 @@ function useMessageActionVisibility(persistentOnMobile = false, persistentOnDesk
       ? "opacity-100"
       : isMobile
         ? "invisible opacity-0"
-        : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 mobile-app:[@media(pointer:coarse)]:opacity-40",
+        : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100",
   };
 }
 
@@ -1322,7 +1323,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
               <MessageAction
                 tooltip="Copy"
                 size="icon-xxs"
-                className="[@media(pointer:coarse)]:size-8"
+                className="max-md:size-8"
                 onClick={handleCopy}
                 componentId="chat.message.copy_user"
               >
@@ -1333,7 +1334,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
               <MessageAction
                 tooltip="Edit and resend"
                 size="icon-xxs"
-                className="[@media(pointer:coarse)]:size-8"
+                className="max-md:size-8"
                 onClick={() =>
                   editSentMessage({
                     text: isShellCommand ? text : userMessageBody(bubble.content),
@@ -1347,7 +1348,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             <MessageAction
               tooltip={isLinkCopied ? "Copied!" : "Copy link"}
               size="icon-xxs"
-              className="[@media(pointer:coarse)]:size-8"
+              className="max-md:size-8"
               data-testid="copy-message-link"
               disabled={bubble.pending}
               onClick={handleCopyLink}
@@ -1433,7 +1434,9 @@ function AssistantBubble({
         ) {
           throw new Error("Wait for the current turn to finish before retrying");
         }
+        const endPlanStop = supersedePlanStop(conversationId);
         await continueFailedTurn(conversationId);
+        endPlanStop();
         return;
       }
       try {
@@ -1570,7 +1573,7 @@ function AssistantBubble({
                   <MessageAction
                     tooltip="Copy"
                     size="icon-xxs"
-                    className="[@media(pointer:coarse)]:size-8"
+                    className="max-md:size-8"
                     onClick={handleCopy}
                     componentId="chat.message.copy_assistant"
                   >

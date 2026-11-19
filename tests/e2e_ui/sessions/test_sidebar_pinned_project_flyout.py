@@ -66,6 +66,7 @@ def _move_to_new_project(page: Page, row: Locator, name: str) -> None:
     row.hover()
     row.get_by_test_id("conversation-actions").click()
     page.get_by_test_id("move-to-project").click()
+    page.get_by_role("menuitem", name="Projects", exact=True).hover()
     page.get_by_role("menuitem", name=name, exact=True).click()
 
 

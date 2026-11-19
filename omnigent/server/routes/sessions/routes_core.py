@@ -2845,6 +2845,7 @@ def register_core_routes(
                 conversation_store=conversation_store,
                 liveness_lookup=liveness_lookup,
                 host_store=getattr(request.app.state, "host_store", None),
+                host_session_recoverer=getattr(request.app.state, "host_session_recoverer", None),
                 # Only an owner's read may settle a row.
                 may_settle=lambda conv, perms=perms_by_conv: (
                     permission_store is None
@@ -3663,6 +3664,11 @@ def register_core_routes(
         # resolved (strictest requested) level gates them all with no redundant
         # second permission-store read.
         set_project = "project_id" in body.model_fields_set
+        set_nest = "nest_source_id" in body.model_fields_set
+        if set_nest and body.model_fields_set != {"nest_source_id"}:
+            raise OmnigentError(
+                "Move a session separately from other updates", code=ErrorCode.INVALID_INPUT
+            )
         set_launch_args = (
             body.terminal_launch_args is not None
             or body.permission_mode is not None
@@ -3675,7 +3681,7 @@ def register_core_routes(
         }
         if pin_only:
             required_level = LEVEL_READ
-        elif body.archived is not None or set_project or set_launch_args:
+        elif body.archived is not None or set_project or set_nest or set_launch_args:
             required_level = LEVEL_OWNER
         elif set_share_workspace:
             required_level = LEVEL_MANAGE
@@ -4021,6 +4027,9 @@ def register_core_routes(
             # claims the session meanwhile keeps its claim.
             if body.runner_id == "":
                 try:
+                    recoverer = getattr(request.app.state, "host_session_recoverer", None)
+                    if recoverer is not None:
+                        await asyncio.to_thread(recoverer.stop_recovery, conv, only_pending=True)
                     if profile_catalog is not None:
                         await asyncio.to_thread(
                             profile_catalog.reassign_runner,
@@ -4098,6 +4107,9 @@ def register_core_routes(
                             host_id=runner_hosts[0] if len(runner_hosts) == 1 else None,
                             host_type="external",
                         )
+                    recoverer = getattr(request.app.state, "host_session_recoverer", None)
+                    if recoverer is not None and runner_id != conv.runner_id:
+                        await asyncio.to_thread(recoverer.stop_recovery, conv, only_pending=True)
                     handled = profile_catalog is not None and await asyncio.to_thread(
                         profile_catalog.reassign_runner,
                         conv,
@@ -4363,6 +4375,31 @@ def register_core_routes(
                     )
                     if owned is None:
                         raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        if set_nest:
+            from omnigent.server.session_orchestration import require_owned_session
+
+            if user_id is None or permission_store is None:
+                raise OmnigentError("Moving sessions requires an owner", code=ErrorCode.FORBIDDEN)
+            if body.nest_source_id is not None and not request.app.state.feature_flags.enabled(
+                Feature.SIBLING_SESSIONS
+            ):
+                raise OmnigentError("Nested agents are disabled", code=ErrorCode.FORBIDDEN)
+            for participant_id in dict.fromkeys([session_id, body.nest_source_id]):
+                if participant_id is None:
+                    continue
+                await asyncio.to_thread(
+                    require_owned_session,
+                    participant_id,
+                    user_id,
+                    conversation_store,
+                    permission_store,
+                )
+            await asyncio.to_thread(
+                conversation_store.set_session_nest,
+                session_id,
+                body.nest_source_id,
+                user_id=user_id,
+            )
         update_result = await asyncio.to_thread(
             conversation_store.update_conversation_with_changes,
             session_id,
@@ -4683,6 +4720,7 @@ def register_core_routes(
                 delete_worktree=body.delete_worktree,
                 host_store=getattr(request.app.state, "host_store", None),
                 sandbox_config=getattr(request.app.state, "sandbox_config", None),
+                host_session_recoverer=getattr(request.app.state, "host_session_recoverer", None),
                 after_turn=normalize_uuid(request.headers.get(ORCHESTRATION_SOURCE_HEADER))
                 == lifecycle_id,
             )
