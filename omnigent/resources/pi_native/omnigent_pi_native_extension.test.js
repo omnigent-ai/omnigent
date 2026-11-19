@@ -730,7 +730,8 @@ async function testQueuedPromptDuringStartupStaysRunningUntilAgentEnd() {
 // Native subagent children: a parent session file plus child session files
 // beneath its per-session directory, watched through the real extension module.
 // Posts are recorded once their response arrives; an infinite delay never responds.
-function childFixture({ responseDelayMs = 0, postTimeoutMs } = {}) {
+// A stalled post fails when aborted, noting why and how many posts had arrived by then.
+function childFixture({ responseDelayMs = 0, postTimeoutMs, stalls = () => false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-children-"));
   harnesses.push({ pi: {}, fixtureRoot: root });
   const sessions = path.join(root, "sessions");
@@ -740,10 +741,17 @@ function childFixture({ responseDelayMs = 0, postTimeoutMs } = {}) {
   const parentFile = path.join(sessions, "2026-01-01T00-00-00-000Z_parent.jsonl");
   fs.writeFileSync(parentFile, JSON.stringify({ type: "session", id: "parent" }) + "\n");
   const posts = [];
+  const stalled = [];
   global.fetch = async (url, opts) => {
     const body = JSON.parse(opts.body);
     const sessionId = decodeURIComponent(String(url).split("/v1/sessions/")[1].split("/")[0]);
     if (responseDelayMs === Infinity) return new Promise(() => {});
+    if (stalls(body)) {
+      return new Promise((_resolve, reject) => opts.signal.addEventListener("abort", () => {
+        stalled.push({ body, postsBefore: posts.length, reason: opts.signal.reason?.name });
+        reject(opts.signal.reason);
+      }));
+    }
     if (responseDelayMs) await new Promise((resolve) => setTimeout(resolve, responseDelayMs));
     posts.push({ sessionId, body });
     const json = body.type === "external_acp_subagent_start"
@@ -756,7 +764,7 @@ function childFixture({ responseDelayMs = 0, postTimeoutMs } = {}) {
   const { createChildSessionWatcher } = require(EXT_PATH);
   const watcher = (now = Date.now) =>
     createChildSessionWatcher(config, { sessionFile: () => parentFile, now });
-  return { sessions, bridgeDir, parentFile, posts, watcher };
+  return { sessions, bridgeDir, parentFile, posts, stalled, watcher };
 }
 
 function childSessionLines({ id, parentFile, agent, startedAt = 1000 }) {
@@ -872,16 +880,39 @@ async function testChildReadsIncrementallyAndSurvivesRestart() {
 
 async function testChildWrittenAfterTheLastPollIsReportedAtShutdown() {
   // Fast responses, but the whole drain outlasts one post timeout.
-  const f = childFixture({ responseDelayMs: 40, postTimeoutMs: 100 });
+  const f = childFixture({
+    responseDelayMs: 40, postTimeoutMs: 100,
+    stalls: (body) => body.data?.subagent_id === "worker-stalled",
+  });
   const watcher = f.watcher();
-  watcher.start();
-  await watcher.poll();
   const childDir = path.join(f.sessions, path.basename(f.parentFile, ".jsonl"));
   const writeChild = (relative, text) => {
     fs.mkdirSync(path.dirname(path.join(childDir, relative)), { recursive: true });
     fs.writeFileSync(path.join(childDir, relative), text);
     return path.join(childDir, relative);
   };
+  const registered = writeChild("registered/session.jsonl",
+    childSessionLines({ id: "registered", parentFile: f.parentFile, agent: "worker" }) +
+    assistantLine("model-a", 2000, 100, 10));
+  await watcher.poll();
+  // Its final reply ends the turn moments before shutdown.
+  fs.appendFileSync(registered, assistantLine("model-a", 3000, 20, 2, "stop"));
+  writeChild("stalled/session.jsonl",
+    childSessionLines({ id: "stalled", parentFile: f.parentFile, agent: "worker" }) +
+    assistantLine("model-a", 2000, 1, 1));
+  await watcher.stop();
+  const registeredUsage = f.posts.findIndex((p) =>
+    p.body.type === "external_session_usage" && p.body.data.cumulative_input_tokens === 140);
+  assert("a registered child's new usage is posted without waiting on a stalled registration",
+    f.posts[registeredUsage]?.sessionId === "conv_worker-registered" && registeredUsage < f.stalled[0]?.postsBefore,
+    JSON.stringify(f.stalled));
+  assert("a poll tries a stalled registration once", f.stalled.length === 1, JSON.stringify(f.stalled));
+  const idle = (sessionId) => f.posts.some((p) => p.sessionId === sessionId && p.body.type === "subagent.status");
+  assert("a child whose turn ended just before shutdown is reported idle",
+    idle("conv_worker-registered"), JSON.stringify(f.posts));
+
+  // A restarted watcher, with the stalled registration still pending.
+  watcher.start();
   // A tool result longer than one read chunk precedes the final usage.
   const bigLine = JSON.stringify({ type: "message", message: { role: "toolResult", content: "x".repeat(1100 * 1024) } }) + "\n";
   writeChild("run/session.jsonl",
@@ -896,18 +927,31 @@ async function testChildWrittenAfterTheLastPollIsReportedAtShutdown() {
   // No session_info title yet, written moments before shutdown.
   writeChild("untitled/session.jsonl",
     JSON.stringify({ type: "session", id: "untitled", timestamp: new Date(1000).toISOString(), parentSession: f.parentFile }) +
-    "\n" + assistantLine("model-a", 2000, 50, 5));
+    "\n" + assistantLine("model-a", 2000, 50, 5, "stop"));
 
   // Sorted enumeration lists the nested child's directory before its launcher's.
   const readdirSync = fs.readdirSync;
   fs.readdirSync = (...args) => readdirSync(...args).sort((a, b) => (a.name < b.name ? -1 : 1));
+  const readSync = fs.readSync;
+  let largestRead = 0;
+  fs.readSync = (...args) => {
+    largestRead = Math.max(largestRead, args[3]);
+    return readSync(...args);
+  };
   try {
     // A poll is already in flight when shutdown begins.
     watcher.poll();
     await watcher.stop();
   } finally {
     fs.readdirSync = readdirSync;
+    fs.readSync = readSync;
   }
+  assert("shutdown abandons the in-flight poll's hung request, and each poll tries it once",
+    f.stalled.length === 3 && f.stalled[1].reason === "AbortError" && f.stalled[2].reason === "TimeoutError",
+    JSON.stringify(f.stalled));
+  assert("a finished child first seen at shutdown is reported idle",
+    idle("conv_subagent-untitled"), JSON.stringify(f.posts));
+  assert("backlog reads stay within one chunk", largestRead <= 1024 * 1024, String(largestRead));
   const started = (subagentId, sessionId = "conv_parent") => f.posts.some((p) =>
     p.sessionId === sessionId && p.body.type === "external_acp_subagent_start" && p.body.data.subagent_id === subagentId);
   assert("a child written after the last poll is registered and reported past a chunk boundary at shutdown",

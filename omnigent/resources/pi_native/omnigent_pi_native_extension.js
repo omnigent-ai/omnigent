@@ -1288,6 +1288,7 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
   const ignoredFiles = new Set();
   let timer = null;
   let polling = null;
+  let cancelPosts = new AbortController();
 
   try {
     const saved = JSON.parse(fs.readFileSync(statePath, "utf8"));
@@ -1327,17 +1328,20 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
   }
 
   async function post(sessionId, body) {
-    return postEventChecked(
-      { ...config, sessionId }, body, AbortSignal.timeout(assistantItemPostTimeoutMs(config)),
-    );
+    const signal = AbortSignal.any([AbortSignal.timeout(assistantItemPostTimeoutMs(config)), cancelPosts.signal]);
+    return postEventChecked({ ...config, sessionId }, body, signal);
+  }
+
+  // A nested child attaches to the child session that launched it.
+  function parentSessionId(child) {
+    return roots.includes(child.parentFile)
+      ? config.sessionId
+      : children.find(other => other.file === child.parentFile)?.childId;
   }
 
   async function ensureMinted(child) {
     if (child.childId) return true;
-    // A nested child attaches to the child session that launched it.
-    const parentId = roots.includes(child.parentFile)
-      ? config.sessionId
-      : children.find(other => other.file === child.parentFile)?.childId;
+    const parentId = parentSessionId(child);
     if (!parentId) return false;
     // The server dedupes on this id, so it keeps the full persisted Pi session id
     // behind a readable agent-name prefix.
@@ -1378,11 +1382,20 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
     }
     child.mtimeMs = stat.mtimeMs;
     for (let remaining = stat.size - child.offset; remaining > 0; remaining = stat.size - child.offset) {
-      let buffer = readFileRange(child.file, child.offset, Math.min(remaining, _CHILD_READ_CHUNK_BYTES));
-      if (buffer && buffer.lastIndexOf(10) < 0 && remaining > _CHILD_READ_CHUNK_BYTES)
-        buffer = readFileRange(child.file, child.offset, remaining);
-      const end = buffer ? buffer.lastIndexOf(10) : -1;
+      // A line longer than one chunk extends the read chunk by chunk until it ends.
+      const parts = [];
+      let length = 0;
+      let end = -1;
+      while (end < 0 && length < remaining) {
+        const part = readFileRange(child.file, child.offset + length, Math.min(remaining - length, _CHILD_READ_CHUNK_BYTES));
+        if (!part?.length) break;
+        const newline = part.lastIndexOf(10);
+        if (newline >= 0) end = length + newline;
+        parts.push(part);
+        length += part.length;
+      }
       if (end < 0) return;
+      const buffer = parts.length === 1 ? parts[0] : Buffer.concat(parts);
       for (const line of buffer.subarray(0, end).toString("utf8").split("\n")) {
         const entry = parseJsonLine(line);
         const message = entry?.type === "message" ? entry.message : null;
@@ -1395,7 +1408,7 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
     }
   }
 
-  async function report(child) {
+  async function report(child, final) {
     const usage = child.usage;
     const postKey = JSON.stringify(usage);
     if ((usage.input || usage.output) && postKey !== child.postedKey) {
@@ -1412,7 +1425,8 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
         child.postedKey = postKey;
       } catch (_err) {}
     }
-    const quiet = now() - child.mtimeMs > _CHILD_QUIET_MS;
+    // The watcher stops after the final poll, so a finished child cannot wait out the quiet window.
+    const quiet = final || now() - child.mtimeMs > _CHILD_QUIET_MS;
     const status = child.lastStop && child.lastStop !== "toolUse" && quiet ? "idle" : "running";
     if (status === child.postedStatus) return;
     // A terminal status edge would deliver a result to the parent's inbox and
@@ -1429,20 +1443,28 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
     const current = sessionFile();
     if (current && !roots.includes(path.resolve(current))) roots.push(path.resolve(current));
     discover(final);
-    const minted = [];
-    // Repeat while registering a launcher lets its nested children attach.
-    for (let progress = true; progress;) {
-      progress = false;
-      for (const child of children) {
-        if (minted.includes(child) || !(await ensureMinted(child))) continue;
-        readNew(child);
-        minted.push(child);
-        progress = true;
-      }
-    }
+    const reports = [];
     // Persist cursors and totals before reporting them.
-    persist();
-    await Promise.all(minted.map(report));
+    const flush = ready => {
+      ready.forEach(readNew);
+      persist();
+      reports.push(...ready.map(child => report(child, final)));
+    };
+    // Registered children report without waiting on new registrations.
+    flush(children.filter(child => child.childId));
+    // Each registration is tried once per poll; registering a launcher lets its nested children attach.
+    const attempted = new Set();
+    const register = async () => {
+      const batch = children.filter(child => !child.childId && !attempted.has(child) && parentSessionId(child));
+      batch.forEach(child => attempted.add(child));
+      await Promise.all(batch.map(async child => {
+        if (!(await ensureMinted(child))) return;
+        flush([child]);
+        await register();
+      }));
+    };
+    await register();
+    await Promise.all(reports);
   }
 
   return {
@@ -1460,6 +1482,9 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
     async stop() {
       clearInterval(timer);
       timer = null;
+      // A hung request in the in-flight poll must not consume the final poll's budget.
+      cancelPosts.abort();
+      cancelPosts = new AbortController();
       const final = Promise.resolve(polling).catch(() => {}).then(() => this.poll(true));
       const bound = new AbortController();
       const deadline = Math.min(
