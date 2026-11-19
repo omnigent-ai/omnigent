@@ -7140,6 +7140,229 @@ describe("chatStore — send (file attachments)", () => {
     expect(uploads).toBe(1);
   });
 
+  it.each(["foreground", "background"])(
+    "releases a failed %s upload batch's quota and reuploads its files on retry",
+    async (path) => {
+      seedConversationsCache([conv("conv_active", "running"), conv("conv_existing", "idle")]);
+      useChatStore.setState({
+        conversationId: path === "foreground" ? "conv_existing" : "conv_active",
+        abortController: new AbortController(),
+      });
+      const stored = new Set<string>();
+      const deleted: string[] = [];
+      const posted: unknown[] = [];
+      let uploads = 0;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = String(input);
+        if (url.endsWith("/v1/sessions/conv_existing/resources/files") && init?.method === "POST") {
+          uploads += 1;
+          if (stored.size === 2) {
+            return mockResponse({ detail: "Attachment quota reached" }, { ok: false, status: 413 });
+          }
+          const id = `file_${uploads}`;
+          stored.add(id);
+          return mockResponse({ id });
+        }
+        if (url.includes("/resources/files/") && init?.method === "DELETE") {
+          const id = url.split("/").at(-1)!;
+          deleted.push(id);
+          stored.delete(id);
+          return mockResponse({ deleted: true });
+        }
+        if (url.endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST") {
+          posted.push(JSON.parse(init.body as string).data.content);
+        }
+        return defaultFetchHandler(input, init);
+      });
+      const files = ["first.zip", "second.zip", "third.zip"].map(
+        (name) => new File(["content"], name, { type: "application/zip" }),
+      );
+      const submit = async (batch: File[]) => {
+        if (path === "foreground") {
+          await useChatStore.getState().send("read these", "agent_xyz", batch);
+        } else {
+          initChatStore(client);
+          useChatStore.setState({
+            queuedMessages: [
+              {
+                queueId: "q_batch",
+                conversationId: "conv_existing",
+                text: "read these",
+                files: batch,
+              },
+            ],
+          });
+          useChatStore.getState().flushBackgroundQueues();
+          await tick();
+          await tick();
+        }
+      };
+
+      await submit(files);
+
+      expect(uploads).toBe(3);
+      expect(deleted.sort()).toEqual(["file_1", "file_2"]);
+      expect(stored.size).toBe(0);
+      expect(posted).toEqual([]);
+      if (path === "foreground") {
+        expect(useChatStore.getState().failedSendDraft?.files).toEqual(files);
+      } else {
+        expect(useChatStore.getState().queuedMessages[0]?.files).toEqual(files);
+      }
+
+      await submit([files[0]!]);
+      await submit([files[1]!]);
+
+      expect(uploads).toBe(5);
+      expect([...stored]).toEqual(["file_4", "file_5"]);
+      expect(posted).toEqual([
+        [
+          { type: "input_file", file_id: "file_4", filename: "first.zip" },
+          { type: "input_text", text: "read these" },
+        ],
+        [
+          { type: "input_file", file_id: "file_5", filename: "second.zip" },
+          { type: "input_text", text: "read these" },
+        ],
+      ]);
+    },
+  );
+
+  it("keeps previously posted attachments when a later upload batch fails", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+    const uploaded: string[] = [];
+    const deleted: string[] = [];
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_existing/resources/files") && init?.method === "POST") {
+        const name = ((init.body as FormData).get("file") as File).name;
+        uploaded.push(name);
+        if (name === "rejected.zip") {
+          return mockResponse({ detail: "Attachment quota reached" }, { ok: false, status: 413 });
+        }
+        return mockResponse({ id: `file_${uploaded.length}` });
+      }
+      if (url.includes("/resources/files/") && init?.method === "DELETE") {
+        deleted.push(url.split("/").at(-1)!);
+        return mockResponse({ deleted: true });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const files = ["posted.zip", "new.zip", "rejected.zip"].map(
+      (name) => new File(["content"], name, { type: "application/zip" }),
+    );
+
+    await useChatStore.getState().send("first", "agent_xyz", [files[0]!]);
+    await useChatStore.getState().send("second", "agent_xyz", files);
+    await useChatStore.getState().send("reuse posted", "agent_xyz", [files[0]!]);
+
+    expect(uploaded).toEqual(["posted.zip", "new.zip", "rejected.zip"]);
+    expect(deleted).toEqual(["file_2"]);
+    expect(useChatStore.getState().pendingUserMessages.at(-1)?.content).toContainEqual({
+      type: "input_file",
+      file_id: "file_1",
+      filename: "posted.zip",
+    });
+  });
+
+  it("keeps an overlapping send's attachment when an earlier upload batch fails", async () => {
+    vi.useFakeTimers();
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+    const deleted: string[] = [];
+    const posted: unknown[] = [];
+    let uploads = 0;
+    let rejectUpload!: () => void;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_existing/resources/files") && init?.method === "POST") {
+        if (((init.body as FormData).get("file") as File).name === "rejected.zip") {
+          return new Promise<Response>((resolve) => {
+            rejectUpload = () =>
+              resolve(
+                mockResponse({ detail: "Attachment quota reached" }, { ok: false, status: 413 }),
+              );
+          });
+        }
+        uploads += 1;
+        return mockResponse({ id: `file_${uploads}` });
+      }
+      if (url.includes("/resources/files/") && init?.method === "DELETE") {
+        deleted.push(url.split("/").at(-1)!);
+        return mockResponse({ deleted: true });
+      }
+      if (url.endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST") {
+        posted.push(JSON.parse(init.body as string).data.content);
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const shared = new File(["content"], "shared.zip", { type: "application/zip" });
+    const rejected = new File(["content"], "rejected.zip", { type: "application/zip" });
+
+    const firstSend = useChatStore.getState().send("first", "agent_xyz", [shared, rejected]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(rejectUpload).toBeDefined();
+    expect(uploads).toBe(1);
+
+    const secondSend = useChatStore.getState().send("second", "agent_xyz", [shared]);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(posted).toEqual([]);
+    await vi.advanceTimersByTimeAsync(180_000);
+    await secondSend;
+
+    expect(uploads).toBe(2);
+    expect(posted).toEqual([
+      [
+        { type: "input_file", file_id: "file_2", filename: "shared.zip" },
+        { type: "input_text", text: "second" },
+      ],
+    ]);
+    rejectUpload();
+    await firstSend;
+
+    expect(deleted).toEqual(["file_1"]);
+  });
+
+  it("continues failed-batch cleanup after a deletion fails and preserves the upload error", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+    });
+    const deleted: string[] = [];
+    let uploads = 0;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_existing/resources/files") && init?.method === "POST") {
+        uploads += 1;
+        return uploads === 3
+          ? mockResponse({ detail: "Attachment quota reached" }, { ok: false, status: 413 })
+          : mockResponse({ id: `file_${uploads}` });
+      }
+      if (url.includes("/resources/files/") && init?.method === "DELETE") {
+        const id = url.split("/").at(-1)!;
+        deleted.push(id);
+        return id === "file_1"
+          ? mockResponse({ detail: "Cleanup unavailable" }, { ok: false, status: 503 })
+          : mockResponse({ deleted: true });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const files = ["first.zip", "second.zip", "third.zip"].map(
+      (name) => new File(["content"], name, { type: "application/zip" }),
+    );
+    const onError = vi.fn();
+
+    await useChatStore.getState().send("read these", "agent_xyz", files, { onError });
+
+    expect(deleted.sort()).toEqual(["file_1", "file_2"]);
+    expect(onError).toHaveBeenCalledWith("Attachment quota reached");
+  });
+
   it("hands the message back for retry when the upload is rejected", async () => {
     // A 415 on an unsupported attachment must not swallow the typed text: the
     // optimistic bubble rolls back, so `failedSendDraft` is the only thing

@@ -1612,6 +1612,25 @@
         "title": "CloneRepositoryRequest",
         "type": "object"
       },
+      "CloneScheduledTaskRequest": {
+        "additionalProperties": false,
+        "description": "Optional body for `POST /v1/scheduled-tasks/{id}/clone`.",
+        "properties": {
+          "host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Id"
+          }
+        },
+        "title": "CloneScheduledTaskRequest",
+        "type": "object"
+      },
       "CodexGoalObject": {
         "description": "Current Codex goal state for a Codex-native session.\n\nMirrors Codex app-server's `ThreadGoal` shape using Omnigent's\nsnake-case API convention. `created_at` and `updated_at` are optional\nbecause older app-server documentation examples omit them even though the\ncurrent protocol includes them.",
         "properties": {
@@ -8165,6 +8184,11 @@
           "scheduled_task_approval_skipping_modes": {
             "default": true,
             "title": "Scheduled Task Approval Skipping Modes",
+            "type": "boolean"
+          },
+          "scheduled_task_clone": {
+            "default": false,
+            "title": "Scheduled Task Clone",
             "type": "boolean"
           },
           "scheduled_task_harness_settings": {
@@ -21581,6 +21605,68 @@
           }
         },
         "summary": "Update Scheduled Task",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      }
+    },
+    "/v1/scheduled-tasks/{scheduled_task_id}/clone": {
+      "post": {
+        "description": "Copy an owned automation under a new ID, without its runs or continued session.\n\nNeeds the database scheduler: the legacy timer re-anchors an interval\nschedule whenever it arms one, so it can't run the clone on the original's days.",
+        "operationId": "clone_scheduled_task_v1_scheduled_tasks__scheduled_task_id__clone_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scheduled_task_id",
+            "required": true,
+            "schema": {
+              "title": "Scheduled Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/CloneScheduledTaskRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Clone Scheduled Task V1 Scheduled Tasks  Scheduled Task Id  Clone Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Clone Scheduled Task",
         "tags": [
           "scheduled_tasks"
         ]

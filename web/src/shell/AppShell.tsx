@@ -3279,6 +3279,7 @@ function AppShellImpl() {
                 )}
                 <GridSessionMain
                   className="relative flex min-h-0 min-w-0 flex-1 flex-col"
+                  data-flyout-boundary=""
                   data-shell-header={extensionOwnsHeader ? "hidden" : "visible"}
                   data-session-id={conversationId}
                 >

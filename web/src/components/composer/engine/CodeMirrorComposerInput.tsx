@@ -43,9 +43,12 @@ import type {
   ComposerTextTarget,
   ComposerTokenAt,
 } from "./composerInput";
+import { readlineKeys } from "./codeMirrorReadline";
 
 /** What the editor takes from the app, handed in by the loader. */
 export interface CodeMirrorComposerEnvironment {
+  /** Whether the platform is macOS, which binds the readline keys. */
+  mac: boolean;
   /** The attribute that marks a composer input's focusable node. */
   inputAttribute: string;
   /** The attribute that carries an input's id within its composer. */
@@ -498,6 +501,7 @@ function CodeMirrorComposer({
               },
             }),
           ),
+          readlineKeys(environment.mac),
           keymap.of(COMPOSER_EDITING_KEYMAP),
           compartments.history.of(history()),
           EditorView.lineWrapping,

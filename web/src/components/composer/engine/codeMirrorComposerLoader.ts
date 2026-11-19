@@ -4,6 +4,7 @@
 
 import type { ComponentType } from "react";
 import { findMentionTokens } from "@/lib/composerMentions";
+import { currentShortcutEnvironment } from "@/lib/shortcuts/registry";
 import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
 import { MENTION_TOKEN_CLASS } from "@/components/composer/MentionTokenOverlay";
 import type { CodeMirrorComposerEnvironment } from "./CodeMirrorComposerInput";
@@ -28,6 +29,7 @@ type Importer = () => Promise<
 /** What the lazy editor takes from the app, so its chunk imports nothing the app already loaded. */
 export function codeMirrorComposerEnvironment(): CodeMirrorComposerEnvironment {
   return {
+    mac: currentShortcutEnvironment().mac,
     inputAttribute: COMPOSER_INPUT_ATTRIBUTE,
     inputIdAttribute: COMPOSER_INPUT_ID_ATTRIBUTE,
     registerSurface: registerComposerSurface,

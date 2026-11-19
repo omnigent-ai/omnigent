@@ -676,6 +676,53 @@ def test_workflows_connect_selection_to_jobs():
     assert sdk_check["if"] == "matrix.group == 'server-rest'"
     assert "kubernetes._ensure_sdk()" in sdk_check["run"]
     assert "openshell._ensure_sdk()" in sdk_check["run"]
+    claude_job = jobs["claude-containment"]
+    assert claude_job["needs"] == "scope"
+    assert "needs.scope.outputs.backend == 'true'" in claude_job["if"]
+    cli_test = next(
+        step
+        for step in claude_job["steps"]
+        if step.get("name") == "Test real CLI skill and child execution paths"
+    )
+    assert cli_test["env"]["OMNIGENT_CLAUDE_CLI_E2E"] == "1"
+    assert "--reruns 0" in cli_test["run"]
+    assert "test_real_cli_bash_tool_round_trip_and_inline_skill_finish" in cli_test["run"]
+    assert "test_sdk_real_cli_bash_policy_runs_before_execution" in cli_test["run"]
+    assert "test_each_cli_execution_path_inherits_the_sandbox" in cli_test["run"]
+    assert "test_bound_host_proc_does_not_expose_synthetic_parent" in cli_test["run"]
+    assert "test_session_terminal_runs_real_cli_with_automatic_model_access" in cli_test["run"]
+    assert "test_omnigent_run_cli_with_contained_claude" in cli_test["run"]
+    assert "os-shell-roundtrip or terminal-roundtrip" in cli_test["run"]
+    bubblewrap_step = next(
+        step for step in claude_job["steps"] if step.get("name") == "Enable Bubblewrap"
+    )
+    assert "bubblewrap ripgrep tmux" in bubblewrap_step["run"]
+    assert "net.ipv4.ip_unprivileged_port_start=0" in bubblewrap_step["run"]
+    assert "len(cases) != 23 or skipped" in cli_test["run"]
+    seatbelt_job = jobs["seatbelt-containment"]
+    assert seatbelt_job["needs"] == "scope"
+    assert seatbelt_job["runs-on"] == "macos-15"
+    assert "needs.scope.outputs.backend == 'true'" in seatbelt_job["if"]
+    assert any(
+        step.get("uses", "").startswith("actions/setup-node@")
+        and step["with"]["node-version"] == "22"
+        for step in seatbelt_job["steps"]
+    )
+    seatbelt_test = next(
+        step
+        for step in seatbelt_job["steps"]
+        if step.get("name")
+        == "Test Seatbelt process, CLI skill/hook, hardlink, and Keychain boundaries"
+    )
+    assert seatbelt_test["env"]["OMNIGENT_CLAUDE_CLI_E2E"] == "1"
+    assert "--reruns 0" in seatbelt_test["run"]
+    assert "test_sibling_cannot_read_process_arguments" in seatbelt_test["run"]
+    assert "test_seatbelt_denies_new_hardlink_from_readonly_source" in seatbelt_test["run"]
+    assert "test_real_callback_cannot_read_parent_keychain" in seatbelt_test["run"]
+    assert "test_real_cli_bash_tool_round_trip_and_inline_skill_finish" in seatbelt_test["run"]
+    assert "test_real_cli_hook_cannot_retrieve_login_keychain_canary" in seatbelt_test["run"]
+    assert any(step.get("with", {}).get("harness") == "claude" for step in seatbelt_job["steps"])
+    assert "len(cases) != 8 or skipped" in seatbelt_test["run"]
     for name in ("pytest", "stores-postgres", "stores-cockroachdb", "stores-mysql"):
         assert jobs[name]["needs"] == "scope"
         output = "backend" if name == "pytest" else "database"
