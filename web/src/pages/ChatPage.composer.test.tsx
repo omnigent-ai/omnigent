@@ -5861,28 +5861,30 @@ describe("Composer native shell mode", () => {
     expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
   });
 
-  it("shows no shell mode on a harness without native `!` input", () => {
-    useChatStore.setState({ sessionHarness: "pi" });
-    render(<Composer {...composerProps({ isNativeWrapper: true, permissionLevel: null })} />);
-    fireEvent.change(textarea(), { target: { value: "!git status" } });
-    expect(screen.queryByTestId("composer-shell-mode-indicator")).toBeNull();
-    expect(screen.queryByTestId("composer-highlight-overlay")).toBeNull();
-  });
-
   // Only codex refuses a non-owner's shell input; the claude-native level-2 row above runs it.
   it.each([
-    { harness: "pi", draft: "!git status" },
-    { harness: "codex-native", draft: "git status" },
-  ])("sends a non-owner's $draft on $harness as typed", ({ harness, draft }) => {
-    useChatStore.setState({ sessionHarness: harness });
-    const props = composerProps({ isNativeWrapper: true, permissionLevel: 2 });
-    render(<Composer {...props} />);
-    fireEvent.change(textarea(), { target: { value: draft } });
-    expect(screen.queryByTestId("composer-shell-mode-indicator")).toBeNull();
+    { label: "an owner on pi", harness: "pi", permissionLevel: null, draft: "!git status" },
+    { label: "a non-owner on pi", harness: "pi", permissionLevel: 2, draft: "!git status" },
+    {
+      label: "a codex non-owner",
+      harness: "codex-native",
+      permissionLevel: 2,
+      draft: "git status",
+    },
+  ])(
+    "sends $draft from $label as typed, with no shell mode",
+    ({ harness, permissionLevel, draft }) => {
+      useChatStore.setState({ sessionHarness: harness });
+      const props = composerProps({ isNativeWrapper: true, permissionLevel });
+      render(<Composer {...props} />);
+      fireEvent.change(textarea(), { target: { value: draft } });
+      expect(screen.queryByTestId("composer-shell-mode-indicator")).toBeNull();
+      expect(screen.queryByTestId("composer-highlight-overlay")).toBeNull();
 
-    fireEvent.keyDown(textarea(), { key: "Enter" });
-    expect(props.onSend).toHaveBeenCalledExactlyOnceWith(draft, undefined);
-  });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(props.onSend).toHaveBeenCalledExactlyOnceWith(draft, undefined);
+    },
+  );
 
   it("tells a codex-native non-owner their `!` send will be refused, and keeps it", () => {
     useChatStore.setState({ sessionHarness: "codex-native" });

@@ -492,8 +492,19 @@ describe("CodeMirrorComposerInput command token", () => {
   });
 
   it("places a token by the value's offset when the editor folds its CRLF line breaks", () => {
-    const { container } = mount({ value: "\r\n!ls", commandToken: { token: "!", start: 2 } });
-    expect(commandMarks(container)).toEqual([["!", COMMAND_TOKEN_CLASS]]);
+    const view = mount({ value: "\r\n!ls", commandToken: { token: "!", start: 2 } });
+    expect(commandMarks(view.container)).toEqual([["!", COMMAND_TOKEN_CLASS]]);
+
+    // A new value and token reconfigure the mark through the same offset mapping.
+    view.rerender(
+      <CodeMirrorComposerInput
+        aria-label="Message the agent"
+        value={"\r\n\r\n!ls"}
+        commandToken={{ token: "!", start: 4 }}
+      />,
+    );
+    expect(commandMarks(view.container)).toEqual([["!", COMMAND_TOKEN_CLASS]]);
+    expect(view.container.querySelector(".cm-content")?.textContent).toBe("!ls");
   });
 
   it("never marks text the token no longer leads, even before the token prop catches up", () => {
