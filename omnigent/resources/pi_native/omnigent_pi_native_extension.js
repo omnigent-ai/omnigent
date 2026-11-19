@@ -1290,9 +1290,11 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now, shutdo
     for (const entry of saved.children) {
       const child = children.find(other => other.key === entry.key);
       if (!child) children.push(entry);
-      else if (entry.offset > child.offset) Object.assign(child, entry, { childId: entry.childId || child.childId });
+      else if (entry.offset > child.offset) Object.assign(child, entry, { childId: entry.childId || child.childId, pending: null });
     }
-    const state = { roots, children: children.map(({ postedKey: _postedKey, postedStatus: _status, ...child }) => child) };
+    const state = {
+      roots, children: children.map(({ postedKey: _postedKey, postedStatus: _status, pending: _pending, ...child }) => child),
+    };
     // An unchanged checkpoint is not rewritten.
     if (JSON.stringify(state) !== saved.text) writeJsonAtomic(statePath, state);
   }
@@ -1373,17 +1375,20 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now, shutdo
       return;
     }
     child.mtimeMs = stat.mtimeMs;
-    // ``parts`` and ``length`` hold the record at the cursor until its newline arrives.
-    let parts = [];
-    let length = 0;
-    while (child.offset + length < stat.size && Date.now() < deadline) {
-      const part = readFileRange(child.file, child.offset + length,
-        Math.min(stat.size - child.offset - length, _CHILD_READ_CHUNK_BYTES));
+    // The record at the cursor stays pending in memory across passes until its newline arrives;
+    // ``length`` counts its bytes read so far, and ``parts`` holds them while within the cap.
+    if (!child.pending || child.offset + child.pending.length > stat.size) child.pending = { parts: [], length: 0 };
+    const pending = child.pending;
+    // Each pass reads at least one chunk, so a record longer than one pass still completes.
+    for (let started = false; child.offset + pending.length < stat.size && (!started || Date.now() < deadline); started = true) {
+      const part = readFileRange(child.file, child.offset + pending.length,
+        Math.min(stat.size - child.offset - pending.length, _CHILD_READ_CHUNK_BYTES));
       if (!part?.length) return;
       const first = part.indexOf(10);
+      const { parts, length } = pending;
       if (first < 0) {
-        length += part.length;
-        if (length > _CHILD_RECORD_MAX_BYTES) parts = [];
+        pending.length += part.length;
+        if (pending.length > _CHILD_RECORD_MAX_BYTES) pending.parts = [];
         else parts.push(part);
         continue;
       }
@@ -1400,8 +1405,8 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now, shutdo
         child.lastStop = typeof message.stopReason === "string" ? message.stopReason : null;
       }
       child.offset += end + 1;
-      parts = [];
-      length = 0;
+      pending.parts = [];
+      pending.length = 0;
     }
   }
 

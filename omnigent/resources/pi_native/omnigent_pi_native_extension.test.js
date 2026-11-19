@@ -1199,6 +1199,60 @@ async function testShutdownStopsReadingAtItsDeadline() {
   assert("shutdown stops inside an unterminated record with the cursor before it",
     fullReads === 1 && JSON.parse(fs.readFileSync(childStatePath(f), "utf8")).children[0].offset === end,
     String(fullReads));
+
+  // A complete record longer than one read pass sits between a 10-token and a 20-token reply.
+  const slowChild = (recordKib) => {
+    const g = childFixture();
+    const head = childSessionLines({ id: "child", parentFile: g.parentFile, agent: "worker" }) + assistantLine("model-a", 2000, 0, 1);
+    writeChildFile(g, "run/session.jsonl", head + toolResultLine(recordKib) + "\n" + assistantLine("model-a", 3000, 10, 1));
+    return { ...g, recordAt: head.length };
+  };
+  const lastInput = (g) => childUsage(g.posts, "conv_child").at(-1)?.cumulative_input_tokens;
+  const pollsToReach = async (g, watcher) => {
+    for (let polls = 1; polls <= 40; polls += 1) {
+      await watcher.poll();
+      if (lastInput(g) === 30) return polls;
+    }
+    return null;
+  };
+  const concat = Buffer.concat;
+  let largestBuffer = 0;
+  Buffer.concat = (list, ...rest) => {
+    largestBuffer = Math.max(largestBuffer, list.reduce((sum, part) => sum + part.length, 0));
+    return concat(list, ...rest);
+  };
+  fs.readSync = (...args) => {
+    if (args[3] === 1024 * 1024) skew += 600;
+    return readSync(...args);
+  };
+  Date.now = () => realNow() + skew;
+  try {
+    const regular = slowChild(12 * 1024);
+    const regularPolls = await pollsToReach(regular, regular.watcher());
+    assert("repeated constrained polls read past a record longer than one pass",
+      regularPolls > 1, `${regularPolls} polls, input ${lastInput(regular)}`);
+
+    const restarted = slowChild(12 * 1024);
+    const stopped = restarted.watcher();
+    await stopped.poll();
+    await stopped.stop();
+    const saved = fs.readFileSync(childStatePath(restarted), "utf8");
+    assert("a shutdown that cannot finish the record checkpoints the cursor before it",
+      JSON.parse(saved).children[0].offset === restarted.recordAt && !saved.includes("pending") && lastInput(restarted) === 10,
+      saved);
+    assert("a fresh watcher after shutdown reads past the record over its own polls",
+      (await pollsToReach(restarted, restarted.watcher())) > 1, String(lastInput(restarted)));
+
+    const oversized = slowChild(17 * 1024);
+    largestBuffer = 0;
+    const oversizedPolls = await pollsToReach(oversized, oversized.watcher());
+    assert("an oversized record is skipped across constrained polls without buffering it",
+      oversizedPolls > 17 && largestBuffer <= 1024 * 1024, `${oversizedPolls} polls, buffer ${largestBuffer}`);
+  } finally {
+    Buffer.concat = concat;
+    fs.readSync = readSync;
+    Date.now = realNow;
+  }
 }
 
 async function testShutdownIsBoundedWhenTheServerNeverResponds() {
