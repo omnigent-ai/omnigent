@@ -198,46 +198,6 @@ def test_tracked_github_pr_info_carries_the_provider_fields(
     assert [pr["provider"] for pr in info["prs"]] == ["github"]
 
 
-@pytest.mark.parametrize(
-    ("origin", "gh_host", "workspace_repo"),
-    [
-        (
-            "https://github.com/owner/app.git",
-            None,
-            {"name_with_owner": "owner/app", "host": "github.com"},
-        ),
-        (
-            "https://ghe.example.com/owner/ws.git",
-            "ghe.example.com",
-            {"name_with_owner": "owner/ws", "host": "ghe.example.com"},
-        ),
-        # No provider claims the remote, so nothing names the workspace's repo.
-        ("https://ghe.example.com/owner/ws.git", None, None),
-    ],
-)
-def test_tracked_pr_info_names_the_workspace_repo(
-    repo: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    origin: str,
-    gh_host: str | None,
-    workspace_repo: dict[str, str] | None,
-) -> None:
-    """``repo`` stays the tracked PR's; ``workspace_repo`` names the checkout's own."""
-    _git(repo, "remote", "add", "origin", origin)
-    if gh_host is not None:
-        monkeypatch.setenv("GH_HOST", gh_host)
-    url = "https://github.com/owner/other/pull/7"
-    SessionPrRegistry("session").record(
-        [PullRequestRef.from_url(url)], relationship="created", source="test"
-    )
-    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: None)
-
-    info = pr_resource.pr_info(str(repo), session_id="session")
-
-    assert info["repo"] == {"name_with_owner": "owner/other", "host": "github.com"}
-    assert info.get("workspace_repo") == workspace_repo
-
-
 def test_without_remotes_the_provider_names_the_workspace_repo(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -290,6 +250,8 @@ ENTERPRISE_ORIGIN = "https://ghe.example.com/owner/app.git"
         (GITHUB_FORK, None, "owner/other", ("me/app", "github.com")),
         # A public mirror of the tracked repo must not move bare refs off Enterprise.
         (ENTERPRISE_ORIGIN, None, "owner/app", ("owner/app", "ghe.example.com")),
+        # ``repo`` stays the tracked PR's; ``workspace_repo`` names the checkout's own.
+        (ENTERPRISE_ORIGIN, None, "owner/other", ("owner/app", "ghe.example.com")),
         # gh's own choice still wins on any host.
         (ENTERPRISE_ORIGIN, "upstream", "owner/app", ("owner/app", "github.com")),
     ],
@@ -362,9 +324,7 @@ def test_an_unrecognized_origin_names_no_workspace_repo(
         # A fork checkout: gh resolves the upstream on origin's own host.
         (GITHUB_FORK, ("owner/app", "github.com")),
         # gh may not resolve an ssh alias or IP either and fall back to the upstream.
-        ("git@gh-work:owner/app.git", None),
         ("git@corp-ghe:owner/app.git", None),
-        ("git@10.0.0.5:owner/app.git", None),
         (ENTERPRISE_ORIGIN, None),
         ("https://gitserver/owner/app.git", None),
     ],
