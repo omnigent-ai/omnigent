@@ -3686,6 +3686,24 @@ describe("chatStore — send (first-send ordering)", () => {
       sent: true,
       itemId: "item_stop",
     });
+
+    // A background session's stream places only that session's Stop.
+    await trackPlanStop("conv_background", async () => ({ pendingId: "pending_background" }));
+    await trackPlanStop("conv_existing", async () => ({ pendingId: "pending_background" }));
+    handleSessionEvent(
+      {
+        type: "session_input_consumed",
+        itemId: "item_background",
+        itemType: "message",
+        clearedPendingId: "pending_background",
+        data: { role: "user", content: [{ type: "input_text", text: stopPlanMessage(null) }] },
+      },
+      "conv_background",
+    );
+    expect(usePlanStops.getState().requests.conv_background).toMatchObject({
+      itemId: "item_background",
+    });
+    expect(usePlanStops.getState().requests.conv_existing).not.toHaveProperty("itemId");
   });
 
   it("keeps a plan's Stop when a message sent before it lands after it", async () => {

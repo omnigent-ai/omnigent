@@ -7272,7 +7272,18 @@ describe("Composer workflow entry point", () => {
     },
   );
 
-  it("restores Stop when the stop message fails, with the error", async () => {
+  it.each([
+    {
+      reply: { error: { message: "The session is offline." } },
+      status: 503,
+      message: "The session is offline.",
+    },
+    {
+      reply: { queued: false, denied: true },
+      status: 200,
+      message: "A policy blocked the message.",
+    },
+  ])("restores Stop when the stop message fails, with the error: $message", async (failure) => {
     setComposerState({
       conversationId: "conv_test",
       sessionHarness: "openai-agents",
@@ -7280,8 +7291,9 @@ describe("Composer workflow entry point", () => {
       sessionStatus: "running",
     });
     const fetchMessage = vi.spyOn(globalThis, "fetch").mockResolvedValue(
-      new Response(JSON.stringify({ error: { message: "The session is offline." } }), {
-        status: 503,
+      new Response(JSON.stringify(failure.reply), {
+        status: failure.status,
+        headers: { "Content-Type": "application/json" },
       }),
     );
     const error = vi.spyOn(toast, "error");
@@ -7294,7 +7306,7 @@ describe("Composer workflow entry point", () => {
 
     act(() => useSessionTasksActions.getState().stopWork.conv_test?.());
     expect(usePlanStops.getState().requests.conv_test).toMatchObject({ sent: false });
-    await waitFor(() => expect(error).toHaveBeenCalledWith("The session is offline."));
+    await waitFor(() => expect(error).toHaveBeenCalledWith(failure.message));
     expect(error).toHaveBeenCalledOnce();
     expect(usePlanStops.getState().requests.conv_test).toBeUndefined();
   });
