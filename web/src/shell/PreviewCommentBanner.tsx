@@ -2,10 +2,9 @@ import { MessageSquarePlusIcon } from "lucide-react";
 import { useCanEdit } from "@/hooks/usePermissions";
 
 /**
- * Shown atop the rendered Markdown preview to point users at the editor for
- * commenting. The rendered preview has no source-offset mapping, so text-
- * selection comments only work on the rich-text Editor surface (and Source);
- * rather than a second, fuzzier comment path here, we nudge the user to switch.
+ * Shown atop the preview of large Markdown to point users at the editor for
+ * commenting. That preview skips the source mapping that makes smaller
+ * previews commentable, so selections there can only be commented on in Source.
  *
  * Only rendered for users who can edit — a read-only viewer has no comment
  * action to reach, so the hint would be noise.

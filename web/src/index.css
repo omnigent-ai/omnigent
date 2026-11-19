@@ -2434,6 +2434,20 @@ html[data-electron-mac] .breadcrumb-folder {
   background-color: color-mix(in oklch, var(--warning) 70%, transparent);
 }
 
+/* Review comments in the rendered markdown preview, matching .md-comment*. */
+::highlight(md-preview-comment) {
+  background-color: color-mix(in oklch, var(--warning) 30%, transparent);
+  text-decoration: underline 2px color-mix(in oklch, var(--warning) 60%, transparent);
+}
+::highlight(md-preview-comment-active) {
+  background-color: color-mix(in oklch, var(--warning) 50%, transparent);
+  text-decoration: underline 2px color-mix(in oklch, var(--warning) 90%, transparent);
+}
+::highlight(md-preview-comment-pending) {
+  background-color: color-mix(in oklch, var(--primary) 20%, transparent);
+  text-decoration: underline 2px color-mix(in oklch, var(--primary) 50%, transparent);
+}
+
 /* TipTap editor prose styling */
 .tiptap-md-content .ProseMirror {
   outline: none;

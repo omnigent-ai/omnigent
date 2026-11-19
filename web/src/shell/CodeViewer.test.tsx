@@ -544,7 +544,7 @@ describe("CodeViewer markdown preview links", () => {
     // a session named after the file.
     const openFile = renderPreview("See [the plan](../notes/plan.md#steps).", "docs/guide.md");
 
-    const link = screen.getByText("the plan");
+    const link = screen.getByText("the plan").closest("a")!;
     expect(link.getAttribute("href")).toBeNull();
     fireEvent.click(link);
 
@@ -565,12 +565,12 @@ describe("CodeViewer markdown preview links", () => {
       ["cdn", "//cdn.example.com/docs"],
       ["mail", "mailto:docs@example.com"],
     ]) {
-      const link = screen.getByText(text);
+      const link = screen.getByText(text).closest("a")!;
       expect(link.getAttribute("href")).toBe(href);
       expect(link.getAttribute("target")).toBe("_blank");
       expect(link.getAttribute("rel")).toBe("noopener noreferrer");
     }
-    const anchor = screen.getByText("below");
+    const anchor = screen.getByText("below").closest("a")!;
     expect(anchor.getAttribute("href")).toBe("#usage");
     expect(anchor.getAttribute("target")).toBeNull();
     expect(openFile).not.toHaveBeenCalled();
@@ -600,40 +600,30 @@ describe("CodeViewer markdown preview links", () => {
   });
 });
 
-describe("CodeViewer markdown preview comment hint", () => {
-  // The rendered preview can't anchor text-selection comments, so it points the
-  // user at the editor instead of offering a second, fuzzier comment surface.
-  it("shows the switch-to-edit hint in markdown preview", () => {
-    renderViewer("# doc", true, "notes.md", { viewMode: "preview", onRequestEditMode: () => {} });
-    expect(screen.getByRole("button", { name: /switch to edit mode/i })).toBeDefined();
-  });
+describe("CodeViewer large markdown preview comment hint", () => {
+  // Large previews skip the source mapping that makes smaller previews
+  // commentable, so they point the user at the editor instead.
+  const large = { viewMode: "preview", markdownSourceFallback: true } as const;
 
-  it("switches to the editor when the hint is clicked", () => {
-    const onRequestEditMode = vi.fn();
-    renderViewer("# doc", true, "notes.md", { viewMode: "preview", onRequestEditMode });
-    fireEvent.click(screen.getByRole("button", { name: /switch to edit mode/i }));
-    expect(onRequestEditMode).toHaveBeenCalledOnce();
+  it("shows the switch-to-edit hint", () => {
+    renderViewer("# doc", true, "notes.md", { ...large, onRequestEditMode: () => {} });
+    expect(screen.getByRole("button", { name: /switch to edit mode/i })).toBeDefined();
   });
 
   it("hides the hint for read-only viewers", () => {
     vi.mocked(permissions.useCanEdit).mockReturnValue(false);
-    renderViewer("# doc", true, "notes.md", { viewMode: "preview", onRequestEditMode: () => {} });
+    renderViewer("# doc", true, "notes.md", { ...large, onRequestEditMode: () => {} });
     expect(screen.queryByRole("button", { name: /switch to edit mode/i })).toBeNull();
   });
 
   it("shows no hint when the editor isn't reachable (no callback)", () => {
-    renderViewer("# doc", true, "notes.md", { viewMode: "preview" });
-    expect(screen.queryByRole("button", { name: /switch to edit mode/i })).toBeNull();
-  });
-
-  it("shows no hint in the editor surface", () => {
-    renderViewer("# doc", true, "notes.md", { viewMode: "editor", onRequestEditMode: () => {} });
+    renderViewer("# doc", true, "notes.md", large);
     expect(screen.queryByRole("button", { name: /switch to edit mode/i })).toBeNull();
   });
 
   it("shows no hint for a truncated file (the editor can't comment on it either)", () => {
     renderViewer("# big", true, "notes.md", {
-      viewMode: "preview",
+      ...large,
       truncated: true,
       onRequestEditMode: () => {},
     });

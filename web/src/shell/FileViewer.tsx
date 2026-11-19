@@ -975,10 +975,9 @@ function FileViewerBody({
     if (deepLinkBiasPath !== null && isDataTablePath(deepLinkBiasPath)) setDeepLinkBiasPath(null);
   }
 
-  // Switch a markdown file to the rich-text editor — the surface where text-
-  // selection commenting works. Used by the preview's "switch to edit mode"
-  // hint. Coming from preview/source there are no edits to guard, so it applies
-  // directly (mirrors the toolbar's switchTo for the non-editor case).
+  // Switch a markdown file to its editing surface (source for large files), for
+  // the large-file preview's "switch to edit mode" hint. Preview has no edits to
+  // guard, so this mirrors the toolbar's switchTo for the non-editor case.
   const handleRequestEditMode = useCallback(() => {
     setDeepLinkBiasPath(null);
     if (markdownSourceFallback) {
