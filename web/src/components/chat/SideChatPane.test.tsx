@@ -3140,6 +3140,38 @@ describe("grid cell @-mention picker", () => {
     expect(screen.getByTestId("file-mention-menu")).toBeInTheDocument();
   });
 
+  it("a quote card's text opens no picker, and moving focus there closes the main text's", () => {
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "Intro", text: "Quoted line" }],
+      text: "",
+    };
+    setSessionDraft(childId, { text: serializeReplyDraft(replyDraft), files: [], replyDraft });
+    useChatStore.setState({
+      sideChatComposers: {
+        [gridCellComposerKey(childId)]: {
+          text: "",
+          files: [],
+          quotes: [{ id: "q", before: "Intro", text: "Quoted line" }],
+        },
+      },
+    });
+    mountCell();
+    const preamble = screen.getByLabelText("Reply text before quote 1");
+
+    typeText("@");
+    expect(screen.getByTestId("file-mention-menu")).toBeInTheDocument();
+    fireEvent.blur(input());
+    fireEvent.focus(preamble);
+    expect(screen.queryByTestId("file-mention-menu")).toBeNull();
+
+    fireEvent.change(preamble, { target: { value: "Intro @read", selectionStart: 11 } });
+    expect(screen.queryByTestId("file-mention-menu")).toBeNull();
+    fireEvent.keyDown(preamble, { key: "Tab" });
+    expect(preamble).toHaveValue("Intro @read");
+    expect(getSessionDraft(childId)?.mentions?.files ?? []).toEqual([]);
+  });
+
   it("a command typed before an @ leaves the arrow and Enter keys to the picker", () => {
     conversationRegistry.acquire(childId).setState({ sessionHarness: "claude-sdk" });
     skillsFixture.current = {
@@ -3187,6 +3219,7 @@ describe("grid cell @-mention picker", () => {
       expect(send).toHaveBeenCalledExactlyOnceWith("@read", "agent_side", undefined, {
         pinnedConversationId: childId,
       });
+      expect(mentionListing.workspaceQueries.length).toBeGreaterThan(0);
       expect(
         mentionListing.workspaceQueries.every(
           (query) => query.owner === undefined && query.enabled === false,
@@ -3198,11 +3231,13 @@ describe("grid cell @-mention picker", () => {
           (query) => query.owner === undefined && query.enabled === false,
         ),
       ).toBe(true);
+      expect(mentionListing.directoryQueries.length).toBeGreaterThan(0);
       expect(
         mentionListing.directoryQueries.every(
           (query) => query.owner === undefined && query.dirPath === null,
         ),
       ).toBe(true);
+      expect(mentionListing.searchQueries.length).toBeGreaterThan(0);
       expect(
         mentionListing.searchQueries.every(
           (query) => query.owner === undefined && query.query === "",

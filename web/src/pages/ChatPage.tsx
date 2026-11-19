@@ -3143,9 +3143,8 @@ function ComposerImpl(
       subagents: childSessions,
     });
 
-  // Shared selection/chip/keyboard glue (see useMentionBrowser). The token
-  // state stays here; everything stateful is shared
-  // so this composer and the launcher can't drift. ``setText`` also flags the
+  // Shared selection/chip/keyboard glue (see useMentionBrowser); the token state stays here.
+  // Sharing keeps this composer and the launcher from drifting. ``setText`` also flags the
   // draft dirty so attach/drill participate in draft persistence.
   const {
     mentionIndex,
