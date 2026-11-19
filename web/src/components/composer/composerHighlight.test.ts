@@ -237,29 +237,24 @@ describe("useComposerHighlight mirror", () => {
 });
 
 describe("usePublishComposerCommands", () => {
-  it("keeps the other composer's commands when one of two publishers unmounts", () => {
-    const first = renderHook(() => usePublishComposerCommands("conv_dup", ["/team"], null));
-    const second = renderHook(() => usePublishComposerCommands("conv_dup", ["/help"], null));
-    const read = renderHook(() => usePublishedComposerCommands("conv_dup"));
-    expect(read.result.current?.commandNames).toEqual(["/help"]);
+  it.each([
+    { label: "the older one", unmountFirst: "older", survivor: ["/help"] },
+    { label: "the newer one", unmountFirst: "newer", survivor: ["/team"] },
+  ] as const)(
+    "keeps the surviving composer's commands when $label of two publishers unmounts first",
+    ({ unmountFirst, survivor }) => {
+      const older = renderHook(() => usePublishComposerCommands("conv_dup", ["/team"], null));
+      const newer = renderHook(() => usePublishComposerCommands("conv_dup", ["/help"], null));
+      const read = renderHook(() => usePublishedComposerCommands("conv_dup"));
+      expect(read.result.current?.commandNames).toEqual(["/help"]);
 
-    first.unmount();
-    expect(read.result.current?.commandNames).toEqual(["/help"]);
-    second.unmount();
-    expect(read.result.current).toBeUndefined();
-  });
-
-  it("falls back to the older publisher when the newer one unmounts first", () => {
-    const first = renderHook(() => usePublishComposerCommands("conv_lifo", ["/team"], null));
-    const second = renderHook(() => usePublishComposerCommands("conv_lifo", ["/help"], null));
-    const read = renderHook(() => usePublishedComposerCommands("conv_lifo"));
-    expect(read.result.current?.commandNames).toEqual(["/help"]);
-
-    second.unmount();
-    expect(read.result.current?.commandNames).toEqual(["/team"]);
-    first.unmount();
-    expect(read.result.current).toBeUndefined();
-  });
+      const [first, second] = unmountFirst === "older" ? [older, newer] : [newer, older];
+      first.unmount();
+      expect(read.result.current?.commandNames).toEqual(survivor);
+      second.unmount();
+      expect(read.result.current).toBeUndefined();
+    },
+  );
 
   it("leaves another conversation's commands alone when one updates or unmounts", () => {
     const a = renderHook(
