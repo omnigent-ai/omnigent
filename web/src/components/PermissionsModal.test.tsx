@@ -20,6 +20,7 @@ vi.mock("@/lib/permissionsApi", async (importOriginal) => ({
   revokePermission: vi.fn(),
   listAutomationPermissions: vi.fn(),
   listWorkflowPermissions: vi.fn(),
+  listThingyPermissions: vi.fn(),
   grantSharePermission: vi.fn(),
   revokeSharePermission: vi.fn(),
 }));
@@ -66,6 +67,7 @@ const grantMock = vi.mocked(api.grantPermission);
 const revokeMock = vi.mocked(api.revokePermission);
 const listAutomationMock = vi.mocked(api.listAutomationPermissions);
 const listWorkflowMock = vi.mocked(api.listWorkflowPermissions);
+const listThingyMock = vi.mocked(api.listThingyPermissions);
 const grantShareMock = vi.mocked(api.grantSharePermission);
 const revokeShareMock = vi.mocked(api.revokeSharePermission);
 
@@ -2060,6 +2062,80 @@ describe("PermissionsModal", () => {
         expect(revokeShareMock).toHaveBeenCalledWith(workflowTarget, "bob@example.com"),
       );
       expect(grantMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("sharing a thingy", () => {
+    const thingy = { id: "thingy-1", name: "Launch board" };
+    const thingyTarget = { kind: "thingy", id: thingy.id };
+
+    function grantee(userId: string, level: number, displayName = userId) {
+      return { user_id: userId, thingy_id: thingy.id, level, display_name: displayName };
+    }
+
+    async function chooseLevel(trigger: HTMLElement, name: string) {
+      await waitFor(() => expect(trigger).toBeEnabled());
+      trigger.focus();
+      fireEvent.keyDown(trigger, { key: "Enter" });
+      fireEvent.click(await screen.findByRole("option", { name }));
+    }
+
+    it("shares it at Can view, Can edit or Can manage, with no public access or link", async () => {
+      listThingyMock.mockResolvedValue(grantList([grantee("bob@example.com", 2, "Bob")]));
+      grantShareMock.mockResolvedValue(grantee("carol@example.com", 3));
+      revokeShareMock.mockResolvedValue(undefined);
+
+      render(<PermissionsModal thingy={thingy} open onOpenChange={() => {}} />, {
+        wrapper: createInfoWrapper({ features: { thingies: true } }),
+      });
+
+      expect(await screen.findByText("Bob")).toHaveAttribute("title", "bob@example.com");
+      expect(screen.getByRole("heading", { name: "Share this thingy" })).toBeInTheDocument();
+      expect(listThingyMock).toHaveBeenCalledWith(thingy.id);
+      expect(listMock).not.toHaveBeenCalled();
+      expect(screen.queryByText("General access")).toBeNull();
+      expect(screen.queryByRole("button", { name: /copy link/i })).toBeNull();
+      expect(
+        screen.getByRole("combobox", { name: "Permission level for bob@example.com" }),
+      ).toHaveTextContent("Can edit");
+
+      fireEvent.change(screen.getByPlaceholderText("alice@example.com"), {
+        target: { value: "carol@example.com" },
+      });
+      await chooseLevel(
+        screen.getByRole("combobox", { name: "New user permission" }),
+        "Can manage",
+      );
+      fireEvent.click(screen.getByRole("button", { name: /grant/i }));
+      await waitFor(() =>
+        expect(grantShareMock).toHaveBeenCalledWith(thingyTarget, "carol@example.com", 3),
+      );
+
+      await chooseLevel(
+        screen.getByRole("combobox", { name: "Permission level for bob@example.com" }),
+        "Can view",
+      );
+      await waitFor(() =>
+        expect(grantShareMock).toHaveBeenCalledWith(thingyTarget, "bob@example.com", 1),
+      );
+      fireEvent.click(screen.getByRole("button", { name: /revoke/i }));
+      await waitFor(() =>
+        expect(revokeShareMock).toHaveBeenCalledWith(thingyTarget, "bob@example.com"),
+      );
+      expect(grantMock).not.toHaveBeenCalled();
+    });
+
+    it("offers only Can view where the server allows read-only sharing", async () => {
+      listThingyMock.mockResolvedValue(grantList([]));
+      render(<PermissionsModal thingy={thingy} open onOpenChange={() => {}} />, {
+        wrapper: createInfoWrapper({ features: { thingies: true }, sharing_mode: "read_only" }),
+      });
+      const trigger = await screen.findByRole("combobox", { name: "New user permission" });
+      trigger.focus();
+      fireEvent.keyDown(trigger, { key: "Enter" });
+      expect(await screen.findByRole("option", { name: "Can view" })).toBeInTheDocument();
+      expect(screen.queryByRole("option", { name: "Can edit" })).toBeNull();
+      expect(screen.queryByRole("option", { name: "Can manage" })).toBeNull();
     });
   });
 

@@ -36,6 +36,7 @@ from omnigent.entities.permission import (
     ResolvedAccess,
     ScheduledTaskPermission,
     SessionPermission,
+    ThingyPermission,
     WorkflowPermission,
 )
 from omnigent.entities.policy import Policy
@@ -90,6 +91,7 @@ __all__ = [
     "SlashCommandData",
     "StoredFile",
     "TerminalCommandData",
+    "ThingyPermission",
     "WorkflowPermission",
     "filter_resources_by_type",
     "get_resource_by_id",

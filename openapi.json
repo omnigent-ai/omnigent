@@ -8381,6 +8381,16 @@
           "smart_routing_sources": {
             "$ref": "#/components/schemas/SmartRoutingSourcesInfo"
           },
+          "thingies": {
+            "default": false,
+            "title": "Thingies",
+            "type": "boolean"
+          },
+          "thingy_sharing": {
+            "default": false,
+            "title": "Thingy Sharing",
+            "type": "boolean"
+          },
           "workflow_sharing": {
             "default": false,
             "title": "Workflow Sharing",

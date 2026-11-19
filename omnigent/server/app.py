@@ -89,6 +89,7 @@ from omnigent.server import (
     session_live_state,
     session_pull_requests,
     shutdown_state,
+    thingies,
     workflows,
 )
 from omnigent.server.auth import (
@@ -166,6 +167,7 @@ from omnigent.server.routes.sessions import (
 )
 from omnigent.server.routes.sharing import create_sharing_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
+from omnigent.server.routes.thingy_permissions import stores_thingy_grants
 from omnigent.server.routes.usage import create_usage_router
 from omnigent.server.routes.user_settings import create_user_settings_router
 from omnigent.server.routes.workflow_permissions import stores_workflow_grants
@@ -214,10 +216,12 @@ from omnigent.stores.proactive_agent_settings_store import ProactiveAgentSetting
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 from omnigent.stores.scheduled_task_store.dispatch import ScheduledTaskDispatchStore
+from omnigent.stores.thingy_store import ThingyStore
 from omnigent.stores.user_settings_store import (
     open_user_settings_store,
     session_owner_title_instructions,
 )
+from omnigent.thingies.access import PermissionStoreThingyAccess, ThingyAccess
 from omnigent.tools.builtins.session_message import SESSION_MESSAGE_MAX_CHARS
 from omnigent.util.event_loop_watchdog import monitor_event_loop
 
@@ -412,6 +416,12 @@ class ServerInfoResponse(BaseModel):
     # ``GET /v1/workflows/shared`` lists those shared with the caller: needs
     # ``workflows`` and a store that keeps workflow grants.
     workflow_sharing: bool = False
+    # /v1/thingies, with the ``thingies`` feature and a thingy store; absent on older
+    # servers, which clients treat as unsupported.
+    thingies: bool = False
+    # Thingies can be shared through ``/v1/thingies/{id}/permissions``: needs
+    # ``thingies`` and a store that keeps thingy grants.
+    thingy_sharing: bool = False
     # GET/PUT /v1/settings/session-title-instructions; absent on older servers,
     # which clients treat as unsupported.
     session_title_instructions: bool = False
@@ -1935,6 +1945,8 @@ def create_app(
     host_session_recovery: DeploymentGate = False,
     proactive_agent_settings_store: ProactiveAgentSettingsStore | None = None,
     memory_store: MemoryStore | None = None,
+    thingy_store: ThingyStore | None = None,
+    thingy_access: ThingyAccess | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1978,6 +1990,10 @@ def create_app(
         automation access without deleting saved tasks.
     :param preference_store: Optional shared-preference API; no launcher adoption.
     :param memory_store: Optional long-term memory backend; mounts ``/v1/memory`` when set.
+    :param thingy_store: Where thingies are kept; mounts ``/v1/thingies`` when set. The
+        routes and the ``sys_thingy_*`` tools also need the ``thingies`` release feature.
+    :param thingy_access: Who may do what with a thingy; ``None`` gives the owner
+        everything and everyone else their thingy grants in ``permission_store``.
     :param automations: Whether this request's caller can use automations. A static
         bool or a zero-arg callable resolved per request; ``None`` enables them.
         When off, the ``/v1/scheduled-tasks`` routes return 404 and ``GET /v1/info``
@@ -2773,6 +2789,9 @@ def create_app(
     app.state.proactive_agent_available = proactive_agent_available
     app.state.proactive_agent_enabled_for = proactive_agent_enabled_for
 
+    app.state.thingies_available = lambda: (
+        thingy_store is not None and app.state.feature_flags.enabled(Feature.THINGIES)
+    )
     app.state.memory_available = lambda: (
         memory_store is not None and app.state.feature_flags.enabled(Feature.MEMORY)
     )
@@ -4194,6 +4213,9 @@ def create_app(
                 "workflows": workflows_available,
                 "workflow_sharing": workflows_available
                 and stores_workflow_grants(permission_store),
+                "thingies": app.state.thingies_available(),
+                "thingy_sharing": app.state.thingies_available()
+                and stores_thingy_grants(permission_store),
                 "session_title_instructions": user_settings_store is not None,
                 "admin_view": admin_view_supported,
                 "filesystem_attachments": {
@@ -4579,6 +4601,18 @@ def create_app(
             ),
             prefix="/v1",
             tags=["scheduled_tasks"],
+        )
+    if thingy_store is not None:
+        app.include_router(
+            thingies.create_thingies_router(
+                thingy_store,
+                thingy_access or PermissionStoreThingyAccess(thingy_store, permission_store),
+                conversation_store=conversation_store,
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+            ),
+            prefix="/v1",
+            tags=["thingies"],
         )
     if memory_store is not None:
         app.include_router(

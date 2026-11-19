@@ -86,6 +86,7 @@ from omnigent.tools.builtins.spawn import (
     SysSessionSendTool,
     SysSessionShareTool,
 )
+from omnigent.tools.builtins.thingies import THINGY_TOOLS
 from omnigent.tools.builtins.timer import (
     SysTimerCancelTool,
     SysTimerSetTool,
@@ -98,6 +99,7 @@ from omnigent.tools.builtins.web_search import WebSearchTool
 __all__ = [
     "BUILTIN_NAMES",
     "INSTANTIABLE_BUILTINS",
+    "THINGY_TOOLS",
     "ListCommentsTool",
     "LoadSkillTool",
     "MemoryDeleteTool",

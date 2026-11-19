@@ -56,6 +56,22 @@ class WorkflowPermission:
 
 
 @dataclasses.dataclass(frozen=True)
+class ThingyPermission:
+    """A single permission grant on a thingy.
+
+    The thingy's owner holds no grant; ownership is ``Thingy.owner_id``.
+
+    :param user_id: The grantee, a user or group, e.g. ``"alice@example.com"``.
+    :param thingy_id: The thingy this grant applies to.
+    :param level: Numeric permission level: ``1`` read, ``2`` edit, ``3`` manage.
+    """
+
+    user_id: str
+    thingy_id: str
+    level: int
+
+
+@dataclasses.dataclass(frozen=True)
 class ResolvedAccess:
     """The raw permission inputs for one ``(user, conversation)`` pair.
 

@@ -1,10 +1,12 @@
 /**
- * Permissions management modal for a session, an automation or a workflow.
+ * Permissions management modal for a session, an automation, a workflow or a thingy.
  *
  * Displays current grants, allows granting/revoking access, and
  * toggling public visibility. Only accessible to users with
  * manage-level (3) permission on the session. An automation or a workflow
  * is shared by its owner at read access only, with no public or link sharing.
+ * A thingy is shared by its managers at Can view, Can edit or Can manage, also
+ * without public or link sharing.
  */
 
 import {
@@ -64,6 +66,7 @@ import { automationSharePath } from "@/lib/automationFromSession";
 import type { ScheduledTask } from "@/lib/scheduledTasksApi";
 import type { SavedWorkflow } from "@/hooks/useSavedWorkflows";
 import type { Session } from "@/lib/types";
+import type { Thingy } from "@/thingies/api/thingyApi";
 import { cn } from "@/lib/utils";
 
 const PUBLIC_USER = "__public__";
@@ -82,6 +85,16 @@ export type SharedAutomation = Pick<ScheduledTask, "id" | "name" | "sessionMode"
 /** The workflow fields its share dialog shows. */
 export type SharedWorkflow = Pick<SavedWorkflow, "id" | "name">;
 
+/** The thingy fields its share dialog shows. */
+export type SharedThingy = Pick<Thingy, "id" | "name">;
+
+/** The levels a thingy can be shared at (read, edit, manage), as its share dialog names them. */
+const THINGY_LEVELS = [
+  { value: 1, label: "Can view" },
+  { value: 2, label: "Can edit" },
+  { value: 3, label: "Can manage" },
+] as const;
+
 type PermissionsModalProps = {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -92,6 +105,7 @@ type PermissionsModalProps = {
       filePath?: string;
       automation?: undefined;
       workflow?: undefined;
+      thingy?: undefined;
     }
   | {
       automation: SharedAutomation;
@@ -99,6 +113,7 @@ type PermissionsModalProps = {
       workspace?: undefined;
       filePath?: undefined;
       workflow?: undefined;
+      thingy?: undefined;
     }
   | {
       workflow: SharedWorkflow;
@@ -106,12 +121,22 @@ type PermissionsModalProps = {
       workspace?: undefined;
       filePath?: undefined;
       automation?: undefined;
+      thingy?: undefined;
+    }
+  | {
+      thingy: SharedThingy;
+      sessionId?: undefined;
+      workspace?: undefined;
+      filePath?: undefined;
+      automation?: undefined;
+      workflow?: undefined;
     }
 );
 
 function shareTarget(props: PermissionsModalProps): ShareTarget {
   if (props.automation !== undefined) return { kind: "automation", id: props.automation.id };
   if (props.workflow !== undefined) return { kind: "workflow", id: props.workflow.id };
+  if (props.thingy !== undefined) return { kind: "thingy", id: props.thingy.id };
   return { kind: "session", id: props.sessionId };
 }
 
@@ -122,7 +147,11 @@ export function PermissionsModal(props: PermissionsModalProps) {
   // read the sessions its runs create. Nor does a workflow: its grantees run it.
   const automation = props.automation ?? null;
   const workflow = props.workflow ?? null;
+  const thingy = props.thingy ?? null;
+  // Only a session has public access, workspace files and a link.
   const readOnlyShare = target.kind !== "session";
+  // An automation or a workflow is shared at read access only; a thingy at any of its levels.
+  const fixedReadShare = readOnlyShare && thingy === null;
   const sessionId = target.kind === "session" ? target.id : null;
   // Server sharing policy. While the boot probe is in flight we treat the
   // server as "on" (fail open) so the modal renders its full controls; the
@@ -301,6 +330,10 @@ export function PermissionsModal(props: PermissionsModalProps) {
   } else if (workflow) {
     description =
       "The people below can view this workflow, run it and make a copy. Their runs stay private.";
+  } else if (thingy) {
+    description = sharingReadOnly
+      ? "This server allows read-only sharing — invite others to view this thingy."
+      : "Can view lets people use it; Can edit also lets them change its data and publish versions; Can manage also lets them share and delete it.";
   } else if (filePath) {
     description = "This link opens the selected file in full screen.";
   } else if (sharingReadOnly) {
@@ -336,9 +369,11 @@ export function PermissionsModal(props: PermissionsModalProps) {
               ? "Share this automation"
               : workflow
                 ? "Share this workflow"
-                : filePath
-                  ? "Share this file"
-                  : "Share this session"}
+                : thingy
+                  ? "Share this thingy"
+                  : filePath
+                    ? "Share this file"
+                    : "Share this session"}
           </DialogTitle>
           <DialogDescription asChild>
             <div className="space-y-3">
@@ -496,7 +531,8 @@ export function PermissionsModal(props: PermissionsModalProps) {
                     onChangeLevel={handleChangeLevel}
                     busy={shareBusy}
                     levelDisabled={fileShareUnavailable}
-                    readOnly={sharingReadOnly || readOnlyShare}
+                    readOnly={sharingReadOnly || fixedReadShare}
+                    levels={thingy ? THINGY_LEVELS : undefined}
                   />
                 ))}
               </div>
@@ -521,7 +557,7 @@ export function PermissionsModal(props: PermissionsModalProps) {
             </label>
             <AddUserField value={newUserId} onChange={setNewUserId} disabled={workspaceBlocked} />
           </div>
-          {readOnlyShare ? (
+          {fixedReadShare ? (
             <div>
               <span className="text-sm font-medium text-muted-foreground">Level</span>
               <p className="mt-1 flex h-8 w-24 items-center px-3 text-ui text-muted-foreground">
@@ -540,13 +576,29 @@ export function PermissionsModal(props: PermissionsModalProps) {
                 componentId="diagnostics.permissions.grant_level"
                 valueHasNoPii
               >
-                <SelectTrigger className="mt-1 w-24" aria-label="New user permission">
+                <SelectTrigger
+                  className={cn("mt-1", thingy ? "w-32" : "w-24")}
+                  aria-label="New user permission"
+                >
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent position="popper" align="start">
-                  <SelectItem value="1">Read</SelectItem>
-                  {/* Read-only sharing caps new grants at view; hide Edit. */}
-                  {!sharingReadOnly && <SelectItem value="2">Edit</SelectItem>}
+                  {thingy ? (
+                    // Read-only sharing caps new grants at view.
+                    THINGY_LEVELS.filter((level) => !sharingReadOnly || level.value === 1).map(
+                      (level) => (
+                        <SelectItem key={level.value} value={String(level.value)}>
+                          {level.label}
+                        </SelectItem>
+                      ),
+                    )
+                  ) : (
+                    <>
+                      <SelectItem value="1">Read</SelectItem>
+                      {/* Read-only sharing caps new grants at view; hide Edit. */}
+                      {!sharingReadOnly && <SelectItem value="2">Edit</SelectItem>}
+                    </>
+                  )}
                 </SelectContent>
               </Select>
             </div>
@@ -954,6 +1006,7 @@ function GrantRow({
   busy,
   levelDisabled,
   readOnly,
+  levels,
 }: {
   permission: ShareGrant;
   onRevoke: (userId: string) => void;
@@ -961,12 +1014,14 @@ function GrantRow({
   busy: boolean;
   levelDisabled: boolean;
   readOnly: boolean;
+  /** The levels the row offers, when the target names its own (a thingy). */
+  levels?: readonly { value: number; label: string }[];
 }) {
   const isOwner = permission.level === 4;
-  // Manage is not grantable from the UI, so a pre-existing manage grant
-  // renders as a fixed label rather than a dropdown choice. Unlike the
+  // Manage is not grantable from a session's dialog, so a pre-existing manage
+  // grant renders as a fixed label rather than a dropdown choice. Unlike the
   // owner row it can still be revoked.
-  const isManage = permission.level === 3;
+  const isManage = permission.level === 3 && levels === undefined;
   // Read-only sharing mode: existing grants can't be re-leveled, so the level
   // shows as a fixed label (like owner/manage) — but the row stays revocable.
   const fixedLevel = isOwner || isManage || readOnly;
@@ -986,7 +1041,9 @@ function GrantRow({
       </span>
       {fixedLevel ? (
         <span className="flex h-8 w-28 items-center px-3 text-ui text-muted-foreground">
-          {LEVEL_LABELS[permission.level] ?? "Read"}
+          {levels?.find((level) => level.value === permission.level)?.label ??
+            LEVEL_LABELS[permission.level] ??
+            "Read"}
         </span>
       ) : (
         <Select
@@ -1001,8 +1058,18 @@ function GrantRow({
             <SelectValue />
           </SelectTrigger>
           <SelectContent position="popper" align="start">
-            <SelectItem value="1">Read</SelectItem>
-            <SelectItem value="2">Edit</SelectItem>
+            {levels ? (
+              levels.map((level) => (
+                <SelectItem key={level.value} value={String(level.value)}>
+                  {level.label}
+                </SelectItem>
+              ))
+            ) : (
+              <>
+                <SelectItem value="1">Read</SelectItem>
+                <SelectItem value="2">Edit</SelectItem>
+              </>
+            )}
           </SelectContent>
         </Select>
       )}

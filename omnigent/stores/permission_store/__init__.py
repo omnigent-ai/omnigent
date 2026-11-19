@@ -7,7 +7,9 @@ sentinel user ID represents public link access, capped by the live server policy
 Scheduled tasks (automations) have grants of the same shape, keyed by
 ``scheduled_task_id``. Stores opt in through
 :attr:`PermissionStore.supports_scheduled_task_grants`. Saved workflows have them
-too, keyed by ``workflow_id``, behind :attr:`PermissionStore.supports_workflow_grants`.
+too, keyed by ``workflow_id``, behind :attr:`PermissionStore.supports_workflow_grants`,
+and so do thingies, keyed by ``thingy_id``, behind
+:attr:`PermissionStore.supports_thingy_grants`.
 """
 
 from abc import ABC, abstractmethod
@@ -19,6 +21,7 @@ from omnigent.entities import (
     ResolvedAccess,
     ScheduledTaskPermission,
     SessionPermission,
+    ThingyPermission,
     WorkflowPermission,
 )
 from omnigent.errors import ErrorCode, OmnigentError
@@ -29,6 +32,8 @@ MAX_GRANTS_PAGE_SIZE = 1000
 MAX_SHARED_SCHEDULED_TASKS_PAGE_SIZE = 100
 # Largest page of workflows shared with a caller; each is loaded and serialized.
 MAX_SHARED_WORKFLOWS_PAGE_SIZE = 100
+# Largest page of thingy IDs shared with a caller.
+MAX_SHARED_THINGIES_PAGE_SIZE = 100
 # Widest grantee ID: the width of users.id and of the grant tables' user_id.
 MAX_GRANTEE_ID_CHARS = 128
 
@@ -73,6 +78,14 @@ def workflow_sharing_unsupported() -> OmnigentError:
     """The error for sharing a workflow where the server cannot store its grants."""
     return OmnigentError(
         "Sharing workflows is not supported by this server.",
+        code=ErrorCode.FORBIDDEN,
+    )
+
+
+def thingy_sharing_unsupported() -> OmnigentError:
+    """The error for sharing a thingy where the server cannot store its grants."""
+    return OmnigentError(
+        "Sharing thingies is not supported by this server.",
         code=ErrorCode.FORBIDDEN,
     )
 
@@ -791,6 +804,114 @@ class PermissionStore(ABC):
         a deleted workflow, and calling again finishes.
 
         :param workflow_id: The deleted workflow.
+        :returns: The number of grants deleted.
+        """
+        return 0
+
+    # ── Thingy grants ─────────────────────────────────────────────────────
+    # Thingies live in a ThingyStore, not in this database, so these grants name a
+    # thingy ID the store cannot check: callers authorize against the thingy first,
+    # and grants left on a deleted thingy are inert because IDs are never reused.
+
+    @property
+    def supports_thingy_grants(self) -> bool:
+        """Whether this store persists thingy grants.
+
+        Callers keep thingies private to their owners when this is ``False``, the
+        default.
+        """
+        return False
+
+    def grant_for_thingy(
+        self,
+        user_id: str,  # noqa: ARG002
+        thingy_id: str,  # noqa: ARG002
+        level: int,  # noqa: ARG002
+        *,
+        ensure_minimum: bool = False,  # noqa: ARG002
+    ) -> ThingyPermission:
+        """Upsert a grant on a thingy, as :meth:`grant` does on a session.
+
+        The caller authorizes the request, refuses the thingy's owner and calls
+        :meth:`ensure_user` first. Thingies are never public.
+
+        :param user_id: The grantee, a user or group, e.g. ``"alice@example.com"``.
+        :param thingy_id: The thingy, 32 lowercase hex characters.
+        :param level: A level in
+            :data:`~omnigent.server.session_sharing.THINGY_GRANT_LEVELS`.
+        :param ensure_minimum: Keep a higher existing level instead of replacing it.
+        :returns: The resulting :class:`ThingyPermission`.
+        :raises OmnigentError: ``INVALID_INPUT`` for a reserved grantee or a level
+            outside the allowlist; ``FORBIDDEN`` when the store does not support
+            these grants.
+        """
+        raise thingy_sharing_unsupported()
+
+    def revoke_for_thingy(
+        self,
+        user_id: str,  # noqa: ARG002
+        thingy_id: str,  # noqa: ARG002
+    ) -> bool:
+        """Remove a grant on a thingy.
+
+        :returns: ``True`` if a grant was deleted, ``False`` if none existed.
+        """
+        return False
+
+    def list_for_thingy(
+        self,
+        thingy_id: str,  # noqa: ARG002
+        *,
+        limit: int = 100,  # noqa: ARG002
+        after_user_id: str | None = None,  # noqa: ARG002
+    ) -> tuple[list[ThingyPermission], str | None]:
+        """Return a thingy's grants with cursor pagination, like :meth:`list_for_session`.
+
+        :param limit: Max grants to return, 1 to :data:`MAX_GRANTS_PAGE_SIZE`.
+        :param after_user_id: Exclusive cursor, a previous page's ``next_cursor``.
+        :returns: ``(grants ordered by user_id, next_cursor)``.
+        :raises OmnigentError: ``INVALID_INPUT`` when *limit* is out of range.
+        """
+        return [], None
+
+    def resolve_thingy_access(
+        self,
+        principals: Sequence[str],  # noqa: ARG002
+        thingy_id: str,  # noqa: ARG002
+    ) -> int | None:
+        """Return the highest level any of *principals* holds on a thingy.
+
+        Reads grants only: owner rules are the caller's.
+
+        :param principals: The caller's ID and groups, from :meth:`caller_principals`.
+        :returns: The highest granted level, or ``None`` when no principal has a grant.
+        """
+        return None
+
+    def list_thingies_shared_with(
+        self,
+        principals: Sequence[str],  # noqa: ARG002
+        *,
+        limit: int = 50,  # noqa: ARG002
+        after_thingy_id: str | None = None,  # noqa: ARG002
+    ) -> tuple[list[str], str | None]:
+        """Return one page of the thingy IDs shared with any of *principals*.
+
+        Ordered by ID, each thingy once however many principals hold a grant on it.
+        The IDs may name deleted thingies; callers resolve them in the thingy store.
+
+        :param principals: The caller's ID and groups, from :meth:`caller_principals`.
+        :param limit: Max IDs to return, 1 to :data:`MAX_SHARED_THINGIES_PAGE_SIZE`.
+        :param after_thingy_id: Exclusive cursor, a previous page's ``next_cursor``.
+        :returns: ``(thingy IDs, next_cursor)``, next_cursor ``None`` on the last page.
+        :raises OmnigentError: ``INVALID_INPUT`` when *limit* is out of range, from a
+            store that keeps these grants.
+        """
+        return [], None
+
+    def delete_for_thingy(self, thingy_id: str) -> int:  # noqa: ARG002
+        """Delete every grant on a thingy, after the thingy is deleted.
+
         :returns: The number of grants deleted.
         """
         return 0

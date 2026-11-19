@@ -28,6 +28,7 @@ from omnigent.spec.types import (
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.tools.browser_agent_tools import ADVANCED_BROWSER_TOOL_NAMES
+from omnigent.tools.builtins.thingies import THINGY_TOOL_NAMES
 from omnigent.tools.client_specified import ClientSideTool, ClientSideToolSpec
 from omnigent.tools.manager import _UCFunctionSchemaTool
 from omnigent.tools.mcp import clear_discovery_cache
@@ -127,6 +128,9 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "memory_delete",
     }
     | ADVANCED_BROWSER_TOOL_NAMES
+    # The thingy tools register unless ``tool_groups.thingies: false``; the runner
+    # drops them unless the server enables thingies. Runner-dispatched.
+    | THINGY_TOOL_NAMES
 )
 
 

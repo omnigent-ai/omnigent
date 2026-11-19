@@ -7,6 +7,7 @@ import {
   GlobeIcon,
   Loader2Icon,
   MaximizeIcon,
+  MessageSquareIcon,
   MessagesSquareIcon,
   MinimizeIcon,
   PlusIcon,
@@ -109,6 +110,12 @@ import {
   workspacePanelTabPresentation,
 } from "./workspacePanelTabs";
 import { Button } from "../components/ui/button";
+import {
+  ThingyFullScreenSlot,
+  type ThingyRailNewItem,
+  ThingyRailTabStrip,
+  useThingyRailTabState,
+} from "@/thingies/ui/ThingyRailTabs";
 
 const TerminalView = lazy(() =>
   import("@/components/blocks/TerminalView").then((m) => ({ default: m.TerminalView })),
@@ -191,6 +198,8 @@ function shellConnectState(liveness: SessionLiveness | undefined): ShellConnectS
   }
 }
 
+const NO_EXTRA_ITEMS: readonly ThingyRailNewItem[] = [];
+
 function NewTabMenu({
   conversationId,
   panels,
@@ -199,6 +208,7 @@ function NewTabMenu({
   onOpenBrowser,
   onOpen,
   onOpenSideChat,
+  extraItems = NO_EXTRA_ITEMS,
   onCreateStart,
   onCreateError,
   liveness,
@@ -215,6 +225,8 @@ function NewTabMenu({
   /** Open a new side chat (a fork of this conversation) as a rail tab. Absent
    *  when the session can't host one (e.g. Codex uses its typed `/side`). */
   onOpenSideChat?: () => void;
+  /** More tabs to open, after Side chat, such as a new thingy. */
+  extraItems?: readonly ThingyRailNewItem[];
   /** Called when a shell create is initiated (before the POST resolves), so
    *  the shell can be focused as soon as its tab appears in the list. */
   onCreateStart?: () => void;
@@ -244,7 +256,14 @@ function NewTabMenu({
   // declare a non-empty ``terminals:`` block.
   const declaredTerminals = agent?.terminals ?? [];
   const canOpenShell = declaredTerminals.length > 0;
-  if (!canOpenShell && !onOpenBrowser && !onOpenSideChat && panels.length === 0) return null;
+  if (
+    !canOpenShell &&
+    !onOpenBrowser &&
+    !onOpenSideChat &&
+    extraItems.length === 0 &&
+    panels.length === 0
+  )
+    return null;
 
   // The remembered shell, or the first declared type. Used only when shell
   // access is available; the menu can also contain just built-in pages.
@@ -347,9 +366,10 @@ function NewTabMenu({
             </DropdownMenuItem>
           );
         })}
-        {panels.length > 0 && (onOpenBrowser || onOpenSideChat || canOpenShell) && (
-          <DropdownMenuSeparator />
-        )}
+        {panels.length > 0 &&
+          (onOpenBrowser || onOpenSideChat || extraItems.length > 0 || canOpenShell) && (
+            <DropdownMenuSeparator />
+          )}
         {onOpenBrowser && (
           <DropdownMenuItem onSelect={onOpenBrowser} className="cursor-pointer">
             <GlobeIcon className="size-4" />
@@ -366,6 +386,12 @@ function NewTabMenu({
             Side chat
           </DropdownMenuItem>
         )}
+        {extraItems.map(({ key, label, icon: Icon, onSelect }) => (
+          <DropdownMenuItem key={key} onSelect={onSelect} className="cursor-pointer">
+            <Icon className="size-4" />
+            {label}
+          </DropdownMenuItem>
+        ))}
         {canOpenShell &&
           (multipleShells ? (
             // Several types → a single "Shell (default)" row that launches the
@@ -783,6 +809,12 @@ interface WorkspacePanelProps {
   maximized: boolean;
   /** Toggle the rail's maximized state. */
   onToggleMaximized: () => void;
+  /** Maximizes the rail and leaves the sidebar open, for a thingy opened from the sidebar. */
+  onMaximizeKeepingSidebar?: () => void;
+  /** Whether the sidebar is open, for a full screen thingy's bar. */
+  sidebarOpen?: boolean;
+  /** Opens the sidebar from a full screen thingy's bar. */
+  onOpenSidebar?: (peek?: boolean) => void;
   /** Viewer's permission level (gates edit affordances). */
   permissionLevel: number | null;
   /** Changed-files sort order, shared with the viewer's prev/next order. */
@@ -928,6 +960,9 @@ function WorkspacePanelImpl({
   onCloseTerminal,
   maximized,
   onToggleMaximized,
+  onMaximizeKeepingSidebar,
+  sidebarOpen,
+  onOpenSidebar,
   permissionLevel,
   filesPanelSort,
   onSortChange,
@@ -949,6 +984,19 @@ function WorkspacePanelImpl({
   const sideChats = useSideChats(conversationId);
   const mobileViewport = useIsMobileViewport();
   const isMobile = mobileViewport && !contained;
+  // The thingies shown beside the session, as tabs after its side chats.
+  const thingyRail = useThingyRailTabState(conversationId, {
+    readOnly: pending || !isEditorLevel(permissionLevel),
+    showing: rightRailTab === "thingy" && selectedFilePath === null && selectedTerminalKey === null,
+    onShow: () => onRightRailTabChange("thingy"),
+    onReveal,
+    maximized,
+    onMaximizedChange: (next, options) => {
+      if (next === maximized) return;
+      if (next && options?.keepSidebar && onMaximizeKeepingSidebar) onMaximizeKeepingSidebar();
+      else onToggleMaximized();
+    },
+  });
   const activeView = resolveWorkspaceActiveView(
     {
       rightRailTab,
@@ -956,6 +1004,7 @@ function WorkspacePanelImpl({
       selectedTerminalKey,
       selectedBrowserId: browsers.selected,
       selectedSideChatId: sideChats.selected,
+      selectedThingyKey: thingyRail.selected,
     },
     {
       terminalPresent: (key) => openTerminals.includes(key),
@@ -967,8 +1016,16 @@ function WorkspacePanelImpl({
       mobile: isMobile,
     },
   );
-  const { browserSelected, sideChatSelected } = activeView;
+  const { browserSelected, sideChatSelected, thingySelected } = activeView;
   const terminalShown = activeView.terminalKey !== null;
+  // In full screen a thingy shows alone: the strip holds its controls and Open session.
+  const thingyFullScreen = maximized && thingySelected;
+  const [thingyToolbar, setThingyToolbar] = useState<HTMLElement | null>(null);
+  const fullScreenLabel = thingyFullScreen
+    ? "Open session"
+    : maximized
+      ? "Exit full screen"
+      : "Full screen";
   const returnPointRef = useRef<ReturnPoint | null>(null);
   // The latest returnFrom, so a close that finishes later uses the tabs open by then.
   const returnFromRef = useRef<(point: ReturnPoint) => void>(() => {});
@@ -1369,6 +1426,7 @@ function WorkspacePanelImpl({
       openFiles.length > 0 ||
       openTerminals.length > 0 ||
       sideChats.tabs.length > 0 ||
+      thingyRail.tabs.length > 0 ||
       (showBrowserTab && browsers.tabs.length > 0));
   const newTabMenu = (menuAlign: "start" | "end") => (
     <NewTabMenu
@@ -1378,6 +1436,7 @@ function WorkspacePanelImpl({
       onOpenBrowser={showBrowserTab ? addBrowserFromMenu : undefined}
       onOpen={noteMenuOrigin}
       onOpenSideChat={onNewSideChat}
+      extraItems={thingyRail.newItems}
       onOpenTerminal={openTerminalTab}
       onCreateStart={onShellCreateStart}
       onCreateError={onShellCreateFailed}
@@ -1424,7 +1483,8 @@ function WorkspacePanelImpl({
   useEffect(() => {
     if (
       ((rightRailTab === "browser" && browsers.selected === null) ||
-        (rightRailTab === "sidechat" && sideChats.selected === null)) &&
+        (rightRailTab === "sidechat" && sideChats.selected === null) ||
+        (rightRailTab === "thingy" && thingyRail.selected === null)) &&
       selectedFilePath === null &&
       selectedTerminalKey === null
     ) {
@@ -1434,6 +1494,7 @@ function WorkspacePanelImpl({
     rightRailTab,
     browsers.selected,
     sideChats.selected,
+    thingyRail.selected,
     selectedFilePath,
     selectedTerminalKey,
     browserFallbackTab,
@@ -1493,6 +1554,13 @@ function WorkspacePanelImpl({
         sideChats.select(childId);
         onRightRailTabChange("sidechat");
       },
+      disabled: false,
+    })),
+    ...thingyRail.tabs.map((tab) => ({
+      key: `thingy:${tab.key}`,
+      label: tab.label,
+      active: thingySelected && thingyRail.selected === tab.key,
+      select: () => thingyRail.select(tab.key),
       disabled: false,
     })),
   ];
@@ -1560,6 +1628,8 @@ function WorkspacePanelImpl({
         handleCloseTab();
       } else if (scopeView === "sidechat" && sideChats.selected !== null) {
         void closeSideChat(sideChats.selected);
+      } else if (scopeView === "thingy" && thingyRail.selected !== null) {
+        if (thingyRail.canClose) thingyRail.close(thingyRail.selected);
       } else if (scopeView === "browser" && browsers.selected !== null) {
         void closeBrowserTab(browsers.selected);
       } else if (openPanel !== undefined) {
@@ -1785,7 +1855,7 @@ function WorkspacePanelImpl({
           tabIndex={-1}
           className="workspace-tab-strip shrink-0 flex items-center overflow-x-hidden border-b border-border px-2 py-3"
         >
-          {visiblePermanentTabs.length > 0 && (
+          {!thingyFullScreen && visiblePermanentTabs.length > 0 && (
             <Tabs
               className={cn("shrink-0", showOpenTabs && "@max-[400px]/rail:hidden")}
               // Soft tabs own their highlight. A vanished shell falls back to a
@@ -1796,6 +1866,7 @@ function WorkspacePanelImpl({
                   : selectedFilePath !== null ||
                       browserSelected ||
                       sideChatSelected ||
+                      thingySelected ||
                       terminalShown
                     ? "__tab__"
                     : (rightRailTab ?? "__empty__")
@@ -1809,7 +1880,7 @@ function WorkspacePanelImpl({
             </Tabs>
           )}
           {/* The divider follows the fixed panel icons' visibility. */}
-          {visiblePermanentTabs.length > 0 && (
+          {!thingyFullScreen && visiblePermanentTabs.length > 0 && (
             <div
               aria-hidden
               className={cn(
@@ -1818,7 +1889,7 @@ function WorkspacePanelImpl({
               )}
             />
           )}
-          {showOpenTabs && (
+          {!thingyFullScreen && showOpenTabs && (
             <>
               {/* Open tabs fill the space before the pinned trailing controls. */}
               <WorkspaceTabsScroller>
@@ -1970,16 +2041,25 @@ function WorkspacePanelImpl({
                     </div>
                   );
                 })}
+                <ThingyRailTabStrip state={thingyRail} active={thingySelected} />
               </WorkspaceTabsScroller>
             </>
           )}
           {/* With no open tabs, "+" sits right after the nav tabs. */}
-          {!pending && !showOpenTabs && newTabMenu("start")}
+          {!pending && !thingyFullScreen && !showOpenTabs && newTabMenu("start")}
+          {/* A full screen thingy fills the bar with its own controls. */}
+          {thingyFullScreen && (
+            <ThingyFullScreenSlot
+              onToolbar={setThingyToolbar}
+              sidebarOpen={sidebarOpen}
+              onOpenSidebar={onOpenSidebar}
+            />
+          )}
           {/* The picker and fullscreen toggle form the trailing control group,
             pinned right outside the scrolling viewport; "+" joins it once tabs exist. */}
           <div className="ml-auto flex shrink-0 items-center gap-1 pl-1">
-            {showOpenTabs && newTabMenu("end")}
-            {panelOptions.length > 0 && (
+            {!thingyFullScreen && showOpenTabs && newTabMenu("end")}
+            {!thingyFullScreen && panelOptions.length > 0 && (
               <DropdownMenu
                 onOpenChange={(isOpen) => {
                   if (isOpen) markPickerKeyboard();
@@ -2032,21 +2112,24 @@ function WorkspacePanelImpl({
               </DropdownMenu>
             )}
             <WorkspaceTabTooltip
-              label={maximized ? "Exit full screen" : "Full screen"}
+              label={fullScreenLabel}
               // Escape exits full screen only from a file; other tabs keep Escape for themselves.
               shortcut={fileViewerInFront && maximized && !isMobile ? [ESC_KEY] : undefined}
             >
               <Button
                 type="button"
                 variant="ghost"
-                aria-label={maximized ? "Exit full screen" : "Full screen"}
-                aria-pressed={maximized}
+                aria-label={fullScreenLabel}
+                aria-pressed={thingyFullScreen ? undefined : maximized}
                 onClick={onToggleMaximized}
                 disabled={pending}
                 size="icon-xs"
                 className="flex size-6 text-muted-foreground hover:text-foreground"
               >
-                {maximized ? (
+                {thingyFullScreen ? (
+                  // Leaving a full screen thingy shows the session.
+                  <MessageSquareIcon className="size-4" />
+                ) : maximized ? (
                   <MinimizeIcon className="size-4" />
                 ) : (
                   <MaximizeIcon className="size-4" />
@@ -2072,6 +2155,7 @@ function WorkspacePanelImpl({
               frontTerminalKey,
               sideChats.selected,
               browsers.viewId,
+              thingyRail.selected,
             ])}
           >
             {/* Phones use AppShell's drawer instead; one mounted panel keeps the input state single-owner. */}
@@ -2162,6 +2246,11 @@ function WorkspacePanelImpl({
                   sort={filesPanelSort}
                 />
               </ResponsiveViewerSlot>
+            ) : scopeView === "thingy" && thingyRail.selected !== null ? (
+              thingyRail.render(thingyRail.selected, {
+                fullScreen: thingyFullScreen,
+                toolbar: thingyFullScreen ? thingyToolbar : null,
+              })
             ) : scopeView === "sidechat" ? (
               // A side chat: a forked child conversation streamed here in its own
               // scoped surface, beside the still-active main chat. Phones show it

@@ -6,7 +6,15 @@ import type { RightRailTab } from "./railTabs";
 
 /** The page beneath any open shell or file. */
 export type WorkspaceScopeView =
-  "sidechat" | "browser" | "github" | "tasks" | "subagents" | "empty" | "content-search" | "files";
+  | "thingy"
+  | "sidechat"
+  | "browser"
+  | "github"
+  | "tasks"
+  | "subagents"
+  | "empty"
+  | "content-search"
+  | "files";
 
 export interface WorkspaceSelection {
   rightRailTab: RightRailTab | null;
@@ -14,6 +22,8 @@ export interface WorkspaceSelection {
   selectedTerminalKey: string | null;
   selectedBrowserId: string | null;
   selectedSideChatId: string | null;
+  /** The selected thingy tab, while it is still shown beside the session. */
+  selectedThingyKey?: string | null;
 }
 
 export interface WorkspaceViewAvailability {
@@ -39,6 +49,7 @@ export interface WorkspaceActiveView {
   flat: boolean;
   sideChatSelected: boolean;
   browserSelected: boolean;
+  thingySelected: boolean;
 }
 
 export function resolveWorkspaceActiveView(
@@ -56,8 +67,11 @@ export function resolveWorkspaceActiveView(
     rightRailTab === "sidechat" && nothingInFront && selection.selectedSideChatId !== null;
   const browserSelected =
     rightRailTab === "browser" && nothingInFront && selection.selectedBrowserId !== null;
-  const scope: WorkspaceScopeView =
-    sideChatSelected && !availability.mobile
+  const thingySelected =
+    rightRailTab === "thingy" && nothingInFront && selection.selectedThingyKey != null;
+  const scope: WorkspaceScopeView = thingySelected
+    ? "thingy"
+    : sideChatSelected && !availability.mobile
       ? "sidechat"
       : browserSelected && availability.showBrowserTab
         ? "browser"
@@ -79,5 +93,6 @@ export function resolveWorkspaceActiveView(
     flat: rightRailTab === "changes",
     sideChatSelected,
     browserSelected,
+    thingySelected,
   };
 }

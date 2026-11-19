@@ -24,6 +24,7 @@ from omnigent.db.db_models import (
     SqlScheduledTask,
     SqlScheduledTaskShare,
     SqlSessionPermission,
+    SqlThingyShare,
     SqlUser,
     SqlWorkflow,
     SqlWorkflowShare,
@@ -41,6 +42,7 @@ from omnigent.entities import (
     ResolvedAccess,
     ScheduledTaskPermission,
     SessionPermission,
+    ThingyPermission,
     WorkflowPermission,
 )
 from omnigent.errors import ErrorCode, OmnigentError
@@ -56,6 +58,7 @@ from omnigent.stores.permission_store import (
     MAX_GRANTEE_ID_CHARS,
     MAX_GRANTS_PAGE_SIZE,
     MAX_SHARED_SCHEDULED_TASKS_PAGE_SIZE,
+    MAX_SHARED_THINGIES_PAGE_SIZE,
     MAX_SHARED_WORKFLOWS_PAGE_SIZE,
     PermissionStore,
     require_grantee_id_fits,
@@ -72,6 +75,7 @@ assert all(
     for column in (
         SqlScheduledTaskShare.__table__.c.user_id,
         SqlWorkflowShare.__table__.c.user_id,
+        SqlThingyShare.__table__.c.user_id,
         SqlUser.__table__.c.id,
     )
 )
@@ -167,7 +171,12 @@ def _to_entity(row: SqlSessionPermission) -> SessionPermission:
 
 def _upsert_grant(
     dialect: str,
-    model: type[SqlSessionPermission] | type[SqlScheduledTaskShare] | type[SqlWorkflowShare],
+    model: (
+        type[SqlSessionPermission]
+        | type[SqlScheduledTaskShare]
+        | type[SqlWorkflowShare]
+        | type[SqlThingyShare]
+    ),
     key: dict[str, str],
     level: int,
     *,
@@ -270,6 +279,17 @@ def _require_storable_workflow_grant(user_id: str, level: int) -> None:
     )
 
 
+def _require_storable_thingy_grant(user_id: str, level: int) -> None:
+    """Refuse a thingy grant the share table cannot hold or the store must never hold."""
+    _require_storable_grant(
+        user_id,
+        level,
+        levels=session_sharing.THINGY_GRANT_LEVELS,
+        resource="A thingy",
+        kinds="Thingies",
+    )
+
+
 def _lock_live_scheduled_task(session: Session, scheduled_task_id: str, grantee: str) -> None:
     """Lock a task's row before its grant rows, the order account deletion also takes.
 
@@ -314,7 +334,9 @@ def _lock_workflow(session: Session, workflow_id: str, grantee: str) -> None:
         )
 
 
-_GrantRow = TypeVar("_GrantRow", SqlSessionPermission, SqlScheduledTaskShare, SqlWorkflowShare)
+_GrantRow = TypeVar(
+    "_GrantRow", SqlSessionPermission, SqlScheduledTaskShare, SqlWorkflowShare, SqlThingyShare
+)
 _Grant = TypeVar("_Grant")
 
 
@@ -352,7 +374,7 @@ def _grant_page(
     return [to_entity(row) for row in page], next_cursor
 
 
-_ShareModel = type[SqlScheduledTaskShare] | type[SqlWorkflowShare]
+_ShareModel = type[SqlScheduledTaskShare] | type[SqlWorkflowShare] | type[SqlThingyShare]
 
 
 def _delete_grant_batch(
@@ -606,6 +628,42 @@ def delete_grants_on_workflows(
             )
             deleted += len(user_ids)
     return deleted
+
+
+def delete_deleted_account_thingy_grants(
+    session_maker: NamedManagedSessionMaker, user_id: str, *, batch_size: int
+) -> int:
+    """Delete the thingy grants a deleted account held, one bounded batch per transaction.
+
+    Walks ``ix_thingy_shares_user_id``. Each batch first locks the account and stops
+    once the name belongs to a live account again, whose grants are its own.
+    """
+    return _delete_grants_in_batches(
+        session_maker,
+        "delete_deleted_account_thingy_grant_batch",
+        model=SqlThingyShare,
+        match=SqlThingyShare.user_id == user_id,
+        key_column=SqlThingyShare.thingy_id,
+        batch_size=batch_size,
+        proceed=_account_is_deleted(user_id),
+    )
+
+
+def holds_thingy_grants(session: Session, user_id: str) -> bool:
+    """Whether any thingy grant to *user_id* remains in the workspace, in one indexed probe."""
+    return session.execute(
+        select(
+            exists().where(
+                SqlThingyShare.workspace_id == current_workspace_id(),
+                SqlThingyShare.user_id == user_id,
+            )
+        )
+    ).scalar_one()
+
+
+def _to_thingy_permission(row: SqlThingyShare) -> ThingyPermission:
+    """Convert a :class:`SqlThingyShare` ORM row to a domain entity."""
+    return ThingyPermission(user_id=row.user_id, thingy_id=row.thingy_id, level=row.level)
 
 
 def _to_workflow_permission(row: SqlWorkflowShare) -> WorkflowPermission:
@@ -1586,4 +1644,147 @@ class SqlAlchemyPermissionStore(PermissionStore):
         """Delete every grant on a workflow, one batch per transaction. See base class."""
         return delete_workflow_grants(
             self._session_immediate, workflow_id, batch_size=self._cleanup_batch_size
+        )
+
+    # ── Thingy grants ─────────────────────────────────────────────────────
+
+    @property
+    def supports_thingy_grants(self) -> bool:
+        """Grants persist in ``thingy_shares``. See base class."""
+        return True
+
+    def grant_for_thingy(
+        self, user_id: str, thingy_id: str, level: int, *, ensure_minimum: bool = False
+    ) -> ThingyPermission:
+        """Upsert a thingy grant. See base class for contract.
+
+        Locks the grantee's account, then the grant row. The thingy lives in the
+        thingy store, so the caller has checked it exists and refused its owner.
+
+        :raises OmnigentError: ``INVALID_INPUT`` for an over-wide ID, a reserved
+            grantee or a level outside
+            :data:`~omnigent.server.session_sharing.THINGY_GRANT_LEVELS`; the
+            account errors of :meth:`grant`.
+        """
+        _require_storable_thingy_grant(user_id, level)
+
+        def write(session: Session) -> int:
+            require_active_account(session, user_id)
+            session.execute(
+                _upsert_grant(
+                    self._engine.dialect.name,
+                    SqlThingyShare,
+                    {"thingy_id": thingy_id, "user_id": user_id},
+                    level,
+                    ensure_minimum=ensure_minimum,
+                )
+            )
+            grant_row = (
+                SqlThingyShare.workspace_id == current_workspace_id(),
+                SqlThingyShare.thingy_id == thingy_id,
+                SqlThingyShare.user_id == user_id,
+            )
+            # The stored key's collation may match a reserved ID the fast path let through.
+            reserved = session.execute(
+                select(SqlThingyShare.user_id).where(
+                    *grant_row, SqlThingyShare.user_id.in_(sorted(_RESERVED_GRANTEES))
+                )
+            ).first()
+            if reserved is not None:
+                raise _reserved_grantee_error(user_id, "A thingy")
+            return session.execute(select(SqlThingyShare.level).where(*grant_row)).scalar_one()
+
+        stored_level = run_write_transaction(
+            self._session_immediate, "grant_thingy_permission", write
+        )
+        return ThingyPermission(user_id=user_id, thingy_id=thingy_id, level=stored_level)
+
+    def revoke_for_thingy(self, user_id: str, thingy_id: str) -> bool:
+        """Remove a thingy grant. See base class for contract."""
+
+        def write(session: Session) -> bool:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    delete(SqlThingyShare).where(
+                        SqlThingyShare.workspace_id == current_workspace_id(),
+                        SqlThingyShare.thingy_id == thingy_id,
+                        SqlThingyShare.user_id == user_id,
+                    )
+                ),
+            )
+            return result.rowcount > 0
+
+        return run_write_transaction(self._session_immediate, "revoke_thingy_permission", write)
+
+    def list_for_thingy(
+        self,
+        thingy_id: str,
+        *,
+        limit: int = 100,
+        after_user_id: str | None = None,
+    ) -> tuple[list[ThingyPermission], str | None]:
+        """Return a thingy's grants with cursor pagination. See base class."""
+        with self._session("list_thingy_permissions") as session:
+            return _grant_page(
+                session,
+                SqlThingyShare,
+                SqlThingyShare.thingy_id == thingy_id,
+                _to_thingy_permission,
+                limit=limit,
+                after_user_id=after_user_id,
+            )
+
+    def resolve_thingy_access(self, principals: Sequence[str], thingy_id: str) -> int | None:
+        """Return the highest level any principal holds. See base class for contract."""
+        if not principals:
+            return None
+        with self._session("resolve_thingy_access") as session:
+            return session.execute(
+                select(func.max(SqlThingyShare.level)).where(
+                    SqlThingyShare.workspace_id == current_workspace_id(),
+                    SqlThingyShare.thingy_id == thingy_id,
+                    SqlThingyShare.user_id.in_(list(principals)),
+                )
+            ).scalar_one()
+
+    def list_thingies_shared_with(
+        self,
+        principals: Sequence[str],
+        *,
+        limit: int = 50,
+        after_thingy_id: str | None = None,
+    ) -> tuple[list[str], str | None]:
+        """Page the thingies shared with any principal. See base class for contract.
+
+        Each principal walks ``ix_thingy_shares_user_id`` past the cursor for at most
+        ``limit + 1`` rows.
+        """
+        if not 1 <= limit <= MAX_SHARED_THINGIES_PAGE_SIZE:
+            raise OmnigentError(
+                f"limit must be between 1 and {MAX_SHARED_THINGIES_PAGE_SIZE}.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if not principals:
+            return [], None
+        with self._session("list_thingies_shared_with_caller") as session:
+            scanned, has_more = _shared_resource_ids(
+                session,
+                SqlThingyShare.user_id,
+                SqlThingyShare.thingy_id,
+                principals,
+                after=after_thingy_id,
+                limit=limit,
+            )
+        return scanned, scanned[-1] if has_more and scanned else None
+
+    def delete_for_thingy(self, thingy_id: str) -> int:
+        """Delete every grant on a thingy, one batch per transaction. See base class."""
+        return _delete_grants_in_batches(
+            self._session_immediate,
+            "delete_thingy_grant_batch",
+            model=SqlThingyShare,
+            match=SqlThingyShare.thingy_id == thingy_id,
+            key_column=SqlThingyShare.user_id,
+            batch_size=self._cleanup_batch_size,
         )

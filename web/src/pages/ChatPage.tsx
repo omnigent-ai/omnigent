@@ -288,6 +288,7 @@ import { canAutoWakeSandbox, useSandboxAutoWake } from "@/hooks/useSandboxAutoWa
 import { isSandboxLaunchStopped } from "@/lib/sandboxStatus";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
+import { useThingyComposerQuotes } from "@/lib/thingyComposerQuotes";
 import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
 import { modelPickerKindForConv, type NativeModelPickerKind } from "@/lib/composerCapabilities";
 
@@ -1868,6 +1869,27 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   });
 
   const composerReadOnly = isComposerReadOnly(permissionLevel, readOnlyReason, sendDisabledReason);
+  // A thingy's Reply and Ask in side chat land here like the transcript's own; the
+  // terminal view switches to chat first.
+  useThingyComposerQuotes(conversationId ?? null, (quote) => {
+    // While the session loads its permissions read as unknown; wait rather than drop the quote.
+    if (permissionLevel === null) return false;
+    if (composerReadOnly) return true;
+    if (showTerminal) {
+      terminalFirst?.setView("chat");
+      return false;
+    }
+    const composer = composerRef.current;
+    // The composer restores this session's saved draft first, which would replace the quote.
+    if (!composer?.canTakeQuote()) return false;
+    if (quote.kind === "side_chat" && supportsSideChat(selectionSessionHarness, canStartSideChat)) {
+      composer.startSideChat(quote.text);
+    } else {
+      // A composer that can't take it yet (offline, read-only) keeps the quote queued.
+      return composer.appendReplyQuote(quote.text);
+    }
+    return true;
+  });
 
   // Single return so both surfaces keep stable fragment positions across
   // view flips — an early return would change the tree shape and remount
@@ -2028,7 +2050,10 @@ export function ConversationLoadError({
 }
 
 interface ComposerHandle {
-  appendReplyQuote: (text: string) => void;
+  /** Whether the quote went in; a blocked composer refuses it. */
+  appendReplyQuote: (text: string) => boolean;
+  /** Whether a quote added now stays: this session's saved draft has been restored. */
+  canTakeQuote: () => boolean;
   /** Load a sent message into the composer, confirming before replacing a draft. */
   editSentMessage: (message: SentMessage) => void;
   startSideChat: (selectedText: string) => void;
@@ -3865,9 +3890,13 @@ function ComposerImpl(
       if (isMobileRef.current || composerLockedByBtw) return;
       textareaRef.current?.focus({ preventScroll: true });
     },
+    canTakeQuote() {
+      // The saved draft must be restored first, or it would replace the quote.
+      return settledConversationId === conversationId && !composerLockedByBtw;
+    },
     appendReplyQuote(text) {
       const blocked = disabled || isReadOnly || (unreachable && !sendReconnectsArca);
-      if (blocked || composerLockedByBtw || !text.trim()) return;
+      if (blocked || composerLockedByBtw || !text.trim()) return false;
       appendQuote(text);
       textareaRef.current = tailTextareaRef.current;
       dirtyRef.current = true;
@@ -3876,6 +3905,7 @@ function ComposerImpl(
       dismissMention();
       resetCursor();
       recallingRef.current = false;
+      return true;
     },
     editSentMessage(message) {
       editSentMessage(message);

@@ -75,6 +75,7 @@ from omnigent.runner.journal_tools import (
     server_workflows_enabled,
 )
 from omnigent.runner.session_requests import remember_session_host
+from omnigent.runner.thingy_tools import THINGY_TOOL_NAMES, execute_thingy_tool
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.spec.types import MEMORY_TOOL_NAMES
 from omnigent.tools import ToolManager
@@ -485,6 +486,9 @@ _SCHEDULED_TASK_TOOLS = frozenset(
 # Priority 5l.2: The session journal — the runner proxies the server's
 # /v1/sessions/{id}/journal routes (see omnigent/runner/journal_tools.py).
 _JOURNAL_TOOLS = JOURNAL_TOOL_NAMES
+# Priority 5l.2: Thingies — the runner proxies the server's /v1/thingies routes
+# (see omnigent/runner/thingy_tools.py). Registered when the server enables thingies.
+_THINGY_TOOLS = THINGY_TOOL_NAMES
 # Priority 5l.2: Owner Inbox — the runner proxies /v1/inbox/items. Registered
 # only for agents that opt into ``tool_groups.user_inbox``.
 _USER_INBOX_TOOLS = frozenset({"sys_user_inbox_post", "sys_user_inbox_list"})
@@ -558,6 +562,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _POLICY_TOOLS
     | _SCHEDULED_TASK_TOOLS
     | _JOURNAL_TOOLS
+    | _THINGY_TOOLS
     | _USER_INBOX_TOOLS
     | _MEMORY_TOOLS
     | _TERMINAL_TOOLS
@@ -1076,6 +1081,7 @@ _ALL_LOCAL_TOOLS = (
     | _POLICY_TOOLS
     | _SCHEDULED_TASK_TOOLS
     | _JOURNAL_TOOLS
+    | _THINGY_TOOLS
     | _USER_INBOX_TOOLS
     | _MEMORY_TOOLS
 )
@@ -8436,6 +8442,14 @@ async def execute_tool(
                 conversation_id=conversation_id,
                 call_id=call_id,
                 publish_event=publish_event,
+            )
+        elif tool_name in _THINGY_TOOLS:
+            output = await execute_thingy_tool(
+                tool_name,
+                arguments,
+                server_client=server_client,
+                conversation_id=conversation_id,
+                call_id=call_id,
             )
         elif tool_name in _USER_INBOX_TOOLS:
             output = await _execute_user_inbox_tool(

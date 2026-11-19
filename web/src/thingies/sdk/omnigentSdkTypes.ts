@@ -1,0 +1,291 @@
+// Public TypeScript declarations for `window.omnigent`, the SDK available to uploaded
+// thingy HTML. The portable implementation is `omnigentSdkRuntimeSource.ts`; its
+// test suite runs that source and checks it against these interfaces. No React or
+// app dependencies, so app authors can copy this file into their own project.
+
+import type {
+  ThingyCapability,
+  ThingyNavigationDisplay,
+  ThingyWireErrorCode,
+} from "./thingyProtocol";
+
+export type {
+  ThingyCapability,
+  ThingyErrorCode,
+  ThingyNavigationDisplay,
+  ThingyWireErrorCode,
+} from "./thingyProtocol";
+
+export type JsonValue =
+  null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue };
+
+/** One stored record. `version` is opaque; pass it back unchanged as `ifVersion`. */
+export interface OmnigentDocument<T extends JsonValue = JsonValue> {
+  id: string;
+  value: T;
+  version: string;
+  createdAt: string;
+  updatedAt: string;
+  createdBy: string;
+  updatedBy: string;
+}
+
+export interface OmnigentDeletedDocument {
+  id: string;
+  version: string;
+  deleted: true;
+}
+
+export interface OmnigentListPage<T extends JsonValue = JsonValue> {
+  items: OmnigentDocument<T>[];
+  /** Opaque cursor for the next page, or null at the end. Pages are not a consistent snapshot. */
+  nextCursor: string | null;
+}
+
+export interface OmnigentCallOptions {
+  signal?: AbortSignal;
+  /** Per-call deadline. Defaults to 15 s; clamped to 0.1–60 s. */
+  timeoutMs?: number;
+}
+
+export interface OmnigentMutationOptions extends OmnigentCallOptions {
+  /**
+   * Stable key for one logical change. Reuse it to retry a change whose outcome is
+   * unknown (for example after `DEADLINE_EXCEEDED`); the server returns the original
+   * result instead of applying the change twice. Defaults to a fresh key per call.
+   */
+  idempotencyKey?: string;
+}
+
+export interface OmnigentCreateOptions extends OmnigentMutationOptions {
+  /** Record ID to create; the server assigns one when omitted. */
+  id?: string;
+}
+
+export interface OmnigentConditionalOptions extends OmnigentMutationOptions {
+  /** Version the change is based on. The call fails with `CONFLICT` if the record moved on. */
+  ifVersion: string;
+}
+
+export type OmnigentWatchStatus = "loading" | "live" | "reconnecting" | "stale";
+
+export interface OmnigentWatchSnapshot<T extends JsonValue = JsonValue> {
+  status: OmnigentWatchStatus;
+  /** Last successfully read first page; kept while reconnecting or stale. */
+  items: OmnigentDocument<T>[];
+  nextCursor: string | null;
+  /** Time of the last successful read (ISO 8601), or null before the first one. */
+  updatedAt: string | null;
+  error: OmnigentError | null;
+}
+
+export interface OmnigentWatchOptions {
+  /** Poll interval; at least 1000 ms. Defaults to 2000 ms. */
+  intervalMs?: number;
+  /** Page size of the watched first page. Defaults to 100, the maximum. */
+  limit?: number;
+}
+
+export interface OmnigentDisposable {
+  dispose: () => void;
+}
+
+export interface OmnigentCollection<T extends JsonValue = JsonValue> {
+  readonly name: string;
+  get: (id: string, options?: OmnigentCallOptions) => Promise<OmnigentDocument<T> | null>;
+  list: (
+    page?: { limit?: number; cursor?: string },
+    options?: OmnigentCallOptions,
+  ) => Promise<OmnigentListPage<T>>;
+  create: (value: T, options?: OmnigentCreateOptions) => Promise<OmnigentDocument<T>>;
+  /** Replaces the whole value; this is not a merge. */
+  replace: (
+    id: string,
+    value: T,
+    options: OmnigentConditionalOptions,
+  ) => Promise<OmnigentDocument<T>>;
+  delete: (id: string, options: OmnigentConditionalOptions) => Promise<OmnigentDeletedDocument>;
+  /** Polls the first page and reports each snapshot, starting with `loading`. */
+  watch: (
+    listener: (snapshot: OmnigentWatchSnapshot<T>) => void,
+    options?: OmnigentWatchOptions,
+  ) => OmnigentDisposable;
+}
+
+export interface OmnigentClientContext {
+  app: { id: string; name: string };
+  revisionId: string;
+  /** `id` is a stable opaque principal ID; store it rather than `displayName`, which can change. */
+  viewer: { id: string; displayName: string };
+  permissions: { writeData: boolean; publish: boolean };
+}
+
+export interface OmnigentSessions {
+  /** False until the host grants `sessions.read` for this revision; calls then fail with `UNSUPPORTED`. */
+  readonly canList: boolean;
+  /** False until the host grants `sessions.create`; Omnigent asks the viewer before each creation. */
+  readonly canCreate: boolean;
+  list: (params?: Record<string, JsonValue>, options?: OmnigentCallOptions) => Promise<JsonValue>;
+  create: (
+    params: Record<string, JsonValue>,
+    options?: OmnigentMutationOptions,
+  ) => Promise<JsonValue>;
+}
+
+/** Opens Omnigent pages in a new tab. Each call must follow a click inside the app. */
+/**
+ * Where a page opens: `tab` (default) a new browser tab; `panel` a pane beside this app, which
+ * keeps running; `page` this tab in place of the app, with Back returning to it.
+ */
+export type OmnigentNavigationDisplay = ThingyNavigationDisplay;
+
+export interface OmnigentNavigation {
+  /**
+   * Opens New session with `prompt` filled in. The viewer chooses where it runs and starts it;
+   * Omnigent appends how the session can reach this app's shared records. With `panel`, the
+   * pane shows the session once the viewer starts it.
+   */
+  newSession: (
+    params?: { prompt?: string; display?: OmnigentNavigationDisplay },
+    options?: OmnigentCallOptions,
+  ) => Promise<{ opened: true }>;
+  /** Opens a session. A viewer without access to it sees Omnigent's usual message. */
+  openSession: (
+    sessionId: string,
+    options?: OmnigentCallOptions & { display?: OmnigentNavigationDisplay },
+  ) => Promise<{ opened: true }>;
+  /**
+   * Opens Automations with the create dialog filled in. `schedule` is an RRULE, for example
+   * `FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9;BYMINUTE=0`.
+   * The viewer picks where it runs and saves it; Omnigent appends the same note as for sessions.
+   * Automations open in a `tab` (default) or the `page`, not a panel.
+   */
+  newAutomation: (
+    params: { name: string; prompt: string; schedule?: string; display?: "tab" | "page" },
+    options?: OmnigentCallOptions,
+  ) => Promise<{ opened: true }>;
+}
+
+/** What `agent.request` resolves with. */
+export interface OmnigentActionReceipt {
+  /** The action's entry in the thingy's ledger; follow it with `agent.watch`. */
+  actionId: string;
+  /**
+   * `sent` to the viewer's thingy session, `starting` while they start one beside the thingy, or
+   * `merged` when the same action with the same params was still open: `actionId` is that one.
+   */
+  delivery: "sent" | "starting" | "merged";
+}
+
+/**
+ * How far an action has got. Omnigent derives `status` from the sessions doing the work (their
+ * live status, runner liveness, pending approvals and errors), not from what the agent reports,
+ * so an action never stays running after its sessions stop:
+ * - `pending`: requested, not delivered to the thingy session yet (the viewer has not started it).
+ * - `queued`: delivered; the thingy session is busy with an earlier action or has not started.
+ * - `running`, or `needs_input` when a session doing the work waits for the viewer.
+ * - `done`, `failed`, `cancelled`: how the agent reported it ended.
+ * - `finished_unreported`: its sessions stopped without the agent reporting how it went.
+ * - `interrupted`: a session failed, went offline or never started it; `reason` says which.
+ * - `not_found`. Handle unknown statuses as finished.
+ */
+export interface OmnigentActionProgress {
+  id: string;
+  status: string;
+  reason: string | null;
+  action: string | null;
+  params: { [key: string]: JsonValue } | null;
+  /** The agent's Markdown summary, if it wrote one. */
+  summary: string | null;
+  /** The session the agent recorded as doing the work. */
+  sessionId: string | null;
+  /** The sessions the status was derived from. */
+  sessionIds: string[];
+}
+
+export interface OmnigentActionWatchSnapshot {
+  status: OmnigentWatchStatus;
+  items: OmnigentActionProgress[];
+  updatedAt: string | null;
+  error: OmnigentError | null;
+}
+
+export interface OmnigentActionWatch extends OmnigentDisposable {
+  /** Reads progress again now, for example right after `agent.request`. */
+  refresh: () => void;
+}
+
+export interface OmnigentAgent {
+  /**
+   * Asks the viewer's thingy session (one per viewer and thingy, shown beside it) to carry out
+   * one of the thingy's declared actions. Needs a click inside the app and edit access to the
+   * thingy (`PERMISSION_DENIED` otherwise). The session records progress in the thingy's
+   * action ledger and, as the action's description says, in the thingy's records.
+   */
+  request: (
+    action: string,
+    params?: { [key: string]: JsonValue },
+    options?: OmnigentCallOptions,
+  ) => Promise<OmnigentActionReceipt>;
+  /** Progress of up to 20 actions, or of the viewer's recent actions (at most 10) when none are given. */
+  progress: (
+    actionIds?: string[],
+    options?: OmnigentCallOptions,
+  ) => Promise<{ items: OmnigentActionProgress[] }>;
+  /**
+   * Polls progress and reports each snapshot, starting with `loading`. Without `actionIds` it
+   * follows the viewer's recent actions, so a reloaded thingy shows them again.
+   */
+  watch: (
+    listener: (snapshot: OmnigentActionWatchSnapshot) => void,
+    options?: { actionIds?: string[]; intervalMs?: number },
+  ) => OmnigentActionWatch;
+}
+
+/**
+ * What a control needs: `write` changes records (edit access to the thingy's data and the
+ * `data.write` capability), `action` runs a declared action (Can edit access to the thingy).
+ * Mark such controls with `data-omnigent-requires="write"` or `"action"` (space-separated for
+ * both): for a viewer without that access the SDK disables them (read-only for text fields, so
+ * their text stays selectable), sets `aria-disabled` and `data-omnigent-blocked`, shows the reason
+ * as their tooltip, and keeps them that way even if the page re-enables them.
+ */
+export type OmnigentRequirement = "write" | "action";
+
+export interface OmnigentClient {
+  readonly context: OmnigentClientContext;
+  readonly capabilities: readonly ThingyCapability[];
+  hasCapability: (capability: ThingyCapability) => boolean;
+  /** Whether this viewer may do what `requirement` needs. */
+  can: (requirement: OmnigentRequirement) => boolean;
+  data: {
+    collection: <T extends JsonValue = JsonValue>(name: string) => OmnigentCollection<T>;
+  };
+  sessions: OmnigentSessions;
+  navigation: OmnigentNavigation;
+  agent: OmnigentAgent;
+  ui: {
+    readonly colorScheme: "light" | "dark";
+    /** Why this viewer can't do what `requirement` needs, for the page's own messages; null when they can. */
+    blockedReason: (requirement: OmnigentRequirement) => string | null;
+  };
+  /** Rejects outstanding calls with `DISPOSED`, stops watches, and closes the port. */
+  dispose: () => void;
+}
+
+export interface OmnigentError extends Error {
+  readonly name: "OmnigentError";
+  /** One of `ThingyErrorCode`, or a newer server code; handle unknown codes as a generic failure. */
+  readonly code: ThingyWireErrorCode;
+  /** True only for failures where repeating the same call is safe. Mutations are never marked retryable. */
+  readonly retryable: boolean;
+  /** For mutations: the idempotency key to pass back when retrying an unknown outcome. */
+  readonly operationId?: string;
+}
+
+export interface OmnigentSdk {
+  readonly version: 1;
+  /** Resolves once the Omnigent host has sent this frame's context. Repeated calls share one client. */
+  connect: (options?: { timeoutMs?: number }) => Promise<OmnigentClient>;
+  isOmnigentError: (error: unknown) => error is OmnigentError;
+}

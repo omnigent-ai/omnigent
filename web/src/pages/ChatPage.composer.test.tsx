@@ -6091,6 +6091,25 @@ describe("Composer reply quotes", () => {
     expect(hasSessionDraft("conv_test")).toBe(false);
   });
 
+  it("takes a queued quote only when the composer keeps it", () => {
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const { unmount } = render(<Composer {...composerProps()} ref={ref} />);
+    expect(ref.current?.canTakeQuote()).toBe(true);
+    let taken: boolean | undefined;
+    act(() => {
+      taken = ref.current?.appendReplyQuote("Quoted from a thingy");
+    });
+    expect(taken).toBe(true);
+    unmount();
+
+    // A read-only composer refuses the quote, so the queue keeps it.
+    render(<Composer {...composerProps({ permissionLevel: 1 })} ref={ref} />);
+    act(() => {
+      taken = ref.current?.appendReplyQuote("Quoted from a thingy");
+    });
+    expect(taken).toBe(false);
+  });
+
   it("inserts into an unreachable composer whose send reconnects Arca", () => {
     const ref = createRef<ComponentRef<typeof Composer>>();
     render(
