@@ -50,7 +50,8 @@ async def test_registry_discovery_and_fresh_native_manager_use_service_route():
 
 
 async def test_registry_discovery_failure_names_the_unavailable_service():
-    error = {"code": -32000, "message": "MCP service returned HTTP 500.\nCheck the service."}
+    message = "MCP service returned HTTP 500.\nCheck the service. " + "x" * 400
+    error = {"code": -32000, "message": message}
 
     def handle(request):
         body = json.loads(request.content)
@@ -64,9 +65,11 @@ async def test_registry_discovery_failure_names_the_unavailable_service():
     assert discovered.tool_names == set()
     notice = discovered.unavailable_notice()
     assert notice is not None
-    assert notice.endswith(
-        "\n- tracker: MCP proxy error -32000: MCP service returned HTTP 500. Check the service."
+    service_line = notice.splitlines()[-1]
+    assert service_line.startswith(
+        "- tracker: MCP proxy error -32000: MCP service returned HTTP 500. Check the service. x"
     )
+    assert len(service_line) == len("- tracker: ") + 300
     assert "configured but unavailable" in notice
 
 
