@@ -303,7 +303,9 @@ def _read_state(bridge_dir: Path) -> _ForwardState | None:
             tools_in_flight=tools_in_flight if isinstance(tools_in_flight, int) else 0,
             last_edge_id=last_edge_id if isinstance(last_edge_id, str) else None,
             dropped_edge_status=(
-                dropped_edge_status if dropped_edge_status in _OUTCOME_STATUS else None
+                dropped_edge_status
+                if isinstance(dropped_edge_status, str) and dropped_edge_status in _OUTCOME_STATUS
+                else None
             ),
             dropped_edge_output=(
                 dropped_edge_output if isinstance(dropped_edge_output, str) else ""
