@@ -3,7 +3,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 
-import { useIsAdmin } from "@/hooks/useIsAdmin";
+import { useAdminViewSwitchShown } from "@/hooks/useAdminViewSwitchShown";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { getDesktopFeatures, supportsBrowser, supportsGlobalShortcut } from "@/lib/nativeBridge";
@@ -12,7 +12,6 @@ import type { SettingsAvailability } from "./catalog/types";
 
 export function useSettingsAvailability(): SettingsAvailability {
   const info = useServerInfo();
-  const isAdmin = useIsAdmin();
   const loaded = info === "loading" ? null : info;
   const providers = loaded?.enabled_connections ?? [];
   const globalShortcut = supportsGlobalShortcut();
@@ -32,7 +31,7 @@ export function useSettingsAvailability(): SettingsAvailability {
   const floatingComposerShortcut =
     globalShortcut && floatingComposerFlag && shellTakesPanelShortcut;
   const inAppBrowser = supportsBrowser();
-  const adminView = isAdmin && loaded?.admin_view !== false;
+  const adminView = useAdminViewSwitchShown();
   const accountsEnabled = loaded?.accounts_enabled === true;
   const archiveWorktreeCleanup = loaded?.archive_worktree_cleanup === true;
   const mcpServices = providers.includes("mcp");
