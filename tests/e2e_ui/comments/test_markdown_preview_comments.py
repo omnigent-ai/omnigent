@@ -166,7 +166,7 @@ def test_add_comment_from_markdown_preview(
     page: Page = request.getfixturevalue("page")
     file_viewer, preview = _open_preview(page, base_url, session_id)
 
-    # The old switch-to-edit hint is gone for regular Markdown.
+    # Regular Markdown shows no switch-to-edit hint in Preview.
     expect(file_viewer.get_by_text("switch to edit mode", exact=False)).to_have_count(0)
 
     paragraph = preview.locator("p").filter(has_text="Ship the")

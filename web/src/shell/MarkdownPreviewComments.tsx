@@ -12,6 +12,7 @@ import { ADD_COMMENT_BUTTON_CLASS_NAME } from "./addCommentButtonStyles";
 import type { ActiveSelection } from "./codeViewerHelpers";
 import {
   previewPointToSource,
+  previewRangeLookup,
   previewRangesForSource,
   previewSelectionToSource,
   type PreviewSourceSelection,
@@ -158,8 +159,11 @@ export function MarkdownPreviewComments({
         if (!pointerDown) offerButton();
       }, SELECTION_SETTLE_MS);
     };
+    // A drag released outside the preview never reaches the root's mouseup.
     const handleDocumentPointerUp = () => {
+      if (!pointerDown) return;
       pointerDown = false;
+      offerButton();
     };
 
     root.addEventListener("mousedown", handlePointerDown);
@@ -206,19 +210,13 @@ export function MarkdownPreviewComments({
           comment.end_index === activeSelection?.end_index,
       )?.id;
     const painted: PaintedRanges = { comment: [], active: [], pending: [] };
+    const rangesFor = previewRangeLookup(root, content);
     for (const comment of comments) {
-      const ranges = previewRangesForSource(root, content, comment.start_index, comment.end_index);
+      const ranges = rangesFor(comment.start_index, comment.end_index);
       painted[comment.id === activeId ? "active" : "comment"].push(...ranges);
     }
     if (activeSelection && !activeId) {
-      painted.pending.push(
-        ...previewRangesForSource(
-          root,
-          content,
-          activeSelection.start_index,
-          activeSelection.end_index,
-        ),
-      );
+      painted.pending.push(...rangesFor(activeSelection.start_index, activeSelection.end_index));
     }
     paintedByPreview.set(key, painted);
     repaint();
@@ -235,13 +233,15 @@ export function MarkdownPreviewComments({
     const { activeSelection: active } = latest.current;
     if (!root || !activeCommentId || !active) return;
     const [first] = previewRangesForSource(root, content, active.start_index, active.end_index);
-    const target = first?.startContainer.parentElement;
-    if (!target) return;
-    const rootRect = root.getBoundingClientRect();
-    const rect = target.getBoundingClientRect();
-    if (rect.top < rootRect.top || rect.bottom > rootRect.bottom) {
-      target.scrollIntoView({ block: "center", behavior: "smooth" });
-    }
+    if (!first) return;
+    // The comment's own rect: in a tall paragraph, the paragraph's could be in view without it.
+    const box = root.getBoundingClientRect();
+    const rect = first.getBoundingClientRect();
+    if (rect.top >= box.top && rect.bottom <= box.bottom) return;
+    root.scrollBy({
+      top: rect.top - box.top - box.height / 2 + rect.height / 2,
+      behavior: "smooth",
+    });
   }, [rootRef, content, activeCommentId]);
 
   if (!floating || !canEdit) return null;

@@ -9,7 +9,11 @@ import type { Comment } from "@/hooks/useComments";
 import * as permissions from "@/hooks/usePermissions";
 import { CodeViewer } from "./CodeViewer";
 import type { ActiveSelection } from "./codeViewerHelpers";
-import { alignTextToSource, rehypeSourceOffsets } from "./markdownPreviewSource";
+import {
+  alignTextToSource,
+  previewPointToSource,
+  rehypeSourceOffsets,
+} from "./markdownPreviewSource";
 
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn() }));
 
@@ -22,21 +26,15 @@ class FakeHighlight {
   }
 }
 
-const originalRangeLayout = {
-  getClientRects: Object.getOwnPropertyDescriptor(Range.prototype, "getClientRects") ?? {
-    configurable: true,
-    writable: true,
-    value: undefined,
-  },
-  getBoundingClientRect: Object.getOwnPropertyDescriptor(
-    Range.prototype,
-    "getBoundingClientRect",
-  ) ?? {
-    configurable: true,
-    writable: true,
-    value: undefined,
-  },
-};
+// jsdom has no Range layout or Element.scrollBy, so these are stubbed per test.
+const STUBBED_LAYOUT = [
+  [Range.prototype, "getClientRects"],
+  [Range.prototype, "getBoundingClientRect"],
+  [Element.prototype, "scrollBy"],
+] as const;
+const originalLayout = STUBBED_LAYOUT.map(
+  ([target, name]) => [target, name, Object.getOwnPropertyDescriptor(target, name)] as const,
+);
 
 beforeEach(() => {
   vi.mocked(permissions.useCanEdit).mockReturnValue(true);
@@ -55,13 +53,17 @@ beforeEach(() => {
   const rect = { top: 40, bottom: 60, left: 10, right: 50, width: 40, height: 20 } as DOMRect;
   Range.prototype.getClientRects = vi.fn(() => [rect] as unknown as DOMRectList);
   Range.prototype.getBoundingClientRect = vi.fn(() => rect);
+  Element.prototype.scrollBy = vi.fn();
 });
 
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
-  // jsdom has no Range layout methods, so restore whatever it had (usually nothing).
-  Object.defineProperties(Range.prototype, originalRangeLayout);
+  // Restore jsdom's methods, removing the stubs where it had none.
+  for (const [target, name, descriptor] of originalLayout) {
+    if (descriptor) Object.defineProperty(target, name, descriptor);
+    else Reflect.deleteProperty(target, name);
+  }
   window.getSelection()?.removeAllRanges();
 });
 
@@ -144,10 +146,11 @@ function domPoint(root: HTMLElement, index: number): [Text, number] {
   throw new Error(`offset ${index} is past the preview text`);
 }
 
-/** Select `text` as rendered (DOM text order), then release the mouse. */
-function selectRendered(text: string) {
+/** Select `text` (its last copy if `last`) as rendered, then release the mouse. */
+function selectRendered(text: string, { last = false } = {}) {
   const root = previewRoot();
-  const index = root.textContent?.indexOf(text) ?? -1;
+  const rendered = root.textContent ?? "";
+  const index = last ? rendered.lastIndexOf(text) : rendered.indexOf(text);
   if (index === -1) throw new Error(`"${text}" is not rendered`);
   const range = document.createRange();
   range.setStart(...domPoint(root, index));
@@ -187,7 +190,7 @@ describe("commenting on a selection in the Markdown preview", () => {
     ],
     ["a fenced code line", "```python\nprint('hi')\n```\n", "print", "print", "print"],
     ["inline code", "Run `just lint` now\n", "just lint", "just lint", "just lint"],
-    ["escaped markup", "a \\*star\\* b\n", "*star*", "*star*", "*star\\*"],
+    ["escaped markup", "a \\*star\\* b\n", "*star*", "*star*", "\\*star\\*"],
     ["a decoded entity", "Tom &amp; Jerry\n", "Tom & Jerry", "Tom & Jerry", "Tom &amp; Jerry"],
     ["text after an emoji shortcode", "Ship it :rocket: now\n", "now", "now", "now"],
     ["a quote's continuation line", "> alpha\n> beta\n", "pha\nbe", "pha\nbe", "pha\n> be"],
@@ -233,6 +236,15 @@ describe("commenting on a selection in the Markdown preview", () => {
     ],
     ["a named entity alone", "Made &copy; here\n", "©", "©", "&copy;"],
     ["an entity in inline code", "Write `&amp;` here\n", "&amp;", "&amp;", "&amp;"],
+    ["an escaped entity", "Write &amp;amp; here\n", "&amp;", "&amp;", "&amp;amp;"],
+    ["an emoji", "Ship it :rocket: now\n", "🚀", "🚀", ":rocket:"],
+    [
+      "a deeply indented continuation line",
+      `- item one\n${" ".repeat(30)}continues here\n`,
+      "one\ncontinues",
+      "one\ncontinues",
+      `one\n${" ".repeat(30)}continues`,
+    ],
   ])("anchors %s to its raw-source range", (_label, content, selected, quote, sourceSlice) => {
     const onSetActiveSelection = vi.fn();
     renderPreview(content, { onSetActiveSelection });
@@ -258,6 +270,22 @@ describe("commenting on a selection in the Markdown preview", () => {
     expect([anchor.start_index, anchor.end_index]).toEqual([5, 7]);
   });
 
+  it("offers the button when a drag is released outside the preview", () => {
+    renderPreview("Intro with Review word.\n");
+    const root = previewRoot();
+    const index = root.textContent?.indexOf("Review") ?? -1;
+    const range = document.createRange();
+    range.setStart(...domPoint(root, index));
+    range.setEnd(...domPoint(root, index + "Review".length));
+
+    fireEvent.mouseDown(root);
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    fireEvent.mouseUp(document.body);
+
+    expect(screen.getByRole("button", { name: "Add comment" })).toBeDefined();
+  });
+
   it("drops the button when the selection collapses", async () => {
     renderPreview("Intro with Review word.\n");
     selectRendered("Review");
@@ -270,15 +298,78 @@ describe("commenting on a selection in the Markdown preview", () => {
   });
 
   it("anchors the selected copy of repeated text", () => {
-    const content = "Repeat one.\n\nThen repeat again: Repeat two.\n";
+    const content = "Same word, then **Same** word.\n";
     const onSetActiveSelection = vi.fn();
     renderPreview(content, { onSetActiveSelection });
 
-    selectRendered("Repeat two");
+    selectRendered("Same word", { last: true });
     fireEvent.click(screen.getByRole("button", { name: "Add comment" }));
 
     const anchor = onSetActiveSelection.mock.calls[0][0] as ActiveSelection;
-    expect(anchor.start_index).toBe(content.lastIndexOf("Repeat two"));
+    const start = content.lastIndexOf("Same");
+    expect([anchor.start_index, anchor.end_index]).toEqual([
+      start,
+      content.lastIndexOf("word") + 4,
+    ]);
+  });
+
+  it("offers no button for a selection across rendered math", () => {
+    renderPreview("Area $$x^2$$ grows fast\n");
+    const root = previewRoot();
+    const rendered = root.textContent ?? "";
+    const range = document.createRange();
+    range.setStart(...domPoint(root, rendered.indexOf("Area")));
+    range.setEnd(...domPoint(root, rendered.indexOf("grows") + "grows".length));
+    window.getSelection()!.removeAllRanges();
+    window.getSelection()!.addRange(range);
+    fireEvent.mouseDown(root);
+    fireEvent.mouseUp(root);
+
+    expect(screen.queryByRole("button", { name: "Add comment" })).toBeNull();
+  });
+
+  it("matches every rendered span of a mixed document to its source", () => {
+    const content = [
+      "# Title :rocket: &copy;",
+      "",
+      "Text with \\*stars\\*, a footnote[^1], `code &amp;` and Tom &amp; Jerry.",
+      "",
+      "> Quoted line",
+      "> and its continuation",
+      "",
+      "- [ ] task item",
+      "- item with",
+      "      deep continuation",
+      "",
+      "  ```js",
+      "  const indented = 1;",
+      "  ```",
+      "",
+      "| a | b \\| c |",
+      "|---|---|",
+      "| cell | two |",
+      "",
+      "> [!NOTE]",
+      "> Mind the gap",
+      "",
+      "<details><summary>More</summary>",
+      "",
+      "Hidden body",
+      "",
+      "</details>",
+      "",
+      "Line one  ",
+      "line two",
+      "",
+      "[^1]: The note.",
+      "",
+    ].join("\n");
+    renderPreview(content);
+
+    const unmatched = [...previewRoot().querySelectorAll("span[data-source-start]")]
+      .filter((span) => previewPointToSource(span.firstChild!, 0, content) === null)
+      .map((span) => span.textContent);
+    expect(unmatched).toEqual([]);
   });
 
   it("offers no button to read-only viewers", () => {
@@ -391,6 +482,27 @@ describe("saved comments in the Markdown preview", () => {
     expect(painted.get("md-preview-comment")).toEqual(["am"]);
   });
 
+  it("scrolls the chosen comment's own text into view", () => {
+    const tall = `${"Filler words. ".repeat(40)}Review this.\n`;
+    const review = comment("c1", tall, "Review");
+    const inView = { top: 0, bottom: 100, left: 0, right: 100, width: 100, height: 100 };
+    const layout = vi
+      .spyOn(Element.prototype, "getBoundingClientRect")
+      .mockReturnValue(inView as DOMRect);
+    const below = { top: 300, bottom: 320, left: 10, right: 50, width: 40, height: 20 };
+    Range.prototype.getBoundingClientRect = vi.fn(() => below as DOMRect);
+    try {
+      renderPreview(tall, {
+        comments: [review],
+        activeSelection: { ...review, anchor_content: "Review", comment_id: "c1" },
+      });
+
+      expect(previewRoot().scrollBy).toHaveBeenCalledWith({ top: 260, behavior: "smooth" });
+    } finally {
+      layout.mockRestore();
+    }
+  });
+
   it("removes its highlights when the preview closes", async () => {
     const view = renderPreview(content, { comments: [comment("c1", content, "Review")] });
     expect(painted.get("md-preview-comment")).toEqual(["Review"]);
@@ -399,12 +511,60 @@ describe("saved comments in the Markdown preview", () => {
 
     expect(painted.get("md-preview-comment")).toEqual([]);
   });
+
+  it("keeps another preview's highlights when one closes", async () => {
+    const first = renderPreview(content, { comments: [comment("c1", content, "Review")] });
+    renderPreview(content, { comments: [comment("c2", content, "second note")] });
+    expect(painted.get("md-preview-comment")).toEqual(["Review", "second note"]);
+
+    await act(async () => first.unmount());
+
+    expect(painted.get("md-preview-comment")).toEqual(["second note"]);
+  });
 });
 
 describe("rehypeSourceOffsets", () => {
   const position = (start: number, end: number) => ({
     start: { offset: start },
     end: { offset: end },
+  });
+
+  it("places repeated unpositioned alert children in order", () => {
+    const source = "> [!NOTE]\n> Same\n>\n> Same\n\nAfter\n";
+    const paragraph = () => ({
+      type: "element",
+      tagName: "p",
+      children: [{ type: "text", value: "Same" }],
+    });
+    const after = source.indexOf("After");
+    const tree = {
+      type: "root",
+      children: [
+        {
+          type: "element",
+          tagName: "div",
+          properties: { className: ["markdown-alert"] },
+          children: [paragraph(), paragraph()],
+        },
+        {
+          type: "element",
+          tagName: "p",
+          position: position(after, after + 5),
+          children: [{ type: "text", value: "After", position: position(after, after + 5) }],
+        },
+      ],
+    };
+
+    rehypeSourceOffsets()(tree as never, { value: source });
+
+    const alertChildren = tree.children[0].children as { children: unknown[] }[];
+    const starts = alertChildren.map(
+      (child) => (child.children[0] as { properties?: { dataSourceStart?: number } }).properties,
+    );
+    expect(starts).toEqual([
+      expect.objectContaining({ dataSourceStart: source.indexOf("Same") }),
+      expect.objectContaining({ dataSourceStart: source.lastIndexOf("Same") }),
+    ]);
   });
 
   it("wraps positioned text but leaves math, Mermaid and blank text alone", () => {
@@ -474,15 +634,37 @@ describe("alignTextToSource", () => {
 
   it("skips markers the renderer dropped", () => {
     const source = "> one\n> two";
-    expect(alignTextToSource("one\ntwo", source, 2, source.length).starts).toEqual([
+    expect(alignTextToSource("one\ntwo", source, 2, source.length)?.starts).toEqual([
       2, 3, 4, 5, 8, 9, 10,
     ]);
   });
 
-  it("keeps characters after an unmatched glyph aligned", () => {
+  it("skips an indent of any width", () => {
+    const source = `one\n${" ".repeat(30)}two`;
+    expect(alignTextToSource("one\ntwo", source, 0, source.length)?.starts).toEqual([
+      0, 1, 2, 3, 34, 35, 36,
+    ]);
+  });
+
+  it("spans an emoji glyph over its shortcode", () => {
     const source = "a :rocket: b";
-    const offsets = alignTextToSource("a 🚀 b", source, 0, source.length).starts;
-    expect(offsets.at(-1)).toBe(source.length - 1);
-    expect(offsets.at(-2)).toBe(source.length - 2);
+    expect(alignTextToSource("a 🚀 b", source, 0, source.length)).toEqual({
+      starts: [0, 1, 2, 2, 10, 11],
+      ends: [1, 2, 10, 10, 11, 12],
+    });
+  });
+
+  it("decodes entities in prose but not in code", () => {
+    const source = "&amp;amp;\n  &amp;";
+    expect(alignTextToSource("&amp;", source, 0, 9)?.starts).toEqual([0, 5, 6, 7, 8]);
+    expect(alignTextToSource("&amp;amp;\n&amp;", source, 0, source.length, true)?.starts).toEqual([
+      0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13, 14, 15, 16,
+    ]);
+    expect(alignTextToSource("&\n&", source, 0, source.length, true)).toBeNull();
+  });
+
+  it("declines text it cannot match to its source", () => {
+    const source = "a :rocket: b";
+    expect(alignTextToSource("a ? b", source, 0, source.length)).toBeNull();
   });
 });

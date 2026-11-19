@@ -5,6 +5,7 @@
 const SOURCE_START = "data-source-start";
 const SOURCE_END = "data-source-end";
 const SOURCE_BLOCK = "data-source-block";
+const SOURCE_VERBATIM = "data-source-verbatim";
 const SPAN_SELECTOR = `span[${SOURCE_START}]`;
 
 // Elements whose text is a separate block in the editor's comment quote, which
@@ -43,10 +44,6 @@ const CONTAINER_TAGS = new Set([
   "div",
   "details",
 ]);
-
-// How far ahead one rendered character may sit from the previous match, e.g.
-// past a quote marker, list indent or entity that the renderer dropped.
-const ALIGN_WINDOW = 24;
 
 interface HastPoint {
   offset?: number;
@@ -112,13 +109,20 @@ function rangeOf(position: HastPosition | undefined): [number, number] | null {
   return typeof start === "number" && typeof end === "number" && end > start ? [start, end] : null;
 }
 
-function wrap(text: HastText, range: [number, number], block: number): HastElement {
-  return {
-    type: "element",
-    tagName: "span",
-    properties: { dataSourceStart: range[0], dataSourceEnd: range[1], dataSourceBlock: block },
-    children: [text],
+function wrap(
+  text: HastText,
+  range: [number, number],
+  block: number,
+  verbatim: boolean,
+): HastElement {
+  const properties: Record<string, unknown> = {
+    dataSourceStart: range[0],
+    dataSourceEnd: range[1],
+    dataSourceBlock: block,
   };
+  // Code shows its source as written: no entities, escapes or emoji shortcodes.
+  if (verbatim) properties.dataSourceVerbatim = "true";
+  return { type: "element", tagName: "span", properties, children: [text] };
 }
 
 // Text that a plugin rebuilt (emoji shortcodes) or that never had a position (a
@@ -154,14 +158,16 @@ export function rehypeSourceOffsets() {
       block: number,
       parentRange: [number, number] | null,
       inAlert: boolean,
-    ) => {
+      inCode: boolean,
+    ): number => {
       let cursor = parentRange?.[0] ?? 0;
       // Unplaced text waiting for the next placed sibling to bound its range.
       let unplaced: { index: number; start: number }[] = [];
       const place = (end: number) => {
         for (const { index, start } of unplaced) {
           if (end > start) {
-            parent.children[index] = wrap(parent.children[index] as HastText, [start, end], block);
+            const text = parent.children[index] as HastText;
+            parent.children[index] = wrap(text, [start, end], block, inCode);
           }
         }
         unplaced = [];
@@ -180,10 +186,15 @@ export function rehypeSourceOffsets() {
           const alert = inAlert || isAlert(element);
           let childRange = range;
           if (!childRange && alert && source) {
-            const end = nextStart(parent.children, index) ?? parentRange?.[1] ?? source.length;
-            childRange = inAlert ? parentRange : end > cursor ? [cursor, end] : null;
+            // Inside an alert, siblings share its range, so each starts where the last ended.
+            const end = inAlert
+              ? parentRange?.[1]
+              : (nextStart(parent.children, index) ?? parentRange?.[1] ?? source.length);
+            childRange = end !== undefined && end > cursor ? [cursor, end] : null;
           }
-          visit(element, childBlock, childRange, alert);
+          const code = inCode || element.tagName === "code" || element.tagName === "pre";
+          const consumed = visit(element, childBlock, childRange, alert, code);
+          if (!range && childRange) cursor = consumed;
         } else if (child.type === "text") {
           const text = child as HastText;
           let range = rangeOf(text.position);
@@ -199,29 +210,39 @@ export function rehypeSourceOffsets() {
           }
           if (!range) continue;
           place(range[0]);
-          parent.children[index] = wrap(text, range, block);
+          parent.children[index] = wrap(text, range, block, inCode);
           cursor = range[1];
         } else if ("children" in child && child.children) {
-          visit(child as HastParent, block, null, inAlert);
+          visit(child as HastParent, block, null, inAlert, inCode);
         }
       }
       if (parentRange) place(parentRange[1]);
+      return cursor;
     };
-    visit(tree, 0, null, false);
+    visit(tree, 0, null, false, false);
   };
 }
 
 // Character references as CommonMark recognizes them; sticky, so it matches at
 // `lastIndex` only.
 const ENTITY_PATTERN = /&(?:#\d{1,7}|#x[\da-f]{1,6}|[a-z][\da-z]*);/iy;
+// remark-emoji's shortcode syntax, and the glyph it renders one as.
+const SHORTCODE_PATTERN = /:\+1:|:-1:|:[\w-]+:/y;
+const EMOJI_PATTERN =
+  /(?:[#*0-9]\ufe0f?\u20e3|\p{Extended_Pictographic}|\p{Emoji_Modifier}|\p{Regional_Indicator}|\u200d|\ufe0f|[\u{e0020}-\u{e007f}])+/uy;
+const ESCAPABLE = /[!-/:-@[-`{-~]/;
 
 let entityDecoder: HTMLTextAreaElement | null = null;
 
-// The pattern admits only `&name;`/`&#n;` text, so no markup is parsed here.
-function decodeEntity(entity: string): string {
+/** Decoded text of a character reference, or null when Markdown keeps it literally. */
+function decodeEntity(entity: string): string | null {
+  // The pattern admits only `&name;`/`&#n;` text, so no markup is parsed here.
   entityDecoder ??= document.createElement("textarea");
   entityDecoder.innerHTML = entity;
-  return entityDecoder.value;
+  const decoded = entityDecoder.value;
+  // HTML also decodes a known prefix (`&ampx;` as `&x;`), which Markdown does not.
+  if (decoded === entity || (decoded.length > 1 && decoded.endsWith(";"))) return null;
+  return decoded;
 }
 
 /** Raw-source range [starts[i], ends[i]) that rendered character `i` came from. */
@@ -231,64 +252,93 @@ export interface TextAlignment {
 }
 
 /**
- * Source range of each character of `text`, which renders `source[start, end)`.
- * Characters are matched in order, a decoded entity spanning its whole reference;
- * one with no match nearby (an emoji glyph, say) takes the next unmatched source
- * character.
+ * Source range of each character of `text`, which renders `source[start, end)`,
+ * or null when the text can't be matched to it. Prose may decode entities,
+ * escapes and emoji shortcodes; `verbatim` (code) text matches as written. A
+ * line's trailing spaces and its indent or quote markers may be dropped, and
+ * whitespace with no source takes an empty range.
  */
 export function alignTextToSource(
   text: string,
   source: string,
   start: number,
   end: number,
-): TextAlignment {
+  verbatim = false,
+): TextAlignment | null {
   const starts = new Array<number>(text.length);
   const ends = new Array<number>(text.length);
-  const assign = (index: number, count: number, from: number, to: number) => {
-    for (let offset = 0; offset < count; offset += 1) {
-      starts[index + offset] = from;
-      ends[index + offset] = to;
-    }
-  };
   if (source.slice(start, end) === text) {
     for (let index = 0; index < text.length; index += 1) {
-      assign(index, 1, start + index, start + index + 1);
+      starts[index] = start + index;
+      ends[index] = start + index + 1;
     }
     return { starts, ends };
   }
+  // Rendered and source lengths of the construct at `position` that renders
+  // text from `index`, or null when none does.
+  const match = (index: number, position: number): [number, number] | null => {
+    const char = source[position];
+    if (!verbatim && char === "\\") {
+      const escaped = source[position + 1];
+      if (position + 1 < end && ESCAPABLE.test(escaped) && text[index] === escaped) return [1, 2];
+    }
+    if (!verbatim && char === "&") {
+      ENTITY_PATTERN.lastIndex = position;
+      const entity = ENTITY_PATTERN.exec(source)?.[0];
+      const decoded = entity && position + entity.length <= end ? decodeEntity(entity) : null;
+      if (entity && decoded !== null) {
+        return text.startsWith(decoded, index) ? [decoded.length, entity.length] : null;
+      }
+    }
+    if (!verbatim && char === ":") {
+      SHORTCODE_PATTERN.lastIndex = position;
+      const shortcode = SHORTCODE_PATTERN.exec(source)?.[0];
+      EMOJI_PATTERN.lastIndex = index;
+      const glyph =
+        shortcode && position + shortcode.length <= end && EMOJI_PATTERN.exec(text)?.[0];
+      if (shortcode && glyph) return [glyph.length, shortcode.length];
+    }
+    return char === text[index] ? [1, 1] : null;
+  };
+  const zeroWidth = (index: number, at: number) => {
+    starts[index] = at;
+    ends[index] = at;
+  };
+  // Syntax before the first visible character (a heading's `#`) renders nothing,
+  // and whitespace before it may be generated (after a task's checkbox).
+  const lead = text.search(/\S/);
   let cursor = start;
-  let index = 0;
+  if (lead > -1) while (cursor < end && !match(lead, cursor)) cursor += 1;
+  for (let index = 0; index < lead; index += 1) zeroWidth(index, cursor);
+  let index = Math.max(lead, 0);
+  let lineStart = false;
   while (index < text.length) {
-    const limit = index === 0 ? end : Math.min(end, cursor + ALIGN_WINDOW);
-    let matched = 0;
-    for (let position = cursor; position < limit; position += 1) {
-      if (source[position] === "&") {
-        ENTITY_PATTERN.lastIndex = position;
-        const entity = ENTITY_PATTERN.exec(source)?.[0];
-        // Code renders a reference verbatim, so a literal match wins.
-        if (entity && position + entity.length <= end && !text.startsWith(entity, index)) {
-          const decoded = decodeEntity(entity);
-          if (decoded && decoded !== entity && text.startsWith(decoded, index)) {
-            assign(index, decoded.length, position, position + entity.length);
-            matched = decoded.length;
-            cursor = position + entity.length;
-            break;
-          }
-        }
+    const step = cursor < end ? match(index, cursor) : null;
+    if (step) {
+      const [rendered, raw] = step;
+      for (let offset = 0; offset < rendered; offset += 1) {
+        starts[index + offset] = cursor;
+        ends[index + offset] = cursor + raw;
       }
-      if (source[position] === text[index]) {
-        assign(index, 1, position, position + 1);
-        matched = 1;
-        cursor = position + 1;
-        break;
-      }
+      index += rendered;
+      cursor += raw;
+      lineStart = text[index - 1] === "\n";
+      continue;
     }
-    if (matched === 0) {
-      const fallback = Math.min(cursor, end - 1);
-      assign(index, 1, fallback, fallback + 1);
-      matched = 1;
+    const skipped = source[cursor];
+    const dropped =
+      cursor < end &&
+      ((text[index] === "\n" && (skipped === " " || skipped === "\t" || skipped === "\r")) ||
+        (lineStart && (skipped === " " || skipped === "\t" || skipped === ">")));
+    if (dropped) {
+      cursor += 1;
+    } else if (/\s/.test(text[index])) {
+      // Whitespace the renderer added, e.g. before a footnote's back link.
+      zeroWidth(index, cursor);
+      index += 1;
+    } else {
+      return null;
     }
-    index += matched;
   }
   return { starts, ends };
 }
@@ -297,12 +347,22 @@ interface SourceSpan {
   element: HTMLElement;
   text: Text;
   block: string;
-  alignment: TextAlignment;
+  start: number;
+  end: number;
+  /** Null when the text couldn't be matched to its source, so no part of it maps. */
+  alignment: TextAlignment | null;
 }
 
 const alignmentCache = new WeakMap<
   HTMLElement,
-  { source: string; start: number; end: number; value: string; alignment: TextAlignment }
+  {
+    source: string;
+    start: number;
+    end: number;
+    value: string;
+    verbatim: boolean;
+    alignment: TextAlignment | null;
+  }
 >();
 
 function readSpan(element: HTMLElement, source: string): SourceSpan | null {
@@ -314,21 +374,29 @@ function readSpan(element: HTMLElement, source: string): SourceSpan | null {
     return null;
   }
   const value = text.data;
+  const verbatim = element.hasAttribute(SOURCE_VERBATIM);
   const cached = alignmentCache.get(element);
-  let alignment: TextAlignment;
+  let alignment: TextAlignment | null;
   if (
     cached &&
     cached.source === source &&
     cached.start === start &&
     cached.end === end &&
-    cached.value === value
+    cached.value === value &&
+    cached.verbatim === verbatim
   ) {
     alignment = cached.alignment;
   } else {
-    alignment = alignTextToSource(value, source, start, end);
-    alignmentCache.set(element, { source, start, end, value, alignment });
+    alignment = alignTextToSource(value, source, start, end, verbatim);
+    alignmentCache.set(element, { source, start, end, value, verbatim, alignment });
   }
-  return { element, text, block: element.getAttribute(SOURCE_BLOCK) ?? "", alignment };
+  const block = element.getAttribute(SOURCE_BLOCK) ?? "";
+  return { element, text, block, start, end, alignment };
+}
+
+function mappedSpan(text: Text, source: string): SourceSpan | null {
+  const element = text.parentElement;
+  return element?.matches(SPAN_SELECTOR) ? readSpan(element, source) : null;
 }
 
 function sourceSpans(root: HTMLElement, source: string): SourceSpan[] {
@@ -371,11 +439,19 @@ export function previewSelectionToSource(
   root: HTMLElement,
   source: string,
 ): PreviewSourceSelection | null {
-  const pieces: { span: SourceSpan; from: number; to: number }[] = [];
-  for (const span of sourceSpans(root, source)) {
-    if (!range.intersectsNode(span.text)) continue;
-    const slice = selectedSlice(range, span.text);
-    if (slice) pieces.push({ span, from: slice[0], to: slice[1] });
+  // `unmapped` counts selected text with no source range (rendered math, an
+  // alert title) before each piece; the editor's quote would include it.
+  const pieces: { span: SourceSpan; from: number; to: number; unmapped: number }[] = [];
+  let unmapped = 0;
+  const walker = root.ownerDocument.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    const text = node as Text;
+    if (!range.intersectsNode(text)) continue;
+    const slice = selectedSlice(range, text);
+    if (!slice) continue;
+    const span = mappedSpan(text, source);
+    if (span) pieces.push({ span, from: slice[0], to: slice[1], unmapped });
+    else if (text.data.slice(slice[0], slice[1]).trim()) unmapped += 1;
   }
   // Trim whitespace at both ends, dropping pieces that become empty.
   while (pieces.length > 0) {
@@ -391,28 +467,29 @@ export function previewSelectionToSource(
     pieces.pop();
   }
   if (pieces.length === 0) return null;
+  const first = pieces[0];
+  const last = pieces[pieces.length - 1];
+  const firstAlignment = first.span.alignment;
+  const lastAlignment = last.span.alignment;
+  if (first.unmapped !== last.unmapped || !firstAlignment || !lastAlignment) return null;
 
   let anchor_content = "";
   pieces.forEach((piece, index) => {
     if (index > 0 && piece.span.block !== pieces[index - 1].span.block) anchor_content += "\n";
     anchor_content += piece.span.text.data.slice(piece.from, piece.to);
   });
-  const first = pieces[0];
-  const last = pieces[pieces.length - 1];
   return {
-    start_index: first.span.alignment.starts[first.from],
-    end_index: last.span.alignment.ends[last.to - 1],
+    start_index: firstAlignment.starts[first.from],
+    end_index: lastAlignment.ends[last.to - 1],
     anchor_content,
   };
 }
 
 /** Raw-source offset of a caret position in the preview, or null off mapped text. */
 export function previewPointToSource(node: Node, offset: number, source: string): number | null {
-  const element = node instanceof Text ? node.parentElement : null;
-  if (!element?.matches(SPAN_SELECTOR)) return null;
-  const span = readSpan(element, source);
-  const { starts, ends } = span?.alignment ?? { starts: [], ends: [] };
-  if (starts.length === 0) return null;
+  const alignment = node instanceof Text ? mappedSpan(node, source)?.alignment : null;
+  if (!alignment || alignment.starts.length === 0) return null;
+  const { starts, ends } = alignment;
   // A caret after a node's last character sits just past that character's source.
   return offset >= starts.length ? ends[ends.length - 1] : starts[offset];
 }
@@ -424,19 +501,46 @@ export function previewRangesForSource(
   start: number,
   end: number,
 ): Range[] {
+  return previewRangeLookup(root, source)(start, end);
+}
+
+/** Reads the preview's mapped text once, for finding the ranges of many comments. */
+export function previewRangeLookup(
+  root: HTMLElement,
+  source: string,
+): (start: number, end: number) => Range[] {
+  const spans = sourceSpans(root, source);
+  return (start, end) => rangesInSpans(root, spans, start, end);
+}
+
+function rangesInSpans(
+  root: HTMLElement,
+  spans: SourceSpan[],
+  start: number,
+  end: number,
+): Range[] {
   const ranges: Range[] = [];
   if (end <= start) return ranges;
-  for (const span of sourceSpans(root, source)) {
+  const textRange = (text: Text, from: number, to: number) => {
+    const range = root.ownerDocument.createRange();
+    range.setStart(text, from);
+    range.setEnd(text, to);
+    return range;
+  };
+  for (const span of spans) {
+    if (!span.alignment) {
+      // Unmatched text is shown only when the comment covers all of it.
+      if (start <= span.start && span.end <= end) {
+        ranges.push(textRange(span.text, 0, span.text.length));
+      }
+      continue;
+    }
     const { starts, ends } = span.alignment;
     let from = 0;
     while (from < ends.length && ends[from] <= start) from += 1;
     let to = from;
     while (to < starts.length && starts[to] < end) to += 1;
-    if (from >= to) continue;
-    const range = root.ownerDocument.createRange();
-    range.setStart(span.text, from);
-    range.setEnd(span.text, to);
-    ranges.push(range);
+    if (from < to) ranges.push(textRange(span.text, from, to));
   }
   return ranges;
 }
