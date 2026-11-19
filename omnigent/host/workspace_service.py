@@ -24,6 +24,8 @@ import shutil
 import socket
 import tempfile
 from collections.abc import AsyncIterator, Callable
+from contextlib import aclosing
+from dataclasses import dataclass
 from pathlib import Path
 from typing import ParamSpec, TypeVar
 
@@ -53,6 +55,7 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     ReadFileResponse,
 )
 from omnigent.host.frames import HostWorkspaceCallFrame, HostWorkspaceReplyFrame
+from omnigent.host.workspace_methods import WORKSPACE_METHODS
 from omnigent.host.workspace_tokens import new_token_key, verify_token
 from omnigent.inner.async_utils import run_sync_on_thread
 from omnigent.util.uvicorn_server import NoSignalServer
@@ -64,11 +67,39 @@ _logger = logging.getLogger(__name__)
 _MAX_PAGE_SIZE = 1000
 # Small enough to keep a stream responsive, large enough to keep framing cheap.
 _READ_CHUNK_BYTES = 64 * 1024
-_CAPABILITIES = ("ListDirectory", "ReadFile")
 _ERROR_CODES = {400: Code.INVALID_ARGUMENT, 404: Code.NOT_FOUND}
 # A local socket bind; seconds means something is wrong, and the host goes on without it.
 _SOCKET_STARTUP_TIMEOUT_S = 5.0
 _SOCKET_SHUTDOWN_TIMEOUT_S = 2.0
+
+
+@dataclass(frozen=True)
+class _Served:
+    """How this host serves one method.
+
+    :param features: Optional features it offers, e.g. ``"search_files.substring"``.
+    :param tool: A program it needs on ``PATH``; without it, the method isn't listed.
+    """
+
+    features: tuple[str, ...] = ()
+    tool: str | None = None
+
+
+# The methods this host answers. Only these, and GetCapabilities, are dispatched.
+_SERVED: dict[str, _Served] = {
+    "ListDirectory": _Served(),
+    "ReadFile": _Served(),
+}
+
+
+def capabilities() -> list[str]:
+    """The method and feature names GetCapabilities lists on this host."""
+    names: list[str] = []
+    for name, served in _SERVED.items():
+        if served.tool is None or shutil.which(served.tool):
+            names += [name, *served.features]
+    return names
+
 
 # The context is ``None`` for calls that arrive over the host tunnel.
 ReaderForCall = Callable[[RequestContext | None], WorkspaceReader]
@@ -102,7 +133,7 @@ class WorkspaceService(WorkspaceServiceMethods):
         _request: GetCapabilitiesRequest,
         _ctx: RequestContext[GetCapabilitiesRequest, GetCapabilitiesResponse] | None,
     ) -> GetCapabilitiesResponse:
-        return GetCapabilitiesResponse(capabilities=_CAPABILITIES)
+        return GetCapabilitiesResponse(capabilities=capabilities())
 
     async def list_directory(
         self,
@@ -164,16 +195,23 @@ def _reader_at(
 
 
 async def _call(service: WorkspaceService, method: str, request: bytes) -> AsyncIterator[Message]:
-    """Run one serialized call against ``service``, yielding its responses."""
-    if method == "GetCapabilities":
-        yield await service.get_capabilities(GetCapabilitiesRequest.FromString(request), None)
-    elif method == "ListDirectory":
-        yield await service.list_directory(ListDirectoryRequest.FromString(request), None)
-    elif method == "ReadFile":
-        async for response in service.read_file(ReadFileRequest.FromString(request), None):
-            yield response
-    else:
+    """Run one serialized call against ``service``, yielding its responses.
+
+    The handler comes from the method table, never from an attribute the
+    caller names, so only served methods can run.
+    """
+    if method != "GetCapabilities" and method not in _SERVED:
         raise ConnectError(Code.UNIMPLEMENTED, f"Unknown workspace method {method!r}")
+    served = WORKSPACE_METHODS[method]
+    handler = getattr(service, served.python_name)
+    parsed = served.request_type.FromString(request)
+    if not served.streaming:
+        yield await handler(parsed, None)
+        return
+    # Closing this call early must stop the stream's work, not leave it to the GC.
+    async with aclosing(handler(parsed, None)) as responses:
+        async for response in responses:
+            yield response
 
 
 async def serve_tunnel_call(

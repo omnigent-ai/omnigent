@@ -17,7 +17,7 @@ import signal
 import socket
 import stat
 import time
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -43,6 +43,7 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     ReadFileRequest,
     SearchFilesRequest,
     SearchTextRequest,
+    SearchTextResponse,
 )
 from omnigent.host.frames import (
     CAP_WORKSPACE_API,
@@ -53,7 +54,9 @@ from omnigent.host.frames import (
     encode_host_frame,
 )
 from omnigent.host.workspace_service import (
+    _SERVED,
     WorkspaceService,
+    _Served,
     serve_tunnel_call,
     start_workspace_socket,
 )
@@ -103,6 +106,7 @@ def _server_app(
     flag: bool = True,
     side_chat: bool = False,
     remote_host: bool = False,
+    content_search: bool = False,
 ) -> FastAPI:
     """The sessions API, with the session's host answering over an in-memory tunnel.
 
@@ -176,7 +180,10 @@ def _server_app(
             lambda _host: WrongReplicaError("host is on another replica", host_id="host_ws"),
         )
     if flag:
-        app.state.feature_flags = FeatureFlags(frozenset({Feature.WORKSPACE_API_SERVER_ACCESS}))
+        features = {Feature.WORKSPACE_API_SERVER_ACCESS}
+        if content_search:
+            features.add(Feature.WORKSPACE_CONTENT_SEARCH)
+        app.state.feature_flags = FeatureFlags(frozenset(features))
     router = create_sessions_router(
         store,  # type: ignore[arg-type]
         _StubAgentStore(),  # type: ignore[arg-type]
@@ -408,6 +415,54 @@ async def test_server_route_serves_a_side_chat_from_its_source_session(
     assert "notes.md" in {e.name for e in page.entries}
 
 
+@pytest.mark.parametrize("content_search", [True, False], ids=["flag-on", "flag-off"])
+async def test_server_route_serves_text_search_only_with_its_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, content_search: bool
+) -> None:
+    """With its flag off, SearchText is refused and unlisted even when the host serves it."""
+    reached: list[str] = []
+
+    async def search_text(
+        _self: WorkspaceService, _request: SearchTextRequest, _ctx: object
+    ) -> AsyncIterator[SearchTextResponse]:
+        reached.append("SearchText")
+        yield SearchTextResponse(done=True)
+
+    monkeypatch.setitem(_SERVED, "SearchText", _Served())
+    monkeypatch.setattr(WorkspaceService, "search_text", search_text)
+    app = _server_app(_workspace(tmp_path), monkeypatch, content_search=content_search)
+    client = _connect(app, _SERVER_BASE, ProtocolType.CONNECT)
+
+    capabilities = set((await client.get_capabilities(GetCapabilitiesRequest())).capabilities)
+    if content_search:
+        searched = [m async for m in client.search_text(SearchTextRequest(query="q"))]
+        assert searched[-1].done
+    else:
+        with pytest.raises(ConnectError) as refused:
+            [m async for m in client.search_text(SearchTextRequest(query="q"))]
+        assert refused.value.code == Code.UNIMPLEMENTED
+
+    assert ("SearchText" in capabilities) is content_search
+    assert reached == (["SearchText"] if content_search else [])
+
+
+@pytest.mark.parametrize(
+    "method",
+    ["Bogus", "list_directory", "__init__", "_reader_for", "GetInfo", "OpenWorkspace"],
+)
+async def test_tunnel_dispatches_only_methods_in_the_table(tmp_path: Path, method: str) -> None:
+    """A method name from the wire never selects an attribute the table doesn't list."""
+    frame = HostWorkspaceCallFrame(
+        request_id="r1", workspace=str(tmp_path), method=method, request=b""
+    )
+
+    replies = [
+        reply async for reply in serve_tunnel_call(lambda ws: WorkspaceReader(Path(ws)), frame)
+    ]
+
+    assert [(r.done, r.error_code) for r in replies] == [(True, Code.UNIMPLEMENTED.value)]
+
+
 async def test_server_route_readdresses_a_host_on_another_replica(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -433,7 +488,7 @@ async def test_host_disconnect_ends_a_waiting_call(tmp_path: Path) -> None:
     hello = HostHelloFrame(version="t", frame_protocol_version=1, name="ws")
     conn = registry.register("host_ws", object(), hello, owner=None)  # type: ignore[arg-type]
     registry.send_text = lambda *_: None  # type: ignore[method-assign]
-    service = HostWorkspaceService(HostTarget(registry, conn, str(tmp_path)))
+    service = HostWorkspaceService(HostTarget(registry, conn, str(tmp_path)), content_search=False)
 
     call = asyncio.create_task(service.list_directory(ListDirectoryRequest(), None))  # type: ignore[arg-type]
     await poll_until_async(lambda: conn.pending_workspace_calls, timeout_s=5)

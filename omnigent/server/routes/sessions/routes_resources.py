@@ -2872,7 +2872,10 @@ def register_resources_routes(
             )
         else:
             target = HostTarget(host_registry, host, reach[2])
-        app = WorkspaceServiceASGIApplication(HostWorkspaceService(target))
+        forwarder = HostWorkspaceService(
+            target, content_search=flags.enabled(Feature.WORKSPACE_CONTENT_SEARCH)
+        )
+        app = WorkspaceServiceASGIApplication(forwarder)
         # connectrpc types ASGI with asgiref's TypedDicts; Starlette's are plain mappings.
         return ConnectCallResponse(cast("ASGIApp", app), f"/{service}/{method}")
 
