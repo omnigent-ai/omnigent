@@ -19,7 +19,8 @@ the header menu), and each place is a separate entry point.
   action, and legacy individual pins keep their place inside the nest.
   Opening Add nested agent shows a draft row in the family until creation
   replaces it. Navigate away and click the draft row to resume its text, attachments,
-  and settings during the same page load; **Delete draft** in the composer removes it.
+  and settings during the same page load. Right-click the draft row and choose
+  **Delete draft** to remove it.
   Owned active sessions can move into an existing nest by dragging onto its center
   or choosing **Move session → Nests** in the sidebar menu. Choose a searchable
   destination, or **Remove from nest** to detach just that session. Dragging a

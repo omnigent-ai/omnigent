@@ -2204,7 +2204,7 @@ describe("Sidebar sections", () => {
     expect(screen.queryByText("conv_only_mine")).toBeNull();
   });
 
-  it("highlights only the nested draft currently open in the composer", async () => {
+  it("highlights the open nested draft and deletes a parked draft from its context menu", async () => {
     mockConversations([conv("conv_first", "Codex"), conv("conv_second", "Codex")]);
     const { queryClient } = renderSidebar(true, "/?sibling=conv_first");
     act(() => {
@@ -2226,9 +2226,10 @@ describe("Sidebar sections", () => {
     fireEvent.click(second);
     expect(first).not.toHaveClass("bg-[var(--sidebar-active)]");
     expect(second).toHaveClass("bg-[var(--sidebar-active)]");
-    fireEvent.click(screen.getByText("conv_first"));
-    expect(first).not.toHaveClass("bg-[var(--sidebar-active)]");
-    expect(second).not.toHaveClass("bg-[var(--sidebar-active)]");
+    fireEvent.contextMenu(first);
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Delete draft" }));
+    await waitFor(() => expect(first).not.toBeInTheDocument());
+    expect(second).toHaveClass("bg-[var(--sidebar-active)]");
   });
 
   it.each([

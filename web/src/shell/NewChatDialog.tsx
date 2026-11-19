@@ -101,7 +101,6 @@ import {
   ShuffleIcon,
   WandSparklesIcon,
   TriangleAlertIcon,
-  Trash2Icon,
   XIcon,
 } from "lucide-react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -2724,9 +2723,14 @@ function NewChatLandingContent({
   // A draft parked at link consumption is the only copy a same-commit remount can
   // read, so it follows every edit; a submitted draft stays spent.
   useEffect(() => {
-    if (!syncsParkedDraftRef.current || submittedRef.current) return;
+    if (
+      !syncsParkedDraftRef.current ||
+      submittedRef.current ||
+      (siblingSourceId && draftState.nestedProvisional !== nestedProvisionalRef.current)
+    )
+      return;
     writeLandingDraft(draftState, { ...draftRef.current, fromLink: true });
-  }, [message, draftState]);
+  }, [message, draftState, siblingSourceId]);
   const [checkingDbcert, setCheckingDbcert] = useState(false);
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
@@ -3146,20 +3150,31 @@ function NewChatLandingContent({
 
   // Mirror the current draft fields into a ref every render so the unmount
   // cleanup below can snapshot the latest values without re-subscribing.
-  // `submittedRef` is flipped once the draft is submitted or deleted, so the
+  // `submittedRef` is flipped once the draft is submitted, so the
   // snapshot is dropped instead of resurrected.
   const submittedRef = useRef(false);
   const [nestedProvisional, setNestedProvisional] = useState(
     () => (draftState.nestedProvisional ??= newTempConversation()),
+  );
+  const nestedProvisionalRef = useRef(nestedProvisional);
+  nestedProvisionalRef.current = nestedProvisional;
+  const clearNestedDraft = useCallback(
+    (id: string) => {
+      if (draftState.nestedProvisional?.id !== id) return;
+      draftState.nestedProvisional = undefined;
+      writeLandingDraft(draftState, null);
+      forgetKeptLinkedPrompt(siblingSourceId, null);
+    },
+    [draftState, siblingSourceId],
   );
   const siblingSourceRef = useRef(siblingSource);
   siblingSourceRef.current = siblingSource;
   const siblingSourceKey = siblingSource?.id;
   useEffect(() => {
     const source = siblingSourceRef.current;
-    if (!source || submittedRef.current) return;
-    addNestedSessionDraft(queryClient, nestedProvisional.id, source);
-  }, [queryClient, nestedProvisional, siblingSourceKey]);
+    if (!source || draftState.nestedProvisional !== nestedProvisional) return;
+    addNestedSessionDraft(queryClient, nestedProvisional.id, source, clearNestedDraft);
+  }, [queryClient, nestedProvisional, siblingSourceKey, clearNestedDraft, draftState]);
   const submittedDraftRevisionRef = useRef<number | null>(null);
   // Whether this composer is still on screen. The create POST can outlive
   // it — the user opens another session while the session bootstraps — and
@@ -3201,12 +3216,14 @@ function NewChatLandingContent({
     return () => {
       onScreenRef.current = false;
       if (!submittedRef.current) {
-        writeLandingDraft(draftState, draftRef.current);
+        if (!siblingSourceId || draftState.nestedProvisional === nestedProvisionalRef.current) {
+          writeLandingDraft(draftState, draftRef.current);
+        }
       } else if (submittedDraftRevisionRef.current === draftState.revision) {
         writeLandingDraft(draftState, null);
       }
     };
-  }, [draftState]);
+  }, [draftState, siblingSourceId]);
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
   const { addRecentHarness } = useRecentHarnesses();
@@ -6200,6 +6217,12 @@ function NewChatLandingContent({
   // including when they navigated away and the unmount cleanup already
   // dropped it on the strength of the submit.
   function returnDraftToUser(temporaryConversationId?: string) {
+    if (
+      siblingSource &&
+      !submittedRef.current &&
+      draftState.nestedProvisional !== nestedProvisional
+    )
+      return;
     submittedRef.current = false;
     if (submittedLinkedPromptRef.current !== null) {
       submittedKeptPromptIds.delete(submittedLinkedPromptRef.current.id);
@@ -6209,7 +6232,7 @@ function NewChatLandingContent({
     removeNestedSessionDraft(queryClient, nestedProvisional.id);
     if (siblingSource) {
       const provisional = (draftState.nestedProvisional ??= newTempConversation());
-      addNestedSessionDraft(queryClient, provisional.id, siblingSource);
+      addNestedSessionDraft(queryClient, provisional.id, siblingSource, clearNestedDraft);
       if (onScreenRef.current) setNestedProvisional(provisional);
     }
     const originalDraft =
@@ -6233,6 +6256,7 @@ function NewChatLandingContent({
   }
 
   async function handleCreate() {
+    if (siblingSource && draftState.nestedProvisional !== nestedProvisional) return;
     // Captured before any await: a newer prompt link can replace the kept record
     // while an earlier submit is still waiting on a pre-create check.
     const submittedLinkedPrompt = keptLinkedRef.current;
@@ -6327,6 +6351,7 @@ function NewChatLandingContent({
         setDbcertRequired(needsDbcert);
         if (needsDbcert) return;
       }
+      if (siblingSource && draftState.nestedProvisional !== nestedProvisional) return;
       // Spend the draft only once provisioning starts, after the laptop credential check.
       // A composer remounted in this commit would otherwise restore the submitted text.
       if (draftState.draft !== null) writeLandingDraft(draftState, null);
@@ -7594,35 +7619,15 @@ function NewChatLandingContent({
               </h1>
             ) : null}
             {siblingSourceId && (
-              <div className="flex max-w-full flex-wrap items-center justify-center gap-x-3 gap-y-1">
-                <p
-                  className="max-w-full break-words text-center text-sm text-muted-foreground line-clamp-2"
-                  data-testid="sibling-composer-context"
-                >
-                  A new conversation alongside{" "}
-                  <span className="font-medium text-foreground">
-                    {siblingSource?.title?.trim() || "Untitled"}
-                  </span>
-                </p>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="text-muted-foreground"
-                  type="button"
-                  disabled={creating}
-                  onClick={() => {
-                    submittedRef.current = true;
-                    writeLandingDraft(draftState, null);
-                    draftState.nestedProvisional = undefined;
-                    forgetKeptLinkedPrompt(siblingSourceId, null);
-                    removeNestedSessionDraft(queryClient, nestedProvisional.id);
-                    navigate(`/c/${siblingSourceId}`);
-                  }}
-                >
-                  <Trash2Icon className="size-3.5" />
-                  Delete draft
-                </Button>
-              </div>
+              <p
+                className="max-w-full break-words text-center text-sm text-muted-foreground line-clamp-2"
+                data-testid="sibling-composer-context"
+              >
+                A new conversation alongside{" "}
+                <span className="font-medium text-foreground">
+                  {siblingSource?.title?.trim() || "Untitled"}
+                </span>
+              </p>
             )}
             {isMobileViewport && workspaceControls}
           </div>

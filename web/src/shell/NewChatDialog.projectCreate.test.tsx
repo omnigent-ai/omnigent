@@ -44,8 +44,8 @@ import type * as SessionsApiModule from "@/lib/sessionsApi";
 import type * as SessionHostModule from "@/lib/sessionHost";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import type { NestedSessionDraft } from "@/lib/nestedSessionDrafts";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { discardNestedSessionDraft, type NestedSessionDraft } from "@/lib/nestedSessionDrafts";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 
 import { authenticatedFetch } from "@/lib/identity";
@@ -772,8 +772,10 @@ describe("NewChatLandingScreen nested agent creation", () => {
 
       searchParams = new URLSearchParams("sibling=first");
       renderLanding({ sibling_sessions: true }, {}, client);
-      fireEvent.click(await screen.findByRole("button", { name: "Delete draft" }));
-      expect(navigateMock).toHaveBeenLastCalledWith("/c/first");
+      expect(await screen.findByTestId("new-chat-landing-input")).toHaveValue(nestedText);
+      act(() => {
+        discardNestedSessionDraft(client, parkedDrafts[0].key);
+      });
       cleanup();
       expect(client.getQueryData(["nested-session-drafts"])).toEqual([parkedDrafts[1]]);
       renderLanding({ sibling_sessions: true }, {}, client);

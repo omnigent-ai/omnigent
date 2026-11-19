@@ -15,6 +15,7 @@ export interface NestedSessionDraft {
   creating: boolean;
   created: boolean;
   createdAt: number;
+  onDiscard?: (id: string) => void;
 }
 
 export function useNestedSessionDrafts(): readonly NestedSessionDraft[] {
@@ -29,7 +30,12 @@ export function useNestedSessionDrafts(): readonly NestedSessionDraft[] {
   );
 }
 
-export function addNestedSessionDraft(client: QueryClient, id: string, source: Session): void {
+export function addNestedSessionDraft(
+  client: QueryClient,
+  id: string,
+  source: Session,
+  onDiscard?: NestedSessionDraft["onDiscard"],
+): void {
   if (
     client
       .getQueryData<readonly NestedSessionDraft[]>(DRAFTS_KEY)
@@ -60,6 +66,7 @@ export function addNestedSessionDraft(client: QueryClient, id: string, source: S
       creating: false,
       created: false,
       createdAt: Date.now() / 1000,
+      onDiscard,
     },
   ]);
 }
@@ -79,6 +86,16 @@ export function removeNestedSessionDraft(client: QueryClient, key: string): void
   client.setQueryData<readonly NestedSessionDraft[]>(DRAFTS_KEY, (drafts = []) =>
     drafts.filter((draft) => draft.key !== key),
   );
+}
+
+export function discardNestedSessionDraft(client: QueryClient, key: string): boolean {
+  const draft = client
+    .getQueryData<readonly NestedSessionDraft[]>(DRAFTS_KEY)
+    ?.find((candidate) => candidate.key === key);
+  if (!draft || draft.creating) return false;
+  draft.onDiscard?.(key);
+  removeNestedSessionDraft(client, key);
+  return true;
 }
 
 export function nestedSessionSidebarKey(id: string): string {

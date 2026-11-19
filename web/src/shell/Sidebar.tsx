@@ -2,6 +2,7 @@ import {
   useNestedSessionDrafts,
   withNestedSessionDrafts,
   removeNestedSessionDraft,
+  discardNestedSessionDraft,
   nestedSessionSidebarKey,
 } from "@/lib/nestedSessionDrafts";
 import {
@@ -5978,6 +5979,7 @@ function ConversationRowImpl({
   const sessionShortcuts = isActive ? desktopCommands : NO_DESKTOP_COMMANDS;
   const hostsById = useContext(HostsByIdContext);
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   // A client-only `temp:` row (navigate-first create window): no server session
   // yet, so per-row mutations are disabled until it's rekeyed to the real id —
   // otherwise they'd POST to `/v1/sessions/temp:*`. The row still navigates.
@@ -6524,11 +6526,9 @@ function ConversationRowImpl({
     </div>
   );
 
-  // Provisional (`temp:`) row: navigable, but no mutating affordances (kebab,
-  // context menu, pin, archive, drag) until the real session exists — those
-  // would POST to `/v1/sessions/temp:*`. Rekey to the real id (`hydrateLocal-
-  // Conversation`) drops `provisional` and the full row renders.
+  // Provisional rows only support local actions until the session exists.
   if (isProvisionalRow) {
+    const draftSourceId = conversation.nested_draft_source_id;
     return (
       <li
         ref={rowRef}
@@ -6537,7 +6537,26 @@ function ConversationRowImpl({
         className={cn("group relative", familyIndented && "ml-6")}
       >
         {familyIndented && <span aria-hidden="true" className={SIDEBAR_FAMILY_LINE} />}
-        {rowLink}
+        {draftSourceId && !selectionMode ? (
+          <ContextMenu>
+            <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
+            <ContextMenuContent className="min-w-44">
+              <ContextMenuItem
+                variant="destructive"
+                onSelect={() => {
+                  if (discardNestedSessionDraft(queryClient, conversation.id) && isActive) {
+                    navigate(`/c/${draftSourceId}`);
+                  }
+                }}
+              >
+                <Trash2Icon className="size-3.5" />
+                Delete draft
+              </ContextMenuItem>
+            </ContextMenuContent>
+          </ContextMenu>
+        ) : (
+          rowLink
+        )}
         {shortcutSlot !== undefined && (
           <SessionShortcutHint slot={shortcutSlot} overlayTop={overlayTop} />
         )}
