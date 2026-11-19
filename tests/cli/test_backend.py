@@ -1950,6 +1950,7 @@ def _render_host_status(*, width: int, payload: dict[str, Any]) -> str:
         height=40,
         force_terminal=True,
         color_system="truecolor",
+        no_color=False,
         highlight=False,
     )
     with patch.object(cli, "_host_console", lambda: console):
