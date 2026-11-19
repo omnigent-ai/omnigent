@@ -39,6 +39,7 @@ const { createConnectionLoading } = require("./connection_loading");
 const { createAboutWindow, resolveAppIconDataUrl } = require("./about_window");
 const { registerFileReveal } = require("./fileReveal");
 const { registerFolderChooser } = require("./folderChooser");
+const { readFindSeed } = require("./findSeed");
 const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
@@ -3074,13 +3075,19 @@ function positionFindBar(target, bar) {
  * @param {BrowserWindow} target The shell window to search.
  */
 function openFindBar(target) {
+  const existing = findBars.get(target);
+  const isOpen = existing !== undefined && !existing.isDestroyed();
+  // Cmd/Ctrl+F from inside the bar keeps its query; from the page, a selection
+  // replaces it. Read before find-opened re-renders the transcript.
+  const seed =
+    isOpen && existing.isFocused() ? Promise.resolve(null) : readFindSeed(target.webContents);
   // The menu item opens the bar without a page keydown; the page must still
   // render every transcript row for find to reach off-screen messages.
   target.webContents.send("omnigent:find-opened");
-  const existing = findBars.get(target);
-  if (existing && !existing.isDestroyed()) {
+  if (isOpen) {
     existing.focus();
     existing.webContents.send("omnigent:find-activate");
+    void seed.then((text) => prefillFindBar(existing, text));
     return;
   }
   const bar = new BrowserWindow({
@@ -3124,6 +3131,7 @@ function openFindBar(target) {
   bar.once("ready-to-show", () => {
     reposition();
     bar.show();
+    void seed.then((text) => prefillFindBar(bar, text));
   });
   bar.on("closed", () => {
     findBars.delete(target);
@@ -3138,6 +3146,12 @@ function openFindBar(target) {
     target.webContents.stopFindInPage("clearSelection");
     target.focus();
   });
+}
+
+// Make the page's selected text the bar's query; a null seed leaves the bar as is.
+function prefillFindBar(bar, text) {
+  if (text === null || bar.isDestroyed()) return;
+  bar.webContents.send("omnigent:find-prefill", { text });
 }
 
 /** The conversation a shell URL shows, or null. Routes end in `/c/<id>` after any mount. */

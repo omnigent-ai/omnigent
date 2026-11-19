@@ -247,6 +247,23 @@ it("renders every bubble in normal flow after native find is detected", () => {
   expect(view.container.querySelectorAll('[data-testid="message-bubble"]')).toHaveLength(1);
 });
 
+it("keeps a selection in mounted rows when native find turns virtualization off", () => {
+  const scrollEl = document.createElement("div");
+  const bubbles = [bubble, assistantBubble];
+  const view = render(list(false, scrollEl, vi.fn(), false, bubbles));
+  const reply = within(view.container).getByText("hello back");
+  const selected = reply.firstChild!;
+  const selection = window.getSelection()!;
+  selection.setBaseAndExtent(selected, 0, selected, 5);
+
+  view.rerender(list(false, scrollEl, vi.fn(), true, bubbles));
+
+  expect(view.container.querySelector('[data-index="0"]')).toBeNull();
+  expect(selected.isConnected).toBe(true);
+  expect(within(view.container).getByText("hello back").firstChild).toBe(selected);
+  expect(selection.toString()).toBe("hello");
+});
+
 it("keeps actions visible only on a final assistant message while idle", () => {
   const bubbles: Bubble[] = [bubble, assistantBubble, { kind: "compaction", itemId: "compact-1" }];
   const view = render(messageList(bubbles, false, true));
