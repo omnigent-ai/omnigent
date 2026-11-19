@@ -238,6 +238,39 @@ def test_tracked_pr_info_names_the_workspace_repo(
     assert info.get("workspace_repo") == workspace_repo
 
 
+@pytest.mark.parametrize(
+    ("gh_resolved", "tracked_repo", "workspace_repo"),
+    [
+        # A fork checkout: gh resolves bare refs against upstream, not the fork.
+        ("upstream", "owner/app", "owner/app"),
+        ("upstream", "owner/other", "owner/app"),
+        (None, "owner/app", "owner/app"),
+        (None, "owner/other", "me/app"),
+    ],
+)
+def test_tracked_pr_info_picks_the_workspace_remote_like_gh(
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    gh_resolved: str | None,
+    tracked_repo: str,
+    workspace_repo: str,
+) -> None:
+    _git(repo, "remote", "add", "origin", "https://github.com/me/app.git")
+    _git(repo, "remote", "add", "upstream", "https://github.com/owner/app.git")
+    if gh_resolved is not None:
+        _git(repo, "config", f"remote.{gh_resolved}.gh-resolved", "base")
+    url = f"https://github.com/{tracked_repo}/pull/7"
+    SessionPrRegistry("session").record(
+        [PullRequestRef.from_url(url)], relationship="created", source="test"
+    )
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: None)
+
+    info = pr_resource.pr_info(str(repo), session_id="session")
+
+    assert info["repo"] == {"name_with_owner": tracked_repo, "host": "github.com"}
+    assert info["workspace_repo"] == {"name_with_owner": workspace_repo, "host": "github.com"}
+
+
 def test_a_directory_outside_git_reports_not_a_git_repo_from_github(tmp_path: Path) -> None:
     info = pr_resource.pr_info(str(tmp_path))
 

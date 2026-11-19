@@ -1075,7 +1075,8 @@ def _workspace_github_info(root: str) -> dict[str, Any]:
         payload["authenticated"] = True
         payload["base_ref"] = data.get("baseRefName")
         payload["repo"] = _repo_payload(_owner_repo_from_pr_url(data.get("url")), data.get("url"))
-        payload["workspace_repo"] = dict(payload["repo"])
+        if payload["repo"]["name_with_owner"]:
+            payload["workspace_repo"] = dict(payload["repo"])
         return payload
 
     # No PR. Probe repo reachability to tell "no PR yet" from "can't reach repo".

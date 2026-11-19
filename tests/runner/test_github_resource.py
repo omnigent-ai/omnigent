@@ -584,6 +584,30 @@ def test_github_info_skips_account_enumeration_on_happy_path(
     assert "accounts" not in info
 
 
+def test_github_info_pr_without_url_names_the_workspace_repo_from_its_remote(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A PR reply without a URL can't name the repo, so the remote still does."""
+    _run(["git", "remote", "add", "origin", "https://github.com/acme/repo.git"], repo)
+    monkeypatch.setattr(github_resource, "_workspace_key", lambda _root: "/ws/x")
+    monkeypatch.setattr(github_resource._config, "github_account_preference", lambda _key: None)
+    pr = {"number": 42, "title": "t", "state": "OPEN", "statusCheckRollup": []}
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        if tuple(argv[:2]) == ("pr", "view"):
+            return (0, json.dumps(pr), "")
+        return (1, "", "no stub")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: "/usr/bin/gh")
+
+    info = github_info(str(repo))
+    assert info["pr"]["number"] == 42
+    assert info["workspace_repo"] == {"name_with_owner": "acme/repo", "host": "github.com"}
+
+
 def test_github_info_runs_gh_as_preferred_account(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

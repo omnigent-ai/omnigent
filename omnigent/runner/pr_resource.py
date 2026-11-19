@@ -29,6 +29,7 @@ from typing import Any
 from filelock import Timeout as FileLockTimeout
 
 from omnigent.git_providers import (
+    ParsedRemote,
     host_of,
     load_facet,
     provider,
@@ -180,17 +181,40 @@ def _workspace_providers(root: str) -> list[ProviderResolution]:
 
 
 def _add_workspace_repo(root: str, info: dict[str, Any]) -> None:
-    """Name the checkout's own repo when the provider hasn't, from its first remote.
+    """Name the checkout's own repo when the provider hasn't, from a local config read.
 
-    ``repo`` names a tracked PR's repo, which can differ from the checkout's. This
-    is a local config read; in a fork checkout it may name the fork.
+    ``repo`` names a tracked PR's repo, which can differ from the checkout's. In a
+    fork checkout ``origin`` is the fork, so gh's resolved base, then a remote of the
+    tracked repo, take precedence over it.
     """
     if "workspace_repo" in info:
         return
-    url = next((url for url in _remote_urls(root) if host_of(url)), None)
-    parsed = resolve_remote(url) if url is not None else None
-    if parsed is not None:
-        info["workspace_repo"] = {"name_with_owner": parsed.repository, "host": parsed.host}
+
+    def run(argv: list[str]) -> tuple[int | None, str]:
+        return _git_output(argv, cwd=root)
+
+    remotes = [
+        (name, parsed)
+        for name, url in local_git.remote_urls(run)
+        if (parsed := resolve_remote(url)) is not None
+    ]
+    if not remotes:
+        return
+    resolved = local_git.remote_settings(run, "gh-resolved")
+    tracked = info.get("repo")
+    tracked = tracked if isinstance(tracked, dict) else {}
+    tracked_name = str(tracked.get("name_with_owner") or "").lower()
+    tracked_host = str(tracked.get("host") or "").lower()
+
+    def is_tracked(parsed: ParsedRemote) -> bool:
+        return parsed.repository.lower() == tracked_name and tracked_host in ("", parsed.host)
+
+    # remote_urls lists origin first, so the last fallback is origin when it parses.
+    _, parsed = next(
+        (remote for remote in remotes if remote[0] in resolved),
+        next((remote for remote in remotes if is_tracked(remote[1])), remotes[0]),
+    )
+    info["workspace_repo"] = {"name_with_owner": parsed.repository, "host": parsed.host}
 
 
 def _workspace_provider(root: str) -> ProviderResolution:
@@ -634,7 +658,9 @@ def pr_info(
             info.setdefault("discovery_warnings", []).extend(candidate.get("warnings", []))
     info["prs"] = _session_prs_with_titles(root, info, registry, entries, request_deadline)
     info["tracking_available"] = True
-    _add_workspace_repo(root, info)
+    if not pr_url:
+        # Explicit PR reads must not touch local git; chat reads the base query.
+        _add_workspace_repo(root, info)
     provider_id = info.get("provider")
     info["provider_display"] = (
         provider_display(provider_id) if isinstance(provider_id, str) else None
