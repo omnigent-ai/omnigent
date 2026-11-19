@@ -41,12 +41,23 @@ const PYTHON_WHITESPACE_CLASS =
 const LEADING_PYTHON_WHITESPACE = new RegExp(`^[${PYTHON_WHITESPACE_CLASS}]*`);
 const PYTHON_WHITESPACE_ONLY = new RegExp(`^[${PYTHON_WHITESPACE_CLASS}]*$`);
 
+// The claude-native paste encoder (claude_native/bridge.py `_paste_payload_bytes`)
+// drops these before the TUI sees the text; it keeps \t, \n, \r, DEL and C1.
+// eslint-disable-next-line no-control-regex
+const CLAUDE_DROPPED_CONTROLS = /[\x00-\x08\x0b\x0c\x0e-\x1f]/g;
+
+/** The text Claude Code's TUI receives for a claude-native send of `value`. */
+export function claudeDeliveredText(value: string): string {
+  return value.replace(CLAUDE_DROPPED_CONTROLS, "");
+}
+
 /**
  * Split a `!command` draft at its `!`, or null when *harness* would treat it
  * as model input. codex-native mirrors `shell_command_from_content`
  * (codex_native/shell_input.py): leading whitespace ignored, `!!` escapes.
  * claude-native pastes the text into the Claude Code TUI, which enters bash
- * mode on a leading `!`, so only a `!` at the very start counts (`!!` too).
+ * mode on a leading `!`, so only a `!` at the very start of the delivered
+ * text counts (`!!` too).
  * Either way the command must be non-blank.
  */
 export function splitNativeShellCommand(
@@ -54,8 +65,10 @@ export function splitNativeShellCommand(
   harness: string,
 ): { before: string; token: string; after: string } | null {
   if (harness === "claude-native") {
-    if (!value.startsWith("!") || value.slice(1).trim() === "") return null;
-    return { before: "", token: "!", after: value.slice(1) };
+    const delivered = claudeDeliveredText(value);
+    if (!delivered.startsWith("!") || delivered.slice(1).trim() === "") return null;
+    const at = value.indexOf("!");
+    return { before: value.slice(0, at), token: "!", after: value.slice(at + 1) };
   }
   const before = value.match(LEADING_PYTHON_WHITESPACE)?.[0] ?? "";
   const rest = value.slice(before.length);

@@ -5860,6 +5860,30 @@ describe("Composer native shell mode", () => {
     expect(props.onSend).toHaveBeenCalledExactlyOnceWith("!cat src/example.ts", undefined);
   });
 
+  it("classifies a claude-native draft by the text the terminal receives", () => {
+    useChatStore.setState({ sessionHarness: "claude-native" });
+    const props = composerProps({ isNativeWrapper: true, permissionLevel: 2 });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "\x05!echo ok" } });
+    expect(textarea()).toHaveAttribute("data-shell-command", "true");
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+
+    act(() =>
+      useChatStore.setState({
+        pendingComposerAttachments: [{ path: "src/example.ts", isDir: false }],
+      }),
+    );
+    const tagged = textarea().value;
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).not.toHaveBeenCalled();
+    expect(screen.getByText(SHELL_MENTION_REFUSAL)).toBeVisible();
+    expect(textarea()).toHaveValue(tagged);
+
+    fireEvent.change(textarea(), { target: { value: "\x05!echo ok" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledExactlyOnceWith("\x05!echo ok", undefined);
+  });
+
   it("classifies a bare `!` by the review context it sends with", () => {
     useChatStore.setState({ sessionHarness: "codex-native" });
     const props = composerProps({ isNativeWrapper: true, permissionLevel: null });

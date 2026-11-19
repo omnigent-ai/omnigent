@@ -955,6 +955,10 @@ describe("UserBubble command tint", () => {
 
     renderScoped(bubble, <PublishCommands />);
     expect(screen.queryByText("!echo **hi**")).toBeNull();
+    const rendered = screen.getByTestId("message-bubble");
+    expect(within(rendered).getByText("hi")).toHaveAttribute("data-streamdown", "strong");
+    expect(rendered.querySelector("pre")).toBeNull();
+    expect(rendered).toHaveTextContent("!echo hi");
   });
 
   it("classifies a pending peer message by its raw text, keeping the sender", () => {

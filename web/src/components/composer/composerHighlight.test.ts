@@ -73,6 +73,9 @@ describe("composerHighlightSplit native shell", () => {
     ["claude-native", "!ls -la", { before: "", token: "!", after: "ls -la" }],
     // The TUI enters bash mode on the first `!`; the second is the command.
     ["claude-native", "!!ls", { before: "", token: "!", after: "!ls" }],
+    ["claude-native", "!\techo", { before: "", token: "!", after: "\techo" }],
+    // The paste encoder drops the \x05, so the TUI sees a leading `!`.
+    ["claude-native", "\x05!echo ok", { before: "\x05", token: "!", after: "echo ok" }],
   ])("%s tints the `!` of %j", (harness, value, split) => {
     expect(composerHighlightSplit(value, KNOWN, harness)).toEqual({ kind: "shell", ...split });
   });
@@ -87,6 +90,9 @@ describe("composerHighlightSplit native shell", () => {
     ["codex-native", "a mid-text `!`", "run !ls"],
     ["codex-native", "a `!` after a BOM", "\ufeff!echo ok"],
     ["codex-native", "a whitespace-only command", "!\x1c"],
+    ["claude-native", "a command the encoder drops", "!\x1c"],
+    ["claude-native", "a `!` after a kept DEL", "\x7f!x"],
+    ["claude-native", "a `!` after a kept line break", "\r!x"],
   ])("%s keeps %s as model input", (harness, _label, value) => {
     expect(splitNativeShellCommand(value, harness)).toBeNull();
   });

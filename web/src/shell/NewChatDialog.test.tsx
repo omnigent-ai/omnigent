@@ -114,6 +114,7 @@ vi.mock("@/pages/settings/HarnessFixDialog", () => ({
   },
 }));
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
+import { SHELL_MENTION_REFUSAL } from "@/components/composer/composerHighlight";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
@@ -14254,5 +14255,139 @@ describe("NewChatLandingScreen picker curation", () => {
     expect(row("a1")).toBeNull();
     expect(row("a2")).not.toBeNull();
     expect(screen.queryByText("Harnesses")).toBeNull();
+  });
+});
+
+describe("NewChatLandingScreen composer highlight", () => {
+  const ROOT = "/Users/corey/repo";
+  beforeEach(() => {
+    setupLandingMocks();
+    setPendingInitialPromptMock.mockReset();
+    authenticatedFetchMock.mockImplementation(
+      async (url) =>
+        ({
+          ok: true,
+          json: async () => (String(url) === "/v1/sessions" ? { id: "conv_new" } : {}),
+        }) as Response,
+    );
+  });
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+  });
+
+  function landingAgent(harness: string) {
+    mockAgents([
+      testAgent("a1", `${harness}-ui`, {
+        display_name: harness,
+        harness,
+        skills: [{ name: "team", description: "Run a team" }],
+      }),
+    ]);
+  }
+  const input = () => screen.getByTestId("new-chat-landing-input");
+  const type = (value: string) => fireEvent.change(input(), { target: { value } });
+
+  it("tints a known skill but not an unknown command", () => {
+    landingAgent("claude-sdk");
+    renderLanding();
+    type("/team fix the bug");
+    const overlay = screen.getByTestId("composer-highlight-overlay");
+    expect(overlay).toHaveTextContent("/team fix the bug");
+    expect(within(overlay).getByText("/team")).toHaveClass("text-brand-accent");
+    expect(input()).toHaveAttribute("data-slash-command", "true");
+
+    type("/typo fix the bug");
+    expect(screen.queryByTestId("composer-highlight-overlay")).toBeNull();
+    expect(input()).not.toHaveAttribute("data-slash-command");
+  });
+
+  it("marks a claude-native `!` draft as a shell command and sends it unchanged", async () => {
+    landingAgent("claude-native");
+    renderLanding();
+    type("!git status --short");
+    expect(input()).toHaveAttribute("data-shell-command", "true");
+    expect(input()).toHaveAccessibleDescription("Shell command");
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+
+    const submit = screen.getByTestId("new-chat-landing-submit");
+    await waitFor(() => expect(submit).toBeEnabled());
+    fireEvent.click(submit);
+    await waitFor(() =>
+      expect(setPendingInitialPromptMock).toHaveBeenCalledWith(
+        "conv_new",
+        expect.objectContaining({ text: "!git status --short" }),
+      ),
+    );
+  });
+
+  it("decides shell mode on the sanitized text but mirrors the raw draft", () => {
+    landingAgent("claude-native");
+    renderLanding();
+    type("\x05!echo ok");
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+    const overlay = screen.getByTestId("composer-highlight-overlay");
+    expect(overlay.textContent).toBe("\x05!echo ok");
+    expect(within(overlay).getByText("!")).toHaveClass("text-brand-accent");
+  });
+
+  it("refuses a `!` send that carries a tag, keeps the draft, then sends once it is gone", async () => {
+    landingAgent("claude-native");
+    useHostFilesystemMock.mockImplementation(((_hostId: string | null, path: string | null) => ({
+      data: {
+        entries:
+          path === ROOT
+            ? [
+                {
+                  name: "README.md",
+                  path: `${ROOT}/README.md`,
+                  type: "file",
+                  bytes: 10,
+                  modified_at: 0,
+                },
+              ]
+            : [],
+        truncated: false,
+      },
+      isLoading: false,
+      error: null,
+      isPlaceholderData: false,
+    })) as unknown as typeof useHostFilesystem);
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.change(input(), { target: { value: "!cat @", selectionStart: 6 } });
+    fireEvent.click(screen.getByTitle("Attach README.md"));
+    expect(input()).toHaveValue("!cat @README.md ");
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+
+    const submit = screen.getByTestId("new-chat-landing-submit");
+    await waitFor(() => expect(submit).toBeEnabled());
+    fireEvent.click(submit);
+    expect(await screen.findByTestId("new-chat-landing-error")).toHaveTextContent(
+      SHELL_MENTION_REFUSAL,
+    );
+    expect(input()).toHaveValue("!cat @README.md ");
+    expect(setPendingInitialPromptMock).not.toHaveBeenCalled();
+    expect(authenticatedFetchMock).not.toHaveBeenCalledWith("/v1/sessions", expect.anything());
+
+    type("!cat README.md");
+    expect(screen.queryByTestId("new-chat-landing-error")).toBeNull();
+    fireEvent.click(submit);
+    await waitFor(() =>
+      expect(setPendingInitialPromptMock).toHaveBeenCalledWith(
+        "conv_new",
+        expect.objectContaining({ text: "!cat README.md" }),
+      ),
+    );
+  });
+
+  it("does not offer shell mode on a harness without native `!` input", () => {
+    landingAgent("claude-sdk");
+    renderLanding();
+    type("!git status");
+    expect(screen.queryByTestId("composer-shell-mode-indicator")).toBeNull();
+    expect(screen.queryByTestId("composer-highlight-overlay")).toBeNull();
   });
 });
