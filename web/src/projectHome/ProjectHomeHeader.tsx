@@ -241,14 +241,12 @@ export function ProjectBoardSearch() {
   );
 }
 
-/**
- * Shows or hides the floating composer over the board. Phones open the
- * full-screen project composer instead, since it moves its pickers into the
- * header.
- */
+/** Ticket boards and phones use the full project composer; desktop session boards keep it floating. */
 export function ProjectNewSessionButton({ projectName }: { projectName: string }) {
   const isMobile = useIsMobileViewport();
+  const tickets = useProjectTicketsEnabled();
   const navigate = useNavigate();
+  const newSessionPath = `/?project=${encodeURIComponent(projectName)}`;
   const open = useProjectComposerStore((state) => state.open);
   const setOpen = useProjectComposerStore((state) => state.setOpen);
   if (isMobile) {
@@ -259,7 +257,7 @@ export function ProjectNewSessionButton({ projectName }: { projectName: string }
         aria-label="New session"
         data-testid="project-new-session-button"
         className="mobile-touch-target text-muted-foreground"
-        onClick={() => navigate(`/?project=${encodeURIComponent(projectName)}`)}
+        onClick={() => navigate(newSessionPath)}
       >
         <MessageCirclePlusIcon className="size-5" />
       </MobileHeaderButton>
@@ -267,9 +265,12 @@ export function ProjectNewSessionButton({ projectName }: { projectName: string }
   }
   return (
     <Button
-      aria-expanded={open}
+      aria-expanded={tickets ? undefined : open}
       data-testid="project-new-session-button"
-      onClick={() => setOpen(!open)}
+      onClick={() => {
+        if (tickets) navigate(newSessionPath);
+        else setOpen(!open);
+      }}
     >
       <MessageCirclePlusIcon />
       New session

@@ -158,26 +158,32 @@ describe("ProjectBoardSearch", () => {
 });
 
 describe("ProjectNewSessionButton", () => {
-  it("keeps New session beside New ticket and Orchestrator, with no filters", () => {
+  it("keeps ticket actions simple and sends New session to the full project composer", () => {
     render(
       <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, project_tickets: true }}>
-        <MemoryRouter initialEntries={["/projects/Payments"]}>
-          <ProjectHomeHeaderActions projectName="Payments" />
+        <MemoryRouter initialEntries={["/projects/Billing%20%26%20Payments?ticket=ticket-1"]}>
+          <ProjectHomeHeaderActions projectName="Billing & Payments" />
+          <LocationProbe />
         </MemoryRouter>
       </CapabilitiesProvider>,
     );
     expect(screen.getByRole("link", { name: "Orchestrator" })).toHaveAttribute(
       "href",
-      "/projects/Payments?orchestrator=1",
+      "/projects/Billing%20%26%20Payments?orchestrator=1",
     );
     expect(screen.getByRole("link", { name: "New ticket" })).toHaveAttribute(
       "href",
-      "/projects/Payments?ticket=new",
+      "/projects/Billing%20%26%20Payments?ticket=new",
     );
     expect(screen.queryByRole("searchbox")).toBeNull();
     expect(screen.queryByRole("combobox")).toBeNull();
-    fireEvent.click(screen.getByRole("button", { name: "New session" }));
-    expect(useProjectComposerStore.getState().open).toBe(true);
+    const button = screen.getByRole("button", { name: "New session" });
+    expect(button).not.toHaveAttribute("aria-expanded");
+    fireEvent.click(button);
+    expect(screen.getByTestId("location")).toHaveTextContent(
+      /^\/\?project=Billing%20%26%20Payments$/,
+    );
+    expect(useProjectComposerStore.getState().open).toBe(false);
   });
 
   it("shows and hides the floating composer", () => {
