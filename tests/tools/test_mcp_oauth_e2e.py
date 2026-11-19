@@ -443,8 +443,7 @@ async def test_only_an_insufficient_scope_403_starts_a_sign_in(
     state.forbid_access_tokens(None)
     conn = McpServerConnection(config=_config(state))
     try:
-        # A 3.11+ builtin (we require 3.12); ruff's py310 target misflags it.
-        with pytest.raises(BaseExceptionGroup) as excinfo:  # noqa: F821
+        with pytest.raises(BaseExceptionGroup) as excinfo:
             await asyncio.wait_for(conn.connect(), timeout=30)
     finally:
         await conn.close()
