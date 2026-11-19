@@ -1,4 +1,5 @@
 import { type KeyboardEvent, type RefObject, useEffect, useRef, useState } from "react";
+import type { ComposerTextTarget } from "@/components/composer/engine/composerInput";
 
 import {
   detectMentionAt,
@@ -38,7 +39,7 @@ export interface MentionBrowserParams {
   /** The textarea value and a setter (which may also flag the draft dirty). */
   text: string;
   setText: (next: string) => void;
-  textareaRef: RefObject<HTMLTextAreaElement | null>;
+  textareaRef: RefObject<ComposerTextTarget | null>;
   /** On mobile, Enter inserts a newline rather than acting on the menu. */
   isMobile?: boolean;
   /** Tags restored with a saved draft, used for the first render only. */
@@ -49,6 +50,20 @@ export interface MentionBrowserParams {
    * a literal, not the deleted tag.
    */
   segments?: readonly string[];
+  /**
+   * Tags the caller keeps (a grid cell's session draft) instead of this hook's
+   * own state. The caller's draft drops a tag once its token leaves the text,
+   * so the release pass is skipped.
+   */
+  tags?: {
+    mentions: TaggedMentions;
+    /** Applies ``update`` to the latest stored tags, not the rendered ones. */
+    updateMentions: (update: (current: TaggedMentions) => TaggedMentions) => void;
+  };
+}
+
+function resolveUpdate<T>(update: React.SetStateAction<T>, current: T): T {
+  return typeof update === "function" ? (update as (previous: T) => T)(current) : update;
 }
 
 /** An open level of the ``@`` session menu; ``null`` is the top level. */
@@ -110,14 +125,29 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     isMobile = false,
     initialMentions,
     segments,
+    tags,
   } = params;
   const [mentionIndex, setMentionIndex] = useState(-1);
-  const [mentionedItems, setMentionedItems] = useState<MentionItem[]>(
-    () => initialMentions?.files ?? [],
-  );
-  const [mentionedSessions, setMentionedSessions] = useState<SessionMention[]>(
+  const [localItems, setLocalItems] = useState<MentionItem[]>(() => initialMentions?.files ?? []);
+  const [localSessions, setLocalSessions] = useState<SessionMention[]>(
     () => initialMentions?.sessions ?? [],
   );
+  const mentionedItems = tags ? tags.mentions.files : localItems;
+  const mentionedSessions = tags ? tags.mentions.sessions : localSessions;
+  const setMentionedItems: React.Dispatch<React.SetStateAction<MentionItem[]>> = tags
+    ? (update) =>
+        tags.updateMentions((current) => ({
+          ...current,
+          files: resolveUpdate(update, current.files),
+        }))
+    : setLocalItems;
+  const setMentionedSessions: React.Dispatch<React.SetStateAction<SessionMention[]>> = tags
+    ? (update) =>
+        tags.updateMentions((current) => ({
+          ...current,
+          sessions: resolveUpdate(update, current.sessions),
+        }))
+    : setLocalSessions;
   // An opened list stays open for the "@" token it was opened from.
   const [browse, setBrowse] = useState<{ start: number; level: SessionMenuLevel } | null>(null);
   if (browse !== null && mention?.start !== browse.start) setBrowse(null);
@@ -178,6 +208,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
   const draftSegments = segments ?? [text];
   const segmentsKey = draftSegments.join("\u0000");
   useEffect(() => {
+    if (tags) return;
     const tokens = [
       ...mentionedItems.map(fileMentionToken),
       ...mentionedSessions.map((it) => it.token ?? `@${it.title}`),

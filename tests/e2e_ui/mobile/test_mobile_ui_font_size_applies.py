@@ -7,7 +7,7 @@ The stepper (``UiFontSizeControl`` in ``pages/SettingsPage.tsx``) writes the
 choice to ``localStorage["omnigent:ui-font-size"]`` and sets
 ``--desktop-ui-font-size`` on ``<html>`` (``lib/uiFontPreferences.ts``). In
 ``index.css`` the typography mapping that reads that variable is gated
-``@media (width >= 48rem)``; without a fix the ``@media (width < 48rem)``
+``@media (width >= 73.8125rem)``; without a fix the ``@media (width < 73.8125rem)``
 branch hard-codes ``--mobile-ui-font-size: 14px`` and never references the
 preference, so on mobile the write is a dead store: the value round-trips
 through Settings but the rendered text stays at 14px.
@@ -28,7 +28,7 @@ from playwright.sync_api import Page, ViewportSize, expect
 STORAGE_KEY = "omnigent:ui-font-size"
 GROUP_NAME = "Interface font size"
 
-# Phone-sized viewport: comfortably below the 48rem (768px) breakpoint where
+# Phone-sized viewport: comfortably below the 73.8125rem (1181px) breakpoint where
 # index.css switches to the mobile typography branch.
 _MOBILE_VIEWPORT: ViewportSize = {"width": 390, "height": 844}
 

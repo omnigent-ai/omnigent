@@ -1,4 +1,6 @@
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import type { ReactNode } from "react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import type * as AvailableAgentsModule from "@/hooks/useAvailableAgents";
@@ -10,6 +12,15 @@ import {
 } from "@/lib/pickerEntryVisibility";
 import { testAgent } from "@/test/agentFixtures";
 import { PickerVisibilitySetting, pickerVisibilitySummary } from "./PickerVisibilitySetting";
+
+/** The row reveals itself from the URL hash, so it renders under a router. */
+function renderSetting() {
+  return render(<PickerVisibilitySetting />, { wrapper: RouterWrapper });
+}
+
+function RouterWrapper({ children }: { children: ReactNode }) {
+  return <MemoryRouter>{children}</MemoryRouter>;
+}
 
 const catalog = vi.hoisted(() => ({
   data: undefined as AvailableAgent[] | undefined,
@@ -74,7 +85,7 @@ describe("PickerVisibilitySetting", () => {
 
   it("toggles an entry from the filterable checklist", () => {
     catalog.data = [claude, codex, polly];
-    render(<PickerVisibilitySetting />);
+    renderSetting();
     expect(summary()).toHaveTextContent("Showing all 3.");
     expect(screen.getByTestId("picker-visibility-reset")).toBeDisabled();
 
@@ -99,7 +110,7 @@ describe("PickerVisibilitySetting", () => {
   it("restores every entry with Show all", () => {
     catalog.data = [claude, debby];
     writeHiddenPickerAgents(new Set(["debby"]));
-    render(<PickerVisibilitySetting />);
+    renderSetting();
     expect(summary()).toHaveTextContent("Showing 1 of 2. Hidden: Debby.");
 
     fireEvent.click(screen.getByTestId("picker-visibility-reset"));
@@ -109,7 +120,7 @@ describe("PickerVisibilitySetting", () => {
 
   it("follows a change made outside the control", () => {
     catalog.data = [claude, codex];
-    render(<PickerVisibilitySetting />);
+    renderSetting();
     act(() => writeHiddenPickerAgents(new Set(["claude-native-ui"])));
     expect(summary()).toHaveTextContent("Showing 1 of 2. Hidden: Claude Code.");
   });
@@ -120,7 +131,7 @@ describe("PickerVisibilitySetting", () => {
     ["when the catalog failed", { isError: true }, "Couldn't load this server's harnesses"],
   ])("explains the empty list %s", (_label, state, expected) => {
     Object.assign(catalog, state);
-    render(<PickerVisibilitySetting />);
+    renderSetting();
     expect(summary()).toHaveTextContent(expected);
     expect(screen.getByTestId("picker-visibility-edit")).toBeDisabled();
     expect(screen.queryByTestId("picker-visibility-retry") !== null).toBe(state.isError ?? false);
@@ -128,7 +139,7 @@ describe("PickerVisibilitySetting", () => {
 
   it("retries a failed catalog load", () => {
     catalog.isError = true;
-    render(<PickerVisibilitySetting />);
+    renderSetting();
     fireEvent.click(screen.getByTestId("picker-visibility-retry"));
     expect(catalog.retry).toHaveBeenCalledTimes(1);
   });

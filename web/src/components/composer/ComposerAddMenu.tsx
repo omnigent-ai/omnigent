@@ -91,7 +91,10 @@ export function ComposerAddMenu({
   const [open, setOpen] = useState(false);
   const [showProjects, setShowProjects] = useState(false);
   const [showWorkflows, setShowWorkflows] = useState(false);
-  const listsSavedWorkflows = savedWorkflows.length > 0 && onRunSavedWorkflow !== undefined;
+  // A list whose loaded pages show nothing yet can still have more to load.
+  const listsSavedWorkflows =
+    (savedWorkflows.length > 0 || workflowPagination?.hasMore === true) &&
+    onRunSavedWorkflow !== undefined;
   const pendingActionRef = useRef<(() => void) | null>(null);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const [geometry, setGeometry] = useState({ width: 456, alignOffset: 0, sideOffset: 6 });

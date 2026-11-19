@@ -1138,6 +1138,18 @@ async def test_handle_launch_recreates_missing_workspace(
     _cleanup_host(host)
 
 
+async def test_recovery_launch_requires_restored_workspace(tmp_path: Path) -> None:
+    host = _make_host_process()
+    workspace = tmp_path / "missing"
+    frame = HostLaunchRunnerFrame(
+        request_id="recover", binding_token="token", workspace=str(workspace), recovery=True
+    )
+    result = await host._handle_launch(frame)
+    assert result.status == "failed"
+    assert result.error_code == "workspace_missing"
+    assert not workspace.exists()
+
+
 async def test_handle_launch_refuses_when_workspace_parent_missing(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -12731,3 +12743,39 @@ async def test_mcp_activation_launch_frame_to_runner_environment(activation):
     assert (RUNNER_MCP_DISABLED_SERVERS_ACTIVE_HARNESSES_ENV_VAR in env) is (
         activation is not None
     )
+
+
+async def test_host_recovery_loop_uses_opt_in_and_current_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.host.frames import HostRecoverSessionsFrame
+
+    host = _make_host_process()
+    sent = []
+    first, second = asyncio.Event(), asyncio.Event()
+    inventory = ["surviving"]
+
+    async def send(ws: object, payload: str) -> None:
+        sent.append(decode_host_frame(payload))
+        (first if len(sent) == 1 else second).set()
+
+    monkeypatch.setattr(host, "_send_text", send)
+    monkeypatch.setattr(host, "_alive_runner_ids", lambda: list(inventory))
+    monkeypatch.setattr("omnigent.session_recovery.RECOVERY_RETRY_S", 0)
+    host._recover_interrupted_sessions = False
+    await host._session_recovery_loop(None)
+    assert sent == []
+    host._recover_interrupted_sessions = True
+    task = asyncio.create_task(host._session_recovery_loop(None))
+    try:
+        await asyncio.wait_for(first.wait(), timeout=2)
+        inventory.clear()
+        await asyncio.wait_for(second.wait(), timeout=2)
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        _cleanup_host(host)
+    assert all(isinstance(frame, HostRecoverSessionsFrame) for frame in sent)
+    assert sent[0].runners == ["surviving"]
+    assert sent[-1].runners == []

@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 import uuid
 from collections.abc import AsyncIterator, Callable
 from dataclasses import replace
@@ -66,6 +67,7 @@ from omnigent.server.routes.scheduled_task_permissions import (
     register_scheduled_task_permissions_routes,
     request_from_agent,
     require_agent_keeps_shared_target,
+    scheduled_task_shareable,
     scheduled_task_sharing_supported,
     scheduled_task_viewer_role,
     without_legacy_sandbox_workspace,
@@ -275,6 +277,7 @@ def _next_run_at(task: ScheduledTask, request: Request) -> str | None:
 def _to_response(
     task: ScheduledTask,
     *,
+    shareable: bool,
     last_run_status: str | None = None,
     next_run_at: str | None = None,
     viewer_role: ScheduledTaskViewerRole = "owner",
@@ -282,6 +285,8 @@ def _to_response(
 ) -> dict[str, Any]:
     """Serialize a :class:`ScheduledTask` to a JSON-safe dict.
 
+    :param shareable: Whether the automation itself can be shared, from
+        :func:`scheduled_task_shareable`.
     :param last_run_status: The status of the task's most recent run
         (``succeeded`` / ``failed`` / ``skipped`` / ``running`` / ``scheduled``),
         or ``None`` when the task has never run. Surfaced so the Tasks list can
@@ -328,6 +333,7 @@ def _to_response(
         "updated_at": task.updated_at,
         "viewer_role": viewer_role,
         "owner_display_name": owner_display_name,
+        "shareable": shareable,
     }
 
 
@@ -1234,6 +1240,7 @@ def create_scheduled_tasks_router(
         # next_run_at comes from the legacy timer or the persisted schedule.
         return _to_response(
             task,
+            shareable=scheduled_task_shareable(permission_store, task.id),
             next_run_at=_next_run_at(task, request),
         )
 
@@ -1275,6 +1282,7 @@ def create_scheduled_tasks_router(
             "scheduled_tasks": [
                 _to_response(
                     t,
+                    shareable=scheduled_task_shareable(permission_store, t.id),
                     last_run_status=latest_status.get(t.id),
                     next_run_at=_next_run_at(t, request),
                 )
@@ -1381,6 +1389,7 @@ def create_scheduled_tasks_router(
             "scheduled_tasks": [
                 _to_response(
                     task,
+                    shareable=scheduled_task_shareable(permission_store, task.id),
                     last_run_status=latest_status.get(task.id),
                     next_run_at=_next_run_at(task, request),
                     viewer_role="viewer",
@@ -1410,6 +1419,7 @@ def create_scheduled_tasks_router(
             owner_name = (await _owner_display_names([task])).get(task.user_id or "", task.user_id)
         return _to_response(
             task,
+            shareable=scheduled_task_shareable(permission_store, task.id),
             last_run_status=latest_status.get(task.id),
             next_run_at=_next_run_at(task, request),
             viewer_role=role,
@@ -1587,6 +1597,54 @@ def create_scheduled_tasks_router(
             ],
             "next_cursor": next_cursor,
         }
+
+    @router.get("/scheduled-tasks/{scheduled_task_id}/run-pull-requests")
+    async def list_scheduled_task_run_pull_requests(
+        request: Request,
+        scheduled_task_id: str,
+        limit: int = Query(default=20, ge=1, le=50),
+        after: str | None = Query(default=None),
+    ) -> dict[str, Any]:
+        """List stored PRs for a page of runs; shared viewers receive no session content."""
+        from omnigent.server import session_pull_requests as server_prs
+
+        _, role = await _require_readable(request, scheduled_task_id)
+        empty: dict[str, Any] = {"runs": [], "refresh_pending": False, "next_cursor": None}
+        if role == "viewer":
+            return empty
+        runs, next_cursor = store.list_runs(scheduled_task_id, limit=limit, after_id=after)
+        pull_request_store = server_prs.open_store(conversation_store)
+        served = [run for run in runs if run.conversation_id is not None]
+        if pull_request_store is None or not served:
+            return {**empty, "next_cursor": next_cursor}
+        conversation_ids = list(dict.fromkeys(run.conversation_id or "" for run in served))
+        stored, initial_runs = await asyncio.gather(
+            asyncio.to_thread(pull_request_store.read_many, conversation_ids),
+            asyncio.to_thread(pull_request_store.initial_run_ids, conversation_ids),
+        )
+        now = time.time()
+        refresh_pending = False
+        for conversation_id, prs in stored.items():
+            if server_prs.has_stale_state(prs, now=now):
+                server_prs.request_refresh(conversation_id)
+                refresh_pending = True
+        rows: list[dict[str, Any]] = []
+        for run in served:
+            conversation_id = run.conversation_id or ""
+            prs = stored.get(conversation_id)
+            if prs is None:
+                continue
+            picked = server_prs.run_pull_requests(
+                run.id, prs, created_session=initial_runs.get(conversation_id) == run.id
+            )
+            if picked:
+                rows.append(
+                    {
+                        "run_id": run.id,
+                        "pull_requests": [server_prs.entry_payload(entry) for entry in picked],
+                    }
+                )
+        return {"runs": rows, "refresh_pending": refresh_pending, "next_cursor": next_cursor}
 
     @router.post("/scheduled-tasks/{scheduled_task_id}/run", status_code=202)
     async def run_scheduled_task_now(
@@ -1933,6 +1991,7 @@ def create_scheduled_tasks_router(
         latest_status = store.list_latest_run_status_for_tasks([updated.id])
         return _to_response(
             updated,
+            shareable=scheduled_task_shareable(permission_store, updated.id),
             last_run_status=latest_status.get(updated.id),
             next_run_at=_next_run_at(updated, request),
         )

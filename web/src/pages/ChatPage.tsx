@@ -11,6 +11,7 @@ import { useConversationRedirect } from "@/hooks/useConversationRedirect";
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation, isCanvasPathname } from "@/canvas/canvasNavigation";
 import { useSkills } from "@/hooks/useSkills";
+import { useDismissOnEscape } from "@/hooks/useDismissOnEscape";
 import {
   type ForwardedRef,
   type ChangeEvent,
@@ -70,7 +71,7 @@ import {
 } from "@/hooks/useNativeServerSwitcher";
 import { isIOSShell, onNativeSidebarDrag, setNativeServerSwitcherHidden } from "@/lib/nativeBridge";
 import { type Agent, useSessionAgent, useAgents } from "@/hooks/useAgents";
-import { useBrainHarnessLabels, useFileMentionHarnesses } from "@/lib/agentLabels";
+import { useFileMentionHarnesses } from "@/lib/agentLabels";
 import { useCanStartSideChat, usePermissions, useSessionOwner } from "@/hooks/usePermissions";
 import type { NativeModelOption, Session, SessionStatus, SkillSummary } from "@/lib/types";
 import { usePromptHistory } from "@/hooks/usePromptHistory";
@@ -104,6 +105,7 @@ import {
   type PendingUserMessage,
   useChatStore,
 } from "@/store/chatStore";
+import { trackPlanStop } from "@/store/planStops";
 import {
   registerContinuePlan,
   registerSaveWorkflow,
@@ -139,18 +141,11 @@ import {
   harnessSupportsFileMentions,
   type MentionItem,
   mentionMarkerFor,
-  MENTION_MATCH_CAP,
   type MentionState,
-  parseMentionToken,
-  rankMentionEntries,
   recallFileMentions,
 } from "@/lib/composerMentions";
 import { useChildSessions } from "@/hooks/useChildSessions";
-import {
-  MENTION_SEARCH_DEBOUNCE_MS,
-  useSessionMentionEntries,
-} from "@/hooks/useSessionMentionEntries";
-import { useDebouncedValue } from "@/hooks/useDebouncedValue";
+import { useMentionListings } from "@/hooks/useMentionListings";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import { getSessionDraft, promoteSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 import {
@@ -258,12 +253,6 @@ import {
 import { FileMentionMenu } from "@/components/FileMentionMenu";
 import { FileDropOverlay } from "@/components/FileDropOverlay";
 import { FilePathAwareMessageResponse } from "@/components/blocks/ChatMarkdown";
-import {
-  useWorkspaceAllFiles,
-  useWorkspaceDirectory,
-  useWorkspaceFileSearch,
-  type WorkspaceFile,
-} from "@/hooks/useWorkspaceChangedFiles";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { ComposerLocalReviewChips } from "@/components/composer/ComposerLocalReviewChips";
@@ -320,17 +309,18 @@ import {
   taskActionMessage,
   workflowMessage,
 } from "@/lib/workflow";
-import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { ConnectionIndicator } from "./ChatIndicators";
 import { SessionHarnessPicker } from "@/components/composer/SessionHarnessPicker";
 import {
   capabilitySourceForSession,
-  composerHarnessLabel,
-  modelResetSupported,
   useSessionPickerInputs,
   type ServerInfoValue,
 } from "@/components/composer/sessionPickerInputs";
+import {
+  isComposerReadOnly,
+  useSessionHarnessPickerProps,
+} from "@/components/composer/useSessionHarnessPickerProps";
 import { nextTranscriptBottomPin, type TranscriptBottomPin } from "./transcriptBottomPin";
 import { Transcript } from "@/components/chat/Transcript";
 
@@ -1269,7 +1259,10 @@ export function ChatPage() {
       showClaudePermissionMode={shouldShowPermissionModeControl(capabilitySource)}
       showCodexApprovalMode={shouldShowCodexApprovalModeControl(capabilitySource)}
       showGoalControl={shouldShowGoalControl(capabilitySource)}
-      showClaudeGoalControl={shouldShowPollyClaudeGoalControl(activeSession)}
+      showClaudeGoalControl={
+        shouldShowPollyClaudeGoalControl(activeSession) ||
+        shouldShowClaudeNativeGoalControl(capabilitySource)
+      }
       showPollyCodexGoalControl={shouldShowPollyCodexGoalControl(activeSession)}
       costRoutingEligible={costRoutingEligible}
       subagentRoutingEligible={subagentRoutingEligible}
@@ -1438,7 +1431,7 @@ interface MainAgentSurfaceProps {
   showCodexApprovalMode?: boolean;
   /** Show the session Goal control. */
   showGoalControl?: boolean;
-  /** Show Polly's Claude SDK command-backed Goal control. */
+  /** Show the Claude command-backed Goal control (Claude Code native, or Polly on Claude SDK). */
   showClaudeGoalControl?: boolean;
   /** Show Polly's Codex command-backed Goal control. */
   showPollyCodexGoalControl?: boolean;
@@ -2092,7 +2085,7 @@ interface ComposerProps {
   runnerOnline?: boolean;
   /** The session is launching or waking its runner or managed sandbox. */
   runnerStarting?: boolean;
-  /** Show Polly's Claude SDK command-backed Goal control. */
+  /** Show the Claude command-backed Goal control (Claude Code native, or Polly on Claude SDK). */
   showClaudeGoalControl?: boolean;
   /** Show Polly's Codex command-backed Goal control. */
   showPollyCodexGoalControl?: boolean;
@@ -2351,18 +2344,8 @@ function SubagentComposerTray({ label }: { label: string }) {
   );
 }
 
-/**
- * Whether the composer refuses input: a read-only grant or a structurally
- * non-interactive session. A temporary send block keeps the level-1 fallback
- * of a still-starting client-only conversation editable.
- */
-export function isComposerReadOnly(
-  permissionLevel: number | null,
-  readOnlyReason: string | null,
-  sendDisabledReason: string | null,
-): boolean {
-  return readOnlyReason !== null || (permissionLevel === 1 && sendDisabledReason === null);
-}
+// Re-exported for existing importers; the definition lives with the picker hook.
+export { isComposerReadOnly };
 
 /**
  * Pill above the composer tallying running background tasks (a dev server, a
@@ -2445,6 +2428,8 @@ function ComposerImpl(
   } = useReplyDraft();
   const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
   const [commandError, setCommandError] = useState<string | null>(null);
+  useDismissOnEscape(commandError !== null, () => setCommandError(null));
+  const pendingSideChatSessionsRef = useRef(new Set<string>());
   const [planModeBusy, setPlanModeBusy] = useState(false);
   const [goalDialogOpen, setGoalDialogOpen] = useState(false);
   const [inputFocused, setInputFocused] = useState(false);
@@ -2546,24 +2531,6 @@ function ComposerImpl(
   // Harness/agent identity shown in the status tray below the card, separate
   // from the composer's read-only model/effort label.
   const sessionHarness = useChatStore((s) => s.sessionHarness);
-  const nativeTerminalSession = useChatStore((s) => s.isNativeTerminalSession);
-  const subAgentName = useChatStore((s) => s.subAgentName);
-  const brainHarnessLabels = useBrainHarnessLabels();
-  const harnessLabel = composerHarnessLabel(
-    modelPickerKind,
-    // For a sub-agent (head) session, identify the head family being viewed
-    // (e.g. the GPT head → "Gpt") rather than the bundle orchestrator
-    // ("Debby") — the bundle is already named in the breadcrumb / Agents rail.
-    // A native sub-agent's name is vendor-side, not an Omnigent head, so the
-    // wrapper below outranks it.
-    subAgentName ??
-      agents?.find((a) => a.id === selectedAgentId)?.name ??
-      agents?.[0]?.name ??
-      null,
-    sessionHarness,
-    brainHarnessLabels,
-    wrapperLabel,
-  );
 
   // Preserve unsent text + file attachments per session so switching
   // tabs and coming back restores the draft. The shared draft store also lets
@@ -2679,6 +2646,29 @@ function ComposerImpl(
   const codexApprovalMode = useChatStore((s) => s.codexApprovalMode);
   const [configBusy, setConfigBusy] = useState(false);
   const configBusyRef = useRef(false);
+  // The active conversation's picker props; ChatPage's fallbacks arrive through the inputs.
+  const sessionHarnessPicker = useSessionHarnessPickerProps({
+    sessionId: undefined,
+    hostId: composerSession?.hostId,
+    inputs: {
+      costRoutingEligible,
+      modelPickerKind,
+      showModels,
+      effortLevels,
+      showEffort,
+      codexModelOptions,
+      modelLabelOptions,
+      modelsFromLaunchPreview: modelsFromLaunchPreview ?? false,
+      inferenceConfigured,
+      inferenceError,
+    },
+    agentName:
+      agents?.find((agent) => agent.id === selectedAgentId)?.name ?? agents?.[0]?.name ?? null,
+    wrapperLabel,
+    isNativeWrapper,
+    runnerOnline,
+    gates: { permissionLevel, readOnlyReason, sendDisabledReason, unreachable },
+  });
 
   // Ctrl+Shift+M opens the model picker, the keyboard equivalent of bare
   // "/model" (same nonce bump). Gated like the gear's model-open path: a picker
@@ -2805,9 +2795,6 @@ function ComposerImpl(
   // ``mentionMarkerFor``. FileViewer's "Attach to agent" gate uses the same helper.
   const fileMentionHarnesses = useFileMentionHarnesses();
   const mentionEnabled = harnessSupportsFileMentions(sessionHarness, fileMentionHarnesses);
-  const workspaceFilesQuery = useWorkspaceAllFiles(composerSessionId ?? undefined, {
-    enabled: mentionEnabled,
-  });
   const valueRef = useRef(fullText);
   valueRef.current = fullText;
   const replyDraftRef = useRef(storedReplyDraft);
@@ -2825,8 +2812,7 @@ function ComposerImpl(
   // Keep desktop's fast-type affordance, but let mobile users explicitly tap
   // the composer when switching back from Terminal or changing sessions.
   const isMobile = useIsMobileViewport();
-  const isCoarsePointer = useIsCoarsePointer();
-  const preventsKeyboardSubmit = isMobile || isCoarsePointer;
+  const preventsKeyboardSubmit = isMobile;
   const isMobileRef = useRef(isMobile);
   isMobileRef.current = isMobile;
 
@@ -2976,11 +2962,7 @@ function ComposerImpl(
   // it each turn; native wrappers expose it only when they have a picker
   // path that the runner can propagate without blocking the vendor TUI.
   const showModel = !isNativeWrapper || showModels;
-  const supportsModelReset = modelResetSupported({
-    inferenceConfigured,
-    modelPickerKind,
-    isNativeWrapper,
-  });
+  const { supportsModelReset } = sessionHarnessPicker;
   // /compact is functional for native wrappers (claude-native,
   // codex-native), which inject the slash command into the terminal, and
   // for claude-sdk, whose runner sends /compact to the live SDK client to
@@ -3009,7 +2991,7 @@ function ComposerImpl(
   // details, and sends the workflow. The "+" menu offers it, and so does the
   // Tasks tab's empty state, which reaches it through the registry below.
   const canStartWorkflow = !isReadOnly && offersWorkflow(skills);
-  const savedWorkflows = useSavedWorkflows({ enabled: canStartWorkflow });
+  const savedWorkflows = useSavedWorkflows({ enabled: canStartWorkflow, includeShared: true });
   const [workflowDialogOpen, setWorkflowDialogOpen] = useState(false);
   const [workflowDialogDescription, setWorkflowDialogDescription] = useState("");
   const [savedWorkflowToRun, setSavedWorkflowToRun] = useState<SavedWorkflow | null>(null);
@@ -3153,72 +3135,19 @@ function ComposerImpl(
       setPlanModeBusy(false);
     }
   };
-  // "@"-mention is a drill-down file/folder browser. The token after "@"
-  // doubles as a path: text up to the last "/" is the directory being
-  // browsed; text after it filters that directory's entries. Opening a
-  // folder rewrites the token to "<dir>/" so the menu re-lists it — that
-  // is how nested files are reached (recursion via navigation, mirroring
-  // the terminal's git-tracked walk). At any level the user can attach a
-  // single file or the whole folder.
-  const { dir: mentionDir, filter: mentionFilter } = parseMentionToken(mention?.query ?? "");
-  // Root listing reuses the gate's useWorkspaceAllFiles; a sub-directory
-  // uses the lazy per-dir hook (disabled — null path — at the root). Both
-  // return files AND directories with a ``type`` discriminator.
-  const mentionDirQuery = useWorkspaceDirectory(
-    conversationId ?? undefined,
-    mentionEnabled && mention && mentionDir ? mentionDir : null,
-  );
-  const mentionSourceEntries: WorkspaceFile[] = mentionDir
-    ? (mentionDirQuery.data ?? [])
-    : (workspaceFilesQuery.data?.data ?? []);
-  // Typing after "@" also searches the server, debounced like the palette.
-  const debouncedMentionQuery = useDebouncedValue(mention?.query ?? "", MENTION_SEARCH_DEBOUNCE_MS);
-  // Root-level typing also finds files in unexpanded folders (files only).
-  const mentionFileSearch = useWorkspaceFileSearch(
-    composerSessionId ?? undefined,
-    mentionEnabled && mention && !mentionDir ? debouncedMentionQuery : "",
-  );
-  // Folders first, filtered by the typed segment, capped (see rankMentionEntries),
-  // then deeper search hits the cached listing doesn't already show.
-  const mentionEntries = ((): WorkspaceFile[] => {
-    if (!mentionEnabled || !mention) return [];
-    const listed = rankMentionEntries(mentionSourceEntries, mentionFilter);
-    if (mentionDir || !mentionFilter) return listed;
-    const listedPaths = new Set(listed.map((entry) => entry.path));
-    // The search ran on the debounced text; re-check hits against the live filter.
-    const needle = mentionFilter.toLowerCase();
-    const deeper = rankMentionEntries(
-      (mentionFileSearch.data?.files ?? []).filter(
-        (file) => !listedPaths.has(file.path) && file.path.toLowerCase().includes(needle),
-      ),
-      "",
-    );
-    return [...listed, ...deeper].slice(0, MENTION_MATCH_CAP);
-  })();
-
   // Sessions: this session's subagents, then sidebar-loaded rows, then search hits.
   const { children: childSessions } = useChildSessions(conversationId);
-  const sessionEntries = useSessionMentionEntries({
-    mention,
-    debouncedQuery: debouncedMentionQuery,
-    currentSessionId: conversationId,
-    subagents: childSessions,
-  });
-  // True while a mention token is active but its listing hasn't resolved yet:
-  // the cold-boot root fetch, or a sub-directory's first load after drilling
-  // in. During this window ``mentionEntries`` is transiently empty (so the
-  // menu is closed), and a stray Enter must NOT fall through to ``submit`` and
-  // send the half-typed "@dir/" token as a chat message. A *settled*
-  // zero-match (e.g. "@notafile") is deliberately excluded — sending that
-  // literally is the user's intent.
-  const mentionListingPending =
-    mentionEnabled &&
-    mention != null &&
-    (mentionDir ? mentionDirQuery.isLoading : workspaceFilesQuery.isLoading);
+  // The "@" menu's rows come from useMentionListings, shared with the grid cell composer.
+  const { mentionDir, mentionFilter, mentionEntries, sessionEntries, mentionListingPending } =
+    useMentionListings({
+      conversationId,
+      enabled: mentionEnabled,
+      mention,
+      subagents: childSessions,
+    });
 
-  // Shared selection/chip/keyboard glue (see useMentionBrowser). The token
-  // state and the data source above stay here; everything stateful is shared
-  // so this composer and the launcher can't drift. ``setText`` also flags the
+  // Shared selection/chip/keyboard glue (see useMentionBrowser); the token state stays here.
+  // Sharing keeps this composer and the launcher from drifting. ``setText`` also flags the
   // draft dirty so attach/drill participate in draft persistence.
   const {
     mentionIndex,
@@ -4006,6 +3935,23 @@ function ComposerImpl(
     )
       return;
 
+    const skill = onSendSlashCommand
+      ? matchSlashCommandInvocation(trimmed, slashCommandNames)
+      : null;
+    const parts = trimmed.split(/\s+/);
+    const cmd = parts[0].toLowerCase();
+    const sendContext = { mentions: liveMentions, reviewComments: localReviewComments };
+    const opensGenericSideChat =
+      cmd === "/side" &&
+      !usesNativeSideChatFork(sessionHarness) &&
+      !carriesMessageContext(draft, files, sendContext) &&
+      (skill === null || skill.command === parts[0]);
+    if (
+      opensGenericSideChat &&
+      pendingSideChatSessionsRef.current.has(useChatStore.getState().conversationId ?? "")
+    )
+      return;
+
     // A send is actually happening: report it for both pointer clicks (which
     // reach here via the form submit) and Enter-key sends. Placed after the
     // guard so guarded no-ops don't emit, matching the disabled Send button.
@@ -4018,36 +3964,35 @@ function ComposerImpl(
     // reaches the runner as plaintext).
     const openGenericSideChat = (question: string) => {
       const sourceId = useChatStore.getState().conversationId;
-      if (sourceId === null) return;
+      if (sourceId === null || pendingSideChatSessionsRef.current.has(sourceId)) return;
+      pendingSideChatSessionsRef.current.add(sourceId);
       setCommandError(null);
-      createSideChat(sourceId).then(
-        ({ childSessionId }) => {
-          // Clear the composer only once the side chat exists, so a failed
-          // create keeps the user's typed question instead of dropping it.
-          dirtyRef.current = true;
-          setValue("");
-          useChatStore.getState().openSideChatWithDraft(childSessionId, question, sourceId);
-        },
-        // Surface the failure as a toast, not an inline composer error; the
-        // composer text is left intact for a retry.
-        () => toast.error("Couldn't start a side chat for this session."),
-      );
+      createSideChat(sourceId)
+        .then(
+          ({ childSessionId }) => {
+            // Clear the composer only once the side chat exists, so a failed
+            // create keeps the user's typed question instead of dropping it.
+            dirtyRef.current = true;
+            setValue("");
+            useChatStore.getState().openSideChatWithDraft(childSessionId, question, sourceId);
+          },
+          // Surface the failure as a toast, not an inline composer error; the
+          // composer text is left intact for a retry.
+          () => toast.error("Couldn't start a side chat for this session."),
+        )
+        .finally(() => {
+          pendingSideChatSessionsRef.current.delete(sourceId);
+        });
     };
 
     // Slash command path: text that reads as "/name ..." (not a file path) or
     // invokes a known catalog skill by its full name, with no attachments.
     // Built-ins run locally; anything unhandled falls through to plaintext.
-    const skill = onSendSlashCommand
-      ? matchSlashCommandInvocation(trimmed, slashCommandNames)
-      : null;
     let goalMessage: string | null = null;
-    const sendContext = { mentions: liveMentions, reviewComments: localReviewComments };
     if (
       (skill !== null || isSlashCommandText(trimmed)) &&
       !carriesMessageContext(draft, files, sendContext)
     ) {
-      const parts = trimmed.split(/\s+/);
-      const cmd = parts[0].toLowerCase();
       const arg = parts[1] ?? "";
       const sendSkill = (match: { command: string; args: string }) => {
         appendEntry(trimmed);
@@ -4113,7 +4058,7 @@ function ComposerImpl(
       // /side opens a side chat. Codex forks in-process (falls through to the
       // plaintext path so its runner forks); every other harness forks
       // server-side here into an empty side chat, carrying the typed question.
-      if (cmd === "/side" && !usesNativeSideChatFork(sessionHarness)) {
+      if (opensGenericSideChat) {
         runCommand(() => openGenericSideChat(trimmed.slice(cmd.length).trim()));
         return;
       }
@@ -4205,16 +4150,20 @@ function ComposerImpl(
     const reason = blockedReasonFor("stop the workflow");
     if (reason) toast.error(reason);
     else if (conversationId) {
+      const sessionId = conversationId;
       const message = stopPlanMessage(null);
       appendEntry(message);
       // Stop must reach the coordinator even while ordinary follow-ups are queued.
-      void sendUserMessage(conversationId, message)
-        .then((result) => {
-          if (result.denied) toast.error("A policy blocked the message.");
-        })
-        .catch((error: unknown) => {
+      void trackPlanStop(sessionId, async () => {
+        try {
+          const result = await sendUserMessage(sessionId, message);
+          if (!result.denied) return result;
+          toast.error("A policy blocked the message.");
+        } catch (error) {
           toast.error(error instanceof Error ? error.message : "Couldn't reach the session.");
-        });
+        }
+        return null;
+      });
     }
   };
 
@@ -4305,6 +4254,12 @@ function ComposerImpl(
       // token isn't sent as a chat message. The menu reopens when entries land.
       if (mentionListingPending) return;
       submit();
+      return;
+    }
+    // Esc closes slash-command output before it can reach the turn.
+    if (e.key === "Escape" && commandError !== null) {
+      e.preventDefault();
+      setCommandError(null);
       return;
     }
     // Esc dismisses the /btw sidechat overlay if open
@@ -4716,8 +4671,11 @@ function ComposerImpl(
                 <ComposerFeedbackRow tone="error">{attachmentError}</ComposerFeedbackRow>
               )}
               <ComposerLocalReviewChips comments={localReviewComments} />
-              {/* Inline slash-command feedback: errors and /help output */}
-              {commandError !== null && <ComposerFeedbackRow>{commandError}</ComposerFeedbackRow>}
+              {/* Inline slash-command feedback: errors and /help output. It closes on
+                  Escape, so page-wide Escape shortcuts leave it the key. */}
+              {commandError !== null && (
+                <ComposerFeedbackRow data-escape-owner="">{commandError}</ComposerFeedbackRow>
+              )}
             </>
           ),
         }}
@@ -4821,34 +4779,9 @@ function ComposerImpl(
                     busy={configBusy}
                     busyRef={configBusyRef}
                     setBusy={setConfigBusy}
-                    agentName={
-                      subAgentName ??
-                      agents?.find((agent) => agent.id === selectedAgentId)?.name ??
-                      agents?.[0]?.name ??
-                      null
-                    }
-                    harnessLabel={harnessLabel}
-                    showModels={showModels}
-                    showEffort={showEffort}
-                    effortLevels={effortLevels}
-                    modelPickerKind={modelPickerKind}
-                    supportsModelReset={supportsModelReset}
-                    codexModelOptions={codexModelOptions}
-                    inferenceConfigured={inferenceConfigured}
-                    inferenceError={inferenceError}
-                    modelsFromLaunchPreview={modelsFromLaunchPreview}
-                    modelLabelOptions={modelLabelOptions}
-                    modelLabelHostId={composerSession?.hostId}
-                    costRoutingEligible={costRoutingEligible}
-                    modelPickWakesSession={nativeTerminalSession && runnerOnline === false}
-                    // Config changes persist server-side and apply on the next
-                    // wake/turn (the runner forward is best-effort), so the gear
-                    // stays live wherever a message could be sent — including
-                    // asleep/starting/unknown. Only read-only viewers and sessions
-                    // no message can wake (unreachable) get an inert gear.
-                    disabled={isReadOnly || unreachable}
                     openNonce={pickerOpenNonce}
                     modelPickerShortcutEnabled={modelPickerHotkeyEnabled}
+                    {...sessionHarnessPicker}
                   />
                 </div>
               </MobileHeaderControlPortal>
@@ -5312,6 +5245,13 @@ export function shouldShowGoalControl(
   conv: { labels?: Record<string, string | null> | null } | null | undefined,
 ): boolean {
   return isCodexNativeSession(conv);
+}
+
+/** True for Claude Code native sessions; the composer sends Claude Code's built-in `/goal`. */
+export function shouldShowClaudeNativeGoalControl(
+  conv: { labels?: Record<string, string | null> | null } | null | undefined,
+): boolean {
+  return isClaudeNativeSession(conv);
 }
 
 /** True for top-level Polly sessions running on the Claude SDK harness. */

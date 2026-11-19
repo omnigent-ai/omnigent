@@ -16,6 +16,7 @@ from omnigent.entities import (
     PagedList,
 )
 from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
+from omnigent.session_recovery import SessionRecovery
 from omnigent.stores.conversation_store.activity_error import (
     LATEST_ACTIVITY_ERROR_LABEL_KEY,
     LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY,
@@ -579,6 +580,35 @@ class ConversationStore(ABC):
     ) -> bool:
         """Compare-and-set delivery state; None discards a canceled, unsent input."""
         raise NotImplementedError
+
+    supports_session_recovery = False
+
+    def admit_session_recovery(self, conversation_id: str, expected: SessionRecovery) -> bool:
+        """Order turn admission against new input and the current host/runner binding."""
+        del conversation_id, expected
+        return False
+
+    def get_session_recovery(self, conversation_id: str) -> SessionRecovery | None:
+        """Read private recovery intent; unsupported stores do not opt in."""
+        del conversation_id
+        return None
+
+    def get_session_interruption_time(self, conversation_id: str) -> int | None:
+        """Original disconnect-error timestamp, or None when unavailable."""
+        del conversation_id
+        return None
+
+    def replace_session_recovery(
+        self,
+        conversation_id: str,
+        expected: SessionRecovery | None,
+        recovery: SessionRecovery | None,
+        *,
+        expected_conversation: Conversation | None = None,
+    ) -> bool:
+        """Compare and replace recovery intent under the conversation input lock."""
+        del conversation_id, expected, recovery, expected_conversation
+        return False
 
     def list_host_conversation_ids(
         self,
@@ -1583,8 +1613,16 @@ class ConversationStore(ABC):
         """Persist the Plan snapshot and return its update; missing metadata returns None."""
         raise NotImplementedError
 
-    def add_new_sibling(self, source_id: str, session_id: str, *, user_id: str | None) -> None:
+    def add_new_sibling(
+        self, source_id: str, session_id: str, *, user_id: str | None, move_existing: bool = False
+    ) -> None:
         """Assign a freshly created session to its source's family before launch."""
+        raise NotImplementedError
+
+    def set_session_nest(
+        self, session_id: str, source_id: str | None, *, user_id: str | None
+    ) -> None:
+        """Move one independent session into a nest, or detach it with ``None``."""
         raise NotImplementedError
 
     def get_session_family(self, session_id: str) -> list[Conversation]:

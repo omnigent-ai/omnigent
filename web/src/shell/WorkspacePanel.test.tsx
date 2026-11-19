@@ -47,6 +47,7 @@ import { WorkspacePanel } from "./WorkspacePanel";
 // Each stub renders a testid (plus, for FileViewer, the path it was asked to
 // show) so we can prove which child mounted without dragging in Monaco / hook
 // stacks / xterm.
+const paneRenders = vi.hoisted(() => vi.fn());
 vi.mock("./FileViewer", () => ({
   FileViewer: ({
     path,
@@ -56,30 +57,37 @@ vi.mock("./FileViewer", () => ({
     path: string;
     open: boolean;
     mediaActive: boolean;
-  }) => (
-    <div data-testid="file-viewer-stub" data-open={open} data-media-active={mediaActive}>
-      {path}
-    </div>
-  ),
+  }) => {
+    paneRenders("file");
+    return (
+      <div data-testid="file-viewer-stub" data-open={open} data-media-active={mediaActive}>
+        {path}
+      </div>
+    );
+  },
 }));
 vi.mock("./FilesPanel", () => ({
   // Echo the fixed scope so tests can prove the Files tab renders the tree
   // (flatView=false) and the Changes tab the changed-only list (flatView=true).
-  FilesPanel: ({ flatView, conversationId }: { flatView: boolean; conversationId: string }) => (
-    <div
-      data-testid="files-panel-stub"
-      data-session={conversationId}
-      data-flat-view={String(flatView)}
-    />
-  ),
+  FilesPanel: ({ flatView, conversationId }: { flatView: boolean; conversationId: string }) => {
+    paneRenders("files");
+    return (
+      <div
+        data-testid="files-panel-stub"
+        data-session={conversationId}
+        data-flat-view={String(flatView)}
+      />
+    );
+  },
 }));
 vi.mock("./SubagentsPanel", () => ({
   SubagentsPanel: () => <div data-testid="subagents-stub" />,
 }));
 vi.mock("./ContentSearchPanel", () => ({
-  ContentSearchPanel: ({ inputRef }: { inputRef: RefObject<HTMLInputElement | null> }) => (
-    <input data-testid="content-search-stub" ref={inputRef} />
-  ),
+  ContentSearchPanel: ({ inputRef }: { inputRef: RefObject<HTMLInputElement | null> }) => {
+    paneRenders("search");
+    return <input data-testid="content-search-stub" ref={inputRef} />;
+  },
 }));
 vi.mock("@/components/BrowserPane/BrowserPane", () => ({
   BrowserPane: ({
@@ -352,6 +360,51 @@ function renderWorkspace(
     view,
   };
 }
+
+describe("WorkspacePanel render failures", () => {
+  it.each([
+    ["file", { selectedFilePath: "results.csv", openFiles: ["results.csv"] }],
+    ["files", {}],
+    ["search", { rightRailTab: "content-search", showContentSearch: true }],
+    ["files", { selectedFilePath: "results.csv", openFiles: ["results.csv"] }],
+    ["search", { selectedFilePath: "results.csv", showContentSearch: true }],
+  ] satisfies [string, Parameters<typeof renderWorkspace>[0]][])(
+    "contains a %s failure while keeping pane navigation available (%j)",
+    (pane, overrides) => {
+      const error = new Error("Workspace content failed");
+      const suppressExpectedError = (event: ErrorEvent) => {
+        if (event.error === error) event.preventDefault();
+      };
+      window.addEventListener("error", suppressExpectedError);
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      paneRenders.mockImplementation((name) => {
+        if (name === pane) throw error;
+      });
+      try {
+        const { rerender, onRightRailTabChange } = renderWorkspace(overrides);
+        expect(screen.getByRole("alert")).toHaveTextContent(
+          "Unable to display this workspace pane.",
+        );
+        if (pane !== "file" && "selectedFilePath" in overrides) {
+          expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("results.csv");
+        }
+        const changesTab = screen.getByRole("tab", { name: "Changes" });
+        expect(changesTab).toBeEnabled();
+        fireEvent.mouseDown(changesTab, { button: 0, ctrlKey: false });
+        expect(onRightRailTabChange).toHaveBeenCalledWith("changes");
+
+        paneRenders.mockReset();
+        rerender({ rightRailTab: "changes", selectedFilePath: null });
+        expect(screen.getByTestId("files-panel-stub")).toBeInTheDocument();
+        if (pane === "search") rerender({ rightRailTab: "content-search" });
+        expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      } finally {
+        paneRenders.mockReset();
+        window.removeEventListener("error", suppressExpectedError);
+      }
+    },
+  );
+});
 
 describe("WorkspacePanel surface presentation", () => {
   it("offers unpinned pages in + without requiring shell or browser support", () => {
