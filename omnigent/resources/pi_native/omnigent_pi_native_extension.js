@@ -913,18 +913,9 @@ function validCost(value) {
     : null;
 }
 
-// Build a stable fingerprint for one assistant message so the same message
-// arriving on multiple lifecycle events is only counted once. Pi's
-// ``AssistantMessage`` (``@earendil-works/pi-ai``) carries NO ``id`` field
-// but DOES carry an optional provider ``responseId`` and a required numeric
-// ``timestamp`` — both stable across the same message's re-emission on
-// ``message_end`` / ``turn_end`` / ``agent_end``. Prefer those identity
-// fields (plus a forward-compat ``id``) over the usage-count fingerprint:
-// hashing counts alone collides two DISTINCT LLM calls that happen to report
-// identical token counts (e.g. two identical short acks under prompt
-// caching), which would silently drop the second call's tokens (undercount).
-// The usage-count fingerprint stays only as a last resort for a message that
-// carries no identity field at all.
+// Fingerprint one assistant message so its re-emission on later lifecycle events counts once.
+// Identity fields come first: two distinct calls can report identical token counts,
+// so the usage-count fingerprint is a last resort for messages without one.
 function usageMessageKey(message, usage) {
   if (message && typeof message === "object") {
     if (typeof message.id === "string" && message.id)
@@ -1193,14 +1184,15 @@ function writeJsonAtomic(filePath, value) {
   }
 }
 
-// Native Pi subagents run as their own Pi sessions. A child file sits beneath
-// the parent's per-session directory (``<dir>/<parent stem>/...``) and names
-// the launching file in its ``parentSession`` header; Pi's /fork and /clone
-// write top-level siblings, so they never match.
+// A native Pi subagent session sits beneath the parent's ``<dir>/<parent stem>/`` and names
+// its launcher in ``parentSession``; Pi's /fork and /clone write top-level siblings instead.
 const _CHILD_POLL_MS = 2_000;
 // A child whose last reply ended its turn this long ago is reported idle.
 const _CHILD_QUIET_MS = 20_000;
 const _CHILD_READ_CHUNK_BYTES = 1024 * 1024;
+// Each synchronous read pass stops starting new chunks after this long.
+const _CHILD_READ_BUDGET_MS = 500;
+const _CHILD_TITLE_MAX_CHARS = 80;
 const _CHILD_HEADER_BYTES = 64 * 1024;
 const _CHILD_SCAN_MAX_DEPTH = 10;
 // The shutdown drain allows this many sequential post timeouts, within the history budget.
@@ -1260,7 +1252,8 @@ function readChildHeader(file) {
     const entry = parseJsonLine(line);
     if (entry?.type !== "session_info" || typeof entry.name !== "string" || !entry.name) continue;
     // The Agents rail splits a child title at its first colon.
-    title = (entry.name.match(_PI_SUBAGENTS_SESSION_NAME)?.[1] || entry.name).replace(/:/g, "-");
+    const name = (entry.name.match(_PI_SUBAGENTS_SESSION_NAME)?.[1] || entry.name).replace(/:/g, "-").trim();
+    title = Array.from(name).slice(0, _CHILD_TITLE_MAX_CHARS).join("") || title;
     break;
   }
   return {
@@ -1271,15 +1264,21 @@ function readChildHeader(file) {
   };
 }
 
-/**
- * Register native Pi subagent sessions as Omnigent child sessions and report
- * each child's cumulative usage, priced by the child's own model, so the
- * server's subtree roll-up includes it.
- *
- * Reads only bytes appended since the last poll. Cursors and totals persist
- * together in the bridge dir, so a relaunch resumes without double counting.
- * Runs on its own timer and retries failed posts on the next poll.
- */
+// A persisted child entry missing a field is dropped and rebuilt from its file.
+function validChildEntry(child) {
+  const usage = child?.usage;
+  return typeof child?.file === "string" && typeof child.key === "string" && Boolean(child.key) &&
+    typeof child.parentFile === "string" && typeof child.title === "string" &&
+    Number.isSafeInteger(child.offset) && child.offset >= 0 && Number.isFinite(child.startedAt) &&
+    (child.childId === null || typeof child.childId === "string") &&
+    (child.lastStop === null || typeof child.lastStop === "string") &&
+    Boolean(usage) && typeof usage === "object" && typeof usage.completeCost === "boolean" &&
+    ["input", "output", "cacheRead", "costUsd"].every(field => Number.isFinite(usage[field])) &&
+    (usage.model === null || typeof usage.model === "string");
+}
+
+// Register Pi subagent sessions as Omnigent children under their Pi session id and SET each one's
+// cumulative usage; cursors and totals persist together, so a relaunch never double counts.
 function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
   const enabled = Boolean(config && config.serverUrl && config.sessionId && config.bridgeDir);
   const statePath = enabled ? path.join(config.bridgeDir, "pi_subagent_children.json") : null;
@@ -1288,12 +1287,12 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
   const ignoredFiles = new Set();
   let timer = null;
   let polling = null;
-  let cancelPosts = new AbortController();
+  let pollAbort = null;
 
   try {
     const saved = JSON.parse(fs.readFileSync(statePath, "utf8"));
     roots = saved.roots.filter(root => typeof root === "string");
-    children = saved.children.filter(child => typeof child?.file === "string");
+    children = saved.children.filter(validChildEntry);
   } catch (_err) {}
 
   function persist() {
@@ -1327,8 +1326,10 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
     }
   }
 
-  async function post(sessionId, body) {
-    const signal = AbortSignal.any([AbortSignal.timeout(assistantItemPostTimeoutMs(config)), cancelPosts.signal]);
+  // Each poll owns its signal, so an aborted poll starts no further posts.
+  async function post(sessionId, body, pollSignal) {
+    if (pollSignal.aborted) throw pollSignal.reason;
+    const signal = AbortSignal.any([AbortSignal.timeout(assistantItemPostTimeoutMs(config)), pollSignal]);
     return postEventChecked({ ...config, sessionId }, body, signal);
   }
 
@@ -1339,18 +1340,16 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
       : children.find(other => other.file === child.parentFile)?.childId;
   }
 
-  async function ensureMinted(child) {
+  async function ensureMinted(child, signal) {
     if (child.childId) return true;
     const parentId = parentSessionId(child);
     if (!parentId) return false;
-    // The server dedupes on this id, so it keeps the full persisted Pi session id
-    // behind a readable agent-name prefix.
-    const subagentId = `${child.title}-${child.key}`;
     try {
+      // The server dedupes on this id; a title change must not mint a second child.
       const response = await post(parentId, {
         type: "external_acp_subagent_start",
-        data: { subagent_id: subagentId, title: child.title },
-      });
+        data: { subagent_id: child.key, title: child.title },
+      }, signal);
       const childId = (await response?.json?.())?.child_session_id;
       if (typeof childId === "string" && childId) child.childId = childId;
     } catch (_err) {}
@@ -1373,7 +1372,8 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
   }
 
   // Consume complete lines appended since the last poll, chunk by chunk up to the observed size.
-  function readNew(child) {
+  // Stops at the deadline with the cursor on a line boundary, so the next poll resumes there.
+  function readNew(child, deadline) {
     let stat;
     try {
       stat = fs.statSync(child.file);
@@ -1381,7 +1381,8 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
       return;
     }
     child.mtimeMs = stat.mtimeMs;
-    for (let remaining = stat.size - child.offset; remaining > 0; remaining = stat.size - child.offset) {
+    for (let remaining = stat.size - child.offset; remaining > 0 && Date.now() < deadline;
+      remaining = stat.size - child.offset) {
       // A line longer than one chunk extends the read chunk by chunk until it ends.
       const parts = [];
       let length = 0;
@@ -1408,7 +1409,7 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
     }
   }
 
-  async function report(child, final) {
+  async function report(child, final, signal) {
     const usage = child.usage;
     const postKey = JSON.stringify(usage);
     if ((usage.input || usage.output) && postKey !== child.postedKey) {
@@ -1421,7 +1422,7 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
       if (usage.completeCost) data.cumulative_cost_usd = usage.costUsd;
       if (usage.model) data.model = usage.model;
       try {
-        await post(child.childId, { type: "external_session_usage", data });
+        await post(child.childId, { type: "external_session_usage", data }, signal);
         child.postedKey = postKey;
       } catch (_err) {}
     }
@@ -1434,21 +1435,22 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
     try {
       await post(child.childId, status === "idle"
         ? { type: "subagent.status", data: { idle: true } }
-        : { type: "external_session_status", data: { status: "running" } });
+        : { type: "external_session_status", data: { status: "running" } }, signal);
       child.postedStatus = status;
     } catch (_err) {}
   }
 
-  async function runPoll(final) {
+  async function runPoll(final, readDeadline, signal) {
     const current = sessionFile();
     if (current && !roots.includes(path.resolve(current))) roots.push(path.resolve(current));
     discover(final);
     const reports = [];
     // Persist cursors and totals before reporting them.
     const flush = ready => {
-      ready.forEach(readNew);
+      const readUntil = Math.min(Date.now() + _CHILD_READ_BUDGET_MS, readDeadline);
+      ready.forEach(child => readNew(child, readUntil));
       persist();
-      reports.push(...ready.map(child => report(child, final)));
+      reports.push(...ready.map(child => report(child, final, signal)));
     };
     // Registered children report without waiting on new registrations.
     flush(children.filter(child => child.childId));
@@ -1458,7 +1460,7 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
       const batch = children.filter(child => !child.childId && !attempted.has(child) && parentSessionId(child));
       batch.forEach(child => attempted.add(child));
       await Promise.all(batch.map(async child => {
-        if (!(await ensureMinted(child))) return;
+        if (!(await ensureMinted(child, signal))) return;
         flush([child]);
         await register();
       }));
@@ -1469,8 +1471,11 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
 
   return {
     // The final poll skips the title grace period so late children are still reported.
-    poll(final = false) {
-      if (enabled) polling ||= runPoll(final).finally(() => { polling = null; });
+    poll(final = false, readDeadline = Infinity) {
+      if (enabled && !polling) {
+        pollAbort = new AbortController();
+        polling = runPoll(final, readDeadline, pollAbort.signal).finally(() => { polling = null; });
+      }
       return polling || Promise.resolve();
     },
     start() {
@@ -1483,13 +1488,13 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
       clearInterval(timer);
       timer = null;
       // A hung request in the in-flight poll must not consume the final poll's budget.
-      cancelPosts.abort();
-      cancelPosts = new AbortController();
-      const final = Promise.resolve(polling).catch(() => {}).then(() => this.poll(true));
-      const bound = new AbortController();
+      if (polling) pollAbort.abort();
       const deadline = Math.min(
         _HISTORY_SHUTDOWN_TIMEOUT_MS, _CHILD_SHUTDOWN_POSTS * assistantItemPostTimeoutMs(config),
       );
+      const deadlineAt = Date.now() + deadline;
+      const final = Promise.resolve(polling).catch(() => {}).then(() => this.poll(true, deadlineAt));
+      const bound = new AbortController();
       await Promise.race([final.catch(() => {}), sleep(deadline, bound.signal)]);
       bound.abort();
     },

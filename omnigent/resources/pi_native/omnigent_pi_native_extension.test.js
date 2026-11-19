@@ -727,10 +727,9 @@ async function testQueuedPromptDuringStartupStaysRunningUntilAgentEnd() {
   }
 }
 
-// Native subagent children: a parent session file plus child session files
-// beneath its per-session directory, watched through the real extension module.
-// Posts are recorded once their response arrives; an infinite delay never responds.
-// A stalled post fails when aborted, noting why and how many posts had arrived by then.
+// A parent session file with child session files beneath it, watched by the real module.
+// Posts are recorded once answered; an infinite delay never answers, and a stalled post
+// fails only when aborted, recording why and how many posts had arrived by then.
 function childFixture({ responseDelayMs = 0, postTimeoutMs, stalls = () => false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-children-"));
   harnesses.push({ pi: {}, fixtureRoot: root });
@@ -822,14 +821,14 @@ async function testChildSessionsAreRegisteredWithTheirOwnModels() {
   assert("each child is registered under the parent once",
     JSON.stringify(starts.map((p) => [p.sessionId, p.body.data.subagent_id, p.body.data.title]).sort()) ===
       JSON.stringify([
-        ["conv_parent", "worker-01a1f1a6-6b58-7306-959e-0a1b2c3d4e5f", "worker"],
-        ["conv_parent", "worker-01a1f1a6-6b58-7306-959e-c50b9edd4745", "worker"],
-        ["conv_parent", "worker-01a1f1a6-6b58-7306-959e-d61c9edd4745", "worker"],
+        ["conv_parent", "01a1f1a6-6b58-7306-959e-0a1b2c3d4e5f", "worker"],
+        ["conv_parent", "01a1f1a6-6b58-7306-959e-c50b9edd4745", "worker"],
+        ["conv_parent", "01a1f1a6-6b58-7306-959e-d61c9edd4745", "worker"],
       ]),
     JSON.stringify(starts));
-  const usageA = childUsage(f.posts, "conv_worker-01a1f1a6-6b58-7306-959e-c50b9edd4745");
-  const usageB = childUsage(f.posts, "conv_worker-01a1f1a6-6b58-7306-959e-0a1b2c3d4e5f");
-  const usageC = childUsage(f.posts, "conv_worker-01a1f1a6-6b58-7306-959e-d61c9edd4745");
+  const usageA = childUsage(f.posts, "conv_01a1f1a6-6b58-7306-959e-c50b9edd4745");
+  const usageB = childUsage(f.posts, "conv_01a1f1a6-6b58-7306-959e-0a1b2c3d4e5f");
+  const usageC = childUsage(f.posts, "conv_01a1f1a6-6b58-7306-959e-d61c9edd4745");
   assert("child usage is priced by its own model, deduped, without a zero Pi cost",
     usageA.length === 1 && usageA[0].model === "model-a" &&
       usageA[0].cumulative_input_tokens === 110 && usageA[0].cumulative_output_tokens === 10 &&
@@ -843,7 +842,7 @@ async function testChildSessionsAreRegisteredWithTheirOwnModels() {
     usageC.length === 1 && usageC[0].cumulative_input_tokens === 210 && usageA[0]?.cumulative_input_tokens === 110,
     JSON.stringify(usageC));
   assert("a running child reports running",
-    f.posts.some((p) => p.sessionId === "conv_worker-01a1f1a6-6b58-7306-959e-c50b9edd4745" && p.body.type === "external_session_status" &&
+    f.posts.some((p) => p.sessionId === "conv_01a1f1a6-6b58-7306-959e-c50b9edd4745" && p.body.type === "external_session_status" &&
       p.body.data.status === "running"));
 }
 
@@ -858,74 +857,90 @@ async function testChildReadsIncrementallyAndSurvivesRestart() {
 
   await f.watcher().poll();
   assert("a partial trailing line is not counted",
-    childUsage(f.posts, "conv_worker-child").at(-1)?.cumulative_input_tokens === 110,
-    JSON.stringify(childUsage(f.posts, "conv_worker-child")));
+    childUsage(f.posts, "conv_child").at(-1)?.cumulative_input_tokens === 110,
+    JSON.stringify(childUsage(f.posts, "conv_child")));
 
   fs.appendFileSync(file, second.slice(30));
   // A relaunched extension resumes from the persisted cursor and totals.
   const later = () => Date.now() + 60_000;
   await f.watcher(later).poll();
-  const usage = childUsage(f.posts, "conv_worker-child");
+  const usage = childUsage(f.posts, "conv_child");
   assert("restart completes the line without double counting",
     usage.at(-1).cumulative_input_tokens === 140 && usage.at(-1).cumulative_output_tokens === 12,
     JSON.stringify(usage));
   assert("restart does not register the child again",
     f.posts.filter((p) => p.body.type === "external_acp_subagent_start").length === 1);
   assert("a quiet child that ended its turn reports idle without a terminal edge",
-    f.posts.some((p) => p.sessionId === "conv_worker-child" && p.body.type === "subagent.status") &&
+    f.posts.some((p) => p.sessionId === "conv_child" && p.body.type === "subagent.status") &&
       !f.posts.some((p) => p.body.type === "external_session_status" && p.body.data.status !== "running"));
   const state = JSON.parse(fs.readFileSync(path.join(f.bridgeDir, "pi_subagent_children.json"), "utf8"));
   assert("the cursor covers exactly the consumed bytes", state.children[0].offset === fs.statSync(file).size);
 }
 
-async function testChildWrittenAfterTheLastPollIsReportedAtShutdown() {
+function writeChildFile(f, relative, text) {
+  const file = path.join(f.sessions, path.basename(f.parentFile, ".jsonl"), relative);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, text);
+  return file;
+}
+
+function childStatePath(f) {
+  return path.join(f.bridgeDir, "pi_subagent_children.json");
+}
+
+async function testShutdownDrainsPastAStalledRegistration() {
   // Fast responses, but the whole drain outlasts one post timeout.
   const f = childFixture({
     responseDelayMs: 40, postTimeoutMs: 100,
-    stalls: (body) => body.data?.subagent_id === "worker-stalled",
+    stalls: (body) => body.data?.subagent_id === "stalled",
   });
   const watcher = f.watcher();
-  const childDir = path.join(f.sessions, path.basename(f.parentFile, ".jsonl"));
-  const writeChild = (relative, text) => {
-    fs.mkdirSync(path.dirname(path.join(childDir, relative)), { recursive: true });
-    fs.writeFileSync(path.join(childDir, relative), text);
-    return path.join(childDir, relative);
-  };
-  const registered = writeChild("registered/session.jsonl",
+  const registered = writeChildFile(f, "registered/session.jsonl",
     childSessionLines({ id: "registered", parentFile: f.parentFile, agent: "worker" }) +
     assistantLine("model-a", 2000, 100, 10));
   await watcher.poll();
   // Its final reply ends the turn moments before shutdown.
   fs.appendFileSync(registered, assistantLine("model-a", 3000, 20, 2, "stop"));
-  writeChild("stalled/session.jsonl",
+  writeChildFile(f, "stalled/session.jsonl",
     childSessionLines({ id: "stalled", parentFile: f.parentFile, agent: "worker" }) +
     assistantLine("model-a", 2000, 1, 1));
   await watcher.stop();
   const registeredUsage = f.posts.findIndex((p) =>
     p.body.type === "external_session_usage" && p.body.data.cumulative_input_tokens === 140);
   assert("a registered child's new usage is posted without waiting on a stalled registration",
-    f.posts[registeredUsage]?.sessionId === "conv_worker-registered" && registeredUsage < f.stalled[0]?.postsBefore,
+    f.posts[registeredUsage]?.sessionId === "conv_registered" && registeredUsage < f.stalled[0]?.postsBefore,
     JSON.stringify(f.stalled));
   assert("a poll tries a stalled registration once", f.stalled.length === 1, JSON.stringify(f.stalled));
-  const idle = (sessionId) => f.posts.some((p) => p.sessionId === sessionId && p.body.type === "subagent.status");
   assert("a child whose turn ended just before shutdown is reported idle",
-    idle("conv_worker-registered"), JSON.stringify(f.posts));
+    f.posts.some((p) => p.sessionId === "conv_registered" && p.body.type === "subagent.status"),
+    JSON.stringify(f.posts));
 
-  // A restarted watcher, with the stalled registration still pending.
+  // A restarted watcher, with the stalled registration still pending and a poll in flight.
   watcher.start();
+  watcher.poll();
+  await watcher.stop();
+  assert("shutdown abandons the in-flight poll's hung request, and each poll tries it once",
+    f.stalled.length === 3 && f.stalled[1].reason === "AbortError" && f.stalled[2].reason === "TimeoutError",
+    JSON.stringify(f.stalled));
+}
+
+async function testChildrenWrittenAfterTheLastPollAreReportedAtShutdown() {
+  const f = childFixture();
+  const watcher = f.watcher();
+  await watcher.poll();
   // A tool result longer than one read chunk precedes the final usage.
   const bigLine = JSON.stringify({ type: "message", message: { role: "toolResult", content: "x".repeat(1100 * 1024) } }) + "\n";
-  writeChild("run/session.jsonl",
+  writeChildFile(f, "run/session.jsonl",
     childSessionLines({ id: "late", parentFile: f.parentFile, agent: "worker" }) +
     bigLine + assistantLine("model-a", 2000, 100, 10));
-  const launcher = writeChild("b-launcher/session.jsonl",
+  const launcher = writeChildFile(f, "b-launcher/session.jsonl",
     childSessionLines({ id: "launcher", parentFile: f.parentFile, agent: "lead" }) +
     assistantLine("model-a", 2000, 30, 3));
-  writeChild("a-nested/session.jsonl",
+  writeChildFile(f, "a-nested/session.jsonl",
     childSessionLines({ id: "nested01", parentFile: launcher, agent: "scout" }) +
     assistantLine("model-b", 2000, 40, 4));
   // No session_info title yet, written moments before shutdown.
-  writeChild("untitled/session.jsonl",
+  writeChildFile(f, "untitled/session.jsonl",
     JSON.stringify({ type: "session", id: "untitled", timestamp: new Date(1000).toISOString(), parentSession: f.parentFile }) +
     "\n" + assistantLine("model-a", 2000, 50, 5, "stop"));
 
@@ -939,34 +954,139 @@ async function testChildWrittenAfterTheLastPollIsReportedAtShutdown() {
     return readSync(...args);
   };
   try {
-    // A poll is already in flight when shutdown begins.
-    watcher.poll();
     await watcher.stop();
   } finally {
     fs.readdirSync = readdirSync;
     fs.readSync = readSync;
   }
-  assert("shutdown abandons the in-flight poll's hung request, and each poll tries it once",
-    f.stalled.length === 3 && f.stalled[1].reason === "AbortError" && f.stalled[2].reason === "TimeoutError",
-    JSON.stringify(f.stalled));
   assert("a finished child first seen at shutdown is reported idle",
-    idle("conv_subagent-untitled"), JSON.stringify(f.posts));
+    f.posts.some((p) => p.sessionId === "conv_untitled" && p.body.type === "subagent.status"), JSON.stringify(f.posts));
   assert("backlog reads stay within one chunk", largestRead <= 1024 * 1024, String(largestRead));
   const started = (subagentId, sessionId = "conv_parent") => f.posts.some((p) =>
     p.sessionId === sessionId && p.body.type === "external_acp_subagent_start" && p.body.data.subagent_id === subagentId);
   assert("a child written after the last poll is registered and reported past a chunk boundary at shutdown",
-    started("worker-late") && childUsage(f.posts, "conv_worker-late").at(-1)?.cumulative_input_tokens === 110,
+    started("late") && childUsage(f.posts, "conv_late").at(-1)?.cumulative_input_tokens === 110,
     JSON.stringify(f.posts.filter((p) => p.sessionId.includes("late"))));
   assert("a nested child enumerated before its launcher attaches to it at shutdown",
-    started("lead-launcher") && started("scout-nested01", "conv_lead-launcher") &&
-      childUsage(f.posts, "conv_lead-launcher").at(-1)?.cumulative_input_tokens === 40 &&
-      childUsage(f.posts, "conv_scout-nested01").at(-1)?.cumulative_input_tokens === 50,
+    started("launcher") && started("nested01", "conv_launcher") &&
+      childUsage(f.posts, "conv_launcher").at(-1)?.cumulative_input_tokens === 40 &&
+      childUsage(f.posts, "conv_nested01").at(-1)?.cumulative_input_tokens === 50,
     JSON.stringify(f.posts));
   assert("an untitled child written just before shutdown is reported under the fallback title",
     f.posts.some((p) => p.body.type === "external_acp_subagent_start" &&
-      p.body.data.subagent_id === "subagent-untitled" && p.body.data.title === "subagent") &&
-      childUsage(f.posts, "conv_subagent-untitled").at(-1)?.cumulative_input_tokens === 60,
+      p.body.data.subagent_id === "untitled" && p.body.data.title === "subagent") &&
+      childUsage(f.posts, "conv_untitled").at(-1)?.cumulative_input_tokens === 60,
     JSON.stringify(f.posts));
+}
+
+async function testAnAbortedPollStartsNoFurtherPosts() {
+  let usageStarts = 0;
+  let idleStarts = 0;
+  let oldUsageStarted;
+  const oldUsage = new Promise((resolve) => { oldUsageStarted = resolve; });
+  // The in-flight poll's usage post hangs, as would any idle post started before the final usage.
+  const f = childFixture({
+    postTimeoutMs: 100,
+    stalls: (body) => {
+      if (body.type === "subagent.status") return ++idleStarts > 0 && usageStarts === 2;
+      if (body.type !== "external_session_usage" || ++usageStarts !== 2) return false;
+      oldUsageStarted();
+      return true;
+    },
+  });
+  let clock = Date.now();
+  const watcher = f.watcher(() => clock);
+  const file = writeChildFile(f, "run/session.jsonl",
+    childSessionLines({ id: "child", parentFile: f.parentFile, agent: "worker" }) + assistantLine("model-a", 2000, 100, 10));
+  await watcher.poll();
+  fs.appendFileSync(file, assistantLine("model-a", 3000, 20, 2, "stop"));
+  // Quiet long enough that the in-flight poll would post idle after its usage post.
+  clock += 60_000;
+  watcher.poll();
+  await oldUsage;
+  await watcher.stop();
+  assert("an aborted poll starts no status post after its usage post is aborted",
+    idleStarts === 1 && f.stalled.length === 1 && f.stalled[0].reason === "AbortError",
+    JSON.stringify({ idleStarts, stalled: f.stalled }));
+  assert("the final poll still delivers the child's usage and idle status",
+    childUsage(f.posts, "conv_child").at(-1)?.cumulative_input_tokens === 140 &&
+      f.posts.some((p) => p.sessionId === "conv_child" && p.body.type === "subagent.status"),
+    JSON.stringify(f.posts));
+}
+
+async function testRediscoveredTitleKeepsOneChildIdentity() {
+  const f = childFixture();
+  const file = writeChildFile(f, "run/session.jsonl",
+    JSON.stringify({ type: "session", id: "child", timestamp: new Date(1000).toISOString(), parentSession: f.parentFile }) +
+    "\n" + assistantLine("model-a", 2000, 100, 10));
+  // Past the title grace period, so the child registers under the fallback title.
+  await f.watcher(() => Date.now() + 60_000).poll();
+  fs.writeFileSync(childStatePath(f), "{not json");
+  const longAgent = "w".repeat(200);
+  fs.appendFileSync(file, JSON.stringify({
+    type: "session_info", name: `subagent-${longAgent}-00000000-0000-4000-8000-000000000000-1`,
+  }) + "\n");
+  await f.watcher().poll();
+  const starts = f.posts.filter((p) => p.body.type === "external_acp_subagent_start").map((p) => p.body.data);
+  assert("a child rediscovered under its real title keeps one registration identity",
+    starts.length === 2 && starts.every((data) => data.subagent_id === "child") && starts[0].title === "subagent",
+    JSON.stringify(starts));
+  const usageTargets = new Set(f.posts.filter((p) => p.body.type === "external_session_usage").map((p) => p.sessionId));
+  assert("a rediscovered child reports usage to a single child session",
+    usageTargets.size === 1 && childUsage(f.posts, "conv_child").at(-1)?.cumulative_input_tokens === 110,
+    JSON.stringify([...usageTargets]));
+  assert("an oversized session name is capped in the title", starts[1]?.title === longAgent.slice(0, 80),
+    JSON.stringify(starts[1]));
+}
+
+async function testMalformedPersistedChildIsRebuiltFromItsFile() {
+  const f = childFixture();
+  const file = writeChildFile(f, "run/session.jsonl",
+    childSessionLines({ id: "child", parentFile: f.parentFile, agent: "worker" }) + assistantLine("model-a", 2000, 100, 10));
+  fs.writeFileSync(childStatePath(f), JSON.stringify({
+    roots: [f.parentFile],
+    children: [{
+      file, key: "child", parentFile: f.parentFile, title: "worker", startedAt: 1000,
+      childId: "conv_child", offset: "bad", lastStop: null, usage: null,
+    }],
+  }));
+  await f.watcher().poll().catch(() => {});
+  assert("a malformed persisted child is rebuilt from its file",
+    childUsage(f.posts, "conv_child").at(-1)?.cumulative_input_tokens === 110, JSON.stringify(f.posts));
+}
+
+async function testShutdownStopsReadingAtItsDeadline() {
+  const f = childFixture();
+  const watcher = f.watcher();
+  const file = writeChildFile(f, "run/session.jsonl",
+    childSessionLines({ id: "child", parentFile: f.parentFile, agent: "worker" }) + assistantLine("model-a", 2000, 100, 10));
+  await watcher.poll();
+  const bigLine = JSON.stringify({ type: "message", message: { role: "toolResult", content: "x".repeat(1100 * 1024) } }) + "\n";
+  fs.appendFileSync(file,
+    bigLine + assistantLine("model-a", 3000, 20, 2) + bigLine + assistantLine("model-a", 4000, 30, 3));
+  // Each full-chunk read appears to outlast the whole shutdown budget.
+  const readSync = fs.readSync;
+  const realNow = Date.now;
+  let skew = 0;
+  fs.readSync = (...args) => {
+    if (args[3] === 1024 * 1024) skew += 10_000;
+    return readSync(...args);
+  };
+  Date.now = () => realNow() + skew;
+  try {
+    await watcher.stop();
+  } finally {
+    fs.readSync = readSync;
+    Date.now = realNow;
+  }
+  const offset = JSON.parse(fs.readFileSync(childStatePath(f), "utf8")).children[0].offset;
+  const bytes = fs.readFileSync(file);
+  assert("shutdown stops reading at its deadline with the cursor on a line boundary",
+    offset < bytes.length && bytes[offset - 1] === 10, `${offset} of ${bytes.length}`);
+  await f.watcher().poll();
+  assert("the next launch resumes from the cursor without double counting",
+    childUsage(f.posts, "conv_child").at(-1)?.cumulative_input_tokens === 180,
+    JSON.stringify(childUsage(f.posts, "conv_child")));
 }
 
 async function testShutdownIsBoundedWhenTheServerNeverResponds() {
@@ -986,7 +1106,12 @@ async function testShutdownIsBoundedWhenTheServerNeverResponds() {
   try {
     await testChildSessionsAreRegisteredWithTheirOwnModels();
     await testChildReadsIncrementallyAndSurvivesRestart();
-    await testChildWrittenAfterTheLastPollIsReportedAtShutdown();
+    await testShutdownDrainsPastAStalledRegistration();
+    await testChildrenWrittenAfterTheLastPollAreReportedAtShutdown();
+    await testAnAbortedPollStartsNoFurtherPosts();
+    await testRediscoveredTitleKeepsOneChildIdentity();
+    await testMalformedPersistedChildIsRebuiltFromItsFile();
+    await testShutdownStopsReadingAtItsDeadline();
     await testShutdownIsBoundedWhenTheServerNeverResponds();
     await testSessionStartupDoesNotCompleteATurn();
     await testSessionStartMarksInputReady();
