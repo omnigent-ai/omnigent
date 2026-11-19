@@ -15,9 +15,13 @@ export interface FakeComposerSurface extends ComposerEditorSurface {
 
 /**
  * A non-textarea composer surface for tests: a focusable, marked element whose
- * value and selection live in memory, as another editor engine's would.
+ * value and selection live in memory, as another editor engine's would. A locked
+ * surface refuses inserts, as a read-only draft does.
  */
-export function createFakeComposerSurface(initial = ""): FakeComposerSurface {
+export function createFakeComposerSurface(
+  initial = "",
+  { locked = false }: { locked?: boolean } = {},
+): FakeComposerSurface {
   const element = document.createElement("div");
   element.contentEditable = "true";
   element.tabIndex = 0;
@@ -26,6 +30,7 @@ export function createFakeComposerSurface(initial = ""): FakeComposerSurface {
   let selection: [number, number] = [initial.length, initial.length];
   let reveals = 0;
   const inserts: FakeComposerSurface["inserts"] = [];
+  const clamp = (offset: number) => Math.min(Math.max(offset, 0), surface.value.length);
   const surface: FakeComposerSurface = {
     element,
     value: initial,
@@ -45,7 +50,9 @@ export function createFakeComposerSurface(initial = ""): FakeComposerSurface {
     scrollTop: 0,
     scrollLeft: 0,
     setSelectionRange(start, end) {
-      selection = [start, end];
+      // As a textarea does: offsets clamp to the value, and a reversed range collapses.
+      const clampedEnd = clamp(end);
+      selection = [Math.min(clamp(start), clampedEnd), clampedEnd];
     },
     focus(options) {
       element.focus(options);
@@ -54,9 +61,14 @@ export function createFakeComposerSurface(initial = ""): FakeComposerSurface {
       element.blur();
     },
     insertText(text, start, end) {
-      inserts.push({ text, start, end });
-      surface.value = surface.value.slice(0, start) + text + surface.value.slice(end);
-      selection = [start + text.length, start + text.length];
+      if (locked) return false;
+      // Clamped as the real surface clamps, and recorded clamped.
+      const from = clamp(start);
+      const to = clamp(end);
+      inserts.push({ text, start: from, end: to });
+      surface.value = surface.value.slice(0, from) + text + surface.value.slice(to);
+      selection = [from + text.length, from + text.length];
+      return true;
     },
     revealCaret() {
       reveals += 1;

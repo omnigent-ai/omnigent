@@ -182,6 +182,10 @@ export function shortcutPageGroups(
           { label: "Reload the browser tab", keys: [mod, "R"] },
           { label: "Focus the browser address bar", keys: [mod, "L"] },
         ]),
+        // Touch and narrow layouts have no workspace full screen.
+        ...when(!context.preventsKeyboardSubmit, [
+          { label: "Exit full screen from a file", keys: ["Esc"] },
+        ]),
       ],
     },
     {

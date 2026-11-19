@@ -38,7 +38,6 @@ import {
   Suspense,
   useCallback,
   useEffect,
-  useId,
   useMemo,
   useRef,
   useState,
@@ -111,10 +110,14 @@ import {
   settingsRuntimeChoiceProps,
 } from "@/pages/settings/search/settingsOwnership";
 import {
+  ADMIN_VIEW_ENTRY,
   ALWAYS_STEER_ENTRY,
   BACKGROUND_SESSION_TITLES_ENTRY,
+  OPEN_LINKS_IN_APP_ENTRY,
   OPEN_SUBAGENTS_IN_PANEL_ENTRY,
+  PROJECT_KANBAN_BOARD_ENTRY,
   SUBMIT_WITH_MOD_ENTER_ENTRY,
+  TERMINAL_CLIPBOARD_ENTRY,
 } from "@/pages/settings/search/catalog/general";
 import {
   APPEARANCE_DATA_ENTRY,
@@ -1979,27 +1982,21 @@ function ComposerSendShortcutControl() {
 /** On by default: clicking a project opens its sessions board. */
 function ProjectKanbanBoardControl() {
   const enabled = useProjectKanbanBoardPreference();
-  const labelId = useId();
-  const descriptionId = useId();
   return (
-    <div className="flex items-start justify-between gap-6">
-      <SettingsLabel
-        label="Kanban board views"
-        labelId={labelId}
-        descriptionId={descriptionId}
-        className="flex-1"
-        description="Monitor a project's agents in one view and respond the moment one needs you."
-      />
+    <SettingsItem
+      entry={PROJECT_KANBAN_BOARD_ENTRY}
+      className="flex items-start justify-between gap-6"
+    >
+      <SettingsEntryLabel entry={PROJECT_KANBAN_BOARD_ENTRY} className="flex-1" />
       <Switch
-        aria-labelledby={labelId}
-        aria-describedby={descriptionId}
+        {...settingsControlProps(PROJECT_KANBAN_BOARD_ENTRY)}
         checked={enabled}
         onCheckedChange={writeProjectKanbanBoard}
         data-testid="project-kanban-board-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.general.project_kanban_board"
       />
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -2011,32 +2008,26 @@ function ProjectKanbanBoardControl() {
  */
 function OpenLinksInAppControl() {
   const [enabled, setEnabled] = useState(readOpenLinksInApp);
-  const labelId = useId();
-  const descriptionId = useId();
   const toggle = useCallback((next: boolean) => {
     setEnabled(next);
     writeOpenLinksInApp(next);
   }, []);
 
   return (
-    <div className="flex items-start justify-between gap-6">
-      <SettingsLabel
-        label="Open links in the in-app browser"
-        labelId={labelId}
-        descriptionId={descriptionId}
-        className="flex-1"
-        description={`Open chat links in-app, reusing matching tabs. ${MOD_KEY}+click also opens in-app; Shift+click opens your default browser.`}
-      />
+    <SettingsItem
+      entry={OPEN_LINKS_IN_APP_ENTRY}
+      className="flex items-start justify-between gap-6"
+    >
+      <SettingsEntryLabel entry={OPEN_LINKS_IN_APP_ENTRY} className="flex-1" />
       <Switch
-        aria-labelledby={labelId}
-        aria-describedby={descriptionId}
+        {...settingsControlProps(OPEN_LINKS_IN_APP_ENTRY)}
         checked={enabled}
         onCheckedChange={toggle}
         data-testid="open-links-in-app-toggle"
         className="mt-0.5 shrink-0"
         componentId="settings.general.open_links_in_app"
       />
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -2094,8 +2085,6 @@ function OpenSubagentsInPanelControl() {
 }
 
 function TerminalClipboardControl() {
-  const labelId = useId();
-  const descriptionId = useId();
   const canRemember = canRememberTerminalClipboardPreference();
   const [preference, setPreference] = useState<TerminalClipboardPreference>(
     readTerminalClipboardPreference,
@@ -2120,12 +2109,13 @@ function TerminalClipboardControl() {
   };
 
   return (
-    <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
+    <SettingsItem
+      entry={TERMINAL_CLIPBOARD_ENTRY}
+      className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3"
+    >
       <div className="min-w-0 flex-1">
-        <SettingsLabel
-          label="Copying from terminals"
-          labelId={labelId}
-          descriptionId={descriptionId}
+        <SettingsEntryLabel
+          entry={TERMINAL_CLIPBOARD_ENTRY}
           description={
             canRemember
               ? "Control copying from all sessions and terminals on this server, in this browser or app. Allowing it lets terminal programs silently replace your clipboard with unwanted text or commands."
@@ -2147,20 +2137,19 @@ function TerminalClipboardControl() {
         valueHasNoPii
       >
         <SelectTrigger
-          aria-labelledby={labelId}
-          aria-describedby={descriptionId}
+          {...settingsControlProps(TERMINAL_CLIPBOARD_ENTRY)}
           data-testid="terminal-clipboard-preference-select"
           className="w-48 shrink-0"
         >
           <SelectValue />
         </SelectTrigger>
-        <SelectContent>
+        <SelectContent {...settingsOverlayProps(TERMINAL_CLIPBOARD_ENTRY)}>
           <SelectItem value="ask">Ask before copying</SelectItem>
           <SelectItem value="allow">Allow copying</SelectItem>
           <SelectItem value="block">Block copying</SelectItem>
         </SelectContent>
       </Select>
-    </div>
+    </SettingsItem>
   );
 }
 
@@ -2178,13 +2167,10 @@ function AdminViewControl() {
     return null;
   return (
     <SettingsGroup title="Administration">
-      <div className="flex items-center justify-between gap-4">
-        <SettingsLabel
-          label="Admin view"
-          description="Turn off to use your normal session access."
-        />
+      <SettingsItem entry={ADMIN_VIEW_ENTRY} className="flex items-center justify-between gap-4">
+        <SettingsEntryLabel entry={ADMIN_VIEW_ENTRY} />
         <Switch
-          aria-label="Admin view"
+          {...settingsControlProps(ADMIN_VIEW_ENTRY)}
           checked={isAdminViewEnabled()}
           onCheckedChange={(enabled) => {
             try {
@@ -2195,7 +2181,7 @@ function AdminViewControl() {
           }}
           componentId="settings.general.admin_view"
         />
-      </div>
+      </SettingsItem>
     </SettingsGroup>
   );
 }

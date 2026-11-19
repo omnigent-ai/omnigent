@@ -688,6 +688,14 @@ describe("desktop command menu items", () => {
     ]);
   });
 
+  it("says closing the last main window quits off macOS, even with a panel open", (t) => {
+    const harness = loadMainHarness({ platform: "linux" });
+    t.after(harness.cleanup);
+    harness.api.windows.set({ isDestroyed: () => false }, { role: "panel" });
+    findMenuItem(reportState(harness, { commands: ["close"] }), "close").click();
+    assert.equal(harness.calls.sent.at(-1).payload.closingQuits, true);
+  });
+
   it("steps a focused web page's own history, else hands Back/Forward to the app", (t) => {
     const harness = loadMainHarness({ platform: "darwin" });
     t.after(harness.cleanup);
