@@ -201,7 +201,7 @@ def register_elicitations_routes(
             "content_preview": params.get("content_preview", ""),
             **{
                 key: params[key]
-                for key in ("native_delivery", "permission_directories")
+                for key in ("native_delivery", "permission_directories", "file_edit")
                 if key in params
             },
         }

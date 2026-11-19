@@ -37,6 +37,11 @@ export interface Host {
   /** Whether this connected host supports the interactive login/logout routes. */
   harness_login_supported?: boolean;
   /**
+   * Whether this host's runners accept session messages over 8,000 characters.
+   * False when the server can't confirm it; absent from older servers.
+   */
+  long_session_messages_supported?: boolean;
+  /**
    * Whether each harness family's launch on this host resolves an
    * AI-Gateway-backed inference config, e.g. `{"claude-native": true,
    * "codex": false}`. Smart Routing's apply layer only works on gateway-backed
@@ -65,7 +70,10 @@ interface HostsResponse {
   hosts: Host[];
 }
 
-export async function fetchHosts(includeSandbox: boolean): Promise<Host[]> {
+export async function fetchHosts(
+  includeSandbox: boolean,
+  sourceHostId?: string | null,
+): Promise<Host[]> {
   const res = await authenticatedFetch("/v1/hosts");
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const body = (await res.json()) as HostsResponse;
@@ -76,12 +84,13 @@ export async function fetchHosts(includeSandbox: boolean): Promise<Host[]> {
   // field and are kept. `includeSandbox` opts a caller (the chat-header
   // HostBadge) back into seeing them so it can label sandbox sessions.
   if (includeSandbox) return body.hosts;
-  return body.hosts.filter((h) => !h.sandbox_provider);
+  return body.hosts.filter((h) => !h.sandbox_provider || h.host_id === sourceHostId);
 }
 
 interface UseHostsOptions {
   enabled?: boolean;
   includeSandbox?: boolean;
+  sourceHostId?: string | null;
   /** Refetch on every window refocus (paired with `staleTime: 0`) so returning
    *  to the tab is a guaranteed readiness recovery. Only the setup flow needs
    *  this; other consumers keep the 30 s stale window to avoid an app-wide bump
@@ -97,8 +106,8 @@ export function useHosts(options: UseHostsOptions = {}) {
     // Distinct cache key per filtering mode so the picker's filtered
     // list and the header's unfiltered list don't overwrite each other.
     // A bare ["hosts"] invalidation still prefix-matches both.
-    queryKey: ["hosts", { includeSandbox }],
-    queryFn: () => fetchHosts(includeSandbox),
+    queryKey: ["hosts", { includeSandbox, sourceHostId: options.sourceHostId }],
+    queryFn: () => fetchHosts(includeSandbox, options.sourceHostId),
     enabled,
     // Readiness is pushed live via WS (hosts_changed → invalidate in
     // SessionUpdatesProvider), so the badge normally clears within seconds of

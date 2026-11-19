@@ -40,6 +40,7 @@ import {
   type To,
   useLocation as useRRLocation,
   useNavigate as useRRNavigate,
+  useNavigationType as useRRNavigationType,
   useParams as useRRParams,
   useSearchParams as useRRSearchParams,
 } from "react-router-dom";
@@ -63,6 +64,7 @@ export interface RoutingApi {
   useParams: typeof useRRParams;
   useSearchParams: typeof useRRSearchParams;
   useLocation: typeof useRRLocation;
+  useNavigationType: typeof useRRNavigationType;
   Link: ComponentType<OmnigentLinkProps & RefAttributes<HTMLAnchorElement>>;
   Outlet: typeof RROutlet;
   /**
@@ -98,6 +100,7 @@ export const reactRouterRouting: RoutingApi = {
   useParams: useRRParams,
   useSearchParams: useRRSearchParams,
   useLocation: useRRLocation,
+  useNavigationType: useRRNavigationType,
   Link: StandaloneLink,
   Outlet: RROutlet,
   rebasePath: (path) => path,
@@ -202,6 +205,18 @@ export const useSearchParams: typeof useRRSearchParams = (defaultInit) =>
   useRouting().useSearchParams(defaultInit);
 
 export const useLocation: typeof useRRLocation = () => useRouting().useLocation();
+export const useNavigationType: typeof useRRNavigationType = () => useRouting().useNavigationType();
+
+/** Replace this page's query without host navigation, which may reload the app. */
+export function useReplaceSearchParams() {
+  const navigate = useRRNavigate();
+  const { hash, state } = useRRLocation();
+  return useCallback(
+    (params: URLSearchParams) =>
+      navigate({ search: params.toString(), hash }, { replace: true, state }),
+    [navigate, hash, state],
+  );
+}
 
 /**
  * The active `rebasePath` primitive. Identity standalone; prepends `basename`

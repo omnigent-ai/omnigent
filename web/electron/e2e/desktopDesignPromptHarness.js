@@ -334,6 +334,7 @@ module.exports = {
   NATIVE_DIALOG_PAGE,
   MOCK_REPLY,
   eventually,
+  jsonRequest,
   startDesignBackend,
   startFormFixture,
   launchDesignDesktop,

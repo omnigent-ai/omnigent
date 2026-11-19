@@ -13,6 +13,8 @@ from typing import Any
 import pytest
 
 from omnigent.db.db_models import current_workspace_id, workspace_scope
+from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.server.scheduled.schedule import next_scheduled_time
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
 pytestmark = pytest.mark.usefixtures("frozen_recurrence_clock")
@@ -56,9 +58,11 @@ def test_create_returns_scheduled_task_with_all_fields(
         model_override="claude-opus-4-7",
         reasoning_effort="high",
         permission_mode="acceptEdits",
+        mcp_services=("github", "linear"),
         session_mode="continue",
         session_id=_uid("conv_abc"),
         workspace="/home/alice/repo",
+        base_branch="HEAD",
         host_id=_uid("host_abc123"),
         project_id=_uid("proj_abc"),
         delegation_ref="workspaces/1/omnigent-scheduled-tasks/st_1/delegations/owner",
@@ -74,10 +78,11 @@ def test_create_returns_scheduled_task_with_all_fields(
     assert task.model_override == "claude-opus-4-7"
     assert task.reasoning_effort == "high"
     assert task.permission_mode == "acceptEdits"
+    assert task.mcp_services == ("github", "linear")
     assert task.session_mode == "continue"
     assert task.session_id == _uid("conv_abc")
     assert task.workspace == "/home/alice/repo"
-    assert task.base_branch is None
+    assert task.base_branch == "HEAD"
     assert task.execution_target == "connected_host"
     assert task.host_id == _uid("host_abc123")
     assert task.project_id == _uid("proj_abc")
@@ -113,6 +118,122 @@ def test_create_minimal_defaults(store: SqlAlchemyScheduledTaskStore) -> None:
     assert task.host_id is None
     assert task.delegation_ref is None
     assert task.state == "active"
+    assert task.kind == "automation"
+
+
+_REMINDER_RULE = "FREQ=YEARLY;BYMONTH=11;BYMONTHDAY=14;BYHOUR=15;BYMINUTE=0;BYSECOND=0;COUNT=1"
+
+
+def _reminder_fields(**overrides: Any) -> dict[str, Any]:
+    fields: dict[str, Any] = {
+        "name": "Reminder: check CI",
+        "prompt": "check CI",
+        "rrule": _REMINDER_RULE,
+        "user_id": "u",
+        "agent_id": _uid("ag"),
+        "timezone": "UTC",
+        "session_mode": "continue",
+        "session_id": _uid("conv"),
+        "kind": "reminder",
+    }
+    fields.update(overrides)
+    return fields
+
+
+def test_a_reminder_round_trips(store: SqlAlchemyScheduledTaskStore) -> None:
+    created = store.create(scheduled_task_id=_uid("st_reminder"), **_reminder_fields())
+    assert created.kind == "reminder"
+    assert store.get(created.id).kind == "reminder"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"rrule": "FREQ=MINUTELY"},
+        {"session_id": None},
+        # Keeps the session, so only the session mode disqualifies it.
+        {"session_mode": "new"},
+    ],
+    ids=["recurring", "no_session", "new_session_mode"],
+)
+def test_create_refuses_a_reminder_that_does_not_fit(
+    store: SqlAlchemyScheduledTaskStore, overrides: dict[str, Any]
+) -> None:
+    with pytest.raises(ValueError, match="a reminder needs"):
+        store.create(scheduled_task_id=_uid("st_bad_reminder"), **_reminder_fields(**overrides))
+    assert store.list() == []
+
+
+def test_create_rejects_an_unknown_kind(store: SqlAlchemyScheduledTaskStore) -> None:
+    with pytest.raises(ValueError, match=r"scheduled_tasks\.kind"):
+        store.create(scheduled_task_id=_uid("st_bad_kind"), **_reminder_fields(kind="trigger"))
+
+
+@pytest.mark.parametrize(
+    "edit",
+    [
+        {"rrule": "FREQ=MINUTELY"},
+        {"session_id": None},
+        # Keeps the session, so only the session mode disqualifies it.
+        {"session_mode": "new"},
+    ],
+    ids=["recurs", "leaves_its_session", "new_session_mode"],
+)
+def test_an_edit_that_stops_a_reminder_fitting_makes_it_an_automation(
+    store: SqlAlchemyScheduledTaskStore, edit: dict[str, Any]
+) -> None:
+    task_id = store.create(scheduled_task_id=_uid("st_demote"), **_reminder_fields()).id
+    assert store.update(task_id, name="renamed").kind == "reminder"
+    assert store.update(task_id, **edit).kind == "automation"
+    # Restoring the old shape does not make it a reminder again.
+    restored = store.update(
+        task_id, rrule=_REMINDER_RULE, session_mode="continue", session_id=_uid("conv")
+    )
+    assert restored.kind == "automation"
+
+
+@pytest.mark.parametrize(
+    "arrival", ["on_time", "one_second_early", "at_the_minute", "late", "late_and_exhausted"]
+)
+def test_first_run_at_is_checked_against_the_saved_schedule(
+    store: SqlAlchemyScheduledTaskStore, monkeypatch: pytest.MonkeyPatch, arrival: str
+) -> None:
+    from datetime import UTC, datetime
+
+    from omnigent.stores.scheduled_task_store import (
+        ScheduledTaskFirstRunMismatchError,
+        sqlalchemy_store,
+    )
+    from omnigent.tools.builtins.scheduled_tasks import reminder_rrule
+
+    store.configure_dispatch(True)
+    fire_at = 1_800_000_000 + 7200 - (1_800_000_000 + 7200) % 60
+    when = datetime.fromtimestamp(fire_at, UTC)
+    rule = reminder_rrule(when)
+    if arrival == "late_and_exhausted":
+        # Ends at the requested minute, so a late create leaves no run at all.
+        rule = rule.replace(";COUNT=1", f";UNTIL={when.strftime('%Y%m%dT%H%M%SZ')}")
+    # A run must fall strictly after creation, so a task created at its minute is late.
+    created_at = {
+        "on_time": fire_at - 7200,
+        "one_second_early": fire_at - 1,
+        "at_the_minute": fire_at,
+    }.get(arrival, fire_at + 1)
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: created_at)
+    fields = _reminder_fields(rrule=rule, kind="automation", first_run_at=fire_at)
+    if arrival in ("on_time", "one_second_early"):
+        task = store.create(scheduled_task_id=_uid("st_first_run"), **fields)
+        assert task.next_run_at == fire_at
+        return
+    with pytest.raises(ScheduledTaskFirstRunMismatchError) as caught:
+        store.create(scheduled_task_id=_uid("st_first_run"), **fields)
+    assert caught.value.expected == fire_at
+    # A late COUNT=1 rule would move to the same minute a year later; nothing is saved.
+    if arrival != "late_and_exhausted":
+        assert caught.value.actual is not None and caught.value.actual > fire_at
+    else:
+        assert caught.value.actual is None
+    assert store.list() == []
 
 
 # ── state enum ────────────────────────────────────────────────────────────────
@@ -210,15 +331,18 @@ def test_update_workspace_explicit_null_clears_it(
         agent_id=_uid("ag"),
         timezone="UTC",
         workspace="/repo",
+        base_branch="HEAD",
         host_id=_uid("h"),
     )
     # Omitting workspace leaves it unchanged.
     unchanged = store.update(_uid("st_ws"), name="renamed")
     assert unchanged is not None and unchanged.workspace == "/repo"
+    assert unchanged.base_branch == "HEAD"
     # Explicit None clears both host and workspace (the managed-switch shape).
-    cleared = store.update(_uid("st_ws"), host_id=None, workspace=None)
+    cleared = store.update(_uid("st_ws"), host_id=None, workspace=None, base_branch=None)
     assert cleared is not None
     assert cleared.workspace is None
+    assert cleared.base_branch is None
     assert cleared.host_id is None
 
 
@@ -290,6 +414,33 @@ def test_get_returns_created_task(store: SqlAlchemyScheduledTaskStore) -> None:
 def test_get_missing_returns_none(store: SqlAlchemyScheduledTaskStore) -> None:
     """``get`` returns ``None`` for an unknown id."""
     assert store.get(_uid("st_nope")) is None
+
+
+def test_get_many_reads_the_workspaces_tasks_by_id(store: SqlAlchemyScheduledTaskStore) -> None:
+    """Deleted tasks come back with their state; unknown and other workspaces' ids don't."""
+
+    def create(seed: str) -> str:
+        return store.create(
+            scheduled_task_id=_uid(seed),
+            name=seed,
+            prompt="p",
+            rrule="FREQ=DAILY",
+            user_id="u",
+            agent_id=_uid("ag_1"),
+            timezone="UTC",
+        ).id
+
+    live, deleted = create("st_live"), create("st_deleted")
+    assert store.update(deleted, state="deleted")
+    with workspace_scope(7):
+        elsewhere = create("st_elsewhere")
+
+    found = store.get_many([live, deleted, live, elsewhere, _uid("st_nope")])
+    assert {task_id: task.state for task_id, task in found.items()} == {
+        live: "active",
+        deleted: "deleted",
+    }
+    assert store.get_many([]) == {}
 
 
 # ── list / list_active ────────────────────────────────────────────────────────
@@ -868,6 +1019,111 @@ def test_update_omitting_overrides_leaves_them_unchanged(
     assert updated.permission_mode == "acceptEdits"
 
 
+def test_update_mcp_services_replaces_clears_and_keeps(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """A tuple replaces the services, ``()`` clears them, and omission keeps them."""
+    store.create(
+        scheduled_task_id=_uid("st_mcp"),
+        name="n",
+        prompt="p",
+        rrule="FREQ=MINUTELY",
+        user_id="u",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        mcp_services=("github",),
+    )
+    kept = store.update(_uid("st_mcp"), name="renamed")
+    assert kept is not None
+    assert kept.mcp_services == ("github",)
+    replaced = store.update(_uid("st_mcp"), mcp_services=("slack", "linear"))
+    assert replaced is not None
+    assert replaced.mcp_services == ("slack", "linear")
+    cleared = store.update(_uid("st_mcp"), mcp_services=())
+    assert cleared is not None
+    assert cleared.mcp_services == ()
+    fetched = store.get(_uid("st_mcp"))
+    assert fetched is not None
+    assert fetched.mcp_services == ()
+
+
+def test_mcp_services_longer_than_the_column_are_rejected_on_every_write(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """SQLite does not enforce VARCHAR widths, so the store checks the encoded length."""
+    fits = ("x" * 4092,)  # JSON-encodes to exactly 4,096 characters
+    too_long = ("x" * 4093,)
+    common = {
+        "name": "n",
+        "prompt": "p",
+        "rrule": "FREQ=MINUTELY",
+        "user_id": "u",
+        "agent_id": _uid("ag"),
+        "timezone": "UTC",
+    }
+    created = store.create(scheduled_task_id=_uid("st_mcp_fit"), mcp_services=fits, **common)
+    assert created.mcp_services == fits
+    with pytest.raises(OmnigentError, match="Too many MCP services"):
+        store.create(scheduled_task_id=_uid("st_mcp_long"), mcp_services=too_long, **common)
+    assert store.get(_uid("st_mcp_long")) is None
+    with pytest.raises(OmnigentError, match="Too many MCP services"):
+        store.update(_uid("st_mcp_fit"), mcp_services=too_long)
+    kept = store.get(_uid("st_mcp_fit"))
+    assert kept is not None
+    assert kept.mcp_services == fits
+
+
+@pytest.mark.parametrize(
+    ("first", "second"),
+    [
+        ({"agent_id": _uid("ag_b")}, {"mcp_services": ("github",)}),
+        ({"mcp_services": ("github",)}, {"agent_id": _uid("ag_b")}),
+    ],
+    ids=["agent-then-services", "services-then-agent"],
+)
+def test_update_from_a_stale_snapshot_conflicts_on_agent_or_mcp_changes(
+    store: SqlAlchemyScheduledTaskStore, first: dict[str, Any], second: dict[str, Any]
+) -> None:
+    """Services are validated against an agent, so neither may change under the other."""
+    snapshot = _session_task(store, "st_stale_mcp")
+    applied = store.update(snapshot.id, expected_schedule=snapshot, **first)
+    assert applied is not None
+
+    with pytest.raises(OmnigentError, match="Reload and try again") as raised:
+        store.update(snapshot.id, expected_schedule=snapshot, **second)
+
+    assert raised.value.code == ErrorCode.CONFLICT
+    saved = store.get(snapshot.id)
+    assert saved is not None
+    assert (saved.agent_id, saved.mcp_services) == (applied.agent_id, applied.mcp_services)
+
+
+def test_update_guard_sees_the_locked_task_and_a_refusal_saves_nothing(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = _session_task(store, "st_guard", workspace="/repo")
+    seen: list[Any] = []
+
+    def refuse(locked: Any) -> None:
+        seen.append(locked)
+        raise OmnigentError("refused", code=ErrorCode.FORBIDDEN)
+
+    with pytest.raises(OmnigentError, match="refused"):
+        store.update(task.id, name="renamed", workspace="/elsewhere", guard=refuse)
+
+    assert [(locked.id, locked.workspace) for locked in seen] == [(task.id, "/repo")]
+    saved = store.get(task.id)
+    assert saved is not None
+    assert (saved.name, saved.workspace, saved.updated_at) == (
+        task.name,
+        task.workspace,
+        task.updated_at,
+    )
+    # A guard that returns lets the update through.
+    applied = store.update(task.id, workspace="/elsewhere", guard=seen.append)
+    assert applied is not None and applied.workspace == "/elsewhere"
+
+
 def test_update_last_run_conversation_id_can_be_cleared_to_null(
     store: SqlAlchemyScheduledTaskStore,
 ) -> None:
@@ -1161,7 +1417,7 @@ def test_list_latest_run_status_for_tasks_returns_most_recent_status(
 ) -> None:
     """Returns each task's single most-recent run status by scheduled_at DESC.
 
-    Powers the Tasks-list completion badge in one windowed query. A task with a
+    Powers the Tasks-list completion badge in one query. A task with a
     terminal run followed by a newer run reports the NEWER run's status (so a
     run-now firing becomes the badge as soon as it is recorded).
     """
@@ -1290,6 +1546,114 @@ def test_list_latest_run_status_is_workspace_scoped(
         }
 
 
+def test_list_latest_run_status_work_stays_flat_as_run_history_grows(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Each task's lookup seeks its newest run on the history index, however many it has."""
+    from sqlalchemy import event, insert
+
+    from omnigent.db.db_models import SqlScheduledTaskRun
+    from omnigent.db.enum_codecs import encode_scheduled_task_run_status
+
+    task = _session_task(store, "lst_history")
+    store.create_run(
+        run_id=_uid("lst_history_latest"),
+        scheduled_task_id=task.id,
+        status="failed",
+        scheduled_at=10_000,
+    )
+
+    def measure() -> tuple[int, str]:
+        """The lookup's SQLite VM steps and query plan; ``(0, "")`` on other databases."""
+        queries = []
+
+        def capture(conn, cursor, statement, parameters, context, executemany):
+            if "scheduled_task_runs" in statement:
+                queries.append((statement, parameters))
+
+        event.listen(store._engine, "before_cursor_execute", capture)
+        try:
+            assert store.list_latest_run_status_for_tasks([task.id]) == {task.id: "failed"}
+        finally:
+            event.remove(store._engine, "before_cursor_execute", capture)
+        [(statement, parameters)] = queries
+        if store._engine.dialect.name != "sqlite":
+            return 0, ""
+        steps = 0
+
+        def count_step() -> int:
+            nonlocal steps
+            steps += 1
+            return 0
+
+        with store._engine.connect() as connection:
+            plan = str(
+                connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
+            )
+            # Warm up first, so loading the schema on a new connection is not counted.
+            connection.exec_driver_sql(statement, parameters).all()
+            driver = connection.connection.driver_connection
+            driver.set_progress_handler(count_step, 1)
+            try:
+                connection.exec_driver_sql(statement, parameters).all()
+            finally:
+                driver.set_progress_handler(None, 1)
+        return steps, plan
+
+    short_history_steps, _ = measure()
+    with store._engine.begin() as connection:
+        connection.execute(
+            insert(SqlScheduledTaskRun),
+            [
+                {
+                    "workspace_id": current_workspace_id(),
+                    "id": _uid(f"lst_history_{index}"),
+                    "scheduled_task_id": task.id,
+                    "status": encode_scheduled_task_run_status("succeeded"),
+                    "scheduled_at": index,
+                }
+                for index in range(500)
+            ],
+        )
+    long_history_steps, plan = measure()
+    assert long_history_steps == short_history_steps
+    if plan:
+        assert "ix_scheduled_task_runs_scheduled_task_id" in plan
+        assert "SCAN scheduled_task_runs" not in plan and "TEMP B-TREE" not in plan
+
+
+# ── has_active_run (workers of a live automation run) ─────────────────────────
+
+
+@pytest.mark.parametrize("status", ["starting", "running"])
+def test_has_active_run_counts_starting_and_running(
+    store: SqlAlchemyScheduledTaskStore, status: str
+) -> None:
+    """A claimed run records its session while still starting, before the prompt is sent."""
+    _seed_running_run(store, "active_other")
+    store.create_run(
+        run_id=_uid(f"run_active_{status}"),
+        scheduled_task_id=_uid("task_active_other"),
+        status=status,
+        scheduled_at=200,
+        conversation_id=_uid(f"conv_active_{status}"),
+    )
+    assert store.has_active_run(_uid("task_active_other"), _uid(f"conv_active_{status}"))
+
+
+def test_has_active_run_false_once_finished_or_for_another_task(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    """Only this task's live run counts, not a finished one or another task's."""
+    run_id = _seed_running_run(store, "active_fin")
+    _seed_running_run(store, "active_peer")
+    assert store.has_active_run(_uid("task_active_fin"), _uid("conv_active_fin"))
+    assert not store.has_active_run(_uid("task_active_peer"), _uid("conv_active_fin"))
+    assert not store.has_active_run(_uid("task_active_fin"), _uid("conv_absent"))
+    store.update_run(run_id, status="succeeded", finished_at=202)
+    assert not store.has_active_run(_uid("task_active_fin"), _uid("conv_active_fin"))
+
+
 # ── get_running_run_by_conversation (event-hook reverse lookup) ───────────────
 
 
@@ -1358,6 +1722,32 @@ def test_get_running_run_by_conversation_is_workspace_scoped(
         assert found is not None and found.id == _uid("run_ws")
 
 
+@pytest.mark.parametrize(("status", "starting"), [("starting", True), ("running", False)])
+def test_has_starting_run_for_conversation_finds_only_its_unsettled_startup(
+    store: SqlAlchemyScheduledTaskStore, status: str, starting: bool
+) -> None:
+    with workspace_scope(11):
+        store.create(
+            scheduled_task_id=_uid("task_startup"),
+            name="startup",
+            prompt="p",
+            rrule="FREQ=MINUTELY",
+            user_id="a",
+            agent_id=_uid("ag"),
+            timezone="UTC",
+        )
+        store.create_run(
+            run_id=_uid("run_startup"),
+            scheduled_task_id=_uid("task_startup"),
+            status=status,
+            scheduled_at=100,
+            conversation_id=_uid("conv_startup"),
+        )
+        assert store.has_starting_run_for_conversation(_uid("conv_startup")) is starting
+        assert store.has_starting_run_for_conversation(_uid("conv_other")) is False
+    assert store.has_starting_run_for_conversation(_uid("conv_startup")) is False
+
+
 def _due_task(store: SqlAlchemyScheduledTaskStore, seed: str = "dispatch"):
     store.configure_dispatch(True)
     task = store.create(
@@ -1422,6 +1812,9 @@ def test_dispatch_rejects_edited_snapshot(store: SqlAlchemyScheduledTaskStore, e
             lease_seconds=120,
         )
         is None
+    )
+    assert not store.skip_scheduled_occurrence(
+        task, now=task.next_run_at, next_run_at=task.next_run_at + 3600
     )
     assert store.get(task.id) == updated
     assert store.list_runs(task.id)[0] == []
@@ -1499,12 +1892,84 @@ def test_dispatch_mutations_require_workspace_scope(store: SqlAlchemyScheduledTa
         )
         is None
     )
+    assert not store.skip_scheduled_occurrence(task, now=now, next_run_at=now + 3600)
     with workspace_scope(task.workspace_id):
         run = store.claim_scheduled_run(
             task, now=now, next_run_at=now + 3600, host_id=task.host_id, lease_seconds=120
         )
     assert store.renew_starting_run(run.id, now=lambda: now + 30, lease_seconds=120) is None
     assert store.transition_starting_run(run, now=lambda: now + 30, status="failed") is None
+
+
+def test_skipping_an_occurrence_advances_the_schedule_without_a_run(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    from dataclasses import replace
+
+    task = _due_task(store)
+    now = task.next_run_at
+    with pytest.raises(ValueError, match="later than now"):
+        store.skip_scheduled_occurrence(task, now=now, next_run_at=now)
+    # Nothing to skip before the occurrence is due, or once the task isn't active.
+    assert store.skip_scheduled_occurrence(task, now=now - 1, next_run_at=now + 3600) is False
+    paused = replace(task, state="paused")
+    assert store.skip_scheduled_occurrence(paused, now=now, next_run_at=now + 3600) is False
+    assert store.skip_scheduled_occurrence(task, now=now, next_run_at=now + 3600) is True
+    assert store.get(task.id).next_run_at == now + 3600
+    assert store.list_runs(task.id)[0] == []
+    # The listed snapshot is now stale, so neither a second skip nor a claim of it acts.
+    assert store.skip_scheduled_occurrence(task, now=now, next_run_at=now + 7200) is False
+    claimed = store.claim_scheduled_run(
+        task, now=now, next_run_at=now + 7200, host_id=task.host_id, lease_seconds=120
+    )
+    assert claimed is None
+    assert store.get(task.id).next_run_at == now + 3600
+    assert store.list_runs(task.id)[0] == []
+
+
+@pytest.mark.parametrize(
+    ("now", "poll_in"),
+    [
+        (1_800_000_000 + 30 * 60, 120),
+        # The hourly schedule's next occurrence is sooner than two minutes out, so it wins.
+        (1_800_000_000 + 3600 - 30, 30),
+    ],
+    ids=["half-past", "just-before-the-hour"],
+)
+def test_an_edit_that_changes_trigger_status_moves_the_next_poll(
+    store: SqlAlchemyScheduledTaskStore,
+    monkeypatch: pytest.MonkeyPatch,
+    now: int,
+    poll_in: int,
+) -> None:
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: now)
+    trigger_prompt = "This automation watches Slack and starts one Omnigent session per message."
+    store.configure_dispatch(True)
+    store.configure_trigger_polling(120)
+    task = store.create(
+        _uid("trigger"),
+        "trigger",
+        trigger_prompt,
+        "FREQ=HOURLY",
+        None,
+        _uid("agent"),
+        "UTC",
+        host_id=_uid("host"),
+        session_mode="continue",
+    )
+    assert task.next_run_at == now + poll_in
+    # Without its opening sentence, the task follows its hourly schedule again.
+    plain = store.update(task.id, prompt="Check the channel.")
+    assert plain.next_run_at == next_scheduled_time(plain, now)
+    trigger = store.update(task.id, prompt=trigger_prompt)
+    assert trigger.next_run_at == now + poll_in
+    # Starting a new session each run also makes it an ordinary automation.
+    plain = store.update(task.id, session_mode="new")
+    assert plain.next_run_at == next_scheduled_time(plain, now)
+    trigger = store.update(task.id, session_mode="continue")
+    assert trigger.next_run_at == now + poll_in
 
 
 def test_startup_lease_renewal_expiry_and_conditional_reconciliation(
@@ -2243,6 +2708,34 @@ def test_update_sets_and_clears_the_continued_session(
     assert back_to_new is not None and back_to_new.session_mode == "new"
 
 
+def test_release_session_clears_only_the_session_it_was_given(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = _session_task(store, "st_release", session_mode="continue")
+    assert store.adopt_session(task.id, _uid("c1"), snapshot=task) == "adopted"
+    before = store.get(task.id)
+
+    # Another run replaced it, or the caller was looking at a stale id: no change.
+    assert store.release_session(task.id, _uid("other")) is False
+    assert store.get(task.id).session_id == _uid("c1")
+
+    assert store.release_session(task.id, _uid("c1")) is True
+    after = store.get(task.id)
+    assert after.session_id is None
+    # Housekeeping, not an edit: a firing compares updated_at with its own read.
+    assert after.updated_at == before.updated_at
+    assert store.release_session(task.id, _uid("c1")) is False
+    assert store.release_session(_uid("missing"), _uid("c1")) is False
+
+    # A released task takes a new session like a first run, from the firing's own
+    # earlier read of the task.
+    assert store.adopt_session(task.id, _uid("c2"), snapshot=before) == "adopted"
+
+    # A deleted task releases nothing.
+    store.delete(task.id)
+    assert store.release_session(task.id, _uid("c2")) is False
+
+
 def test_adopt_session_records_only_an_unchanged_continue_task_without_one(
     store: SqlAlchemyScheduledTaskStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2268,9 +2761,11 @@ def test_adopt_session_records_only_an_unchanged_continue_task_without_one(
     monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: 1_800_000_000)
     for name, value in (
         ("workspace", "/elsewhere"),
+        ("base_branch", "HEAD"),
         ("model_override", "claude-opus"),
         ("reasoning_effort", "high"),
         ("permission_mode", "acceptEdits"),
+        ("mcp_services", ("github",)),
         ("project_id", _uid("proj")),
     ):
         edited = _session_task(store, f"st_adopt_edit_{name}", session_mode="continue")
@@ -2301,3 +2796,201 @@ def test_an_executor_records_succeeded_for_a_prompt_delivered_into_a_session(
     assert (delivered.status, delivered.conversation_id) == ("succeeded", _uid("c1"))
     assert delivered.finished_at == now + 30
     assert delivered.lease_expires_at is None
+
+
+@pytest.mark.parametrize("state", ["active", "paused"])
+@pytest.mark.parametrize(
+    "latest_status, conversation_id",
+    [("failed", _uid("session")), ("starting", None), ("running", None), ("succeeded", None)],
+    ids=["linked-failure", "starting", "running", "succeeded"],
+)
+def test_inbox_failures_latest_run_and_session_dedup(store, state, latest_status, conversation_id):
+    task = _session_task(store, "inbox", state=state)
+    run_id = _uid("inbox-failure")
+    store.create_run(
+        run_id=run_id,
+        scheduled_task_id=task.id,
+        status="failed",
+        scheduled_at=100,
+        finished_at=101,
+        error_code="host_offline",
+        error="private error must not be returned",
+    )
+    failures, cursor = store.list_inbox_failures(owner_user_id=task.user_id)
+    assert cursor is None
+    assert [item.run_id for item in failures] == [run_id]
+    assert failures[0].error_code == "host_offline"
+    assert not hasattr(failures[0], "error")
+    assert not hasattr(failures[0], "prompt")
+
+    # Each newer state independently replaces the visible sessionless failure.
+    store.create_run(
+        run_id=_uid("latest"),
+        scheduled_task_id=task.id,
+        status=latest_status,
+        scheduled_at=200,
+        conversation_id=conversation_id,
+    )
+    assert store.list_inbox_failures(owner_user_id=task.user_id) == ([], None)
+
+
+def test_inbox_failures_pages_examined_tasks_and_scopes_owner_workspace_generation(store):
+    from omnigent.db.account_authority import account_authority_scope
+    from omnigent.db.db_models import SqlScheduledTask
+
+    tasks = [_session_task(store, f"inbox-page-{i}") for i in range(4)]
+    for task in tasks:
+        store.create_run(
+            run_id=_uid(task.id),
+            scheduled_task_id=task.id,
+            status="failed",
+            scheduled_at=100,
+            error_code="no_online_host",
+        )
+    ordered = sorted(tasks, key=lambda task: (task.created_at, task.id), reverse=True)
+    with store._session("test_inbox_scope") as session:
+        session.get(SqlScheduledTask, (0, ordered[0].id)).state = 3  # deleted, retained history
+        session.get(SqlScheduledTask, (0, ordered[1].id)).account_generation = "old"
+    # Post-page filtering must still advance through empty pages.
+    first, cursor = store.list_inbox_failures(owner_user_id=tasks[0].user_id, limit=1)
+    assert first == [] and cursor is not None
+    with account_authority_scope(tasks[0].user_id, "current"):
+        second, next_cursor = store.list_inbox_failures(
+            owner_user_id=tasks[0].user_id,
+            generation="current",
+            check_generation=True,
+            after=cursor,
+            limit=1,
+        )
+    assert second == [] and next_cursor is not None and next_cursor != cursor
+    remaining, final = store.list_inbox_failures(
+        owner_user_id=tasks[0].user_id,
+        after=next_cursor,
+        limit=2,
+    )
+    assert [item.task_id for item in remaining] == [task.id for task in ordered[2:]]
+    assert final is None
+    assert store.list_inbox_failures(owner_user_id="someone-else") == ([], None)
+    assert store.list_inbox_failures(owner_user_id=None) == ([], None)
+    with store._session("test_matching_inbox_scope") as session:
+        session.get(SqlScheduledTask, (0, ordered[2].id)).account_generation = "current"
+        session.get(SqlScheduledTask, (0, ordered[3].id)).user_id = None
+    with account_authority_scope(tasks[0].user_id, "current"):
+        matching, _ = store.list_inbox_failures(
+            owner_user_id=tasks[0].user_id, generation="current", check_generation=True
+        )
+    assert [item.task_id for item in matching] == [ordered[2].id]
+    local, _ = store.list_inbox_failures(owner_user_id=None)
+    assert [item.task_id for item in local] == [ordered[3].id]
+    with workspace_scope(99):
+        assert store.list_inbox_failures(owner_user_id=tasks[0].user_id) == ([], None)
+
+
+def test_inbox_query_plans_use_bounded_task_and_run_indexes(store):
+    from sqlalchemy import event
+
+    task = _session_task(store, "inbox-plan")
+    store.create_run(
+        run_id=_uid("plan-run"), scheduled_task_id=task.id, scheduled_at=100, status="failed"
+    )
+    queries = []
+
+    def capture(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().startswith("SELECT"):
+            queries.append((statement, parameters))
+
+    event.listen(store._engine, "before_cursor_execute", capture)
+    try:
+        store.list_inbox_failures(owner_user_id=task.user_id, limit=1)
+        store.list_inbox_failures(
+            owner_user_id=task.user_id, after=(task.created_at + 1, task.id), limit=1
+        )
+    finally:
+        event.remove(store._engine, "before_cursor_execute", capture)
+    assert len(queries) == 4
+    assert all("LIMIT" in statement for statement, _ in queries)
+    if store._engine.dialect.name != "sqlite":
+        return
+    with store._engine.connect() as connection:
+        for statement, parameters in queries:
+            plan = str(
+                connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
+            )
+            index = (
+                "ix_scheduled_task_runs_scheduled_task_id"
+                if "FROM scheduled_task_runs" in statement
+                else "ix_scheduled_tasks_user_scope"
+            )
+            assert index in plan
+            assert "SEARCH" in plan and "TEMP B-TREE" not in plan
+            assert "LIMIT" in statement
+
+
+@pytest.mark.parametrize("returned_owner", ["OWNER", "owner ", "ownér"])
+def test_inbox_rechecks_exact_owner_before_reading_runs(store, monkeypatch, returned_owner):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    # Simulate rows already matched by a case/accent-insensitive SQL collation.
+    candidate = SimpleNamespace(id=_uid("candidate"), created_at=100, user_id=returned_owner)
+    session = MagicMock()
+    session.execute.return_value.all.return_value = [candidate, candidate]
+    session_context = MagicMock()
+    session_context.return_value.__enter__.return_value = session
+    monkeypatch.setattr(store, "_session", session_context)
+    assert store.list_inbox_failures(owner_user_id="owner", limit=1) == (
+        [],
+        (candidate.created_at, candidate.id),
+    )
+    assert session.execute.call_count == 1  # Rejected owners never trigger run reads.
+
+
+def test_inbox_mysql_deep_page_seeks_to_cursor(store):
+    import re
+
+    from sqlalchemy import event, insert
+
+    from omnigent.db.db_models import SqlScheduledTask
+
+    if store._engine.dialect.name != "mysql":
+        pytest.skip("MySQL execution-plan regression")
+    with store._engine.begin() as connection:
+        connection.execute(
+            insert(SqlScheduledTask),
+            [
+                {
+                    "id": f"{index:032x}",
+                    "workspace_id": 0,
+                    "user_id": "plan-owner",
+                    "name": "Report",
+                    "prompt": "Report",
+                    "rrule": "FREQ=DAILY",
+                    "agent_id": _uid("agent"),
+                    "created_at": index // 10,
+                }
+                for index in range(10_000)
+            ],
+        )
+        connection.exec_driver_sql("ANALYZE TABLE scheduled_tasks").all()
+    plans = []
+
+    def explain(conn, cursor, statement, parameters, context, executemany):
+        if statement.startswith("SELECT scheduled_tasks."):
+            plans.append(
+                conn.exec_driver_sql("EXPLAIN ANALYZE " + statement, parameters).scalar_one()
+            )
+
+    event.listen(store._engine, "before_cursor_execute", explain)
+    try:
+        failures, cursor = store.list_inbox_failures(
+            owner_user_id="plan-owner", after=(100, f"{1005:032x}"), limit=50
+        )
+    finally:
+        event.remove(store._engine, "before_cursor_execute", explain)
+    assert failures == [] and cursor == (95, f"{955:032x}")
+    assert len(plans) == 1
+    assert "Index range scan" in plans[0] and "ix_scheduled_tasks_user_scope" in plans[0]
+    examined = [
+        float(value) for value in re.findall(r"actual time=[^)]*? rows=([\d.]+)", plans[0])
+    ]
+    assert examined and max(examined) <= 51, plans[0]

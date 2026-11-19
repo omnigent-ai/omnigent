@@ -1,12 +1,28 @@
+import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { CODE_BLOCK_WORD_WRAP_STORAGE_KEY, useCodeBlockWordWrap } from "./codeWrapPreferences";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
-import { FOLD_ASSISTANT_NARRATION_STORAGE_KEY } from "./foldNarrationPreferences";
+import {
+  FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+  useFoldAssistantNarration,
+} from "./foldNarrationPreferences";
 import {
   HIDDEN_PICKER_AGENTS_STORAGE_KEY,
   readHiddenPickerAgents,
   subscribeHiddenPickerAgents,
   writeHiddenPickerAgents,
 } from "./pickerEntryVisibility";
+import {
+  PROJECT_FOLDER_COLLAPSE_STORAGE_KEY,
+  PROJECT_FOLDER_PAGE_SIZE,
+  PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY,
+  useProjectFolderCollapse,
+  useProjectFolderPageSize,
+} from "./projectFolderPaginationPreferences";
+import {
+  SESSION_ROW_QUICK_ACTIONS_STORAGE_KEY,
+  useSessionRowQuickActions,
+} from "./sessionRowQuickActionsPreferences";
 import { applyImportedSettings, collectSettings } from "./settingsPortability";
 import {
   type SessionWorkspaceState,
@@ -28,7 +44,7 @@ it("round-trips workspace pins and default without restoring stale selections", 
   writeDefaultWorkspaceTab("changes");
   const exported = collectSettings()!;
   applyImportedSettings({ version: 1, settings: {} });
-  expect(readPinnedWorkspaceTabs()).toHaveLength(4);
+  expect(readPinnedWorkspaceTabs()).toHaveLength(5);
   expect(readInitialWorkspaceTab()).toBe("files");
 
   writeSessionWorkspaceState("conv", { open: true, rightRailTab: "files" });
@@ -113,22 +129,49 @@ it.each([
 });
 
 describe.each([
-  ["composer shortcut", COMPOSER_SEND_SHORTCUT_STORAGE_KEY],
-  ["final-answer fold", FOLD_ASSISTANT_NARRATION_STORAGE_KEY],
-])("%s portability", (_label, storageKey) => {
+  ["composer shortcut", COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true"],
+  ["final-answer fold", FOLD_ASSISTANT_NARRATION_STORAGE_KEY, "true"],
+  ["code block word wrap", CODE_BLOCK_WORD_WRAP_STORAGE_KEY, "false"],
+])("%s portability", (_label, storageKey, storedValue) => {
   it("exports, imports, and clears the device-local preference", () => {
-    localStorage.setItem(storageKey, "true");
-    expect(collectSettings()?.settings[storageKey]).toBe("true");
+    localStorage.setItem(storageKey, storedValue);
+    expect(collectSettings()?.settings[storageKey]).toBe(storedValue);
 
     applyImportedSettings({ version: 1, settings: {} });
     expect(localStorage.getItem(storageKey)).toBeNull();
 
     applyImportedSettings({
       version: 1,
-      settings: { [storageKey]: "true" },
+      settings: { [storageKey]: storedValue },
     });
-    expect(localStorage.getItem(storageKey)).toBe("true");
+    expect(localStorage.getItem(storageKey)).toBe(storedValue);
   });
+});
+
+it("updates a mounted final-answer fold reader on import", () => {
+  const { result } = renderHook(() => useFoldAssistantNarration());
+  expect(result.current).toBe(false);
+
+  act(() => {
+    applyImportedSettings({
+      version: 1,
+      settings: { [FOLD_ASSISTANT_NARRATION_STORAGE_KEY]: "true" },
+    });
+  });
+  expect(result.current).toBe(true);
+});
+
+it("updates mounted code blocks' word wrap on import", () => {
+  const { result } = renderHook(() => useCodeBlockWordWrap());
+  expect(result.current).toBe(true);
+
+  act(() => {
+    applyImportedSettings({
+      version: 1,
+      settings: { [CODE_BLOCK_WORD_WRAP_STORAGE_KEY]: "false" },
+    });
+  });
+  expect(result.current).toBe(false);
 });
 
 it("carries hidden picker entries through export and import and tells an open picker", () => {
@@ -144,4 +187,42 @@ it("carries hidden picker entries through export and import and tells an open pi
   expect(readHiddenPickerAgents()).toEqual(new Set(["polly"]));
   expect(listener).toHaveBeenCalledTimes(2);
   unsubscribe();
+});
+
+it("carries project folder pagination through export and import and updates mounted readers", () => {
+  localStorage.setItem(PROJECT_FOLDER_COLLAPSE_STORAGE_KEY, "false");
+  localStorage.setItem(PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY, "3");
+  const exported = collectSettings()!;
+  expect(exported.settings[PROJECT_FOLDER_COLLAPSE_STORAGE_KEY]).toBe("false");
+  expect(exported.settings[PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY]).toBe("3");
+  const { result } = renderHook(() => [useProjectFolderCollapse(), useProjectFolderPageSize()]);
+  expect(result.current).toEqual([false, 3]);
+
+  act(() => {
+    applyImportedSettings({ version: 1, settings: {} });
+  });
+  expect(localStorage.getItem(PROJECT_FOLDER_COLLAPSE_STORAGE_KEY)).toBeNull();
+  expect(localStorage.getItem(PROJECT_FOLDER_PAGE_SIZE_STORAGE_KEY)).toBeNull();
+  expect(result.current).toEqual([true, PROJECT_FOLDER_PAGE_SIZE]);
+  act(() => {
+    applyImportedSettings(exported);
+  });
+  expect(result.current).toEqual([false, 3]);
+});
+
+it("carries hidden session-row quick actions through export and import to a mounted sidebar", () => {
+  localStorage.setItem(SESSION_ROW_QUICK_ACTIONS_STORAGE_KEY, "false");
+  const exported = collectSettings()!;
+  expect(exported.settings[SESSION_ROW_QUICK_ACTIONS_STORAGE_KEY]).toBe("false");
+  const { result } = renderHook(() => useSessionRowQuickActions());
+  expect(result.current).toBe(false);
+
+  act(() => {
+    applyImportedSettings({ version: 1, settings: {} });
+  });
+  expect(result.current).toBe(true);
+  act(() => {
+    applyImportedSettings(exported);
+  });
+  expect(result.current).toBe(false);
 });

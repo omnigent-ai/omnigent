@@ -6,7 +6,7 @@ import { connectSshHost, getDesktopFeatures, supportsSshConnect } from "@/lib/na
 
 /**
  * Whether to offer the SSH connect form: the desktop shell can connect over SSH,
- * and this window isn't one where Run on Arca (Databricks-internal) replaces it.
+ * and this window isn't one where Run on Arca replaces it.
  * False until the shell answers, so the form never flashes in and out.
  */
 export function useSshConnectAvailable(): boolean {

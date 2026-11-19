@@ -7,6 +7,7 @@ import pytest
 from omnigent.entities.conversation import (
     ConversationItem,
     MessageData,
+    humanize_mention_markers,
     synthesize_conversation_title,
 )
 
@@ -115,11 +116,31 @@ def test_to_api_dict_exposes_interrupted_assistant_marker() -> None:
             [{"type": "input_text", "text": "[Attached: /tmp/omnigent/u/img.png]"}],
             None,
         ),
-        # A marker mid-line is user prose, not an executor-emitted
-        # attachment line — it must survive into the title.
+        # A workspace file mention is part of the prompt, even alone on a
+        # line or several to a line; only absolute upload paths drop out.
         (
-            [{"type": "input_text", "text": "why does [Attached: x.png] render twice?"}],
-            "why does [Attached: x.png] render twice?",
+            [{"type": "input_text", "text": "[Attached: README.md]"}],
+            "@README.md",
+        ),
+        (
+            [{"type": "input_text", "text": "[Attached: a.ts] vs [Attached: b.ts]"}],
+            "@a.ts vs @b.ts",
+        ),
+        (
+            [{"type": "input_text", "text": "review this\n[Attached: src/app.ts]"}],
+            "review this @src/app.ts",
+        ),
+        # Composer "@" mentions sit inline: they read as "@name" in the
+        # title and the session tool hint is dropped.
+        (
+            [
+                {
+                    "type": "input_text",
+                    "text": 'compare [Session: "Fix CI" id=s_1 subagent=no] with '
+                    "[Attached: x.png]\n\n[Tagged sessions: read with sys_session_get_history]",
+                }
+            ],
+            "compare @Fix CI with @x.png",
         ),
         # Failed-attachment marker (native_attachments'
         # unresolved_attachment_marker) is likewise dropped from titles.
@@ -164,3 +185,47 @@ def test_synthesize_conversation_title_respects_custom_limit() -> None:
     """Custom ``limit`` is honored."""
     content = [{"type": "input_text", "text": "a" * 50}]
     assert synthesize_conversation_title(content, limit=10) == "a" * 9 + "…"
+
+
+def test_humanize_mention_markers_reads_markers_as_names() -> None:
+    text = (
+        'Ask [Session: "Fix CI" id=s_1 subagent=yes] about [Attached file: src/a.py:3-9] '
+        "and [Attached: /tmp/upload.png]\n\n[Tagged sessions: read with sys_session_get_history]"
+    )
+    # Absolute paths are uploads shown as file blocks, so they drop out.
+    assert humanize_mention_markers(text) == "Ask @Fix CI about @src/a.py:3-9 and "
+
+
+def test_humanize_mention_markers_keeps_a_typed_session_marker_without_hint() -> None:
+    # Only composer-tagged messages end with the hint; this is the user's text.
+    text = 'why is [Session: "x" id=y subagent=no] inline?'
+    assert humanize_mention_markers(text) == text
+
+
+@pytest.mark.timeout(30)
+@pytest.mark.parametrize(
+    "text",
+    [
+        " " * 200_000 + "x",
+        "[Attached:" * 50_000,
+        "[Attached:" + " " * 200_000,
+        "[Tagged sessions:" * 20_000 + "x",
+        '[Session: "' + "a" * 200_000,
+    ],
+    ids=[
+        "spaces",
+        "unclosed-attached",
+        "attached-then-spaces",
+        "unclosed-hint",
+        "unclosed-session",
+    ],
+)
+def test_humanize_mention_markers_stays_linear_on_malformed_markers(text: str) -> None:
+    # Patterns that rescan after an unclosed "[" took seconds on these; the
+    # generous timeout is the guard rather than a tight timing assertion.
+    assert humanize_mention_markers(text) == text
+
+
+def test_humanize_mention_markers_keeps_a_hint_typed_mid_message() -> None:
+    text = "why does [Tagged sessions: read] show up here?"
+    assert humanize_mention_markers(text) == text

@@ -67,6 +67,8 @@ interface MonacoDiffViewerProps {
   onSetActiveSelection: (sel: ActiveSelection | null) => void;
   /** In-progress comment body; clicking away won't clear an active draft. */
   pendingBodyRef?: React.RefObject<string>;
+  /** Whether the session's agent opens an attached workspace path. */
+  attachToAgent?: boolean;
   /**
    * Toolbar / Cmd+F "Find in file" toggle. The diff mirrors Monaco's native
    * find widget (on the modified side) to it: true opens find, false closes it.
@@ -113,6 +115,7 @@ export function MonacoDiffViewer({
   activeSelection,
   onSetActiveSelection,
   pendingBodyRef,
+  attachToAgent,
   searchOpen,
   searchFocusNonce,
   onSearchHandled,
@@ -287,6 +290,7 @@ export function MonacoDiffViewer({
     canComment: canEdit,
     pendingBodyRef,
     path,
+    attachToAgent,
   });
 
   const options = useMemo<DiffEditorProps["options"]>(() => {

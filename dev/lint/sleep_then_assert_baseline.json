@@ -51,7 +51,7 @@
   "tests/host/test_mcp_tools.py": 1,
   "tests/runner/test_app_sessions_native_supervision.py": 2,
   "tests/runner/test_app_sessions_native_workflow_messages.py": 4,
-  "tests/runner/test_claude_pending_prompt_queue.py": 2,
+  "tests/runner/test_claude_pending_prompt_queue.py": 1,
   "tests/runner/test_mcp_manager.py": 2,
   "tests/runner/test_native_interrupt_runner.py": 3,
   "tests/runner/test_pending_approvals.py": 5,
@@ -82,6 +82,5 @@
   "tests/test_opencode_native_mcp_timeout.py": 1,
   "tests/test_opencode_native_provider.py": 1,
   "tests/test_process_logging.py": 1,
-  "tests/test_qwen_native_permissions.py": 1,
-  "tests/testing/test_process_reaper.py": 1
+  "tests/test_qwen_native_permissions.py": 1
 }

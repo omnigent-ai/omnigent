@@ -332,51 +332,73 @@ def test_fetch_pricing_provider_entry_without_pricing_falls_through_to_catalog(
     assert pricing is catalog_pricing
 
 
-def test_fetch_pricing_provider_entry_takes_precedence_over_config_default(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """provider_entry beats the config default even when provider_config is also given."""
+def _named_entry(name: str, input_per_million: float, output_per_million: float):
+    """Build a real ProviderEntry with custom pricing via the public parser."""
     from omnigent.onboarding.provider_config import load_providers
 
-    explicit_entry = load_providers(
+    return load_providers(
         {
             "providers": {
-                "explicit": {
+                name: {
                     "kind": "key",
                     "anthropic": {
-                        "base_url": "https://explicit.example/v1",
-                        "api_key": "explicit-key",
-                        "pricing": {"input_per_million": 42.0, "output_per_million": 84.0},
+                        "base_url": f"https://{name}.example/v1",
+                        "api_key": f"{name}-key",
+                        "pricing": {
+                            "input_per_million": input_per_million,
+                            "output_per_million": output_per_million,
+                        },
                     },
                 }
             }
         }
-    )["explicit"]
-    provider_config = {
-        "providers": {
-            "some-default": {
-                "kind": "key",
-                "default": True,
-                "anthropic": {
-                    "base_url": "https://default.example/v1",
-                    "api_key": "default-key",
-                    "pricing": {"input_per_million": 1.0, "output_per_million": 2.0},
-                },
-            }
-        }
-    }
-    # catalog must not be consulted
+    )[name]
+
+
+def test_fetch_pricing_provider_entry_without_harness_is_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without a harness the family cannot be resolved, so the entry is skipped.
+
+    The entry's custom rate must not leak in: the call falls through to the
+    catalog exactly as an unpriced session does.
+    """
+    from omnigent.llms.context_window import ModelPricing
+
+    catalog_pricing = ModelPricing(input_per_token=5.0, output_per_token=15.0)
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda _model: catalog_pricing,
+    )
+
+    pricing = fetch_model_pricing_with_provider(
+        model="claude-sonnet-4-6",
+        provider_entry=_named_entry("expensive-named", 10.0, 20.0),
+    )
+    assert pricing is catalog_pricing
+
+
+def test_fetch_pricing_follows_the_provider_entry_it_is_given(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pricing has no memo keyed by model alone, so a provider switch reprices.
+
+    The same model priced through two different named providers must yield
+    each provider's own rate, never the rate cached for the other provider.
+    """
     monkeypatch.setattr(
         "omnigent.llms.context_window.fetch_model_pricing",
         lambda _model: (_ for _ in ()).throw(AssertionError("catalog must not be called")),
     )
+    cheap = _named_entry("cheap-named", 1.0, 2.0)
+    expensive = _named_entry("expensive-named", 10.0, 20.0)
 
-    pricing = fetch_model_pricing_with_provider(
-        model="any-model",
-        provider_config=provider_config,
-        harness="claude-sdk",
-        provider_entry=explicit_entry,
+    first = fetch_model_pricing_with_provider(
+        model="claude-sonnet-4-6", harness="claude-sdk", provider_entry=expensive
     )
-    assert pricing is not None
-    assert pricing.input_per_token == pytest.approx(42.0 / 1_000_000)
-    assert pricing.output_per_token == pytest.approx(84.0 / 1_000_000)
+    second = fetch_model_pricing_with_provider(
+        model="claude-sonnet-4-6", harness="claude-sdk", provider_entry=cheap
+    )
+    assert first is not None and second is not None
+    assert first.input_per_token == pytest.approx(10.0 / 1_000_000)
+    assert second.input_per_token == pytest.approx(1.0 / 1_000_000)

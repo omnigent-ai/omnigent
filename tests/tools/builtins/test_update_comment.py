@@ -104,6 +104,12 @@ class _InMemoryCommentStore(CommentStore):
             if c.conversation_id == conversation_id and (path is None or c.path == path)
         ]
 
+    def list_page(
+        self, conversation_id: str, *, limit: int = 100, after_id: str | None = None
+    ) -> tuple[list[Comment], str | None]:
+        """The update tool does not list comment pages."""
+        raise NotImplementedError
+
     def update_comment(
         self,
         comment_id: str,

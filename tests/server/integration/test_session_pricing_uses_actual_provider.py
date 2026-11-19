@@ -292,3 +292,154 @@ def test_resolve_session_provider_entry_does_not_expand_user_bundle_env(
         "pricing lookup expanded env for a non-operator-authored user bundle; "
         "a tenant ${VAR} could capture a server secret into the cached spec"
     )
+
+
+async def test_native_cumulative_usage_priced_at_named_provider_rate(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The native cumulative path (claude-native / codex-native) prices the named provider too.
+
+    ``_persist_native_cumulative_usage`` is the second accounting site. It has
+    no authoritative cost in this report, so the session's own provider rate
+    must price the reported token totals.
+    """
+    from omnigent.server.routes._sessions.orchestration import (
+        _persist_native_cumulative_usage,
+    )
+
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: None,
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.provider_config.load_config",
+        lambda: _PROVIDER_CONFIG,
+    )
+
+    agent = await _create_agent_with_named_provider(client)
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="native-named", agent_id=agent["id"])
+
+    _persist_native_cumulative_usage(
+        conv.id,
+        {
+            "cumulative_input_tokens": _INPUT_TOKENS,
+            "cumulative_output_tokens": _OUTPUT_TOKENS,
+            "model": "claude-sonnet-4-6",
+        },
+        store,
+    )
+
+    cost = _read_session_usage(db_uri, conv.id).get("total_cost_usd")
+    assert cost is not None, "native turn was not priced at all"
+    assert cost != pytest.approx(_DEFAULT_PROVIDER_COST)
+    assert cost == pytest.approx(_EXPECTED_NAMED_COST)
+
+
+def test_resolve_session_provider_entry_keeps_default_for_unnamed_auth(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sessions without a named ProviderAuth keep the default-provider fallback.
+
+    Pre-existing sessions and agents that pin no provider must resolve to
+    ``None`` so the harness-default lookup still prices them as before.
+    """
+    from types import SimpleNamespace
+
+    from omnigent.server.routes._sessions.orchestration import (
+        _resolve_session_provider_entry,
+    )
+    from omnigent.spec.types import AgentSpec, ExecutorSpec
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="unpinned",
+        executor=ExecutorSpec(config={"harness": "claude-sdk"}),
+    )
+    agent = SimpleNamespace(
+        id="a1", bundle_location="loc", session_id=None, operator_authored=True
+    )
+    monkeypatch.setattr(
+        "omnigent.runtime.get_agent_store",
+        lambda: SimpleNamespace(get=lambda _agent_id: agent),
+    )
+    monkeypatch.setattr(
+        "omnigent.runtime.get_agent_cache",
+        lambda: SimpleNamespace(load=lambda *a, **k: SimpleNamespace(spec=spec)),
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.provider_config.load_config",
+        lambda: _PROVIDER_CONFIG,
+    )
+
+    assert (
+        _resolve_session_provider_entry(
+            SimpleNamespace(id="s1", agent_id="a1", sub_agent_name=None)
+        )
+        is None
+    )
+    # A session with no bound agent (e.g. a legacy row) also keeps the fallback.
+    assert (
+        _resolve_session_provider_entry(
+            SimpleNamespace(id="s2", agent_id=None, sub_agent_name=None)
+        )
+        is None
+    )
+
+
+def test_resolve_session_provider_entry_warns_once_for_unconfigured_name(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A named provider missing from config falls back, but is never silent.
+
+    Pricing reverts to the default provider in this case, which is exactly the
+    mispricing this change removes, so the fallback must be operator-visible
+    and must not spam the per-usage-event path.
+    """
+    import logging
+    from types import SimpleNamespace
+
+    from omnigent.server.routes._sessions import orchestration
+    from omnigent.spec.types import AgentSpec, ExecutorSpec, ProviderAuth
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="missing-provider",
+        executor=ExecutorSpec(
+            auth=ProviderAuth(name="not-configured-anywhere"),
+            config={"harness": "claude-sdk"},
+        ),
+    )
+    agent = SimpleNamespace(
+        id="a-missing", bundle_location="loc", session_id=None, operator_authored=True
+    )
+    monkeypatch.setattr(
+        "omnigent.runtime.get_agent_store",
+        lambda: SimpleNamespace(get=lambda _agent_id: agent),
+    )
+    monkeypatch.setattr(
+        "omnigent.runtime.get_agent_cache",
+        lambda: SimpleNamespace(load=lambda *a, **k: SimpleNamespace(spec=spec)),
+    )
+    monkeypatch.setattr(
+        "omnigent.onboarding.provider_config.load_config",
+        lambda: _PROVIDER_CONFIG,
+    )
+    # Ambient detection must not turn a missing name into a hit in a test run.
+    monkeypatch.setattr("omnigent.onboarding.detected.detect_providers", list)
+    from omnigent.db.workspace_cache import WorkspaceScopedSet
+
+    monkeypatch.setattr(
+        orchestration, "_WARNED_PRICING_LOOKUPS", WorkspaceScopedSet()
+    )
+
+    conv = SimpleNamespace(id="s-missing", agent_id="a-missing", sub_agent_name=None)
+    with caplog.at_level(logging.WARNING):
+        assert orchestration._resolve_session_provider_entry(conv) is None
+        assert orchestration._resolve_session_provider_entry(conv) is None
+
+    warnings = [r for r in caplog.records if "not-configured-anywhere" in r.getMessage()]
+    assert len(warnings) == 1, [r.getMessage() for r in caplog.records]

@@ -3,7 +3,7 @@
 
 import { type ReactNode, useMemo } from "react";
 import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
-import { type FileDiffSection, getFileEditDiff } from "@/lib/toolEditDiff";
+import { type FileDiffSection, type FileEditDiff, getFileEditDiff } from "@/lib/toolEditDiff";
 import { type ToolCall, editApplied } from "@/lib/toolResultSummary";
 import { editErrorMessage } from "@/lib/toolValue";
 import { cn } from "@/lib/utils";
@@ -50,14 +50,19 @@ export function FileEditBody({ call }: { call: ToolCall }) {
                 : "Requested change; the output does not confirm it applied:"}
             </p>
           )}
-          {diff.files.map((file) => (
-            // A patch lists each file once, so its path names its panel.
-            <FileDiffPanel key={file.path} file={file} perMatch={diff.countsArePerMatch} />
-          ))}
+          <FileEditDiffView diff={diff} />
         </>
       )}
     </div>
   );
+}
+
+/** An edit's change as one titled diff panel per file. */
+export function FileEditDiffView({ diff }: { diff: FileEditDiff }) {
+  return diff.files.map((file) => (
+    // A patch lists each file once, so its path names its panel.
+    <FileDiffPanel key={file.path} file={file} perMatch={diff.countsArePerMatch} />
+  ));
 }
 
 /** One file's diff, titled with its path, its kind of change and its counts. */

@@ -18,6 +18,8 @@ from collections.abc import Callable
 from enum import Enum
 from typing import Any, ParamSpec, TypeVar, cast
 
+from omnigent.util.uuid import normalize_uuid
+
 _P = ParamSpec("_P")
 _T = TypeVar("_T")
 
@@ -188,9 +190,12 @@ class ErrorCode:
         one host can reach a replica that doesn't hold its tunnel — the key
         doesn't match where the tunnel lives. The request itself is valid
         (the same bytes succeed on the right replica), so the fix is to
-        re-address it: reissue WITHOUT the key and reach the host via the
-        default route. Distinct from ``RUNNER_UNAVAILABLE`` (no runner
-        bound anywhere), which no re-addressing can fix.
+        re-address it: a request not keyed to the host resends keyed to it,
+        and one already keyed to it resends WITHOUT the key to reach a tunnel
+        on the default route. :class:`WrongReplicaError` names that key; an
+        error without one (a binding that changed mid-request) retries
+        unchanged. Distinct from ``RUNNER_UNAVAILABLE`` (no runner bound
+        anywhere), which no re-addressing can fix.
     :cvar UNAUTHORIZED: No valid authentication credentials (HTTP 401).
     :cvar FORBIDDEN: Authenticated but insufficient permissions (HTTP 403).
     :cvar RUNNER_CAPABILITY_MISMATCH: The selected runner cannot
@@ -562,6 +567,24 @@ class StaleCursorError(OmnigentError):
             code=ErrorCode.STALE_CURSOR,
         )
         self.cursor_id = cursor_id
+
+
+class WrongReplicaError(OmnigentError):
+    """A request reached a replica that does not hold its host's tunnel.
+
+    The HTTP error handler compares ``host_id`` with the request's slice key to
+    tell the client whether to resend keyed to the host or without the key.
+
+    :param message: What is not on this replica, e.g.
+        ``"host 'laptop' is on another replica"``.
+    :param host_id: The host whose tunnel serves the request, e.g.
+        ``"a1b2c3d4..."``. Stored in the bare-hex form the host dials with,
+        since ingress routes on the literal key.
+    """
+
+    def __init__(self, message: str, *, host_id: str) -> None:
+        super().__init__(message, code=ErrorCode.WRONG_REPLICA)
+        self.host_id = normalize_uuid(host_id)
 
 
 # Full-enumeration attempts before a persistently stale cursor propagates.

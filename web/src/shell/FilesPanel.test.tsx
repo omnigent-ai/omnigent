@@ -23,7 +23,7 @@ vi.mock("@/hooks/useHostSshTarget", () => ({ useHostSshTarget: () => null }));
 vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 
 import { useSession } from "@/hooks/useSession";
-import { FilesPanel, revealFolderInFilesPanel } from "./FilesPanel";
+import { FilesPanel, fileListStatus, revealFolderInFilesPanel } from "./FilesPanel";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
 import { FolderTree } from "./FolderTree";
 import { SCROLL_RESTORE_BUDGET_MS } from "./useScrollRestore";
@@ -69,6 +69,10 @@ vi.mock("./WorkspacePicker", async (importOriginal) => ({
 }));
 
 // The panel reads the session's host to point the directory browser at it.
+let sandboxStarting = false;
+vi.mock("@/hooks/useSessionReconnect", () => ({
+  useSandboxStarting: () => sandboxStarting,
+}));
 vi.mock("@/hooks/useSession", () => ({
   useSession: vi.fn(() => ({ session: { hostId: "host_test" } })),
 }));
@@ -201,6 +205,7 @@ function renderPanel({
   reachable = null,
   onFileSelect = vi.fn(),
   listsLoaded = true,
+  environment,
 }: {
   conversationId: string;
   flatView?: boolean;
@@ -220,6 +225,8 @@ function renderPanel({
   onFileSelect?: (path: string) => void;
   /** False: both list queries are disabled and hold no data (nothing could serve them). */
   listsLoaded?: boolean;
+  /** The environment query's state; defaults to a loaded environment. */
+  environment?: { data: unknown; isLoading: boolean; isError: boolean; error: Error | null };
 }) {
   useAllFilesMock.mockReturnValue(
     listsLoaded
@@ -232,7 +239,10 @@ function renderPanel({
       : (unloadedResult() as ReturnType<typeof useWorkspaceChangedFiles>),
   );
   useDirectoryMock.mockReturnValue(directoryResult());
-  useEnvironmentMock.mockReturnValue(environmentResult(workingDir, reachable));
+  useEnvironmentMock.mockReturnValue(
+    (environment as ReturnType<typeof useWorkspaceEnvironment> | undefined) ??
+      environmentResult(workingDir, reachable),
+  );
   useSearchMock.mockReturnValue(
     searchResult(treeSearchResults, isSearching, isSearchPlaceholder, isSearchTruncated),
   );
@@ -412,6 +422,63 @@ describe("FilesPanel hidden-files toggle icon", () => {
   });
 });
 
+describe("FilesPanel before the workspace environment answers", () => {
+  const environment = (state: { isLoading?: boolean; error?: Error }) => ({
+    data: undefined,
+    isLoading: state.isLoading ?? false,
+    isError: state.error !== undefined,
+    error: state.error ?? null,
+  });
+
+  it.each([false, true])(
+    "says it's loading, not that the list is empty (flatView=%s)",
+    (flatView) => {
+      renderPanel({
+        conversationId: "conv_env_pending",
+        flatView,
+        files: [],
+        listsLoaded: false,
+        environment: environment({ isLoading: true }),
+      });
+
+      expect(screen.getByText("Loading…")).toBeInTheDocument();
+      expect(screen.queryByText("No files in workspace")).not.toBeInTheDocument();
+      expect(screen.queryByText("No workspace changes yet")).not.toBeInTheDocument();
+    },
+  );
+
+  it.each([false, true])("shows why the environment failed (flatView=%s)", (flatView) => {
+    renderPanel({
+      conversationId: "conv_env_failed",
+      flatView,
+      files: [],
+      listsLoaded: false,
+      environment: environment({ error: new Error("environment unavailable") }),
+    });
+
+    expect(screen.getByText("Failed to load: environment unavailable")).toBeInTheDocument();
+  });
+
+  it.each([
+    [
+      "the environment has loaded",
+      { data: undefined, isLoading: true, isError: false, error: null },
+      { data: {}, isLoading: false, isError: true, error: new Error("refetch failed") },
+    ],
+    [
+      "the list has data",
+      { data: { data: [] }, isLoading: false, isError: false, error: null },
+      { data: undefined, isLoading: false, isError: true, error: new Error("unavailable") },
+    ],
+  ])("keeps a list's own state once %s", (_case, list, environmentStatus) => {
+    expect(fileListStatus(list, environmentStatus)).toEqual({
+      isLoading: list.isLoading,
+      isError: false,
+      error: null,
+    });
+  });
+});
+
 describe("FilesPanel on an asleep sandbox", () => {
   it.each([true, false])(
     "says the sandbox is offline instead of an empty workspace (flatView=%s)",
@@ -424,6 +491,18 @@ describe("FilesPanel on an asleep sandbox", () => {
       expect(screen.queryByText("No workspace changes yet")).not.toBeInTheDocument();
     },
   );
+
+  it("says the sandbox is starting while Reconnect host wakes it", () => {
+    useAsleepMock.mockReturnValue(true);
+    sandboxStarting = true;
+    try {
+      renderPanel({ conversationId: "conv_asleep", files: [], listsLoaded: false });
+      expect(screen.getByRole("status")).toHaveTextContent("Starting sandbox…");
+      expect(screen.queryByText("Send a message in the chat to start it again.")).toBeNull();
+    } finally {
+      sandboxStarting = false;
+    }
+  });
 
   it("keeps showing a list cached before the sandbox went offline", () => {
     useAsleepMock.mockReturnValue(true);

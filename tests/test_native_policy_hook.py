@@ -2,11 +2,20 @@
 
 from __future__ import annotations
 
+import contextlib
+import subprocess
+import sys
+import threading
+from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
 import httpx
 import pytest
 
 from omnigent.native import native_policy_hook
 from omnigent.native.native_policy_hook import (
+    TOOL_FAILED_PAYLOAD_KEY,
     _is_login_redirect_or_unauthorized,
     evaluation_response_to_hook_output,
     fail_ask_hook_output,
@@ -57,6 +66,8 @@ def test_post_tool_use_maps_to_phase_tool_result() -> None:
     event = result["event"]
     assert event["type"] == "PHASE_TOOL_RESULT"
     assert event["data"]["result"] == "root:x:0:0:..."
+    # Success is never asserted, so result policies still read the text.
+    assert "is_error" not in event["data"]
     # request_data carries the originating call so result policies can
     # correlate output back to the tool + args that produced it.
     assert event["request_data"] == {
@@ -65,7 +76,82 @@ def test_post_tool_use_maps_to_phase_tool_result() -> None:
     }
 
 
-@pytest.mark.parametrize("hook_event", ["PreToolUse", "PostToolUse"])
+def test_post_tool_use_failure_maps_to_phase_tool_result_error() -> None:
+    """
+    A failed tool call reaches TOOL_RESULT policies as an error result.
+
+    Claude Code fires PostToolUseFailure, not PostToolUse, when e.g. Bash
+    exits non-zero, and carries the failure text under ``error``. The text
+    is wrapped as ``{"error": ...}`` for policies that read it, and
+    ``is_error`` marks the failure so ``detect_thrashing`` counts it
+    whatever the text says.
+    """
+    result = hook_payload_to_evaluation_request(
+        "PostToolUseFailure",
+        {
+            "hook_event_name": "PostToolUseFailure",
+            "tool_name": "Bash",
+            "tool_input": {"command": "cat /nonexistent/t1"},
+            "tool_use_id": "toolu_1",
+            "error": "Exit code 1\ncat: /nonexistent/t1: No such file or directory",
+            "is_interrupt": False,
+        },
+    )
+    assert result is not None
+    event = result["event"]
+    assert event["type"] == "PHASE_TOOL_RESULT"
+    assert event["data"] == {
+        "result": {"error": "Exit code 1\ncat: /nonexistent/t1: No such file or directory"},
+        "is_error": True,
+    }
+    assert event["request_data"] == {
+        "name": "Bash",
+        "arguments": {"command": "cat /nonexistent/t1"},
+    }
+
+
+def test_post_tool_use_reported_failure_sets_is_error() -> None:
+    """An adapter's failure flag reaches result policies as ``is_error``.
+
+    Some harnesses report a failed call through ``PostToolUse`` with output
+    text that doesn't look like an error (Devin's ``"success": false``), so
+    the adapter's flag is the only reliable signal.
+    """
+    result = hook_payload_to_evaluation_request(
+        "PostToolUse",
+        {
+            "tool_name": "exec",
+            "tool_input": {"command": "cat /nonexistent/t1"},
+            "tool_output": "cat: /nonexistent/t1: No such file or directory",
+            TOOL_FAILED_PAYLOAD_KEY: True,
+        },
+    )
+    assert result is not None
+    assert result["event"]["data"] == {
+        "result": "cat: /nonexistent/t1: No such file or directory",
+        "is_error": True,
+    }
+
+
+def test_interrupted_tool_call_is_not_evaluated() -> None:
+    """A user interrupt is not a tool error, so result policies never count it."""
+    assert (
+        hook_payload_to_evaluation_request(
+            "PostToolUseFailure",
+            {
+                "hook_event_name": "PostToolUseFailure",
+                "tool_name": "Bash",
+                "tool_input": {"command": "sleep 30"},
+                "tool_use_id": "toolu_1",
+                "error": "Interrupted by user",
+                "is_interrupt": True,
+            },
+        )
+        is None
+    )
+
+
+@pytest.mark.parametrize("hook_event", ["PreToolUse", "PostToolUse", "PostToolUseFailure"])
 def test_omnigent_mcp_tools_are_skipped(hook_event: str) -> None:
     """
     Omnigent MCP tools return None and are never sent to /policies/evaluate.
@@ -207,21 +293,22 @@ def test_pre_tool_use_unknown_action_returns_none() -> None:
     assert output is None
 
 
-def test_post_tool_use_deny_maps_to_additional_context() -> None:
+@pytest.mark.parametrize("hook_event", ["PostToolUse", "PostToolUseFailure"])
+def test_post_tool_use_deny_maps_to_additional_context(hook_event: str) -> None:
     """
-    A PostToolUse DENY becomes an additionalContext warning, not a block.
+    A tool-result DENY becomes an additionalContext warning, not a block.
 
-    PostToolUse fires after the tool ran, so it cannot block — the
+    These hooks fire after the tool ran, so they cannot block — the
     verdict is surfaced to the model as context. A failure would either
     drop the warning or wrongly attempt to block an already-run tool.
     """
     output = evaluation_response_to_hook_output(
-        "PostToolUse",
+        hook_event,
         {"result": "POLICY_ACTION_DENY", "reason": "Sensitive data in output"},
     )
     assert output is not None
     hook_specific = output["hookSpecificOutput"]
-    assert hook_specific["hookEventName"] == "PostToolUse"
+    assert hook_specific["hookEventName"] == hook_event
     # The warning text must carry the reason so the model sees why.
     assert hook_specific["additionalContext"] == "[Policy violation] Sensitive data in output"
 
@@ -410,9 +497,10 @@ def test_fail_ask_user_prompt_submit_still_fails_closed() -> None:
     assert output["reason"]
 
 
-def test_fail_ask_post_tool_use_fails_open() -> None:
-    """``PostToolUse`` fails open under fail-ask, same as fail-closed."""
-    assert fail_ask_hook_output("PostToolUse") is None
+@pytest.mark.parametrize("hook_event", ["PostToolUse", "PostToolUseFailure"])
+def test_fail_ask_post_tool_use_fails_open(hook_event: str) -> None:
+    """Tool-result hooks fail open under fail-ask, same as fail-closed."""
+    assert fail_ask_hook_output(hook_event) is None
 
 
 def test_fail_ask_unknown_event_fails_open() -> None:
@@ -464,7 +552,7 @@ def _make_redirect_then_ok_client(
     """Build an httpx.Client stub: redirect on attempt 1, ``ok`` thereafter."""
 
     class _Client:
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             del timeout
             self._headers = headers
 
@@ -489,7 +577,7 @@ def _make_sequence_client(
     """Build an httpx.Client stub that returns responses in order."""
 
     class _Client:
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             del headers, timeout
 
         def __enter__(self) -> _Client:
@@ -621,6 +709,207 @@ def test_post_evaluate_with_retry_keeps_non_429_4xx_single_attempt(
     assert len(request_bodies) == 1
 
 
+@pytest.mark.parametrize(
+    ("url", "expected_trust_env"),
+    [
+        ("http://127.0.0.1:6767/v1/sessions/s/policies/evaluate", False),
+        ("https://omnigent.example.com/v1/sessions/s/policies/evaluate", True),
+    ],
+)
+def test_post_evaluate_with_retry_bypasses_proxies_only_for_loopback_targets(
+    monkeypatch: pytest.MonkeyPatch,
+    url: str,
+    expected_trust_env: bool,
+) -> None:
+    """Local policy callbacks bypass proxies; remote deployments retain them."""
+    captured_trust_env: list[bool] = []
+
+    class _Client:
+        def __init__(
+            self,
+            *,
+            headers: dict[str, str],
+            timeout: object,
+            trust_env: bool,
+        ) -> None:
+            del headers, timeout
+            captured_trust_env.append(trust_env)
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, request_url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            return httpx.Response(
+                200,
+                text='{"result":"POLICY_ACTION_ALLOW"}',
+                request=httpx.Request("POST", request_url),
+            )
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _Client)
+
+    response, error = post_evaluate_with_retry(url, {}, {"event": {}}, 5.0, "evaluate-policy hook")
+
+    assert response is not None
+    assert error is None
+    assert captured_trust_env == [expected_trust_env]
+
+
+_ALLOW_BODY = b'{"result":"POLICY_ACTION_ALLOW"}'
+
+
+@contextlib.contextmanager
+def _http_endpoint(status: int, body: bytes) -> Iterator[tuple[str, list[str]]]:
+    """
+    Serve *status*/*body* to every POST on a loopback port, recording request targets.
+
+    Doubles as a forward-proxy stand-in: a proxied request arrives with the
+    absolute URL as its target, a direct one with just the path.
+
+    :param status: HTTP status to answer with.
+    :param body: Response body.
+    :returns: ``(base_url, targets)`` -- the targets list fills as requests land.
+    """
+    targets: list[str] = []
+
+    class _Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, *args: object) -> None:
+            del args
+
+        def do_POST(self) -> None:
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            targets.append(self.path)
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}", targets
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def _point_proxy_env_at(monkeypatch: pytest.MonkeyPatch, proxy_url: str) -> None:
+    """Export *proxy_url* the way a proxied host does: every scheme, no loopback exemption."""
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        monkeypatch.setenv(name, proxy_url)
+        monkeypatch.setenv(name.lower(), proxy_url)
+    for name in ("NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+
+
+def test_post_evaluate_with_retry_loopback_callback_ignores_ambient_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A loopback callback reaches the local server even when the host exports a proxy.
+
+    On a proxied host the runner-local relay is ``127.0.0.1``, which the proxy
+    resolves against itself and refuses. Sending that callback through the
+    proxy made every prompt fail closed; it must connect directly and never
+    consult the proxy at all.
+    """
+    # Keep the fail-closed retry loop short so the buggy path fails in seconds.
+    monkeypatch.setattr(native_policy_hook, "_EVALUATE_POLICY_RETRY_BUDGET_S", 3.0)
+    with (
+        _http_endpoint(200, _ALLOW_BODY) as (relay_url, relay_targets),
+        _http_endpoint(502, b"proxy: connect to 127.0.0.1 refused") as (proxy_url, proxy_targets),
+    ):
+        _point_proxy_env_at(monkeypatch, proxy_url)
+        resp, error = post_evaluate_with_retry(
+            f"{relay_url}/policies/evaluate",
+            {"Authorization": "Bearer relay-token"},
+            {"event": {}},
+            5.0,
+            "evaluate-policy hook",
+        )
+
+    assert error is None, f"loopback callback failed: {error}; proxy saw {proxy_targets!r}"
+    assert resp is not None and resp.json() == {"result": "POLICY_ACTION_ALLOW"}
+    assert relay_targets == ["/policies/evaluate"]
+    assert proxy_targets == []
+
+
+def test_post_evaluate_with_retry_remote_callback_honours_ambient_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A non-loopback callback still travels through the environment's proxy.
+
+    Hosted deployments reach the Omnigent server only through a corporate
+    proxy, so the bypass must stay limited to loopback targets. The server
+    name here does not resolve; the request can only succeed via the proxy.
+    """
+    url = "http://omnigent-server.corp.invalid/v1/sessions/s/policies/evaluate"
+    with _http_endpoint(200, _ALLOW_BODY) as (proxy_url, proxy_targets):
+        _point_proxy_env_at(monkeypatch, proxy_url)
+        resp, error = post_evaluate_with_retry(url, {}, {"event": {}}, 5.0, "evaluate-policy hook")
+
+    assert error is None
+    assert resp is not None and resp.json() == {"result": "POLICY_ACTION_ALLOW"}
+    assert proxy_targets == [url]
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1:28700/policies/evaluate",
+        "http://127.8.9.10:1/x",
+        "http://localhost:6767/x",
+        "http://relay.localhost/x",
+        "http://[::1]:6767/x",
+        "https://omnigent.example.com/x",
+        "http://10.0.0.7:6767/x",
+        "http://[fe80::1]:6767/x",
+        "not a url",
+        "",
+        "http://[bad",
+        "http://[::1",
+    ],
+)
+def test_is_loopback_url_matches_the_sdk_helper(url: str) -> None:
+    """The hook's stdlib copy must classify URLs exactly like the SDK helper it mirrors."""
+    from omnigent_client._http import is_loopback_url as sdk_is_loopback_url
+
+    assert native_policy_hook.is_loopback_url(url) is sdk_is_loopback_url(url)
+
+
+def test_policy_hook_import_does_not_load_the_sdk() -> None:
+    """
+    Importing the hook module must not pull in ``omnigent_client``.
+
+    The hook runs as a fresh subprocess on every native tool call; the SDK
+    package loads the server schemas and roughly triples that startup time.
+    """
+    probe = (
+        "import sys; import omnigent.native.native_policy_hook; "
+        "loaded = {name.partition('.')[0] for name in sys.modules}; "
+        "sys.exit(1 if 'omnigent_client' in loaded else 0)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, (
+        f"omnigent_client was imported by the hook module\n{result.stderr}"
+    )
+
+
 def test_post_evaluate_with_retry_reauths_on_login_redirect(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -697,7 +986,7 @@ def test_post_evaluate_with_retry_reparks_a_held_ask_poll_the_gateway_severed(
     )
 
     class _Client:
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             del headers, timeout
 
         def __enter__(self) -> _Client:
@@ -750,7 +1039,7 @@ def test_post_evaluate_with_retry_slow_429_spends_the_budget(
     )
 
     class _Client:
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             del headers, timeout
 
         def __enter__(self) -> _Client:
@@ -806,7 +1095,7 @@ def test_post_evaluate_with_retry_fast_5xx_still_exhausts_the_budget(
     posts: list[str] = []
 
     class _Client:
-        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+        def __init__(self, *, headers: dict[str, str], timeout: object, **_kwargs: object) -> None:
             del headers, timeout
 
         def __enter__(self) -> _Client:

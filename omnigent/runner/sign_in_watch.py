@@ -11,6 +11,7 @@ from typing import Any
 import httpx
 
 from omnigent.runner.resource_registry import SessionResourceRegistry
+from omnigent.scheduled_context import scheduled_run_scope
 
 _logger = logging.getLogger("omnigent.runner.app")
 
@@ -63,9 +64,10 @@ def build_sign_in_watch(
         existing = _sign_in_watchers.get(conv_id)
         if existing is not None and not existing.done():
             return
-        task = asyncio.get_running_loop().create_task(
-            _watch_sign_in_completion(conv_id), name=f"sign-in-watch-{conv_id}"
-        )
+        with scheduled_run_scope(None, session_id=conv_id):
+            task = asyncio.get_running_loop().create_task(
+                _watch_sign_in_completion(conv_id), name=f"sign-in-watch-{conv_id}"
+            )
         _sign_in_watchers[conv_id] = task
         task.add_done_callback(_background_tasks.discard)
         _background_tasks.add(task)

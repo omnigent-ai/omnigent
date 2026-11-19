@@ -1,9 +1,10 @@
 import type { ReactNode } from "react";
 
 export { CompactKbd, CompactShortcutKeys } from "@/components/ui/kbd";
-import { TooltipContent } from "@/components/ui/tooltip";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { isMacPlatform } from "@/lib/hotkeys";
-import { isNativeShell } from "@/lib/nativeBridge";
+import { isNativeShell, supportsDesktopCommands } from "@/lib/nativeBridge";
+import { shortcutKeys } from "@/lib/shortcuts/registry";
 import type { TerminalSplitAxis } from "@/lib/terminalSplitLayout";
 import { cn } from "@/lib/utils";
 
@@ -15,20 +16,107 @@ export const MOD_KEY = IS_MAC ? "⌘" : "Ctrl";
 export const CTRL_KEY = IS_MAC ? "⌃" : "Ctrl";
 export const ALT_KEY = IS_MAC ? "⌥" : "Alt";
 export const ENTER_KEY = "↵";
+export const ESC_KEY = "Esc";
 export const SHIFT_KEY = "⇧";
+export const ARROW_UP_KEY = "↑";
+export const ARROW_DOWN_KEY = "↓";
+export const ARROW_LEFT_KEY = "←";
+export const ARROW_RIGHT_KEY = "→";
 export const ARIA_MOD_KEY = IS_MAC ? "Meta" : "Control";
-export const VIEW_MODE_TOGGLE_KEYS = [MOD_KEY, ALT_KEY, "\\"] as const;
+export const VIEW_MODE_TOGGLE_KEYS = shortcutKeys("view.mode");
 export const SPLIT_TERMINAL_KEYS: Record<TerminalSplitAxis, string[]> = {
-  columns: [MOD_KEY, ALT_KEY, SHIFT_KEY, "\\"],
-  rows: [MOD_KEY, ALT_KEY, "-"],
+  columns: shortcutKeys("terminal.splitRight"),
+  rows: shortcutKeys("terminal.splitDown"),
 };
+// ⌃` opens a shell in every runtime; the rest are desktop menu chords (see the
+// accelerators in web/electron/src/main.js).
+export const NEW_TERMINAL_KEYS = shortcutKeys("terminal.new");
+export const NEW_BROWSER_TAB_KEYS = [MOD_KEY, "T"] as const;
+export const CLOSE_KEYS = [MOD_KEY, "W"] as const;
+export const CLOSE_WINDOW_KEYS = [MOD_KEY, SHIFT_KEY, "W"] as const;
+export const PIN_SESSION_KEYS = [MOD_KEY, ALT_KEY, "P"] as const;
+export const TOGGLE_UNREAD_KEYS = [MOD_KEY, ALT_KEY, "U"] as const;
+export const ARCHIVE_SESSION_KEYS = [MOD_KEY, SHIFT_KEY, "A"] as const;
+export const FORK_SESSION_KEYS = [MOD_KEY, ALT_KEY, "F"] as const;
+export const QUIT_KEYS = [MOD_KEY, "Q"] as const;
+export const RELOAD_KEYS = [MOD_KEY, "R"] as const;
+export const ADDRESS_BAR_KEYS = [MOD_KEY, "L"] as const;
+export const REOPEN_TAB_KEYS = [MOD_KEY, SHIFT_KEY, "T"] as const;
+export const PREVIOUS_TAB_KEYS = [MOD_KEY, SHIFT_KEY, "["] as const;
+export const NEXT_TAB_KEYS = [MOD_KEY, SHIFT_KEY, "]"] as const;
+export const BACK_KEYS = shortcutKeys("history.back");
+export const FORWARD_KEYS = shortcutKeys("history.forward");
+export const COMMAND_PALETTE_KEYS = shortcutKeys("palette.commands");
+// The browser chords; the desktop app's are below.
+export const SIDEBAR_TOGGLE_KEYS = shortcutKeys("sidebar.left", { native: false });
+export const RIGHT_SIDEBAR_TOGGLE_KEYS = shortcutKeys("sidebar.right", { native: false });
+export const SETTINGS_KEYS = shortcutKeys("settings.open", { desktopMenu: false });
+
+/** A chord as plain text for native `title` tooltips: "⌘R" on macOS, "Ctrl+R" elsewhere. */
+export function shortcutText(keys: readonly string[]): string {
+  return keys.join(IS_MAC ? "" : "+");
+}
 
 export function newSessionShortcutKeys(native = isNativeShell()): string[] {
-  return native ? [MOD_KEY, ALT_KEY, "N"] : [MOD_KEY, IS_MAC ? SHIFT_KEY : "Shift", "O"];
+  return native ? [MOD_KEY, "N"] : [MOD_KEY, IS_MAC ? SHIFT_KEY : "Shift", "O"];
 }
 
 export function newSessionAriaShortcut(native = isNativeShell()): string {
-  return `${ARIA_MOD_KEY}+${native ? "Alt+N" : "Shift+O"}`;
+  return `${ARIA_MOD_KEY}+${native ? "N" : "Shift+O"}`;
+}
+
+/**
+ * Keys that open Settings: the desktop menu's ⌘, (Ctrl+, elsewhere), or ⌘⌥, in a
+ * browser, where ⌘, belongs to the browser's own settings.
+ */
+export function settingsShortcutKeys(desktopMenu = supportsDesktopCommands()): string[] {
+  return desktopMenu ? [MOD_KEY, ","] : [...SETTINGS_KEYS];
+}
+
+export function settingsAriaShortcut(desktopMenu = supportsDesktopCommands()): string {
+  return `${ARIA_MOD_KEY}+${desktopMenu ? "," : "Alt+,"}`;
+}
+
+/**
+ * Keys that toggle the left (Conversations) sidebar: ⌘B in the desktop app, or
+ * ⌘⌥[ in a browser, where ⌘B can open the browser's bookmarks.
+ */
+export function sidebarToggleShortcutKeys(native = isNativeShell()): string[] {
+  return shortcutKeys("sidebar.left", { native });
+}
+
+export function sidebarToggleAriaShortcut(native = isNativeShell()): string {
+  return `${ARIA_MOD_KEY}+${native ? "B" : "Alt+["}`;
+}
+
+/** Keys that toggle the right (Workspace) sidebar: ⇧⌘B in the desktop app, ⌘⌥] in a browser. */
+export function rightSidebarToggleShortcutKeys(native = isNativeShell()): string[] {
+  return shortcutKeys("sidebar.right", { native });
+}
+
+export function rightSidebarToggleAriaShortcut(native = isNativeShell()): string {
+  return `${ARIA_MOD_KEY}+${native ? "Shift+B" : "Alt+]"}`;
+}
+
+// Ctrl+digit opens sidebar sessions off macOS, so workspace tabs take Alt there.
+const WORKSPACE_TAB_MODIFIER = IS_MAC ? CTRL_KEY : ALT_KEY;
+
+/** Keys that pick a workspace tab by its position: ⌃1 on macOS, Alt+1 elsewhere. */
+export function workspaceTabShortcutKeys(digit: string): string[] {
+  return [WORKSPACE_TAB_MODIFIER, digit];
+}
+
+export function workspaceTabAriaShortcut(digit: string): string {
+  return `${IS_MAC ? "Control" : "Alt"}+${digit}`;
+}
+
+/** Keys for the numbered-session jump chord; `digit` is one slot's digit or a range label. */
+export function sessionNumberShortcutKeys(digit: string, native = isNativeShell()): string[] {
+  return native ? [MOD_KEY, digit] : [MOD_KEY, ALT_KEY, digit];
+}
+
+export function sessionNumberAriaShortcut(digit: string, native = isNativeShell()): string {
+  return native ? `${ARIA_MOD_KEY}+${digit}` : `${ARIA_MOD_KEY}+Alt+${digit}`;
 }
 
 export function composerSendShortcutKeys(submitWithModEnter: boolean): string[] {
@@ -68,5 +156,32 @@ export function KeyboardShortcutTooltipContent({ label, keys }: { label: string;
     <TooltipContent side="top" shortcut={keys}>
       <span>{label}</span>
     </TooltipContent>
+  );
+}
+
+/**
+ * Hover and focus tooltip for one trigger: the action name, plus its chord
+ * when `keys` is given. Omit `keys` when the chord is inactive in this state.
+ */
+export function KeyboardShortcutTooltip({
+  label,
+  keys,
+  side = "top",
+  children,
+}: {
+  label: string;
+  keys?: readonly string[];
+  side?: "top" | "right" | "bottom" | "left";
+  children: ReactNode;
+}) {
+  return (
+    <TooltipProvider>
+      <Tooltip>
+        <TooltipTrigger asChild>{children}</TooltipTrigger>
+        <TooltipContent side={side} shortcut={keys}>
+          {label}
+        </TooltipContent>
+      </Tooltip>
+    </TooltipProvider>
   );
 }

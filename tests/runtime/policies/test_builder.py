@@ -398,6 +398,78 @@ llm:
     assert engine.usage["total_cost_usd"] == pytest.approx(10.0)
 
 
+def test_build_subagent_prices_on_its_own_named_provider(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A named sub-agent seeds its cost gate at ITS provider's rate, not the root's.
+
+    The root runs on the cheap default. The child spec pins the expensive named
+    provider, so its engine must price at $10/M even though the root's own
+    executor (and the family default) would give $1/M.
+    """
+    from omnigent.spec.types import AgentSpec, ExecutorSpec, LLMConfig, ProviderAuth
+
+    leaf = AgentSpec(
+        spec_version=1,
+        name="leaf",
+        executor=ExecutorSpec(
+            auth=ProviderAuth(name="expensive-named"), config={"harness": "claude-sdk"}
+        ),
+        llm=LLMConfig(model="self-hosted-model"),
+    )
+    root = AgentSpec(
+        spec_version=1,
+        name="root",
+        executor=ExecutorSpec(
+            auth=ProviderAuth(name="cheap-default"), config={"harness": "claude-sdk"}
+        ),
+        llm=LLMConfig(model="self-hosted-model"),
+        sub_agents=[leaf],
+    )
+    provider_config = {
+        "providers": {
+            "cheap-default": {
+                "kind": "local",
+                "default": True,
+                "anthropic": {
+                    "base_url": "http://cheap.local/v1",
+                    "api_key": "test",
+                    "pricing": {"input_per_million": 1.0, "output_per_million": 2.0},
+                },
+            },
+            "expensive-named": {
+                "kind": "local",
+                "anthropic": {
+                    "base_url": "http://expensive.local/v1",
+                    "api_key": "test",
+                    "pricing": {"input_per_million": 10.0, "output_per_million": 20.0},
+                },
+            },
+        }
+    }
+    monkeypatch.setattr(
+        "omnigent.onboarding.provider_config.load_config",
+        lambda: provider_config,
+    )
+    parent = conversation_store.create_conversation()
+    child = conversation_store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=parent.id,
+        title=_sub_agent_title(),
+        sub_agent_name="leaf",
+    )
+
+    engine = build_policy_engine(
+        spec=root,
+        conversation_id=child.id,
+        conversation_store=conversation_store,
+    )
+    engine.record_usage(input_tokens=1_000_000, output_tokens=0, total_tokens=1_000_000)
+
+    assert engine.usage["total_cost_usd"] == pytest.approx(10.0)
+
+
 def test_build_resolves_model_none_without_llm_or_override(
     tmp_path: Path,
     conversation_store: SqlAlchemyConversationStore,

@@ -274,10 +274,13 @@ sandbox -n omnigent-sandboxes` shows suspended ones with `Ready=False`,
 ### Watching and tuning the lifecycle
 
 **Tune it — one knob.** Set `keep_warm_s` on the sandbox config: how long an idle
-sandbox stays warm (its runner alive, so follow-ups are instant) after the last
-turn. Once that elapses the runner exits and the pod suspends a short window
-later (~5 min), so a sandbox is reclaimed roughly `keep_warm_s` after the agent
-goes quiet:
+sandbox stays warm (its runner alive, so follow-ups are instant) after its runner
+stops doing work. The server keeps renewing the sandbox while the runner reports
+work and for `keep_warm_s` after that; once it stops, the pod suspends a short
+window later (~5 min), so a sandbox is reclaimed roughly `keep_warm_s` after the
+agent goes quiet. Only agent work counts: viewing a session or terminal, or a
+command left running in a plain shell terminal with no agent turn, does not keep
+it warm:
 
 ```yaml
 sandbox:

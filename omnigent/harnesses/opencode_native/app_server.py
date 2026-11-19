@@ -43,6 +43,7 @@ from typing import IO
 import httpx
 from packaging.version import InvalidVersion, Version
 
+from omnigent.git_providers.github import gh_config_dir
 from omnigent.harnesses.diagnostics import (
     MAX_STDERR_RECORD_BYTES,
     HarnessStderrExporter,
@@ -64,6 +65,7 @@ from omnigent.harnesses.opencode_native.client import (
     OPENCODE_MIN_VERSION,
     OpenCodeClient,
 )
+from omnigent.inner.agent_env import forwarded_session_env_names
 from omnigent.process_logging import harness_stderr_capture_enabled
 
 _logger = logging.getLogger(__name__)
@@ -297,9 +299,12 @@ def filtered_server_env(
     Build the launch environment for ``opencode serve``.
 
     Per-session XDG dirs isolate OpenCode's state from the user's global
-    config; ``OPENCODE_PASSWORD`` (plus the legacy ``OPENCODE_SERVER_PASSWORD``)
-    secures the loopback server. Only provider/proxy env and operator-declared
-    runner passthrough vars from the parent are passed through.
+    config; ``GH_CONFIG_DIR`` keeps the GitHub CLI on the host's own login,
+    which that isolation would otherwise hide from the agent's shell.
+    ``OPENCODE_PASSWORD`` (plus the legacy ``OPENCODE_SERVER_PASSWORD``) secures
+    the loopback server. Only provider/proxy env, operator-declared runner
+    passthrough vars, and variables the launching CLI forwarded for this
+    session are passed through.
 
     :param bridge_dir: Native OpenCode bridge directory.
     :param auth_secret: Server password for basic auth.
@@ -310,7 +315,7 @@ def filtered_server_env(
         name.strip()
         for name in os.environ.get(_RUNNER_ENV_PASSTHROUGH_ENV_VAR, "").split(",")
         if name.strip()
-    }
+    } | forwarded_session_env_names()
     env: dict[str, str] = {}
     for key, value in os.environ.items():
         if key in _ENV_OPENCODE_DENYLIST:
@@ -322,6 +327,11 @@ def filtered_server_env(
             or key in extra_names
         ):
             env[key] = value
+    # gh resolves its config under XDG_CONFIG_HOME, so the per-session override
+    # below would hide the host's `gh auth login`; pin gh to the host's dir.
+    # Without a home directory there is no host login to expose.
+    with contextlib.suppress(RuntimeError):
+        env["GH_CONFIG_DIR"] = gh_config_dir()
     env.update(extra_env or {})
     env["XDG_DATA_HOME"] = str(xdg_data_home_for_bridge_dir(bridge_dir))
     env["XDG_CONFIG_HOME"] = str(xdg_config_home_for_bridge_dir(bridge_dir))

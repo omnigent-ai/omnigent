@@ -8,7 +8,11 @@ import type { Host } from "@/hooks/useHosts";
 const authenticatedFetchMock = vi.hoisted(() => vi.fn());
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: authenticatedFetchMock }));
 
-import { installedHarnesses, useHarnessInventory } from "./useHarnessInventory";
+import {
+  INVENTORY_HARNESSES,
+  installedHarnesses,
+  useHarnessInventory,
+} from "./useHarnessInventory";
 
 const HOST: Host = {
   host_id: "host_1",
@@ -22,6 +26,8 @@ const HOST: Host = {
   },
   gateway_inference: { "claude-native": true },
 };
+
+const PI_ONLY = ["pi"] as const;
 
 type Routes = Record<string, unknown | number>;
 
@@ -55,6 +61,16 @@ describe("installedHarnesses", () => {
     expect(
       installedHarnesses({ ...HOST, configured_harnesses: { "codex-native": false } }),
     ).toEqual(["codex"]);
+  });
+
+  it("checks only the requested families", () => {
+    const host = {
+      ...HOST,
+      configured_harnesses: { ...HOST.configured_harnesses, "pi-native": true },
+    };
+    expect(installedHarnesses(host)).toEqual(["claude", "codex"]);
+    expect(installedHarnesses(host, INVENTORY_HARNESSES)).toEqual(["claude", "codex", "pi"]);
+    expect(installedHarnesses({ ...HOST, configured_harnesses: null }, ["pi"])).toEqual(["pi"]);
   });
 
   it("probes every harness when an older host doesn't report readiness", () => {
@@ -126,6 +142,41 @@ describe("useHarnessInventory", () => {
         { id: "claude:figma", name: "figma", harness: "claude", skills: [] },
       ],
     });
+  });
+
+  it("lists Pi's skills and MCP servers only when asked for the Pi family", async () => {
+    const host: Host = { ...HOST, configured_harnesses: { "pi-native": true } };
+    serve({
+      "skills:pi-native:~": { skills: [{ name: "plan", description: "" }] },
+      "/v1/hosts/host_1/mcp-servers": {
+        mcp_servers: [
+          { name: "github", harness: "claude", transport: "stdio", scope: "user" },
+          {
+            name: "wiki",
+            harness: "pi",
+            transport: "http",
+            scope: "user",
+            url_host: "wiki.example.com",
+          },
+        ],
+      },
+    });
+
+    const pi = renderHook(() => useHarnessInventory(host, { families: PI_ONLY }), {
+      wrapper,
+    });
+    await waitFor(() => expect(pi.result.current.status).toBe("ready"));
+    expect(pi.result.current.context).toEqual({
+      credentials: [{ harness: "pi", source: "Signed in" }],
+      skills: [{ id: "pi:plan", name: "plan", harness: "pi", description: "" }],
+      mcps: [{ id: "pi:wiki", name: "wiki", harness: "pi", detail: "wiki.example.com" }],
+      plugins: [],
+    });
+
+    // Onboarding import keeps to the brand families, so Pi's rows stay out of it.
+    const brand = renderHook(() => useHarnessInventory(host), { wrapper });
+    await waitFor(() => expect(brand.result.current.status).toBe("ready"));
+    expect(brand.result.current.isEmpty).toBe(true);
   });
 
   it("says Signed in when the login source is unknown", async () => {

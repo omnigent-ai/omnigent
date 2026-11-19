@@ -16,6 +16,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSession } from "@/hooks/useSession";
 import { writeOpenSubagentsInPanel } from "@/lib/subagentPanelPreferences";
+import type * as UseAgentCostsModule from "@/hooks/useAgentCosts";
+import type { AgentCosts } from "@/hooks/useAgentCosts";
 import { SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { iconForAgentType, SubagentsPanel } from "./SubagentsPanel";
 
@@ -26,6 +28,12 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
   useChildSessions: vi.fn(),
 }));
 
+// The panel reads costs through this hook; tests set what it returns.
+const agentCosts = vi.hoisted(() => ({ current: undefined as AgentCosts | undefined }));
+vi.mock("@/hooks/useAgentCosts", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseAgentCostsModule>()),
+  useAgentCosts: () => ({ data: agentCosts.current }),
+}));
 vi.mock("@/hooks/useSession", () => ({
   useSession: vi.fn(),
 }));
@@ -135,6 +143,7 @@ const ICON_CASES: [string | null, ReturnType<typeof iconForAgentType>][] = [
 ];
 
 beforeEach(() => {
+  agentCosts.current = undefined;
   useChildSessionsMock.mockReset();
   useSessionMock.mockReset();
   // Default: parent's status is idle. Tests override per-case.
@@ -170,6 +179,27 @@ function CurrentPath() {
 }
 
 describe("SubagentsPanel", () => {
+  it("shows each agent's cost, marking estimates, and omits unknown costs", () => {
+    mockChildTree({
+      conv_parent: [childInfo({ id: "conv_a" }), childInfo({ id: "conv_b" })],
+      conv_a: [childInfo({ id: "conv_c" })],
+    });
+    agentCosts.current = new Map([
+      ["conv_parent", { costUsd: 1.5, estimated: false }],
+      ["conv_a", { costUsd: 0.4, estimated: false }],
+      ["conv_b", { costUsd: null, estimated: false }],
+      ["conv_c", { costUsd: 0.25, estimated: true }],
+    ]);
+    const { container } = renderPanel();
+
+    const costOf = (element: Element | null) =>
+      element?.querySelector('[data-testid="subagent-cost"]')?.textContent ?? null;
+    expect(costOf(screen.getByTestId("subagent-main-row"))).toBe("$1.50");
+    expect(costOf(childRow(container, "conv_a"))).toBe("$0.40");
+    expect(costOf(childRow(container, "conv_b"))).toBeNull();
+    expect(costOf(childRow(container, "conv_c"))).toBe("~$0.25");
+  });
+
   it("always renders a 'main' row linking to the root session", () => {
     // No children at all — the panel still shows the main link so
     // the user always has a path back to the parent.
@@ -654,41 +684,15 @@ describe("SubagentsPanel", () => {
     expect(kiroRow.querySelector('[data-harness-icon="kiro"]')).not.toBeNull();
   });
 
-  it("gives native sub-agent children role/bot icons, not the brand logo", () => {
-    // A native session's sub-agents are all the same brand, so the logo
-    // is reserved for full native sessions; sub-agent rows read by role,
-    // with the generic bot as the fallback.
+  it("gives native sub-agent children their harness logo, keeping the nickname as the label", () => {
     mockChildTree({
       conv_root: [
         childInfo({
-          id: "conv_generic",
-          title: "claude:tell-a-joke",
-          tool: "claude",
-          labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
-        }),
-        childInfo({
-          id: "conv_explore",
+          id: "conv_claude_explore",
           title: "Explore:find-the-bug",
           tool: "Explore",
           labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" },
         }),
-      ],
-    });
-
-    const { container } = renderPanel({ rootSessionId: "conv_root" });
-
-    const genericRow = childRow(container, "conv_generic");
-    expect(genericRow.querySelector(".lucide-bot")).not.toBeNull();
-    expect(genericRow.querySelector('[data-harness-icon="claude"]')).toBeNull();
-
-    const exploreRow = childRow(container, "conv_explore");
-    expect(exploreRow.querySelector(".lucide-search")).not.toBeNull();
-    expect(exploreRow.querySelector('[data-harness-icon="claude"]')).toBeNull();
-  });
-
-  it("uses a native sub-agent's role for its icon while keeping its nickname as the label", () => {
-    mockChildTree({
-      conv_root: [
         childInfo({
           id: "conv_codex_researcher",
           title: "codex-native-ui-subagent:thread-1",
@@ -703,11 +707,15 @@ describe("SubagentsPanel", () => {
 
     const { container } = renderPanel({ rootSessionId: "conv_root" });
 
-    const row = childRow(container, "conv_codex_researcher");
-    expect(row).toHaveTextContent("Archimedes");
-    expect(row.querySelector(".lucide-book-open")).not.toBeNull();
-    expect(row.querySelector(".lucide-bot")).toBeNull();
-    expect(row.querySelector('[data-harness-icon="codex"]')).toBeNull();
+    const claudeRow = childRow(container, "conv_claude_explore");
+    expect(claudeRow.querySelector('[data-harness-icon="claude"]')).not.toBeNull();
+    expect(claudeRow.querySelector(".lucide-search")).toBeNull();
+
+    const codexRow = childRow(container, "conv_codex_researcher");
+    expect(codexRow).toHaveTextContent("Archimedes");
+    expect(codexRow.querySelector('[data-harness-icon="codex"]')).not.toBeNull();
+    expect(codexRow.querySelector(".lucide-bot")).toBeNull();
+    expect(codexRow.querySelector(".lucide-book-open")).toBeNull();
   });
 
   it("does not infer native logos from child title or tool names alone", () => {

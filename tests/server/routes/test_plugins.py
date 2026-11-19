@@ -16,7 +16,6 @@ from omnigent.host.frames import (
     HostHelloFrame,
     HostPluginsFrame,
     HostPluginsResultFrame,
-    decode_host_frame,
 )
 from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes.plugins import (
@@ -24,6 +23,7 @@ from omnigent.server.routes.plugins import (
     request_host_plugins,
 )
 from omnigent.stores.host_store import HostStore
+from tests.server.helpers import sent_to_host
 
 _HOST_ID = "a828988dc0b441fb8d04dad3761773b9"
 _URL = f"/v1/hosts/{_HOST_ID}/plugins"
@@ -104,7 +104,7 @@ async def test_owner_gets_plugins(
     conn = _register(registry, CAP_PLUGINS)
     async with _client(app) as client:
         task = asyncio.create_task(client.get(_URL, headers={"x-test-user": "owner"}))
-        frame = decode_host_frame((await asyncio.wait_for(conn.outbound_queue.get(), 2)).data)
+        frame = await sent_to_host(conn, task)
         assert isinstance(frame, HostPluginsFrame)
         result.request_id = frame.request_id
         conn.pending_plugins[frame.request_id].set_result(result)

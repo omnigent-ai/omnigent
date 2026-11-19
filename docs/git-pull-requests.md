@@ -21,8 +21,11 @@ loads facets without opening the panel.
 
 Declare supported controls through `ProviderCapabilities`: account switching,
 base remote selection, line counts, and diffs for linked requests outside the
-workspace's repository. Return authentication state and actionable host-side
-instructions in `auth`. A provider can authenticate without a CLI; the panel
+workspace's repository. A provider that merges and switches accounts can also
+implement the optional `AccountMergeFacet` and set `merge_as_account`. The merge
+dialog then offers the signed-in accounts, and `merge_as` must run as the chosen
+account for that call alone, never as a saved preference read back. Return
+authentication state and actionable host-side instructions in `auth`. A provider can authenticate without a CLI; the panel
 requires a CLI installation only while the provider is also signed out.
 
 Requests route to the selected association's provider. Without an association,
@@ -67,6 +70,7 @@ checks, or changes when its API failed:
 | `pr.checks.partial: true`         | Qualify check counts as incomplete; keep any loaded checks.                                                                            |
 | `pr.checks_supported: false`      | The token cannot read check runs (GitHub refuses them to fine-grained PATs); say so in the Checks area instead of showing counts.      |
 | `pr.comments_partial: true`       | Mark comments incomplete; retain loaded comments and display a `+` with their count.                                                   |
+| `pr.timeline_partial: true`       | Retain loaded commit/force-push events and show an incomplete-history message with a provider link.                                    |
 | Changed files `has_more: true`    | Mark the file list incomplete.                                                                                                         |
 | Changed files `warning: string`   | Show the provider's explanation, including a failed file-list lookup.                                                                  |
 | Diff `unavailable_reason: string` | Show an unavailable state instead of rendering an empty patch.                                                                         |
@@ -123,8 +127,15 @@ host.
 **Freshness.** Summaries carry `state_checked_at`. A listed session whose first
 request is open (or unknown) and older than five minutes is refreshed in the
 background, at most once per five minutes, when its tunnel is on the serving
-replica; clients show older states as stale. After a turn ends the server
-refreshes the session once, unless a client's read already covered that turn.
+replica; clients show older states as stale. A refresh stores every linked
+request's state, not only the selected one's: when the runner or host refreshes
+the titles of the other requests (each at most every five minutes), a provider
+that implements the optional `PullRequestStatusFacet.pr_status` reads the state
+and draft flag in the same call, and adds `state` and `is_draft` to those
+entries of `prs`. The server stores them as of its request, like the selected
+request's state. Providers with only `pr_title` keep reporting titles alone.
+After a turn ends the server refreshes the session once, unless a client's read
+already covered that turn.
 
 **Limits.** A session keeps at most 50 linked requests and 50 unlinks. Their
 identities must fit 12,000 stored bytes, checked when a request is added:
@@ -141,6 +152,21 @@ that store requests report `session_pull_requests` in `/v1/info`; against older
 servers the web reads only the live host.
 
 ## Verification
+
+### Commit and push history
+
+GitHub PR info includes optional `timeline_events`, interleaved with comments
+in the Comments tab. Entries contain `id`, `kind` (`commit` or `force_push`),
+`author`, `created_at`, `url`, `sha`, and optional `previous_sha` and `message`.
+The host fetches the latest 100 commit/force-push timeline entries and reports
+`timeline_partial` when older entries exist or the read fails. Older hosts and
+other providers can omit these fields.
+
+GitHub does not expose supported timestamps for regular pushes, so commits use
+their commit time and are labeled “committed.” Force pushes use the event time.
+Timeline-only reads use GitHub CLI's 30-second response cache. PRs with at least
+100 comments keep the existing uncached latest-comment refresh and fetch activity
+in that request. Incomplete history does not extend normal metadata polling.
 
 ### Inline GitHub conversations
 

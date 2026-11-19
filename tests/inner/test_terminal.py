@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 import omnigent.inner.terminal as terminal_mod
+import omnigent.util.tmux_compat as tmux_compat
 from omnigent.errors import ErrorCategory, ErrorImpact, classify_exception
 from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
@@ -38,6 +39,7 @@ from omnigent.inner.terminal_lifecycle import (
 from omnigent.native import owner_claim
 from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
 from omnigent.runner.resource_registry import trim_terminal_output
+from tests._helpers.polling import poll_until
 
 
 @dataclass
@@ -93,7 +95,7 @@ def test_threaded_idle_watcher_reports_terminal_exit(
     )
     exited = threading.Event()
 
-    instance._capture_pane_for_idle_or_none = lambda: None  # type: ignore[method-assign]
+    instance._capture_pane_state_or_none = lambda: None  # type: ignore[method-assign]
     instance._tmux_session_exists_sync = lambda: False  # type: ignore[method-assign]
 
     instance.start_idle_watcher_thread(
@@ -170,10 +172,14 @@ def test_threaded_idle_watcher_keeps_last_pane_text_on_exit(
     exited = threading.Event()
     snapshots = iter(["\x1b[31mstartup failed\x1b[0m\ntry config", None, None, None])
 
-    instance._capture_pane_for_idle_or_none = lambda: next(snapshots)  # type: ignore[method-assign]
+    def _capture() -> tuple[bool, str] | None:
+        # A live-pane capture, then tmux "gone"; the fold reports both the
+        # live/dead state and the snapshot in one call.
+        snap = next(snapshots)
+        return None if snap is None else (False, snap)
+
+    instance._capture_pane_state_or_none = _capture  # type: ignore[method-assign]
     instance._tmux_session_exists_sync = lambda: False  # type: ignore[method-assign]
-    # The initial synthetic capture is from a live pane; never probe real tmux.
-    monkeypatch.setattr(instance, "_pane_is_dead", lambda: False)
 
     instance.start_idle_watcher_thread(
         on_exit=exited.set,
@@ -604,8 +610,9 @@ def test_threaded_idle_watcher_resets_transient_capture_failures(tmp_path: Path)
     recovered_twice = threading.Event()
     successful_ticks = 0
 
-    def _capture() -> str | None:
-        return next(captures, "steady")
+    def _capture() -> tuple[bool, str] | None:
+        snap = next(captures, "steady")
+        return None if snap is None else (False, snap)
 
     def _on_tick() -> None:
         nonlocal successful_ticks
@@ -613,9 +620,8 @@ def test_threaded_idle_watcher_resets_transient_capture_failures(tmp_path: Path)
         if successful_ticks >= 2:
             recovered_twice.set()
 
-    instance._capture_pane_for_idle_or_none = _capture  # type: ignore[method-assign]
+    instance._capture_pane_state_or_none = _capture  # type: ignore[method-assign]
     instance._tmux_session_exists_sync = lambda: False  # type: ignore[method-assign]
-    instance._pane_is_dead = lambda: False  # type: ignore[method-assign]
 
     instance.start_idle_watcher_thread(
         on_exit=exited.set,
@@ -651,7 +657,7 @@ def test_threaded_idle_watcher_uses_session_probe_to_confirm_capture_failure(
             confirmed.set()
         return True
 
-    instance._capture_pane_for_idle_or_none = lambda: None  # type: ignore[method-assign]
+    instance._capture_pane_state_or_none = lambda: None  # type: ignore[method-assign]
     instance._tmux_session_exists_sync = _confirm  # type: ignore[method-assign]
 
     instance.start_idle_watcher_thread(on_exit=exited.set, poll_interval_s=0.01)
@@ -721,7 +727,7 @@ def test_threaded_idle_watcher_treats_confirmation_start_failure_as_unknown(
             retried.set()
         raise BlockingIOError(errno.EAGAIN, "resource temporarily unavailable")
 
-    instance._capture_pane_for_idle_or_none = lambda: None  # type: ignore[method-assign]
+    instance._capture_pane_state_or_none = lambda: None  # type: ignore[method-assign]
     monkeypatch.setattr(terminal_mod.subprocess, "run", _cannot_fork)
     monkeypatch.setattr(terminal_mod, "_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS", 0.01)
 
@@ -965,20 +971,26 @@ def test_capture_probe_logs_command_return_code_and_stderr(
     )
 
     with caplog.at_level(logging.WARNING, logger=terminal_mod.__name__):
-        snapshot = instance._capture_pane_for_idle_or_none()
+        state = instance._capture_pane_state_or_none()
 
-    assert snapshot is None
+    assert state is None
     message = caplog.records[-1].getMessage()
     assert "rc=17" in message
     assert "\n" not in message
     payload = json.loads(message.split("(rc=17): ", 1)[1])
     assert payload == {
         "cmd": [
-            "tmux",
+            terminal_mod._tmux_executable(),
             "-S",
             str(instance.socket_path),
             "-f",
             terminal_mod._TMUX_CONFIG_PATH,
+            "list-panes",
+            "-t",
+            "main",
+            "-F",
+            "#{pane_dead} #{pane_dead_status}",
+            ";",
             "capture-pane",
             "-t",
             "main",
@@ -1006,8 +1018,7 @@ def test_threaded_idle_watcher_fires_on_tick_each_poll(tmp_path: Path) -> None:
         running=True,
     )
     # A steady, unchanging pane: no activity edges, but ticks still fire.
-    instance._capture_pane_for_idle_or_none = lambda: "steady frame"  # type: ignore[method-assign]
-    instance._pane_is_dead = lambda: False  # type: ignore[method-assign]
+    instance._capture_pane_state_or_none = lambda: (False, "steady frame")  # type: ignore[method-assign]
     ticks = threading.Event()
     count = {"n": 0}
 
@@ -1038,12 +1049,11 @@ def test_threaded_idle_watcher_records_when_output_changed_the_screen(tmp_path: 
     frames = iter(["booting", "working 1", "working 2"])
     current = {"frame": "booting"}
 
-    def _capture() -> str:
+    def _capture() -> tuple[bool, str]:
         current["frame"] = next(frames, current["frame"])
-        return current["frame"]
+        return False, current["frame"]
 
-    instance._capture_pane_for_idle_or_none = _capture  # type: ignore[method-assign]
-    instance._pane_is_dead = lambda: False  # type: ignore[method-assign]
+    instance._capture_pane_state_or_none = _capture  # type: ignore[method-assign]
     ticks = threading.Event()
     count = {"n": 0}
 
@@ -1221,8 +1231,10 @@ def test_threaded_idle_watcher_reports_exit_on_dead_pane(tmp_path: Path) -> None
     )
     exited = threading.Event()
     # capture-pane still succeeds (server alive); the pane is dead.
-    instance._capture_pane_for_idle_or_none = lambda: "claude exited: boom\nbye"  # type: ignore[method-assign]
-    instance._pane_is_dead = lambda: True  # type: ignore[method-assign]
+    instance._capture_pane_state_or_none = lambda: (  # type: ignore[method-assign]
+        True,
+        "claude exited: boom\nbye",
+    )
 
     instance.start_idle_watcher_thread(on_exit=exited.set, poll_interval_s=0.01)
 
@@ -1235,7 +1247,7 @@ def test_threaded_idle_watcher_retries_unknown_pane_death(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A pane-death probe that cannot start backs off without reporting exit."""
+    """A pane probe that cannot start backs off without reporting exit."""
     instance = TerminalInstance(
         name="runtime",
         session_key="main",
@@ -1246,8 +1258,6 @@ def test_threaded_idle_watcher_retries_unknown_pane_death(
     exited = threading.Event()
     retried = threading.Event()
     attempts = 0
-
-    instance._capture_pane_for_idle_or_none = lambda: "steady frame"  # type: ignore[method-assign]
 
     def _cannot_probe(*args: str) -> NoReturn:
         del args
@@ -1266,6 +1276,316 @@ def test_threaded_idle_watcher_retries_unknown_pane_death(
     instance._stop_idle_watcher_thread()
     assert not exited.is_set()
     assert instance.running is True
+
+
+def _idle_watch_instance(tmp_path: Path) -> TerminalInstance:
+    """Build a running terminal instance for idle-watcher unit tests."""
+    return TerminalInstance(
+        name="runtime",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+
+
+class _StubDetector:
+    """Minimal :class:`_IdleDetector` stand-in for interval-policy tests."""
+
+    def __init__(self, *, changed: bool, quiescent: bool) -> None:
+        self.changed_this_tick = changed
+        self._quiescent = quiescent
+
+    def quiescent_for(self, seconds: float) -> bool:
+        del seconds
+        return self._quiescent
+
+
+def test_next_idle_poll_interval_grows_toward_capped_ceiling() -> None:
+    """Backoff grows geometrically but never past the per-base ceiling."""
+    # Generic 1s base: the global 2s cap bounds growth.
+    assert terminal_mod._next_idle_poll_interval(1.0, 1.0) == 2.0
+    assert terminal_mod._next_idle_poll_interval(2.0, 1.0) == 2.0
+    # Fast 0.2s claude-native base: base * max-multiple (2s) bounds growth.
+    assert terminal_mod._next_idle_poll_interval(0.2, 0.2) == pytest.approx(0.4)
+    assert terminal_mod._next_idle_poll_interval(1.6, 0.2) == pytest.approx(2.0)
+    assert terminal_mod._next_idle_poll_interval(2.0, 0.2) == pytest.approx(2.0)
+
+
+def test_idle_poll_backoff_env_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The env var pins the base cadence without a code rollback."""
+    monkeypatch.delenv(terminal_mod._IDLE_POLL_BACKOFF_ENV_VAR, raising=False)
+    assert terminal_mod._idle_poll_backoff_enabled() is True
+    for off in ("0", "false", "no", "off", "OFF", " Off "):
+        monkeypatch.setenv(terminal_mod._IDLE_POLL_BACKOFF_ENV_VAR, off)
+        assert terminal_mod._idle_poll_backoff_enabled() is False
+    monkeypatch.setenv(terminal_mod._IDLE_POLL_BACKOFF_ENV_VAR, "1")
+    assert terminal_mod._idle_poll_backoff_enabled() is True
+
+
+def test_wake_signal_coalesces_and_latches_expected_output() -> None:
+    """Repeated wakes collapse to one; expect_output latches until consumed."""
+    signal = terminal_mod._WakeSignal()
+    assert signal.consume(0.0) == (False, False)
+    signal.wake(expect_output=False)
+    signal.wake(expect_output=True)
+    signal.wake(expect_output=False)
+    assert signal.consume(0.0) == (True, True)
+    assert signal.consume(0.0) == (False, False)
+
+
+def test_wake_signal_consume_returns_on_wake_not_timeout() -> None:
+    """A backed-off watcher's wait returns on the wake, not the full timeout."""
+    signal = terminal_mod._WakeSignal()
+
+    def _producer() -> None:
+        time.sleep(0.05)
+        signal.wake(expect_output=True)
+
+    threading.Thread(target=_producer, daemon=True).start()
+    start = time.monotonic()
+    woken, expects_output = signal.consume(5.0)
+    elapsed = time.monotonic() - start
+    assert woken is True and expects_output is True
+    assert elapsed < 1.0
+
+
+def test_idle_detector_quiescent_for_tracks_last_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``quiescent_for`` accrues quiet time, and a content change resets it."""
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(terminal_mod.time, "monotonic", lambda: clock["now"])
+    detector = terminal_mod._IdleDetector()
+    detector.tick("frame-one")
+    clock["now"] = 1005.0
+    assert detector.quiescent_for(5.0) is True
+    assert detector.quiescent_for(6.0) is False
+    # A changed snapshot resets the quiet clock.
+    detector.tick("frame-two")
+    assert detector.quiescent_for(5.0) is False
+    # An unchanged snapshot keeps accruing from the last change.
+    clock["now"] = 1011.0
+    detector.tick("frame-two")
+    assert detector.quiescent_for(5.0) is True
+
+
+def test_next_watch_interval_backs_off_only_when_fully_quiet(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Interval growth is held back by any signal that the pane is not idle."""
+    instance = _idle_watch_instance(tmp_path)
+    quiet = _StubDetector(changed=False, quiescent=True)
+
+    def interval(**kwargs: object) -> float:
+        base = {
+            "detector": quiet,
+            "woken": False,
+            "backoff_enabled": True,
+            "backoff_allowed": None,
+            "hold_base_until": 0.0,
+            "now": 100.0,
+        }
+        base.update(kwargs)
+        return instance._next_watch_interval(1.0, 1.0, **base)  # type: ignore[arg-type]
+
+    # Fully quiet and allowed → grows one step, capped at the global 2s.
+    assert interval() == 2.0
+    assert interval(backoff_allowed=lambda: True) == 2.0
+    # Any "not idle" signal pins the base cadence.
+    assert interval(detector=_StubDetector(changed=True, quiescent=True)) == 1.0
+    assert interval(detector=_StubDetector(changed=False, quiescent=False)) == 1.0
+    assert interval(woken=True) == 1.0
+    assert interval(backoff_enabled=False) == 1.0
+    assert interval(backoff_allowed=lambda: False) == 1.0
+    assert interval(hold_base_until=200.0) == 1.0
+
+    # A failing predicate holds the base cadence instead of ending the watcher,
+    # and is logged once rather than on every tick.
+    def failing_predicate() -> bool:
+        raise NameError("status poller gone")
+
+    with caplog.at_level(logging.ERROR, logger="omnigent.inner.terminal"):
+        assert interval(backoff_allowed=failing_predicate) == 1.0
+        assert interval(backoff_allowed=failing_predicate) == 1.0
+    failures = [r for r in caplog.records if "backoff predicate failed" in r.getMessage()]
+    assert len(failures) == 1
+
+
+def test_tmux_executable_for_path_caches_and_searches_path_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resolution is cached per ``PATH`` value and searches that value.
+
+    An unchanged ``PATH`` reuses the cached binary without re-walking it; a
+    changed ``PATH`` re-resolves. Each lookup searches the same ``PATH`` string
+    used as the cache key, so a cached result matches the path it was found on.
+    """
+    terminal_mod._tmux_executable_for_path.cache_clear()
+    searched: list[str | None] = []
+
+    def _fake_which(cmd: str, path: str | None = None) -> str | None:
+        searched.append(path)
+        return f"{path}/tmux"
+
+    monkeypatch.setattr(terminal_mod.shutil, "which", _fake_which)
+    try:
+        first = terminal_mod._tmux_executable_for_path("/a/bin")
+        cached = terminal_mod._tmux_executable_for_path("/a/bin")
+        changed = terminal_mod._tmux_executable_for_path("/b/bin")
+    finally:
+        terminal_mod._tmux_executable_for_path.cache_clear()
+
+    assert first == "/a/bin/tmux"
+    assert cached == "/a/bin/tmux"
+    assert changed == "/b/bin/tmux"
+    # One walk per distinct PATH, each searching exactly its own value.
+    assert searched == ["/a/bin", "/b/bin"]
+
+
+def test_capture_pane_state_or_none_folds_liveness_and_capture(tmp_path: Path) -> None:
+    """One tmux invocation yields both the dead/alive flag and the capture."""
+    instance = _idle_watch_instance(tmp_path)
+    calls: list[tuple[str, ...]] = []
+
+    def _one_shot(*args: str) -> str:
+        calls.append(args)
+        return "0 \n\x1b[31mframe line\x1b[0m\nsecond"
+
+    instance._tmux_output_sync = _one_shot  # type: ignore[method-assign]
+    assert instance._capture_pane_state_or_none() == (False, "\x1b[31mframe line\x1b[0m\nsecond")
+    assert len(calls) == 1
+    assert calls[0][0] == "list-panes"
+    assert ";" in calls[0] and "capture-pane" in calls[0]
+    assert instance.last_exit_status() is None
+
+    instance._tmux_output_sync = lambda *a: "1 42\nfinal frame"  # type: ignore[method-assign]
+    assert instance._capture_pane_state_or_none() == (True, "final frame")
+    assert instance.last_exit_status() == 42
+
+
+def test_threaded_watcher_reduces_tmux_forks_once_pane_is_quiet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An idle pane bounds the watcher's tmux forks near the backed-off ceiling."""
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_BACKOFF_AFTER_SECONDS", 0.03)
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_BACKOFF_MAX_MULTIPLE", 1000.0)
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_MAX_INTERVAL_SECONDS", 0.2)
+
+    def forks_over_window(*, backoff: bool) -> int:
+        monkeypatch.setenv(terminal_mod._IDLE_POLL_BACKOFF_ENV_VAR, "1" if backoff else "0")
+        instance = _idle_watch_instance(tmp_path)
+        count = {"n": 0}
+
+        def _capture() -> tuple[bool, str]:
+            count["n"] += 1
+            return (False, "steady")
+
+        instance._capture_pane_state_or_none = _capture  # type: ignore[method-assign]
+        instance.start_idle_watcher_thread(on_tick=lambda: None, poll_interval_s=0.01)
+        time.sleep(1.0)
+        instance._stop_idle_watcher_thread()
+        return count["n"]
+
+    without_backoff = forks_over_window(backoff=False)
+    with_backoff = forks_over_window(backoff=True)
+    # Backoff must strictly cut forks and bound them near the ceiling rate
+    # (window / max interval plus the geometric ramp), not the base-tick rate.
+    assert with_backoff < without_backoff
+    assert with_backoff <= 15
+
+
+def test_threaded_watcher_wakes_promptly_from_backoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A wake interrupts a backed-off watcher's multi-second sleep at once."""
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_BACKOFF_AFTER_SECONDS", 0.02)
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_BACKOFF_MAX_MULTIPLE", 1000.0)
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_MAX_INTERVAL_SECONDS", 2.0)
+    instance = _idle_watch_instance(tmp_path)
+    ticks = {"n": 0}
+
+    def _capture() -> tuple[bool, str]:
+        ticks["n"] += 1
+        return (False, "steady")
+
+    instance._capture_pane_state_or_none = _capture  # type: ignore[method-assign]
+    instance.start_idle_watcher_thread(on_tick=lambda: None, poll_interval_s=0.01)
+    try:
+        # Grow the interval to the 2s ceiling, then align to the start of a
+        # fresh backed-off sleep so the wake has the full ceiling to beat.
+        time.sleep(1.5)
+        start = ticks["n"]
+        align_deadline = time.monotonic() + 10.0
+        while ticks["n"] == start:
+            assert time.monotonic() < align_deadline, "watcher stopped ticking"
+            time.sleep(0.01)
+        before = ticks["n"]
+        woke_at = time.monotonic()
+        instance.wake_idle_watcher()
+        deadline = woke_at + 1.0
+        while ticks["n"] == before and time.monotonic() < deadline:
+            time.sleep(0.005)
+        latency = time.monotonic() - woke_at
+    finally:
+        instance._stop_idle_watcher_thread()
+    assert ticks["n"] > before
+    assert latency < 1.0  # far below the ~2s sleep the wake interrupted
+
+
+def test_threaded_idle_watcher_confirms_exit_at_base_cadence_after_backoff(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A backed-off watcher drops to the base cadence to confirm an exit.
+
+    Each failure-confirmation retry must run at the base interval, not the
+    grown backoff ceiling, so a lost terminal is reported within the base
+    window instead of several ceiling-length sleeps.
+    """
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_BACKOFF_AFTER_SECONDS", 0.03)
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_BACKOFF_MAX_MULTIPLE", 1000.0)
+    monkeypatch.setattr(terminal_mod, "_IDLE_POLL_MAX_INTERVAL_SECONDS", 0.5)
+    monkeypatch.setenv(terminal_mod._IDLE_POLL_BACKOFF_ENV_VAR, "1")
+    instance = _idle_watch_instance(tmp_path)
+    instance._tmux_session_exists_sync = lambda: False  # type: ignore[method-assign]
+    quiet_capture_times: list[float] = []
+    failing = {"on": False}
+    first_fail = {"at": 0.0}
+
+    def _capture() -> tuple[bool, str] | None:
+        if not failing["on"]:
+            quiet_capture_times.append(time.monotonic())
+            return (False, "steady")
+        if first_fail["at"] == 0.0:
+            first_fail["at"] = time.monotonic()
+        return None
+
+    instance._capture_pane_state_or_none = _capture  # type: ignore[method-assign]
+    exited = threading.Event()
+    instance.start_idle_watcher_thread(on_exit=exited.set, poll_interval_s=0.01)
+    try:
+        # Let the quiet pane grow the interval to the 0.5s ceiling, then fail
+        # so the exit is confirmed from a fully backed-off state.
+        poll_until(
+            lambda: (
+                len(quiet_capture_times) >= 2
+                and quiet_capture_times[-1] - quiet_capture_times[-2] >= 0.4
+            ),
+            timeout_s=5.0,
+            interval_s=0.05,
+        )
+        quiet_captures = len(quiet_capture_times)
+        failing["on"] = True
+        assert exited.wait(timeout=2.0)
+        exit_latency = time.monotonic() - first_fail["at"]
+    finally:
+        instance._stop_idle_watcher_thread()
+    # Backoff engaged: far fewer than the ~100 base-cadence ticks the ~1s it
+    # takes to reach the ceiling would otherwise produce.
+    assert quiet_captures <= 15
+    # Exit confirmed within the base window, not three ceiling-length sleeps.
+    assert exit_latency < 0.4
+    assert instance.running is False
 
 
 @pytest.mark.asyncio
@@ -2002,7 +2322,8 @@ async def test_server_survives_inner_process_exit_real_tmux(
             "exit-empty/remain-on-exit were not applied: "
             f"{probe.stderr.decode().strip()!r}"
         )
-        assert instance._pane_is_dead() is True
+        state = instance._capture_pane_state_or_none()
+        assert state is not None and state[0] is True
         assert instance.last_exit_status() == (exit_status if exit_status >= 0 else None), (
             instance.last_exit_text()
         )
@@ -2264,7 +2585,11 @@ async def test_launch_discards_previous_exit_diagnostics_before_starting(
     monkeypatch.setattr(
         terminal_mod,
         "asyncio",
-        SimpleNamespace(create_subprocess_exec=spawn, subprocess=asyncio.subprocess),
+        SimpleNamespace(
+            create_subprocess_exec=spawn,
+            subprocess=asyncio.subprocess,
+            to_thread=asyncio.to_thread,
+        ),
     )
     if launch_fails:
         with pytest.raises(RuntimeError, match="tmux launch failed"):
@@ -2299,7 +2624,11 @@ async def test_launch_replaces_inherited_correlation_and_resets_only_for_new_lau
     monkeypatch.setattr(
         terminal_mod,
         "asyncio",
-        SimpleNamespace(create_subprocess_exec=spawn, subprocess=asyncio.subprocess),
+        SimpleNamespace(
+            create_subprocess_exec=spawn,
+            subprocess=asyncio.subprocess,
+            to_thread=asyncio.to_thread,
+        ),
     )
 
     await instance.launch()
@@ -2347,7 +2676,11 @@ async def test_failed_launch_telemetry_does_not_block_or_reuse_parent_identity(
     monkeypatch.setattr(
         terminal_mod,
         "asyncio",
-        SimpleNamespace(create_subprocess_exec=spawn, subprocess=asyncio.subprocess),
+        SimpleNamespace(
+            create_subprocess_exec=spawn,
+            subprocess=asyncio.subprocess,
+            to_thread=asyncio.to_thread,
+        ),
     )
     await instance.launch()
     assert instance.running
@@ -2365,7 +2698,7 @@ def test_require_supported_tmux_accepts_minimum_or_newer(
 ) -> None:
     """Managed-terminal preflight accepts tmux 3.3 and newer."""
     monkeypatch.setattr(terminal_mod.shutil, "which", lambda _: "/usr/bin/tmux")
-    monkeypatch.setattr(terminal_mod, "tmux_version", lambda _: version)
+    monkeypatch.setattr(tmux_compat, "tmux_version", lambda _: version)
 
     terminal_mod._require_supported_tmux()
 
@@ -2382,6 +2715,8 @@ def test_require_supported_tmux_rejects_missing_binary(
     assert isinstance(caught.value, terminal_mod.TmuxUnavailableError)
     assert classify_exception(caught.value) == (ErrorCategory.CONFIG, ErrorImpact.BLOCKING)
     assert "brew install tmux" in str(caught.value)
+    # Desktop hosts keep the app's startup PATH, so restarting the host alone can't help.
+    assert "quit and reopen the Omnigent app" in str(caught.value)
 
 
 @pytest.mark.parametrize(
@@ -2398,9 +2733,25 @@ def test_require_supported_tmux_rejects_old_or_unknown_version(
 ) -> None:
     """Managed terminals fail early unless tmux 3.3 support is confirmed."""
     monkeypatch.setattr(terminal_mod.shutil, "which", lambda _: "/usr/bin/tmux")
-    monkeypatch.setattr(terminal_mod, "tmux_version", lambda _: version)
+    monkeypatch.setattr(tmux_compat, "tmux_version", lambda _: version)
 
     with pytest.raises(terminal_mod.TmuxUnavailableError, match=message):
+        terminal_mod._require_supported_tmux()
+
+
+def test_require_supported_tmux_treats_undecodable_version_as_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A ``tmux -V`` that prints invalid UTF-8 still fails as a clear host setup error."""
+    tmux = tmp_path / "tmux"
+    tmux.write_text("#!/bin/sh\nprintf '\\377\\n'\n")
+    tmux.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    with pytest.raises(
+        terminal_mod.TmuxUnavailableError, match="Could not determine the installed tmux version"
+    ):
         terminal_mod._require_supported_tmux()
 
 
