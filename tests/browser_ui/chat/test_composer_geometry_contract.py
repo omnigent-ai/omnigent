@@ -626,6 +626,41 @@ def test_picker_rows_follow_the_row_grid(
         assert choice_xs[0] - box(navigation_labels[0])["x"] > TOLERANCE
 
 
+def test_model_flyout_stays_inside_the_chat_beside_the_workspace(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    chat = chat_session_contract
+    chat.set_catalog(
+        harness="claude-native",
+        models=[model_option("sonnet", display_name="Sonnet 5", is_default=True)],
+        selected_model="sonnet",
+    )
+    chat.update_session(labels={"omnigent.wrapper": "claude-code-native-ui"})
+    open_live(page, chat, DESKTOP)
+    page.get_by_role("button", name="Expand right panel").click()
+    workspace = page.get_by_role("complementary", name="Workspace")
+    expect(workspace).to_be_visible()
+    workspace.evaluate(
+        "el => Promise.all(el.getAnimations().map(animation => animation.finished))"
+    )
+    page.get_by_test_id("composer-config-gear").click()
+    page.get_by_test_id("composer-agent-edit").click()
+    flyout_menu = page.get_by_test_id("composer-agent-config-menu")
+    expect(flyout_menu).to_be_visible()
+    _settle_menu(flyout_menu)
+    chat_pane = box(page.get_by_role("main"))
+    picker = box(page.locator(".composer-agent-menu:not(.composer-agent-config-menu)"))
+    flyout = box(flyout_menu)
+    rail_left = box(workspace)["x"]
+    # The flyout fits on neither side of the picker inside this pane.
+    assert picker["x"] + picker["width"] + flyout["width"] > rail_left
+    assert picker["x"] - flyout["width"] < chat_pane["x"]
+    assert flyout["x"] >= chat_pane["x"] - TOLERANCE
+    pane_right = min(rail_left, chat_pane["x"] + chat_pane["width"])
+    assert flyout["x"] + flyout["width"] <= pane_right + TOLERANCE
+
+
 @pytest.mark.parametrize("surface", ["landing", "live"])
 def test_workspace_tray_aligns_with_the_card(
     page: Page,
