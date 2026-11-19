@@ -286,6 +286,8 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
     });
   }
 
+  const cloneAvailable = info !== "loading" && info.scheduled_task_clone === true;
+
   function handleClone(task: ScheduledTask) {
     cloneMutation.mutate(task, {
       onSuccess: (clone) => {
@@ -474,9 +476,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
                     canShareAutomation(info, viewerId, task.ownerUserId) ? handleShare : undefined
                   }
                   shareDisabledReason={automationShareDisabledReason(info, task)}
-                  onClone={
-                    info !== "loading" && info.scheduled_task_clone ? handleClone : undefined
-                  }
+                  onClone={cloneAvailable ? handleClone : undefined}
                 />
               ))}
             </div>
@@ -527,6 +527,8 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
                   onPauseToggle={handlePauseToggle}
                   onRunNow={handleRunNow}
                   onDelete={handleDelete}
+                  // Shown disabled: only the owner can clone it.
+                  onClone={cloneAvailable ? handleClone : undefined}
                 />
               ))}
             </div>

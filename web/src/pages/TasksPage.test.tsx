@@ -957,14 +957,15 @@ describe("automations shared with the viewer", () => {
     expect(within(list).queryByText("Mine")).toBeNull();
   });
 
-  it("shows every action disabled with why, and takes none", () => {
+  it("shows every action disabled with why, and takes none", async () => {
     setSharedPages([{ tasks: [shared()], nextCursor: null }]);
-    openSharedTab();
+    openSharedTab({ ...SHARING_INFO, scheduled_task_clone: true });
     fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
     for (const testId of [
       "task-run-now",
       "task-edit",
       "task-share",
+      "task-clone",
       "task-pause-toggle",
       "task-delete",
     ]) {
@@ -975,8 +976,13 @@ describe("automations shared with the viewer", () => {
     expect(runNowMutate).not.toHaveBeenCalled();
     expect(mutate).not.toHaveBeenCalled();
     expect(deleteMutate).not.toHaveBeenCalled();
+    expect(cloneMutate).not.toHaveBeenCalled();
     expect(screen.queryByTestId("manual-dialog-open")).toBeNull();
     expect(screen.queryByTestId("share-dialog-open")).toBeNull();
+    fireEvent.focus(screen.getByTestId("task-clone").parentElement!);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+      "Only the automation's owner can clone it.",
+    );
   });
 
   it("loads more on request, and past a page that came back empty", () => {
