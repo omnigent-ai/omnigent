@@ -31,6 +31,7 @@ import { cn } from "@/lib/utils";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import {
   CompactShortcutKeys,
+  ESC_KEY,
   NEW_BROWSER_TAB_KEYS,
   NEW_TERMINAL_KEYS,
   workspaceTabAriaShortcut,
@@ -1531,6 +1532,7 @@ function WorkspacePanelImpl({
   const scopeView = activeView.scope;
   const frontTerminalKey = activeView.terminalKey;
   const frontFilePath = activeView.filePath;
+  const fileViewerInFront = !pending && frontTerminalKey === null && frontFilePath !== null;
   // Stays mounted behind a file or shell to keep tree expansion, listing and scroll.
   const filesPanelMounted = showFilesPanel && !pending && scopeView === "files";
   const filesPanelActive = filesPanelMounted && !terminalShown && selectedFilePath === null;
@@ -2029,7 +2031,11 @@ function WorkspacePanelImpl({
                 </DropdownMenuContent>
               </DropdownMenu>
             )}
-            <WorkspaceTabTooltip label={maximized ? "Exit full screen" : "Full screen"}>
+            <WorkspaceTabTooltip
+              label={maximized ? "Exit full screen" : "Full screen"}
+              // Escape exits full screen only from a file; other tabs keep Escape for themselves.
+              shortcut={fileViewerInFront && maximized && !isMobile ? [ESC_KEY] : undefined}
+            >
               <Button
                 type="button"
                 variant="ghost"
@@ -2147,6 +2153,7 @@ function WorkspacePanelImpl({
                   position={filePosition}
                   onClose={isMobile && onMobileFileClose ? onMobileFileClose : onShowScopeView}
                   onCloseTab={isMobile && onMobileFileClose ? onMobileFileClose : handleCloseTab}
+                  onExitFullScreen={maximized && !isMobile ? onToggleMaximized : undefined}
                   onNavigateTo={openFileViewer}
                   permissionLevel={permissionLevel}
                   onCommentsOpenChange={onCommentsOpenChange}
