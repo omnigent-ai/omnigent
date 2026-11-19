@@ -52,6 +52,8 @@ export interface ClaudeQuestion {
   multiSelect: boolean;
   isOther?: boolean;
   isSecret?: boolean;
+  /** Editable text whose exact contents, including empty text, are the answer. */
+  textInput?: { default: string };
 }
 
 export interface AskUserQuestionPayload {
@@ -157,11 +159,27 @@ export function parseAskUserQuestionPreview(preview: string): AskUserQuestionPay
     if (typeof id === "string" && id) {
       questionPayload.id = id;
     }
+    if (rec.isSecret === true) questionPayload.isSecret = true;
     questions.push(questionPayload);
   }
 
   if (questions.length === 0) return null;
   return { questions };
+}
+
+/**
+ * The AskUserQuestion payload an elicitation renders as its form: the
+ * structured field when present, else the legacy content preview. Null
+ * when the elicitation is not an AskUserQuestion.
+ */
+export function askUserQuestionPayloadOf(elicitation: {
+  askUserQuestion?: Record<string, unknown> | null;
+  contentPreview: string;
+}): AskUserQuestionPayload | null {
+  return (
+    castAskUserQuestionPayload(elicitation.askUserQuestion) ??
+    parseAskUserQuestionPreview(elicitation.contentPreview)
+  );
 }
 
 /**
@@ -210,9 +228,7 @@ export function userInputElicitationKey(elicitation: {
   exitPlanMode?: Record<string, unknown> | null;
   contentPreview: string;
 }): string | null {
-  const questions =
-    castAskUserQuestionPayload(elicitation.askUserQuestion) ??
-    parseAskUserQuestionPreview(elicitation.contentPreview);
+  const questions = askUserQuestionPayloadOf(elicitation);
   if (questions !== null) {
     return `questions:${JSON.stringify(questions.questions.map((q) => q.question))}`;
   }

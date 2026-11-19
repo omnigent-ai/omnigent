@@ -85,6 +85,7 @@ def _build_app(
     client_secret: str,
     signing_algorithm: str,
     endpoint_prefix: str,
+    include_auth_time: bool,
 ) -> FastAPI:
     app = FastAPI()
     codes: dict[str, tuple[str, str]] = {}
@@ -169,17 +170,19 @@ def _build_app(
         ):
             return JSONResponse({"error": "invalid_grant"}, status_code=400)
         now = int(time.time())
+        claims = {
+            "iss": issuer,
+            "aud": client_id,
+            "sub": "fake-idp-subject",
+            "email": email,
+            "email_verified": True,
+            "iat": now,
+            "exp": now + 300,
+        }
+        if include_auth_time:
+            claims["auth_time"] = now
         id_token = jwt.encode(
-            {
-                "iss": issuer,
-                "aud": client_id,
-                "sub": "fake-idp-subject",
-                "email": email,
-                "email_verified": True,
-                "iat": now,
-                "auth_time": now,
-                "exp": now + 300,
-            },
+            claims,
             private_pem,
             algorithm=signing_algorithm,
             headers={"kid": _KID},
@@ -204,6 +207,7 @@ def fake_idp(
     signing_algorithm: str = "RS256",
     endpoint_prefix: str = "",
     canonical_issuer: str | None = None,
+    include_auth_time: bool = True,
 ) -> Iterator[FakeIdP]:
     """Run a fake OIDC IdP on a background thread; yield its handle.
 
@@ -216,6 +220,7 @@ def fake_idp(
     :param signing_algorithm: JWT signing algorithm (RS256 or PS256).
     :param endpoint_prefix: Endpoint path prefix; disables discovery when set.
     :param canonical_issuer: Optional separate issuer asserted in ID tokens.
+    :param include_auth_time: Whether ID tokens carry the ``auth_time`` claim.
     :yields: The running provider's connection details.
     """
     from cryptography.hazmat.primitives import serialization
@@ -238,6 +243,7 @@ def fake_idp(
         client_secret=client_secret,
         signing_algorithm=signing_algorithm,
         endpoint_prefix=endpoint_prefix,
+        include_auth_time=include_auth_time,
     )
 
     config = uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")

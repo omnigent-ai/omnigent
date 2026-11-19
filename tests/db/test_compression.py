@@ -8,10 +8,55 @@ unchanged, so the ``TEXT`` → ``BLOB`` migration needs no backfill.
 from __future__ import annotations
 
 import json
+import random
+import string
 
 import pytest
 
-from omnigent.db.compression import _MIN_COMPRESS_BYTES, decode, encode
+from omnigent.db.compression import (
+    _MIN_COMPRESS_BYTES,
+    CompressedText,
+    EncryptedTextPayload,
+    decode,
+    encode,
+    encode_encrypted,
+)
+
+
+def test_encrypted_envelopes_require_a_deployment_decryptor() -> None:
+    encrypted = EncryptedTextPayload(b"\xff\x00opaque", {"provider": "example", "key_id": "key-7"})
+    envelope = encode_encrypted(encrypted)
+    with pytest.raises(ValueError, match="configured decryptor"):
+        decode(envelope)
+    with pytest.raises(ValueError, match="configured decryptor"):
+        CompressedText().process_result_value(envelope, None)
+
+    # The deployment owns encryption; this callback checks the codec's handoff.
+    def decrypt(payload: EncryptedTextPayload) -> str:
+        assert payload == encrypted
+        return "café"
+
+    def encrypt(plaintext: str) -> EncryptedTextPayload:
+        assert plaintext == "café"
+        return encrypted
+
+    codec = CompressedText(max_stored_bytes=len(envelope), encrypt=encrypt, decrypt=decrypt)
+    assert codec.process_result_value(codec.process_bind_param("café", None), None) == "café"
+    smaller = CompressedText(max_stored_bytes=len(envelope) - 1, encrypt=encrypt, decrypt=decrypt)
+    with pytest.raises(ValueError, match="size limit"):
+        smaller.process_bind_param("café", None)
+    assert decode(memoryview(envelope), decrypt=decrypt, max_decoded_bytes=5) == "café"
+    with pytest.raises(ValueError, match="size limit"):
+        decode(envelope, decrypt=decrypt, max_decoded_bytes=4)
+
+
+@pytest.mark.parametrize(
+    "envelope",
+    [b"\x00\x02", b"\x00\x02\x00\x00\x00\x10{}", b"\x00\x02\x00\x00\x00\x02{}x", b"\x00\x03text"],
+)
+def test_invalid_envelopes_never_fall_back_to_plaintext(envelope: bytes) -> None:
+    with pytest.raises(ValueError):
+        decode(envelope)
 
 
 @pytest.mark.parametrize("write_content_size", [False, True])
@@ -96,3 +141,37 @@ def test_memoryview_is_accepted() -> None:
 def test_empty_bytes_decode_to_empty_string() -> None:
     """A legacy empty ``TEXT`` value (empty bytes) decodes to ``''``."""
     assert decode(b"") == ""
+
+
+def _incompressible_text(length: int) -> str:
+    """Seeded high-entropy text, which zstd cannot shrink much."""
+    rng = random.Random(42)
+    return "".join(rng.choices(string.ascii_letters + string.digits, k=length))
+
+
+def test_compressed_text_without_limits_accepts_any_size() -> None:
+    codec = CompressedText()
+    value = _incompressible_text(100_000)
+    assert codec.process_result_value(codec.process_bind_param(value, None), None) == value
+
+
+def test_compressed_text_max_stored_bytes_bounds_framed_writes() -> None:
+    codec = CompressedText(max_stored_bytes=65_535)
+    # Compressible text far above the stored limit still fits once compressed.
+    value = "x" * (1024 * 1024)
+    assert codec.process_result_value(codec.process_bind_param(value, None), None) == value
+    value = _incompressible_text(100_000)
+    assert len(encode(value)) > 65_535
+    with pytest.raises(ValueError, match="size limit"):
+        codec.process_bind_param(value, None)
+    # Reads are not size-checked: legacy and framed values already stored still decode.
+    assert codec.process_result_value(b"x" * 65_536, None) == "x" * 65_536
+    assert codec.process_result_value(encode(value), None) == value
+
+
+@pytest.mark.parametrize("value", ["x" * 10, _incompressible_text(2048)], ids=["raw", "zstd"])
+def test_compressed_text_max_stored_bytes_is_inclusive(value: str) -> None:
+    stored = len(encode(value))
+    assert CompressedText(max_stored_bytes=stored).process_bind_param(value, None) == encode(value)
+    with pytest.raises(ValueError, match="size limit"):
+        CompressedText(max_stored_bytes=stored - 1).process_bind_param(value, None)

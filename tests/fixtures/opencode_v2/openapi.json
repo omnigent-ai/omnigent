@@ -1,0 +1,6549 @@
+{
+  "components": {
+    "schemas": {
+      "ConflictErrorEncoded": {
+        "additionalProperties": false,
+        "properties": {
+          "_tag": {
+            "enum": [
+              "ConflictError"
+            ],
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "resource": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "_tag",
+          "message"
+        ],
+        "type": "object"
+      },
+      "FileDiff.Info": {
+        "additionalProperties": false,
+        "properties": {
+          "additions": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "deletions": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "file": {
+            "type": "string"
+          },
+          "patch": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "added",
+              "deleted",
+              "modified"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "file",
+          "patch",
+          "additions",
+          "deletions",
+          "status"
+        ],
+        "type": "object"
+      },
+      "Form.Answer": {
+        "additionalProperties": {
+          "$ref": "#/components/schemas/Form.Value"
+        },
+        "type": "object"
+      },
+      "Form.BooleanField": {
+        "additionalProperties": false,
+        "properties": {
+          "default": {
+            "type": "boolean"
+          },
+          "description": {
+            "type": "string"
+          },
+          "hidden": {
+            "type": "boolean"
+          },
+          "key": {
+            "type": "string"
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "title": {
+            "type": "string"
+          },
+          "type": {
+            "enum": [
+              "boolean"
+            ],
+            "type": "string"
+          },
+          "when": {
+            "items": {
+              "$ref": "#/components/schemas/Form.When"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "key",
+          "type"
+        ],
+        "type": "object"
+      },
+      "Form.CreatePayload": {
+        "additionalProperties": false,
+        "properties": {
+          "fields": {
+            "$ref": "#/components/schemas/Form.Fields"
+          },
+          "id": {
+            "anyOf": [
+              {
+                "pattern": "^frm_",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/Form.Metadata"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "fields"
+        ],
+        "type": "object"
+      },
+      "Form.Detail": {
+        "additionalProperties": false,
+        "properties": {
+          "fields": {
+            "$ref": "#/components/schemas/Form.Fields"
+          },
+          "id": {
+            "pattern": "^frm_",
+            "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/Form.Metadata"
+          },
+          "sessionID": {
+            "type": "string"
+          },
+          "state": {
+            "$ref": "#/components/schemas/Form.State"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "sessionID",
+          "title",
+          "fields",
+          "state"
+        ],
+        "type": "object"
+      },
+      "Form.ExternalField": {
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "key": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "type": {
+            "enum": [
+              "external"
+            ],
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "type",
+          "url"
+        ],
+        "type": "object"
+      },
+      "Form.Field": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/Form.StringField"
+          },
+          {
+            "$ref": "#/components/schemas/Form.NumberField"
+          },
+          {
+            "$ref": "#/components/schemas/Form.IntegerField"
+          },
+          {
+            "$ref": "#/components/schemas/Form.BooleanField"
+          },
+          {
+            "$ref": "#/components/schemas/Form.MultiselectField"
+          },
+          {
+            "$ref": "#/components/schemas/Form.ExternalField"
+          }
+        ]
+      },
+      "Form.Fields": {
+        "items": {
+          "$ref": "#/components/schemas/Form.Field"
+        },
+        "minItems": 1,
+        "prefixItems": [
+          {
+            "$ref": "#/components/schemas/Form.Field"
+          }
+        ],
+        "type": "array"
+      },
+      "Form.Info": {
+        "additionalProperties": false,
+        "properties": {
+          "fields": {
+            "$ref": "#/components/schemas/Form.Fields"
+          },
+          "id": {
+            "pattern": "^frm_",
+            "type": "string"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/Form.Metadata"
+          },
+          "sessionID": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "sessionID",
+          "title",
+          "fields"
+        ],
+        "type": "object"
+      },
+      "Form.IntegerField": {
+        "additionalProperties": false,
+        "properties": {
+          "default": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "enum": [
+                  "Infinity",
+                  "-Infinity",
+                  "NaN"
+                ],
+                "type": "string"
+              }
+            ]
+          },
+          "description": {
+            "type": "string"
+          },
+          "hidden": {
+            "type": "boolean"
+          },
+          "key": {
+            "type": "string"
+          },
+          "maximum": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "enum": [
+                  "Infinity",
+                  "-Infinity",
+                  "NaN"
+                ],
+                "type": "string"
+              }
+            ]
+          },
+          "minimum": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "enum": [
+                  "Infinity",
+                  "-Infinity",
+                  "NaN"
+                ],
+                "type": "string"
+              }
+            ]
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "title": {
+            "type": "string"
+          },
+          "type": {
+            "enum": [
+              "integer"
+            ],
+            "type": "string"
+          },
+          "when": {
+            "items": {
+              "$ref": "#/components/schemas/Form.When"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "key",
+          "type"
+        ],
+        "type": "object"
+      },
+      "Form.Metadata": {
+        "type": "object"
+      },
+      "Form.MultiselectField": {
+        "additionalProperties": false,
+        "properties": {
+          "custom": {
+            "type": "boolean"
+          },
+          "default": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "description": {
+            "type": "string"
+          },
+          "hidden": {
+            "type": "boolean"
+          },
+          "key": {
+            "type": "string"
+          },
+          "maxItems": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "minItems": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "options": {
+            "items": {
+              "$ref": "#/components/schemas/Form.Option"
+            },
+            "type": "array"
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "title": {
+            "type": "string"
+          },
+          "type": {
+            "enum": [
+              "multiselect"
+            ],
+            "type": "string"
+          },
+          "when": {
+            "items": {
+              "$ref": "#/components/schemas/Form.When"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "key",
+          "type",
+          "options"
+        ],
+        "type": "object"
+      },
+      "Form.NumberField": {
+        "additionalProperties": false,
+        "properties": {
+          "default": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "enum": [
+                  "Infinity",
+                  "-Infinity",
+                  "NaN"
+                ],
+                "type": "string"
+              }
+            ]
+          },
+          "description": {
+            "type": "string"
+          },
+          "hidden": {
+            "type": "boolean"
+          },
+          "key": {
+            "type": "string"
+          },
+          "maximum": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "enum": [
+                  "Infinity",
+                  "-Infinity",
+                  "NaN"
+                ],
+                "type": "string"
+              }
+            ]
+          },
+          "minimum": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "enum": [
+                  "Infinity",
+                  "-Infinity",
+                  "NaN"
+                ],
+                "type": "string"
+              }
+            ]
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "title": {
+            "type": "string"
+          },
+          "type": {
+            "enum": [
+              "number"
+            ],
+            "type": "string"
+          },
+          "when": {
+            "items": {
+              "$ref": "#/components/schemas/Form.When"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "key",
+          "type"
+        ],
+        "type": "object"
+      },
+      "Form.Option": {
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "value",
+          "label"
+        ],
+        "type": "object"
+      },
+      "Form.Reply": {
+        "additionalProperties": false,
+        "properties": {
+          "answer": {
+            "$ref": "#/components/schemas/Form.Answer"
+          }
+        },
+        "required": [
+          "answer"
+        ],
+        "type": "object"
+      },
+      "Form.State": {
+        "anyOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "status": {
+                "enum": [
+                  "pending"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "answer": {
+                "$ref": "#/components/schemas/Form.Answer"
+              },
+              "status": {
+                "enum": [
+                  "answered"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "answer"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "status": {
+                "enum": [
+                  "cancelled"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "Form.StringField": {
+        "additionalProperties": false,
+        "properties": {
+          "custom": {
+            "type": "boolean"
+          },
+          "default": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "format": {
+            "enum": [
+              "email",
+              "uri",
+              "date",
+              "date-time"
+            ],
+            "type": "string"
+          },
+          "hidden": {
+            "type": "boolean"
+          },
+          "key": {
+            "type": "string"
+          },
+          "maxLength": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "minLength": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "options": {
+            "items": {
+              "$ref": "#/components/schemas/Form.Option"
+            },
+            "type": "array"
+          },
+          "pattern": {
+            "type": "string"
+          },
+          "placeholder": {
+            "type": "string"
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "title": {
+            "type": "string"
+          },
+          "type": {
+            "enum": [
+              "string"
+            ],
+            "type": "string"
+          },
+          "when": {
+            "items": {
+              "$ref": "#/components/schemas/Form.When"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "key",
+          "type"
+        ],
+        "type": "object"
+      },
+      "Form.Value": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "enum": [
+                  "Infinity",
+                  "-Infinity",
+                  "NaN"
+                ],
+                "type": "string"
+              }
+            ]
+          },
+          {
+            "type": "boolean"
+          },
+          {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        ]
+      },
+      "Form.When": {
+        "additionalProperties": false,
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "op": {
+            "enum": [
+              "eq",
+              "neq"
+            ],
+            "type": "string"
+          },
+          "value": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "anyOf": [
+                  {
+                    "type": "number"
+                  },
+                  {
+                    "enum": [
+                      "Infinity",
+                      "-Infinity",
+                      "NaN"
+                    ],
+                    "type": "string"
+                  }
+                ]
+              },
+              {
+                "type": "boolean"
+              }
+            ]
+          }
+        },
+        "required": [
+          "key",
+          "op",
+          "value"
+        ],
+        "type": "object"
+      },
+      "FormAlreadySettledErrorEncoded": {
+        "additionalProperties": false,
+        "properties": {
+          "_tag": {
+            "enum": [
+              "FormAlreadySettledError"
+            ],
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "_tag",
+          "id",
+          "message"
+        ],
+        "type": "object"
+      },
+      "FormInvalidAnswerErrorEncoded": {
+        "additionalProperties": false,
+        "properties": {
+          "_tag": {
+            "enum": [
+              "FormInvalidAnswerError"
+            ],
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "_tag",
+          "id",
+          "message"
+        ],
+        "type": "object"
+      },
+      "FormNotFoundErrorEncoded": {
+        "additionalProperties": false,
+        "properties": {
+          "_tag": {
+            "enum": [
+              "FormNotFoundError"
+            ],
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "_tag",
+          "id",
+          "message"
+        ],
+        "type": "object"
+      },
+      "IntegrationNotFoundErrorEncoded": {
+        "additionalProperties": false,
+        "properties": {
+          "_tag": {
+            "enum": [
+              "IntegrationNotFoundError"
+            ],
+            "type": "string"
+          },
+          "integrationID": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "_tag",
+          "integrationID",
+          "message"
+        ],
+        "type": "object"
+      },
+      "InvalidCursorErrorEncoded": {
+        "additionalProperties": false,
+        "properties": {
+          "_tag": {
+            "enum": [
+              "InvalidCursorError"
+            ],
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "_tag",
+          "message"
+        ],
+        "type": "object"
+      },
+      "InvalidRequestErrorEncoded": {
+        "additionalProperties": false,
+        "properties": {
+          "_tag": {
+            "enum": [
+              "InvalidRequestError"
+            ],
+            "type": "string"
+          },
+          "field": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "kind": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "_tag",
+          "message"
+        ],
+        "type": "object"
+      },
+      "Location.PublicRef": {
+        "additionalProperties": false,
+        "properties": {
+          "directory": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "directory"
+        ],
+        "type": "object"
+      },
+      "MessageNotFoundErrorEncoded": {
+        "additionalProperties": false,
+        "properties": {
+          "_tag": {
+            "enum": [
+              "MessageNotFoundError"
+            ],
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "messageID": {
+            "type": "string"
+          },
+          "sessionID": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "_tag",
+          "sessionID",
+          "messageID",
+          "message"
+        ],
+        "type": "object"
+      },
+      "Model.Capabilities": {
+        "additionalProperties": false,
+        "properties": {
+          "input": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "output": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "tools": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "tools",
+          "input",
+          "output"
+        ],
+        "type": "object"
+      },
+      "Model.Compatibility": {
+        "additionalProperties": false,
+        "properties": {
+          "maxTokensField": {
+            "$ref": "#/components/schemas/Model.MaxTokensField"
+          },
+          "reasoningField": {
+            "$ref": "#/components/schemas/Model.ReasoningField"
+          },
+          "requireAssistantAfterTool": {
+            "type": "boolean"
+          },
+          "requireFinishReason": {
+            "type": "boolean"
+          },
+          "requireReasoning": {
+            "type": "boolean"
+          },
+          "supportsPromptCacheKey": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "Model.Cost": {
+        "additionalProperties": false,
+        "properties": {
+          "cache": {
+            "additionalProperties": false,
+            "properties": {
+              "read": {
+                "$ref": "#/components/schemas/Money.USDPerMillionTokens"
+              },
+              "write": {
+                "$ref": "#/components/schemas/Money.USDPerMillionTokens"
+              }
+            },
+            "required": [
+              "read",
+              "write"
+            ],
+            "type": "object"
+          },
+          "input": {
+            "$ref": "#/components/schemas/Money.USDPerMillionTokens"
+          },
+          "output": {
+            "$ref": "#/components/schemas/Money.USDPerMillionTokens"
+          },
+          "tier": {
+            "additionalProperties": false,
+            "properties": {
+              "size": {
+                "type": "integer"
+              },
+              "type": {
+                "enum": [
+                  "context"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "size"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "input",
+          "output",
+          "cache"
+        ],
+        "type": "object"
+      },
+      "Model.Info": {
+        "additionalProperties": false,
+        "properties": {
+          "body": {
+            "type": "object"
+          },
+          "canonical": {
+            "type": "string"
+          },
+          "capabilities": {
+            "$ref": "#/components/schemas/Model.Capabilities"
+          },
+          "compatibility": {
+            "$ref": "#/components/schemas/Model.Compatibility"
+          },
+          "cost": {
+            "items": {
+              "$ref": "#/components/schemas/Model.Cost"
+            },
+            "type": "array"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "family": {
+            "type": "string"
+          },
+          "headers": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "id": {
+            "type": "string"
+          },
+          "limit": {
+            "additionalProperties": false,
+            "properties": {
+              "context": {
+                "type": "integer"
+              },
+              "input": {
+                "type": "integer"
+              },
+              "output": {
+                "type": "integer"
+              }
+            },
+            "required": [
+              "context",
+              "output"
+            ],
+            "type": "object"
+          },
+          "modelID": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "package": {
+            "type": "string"
+          },
+          "providerID": {
+            "type": "string"
+          },
+          "settings": {
+            "$ref": "#/components/schemas/Model.Settings"
+          },
+          "status": {
+            "enum": [
+              "alpha",
+              "beta",
+              "deprecated",
+              "active"
+            ],
+            "type": "string"
+          },
+          "time": {
+            "additionalProperties": false,
+            "properties": {
+              "released": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "released"
+            ],
+            "type": "object"
+          },
+          "variants": {
+            "items": {
+              "$ref": "#/components/schemas/Model.Variant"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "modelID",
+          "providerID",
+          "name",
+          "capabilities",
+          "variants",
+          "time",
+          "cost",
+          "status",
+          "enabled",
+          "limit"
+        ],
+        "type": "object"
+      },
+      "Model.MaxTokensField": {
+        "enum": [
+          "max_completion_tokens",
+          "max_tokens"
+        ],
+        "type": "string"
+      },
+      "Model.ReasoningField": {
+        "anyOf": [
+          {
+            "enum": [
+              "reasoning",
+              "reasoning_content",
+              "reasoning_text"
+            ],
+            "type": "string"
+          },
+          {
+            "type": "string"
+          }
+        ]
+      },
+      "Model.Ref": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "providerID": {
+            "type": "string"
+          },
+          "variant": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "providerID"
+        ],
+        "type": "object"
+      },
+      "Model.Settings": {
+        "allOf": [
+          {
+            "additionalProperties": {},
+            "type": "object"
+          }
+        ],
+        "properties": {
+          "compaction": {
+            "$ref": "#/components/schemas/Provider.Compaction"
+          }
+        },
+        "type": "object"
+      },
+      "Model.Variant": {
+        "additionalProperties": false,
+        "properties": {
+          "body": {
+            "type": "object"
+          },
+          "headers": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "id": {
+            "type": "string"
+          },
+          "settings": {
+            "$ref": "#/components/schemas/Model.Settings"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "Money.USD": {
+        "type": "number"
+      },
+      "Money.USDPerMillionTokens": {
+        "type": "number"
+      },
+      "Permission.Effect": {
+        "enum": [
+          "allow",
+          "deny",
+          "ask"
+        ],
+        "type": "string"
+      },
+      "Permission.Reply": {
+        "enum": [
+          "once",
+          "always",
+          "reject"
+        ],
+        "type": "string"
+      },
+      "Permission.Request": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "id": {
+            "pattern": "^per",
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "resources": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "save": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "sessionID": {
+            "pattern": "^ses",
+            "type": "string"
+          },
+          "source": {
+            "$ref": "#/components/schemas/Permission.Source"
+          }
+        },
+        "required": [
+          "id",
+          "sessionID",
+          "action",
+          "resources"
+        ],
+        "type": "object"
+      },
+      "Permission.Rule": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "effect": {
+            "$ref": "#/components/schemas/Permission.Effect"
+          },
+          "resource": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "action",
+          "resource",
+          "effect"
+        ],
+        "type": "object"
+      },
+      "Permission.Ruleset": {
+        "items": {
+          "$ref": "#/components/schemas/Permission.Rule"
+        },
+        "type": "array"
+      },
+      "Permission.Source": {
+        "anyOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "messageID": {
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "tool"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "messageID",
+              "id"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "PermissionNotFoundErrorEncoded": {
+        "additionalProperties": false,
+        "properties": {
+          "_tag": {
+            "enum": [
+              "PermissionNotFoundError"
+            ],
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "requestID": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "_tag",
+          "requestID",
+          "message"
+        ],
+        "type": "object"
+      },
+      "Prompt.AgentAttachment": {
+        "additionalProperties": false,
+        "properties": {
+          "mention": {
+            "$ref": "#/components/schemas/Prompt.Mention"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "Prompt.Base64": {
+        "pattern": "^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$",
+        "type": "string"
+      },
+      "Prompt.FileAttachment": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "$ref": "#/components/schemas/Prompt.Base64"
+          },
+          "description": {
+            "type": "string"
+          },
+          "mention": {
+            "$ref": "#/components/schemas/Prompt.Mention"
+          },
+          "mime": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "source": {
+            "$ref": "#/components/schemas/Prompt.FileSource"
+          }
+        },
+        "required": [
+          "data",
+          "mime",
+          "source"
+        ],
+        "type": "object"
+      },
+      "Prompt.FileSource": {
+        "anyOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "enum": [
+                  "inline"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "enum": [
+                  "uri"
+                ],
+                "type": "string"
+              },
+              "uri": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "uri"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "Prompt.Mention": {
+        "additionalProperties": false,
+        "properties": {
+          "end": {
+            "type": "number"
+          },
+          "start": {
+            "type": "number"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "start",
+          "end",
+          "text"
+        ],
+        "type": "object"
+      },
+      "Prompt.SkillAttachment": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "mention": {
+            "$ref": "#/components/schemas/Prompt.Mention"
+          },
+          "name": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "type": "object"
+      },
+      "PromptInput.FileAttachment": {
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "mention": {
+            "$ref": "#/components/schemas/Prompt.Mention"
+          },
+          "name": {
+            "type": "string"
+          },
+          "uri": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "uri"
+        ],
+        "type": "object"
+      },
+      "PromptInput.SkillAttachment": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "mention": {
+            "$ref": "#/components/schemas/Prompt.Mention"
+          }
+        },
+        "required": [
+          "id"
+        ],
+        "type": "object"
+      },
+      "Provider.Compaction": {
+        "anyOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "enum": [
+                  "summary"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "type": {
+                "enum": [
+                  "native"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "Provider.Info": {
+        "additionalProperties": false,
+        "properties": {
+          "activation": {
+            "enum": [
+              "auto",
+              "enabled",
+              "disabled"
+            ],
+            "type": "string"
+          },
+          "body": {
+            "type": "object"
+          },
+          "canonical": {
+            "type": "string"
+          },
+          "headers": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "id": {
+            "type": "string"
+          },
+          "integrationID": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "package": {
+            "type": "string"
+          },
+          "settings": {
+            "$ref": "#/components/schemas/Provider.Settings"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "activation",
+          "package"
+        ],
+        "type": "object"
+      },
+      "Provider.Settings": {
+        "allOf": [
+          {
+            "additionalProperties": {},
+            "type": "object"
+          }
+        ],
+        "properties": {
+          "chunkTimeout": {
+            "type": "number"
+          },
+          "compaction": {
+            "$ref": "#/components/schemas/Provider.Compaction"
+          },
+          "timeout": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "enum": [
+                  false
+                ],
+                "type": "boolean"
+              }
+            ]
+          },
+          "transport": {
+            "$ref": "#/components/schemas/Provider.Transport"
+          }
+        },
+        "type": "object"
+      },
+      "Provider.Transport": {
+        "enum": [
+          "http",
+          "websocket"
+        ],
+        "type": "string"
+      },
+      "ServerInfo": {
+        "additionalProperties": false,
+        "properties": {
+          "paths": {
+            "additionalProperties": false,
+            "properties": {
+              "tmp": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "tmp"
+            ],
+            "type": "object"
+          },
+          "pid": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "urls": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "version",
+          "pid",
+          "urls",
+          "paths"
+        ],
+        "type": "object"
+      },
+      "ServiceUnavailableErrorEncoded": {
+        "additionalProperties": false,
+        "properties": {
+          "_tag": {
+            "enum": [
+              "ServiceUnavailableError"
+            ],
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "service": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "_tag",
+          "message"
+        ],
+        "type": "object"
+      },
+      "Session.ForkBoundary": {
+        "anyOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "messageID": {
+                "pattern": "^msg_",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "before"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "messageID"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "messageID": {
+                "pattern": "^msg_",
+                "type": "string"
+              },
+              "type": {
+                "enum": [
+                  "through"
+                ],
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "messageID"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "Session.Inbox.Compaction": {
+        "additionalProperties": false,
+        "properties": {
+          "delivery": {
+            "$ref": "#/components/schemas/Session.Inbox.Delivery"
+          },
+          "id": {
+            "pattern": "^msg_",
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/Session.Inbox.CompactionPayload"
+          },
+          "sessionID": {
+            "pattern": "^ses",
+            "type": "string"
+          },
+          "time": {
+            "additionalProperties": false,
+            "properties": {
+              "created": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "created"
+            ],
+            "type": "object"
+          },
+          "type": {
+            "enum": [
+              "compaction"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "sessionID",
+          "time",
+          "type",
+          "payload",
+          "delivery"
+        ],
+        "type": "object"
+      },
+      "Session.Inbox.CompactionPayload": {
+        "anyOf": [
+          {
+            "type": "object"
+          },
+          {
+            "type": "array"
+          }
+        ]
+      },
+      "Session.Inbox.Delivery": {
+        "enum": [
+          "steer",
+          "queue"
+        ],
+        "type": "string"
+      },
+      "Session.Inbox.Synthetic": {
+        "additionalProperties": false,
+        "properties": {
+          "delivery": {
+            "$ref": "#/components/schemas/Session.Inbox.Delivery"
+          },
+          "id": {
+            "pattern": "^msg_",
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/Session.Inbox.SyntheticPayload"
+          },
+          "sessionID": {
+            "pattern": "^ses",
+            "type": "string"
+          },
+          "time": {
+            "additionalProperties": false,
+            "properties": {
+              "created": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "created"
+            ],
+            "type": "object"
+          },
+          "type": {
+            "enum": [
+              "synthetic"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "sessionID",
+          "time",
+          "type",
+          "payload",
+          "delivery"
+        ],
+        "type": "object"
+      },
+      "Session.Inbox.SyntheticPayload": {
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "type": "object"
+      },
+      "Session.Inbox.User": {
+        "additionalProperties": false,
+        "properties": {
+          "delivery": {
+            "$ref": "#/components/schemas/Session.Inbox.Delivery"
+          },
+          "id": {
+            "pattern": "^msg_",
+            "type": "string"
+          },
+          "payload": {
+            "$ref": "#/components/schemas/Session.Inbox.UserPayload"
+          },
+          "sessionID": {
+            "pattern": "^ses",
+            "type": "string"
+          },
+          "time": {
+            "additionalProperties": false,
+            "properties": {
+              "created": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "created"
+            ],
+            "type": "object"
+          },
+          "type": {
+            "enum": [
+              "user"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "sessionID",
+          "time",
+          "type",
+          "payload",
+          "delivery"
+        ],
+        "type": "object"
+      },
+      "Session.Inbox.UserPayload": {
+        "additionalProperties": false,
+        "properties": {
+          "agents": {
+            "items": {
+              "$ref": "#/components/schemas/Prompt.AgentAttachment"
+            },
+            "type": "array"
+          },
+          "files": {
+            "items": {
+              "$ref": "#/components/schemas/Prompt.FileAttachment"
+            },
+            "type": "array"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "skills": {
+            "items": {
+              "$ref": "#/components/schemas/Prompt.SkillAttachment"
+            },
+            "type": "array"
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "text"
+        ],
+        "type": "object"
+      },
+      "Session.Info": {
+        "additionalProperties": false,
+        "properties": {
+          "agent": {
+            "type": "string"
+          },
+          "cost": {
+            "$ref": "#/components/schemas/Money.USD"
+          },
+          "fork": {
+            "additionalProperties": false,
+            "properties": {
+              "boundary": {
+                "$ref": "#/components/schemas/Session.ForkBoundary"
+              },
+              "sessionID": {
+                "pattern": "^ses",
+                "type": "string"
+              }
+            },
+            "required": [
+              "sessionID",
+              "boundary"
+            ],
+            "type": "object"
+          },
+          "id": {
+            "pattern": "^ses",
+            "type": "string"
+          },
+          "location": {
+            "$ref": "#/components/schemas/Location.PublicRef"
+          },
+          "metadata": {
+            "$ref": "#/components/schemas/Session.Metadata"
+          },
+          "model": {
+            "$ref": "#/components/schemas/Model.Ref"
+          },
+          "outcome": {
+            "enum": [
+              "succeeded",
+              "failed",
+              "interrupted"
+            ],
+            "type": "string"
+          },
+          "parentID": {
+            "pattern": "^ses",
+            "type": "string"
+          },
+          "permissions": {
+            "$ref": "#/components/schemas/Permission.Ruleset"
+          },
+          "projectID": {
+            "type": "string"
+          },
+          "revert": {
+            "$ref": "#/components/schemas/Session.Revert"
+          },
+          "subpath": {
+            "type": "string"
+          },
+          "time": {
+            "additionalProperties": false,
+            "properties": {
+              "archived": {
+                "type": "number"
+              },
+              "created": {
+                "type": "number"
+              },
+              "idle": {
+                "type": "number"
+              },
+              "updated": {
+                "type": "number"
+              },
+              "viewed": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "created",
+              "updated"
+            ],
+            "type": "object"
+          },
+          "title": {
+            "type": "string"
+          },
+          "tokens": {
+            "$ref": "#/components/schemas/TokenUsage.Info"
+          }
+        },
+        "required": [
+          "id",
+          "projectID",
+          "cost",
+          "tokens",
+          "time",
+          "location"
+        ],
+        "type": "object"
+      },
+      "Session.Message.AgentSelected": {
+        "additionalProperties": false,
+        "properties": {
+          "agent": {
+            "type": "string"
+          },
+          "id": {
+            "pattern": "^msg_",
+            "type": "string"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "previous": {
+            "type": "string"
+          },
+          "time": {
+            "additionalProperties": false,
+            "properties": {
+              "created": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "created"
+            ],
+            "type": "object"
+          },
+          "type": {
+            "enum": [
+              "agent-switched"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "time",
+          "type",
+          "agent"
+        ],
+        "type": "object"
+      },
+      "Session.Message.Assistant": {
+        "additionalProperties": false,
+        "properties": {
+          "agent": {
+            "type": "string"
+          },
+          "content": {
+            "items": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/Session.Message.Assistant.Text"
+                },
+                {
+                  "$ref": "#/components/schemas/Session.Message.Assistant.Reasoning"
+                },
+                {
+                  "$ref": "#/components/schemas/Session.Message.Assistant.Tool"
+                }
+              ]
+            },
+            "type": "array"
+          },
+          "cost": {
+            "$ref": "#/components/schemas/Money.USD"
+          },
+          "error": {
+            "$ref": "#/components/schemas/Session.StructuredError"
+          },
+          "finish": {
+            "enum": [
+              "stop",
+              "length",
+              "tool-calls",
+              "content-filter",
+              "error",
+              "unknown"
+            ],
+            "type": "string"
+          },
+          "id": {
+            "pattern": "^msg_",
+            "type": "string"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "model": {
+            "$ref": "#/components/schemas/Model.Ref"
+          },
+          "providerState": {
+            "$ref": "#/components/schemas/Session.Message.ProviderState_4"
+          },
+          "rawFinish": {
+            "type": "string"
+          },
+          "retry": {
+            "$ref": "#/components/schemas/Session.Message.Assistant.Retry"
+          },
+          "snapshot": {
+            "additionalProperties": false,
+            "properties": {
+              "end": {
+                "type": "string"
+              },
+              "files": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "start": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          },
+          "time": {
+            "additionalProperties": false,
+            "properties": {
+              "completed": {
+                "type": "number"
+              },
+              "created": {
+                "type": "number"
+              },
+              "streamed": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "created"
+            ],
+            "type": "object"
+          },
+          "tokens": {
+            "$ref": "#/components/schemas/TokenUsage.Info"
+          },
+          "type": {
+            "enum": [
+              "assistant"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "time",
+          "type",
+          "agent",
+          "model",
+          "content"
+        ],
+        "type": "object"
+      },
+      "Session.Message.Assistant.Reasoning": {
+        "additionalProperties": false,
+        "properties": {
+          "state": {
+            "$ref": "#/components/schemas/Session.Message.ProviderState_1"
+          },
+          "text": {
+            "type": "string"
+          },
+          "time": {
+            "additionalProperties": false,
+            "properties": {
+              "completed": {
+                "type": "number"
+              },
+              "created": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "created"
+            ],
+            "type": "object"
+          },
+          "type": {
+            "enum": [
+              "reasoning"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "text"
+        ],
+        "type": "object"
+      },
+      "Session.Message.Assistant.Retry": {
+        "additionalProperties": false,
+        "properties": {
+          "at": {
+            "type": "number"
+          },
+          "attempt": {
+            "exclusiveMinimum": 0,
+            "type": "integer"
+          },
+          "error": {
+            "$ref": "#/components/schemas/Session.StructuredError"
+          }
+        },
+        "required": [
+          "attempt",
+          "at",
+          "error"
+        ],
+        "type": "object"
+      },
+      "Session.Message.Assistant.Text": {
+        "additionalProperties": false,
+        "properties": {
+          "state": {
+            "$ref": "#/components/schemas/Session.Message.ProviderState"
+          },
+          "text": {
+            "type": "string"
+          },
+          "type": {
+            "enum": [
+              "text"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "text"
+        ],
+        "type": "object"
+      },
+      "Session.Message.Assistant.Tool": {
+        "additionalProperties": false,
+        "properties": {
+          "executed": {
+            "type": "boolean"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "providerResultState": {
+            "$ref": "#/components/schemas/Session.Message.ProviderState_3"
+          },
+          "providerState": {
+            "$ref": "#/components/schemas/Session.Message.ProviderState_2"
+          },
+          "state": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Session.Message.ToolState.Streaming"
+              },
+              {
+                "$ref": "#/components/schemas/Session.Message.ToolState.Running"
+              },
+              {
+                "$ref": "#/components/schemas/Session.Message.ToolState.Completed"
+              },
+              {
+                "$ref": "#/components/schemas/Session.Message.ToolState.Error"
+              }
+            ]
+          },
+          "time": {
+            "additionalProperties": false,
+            "properties": {
+              "completed": {
+                "type": "number"
+              },
+              "created": {
+                "type": "number"
+              },
+              "ran": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "created"
+            ],
+            "type": "object"
+          },
+          "type": {
+            "enum": [
+              "tool"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "id",
+          "name",
+          "state",
+          "time"
+        ],
+        "type": "object"
+      },
+      "Session.Message.Compaction": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/Session.Message.Compaction.Running"
+          },
+          {
+            "$ref": "#/components/schemas/Session.Message.Compaction.Completed"
+          },
+          {
+            "$ref": "#/components/schemas/Session.Message.Compaction.Failed"
+          }
+        ]
+      },
+      "Session.Message.Compaction.Completed": {
+        "additionalProperties": false,
+        "properties": {
+          "cost": {
+            "$ref": "#/components/schemas/Money.USD"
+          },
+          "id": {
+            "pattern": "^msg_",
+            "type": "string"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "model": {
+            "$ref": "#/components/schemas/Model.Ref"
+          },
+          "providerContext": {
+            "$ref": "#/components/schemas/Session.ProviderContext"
+          },
+          "providerState": {
+            "$ref": "#/components/schemas/Session.Message.ProviderState_5"
+          },
+          "reason": {
+            "enum": [
+              "auto",
+              "manual"
+            ],
+            "type": "string"
+          },
+          "recent": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "completed"
+            ],
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "time": {
+            "additionalProperties": false,
+            "properties": {
+              "created": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "created"
+            ],
+            "type": "object"
+          },
+          "tokens": {
+            "$ref": "#/components/schemas/TokenUsage.Info"
+          },
+          "type": {
+            "enum": [
+              "compaction"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "id",
+          "time",
+          "status",
+          "reason",
+          "summary",
+          "recent"
+        ],
+        "type": "object"
+      },
+      "Session.Message.Compaction.Failed": {
+        "additionalProperties": false,
+        "properties": {
+          "cost": {
+            "$ref": "#/components/schemas/Money.USD"
+          },
+          "error": {
+            "$ref": "#/components/schemas/Session.StructuredError"
+          },
+          "id": {
+            "pattern": "^msg_",
+            "type": "string"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "reason": {
+            "enum": [
+              "auto",
+              "manual"
+            ],
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "failed"
+            ],
+            "type": "string"
+          },
+          "time": {
+            "additionalProperties": false,
+            "properties": {
+              "created": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "created"
+            ],
+            "type": "object"
+          },
+          "tokens": {
+            "$ref": "#/components/schemas/TokenUsage.Info"
+          },
+          "type": {
+            "enum": [
+              "compaction"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "id",
+          "time",
+          "status",
+          "reason",
+          "error"
+        ],
+        "type": "object"
+      },
+      "Session.Message.Compaction.Running": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "pattern": "^msg_",
+            "type": "string"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "reason": {
+            "enum": [
+              "auto",
+              "manual"
+            ],
+            "type": "string"
+          },
+          "recent": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "running"
+            ],
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "time": {
+            "additionalProperties": false,
+            "properties": {
+              "created": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "created"
+            ],
+            "type": "object"
+          },
+          "type": {
+            "enum": [
+              "compaction"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "id",
+          "time",
+          "status",
+          "reason",
+          "summary",
+          "recent"
+        ],
+        "type": "object"
+      },
+      "Session.Message.Idle": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "pattern": "^msg_",
+            "type": "string"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "outcome": {
+            "enum": [
+              "succeeded",
+              "failed",
+              "interrupted"
+            ],
+            "type": "string"
+          },
+          "time": {
+            "additionalProperties": false,
+            "properties": {
+              "created": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "created"
+            ],
+            "type": "object"
+          },
+          "type": {
+            "enum": [
+              "idle"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "time",
+          "type",
+          "outcome"
+        ],
+        "type": "object"
+      },
+      "Session.Message.Info": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/Session.Message.AgentSelected"
+          },
+          {
+            "$ref": "#/components/schemas/Session.Message.ModelSelected"
+          },
+          {
+            "$ref": "#/components/schemas/Session.Message.LocationSwitched"
+          },
+          {
+            "$ref": "#/components/schemas/Session.Message.User"
+          },
+          {
+            "$ref": "#/components/schemas/Session.Message.Synthetic"
+          },
+          {
+            "$ref": "#/components/schemas/Session.Message.System"
+          },
+          {
+            "$ref": "#/components/schemas/Session.Message.Skill"
+          },
+          {
+            "$ref": "#/components/schemas/Session.Message.Shell"
+          },
+          {
+            "$ref": "#/components/schemas/Session.Message.Assistant"
+          },
+          {
+            "$ref": "#/components/schemas/Session.Message.Compaction"
+          },
+          {
+            "$ref": "#/components/schemas/Session.Message.Idle"
+          }
+        ]
+      },
+      "Session.Message.LocationSwitched": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "pattern": "^msg_",
+            "type": "string"
+          },
+          "location": {
+            "$ref": "#/components/schemas/Location.PublicRef"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "previous": {
+            "anyOf": [
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "location": {
+                    "$ref": "#/components/schemas/Location.PublicRef"
+                  },
+                  "projectID": {
+                    "type": "string"
+                  },
+                  "subpath": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "location"
+                ],
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "projectID": {
+            "type": "string"
+          },
+          "subpath": {
+            "type": "string"
+          },
+          "time": {
+            "additionalProperties": false,
+            "properties": {
+              "created": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "created"
+            ],
+            "type": "object"
+          },
+          "type": {
+            "enum": [
+              "location-switched"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "time",
+          "type",
+          "location"
+        ],
+        "type": "object"
+      },
+      "Session.Message.ModelSelected": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "pattern": "^msg_",
+            "type": "string"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "model": {
+            "$ref": "#/components/schemas/Model.Ref"
+          },
+          "previous": {
+            "$ref": "#/components/schemas/Model.Ref"
+          },
+          "time": {
+            "additionalProperties": false,
+            "properties": {
+              "created": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "created"
+            ],
+            "type": "object"
+          },
+          "type": {
+            "enum": [
+              "model-switched"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "time",
+          "type",
+          "model"
+        ],
+        "type": "object"
+      },
+      "Session.Message.ProviderState": {
+        "type": "object"
+      },
+      "Session.Message.ProviderState_1": {
+        "type": "object"
+      },
+      "Session.Message.ProviderState_2": {
+        "type": "object"
+      },
+      "Session.Message.ProviderState_3": {
+        "type": "object"
+      },
+      "Session.Message.ProviderState_4": {
+        "type": "object"
+      },
+      "Session.Message.ProviderState_5": {
+        "type": "object"
+      },
+      "Session.Message.Shell": {
+        "additionalProperties": false,
+        "properties": {
+          "command": {
+            "type": "string"
+          },
+          "exit": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "enum": [
+                  "Infinity",
+                  "-Infinity",
+                  "NaN"
+                ],
+                "type": "string"
+              }
+            ]
+          },
+          "id": {
+            "pattern": "^msg_",
+            "type": "string"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "output": {
+            "additionalProperties": false,
+            "properties": {
+              "cursor": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "output": {
+                "type": "string"
+              },
+              "size": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "truncated": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "output",
+              "cursor",
+              "size",
+              "truncated"
+            ],
+            "type": "object"
+          },
+          "shellID": {
+            "pattern": "^sh_",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "running",
+              "exited",
+              "timeout",
+              "killed"
+            ],
+            "type": "string"
+          },
+          "time": {
+            "additionalProperties": false,
+            "properties": {
+              "completed": {
+                "type": "number"
+              },
+              "created": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "created"
+            ],
+            "type": "object"
+          },
+          "type": {
+            "enum": [
+              "shell"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "time",
+          "type",
+          "shellID",
+          "command",
+          "status"
+        ],
+        "type": "object"
+      },
+      "Session.Message.Skill": {
+        "additionalProperties": false,
+        "properties": {
+          "id": {
+            "pattern": "^msg_",
+            "type": "string"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "name": {
+            "type": "string"
+          },
+          "skill": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "time": {
+            "additionalProperties": false,
+            "properties": {
+              "created": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "created"
+            ],
+            "type": "object"
+          },
+          "type": {
+            "enum": [
+              "skill"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "time",
+          "type",
+          "skill",
+          "name",
+          "text"
+        ],
+        "type": "object"
+      },
+      "Session.Message.Synthetic": {
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "id": {
+            "pattern": "^msg_",
+            "type": "string"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "text": {
+            "type": "string"
+          },
+          "time": {
+            "additionalProperties": false,
+            "properties": {
+              "created": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "created"
+            ],
+            "type": "object"
+          },
+          "type": {
+            "enum": [
+              "synthetic"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "time",
+          "text",
+          "type"
+        ],
+        "type": "object"
+      },
+      "Session.Message.System": {
+        "additionalProperties": false,
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "id": {
+            "pattern": "^msg_",
+            "type": "string"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "text": {
+            "type": "string"
+          },
+          "time": {
+            "additionalProperties": false,
+            "properties": {
+              "created": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "created"
+            ],
+            "type": "object"
+          },
+          "type": {
+            "enum": [
+              "system"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "time",
+          "type",
+          "text"
+        ],
+        "type": "object"
+      },
+      "Session.Message.ToolState.Completed": {
+        "additionalProperties": false,
+        "properties": {
+          "content": {
+            "items": {
+              "$ref": "#/components/schemas/Tool.Content"
+            },
+            "minItems": 1,
+            "prefixItems": [
+              {
+                "$ref": "#/components/schemas/Tool.Content"
+              }
+            ],
+            "type": "array"
+          },
+          "input": {
+            "type": "object"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "status": {
+            "enum": [
+              "completed"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "input",
+          "content"
+        ],
+        "type": "object"
+      },
+      "Session.Message.ToolState.Error": {
+        "additionalProperties": false,
+        "properties": {
+          "content": {
+            "items": {
+              "$ref": "#/components/schemas/Tool.Content"
+            },
+            "minItems": 1,
+            "prefixItems": [
+              {
+                "$ref": "#/components/schemas/Tool.Content"
+              }
+            ],
+            "type": "array"
+          },
+          "error": {
+            "$ref": "#/components/schemas/Session.StructuredError"
+          },
+          "input": {
+            "type": "object"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "status": {
+            "enum": [
+              "error"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "input",
+          "error"
+        ],
+        "type": "object"
+      },
+      "Session.Message.ToolState.Running": {
+        "additionalProperties": false,
+        "properties": {
+          "input": {
+            "type": "object"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "status": {
+            "enum": [
+              "running"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "input",
+          "metadata"
+        ],
+        "type": "object"
+      },
+      "Session.Message.ToolState.Streaming": {
+        "additionalProperties": false,
+        "properties": {
+          "input": {
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "streaming"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "input"
+        ],
+        "type": "object"
+      },
+      "Session.Message.User": {
+        "additionalProperties": false,
+        "properties": {
+          "agents": {
+            "items": {
+              "$ref": "#/components/schemas/Prompt.AgentAttachment"
+            },
+            "type": "array"
+          },
+          "files": {
+            "items": {
+              "$ref": "#/components/schemas/Prompt.FileAttachment"
+            },
+            "type": "array"
+          },
+          "id": {
+            "pattern": "^msg_",
+            "type": "string"
+          },
+          "metadata": {
+            "type": "object"
+          },
+          "skills": {
+            "items": {
+              "$ref": "#/components/schemas/Prompt.SkillAttachment"
+            },
+            "type": "array"
+          },
+          "text": {
+            "type": "string"
+          },
+          "time": {
+            "additionalProperties": false,
+            "properties": {
+              "created": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "created"
+            ],
+            "type": "object"
+          },
+          "type": {
+            "enum": [
+              "user"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "time",
+          "text",
+          "type"
+        ],
+        "type": "object"
+      },
+      "Session.Metadata": {
+        "type": "object"
+      },
+      "Session.ProviderContext": {
+        "additionalProperties": false,
+        "properties": {
+          "messages": {},
+          "provenance": {
+            "$ref": "#/components/schemas/Session.ProviderContext.Provenance"
+          },
+          "version": {
+            "enum": [
+              1
+            ],
+            "type": "number"
+          }
+        },
+        "required": [
+          "version",
+          "provenance",
+          "messages"
+        ],
+        "type": "object"
+      },
+      "Session.ProviderContext.Provenance": {
+        "additionalProperties": false,
+        "properties": {
+          "endpoint": {
+            "type": "string"
+          },
+          "modelID": {
+            "type": "string"
+          },
+          "protocol": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "providerID": {
+            "type": "string"
+          },
+          "route": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "providerID",
+          "provider",
+          "modelID",
+          "route",
+          "protocol",
+          "endpoint"
+        ],
+        "type": "object"
+      },
+      "Session.Revert": {
+        "additionalProperties": false,
+        "properties": {
+          "files": {
+            "items": {
+              "$ref": "#/components/schemas/FileDiff.Info"
+            },
+            "type": "array"
+          },
+          "messageID": {
+            "pattern": "^msg_",
+            "type": "string"
+          },
+          "partID": {
+            "type": "string"
+          },
+          "snapshot": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "messageID"
+        ],
+        "type": "object"
+      },
+      "Session.StructuredError": {
+        "additionalProperties": false,
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "status": {
+            "maximum": 599,
+            "minimum": 100,
+            "type": "integer"
+          },
+          "type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "message"
+        ],
+        "type": "object"
+      },
+      "SessionInterruptResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "interrupted": {
+            "description": "Whether an active execution owned by this OpenCode process was interrupted.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "interrupted"
+        ],
+        "type": "object"
+      },
+      "SessionMessagesResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "additionalProperties": false,
+            "properties": {
+              "next": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "previous": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "type": "object"
+          },
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/Session.Message.Info"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "data",
+          "cursor"
+        ],
+        "type": "object"
+      },
+      "SessionNotFoundErrorEncoded": {
+        "additionalProperties": false,
+        "properties": {
+          "_tag": {
+            "enum": [
+              "SessionNotFoundError"
+            ],
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "sessionID": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "_tag",
+          "sessionID",
+          "message"
+        ],
+        "type": "object"
+      },
+      "SessionsResponse": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "additionalProperties": false,
+            "properties": {
+              "next": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "previous": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "type": "object"
+          },
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/Session.Info"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "data",
+          "cursor"
+        ],
+        "type": "object"
+      },
+      "TokenUsage.Info": {
+        "additionalProperties": false,
+        "properties": {
+          "cache": {
+            "additionalProperties": false,
+            "properties": {
+              "read": {
+                "type": "number"
+              },
+              "write": {
+                "type": "number"
+              }
+            },
+            "required": [
+              "read",
+              "write"
+            ],
+            "type": "object"
+          },
+          "input": {
+            "type": "number"
+          },
+          "output": {
+            "type": "number"
+          },
+          "reasoning": {
+            "type": "number"
+          }
+        },
+        "required": [
+          "input",
+          "output",
+          "reasoning",
+          "cache"
+        ],
+        "type": "object"
+      },
+      "Tool.Content": {
+        "anyOf": [
+          {
+            "$ref": "#/components/schemas/Tool.TextContent"
+          },
+          {
+            "$ref": "#/components/schemas/Tool.FileContent"
+          }
+        ]
+      },
+      "Tool.FileContent": {
+        "additionalProperties": false,
+        "properties": {
+          "mime": {
+            "type": "string"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "type": {
+            "enum": [
+              "file"
+            ],
+            "type": "string"
+          },
+          "uri": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "uri",
+          "mime"
+        ],
+        "type": "object"
+      },
+      "Tool.TextContent": {
+        "additionalProperties": false,
+        "properties": {
+          "text": {
+            "type": "string"
+          },
+          "type": {
+            "enum": [
+              "text"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "text"
+        ],
+        "type": "object"
+      },
+      "UnauthorizedErrorEncoded": {
+        "additionalProperties": false,
+        "properties": {
+          "_tag": {
+            "enum": [
+              "UnauthorizedError"
+            ],
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "_tag",
+          "message"
+        ],
+        "type": "object"
+      },
+      "UnknownErrorEncoded": {
+        "additionalProperties": false,
+        "properties": {
+          "_tag": {
+            "enum": [
+              "UnknownError"
+            ],
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "ref": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "_tag",
+          "message"
+        ],
+        "type": "object"
+      },
+      "V2EventEncoded": {
+        "contentMediaType": "application/json",
+        "type": "string"
+      }
+    },
+    "securitySchemes": {}
+  },
+  "info": {
+    "description": "Experimental HttpApi surface for selected instance routes.",
+    "title": "opencode HttpApi",
+    "version": "0.0.1"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/event": {
+      "get": {
+        "description": "Subscribe to native events and plugin RPC events across all server locations. Volatile by contract: a slow consumer overflows and fails the stream, and events during disconnection are missed.",
+        "operationId": "event.subscribe",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "text/event-stream": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/V2EventEncoded"
+                    },
+                    "event": {
+                      "type": "string"
+                    },
+                    "id": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "id",
+                    "event",
+                    "data"
+                  ],
+                  "type": "object"
+                },
+                "x-effect-stream": {
+                  "causeSchema": {
+                    "items": {
+                      "anyOf": [
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "_tag": {
+                              "enum": [
+                                "Fail"
+                              ],
+                              "type": "string"
+                            },
+                            "error": {
+                              "not": {}
+                            }
+                          },
+                          "required": [
+                            "_tag",
+                            "error"
+                          ],
+                          "type": "object"
+                        },
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "_tag": {
+                              "enum": [
+                                "Die"
+                              ],
+                              "type": "string"
+                            },
+                            "defect": {}
+                          },
+                          "required": [
+                            "_tag",
+                            "defect"
+                          ],
+                          "type": "object"
+                        },
+                        {
+                          "additionalProperties": false,
+                          "properties": {
+                            "_tag": {
+                              "enum": [
+                                "Interrupt"
+                              ],
+                              "type": "string"
+                            },
+                            "fiberId": {
+                              "anyOf": [
+                                {
+                                  "type": "number"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            }
+                          },
+                          "required": [
+                            "_tag",
+                            "fiberId"
+                          ],
+                          "type": "object"
+                        }
+                      ]
+                    },
+                    "type": "array"
+                  },
+                  "encoding": "sse",
+                  "errorSchema": {
+                    "not": {}
+                  },
+                  "failureEvent": "effect/httpapi/stream/failure"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            },
+            "description": "InvalidRequestError"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            },
+            "description": "UnauthorizedError"
+          }
+        },
+        "security": [],
+        "summary": "Subscribe to events",
+        "tags": [
+          "event"
+        ]
+      }
+    },
+    "/api/info": {
+      "get": {
+        "description": "Return the server identity, connection URLs, paths, and readiness status.",
+        "operationId": "server.info",
+        "parameters": [],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServerInfo"
+                }
+              }
+            },
+            "description": "ServerInfo"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            },
+            "description": "InvalidRequestError"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            },
+            "description": "UnauthorizedError"
+          }
+        },
+        "security": [],
+        "summary": "Get server info",
+        "tags": [
+          "server"
+        ]
+      }
+    },
+    "/api/integration/{integrationID}/connect/key": {
+      "post": {
+        "description": "Run a key authentication method and store the resulting credential.",
+        "operationId": "integration.connect.key",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "integrationID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "explode": true,
+            "in": "query",
+            "name": "location",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "directory": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  },
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "style": "deepObject"
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "answer": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/Form.Answer"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "key": {
+                    "type": "string"
+                  },
+                  "label": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "key"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "<No Content>"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "InvalidRequestError"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            },
+            "description": "UnauthorizedError"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IntegrationNotFoundErrorEncoded"
+                }
+              }
+            },
+            "description": "IntegrationNotFoundError"
+          }
+        },
+        "security": [],
+        "summary": "Connect with key",
+        "tags": [
+          "integration"
+        ]
+      }
+    },
+    "/api/model": {
+      "get": {
+        "description": "Retrieve the current snapshot of available models ordered by release date. The snapshot may precede initial plugin settlement.",
+        "operationId": "model.list",
+        "parameters": [
+          {
+            "explode": true,
+            "in": "query",
+            "name": "location",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "directory": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  },
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "style": "deepObject"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "data": {
+                      "items": {
+                        "$ref": "#/components/schemas/Model.Info"
+                      },
+                      "type": "array"
+                    },
+                    "location": {
+                      "$ref": "#/components/schemas/Location.PublicRef"
+                    }
+                  },
+                  "required": [
+                    "location",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            },
+            "description": "InvalidRequestError"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            },
+            "description": "UnauthorizedError"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableErrorEncoded"
+                }
+              }
+            },
+            "description": "ServiceUnavailableError"
+          }
+        },
+        "security": [],
+        "summary": "List models",
+        "tags": [
+          "model"
+        ]
+      }
+    },
+    "/api/provider": {
+      "get": {
+        "description": "Retrieve active AI providers so clients can show provider availability and configuration.",
+        "operationId": "provider.list",
+        "parameters": [
+          {
+            "explode": true,
+            "in": "query",
+            "name": "location",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "additionalProperties": false,
+                  "properties": {
+                    "directory": {
+                      "anyOf": [
+                        {
+                          "type": "string"
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  },
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "style": "deepObject"
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "data": {
+                      "items": {
+                        "$ref": "#/components/schemas/Provider.Info"
+                      },
+                      "type": "array"
+                    },
+                    "location": {
+                      "$ref": "#/components/schemas/Location.PublicRef"
+                    }
+                  },
+                  "required": [
+                    "location",
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            },
+            "description": "InvalidRequestError"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            },
+            "description": "UnauthorizedError"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceUnavailableErrorEncoded"
+                }
+              }
+            },
+            "description": "ServiceUnavailableError"
+          }
+        },
+        "security": [],
+        "summary": "List providers",
+        "tags": [
+          "provider"
+        ]
+      }
+    },
+    "/api/session": {
+      "get": {
+        "description": "Retrieve sessions in the requested order. Items keep that order across pages; use cursor.next or cursor.previous to move through the ordered list.",
+        "operationId": "session.list",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Maximum number of sessions to return. Defaults to the newest 50 sessions."
+            }
+          },
+          {
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "asc",
+                    "desc"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Session order for the first page. Use desc for newest first or asc for oldest first."
+            }
+          },
+          {
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "parentID",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "anyOf": [
+                    {
+                      "pattern": "^ses",
+                      "type": "string"
+                    },
+                    {
+                      "enum": [
+                        "null"
+                      ],
+                      "type": "string"
+                    }
+                  ],
+                  "description": "Filter by parent session. Use null to return only root sessions."
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "directory",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "project",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "subpath",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "description": "Opaque pagination cursor returned as cursor.previous or cursor.next in the previous response.",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionsResponse"
+                }
+              }
+            },
+            "description": "SessionsResponse"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/InvalidCursorErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "InvalidCursorError | InvalidRequestError"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            },
+            "description": "UnauthorizedError"
+          }
+        },
+        "security": [],
+        "summary": "List sessions",
+        "tags": [
+          "session"
+        ]
+      },
+      "post": {
+        "description": "Create a session at the requested location.",
+        "operationId": "session.create",
+        "parameters": [],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "agent": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "id": {
+                    "anyOf": [
+                      {
+                        "pattern": "^ses",
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "location": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/Location.PublicRef"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "metadata": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/Session.Metadata"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "model": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/Model.Ref"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "permissions": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/Permission.Ruleset"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "title": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Session.Info"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            },
+            "description": "InvalidRequestError"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            },
+            "description": "UnauthorizedError"
+          }
+        },
+        "security": [],
+        "summary": "Create session",
+        "tags": [
+          "session"
+        ]
+      }
+    },
+    "/api/session/{sessionID}": {
+      "delete": {
+        "description": "Delete a session and its child sessions.",
+        "operationId": "session.remove",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sessionID",
+            "required": true,
+            "schema": {
+              "pattern": "^ses",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "<No Content>"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            },
+            "description": "InvalidRequestError"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            },
+            "description": "UnauthorizedError"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                }
+              }
+            },
+            "description": "SessionNotFoundError"
+          }
+        },
+        "security": [],
+        "summary": "Delete session",
+        "tags": [
+          "session"
+        ]
+      },
+      "get": {
+        "description": "Retrieve a session by ID.",
+        "operationId": "session.get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sessionID",
+            "required": true,
+            "schema": {
+              "pattern": "^ses",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Session.Info"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            },
+            "description": "InvalidRequestError"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            },
+            "description": "UnauthorizedError"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                }
+              }
+            },
+            "description": "SessionNotFoundError"
+          }
+        },
+        "security": [],
+        "summary": "Get session",
+        "tags": [
+          "session"
+        ]
+      },
+      "patch": {
+        "description": "Update mutable session properties.",
+        "operationId": "session.update",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sessionID",
+            "required": true,
+            "schema": {
+              "pattern": "^ses",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "metadata": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/Session.Metadata"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "permissions": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/Permission.Ruleset"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "title": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "<No Content>"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            },
+            "description": "InvalidRequestError"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            },
+            "description": "UnauthorizedError"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "SessionNotFoundError"
+          }
+        },
+        "security": [],
+        "summary": "Update session",
+        "tags": [
+          "session"
+        ]
+      }
+    },
+    "/api/session/{sessionID}/compact": {
+      "post": {
+        "description": "Durably admit a session compaction request. Steers by default: it runs at the next step boundary instead of waiting behind queued prompts.",
+        "operationId": "session.compact",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sessionID",
+            "required": true,
+            "schema": {
+              "pattern": "^ses",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "delivery": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/Session.Inbox.Delivery"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "id": {
+                    "anyOf": [
+                      {
+                        "pattern": "^msg_",
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Session.Inbox.Compaction"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            },
+            "description": "InvalidRequestError"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            },
+            "description": "UnauthorizedError"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "SessionNotFoundError"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictErrorEncoded"
+                }
+              }
+            },
+            "description": "ConflictError"
+          }
+        },
+        "security": [],
+        "summary": "Compact session",
+        "tags": [
+          "session"
+        ]
+      }
+    },
+    "/api/session/{sessionID}/context": {
+      "get": {
+        "description": "Retrieve the active context messages for a session (all messages after the last compaction).",
+        "operationId": "session.context",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sessionID",
+            "required": true,
+            "schema": {
+              "pattern": "^ses",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "data": {
+                      "items": {
+                        "$ref": "#/components/schemas/Session.Message.Info"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            },
+            "description": "InvalidRequestError"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            },
+            "description": "UnauthorizedError"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                }
+              }
+            },
+            "description": "SessionNotFoundError"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnknownErrorEncoded"
+                }
+              }
+            },
+            "description": "UnknownError"
+          }
+        },
+        "security": [],
+        "summary": "Get session context",
+        "tags": [
+          "session"
+        ]
+      }
+    },
+    "/api/session/{sessionID}/fork": {
+      "post": {
+        "description": "Create a child session by copying projected history before a message. Omit before to copy the full history.",
+        "operationId": "session.fork",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sessionID",
+            "required": true,
+            "schema": {
+              "pattern": "^ses",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "before": {
+                    "anyOf": [
+                      {
+                        "pattern": "^msg_",
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Session.Info"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "InvalidRequestError"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            },
+            "description": "UnauthorizedError"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/MessageNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "SessionNotFoundError | MessageNotFoundError"
+          }
+        },
+        "security": [],
+        "summary": "Fork session",
+        "tags": [
+          "session"
+        ]
+      }
+    },
+    "/api/session/{sessionID}/form": {
+      "get": {
+        "description": "Retrieve pending forms for a session.",
+        "operationId": "session.form.list",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sessionID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "data": {
+                      "items": {
+                        "$ref": "#/components/schemas/Form.Info"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            },
+            "description": "InvalidRequestError"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            },
+            "description": "UnauthorizedError"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "SessionNotFoundError"
+          }
+        },
+        "security": [],
+        "summary": "List session forms",
+        "tags": [
+          "session"
+        ]
+      },
+      "post": {
+        "description": "Create a form for a session.",
+        "operationId": "session.form.create",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sessionID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Form.CreatePayload"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Form.Info"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "InvalidRequestError"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            },
+            "description": "UnauthorizedError"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "SessionNotFoundError"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictErrorEncoded"
+                }
+              }
+            },
+            "description": "ConflictError"
+          }
+        },
+        "security": [],
+        "summary": "Create session form",
+        "tags": [
+          "session"
+        ]
+      }
+    },
+    "/api/session/{sessionID}/form/{formID}": {
+      "delete": {
+        "description": "Cancel a pending form.",
+        "operationId": "session.form.cancel",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sessionID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "formID",
+            "required": true,
+            "schema": {
+              "pattern": "^frm_",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "<No Content>"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            },
+            "description": "InvalidRequestError"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            },
+            "description": "UnauthorizedError"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/FormNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "SessionNotFoundError | FormNotFoundError"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FormAlreadySettledErrorEncoded"
+                }
+              }
+            },
+            "description": "FormAlreadySettledError"
+          }
+        },
+        "security": [],
+        "summary": "Cancel form",
+        "tags": [
+          "session"
+        ]
+      },
+      "get": {
+        "description": "Retrieve a form and its current state for a session.",
+        "operationId": "session.form.get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sessionID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "formID",
+            "required": true,
+            "schema": {
+              "pattern": "^frm_",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Form.Detail"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            },
+            "description": "InvalidRequestError"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            },
+            "description": "UnauthorizedError"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/FormNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "SessionNotFoundError | FormNotFoundError"
+          }
+        },
+        "security": [],
+        "summary": "Get session form",
+        "tags": [
+          "session"
+        ]
+      }
+    },
+    "/api/session/{sessionID}/form/{formID}/reply": {
+      "post": {
+        "description": "Submit an answer to a pending form.",
+        "operationId": "session.form.reply",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sessionID",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "formID",
+            "required": true,
+            "schema": {
+              "pattern": "^frm_",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Form.Reply"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "<No Content>"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/FormInvalidAnswerErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "FormInvalidAnswerError | InvalidRequestError"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            },
+            "description": "UnauthorizedError"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/FormNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "SessionNotFoundError | FormNotFoundError"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FormAlreadySettledErrorEncoded"
+                }
+              }
+            },
+            "description": "FormAlreadySettledError"
+          }
+        },
+        "security": [],
+        "summary": "Reply to form",
+        "tags": [
+          "session"
+        ]
+      }
+    },
+    "/api/session/{sessionID}/interrupt": {
+      "post": {
+        "description": "Interrupt active execution owned by this OpenCode process. Returns interrupted=true when an active execution was interrupted and false for the idle no-op. When resume=true, execution resumes pending steering input and next-in-line control items (manual compaction, moves) while queued prompts remain parked.",
+        "operationId": "session.interrupt",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sessionID",
+            "required": true,
+            "schema": {
+              "pattern": "^ses",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "resume",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "true",
+                    "false"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionInterruptResponse"
+                }
+              }
+            },
+            "description": "SessionInterruptResponse"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            },
+            "description": "InvalidRequestError"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            },
+            "description": "UnauthorizedError"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "SessionNotFoundError"
+          }
+        },
+        "security": [],
+        "summary": "Interrupt session execution",
+        "tags": [
+          "session"
+        ]
+      }
+    },
+    "/api/session/{sessionID}/message": {
+      "get": {
+        "description": "Retrieve projected messages for a session, optionally filtered by type. Items keep the requested order across pages; use cursor.next or cursor.previous to move through the ordered timeline, passing the same type filter on each page.",
+        "operationId": "session.message.list",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sessionID",
+            "required": true,
+            "schema": {
+              "pattern": "^ses",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Maximum number of messages to return. When omitted, the endpoint returns its default page size."
+            }
+          },
+          {
+            "in": "query",
+            "name": "order",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "asc",
+                    "desc"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Message order for the first page. Use desc for newest first or asc for oldest first."
+            }
+          },
+          {
+            "in": "query",
+            "name": "cursor",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "description": "Opaque pagination cursor returned as cursor.previous or cursor.next in the previous response. Do not combine with order.",
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          {
+            "in": "query",
+            "name": "type",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "enum": [
+                    "agent-switched",
+                    "model-switched",
+                    "location-switched",
+                    "user",
+                    "synthetic",
+                    "system",
+                    "skill",
+                    "shell",
+                    "assistant",
+                    "compaction"
+                  ],
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Filter by message type before pagination. When omitted, all message types are returned. Pass the same type when following cursors."
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionMessagesResponse"
+                }
+              }
+            },
+            "description": "SessionMessagesResponse"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/InvalidCursorErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "InvalidCursorError | InvalidRequestError"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            },
+            "description": "UnauthorizedError"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                }
+              }
+            },
+            "description": "SessionNotFoundError"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnknownErrorEncoded"
+                }
+              }
+            },
+            "description": "UnknownError"
+          }
+        },
+        "security": [],
+        "summary": "Get session messages",
+        "tags": [
+          "session"
+        ]
+      }
+    },
+    "/api/session/{sessionID}/model": {
+      "post": {
+        "description": "Switch the model used by subsequent provider turns.",
+        "operationId": "session.switchModel",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sessionID",
+            "required": true,
+            "schema": {
+              "pattern": "^ses",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "model": {
+                    "$ref": "#/components/schemas/Model.Ref"
+                  }
+                },
+                "required": [
+                  "model"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "<No Content>"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            },
+            "description": "InvalidRequestError"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            },
+            "description": "UnauthorizedError"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "SessionNotFoundError"
+          }
+        },
+        "security": [],
+        "summary": "Switch session model",
+        "tags": [
+          "session"
+        ]
+      }
+    },
+    "/api/session/{sessionID}/permission": {
+      "get": {
+        "description": "Retrieve pending permission requests owned by a session.",
+        "operationId": "session.permission.list",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sessionID",
+            "required": true,
+            "schema": {
+              "pattern": "^ses",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "data": {
+                      "items": {
+                        "$ref": "#/components/schemas/Permission.Request"
+                      },
+                      "type": "array"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            },
+            "description": "InvalidRequestError"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            },
+            "description": "UnauthorizedError"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                }
+              }
+            },
+            "description": "SessionNotFoundError"
+          }
+        },
+        "security": [],
+        "summary": "List session permission requests",
+        "tags": [
+          "permission"
+        ]
+      },
+      "post": {
+        "description": "Evaluate and, when approval is required, create a permission request for a session.",
+        "operationId": "session.permission.create",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sessionID",
+            "required": true,
+            "schema": {
+              "pattern": "^ses",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "action": {
+                    "type": "string"
+                  },
+                  "agent": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "id": {
+                    "anyOf": [
+                      {
+                        "pattern": "^per",
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "metadata": {
+                    "type": "object"
+                  },
+                  "resources": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "save": {
+                    "items": {
+                      "type": "string"
+                    },
+                    "type": "array"
+                  },
+                  "source": {
+                    "$ref": "#/components/schemas/Permission.Source"
+                  }
+                },
+                "required": [
+                  "action",
+                  "resources"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "data": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "effect": {
+                          "$ref": "#/components/schemas/Permission.Effect"
+                        },
+                        "id": {
+                          "pattern": "^per",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "id",
+                        "effect"
+                      ],
+                      "type": "object"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            },
+            "description": "InvalidRequestError"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            },
+            "description": "UnauthorizedError"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "SessionNotFoundError"
+          }
+        },
+        "security": [],
+        "summary": "Create permission request",
+        "tags": [
+          "permission"
+        ]
+      }
+    },
+    "/api/session/{sessionID}/permission/{requestID}/reply": {
+      "post": {
+        "description": "Respond to a pending permission request owned by a session.",
+        "operationId": "session.permission.reply",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sessionID",
+            "required": true,
+            "schema": {
+              "pattern": "^ses",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "requestID",
+            "required": true,
+            "schema": {
+              "pattern": "^per",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "decision": {
+                    "$ref": "#/components/schemas/Permission.Reply"
+                  },
+                  "message": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "decision"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "<No Content>"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            },
+            "description": "InvalidRequestError"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            },
+            "description": "UnauthorizedError"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/PermissionNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "SessionNotFoundError | PermissionNotFoundError"
+          }
+        },
+        "security": [],
+        "summary": "Reply to pending permission request",
+        "tags": [
+          "permission"
+        ]
+      }
+    },
+    "/api/session/{sessionID}/prompt": {
+      "post": {
+        "description": "Durably admit one session input and schedule agent-loop execution unless resume is false.",
+        "operationId": "session.prompt",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sessionID",
+            "required": true,
+            "schema": {
+              "pattern": "^ses",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "agents": {
+                    "items": {
+                      "$ref": "#/components/schemas/Prompt.AgentAttachment"
+                    },
+                    "type": "array"
+                  },
+                  "delivery": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/Session.Inbox.Delivery"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "files": {
+                    "items": {
+                      "$ref": "#/components/schemas/PromptInput.FileAttachment"
+                    },
+                    "type": "array"
+                  },
+                  "id": {
+                    "anyOf": [
+                      {
+                        "pattern": "^msg_",
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "metadata": {
+                    "type": "object"
+                  },
+                  "resume": {
+                    "anyOf": [
+                      {
+                        "type": "boolean"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "skills": {
+                    "items": {
+                      "$ref": "#/components/schemas/PromptInput.SkillAttachment"
+                    },
+                    "type": "array"
+                  },
+                  "text": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "text"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Session.Inbox.User"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "InvalidRequestError"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            },
+            "description": "UnauthorizedError"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "SessionNotFoundError"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictErrorEncoded"
+                }
+              }
+            },
+            "description": "ConflictError"
+          }
+        },
+        "security": [],
+        "summary": "Send message",
+        "tags": [
+          "session"
+        ]
+      }
+    },
+    "/api/session/{sessionID}/synthetic": {
+      "post": {
+        "description": "Durably admit synthetic session input and schedule execution unless resume is false.",
+        "operationId": "session.synthetic",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "sessionID",
+            "required": true,
+            "schema": {
+              "pattern": "^ses",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "properties": {
+                  "delivery": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/Session.Inbox.Delivery"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "description": {
+                    "anyOf": [
+                      {
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "id": {
+                    "anyOf": [
+                      {
+                        "pattern": "^msg_",
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "metadata": {
+                    "type": "object"
+                  },
+                  "resume": {
+                    "anyOf": [
+                      {
+                        "type": "boolean"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "text": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "text"
+                ],
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/Session.Inbox.Synthetic"
+                    }
+                  },
+                  "required": [
+                    "data"
+                  ],
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Success"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InvalidRequestErrorEncoded"
+                }
+              }
+            },
+            "description": "InvalidRequestError"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnauthorizedErrorEncoded"
+                }
+              }
+            },
+            "description": "UnauthorizedError"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    },
+                    {
+                      "$ref": "#/components/schemas/SessionNotFoundErrorEncoded"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "SessionNotFoundError"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConflictErrorEncoded"
+                }
+              }
+            },
+            "description": "ConflictError"
+          }
+        },
+        "security": [],
+        "summary": "Add synthetic message",
+        "tags": [
+          "session"
+        ]
+      }
+    }
+  },
+  "security": [],
+  "tags": [
+    {
+      "name": "server"
+    },
+    {
+      "name": "location"
+    },
+    {
+      "name": "agent"
+    },
+    {
+      "description": "Experimental plugin routes.",
+      "name": "plugin"
+    },
+    {
+      "description": "Experimental session routes.",
+      "name": "session"
+    },
+    {
+      "description": "Experimental message routes.",
+      "name": "session"
+    },
+    {
+      "description": "Experimental model routes.",
+      "name": "model"
+    },
+    {
+      "description": "Experimental one-shot generation routes.",
+      "name": "generate"
+    },
+    {
+      "description": "Experimental provider routes.",
+      "name": "provider"
+    },
+    {
+      "description": "Integration discovery and authentication routes.",
+      "name": "integration"
+    },
+    {
+      "description": "MCP server and resource routes.",
+      "name": "mcp"
+    },
+    {
+      "name": "credential"
+    },
+    {
+      "description": "Project routes.",
+      "name": "project"
+    },
+    {
+      "description": "Location form routes.",
+      "name": "form"
+    },
+    {
+      "description": "Experimental permission routes.",
+      "name": "permission"
+    },
+    {
+      "description": "Experimental location-scoped filesystem routes.",
+      "name": "filesystem"
+    },
+    {
+      "description": "Experimental command routes.",
+      "name": "command"
+    },
+    {
+      "description": "Experimental skill routes.",
+      "name": "skill"
+    },
+    {
+      "description": "Plugin RPC routes.",
+      "name": "rpc"
+    },
+    {
+      "description": "Experimental event stream routes.",
+      "name": "event"
+    },
+    {
+      "description": "Experimental location-scoped PTY routes.",
+      "name": "pty"
+    },
+    {
+      "description": "Prototype persistent PTY routes.",
+      "name": "persistentPty"
+    },
+    {
+      "description": "Location-scoped shell command routes.",
+      "name": "shell"
+    },
+    {
+      "description": "Location-scoped project references.",
+      "name": "reference"
+    },
+    {
+      "description": "Project-based worktree management routes.",
+      "name": "worktree"
+    },
+    {
+      "description": "Location-scoped version control routes.",
+      "name": "vcs"
+    },
+    {
+      "name": "debug"
+    },
+    {
+      "name": "migration"
+    },
+    {
+      "description": "Location-scoped web search routes.",
+      "name": "websearch"
+    },
+    {
+      "description": "Location-scoped configuration routes.",
+      "name": "config"
+    }
+  ]
+}

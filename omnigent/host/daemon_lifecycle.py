@@ -61,6 +61,8 @@ class HostDaemonRecord:
     :param workspace_id: Databricks workspace id the daemon connects to, as
         the server reported it at startup, e.g. ``"123"``; ``None`` when
         unknown or for records written by older daemons.
+    :param org_pin: Immutable routing pin, including ``?o=`` for no selector;
+        ``None`` for legacy records without a routing snapshot.
     """
 
     pid: int
@@ -74,6 +76,9 @@ class HostDaemonRecord:
     config_sig: str | None = None
     open_file_limit: int | None = None
     workspace_id: str | None = None
+    # Launch-time routing binding; unlike workspace_id this is not a probe
+    # result. None identifies a legacy record without an immutable snapshot.
+    org_pin: str | None = None
 
 
 def normalize_daemon_target(server_url: str | None, *, org_id: str | None = None) -> str:
@@ -223,9 +228,12 @@ def _read_workspace_header(url: str, *, org_id: str | None, timeout_s: float) ->
     import httpx
 
     from omnigent.cli_auth import DATABRICKS_ORG_ID_HEADER
+    from omnigent.telemetry.request_headers import client_identity_headers
     from omnigent.util.tls import client_ssl_context
 
-    headers = {DATABRICKS_ORG_ID_HEADER: org_id} if org_id else {}
+    headers = client_identity_headers()
+    if org_id:
+        headers[DATABRICKS_ORG_ID_HEADER] = org_id
     try:
         # The tunnel's trust store, so a TLS-intercepting proxy it trusts works here too.
         with httpx.stream(
@@ -404,6 +412,7 @@ def record_from_json(raw: Mapping[str, object]) -> HostDaemonRecord | None:
             else None
         ),
         workspace_id=_text("workspace_id"),
+        org_pin=_text("org_pin"),
     )
 
 

@@ -42,7 +42,7 @@ def _valid_hostname(host: str) -> bool:
     )
 
 
-def _gh_config_dir() -> str:
+def gh_config_dir() -> str:
     """Return the gh CLI config dir, chosen in gh's own order.
 
     ``GH_CONFIG_DIR``, else ``$XDG_CONFIG_HOME/gh``, else ``%AppData%\\GitHub CLI``
@@ -92,7 +92,7 @@ def _gh_signed_in_hosts() -> frozenset[str]:
     """
     global _hosts_cache
     try:
-        hosts_path = os.path.join(_gh_config_dir(), "hosts.yml")
+        hosts_path = os.path.join(gh_config_dir(), "hosts.yml")
     except RuntimeError:
         # Path.home() found no home directory.
         return frozenset()

@@ -1,6 +1,6 @@
 // Tests for src/chromeCookieStore.js, run with `node --test`. Anything that
-// shells out to `sqlite3` is skipped where that CLI is missing; the Keychain and
-// the Electron session are always injected.
+// shells out to `sqlite3` is skipped where that CLI is missing or predates `-json`
+// (sqlite 3.33); the Keychain and the Electron session are always injected.
 
 const { describe, it } = require("node:test");
 const assert = require("node:assert/strict");
@@ -12,10 +12,10 @@ const { execFileSync } = require("node:child_process");
 
 const store = require("../src/chromeCookieStore");
 
-// Probe the same binary the module runs, not whatever `PATH` resolves.
+// Probe the same binary and output mode the module uses, not whatever `PATH` resolves.
 const hasSqlite3 = (() => {
   try {
-    execFileSync("/usr/bin/sqlite3", ["-version"], { stdio: "ignore" });
+    execFileSync("/usr/bin/sqlite3", ["-json", ":memory:", "SELECT 1"], { stdio: "ignore" });
     return true;
   } catch {
     return false;

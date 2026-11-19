@@ -1,4 +1,4 @@
-/** Isaac seeds "<user>'s arca"; accept that suffix or the id saved by Run on Arca. */
+/** Accepts the default "<user>'s arca" host name, or the id saved by Run on Arca. */
 
 import type { Host } from "@/hooks/useHosts";
 
@@ -11,6 +11,18 @@ export function isArcaHost(
   return (
     host.name.endsWith("'s arca") ||
     (storedArcaHostId !== null && host.host_id === storedArcaHostId)
+  );
+}
+
+/** Prefer the remembered Arca, then one with the default name and a live connection. */
+export function findConnectedArcaHost(
+  hosts: readonly Host[],
+  storedArcaHostId: string | null,
+): Host | undefined {
+  const connectedHosts = hosts.filter((host) => host.status === "online" && !host.sandbox_provider);
+  return (
+    connectedHosts.find((host) => host.host_id === storedArcaHostId) ??
+    connectedHosts.find((host) => isArcaHost(host, storedArcaHostId))
   );
 }
 

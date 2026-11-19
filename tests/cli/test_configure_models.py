@@ -817,11 +817,15 @@ def test_add_subscription_invokes_harness_login(isolated_config, monkeypatch) ->
     Proves "configure is the single place to sign in": picking "Claude —
     subscription" calls ``harness_login("anthropic")``. A failure means the menu
     recorded a subscription without ever logging the user in (the original bug).
+    The sign-in also clears that login's detection dismissal.
     """
     calls: list[str] = []
     monkeypatch.setattr(
         "omnigent.onboarding.harness_install.harness_login",
         lambda family: calls.append(family) or True,
+    )
+    (isolated_config / "config.yaml").write_text(
+        yaml.safe_dump({"dismissed_detections": ["claude", "ollama"]})
     )
     stdin = "\n".join(["1", "1", "2", "q", "q"]) + "\n"  # Claude → +Add → subscription
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
@@ -830,6 +834,8 @@ def test_add_subscription_invokes_harness_login(isolated_config, monkeypatch) ->
     assert calls == ["anthropic"]
     cfg = _config_yaml(isolated_config)
     assert cfg["providers"]["claude-subscription"]["kind"] == "subscription"
+    # Signing in again re-enables a dismissed detection of that login.
+    assert cfg["dismissed_detections"] == ["ollama"]
 
 
 def test_add_subscription_aborts_when_login_fails(isolated_config, monkeypatch) -> None:
@@ -2369,7 +2375,8 @@ def test_overview_descriptions_map_to_their_rows(isolated_config, monkeypatch) -
     assert desc_by_name["Claude"] == "Open to add a credential."
     assert desc_by_name["Codex"] == "Open to add a credential."
     assert desc_by_name["Cursor"] == ""
-    assert desc_by_name["OpenCode"] == "Open to sign in (opencode auth login)."
+    # No provider signed in still runs OpenCode's free models, so the row is ready.
+    assert desc_by_name["OpenCode"] == ""
     assert desc_by_name["Hermes"] == "Open to configure with `hermes model`."
     assert desc_by_name["Pi"] == "Open to add a credential."
     assert (
@@ -2714,7 +2721,7 @@ def test_build_cli_config_provider_entry_shapes() -> None:
 
 # ── cli-config removal dismissal + re-add ────────────────────────────────────
 
-# The exact state `isaac configure codex` leaves behind: a custom provider
+# The state a Codex setup leaves behind: a custom provider
 # with self-contained auth in config.toml, and NO auth.json.
 _CODEX_CONFIG_TOML = """
 model_provider = "Databricks"
@@ -3942,6 +3949,147 @@ def test_setup_repairs_gemini_upgrade_default_conflict(isolated_config, choice, 
             == {key: value for key, value in entry.items() if key != "default"}
             for name, entry in original["providers"].items()
         )
+
+
+@pytest.mark.parametrize("choice", ["1", "2", "3", "q"])
+def test_setup_repairs_provider_default_it_does_not_serve(isolated_config, monkeypatch, choice):
+    config_path = isolated_config / "config.yaml"
+    gemini_entry = {
+        "kind": "databricks",
+        "profile": "example",
+        "native_gemini": True,
+        "default": "openai",
+    }
+    anthropic_entry = {
+        "kind": "key",
+        "default": True,
+        "anthropic": {"base_url": "https://gateway.example/anthropic", "api_key": "fake"},
+    }
+    original = {
+        "providers": {"databricks-gemini-example": gemini_entry, "anthropic": anthropic_entry}
+    }
+    config_path.write_text(yaml.safe_dump(original))
+    before = config_path.read_bytes()
+    monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: True)
+    result = CliRunner().invoke(cli, ["setup"], input=f"{choice}\nq\n")
+    output = " ".join(result.output.split())
+    assert "'default' names ['openai'], which it does not serve (serves ['gemini'])" in output
+    assert "Traceback" not in result.output
+    if choice in {"3", "q"}:
+        assert result.exit_code == 1, result.output
+        assert "Invalid provider configuration in" in output
+        assert config_path.read_bytes() == before
+        return
+    assert result.exit_code == 0, result.output
+    providers = _config_yaml(isolated_config)["providers"]
+    assert providers["anthropic"] == anthropic_entry
+    if choice == "1":
+        assert providers["databricks-gemini-example"] == {
+            key: value for key, value in gemini_entry.items() if key != "default"
+        }
+    else:
+        assert "databricks-gemini-example" not in providers
+    assert set(load_providers({"providers": providers})) == set(providers)
+
+
+@pytest.mark.parametrize(("first", "second"), [("1", "1"), ("2", "1"), ("1", "2"), ("2", "q")])
+def test_setup_saves_invalid_provider_choices_only_after_every_entry(
+    isolated_config, monkeypatch, first, second
+):
+    config_path = isolated_config / "config.yaml"
+    repairable = {
+        "kind": "databricks",
+        "profile": "example",
+        "native_gemini": True,
+        "default": "openai",
+    }
+    unrepairable = {"kind": "databricks", "default": True}
+    config_path.write_text(
+        yaml.safe_dump(
+            {"providers": {"databricks-gemini-example": repairable, "workspace": unrepairable}}
+        )
+    )
+    before = config_path.read_bytes()
+    monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: True)
+    result = CliRunner().invoke(cli, ["setup"], input=f"{first}\n{second}\nq\n")
+    output = " ".join(result.output.split())
+    assert "provider 'workspace': a profile or connection: databricks is required" in output
+    assert output.count("Keep it without the invalid default") == 1
+    assert output.count("Remove this provider") == 2
+    if second != "1":
+        assert result.exit_code == 1, result.output
+        assert config_path.read_bytes() == before
+        return
+    assert result.exit_code == 0, result.output
+    providers = _config_yaml(isolated_config).get("providers") or {}
+    assert "workspace" not in providers
+    if first == "1":
+        assert providers["databricks-gemini-example"] == {
+            key: value for key, value in repairable.items() if key != "default"
+        }
+    else:
+        assert "databricks-gemini-example" not in providers
+
+
+def test_setup_removing_invalid_provider_keeps_stored_key_and_dismisses_detection(
+    isolated_config, monkeypatch
+):
+    entry = {
+        "kind": "key",
+        "default": "openai",
+        "anthropic": {"base_url": "https://api.example.com", "api_key_ref": "keychain:anthropic"},
+    }
+    (isolated_config / "config.yaml").write_text(
+        yaml.safe_dump({"providers": {"anthropic": entry}})
+    )
+    secrets.store_secret("anthropic", "stored-key")
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "fake")
+    monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: True)
+    result = CliRunner().invoke(cli, ["setup"], input="2\nq\n")
+    assert result.exit_code == 0, result.output
+    assert "Remove this provider" in result.output
+    config = _config_yaml(isolated_config)
+    assert "anthropic" not in (config.get("providers") or {})
+    assert config["dismissed_detections"] == ["anthropic"]
+    assert secrets.load_secret("anthropic") == "stored-key"
+
+
+@pytest.mark.parametrize("name", ["codex", "codex-subscription"])
+def test_setup_removing_invalid_subscription_keeps_login_and_dismisses_detection(
+    isolated_config, monkeypatch, name
+):
+    login = '{"tokens": {"refresh_token": "fake"}}'
+    auth = isolated_config / ".codex" / "auth.json"
+    auth.parent.mkdir()
+    auth.write_text(login)
+    entry = {"kind": "subscription", "cli": "codex", "default": "anthropic"}
+    (isolated_config / "config.yaml").write_text(yaml.safe_dump({"providers": {name: entry}}))
+    monkeypatch.setattr(
+        "omnigent.onboarding.harness_install.harness_logout",
+        lambda family: pytest.fail("repair must not sign out"),
+    )
+    monkeypatch.setattr("omnigent.cli._stdin_is_tty", lambda: True)
+    result = CliRunner().invoke(cli, ["setup"], input="2\nq\n")
+    assert result.exit_code == 0, result.output
+    assert "Remove this provider" in result.output
+    config = _config_yaml(isolated_config)
+    providers = config.get("providers") or {}
+    assert name not in providers and "codex" not in providers
+    assert config["dismissed_detections"] == ["codex"]
+    assert auth.read_text() == login
+
+
+@pytest.mark.parametrize("cli", ["codex", ["codex"], {"name": "codex"}])
+def test_repair_removal_keeps_a_login_that_a_kept_subscription_covers(monkeypatch, cli):
+    from omnigent.cli_config import _repair_removal_dismissals
+    from omnigent.onboarding.ambient import DetectedProvider
+
+    login = DetectedProvider(name="codex", kind="subscription", family="openai", source="login")
+    monkeypatch.setattr("omnigent.onboarding.ambient.detect_providers", lambda: [login])
+    removed = {"codex": {"kind": "subscription", "cli": cli, "default": "anthropic"}}
+    kept = {"codex-subscription": {"kind": "subscription", "cli": "codex"}}
+    assert _repair_removal_dismissals(removed, {}) == {"codex"}
+    assert _repair_removal_dismissals(removed, kept) == set()
 
 
 @pytest.mark.parametrize(

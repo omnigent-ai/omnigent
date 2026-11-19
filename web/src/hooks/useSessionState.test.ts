@@ -1,10 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { getSessionState } from "./useSessionState";
+import { getSessionState, isSessionWorking } from "./useSessionState";
 import type { Conversation } from "@/hooks/useConversations";
 
-function conv(
-  partial: Partial<Pick<Conversation, "status" | "pending_elicitations_count">>,
-): Pick<Conversation, "status" | "pending_elicitations_count"> {
+type SessionFields = Pick<
+  Conversation,
+  "status" | "pending_elicitations_count" | "background_work_running" | "blocked_on"
+>;
+
+function conv(partial: Partial<SessionFields>): SessionFields {
   return partial;
 }
 
@@ -34,6 +37,50 @@ describe("getSessionState — priority composition", () => {
     expect(getSessionState(conv({ status: "idle" }))).toBeNull();
   });
 
+  it("shows a turn parked on a terminal prompt as awaiting, after web prompts", () => {
+    expect(getSessionState(conv({ status: "running", blocked_on: "dialog open" }))).toEqual({
+      kind: "awaiting",
+      count: 0,
+      terminalReason: "dialog open",
+    });
+    expect(
+      getSessionState(
+        conv({ status: "running", blocked_on: "permission prompt", pending_elicitations_count: 1 }),
+      ),
+    ).toEqual({ kind: "awaiting", count: 1 });
+    // A reason left on a session that is no longer running is not a prompt.
+    expect(getSessionState(conv({ status: "idle", blocked_on: "dialog open" }))).toBeNull();
+  });
+
+  it("shows an ended turn with a running background shell as working", () => {
+    expect(getSessionState(conv({ status: "idle", background_work_running: true }))).toEqual({
+      kind: "running",
+      background: true,
+    });
+    // A recovered runner that reports its shells shows them.
+    expect(
+      getSessionState(
+        conv({ status: "failed", background_work_running: true }),
+        "recovered_disconnect",
+      ),
+    ).toEqual({ kind: "running", background: true });
+  });
+
+  it("ranks prompts, turns, disconnects and errors ahead of background shells", () => {
+    const shells = { background_work_running: true };
+    expect(getSessionState(conv({ ...shells, pending_elicitations_count: 1 }))).toEqual({
+      kind: "awaiting",
+      count: 1,
+    });
+    expect(getSessionState(conv({ ...shells, status: "running" }))).toEqual({ kind: "running" });
+    expect(getSessionState(conv({ ...shells, status: "idle" }), "disconnected")).toEqual({
+      kind: "disconnected",
+    });
+    expect(getSessionState(conv({ ...shells, status: "idle" }), "error")).toEqual({
+      kind: "error",
+    });
+  });
+
   it("flags a latest-message error even when the session has settled to idle", () => {
     expect(getSessionState(conv({ status: "idle" }), "error")).toEqual({ kind: "error" });
   });
@@ -45,7 +92,7 @@ describe("getSessionState — priority composition", () => {
     ).toEqual({ kind: "awaiting", count: 1 });
   });
 
-  it("returns error from the existing failed session status", () => {
+  it("flags status-only failures without a latest-activity label", () => {
     expect(getSessionState(conv({ status: "failed" }))).toEqual({ kind: "error" });
   });
 
@@ -56,13 +103,13 @@ describe("getSessionState — priority composition", () => {
     expect(getSessionState(conv({ status: "failed" }), "recovered_disconnect")).toBeNull();
   });
 
-  it("follows status updates without retaining an old error", () => {
-    const conversation = conv({ status: "failed" });
-    expect(getSessionState(conversation)).toEqual({ kind: "error" });
+  it("follows status updates while the labelled error is kept", () => {
+    const conversation = conv({ status: "idle" });
+    expect(getSessionState(conversation, "error")).toEqual({ kind: "error" });
     conversation.status = "running";
-    expect(getSessionState(conversation)).toEqual({ kind: "running" });
+    expect(getSessionState(conversation, "error")).toEqual({ kind: "running" });
     conversation.status = "idle";
-    expect(getSessionState(conversation)).toBeNull();
+    expect(getSessionState(conversation, null)).toBeNull();
   });
 
   it("treats failed + pending elicitation as awaiting (the actionable signal)", () => {
@@ -88,5 +135,19 @@ describe("getSessionState — priority composition", () => {
   it("returns null when conversation status is undefined", () => {
     // Older sessions whose server payload predates the `status` field.
     expect(getSessionState(conv({}))).toBeNull();
+  });
+});
+
+describe("isSessionWorking", () => {
+  it.each([
+    [{ status: "running" }, true],
+    [{ status: "idle", pending_elicitations_count: 1 }, true],
+    [{ status: "idle", background_work_running: true }, true],
+    [{ status: "failed", background_work_running: true }, true],
+    [{ status: "idle", pending_elicitations_count: 0, background_work_running: false }, false],
+    [{ status: "failed" }, false],
+    [{}, false],
+  ] satisfies [SessionFields, boolean][])("%o -> %s", (fields, expected) => {
+    expect(isSessionWorking(conv(fields))).toBe(expected);
   });
 });

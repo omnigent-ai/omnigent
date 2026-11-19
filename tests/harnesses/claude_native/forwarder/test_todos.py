@@ -103,6 +103,8 @@ async def test_forwarder_posts_todos_on_task_created(tmp_path: Path) -> None:
 
     assert data["todos"] == [
         {
+            # Claude's task ID, so the server can tell a renamed task from a new one.
+            "id": "1",
             "content": "Write integration tests",
             "status": "pending",
             # activeForm equals content for native tasks (suppresses

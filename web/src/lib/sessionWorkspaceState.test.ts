@@ -1,8 +1,9 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   type SessionWorkspaceState,
   readSessionWorkspaceState,
   resetSessionWorkspaceTabSelections,
+  saveSessionWorkspaceState,
   unpinSessionWorkspaceTabs,
   writeSessionWorkspaceState,
 } from "./sessionWorkspaceState";
@@ -13,6 +14,7 @@ const STORAGE_KEY = "omnigent:session-workspace-state";
 const MAX_SESSIONS = 100;
 
 afterEach(() => {
+  vi.restoreAllMocks();
   localStorage.clear();
 });
 
@@ -159,6 +161,24 @@ describe("sessionWorkspaceState", () => {
     expect(stored).toEqual(Array.from({ length: 20 }, (_, i) => `browser:b${i + 5}`));
   });
 
+  it("caps the persisted sub-agent tabs at 20, keeping the most recent", () => {
+    const tabs = Array.from({ length: 25 }, (_, i) => `subagent:conv_${i}`);
+    writeSessionWorkspaceState("conv_parent", { openSubagentTabs: tabs });
+
+    expect(readSessionWorkspaceState("conv_parent").openSubagentTabs).toEqual(tabs.slice(5));
+  });
+
+  it("reports whether storage accepted a save", () => {
+    expect(saveSessionWorkspaceState("conv_a", { open: true })).toBe(true);
+
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("Quota exceeded", "QuotaExceededError");
+    });
+    expect(saveSessionWorkspaceState("conv_a", { open: false })).toBe(false);
+    expect(() => writeSessionWorkspaceState("conv_a", { open: false })).not.toThrow();
+    expect(readSessionWorkspaceState("conv_a")).toEqual({ open: true });
+  });
+
   it("prunes the least-recently-touched session past the cap (numeric ids)", () => {
     // Seed exactly MAX_SESSIONS sessions with purely numeric ids ("1".."100").
     // Numeric-string keys are the case a plain object store gets wrong: V8
@@ -200,5 +220,19 @@ describe("sessionWorkspaceState", () => {
       JSON.stringify([{ id: "conv_b", state: { open: true, widthPx: -5, rightRailTab: "bogus" } }]),
     );
     expect(readSessionWorkspaceState("conv_b")).toEqual({ open: true });
+
+    // Tab id lists keep each non-empty string once, in order.
+    localStorage.setItem(
+      STORAGE_KEY,
+      JSON.stringify([
+        {
+          id: "conv_c",
+          state: { openSubagentTabs: ["subagent:a", "", 7, "subagent:a", "subagent:b"] },
+        },
+      ]),
+    );
+    expect(readSessionWorkspaceState("conv_c")).toEqual({
+      openSubagentTabs: ["subagent:a", "subagent:b"],
+    });
   });
 });
