@@ -104,7 +104,7 @@ import { useFileMentionHarnesses } from "@/lib/agentLabels";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import {
   nativeShellHarness,
-  shellMentionRefusal,
+  shellSendRefusal,
   useComposerHighlight,
   usePublishComposerCommands,
 } from "@/components/composer/composerHighlight";
@@ -1252,7 +1252,7 @@ function SideChatComposer({
     }
     // A grid cell queues or steers its send while the session works; other full sessions wait.
     if ((busy && fullSession && !gridCell) || !canSend || agentId === null) return;
-    const refusal = shellMentionRefusal(highlight.kind, sendContext.mentions);
+    const refusal = shellSendRefusal(highlight.kind, sendContext);
     if (refusal !== null) {
       setCommandNotice(refusal);
       return;

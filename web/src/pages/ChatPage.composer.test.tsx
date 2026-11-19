@@ -1,9 +1,16 @@
 import { LEVEL_OWNER } from "@/lib/permissionsApi";
 import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
 import { formatLocalReviewComments } from "@/lib/localReviewComments";
-import { requestLocalReviewContext, updateLocalReviewContext } from "@/lib/localReviewContext";
+import {
+  clearLocalReviewContexts,
+  requestLocalReviewContext,
+  updateLocalReviewContext,
+} from "@/lib/localReviewContext";
 import { create } from "zustand";
-import { SHELL_MENTION_REFUSAL } from "@/components/composer/composerHighlight";
+import {
+  SHELL_MENTION_REFUSAL,
+  SHELL_REVIEW_COMMENT_REFUSAL,
+} from "@/components/composer/composerHighlight";
 import { SHIFT_KEY } from "@/components/KeyboardShortcut";
 import type { SkillSummary, SkillsStatus } from "@/lib/types";
 
@@ -5892,48 +5899,58 @@ describe("Composer native shell mode", () => {
     },
   );
 
-  it("classifies a bare `!` by the review context it sends with", () => {
-    useChatStore.setState({ sessionHarness: "codex-native" });
-    const props = composerProps({ isNativeWrapper: true, permissionLevel: null });
-    render(
-      <QueryClientProvider client={new QueryClient()}>
-        <Composer {...props} />
-      </QueryClientProvider>,
-    );
-    fireEvent.change(textarea(), { target: { value: "!" } });
-    expect(screen.queryByTestId("composer-shell-mode-indicator")).toBeNull();
+  it.each([
+    // The review context alone would make a bare `!` a command.
+    { draft: "!", shellBeforeReview: false },
+    { draft: "!git status", shellBeforeReview: true },
+  ])(
+    "refuses a `!` send of $draft that review context would reach the shell with",
+    ({ draft, shellBeforeReview }) => {
+      useChatStore.setState({ sessionHarness: "codex-native" });
+      const props = composerProps({ isNativeWrapper: true, permissionLevel: null });
+      render(
+        <QueryClientProvider client={new QueryClient()}>
+          <Composer {...props} />
+        </QueryClientProvider>,
+      );
+      fireEvent.change(textarea(), { target: { value: draft } });
+      expect(screen.queryByTestId("composer-shell-mode-indicator") !== null).toBe(
+        shellBeforeReview,
+      );
 
-    const comment = {
-      id: "shell-review",
-      conversation_id: "conv_shell",
-      path: "src/example.ts",
-      start_index: 0,
-      end_index: 0,
-      body: "Preserve the public API.",
-      status: "draft" as const,
-      created_at: 1,
-      updated_at: 1,
-      anchor_content: null,
-      created_by: null,
-      anchor_metadata: {
-        pr_url: "https://github.com/acme/repo/pull/1",
-        side: "RIGHT" as const,
-        line: 12,
-        start_line: null,
-        head_sha: "a".repeat(40),
-        base_sha: "b".repeat(40),
-      },
-    };
-    act(() => requestLocalReviewContext(comment));
-    expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
-    expect(screen.getByTestId("composer-highlight-overlay").textContent).toBe("!");
+      const comment = {
+        id: "shell-review",
+        conversation_id: "conv_shell",
+        path: "src/example.ts",
+        start_index: 0,
+        end_index: 0,
+        body: "Preserve the public API.",
+        status: "draft" as const,
+        created_at: 1,
+        updated_at: 1,
+        anchor_content: null,
+        created_by: null,
+        anchor_metadata: {
+          pr_url: "https://github.com/acme/repo/pull/1",
+          side: "RIGHT" as const,
+          line: 12,
+          start_line: null,
+          head_sha: "a".repeat(40),
+          base_sha: "b".repeat(40),
+        },
+      };
+      // A refused send keeps the context; drop it so later tests don't render its chips.
+      onTestFinished(() => clearLocalReviewContexts("conv_shell"));
+      act(() => requestLocalReviewContext(comment));
+      expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+      expect(screen.getByTestId("composer-highlight-overlay").textContent).toBe(draft);
 
-    fireEvent.keyDown(textarea(), { key: "Enter" });
-    expect(props.onSend).toHaveBeenCalledExactlyOnceWith(
-      `!\n\n${formatLocalReviewComments([comment], { includeInstruction: false })}`,
-      undefined,
-    );
-  });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(props.onSend).not.toHaveBeenCalled();
+      expect(screen.getByText(SHELL_REVIEW_COMMENT_REFUSAL)).toBeVisible();
+      expect(textarea()).toHaveValue(draft);
+    },
+  );
 });
 
 describe("Composer placeholder", () => {

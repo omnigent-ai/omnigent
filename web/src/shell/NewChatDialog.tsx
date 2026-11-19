@@ -75,7 +75,7 @@ import { useRequestedComposerEngine } from "@/components/composer/engine/compose
 import type { ComposerTextTarget } from "@/components/composer/engine/composerInput";
 import {
   SHELL_MENTION_REFUSAL,
-  shellMentionRefusal,
+  shellSendRefusal,
   useComposerHighlight,
 } from "@/components/composer/composerHighlight";
 import {
@@ -6251,7 +6251,7 @@ function NewChatLandingContent({
       composerInlineMentions(mentionedItems, mentionedSessions, selectedAgent?.harness ?? null),
       [message],
     );
-    const refusal = shellMentionRefusal(highlight.kind, liveMentions);
+    const refusal = shellSendRefusal(highlight.kind, { mentions: liveMentions });
     if (refusal !== null) {
       setCreateError(refusal);
       return;

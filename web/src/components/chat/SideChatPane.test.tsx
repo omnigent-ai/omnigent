@@ -23,8 +23,10 @@ import * as filesApi from "@/lib/filesApi";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { SESSION_MENTION_HINT } from "@/lib/composerMentions";
-import { SHELL_MENTION_REFUSAL } from "@/components/composer/composerHighlight";
-import { formatLocalReviewComments } from "@/lib/localReviewComments";
+import {
+  SHELL_MENTION_REFUSAL,
+  SHELL_REVIEW_COMMENT_REFUSAL,
+} from "@/components/composer/composerHighlight";
 import type { Comment } from "@/hooks/useComments";
 import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
 import { clearSessionDrafts, getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
@@ -1779,17 +1781,23 @@ describe("grid cell composer shares its session's draft", () => {
     expect(screen.getByTestId("side-chat-input")).toHaveValue(text);
   });
 
-  it("classifies a bare `!` by the review comments it sends with", () => {
-    bridgedCell({ text: "!", files: [], reviewComments: [reviewComment] });
+  // The review comments alone would make a bare `!` a command.
+  it.each(["!", "!git status"])(
+    "refuses a `!` send of %j that review comments would reach the shell with",
+    (text) => {
+      bridgedCell({ text, files: [], reviewComments: [reviewComment] });
 
-    expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
-    expect(screen.getByTestId("composer-highlight-overlay").textContent).toBe("!");
-    fireEvent.click(screen.getByTestId("side-chat-send"));
+      expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+      expect(screen.getByTestId("composer-highlight-overlay").textContent).toBe(text);
+      fireEvent.click(screen.getByTestId("side-chat-send"));
 
-    expect(send.mock.calls[0]?.[0]).toBe(
-      `!\n\n${formatLocalReviewComments([reviewComment], { includeInstruction: false })}`,
-    );
-  });
+      expect(send).not.toHaveBeenCalled();
+      expect(screen.getByTestId("side-chat-command-notice")).toHaveTextContent(
+        SHELL_REVIEW_COMMENT_REFUSAL,
+      );
+      expect(screen.getByTestId("side-chat-input")).toHaveValue(text);
+    },
+  );
 
   /** Fails a grid send of `sent` and mounts the cell, which restores it. */
   function failedGridSend(sent: string) {

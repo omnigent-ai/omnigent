@@ -45,7 +45,7 @@ import {
 } from "@/components/composer/ChatComposer";
 import {
   nativeShellHarness,
-  shellMentionRefusal,
+  shellSendRefusal,
   useComposerHighlight,
   usePublishComposerCommands,
 } from "@/components/composer/composerHighlight";
@@ -3931,7 +3931,7 @@ function ComposerImpl(
       hasPendingElicitation
     )
       return;
-    const refusal = shellMentionRefusal(highlight.kind, liveMentions);
+    const refusal = shellSendRefusal(highlight.kind, sendContext);
     if (refusal !== null) {
       setCommandError(refusal);
       return;

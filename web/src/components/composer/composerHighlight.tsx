@@ -97,23 +97,20 @@ export function nativeShellHarness(
 
 export const SHELL_MENTION_REFUSAL =
   "Shell commands can't include @mentions; remove them or drop the leading `!`.";
+export const SHELL_REVIEW_COMMENT_REFUSAL =
+  "Shell commands can't carry review comments; remove them or drop the leading `!`.";
 
-/**
- * Why a send must not go out, or null. A tag expands to an attachment marker,
- * which a shell command would receive as literal arguments.
- */
-export function shellMentionRefusal(
+/** Why a `!` send must not go out, or null: tags and review comments would reach the shell. */
+export function shellSendRefusal(
   kind: ComposerHighlight["kind"],
-  mentions: readonly unknown[],
+  context: { mentions: readonly unknown[]; reviewComments?: readonly unknown[] },
 ): string | null {
-  return kind === "shell" && mentions.length > 0 ? SHELL_MENTION_REFUSAL : null;
+  if (kind !== "shell") return null;
+  if (context.mentions.length > 0) return SHELL_MENTION_REFUSAL;
+  return (context.reviewComments?.length ?? 0) > 0 ? SHELL_REVIEW_COMMENT_REFUSAL : null;
 }
 
-/**
- * What the composer overlay tints in `value`. `nativeShell` is the harness
- * whose `!` rule applies when a `!command` from this viewer runs as a shell
- * command in the session, else null.
- */
+/** What the overlay tints in `value`; `nativeShell` names the harness whose `!` rule applies. */
 export function composerHighlightSplit(
   value: string,
   commands: Iterable<string>,
