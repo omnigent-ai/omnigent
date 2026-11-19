@@ -46,6 +46,9 @@ interface MarkdownNode {
 
 // Their text is already a link. Code and raw HTML carry a `value`, not text children.
 const LINK_NODE_TYPES = new Set(["link", "linkReference"]);
+// Inline raw HTML parses as separate tag and text siblings: `<a href>`, `#1234`, `</a>`.
+const HTML_ANCHOR_OPEN = /^<a[\s>]/i;
+const HTML_ANCHOR_CLOSE = /^<\/a\s*>/i;
 
 /** Remark plugin parking every pull request reference in a text node on a fragment link. */
 export function remarkPullRequestRefs() {
@@ -54,7 +57,14 @@ export function remarkPullRequestRefs() {
 
 function linkifyChildren(node: MarkdownNode): void {
   if (!node.children || LINK_NODE_TYPES.has(node.type)) return;
+  let openAnchors = 0;
   node.children = node.children.flatMap((child) => {
+    if (child.type === "html" && typeof child.value === "string") {
+      if (HTML_ANCHOR_OPEN.test(child.value)) openAnchors += 1;
+      else if (HTML_ANCHOR_CLOSE.test(child.value)) openAnchors = Math.max(0, openAnchors - 1);
+      return [child];
+    }
+    if (openAnchors > 0) return [child];
     if (child.type === "text" && typeof child.value === "string") {
       return splitPullRequestRefs(child.value);
     }
@@ -117,11 +127,7 @@ function isGitHubRepo(nameWithOwner: string): boolean {
   );
 }
 
-/**
- * The github.com repo whose numbers `nameWithOwner`'s references use, or null
- * to leave them as text. The repo itself here; a fork or mirror that shares
- * another repo's numbering would map to that repo.
- */
+/** The github.com repo whose numbers `nameWithOwner`'s references use; currently the repo itself. */
 function canonicalRepo(nameWithOwner: string): string | null {
   return nameWithOwner;
 }

@@ -130,6 +130,36 @@ describe("remarkPullRequestRefs", () => {
     expect(tree.children[0].children).toEqual(opaque);
   });
 
+  it("skips text inside an inline raw HTML anchor, whose tags parse as siblings", () => {
+    const anchored = [
+      { type: "text", value: "See " },
+      { type: "html", value: '<A href="https://example.com/raw">' },
+      { type: "text", value: "#2468 " },
+      { type: "emphasis", children: [{ type: "text", value: "#1357" }] },
+      { type: "html", value: "</a>" },
+    ];
+    const tree = {
+      type: "root",
+      children: [
+        {
+          type: "paragraph",
+          children: [...structuredClone(anchored), { type: "text", value: " then #4321" }],
+        },
+      ],
+    };
+    remarkPullRequestRefs()(tree);
+    expect(tree.children[0].children).toEqual([
+      ...anchored,
+      { type: "text", value: " then " },
+      {
+        type: "link",
+        url: "#omnigent-pr-4321",
+        title: null,
+        children: [{ type: "text", value: "#4321" }],
+      },
+    ]);
+  });
+
   it("links text nested in emphasis and headings", () => {
     const tree = {
       type: "root",
