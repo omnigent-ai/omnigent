@@ -867,3 +867,90 @@ async def test_project_rename_does_not_move_sessions_from_a_reused_old_name():
         f"/v1/projects/{PROJECT_ID}",
         f"/v1/sessions/{PARENT}",
     ]
+
+
+@pytest.mark.parametrize(
+    ("title", "stored_title"),
+    [
+        ("researcher:auth", f"researcher:auth:closed:{SUB_AGENT}"),
+        (
+            "Long " * 50,
+            ("Long " * 50)[: 200 - len(f":closed:{SUB_AGENT}")] + f":closed:{SUB_AGENT}",
+        ),
+        (None, None),
+    ],
+    ids=["named", "trimmed-to-200", "untitled"],
+)
+async def test_update_archives_and_closes_a_sub_agent_on_the_callers_runner(title, stored_title):
+    requests: list[httpx.Request] = []
+    # The caller's own child rides its runner; the server leaves that runner up.
+    snapshot = {
+        "id": SUB_AGENT,
+        "parent_session_id": SOURCE,
+        "runner_id": "runner-1",
+        "title": title,
+        "labels": {},
+    }
+    async with _client(_organize_server(requests, snapshot)) as client:
+        result = json.loads(
+            await execute_session_update(
+                {"session_id": SUB_AGENT, "archived": True}, client, SOURCE
+            )
+        )
+    assert result == {
+        "session_id": SUB_AGENT,
+        "status": "updated",
+        "archived": True,
+        "closed": True,
+    }
+    (patch,) = [r for r in requests if r.method == "PATCH"]
+    assert patch.url.path == f"/v1/sessions/{SUB_AGENT}"
+    assert patch.headers[ORCHESTRATION_SOURCE_HEADER] == SOURCE
+    expected = {"archived": True, "labels": {"omnigent.closed": "true"}}
+    if stored_title is not None:
+        expected["title"] = stored_title
+        assert len(stored_title) <= 200
+    assert json.loads(patch.content) == expected
+    assert not [r for r in requests if "include_live_status" in r.url.params]
+
+
+async def test_update_leaves_an_already_closed_sub_agent_unchanged():
+    requests: list[httpx.Request] = []
+    snapshot = {
+        "id": SUB_AGENT,
+        "parent_session_id": PARENT,
+        "title": "researcher:auth",
+        "archived": True,
+        "labels": {"omnigent.closed": "true"},
+    }
+    async with _client(_organize_server(requests, snapshot)) as client:
+        result = json.loads(
+            await execute_session_update(
+                {"session_id": SUB_AGENT, "archived": True}, client, SOURCE
+            )
+        )
+    assert result["status"] == "unchanged" and result["closed"] is True
+    assert not [r for r in requests if r.method == "PATCH"]
+
+
+@pytest.mark.parametrize(
+    ("session_id", "args", "error"),
+    [
+        (SUB_AGENT, {"title": "New"}, "archived: true is the only change"),
+        (SUB_AGENT, {"pinned": True}, "archived: true is the only change"),
+        (SUB_AGENT, {"archived": False}, "archived: true is the only change"),
+        (SUB_AGENT, {"archived": True, "title": "New"}, "archived: true is the only change"),
+        (SUB_AGENT, {"archived": True, "project": ""}, "follow their parent's project"),
+        (SOURCE, {"archived": True}, "a sub-agent session cannot archive itself"),
+    ],
+    ids=["rename", "pin", "restore", "archive-and-rename", "archive-and-unfile", "itself"],
+)
+async def test_update_only_archives_another_sub_agent(session_id, args, error):
+    requests: list[httpx.Request] = []
+    snapshot = {"id": session_id, "parent_session_id": PARENT, "title": "a:b", "labels": {}}
+    async with _client(_organize_server(requests, snapshot)) as client:
+        result = json.loads(
+            await execute_session_update({"session_id": session_id, **args}, client, SOURCE)
+        )
+    assert error in result["error"], result
+    assert not [r for r in requests if r.method != "GET"]

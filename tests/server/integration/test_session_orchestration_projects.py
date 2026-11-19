@@ -645,6 +645,78 @@ async def test_organizing_tools_rename_pin_archive_and_manage_projects(
 
 
 @_ONE_ENVIRONMENT
+async def test_the_tool_archives_sub_agents_in_any_of_the_owners_trees(
+    auth_client, peers, db_uri, monkeypatch
+):
+    source, target, _ = peers
+    store = SqlAlchemyConversationStore(db_uri)
+    # One sub-agent in another tree, and one of the caller's own on its runner.
+    other_tree_child = store.create_conversation(
+        agent_id=source["agent_id"], parent_conversation_id=target["id"], title="researcher:auth"
+    )
+    own_child = store.create_conversation(
+        agent_id=source["agent_id"], parent_conversation_id=source["id"], title="Worker"
+    )
+    runner_id = store.get_conversation(source["id"]).runner_id
+    assert runner_id and store.set_runner_id(own_child.id, runner_id)
+    stopped: list[str] = []
+
+    async def record_stop(session_id: str, _runner_router) -> bool:
+        stopped.append(session_id)
+        return True
+
+    monkeypatch.setattr(sessions_module, "_ARCHIVE_STOP_UNDO_GRACE_S", 0.0)
+    monkeypatch.setattr(orchestration, "_stop_session_via_runner", record_stop)
+    store.set_session_live_status(source["id"], "running")
+    for session_id in (source["id"], target["id"], other_tree_child.id, own_child.id):
+        monkeypatch.setitem(sessions_common._session_status_cache, session_id, "running")
+
+    for child in (other_tree_child, own_child):
+        result = await _project_tool(
+            auth_client, source, "sys_session_update", session_id=child.id, archived=True
+        )
+        assert result == {
+            "session_id": child.id,
+            "status": "updated",
+            "archived": True,
+            "closed": True,
+        }
+    await asyncio.gather(*list(orchestration._detached_stop_tasks))
+    # Only the archived sub-agents stop; their parents keep running.
+    assert sorted(stopped) == sorted([other_tree_child.id, own_child.id])
+    assert store.get_conversation(source["id"]).live_status == "running"
+    assert store.get_conversation(target["id"]).archived is not True
+    for child, title in ((other_tree_child, "researcher:auth"), (own_child, "Worker")):
+        saved = store.get_conversation(child.id)
+        assert saved.archived is True and saved.labels["omnigent.closed"] == "true"
+        assert saved.title == f"{title}:closed:{child.id}"
+        shown = (await auth_client.get(f"/v1/sessions/{child.id}")).json()
+        assert shown["title"] == title
+        # The parent can start a new sub-agent under the freed name.
+        store.create_conversation(
+            agent_id=source["agent_id"],
+            parent_conversation_id=saved.parent_conversation_id,
+            title=title,
+        )
+
+    renamed = await _project_tool(
+        auth_client, source, "sys_session_update", session_id=own_child.id, title="Renamed"
+    )
+    assert "archived: true is the only change" in renamed["error"], renamed
+    # A sub-agent still cannot archive the session it runs under.
+    refused = json.loads(
+        await execute_tool(
+            tool_name="sys_session_update",
+            arguments=json.dumps({"session_id": source["id"], "archived": True}),
+            server_client=auth_client,
+            conversation_id=own_child.id,
+        )
+    )
+    assert "archiving it would stop this session too" in refused["error"], refused
+    assert store.get_conversation(source["id"]).archived is not True
+
+
+@_ONE_ENVIRONMENT
 async def test_organizing_tools_refuse_a_source_shared_with_edit_access(
     auth_client, peers, db_uri
 ):
