@@ -159,6 +159,8 @@ async def _drive(
                 sandbox_provider_capabilities={"agent_sandbox": {"inference_models": True}},
             )
             await page.route("**/v1/info", lambda route: route.fulfill(json=info))
+            # No connected hosts, so the sandbox is the default.
+            await page.route("**/v1/hosts", lambda route: route.fulfill(json={"hosts": []}))
 
             async def models(route: Route) -> None:
                 catalog_requests.append(route.request.url)
