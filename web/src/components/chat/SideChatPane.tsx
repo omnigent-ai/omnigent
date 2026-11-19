@@ -1437,6 +1437,7 @@ function SideChatComposer({
           },
           placeholder: fullSession ? "Reply to this session..." : "Ask a side question...",
           rows: gridComposer ? 1 : undefined,
+          heightMode: quotes.length ? "unbounded" : "compact",
           disabled: !ready,
           "data-testid": "side-chat-input",
           onKeyDown: handleKeyDown,
