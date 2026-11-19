@@ -5794,6 +5794,17 @@ describe("Composer native shell mode", () => {
     },
   );
 
+  it("offers no shell mode until the permission level has loaded", () => {
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    const props = composerProps({ isNativeWrapper: true, permissionLevel: null });
+    const view = render(<Composer {...props} permissionPending />);
+    fireEvent.change(textarea(), { target: { value: "!git status" } });
+    expect(screen.queryByTestId("composer-shell-mode-indicator")).toBeNull();
+
+    view.rerender(<Composer {...props} permissionPending={false} />);
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+  });
+
   it.each([
     { label: "an unsupported harness", harness: "pi", permissionLevel: null },
     { label: "a codex-native non-owner", harness: "codex-native", permissionLevel: 2 },
