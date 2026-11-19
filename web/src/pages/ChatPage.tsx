@@ -74,6 +74,7 @@ import { hasPendingOwnElicitation, isPendingBlockingElicitation } from "@/lib/bl
 import { cn } from "@/lib/utils";
 import { isInlineRenameFocused } from "@/lib/inlineRename";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
+import { DesignOutboxStrip } from "@/components/BrowserPane/designTools/LazyDesignOutboxStrip";
 import {
   serverSwitcherHiddenForSurface,
   useSurfaceFrontmost,
@@ -4389,6 +4390,8 @@ function ComposerImpl(
           bottom corners when the surface below is at least as wide,
           otherwise page background shows and the tray floats detached. */}
       <div className={cn("mx-auto", COMPOSER_COLUMN_WIDTH)}>
+        {/* Design tool requests still on their way to this session. */}
+        <DesignOutboxStrip conversationId={conversationId} widthClassName="mx-3 w-auto" />
         {/* Queued messages — peeks above the workspace bar like the
             sub-agent tray. Lists follow-ups held while the agent is busy;
             drains FIFO on idle. Scope to this conversation so a queue held

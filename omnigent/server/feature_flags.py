@@ -37,7 +37,6 @@ class Feature(StrEnum):
     MCP_DISABLED_SERVERS_CLAUDE = "mcp_disabled_servers_claude"
     MCP_DISABLED_SERVERS_CODEX = "mcp_disabled_servers_codex"
     CANVAS = "canvas"
-    ARCA_SHUTDOWN_WARNINGS = "arca_shutdown_warnings"
     IMPORT_REVIEW = "import_review"
     SIDEBAR_GROUPING_UI = "sidebar_grouping_ui"
     CLAUDE_OSC_STATUS = "claude_osc_status"
@@ -210,13 +209,6 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Web Canvas page: sessions as draggable cards grouped by project",
         owner="web",
         review_by_release="0.15.0",
-    ),
-    FeatureDefinition(
-        feature=Feature.ARCA_SHUTDOWN_WARNINGS,
-        description="Weekday Arca shutdown warning in the web UI",
-        owner="web",
-        review_by_release="0.20.0",
-        frontend_visible=True,
     ),
     FeatureDefinition(
         feature=Feature.IMPORT_REVIEW,

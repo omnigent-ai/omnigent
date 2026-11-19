@@ -81,6 +81,7 @@ const { createBrowserViewRegistry } = require("./browserViewRegistry");
 const { registerBrowserTabsIpc } = require("./browserTabs");
 const { createBrowserViewBoundsController } = require("./browserViewBounds");
 const { goBack, goForward, registerBrowserIpc } = require("./browserIpc");
+const { isBrowserViewFocused, sharedDesignTools } = require("./designTools");
 const { arcaTarget, createArcaIdentityStore, isArcaAgentContext } = require("./arcaIdentity");
 const { createHostThisMachineChecker, SESSION_HOST_PROTOCOL } = require("./hostIdentity");
 const { isDeveloperModeEnabled } = require("./developer_mode");
@@ -2970,6 +2971,26 @@ function createWindow(targetUrl, opts = {}) {
     const state = windows.get(win);
     if (state) state.unresponsive = false;
   });
+  // A page's beforeunload objecting (unsaved changes) cancels a close or reload with no
+  // prompt unless main asks: ask, as a browser would.
+  win.webContents.on("will-prevent-unload", (event) => {
+    // Quitting has already stopped the server, so staying would leave a broken app.
+    if (quitConfirmation.isQuitting()) {
+      event.preventDefault();
+      return;
+    }
+    const choice = dialog.showMessageBoxSync(win, {
+      type: "question",
+      title: "Omnigent",
+      message: "Leave this page?",
+      detail: "Changes you made may not be saved.",
+      buttons: ["Leave", "Stay"],
+      defaultId: 0,
+      cancelId: 1,
+      noLink: true,
+    });
+    if (choice === 0) event.preventDefault();
+  });
   registerWorkspaceRootBounce(win.webContents, () => pinnedOrigin(win));
   // Show the return banner when the window navigates away from its server
   // (e.g. SSO) and stays away. The watch's on-away URL is the last committed
@@ -3018,7 +3039,11 @@ function createWindow(targetUrl, opts = {}) {
   // exception — an OAuth sign-in popup, whose callback needs window.opener
   // and the opener's localStorage — opens as a hardened child window.
   // Conditions in popupPolicy.js; hardening in hardenOauthPopup.
-  win.webContents.setWindowOpenHandler(({ url, disposition, features }) => {
+  win.webContents.setWindowOpenHandler(({ url, disposition, features, frameName }) => {
+    // A design tool's overlay: allowed only as about:blank, from the opening's owner, under
+    // the unclaimed frame name designTools.start issued. Null for any other open.
+    const designOverlay = sharedDesignTools().windowOpen(win, { url, frameName });
+    if (designOverlay) return designOverlay;
     const origin = pinnedOrigin(win);
     if (usesBrowserAuth(origin) && isDatabricksLoginUrl(url, origin)) {
       getDatabricksAuth().recover(win);
@@ -4524,6 +4549,7 @@ function createBrowserRegistryForWindow(win) {
     resolveProxy: (url, partition) => session.fromPartition(partition).resolveProxy(url),
     onSuppressionChange: (suppressed) => {
       if (suppressed) browserPermissionPrompt.dismiss(win);
+      sharedDesignTools().visibilityChanged(win);
     },
     allowsLocalhost: (context) => {
       if (context?.revoked || win.isDestroyed() || !pinnedOrigin(win)) return false;
@@ -4542,8 +4568,13 @@ function createBrowserRegistryForWindow(win) {
     attachToHost: (view) => {
       win.contentView.addChildView(view);
       reconnectOverlay.raise(win);
+      // A design tool's overlay goes back just above its page (below the reconnect overlay).
+      sharedDesignTools().viewAttached(win, view);
     },
-    detachFromHost: (view) => win.contentView.removeChildView(view),
+    detachFromHost: (view) => {
+      win.contentView.removeChildView(view);
+      sharedDesignTools().viewDetached(win, view);
+    },
     sendToRenderer: (channel, payload) => {
       if (channel === "browser-host-active-changed") browserPermissionPrompt.dismiss(win);
       try {
@@ -6173,7 +6204,7 @@ function sendDesktopCommand(win, command, extra = {}) {
 
 /**
  * The embedded browser view (by view ID) holding keyboard focus in `win`, or
- * null. Only the attached view can hold focus, so checking it is enough.
+ * null. Only the attached view (or its design tool's overlay) can hold focus.
  *
  * @param {BrowserWindow} win
  * @returns {string | null}
@@ -6183,7 +6214,7 @@ function focusedBrowserViewId(win) {
   const viewId = registry?.activeConversationId() ?? null;
   if (viewId === null) return null;
   try {
-    return registry.get(viewId)?.view.webContents.isFocused() ? viewId : null;
+    return isBrowserViewFocused(registry.get(viewId)) ? viewId : null;
   } catch {
     return null;
   }
