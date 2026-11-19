@@ -187,12 +187,18 @@ describe("browser permission popover", () => {
       kind: "security-key",
       origin: ORIGIN,
       cookieImport: true,
+      openInBrowser: true,
       getAnchorBounds: () => ({ x: 450, y: 64, width: 540, height: 600 }),
       signal: h.abort.signal,
     });
     h.windows[0].emit("ready-to-show");
     assert.equal(h.windows[0].visible, true);
-    assert.deepEqual(h.info(), { kind: "security-key", origin: ORIGIN, cookieImport: true });
+    assert.deepEqual(h.info(), {
+      kind: "security-key",
+      origin: ORIGIN,
+      cookieImport: true,
+      openInBrowser: true,
+    });
     assert.throws(() => h.choose("allow-once"), /Invalid permission choice/);
     h.choose("open-in-browser");
     assert.equal(await result, "open-in-browser");
@@ -238,6 +244,7 @@ describe("browser permission popover", () => {
       kind: "security-key",
       origin: "https://replacement.example",
       cookieImport: true,
+      openInBrowser: false,
     });
     assert.deepEqual(
       h.windows.map((popup) => popup.destroyed),
@@ -457,6 +464,7 @@ function pageHarness(info = { kind: "permission", origin: ORIGIN, reload: true }
     "origin",
     "reload",
     "cookie-hint",
+    "other-method-hint",
     "permission-choices",
     "security-key-choices",
     "close",
@@ -464,7 +472,13 @@ function pageHarness(info = { kind: "permission", origin: ORIGIN, reload: true }
   ]) {
     elements.set(id, {
       disabled: PAGE_BUTTONS.includes(id),
-      hidden: ["prompt", "reload", "cookie-hint", "security-key-choices"].includes(id),
+      hidden: [
+        "prompt",
+        "reload",
+        "cookie-hint",
+        "other-method-hint",
+        "security-key-choices",
+      ].includes(id),
       listeners: {},
       addEventListener(name, fn) {
         this.listeners[name] = fn;
@@ -518,7 +532,11 @@ describe("permission popover page", () => {
     ["once", "allow-once"],
     ["always", "always-allow"],
     ["deny", "deny"],
-    ["open-in-browser", "open-in-browser", { kind: "security-key", origin: ORIGIN }],
+    [
+      "open-in-browser",
+      "open-in-browser",
+      { kind: "security-key", origin: ORIGIN, openInBrowser: true },
+    ],
     ["close", "dismiss"],
   ]) {
     it(`maps ${id} to ${choice} and ignores repeated submissions`, async () => {
@@ -560,7 +578,7 @@ describe("permission popover page", () => {
       // oxlint-disable-next-line no-await-in-loop -- inspect the page before IPC settles.
       await tick();
       assert.equal(h.elements.get("prompt").hidden, true);
-      resolveInfo({ kind: "security-key", origin: ORIGIN, cookieImport });
+      resolveInfo({ kind: "security-key", origin: ORIGIN, cookieImport, openInBrowser: true });
       // oxlint-disable-next-line no-await-in-loop -- each page loads its info separately.
       await tick();
       assert.equal(h.elements.get("prompt").hidden, false);
@@ -575,9 +593,28 @@ describe("permission popover page", () => {
       assert.equal(h.elements.get("permission-choices").hidden, true);
       assert.equal(h.elements.get("security-key-choices").hidden, false);
       assert.equal(h.elements.get("cookie-hint").hidden, !cookieImport);
+      assert.equal(h.elements.get("other-method-hint").hidden, true);
       assert.equal(h.elements.get("reload").hidden, true);
       assert.equal(h.elements.get("close").focused, true);
     }
+  });
+
+  it("suggests another verification method when the page cannot move to a browser", async () => {
+    const html = fs.readFileSync(path.join(__dirname, "../browser-permission/index.html"), "utf8");
+    assert.match(html, /No security key\? Choose another verification method on the sign-in page/);
+    const h = pageHarness({
+      kind: "security-key",
+      origin: ORIGIN,
+      cookieImport: false,
+      openInBrowser: false,
+    });
+    await tick();
+    assert.equal(h.elements.get("prompt").hidden, false);
+    assert.equal(h.elements.get("heading").textContent, "Use your security key");
+    assert.equal(h.elements.get("security-key-choices").hidden, true);
+    assert.equal(h.elements.get("other-method-hint").hidden, false);
+    assert.equal(h.elements.get("cookie-hint").hidden, true);
+    assert.equal(h.elements.get("close").focused, true);
   });
 
   it("reports failed initialization without claiming the user dismissed it", async () => {

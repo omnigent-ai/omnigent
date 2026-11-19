@@ -11,15 +11,16 @@ function choose(choice) {
   void bridge.choose(choice).catch(() => {});
 }
 
-function showSecurityKey(cookieImport) {
+function showSecurityKey({ cookieImport, openInBrowser }) {
   document.title = "Security key";
   document.getElementById("close").ariaLabel = "Dismiss security key notice";
   document.getElementById("heading").textContent = "Use your security key";
   document.getElementById("description").textContent =
     "Insert your security key and touch it to continue. Built-in biometrics and passkeys saved on this device can't be used here.";
   document.getElementById("cookie-hint").hidden = !cookieImport;
+  document.getElementById("other-method-hint").hidden = openInBrowser;
   document.getElementById("permission-choices").hidden = true;
-  document.getElementById("security-key-choices").hidden = false;
+  document.getElementById("security-key-choices").hidden = !openInBrowser;
 }
 
 document.getElementById("once").addEventListener("click", () => choose("allow-once"));
@@ -35,10 +36,10 @@ document.addEventListener("keydown", (event) => {
 
 void bridge
   .getInfo()
-  .then(({ kind, origin, reload, cookieImport }) => {
-    document.getElementById("origin").textContent = origin;
-    document.getElementById("reload").hidden = !reload;
-    if (kind === "security-key") showSecurityKey(cookieImport);
+  .then((info) => {
+    document.getElementById("origin").textContent = info.origin;
+    document.getElementById("reload").hidden = !info.reload;
+    if (info.kind === "security-key") showSecurityKey(info);
     if (!submitted) {
       for (const button of document.querySelectorAll("footer button")) button.disabled = false;
       document.getElementById("prompt").hidden = false;

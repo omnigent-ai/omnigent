@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { PENDING_CHANNEL } = require("../src/browserSecurityKeyNotice");
 
 const PRELOAD = fs.readFileSync(path.join(__dirname, "../src/preload.js"), "utf8");
 
@@ -13,6 +14,7 @@ function loadPreload({ platform = "linux", fullScreen = false } = {}) {
   const invokes = [];
   const sends = [];
   const attributes = new Set();
+  const mainWorldScripts = [];
   let updateStatus = { state: "idle" };
   const ipcRenderer = {
     invoke: async (channel, args) => {
@@ -45,7 +47,10 @@ function loadPreload({ platform = "linux", fullScreen = false } = {}) {
     require: (specifier) => {
       assert.equal(specifier, "electron");
       return {
-        contextBridge: { exposeInMainWorld: (name, value) => exposed.set(name, value) },
+        contextBridge: {
+          exposeInMainWorld: (name, value) => exposed.set(name, value),
+          executeInMainWorld: (script) => mainWorldScripts.push(script),
+        },
         ipcRenderer,
         webFrame: { getZoomFactor: () => 1 },
         webUtils: { getPathForFile: (file) => file.path },
@@ -62,9 +67,34 @@ function loadPreload({ platform = "linux", fullScreen = false } = {}) {
     hasAttribute: (name) => attributes.has(name),
     hasListener: (channel) => listeners.has(channel),
     invokes,
+    mainWorldScripts,
     sends,
   };
 }
+
+describe("security-key request observer", () => {
+  it("installs the Browser pane's WebAuthn observer except on Windows", () => {
+    let paneObserver;
+    vm.runInNewContext(
+      fs.readFileSync(path.join(__dirname, "../src/browser_view_preload.js"), "utf8"),
+      {
+        require: () => ({
+          contextBridge: { executeInMainWorld: ({ func }) => (paneObserver = func) },
+          ipcRenderer: {},
+        }),
+      },
+    );
+    for (const platform of ["linux", "darwin"]) {
+      const h = loadPreload({ platform });
+      assert.equal(h.mainWorldScripts.length, 1);
+      const [{ func, args }] = h.mainWorldScripts;
+      assert.equal(String(func), String(paneObserver));
+      args[0](true);
+      assert.deepEqual(h.sends.at(-1), { channel: PENDING_CHANNEL, args: true });
+    }
+    assert.deepEqual(loadPreload({ platform: "win32" }).mainWorldScripts, []);
+  });
+});
 
 describe("macOS fullscreen titlebar bridge", () => {
   it("tracks native fullscreen state on initial load and shell events", async () => {

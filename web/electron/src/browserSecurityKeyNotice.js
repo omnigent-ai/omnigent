@@ -14,7 +14,7 @@ function pageOrigin(url) {
   }
 }
 
-/** Tell the user to use their security key while the pane's page waits on WebAuthn. */
+/** Tell the user to use their security key while the page waits on WebAuthn. */
 function attachSecurityKeyNotice(contents, { canPrompt, showPrompt, openExternal, cookieImport }) {
   let pending = false;
   let requestGeneration = 0;
@@ -52,7 +52,13 @@ function attachSecurityKeyNotice(contents, { canPrompt, showPrompt, openExternal
     shown = controller;
     void Promise.resolve()
       .then(() =>
-        showPrompt({ kind: "security-key", origin, cookieImport, signal: controller.signal }),
+        showPrompt({
+          kind: "security-key",
+          origin,
+          cookieImport,
+          openInBrowser: Boolean(openExternal),
+          signal: controller.signal,
+        }),
       )
       .then((choice) => {
         if (shown !== controller) return;
@@ -67,7 +73,7 @@ function attachSecurityKeyNotice(contents, { canPrompt, showPrompt, openExternal
         }
         if (!pending || contents.isDestroyed()) return;
         const url = contents.getURL();
-        if (choice !== "open-in-browser" || pageOrigin(url) !== origin) return;
+        if (choice !== "open-in-browser" || !openExternal || pageOrigin(url) !== origin) return;
         const launchGeneration = requestGeneration;
         // Retry only for the request that launched the system browser.
         return Promise.resolve()
