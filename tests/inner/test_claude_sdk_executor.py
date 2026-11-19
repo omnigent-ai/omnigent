@@ -3032,7 +3032,7 @@ class TestStreamEventStreaming(unittest.TestCase):
                     for message in _FakeSDK.messages:
                         yield message
 
-        async def _t(preset):
+        async def _t(preset, permission_mode="auto"):
             # Explicit ``sandbox=none`` so the test runs on any
             # platform. The default ``OSEnvSandboxSpec.type`` is
             # ``"linux_bwrap"``; without this override,
@@ -3041,6 +3041,7 @@ class TestStreamEventStreaming(unittest.TestCase):
             # sandbox behavior.
             executor = ClaudeSDKExecutor(
                 system_prompt_preset=preset,
+                permission_mode=permission_mode,
                 os_env=OSEnvSpec(
                     type="caller_process",
                     sandbox=OSEnvSandboxSpec(type="none"),
@@ -3064,7 +3065,6 @@ class TestStreamEventStreaming(unittest.TestCase):
             # OS operations route through sys_os_* MCP tools, not SDK
             # built-ins. Skill and ToolSearch do not widen OS access.
             self.assertEqual(captured_options["tools"], ["Skill", "ToolSearch"])
-            self.assertEqual(captured_options["allowed_tools"], ["mcp__omnigent"])
             self.assertIsInstance(events[-1], TurnComplete)
             prompt = captured_options["system_prompt"]
             if preset:
@@ -3077,6 +3077,13 @@ class TestStreamEventStreaming(unittest.TestCase):
         for preset in (None, "claude_code"):
             with self.subTest(preset=preset):
                 _run(_t(preset))
+                self.assertEqual(captured_options["allowed_tools"], ["mcp__omnigent"])
+
+        # Other permission modes pre-approve nothing, even with Omnigent tools present.
+        for permission_mode in ("default", "acceptEdits", "plan", "dontAsk"):
+            with self.subTest(permission_mode=permission_mode):
+                _run(_t(None, permission_mode))
+                self.assertEqual(captured_options["allowed_tools"], [])
 
         with self.assertRaisesRegex(ValueError, "system_prompt_preset"):
             ClaudeSDKExecutor(system_prompt_preset="unknown")
