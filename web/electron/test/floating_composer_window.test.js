@@ -171,7 +171,6 @@ test("focusing an Omnigent window hides visible panels and remembers where they 
   assert.equal(panel.visible, false);
   assert.equal(panel.destroyed, false);
   assert.deepEqual(frames()["https://a.example"], panel.bounds);
-  // It reopens where it was.
   controller.show("https://a.example");
   assert.deepEqual(panel.bounds, { x: 1600, y: 50, width: 700, height: 400 });
 });
@@ -346,11 +345,12 @@ test("an opening panel starts clear, comes on screen, then eases to fully opaque
     ...clock,
   });
   assert.deepEqual(order, ["show at 0"]);
+  for (let elapsed = 0; elapsed < 60; elapsed += 10) clock.advance(10);
+  // Eases out: well past halfway by the time half the duration has gone.
+  const halfway = panel.opacities.at(-1);
+  assert.ok(halfway > 0.8 && halfway < 1, `opacity at 60 ms: ${halfway}`);
   for (let step = 0; step < 20 && clock.pending() > 0; step += 1) clock.advance(10);
   assert.equal(panel.opacities.at(-1), 1);
-  // Eases out: well past halfway by the time half the duration has gone.
-  const halfway = panel.opacities[6];
-  assert.ok(halfway > 0.8 && halfway < 1, `halfway opacity ${halfway}`);
   assert.equal(clock.pending(), 0);
 });
 

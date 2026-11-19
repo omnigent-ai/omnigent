@@ -3717,18 +3717,23 @@ describe("CLI deep-link handoff", () => {
 describe("floating panel wiring", () => {
   const chord = "CommandOrControl+Shift+Space";
   const serverUrl = "https://host.example/ml/omnigents";
-  const announce = (h, version, url = h.webContents.getURL()) =>
+  /** The page's announcement, from its top frame unless `subframe` says otherwise. */
+  const announce = (h, version, { url = h.webContents.getURL(), subframe = false } = {}) => {
+    const frame = { url };
+    if (!subframe) h.webContents.mainFrame = frame;
     h.ipc.get("omnigent:floating-composer:announce")(
-      { sender: h.webContents, senderFrame: { url } },
+      { sender: h.webContents, senderFrame: frame },
       version,
     );
+  };
 
   it("holds ⇧⌘Space only while a main window's page supports the panel", (t) => {
     const h = loadNavigationHarness({ platform: "darwin" });
     t.after(h.cleanup);
     h.api.registerIpc();
     announce(h, 2);
-    announce(h, 1, "https://evil.example/");
+    announce(h, 1, { url: "https://evil.example/" });
+    announce(h, 1, { subframe: true });
     assert.equal(h.calls.globalShortcuts, undefined);
     announce(h, 1);
     assert.deepEqual(h.calls.globalShortcuts, [["register", chord]]);
@@ -3744,6 +3749,20 @@ describe("floating panel wiring", () => {
     const saved = fs.existsSync(h.settingsPath) ? fs.readFileSync(h.settingsPath, "utf8") : "";
     assert.doesNotMatch(saved, /floating_composer/);
   });
+
+  for (const [what, page] of [
+    ["another server on the same origin", "https://host.example/other/"],
+    ["the server's sign-in page", `${serverUrl}/login`],
+  ]) {
+    it(`takes no announcement from a window showing ${what}`, (t) => {
+      const h = loadNavigationHarness({ platform: "darwin" });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      h.setUrl(page);
+      announce(h, 1);
+      assert.equal(h.calls.globalShortcuts, undefined);
+    });
+  }
 
   it("lets go of ⇧⌘Space when the supporting page's renderer goes away", (t) => {
     const h = loadNavigationHarness({ platform: "darwin" });
@@ -3954,15 +3973,45 @@ describe("floating panel wiring", () => {
     t.after(h.cleanup);
     openPanel(h);
     const current = (server = serverUrl) => h.api.floatingComposerPanelIsCurrent(h.win, server);
-    h.setUrl(`${serverUrl}/compose/floating`);
+    h.setUrl(`${serverUrl}/compose/floating?draft=1`);
     assert.equal(current(), true);
     assert.equal(current("https://other.example"), false);
-    h.setUrl(`${serverUrl}/c/abc`);
-    assert.equal(current(), false);
+    for (const elsewhere of [
+      `${serverUrl}/c/abc`,
+      // The same page under another server's mount, or on another origin, isn't this panel's.
+      "https://host.example/other/compose/floating",
+      "https://evil.example/ml/omnigents/compose/floating",
+    ]) {
+      h.setUrl(elsewhere);
+      assert.equal(current(), false, elsewhere);
+    }
     h.setUrl(`${serverUrl}/compose/floating`);
     h.webContents.isCrashed = () => true;
     assert.equal(current(), false);
   });
+
+  for (const [event, args, what] of [
+    ["did-navigate", [], "a full navigation"],
+    ["did-navigate-in-page", [`${serverUrl}/c/abc`, true], "its own router"],
+  ]) {
+    it(`closes a panel that leaves its page by ${what}, and keeps one that stays`, async (t) => {
+      const h = loadNavigationHarness({ platform: "darwin" });
+      t.after(h.cleanup);
+      const panel = openPanel(h);
+      h.setUrl(`${serverUrl}/compose/floating`);
+      h.webContents.emitWith(event, {}, ...args);
+      await new Promise((resolve) => {
+        setTimeout(resolve, 5);
+      });
+      assert.equal(panel.destroyed, false);
+      h.setUrl(`${serverUrl}/c/abc`);
+      h.webContents.emitWith(event, {}, ...args);
+      await new Promise((resolve) => {
+        setTimeout(resolve, 5);
+      });
+      assert.equal(panel.destroyed, true);
+    });
+  }
 
   it("closes a panel instead of showing it the setup page", async (t) => {
     const h = loadNavigationHarness({ platform: "darwin" });

@@ -1,5 +1,7 @@
 "use strict";
 
+const { FLOATING_COMPOSER_PATH } = require("./floating_composer_window");
+
 /**
  * Which main-window documents can render the floating New Agent panel, and which server
  * ⇧⌘Space opens it for.
@@ -81,47 +83,40 @@ function mainWindowsByRecency(focusOrder, allMainWindows) {
 }
 
 /**
- * Whether `url` is a page of the server at `serverUrl`: the same origin, and at or under its
- * mount path, so another server mounted on the same origin doesn't count.
+ * Which page of the server at `serverUrl` a URL shows: its floating `"panel"`, its `"sign-in"`
+ * page (accounts `/login` or `/register`, or an OIDC `/auth/…` route), the rest of its `"app"`,
+ * or null for anything not under the server's mount: another server on the same origin,
+ * another site, or the bundled setup page. The one place main decides this.
  *
  * @param {string} url
- * @param {string} serverUrl
- * @returns {boolean}
+ * @param {string | null | undefined} serverUrl
+ * @returns {"panel" | "app" | "sign-in" | null}
  */
-function isPageOfServer(url, serverUrl) {
+function serverPageOf(url, serverUrl) {
+  if (!serverUrl) return null;
+  let page;
+  let server;
   try {
-    const page = new URL(url);
-    const server = new URL(serverUrl);
-    if (page.origin !== server.origin) return false;
-    const mount = server.pathname.replace(/\/+$/, "");
-    return mount === "" || page.pathname === mount || page.pathname.startsWith(`${mount}/`);
+    page = new URL(url);
+    server = new URL(serverUrl);
   } catch {
-    return false;
+    return null;
   }
-}
-
-/**
- * Whether `url` is the sign-in page of the server mounted at `serverUrl`: accounts `/login`
- * or `/register`, or an OIDC `/auth/…` route, under the mount.
- *
- * @param {string} url
- * @param {string | null} serverUrl
- */
-function isServerSignInPage(url, serverUrl) {
-  if (!serverUrl || !isPageOfServer(url, serverUrl)) return false;
-  try {
-    const mount = new URL(serverUrl).pathname.replace(/\/+$/, "");
-    const route = new URL(url).pathname.slice(mount.length) || "/";
-    return route === "/login" || route === "/register" || route.startsWith("/auth/");
-  } catch {
-    return false;
+  if (page.origin !== server.origin) return null;
+  // The mount as resolveServerPath joins routes onto it: the server's path, no trailing slash.
+  const mount = server.pathname.replace(/\/+$/, "");
+  if (mount !== "" && page.pathname !== mount && !page.pathname.startsWith(`${mount}/`)) {
+    return null;
   }
+  const route = page.pathname.slice(mount.length) || "/";
+  if (route === FLOATING_COMPOSER_PATH) return "panel";
+  if (route === "/login" || route === "/register" || route.startsWith("/auth/")) return "sign-in";
+  return "app";
 }
 
 module.exports = {
   createFloatingComposerSupport,
   floatingComposerTarget,
-  isPageOfServer,
-  isServerSignInPage,
   mainWindowsByRecency,
+  serverPageOf,
 };

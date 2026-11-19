@@ -59,7 +59,6 @@ test("moves a frame to another display by its fraction of free travel", () => {
     width: 620,
     height: 360,
   });
-  // Centre stays centre.
   const centre = centeredFrame(laptop.workArea);
   assert.deepEqual(
     translateFrame(centre, laptop.workArea, external.workArea),
@@ -97,11 +96,19 @@ test("a remembered frame shrinks to fit a smaller display", () => {
   assert.deepEqual(placed, { x: -800, y: 0, width: 800, height: 560 });
 });
 
-test("a frame left on an unplugged display reopens inside the pointer's display", () => {
-  const savedFrame = { x: 9000, y: 9000, width: 620, height: 360 };
-  const placed = placeFloatingComposer({ savedFrame, displays: [laptop], pointerDisplay: laptop });
-  assert.equal(displayShowingFrame(placed, [laptop])?.id, laptop.id);
-  assert.deepEqual(clampFrame(placed, laptop.workArea), placed);
+test("a frame left on an unplugged display keeps its size, centred on the pointer's display", () => {
+  for (const savedFrame of [
+    { x: 9000, y: 9000, width: 700, height: 400 },
+    { x: -9000, y: -9000, width: 700, height: 400 },
+  ]) {
+    const placed = placeFloatingComposer({
+      savedFrame,
+      displays: [laptop],
+      pointerDisplay: laptop,
+    });
+    assert.deepEqual(placed, { x: 406, y: 285, width: 700, height: 400 });
+    assert.equal(displayShowingFrame(placed, [laptop])?.id, laptop.id);
+  }
 });
 
 test("ignores a malformed remembered frame", () => {

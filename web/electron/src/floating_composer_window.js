@@ -169,6 +169,11 @@ function createFloatingComposerController(deps) {
     return false;
   }
 
+  function isPanel(win) {
+    for (const panel of panels.values()) if (panel === win) return true;
+    return false;
+  }
+
   function panelFor(serverUrl) {
     const existing = panels.get(serverUrl);
     if (existing && !existing.isDestroyed()) {
@@ -278,17 +283,14 @@ function createFloatingComposerController(deps) {
     },
 
     filePickerOpened(panel) {
-      if (this.isPanel(panel)) pickerOpen.add(panel);
+      if (isPanel(panel)) pickerOpen.add(panel);
     },
 
     filePickerClosed(panel) {
       pickerOpen.delete(panel);
     },
 
-    isPanel(win) {
-      for (const panel of panels.values()) if (panel === win) return true;
-      return false;
-    },
+    isPanel,
 
     /** The server a panel is bound to, set by main when it built the panel, never by its page. */
     serverUrlFor(win) {

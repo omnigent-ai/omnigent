@@ -523,8 +523,9 @@ describe("createGlobalShortcuts", () => {
     assert.deepEqual(s.pressed, { show: 1, floatingComposer: 0 });
   });
 
-  it("saves a chord while inactive without holding it", async () => {
-    const s = shortcuts({}, { active: { floatingComposer: () => false } });
+  it("saves a chord while inactive without holding it, and holds it once active", async () => {
+    let on = false;
+    const s = shortcuts({}, { active: { floatingComposer: () => on } });
     const result = await s.floatingComposer.set(
       { enabled: true, accelerator: "Alt+Shift+K" },
       async () => true,
@@ -535,6 +536,11 @@ describe("createGlobalShortcuts", () => {
       enabled: true,
       accelerator: "Alt+Shift+K",
     });
+    on = true;
+    s.floatingComposer.apply();
+    assert.deepEqual(s.registered(), ["Alt+Shift+K"]);
+    s.press("Alt+Shift+K");
+    assert.deepEqual(s.pressed, { show: 0, floatingComposer: 1 });
   });
 
   it("lets a shortcut the app doesn't build leave its default chord free", async () => {

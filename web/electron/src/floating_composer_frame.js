@@ -142,8 +142,8 @@ function translateFrame(frame, source, target) {
 
 /**
  * The frame to open the composer at, on the display under the pointer. A remembered frame on
- * that display keeps its place; one from another display is carried over proportionally; and
- * without one the composer opens centred.
+ * that display keeps its place; one from another display is carried over proportionally; one
+ * whose display is gone keeps its size, centred; and without one the composer opens centred.
  *
  * @param {{ savedFrame?: unknown, displays: DisplayLike[], pointerDisplay: DisplayLike }} options
  * @returns {Rect}
@@ -153,7 +153,12 @@ function placeFloatingComposer({ savedFrame, displays, pointerDisplay }) {
   const saved = isFiniteRect(savedFrame) ? savedFrame : null;
   if (saved === null) return centeredFrame(target);
   const savedDisplay = displayShowingFrame(saved, displays);
-  if (savedDisplay === null) return translateFrame(saved, target, target);
+  if (savedDisplay === null) {
+    // Its display is gone, so where it sat says nothing here: keep its size, centred.
+    const { width, height } = clampFrame({ ...saved, x: target.x, y: target.y }, target);
+    const x = target.x + (target.width - width) / 2;
+    return clampFrame({ x, y: target.y + (target.height - height) / 2, width, height }, target);
+  }
   if (savedDisplay.id === pointerDisplay.id) return clampFrame(saved, target);
   return translateFrame(saved, savedDisplay.workArea, target);
 }

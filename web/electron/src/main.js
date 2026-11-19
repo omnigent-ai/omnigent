@@ -140,9 +140,8 @@ const {
 const {
   createFloatingComposerSupport,
   floatingComposerTarget,
-  isPageOfServer,
-  isServerSignInPage,
   mainWindowsByRecency,
+  serverPageOf,
 } = require("./floating_composer_support");
 const {
   registerDesktopCommandStateReset,
@@ -1837,10 +1836,17 @@ function floatingComposer() {
         path: FLOATING_COMPOSER_PATH,
         windowOptions: floatingComposerWindowOptions(),
       });
-      // A link the page didn't route itself must not turn the panel into an app window.
+      // Leaving its page, by a link, a redirect or its own router, must not turn the floating
+      // panel into an app window or a sign-in page; it closes, and the next open rebuilds it.
+      // Deferred, so a panel isn't destroyed inside its own navigation event.
+      const leaveIfNotCurrent = () =>
+        setTimeout(() => {
+          if (floatingComposerPanelIsCurrent(panel, serverUrl)) return;
+          floatingComposerController?.closePanels((candidate) => candidate === serverUrl);
+        }, 0);
+      panel.webContents.on("did-navigate", leaveIfNotCurrent);
       panel.webContents.on("did-navigate-in-page", (_event, _url, isMainFrame) => {
-        if (isMainFrame === false || floatingComposerPanelIsCurrent(panel, serverUrl)) return;
-        floatingComposerController?.closePanels((candidate) => candidate === serverUrl);
+        if (isMainFrame !== false) leaveIfNotCurrent();
       });
       return panel;
     },
@@ -1865,13 +1871,7 @@ function floatingComposer() {
 function floatingComposerPanelIsCurrent(panel, serverUrl) {
   if (panel.isDestroyed() || panel.webContents.isCrashed()) return false;
   if (windows.get(panel)?.serverUrl !== serverUrl) return false;
-  const url = panel.webContents.getURL();
-  if (url === "") return true;
-  try {
-    return new URL(url).pathname.endsWith(FLOATING_COMPOSER_PATH);
-  } catch {
-    return false;
-  }
+  return panel.webContents.getURL() === "" || serverPageShown(panel) === "panel";
 }
 
 /** Whether `win`'s current document announced support for its own server. */
@@ -1905,17 +1905,14 @@ function openFloatingComposerFromShortcut() {
 }
 
 /**
- * What a main window shows of its own server now: its `"app"`, its `"sign-in"` page, or null
- * for anything else, such as the setup page or another site.
+ * Which page of its own server a window's top document shows now (see serverPageOf).
  *
  * @param {BrowserWindow} win
- * @returns {"app" | "sign-in" | null}
+ * @returns {"panel" | "app" | "sign-in" | null}
  */
 function serverPageShown(win) {
-  const serverUrl = windows.get(win)?.serverUrl;
-  const url = win.isDestroyed() ? "" : win.webContents.getURL();
-  if (!serverUrl || !isPageOfServer(url, serverUrl)) return null;
-  return isServerSignInPage(url, serverUrl) ? "sign-in" : "app";
+  if (win.isDestroyed()) return null;
+  return serverPageOf(win.webContents.getURL(), windows.get(win)?.serverUrl);
 }
 
 /**
@@ -5236,8 +5233,9 @@ function registerIpc() {
   ipcMain.on("omnigent:floating-composer:announce", (event, version) => {
     const win = BrowserWindow.fromWebContents(event.sender);
     if (!isPinnedOriginSender(event) || !isMainWindow(win) || version !== 1) return;
-    const serverUrl = windows.get(win)?.serverUrl;
-    if (!serverUrl) return;
+    // Only the window's top document, showing its own server's app, speaks for that server.
+    if (event.senderFrame !== event.sender.mainFrame || serverPageShown(win) !== "app") return;
+    const serverUrl = windows.get(win).serverUrl;
     const contents = win.webContents;
     const hadSupport = floatingComposerSupport.any();
     if (!floatingComposerSupport.announce(contents.id, serverUrl)) return;
@@ -5282,15 +5280,14 @@ function registerIpc() {
     if (openPath === null) return { ok: false, error: "bad-path" };
     // Bound by main when it built the panel; never taken from the page.
     const serverUrl = floatingComposerController.serverUrlFor(panel);
-    const sameServer = mainWindowsByRecency(mainWindowFocusOrder, mainWindows()).filter(
-      (win) => windows.get(win)?.serverUrl === serverUrl,
+    // Only a window showing its server's app hears the route, not one on setup or sign-in.
+    const target = mainWindowsByRecency(mainWindowFocusOrder, mainWindows()).find(
+      (win) => windows.get(win)?.serverUrl === serverUrl && serverPageShown(win) === "app",
     );
     // A window still connecting would drop the route when its page loads; the panel stays.
-    if (sameServer[0] && connectionAttempts.get(sameServer[0])?.pending === true) {
+    if (target && connectionAttempts.get(target)?.pending === true) {
       return { ok: false, error: "window-loading" };
     }
-    // Only a window showing its server's app hears the route, not one on setup or sign-in.
-    const target = sameServer.find((win) => serverPageShown(win) === "app");
     if (target) {
       sendOpenPath(target, openPath);
       // A linked page comes forward; a launched session waits behind the app the user is in.

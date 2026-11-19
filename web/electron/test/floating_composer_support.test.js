@@ -4,8 +4,8 @@ const assert = require("node:assert/strict");
 const {
   createFloatingComposerSupport,
   floatingComposerTarget,
-  isServerSignInPage,
   mainWindowsByRecency,
+  serverPageOf,
 } = require("../src/floating_composer_support");
 
 test("support belongs to one document of one server", () => {
@@ -75,19 +75,40 @@ test("windows by recency: focused ones first, then the rest in creation order", 
   assert.deepEqual(mainWindowsByRecency(["B", "gone"], ["A", "B", "C"]), ["B", "A", "C"]);
 });
 
-test("a sign-in page is the server's own login, register or OIDC route, under its mount", () => {
+test("names which page of its server a URL shows, under the server's mount only", () => {
   const server = "https://host.example/ml/omnigents";
-  assert.equal(isServerSignInPage(`${server}/login`, server), true);
-  assert.equal(isServerSignInPage(`${server}/register?next=/`, server), true);
-  assert.equal(isServerSignInPage(`${server}/auth/login`, server), true);
-  assert.equal(isServerSignInPage(`${server}/login`, `${server}/`), true);
-  assert.equal(isServerSignInPage("https://host.example/login", "https://host.example"), true);
-  assert.equal(isServerSignInPage(`${server}/c/abc`, server), false);
-  assert.equal(isServerSignInPage(`${server}/loginx`, server), false);
-  // Another mount on the same origin, or a longer one sharing its prefix, isn't this server.
-  assert.equal(isServerSignInPage("https://host.example/ml/other/login", server), false);
-  assert.equal(isServerSignInPage("https://host.example/ml/omnigentsx/login", server), false);
-  assert.equal(isServerSignInPage("https://other.example/ml/omnigents/login", server), false);
-  assert.equal(isServerSignInPage(`${server}/login`, null), false);
-  assert.equal(isServerSignInPage("not a url", server), false);
+  const cases = [
+    [`${server}/compose/floating`, "panel"],
+    [`${server}/compose/floating?draft=1#top`, "panel"],
+    [`${server}/login`, "sign-in"],
+    [`${server}/register?next=/`, "sign-in"],
+    [`${server}/auth/callback`, "sign-in"],
+    [`${server}`, "app"],
+    [`${server}/`, "app"],
+    [`${server}/c/abc`, "app"],
+    [`${server}/loginx`, "app"],
+    [`${server}/compose/floating/extra`, "app"],
+    [`${server}/c/compose/floating`, "app"],
+    // Another server on the same origin, even with a matching suffix, or a longer mount.
+    ["https://host.example/ml/other/compose/floating", null],
+    ["https://host.example/ml/omnigentsx/compose/floating", null],
+    ["https://host.example/compose/floating", null],
+    ["https://host.example/login", null],
+    // Another origin, the setup page, or no URL at all.
+    ["https://other.example/ml/omnigents/compose/floating", null],
+    ["http://host.example/ml/omnigents/compose/floating", null],
+    ["file:///app/setup/index.html", null],
+    ["", null],
+    ["not a url", null],
+  ];
+  for (const [url, page] of cases) assert.equal(serverPageOf(url, server), page, url);
+  // A trailing slash on the server is the same mount; a server at the root owns every path.
+  assert.equal(serverPageOf(`${server}/compose/floating`, `${server}/`), "panel");
+  assert.equal(
+    serverPageOf("https://host.example/compose/floating", "https://host.example"),
+    "panel",
+  );
+  assert.equal(serverPageOf("https://host.example/x/login", "https://host.example/"), "app");
+  assert.equal(serverPageOf("https://host.example/login", "https://host.example/"), "sign-in");
+  assert.equal(serverPageOf(`${server}/login`, null), null);
 });
