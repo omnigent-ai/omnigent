@@ -59,19 +59,18 @@ runs' sessions in their own Omnigent Automation folder.
   moving on by itself past a page that came back empty. Empty: No automations
   are shared with you yet.
 - `clone`: on a server advertising `scheduled_task_clone` (which needs
-  `automations_v2`), Clone on an
-  automation's page (left of Edit) and in its row's ⋯ and right-click menus makes
-  a new automation named after it with (copy), with its settings and schedule
-  (on the same days for an every-other-day rule) and none of its runs, and opens
-  it. The copy has its own ID, so it can be shared
-  where the original can't. A continue-session automation's copy starts its own
+  `automations_v2`), Clone in an automation's row ⋯ and right-click menus makes a
+  new automation named after it with (copy), with its settings and schedule (on
+  the same days for an every-other-day rule) and none of its runs, and opens it.
+  The automation's page has no Clone. The copy has its own ID, so it can be
+  shared where the original can't. A continue-session automation's copy starts its own
   session on its first run. The copy is paused when the original is (toast: The
   copy is paused like the original.). A copy of a finite schedule with no runs
   left says so (Its schedule has no runs left.); otherwise the toast says to pause
   or delete the original so they don't both run. A refused clone shows the
   server's reason in a toast and stays put.
 - `read-only-view`: on those cards' ⋯ and right-click menus and on the
-  automation's page, Run now, Edit, Share, Clone, Pause/Resume and Delete are visible
+  automation's page, Run now, Edit, Share, Clone (menus only), Pause/Resume and Delete are visible
   but disabled, each with a tooltip such as Only the automation's owner can edit
   it. The page shows Shared by and the owner under the title. Its run history
   lists every run's time, outcome and error code, and a run opens its session
@@ -100,9 +99,8 @@ runs' sessions in their own Omnigent Automation folder.
   then the Share button left of Edit in the header.
 - **Automations list:** open an owned automation's ⋯ menu, or right-click its
   card, then choose Share. The dialog opens over the list.
-- **Clone:** on an automation you own, the Clone button left of Edit on its
-  detail page, or Clone in its card's ⋯ and right-click menus. The copy's page
-  opens.
+- **Clone:** open an owned automation's ⋯ menu on the Automations list, or
+  right-click its card, then choose Clone. The copy's page opens.
 - **Session share dialog:** open Share on the session a shared continue-session
   automation created on its first run, then follow the automation's name in the
   warning. The automation's page opens with its share dialog; closing it replaces
@@ -131,7 +129,7 @@ uses, because the session Share button is disabled on a local server.
 - **Every sub-feature (component tests):**
   `web/src/components/PermissionsModal.test.tsx` (sharing an automation; a grants
   list that fails to load; a session an automation manages),
-  `web/src/pages/TaskDetailPage.test.tsx` (sharing; cloning),
+  `web/src/pages/TaskDetailPage.test.tsx` (sharing),
   `web/src/pages/TasksPage.test.tsx` (sharing from the row menu; cloning from the
   row menu),
   `web/src/components/scheduled/ScheduledTaskRow.test.tsx`,

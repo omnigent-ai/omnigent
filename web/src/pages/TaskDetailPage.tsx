@@ -20,7 +20,6 @@ import {
   CalendarOffIcon,
   ChevronDownIcon,
   ChevronLeftIcon,
-  CopyIcon,
   Loader2Icon,
   PencilIcon,
   PlayIcon,
@@ -63,7 +62,6 @@ import {
 import { planRunButtonState, planRunControl } from "@/shell/PlanRunButton";
 import { WorkflowGraphOverlay } from "@/components/workflows/WorkflowStepsGraph";
 import {
-  useCloneScheduledTask,
   useDeleteScheduledTask,
   useRunScheduledTaskNow,
   useScheduledTask,
@@ -102,11 +100,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AUTOMATION_SHARE_PARAM } from "@/lib/automationFromSession";
 import { isFeatureEnabled, sandboxOptionLabel } from "@/lib/capabilities";
 import { automationShareDisabledReason, canShareAutomation } from "@/lib/permissionsApi";
-import {
-  cloneCreatedMessage,
-  cloneFailedMessage,
-  ScheduledTaskApiError,
-} from "@/lib/scheduledTasksApi";
+import { ScheduledTaskApiError } from "@/lib/scheduledTasksApi";
 import type {
   ScheduledTaskRun,
   ScheduledTaskRunPullRequest,
@@ -173,7 +167,6 @@ function TaskDetail({ taskId }: { taskId: string }) {
   const updateMutation = useUpdateScheduledTask();
   const deleteMutation = useDeleteScheduledTask();
   const runNowMutation = useRunScheduledTaskNow();
-  const cloneMutation = useCloneScheduledTask();
 
   const [editOpen, setEditOpen] = useState(false);
   const viewerId = useViewerId();
@@ -380,12 +373,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
   const nextRun = formatNextRunAt(task.nextRunAt, now);
   // A single per-task busy flag: the header actions disable while any of this
   // task's mutations are in flight.
-  const busy =
-    updateMutation.isPending ||
-    deleteMutation.isPending ||
-    runNowMutation.isPending ||
-    cloneMutation.isPending;
-  const cloneAvailable = info !== "loading" && info.scheduled_task_clone === true;
+  const busy = updateMutation.isPending || deleteMutation.isPending || runNowMutation.isPending;
 
   function handlePauseToggle() {
     updateMutation.mutate({
@@ -442,16 +430,6 @@ function TaskDetail({ taskId }: { taskId: string }) {
         { replace: true },
       );
     }
-  }
-
-  function handleClone() {
-    cloneMutation.mutate(task!.id, {
-      onSuccess: (clone) => {
-        showToast(cloneCreatedMessage(clone));
-        navigate(`/tasks/${encodeURIComponent(clone.id)}`);
-      },
-      onError: (err) => showToast(cloneFailedMessage(err)),
-    });
   }
 
   function handleDelete() {
@@ -530,24 +508,6 @@ function TaskDetail({ taskId }: { taskId: string }) {
                 <ShareIcon className="size-4" />
               </Button>
             ))
-          )}
-          {cloneAvailable && (
-            <OwnerOnly
-              readOnly={readOnly}
-              label="Clone automation"
-              reason={OWNER_ONLY_REASONS.clone}
-            >
-              <Button
-                variant="ghost"
-                size="icon-sm"
-                aria-label="Clone automation"
-                data-testid="task-detail-clone"
-                disabled={busy || readOnly}
-                onClick={handleClone}
-              >
-                <CopyIcon className="size-4" />
-              </Button>
-            </OwnerOnly>
           )}
           <OwnerOnly readOnly={readOnly} label="Edit automation" reason={OWNER_ONLY_REASONS.edit}>
             <Button

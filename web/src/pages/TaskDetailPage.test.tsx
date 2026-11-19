@@ -68,7 +68,6 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
   useUpdateScheduledTask: vi.fn(),
   useDeleteScheduledTask: vi.fn(),
   useRunScheduledTaskNow: vi.fn(),
-  useCloneScheduledTask: vi.fn(),
 }));
 vi.mock("@/hooks/useSidebarData", async (importOriginal) => ({
   ...(await importOriginal<typeof SidebarDataModule>()),
@@ -247,7 +246,6 @@ function run(overrides: Partial<ScheduledTaskRun> = {}): ScheduledTaskRun {
 const updateMutate = vi.fn();
 const deleteMutate = vi.fn();
 const runNowMutate = vi.fn();
-const cloneMutate = vi.fn();
 
 const refetchTask = vi.fn();
 function setTask(
@@ -285,7 +283,6 @@ beforeEach(() => {
   updateMutate.mockReset();
   deleteMutate.mockReset();
   runNowMutate.mockReset();
-  cloneMutate.mockReset();
   showToast.mockReset();
   resetReadStateForTests();
   seedRunUnreadBaseline.mockReset();
@@ -301,10 +298,6 @@ beforeEach(() => {
     mutate: runNowMutate,
     isPending: false,
   } as unknown as ReturnType<typeof hooks.useRunScheduledTaskNow>);
-  vi.mocked(hooks.useCloneScheduledTask).mockReturnValue({
-    mutate: cloneMutate,
-    isPending: false,
-  } as unknown as ReturnType<typeof hooks.useCloneScheduledTask>);
   setRuns([]);
 });
 
@@ -1041,72 +1034,6 @@ describe("sharing", () => {
     expect(await screen.findByRole("tooltip")).toHaveTextContent(reason);
     fireEvent.click(share);
     expect(screen.queryByTestId("share-dialog-open")).toBeNull();
-  });
-});
-
-describe("cloning", () => {
-  const cloneInfo: ServerInfo = { ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_clone: true };
-  interface CloneOptions {
-    onSuccess?: (clone: ScheduledTask) => void;
-    onError?: (e: unknown) => void;
-  }
-
-  function renderClonePage(info: ServerInfo, data: ScheduledTask = task()) {
-    setTask(data);
-    render(<CapabilitiesProvider info={info}>{pageTree()}</CapabilitiesProvider>);
-  }
-
-  it("offers Clone only on a server that can clone", () => {
-    renderClonePage(SERVER_INFO_OFFLINE_FALLBACK);
-    expect(screen.queryByTestId("task-detail-clone")).toBeNull();
-    cleanup();
-    renderClonePage(cloneInfo);
-    expect(screen.getByTestId("task-detail-clone")).toBeEnabled();
-  });
-
-  it("opens the copy and says what's left", () => {
-    cloneMutate.mockImplementation((_id: string, opts?: CloneOptions) =>
-      opts?.onSuccess?.(task({ id: "st 2", state: "paused" })),
-    );
-    renderClonePage(cloneInfo, task({ state: "paused" }));
-
-    fireEvent.click(screen.getByRole("button", { name: "Clone automation" }));
-
-    expect(cloneMutate).toHaveBeenCalledWith("st_1", expect.anything());
-    expect(showToast).toHaveBeenCalledWith(
-      "Automation cloned. The copy is paused like the original.",
-    );
-    expect(navigate).toHaveBeenCalledWith("/tasks/st%202");
-  });
-
-  it("shows the server's reason when the clone is refused", () => {
-    cloneMutate.mockImplementation((_id: string, opts?: CloneOptions) =>
-      opts?.onError?.(new ScheduledTaskApiError("The agent is gone", 400, "invalid_input")),
-    );
-    renderClonePage(cloneInfo);
-
-    fireEvent.click(screen.getByRole("button", { name: "Clone automation" }));
-
-    expect(showToast).toHaveBeenCalledWith("Couldn't clone the automation: The agent is gone");
-    expect(navigate).not.toHaveBeenCalled();
-  });
-
-  it("disables Clone for someone the automation is shared with", () => {
-    vi.mocked(useViewerId).mockReturnValue("bob@example.com");
-    renderClonePage(
-      cloneInfo,
-      task({ ownerUserId: "alice@example.com", viewerRole: "viewer", ownerDisplayName: "Alice" }),
-    );
-    const wrapper = screen.getByRole("group", { name: "Clone automation" });
-    expect(wrapper).toHaveAttribute("aria-disabled", "true");
-    const clone = within(wrapper).getByRole("button");
-    expect(clone).toBeDisabled();
-    fireEvent.click(clone);
-    expect(cloneMutate).not.toHaveBeenCalled();
-    fireEvent.focus(wrapper);
-    expect(screen.getByRole("tooltip")).toHaveTextContent(
-      "Only the automation's owner can clone it.",
-    );
   });
 });
 
