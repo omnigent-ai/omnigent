@@ -28,6 +28,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query, Request
+from starlette.datastructures import State
 
 from omnigent.entities import Conversation
 from omnigent.entities.session_journal import JournalEntry
@@ -248,10 +249,18 @@ def _sandbox_launching(session: Conversation) -> bool:
     return session.labels.get(STARTUP_LABEL) == "pending"
 
 
+def workflows_enabled(app_state: State | None) -> bool:
+    """Whether the server whose ``app.state`` this is enables workflows.
+
+    :param app_state: The server's ``app.state``; ``None`` reads the default flags.
+    """
+    flags = getattr(app_state, "feature_flags", FeatureFlags())
+    return flags.enabled(Feature.WORKFLOWS)
+
+
 def require_workflows(request: Request) -> None:
     """Reject workflow and journal requests unless the server enables workflows."""
-    flags = getattr(request.app.state, "feature_flags", FeatureFlags())
-    if not flags.enabled(Feature.WORKFLOWS):
+    if not workflows_enabled(request.app.state):
         raise OmnigentError("Workflows are disabled on this server", code=ErrorCode.NOT_FOUND)
 
 
