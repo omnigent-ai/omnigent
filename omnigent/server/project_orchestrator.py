@@ -8,14 +8,14 @@ from typing import Any
 
 from fastapi import Request
 
-from omnigent.entities import Project
+from omnigent.entities import MessageData, NewConversationItem, Project
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.native.native_coding_agents import NATIVE_CODING_AGENTS
 from omnigent.server.auth import RESERVED_USER_LOCAL
 from omnigent.server.proactive_agent import PROACTIVE_AGENT_NAME
 from omnigent.server.routes._session_create_validation import _authorize_host_for_workspace
 from omnigent.server.routes._workspace_validation import WorkspaceValidationError, _ask_host_stat
-from omnigent.stores import AgentStore
+from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.project_store import ProjectStore
 
 ProjectSessionBinder = Callable[[str], Awaitable[None]]
@@ -30,6 +30,7 @@ async def ensure_project_orchestrator(
     project: Project,
     *,
     projects: ProjectStore,
+    conversations: ConversationStore,
     agents: AgentStore | None,
     create_session: ProjectSessionCreator | None,
     delete_session: ProjectSessionDeleter | None,
@@ -127,6 +128,28 @@ async def ensure_project_orchestrator(
         result = await asyncio.to_thread(
             projects.set_orchestrator, project.id, created_id, user_id=project.user_id
         )
+        if result.orchestrator_session_id == created_id:
+            # Seed history before launch without dispatching an agent turn.
+            await asyncio.to_thread(
+                conversations.append,
+                created_id,
+                [
+                    NewConversationItem(
+                        type="message",
+                        response_id="seed",
+                        data=MessageData(
+                            role="assistant",
+                            agent="orchestrator",
+                            content=[
+                                {
+                                    "type": "output_text",
+                                    "text": "Hello, what would you like to work on?",
+                                }
+                            ],
+                        ),
+                    )
+                ],
+            )
 
     try:
         await create_session(request, project.user_id, payload, bind_before_launch)

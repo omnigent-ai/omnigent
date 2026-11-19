@@ -90,6 +90,7 @@ def create_projects_router(
             request,
             project,
             projects=project_store,
+            conversations=conversation_store,
             agents=agent_store,
             create_session=create_session,
             delete_session=delete_session,

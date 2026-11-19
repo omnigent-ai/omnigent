@@ -4,6 +4,7 @@ from uuid import uuid4
 
 import pytest
 
+from omnigent.entities import MessageData
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     HostHelloFrame,
@@ -39,9 +40,20 @@ async def test_project_creation_has_one_normal_orchestrator(project_client, db_u
     assert session["title"] == "Orchestrator"
     assert session["project_id"] == project["id"]
     assert session["project_orchestrator"] is True
+    assert session["status"] == "idle"
+    assert session.get("active_response_id") is None
+    assert len(session["items"]) == 1
+    greeting = session["items"][0]
+    assert greeting["type"] == "message"
+    assert greeting["status"] == "completed"
+    assert greeting["data"]["role"] == "assistant"
+    assert greeting["data"]["content"] == [
+        {"type": "output_text", "text": "Hello, what would you like to work on?"}
+    ]
     assert SqlAlchemyConversationStore(db_uri).get_conversation(session_id).kind == "default"
     again = await project_client.post(f"/v1/projects/{project['id']}/orchestrator")
     assert again.json()["orchestrator_session_id"] == session_id
+    assert (await project_client.get(f"/v1/sessions/{session_id}")).json()["items"] == [greeting]
     info = (await project_client.get("/v1/info")).json()
     assert info["project_tickets"] is True
     assert info["durable_initial_input"] is False
@@ -59,6 +71,7 @@ async def test_project_creation_has_one_normal_orchestrator(project_client, db_u
     worker = (await project_client.get(f"/v1/sessions/{worker['id']}")).json()
     assert worker["project_id"] == project["id"]
     assert worker["project_orchestrator"] is False
+    assert worker["items"] == []
 
 
 async def test_orchestrator_inherits_defaults_but_not_public_sharing(
@@ -105,6 +118,12 @@ async def test_existing_project_can_initialize_its_orchestrator(project_client, 
     second = await project_client.post(f"/v1/projects/{project.id}/orchestrator")
     assert first.status_code == second.status_code == 200
     assert first.json()["orchestrator_session_id"] == second.json()["orchestrator_session_id"]
+    session_id = first.json()["orchestrator_session_id"]
+    session = (await project_client.get(f"/v1/sessions/{session_id}")).json()
+    assert len(session["items"]) == 1
+    assert session["items"][0]["data"]["content"][0]["text"] == (
+        "Hello, what would you like to work on?"
+    )
     assert len(SqlAlchemyConversationStore(db_uri).list_conversations().data) == 1
 
 
@@ -145,6 +164,7 @@ async def test_concurrent_initializer_uses_normal_session_teardown(
     assert response.status_code == 200, response.text
     assert response.json()["orchestrator_session_id"] == winner.id
     assert [session.id for session in conversations.list_conversations().data] == [winner.id]
+    assert (await project_client.get(f"/v1/sessions/{winner.id}")).json()["items"] == []
 
 
 @pytest.mark.parametrize("explicit_host", [False, True])
@@ -174,6 +194,10 @@ async def test_name_only_project_uses_owned_host_home_and_normal_launch(
             conversation = SqlAlchemyConversationStore(db_uri).get_conversation(frame.session_id)
             project = SqlAlchemyProjectStore(db_uri).get(conversation.project_id, user_id=ALICE)
             assert project.orchestrator_session_id == frame.session_id
+            items = SqlAlchemyConversationStore(db_uri).list_items(frame.session_id).data
+            assert len(items) == 1 and items[0].type == "message"
+            assert isinstance(items[0].data, MessageData)
+            assert items[0].data.role == "assistant"
             launches.append(frame)
             connection.pending_launches[frame.request_id].set_result({"status": "launched"})
         else:
