@@ -1041,6 +1041,9 @@ class ConversationStore(ABC):
         pinned: bool = False,
         pinned_owner: str | None = None,
         title: str | None = None,
+        host_id: str | None = None,
+        runner_seen_since: int | None = None,
+        live_runner_ids: list[str] | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -1160,6 +1163,16 @@ class ConversationStore(ABC):
             Powers the ``(agent, title)`` child-session lookup in
             ``sys_session_send`` so the server can resolve the target
             in a single indexed query instead of fetching all children.
+        :param host_id: When set, only return conversations whose root
+            conversation is bound to this host, so a host's sub-agents
+            match although they carry no host. ``None`` disables the filter.
+        :param runner_seen_since: When set, only return conversations
+            bound to a runner whose ``runner_last_seen`` is at or after
+            this Unix time in seconds, or to one of ``live_runner_ids``.
+            ``None`` disables the filter.
+        :param live_runner_ids: Runner ids known to be connected (this
+            replica's tunnels), counted live whatever their
+            ``runner_last_seen``. Used only with ``runner_seen_since``.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         :raises omnigent.errors.StaleCursorError: If the ``after``/``before``

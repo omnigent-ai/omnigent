@@ -4211,6 +4211,9 @@ class SqlAlchemyConversationStore(ConversationStore):
         pinned: bool = False,
         pinned_owner: str | None = None,
         title: str | None = None,
+        host_id: str | None = None,
+        runner_seen_since: int | None = None,
+        live_runner_ids: list[str] | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -4416,6 +4419,39 @@ class SqlAlchemyConversationStore(ConversationStore):
 
             if qualifying_ids is not None:
                 stmt = stmt.where(SqlConversation.id.in_(qualifying_ids))
+
+            meta_filters: list[tuple[Any, list[Any]]] = []
+            if host_id is not None:
+                # A sub-agent carries no host: match on its root's.
+                meta_filters.append(
+                    (
+                        SqlConversation.root_conversation_id,
+                        [SqlConversationMetadata.host_id == host_id],
+                    )
+                )
+            if runner_seen_since is not None:
+                meta_filters.append(
+                    (
+                        SqlConversation.id,
+                        [
+                            SqlConversationMetadata.runner_id.is_not(None),
+                            or_(
+                                SqlConversationMetadata.runner_last_seen >= runner_seen_since,
+                                SqlConversationMetadata.runner_id.in_(live_runner_ids or []),
+                            ),
+                        ],
+                    )
+                )
+            for column, conditions in meta_filters:
+                bound = select(SqlConversationMetadata.id).where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    *conditions,
+                )
+                if self._conv_engine is not self._engine:
+                    # The metadata table lives in another database.
+                    with self._session("list_conversations") as meta_session:
+                        bound = list(meta_session.execute(bound).scalars())
+                stmt = stmt.where(column.in_(bound))
 
             if acl_pushdown:
                 # Correlated on both PK members so Postgres can drive the

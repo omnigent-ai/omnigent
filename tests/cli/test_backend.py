@@ -2037,6 +2037,7 @@ def test_host_stop_stops_sessions_before_daemon(
                 "limit": 1000,
                 "include_archived": "true",
                 "visibility": "all",
+                "host_id": "host_abc",
             }
             return cli._HostHttpResult(
                 status_code=200,
