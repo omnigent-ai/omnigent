@@ -41,6 +41,7 @@ import { StepDescription } from "@/components/workflows/StepDescription";
 import { useConversationEntryValue } from "@/hooks/useConversationEntryState";
 import { useNow } from "@/hooks/useNow";
 import { useSavedWorkflows } from "@/hooks/useSavedWorkflows";
+import { usePlanStopping } from "@/hooks/usePlanStopping";
 import { useSessionTasks } from "@/hooks/useSessionTasks";
 import { pendingWorkflowQuestions } from "@/lib/blocks";
 import { isFeatureEnabled } from "@/lib/capabilities";
@@ -975,6 +976,7 @@ function TasksHeader({
   onContinuePlan,
   menuActionFor,
   onStop,
+  stopping = false,
   onOpenGraph,
 }: {
   plan: JournalEntry | null;
@@ -992,6 +994,8 @@ function TasksHeader({
   menuActionFor: (item: StepProgress) => TaskMenuAction | undefined;
   /** Stops the agent; offered only while it works. */
   onStop?: () => void;
+  /** Whether the agent is stopping after a Stop, which shows in Stop's place. */
+  stopping?: boolean;
   /** Opens the plan on its graph; absent without a plan, which says what waits on what. */
   onOpenGraph?: () => void;
 }) {
@@ -1040,7 +1044,9 @@ function TasksHeader({
                   Updated <Ago seconds={updatedAt} />
                 </span>
               )}
-              {onStop ? (
+              {stopping ? (
+                <PlanRunButton control="stopping" size="icon-xs" className="self-center" />
+              ) : onStop ? (
                 <PlanRunButton
                   control="stop"
                   size="icon-xs"
@@ -1221,13 +1227,16 @@ export function TasksPanel({
   const saveWorkflow = useSessionTasksActions((state) => state.saveWorkflow[conversationId]);
   const taskAction = useSessionTasksActions((state) => state.taskAction[conversationId]);
   const stopWork = useSessionTasksActions((state) => state.stopWork[conversationId]);
-  const stopActiveWork = tasks.sessionWorking ? stopWork : undefined;
+  const stopping = usePlanStopping(conversationId, tasks.sessionWorking);
+  // A run that is already stopping offers no Stop, so its stop message isn't sent twice.
+  const stopActiveWork = tasks.sessionWorking && !stopping ? stopWork : undefined;
   const continuePlan = useSessionTasksActions((state) => state.continuePlan[conversationId]);
   const entries = tasks.journalSupported ? journal.entries : NO_ENTRIES;
   const workflowId = planWorkflowId(entries);
   const names = new Map(progress.map((item) => [item.step.id, item.step.name]));
   const empty = progress.length === 0;
   const showPlan = !tasks.loading && !journal.error && progress.length > 0;
+  const planComplete = plan !== null && isPlanComplete(progress, planGraphRevision(entries));
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const [stuck, setStuck] = useState(false);
@@ -1374,11 +1383,8 @@ export function TasksPanel({
               }
               onContinuePlan={continuePlan && (() => continuePlan(planName(plan)))}
               menuActionFor={menuActionFor}
-              onStop={
-                plan && isPlanComplete(progress, planGraphRevision(entries))
-                  ? undefined
-                  : stopActiveWork
-              }
+              onStop={planComplete ? undefined : stopActiveWork}
+              stopping={!planComplete && stopping && stopWork !== undefined}
               onOpenGraph={plan ? () => setGraphOpen(true) : undefined}
             />
             <TaskList

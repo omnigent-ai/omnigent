@@ -70,9 +70,17 @@ const pendingRefreshes = new WeakSet<QueryClient>();
 
 /**
  * Refetch mounted breakdowns after a cost moved, skipping servers without one.
+ * Hiding clears cached costs immediately and cancels older reads.
  * Calls within {@link AGENT_COSTS_REFRESH_MS} coalesce into one trailing refetch.
  */
-export function invalidateAgentCosts(queryClient: QueryClient): void {
+export function invalidateAgentCosts(queryClient: QueryClient, hideCost = false): void {
+  if (hideCost) {
+    void queryClient.cancelQueries({ queryKey: AGENT_COSTS_QUERY_PREFIX });
+    queryClient.setQueriesData<AgentCosts | null>(
+      { queryKey: AGENT_COSTS_QUERY_PREFIX },
+      (costs) => (costs == null ? costs : new Map()),
+    );
+  }
   if (pendingRefreshes.has(queryClient)) return;
   pendingRefreshes.add(queryClient);
   setTimeout(() => {

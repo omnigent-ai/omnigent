@@ -93,6 +93,7 @@ export interface ServerInfo {
   /** The server enforces the browser's Admin view cookie; absent on older servers. */
   admin_view?: boolean;
   sibling_sessions?: boolean;
+  session_nest_moves?: boolean;
   session_bundle_workspaces?: boolean;
   sibling_session_destinations?: SiblingSessionDestinations;
   accounts_enabled: boolean;
@@ -676,6 +677,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
         const harnessInstallEnabled = data.harness_install_enabled === true;
         cachedServerInfo = {
           sibling_sessions: data.sibling_sessions === true,
+          session_nest_moves: data.session_nest_moves === true,
           sibling_session_destinations: parseSiblingSessionDestinations(
             data.sibling_session_destinations,
           ),

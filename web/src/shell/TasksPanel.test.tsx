@@ -7,7 +7,7 @@ import type * as CapabilitiesModule from "@/lib/CapabilitiesContext";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MemoryRouter, useLocation } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { FullscreenIcon } from "@/components/ai-elements/MermaidBlock";
 import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
 import { useSavedWorkflows } from "@/hooks/useSavedWorkflows";
@@ -18,6 +18,7 @@ import { formatMessageTimestamp } from "@/lib/relativeTime";
 import type { JournalEntry, StepProgress } from "@/lib/sessionJournal";
 import type { ConversationState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
+import { type MessageReceipt, trackPlanStop, usePlanStops } from "@/store/planStops";
 import {
   openTasksTab,
   registerContinuePlan,
@@ -757,6 +758,72 @@ describe("TasksPanel", () => {
     } finally {
       act(withdrawContinue);
     }
+  });
+
+  describe("after Stop", () => {
+    const named = journalPlan(0, ["baseline"], ["ship", ["baseline"]]);
+    named.content.name = "Ship the fix";
+
+    /** Registers the composer's Stop, whose message the session takes once `deliver` settles. */
+    function registerTrackedStop() {
+      let deliver!: (receipt: MessageReceipt | null) => void;
+      const withdraw = registerStopWork(
+        "conv",
+        () =>
+          void trackPlanStop(
+            "conv",
+            () =>
+              new Promise<MessageReceipt | null>((resolve) => {
+                deliver = resolve;
+              }),
+          ),
+      );
+      onTestFinished(() => act(withdraw));
+      onTestFinished(() => usePlanStops.setState({ requests: {}, settledStops: {} }));
+      return (taken: boolean) => act(async () => deliver(taken ? {} : null));
+    }
+
+    beforeEach(() => {
+      showJournal([named, status(1, "baseline", "started")]);
+      const withdrawContinue = registerContinuePlan("conv", vi.fn());
+      onTestFinished(() => act(withdrawContinue));
+    });
+
+    it("shows Stopping… until the agent and its background work stop, then Continue", async () => {
+      const deliver = registerTrackedStop();
+      setSession({ sessionStatus: "running" });
+      renderPanel();
+      expect(screen.getByTestId("tasks-row-menu")).toBeInTheDocument();
+      fireEvent.click(screen.getByTestId("plan-stop"));
+
+      expect(screen.getByTestId("plan-stopping")).toBeDisabled();
+      expect(screen.getByTestId("plan-stopping")).toHaveTextContent("Stopping…");
+      expect(screen.queryByTestId("plan-stop")).toBeNull();
+      // Its running task doesn't offer Stop again.
+      expect(screen.queryByTestId("tasks-row-menu")).toBeNull();
+      await deliver(true);
+      expect(screen.getByTestId("plan-stopping")).toBeInTheDocument();
+
+      // The agent's turn ends while its background work still runs.
+      setSession({ sessionStatus: "idle", backgroundTaskCount: 1 });
+      expect(screen.getByTestId("plan-stopping")).toBeInTheDocument();
+      setSession({ backgroundTaskCount: 0 });
+      expect(screen.queryByTestId("plan-stopping")).toBeNull();
+      expect(screen.getByTestId("plan-continue")).toBeInTheDocument();
+      expect(screen.getByTestId("tasks-paused")).toHaveTextContent("Stopped");
+    });
+
+    it("restores Stop when the session doesn't take the stop message", async () => {
+      const deliver = registerTrackedStop();
+      setSession({ sessionStatus: "running" });
+      renderPanel();
+      fireEvent.click(screen.getByTestId("plan-stop"));
+      expect(screen.getByTestId("plan-stopping")).toBeInTheDocument();
+
+      await deliver(false);
+      expect(screen.queryByTestId("plan-stopping")).toBeNull();
+      expect(screen.getByTestId("plan-stop")).toBeEnabled();
+    });
   });
 
   it("hides run controls after the final step finishes, even with unfinished earlier steps", () => {

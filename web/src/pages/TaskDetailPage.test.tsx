@@ -13,7 +13,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter, useLocation, useNavigationType } from "react-router-dom";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 import { TaskDetailPage } from "./TaskDetailPage";
@@ -46,6 +46,7 @@ import type {
   ScheduledTaskRunSteps,
 } from "@/lib/scheduledTasksApi";
 import { conversation, conversationPage } from "@/test/sidebarMockHelpers";
+import { usePlanStops } from "@/store/planStops";
 
 const navigate = vi.fn();
 let routeParams = { taskId: "st_1" };
@@ -1749,14 +1750,12 @@ describe("runs of a saved workflow", () => {
   });
 
   // Runs show their plans only while the server offers workflows.
-  const renderWithWorkflows = () =>
-    render(
-      <CapabilitiesProvider
-        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { workflows: true } }}
-      >
-        {pageTree()}
-      </CapabilitiesProvider>,
-    );
+  const pageWithWorkflows = () => (
+    <CapabilitiesProvider info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { workflows: true } }}>
+      {pageTree()}
+    </CapabilitiesProvider>
+  );
+  const renderWithWorkflows = () => render(pageWithWorkflows());
 
   it.each([false, true])("shows each run's tasks and graph (trigger header=%s)", (header) => {
     const prompt = header
@@ -1891,6 +1890,53 @@ describe("runs of a saved workflow", () => {
     );
     rerender(renderWorkflowPage());
     expect(within(row).getByRole("button", { name: "Stop" })).toBeInTheDocument();
+  });
+
+  it("shows Stopping… on a run's row from Stop until its session stops, then Continue", async () => {
+    setTask(task({ prompt: WORKFLOW_PROMPT }));
+    const runningRun = run({
+      id: "run_1",
+      status: "succeeded",
+      conversationId: "c_9",
+      conversationStatus: "running",
+    });
+    setRuns([runningRun]);
+    const fixStarted = {
+      ...STEPS.statuses[0]!,
+      id: "s2",
+      position: 2,
+      step: "fix",
+      content: { status: "started", text: "Working" },
+    };
+    vi.mocked(hooks.useScheduledTaskRunSteps).mockReturnValue(
+      new Map([["run_1", { ...STEPS, statuses: [...STEPS.statuses, fixStarted] }]]),
+    );
+    const fetchMessage = vi.spyOn(globalThis, "fetch").mockImplementation(
+      async () =>
+        new Response(JSON.stringify({ queued: true }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+    );
+    onTestFinished(() => {
+      fetchMessage.mockRestore();
+      usePlanStops.setState({ requests: {}, settledStops: {} });
+    });
+    const { rerender } = renderWithWorkflows();
+    const row = screen.getByTestId("task-detail-run");
+    fireEvent.click(within(row).getByRole("button", { name: "Stop" }));
+    expect(within(row).getByTestId("plan-stopping")).toBeDisabled();
+    await waitFor(() => expect(usePlanStops.getState().requests.c_9).toMatchObject({ sent: true }));
+    expect(fetchMessage).toHaveBeenCalledWith(
+      "/v1/sessions/c_9/events",
+      expect.objectContaining({ method: "POST" }),
+    );
+    expect(within(row).getByTestId("plan-stopping")).toBeInTheDocument();
+
+    setRuns([{ ...runningRun, conversationStatus: "idle" }]);
+    rerender(pageWithWorkflows());
+    expect(within(row).queryByTestId("plan-stopping")).toBeNull();
+    expect(within(row).getByRole("button", { name: "Continue the plan" })).toBeInTheDocument();
   });
 
   it.each([false, true])(
