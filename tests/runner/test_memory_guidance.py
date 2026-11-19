@@ -11,6 +11,8 @@ import pytest
 
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
 from omnigent.runner.memory_guidance import (
+    claude_memory_import_note,
+    count_claude_memory_notes,
     format_memory_guidance,
     memory_guidance,
     memory_startup_guidance,
@@ -397,3 +399,114 @@ async def test_a_resolved_spec_is_unwrapped() -> None:
     resolved = ResolvedSpec(spec=_spec(memory=False), workdir=None)
 
     assert await memory_startup_guidance(_Client(), _SESSION, resolved) is None
+
+
+# ─── Claude Code's own notes ────────────────────────
+
+
+def _claude_note(config_dir: Path, project: str, name: str) -> Path:
+    """Write one note file under *config_dir*'s project memory directory."""
+    memory = config_dir / "projects" / project / "memory"
+    memory.mkdir(parents=True, exist_ok=True)
+    path = memory / name
+    path.write_text("---\nname: n\ntype: user\n---\nBody.\n")
+    return path
+
+
+@pytest.fixture
+def claude_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """The launch's Claude config dir, with the runner's own data dir kept under tmp_path."""
+    config = tmp_path / "claude-config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "omnigent-data"))
+    return config
+
+
+async def test_offer_counts_the_notes_and_is_made_once_per_config_dir(
+    claude_config: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _claude_note(claude_config, "-home-me-repo", "role.md")
+    _claude_note(claude_config, "-home-me-repo", "style.md")
+
+    text = await claude_memory_import_note(tmp_path)
+
+    assert text is not None
+    assert "2 note files from it are still on this machine" in text
+    assert json.dumps(str(claude_config)) in text
+    assert "import-memory skill" in text
+    assert "do not ask again" in text
+    assert await claude_memory_import_note(tmp_path) is None
+    # The offer is keyed by the config dir, so another dir with notes is offered too.
+    other = tmp_path / "other-config"
+    _claude_note(other, "-home-me-other", "role.md")
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(other))
+    assert "1 note file from it is still" in (await claude_memory_import_note(tmp_path) or "")
+
+
+async def test_a_relative_config_dir_resolves_against_the_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "repo"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "cfg")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "omnigent-data"))
+    _claude_note(workspace / "cfg", "-repo", "role.md")
+
+    text = await claude_memory_import_note(workspace)
+
+    assert text is not None
+    assert json.dumps(str(workspace / "cfg")) in text
+
+
+async def test_without_a_config_dir_the_default_is_home_claude(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "omnigent-data"))
+    _claude_note(home / ".claude", "-home-me-repo", "role.md")
+
+    text = await claude_memory_import_note(tmp_path)
+
+    assert text is not None
+    assert json.dumps(str(home / ".claude")) in text
+
+
+@pytest.mark.parametrize("layout", ["no-projects", "empty-memory", "index-and-non-notes"])
+async def test_no_offer_without_claude_notes_and_no_marker_is_written(
+    claude_config: Path, tmp_path: Path, layout: str
+) -> None:
+    if layout == "empty-memory":
+        (claude_config / "projects" / "-home-me-repo" / "memory").mkdir(parents=True)
+    elif layout == "index-and-non-notes":
+        memory = claude_config / "projects" / "-home-me-repo" / "memory"
+        memory.mkdir(parents=True)
+        (memory / "MEMORY.md").write_text("- [role](role.md)\n")
+        (memory / "notes.txt").write_text("not a note\n")
+        (memory / "archived.md").mkdir()
+
+    assert count_claude_memory_notes(claude_config) == 0
+    assert await claude_memory_import_note(tmp_path) is None
+    assert not (tmp_path / "omnigent-data").exists()
+
+
+@pytest.mark.parametrize("failure", ["not-a-directory", "probe-raises"])
+async def test_a_failing_probe_yields_no_offer(
+    claude_config: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    if failure == "not-a-directory":
+        # A ``projects`` entry that is a file cannot be listed.
+        claude_config.mkdir(parents=True)
+        (claude_config / "projects").write_text("not a directory\n")
+    else:
+
+        def _probe_fails(_config_dir: Path) -> int:
+            raise RuntimeError("probe failed")
+
+        monkeypatch.setattr(
+            "omnigent.runner.memory_guidance.count_claude_memory_notes", _probe_fails
+        )
+        _claude_note(claude_config, "-home-me-repo", "role.md")
+
+    assert await claude_memory_import_note(tmp_path) is None
+    assert not (tmp_path / "omnigent-data").exists()
