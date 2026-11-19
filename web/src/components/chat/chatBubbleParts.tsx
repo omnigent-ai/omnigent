@@ -1099,8 +1099,9 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const visibleText = isCollapsed
     ? omitIncompleteLocalReviewComment(sliceByCodePoint(renderedText, COLLAPSE_THRESHOLD))
     : renderedText;
+  // Another session's message reaches the agent as plain input, so it is never a command.
   const command =
-    !isShellCommand && published
+    !isShellCommand && origin === null && published
       ? splitKnownSlashCommand(visibleText, published.commandNames)
       : null;
   // Runtime-injected `[System: ...]` notifications ride in on role=user. When

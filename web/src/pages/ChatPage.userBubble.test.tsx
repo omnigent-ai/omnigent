@@ -974,6 +974,15 @@ describe("UserBubble command tint", () => {
     expect(within(bubble).getByText("hi")).toHaveAttribute("data-streamdown", "strong");
   });
 
+  it("does not tint a known command in another session's message", () => {
+    renderScoped(userBubble("[Message from session s_source]\n/team fix it"), <PublishCommands />);
+    fireEvent.click(screen.getByTestId("expand-session-message"));
+    const bubble = screen.getByTestId("message-bubble");
+    expect(within(bubble).getByTestId("message-origin")).toBeInTheDocument();
+    expect(bubble).toHaveTextContent("/team fix it");
+    expect(bubble.querySelector(".text-brand-accent")).toBeNull();
+  });
+
   it.each([
     ["a committed bubble", userBubble("!echo **hi**")],
     [
