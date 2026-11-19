@@ -112,12 +112,27 @@ describe("macOS Electron embed", () => {
 
     let insetSelector = "";
     css.walkDecls("padding-top", (declaration) => {
-      if (declaration.value.includes("--mac-header-control-inset")) {
-        insetSelector = (declaration.parent as Rule).selector;
+      const { selector } = declaration.parent as Rule;
+      if (
+        declaration.value.includes("--mac-header-control-inset") &&
+        selector.includes(".sidebar-header-row")
+      ) {
+        insetSelector = selector;
       }
     });
     expect(scope.querySelector(".sidebar-header-row")!.matches(insetSelector)).toBe(expected);
     const fullScreenSelector = selectorFor("[data-electron-full-screen]");
+    const fullScreenDeclarations: Record<string, string> = {};
+    css.walkDecls((declaration) => {
+      if ((declaration.parent as Rule).selector === fullScreenSelector) {
+        fullScreenDeclarations[declaration.prop] = declaration.value;
+      }
+    });
+    expect(fullScreenDeclarations).toEqual({
+      "--mac-traffic-light-width": "12px",
+      "--mac-header-control-inset": "1rem",
+      "--mac-chat-header-padding-bottom": "1rem",
+    });
     expect(scope.matches(fullScreenSelector)).toBe(false);
     document.documentElement.toggleAttribute("data-electron-full-screen", true);
     expect(scope.matches(fullScreenSelector)).toBe(expected);

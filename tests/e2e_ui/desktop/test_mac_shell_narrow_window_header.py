@@ -207,6 +207,18 @@ def test_narrow_window_header_controls_center_on_window_controls(
     )
     _assert_vertically_centered_at(header_controls, 16 + 44 / 2)
 
+    # A page embedding the app may use a 14px root, which shrinks the rem-sized
+    # controls but not the header's fixed 76px height.
+    page.evaluate(
+        """() => {
+            const root = document.documentElement;
+            root.removeAttribute("data-electron-full-screen");
+            root.style.removeProperty("--omnigent-electron-zoom");
+            root.style.fontSize = "14px";
+        }"""
+    )
+    _assert_vertically_centered_at(header_controls, _WINDOW_CONTROLS_CENTER_Y)
+
 
 def test_narrow_window_command_palette_clears_window_controls(
     request: pytest.FixtureRequest, seeded_session: tuple[str, str]

@@ -1274,12 +1274,15 @@ html[data-electron-mac] {
   --mac-header-actions-clearance: calc(var(--mac-traffic-light-width) + 6.75rem);
   /* Centers the narrow layout's 2.75rem header controls on the lights. */
   --mac-header-control-inset: max(0px, calc(var(--mac-titlebar-height) / 2 - 1.375rem));
+  /* The narrow chat header is a fixed 76px tall, so fit its content box to the controls. */
+  --mac-chat-header-padding-bottom: calc(76px - 2.75rem - var(--mac-header-control-inset));
 }
 /* Embedded, the preload's full-screen attribute stays on html above the scope root. */
 html[data-electron-mac][data-electron-full-screen],
 .omnigent-app[data-electron-mac]:is([data-electron-full-screen] *) {
   --mac-traffic-light-width: 12px;
   --mac-header-control-inset: 1rem;
+  --mac-chat-header-padding-bottom: 1rem;
 }
 @media (min-width: 73.8125rem) {
   /* Reserve the board's shared sidebar toggle only while navigation is closed. */
@@ -1403,11 +1406,15 @@ html[data-electron-mac]
   html[data-electron-mac] .sidebar-header-row {
     padding-left: var(--mac-traffic-light-width);
   }
-  /* Keep each row's height; the canvas workspace already starts below the title bar. */
-  html[data-electron-mac] .sidebar-header-row,
-  html[data-electron-mac] .chat-header:not(.canvas-workspace .chat-header) {
+  /* Keep the row's height while its controls move up. */
+  html[data-electron-mac] .sidebar-header-row {
     padding-top: var(--mac-header-control-inset);
     padding-bottom: calc(2rem - var(--mac-header-control-inset));
+  }
+  /* The canvas workspace already starts below the title bar. */
+  html[data-electron-mac] .chat-header:not(.canvas-workspace .chat-header) {
+    padding-top: var(--mac-header-control-inset);
+    padding-bottom: var(--mac-chat-header-padding-bottom);
   }
   /* Drag regions ignore clipping and opacity, so the collapsed docked sidebar's
    * header buttons would still block the title bar. Hide them once the fade ends. */

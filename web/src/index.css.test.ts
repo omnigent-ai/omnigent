@@ -1346,6 +1346,11 @@ describe("index.css electron-mac sidebar header", () => {
   const peekHeaderRowRule = cssSource.match(
     /\[data-electron-mac\] \.conversations-sidebar\.is-peek \.sidebar-header-row \{[^}]*\}/,
   )?.[0];
+  const narrowBlock = cssSource.match(
+    new RegExp(
+      String.raw`${mdWidthMedia("<")}(?=\s*html\[data-electron-mac\] \.electron-sidebar-header-actions \{)(?:[^{}]|\{[^{}]*\})*\}`,
+    ),
+  )?.[0];
 
   it("starts the sidebar at the window's top edge (no empty strip above it)", () => {
     // Was 2.25rem, which left the band of blank canvas this change removes.
@@ -1424,11 +1429,6 @@ describe("index.css electron-mac sidebar header", () => {
   it("hands the phone layout's headers the lights' corner below md", () => {
     // Electron's 720px minimum is below md, where the drawer and chat header
     // carry their own controls; a fixed rem pad would drift with zoom.
-    const narrowBlock = cssSource.match(
-      new RegExp(
-        String.raw`${mdWidthMedia("<")}(?=\s*html\[data-electron-mac\] \.electron-sidebar-header-actions \{)(?:[^{}]|\{[^{}]*\})*\}`,
-      ),
-    )?.[0];
     expect(narrowBlock, "expected the macOS sub-md header block").toBeDefined();
     expect(narrowBlock).toMatch(/\.electron-sidebar-header-actions \{\s*display: none;/);
     expect(narrowBlock).toMatch(
@@ -1437,25 +1437,39 @@ describe("index.css electron-mac sidebar header", () => {
   });
 
   it("centers the phone layout's headers on the lights, except below the canvas title bar", () => {
-    const insetRule = cssBlocks.find(([block]) =>
-      block.includes("padding-top: var(--mac-header-control-inset)"),
-    )?.[0];
-    expect(insetRule, "expected the macOS sub-md header inset rule").toBeDefined();
-    expect(insetRule).toContain("padding-bottom: calc(2rem - var(--mac-header-control-inset))");
+    const insetRules = [...(narrowBlock ?? "").matchAll(/[^{}]+\{[^{}]*\}/g)]
+      .map(([rule]) => rule)
+      .filter((rule) => rule.includes("padding-top: var(--mac-header-control-inset)"));
+    const rowRule = insetRules.find((rule) =>
+      rule.includes("padding-bottom: calc(2rem - var(--mac-header-control-inset))"),
+    );
+    const chatHeaderRule = insetRules.find((rule) =>
+      rule.includes("padding-bottom: var(--mac-chat-header-padding-bottom)"),
+    );
+    expect(rowRule, "expected the macOS sub-md sidebar header inset").toBeDefined();
+    expect(chatHeaderRule, "expected the macOS sub-md chat header inset").toBeDefined();
+    // Below md the chat header is h-[76px]; sizing its content box to the controls centers them.
+    expect(cssSource).toContain(
+      "--mac-chat-header-padding-bottom: calc(76px - 2.75rem - var(--mac-header-control-inset))",
+    );
     document.documentElement.setAttribute("data-electron-mac", "true");
     document.body.innerHTML = `
       <div class="sidebar-header-row"></div>
       <header class="chat-header"></header>
       <div class="canvas-workspace"><header class="chat-header"></header></div>`;
-    const [sidebarRow, sessionHeader, canvasHeader] = document.body.querySelectorAll(
-      ".sidebar-header-row, .chat-header",
-    );
-    const selector = selectorOf(insetRule ?? "");
-    expect(sidebarRow.matches(selector)).toBe(true);
-    expect(sessionHeader.matches(selector)).toBe(true);
-    expect(canvasHeader.matches(selector)).toBe(false);
-    document.body.innerHTML = "";
-    document.documentElement.removeAttribute("data-electron-mac");
+    try {
+      const [sidebarRow, sessionHeader, canvasHeader] = document.body.querySelectorAll(
+        ".sidebar-header-row, .chat-header",
+      );
+      const rowSelector = selectorOf(rowRule ?? "");
+      const chatHeaderSelector = selectorOf(chatHeaderRule ?? "");
+      expect(sidebarRow.matches(rowSelector)).toBe(true);
+      expect(sessionHeader.matches(chatHeaderSelector)).toBe(true);
+      expect(canvasHeader.matches(chatHeaderSelector)).toBe(false);
+    } finally {
+      document.body.innerHTML = "";
+      document.documentElement.removeAttribute("data-electron-mac");
+    }
   });
 
   it("keeps every header rule scoped to the desktop shell", () => {
