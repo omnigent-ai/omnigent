@@ -63,21 +63,26 @@ export function remarkPullRequestRefs() {
     linkifyChildren(tree, typeof file?.value === "string" ? file.value : undefined);
 }
 
-/** Per `#` in a text node's value, whether its author escaped it; null if unknown. */
+/**
+ * Per `#` in a text node's value, whether its author escaped it. Null without a
+ * source file, as when the plugin runs on a tree it didn't parse.
+ */
 function escapedHashes(node: MarkdownNode, source: string | undefined): boolean[] | null {
+  if (source === undefined) return null;
+  const hashes = (node.value?.split("#").length ?? 1) - 1;
   const start = node.position?.start.offset;
   const end = node.position?.end.offset;
-  if (source === undefined || start === undefined || end === undefined) return null;
-  const raw = source.slice(start, end);
+  const raw = start === undefined || end === undefined ? null : source.slice(start, end);
   if (raw === node.value) return null;
   const escaped: boolean[] = [];
-  for (const [token] of raw.matchAll(SOURCE_TOKEN)) {
+  for (const [token] of raw?.matchAll(SOURCE_TOKEN) ?? []) {
     if (token === "#") escaped.push(false);
     else if (ESCAPED_HASH.test(token)) escaped.push(true);
   }
-  const hashes = node.value?.split("#").length ?? 1;
-  // A source this pass misreads leaves the whole node as text.
-  return escaped.length === hashes - 1 ? escaped : Array.from({ length: hashes - 1 }, () => true);
+  // A node the source can't place, or that this pass misreads, stays text.
+  return raw !== null && escaped.length === hashes
+    ? escaped
+    : Array.from({ length: hashes }, () => true);
 }
 
 function linkifyChildren(node: MarkdownNode, source?: string): void {

@@ -183,6 +183,10 @@ describe("pull request references in chat markdown", () => {
       "https://github.com/acme/app/pull/4247",
     ]);
     expect(screen.getByText(/#4242, #4243, #4244 or #4245/)).toBeVisible();
+    cleanup();
+    // Text the GFM autolink pass splits off still maps back to its source.
+    renderMarkdown("See https://x.test and \\#4248, then #4249.");
+    expect(hrefs()).toEqual(["https://x.test/", "https://github.com/acme/app/pull/4249"]);
   });
 
   it.each([true, false])("leaves a hand-written parked fragment alone (opted in: %s)", (optIn) => {

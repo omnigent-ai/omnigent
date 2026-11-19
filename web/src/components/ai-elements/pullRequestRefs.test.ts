@@ -233,8 +233,12 @@ describe("remarkPullRequestRefs", () => {
     ["a &#1234; #5678", "a \u04d2 #5678", ["5678"]],
     // A source that doesn't account for every `#` links nothing.
     ["a b c", "a #1234", []],
-  ])("reads escaped hashes in %j from the source", (source, value, linked) => {
-    const position = { start: { offset: 0 }, end: { offset: source.length } };
+    // Neither does a node the source can't place.
+    [null, "a #1234", []],
+  ])("reads escaped hashes in %j from the source", (raw, value, linked) => {
+    const source = raw ?? "a #1234";
+    const position =
+      raw === null ? undefined : { start: { offset: 0 }, end: { offset: source.length } };
     const tree = {
       type: "root",
       children: [{ type: "paragraph", children: [{ type: "text", value, position }] }],
