@@ -794,9 +794,8 @@ interface MarkdownTextNode extends MarkdownNode {
 }
 
 /**
- * Marks *token* where it opens the first paragraph, leaving the rest of the
- * tree as parsed. Sanitize keeps a `kbd` but strips classes, and the user
- * bubble renders raw HTML as text, so this plugin is its only source of one.
+ * Mark a leading token without reparsing the rest of the paragraph. Raw HTML renders as text
+ * and sanitize strips classes, so this plugin is the bubble's only way to tint it.
  */
 function remarkLeadingCommand(token: string) {
   return (tree: MarkdownTextNode) => {

@@ -25,11 +25,7 @@ export interface ComposerHighlightSplit {
   after: string;
 }
 
-/**
- * Splits a draft that invokes a known command or skill into the tinted token
- * and the rest. There is no command-shaped fallback: unknown /words stay plain
- * so the tint never claims a command that won't run.
- */
+/** Split a leading known command; unknown command-shaped words stay plain, as they won't run. */
 export function splitKnownSlashCommand(
   value: string,
   commands: Iterable<string>,
@@ -58,13 +54,8 @@ function claudeDeliveredText(value: string): string {
 }
 
 /**
- * Split a `!command` draft at its `!`, or null when *harness* would treat it
- * as model input. codex-native mirrors `shell_command_from_content`
- * (codex_native/shell_input.py): leading whitespace ignored, `!!` escapes.
- * claude-native pastes the text into the Claude Code TUI, which enters bash
- * mode on a leading `!`, so only a `!` at the very start of the delivered
- * text counts (`!!` too).
- * Either way the command must be non-blank.
+ * Mirror each native harness's leading-`!` rule (codex: `shell_command_from_content`; claude: a
+ * `!` opening the text the TUI receives); the command must be non-blank.
  */
 export function splitNativeShellCommand(
   value: string,
@@ -175,12 +166,7 @@ export interface ComposerHighlight {
   hint: ReactNode;
 }
 
-/**
- * Paint a leading known command or native `!` shell token, plus inline
- * @mention pills, in the composer mirror. One mirror serves both, so a draft
- * holding a command and mentions shows each. Display-only: the draft value is
- * never changed.
- */
+/** Paint command and mention tokens in one mirror; display-only, the draft is never changed. */
 export function useComposerHighlight({
   value,
   commandNames,

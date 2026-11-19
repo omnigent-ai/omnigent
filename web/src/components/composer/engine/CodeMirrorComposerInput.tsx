@@ -128,8 +128,8 @@ const commandTokenFacet = Facet.define<CommandToken, CommandToken>({
 });
 
 /**
- * Where `token` sits when `text` starts with it, after any leading whitespace; else null. A
- * placed token only has to still be at its offset.
+ * Where `token` leads `text` after any whitespace, else null; a placed token matches only at
+ * its offset.
  */
 export function leadingCommandSpan(text: string, token: CommandToken): TokenSpan | null {
   if (!token) return null;

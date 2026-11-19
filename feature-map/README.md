@@ -157,7 +157,8 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
   one-shot host launch, existing-session boundaries, and failure diagnostics.
 
 - [Composer](./composer.md) covers the session and new-session composers,
-  the model/effort pill, the configuration gear, and slash commands.
+  the model/effort pill, the configuration gear, slash commands, and the
+  native `!` shell mode.
 - [Terminals](./terminals.md) covers the Chat/Terminal switcher, the agent
   terminal, shell terminals, and terminal reattachment.
 - [Native harnesses](./native-harnesses.md) is the matrix of every native

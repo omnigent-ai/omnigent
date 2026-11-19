@@ -152,10 +152,7 @@ export interface ComposerInputProps {
   inputId?: string;
   /** Tagged @-mention tokens to present as one unit, such as "@README.md". */
   mentionTokens?: readonly string[];
-  /**
-   * The slash command or skill the draft starts with, such as "/context", to tint. Pass a
-   * `ComposerTokenAt` to place it exactly, as for a shell `!` that the command follows directly.
-   */
+  /** Leading command to tint, such as "/context"; a `{token, start}` pins it to an offset. */
   commandToken?: string | ComposerTokenAt | null;
   onChange?: (event: ComposerInputEvent) => void;
   onSelect?: (event: ComposerInputEvent) => void;
