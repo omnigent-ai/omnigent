@@ -18,8 +18,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   default; enable it with `OMNIGENT_FEATURES=chat_composer_codemirror` on the
   server), the main chat's message box is a CodeMirror editor. It takes plain
   text, scrolls inside the box when the draft is taller than the cap, and keeps
-  the same send, history, and completion keys. Side chats and New Chat keep the
-  plain text box. Mobile widths always use the plain text box. It also stays
+  the same send, history, and completion keys. Side chats and New Chat follow
+  the same choice. Mobile widths always use the plain text box. It also stays
   while the editor loads, and stays if loading fails; a failed load retries on
   window focus, at most once a minute.
 - `touch-targets`: native iOS/Android apps and browsers with a coarse primary
