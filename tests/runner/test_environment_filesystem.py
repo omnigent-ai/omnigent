@@ -2337,10 +2337,28 @@ async def test_content_search_limits_errors_and_hidden_files(
     assert len(match["text"]) <= 402
 
 
+@pytest.mark.asyncio
+async def test_content_search_keeps_matches_with_unicode_line_separators(
+    client: httpx.AsyncClient, workspace: Path
+) -> None:
+    """Minified bundles hold U+2028, U+2029 and U+0085, which Python also reads as line breaks."""
+    text = 'var s = "a\u2028b\u2029c\u0085d";'
+    (workspace / "bundle.js").write_text(text + "\n", encoding="utf-8")
+
+    response = await client.get(
+        "/v1/sessions/conv_test/resources/environments/default/content-search",
+        params={"q": "var s"},
+    )
+
+    result = response.json()
+    assert "error" not in result, result
+    assert [match["text"] for match in result["matches"]] == [text]
+
+
 @pytest.mark.parametrize("mode", ["missing", "timeout", "long-line"])
 def test_content_search_process_boundaries(tmp_path: Path, mode: str) -> None:
     """Exercise the sandbox script with controlled executables and a bounded timeout."""
-    from omnigent.runner.content_search import _SEARCH_SCRIPT
+    from omnigent.workspace_content_search import _SEARCH_SCRIPT, collect_records
 
     if mode != "missing":
         executable = tmp_path / "rg"
@@ -2353,6 +2371,7 @@ def test_content_search_process_boundaries(tmp_path: Path, mode: str) -> None:
         executable.chmod(0o755)
     parameters = (
         "query = 'needle'\ncase_sensitive = False\nregex = False\nlimit = 2\nglob_args = []\n"
+        "extra_args = []\nsearch_paths = ['.']\n"
     )
     timer = ""
     if mode == "timeout":
@@ -2373,7 +2392,7 @@ def test_content_search_process_boundaries(tmp_path: Path, mode: str) -> None:
         timeout=5,
         check=True,
     )
-    result = json.loads(completed.stdout)
+    result = collect_records(completed.stdout.splitlines())
     if mode == "missing":
         assert "Install ripgrep" in result["error"]
     elif mode == "timeout":
