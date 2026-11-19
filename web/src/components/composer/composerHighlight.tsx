@@ -166,7 +166,7 @@ export interface ComposerHighlight {
   input: {
     className: string | undefined;
     /** The same token for the CodeMirror engine, which paints it itself. */
-    commandToken: ComposerTokenAt | null;
+    commandToken: string | ComposerTokenAt | null;
     onScroll: (event: ComposerInputEvent) => void;
     "aria-describedby": string | undefined;
     "data-slash-command": "true" | undefined;
@@ -206,7 +206,8 @@ export function useComposerHighlight({
     kind: split?.kind ?? null,
     input: {
       className: mirrorActive ? MIRRORED_TEXTAREA_CLASS : undefined,
-      commandToken: split ? { token: split.token, start: split.before.length } : null,
+      // A command keeps the editor's own leading-word check; `!` needs its exact offset.
+      commandToken: shell ? { token: "!", start: split.before.length } : (split?.token ?? null),
       onScroll: (event) => {
         if (mirrorRef.current) mirrorRef.current.scrollTop = event.currentTarget.scrollTop;
       },

@@ -486,8 +486,13 @@ describe("CodeMirrorComposerInput command token", () => {
     expect(commandMarks(view.container)).toEqual([["/review", COMMAND_TOKEN_CLASS]]);
   });
 
-  it("tints a placed shell `!` that its command follows directly", () => {
-    const { container } = mount({ value: "\x7f!pwd", commandToken: { token: "!", start: 1 } });
+  it("tints a placed `!` behind a control character, with its command right after it", () => {
+    const { container } = mount({ value: "\x01!pwd", commandToken: { token: "!", start: 1 } });
+    expect(commandMarks(container)).toEqual([["!", COMMAND_TOKEN_CLASS]]);
+  });
+
+  it("places a token by the value's offset when the editor folds its CRLF line breaks", () => {
+    const { container } = mount({ value: "\r\n!ls", commandToken: { token: "!", start: 2 } });
     expect(commandMarks(container)).toEqual([["!", COMMAND_TOKEN_CLASS]]);
   });
 

@@ -147,6 +147,14 @@ export function leadingCommandSpan(text: string, token: CommandToken): TokenSpan
   return { start, end };
 }
 
+/** `props.commandToken` with a placed token's offset moved from the value into the document. */
+function documentCommandToken(props: ComposerInputProps): CommandToken {
+  const token = props.commandToken ?? null;
+  if (token === null || typeof token === "string") return token;
+  const start = normalizeLineBreaks((props.value ?? "").slice(0, token.start)).length;
+  return { token: token.token, start };
+}
+
 /** Paints the draft's leading command token, checked against the editor's own text. */
 function commandTokenField(environment: CodeMirrorComposerEnvironment): Extension {
   const mark = Decoration.mark({
@@ -403,15 +411,7 @@ function CodeMirrorComposer({
   environment: CodeMirrorComposerEnvironment;
   forwardedRef: Ref<ComposerTextTarget>;
 }) {
-  const {
-    value,
-    placeholder,
-    autoFocus,
-    heightMode = "compact",
-    className,
-    mentionTokens,
-    commandToken = null,
-  } = props;
+  const { value, placeholder, autoFocus, heightMode = "compact", className, mentionTokens } = props;
   const hostRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const surfaceRef = useRef<ComposerEditorSurface | null>(null);
@@ -506,7 +506,7 @@ function CodeMirrorComposer({
           compartments.theme.of(theme(initial.heightMode ?? "compact")),
           compartments.mentionTokens.of(mentionTokensFacet.of(initial.mentionTokens ?? [])),
           mentionTokenField(environment),
-          compartments.commandToken.of(commandTokenFacet.of(initial.commandToken ?? null)),
+          compartments.commandToken.of(commandTokenFacet.of(documentCommandToken(initial))),
           commandTokenField(environment),
           EditorView.updateListener.of((update) => {
             const fromUser = !update.transactions.some((transaction) =>
@@ -610,11 +610,11 @@ function CodeMirrorComposer({
     });
   }, [compartments, mentionTokensKey]);
   // Keyed by content, as a placed token is a new object each render.
-  const commandTokenKey = JSON.stringify(commandToken);
+  const commandTokenKey = JSON.stringify(documentCommandToken(props));
   useLayoutEffect(() => {
     viewRef.current?.dispatch({
       effects: compartments.commandToken.reconfigure(
-        commandTokenFacet.of(latest.current.commandToken ?? null),
+        commandTokenFacet.of(documentCommandToken(latest.current)),
       ),
     });
   }, [compartments, commandTokenKey]);

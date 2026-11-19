@@ -130,6 +130,32 @@ describe("useComposerHighlight shell hint", () => {
   });
 });
 
+describe("useComposerHighlight CodeMirror token", () => {
+  const tokenFor = (value: string) =>
+    renderHook(() =>
+      useComposerHighlight({
+        value,
+        commandNames: KNOWN,
+        enabled: true,
+        nativeShell: "codex-native",
+        mentionTokens: [],
+        textareaRef: { current: null },
+      }),
+    ).result.current.input.commandToken;
+
+  it("hands a command over as text, so the editor still checks it leads a whole word", () => {
+    expect(tokenFor("  /team fix")).toBe("/team");
+  });
+
+  it("places the shell `!` at its offset", () => {
+    expect(tokenFor("  !ls")).toEqual({ token: "!", start: 2 });
+  });
+
+  it("hands over nothing for prose", () => {
+    expect(tokenFor("fix it")).toBeNull();
+  });
+});
+
 describe("useComposerHighlight mirror", () => {
   function Mirror({
     value,

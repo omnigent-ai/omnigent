@@ -1,3 +1,4 @@
+import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
 import { formatLocalReviewComments } from "@/lib/localReviewComments";
 import { requestLocalReviewContext, updateLocalReviewContext } from "@/lib/localReviewContext";
 import { create } from "zustand";
@@ -10006,5 +10007,51 @@ describe("Composer with the CodeMirror release flag on", () => {
 
     expect(props.onSend).toHaveBeenCalledExactlyOnceWith("ship the fix", undefined);
     await waitFor(() => expect(composerTargetOf(editor)?.value).toBe(""));
+  });
+
+  const commandMarks = () =>
+    Array.from(document.querySelectorAll('[data-testid="composer-command-token"]'), (mark) => [
+      mark.textContent,
+      mark.className,
+    ]);
+  async function renderEditor(props: ReturnType<typeof composerProps>) {
+    render(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <Composer {...props} />
+      </CapabilitiesProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText("Message the agent")).toHaveClass("cm-content"),
+    );
+    return screen.getByLabelText("Message the agent");
+  }
+
+  it("tints a known command in the editor but not an unknown one", async () => {
+    setComposerState({
+      conversationId: "conv_codemirror_tint",
+      skills: [{ name: "team", description: "Run a team" }],
+    });
+    const editor = await renderEditor(composerProps());
+    act(() => insertComposerText(composerTargetOf(editor)!, "/team fix it"));
+    expect(commandMarks()).toEqual([["/team", COMMAND_TOKEN_CLASS]]);
+    expect(editor).toHaveAttribute("data-slash-command", "true");
+
+    act(() => insertComposerText(composerTargetOf(editor)!, "/typo", 0, 5));
+    expect(commandMarks()).toEqual([]);
+    expect(editor).not.toHaveAttribute("data-slash-command");
+  });
+
+  it("tints a codex-native owner's `!` in the editor and marks it as a shell command", async () => {
+    const { sessionHarness } = useChatStore.getState();
+    onTestFinished(() => useChatStore.setState({ sessionHarness }));
+    setComposerState({ conversationId: "conv_codemirror_shell", skills: [], blocks: [] });
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    const editor = await renderEditor(
+      composerProps({ isNativeWrapper: true, permissionLevel: null }),
+    );
+    act(() => insertComposerText(composerTargetOf(editor)!, "!git status"));
+    expect(commandMarks()).toEqual([["!", COMMAND_TOKEN_CLASS]]);
+    expect(editor).toHaveAttribute("data-shell-command", "true");
+    expect(editor).toHaveAccessibleDescription("Shell command");
   });
 });
