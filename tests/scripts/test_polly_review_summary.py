@@ -286,6 +286,125 @@ def _check_review_context(
 
     short = table_variant.startswith("short-")
     variant = table_variant.removeprefix("short-")
+    if variant.startswith("inline-code-"):
+        parser = MarkdownIt("commonmark").enable("table")
+        metadata = {"head_sha": "a" * 40, "run_id": "10-1", "run_url": "https://example.test/run"}
+        summary = {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+        assessment = _REVIEW.replace("::test_empty", f"::test_empty[{table_variant}]")
+        marker = "``" if variant.endswith("-double") else "`"
+        literal = r"&amp; \* literal" + (" ` tick" if len(marker) == 2 else "")
+        construct = marker + literal + marker
+        if variant == "inline-code-oversized":
+            expected_code = ["x" * 70000 + " " + literal]
+            rationale = marker + expected_code[0] + marker
+        elif short:
+            expected_code = [literal]
+            rationale = construct + "prose"
+        else:
+            calibration = _HELPERS["compose_review"](
+                assessment.replace("Guards the regression.", "x" * 130000), summary
+            )
+            padding = [
+                token.content
+                for comment in _HELPERS["review_comments"](calibration, **metadata)
+                for tokens in [parser.parse(comment)]
+                for index, token in enumerate(tokens)
+                if token.type == "inline" and tokens[index - 1].type == "td_open"
+            ][4]
+            assert padding and set(padding) == {"x"}
+            if variant == "inline-code-repeated":
+                unit = construct + "prose"
+                rationale = "x" * ((len(padding) - len(marker) - 3) % len(unit)) + unit * 3000
+                expected_code = [literal] * 3000
+            else:
+                rationale = (
+                    "x" * (len(padding) - len(marker) - 3) + construct + "prose" + "y" * 70000
+                )
+                expected_code = [literal]
+        review = _HELPERS["compose_review"](
+            assessment.replace("Guards the regression.", rationale), summary
+        )
+        original = parser.parse(review)
+        cells = [
+            token
+            for index, token in enumerate(original)
+            if token.type == "inline" and original[index - 1].type == "td_open"
+        ]
+        assert len(cells) == 5
+        assert [
+            child.content for child in cells[4].children if child.type == "code_inline"
+        ] == expected_code
+        assert (len(review.encode("utf-8")) < 60000) == short
+        review_path, receipt, posts = _prepare_publication(
+            tmp_path, monkeypatch, head_sha=metadata["head_sha"], run_url=metadata["run_url"]
+        )
+        try:
+            comments = _published_comments(review, review_path, receipt)
+        except ValueError as error:
+            assert variant == "inline-code-oversized" and not short
+            assert str(error) == (
+                "Polly review table row cannot continue within comment capacity "
+                "without five parsed fields."
+            )
+            assert not posts and not receipt.exists()
+            assert sorted(path.name for path in tmp_path.iterdir()) == ["review.md"]
+            return
+        assert posts == comments[1:] + comments[:1]
+        assert receipt.read_text() == metadata["head_sha"] + "\n"
+        assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
+        assert sum(comment.count("<!-- polly-reviewed-sha:") for comment in comments) == 1
+        rendered = [parser.parse(comment) for comment in comments]
+        rendered_cells = []
+        for tokens in rendered:
+            footer = [
+                token
+                for token in tokens
+                if token.type == "inline" and "Automated review by Polly" in token.content
+            ]
+            assert len(footer) == 1
+            assert any(
+                child.type == "html_inline" and child.content == "<sub>"
+                for child in footer[0].children
+            )
+            data = [
+                token
+                for index, token in enumerate(tokens)
+                if token.type == "inline" and tokens[index - 1].type == "td_open"
+            ]
+            if not data:
+                continue
+            assert len(data) == 5
+            assert [token.content for token in data[:4]] == [token.content for token in cells[:4]]
+            assert [
+                token.content
+                for index, token in enumerate(tokens)
+                if token.type == "inline" and tokens[index - 1].type == "th_open"
+            ] == [
+                token.content
+                for index, token in enumerate(original)
+                if token.type == "inline" and original[index - 1].type == "th_open"
+            ]
+            rendered_cells.append(data[4])
+        assert [
+            child.content
+            for cell in rendered_cells
+            for child in cell.children
+            if child.type == "code_inline"
+        ] == expected_code, "A cut changed literal inline-code content or backtick pairing"
+        assert "".join(
+            child.content for cell in rendered_cells for child in cell.children
+        ) == "".join(child.content for child in cells[4].children), (
+            "A cut changed parsed code/prose meaning"
+        )
+        assert variant != "inline-code-oversized", (
+            "An oversized atomic code span must refuse publication"
+        )
+        if short:
+            assert len(comments) == 1
+            assert comments[0].split("Polly AI Review\n\n", 1)[1].rsplit("\n---\n", 1)[0] == review
+        else:
+            assert 1 < len(comments) <= _HELPERS["MAX_REVIEW_PARTS"]
+        return
     table_rows = []
     assessment_review = _REVIEW
     comment_context = None
@@ -770,46 +889,6 @@ def _check_review_context(
     return
 
 
-def _check_nested_list_refusal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    from markdown_it import MarkdownIt
-
-    findings = "## Findings\n\n" + "".join(
-        f"- Finding {index}\n    - nested {index} " + "z" * 200 + "\n" for index in range(400)
-    )
-    review = (
-        findings
-        + "\n"
-        + _HELPERS["compose_review"](
-            _REVIEW, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
-        )
-    )
-    parser = MarkdownIt("commonmark").enable("table")
-    original = parser.parse(review)
-    expected = [
-        item
-        for index in range(400)
-        for item in [(f"Finding {index}", 3), (f"nested {index} " + "z" * 200, 5)]
-    ]
-    assert [
-        (token.content, token.level)
-        for token in original
-        if token.type == "inline" and token.content.startswith(("Finding ", "nested "))
-    ] == expected
-    assert not any(token.type in {"code_block", "fence"} for token in original)
-    assert sum(token.type == "table_open" for token in original) == 1
-    assert _HELPERS["COMMENT_BYTE_LIMIT"] == 60000
-    assert len(review.encode("utf-8")) > 60000
-    review_path, receipt, posts = _prepare_publication(
-        tmp_path, monkeypatch, head_sha="a" * 40, run_url="https://example.test/run"
-    )
-    with pytest.raises(ValueError) as error:
-        _published_comments(review, review_path, receipt)
-    assert str(error.value) == "Polly review nested lists are not supported in multipart comments."
-    assert not posts and not receipt.exists()
-    assert sorted(path.name for path in tmp_path.iterdir()) == ["review.md"]
-    return
-
-
 def _rendered_comments(review: str) -> list[str]:
     comments = _HELPERS["review_comments"](
         review, head_sha="a" * 40, run_id="10-1", run_url="https://example.test/run"
@@ -837,174 +916,6 @@ def _assert_fragments(
     assert (
         "".join(cells[4].removeprefix(" ").removesuffix(" ") for cells in fragments) == rationale
     )
-
-
-def _check_capacity_and_work_limits(
-    table_variant: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    review = _REVIEW
-    if table_variant.startswith(
-        ("oversized-fence-", "unsafe-inline-run-", "unsafe-fence-whitespace-")
-    ):
-        char = "`" if table_variant.endswith("backticks") else "~"
-        fence = char * 3
-        if table_variant.startswith("oversized-fence-"):
-            fence = char * 70000
-            code = "literal" + "\n"
-            message = "fence delimiter cannot fit within comment capacity"
-        else:
-            code = (
-                "x" + char * 130000 + "a" + "\n"
-                if table_variant.startswith("unsafe-inline-run-")
-                else fence + " " * 130000 + "a" + "\n"
-            )
-            message = "literal fence run cannot fit within comment capacity"
-        review = fence + "text\n" + code + fence + "\n\n" + review
-    elif table_variant in {"oversized-header", "fenced-header-control"}:
-        table = "| " + "H" * 70000 + " | Details |\n| --- | --- |\n| item | note |\n"
-        review = (
-            ("```text\n" + table + "```\n" if table_variant == "fenced-header-control" else table)
-            + "\n"
-            + review
-        )
-        message = "table header cannot fit within comment capacity"
-    else:
-        review = review.replace("Empty input", "Empty input" + "b" * 31000)
-        review = review.replace("Guards the regression.", "x" * 70000)
-        setting, limit, message = (
-            ("MAX_REVIEW_PARTS", 2, "part limit")
-            if table_variant == "part-limit"
-            else ("RENDER_WORK_BYTE_LIMIT", 1, "rendering work budget")
-        )
-        monkeypatch.setitem(_HELPERS["review_comments"].__globals__, setting, limit)
-    composed = _HELPERS["compose_review"](
-        review, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
-    )
-    if table_variant == "fenced-header-control":
-        comments = _rendered_comments(composed)
-        assert sum(comment.count("H") for comment in comments) == 70000
-        assert sum(comment.count("| item | note |") for comment in comments) == 1
-        assert all(comment.count("```text") == comment.count("\n```\n") for comment in comments)
-    else:
-        review_path, receipt, posts = _prepare_publication(
-            tmp_path, monkeypatch, head_sha="a" * 40, run_url="https://example.test/run"
-        )
-        review_path.write_text(composed, encoding="utf-8")
-        with pytest.raises(ValueError, match=message):
-            _HELPERS["publish_review"](review_path, receipt)
-        assert not posts
-        assert not receipt.exists()
-        assert not list(tmp_path.glob("comment*.md"))
-        if table_variant == "part-limit":
-            raw_ceiling = _HELPERS["COMMENT_BYTE_LIMIT"] * limit
-            assert len(composed.encode("utf-8")) < raw_ceiling
-            initial_oversized = "é" * (raw_ceiling // 2 + 1) + "\n\n" + composed
-            assert len(initial_oversized.encode("utf-8")) > raw_ceiling
-
-            def unexpected_context(*args, **kwargs):
-                pytest.fail("Initial raw-byte refusal must precede Markdown context rendering")
-
-            with monkeypatch.context() as context:
-                context.setitem(
-                    _HELPERS["review_comments"].__globals__,
-                    "_markdown_context",
-                    unexpected_context,
-                )
-                with pytest.raises(
-                    ValueError, match=r"^Polly review exceeds the publication part limit\.$"
-                ):
-                    _published_comments(initial_oversized, review_path, receipt)
-            assert not posts and not receipt.exists()
-            assert sorted(path.name for path in tmp_path.iterdir()) == ["review.md"]
-    return
-
-
-def _check_identity_and_work(table_variant: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    large_identity = table_variant == "incremental-work"
-    rationale = "x" * 70000
-    header, delimiter, original = _REVIEW.split("### Tests\n", 1)[1].split("\n")[:3]
-    if large_identity:
-        row = original.replace("Empty input", "Empty input" + "b" * 31000)
-        row = row.replace("Guards the regression.", rationale)
-        review = _REVIEW.replace(original, row)
-    else:
-        header = "| Item | Details | Kind | Action | Notes |"
-        row = "| finding-0 | | Info | Keep | " + rationale + " |"
-        review = header + "\n" + delimiter + "\n" + row + "\n\n" + _REVIEW
-    composed = _HELPERS["compose_review"](
-        review, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
-    )
-    if large_identity:
-        metadata = {
-            "head_sha": "a" * 40,
-            "run_id": "10-1",
-            "run_url": "https://example.test/run",
-        }
-        smaller = composed.replace(rationale, "x" * 20000)
-        small_comments = _HELPERS["review_comments"](smaller, **metadata)
-        assert len(small_comments) == 1
-        assert len(small_comments[0].encode("utf-8")) < 52000
-        with monkeypatch.context() as render_patch:
-            context = _HELPERS["_markdown_context"]
-            visited = set()
-
-            def checked_context(text: str, **kwargs):
-                if text != composed and not text.startswith("<!--"):
-                    assert text not in visited, "Accepted review prefix was parsed again"
-                    assert len(visited) < 32, "Exceeded bounded component context visits"
-                    visited.add(text)
-                return context(text, **kwargs)
-
-            render_patch.setitem(
-                _HELPERS["review_comments"].__globals__,
-                "_markdown_context",
-                checked_context,
-            )
-            comments = _HELPERS["review_comments"](composed, **metadata)
-    else:
-        comments = _rendered_comments(composed)
-    expected = _HELPERS["split_table_row"](row.strip().strip("|"))
-    fragments = []
-    for comment in comments:
-        rows = [line for line in comment.split("\n") if line.startswith("|" + expected[0] + "|")]
-        if rows:
-            assert header + "\n" + delimiter in comment
-        for line in rows:
-            cells = _HELPERS["split_table_row"](line.strip().strip("|"))
-            fragments.append(cells)
-    assert len(comments) > 1
-    _assert_fragments(
-        fragments, expected, rationale, minimum=2, ordinary_empty_cell=not large_identity
-    )
-    assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
-    if large_identity:
-        later_rationale = "Retains the later independent identity."
-        later_row = original.replace("test_empty", "test_later").replace(
-            "Empty input", "Different input" + "c" * 40000
-        )
-        later_row = later_row.replace("Guards the regression.", later_rationale)
-        later_review = _HELPERS["compose_review"](
-            _REVIEW.replace(original, later_row),
-            {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]},
-        )
-        later_comments = _HELPERS["review_comments"](later_review, **metadata)
-        assert len(later_comments) == 1
-        assert len(later_comments[0].encode("utf-8")) < 60000
-        comments = _rendered_comments(composed.replace(row, row + "\n" + later_row))
-        assert sum(comment.count(later_row) for comment in comments) == 1
-        for expected_row, expected_rationale in [
-            (row, rationale),
-            (later_row, later_rationale),
-        ]:
-            expected = _HELPERS["split_table_row"](expected_row.strip().strip("|"))
-            fragments = []
-            for comment in comments:
-                for line in comment.split("\n"):
-                    if line.startswith("|" + expected[0] + "|"):
-                        assert header + "\n" + delimiter in comment
-                        fragments.append(_HELPERS["split_table_row"](line.strip().strip("|")))
-            _assert_fragments(fragments, expected, expected_rationale)
-    return
 
 
 @pytest.mark.parametrize(
@@ -1465,6 +1376,12 @@ def test_multipart_reference_dependencies_are_refused(
         "short-code-span-completed-reference-details-rationale",
         "short-code-span-completed-reference-summary-prose",
         "short-code-span-completed-reference-summary-rationale",
+        "inline-code-oversized",
+        "inline-code-repeated",
+        "inline-code-calibrated",
+        "inline-code-calibrated-double",
+        "short-inline-code-calibrated",
+        "short-inline-code-calibrated-double",
     ],
 )
 def test_review_comments_preserve_supported_markdown_context(
@@ -1491,7 +1408,81 @@ def test_review_comments_preserve_supported_markdown_context(
 def test_review_comments_enforce_capacity_and_work_limits(
     table_variant: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _check_capacity_and_work_limits(table_variant, tmp_path, monkeypatch)
+    review = _REVIEW
+    if table_variant.startswith(
+        ("oversized-fence-", "unsafe-inline-run-", "unsafe-fence-whitespace-")
+    ):
+        char = "`" if table_variant.endswith("backticks") else "~"
+        fence = char * 3
+        if table_variant.startswith("oversized-fence-"):
+            fence = char * 70000
+            code = "literal" + "\n"
+            message = "fence delimiter cannot fit within comment capacity"
+        else:
+            code = (
+                "x" + char * 130000 + "a" + "\n"
+                if table_variant.startswith("unsafe-inline-run-")
+                else fence + " " * 130000 + "a" + "\n"
+            )
+            message = "literal fence run cannot fit within comment capacity"
+        review = fence + "text\n" + code + fence + "\n\n" + review
+    elif table_variant in {"oversized-header", "fenced-header-control"}:
+        table = "| " + "H" * 70000 + " | Details |\n| --- | --- |\n| item | note |\n"
+        review = (
+            ("```text\n" + table + "```\n" if table_variant == "fenced-header-control" else table)
+            + "\n"
+            + review
+        )
+        message = "table header cannot fit within comment capacity"
+    else:
+        review = review.replace("Empty input", "Empty input" + "b" * 31000)
+        review = review.replace("Guards the regression.", "x" * 70000)
+        setting, limit, message = (
+            ("MAX_REVIEW_PARTS", 2, "part limit")
+            if table_variant == "part-limit"
+            else ("RENDER_WORK_BYTE_LIMIT", 1, "rendering work budget")
+        )
+        monkeypatch.setitem(_HELPERS["review_comments"].__globals__, setting, limit)
+    composed = _HELPERS["compose_review"](
+        review, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+    )
+    if table_variant == "fenced-header-control":
+        comments = _rendered_comments(composed)
+        assert sum(comment.count("H") for comment in comments) == 70000
+        assert sum(comment.count("| item | note |") for comment in comments) == 1
+        assert all(comment.count("```text") == comment.count("\n```\n") for comment in comments)
+    else:
+        review_path, receipt, posts = _prepare_publication(
+            tmp_path, monkeypatch, head_sha="a" * 40, run_url="https://example.test/run"
+        )
+        review_path.write_text(composed, encoding="utf-8")
+        with pytest.raises(ValueError, match=message):
+            _HELPERS["publish_review"](review_path, receipt)
+        assert not posts
+        assert not receipt.exists()
+        assert not list(tmp_path.glob("comment*.md"))
+        if table_variant == "part-limit":
+            raw_ceiling = _HELPERS["COMMENT_BYTE_LIMIT"] * limit
+            assert len(composed.encode("utf-8")) < raw_ceiling
+            initial_oversized = "é" * (raw_ceiling // 2 + 1) + "\n\n" + composed
+            assert len(initial_oversized.encode("utf-8")) > raw_ceiling
+
+            def unexpected_context(*args, **kwargs):
+                pytest.fail("Initial raw-byte refusal must precede Markdown context rendering")
+
+            with monkeypatch.context() as context:
+                context.setitem(
+                    _HELPERS["review_comments"].__globals__,
+                    "_markdown_context",
+                    unexpected_context,
+                )
+                with pytest.raises(
+                    ValueError, match=r"^Polly review exceeds the publication part limit\.$"
+                ):
+                    _published_comments(initial_oversized, review_path, receipt)
+            assert not posts and not receipt.exists()
+            assert sorted(path.name for path in tmp_path.iterdir()) == ["review.md"]
+    return
 
 
 @pytest.mark.parametrize(
@@ -1504,13 +1495,133 @@ def test_review_comments_enforce_capacity_and_work_limits(
 def test_review_comments_preserve_identity_with_bounded_work(
     table_variant: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _check_identity_and_work(table_variant, monkeypatch)
+    large_identity = table_variant == "incremental-work"
+    rationale = "x" * 70000
+    header, delimiter, original = _REVIEW.split("### Tests\n", 1)[1].split("\n")[:3]
+    if large_identity:
+        row = original.replace("Empty input", "Empty input" + "b" * 31000)
+        row = row.replace("Guards the regression.", rationale)
+        review = _REVIEW.replace(original, row)
+    else:
+        header = "| Item | Details | Kind | Action | Notes |"
+        row = "| finding-0 | | Info | Keep | " + rationale + " |"
+        review = header + "\n" + delimiter + "\n" + row + "\n\n" + _REVIEW
+    composed = _HELPERS["compose_review"](
+        review, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+    )
+    if large_identity:
+        metadata = {
+            "head_sha": "a" * 40,
+            "run_id": "10-1",
+            "run_url": "https://example.test/run",
+        }
+        smaller = composed.replace(rationale, "x" * 20000)
+        small_comments = _HELPERS["review_comments"](smaller, **metadata)
+        assert len(small_comments) == 1
+        assert len(small_comments[0].encode("utf-8")) < 52000
+        with monkeypatch.context() as render_patch:
+            context = _HELPERS["_markdown_context"]
+            visited = set()
+
+            def checked_context(text: str, **kwargs):
+                if text != composed and not text.startswith("<!--"):
+                    assert text not in visited, "Accepted review prefix was parsed again"
+                    assert len(visited) < 32, "Exceeded bounded component context visits"
+                    visited.add(text)
+                return context(text, **kwargs)
+
+            render_patch.setitem(
+                _HELPERS["review_comments"].__globals__,
+                "_markdown_context",
+                checked_context,
+            )
+            comments = _HELPERS["review_comments"](composed, **metadata)
+    else:
+        comments = _rendered_comments(composed)
+    expected = _HELPERS["split_table_row"](row.strip().strip("|"))
+    fragments = []
+    for comment in comments:
+        rows = [line for line in comment.split("\n") if line.startswith("|" + expected[0] + "|")]
+        if rows:
+            assert header + "\n" + delimiter in comment
+        for line in rows:
+            cells = _HELPERS["split_table_row"](line.strip().strip("|"))
+            fragments.append(cells)
+    assert len(comments) > 1
+    _assert_fragments(
+        fragments, expected, rationale, minimum=2, ordinary_empty_cell=not large_identity
+    )
+    assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
+    if large_identity:
+        later_rationale = "Retains the later independent identity."
+        later_row = original.replace("test_empty", "test_later").replace(
+            "Empty input", "Different input" + "c" * 40000
+        )
+        later_row = later_row.replace("Guards the regression.", later_rationale)
+        later_review = _HELPERS["compose_review"](
+            _REVIEW.replace(original, later_row),
+            {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]},
+        )
+        later_comments = _HELPERS["review_comments"](later_review, **metadata)
+        assert len(later_comments) == 1
+        assert len(later_comments[0].encode("utf-8")) < 60000
+        comments = _rendered_comments(composed.replace(row, row + "\n" + later_row))
+        assert sum(comment.count(later_row) for comment in comments) == 1
+        for expected_row, expected_rationale in [
+            (row, rationale),
+            (later_row, later_rationale),
+        ]:
+            expected = _HELPERS["split_table_row"](expected_row.strip().strip("|"))
+            fragments = []
+            for comment in comments:
+                for line in comment.split("\n"):
+                    if line.startswith("|" + expected[0] + "|"):
+                        assert header + "\n" + delimiter in comment
+                        fragments.append(_HELPERS["split_table_row"](line.strip().strip("|")))
+            _assert_fragments(fragments, expected, expected_rationale)
+    return
 
 
 def test_multipart_nested_lists_are_refused(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _check_nested_list_refusal(tmp_path, monkeypatch)
+    from markdown_it import MarkdownIt
+
+    findings = "## Findings\n\n" + "".join(
+        f"- Finding {index}\n    - nested {index} " + "z" * 200 + "\n" for index in range(400)
+    )
+    review = (
+        findings
+        + "\n"
+        + _HELPERS["compose_review"](
+            _REVIEW, {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+        )
+    )
+    parser = MarkdownIt("commonmark").enable("table")
+    original = parser.parse(review)
+    expected = [
+        item
+        for index in range(400)
+        for item in [(f"Finding {index}", 3), (f"nested {index} " + "z" * 200, 5)]
+    ]
+    assert [
+        (token.content, token.level)
+        for token in original
+        if token.type == "inline" and token.content.startswith(("Finding ", "nested "))
+    ] == expected
+    assert not any(token.type in {"code_block", "fence"} for token in original)
+    assert sum(token.type == "table_open" for token in original) == 1
+    assert _HELPERS["COMMENT_BYTE_LIMIT"] == 60000
+    assert len(review.encode("utf-8")) > 60000
+    review_path, receipt, posts = _prepare_publication(
+        tmp_path, monkeypatch, head_sha="a" * 40, run_url="https://example.test/run"
+    )
+    with pytest.raises(ValueError) as error:
+        _published_comments(review, review_path, receipt)
+    assert str(error.value) == "Polly review nested lists are not supported in multipart comments."
+    assert not posts and not receipt.exists()
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["review.md"]
+    return
 
 
 @pytest.mark.parametrize(
