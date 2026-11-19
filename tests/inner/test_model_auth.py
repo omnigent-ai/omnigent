@@ -20,6 +20,7 @@ from omnigent.inner.model_auth import (
     _profile_token_argv,
     _resolve_auth_executable,
     _TrustedExecutable,
+    _validate_auth_executable_path,
     _validate_auth_runtime,
     mint_profile_token,
 )
@@ -323,6 +324,15 @@ def test_ucode_resolution_rejects_unsafe_symlink_chain(
 
     with pytest.raises(PermissionError, match="unsafe"):
         _resolve_auth_executable()
+
+
+def test_auth_executable_symlink_loop_reports_a_path_free_error(tmp_path: Path) -> None:
+    loop = tmp_path / "loop"
+    loop.symlink_to(loop)
+
+    with pytest.raises(PermissionError, match="cannot validate trusted authentication") as error:
+        _validate_auth_executable_path(loop)
+    assert str(loop) not in str(error.value)
 
 
 async def test_ucode_replacement_after_validation_fails_before_exec(

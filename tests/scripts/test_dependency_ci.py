@@ -687,6 +687,7 @@ def test_workflows_connect_selection_to_jobs():
     assert cli_test["env"]["OMNIGENT_CLAUDE_CLI_E2E"] == "1"
     assert "--reruns 0" in cli_test["run"]
     assert "test_real_cli_bash_tool_round_trip_and_inline_skill_finish" in cli_test["run"]
+    assert "test_sdk_real_cli_bash_policy_runs_before_execution" in cli_test["run"]
     assert "test_each_cli_execution_path_inherits_the_sandbox" in cli_test["run"]
     assert "test_bound_host_proc_does_not_expose_synthetic_parent" in cli_test["run"]
     assert "len(cases) != 17 or skipped" in cli_test["run"]

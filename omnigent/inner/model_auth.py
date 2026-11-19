@@ -135,8 +135,8 @@ def _validate_auth_executable_path(path: Path) -> _TrustedExecutable:
 
     try:
         variants = _launcher_path_variants(path)
-    except RuntimeError as exc:
-        raise PermissionError("trusted authentication executable has a symlink loop") from exc
+    except (OSError, RuntimeError) as exc:
+        raise PermissionError("cannot validate trusted authentication executable path") from exc
     for variant in variants:
         _validate_provenance_chain(variant)
     resolved = path.resolve(strict=True)

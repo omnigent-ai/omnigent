@@ -1239,11 +1239,16 @@ class ExecutorAdapter(HarnessApp):
                 executor = await asyncio.shield(build_task)
             except BaseException:
                 # A cancelled turn still owns any proxy and launcher the factory created.
-                with contextlib.suppress(BaseException):
+                try:
                     await await_cleanup_task(build_task)
-                    executor = build_task.result()
-                    cleanup_task = asyncio.create_task(executor.close())
-                    await await_cleanup_task(cleanup_task)
+                except BaseException:
+                    pass
+                else:
+                    cleanup_task = asyncio.create_task(build_task.result().close())
+                    try:
+                        await await_cleanup_task(cleanup_task)
+                    except BaseException:
+                        _logger.exception("Failed to close executor built for a cancelled turn")
                 raise
             self._executor = executor
             return executor

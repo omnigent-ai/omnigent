@@ -36,13 +36,18 @@ _TEST_HARNESS_NAME = "executor_adapter_fixture"
 _TEST_HARNESS_MODULE = "tests.runtime.harnesses._test_executor_adapter_harness"
 
 
-async def test_threaded_executor_factory_cancellation_closes_completed_startup() -> None:
+@pytest.mark.parametrize("close_fails", [False, True])
+async def test_threaded_executor_factory_cancellation_closes_completed_startup(
+    caplog: pytest.LogCaptureFixture, close_fails: bool
+) -> None:
     """A cancelled first turn must reap a proxy-owning executor built on a thread."""
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
 
     started = threading.Event()
     release = threading.Event()
     executor = AsyncMock(spec=Executor)
+    if close_fails:
+        executor.close.side_effect = RuntimeError("injected close failure")
 
     def build_executor() -> Executor:
         started.set()
@@ -59,6 +64,9 @@ async def test_threaded_executor_factory_cancellation_closes_completed_startup()
             await startup
         executor.close.assert_awaited_once()
         assert adapter._executor is None
+        assert (
+            "Failed to close executor built for a cancelled turn" in caplog.text
+        ) is close_fails
     finally:
         release.set()
 
