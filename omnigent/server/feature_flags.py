@@ -56,6 +56,7 @@ class Feature(StrEnum):
     WORKSPACE_API_SERVER_ACCESS = "workspace_api_server_access"
     PROACTIVE_AGENT = "proactive_agent"
     USER_INBOX = "user_inbox"
+    PI_CLAUDE_PLUGINS = "pi_claude_plugins"
     MEMORY = "memory"
     QUICK_PICK_PALETTE = "quick_pick_palette"
 
@@ -312,6 +313,13 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         # Clients probe inbox_items_available in GET /v1/info.
         frontend_visible=False,
         default_enabled=True,
+    ),
+    FeatureDefinition(
+        feature=Feature.PI_CLAUDE_PLUGINS,
+        description="Expose enabled Claude Code plugins to managed Pi sessions",
+        owner="runner",
+        review_by_release="0.24.0",
+        frontend_visible=False,
     ),
     FeatureDefinition(
         feature=Feature.QUICK_PICK_PALETTE,
