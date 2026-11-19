@@ -54,9 +54,7 @@ def test_a_csv_opens_as_a_table_with_a_sticky_header_and_resizable_columns(
     """
     table = _open_table(page, seeded_session, 1500, 900)
     viewer = page.locator('[data-testid="file-viewer"]:visible')
-    expect(viewer.get_by_test_id("data-table-summary")).to_contain_text(
-        "200 rows · 6 columns · comma-separated"
-    )
+    expect(viewer.get_by_test_id("data-table-summary")).to_have_text("200 rows · 6 columns")
 
     header = table.get_by_role("columnheader").first
     top_before = header.bounding_box()["y"]

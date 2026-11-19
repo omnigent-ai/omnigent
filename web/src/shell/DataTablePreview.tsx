@@ -34,13 +34,6 @@ const TYPE_LABELS: Record<DataColumnType, string> = {
   text: "text",
 };
 
-const DELIMITER_LABELS: Record<string, string> = {
-  ",": "comma-separated",
-  ";": "semicolon-separated",
-  "\t": "tab-separated",
-  "|": "pipe-separated",
-};
-
 /** Widest a column starts out; dragging its edge can widen it further. */
 const DEFAULT_MAX_COLUMN_WIDTH = 512;
 const MIN_COLUMN_WIDTH = 64;
@@ -264,8 +257,7 @@ function DataTableView({
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b px-4 py-2 text-sm text-muted-foreground">
         <span data-testid="data-table-summary">
           {rowCount} · {table.totalColumns.toLocaleString()}{" "}
-          {table.totalColumns === 1 ? "column" : "columns"} ·{" "}
-          {DELIMITER_LABELS[table.delimiter] ?? "delimited"}
+          {table.totalColumns === 1 ? "column" : "columns"}
           {table.encoding !== "utf-8" ? ` · ${table.encoding}` : ""}
         </span>
         {filtered && <span>{visibleRows.length.toLocaleString()} matching</span>}

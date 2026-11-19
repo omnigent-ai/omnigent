@@ -5,7 +5,7 @@ CSV and TSV files open as a read-only table in the file viewer instead of as hig
 ## Sub-features
 
 - `table-open`: `.csv` and `.tsv` files open on the table; the shared Preview ↔ Source toggle switches to the raw text and back.
-- `table-summary`: row count, column count, the delimiter (comma, semicolon, tab or pipe, detected from the first lines; always tab for `.tsv`), and the encoding when it isn't UTF-8.
+- `table-summary`: row count, column count, and the encoding when it isn't UTF-8.
 - `table-types`: each column is labeled number, date or text from its non-empty cells; number columns align right.
 - `table-sort`: clicking a column header sorts ascending, then descending, then back to file order. Numbers and dates sort by value (a percentage as its fraction, so 25% sorts before 0.5, and integers past 2^53 exactly), text naturally; empty cells stay last. A date or time without an offset sorts as UTC, so a date comes before times later that day in any time zone.
 - `table-filter`: each column has a filter that keeps rows whose cell contains the text, case-insensitively; the summary shows how many rows match.

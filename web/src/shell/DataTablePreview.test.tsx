@@ -53,9 +53,7 @@ describe("DataTablePreview", () => {
     expect(
       headers.map((header) => within(header).getByText(/^(text|number|date)$/).textContent),
     ).toEqual(["text", "number", "date"]);
-    expect(screen.getByTestId("data-table-summary")).toHaveTextContent(
-      "3 rows · 3 columns · comma-separated",
-    );
+    expect(screen.getByTestId("data-table-summary")).toHaveTextContent(/^3 rows · 3 columns$/);
     expect(columnValues(0)).toEqual(["West", "East", "North"]);
   });
 
@@ -276,9 +274,7 @@ describe("DataTablePreview", () => {
 
   it("reads a tab-separated file by its extension", () => {
     renderTable("a,b\tc\n1,2\t3\n", { path: "data.tsv" });
-    expect(screen.getByTestId("data-table-summary")).toHaveTextContent(
-      "1 row · 2 columns · tab-separated",
-    );
+    expect(screen.getByTestId("data-table-summary")).toHaveTextContent(/^1 row · 2 columns$/);
     expect(columnValues(0)).toEqual(["1,2"]);
   });
 
