@@ -1490,7 +1490,8 @@ function AssistantBubble({
   // thread-level card, not an assistant reply, so it takes the "error" role; a
   // failed turn that still produced tool or reasoning output keeps the assistant role.
   const errorNotice = hasError && bubble.items.every((it) => it.kind === "error");
-  const spansFullColumn = isWide || hasError;
+  const spansFullColumn =
+    isWide || hasError || /[\p{Script=Hebrew}\p{Script=Arabic}]/u.test(markdownText);
   const hasSubagentNotice = bubble.items.some((it) => it.kind === "subagent_activity");
   // Shrink-wrapped to a short reply, tool rows would cut their titles off mid-column.
   const hasToolRows = bubble.items.some((it) => it.kind === "tool" || it.kind === "native_tool");
