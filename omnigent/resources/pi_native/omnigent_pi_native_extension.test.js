@@ -729,7 +729,8 @@ async function testQueuedPromptDuringStartupStaysRunningUntilAgentEnd() {
 
 // Native subagent children: a parent session file plus child session files
 // beneath its per-session directory, watched through the real extension module.
-function childFixture() {
+// Posts are recorded once their response arrives; an infinite delay never responds.
+function childFixture({ responseDelayMs = 0, postTimeoutMs } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-children-"));
   harnesses.push({ pi: {}, fixtureRoot: root });
   const sessions = path.join(root, "sessions");
@@ -742,13 +743,15 @@ function childFixture() {
   global.fetch = async (url, opts) => {
     const body = JSON.parse(opts.body);
     const sessionId = decodeURIComponent(String(url).split("/v1/sessions/")[1].split("/")[0]);
+    if (responseDelayMs === Infinity) return new Promise(() => {});
+    if (responseDelayMs) await new Promise((resolve) => setTimeout(resolve, responseDelayMs));
     posts.push({ sessionId, body });
     const json = body.type === "external_acp_subagent_start"
       ? { child_session_id: `conv_${body.data.subagent_id}` }
       : {};
     return { ok: true, status: 202, json: async () => json };
   };
-  const config = { serverUrl: "http://mock", sessionId: "conv_parent", bridgeDir };
+  const config = { serverUrl: "http://mock", sessionId: "conv_parent", bridgeDir, assistantItemPostTimeoutMs: postTimeoutMs };
   delete require.cache[EXT_PATH];
   const { createChildSessionWatcher } = require(EXT_PATH);
   const watcher = (now = Date.now) =>
@@ -796,6 +799,10 @@ async function testChildSessionsAreRegisteredWithTheirOwnModels() {
     // Copied by a fork from the parent before the child started.
     assistantLine("model-parent", 4000, 999, 999) +
     assistantLine("model-b", 6000, 50, 5));
+  // Same agent name and the same last eight id characters as the first child.
+  writeChild("run-c/run-0/session.jsonl",
+    childSessionLines({ id: "01a1f1a6-6b58-7306-959e-d61c9edd4745", parentFile: f.parentFile, agent: "worker" }) +
+    assistantLine("model-c", 2000, 200, 20));
   // Pi's own /fork writes a top-level sibling that names the parent.
   fs.writeFileSync(path.join(f.sessions, "fork.jsonl"),
     childSessionLines({ id: "pi-fork", parentFile: f.parentFile, agent: "x" }) +
@@ -806,10 +813,15 @@ async function testChildSessionsAreRegisteredWithTheirOwnModels() {
   const starts = f.posts.filter((p) => p.body.type === "external_acp_subagent_start");
   assert("each child is registered under the parent once",
     JSON.stringify(starts.map((p) => [p.sessionId, p.body.data.subagent_id, p.body.data.title]).sort()) ===
-      JSON.stringify([["conv_parent", "worker-2c3d4e5f", "worker"], ["conv_parent", "worker-9edd4745", "worker"]]),
+      JSON.stringify([
+        ["conv_parent", "worker-01a1f1a6-6b58-7306-959e-0a1b2c3d4e5f", "worker"],
+        ["conv_parent", "worker-01a1f1a6-6b58-7306-959e-c50b9edd4745", "worker"],
+        ["conv_parent", "worker-01a1f1a6-6b58-7306-959e-d61c9edd4745", "worker"],
+      ]),
     JSON.stringify(starts));
-  const usageA = childUsage(f.posts, "conv_worker-9edd4745");
-  const usageB = childUsage(f.posts, "conv_worker-2c3d4e5f");
+  const usageA = childUsage(f.posts, "conv_worker-01a1f1a6-6b58-7306-959e-c50b9edd4745");
+  const usageB = childUsage(f.posts, "conv_worker-01a1f1a6-6b58-7306-959e-0a1b2c3d4e5f");
+  const usageC = childUsage(f.posts, "conv_worker-01a1f1a6-6b58-7306-959e-d61c9edd4745");
   assert("child usage is priced by its own model, deduped, without a zero Pi cost",
     usageA.length === 1 && usageA[0].model === "model-a" &&
       usageA[0].cumulative_input_tokens === 110 && usageA[0].cumulative_output_tokens === 10 &&
@@ -819,8 +831,11 @@ async function testChildSessionsAreRegisteredWithTheirOwnModels() {
   assert("forked history is not billed to the child",
     usageB.length === 1 && usageB[0].model === "model-b" && usageB[0].cumulative_input_tokens === 60,
     JSON.stringify(usageB));
+  assert("same-named children sharing an id suffix keep separate usage",
+    usageC.length === 1 && usageC[0].cumulative_input_tokens === 210 && usageA[0]?.cumulative_input_tokens === 110,
+    JSON.stringify(usageC));
   assert("a running child reports running",
-    f.posts.some((p) => p.sessionId === "conv_worker-9edd4745" && p.body.type === "external_session_status" &&
+    f.posts.some((p) => p.sessionId === "conv_worker-01a1f1a6-6b58-7306-959e-c50b9edd4745" && p.body.type === "external_session_status" &&
       p.body.data.status === "running"));
 }
 
@@ -856,7 +871,8 @@ async function testChildReadsIncrementallyAndSurvivesRestart() {
 }
 
 async function testChildWrittenAfterTheLastPollIsReportedAtShutdown() {
-  const f = childFixture();
+  // Fast responses, but the whole drain outlasts one post timeout.
+  const f = childFixture({ responseDelayMs: 40, postTimeoutMs: 100 });
   const watcher = f.watcher();
   watcher.start();
   await watcher.poll();
@@ -886,6 +902,8 @@ async function testChildWrittenAfterTheLastPollIsReportedAtShutdown() {
   const readdirSync = fs.readdirSync;
   fs.readdirSync = (...args) => readdirSync(...args).sort((a, b) => (a.name < b.name ? -1 : 1));
   try {
+    // A poll is already in flight when shutdown begins.
+    watcher.poll();
     await watcher.stop();
   } finally {
     fs.readdirSync = readdirSync;
@@ -907,11 +925,25 @@ async function testChildWrittenAfterTheLastPollIsReportedAtShutdown() {
     JSON.stringify(f.posts));
 }
 
+async function testShutdownIsBoundedWhenTheServerNeverResponds() {
+  const f = childFixture({ responseDelayMs: Infinity, postTimeoutMs: 20 });
+  const file = path.join(f.sessions, path.basename(f.parentFile, ".jsonl"), "run", "session.jsonl");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file,
+    childSessionLines({ id: "hung", parentFile: f.parentFile, agent: "worker" }) + assistantLine("model-a", 2000, 1, 1));
+  const watcher = f.watcher();
+  watcher.poll();
+  const startedAt = Date.now();
+  await watcher.stop();
+  assert("shutdown stops waiting for a server that never responds", Date.now() - startedAt < 2_000);
+}
+
 (async () => {
   try {
     await testChildSessionsAreRegisteredWithTheirOwnModels();
     await testChildReadsIncrementallyAndSurvivesRestart();
     await testChildWrittenAfterTheLastPollIsReportedAtShutdown();
+    await testShutdownIsBoundedWhenTheServerNeverResponds();
     await testSessionStartupDoesNotCompleteATurn();
     await testSessionStartMarksInputReady();
     await testQueuedPromptDuringStartupStaysRunningUntilAgentEnd();

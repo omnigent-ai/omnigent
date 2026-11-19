@@ -1203,6 +1203,8 @@ const _CHILD_QUIET_MS = 20_000;
 const _CHILD_READ_CHUNK_BYTES = 1024 * 1024;
 const _CHILD_HEADER_BYTES = 64 * 1024;
 const _CHILD_SCAN_MAX_DEPTH = 10;
+// The shutdown drain allows this many sequential post timeouts, within the history budget.
+const _CHILD_SHUTDOWN_POSTS = 10;
 // pi-subagents names each child session ``subagent-<agent>-<run uuid>-<n>``.
 const _PI_SUBAGENTS_SESSION_NAME = /^subagent-(.+)-[0-9a-f-]{36}-\d+$/;
 
@@ -1337,8 +1339,9 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
       ? config.sessionId
       : children.find(other => other.file === child.parentFile)?.childId;
     if (!parentId) return false;
-    // The Agents rail labels the row with this id; UUIDv7 ids share a timestamp prefix.
-    const subagentId = `${child.title}-${child.key.replace(/[^a-z0-9]/gi, "").slice(-8)}`;
+    // The server dedupes on this id, so it keeps the full persisted Pi session id
+    // behind a readable agent-name prefix.
+    const subagentId = `${child.title}-${child.key}`;
     try {
       const response = await post(parentId, {
         type: "external_acp_subagent_start",
@@ -1439,7 +1442,7 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
     }
     // Persist cursors and totals before reporting them.
     persist();
-    for (const child of minted) await report(child);
+    await Promise.all(minted.map(report));
   }
 
   return {
@@ -1453,13 +1456,16 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
       timer = setInterval(() => this.poll().catch(() => {}), _CHILD_POLL_MS);
       timer?.unref?.();
     },
-    // A last poll, after any in-flight one, captures the final window within one post timeout.
+    // A last poll, after any in-flight one, captures the final window within the shutdown budget.
     async stop() {
       clearInterval(timer);
       timer = null;
       const final = Promise.resolve(polling).catch(() => {}).then(() => this.poll(true));
       const bound = new AbortController();
-      await Promise.race([final.catch(() => {}), sleep(assistantItemPostTimeoutMs(config), bound.signal)]);
+      const deadline = Math.min(
+        _HISTORY_SHUTDOWN_TIMEOUT_MS, _CHILD_SHUTDOWN_POSTS * assistantItemPostTimeoutMs(config),
+      );
+      await Promise.race([final.catch(() => {}), sleep(deadline, bound.signal)]);
       bound.abort();
     },
   };
