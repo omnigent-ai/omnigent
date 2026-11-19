@@ -3459,13 +3459,19 @@ class WorkflowSummary(BaseModel):
     """
     A saved workflow as a list page returns it, without its steps.
 
-    :param id: Workflow ID, a bare 32-character hex UUID.
+    :param id: Workflow ID, bare 32-character hex.
     :param object: Discriminator; always ``"workflow"``.
     :param name: One line, unique among the owner's workflows.
     :param description: What the workflow is for.
     :param created_at: Unix epoch seconds when it was saved.
     :param updated_at: Unix epoch seconds of the last write.
     :param is_draft: Derived from whether the saved plan has no steps.
+    :param viewer_role: ``"owner"``, or ``"viewer"`` for someone it is shared with, who
+        may view, run and copy it but not change it.
+    :param owner_display_name: The owner's name for a viewer; ``None`` for the owner.
+    :param shareable: Whether the workflow itself can be shared where the server shares
+        workflows (``/v1/info`` ``workflow_sharing``); ``False`` for one whose grants
+        the server cannot keep.
     """
 
     id: str
@@ -3475,6 +3481,9 @@ class WorkflowSummary(BaseModel):
     created_at: int
     updated_at: int
     is_draft: bool = False
+    viewer_role: Literal["owner", "viewer"] = "owner"
+    owner_display_name: str | None = None
+    shareable: bool = True
 
 
 class WorkflowObject(WorkflowSummary):
@@ -3512,6 +3521,23 @@ class WorkflowList(BaseModel):
     last_id: str | None = None
     next_cursor: str | None = None
     has_more: bool = False
+
+
+class SharedWorkflowList(BaseModel):
+    """
+    One page of the workflows other people shared with the caller, for
+    ``GET /v1/workflows/shared``, ordered by ID.
+
+    :param object: Discriminator; always ``"list"``.
+    :param data: The page's workflows, without their steps, each with ``viewer_role``
+        ``"viewer"`` and its owner's ``owner_display_name``.
+    :param next_cursor: Pass it as ``after`` for the next page; ``None`` on the last
+        page. A page can be short, even empty, while it is set.
+    """
+
+    object: Literal["list"] = "list"
+    data: list[WorkflowSummary] = Field(default_factory=list)
+    next_cursor: str | None = None
 
 
 class WorkflowRunProgress(BaseModel):

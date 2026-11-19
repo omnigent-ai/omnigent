@@ -8376,6 +8376,11 @@
           "smart_routing_sources": {
             "$ref": "#/components/schemas/SmartRoutingSourcesInfo"
           },
+          "workflow_sharing": {
+            "default": false,
+            "title": "Workflow Sharing",
+            "type": "boolean"
+          },
           "workflows": {
             "default": false,
             "title": "Workflows",
@@ -14760,6 +14765,40 @@
         "title": "SetSharingRequest",
         "type": "object"
       },
+      "SharedWorkflowList": {
+        "description": "One page of the workflows other people shared with the caller, for\n`GET /v1/workflows/shared`, ordered by ID.",
+        "properties": {
+          "data": {
+            "description": "The page's workflows, without their steps, each with `viewer_role` `\"viewer\"` and its owner's `owner_display_name`.",
+            "items": {
+              "$ref": "#/components/schemas/WorkflowSummary"
+            },
+            "title": "Data",
+            "type": "array"
+          },
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Pass it as `after` for the next page; `None` on the last page. A page can be short, even empty, while it is set.",
+            "title": "Next Cursor"
+          },
+          "object": {
+            "const": "list",
+            "default": "list",
+            "description": "Discriminator; always `\"list\"`.",
+            "title": "Object",
+            "type": "string"
+          }
+        },
+        "title": "SharedWorkflowList",
+        "type": "object"
+      },
       "SideChatList": {
         "description": "Paginated list of side chats; `data` is a page of `SideChatSummary`.",
         "properties": {
@@ -16658,6 +16697,17 @@
             "title": "Object",
             "type": "string"
           },
+          "owner_display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Owner Display Name"
+          },
           "planning_session_id": {
             "anyOf": [
               {
@@ -16669,6 +16719,11 @@
             ],
             "description": "The conversation for proposing revisions, separate from runs.",
             "title": "Planning Session Id"
+          },
+          "shareable": {
+            "default": true,
+            "title": "Shareable",
+            "type": "boolean"
           },
           "steps": {
             "description": "The workflow's graph.",
@@ -16682,6 +16737,15 @@
             "format": "int64",
             "title": "Updated At",
             "type": "integer"
+          },
+          "viewer_role": {
+            "default": "owner",
+            "enum": [
+              "owner",
+              "viewer"
+            ],
+            "title": "Viewer Role",
+            "type": "string"
           }
         },
         "required": [
@@ -16693,6 +16757,69 @@
           "steps"
         ],
         "title": "WorkflowObject",
+        "type": "object"
+      },
+      "WorkflowPermissionList": {
+        "description": "One page of a workflow's grants, ordered by `user_id`.",
+        "properties": {
+          "next_cursor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Next Cursor"
+          },
+          "permissions": {
+            "items": {
+              "$ref": "#/components/schemas/WorkflowPermissionObject"
+            },
+            "title": "Permissions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "permissions",
+          "next_cursor"
+        ],
+        "title": "WorkflowPermissionList",
+        "type": "object"
+      },
+      "WorkflowPermissionObject": {
+        "description": "One grant on a workflow.",
+        "properties": {
+          "display_name": {
+            "description": "The grantee's name for display; the ID when the server has no other name.",
+            "title": "Display Name",
+            "type": "string"
+          },
+          "level": {
+            "description": "Numeric permission level; workflows grant `1` (read) only.",
+            "format": "int64",
+            "title": "Level",
+            "type": "integer"
+          },
+          "user_id": {
+            "description": "The grantee's canonical ID, e.g. `\"alice@example.com\"`.",
+            "title": "User Id",
+            "type": "string"
+          },
+          "workflow_id": {
+            "description": "The workflow.",
+            "title": "Workflow Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "workflow_id",
+          "level",
+          "display_name"
+        ],
+        "title": "WorkflowPermissionObject",
         "type": "object"
       },
       "WorkflowRun": {
@@ -17019,7 +17146,7 @@
             "type": "string"
           },
           "id": {
-            "description": "Workflow ID, a bare 32-character hex UUID.",
+            "description": "Workflow ID, bare 32-character hex.",
             "title": "Id",
             "type": "string"
           },
@@ -17041,11 +17168,39 @@
             "title": "Object",
             "type": "string"
           },
+          "owner_display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The owner's name for a viewer; `None` for the owner.",
+            "title": "Owner Display Name"
+          },
+          "shareable": {
+            "default": true,
+            "description": "Whether the workflow itself can be shared where the server shares workflows (`/v1/info` `workflow_sharing`); `False` for one whose grants the server cannot keep.",
+            "title": "Shareable",
+            "type": "boolean"
+          },
           "updated_at": {
             "description": "Unix epoch seconds of the last write.",
             "format": "int64",
             "title": "Updated At",
             "type": "integer"
+          },
+          "viewer_role": {
+            "default": "owner",
+            "description": "`\"owner\"`, or `\"viewer\"` for someone it is shared with, who may view, run and copy it but not change it.",
+            "enum": [
+              "owner",
+              "viewer"
+            ],
+            "title": "Viewer Role",
+            "type": "string"
           }
         },
         "required": [
@@ -28714,9 +28869,75 @@
         ]
       }
     },
+    "/v1/workflows/shared": {
+      "get": {
+        "description": "List one page of the workflows other people shared with the caller.\n\nA grant to the caller or to any of their groups counts, and each workflow is\nlisted once, ordered by ID. Deleted workflows, those of deleted accounts and the\ncaller's own are left out, so a page can be short, or empty while\n`next_cursor` is set. Each item\nhas `viewer_role` `\"viewer\"` and the owner's `owner_display_name`. Empty\non a server that cannot share workflows and for the local user.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 403 for an agent's request, 400 for a malformed cursor.",
+        "operationId": "list_shared_workflows_v1_workflows_shared_get",
+        "parameters": [
+          {
+            "description": "Max workflows to return (1\u2013100, default 50).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "maximum": 100,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor: a previous page's next_cursor",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 64,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Cursor: a previous page's next_cursor",
+              "title": "After"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SharedWorkflowList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Shared Workflows",
+        "tags": [
+          "workflows"
+        ]
+      }
+    },
     "/v1/workflows/{workflow_id}": {
       "delete": {
-        "description": "Delete one of the caller's workflows.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 404 if the caller has no such workflow.",
+        "description": "Delete one of the caller's workflows, and then who it was shared with.\n\nGrants a failed cleanup leaves are inert, since readers check the workflow.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 404 if the caller has no such workflow.",
         "operationId": "delete_workflow_v1_workflows__workflow_id__delete",
         "parameters": [
           {
@@ -28757,7 +28978,7 @@
         ]
       },
       "get": {
-        "description": "Return one of the caller's workflows, with its steps.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 404 if the caller has no such workflow.",
+        "description": "Return a workflow the caller owns or that is shared with them, with its steps.\n\n`viewer_role` says which, and someone it is shared with also gets the owner's\n`owner_display_name`. Agents read shared workflows too, so a run of one can\nload its description.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 404 if the caller can't read such a workflow.",
         "operationId": "get_workflow_v1_workflows__workflow_id__get",
         "parameters": [
           {
@@ -28849,9 +29070,183 @@
         ]
       }
     },
+    "/v1/workflows/{workflow_id}/permissions": {
+      "get": {
+        "description": "List the grants on one of the caller's workflows with cursor pagination.\n\nThe owner holds no grant and is not listed.\n\n**Returns:** `{\"permissions\": [...], \"next_cursor\": str|null}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 when the caller does not own the workflow, 403 for an agent or a server that cannot keep workflow grants.",
+        "operationId": "list_workflow_permissions_v1_workflows__workflow_id__permissions_get",
+        "parameters": [
+          {
+            "description": "The workflow.",
+            "in": "path",
+            "name": "workflow_id",
+            "required": true,
+            "schema": {
+              "title": "Workflow Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Max grants to return (1\u20131000, default 100).",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "maximum": 1000,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Cursor: user_id to start after",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Cursor: user_id to start after",
+              "title": "After"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowPermissionList"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Workflow Permissions",
+        "tags": [
+          "workflows"
+        ]
+      },
+      "put": {
+        "description": "Share one of the caller's workflows with a user or group.\n\nRead is the only level, and a workflow is never public. They can view, run and\ncopy it; their runs stay their own. Auto-creates the grantee user if they don't\nexist yet.\n\n**Parameters**\n\n- `body` \u2014 The grant request with `user_id` and `level`.\n\n**Returns:** The resulting grant.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 when the caller does not own the workflow, 403 for an agent, a server that cannot share workflows, the sharing policy or a workflow its store cannot keep grants for, 400 for an empty or over-long ID, the owner, `__public__` or a level other than read.",
+        "operationId": "grant_workflow_permission_v1_workflows__workflow_id__permissions_put",
+        "parameters": [
+          {
+            "description": "The workflow.",
+            "in": "path",
+            "name": "workflow_id",
+            "required": true,
+            "schema": {
+              "title": "Workflow Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GrantPermissionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkflowPermissionObject"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Grant Workflow Permission",
+        "tags": [
+          "workflows"
+        ]
+      }
+    },
+    "/v1/workflows/{workflow_id}/permissions/{target_user_id}": {
+      "delete": {
+        "description": "Stop sharing one of the caller's workflows with a user or group.\n\nTheir runs are their own sessions, so they keep those. Idempotent: 204 when they\nhold no grant.\n\n**Returns:** 204 No Content.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 when the caller does not own the workflow, 403 for an agent or a server that cannot keep workflow grants.",
+        "operationId": "revoke_workflow_permission_v1_workflows__workflow_id__permissions__target_user_id__delete",
+        "parameters": [
+          {
+            "description": "The workflow.",
+            "in": "path",
+            "name": "workflow_id",
+            "required": true,
+            "schema": {
+              "title": "Workflow Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The grantee to remove, e.g. `\"alice@example.com\"`, in any spelling `PermissionStore.validate_grants` resolves.",
+            "in": "path",
+            "name": "target_user_id",
+            "required": true,
+            "schema": {
+              "title": "Target User Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revoke Workflow Permission",
+        "tags": [
+          "workflows"
+        ]
+      }
+    },
     "/v1/workflows/{workflow_id}/runs": {
       "get": {
-        "description": "List one of the caller's workflows' runs, newest first.\n\nA run is the plan that named the workflow, so a session that ran it\ntwice is listed twice. Sessions the caller can't read are left out.\nEach run names the session that started it and the workflow runs below it.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 404 if the caller has no such workflow or can't read the session, 400 for an invalid cursor.",
+        "description": "List the runs of a workflow the caller owns or that is shared with them, newest first.\n\nA run is the plan that named the workflow, so a session that ran it\ntwice is listed twice. Sessions the caller can't read are left out, so\nsomeone a workflow is shared with sees their own runs, and its owner\ndoesn't see theirs; a page can be short while `next_cursor` is set.\nEach run names the session that started it and the workflow runs below it.\n\n**Raises**\n\n- `OmnigentError` \u2014 401 if unauthenticated in multi-user mode, 404 if the caller can't read such a workflow or the session, 400 for an invalid cursor.",
         "operationId": "list_workflow_runs_v1_workflows__workflow_id__runs_get",
         "parameters": [
           {

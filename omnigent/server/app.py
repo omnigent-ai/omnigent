@@ -168,6 +168,7 @@ from omnigent.server.routes.sharing import create_sharing_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.server.routes.usage import create_usage_router
 from omnigent.server.routes.user_settings import create_user_settings_router
+from omnigent.server.routes.workflow_permissions import stores_workflow_grants
 from omnigent.server.runner_session_init import (
     TRANSIENT_REJECTION_STATUSES,
     RunnerSessionInitializer,
@@ -404,6 +405,10 @@ class ServerInfoResponse(BaseModel):
     # /v1/workflows, the caller's saved workflows; absent on older servers, which
     # clients treat as unsupported.
     workflows: bool = False
+    # Workflows can be shared through ``/v1/workflows/{id}/permissions``, and
+    # ``GET /v1/workflows/shared`` lists those shared with the caller: needs
+    # ``workflows`` and a store that keeps workflow grants.
+    workflow_sharing: bool = False
     # GET/PUT /v1/settings/session-title-instructions; absent on older servers,
     # which clients treat as unsupported.
     session_title_instructions: bool = False
@@ -4126,6 +4131,10 @@ def create_app(
         automation_sharing = automations_enabled and scheduled_task_sharing_supported(
             app.state, permission_store
         )
+        workflows_available = (
+            frontend_features[Feature.WORKFLOWS.value]
+            and workflows.open_store(conversation_store) is not None
+        )
         return ServerInfoResponse.model_validate(
             {
                 "accounts_enabled": accounts_enabled,
@@ -4178,8 +4187,9 @@ def create_app(
                 is not None,
                 "session_journal": frontend_features[Feature.WORKFLOWS.value]
                 and session_journal.open_store(conversation_store) is not None,
-                "workflows": frontend_features[Feature.WORKFLOWS.value]
-                and workflows.open_store(conversation_store) is not None,
+                "workflows": workflows_available,
+                "workflow_sharing": workflows_available
+                and stores_workflow_grants(permission_store),
                 "session_title_instructions": user_settings_store is not None,
                 "admin_view": admin_view_supported,
                 "filesystem_attachments": {

@@ -2,9 +2,11 @@
 
 Workflows are rows of ``workflows`` in the database that holds the session
 metadata. Every read and write is scoped to the caller: another owner's
-workflow reads as missing. A unique owner-and-name index arbitrates competing saves.
-Every workflow query is served by, and on MySQL pinned to, the primary key or
-``uq_workflows_user_id_name``. Description and plan codecs run in batches in the store.
+workflow reads as missing. :meth:`WorkflowStore.get_many` is the exception, for
+callers that already checked the caller's grant on each workflow. A unique
+owner-and-name index arbitrates competing saves. Every workflow query is served
+by, and on MySQL pinned to, the primary key or ``uq_workflows_user_id_name``.
+Description and plan codecs run in batches in the store.
 """
 
 from __future__ import annotations
@@ -278,6 +280,38 @@ class WorkflowStore:
                 )
             ).scalar_one_or_none()
             return None if row is None else self._workflows([row])[0]
+
+    def get_many(self, workflow_ids: Sequence[str]) -> dict[str, Workflow]:
+        """Return the workflows with these IDs, with their steps, whoever owns them.
+
+        Not scoped to an owner: for callers that checked the caller's grant on each
+        workflow, such as a list of the workflows shared with them. Missing IDs are
+        left out, and one that can't name a workflow finds none.
+
+        :param workflow_ids: Workflow IDs, e.g. a page of grants' workflows.
+        :returns: The workflows found, by ID.
+        """
+        wanted = []
+        for workflow_id in dict.fromkeys(workflow_ids):
+            try:
+                wanted.append(uuid_to_bytes(workflow_id).hex())
+            except InvalidUuidError:
+                continue
+        if not wanted:
+            return {}
+        with self._session("get_workflows_by_id") as session:
+            rows = session.scalars(
+                _using(
+                    select(SqlWorkflow)
+                    .where(
+                        SqlWorkflow.workspace_id == current_workspace_id(),
+                        SqlWorkflow.id.in_(wanted),
+                    )
+                    .options(undefer(SqlWorkflow.plan)),
+                    "PRIMARY",
+                )
+            ).all()
+            return {workflow.id: workflow for workflow in self._workflows(rows)}
 
     def names(self, workflow_ids: Sequence[str], *, user_id: str | None) -> dict[str, str]:
         """Name those of the workflows the owner has, by ID; one primary-key read each.

@@ -12727,7 +12727,10 @@ async def _create_session_from_existing_agent(
     if body.workflow_id is not None:
         require_workflows(request)
         workflow = await load_workflow_for_run(
-            conversation_store, body.workflow_id, user_id=user_id
+            conversation_store,
+            body.workflow_id,
+            user_id=user_id,
+            permission_store=getattr(request.app.state, "permission_store", None),
         )
 
     project_resolution = await resolve_project_session_create(
