@@ -41,6 +41,7 @@ _MAX_LOOKUP_PAGES = 20
 # organizing write (session title/pin/archive, project rename/icon/delete).
 _MOVE_SOURCE_CHECKS = "session_move_source_checks"
 _ORGANIZE_SOURCE_CHECKS = "session_organize_source_checks"
+_ARCHIVE_RUNNER_CHECKS = "session_archive_runner_checks"
 
 
 async def resolve_project_id(
@@ -605,12 +606,12 @@ async def execute_session_update(
                 "runs it closes it",
             }
         )
-    # A sub-agent's archive leaves an ancestor's runner up, and the server refuses
-    # one whose runner it owns, so only a top-level session is checked here.
+    # A sub-agent's archive leaves an ancestor's runner up, and a server with the
+    # runner check refuses one whose runner it owns, so it is not checked here.
     if (
         changes.get("archived") is True
         and not archives_itself
-        and not sub_agent
+        and not (sub_agent and await _server_checks_source(client, _ARCHIVE_RUNNER_CHECKS))
         and await _shares_runner(client, current, source_id)
     ):
         return json.dumps(

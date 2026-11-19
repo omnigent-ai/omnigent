@@ -131,7 +131,9 @@ MCP independent creation.
   session to update instead. `archived: true` is the one change that applies
   to a sub-agent: the tool archives any of the owner's sub-agents, in another
   tree or the caller's own on its runner (the server never stops an
-  ancestor's runner), and closes it like `sys_session_close` so its parent
+  ancestor's runner; against a server that does not advertise
+  `session_archive_runner_checks`, the tool still refuses one on the caller's
+  runner), and closes it like `sys_session_close` so its parent
   can reuse the name. A sub-agent cannot archive itself. An edit-shared caller cannot change a project or
   create or rename one, or rename, pin or archive a session, while
   listing stays an ordinary owner read. A session shared with the caller

@@ -232,7 +232,11 @@ async def test_list_pages_projects_and_sessions_until_the_last_page():
     assert last["next_cursor"] is None and last["projects_next_cursor"] is None
 
 
-ORGANIZE_INFO = {"session_move_source_checks": True, "session_organize_source_checks": True}
+ORGANIZE_INFO = {
+    "session_move_source_checks": True,
+    "session_organize_source_checks": True,
+    "session_archive_runner_checks": True,
+}
 
 
 @pytest.mark.parametrize(
@@ -256,11 +260,11 @@ async def test_organizing_writes_need_the_organize_source_check(execute, args):
     assert [(r.method, r.url.path) for r in requests] == [("GET", "/v1/info")]
 
 
-def _organize_server(requests: list[httpx.Request], snapshot: dict):
+def _organize_server(requests: list[httpx.Request], snapshot: dict, info: dict = ORGANIZE_INFO):
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
         if request.url.path == "/v1/info":
-            return httpx.Response(200, json=ORGANIZE_INFO)
+            return httpx.Response(200, json=info)
         if request.method == "GET":
             return httpx.Response(200, json=snapshot)
         return httpx.Response(200, json={})
@@ -912,6 +916,21 @@ async def test_update_archives_and_closes_a_sub_agent_on_the_callers_runner(titl
         assert len(stored_title) <= 200
     assert json.loads(patch.content) == expected
     assert not [r for r in requests if "include_live_status" in r.url.params]
+
+
+async def test_update_refuses_a_sub_agent_on_the_callers_runner_without_the_server_check():
+    requests: list[httpx.Request] = []
+    # An older server cannot tell whether the sub-agent owns the shared runner.
+    info = {key: value for key, value in ORGANIZE_INFO.items() if key != "session_archive_runner_checks"}
+    snapshot = {"id": SUB_AGENT, "parent_session_id": PARENT, "runner_id": "runner-1", "labels": {}}
+    async with _client(_organize_server(requests, snapshot, info)) as client:
+        result = json.loads(
+            await execute_session_update(
+                {"session_id": SUB_AGENT, "archived": True}, client, SOURCE
+            )
+        )
+    assert "shares the calling session's runner" in result["error"]
+    assert not [r for r in requests if r.method == "PATCH"]
 
 
 async def test_update_leaves_an_already_closed_sub_agent_unchanged():
