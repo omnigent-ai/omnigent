@@ -28,6 +28,7 @@ import remarkBreaks from "remark-breaks";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
 import {
   MessageResponse,
+  useBlockMarkdown,
   useIsStreamingText,
   useMessageMarkdown,
 } from "@/components/ai-elements/message";
@@ -653,7 +654,8 @@ function SessionIdReference({
   // An id that ends a block may be the start of a longer token that is still streaming in.
   const markdown = useMessageMarkdown();
   const streaming = useIsStreamingText();
-  const pending = trailing && sessionIdMayStillGrow(markdown, id, streaming);
+  const block = useBlockMarkdown();
+  const pending = trailing && sessionIdMayStillGrow(markdown, block, id, streaming);
   const label = useSessionLabel(pending ? null : id, useFileViewerConversationId() ?? null);
   if (!label) return children;
   return (

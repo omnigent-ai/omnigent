@@ -97,21 +97,24 @@ describe("remarkSessionIdReferences", () => {
   });
 
   it.each([
-    [`Open ${ID}`, false, false],
-    [`| a |${ID}|`, false, false],
-    [`Open ${ID}\\.`, false, false],
-    [`Open ${ID}ab`, false, true],
-    [`Open ${ID}`, true, true],
-    [`Open **${ID}**.`, true, true],
-    [`${ID} and then ${ID}`, true, true],
-    [`Open ${ID}ab`, true, true],
-    [`Open \`${ID}\``, true, false],
-    [`Open ${ID} `, true, false],
-    [`Open ${ID}\n\nThen`, true, false],
+    [`Open ${ID}`, `Open ${ID}`, false, false],
+    [`| a |${ID}|`, `| a |${ID}|`, false, false],
+    [`Open ${ID}\\.`, `Open ${ID}\\.`, false, false],
+    [`Open &quot;${ID}&quot;`, `Open &quot;${ID}&quot;`, false, false],
+    [`Open ${ID}ab`, `Open ${ID}`, false, true],
+    [`Open ${ID}.json`, `Open ${ID}.`, false, true],
+    ["```\n" + ID + "\n```\n\nOpen " + ID + "ab", `Open ${ID}`, true, true],
+    [`Open ${ID}`, `Open ${ID}`, true, true],
+    [`Open **${ID}**.`, `Open **${ID}**.`, true, true],
+    [`${ID} and then ${ID}`, `${ID} and then ${ID}`, true, true],
+    [`Open \`${ID}\``, `Open \`${ID}\``, true, false],
+    [`Open ${ID} `, `Open ${ID} `, true, false],
+    [`Open ${ID}\n\nThen`, `Open ${ID}\n\n`, true, false],
+    [`Open ${ID}`, "", false, false],
   ])(
-    "knows whether the id ending %j may still grow (streaming: %s)",
-    (markdown, streaming, grows) => {
-      expect(sessionIdMayStillGrow(markdown, ID, streaming)).toBe(grows);
+    "knows whether the id ending %j may still grow (block %j, streaming: %s)",
+    (markdown, block, streaming, grows) => {
+      expect(sessionIdMayStillGrow(markdown, block, ID, streaming)).toBe(grows);
     },
   );
 

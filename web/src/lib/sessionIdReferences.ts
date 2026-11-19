@@ -15,14 +15,23 @@ const TRAILING_CLOSING_PUNCTUATION_RE = new RegExp(`[${CLOSING_PUNCTUATION}]+$`)
 // Marks the id that ends a parsed block, which may still be growing while text streams in.
 const TRAILING_SUFFIX = ":end";
 
-/** Whether a reference to `id` that ends a block may be the start of a longer token. */
-export function sessionIdMayStillGrow(markdown: string, id: string, streaming: boolean): boolean {
+/** Whether a reference to `id` that ends `block` may be the start of a longer token. */
+export function sessionIdMayStillGrow(
+  markdown: string,
+  block: string,
+  id: string,
+  streaming: boolean,
+): boolean {
   if (streaming && markdown.replace(TRAILING_CLOSING_PUNCTUATION_RE, "").endsWith(id)) return true;
-  // A block rendered from older text is stale when every mention of the id now runs on.
-  for (let at = markdown.indexOf(id); at !== -1; at = markdown.indexOf(id, at + 1)) {
-    if (!/[0-9A-Za-z]/.test(markdown.charAt(at + id.length))) return false;
+  // A block rendered from older text is stale once that text runs on in the message.
+  const blockText = block.trimEnd();
+  if (!blockText) return false;
+  let found = false;
+  for (let at = markdown.indexOf(blockText); at !== -1; at = markdown.indexOf(blockText, at + 1)) {
+    if (!/\S/.test(markdown.charAt(at + blockText.length))) return false;
+    found = true;
   }
-  return true;
+  return found;
 }
 
 interface MarkdownNode {

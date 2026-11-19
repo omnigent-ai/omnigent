@@ -165,6 +165,10 @@ describe("bare session ids in chat", () => {
         "",
         `<a name="top"/> and <a href="https://example.com/raw">raw</a> then ${WORKER}`,
         "",
+        `Escaped ${WORKER}\\.`,
+        "",
+        `Quoted &quot;${WORKER}&quot;`,
+        "",
         "| Worker |",
         "| --- |",
         `|${WORKER}|`,
@@ -172,7 +176,7 @@ describe("bare session ids in chat", () => {
       cachedWorker(),
     );
     expect((await screen.findAllByTestId("mention-pill")).map((pill) => pill.textContent)).toEqual(
-      Array(4).fill("@Build worker"),
+      Array(6).fill("@Build worker"),
     );
   });
 
@@ -181,20 +185,22 @@ describe("bare session ids in chat", () => {
     fetchMock.mockResolvedValue(
       jsonResponse({ id: WORKER, object: "session", title: "Build worker" }),
     );
+    // An earlier mention of the same characters, in a code block, completes nothing.
+    const earlier = `\`\`\`\n${WORKER}\n\`\`\`\n\n`;
     const client = new QueryClient();
-    const { rerender } = render(markdownTree(`Open ${WORKER}`, client, true));
+    const { rerender } = render(markdownTree(`${earlier}Open ${WORKER}`, client, true));
     expect(screen.queryByTestId("mention-pill")).not.toBeInTheDocument();
     expect(fetchMock).not.toHaveBeenCalled();
 
     // The same 32 characters turn out to start a longer hash.
-    rerender(markdownTree(`Open ${WORKER}ab`, client, true));
-    rerender(markdownTree(`Open ${WORKER}ab`, client, false));
+    rerender(markdownTree(`${earlier}Open ${WORKER}ab`, client, true));
+    rerender(markdownTree(`${earlier}Open ${WORKER}ab`, client, false));
     expect(screen.queryByTestId("mention-pill")).not.toBeInTheDocument();
     expect(fetchMock).not.toHaveBeenCalled();
 
-    rerender(markdownTree(`Open ${WORKER}`, client, true));
+    rerender(markdownTree(`${earlier}Open ${WORKER}`, client, true));
     // A finished paragraph's id resolves while later paragraphs still stream.
-    rerender(markdownTree(`Open ${WORKER}\n\nThen ask it`, client, true));
+    rerender(markdownTree(`${earlier}Open ${WORKER}\n\nThen ask it`, client, true));
     expect((await screen.findByTestId("mention-pill")).textContent).toBe("@Build worker");
   });
 

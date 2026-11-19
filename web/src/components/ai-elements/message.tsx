@@ -379,12 +379,23 @@ export function useMessageMarkdown(): string {
   return useContext(MessageMarkdownContext);
 }
 
+const BlockMarkdownContext = createContext("");
+
+/** The markdown of the block being rendered, which can lag the message's markdown. */
+export function useBlockMarkdown(): string {
+  return useContext(BlockMarkdownContext);
+}
+
 // Streamdown marks a block's open fence only while `isAnimating`, which also
 // disables its copy and download buttons, so mark it here for streaming text.
 function StreamingTextBlock(props: BlockProps) {
   const isStreaming = useContext(StreamingTextContext);
   const isIncomplete = props.isIncomplete || (isStreaming && hasOpenCodeFence(props.content));
-  return <Block {...props} isIncomplete={isIncomplete} />;
+  return (
+    <BlockMarkdownContext.Provider value={props.content}>
+      <Block {...props} isIncomplete={isIncomplete} />
+    </BlockMarkdownContext.Provider>
+  );
 }
 
 function getChatCodeControls(controls: StreamdownProps["controls"]): StreamdownProps["controls"] {
