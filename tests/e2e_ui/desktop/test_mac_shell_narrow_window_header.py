@@ -32,6 +32,8 @@ _NARROW_VIEWPORT = {"width": 740, "height": 860}
 
 # macOS paints the traffic lights outside the DOM; index.css reserves this strip for them.
 _WINDOW_CONTROLS_STRIP = {"x": 0, "y": 0, "width": 88, "height": 48}
+# Electron's trafficLightPosition centers the lights this many window pixels down.
+_WINDOW_CONTROLS_CENTER_Y = 24
 
 # Electron applies app-region rects in document order, ignoring stacking, opacity
 # and pointer-events, so the last rendered region over a point decides dragging.
@@ -46,16 +48,24 @@ _EMPTY_TITLE_BAR_POINTS_SCRIPT = """
     const hasRegion = region === "drag" || region === "no-drag";
     return hasRegion && rendered ? [{ element, region, rect }] : [];
   });
+  const contains = (rect, x, y) =>
+    x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom;
+  // Hit testing skips a rounded control's corners, but its region covers the whole box.
+  const controlBoxes = regions
+    .filter(({ element, region, rect }) => region === "no-drag" && document
+      .elementsFromPoint(rect.left + rect.width / 2, rect.top + rect.height / 2)
+      .includes(element))
+    .map(({ rect }) => rect);
   let empty = 0;
   const undraggable = [];
   for (let x = 4; x < window.innerWidth; x += 16) {
     for (const y of [8, 24, stripHeight - 4]) {
-      const isEmpty = document.elementsFromPoint(x, y).every((el) => appRegion(el) !== "no-drag");
+      const isEmpty =
+        document.elementsFromPoint(x, y).every((el) => appRegion(el) !== "no-drag") &&
+        !controlBoxes.some((rect) => contains(rect, x, y));
       if (!isEmpty) continue;
       empty += 1;
-      const covering = regions.filter(
-        ({ rect }) => x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom,
-      ).at(-1);
+      const covering = regions.filter(({ rect }) => contains(rect, x, y)).at(-1);
       if (covering?.region !== "drag") {
         const element = covering?.element;
         const coveredBy = element ? element.dataset.testid || element.tagName : null;
@@ -83,6 +93,17 @@ def _intersects_window_controls(box: dict[str, float] | None) -> bool:
         and box["y"] < strip["y"] + strip["height"]
         and strip["y"] < box["y"] + box["height"]
     )
+
+
+def _assert_vertically_centered_at(controls: dict[str, Locator], center_y: float) -> None:
+    for name, control in controls.items():
+        expect(control).to_be_visible()
+        box = control.bounding_box()
+        assert box is not None
+        center = box["y"] + box["height"] / 2
+        assert abs(center - center_y) <= 1, (
+            f"{name} is centered at y={center:.1f}px, not on the lights at {center_y:.1f}px"
+        )
 
 
 def _hold_for_recording(page: Page) -> None:
@@ -144,6 +165,47 @@ def test_narrow_window_sidebar_header_stays_clear_of_window_controls(
     expect(
         page.get_by_role("button", name="Search", exact=True).filter(visible=True)
     ).to_have_count(1)
+
+
+def test_narrow_window_header_controls_center_on_window_controls(
+    request: pytest.FixtureRequest, seeded_session: tuple[str, str]
+) -> None:
+    base_url, session_id = seeded_session
+    page = _open_session_in_mac_shell(request, base_url, session_id)
+    aside = _shrink_window_and_open_sidebar(page)
+    close_sidebar = aside.get_by_role("button", name="Close sidebar", exact=True)
+    _hold_for_recording(page)
+
+    _assert_vertically_centered_at(
+        {
+            "sidebar wordmark": aside.get_by_test_id("sidebar-brand"),
+            "Close sidebar button": close_sidebar,
+            "sidebar Search button": aside.get_by_role("button", name="Search", exact=True),
+        },
+        _WINDOW_CONTROLS_CENTER_Y,
+    )
+
+    close_sidebar.click()
+    expect(aside).to_have_attribute("data-collapsed", "true")
+    header = page.locator("header.chat-header")
+    header_controls = {
+        "Open sidebar button": header.get_by_role("button", name="Open sidebar", exact=True),
+        "conversation actions": header.get_by_test_id("header-conversation-actions"),
+    }
+    _hold_for_recording(page)
+    _assert_vertically_centered_at(header_controls, _WINDOW_CONTROLS_CENTER_Y)
+
+    # The preload publishes the window zoom; at 90% the lights sit lower in CSS pixels.
+    page.evaluate(
+        "() => document.documentElement.style.setProperty('--omnigent-electron-zoom', '0.9')"
+    )
+    _assert_vertically_centered_at(header_controls, _WINDOW_CONTROLS_CENTER_Y / 0.9)
+
+    # Full screen hides the lights, so the header keeps its usual 1rem inset.
+    page.evaluate(
+        "() => document.documentElement.toggleAttribute('data-electron-full-screen', true)"
+    )
+    _assert_vertically_centered_at(header_controls, 16 + 44 / 2)
 
 
 def test_narrow_window_command_palette_clears_window_controls(

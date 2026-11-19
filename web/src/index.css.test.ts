@@ -1436,6 +1436,28 @@ describe("index.css electron-mac sidebar header", () => {
     );
   });
 
+  it("centers the phone layout's headers on the lights, except below the canvas title bar", () => {
+    const insetRule = cssBlocks.find(([block]) =>
+      block.includes("padding-top: var(--mac-header-control-inset)"),
+    )?.[0];
+    expect(insetRule, "expected the macOS sub-md header inset rule").toBeDefined();
+    expect(insetRule).toContain("padding-bottom: calc(2rem - var(--mac-header-control-inset))");
+    document.documentElement.setAttribute("data-electron-mac", "true");
+    document.body.innerHTML = `
+      <div class="sidebar-header-row"></div>
+      <header class="chat-header"></header>
+      <div class="canvas-workspace"><header class="chat-header"></header></div>`;
+    const [sidebarRow, sessionHeader, canvasHeader] = document.body.querySelectorAll(
+      ".sidebar-header-row, .chat-header",
+    );
+    const selector = selectorOf(insetRule ?? "");
+    expect(sidebarRow.matches(selector)).toBe(true);
+    expect(sessionHeader.matches(selector)).toBe(true);
+    expect(canvasHeader.matches(selector)).toBe(false);
+    document.body.innerHTML = "";
+    document.documentElement.removeAttribute("data-electron-mac");
+  });
+
   it("keeps every header rule scoped to the desktop shell", () => {
     // A browser tab has no window controls to align to, so none of this may
     // apply there. Every SELECTOR mentioning these classes must carry the
