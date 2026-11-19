@@ -10,14 +10,19 @@ export const SESSION_ID_REFERENCE_HREF = "#session-id";
 const CLOSING_PUNCTUATION = `)\\]}"'”’*_~.,;:!?`;
 const SESSION_ID_WORD_RE = new RegExp(`^([([{"'“‘*_~]*)([0-9a-f]{32})([${CLOSING_PUNCTUATION}]*)$`);
 const EXACT_SESSION_ID_RE = /^[0-9a-f]{32}$/;
-const TRAILING_CLOSING_PUNCTUATION_RE = new RegExp(`[${CLOSING_PUNCTUATION}]+$`);
 
 // Marks the id that ends a parsed block, which may still be growing while text streams in.
 const TRAILING_SUFFIX = ":end";
 
-/** Whether streamed text ends in `id`, so more characters could still extend that word. */
-export function streamedTextEndsWithId(markdown: string, id: string): boolean {
-  return markdown.replace(TRAILING_CLOSING_PUNCTUATION_RE, "").endsWith(id);
+/** Whether `markdown` names `id` as a whole word, apart from a last word still streaming in. */
+export function mentionsCompleteSessionId(
+  markdown: string,
+  id: string,
+  streaming: boolean,
+): boolean {
+  const words = markdown.split(/\s+/);
+  if (streaming && !/\s$/.test(markdown)) words.pop();
+  return words.some((word) => SESSION_ID_WORD_RE.exec(word.replace(/`/g, ""))?.[2] === id);
 }
 
 interface MarkdownNode {
@@ -54,63 +59,134 @@ function referenceLink(id: string, child: MarkdownNode, trailing = false): Markd
   };
 }
 
-function splitText(value: string, endsBlock: boolean): MarkdownNode[] | null {
-  // Odd indexes hold the whitespace between words.
-  const pieces = value.split(/(\s+)/);
-  const lastWordIndex = endsBlock ? pieces.length - 1 : -1;
-  const parts: MarkdownNode[] = [];
-  let pending = "";
-  let found = false;
-  pieces.forEach((piece, index) => {
-    const match = index % 2 === 0 && SESSION_ID_WORD_RE.exec(piece);
-    if (!match) {
-      pending += piece;
-      return;
-    }
-    const [, opening, id, closing] = match;
-    pending += opening;
-    if (pending) parts.push({ type: "text", value: pending });
-    parts.push(referenceLink(id, { type: "text", value: id }, index === lastWordIndex));
-    pending = closing;
-    found = true;
-  });
-  if (!found) return null;
-  if (pending) parts.push({ type: "text", value: pending });
-  return parts;
+// Formatting whose text reads as part of the surrounding words.
+const FORMATTING_TYPES = new Set(["emphasis", "strong", "delete"]);
+// Inline nodes that join the surrounding word but whose own text is never a reference.
+const OPAQUE_INLINE_TYPES = new Set([
+  "link",
+  "linkReference",
+  "html",
+  "image",
+  "imageReference",
+  "inlineMath",
+  "footnoteReference",
+]);
+const OPAQUE_CHARACTER = "\u0000";
+const OPENING_ANCHOR_RE = /^<a[\s>]/i;
+const CLOSING_ANCHOR_RE = /^<\/a\s*>/i;
+
+interface InlineLeaf {
+  node: MarkdownNode;
+  parent: MarkdownNode;
+  start: number;
+  end: number;
+  insideAnchor: boolean;
 }
 
-function lastLeaf(node: MarkdownNode): MarkdownNode {
-  let leaf = node;
-  while (leaf.children?.length) leaf = leaf.children[leaf.children.length - 1];
-  return leaf;
+// The text a block's inline content reads as, with the text and code leaves it came from.
+interface InlineRun {
+  text: string;
+  leaves: InlineLeaf[];
 }
 
-function markChildren(node: MarkdownNode, finalLeaf: MarkdownNode): void {
-  if (!node.children) return;
-  // Text already inside a link keeps that link's target.
-  if (node.type === "link" || node.type === "linkReference") return;
-  const next: MarkdownNode[] = [];
-  for (const child of node.children) {
-    const endsBlock = child === finalLeaf;
-    if (child.type === "text" && child.value) {
-      const parts = splitText(child.value, endsBlock);
-      if (parts) {
-        next.push(...parts);
-        continue;
+function inlineRuns(tree: MarkdownNode): InlineRun[] {
+  const runs: InlineRun[] = [];
+  let run: InlineRun = { text: "", leaves: [] };
+  let anchorDepth = 0;
+  const flush = () => {
+    if (run.leaves.length) runs.push(run);
+    run = { text: "", leaves: [] };
+  };
+  const visit = (parent: MarkdownNode) => {
+    for (const child of parent.children ?? []) {
+      if (child.type === "text" || child.type === "inlineCode") {
+        const value = child.value ?? "";
+        const start = run.text.length;
+        run.leaves.push({
+          node: child,
+          parent,
+          start,
+          end: start + value.length,
+          insideAnchor: anchorDepth > 0,
+        });
+        run.text += value;
+      } else if (child.type === "break") {
+        run.text += "\n";
+      } else if (FORMATTING_TYPES.has(child.type)) {
+        visit(child);
+      } else if (OPAQUE_INLINE_TYPES.has(child.type)) {
+        // Raw HTML anchors are separate open and close nodes around their text.
+        if (child.type === "html" && OPENING_ANCHOR_RE.test(child.value ?? "")) anchorDepth += 1;
+        else if (child.type === "html" && CLOSING_ANCHOR_RE.test(child.value ?? "")) {
+          anchorDepth = Math.max(0, anchorDepth - 1);
+        }
+        run.text += OPAQUE_CHARACTER;
+      } else {
+        flush();
+        visit(child);
+        flush();
       }
     }
-    if (child.type === "inlineCode" && child.value && EXACT_SESSION_ID_RE.test(child.value)) {
-      next.push(referenceLink(child.value, child, endsBlock));
-      continue;
-    }
-    markChildren(child, finalLeaf);
-    next.push(child);
+  };
+  visit(tree);
+  flush();
+  return runs;
+}
+
+interface ReferenceSpan {
+  id: string;
+  start: number;
+  trailing: boolean;
+}
+
+function replacementNodes(leaf: InlineLeaf, spans: ReferenceSpan[]): MarkdownNode[] {
+  if (leaf.node.type === "inlineCode") {
+    return [referenceLink(spans[0].id, leaf.node, spans[0].trailing)];
   }
-  node.children = next;
+  const value = leaf.node.value ?? "";
+  const nodes: MarkdownNode[] = [];
+  let offset = 0;
+  for (const span of spans) {
+    const start = span.start - leaf.start;
+    if (start > offset) nodes.push({ type: "text", value: value.slice(offset, start) });
+    nodes.push(referenceLink(span.id, { type: "text", value: span.id }, span.trailing));
+    offset = start + span.id.length;
+  }
+  if (offset < value.length) nodes.push({ type: "text", value: value.slice(offset) });
+  return nodes;
+}
+
+function markSessionIds(tree: MarkdownNode): void {
+  const runs = inlineRuns(tree);
+  const spansByLeaf = new Map<InlineLeaf, ReferenceSpan[]>();
+  runs.forEach((run, runIndex) => {
+    const textEnd = run.text.trimEnd().length;
+    for (const word of run.text.matchAll(/\S+/g)) {
+      const match = SESSION_ID_WORD_RE.exec(word[0]);
+      if (!match) continue;
+      const [, opening, id] = match;
+      const start = word.index + opening.length;
+      const end = start + id.length;
+      const leaf = run.leaves.find((candidate) => candidate.start <= start && end <= candidate.end);
+      if (!leaf || leaf.insideAnchor) continue;
+      if (leaf.node.type === "inlineCode" && (leaf.start !== start || leaf.end !== end)) continue;
+      const trailing = runIndex === runs.length - 1 && word.index + word[0].length === textEnd;
+      spansByLeaf.set(leaf, [...(spansByLeaf.get(leaf) ?? []), { id, start, trailing }]);
+    }
+  });
+  const replacements = new Map<MarkdownNode, MarkdownNode[]>();
+  const parents = new Set<MarkdownNode>();
+  for (const [leaf, spans] of spansByLeaf) {
+    replacements.set(leaf.node, replacementNodes(leaf, spans));
+    parents.add(leaf.parent);
+  }
+  for (const parent of parents) {
+    parent.children = parent.children?.flatMap((child) => replacements.get(child) ?? [child]);
+  }
 }
 
 // Remark plugin marking bare session ids in prose and inline code as reference links.
 // Fenced code blocks, link text and ids embedded in longer tokens are left alone.
 export function remarkSessionIdReferences() {
-  return (tree: MarkdownNode) => markChildren(tree, lastLeaf(tree));
+  return markSessionIds;
 }

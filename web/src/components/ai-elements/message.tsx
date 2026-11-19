@@ -367,11 +367,16 @@ export function hasOpenCodeFence(text: string): boolean {
 
 const StreamingTextContext = createContext(false);
 
-const StreamingMarkdownContext = createContext<string | null>(null);
+const MessageMarkdownContext = createContext("");
 
-/** The markdown streamed in so far, or ``null`` when the text is not streaming. */
-export function useStreamingMarkdown(): string | null {
-  return useContext(StreamingMarkdownContext);
+/** Whether the markdown being rendered is still streaming in. */
+export function useIsStreamingText(): boolean {
+  return useContext(StreamingTextContext);
+}
+
+/** The markdown source of the message being rendered, which can be ahead of its rendered blocks. */
+export function useMessageMarkdown(): string {
+  return useContext(MessageMarkdownContext);
 }
 
 // Streamdown marks a block's open fence only while `isAnimating`, which also
@@ -791,8 +796,7 @@ export const MessageResponse = memo(
       [components],
     );
 
-    const streamingMarkdown =
-      isStreaming && typeof props.children === "string" ? props.children : null;
+    const messageMarkdown = typeof props.children === "string" ? props.children : "";
     const messageControls = useMemo(() => getChatCodeControls(controls), [controls]);
     const mermaidOptions = useMemo(() => mermaidOptionsForTheme(themeMode), [themeMode]);
     let rehypePlugins = SECURE_STREAMDOWN_REHYPE_PLUGINS;
@@ -806,7 +810,7 @@ export const MessageResponse = memo(
         <ShellCommandContext.Provider value={shellAction}>
           <LocalReviewCommentRendererContext.Provider value={renderLocalReviewComment}>
             <StreamingTextContext.Provider value={isStreaming}>
-              <StreamingMarkdownContext.Provider value={streamingMarkdown}>
+              <MessageMarkdownContext.Provider value={messageMarkdown}>
                 {/* Streamdown is memoized and its comparator ignores the mermaid prop,
               so remount on theme change to recolor already-rendered diagrams. */}
                 <Streamdown
@@ -828,7 +832,7 @@ export const MessageResponse = memo(
                   // Block remote image fetches that can exfiltrate data through URLs.
                   rehypePlugins={rehypePlugins}
                 />
-              </StreamingMarkdownContext.Provider>
+              </MessageMarkdownContext.Provider>
             </StreamingTextContext.Provider>
           </LocalReviewCommentRendererContext.Provider>
         </ShellCommandContext.Provider>

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   parseSessionIdReferenceTitle,
   remarkSessionIdReferences,
-  streamedTextEndsWithId,
+  mentionsCompleteSessionId,
 } from "./sessionIdReferences";
 
 const ID = "e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9";
@@ -97,14 +97,16 @@ describe("remarkSessionIdReferences", () => {
   });
 
   it.each([
-    [`Open ${ID}`, true],
-    [`Open \`${ID}`, true],
-    [`Open **${ID}**.`, true],
-    [`Open \`${ID}\``, false],
-    [`Open ${ID} `, false],
-    [`Open ${ID}\n\nThen`, false],
-  ])("knows whether streamed %j may still extend the id", (markdown, extendable) => {
-    expect(streamedTextEndsWithId(markdown, ID)).toBe(extendable);
+    [`Open ${ID}`, false, true],
+    [`Open \`${ID}\``, false, true],
+    [`Open **${ID}**.`, false, true],
+    [`Open ${ID}ab`, false, false],
+    [`Open ${ID}`, true, false],
+    [`Open **${ID}**.`, true, false],
+    [`Open ${ID} `, true, true],
+    [`Open ${ID}\n\nThen`, true, true],
+  ])("finds a complete id in %j (streaming: %s)", (markdown, streaming, complete) => {
+    expect(mentionsCompleteSessionId(markdown, ID, streaming)).toBe(complete);
   });
 
   it("leaves link text, partial inline code and fenced code alone", () => {

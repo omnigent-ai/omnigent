@@ -26,7 +26,11 @@ import { toast } from "sonner";
 import { defaultRemarkPlugins } from "streamdown";
 import remarkBreaks from "remark-breaks";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
-import { MessageResponse, useStreamingMarkdown } from "@/components/ai-elements/message";
+import {
+  MessageResponse,
+  useIsStreamingText,
+  useMessageMarkdown,
+} from "@/components/ai-elements/message";
 import {
   sameServerSessionPath,
   shortFileCitationLabel,
@@ -55,7 +59,7 @@ import {
   SESSION_ID_REFERENCE_HREF,
   parseSessionIdReferenceTitle,
   remarkSessionIdReferences,
-  streamedTextEndsWithId,
+  mentionsCompleteSessionId,
   type SessionIdReferenceTarget,
 } from "@/lib/sessionIdReferences";
 import { useSessionLabel } from "@/hooks/useSessionLabel";
@@ -646,10 +650,10 @@ function SessionIdReference({
   trailing,
   children,
 }: SessionIdReferenceTarget & { children: React.ReactNode }) {
-  // While text streams in, an id that ends the text may be the start of a longer token.
-  const streamedMarkdown = useStreamingMarkdown();
-  const pending =
-    trailing && streamedMarkdown !== null && streamedTextEndsWithId(streamedMarkdown, id);
+  // An id that ends a block may be the start of a longer token that is still streaming in.
+  const markdown = useMessageMarkdown();
+  const streaming = useIsStreamingText();
+  const pending = trailing && !mentionsCompleteSessionId(markdown, id, streaming);
   const label = useSessionLabel(pending ? null : id, useFileViewerConversationId() ?? null);
   if (!label) return children;
   return (

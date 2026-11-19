@@ -144,10 +144,26 @@ describe("bare session ids in chat", () => {
         "```",
         "",
         `[${WORKER}](https://example.com/run) and /tmp/${WORKER}/out.log`,
+        "",
+        `<a href="https://example.com/raw"> ${WORKER} </a>`,
+        "",
+        `conv_**${WORKER}**, **${WORKER}**.json and /tmp/**${WORKER}**/out.log`,
       ].join("\n"),
     );
     expect(screen.queryByTestId("mention-pill")).not.toBeInTheDocument();
     expect(fetchMock).not.toHaveBeenCalled();
+    expect(screen.getAllByRole("link").map((link) => link.getAttribute("href"))).toEqual([
+      "https://example.com/run",
+      "https://example.com/raw",
+    ]);
+  });
+
+  it("finds an id that formatting wraps", async () => {
+    renderMarkdown(`Open **${WORKER}**. Or _(${WORKER})_`, cachedWorker());
+    expect((await screen.findAllByTestId("mention-pill")).map((pill) => pill.textContent)).toEqual([
+      "@Build worker",
+      "@Build worker",
+    ]);
   });
 
   it("waits for a streamed id at the end of the text to finish before looking it up", async () => {
@@ -160,6 +176,13 @@ describe("bare session ids in chat", () => {
     expect(screen.queryByTestId("mention-pill")).not.toBeInTheDocument();
     expect(fetchMock).not.toHaveBeenCalled();
 
+    // The same 32 characters turn out to start a longer hash.
+    rerender(markdownTree(`Open ${WORKER}ab`, client, true));
+    rerender(markdownTree(`Open ${WORKER}ab`, client, false));
+    expect(screen.queryByTestId("mention-pill")).not.toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    rerender(markdownTree(`Open ${WORKER}`, client, true));
     // A finished paragraph's id resolves while later paragraphs still stream.
     rerender(markdownTree(`Open ${WORKER}\n\nThen ask it`, client, true));
     expect((await screen.findByTestId("mention-pill")).textContent).toBe("@Build worker");
