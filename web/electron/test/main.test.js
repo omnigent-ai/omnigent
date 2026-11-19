@@ -2873,6 +2873,9 @@ describe("panel windows", () => {
   it("tracks a panel without targeting it or saving its bounds as the main window's", (t) => {
     const h = loadNavigationHarness();
     t.after(h.cleanup);
+    // The main window's saved place must neither size the panel nor be overwritten by it.
+    const mainBounds = { x: 40, y: 50, width: 1400, height: 900, maximized: false };
+    fs.writeFileSync(h.settingsPath, JSON.stringify({ window_bounds: mainBounds }));
     h.api.createWindow("https://host.example/ml/omnigents", {
       role: "panel",
       windowOptions: {
@@ -2883,6 +2886,7 @@ describe("panel windows", () => {
           preload: "/tmp/other.js",
           contextIsolation: false,
           nodeIntegration: true,
+          webviewTag: true,
         },
       },
     });
@@ -2900,9 +2904,11 @@ describe("panel windows", () => {
     assert.match(options.webPreferences.preload, /src[\\/]preload\.js$/);
     assert.equal(options.webPreferences.contextIsolation, true);
     assert.equal(options.webPreferences.nodeIntegration, false);
+    assert.equal(options.webPreferences.webviewTag, undefined);
+    assert.equal(options.x, undefined);
     assert.equal(h.calls.overlays, undefined);
     h.emitWindow("close");
-    assert.equal(savedBounds(h), undefined);
+    assert.deepEqual(savedBounds(h), mainBounds);
   });
 
   for (const [platform, otherMain, destroysPanel] of [
