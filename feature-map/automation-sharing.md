@@ -43,6 +43,12 @@ runs' sessions in their own Omnigent Automation folder.
   on the detail page and in the row menus, with the session Share's tooltip
   (Sharing has been disabled for this Omnigent server.), and a session's link
   does not open the automation's share dialog.
+- `legacy-automation`: when the server reports `shareable: false` for an
+  automation, such as one created before its store could keep grants, Share stays
+  visible but disabled in the same places, with the tooltip "This is a legacy
+  automation. Recreate it to share it." The server refuses a grant with the same
+  message. Sharing off's reason wins when both apply; a server that sends no
+  `shareable` leaves Share enabled.
 - `shared-list`: a Shared with me tab beside Your automations lists the
   automations shared with the viewer, directly or through a group, only on a
   multi-user server advertising `scheduled_task_shared_with_me`; older servers
@@ -125,9 +131,11 @@ uses, because the session Share button is disabled on a local server.
   `tests/server/integration/test_scheduled_tasks_routes.py`, the tests
   `test_owner_shares_lists_and_revokes_an_automation`,
   `test_grant_refuses_what_an_automation_cannot_be_shared_with`,
-  `test_sharing_is_advertised_and_served_together` and
+  `test_sharing_is_advertised_and_served_together`,
+  `test_an_automation_its_store_cannot_share_is_reported_and_refused` and
   `test_session_permissions_name_the_automation_that_manages_them` cover the
-  routes, refusals, capability and the managed-session marker. The tests from
+  routes, refusals, capability, the `shareable` field and the managed-session
+  marker. The tests from
   `test_recipients_read_an_automation_its_runs_and_their_steps` to
   `test_a_shared_run_session_lists_with_its_run_labels` cover recipients' reads,
   refused changes, agents, the capability, the shared list and the run labels;
@@ -186,3 +194,6 @@ uses, because the session Share button is disabled on a local server.
   them: it places runs from the shared sessions already loaded for the inbox,
   and pages only the viewer's own. An embedding host that sets
   `inboxIncludesShared: false` loads none there, so My sessions shows none.
+- Only a permission store that cannot keep some automation's grants reports
+  `shareable: false`. The built-in stores never do, so `legacy-automation` appears
+  only on deployments with such a store and is covered by the component tests.
