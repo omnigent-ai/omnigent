@@ -29,10 +29,11 @@ import { useChatStore } from "@/store/chatStore";
 import { ApprovalCard, ElicitationCard } from "./ApprovalCard";
 
 // jsdom has no layout or media queries, so check the classes that set the button's
-// shape: one line with the prefix shrinking first, wrapping in touch layouts.
+// shape: one line with the prefix shrinking first, wrapping in the narrow layout.
 function expectOneLinePrefixButton(button: HTMLElement, prefix: string) {
   expect(button).toHaveClass("whitespace-nowrap");
-  expect(button).not.toHaveClass("whitespace-normal", "h-auto");
+  expect(button).not.toHaveClass("whitespace-normal");
+  expect(button).not.toHaveClass("h-auto");
   const shownPrefix = within(button).getByText(prefix);
   expect(shownPrefix).toHaveClass("truncate", "min-w-0", "shrink-[1000]");
   expect(shownPrefix).toHaveClass("mobile-app:whitespace-normal", "mobile-app:break-all");

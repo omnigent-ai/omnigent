@@ -188,8 +188,9 @@ function FileEditApproval({
   );
 }
 
-// Touch layouts have no hover tooltip, so the label wraps there to show the whole rule.
-const WRAP_ON_TOUCH_CLASS = "mobile-app:overflow-visible mobile-app:whitespace-normal";
+// The narrow (touch) layout has no hover tooltip, so the label wraps there to show
+// the whole rule; the wide layout keeps one line and relies on the tooltip.
+const WRAP_IN_NARROW_LAYOUT_CLASS = "mobile-app:overflow-visible mobile-app:whitespace-normal";
 
 // One-line "commands starting with <prefix>" button: a long prefix shrinks first
 // and ends in an ellipsis; the full prefix stays in the title and accessible name.
@@ -205,7 +206,7 @@ function CommandPrefixButton({
 } & Omit<ComponentProps<typeof Button>, "children" | "size" | "variant">) {
   // Flex items drop the spaces between them from the computed name.
   const name = [lead, prefix, trail].filter(Boolean).join(" ");
-  const wordsClass = cn("truncate", WRAP_ON_TOUCH_CLASS);
+  const wordsClass = cn("truncate", WRAP_IN_NARROW_LAYOUT_CLASS);
   return (
     <Button
       size="sm"
@@ -220,7 +221,7 @@ function CommandPrefixButton({
         <code
           className={cn(
             "min-w-0 shrink-[1000] truncate rounded bg-muted px-1 font-mono",
-            WRAP_ON_TOUCH_CLASS,
+            WRAP_IN_NARROW_LAYOUT_CLASS,
             "mobile-app:break-all",
           )}
         >
