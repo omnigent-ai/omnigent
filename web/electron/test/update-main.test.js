@@ -1110,12 +1110,16 @@ describe("global show shortcut IPC", () => {
     const record = harness.ipcHandlers.get("omnigent:record-global-shortcut");
 
     const first = record(harness.events.pinned);
-    void record(harness.events.pinned, "floatingComposer");
+    const second = record(harness.events.pinned, "floatingComposer");
 
+    let timer;
     const stillRecording = new Promise((resolve) => {
-      setTimeout(() => resolve("still recording"), 200);
+      timer = setTimeout(() => resolve("still recording"), 200);
     });
     assert.equal(await Promise.race([first, stillRecording]), null);
+    clearTimeout(timer);
+    harness.ipcHandlers.get("omnigent:cancel-global-shortcut-recording")(harness.events.pinned);
+    assert.equal(await second, null);
   });
 });
 

@@ -92,6 +92,7 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
   const descriptionId = useId();
 
   useEffect(() => {
+    let cancelled = false;
     void (async () => {
       // An older shell ignores the id and would read and save "show" instead.
       if (
@@ -101,10 +102,14 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
         return;
       }
       const saved = await getGlobalShortcut(shortcutId);
+      if (cancelled) return;
       setSetting(saved);
       // On, but the shell couldn't register it at launch.
       if (saved?.error) setError(saved.error);
     })();
+    return () => {
+      cancelled = true;
+    };
   }, [shortcutId]);
 
   const save = useCallback(

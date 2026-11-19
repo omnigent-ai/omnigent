@@ -581,28 +581,33 @@ describe("SettingsPage", () => {
         : { enabled: false, accelerator: "Alt+Space" },
     );
     const shell = (floatingComposerShortcut: boolean) => {
+      const getDesktopFeatures = vi.fn(async () => ({
+        floatingComposer: true,
+        floatingComposerShortcut,
+      }));
       (window as unknown as Record<string, unknown>).omnigentDesktop = {
         kind: "electron",
         setBadgeCount: vi.fn(),
         notify: vi.fn(),
         getGlobalShortcut,
         setGlobalShortcut: vi.fn(),
-        getDesktopFeatures: vi.fn(async () => ({
-          floatingComposer: true,
-          floatingComposerShortcut,
-        })),
+        getDesktopFeatures,
       };
+      return getDesktopFeatures;
     };
     const newAgent = { name: "Open New Agent from anywhere" };
 
     // An older shell would read and save "show" for any id.
     mocks.floatingComposer = true;
-    shell(false);
+    const oldShellFeatures = shell(false);
     renderPage("/settings/general");
     expect(
       await screen.findByRole("switch", { name: "Show Omnigent from anywhere" }),
     ).toBeInTheDocument();
-    await waitFor(() => expect(screen.queryByRole("switch", newAgent)).toBeNull());
+    // Let the New Agent row's own check answer before asserting it stayed away.
+    await waitFor(() => expect(oldShellFeatures).toHaveBeenCalled());
+    await act(async () => {});
+    expect(screen.queryByRole("switch", newAgent)).toBeNull();
     expect(getGlobalShortcut).not.toHaveBeenCalledWith("floatingComposer");
     cleanup();
 

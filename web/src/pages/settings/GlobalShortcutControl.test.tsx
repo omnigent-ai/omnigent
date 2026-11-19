@@ -242,25 +242,23 @@ describe("GlobalShortcutControl", () => {
     expect(bridge.getGlobalShortcut).not.toHaveBeenCalled();
   });
 
-  it("shows why the New Agent shortcut can't take the show-window chord", async () => {
+  it("records the New Agent chord in the shell by id, and shows why a taken one is refused", async () => {
     const error = "Another Omnigent shortcut already uses that chord. Choose a different one.";
     const bridge = {
       ...installBridge(
         { enabled: true, accelerator: "CommandOrControl+Shift+Space" },
-        {
-          ok: false,
-          error,
-        },
+        { ok: false, error },
       ),
       getDesktopFeatures: vi.fn().mockResolvedValue({ floatingComposerShortcut: true }),
+      recordGlobalShortcut: vi.fn().mockResolvedValue("Alt+Space"),
     };
     (window as unknown as Record<string, unknown>).omnigentDesktop = bridge;
     render(<GlobalShortcutControl shortcutId="floatingComposer" />);
+
     fireEvent.click(await screen.findByTestId("floating-composer-shortcut-recorder"));
 
-    fireEvent.keyDown(window, { code: "Space", altKey: true });
-
     expect(await screen.findByRole("alert")).toHaveTextContent(error);
+    expect(bridge.recordGlobalShortcut).toHaveBeenCalledExactlyOnceWith("floatingComposer");
     expect(bridge.setGlobalShortcut).toHaveBeenCalledExactlyOnceWith(
       { enabled: true, accelerator: "Alt+Space" },
       "floatingComposer",

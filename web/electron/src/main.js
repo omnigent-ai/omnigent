@@ -1829,7 +1829,10 @@ const globalShowShortcut = globalShortcuts.show;
 function settingsShortcut(id = "show") {
   // The panel's shortcut exists only where the panel does.
   if (id === "floatingComposer" && process.platform !== "darwin") return null;
-  return Object.hasOwn(globalShortcuts, id) ? globalShortcuts[id] : null;
+  // A shortcut the consent dialog can't describe can't be offered.
+  return Object.hasOwn(globalShortcuts, id) && Object.hasOwn(GLOBAL_SHORTCUT_CONSENT, id)
+    ? globalShortcuts[id]
+    : null;
 }
 
 /** Main windows, most recently focused first; a closed one drops out on the next focus. */
@@ -5240,7 +5243,7 @@ function registerIpc() {
       throw new Error("record-global-shortcut is only available to a connected server page");
     }
     const shortcut = requireSettingsShortcut(id);
-    // One recording at a time, whichever shortcut it's for.
+    // Each shortcut ends only its own recording, so end them all before this one takes the keys.
     for (const other of Object.values(globalShortcuts)) other.cancelRecording();
     return shortcut.record(event.sender);
   });
