@@ -28,6 +28,22 @@ const BLOCK_TAGS = new Set([
   "div",
 ]);
 
+// Containers whose whitespace children separate blocks (or that React drops), so
+// their whitespace is not part of any quote.
+const CONTAINER_TAGS = new Set([
+  "table",
+  "thead",
+  "tbody",
+  "tfoot",
+  "tr",
+  "ul",
+  "ol",
+  "dl",
+  "blockquote",
+  "div",
+  "details",
+]);
+
 // How far ahead one rendered character may sit from the previous match, e.g.
 // past a quote marker, list indent or entity that the renderer dropped.
 const ALIGN_WINDOW = 24;
@@ -121,6 +137,10 @@ function locate(
   return null;
 }
 
+function holdsInlineWhitespace(parent: HastParent): boolean {
+  return parent.type === "element" && !CONTAINER_TAGS.has((parent as HastElement).tagName);
+}
+
 /**
  * Wraps each placeable text node in a span carrying its raw-source range.
  * Run after sanitize (so only this plugin sets the attributes) and before KaTeX.
@@ -166,8 +186,10 @@ export function rehypeSourceOffsets() {
           visit(element, childBlock, childRange, alert);
         } else if (child.type === "text") {
           const text = child as HastText;
-          if (!text.value.trim()) continue;
           let range = rangeOf(text.position);
+          // Generated separators have no position; positioned whitespace (a space
+          // between two bold words, say) is part of the selected quote.
+          if (!text.value.trim() && (!range || !holdsInlineWhitespace(parent))) continue;
           if (!range && parentRange && source) {
             range = locate(source, text.value, cursor, parentRange[1]);
             if (!range) {
@@ -189,52 +211,98 @@ export function rehypeSourceOffsets() {
   };
 }
 
+// Character references as CommonMark recognizes them; sticky, so it matches at
+// `lastIndex` only.
+const ENTITY_PATTERN = /&(?:#\d{1,7}|#x[\da-f]{1,6}|[a-z][\da-z]*);/iy;
+
+let entityDecoder: HTMLTextAreaElement | null = null;
+
+// The pattern admits only `&name;`/`&#n;` text, so no markup is parsed here.
+function decodeEntity(entity: string): string {
+  entityDecoder ??= document.createElement("textarea");
+  entityDecoder.innerHTML = entity;
+  return entityDecoder.value;
+}
+
+/** Raw-source range [starts[i], ends[i]) that rendered character `i` came from. */
+export interface TextAlignment {
+  starts: number[];
+  ends: number[];
+}
+
 /**
- * Source offset of each character of `text`, which renders `source[start, end)`.
- * Characters are matched in order; one with no match nearby (an emoji glyph,
- * say) takes the position of the next unmatched source character.
+ * Source range of each character of `text`, which renders `source[start, end)`.
+ * Characters are matched in order, a decoded entity spanning its whole reference;
+ * one with no match nearby (an emoji glyph, say) takes the next unmatched source
+ * character.
  */
 export function alignTextToSource(
   text: string,
   source: string,
   start: number,
   end: number,
-): number[] {
-  const offsets = new Array<number>(text.length);
+): TextAlignment {
+  const starts = new Array<number>(text.length);
+  const ends = new Array<number>(text.length);
+  const assign = (index: number, count: number, from: number, to: number) => {
+    for (let offset = 0; offset < count; offset += 1) {
+      starts[index + offset] = from;
+      ends[index + offset] = to;
+    }
+  };
   if (source.slice(start, end) === text) {
-    for (let index = 0; index < text.length; index += 1) offsets[index] = start + index;
-    return offsets;
+    for (let index = 0; index < text.length; index += 1) {
+      assign(index, 1, start + index, start + index + 1);
+    }
+    return { starts, ends };
   }
   let cursor = start;
-  for (let index = 0; index < text.length; index += 1) {
+  let index = 0;
+  while (index < text.length) {
     const limit = index === 0 ? end : Math.min(end, cursor + ALIGN_WINDOW);
-    let found = -1;
+    let matched = 0;
     for (let position = cursor; position < limit; position += 1) {
+      if (source[position] === "&") {
+        ENTITY_PATTERN.lastIndex = position;
+        const entity = ENTITY_PATTERN.exec(source)?.[0];
+        // Code renders a reference verbatim, so a literal match wins.
+        if (entity && position + entity.length <= end && !text.startsWith(entity, index)) {
+          const decoded = decodeEntity(entity);
+          if (decoded && decoded !== entity && text.startsWith(decoded, index)) {
+            assign(index, decoded.length, position, position + entity.length);
+            matched = decoded.length;
+            cursor = position + entity.length;
+            break;
+          }
+        }
+      }
       if (source[position] === text[index]) {
-        found = position;
+        assign(index, 1, position, position + 1);
+        matched = 1;
+        cursor = position + 1;
         break;
       }
     }
-    if (found === -1) {
-      offsets[index] = Math.min(cursor, end - 1);
-    } else {
-      offsets[index] = found;
-      cursor = found + 1;
+    if (matched === 0) {
+      const fallback = Math.min(cursor, end - 1);
+      assign(index, 1, fallback, fallback + 1);
+      matched = 1;
     }
+    index += matched;
   }
-  return offsets;
+  return { starts, ends };
 }
 
 interface SourceSpan {
   element: HTMLElement;
   text: Text;
   block: string;
-  offsets: number[];
+  alignment: TextAlignment;
 }
 
 const alignmentCache = new WeakMap<
   HTMLElement,
-  { source: string; start: number; end: number; value: string; offsets: number[] }
+  { source: string; start: number; end: number; value: string; alignment: TextAlignment }
 >();
 
 function readSpan(element: HTMLElement, source: string): SourceSpan | null {
@@ -247,7 +315,7 @@ function readSpan(element: HTMLElement, source: string): SourceSpan | null {
   }
   const value = text.data;
   const cached = alignmentCache.get(element);
-  let offsets: number[];
+  let alignment: TextAlignment;
   if (
     cached &&
     cached.source === source &&
@@ -255,12 +323,12 @@ function readSpan(element: HTMLElement, source: string): SourceSpan | null {
     cached.end === end &&
     cached.value === value
   ) {
-    offsets = cached.offsets;
+    alignment = cached.alignment;
   } else {
-    offsets = alignTextToSource(value, source, start, end);
-    alignmentCache.set(element, { source, start, end, value, offsets });
+    alignment = alignTextToSource(value, source, start, end);
+    alignmentCache.set(element, { source, start, end, value, alignment });
   }
-  return { element, text, block: element.getAttribute(SOURCE_BLOCK) ?? "", offsets };
+  return { element, text, block: element.getAttribute(SOURCE_BLOCK) ?? "", alignment };
 }
 
 function sourceSpans(root: HTMLElement, source: string): SourceSpan[] {
@@ -332,8 +400,8 @@ export function previewSelectionToSource(
   const first = pieces[0];
   const last = pieces[pieces.length - 1];
   return {
-    start_index: first.span.offsets[first.from],
-    end_index: last.span.offsets[last.to - 1] + 1,
+    start_index: first.span.alignment.starts[first.from],
+    end_index: last.span.alignment.ends[last.to - 1],
     anchor_content,
   };
 }
@@ -343,8 +411,10 @@ export function previewPointToSource(node: Node, offset: number, source: string)
   const element = node instanceof Text ? node.parentElement : null;
   if (!element?.matches(SPAN_SELECTOR)) return null;
   const span = readSpan(element, source);
-  if (!span || span.offsets.length === 0) return null;
-  return span.offsets[Math.min(offset, span.offsets.length - 1)];
+  const { starts, ends } = span?.alignment ?? { starts: [], ends: [] };
+  if (starts.length === 0) return null;
+  // A caret after a node's last character sits just past that character's source.
+  return offset >= starts.length ? ends[ends.length - 1] : starts[offset];
 }
 
 /** DOM ranges covering the rendered text of raw-source range [start, end). */
@@ -357,11 +427,11 @@ export function previewRangesForSource(
   const ranges: Range[] = [];
   if (end <= start) return ranges;
   for (const span of sourceSpans(root, source)) {
-    const { offsets } = span;
+    const { starts, ends } = span.alignment;
     let from = 0;
-    while (from < offsets.length && offsets[from] < start) from += 1;
+    while (from < ends.length && ends[from] <= start) from += 1;
     let to = from;
-    while (to < offsets.length && offsets[to] < end) to += 1;
+    while (to < starts.length && starts[to] < end) to += 1;
     if (from >= to) continue;
     const range = root.ownerDocument.createRange();
     range.setStart(span.text, from);

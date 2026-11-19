@@ -95,9 +95,16 @@ export function MarkdownPreviewComments({
     const offerButton = () => {
       const { content: source, canEdit: editable } = latest.current;
       const selection = window.getSelection();
-      if (!editable || !selection || selection.rangeCount === 0 || selection.isCollapsed) return;
+      // A collapsed or moved selection abandons the button.
+      if (!editable || !selection || selection.rangeCount === 0 || selection.isCollapsed) {
+        setFloating(null);
+        return;
+      }
       const range = selection.getRangeAt(0);
-      if (!root.contains(range.commonAncestorContainer)) return;
+      if (!root.contains(range.commonAncestorContainer)) {
+        setFloating(null);
+        return;
+      }
       const anchor = previewSelectionToSource(range, root, source);
       if (!anchor) {
         setFloating(null);
@@ -244,6 +251,8 @@ export function MarkdownPreviewComments({
       type="button"
       className={`fixed z-50 ${ADD_COMMENT_BUTTON_CLASS_NAME}`}
       style={{ left: floating.x, top: floating.y, transform: "translateY(-100%)" }}
+      // Keep the selection while pressed so it doesn't abandon the button.
+      onMouseDown={(event) => event.preventDefault()}
       onClick={() => {
         onSetActiveSelection({
           start_index: floating.start_index,

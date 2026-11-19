@@ -975,17 +975,11 @@ function FileViewerBody({
     if (deepLinkBiasPath !== null && isDataTablePath(deepLinkBiasPath)) setDeepLinkBiasPath(null);
   }
 
-  // Switch a markdown file to its editing surface (source for large files), for
-  // the large-file preview's "switch to edit mode" hint. Preview has no edits to
-  // guard, so this mirrors the toolbar's switchTo for the non-editor case.
+  // Switch large markdown to Source for the preview's "switch to edit mode" hint.
   const handleRequestEditMode = useCallback(() => {
     setDeepLinkBiasPath(null);
-    if (markdownSourceFallback) {
-      setLargeMarkdownMode({ conversationId, path, mode: "source" });
-    } else {
-      setPreviewableViewMode("editor");
-    }
-  }, [markdownSourceFallback, conversationId, path]);
+    setLargeMarkdownMode({ conversationId, path, mode: "source" });
+  }, [conversationId, path]);
 
   // Persist the global view preferences so they survive a refresh. commentsOpen
   // is intentionally excluded — it's contextual (per-open), not a sticky
@@ -2081,7 +2075,9 @@ function FileViewerBody({
                 wrapLines={wrapLines}
                 tocOpen={tocOpen}
                 onTocToggle={() => setTocOpen((prev) => !prev)}
-                onRequestEditMode={lang === "markdown" ? handleRequestEditMode : undefined}
+                onRequestEditMode={
+                  lang === "markdown" && markdownSourceFallback ? handleRequestEditMode : undefined
+                }
                 attachToAgent={attachToAgent}
               />
             )}

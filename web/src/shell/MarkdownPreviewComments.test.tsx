@@ -2,7 +2,7 @@
 // react-markdown pipeline. jsdom has no layout or CSS Custom Highlight API, so
 // rects are stubbed and a fake highlight registry records what would be painted.
 
-import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { useFileContent } from "@/hooks/useFileContent";
 import type { Comment } from "@/hooks/useComments";
@@ -21,6 +21,22 @@ class FakeHighlight {
     this.ranges.push(range);
   }
 }
+
+const originalRangeLayout = {
+  getClientRects: Object.getOwnPropertyDescriptor(Range.prototype, "getClientRects") ?? {
+    configurable: true,
+    writable: true,
+    value: undefined,
+  },
+  getBoundingClientRect: Object.getOwnPropertyDescriptor(
+    Range.prototype,
+    "getBoundingClientRect",
+  ) ?? {
+    configurable: true,
+    writable: true,
+    value: undefined,
+  },
+};
 
 beforeEach(() => {
   vi.mocked(permissions.useCanEdit).mockReturnValue(true);
@@ -44,6 +60,8 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  // jsdom has no Range layout methods, so restore whatever it had (usually nothing).
+  Object.defineProperties(Range.prototype, originalRangeLayout);
   window.getSelection()?.removeAllRanges();
 });
 
@@ -141,11 +159,12 @@ function selectRendered(text: string) {
   fireEvent.mouseUp(root);
 }
 
-function clickAt(text: string) {
+/** Click with the caret `offset` characters into the rendered `text`. */
+function clickAt(text: string, offset = 1) {
   const root = previewRoot();
   const index = root.textContent?.indexOf(text) ?? -1;
   const range = document.createRange();
-  range.setStart(...domPoint(root, index + 1));
+  range.setStart(...domPoint(root, index + offset));
   range.collapse(true);
   window.getSelection()!.removeAllRanges();
   window.getSelection()!.addRange(range);
@@ -204,6 +223,16 @@ describe("commenting on a selection in the Markdown preview", () => {
     ["a nested list item", "- outer\n  - inner leaf\n", "inner leaf", "inner leaf", "inner leaf"],
     ["text beside math", "Area $$x^2$$ grows fast\n", "grows", "grows", "grows"],
     ["struck text", "Drop ~~old plan~~ today\n", "old plan", "old plan", "old plan"],
+    ["bold words split by a space", "**one** **two**\n", "one two", "one two", "one** **two"],
+    [
+      "bold words split by a soft break",
+      "**one**\n**two**\n",
+      "one\ntwo",
+      "one\ntwo",
+      "one**\n**two",
+    ],
+    ["a named entity alone", "Made &copy; here\n", "©", "©", "&copy;"],
+    ["an entity in inline code", "Write `&amp;` here\n", "&amp;", "&amp;", "&amp;"],
   ])("anchors %s to its raw-source range", (_label, content, selected, quote, sourceSlice) => {
     const onSetActiveSelection = vi.fn();
     renderPreview(content, { onSetActiveSelection });
@@ -215,6 +244,29 @@ describe("commenting on a selection in the Markdown preview", () => {
     const anchor = onSetActiveSelection.mock.calls[0][0] as ActiveSelection;
     expect(anchor.anchor_content).toBe(quote);
     expect(content.slice(anchor.start_index, anchor.end_index)).toBe(sourceSlice);
+  });
+
+  it("anchors text after an entity past the whole reference", () => {
+    const content = "&amp;am\n";
+    const onSetActiveSelection = vi.fn();
+    renderPreview(content, { onSetActiveSelection });
+
+    selectRendered("am");
+    fireEvent.click(screen.getByRole("button", { name: "Add comment" }));
+
+    const anchor = onSetActiveSelection.mock.calls[0][0] as ActiveSelection;
+    expect([anchor.start_index, anchor.end_index]).toEqual([5, 7]);
+  });
+
+  it("drops the button when the selection collapses", async () => {
+    renderPreview("Intro with Review word.\n");
+    selectRendered("Review");
+    expect(screen.getByRole("button", { name: "Add comment" })).toBeDefined();
+
+    window.getSelection()!.collapseToEnd();
+    fireEvent(document, new Event("selectionchange"));
+
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Add comment" })).toBeNull());
   });
 
   it("anchors the selected copy of repeated text", () => {
@@ -308,6 +360,15 @@ describe("saved comments in the Markdown preview", () => {
     });
   });
 
+  it("does not activate a comment from a click just past its last character", () => {
+    const onSetActiveSelection = vi.fn();
+    renderPreview(content, { comments: [comment("c1", content, "Review")], onSetActiveSelection });
+
+    clickAt("Review", "Review".length);
+
+    expect(onSetActiveSelection).not.toHaveBeenCalled();
+  });
+
   it("clears the active comment when other text is clicked", () => {
     const review = comment("c1", content, "Review");
     const onSetActiveSelection = vi.fn();
@@ -320,6 +381,14 @@ describe("saved comments in the Markdown preview", () => {
     clickAt("second");
 
     expect(onSetActiveSelection).toHaveBeenCalledWith(null);
+  });
+
+  it("highlights an editor comment placed after an entity", () => {
+    const entitySource = "&amp;am and more\n";
+    const after = { ...comment("c1", entitySource, "am"), start_index: 5, end_index: 7 };
+    renderPreview(entitySource, { comments: [after] });
+
+    expect(painted.get("md-preview-comment")).toEqual(["am"]);
   });
 
   it("removes its highlights when the preview closes", async () => {
@@ -389,18 +458,30 @@ describe("rehypeSourceOffsets", () => {
 });
 
 describe("alignTextToSource", () => {
+  it("spans a decoded entity over its whole reference", () => {
+    expect(alignTextToSource("© x", "&copy; x", 0, 8)).toEqual({
+      starts: [0, 6, 7],
+      ends: [6, 7, 8],
+    });
+  });
+
   it("maps verbatim text one to one", () => {
-    expect(alignTextToSource("abc", "xxabcxx", 2, 5)).toEqual([2, 3, 4]);
+    expect(alignTextToSource("abc", "xxabcxx", 2, 5)).toEqual({
+      starts: [2, 3, 4],
+      ends: [3, 4, 5],
+    });
   });
 
   it("skips markers the renderer dropped", () => {
     const source = "> one\n> two";
-    expect(alignTextToSource("one\ntwo", source, 2, source.length)).toEqual([2, 3, 4, 5, 8, 9, 10]);
+    expect(alignTextToSource("one\ntwo", source, 2, source.length).starts).toEqual([
+      2, 3, 4, 5, 8, 9, 10,
+    ]);
   });
 
   it("keeps characters after an unmatched glyph aligned", () => {
     const source = "a :rocket: b";
-    const offsets = alignTextToSource("a 🚀 b", source, 0, source.length);
+    const offsets = alignTextToSource("a 🚀 b", source, 0, source.length).starts;
     expect(offsets.at(-1)).toBe(source.length - 1);
     expect(offsets.at(-2)).toBe(source.length - 2);
   });

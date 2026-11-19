@@ -129,6 +129,22 @@ def _color_distance(first: tuple[float, ...], second: tuple[float, ...]) -> floa
     return sum(abs(a - b) for a, b in zip(first, second, strict=True))
 
 
+_LIFT_HIGHLIGHTS_JS = """() => {
+  globalThis.__liftedHighlights = [];
+  for (const name of ["md-preview-comment", "md-preview-comment-active"]) {
+    const highlight = CSS.highlights.get(name);
+    if (highlight) globalThis.__liftedHighlights.push([name, highlight]);
+    CSS.highlights.delete(name);
+  }
+}"""
+
+_RESTORE_HIGHLIGHTS_JS = """() => {
+  for (const [name, highlight] of globalThis.__liftedHighlights) {
+    CSS.highlights.set(name, highlight);
+  }
+}"""
+
+
 def _wait_for_highlights(page: Page, name: str, count: int = 1, *, exact: bool = False) -> None:
     """Wait until the CSS custom highlight ``name`` holds ``count`` (or more) ranges."""
     page.wait_for_function(
@@ -176,10 +192,14 @@ def test_add_comment_from_markdown_preview(
     assert stored[0]["end_index"] == raw_start + len(_SELECTED_RAW)
     assert stored[0]["anchor_content"] == _SELECTED_TEXT
     _wait_for_highlights(page, "md-preview-comment")
-    # The saved comment is painted over the rendered words, not just registered.
+    # The saved comment is painted over the rendered words, not just registered:
+    # the same pixels change when the comment highlights are lifted.
     page.evaluate("window.getSelection()?.removeAllRanges()")
-    highlighted = _mean_color(page, _text_rects(paragraph, "comments")[0])
-    plain = _mean_color(page, _text_rects(paragraph, "before")[0])
+    words = _text_rects(paragraph, "comments")[0]
+    highlighted = _mean_color(page, words)
+    page.evaluate(_LIFT_HIGHLIGHTS_JS)
+    plain = _mean_color(page, words)
+    page.evaluate(_RESTORE_HIGHLIGHTS_JS)
     assert _color_distance(highlighted, plain) > 20, (highlighted, plain)
 
     switch_markdown_view_mode(page, file_viewer, "Edit")

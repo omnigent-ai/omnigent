@@ -174,21 +174,24 @@ function rehypeRawWhenPresent() {
 // iframe. Order matters: alerts transform before sanitize, slug adds IDs to
 // headings, and sanitize runs after raw parsing and GFM — only KaTeX comes
 // later, rendering math from the already-sanitized tree.
-const MARKDOWN_REHYPE_PLUGINS: Options["rehypePlugins"] = [
+const MARKDOWN_SANITIZED_REHYPE_PLUGINS: NonNullable<Options["rehypePlugins"]> = [
   rehypeRawWhenPresent,
   rehypeSlug,
   rehypeGithubAlerts,
   [rehypeSanitize, MARKDOWN_SANITIZE_SCHEMA],
-  // After sanitize: sanitize neutralises the untrusted markdown/HTML, leaving the
-  // `language-math` code nodes as plain text; KaTeX then renders that trusted
-  // output. Running KaTeX before sanitize would strip its MathML/spans as unknown.
+];
+// After sanitize: sanitize neutralises the untrusted markdown/HTML, leaving the
+// `language-math` code nodes as plain text; KaTeX then renders that trusted
+// output. Running KaTeX before sanitize would strip its MathML/spans as unknown.
+const MARKDOWN_REHYPE_PLUGINS: Options["rehypePlugins"] = [
+  ...MARKDOWN_SANITIZED_REHYPE_PLUGINS,
   MATH_PLUGIN.rehypePlugin,
 ];
 
 // Commentable previews also record each text node's raw-source range, after
 // sanitize (so only this plugin sets the attributes) and before KaTeX.
 const MARKDOWN_COMMENTABLE_REHYPE_PLUGINS: Options["rehypePlugins"] = [
-  ...MARKDOWN_REHYPE_PLUGINS.slice(0, -1),
+  ...MARKDOWN_SANITIZED_REHYPE_PLUGINS,
   rehypeSourceOffsets,
   MATH_PLUGIN.rehypePlugin,
 ];
@@ -601,9 +604,8 @@ export interface CodeViewerProps {
   /** Callback to toggle TOC panel. */
   onTocToggle?: () => void;
   /**
-   * Switches a markdown file to the rich-text editor. When set, the rendered
-   * preview shows a banner pointing users there for commenting (the preview
-   * itself can't anchor text-selection comments).
+   * Switches a large markdown file to Source. When set, the large-file preview
+   * (which skips Preview commenting) shows a banner pointing users there.
    */
   onRequestEditMode?: () => void;
   /** Whether the session's agent opens an attached workspace path. */
