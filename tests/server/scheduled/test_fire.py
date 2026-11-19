@@ -33,6 +33,7 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 from starlette.datastructures import Headers
 
+from omnigent.db.account_authority import account_checks_scope
 from omnigent.db.db_models import current_workspace_id
 from omnigent.db.utils import generate_agent_id
 from omnigent.entities import (
@@ -1103,9 +1104,16 @@ async def test_a_task_saved_on_another_users_agent_moves_to_its_owners_copy(
 
 
 @pytest.mark.asyncio
-async def test_existing_owner_is_granted_without_ensure_user() -> None:
+@pytest.mark.parametrize(
+    ("checks_enabled", "owner_generation"), [(True, None), (False, "current")]
+)
+async def test_existing_owner_is_granted_without_ensure_user(
+    monkeypatch: pytest.MonkeyPatch, checks_enabled: bool, owner_generation: str | None
+) -> None:
     """A real owner's row is never (re)created by the fire path."""
     perm = FakePermissionStore(users={"alice"})
+    owner = replace(perm.get_user("alice"), account_generation=owner_generation)
+    monkeypatch.setattr(perm, "get_user", lambda _user_id: owner)
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task(user_id="alice")})
 
@@ -1116,8 +1124,9 @@ async def test_existing_owner_is_granted_without_ensure_user() -> None:
         _deps(store, permission_store=perm, conversation_store=conv_store),
         launch_dispatch=_launch,
     )
-    await on_fire(0, "task_1")
-    await _drain()
+    with account_checks_scope(checks_enabled):
+        await on_fire(0, "task_1")
+        await _drain()
 
     assert len(conv_store.created) == 1
     assert perm.ensured == []
@@ -1125,22 +1134,29 @@ async def test_existing_owner_is_granted_without_ensure_user() -> None:
 
 
 @pytest.mark.asyncio
-async def test_deleted_owner_disables_task_and_records_failed_run() -> None:
+@pytest.mark.parametrize("dispatch_enabled", [False, True])
+async def test_deleted_owner_disables_task_and_records_failed_run(dispatch_enabled: bool) -> None:
     """A task whose owner no longer exists is disabled, not resurrected."""
     perm = FakePermissionStore(users=set())
     conv_store = FakeConversationStore()
     store = FakeScheduledTaskStore(rows={"task_1": _task(user_id="alice")})
+    scheduler = Mock()
+    app_state = SimpleNamespace(
+        scheduled_task_scheduler=scheduler,
+        scheduled_task_dispatch_enabled=dispatch_enabled,
+    )
     launched: list[Any] = []
 
     async def _launch(conv: Any, task: Any) -> None:
         launched.append(conv)
 
     on_fire = build_on_fire(
-        _deps(store, permission_store=perm, conversation_store=conv_store),
+        _deps(store, permission_store=perm, conversation_store=conv_store, app_state=app_state),
         launch_dispatch=_launch,
     )
-    await on_fire(0, "task_1")
-    await _drain()
+    with account_checks_scope(False):
+        await on_fire(0, "task_1")
+        await _drain()
 
     assert launched == []
     assert conv_store.created == []
@@ -1152,6 +1168,39 @@ async def test_deleted_owner_disables_task_and_records_failed_run() -> None:
     assert store.runs[0]["status"] == "failed"
     assert store.runs[0]["error_code"] == "owner_deleted"
     assert "alice" in store.runs[0]["error"]
+    if dispatch_enabled:
+        scheduler.remove.assert_not_called()
+    else:
+        scheduler.remove.assert_called_once_with("task_1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("checks_enabled", "task_generation", "owner_generation", "expected_deleted"),
+    [
+        (False, None, "current", False),
+        (True, None, "current", True),
+        (False, "current", "current", False),
+        (True, "current", "current", False),
+        (False, "old", "current", True),
+        (True, "old", "current", True),
+    ],
+)
+async def test_owner_generation_check(
+    monkeypatch: pytest.MonkeyPatch,
+    checks_enabled: bool,
+    task_generation: str | None,
+    owner_generation: str | None,
+    expected_deleted: bool,
+) -> None:
+    perm = FakePermissionStore(users={"alice"})
+    owner = replace(perm.get_user("alice"), account_generation=owner_generation)
+    monkeypatch.setattr(perm, "get_user", lambda _user_id: owner)
+    task = _task(user_id="alice", account_generation=task_generation)
+    deps = _deps(FakeScheduledTaskStore(), permission_store=perm)
+
+    with account_checks_scope(checks_enabled):
+        assert await fire_mod._owner_is_deleted(deps, task) is expected_deleted
 
 
 def _claude_agent_deps(
