@@ -1601,6 +1601,7 @@ class SessionResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: OSEnvSpec | None = None,
         resource_role: str | None = None,
+        program_status_forward_app: str | None = None,
     ) -> SessionResourceView:
         """Launch a terminal required for the owning session to execute.
 
@@ -1621,6 +1622,7 @@ class SessionResourceRegistry:
             sandbox_override=sandbox_override,
             parent_os_env=parent_os_env,
             resource_role=resource_role,
+            program_status_forward_app=program_status_forward_app,
         )
 
     async def launch_auxiliary_terminal(
@@ -1634,6 +1636,7 @@ class SessionResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: OSEnvSpec | None = None,
         resource_role: str | None = None,
+        program_status_forward_app: str | None = None,
     ) -> SessionResourceView:
         """Launch a terminal resource attached to the owning session.
 
@@ -1654,6 +1657,7 @@ class SessionResourceRegistry:
             sandbox_override=sandbox_override,
             parent_os_env=parent_os_env,
             resource_role=resource_role,
+            program_status_forward_app=program_status_forward_app,
         )
 
     async def _launch_terminal_with_lifecycle(
@@ -1668,6 +1672,7 @@ class SessionResourceRegistry:
         sandbox_override: str | None = None,
         parent_os_env: OSEnvSpec | None = None,
         resource_role: str | None = None,
+        program_status_forward_app: str | None = None,
     ) -> SessionResourceView:
         """Launch a terminal, then observe it with the requested lifecycle."""
         if self._terminal_registry is None:
@@ -1691,6 +1696,11 @@ class SessionResourceRegistry:
                 parent_os_env=parent_os_env,
                 cwd_override=cwd_override,
                 sandbox_override=sandbox_override,
+                program_status_forward_app=program_status_forward_app
+                or {
+                    CLAUDE_NATIVE_TERMINAL_ROLE: "claude-code",
+                    CODEX_NATIVE_TERMINAL_ROLE: "codex",
+                }.get(resource_role or ""),
                 **program_status_args,
             )
         except TerminalExitedDuringLaunch as exc:
@@ -2345,7 +2355,7 @@ class SessionResourceRegistry:
             on_status=on_status,
             on_replay=on_replay,
             pane_pid_getter=(
-                (lambda: reader.child_pid) if reader is not None else instance.pane_pid_sync
+                (lambda: reader.child_pid) if reader is not None else instance.command_pid_sync
             ),
             session_id_getter=_session_id_getter,
             omnigent_session_id=session_id,

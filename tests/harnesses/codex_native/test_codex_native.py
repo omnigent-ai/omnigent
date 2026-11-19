@@ -10203,6 +10203,7 @@ def test_launch_codex_terminal_uses_remote_resume_order(
             {
                 "terminal": "codex",
                 "session_key": "main",
+                "forward_program_status": True,
                 "spec": {
                     "command": "/opt/codex/bin/codex",
                     "args": [
