@@ -203,11 +203,7 @@ def scroll_to_distance_from_bottom(page: Page, distance: int) -> dict:
 
 @contextmanager
 def native_touch_emulation(page: Page) -> Iterator[CDPSession]:
-    """Emulate touch input until the block exits.
-
-    Ending emulation re-evaluates pointer/hover media, which resizes touch-sized
-    targets; measurements that must share one layout belong inside the block.
-    """
+    """Emulate touch input until the block exits."""
     session = page.context.new_cdp_session(page)
     try:
         session.send("Emulation.setTouchEmulationEnabled", {"enabled": True, "maxTouchPoints": 1})

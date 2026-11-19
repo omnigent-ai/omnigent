@@ -27,6 +27,10 @@ READ_ONLY_MODE_LEVELS: frozenset[int] = frozenset({LEVEL_READ})
 # permission store enforces it; widening it needs no migration.
 SCHEDULED_TASK_GRANT_LEVELS: frozenset[int] = frozenset({LEVEL_READ})
 
+# Levels a saved workflow may grant: people it is shared with view, run and copy it.
+# The permission store enforces it; widening it needs no migration.
+WORKFLOW_GRANT_LEVELS: frozenset[int] = frozenset({LEVEL_READ})
+
 
 def is_reserved_grantee(user_id: str) -> bool:
     """Whether *user_id* names the local user or the public, ignoring case and outer space.

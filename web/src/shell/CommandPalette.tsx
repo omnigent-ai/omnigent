@@ -4,7 +4,7 @@
 
 import type React from "react";
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronRightIcon, CornerDownRightIcon, FolderIcon, XIcon } from "lucide-react";
+import { XIcon } from "lucide-react";
 import { useNavigate } from "@/lib/routing";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { cn } from "@/lib/utils";
@@ -21,6 +21,7 @@ import {
   CommandList,
 } from "@/components/ui/command";
 import { type ActionCommand, filterAppCommands, useAppCommands } from "./appCommands";
+import { PaletteSessionContext } from "./PaletteSessionContext";
 import { type PaletteSession, usePaletteSessionSearch } from "./usePaletteSessionSearch";
 
 export interface CommandPaletteProps {
@@ -155,31 +156,7 @@ export function CommandPalette({
         <span className="truncate text-left">
           <HighlightedText text={s.label} query={sessionsOnly ? query : debouncedQuery} />
         </span>
-        {(s.project || s.parent) && (
-          <span className="flex min-w-0 items-center gap-1 text-xs text-muted-foreground">
-            {s.project && (
-              <>
-                <FolderIcon aria-hidden="true" className="size-3 shrink-0" />
-                <span className="truncate" title={s.project}>
-                  <span className="sr-only">Project: </span>
-                  {s.project}
-                </span>
-              </>
-            )}
-            {s.project && s.parent && (
-              <ChevronRightIcon aria-hidden="true" className="size-3 shrink-0" />
-            )}
-            {s.parent && (
-              <>
-                <CornerDownRightIcon aria-hidden="true" className="size-3 shrink-0" />
-                <span className="truncate" title={s.parent}>
-                  <span className="sr-only">Nested under: </span>
-                  {s.parent}
-                </span>
-              </>
-            )}
-          </span>
-        )}
+        <PaletteSessionContext project={s.project} parent={s.parent} />
         {s.snippet && (
           // Where the match was found in the chat body — the session is often
           // unidentifiable from the title alone.

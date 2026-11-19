@@ -13,6 +13,7 @@ import {
   createScheduledTask,
   deleteScheduledTask,
   getScheduledTask,
+  listScheduledTaskRunPullRequests,
   listScheduledTaskRuns,
   listScheduledTasks,
   listSharedScheduledTasks,
@@ -126,6 +127,11 @@ describe("listScheduledTasks", () => {
 });
 
 describe("getScheduledTask", () => {
+  it.each([undefined, null, 2.5])("reads the saved cost limit (%s)", async (maxCostUsd) => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ ...TASK_WIRE, max_cost_usd: maxCostUsd }));
+    expect((await getScheduledTask("st_1")).maxCostUsd).toBe(maxCostUsd ?? null);
+  });
+
   it("GETs /v1/scheduled-tasks/{id} and encodes the id", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
     const task = await getScheduledTask("st 1");
@@ -254,6 +260,20 @@ describe("listScheduledTaskRuns", () => {
 });
 
 describe("createScheduledTask", () => {
+  it.each([undefined, null, 2.5])("sends a cost limit only when set (%s)", async (maxCostUsd) => {
+    fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
+    await createScheduledTask({
+      name: "Nightly review",
+      prompt: "Review new issues",
+      rrule: "FREQ=DAILY",
+      agentId: "ag_1",
+      maxCostUsd,
+    });
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body);
+    if (maxCostUsd == null) expect(body).not.toHaveProperty("max_cost_usd");
+    else expect(body.max_cost_usd).toBe(maxCostUsd);
+  });
+
   it("POSTs required fields and omits unset optionals", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
     await createScheduledTask({
@@ -368,6 +388,17 @@ describe("createScheduledTask", () => {
 });
 
 describe("updateScheduledTask", () => {
+  it.each([undefined, null, 2.5])(
+    "preserves, clears, or sets the cost limit (%s)",
+    async (maxCostUsd) => {
+      fetchMock.mockResolvedValueOnce(mockResponse(TASK_WIRE));
+      await updateScheduledTask("st_1", { maxCostUsd });
+      expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual(
+        maxCostUsd === undefined ? {} : { max_cost_usd: maxCostUsd },
+      );
+    },
+  );
+
   it("PATCHes only the fields present in the input", async () => {
     fetchMock.mockResolvedValueOnce(mockResponse({ ...TASK_WIRE, state: "paused" }));
     const updated = await updateScheduledTask("st_1", { state: "paused" });
@@ -492,5 +523,56 @@ describe("random worktree setting", () => {
     const task = await updateScheduledTask("st_1", { baseBranch });
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ base_branch: baseBranch });
     expect(task.baseBranch).toBe(baseBranch);
+  });
+});
+
+describe("listScheduledTaskRunPullRequests", () => {
+  it("pages after a run and maps each run's PRs and the refresh flag", async () => {
+    const pr = {
+      url: "https://github.com/example/repo/pull/1",
+      provider: "github",
+      repository: "example/repo",
+      number: 1,
+      relationship: "created",
+      state: "MERGED",
+      is_draft: false,
+      state_checked_at: 1_700_000_100,
+    };
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        runs: [{ run_id: "run_1", pull_requests: [pr] }, { run_id: "run_2" }],
+        refresh_pending: true,
+        next_cursor: null,
+      }),
+    );
+    const page = await listScheduledTaskRunPullRequests("st/1", { limit: 20, after: "run 0" });
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/v1/scheduled-tasks/st%2F1/run-pull-requests?limit=20&after=run+0",
+    );
+    expect(page).toEqual({
+      runs: [
+        { runId: "run_1", pullRequests: [pr] },
+        { runId: "run_2", pullRequests: [] },
+      ],
+      refreshPending: true,
+    });
+  });
+
+  it("reads an answer without runs or the refresh flag as empty and settled", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({}));
+    expect(await listScheduledTaskRunPullRequests("st_1", { limit: 20 })).toEqual({
+      runs: [],
+      refreshPending: false,
+    });
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/scheduled-tasks/st_1/run-pull-requests?limit=20");
+  });
+
+  it("rejects with the server's error", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ detail: "Scheduled task not found" }, { ok: false, status: 404 }),
+    );
+    await expect(listScheduledTaskRunPullRequests("st_1", { limit: 20 })).rejects.toMatchObject({
+      status: 404,
+    });
   });
 });

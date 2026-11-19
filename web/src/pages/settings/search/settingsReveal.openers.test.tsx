@@ -175,7 +175,7 @@ describe("a field only a form shows", () => {
     const { path } = chooseResult(AGENTS, "name");
     expect(path).toBe("/settings/custom-agents#fixture.agents:");
     expect(row(AGENTS).hasAttribute(SETTINGS_HIGHLIGHT_ATTRIBUTE)).toBe(true);
-    expect(document.activeElement).toBe(control("fixture.agents"));
+    expect(document.activeElement).toBe(control("fixture.agents:"));
     expect(openForm).not.toHaveBeenCalled();
   });
 
@@ -203,7 +203,7 @@ describe("a field only a form shows", () => {
       expect(document.activeElement).toBe(document.body);
       document.querySelector("[data-testid=wrapper]")!.removeAttribute(hiding);
       // oxlint-disable-next-line no-await-in-loop -- each hiding attribute in turn
-      await vi.waitFor(() => expect(document.activeElement).toBe(control("fixture.agents")));
+      await vi.waitFor(() => expect(document.activeElement).toBe(control("fixture.agents:")));
       cleanup();
     }
   });
@@ -223,7 +223,7 @@ describe("a field only a form shows", () => {
       expect(document.activeElement).toBe(document.body);
       document.querySelector("[data-testid=drawer]")!.removeAttribute(hiding);
       // oxlint-disable-next-line no-await-in-loop -- each hiding attribute in turn
-      await vi.waitFor(() => expect(document.activeElement).toBe(control("fixture.agents")));
+      await vi.waitFor(() => expect(document.activeElement).toBe(control("fixture.agents:")));
       cleanup();
     }
   });
@@ -245,10 +245,10 @@ describe("a part shown only in some states", () => {
 
   it("lands on the row's main control while it's disabled or absent", () => {
     chooseResult(TITLES, "save", <Titles state="loaded" />);
-    expect(document.activeElement).toBe(control("fixture.titles"));
+    expect(document.activeElement).toBe(control("fixture.titles:"));
     cleanup();
     chooseResult(TITLES, "retry", <Titles state="loaded" />);
-    expect(document.activeElement).toBe(control("fixture.titles"));
+    expect(document.activeElement).toBe(control("fixture.titles:"));
   });
 
   it("lands on another of the row's controls when the main one can't take focus", () => {
@@ -267,7 +267,7 @@ describe("a part shown only in some states", () => {
       return <Titles state={failed ? "load failed" : "loaded"} />;
     }
     chooseResult(TITLES, "retry", <LateRetry />);
-    expect(document.activeElement).toBe(control("fixture.titles"));
+    expect(document.activeElement).toBe(control("fixture.titles:"));
     act(() => showRetry());
     await vi.waitFor(() => expect(document.activeElement).toBe(control("fixture.titles:retry")));
   });
@@ -281,7 +281,7 @@ describe("a part shown only in some states", () => {
     }
     for (const input of ["keydown", "pointerdown"] as const) {
       chooseResult(TITLES, "save", <LateSave />);
-      const field = control("fixture.titles")!;
+      const field = control("fixture.titles:")!;
       expect(document.activeElement).toBe(field);
       // Typing in the field is what enables Save; the user's caret stays where it is.
       if (input === "keydown") fireEvent.keyDown(field, { key: "a" });
@@ -294,6 +294,38 @@ describe("a part shown only in some states", () => {
     }
   });
 
+  it.each([
+    ["types", (field: HTMLElement) => fireEvent.keyDown(field, { key: "a" })],
+    ["clicks", (field: HTMLElement) => fireEvent.pointerDown(field)],
+  ])(
+    "stops waiting once the user %s in another field of the row, before any control has focus",
+    async (_verb, interact) => {
+      let enableSave: () => void = () => {};
+      function LateSave() {
+        const [enabled, setEnabled] = useState(false);
+        enableSave = () => setEnabled(true);
+        return (
+          <SettingsItem entry={TITLES}>
+            <textarea disabled {...settingsControlProps(TITLES)} />
+            <input aria-label="Notes" />
+            {enabled && (
+              <button type="button" {...settingsControlProps(TITLES, "save")}>
+                Save
+              </button>
+            )}
+          </SettingsItem>
+        );
+      }
+      chooseResult(TITLES, "save", <LateSave />);
+      const notes = document.querySelector<HTMLInputElement>('input[aria-label="Notes"]')!;
+      notes.focus();
+      interact(notes);
+      act(() => enableSave());
+      await act(async () => {});
+      expect(document.activeElement).toBe(notes);
+    },
+  );
+
   it("stops waiting to take over once the reveal window closes", async () => {
     let enableSave: () => void = () => {};
     function LateSave() {
@@ -305,7 +337,7 @@ describe("a part shown only in some states", () => {
     act(() => vi.advanceTimersByTime(SETTINGS_REVEAL_WINDOW_MS + 1));
     act(() => enableSave());
     await act(async () => {});
-    expect(document.activeElement).toBe(control("fixture.titles"));
+    expect(document.activeElement).toBe(control("fixture.titles:"));
   });
 
   it("never lands on another row's control nested inside it", async () => {
@@ -323,7 +355,7 @@ describe("a part shown only in some states", () => {
     );
     expect(document.activeElement).toBe(document.body);
     // Once the field is usable, it takes the focus the reveal was waiting to give.
-    const field = control("fixture.titles") as HTMLTextAreaElement;
+    const field = control("fixture.titles:") as HTMLTextAreaElement;
     field.disabled = false;
     await vi.waitFor(() => expect(document.activeElement).toBe(field));
   });

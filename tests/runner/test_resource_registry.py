@@ -9,6 +9,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import sys
 import threading
 from collections.abc import Callable, Sequence
@@ -3691,6 +3692,87 @@ def test_sanitize_session_id_yields_one_safe_component(raw: str, expected: str, 
     assert got, "must never be empty — it becomes a path component"
     assert "/" not in got and "\\" not in got, "must be a single component"
     assert set(got) != {"."}, "must not be '.' or '..'"
+
+
+@pytest.mark.parametrize("windows", [False, True], ids=["posix", "windows"])
+@pytest.mark.parametrize(
+    "root_source",
+    ["default", "tmpdir", "empty-tmpdir", "explicit", "explicit-only", "empty-explicit"],
+)
+def test_session_workspace_uses_platform_temp_default(
+    tmp_path: Path, windows: bool, root_source: str
+) -> None:
+    native_temp = tmp_path / "native temp"
+    native_temp.mkdir()
+    tmpdir = tmp_path / "tmpdir"
+    tmpdir.mkdir()
+    explicit_root = tmp_path / "explicit-root"
+    repo_root = Path(__file__).resolve().parents[2]
+    env = {**os.environ, "TEMP": str(native_temp), "TMP": str(native_temp)}
+    env.pop("TMPDIR", None)
+    env.pop("OMNIGENT_RUNNER_OS_ENV_ROOT", None)
+    if root_source in ("tmpdir", "explicit"):
+        env["TMPDIR"] = str(tmpdir)
+    elif root_source == "empty-tmpdir":
+        env["TMPDIR"] = ""
+    if root_source in ("explicit", "explicit-only"):
+        env["OMNIGENT_RUNNER_OS_ENV_ROOT"] = str(explicit_root)
+    elif root_source == "empty-explicit":
+        env["OMNIGENT_RUNNER_OS_ENV_ROOT"] = ""
+
+    # Reload only the registry in a child so platform branches cannot affect pytest.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import importlib, json, os, sys, tempfile\n"
+            "from omnigent import _platform\n"
+            "from omnigent.runner import resource_registry\n"
+            "_platform.IS_WINDOWS = sys.argv[1] == 'True'\n"
+            "tempfile.tempdir = None\n"
+            "def unavailable_tempdir():\n"
+            "    raise OSError('no usable temporary directory')\n"
+            "if sys.argv[2] != 'default':\n"
+            "    tempfile.gettempdir = unavailable_tempdir\n"
+            "importlib.reload(resource_registry)\n"
+            "if sys.argv[2] in ('tmpdir', 'empty-tmpdir'):\n"
+            "    imported_workspace = resource_registry._session_workspace('conv_temp')\n"
+            "    os.environ['TMPDIR'] += '-changed'\n"
+            "    assert resource_registry._session_workspace('conv_temp') == imported_workspace\n"
+            "    del os.environ['TMPDIR']\n"
+            "    assert resource_registry._session_workspace('conv_temp') == imported_workspace\n"
+            "if sys.argv[2] == 'default' and _platform.IS_WINDOWS:\n"
+            "    os.environ['TMPDIR'] = sys.argv[3]\n"
+            "    expected = os.path.join(os.path.realpath(sys.argv[3]),\n"
+            "                            'omnigent-sessions', 'conv_temp', 'workspace')\n"
+            "    assert resource_registry._session_workspace('conv_temp') == expected\n"
+            "    del os.environ['TMPDIR']\n"
+            "    assert resource_registry._session_workspace('conv_temp') == expected\n"
+            "    tempfile.tempdir = None\n"
+            "print(json.dumps(resource_registry._session_workspace('conv_temp')))\n",
+            str(windows),
+            root_source,
+            str(tmpdir),
+        ],
+        cwd=repo_root,
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    root = (native_temp if windows else Path("/tmp")) / "omnigent-sessions"
+    if root_source == "tmpdir":
+        root = tmpdir / "omnigent-sessions"
+    elif root_source == "empty-tmpdir":
+        root = Path("omnigent-sessions")
+    elif root_source in ("explicit", "explicit-only"):
+        root = explicit_root
+    elif root_source == "empty-explicit":
+        root = Path()
+    assert (
+        Path(json.loads(result.stdout)) == (repo_root / root / "conv_temp" / "workspace").resolve()
+    )
 
 
 def test_sanitize_session_id_keeps_traversal_out_of_the_workspace_path(

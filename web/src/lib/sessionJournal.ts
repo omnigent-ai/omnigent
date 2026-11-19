@@ -13,7 +13,7 @@ export type StepStatus = "started" | "done" | "needs_input" | "failed";
 
 const STEP_STATUSES: readonly string[] = ["started", "done", "needs_input", "failed"];
 
-/** What a task waiting for the user says, in pink: the sidebar's Needs response color. */
+/** What a task waiting for the user says, in pink. */
 export const WAITING_FOR_YOU = "Waiting for you";
 
 /** The phase of a workflow question's prompt, which already marks its own task waiting. */

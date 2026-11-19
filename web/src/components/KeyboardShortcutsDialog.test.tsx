@@ -83,11 +83,11 @@ describe("KeyboardShortcutsList composer rows", () => {
     expect(keysFor("New line in message")).toEqual(["↵"]);
   });
 
-  it("does not advertise inactive composer chords on touch-primary devices", () => {
+  it("does not advertise inactive composer chords in the mobile layout", () => {
     const matchMedia = window.matchMedia;
     vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
       ...matchMedia(query),
-      matches: query.includes("pointer: coarse"),
+      matches: query.includes("max-width"),
     }));
     render(<KeyboardShortcutsList />);
 
@@ -173,6 +173,7 @@ describe("KeyboardShortcutsDialog", () => {
     expect(screen.getByText("Open command palette")).toBeTruthy();
     expect(keysFor("Open Settings")).toEqual(["Ctrl", "Alt", ","]);
     expect(keysFor("Rename current session")).toEqual(["Ctrl", "Alt", "R"]);
+    expect(keysFor("Mark current session unread or read")).toEqual(["Ctrl", "Alt", "U"]);
     expect(screen.getByText("Show keyboard shortcuts")).toBeTruthy();
     expect(screen.getByText("Send message")).toBeTruthy();
     expect(keysFor("Open model picker")).toEqual(["Ctrl", "⇧", "M"]);
@@ -297,11 +298,11 @@ describe("KeyboardShortcutsList question rows", () => {
     expect(keysFor("Cancel pending question")).toEqual(["Esc"]);
   });
 
-  it("hides the question keys on touch-primary devices", () => {
+  it("hides the question keys in the mobile layout", () => {
     const matchMedia = window.matchMedia;
     vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
       ...matchMedia(query),
-      matches: query.includes("pointer: coarse"),
+      matches: query.includes("max-width"),
     }));
     render(<KeyboardShortcutsList />);
 

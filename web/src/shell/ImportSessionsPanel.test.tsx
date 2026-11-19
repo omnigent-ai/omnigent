@@ -16,29 +16,49 @@ vi.mock("./HostLabel", () => ({
 }));
 // Radix Select uses a portal + pointer events jsdom can't drive; a native
 // <select> keeps the option list assertable.
-vi.mock("@/components/ui/select", () => ({
-  Select: ({
-    value,
-    onValueChange,
-    children,
-    disabled,
-  }: {
-    disabled?: boolean;
-    value: string;
-    onValueChange: (v: string) => void;
-    children: ReactNode;
-  }) => (
-    <select disabled={disabled} value={value} onChange={(e) => onValueChange(e.target.value)}>
-      {children}
-    </select>
-  ),
-  SelectTrigger: ({ children }: { children: ReactNode }) => children,
-  SelectValue: () => null,
-  SelectContent: ({ children }: { children: ReactNode }) => children,
-  SelectItem: ({ value, children }: { value: string; children: ReactNode }) => (
-    <option value={value}>{children}</option>
-  ),
-}));
+vi.mock("@/components/ui/select", async () => {
+  const { Children, isValidElement } = await import("react");
+  const SelectTrigger = ({ children }: { children: ReactNode }) => children;
+  return {
+    Select: ({
+      value,
+      onValueChange,
+      children,
+      disabled,
+    }: {
+      disabled?: boolean;
+      value: string;
+      onValueChange: (v: string) => void;
+      children: ReactNode;
+    }) => {
+      // The native select takes its name from the trigger's Settings props, which the mock drops otherwise.
+      const trigger = Children.toArray(children).find(
+        (child) => isValidElement(child) && child.type === SelectTrigger,
+      );
+      const triggerProps = (isValidElement(trigger) ? trigger.props : {}) as Record<
+        string,
+        unknown
+      >;
+      return (
+        <select
+          aria-label={triggerProps["aria-label"] as string | undefined}
+          aria-labelledby={triggerProps["aria-labelledby"] as string | undefined}
+          disabled={disabled}
+          value={value}
+          onChange={(e) => onValueChange(e.target.value)}
+        >
+          {children}
+        </select>
+      );
+    },
+    SelectTrigger,
+    SelectValue: () => null,
+    SelectContent: ({ children }: { children: ReactNode }) => children,
+    SelectItem: ({ value, children }: { value: string; children: ReactNode }) => (
+      <option value={value}>{children}</option>
+    ),
+  };
+});
 
 const useHostsMock = vi.mocked(useHosts);
 const importLocalSessionsMock = vi.mocked(importLocalSessions);
@@ -91,6 +111,15 @@ describe("ImportSessionsPanel", () => {
       expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
     }
     expect(document.querySelector('[data-settings-item="import-session-id"]')).toBeNull();
+  });
+
+  it("names the mode row as its catalog label, the same text the select shows", () => {
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_1", name: "mac-laptop", owner: "alice", status: "online" }],
+    } as unknown as ReturnType<typeof useHosts>);
+    renderPanel();
+    expect(screen.getByText("What to import")).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "What to import" })).toBeInTheDocument();
   });
 
   it("keeps a large batch compact and points to the existing session list", async () => {

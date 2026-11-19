@@ -1,8 +1,10 @@
 /**
- * Typed client for the `/v1/sessions/{id}/permissions` and
- * `/v1/scheduled-tasks/{id}/permissions` endpoints. Mirrors the handlers in
- * `omnigent/server/routes/sessions/routes_permissions.py` and
- * `omnigent/server/routes/scheduled_task_permissions.py`.
+ * Typed client for the `/v1/sessions/{id}/permissions`,
+ * `/v1/scheduled-tasks/{id}/permissions` and `/v1/workflows/{id}/permissions`
+ * endpoints. Mirrors the handlers in
+ * `omnigent/server/routes/sessions/routes_permissions.py`,
+ * `omnigent/server/routes/scheduled_task_permissions.py` and
+ * `omnigent/server/routes/workflow_permissions.py`.
  */
 
 import type { Conversation } from "@/hooks/useConversations";
@@ -10,10 +12,16 @@ import { isSingleUserMode, type ServerInfo } from "@/lib/capabilities";
 import type { Session } from "@/lib/types";
 import { authenticatedFetch } from "./identity";
 
-/** What a share dialog shares: a session, or an automation whose runs' sessions follow it. */
-export type ShareTarget = { kind: "session"; id: string } | { kind: "automation"; id: string };
+/**
+ * What a share dialog shares: a session, an automation whose runs' sessions follow
+ * it, or a saved workflow, which people it is shared with can view, run and copy.
+ */
+export type ShareTarget =
+  | { kind: "session"; id: string }
+  | { kind: "automation"; id: string }
+  | { kind: "workflow"; id: string };
 
-/** Numeric read level, the only level an automation can be shared at. */
+/** Numeric read level, the only level an automation or a workflow can be shared at. */
 export const LEVEL_READ = 1;
 
 /**
@@ -147,6 +155,12 @@ export interface AutomationPermission extends ShareGrant {
   display_name: string;
 }
 
+/** One grant on a saved workflow; each carries the grantee's display name. */
+export interface WorkflowPermission extends ShareGrant {
+  workflow_id: string;
+  display_name: string;
+}
+
 /** The viewer's automation that sets a session's sharing on each run. */
 export interface ManagingAutomation {
   id: string;
@@ -163,9 +177,14 @@ export interface GrantList<T extends ShareGrant = ShareGrant> {
   managedByAutomation: ManagingAutomation | null;
 }
 
+const PERMISSION_COLLECTIONS: Record<ShareTarget["kind"], string> = {
+  session: "sessions",
+  automation: "scheduled-tasks",
+  workflow: "workflows",
+};
+
 function permissionsPath(target: ShareTarget): string {
-  const collection = target.kind === "session" ? "sessions" : "scheduled-tasks";
-  return `/v1/${collection}/${encodeURIComponent(target.id)}/permissions`;
+  return `/v1/${PERMISSION_COLLECTIONS[target.kind]}/${encodeURIComponent(target.id)}/permissions`;
 }
 
 /** The server's error message for a failed response, or its status line. */
@@ -212,6 +231,13 @@ export async function listAutomationPermissions(
   return listAllGrants<AutomationPermission>({ kind: "automation", id: taskId });
 }
 
+/** Everyone a saved workflow is shared with, which only its owner may list. */
+export async function listWorkflowPermissions(
+  workflowId: string,
+): Promise<GrantList<WorkflowPermission>> {
+  return listAllGrants<WorkflowPermission>({ kind: "workflow", id: workflowId });
+}
+
 export async function getSessionOwner(sessionId: string): Promise<string | null> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/owner`);
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
@@ -220,9 +246,10 @@ export async function getSessionOwner(sessionId: string): Promise<string | null>
 }
 
 /**
- * Grant a user or group access to a session or an automation. An automation
- * takes read access only; the server refuses the owner, the public and reserved
- * IDs (400) and what its sharing policy forbids (403), with a message saying why.
+ * Grant a user or group access to a session, an automation or a workflow. An
+ * automation or a workflow takes read access only; the server refuses the owner,
+ * the public and reserved IDs (400) and what its sharing policy forbids (403),
+ * with a message saying why.
  */
 export async function grantSharePermission<T extends ShareGrant = ShareGrant>(
   target: ShareTarget,
@@ -257,7 +284,7 @@ export async function grantPermission(
   );
 }
 
-/** Remove a grant on a session or an automation; removing a missing one is harmless (204). */
+/** Remove a grant on a session, an automation or a workflow; a missing one is harmless (204). */
 export async function revokeSharePermission(target: ShareTarget, userId: string): Promise<void> {
   const res = await authenticatedFetch(`${permissionsPath(target)}/${encodeURIComponent(userId)}`, {
     method: "DELETE",
@@ -304,4 +331,16 @@ export function sharedAutomationsListed(info: ServerInfo | "loading"): boolean {
   return (
     info !== "loading" && info.scheduled_task_shared_with_me === true && !isSingleUserMode(info)
   );
+}
+
+/** Why a workflow saved before sharing was available can't be shared; the server says the same. */
+export const UNSHAREABLE_WORKFLOW_MESSAGE =
+  "This workflow was saved before sharing was available. Clone it, then share the copy.";
+
+/**
+ * Whether the server shares saved workflows and has other users, as session sharing
+ * requires. The Share button and the "Shared with you" list need it.
+ */
+export function workflowSharingAvailable(info: ServerInfo | "loading"): boolean {
+  return info !== "loading" && info.workflow_sharing === true && !isSingleUserMode(info);
 }

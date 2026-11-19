@@ -17,7 +17,7 @@ import secrets
 import time
 import uuid
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import httpx
 from fastapi import (
@@ -392,10 +392,16 @@ from omnigent.server.routes._sessions.helpers import (
     _validated_subagent_routing_override,
     _wait_for_managed_runner_tunnel,
     _wait_for_runner_client,
+    cost_display_hidden,
     reconcile_orphaned_running_status,
 )
 from omnigent.server.runner_session_init import RunnerSessionInitializer
-from omnigent.server.sandbox_profile_launch import prepare_profile, record_profile, saved_profile
+from omnigent.server.sandbox_profile_launch import (
+    default_profile_for_unrecorded_host,
+    prepare_profile,
+    record_profile,
+    saved_profile,
+)
 from omnigent.server.schemas import (
     AgentCost,
     BackgroundTaskInfo,
@@ -475,6 +481,9 @@ from omnigent.util.session_lifecycle import (
     title_without_closed_marker,
 )
 from omnigent.util.tmux_compat import MIN_TMUX_VERSION_HINT
+
+if TYPE_CHECKING:
+    from omnigent.server.host_session_recovery import HostSessionRecoverer
 
 
 def _harness_elicitation_request_fingerprint(params: ElicitationRequestParams) -> str:
@@ -869,6 +878,8 @@ async def _stop_host_runner_intentionally(
     runner_id: str,
     host_registry: Any,
     conversation_store: ConversationStore,
+    *,
+    host_session_recoverer: HostSessionRecoverer | None = None,
 ) -> bool:
     """Carry stop intent to the active sessions sharing the terminated runner.
 
@@ -932,6 +943,12 @@ async def _stop_host_runner_intentionally(
                     completed_stop_relays[related_id] = (handle, handle.running_event_count)
                 handle.intentional_stop_turn_ended = False
 
+        if host_session_recoverer is not None:
+            for related_id in stop_targets:
+                related = await asyncio.to_thread(conversation_store.get_conversation, related_id)
+                if related is not None:
+                    await asyncio.to_thread(host_session_recoverer.stop_recovery, related)
+
         acknowledged = False
         attempt = _HostRunnerStopAttempt()
         try:
@@ -989,6 +1006,7 @@ async def _archive_stop(
     delete_worktree: bool = False,
     host_store: HostStore | None = None,
     sandbox_config: ManagedSandboxDeployment | None = None,
+    host_session_recoverer: HostSessionRecoverer | None = None,
 ) -> None:
     """
     Stop an archived session and tear down its host-launched runner.
@@ -1093,6 +1111,7 @@ async def _archive_stop(
                     conv.runner_id,
                     host_registry,
                     conversation_store,
+                    host_session_recoverer=host_session_recoverer,
                 )
         except Exception:  # noqa: BLE001
             _logger.debug(
@@ -1187,6 +1206,7 @@ def _spawn_archive_stop(
     delete_worktree: bool = False,
     host_store: HostStore | None = None,
     sandbox_config: ManagedSandboxDeployment | None = None,
+    host_session_recoverer: HostSessionRecoverer | None = None,
     after_turn: bool = False,
 ) -> None:
     """
@@ -1245,6 +1265,7 @@ def _spawn_archive_stop(
             delete_worktree=delete_worktree,
             host_store=host_store,
             sandbox_config=sandbox_config,
+            host_session_recoverer=host_session_recoverer,
         )
 
     task = asyncio.create_task(_stop_after_grace())
@@ -1544,6 +1565,8 @@ def _publish_ancestor_subtree_costs(tree: list[Conversation], session_id: str) -
         }
         if subtree_cost is not None:
             payload["total_cost_usd"] = subtree_cost
+        if cost_display_hidden():
+            payload["cost_hidden"] = True
         if usage_by_model is not None:
             payload["usage_by_model"] = usage_by_model
         event = SessionUsageEvent(**payload)
@@ -1616,7 +1639,9 @@ def _agent_costs(tree: Sequence[SpawnTreeUsage], session_id: str) -> list[AgentC
             id=row.id,
             cost_usd=totals.get(row.id),
             estimated_cost_usd=(
-                estimates[row.id][1] if row.id not in totals and row.id in estimates else None
+                estimates[row.id][1]
+                if row.id not in totals and row.id in estimates and not cost_display_hidden()
+                else None
             ),
         )
         for row in tree
@@ -1811,6 +1836,7 @@ def _build_session_response(
         # back to this conversation's own usage otherwise. A priced
         # cumulative total, or None (rendered "—") when never priced.
         total_cost_usd=_priced_cost_for_display(display_usage),
+        cost_hidden=True if cost_display_hidden() else None,
         # Per-model breakdown over the same subtree usage. None (omitted)
         # when no per-model usage was recorded.
         usage_by_model=_usage_by_model_for_display(display_usage),
@@ -2511,6 +2537,8 @@ async def _persist_external_session_usage(
         event_payload["context_window"] = raw_window
     if subtree_cost is not None:
         event_payload["total_cost_usd"] = subtree_cost
+    if cost_display_hidden():
+        event_payload["cost_hidden"] = True
     if usage_by_model is not None:
         event_payload["usage_by_model"] = usage_by_model
     event = SessionUsageEvent(**event_payload)
@@ -3336,6 +3364,7 @@ async def _persist_external_conversation_item(
     created_by: str | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     enabled: bool = True,
+    on_direct_input: Callable[[], Awaitable[None]] | None = None,
 ) -> str:
     """
     Persist and broadcast a conversation item produced outside AP.
@@ -3360,6 +3389,7 @@ async def _persist_external_conversation_item(
             created_by=created_by,
             background_title_coordinator=background_title_coordinator,
             enabled=enabled,
+            on_direct_input=on_direct_input,
         )
     )
     try:
@@ -3397,6 +3427,7 @@ async def _persist_external_conversation_item_serialized(
     created_by: str | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     enabled: bool = True,
+    on_direct_input: Callable[[], Awaitable[None]] | None = None,
 ) -> str:
     """
     Run :func:`_persist_external_conversation_item_unlocked` under the mirror lock.
@@ -3412,6 +3443,7 @@ async def _persist_external_conversation_item_serialized(
             created_by=created_by,
             background_title_coordinator=background_title_coordinator,
             enabled=enabled,
+            on_direct_input=on_direct_input,
         )
 
 
@@ -3423,6 +3455,7 @@ async def _persist_external_conversation_item_unlocked(
     created_by: str | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     enabled: bool = True,
+    on_direct_input: Callable[[], Awaitable[None]] | None = None,
 ) -> str:
     """
     Persist and broadcast a conversation item produced outside AP.
@@ -3436,6 +3469,10 @@ async def _persist_external_conversation_item_unlocked(
     :param conv: Conversation row for title seeding.
     :param body: External item event body.
     :param conversation_store: Store used to append the item.
+    :param on_direct_input: Called once a newly persisted input landed that no
+        queued message accounts for: a person typing in the native terminal, not
+        a web or automation message's echo or a replayed item. Its failure is
+        logged and never fails the persist.
     :param created_by: Authenticated identity of the actor whose
         request triggered the forwarder POST, e.g.
         ``"alice@example.com"``. Used to attribute user messages typed
@@ -3619,6 +3656,21 @@ async def _persist_external_conversation_item_unlocked(
     # go back into play.
     _release_drained_inputs(session_id, [*skipped_pending, *uncertain_pending, drained])
     _restore_drained_inputs(session_id, held_older, None)
+    # Typed in the terminal: no queued message, not even by position, matched it.
+    if (
+        on_direct_input is not None
+        and drains_pending_inputs
+        and drained is None
+        and body.data.get("agent_message_candidate") is not True
+    ):
+        try:
+            await on_direct_input()
+        except Exception:  # noqa: BLE001 — a follow-up must not fail the mirror
+            _logger.warning(
+                "Direct native input follow-up failed",
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
     if item.replaces_pending_id is not None and conv.host_id is not None:
         # A saved startup input's receipt frees the next one queued behind it.
         wake_startup_worker(conv.host_id)
@@ -4729,6 +4781,8 @@ async def _mark_runner_sessions_offline_impl(
     *,
     fail_idle_top_level: bool = False,
     disconnect_evidence: Mapping[str, str] | None = None,
+    host_session_recoverer: HostSessionRecoverer | None = None,
+    interrupted_at: int | None = None,
 ) -> None:
     """
     Fail the sessions a departed runner actually interrupted, with the cause.
@@ -4777,6 +4831,8 @@ async def _mark_runner_sessions_offline_impl(
             conversation_store,
             fail_idle_top_level=fail_idle_top_level,
             disconnect_evidence=disconnect_evidence,
+            host_session_recoverer=host_session_recoverer,
+            interrupted_at=interrupted_at,
             swept_at=swept_at,
         )
         if not pending:
@@ -4820,6 +4876,8 @@ async def _mark_runner_sessions_offline_once(
     fail_idle_top_level: bool,
     disconnect_evidence: Mapping[str, str] | None = None,
     swept_at: int,
+    host_session_recoverer: HostSessionRecoverer | None = None,
+    interrupted_at: int | None = None,
 ) -> list[Conversation]:
     """Reconcile each session once and return the ones blocked by metadata errors."""
     retry: list[Conversation] = []
@@ -4892,6 +4950,15 @@ async def _mark_runner_sessions_offline_once(
             error_code=error.code,
         ):
             continue
+        recovery = None
+        if host_session_recoverer is not None:
+            await asyncio.to_thread(
+                host_session_recoverer.record_interruption, conv, interrupted_at=interrupted_at
+            )
+            if await asyncio.to_thread(host_session_recoverer.enabled, conv.host_id):
+                recovery = await asyncio.to_thread(
+                    conversation_store.get_session_recovery, conv.id
+                )
         decision_status = _session_status_cache.get(conv.id)
         binding_unavailable = False
         try:
@@ -4928,6 +4995,13 @@ async def _mark_runner_sessions_offline_once(
                 conv.runner_id,
                 conv.id,
             )
+            continue
+        if (
+            recovery is not None
+            and recovery.host_id == conv.host_id
+            and recovery.runner_id == conv.runner_id
+            and recovery.phase in {"pending", "launching", "dispatching", "submitted"}
+        ):
             continue
         _publish_status(
             conv.id,
@@ -5130,6 +5204,7 @@ async def _run_managed_launch(
     host_id: str | None = None,
     sandbox_profiles: Any = None,
     held_runner_id: str | None = None,
+    adopt_default_profile: bool = False,
 ) -> None:
     """
     Provision a managed sandbox for a session in the background.
@@ -5198,6 +5273,9 @@ async def _run_managed_launch(
     :param held_runner_id: The claim a move holds on the session's runner
         while it provisions, or ``None``. The sandbox binds only while that
         claim stands, and any failure releases it.
+    :param adopt_default_profile: Whether a relaunch whose host has no
+        recorded profile takes the provider's default, as a scheduled
+        fire's session reset does.
     """
     from omnigent.server.managed_hosts import (
         deployment_with_inference_snapshot,
@@ -5207,13 +5285,23 @@ async def _run_managed_launch(
     )
 
     try:
-        profile = await saved_profile(
-            sandbox_profiles,
-            session_id,
-            user_id=owner,
-            host_id=relaunch_host.host_id if relaunch_host is not None else None,
-            bind_host=False,
-        )
+        profile = None
+        if adopt_default_profile and relaunch_host is not None:
+            profile = await default_profile_for_unrecorded_host(
+                sandbox_profiles,
+                session_id,
+                relaunch_host.host_id,
+                relaunch_host.sandbox_provider,
+                user_id=owner,
+            )
+        if profile is None:
+            profile = await saved_profile(
+                sandbox_profiles,
+                session_id,
+                user_id=owner,
+                host_id=relaunch_host.host_id if relaunch_host is not None else None,
+                bind_host=False,
+            )
         if profile is not None:
             sandbox_config = deployment_with_sandbox_profile(sandbox_config, profile)
             provider = profile["provider"]
@@ -9459,6 +9547,7 @@ async def _settle_orphaned_running_rows(
     liveness_lookup: Callable[[list[str]], dict[str, SessionLiveness]] | None,
     host_store: HostStore | None,
     may_settle: Callable[[Conversation], bool],
+    host_session_recoverer: HostSessionRecoverer | None = None,
 ) -> None:
     """
     Settle rows whose persisted ``running`` outlived their runner, before a read.
@@ -9517,6 +9606,7 @@ async def _settle_orphaned_running_rows(
             conv.id,
             conversation_store,
             now - RUNNER_LIVENESS_TTL_S,
+            host_session_recoverer=host_session_recoverer,
         )
 
 
@@ -10359,6 +10449,29 @@ async def _relay_runner_stream_once(
                         ):
                             continue
 
+                    turn_response = event.get("response")
+                    turn_response_id = (
+                        turn_response.get("id")
+                        if isinstance(turn_response, dict)
+                        else event.get("response_id")
+                    )
+                    terminal_turn = evt_type in _TERMINAL_RESPONSE_EVENT_TYPES
+                    status = event.get("status")
+                    blocked_turn = evt_type == "session.status" and (
+                        status in {"failed", "waiting"}
+                        or bool(event.get("blocked_on"))
+                        or (status == "idle" and event.get("turn_completed") is True)
+                    )
+                    if terminal_turn or blocked_turn or evt_type == "response.in_progress":
+                        await asyncio.to_thread(
+                            session_live_state.record_recovery_turn,
+                            conversation_store,
+                            session_id,
+                            runner_id,
+                            turn_response_id if isinstance(turn_response_id, str) else None,
+                            finished=terminal_turn or blocked_turn,
+                        )
+
                     if evt_type == "session.status":
                         status = event.get("status", "")
                         if status in {"idle", "failed"} and pending_subagent_return_id is not None:
@@ -10876,6 +10989,8 @@ async def _relay_runner_stream_once(
                                     _usage_payload["context_window"] = int(_ctx_window_label)
                                 if _subtree_cost is not None:
                                     _usage_payload["total_cost_usd"] = _subtree_cost
+                                if cost_display_hidden():
+                                    _usage_payload["cost_hidden"] = True
                                 if _usage_by_model is not None:
                                     _usage_payload["usage_by_model"] = _usage_by_model
                                 session_stream.publish(
@@ -12612,7 +12727,10 @@ async def _create_session_from_existing_agent(
     if body.workflow_id is not None:
         require_workflows(request)
         workflow = await load_workflow_for_run(
-            conversation_store, body.workflow_id, user_id=user_id
+            conversation_store,
+            body.workflow_id,
+            user_id=user_id,
+            permission_store=getattr(request.app.state, "permission_store", None),
         )
 
     project_resolution = await resolve_project_session_create(
