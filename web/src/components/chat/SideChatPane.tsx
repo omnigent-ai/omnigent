@@ -42,6 +42,7 @@ import {
   type ComposerKeyIntent,
 } from "@/components/composer/ChatComposer";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
+import { isComposerInput } from "@/components/composer/engine/composerInput";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
 import {
@@ -225,6 +226,7 @@ function isOtherTextInput(target: EventTarget | null, own: HTMLElement | null): 
   if (!(target instanceof HTMLElement) || target === own) return false;
   if (target instanceof HTMLInputElement) return TEXT_INPUT_TYPES.has(target.type);
   return (
+    isComposerInput(target) ||
     target instanceof HTMLTextAreaElement ||
     target.matches('[contenteditable]:not([contenteditable="false"])')
   );
