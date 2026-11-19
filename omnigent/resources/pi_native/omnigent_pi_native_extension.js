@@ -1337,10 +1337,12 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
       ? config.sessionId
       : children.find(other => other.file === child.parentFile)?.childId;
     if (!parentId) return false;
+    // The Agents rail labels the row with this id; UUIDv7 ids share a timestamp prefix.
+    const subagentId = `${child.title}-${child.key.replace(/[^a-z0-9]/gi, "").slice(-8)}`;
     try {
       const response = await post(parentId, {
         type: "external_acp_subagent_start",
-        data: { subagent_id: child.key, title: child.title },
+        data: { subagent_id: subagentId, title: child.title },
       });
       const childId = (await response?.json?.())?.child_session_id;
       if (typeof childId === "string" && childId) child.childId = childId;

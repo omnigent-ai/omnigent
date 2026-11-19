@@ -786,12 +786,13 @@ async function testChildSessionsAreRegisteredWithTheirOwnModels() {
     fs.writeFileSync(path.join(childDir, relative), text);
   };
   writeChild("run-a/run-0/session.jsonl",
-    childSessionLines({ id: "child-a", parentFile: f.parentFile, agent: "worker" }) +
+    // Launched in the same millisecond: the UUIDv7 ids differ only at the end.
+    childSessionLines({ id: "01a1f1a6-6b58-7306-959e-c50b9edd4745", parentFile: f.parentFile, agent: "worker" }) +
     assistantLine("model-a", 2000, 100, 10) +
     // The same message seen twice is counted once.
     assistantLine("model-a", 2000, 100, 10));
   writeChild("run-b/run-0/session.jsonl",
-    childSessionLines({ id: "child-b", parentFile: f.parentFile, agent: "reviewer", startedAt: 5000 }) +
+    childSessionLines({ id: "01a1f1a6-6b58-7306-959e-0a1b2c3d4e5f", parentFile: f.parentFile, agent: "worker", startedAt: 5000 }) +
     // Copied by a fork from the parent before the child started.
     assistantLine("model-parent", 4000, 999, 999) +
     assistantLine("model-b", 6000, 50, 5));
@@ -805,10 +806,10 @@ async function testChildSessionsAreRegisteredWithTheirOwnModels() {
   const starts = f.posts.filter((p) => p.body.type === "external_acp_subagent_start");
   assert("each child is registered under the parent once",
     JSON.stringify(starts.map((p) => [p.sessionId, p.body.data.subagent_id, p.body.data.title]).sort()) ===
-      JSON.stringify([["conv_parent", "child-a", "worker"], ["conv_parent", "child-b", "reviewer"]]),
+      JSON.stringify([["conv_parent", "worker-2c3d4e5f", "worker"], ["conv_parent", "worker-9edd4745", "worker"]]),
     JSON.stringify(starts));
-  const usageA = childUsage(f.posts, "conv_child-a");
-  const usageB = childUsage(f.posts, "conv_child-b");
+  const usageA = childUsage(f.posts, "conv_worker-9edd4745");
+  const usageB = childUsage(f.posts, "conv_worker-2c3d4e5f");
   assert("child usage is priced by its own model, deduped, without a zero Pi cost",
     usageA.length === 1 && usageA[0].model === "model-a" &&
       usageA[0].cumulative_input_tokens === 110 && usageA[0].cumulative_output_tokens === 10 &&
@@ -819,7 +820,7 @@ async function testChildSessionsAreRegisteredWithTheirOwnModels() {
     usageB.length === 1 && usageB[0].model === "model-b" && usageB[0].cumulative_input_tokens === 60,
     JSON.stringify(usageB));
   assert("a running child reports running",
-    f.posts.some((p) => p.sessionId === "conv_child-a" && p.body.type === "external_session_status" &&
+    f.posts.some((p) => p.sessionId === "conv_worker-9edd4745" && p.body.type === "external_session_status" &&
       p.body.data.status === "running"));
 }
 
@@ -834,21 +835,21 @@ async function testChildReadsIncrementallyAndSurvivesRestart() {
 
   await f.watcher().poll();
   assert("a partial trailing line is not counted",
-    childUsage(f.posts, "conv_child").at(-1)?.cumulative_input_tokens === 110,
-    JSON.stringify(childUsage(f.posts, "conv_child")));
+    childUsage(f.posts, "conv_worker-child").at(-1)?.cumulative_input_tokens === 110,
+    JSON.stringify(childUsage(f.posts, "conv_worker-child")));
 
   fs.appendFileSync(file, second.slice(30));
   // A relaunched extension resumes from the persisted cursor and totals.
   const later = () => Date.now() + 60_000;
   await f.watcher(later).poll();
-  const usage = childUsage(f.posts, "conv_child");
+  const usage = childUsage(f.posts, "conv_worker-child");
   assert("restart completes the line without double counting",
     usage.at(-1).cumulative_input_tokens === 140 && usage.at(-1).cumulative_output_tokens === 12,
     JSON.stringify(usage));
   assert("restart does not register the child again",
     f.posts.filter((p) => p.body.type === "external_acp_subagent_start").length === 1);
   assert("a quiet child that ended its turn reports idle without a terminal edge",
-    f.posts.some((p) => p.sessionId === "conv_child" && p.body.type === "subagent.status") &&
+    f.posts.some((p) => p.sessionId === "conv_worker-child" && p.body.type === "subagent.status") &&
       !f.posts.some((p) => p.body.type === "external_session_status" && p.body.data.status !== "running"));
   const state = JSON.parse(fs.readFileSync(path.join(f.bridgeDir, "pi_subagent_children.json"), "utf8"));
   assert("the cursor covers exactly the consumed bytes", state.children[0].offset === fs.statSync(file).size);
@@ -867,8 +868,8 @@ async function testChildWrittenAfterTheLastPollIsReportedAtShutdown() {
 
   await watcher.stop();
   assert("a child written after the last poll is registered and reported at shutdown",
-    f.posts.some((p) => p.body.type === "external_acp_subagent_start" && p.body.data.subagent_id === "late") &&
-      childUsage(f.posts, "conv_late").at(-1)?.cumulative_input_tokens === 110,
+    f.posts.some((p) => p.body.type === "external_acp_subagent_start" && p.body.data.subagent_id === "worker-late") &&
+      childUsage(f.posts, "conv_worker-late").at(-1)?.cumulative_input_tokens === 110,
     JSON.stringify(f.posts));
 }
 
