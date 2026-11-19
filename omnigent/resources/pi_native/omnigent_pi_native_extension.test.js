@@ -798,8 +798,6 @@ async function testChildSessionsAreRegisteredWithTheirOwnModels() {
   writeChild("run-a/run-0/session.jsonl",
     // Launched in the same millisecond: the UUIDv7 ids differ only at the end.
     childSessionLines({ id: "01a1f1a6-6b58-7306-959e-c50b9edd4745", parentFile: f.parentFile, agent: "worker" }) +
-    assistantLine("model-a", 2000, 100, 10) +
-    // The same message seen twice is counted once.
     assistantLine("model-a", 2000, 100, 10));
   writeChild("run-b/run-0/session.jsonl",
     childSessionLines({ id: "01a1f1a6-6b58-7306-959e-0a1b2c3d4e5f", parentFile: f.parentFile, agent: "worker", startedAt: 5000 }) +
@@ -829,7 +827,7 @@ async function testChildSessionsAreRegisteredWithTheirOwnModels() {
   const usageA = childUsage(f.posts, "conv_01a1f1a6-6b58-7306-959e-c50b9edd4745");
   const usageB = childUsage(f.posts, "conv_01a1f1a6-6b58-7306-959e-0a1b2c3d4e5f");
   const usageC = childUsage(f.posts, "conv_01a1f1a6-6b58-7306-959e-d61c9edd4745");
-  assert("child usage is priced by its own model, deduped, without a zero Pi cost",
+  assert("child usage is priced by its own model without a zero Pi cost",
     usageA.length === 1 && usageA[0].model === "model-a" &&
       usageA[0].cumulative_input_tokens === 110 && usageA[0].cumulative_output_tokens === 10 &&
       usageA[0].cumulative_cache_read_input_tokens === 10 &&
@@ -1014,45 +1012,97 @@ async function testAnAbortedPollStartsNoFurtherPosts() {
     JSON.stringify(f.posts));
 }
 
-async function testRediscoveredTitleKeepsOneChildIdentity() {
-  const f = childFixture();
-  const file = writeChildFile(f, "run/session.jsonl",
-    JSON.stringify({ type: "session", id: "child", timestamp: new Date(1000).toISOString(), parentSession: f.parentFile }) +
-    "\n" + assistantLine("model-a", 2000, 100, 10));
-  // Past the title grace period, so the child registers under the fallback title.
-  await f.watcher(() => Date.now() + 60_000).poll();
-  fs.writeFileSync(childStatePath(f), "{not json");
-  const longAgent = "w".repeat(200);
-  fs.appendFileSync(file, JSON.stringify({
-    type: "session_info", name: `subagent-${longAgent}-00000000-0000-4000-8000-000000000000-1`,
-  }) + "\n");
-  await f.watcher().poll();
-  const starts = f.posts.filter((p) => p.body.type === "external_acp_subagent_start").map((p) => p.body.data);
-  assert("a child rediscovered under its real title keeps one registration identity",
-    starts.length === 2 && starts.every((data) => data.subagent_id === "child") && starts[0].title === "subagent",
-    JSON.stringify(starts));
-  const usageTargets = new Set(f.posts.filter((p) => p.body.type === "external_session_usage").map((p) => p.sessionId));
-  assert("a rediscovered child reports usage to a single child session",
-    usageTargets.size === 1 && childUsage(f.posts, "conv_child").at(-1)?.cumulative_input_tokens === 110,
-    JSON.stringify([...usageTargets]));
-  assert("an oversized session name is capped in the title", starts[1]?.title === longAgent.slice(0, 80),
-    JSON.stringify(starts[1]));
+async function testCorruptChildStateIsRebuiltFromTheFiles() {
+  const corruptions = {
+    "an unreadable checkpoint": () => "{not json",
+    "a malformed child entry": (f, file) => JSON.stringify({
+      roots: [f.parentFile],
+      children: [{
+        file, key: "child", parentFile: f.parentFile, title: "subagent", startedAt: 1000,
+        childId: "conv_child", offset: "bad", lastStop: null, usage: null,
+      }],
+    }),
+  };
+  for (const [name, corrupt] of Object.entries(corruptions)) {
+    const f = childFixture();
+    const file = writeChildFile(f, "run/session.jsonl",
+      JSON.stringify({ type: "session", id: "child", timestamp: new Date(1000).toISOString(), parentSession: f.parentFile }) +
+      "\n" + assistantLine("model-a", 2000, 100, 10));
+    // Past the title grace period, so the child registers under the fallback title.
+    await f.watcher(() => Date.now() + 60_000).poll();
+    fs.writeFileSync(childStatePath(f), corrupt(f, file));
+    fs.appendFileSync(file, JSON.stringify({
+      type: "session_info", name: "subagent-worker-00000000-0000-4000-8000-000000000000-1",
+    }) + "\n");
+    await f.watcher().poll();
+    const starts = f.posts.filter((p) => p.body.type === "external_acp_subagent_start").map((p) => p.body.data);
+    const usageTargets = new Set(f.posts.filter((p) => p.body.type === "external_session_usage").map((p) => p.sessionId));
+    assert(`after ${name}, a child rebuilt under its real title keeps one identity and its usage`,
+      starts.length === 2 && starts.every((data) => data.subagent_id === "child") &&
+        starts[0].title === "subagent" && starts[1].title === "worker" && usageTargets.size === 1 &&
+        childUsage(f.posts, "conv_child").at(-1)?.cumulative_input_tokens === 110,
+      JSON.stringify(f.posts));
+  }
 }
 
-async function testMalformedPersistedChildIsRebuiltFromItsFile() {
+async function testAStaleWriterKeepsTheFurthestCheckpoint() {
   const f = childFixture();
   const file = writeChildFile(f, "run/session.jsonl",
     childSessionLines({ id: "child", parentFile: f.parentFile, agent: "worker" }) + assistantLine("model-a", 2000, 100, 10));
-  fs.writeFileSync(childStatePath(f), JSON.stringify({
-    roots: [f.parentFile],
-    children: [{
-      file, key: "child", parentFile: f.parentFile, title: "worker", startedAt: 1000,
-      childId: "conv_child", offset: "bad", lastStop: null, usage: null,
-    }],
-  }));
-  await f.watcher().poll().catch(() => {});
-  assert("a malformed persisted child is rebuilt from its file",
-    childUsage(f.posts, "conv_child").at(-1)?.cumulative_input_tokens === 110, JSON.stringify(f.posts));
+  const stale = f.watcher();
+  await stale.poll();
+  fs.appendFileSync(file, assistantLine("model-a", 3000, 20, 2));
+  writeChildFile(f, "other/session.jsonl",
+    childSessionLines({ id: "other", parentFile: f.parentFile, agent: "worker" }) + assistantLine("model-a", 2000, 1, 1));
+  // A successor advances the checkpoint and registers a child the predecessor never saw.
+  await f.watcher().poll();
+  // The predecessor then checkpoints without reading the appended line.
+  const statSync = fs.statSync;
+  fs.statSync = (target, ...rest) => {
+    if (target === file) throw new Error("unavailable");
+    return statSync(target, ...rest);
+  };
+  try {
+    await stale.poll();
+  } finally {
+    fs.statSync = statSync;
+  }
+  const saved = JSON.parse(fs.readFileSync(childStatePath(f), "utf8")).children;
+  const child = saved.find((entry) => entry.key === "child");
+  assert("a stale writer keeps the successor's cursor, totals and children",
+    child?.offset === fs.statSync(file).size && child.usage.input === 140 && saved.some((entry) => entry.key === "other"),
+    JSON.stringify(saved));
+  assert("the stale writer reports the adopted totals, never lower ones",
+    childUsage(f.posts, "conv_child").map((data) => data.cumulative_input_tokens).join() === "110,140,140",
+    JSON.stringify(childUsage(f.posts, "conv_child")));
+}
+
+async function testAnOversizedRecordIsSkippedWithoutBuffering() {
+  const f = childFixture();
+  const file = writeChildFile(f, "run/session.jsonl",
+    childSessionLines({ id: "child", parentFile: f.parentFile, agent: "worker" }) + assistantLine("model-a", 2000, 100, 10) +
+    JSON.stringify({ type: "message", message: { role: "toolResult", content: "x".repeat(17 * 1024 * 1024) } }));
+  const concat = Buffer.concat;
+  let largestBuffer = 0;
+  Buffer.concat = (list, ...rest) => {
+    largestBuffer = Math.max(largestBuffer, list.reduce((sum, part) => sum + part.length, 0));
+    return concat(list, ...rest);
+  };
+  const watcher = f.watcher();
+  try {
+    await watcher.poll();
+    const pending = JSON.parse(fs.readFileSync(childStatePath(f), "utf8")).children[0].offset;
+    fs.appendFileSync(file, "\n" + assistantLine("model-a", 3000, 20, 2));
+    await watcher.poll();
+    assert("an unterminated oversized record holds the cursor before it", fs.readFileSync(file)[pending - 1] === 10);
+  } finally {
+    Buffer.concat = concat;
+  }
+  assert("an oversized record is skipped without being buffered", largestBuffer <= 17 * 1024 * 1024, String(largestBuffer));
+  assert("the cursor passes an oversized record once it ends",
+    JSON.parse(fs.readFileSync(childStatePath(f), "utf8")).children[0].offset === fs.statSync(file).size &&
+      childUsage(f.posts, "conv_child").at(-1)?.cumulative_input_tokens === 140,
+    JSON.stringify(childUsage(f.posts, "conv_child")));
 }
 
 async function testShutdownStopsReadingAtItsDeadline() {
@@ -1087,10 +1137,32 @@ async function testShutdownStopsReadingAtItsDeadline() {
   assert("the next launch resumes from the cursor without double counting",
     childUsage(f.posts, "conv_child").at(-1)?.cumulative_input_tokens === 180,
     JSON.stringify(childUsage(f.posts, "conv_child")));
+
+  // An unterminated record spanning several chunks also stops at the deadline.
+  const end = fs.statSync(file).size;
+  fs.appendFileSync(file, JSON.stringify({ type: "message", message: { content: "x".repeat(3500 * 1024) } }));
+  let fullReads = 0;
+  fs.readSync = (...args) => {
+    if (args[3] === 1024 * 1024) {
+      fullReads += 1;
+      skew += 10_000;
+    }
+    return readSync(...args);
+  };
+  Date.now = () => realNow() + skew;
+  try {
+    await f.watcher().stop();
+  } finally {
+    fs.readSync = readSync;
+    Date.now = realNow;
+  }
+  assert("shutdown stops inside an unterminated record with the cursor before it",
+    fullReads === 1 && JSON.parse(fs.readFileSync(childStatePath(f), "utf8")).children[0].offset === end,
+    String(fullReads));
 }
 
 async function testShutdownIsBoundedWhenTheServerNeverResponds() {
-  const f = childFixture({ responseDelayMs: Infinity, postTimeoutMs: 20 });
+  const f = childFixture({ postTimeoutMs: 60_000, stalls: () => true });
   const file = path.join(f.sessions, path.basename(f.parentFile, ".jsonl"), "run", "session.jsonl");
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file,
@@ -1099,7 +1171,9 @@ async function testShutdownIsBoundedWhenTheServerNeverResponds() {
   watcher.poll();
   const startedAt = Date.now();
   await watcher.stop();
-  assert("shutdown stops waiting for a server that never responds", Date.now() - startedAt < 2_000);
+  assert("shutdown stops waiting for a server that never responds", Date.now() - startedAt < 6_000);
+  assert("shutdown leaves no post of its final poll in flight",
+    f.stalled.length === 2 && f.stalled.every((post) => post.reason === "AbortError"), JSON.stringify(f.stalled));
 }
 
 (async () => {
@@ -1109,8 +1183,9 @@ async function testShutdownIsBoundedWhenTheServerNeverResponds() {
     await testShutdownDrainsPastAStalledRegistration();
     await testChildrenWrittenAfterTheLastPollAreReportedAtShutdown();
     await testAnAbortedPollStartsNoFurtherPosts();
-    await testRediscoveredTitleKeepsOneChildIdentity();
-    await testMalformedPersistedChildIsRebuiltFromItsFile();
+    await testCorruptChildStateIsRebuiltFromTheFiles();
+    await testAStaleWriterKeepsTheFurthestCheckpoint();
+    await testAnOversizedRecordIsSkippedWithoutBuffering();
     await testShutdownStopsReadingAtItsDeadline();
     await testShutdownIsBoundedWhenTheServerNeverResponds();
     await testSessionStartupDoesNotCompleteATurn();

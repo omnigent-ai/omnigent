@@ -1184,19 +1184,19 @@ function writeJsonAtomic(filePath, value) {
   }
 }
 
-// A native Pi subagent session sits beneath the parent's ``<dir>/<parent stem>/`` and names
-// its launcher in ``parentSession``; Pi's /fork and /clone write top-level siblings instead.
+// Pi stores delegated sessions below the parent session directory.
 const _CHILD_POLL_MS = 2_000;
 // A child whose last reply ended its turn this long ago is reported idle.
 const _CHILD_QUIET_MS = 20_000;
 const _CHILD_READ_CHUNK_BYTES = 1024 * 1024;
+// A longer record is skipped unbuffered: usage-bearing replies are far smaller, while
+// tool results carrying images can reach megabytes.
+const _CHILD_RECORD_MAX_BYTES = 16 * 1024 * 1024;
 // Each synchronous read pass stops starting new chunks after this long.
 const _CHILD_READ_BUDGET_MS = 500;
 const _CHILD_TITLE_MAX_CHARS = 80;
 const _CHILD_HEADER_BYTES = 64 * 1024;
 const _CHILD_SCAN_MAX_DEPTH = 10;
-// The shutdown drain allows this many sequential post timeouts, within the history budget.
-const _CHILD_SHUTDOWN_POSTS = 10;
 // pi-subagents names each child session ``subagent-<agent>-<run uuid>-<n>``.
 const _PI_SUBAGENTS_SESSION_NAME = /^subagent-(.+)-[0-9a-f-]{36}-\d+$/;
 
@@ -1282,24 +1282,34 @@ function validChildEntry(child) {
 function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
   const enabled = Boolean(config && config.serverUrl && config.sessionId && config.bridgeDir);
   const statePath = enabled ? path.join(config.bridgeDir, "pi_subagent_children.json") : null;
-  let roots = [];
-  let children = [];
   const ignoredFiles = new Set();
   let timer = null;
   let polling = null;
   let pollAbort = null;
 
-  try {
-    const saved = JSON.parse(fs.readFileSync(statePath, "utf8"));
-    roots = saved.roots.filter(root => typeof root === "string");
-    children = saved.children.filter(validChildEntry);
-  } catch (_err) {}
+  function readState() {
+    try {
+      const saved = JSON.parse(fs.readFileSync(statePath, "utf8"));
+      return { roots: saved.roots.filter(root => typeof root === "string"), children: saved.children.filter(validChildEntry) };
+    } catch (_err) {
+      return { roots: [], children: [] };
+    }
+  }
+  const { roots, children } = readState();
 
+  // An overlapping process may have checkpointed further; each child keeps its furthest cursor.
   function persist() {
     if (!statePath) return;
+    const saved = readState();
+    roots.push(...saved.roots.filter(root => !roots.includes(root)));
+    for (const entry of saved.children) {
+      const child = children.find(other => other.key === entry.key);
+      if (!child) children.push(entry);
+      else if (entry.offset > child.offset) Object.assign(child, entry, { childId: entry.childId || child.childId });
+    }
     writeJsonAtomic(statePath, {
       roots,
-      children: children.map(({ seen: _seen, postedKey: _postedKey, postedStatus: _status, ...child }) => child),
+      children: children.map(({ postedKey: _postedKey, postedStatus: _status, ...child }) => child),
     });
   }
 
@@ -1358,10 +1368,7 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
 
   function addUsage(child, message) {
     const usage = extractPiUsage(message);
-    child.seen ||= new Set();
-    const key = usage && usageMessageKey(message, usage);
-    if (!usage || child.seen.has(key)) return;
-    child.seen.add(key);
+    if (!usage) return;
     // Same input accounting as the parent's accumulateUsage.
     child.usage.input += usage.input + usage.cacheRead + usage.cacheWrite;
     child.usage.output += usage.output;
@@ -1381,23 +1388,25 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
       return;
     }
     child.mtimeMs = stat.mtimeMs;
-    for (let remaining = stat.size - child.offset; remaining > 0 && Date.now() < deadline;
-      remaining = stat.size - child.offset) {
-      // A line longer than one chunk extends the read chunk by chunk until it ends.
-      const parts = [];
-      let length = 0;
-      let end = -1;
-      while (end < 0 && length < remaining) {
-        const part = readFileRange(child.file, child.offset + length, Math.min(remaining - length, _CHILD_READ_CHUNK_BYTES));
-        if (!part?.length) break;
-        const newline = part.lastIndexOf(10);
-        if (newline >= 0) end = length + newline;
-        parts.push(part);
+    // ``parts`` and ``length`` hold the record at the cursor until its newline arrives.
+    let parts = [];
+    let length = 0;
+    while (child.offset + length < stat.size && Date.now() < deadline) {
+      const part = readFileRange(child.file, child.offset + length,
+        Math.min(stat.size - child.offset - length, _CHILD_READ_CHUNK_BYTES));
+      if (!part?.length) return;
+      const first = part.indexOf(10);
+      if (first < 0) {
         length += part.length;
+        if (length > _CHILD_RECORD_MAX_BYTES) parts = [];
+        else parts.push(part);
+        continue;
       }
-      if (end < 0) return;
-      const buffer = parts.length === 1 ? parts[0] : Buffer.concat(parts);
-      for (const line of buffer.subarray(0, end).toString("utf8").split("\n")) {
+      // An oversized record is passed unparsed once its newline arrives.
+      const oversized = length + first > _CHILD_RECORD_MAX_BYTES;
+      const end = length + (oversized ? first : part.lastIndexOf(10));
+      const lines = oversized ? [] : Buffer.concat([...parts, part]).subarray(0, end).toString("utf8").split("\n");
+      for (const line of lines) {
         const entry = parseJsonLine(line);
         const message = entry?.type === "message" ? entry.message : null;
         // A forked child starts with a copy of its parent's history.
@@ -1406,6 +1415,8 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
         child.lastStop = typeof message.stopReason === "string" ? message.stopReason : null;
       }
       child.offset += end + 1;
+      parts = [];
+      length = 0;
     }
   }
 
@@ -1447,6 +1458,8 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
     const reports = [];
     // Persist cursors and totals before reporting them.
     const flush = ready => {
+      // Once shutdown aborts this poll, it neither posts nor writes state.
+      if (signal.aborted) return;
       const readUntil = Math.min(Date.now() + _CHILD_READ_BUDGET_MS, readDeadline);
       ready.forEach(child => readNew(child, readUntil));
       persist();
@@ -1489,14 +1502,14 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
       timer = null;
       // A hung request in the in-flight poll must not consume the final poll's budget.
       if (polling) pollAbort.abort();
-      const deadline = Math.min(
-        _HISTORY_SHUTDOWN_TIMEOUT_MS, _CHILD_SHUTDOWN_POSTS * assistantItemPostTimeoutMs(config),
-      );
-      const deadlineAt = Date.now() + deadline;
-      const final = Promise.resolve(polling).catch(() => {}).then(() => this.poll(true, deadlineAt));
+      const deadlineAt = Date.now() + _HISTORY_SHUTDOWN_TIMEOUT_MS;
+      const final = Promise.resolve(polling).catch(() => {})
+        .then(() => Date.now() < deadlineAt && this.poll(true, deadlineAt));
       const bound = new AbortController();
-      await Promise.race([final.catch(() => {}), sleep(deadline, bound.signal)]);
+      await Promise.race([final.catch(() => {}), sleep(_HISTORY_SHUTDOWN_TIMEOUT_MS, bound.signal)]);
       bound.abort();
+      // Nothing posts or writes state after shutdown returns.
+      if (polling) pollAbort.abort();
     },
   };
 }
