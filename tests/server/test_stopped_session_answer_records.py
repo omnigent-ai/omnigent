@@ -20,7 +20,9 @@ from tests._helpers.polling import poll_until_async
 
 
 def _record(started_at: float, *, delivering: bool) -> orchestration._StoppedSessionAnswer:
-    record = orchestration._StoppedSessionAnswer(started_at=started_at, fingerprint="old")
+    record = orchestration._StoppedSessionAnswer(
+        started_at=started_at, fingerprint="old", runner_id=None
+    )
     if delivering:
         record.delivery = asyncio.get_running_loop().create_future()
     return record
@@ -65,6 +67,8 @@ async def test_an_answer_prunes_old_records() -> None:
             {"elicitation_id": "elicit_x", "action": "decline"},
             None,
             _post_event,
+            conversation_store=None,
+            runner_exit_reports=None,
         )
 
         assert delivered is None
@@ -101,6 +105,8 @@ async def test_a_reused_id_does_not_drop_a_running_delivery() -> None:
                 {"elicitation_id": elicitation_id, "action": "accept", "content": {}},
                 None,
                 _post_event,
+                conversation_store=None,
+                runner_exit_reports=None,
             )
         )
         await asyncio.sleep(0)
@@ -182,6 +188,8 @@ class _Question:
                 },
                 None,
                 post_event,
+                conversation_store=None,
+                runner_exit_reports=None,
             )
         )
 
@@ -221,11 +229,15 @@ def _gated_post_event(
 
 
 async def test_a_denied_answer_keeps_the_question_open(question: _Question) -> None:
+    """A denial fails the request, so the card rolls back, and a later answer is delivered."""
     denial = {"queued": False, "denied": True, "reason": "blocked"}
     post_event, _reached, release = _gated_post_event(question, [denial, {"queued": True}])
     release.set()
 
-    assert await question.answer(post_event) == denial
+    with pytest.raises(OmnigentError) as denied:
+        await question.answer(post_event)
+    assert denied.value.code == ErrorCode.FORBIDDEN
+    assert "blocked" in str(denied.value)
     assert question.pending()
     assert question.resolved == []
     record = orchestration._stopped_session_answers.get(question.key)
@@ -357,7 +369,7 @@ async def _gate_runner_check(
         await release.wait()
         return False
 
-    monkeypatch.setattr(orchestration, "_session_runner_reconnects", _gated)
+    monkeypatch.setattr(orchestration, "_session_runner_reachable", _gated)
     return reached, release
 
 
@@ -368,6 +380,7 @@ async def test_a_retry_that_waits_returns_the_finished_retry_ack(
     record = orchestration._StoppedSessionAnswer(
         started_at=time.time(),
         fingerprint=orchestration._harness_elicitation_fingerprint_or_none(_question_params()),
+        runner_id=None,
     )
     orchestration._stopped_session_answers[question.key] = record
     reached, release = await _gate_runner_check(monkeypatch)
@@ -381,14 +394,26 @@ async def test_a_retry_that_waits_returns_the_finished_retry_ack(
     assert question.posts == []
 
 
-async def test_an_answer_resolved_elsewhere_during_the_runner_check_is_not_sent(
-    question: _Question, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("change", ["resolved", "asked_again"])
+async def test_an_answer_whose_question_changes_during_the_runner_check_is_not_sent(
+    question: _Question, monkeypatch: pytest.MonkeyPatch, change: str
 ) -> None:
+    """A question resolved or asked again during the runner check goes to the old path."""
     reached, release = await _gate_runner_check(monkeypatch)
     post_event, _reached, _release = _gated_post_event(question, [])
     answer = question.answer(post_event)
     await asyncio.wait_for(reached.wait(), 5.0)
-    pending_elicitations.resolve(question.session_id, question.elicitation_id)
+    if change == "resolved":
+        pending_elicitations.resolve(question.session_id, question.elicitation_id)
+    else:
+        pending_elicitations.record_publish(
+            question.session_id,
+            {
+                "type": "response.elicitation_request",
+                "elicitation_id": question.elicitation_id,
+                "params": {**_question_params(), "message": "a different question"},
+            },
+        )
     release.set()
 
     assert await asyncio.wait_for(answer, 5.0) is None
@@ -399,7 +424,6 @@ async def test_an_answer_resolved_elsewhere_during_the_runner_check_is_not_sent(
 async def test_a_reported_exit_skips_the_offline_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
     """A reported runner exit skips the host lookup, as the message path does."""
     from omnigent.server.routes import sessions as sessions_module
-    from omnigent.server.routes.sessions import routes_events
 
     reports = RunnerExitReports()
     reports.record("runner_gone", "exited", None)
@@ -426,13 +450,75 @@ async def test_a_reported_exit_skips_the_offline_lookup(monkeypatch: pytest.Monk
         waits.append(kwargs.get("runner_exit_reports"))
 
     monkeypatch.setattr(orchestration, "_get_runner_client", _no_runner)
-    monkeypatch.setattr(routes_events, "_session_offline_host_id", _offline_lookup)
+    monkeypatch.setattr(orchestration, "_session_offline_host_id", _offline_lookup)
     monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 30.0)
     monkeypatch.setattr(sessions_module, "_wait_for_runner_client", _wait)
 
-    reconnects = await orchestration._session_runner_reconnects(
+    reachable = await orchestration._session_runner_reachable(
         request, conv.id, conv, None, cast("Any", object()), reports
     )
 
-    assert reconnects is False
+    assert reachable is False
     assert waits == [reports]
+
+
+async def test_a_retry_that_waits_joins_a_delivery_that_started_meanwhile(
+    question: _Question, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A retry whose runner check outlasts the start of another delivery waits for it."""
+    record = orchestration._StoppedSessionAnswer(
+        started_at=time.time(),
+        fingerprint=orchestration._harness_elicitation_fingerprint_or_none(_question_params()),
+        runner_id=None,
+    )
+    orchestration._stopped_session_answers[question.key] = record
+    reached, release = await _gate_runner_check(monkeypatch)
+    post_event, _reached, _release = _gated_post_event(question, [])
+    retry = question.answer(post_event)
+    await asyncio.wait_for(reached.wait(), 5.0)
+    other = asyncio.get_running_loop().create_future()
+    record.delivery = other
+    release.set()
+    await asyncio.sleep(0)
+    assert not retry.done(), "the retry must wait for the delivery that started meanwhile"
+    other.set_result({"queued": True, "item_id": "item_other"})
+
+    assert await asyncio.wait_for(retry, 5.0) == {"queued": True, "item_id": "item_other"}
+    assert question.posts == []
+
+
+async def test_an_offline_host_skips_the_runner_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An offline host cannot bring the runner back, so the check does not wait."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    conv = Conversation(
+        id="conv_offline",
+        created_at=0,
+        updated_at=0,
+        root_conversation_id="conv_offline",
+        host_id="host_offline",
+        runner_id="runner_offline",
+    )
+    app = SimpleNamespace(state=SimpleNamespace(host_registry=None, tunnel_registry=None))
+    request = Request({"type": "http", "method": "POST", "path": "/", "headers": [], "app": app})
+
+    async def _no_runner(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    async def _offline(*args: object, **kwargs: object) -> str:
+        del args, kwargs
+        return "host_offline"
+
+    async def _wait(*args: object, **kwargs: object) -> None:
+        raise AssertionError("an offline host must skip the runner wait")
+
+    monkeypatch.setattr(orchestration, "_get_runner_client", _no_runner)
+    monkeypatch.setattr(orchestration, "_session_offline_host_id", _offline)
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 30.0)
+    monkeypatch.setattr(sessions_module, "_wait_for_runner_client", _wait)
+
+    reachable = await orchestration._session_runner_reachable(
+        request, conv.id, conv, None, cast("Any", object()), RunnerExitReports()
+    )
+
+    assert reachable is False

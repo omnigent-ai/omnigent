@@ -297,6 +297,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _resolve_elicitation,
     _runner_live_on_another_replica_from_conversations,
     _session_is_moving,
+    _session_offline_host_id,
     _side_chat_source_id,
     _stop_host_runner_intentionally,
     _wait_for_host_bound_runner_client,
@@ -586,48 +587,6 @@ async def _raise_if_runner_re_tunnelled_to_another_replica(
             "session runner re-tunnelled to another replica; retry",
             code=ErrorCode.WRONG_REPLICA,
         )
-
-
-async def _session_offline_host_id(
-    conv: Conversation,
-    app_state: Any,
-    conversation_store: ConversationStore,
-) -> str | None:
-    """
-    Return the session's user-run routing host when it has no live tunnel.
-
-    Called after a send found no runner to use and the host never took a
-    launch. A host that is not connected cannot start a runner, so the failure
-    is an offline host rather than a runner that failed to start. Managed
-    sandboxes are excluded (the server wakes those itself and the user cannot
-    start them), as is a host whose row still reads live, which can only be
-    connected to another replica.
-
-    Side chats and sub-agents can inherit their host from an ancestor, so the
-    routing host is authoritative rather than only ``conv.host_id``.
-
-    :param conv: The session row whose send failed.
-    :param app_state: ``request.app.state`` — supplies the host registry and
-        the host store.
-    :param conversation_store: Store used to resolve an inherited routing host.
-    :returns: The offline user-run host id, or ``None`` when the session has no
-        such host.
-    """
-    host_id = conv.host_id
-    if host_id is None:
-        host_id = await asyncio.to_thread(routing_host_id, conv, conversation_store)
-    if host_id is None:
-        return None
-    host_registry = getattr(app_state, "host_registry", None)
-    if host_registry is None or host_registry.get(host_id) is not None:
-        return None
-    host_store = getattr(app_state, "host_store", None)
-    if host_store is None:
-        return host_id
-    host = await asyncio.to_thread(host_store.get_host, host_id)
-    if host is None or host.sandbox_provider is not None or host_is_live(host):
-        return None
-    return host_id
 
 
 def _host_offline_message() -> str:

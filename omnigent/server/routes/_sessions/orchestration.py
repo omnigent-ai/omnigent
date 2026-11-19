@@ -2930,11 +2930,15 @@ def _harness_elicitation_fingerprint_or_none(params: Any) -> str | None:
 
 @dataclass
 class _StoppedSessionAnswer:
-    """One question's recovery on this replica: a running delivery, then its acknowledgement."""
+    """
+    One question's recovery on this replica: a running delivery, then its acknowledgement.
+
+    ``runner_id`` is the session's runner at the first answer; a retry checks it again.
+    """
 
     started_at: float
     fingerprint: str | None
-    runner_id: str | None = None
+    runner_id: str | None
     delivery: asyncio.Future[Any] | None = None
     acknowledgement: dict[str, Any] | None = None
 
@@ -2980,15 +2984,15 @@ async def _deliver_answer_to_stopped_session(
     runner_router: RunnerRouter | None,
     post_event: Callable[..., Awaitable[Any]] | None,
     *,
-    conversation_store: ConversationStore | None = None,
-    runner_exit_reports: RunnerExitReports | None = None,
+    conversation_store: ConversationStore | None,
+    runner_exit_reports: RunnerExitReports | None,
 ) -> dict[str, Any] | None:
     """
-    Send an AskUserQuestion answer as a user message when the session's runner is gone.
+    Send an AskUserQuestion answer as a user message when the session's runner stays gone.
 
     The message path relaunches the runner; the card closes only after it accepts the message.
-    :returns: The message path's acknowledgement (also for a later answer to the same question),
-        or ``None`` when out of scope. An accept during a delivery gets that delivery's result.
+    :returns: The acknowledgement (also for a later answer to the question), or ``None`` for the
+        old path: out of scope, or the runner came back. A waiting accept gets the same result.
     """
     elicitation_id = data.get("elicitation_id")
     if post_event is None or not isinstance(request, Request):
@@ -3033,7 +3037,7 @@ async def _deliver_answer_to_stopped_session(
         return None
     # A retry under a new runner id skips the check: that runner never parked this question.
     if record is None or record.runner_id == conv.runner_id:
-        runner_back = await _session_runner_reconnects(
+        runner_back = await _session_runner_reachable(
             request, session_id, conv, runner_router, conversation_store, runner_exit_reports
         )
         current = _stopped_session_answers.get(key)
@@ -3041,7 +3045,7 @@ async def _deliver_answer_to_stopped_session(
             current is not None
             and (current.delivery is not None or current.acknowledgement is not None)
         ):
-            # Another request started or finished this question's recovery during the wait.
+            # Another request changed this question's recovery record during the wait.
             return await _deliver_answer_to_stopped_session(
                 request,
                 session_id,
@@ -3052,9 +3056,9 @@ async def _deliver_answer_to_stopped_session(
                 conversation_store=conversation_store,
                 runner_exit_reports=runner_exit_reports,
             )
-        if pending_elicitations.lookup(elicitation_id, conversation_id=session_id) is None:
-            return None
-        if runner_back:
+        after = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
+        if after is None or after[1].get("params") != params or runner_back:
+            # Resolved elsewhere, asked again, or the runner is back: the old path handles it.
             _stopped_session_answers.pop(key, None)
             return None
     if record is None:
@@ -3103,14 +3107,16 @@ async def _run_stopped_session_delivery(
         )
         with contextlib.ExitStack() as in_flight:
             acknowledgement = await post_event(request, session_id, message, in_flight=in_flight)
-        delivery.set_result(acknowledgement)
         if isinstance(acknowledgement, dict) and acknowledgement.get("denied") is True:
+            reason = acknowledgement.get("reason") or "Denied by policy"
             _logger.info(
-                "Policy denied the answer to %s; the question stays open",
+                "Policy denied the answer to %s (%s); the question stays open",
                 elicitation_id,
+                reason,
                 extra={"session_id": session_id},
             )
-            return acknowledgement
+            raise OmnigentError(f"A policy denied this answer: {reason}", code=ErrorCode.FORBIDDEN)
+        delivery.set_result(acknowledgement)
         record.acknowledgement = acknowledgement
         _close_answered_card(session_id, elicitation_id, params)
         return acknowledgement
@@ -3134,7 +3140,49 @@ async def _run_stopped_session_delivery(
             )
 
 
-async def _session_runner_reconnects(
+async def _session_offline_host_id(
+    conv: Conversation,
+    app_state: Any,
+    conversation_store: ConversationStore,
+) -> str | None:
+    """
+    Return the session's user-run routing host when it has no live tunnel.
+
+    Called after a send found no runner to use and the host never took a
+    launch. A host that is not connected cannot start a runner, so the failure
+    is an offline host rather than a runner that failed to start. Managed
+    sandboxes are excluded (the server wakes those itself and the user cannot
+    start them), as is a host whose row still reads live, which can only be
+    connected to another replica.
+
+    Side chats and sub-agents can inherit their host from an ancestor, so the
+    routing host is authoritative rather than only ``conv.host_id``.
+
+    :param conv: The session row whose send failed.
+    :param app_state: ``request.app.state`` — supplies the host registry and
+        the host store.
+    :param conversation_store: Store used to resolve an inherited routing host.
+    :returns: The offline user-run host id, or ``None`` when the session has no
+        such host.
+    """
+    host_id = conv.host_id
+    if host_id is None:
+        host_id = await asyncio.to_thread(routing_host_id, conv, conversation_store)
+    if host_id is None:
+        return None
+    host_registry = getattr(app_state, "host_registry", None)
+    if host_registry is None or host_registry.get(host_id) is not None:
+        return None
+    host_store = getattr(app_state, "host_store", None)
+    if host_store is None:
+        return host_id
+    host = await asyncio.to_thread(host_store.get_host, host_id)
+    if host is None or host.sandbox_provider is not None or host_is_live(host):
+        return None
+    return host_id
+
+
+async def _session_runner_reachable(
     request: Request,
     session_id: str,
     conv: Conversation,
@@ -3143,27 +3191,23 @@ async def _session_runner_reconnects(
     runner_exit_reports: RunnerExitReports | None,
 ) -> bool:
     """
-    Return whether the session's runner is reachable, waiting as the message path does.
+    Return whether the session's runner is reachable, after the message path's connect grace.
 
-    Mirrors the message path's connect grace, so a short tunnel gap reaches the hook.
+    Same gates as the message path's runner wait in routes_events.py: a host-bound session
+    only, cut short by a dead report or a known exit. A hostless session returns at once.
     """
     if await _get_runner_client(session_id, runner_router, conversation=conv, for_control=True):
         return True
-    from omnigent.server.routes import sessions as _sf
-    from omnigent.server.routes.sessions import routes_events
+    from omnigent.server.routes import sessions as _facade
 
+    grace_s = _facade._HOST_BOUND_RUNNER_CONNECT_GRACE_S
     runner_id = conv.runner_id
-    if (
-        conv.host_id is None
-        or runner_id is None
-        or conversation_store is None
-        or _sf._HOST_BOUND_RUNNER_CONNECT_GRACE_S <= 0
-    ):
+    if conv.host_id is None or runner_id is None or conversation_store is None or grace_s <= 0:
         return False
     app_state = request.app.state
     known_exit = runner_exit_reports.get(runner_id) if runner_exit_reports is not None else None
     offline = (
-        await routes_events._session_offline_host_id(conv, app_state, conversation_store)
+        await _session_offline_host_id(conv, app_state, conversation_store)
         if known_exit is None
         else None
     )
@@ -3171,28 +3215,40 @@ async def _session_runner_reconnects(
     host_conn = host_registry.get(conv.host_id) if host_registry is not None else None
     if offline is not None and host_conn is None:
         return False
+    _logger.info(
+        "Waiting up to %.1fs for runner %s before sending an answer as a message",
+        grace_s,
+        runner_id,
+        extra={"session_id": session_id},
+    )
     tunnel_registry = getattr(app_state, "tunnel_registry", None)
     if host_registry is not None and host_conn is not None:
-        client = await _sf._wait_for_host_bound_runner_client(
+        client = await _wait_for_host_bound_runner_client(
             session_id,
             runner_router,
             tunnel_registry,
             runner_id=runner_id,
-            timeout_s=_sf._HOST_BOUND_RUNNER_CONNECT_GRACE_S,
+            timeout_s=grace_s,
             runner_exit_reports=runner_exit_reports,
             host_conn=host_conn,
             host_registry=host_registry,
             conversation_store=conversation_store,
         )
     else:
-        client = await _sf._wait_for_runner_client(
+        client = await _wait_for_runner_client(
             session_id,
             runner_router,
             tunnel_registry,
             runner_id=runner_id,
-            timeout_s=_sf._HOST_BOUND_RUNNER_CONNECT_GRACE_S,
+            timeout_s=grace_s,
             runner_exit_reports=runner_exit_reports,
         )
+    _logger.info(
+        "Runner %s %s",
+        runner_id,
+        "came back; the answer goes to its hook" if client is not None else "did not come back",
+        extra={"session_id": session_id},
+    )
     return client is not None
 
 
@@ -15715,6 +15771,7 @@ __all__ = [
     "_run_managed_wake",
     "_runner_reject_detail",
     "_schedule_deferred_elicitation_clear",
+    "_session_offline_host_id",
     "_spawn_archive_stop",
     "_spawn_gateway_backed",
     "_spawn_native_approval_popup_forward",
