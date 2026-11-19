@@ -471,11 +471,41 @@ class AgentSandboxLauncher(KubernetesSandboxLauncher):
             skips its success log.
         """
         _ensure_sdk()
+        namespace = self._resolve_namespace()
+        try:
+            return self._patch_shutdown_time(namespace, sandbox_id, resolve_shutdown_window_s())
+        finally:
+            self._close_clients()
+
+    def _extend_for_workspace_prep(
+        self, namespace: str, workload_name: str, prep_timeout_s: int
+    ) -> None:
+        """
+        Push ``spec.shutdownTime`` past the clone budget. Nothing refreshes the
+        boot deadline until the runner connects, so a clone longer than
+        :data:`_BOOT_GRACE_S` would otherwise be suspended mid-launch.
+
+        :param namespace: Namespace the ``Sandbox`` lives in.
+        :param workload_name: The ``Sandbox`` whose clone just started.
+        :param prep_timeout_s: The clone budget now in effect.
+        """
+        self._patch_shutdown_time(
+            namespace, workload_name, initial_shutdown_window_s() + prep_timeout_s
+        )
+
+    def _patch_shutdown_time(self, namespace: str, sandbox_id: str, window_s: int) -> bool:
+        """
+        Merge-patch ``spec.shutdownTime`` to *window_s* from now, soft-failing.
+
+        :param namespace: Namespace the ``Sandbox`` lives in.
+        :param sandbox_id: The ``Sandbox`` to extend.
+        :param window_s: Seconds from now until the controller may suspend it.
+        :returns: ``True`` when the patch landed, ``False`` on a logged soft
+            failure or a gone (404) ``Sandbox``.
+        """
         from kubernetes.client.rest import ApiException
         from urllib3.exceptions import HTTPError
 
-        namespace = self._resolve_namespace()
-        window_s = resolve_shutdown_window_s()
         shutdown_time = _shutdown_time(window_s)
         try:
             self._load_custom().patch_namespaced_custom_object(
@@ -504,11 +534,8 @@ class AgentSandboxLauncher(KubernetesSandboxLauncher):
                 _api_reason(exc),
             )
             return False
-        else:
-            _logger.debug("extended agent-sandbox '%s' to %s", sandbox_id, shutdown_time)
-            return True
-        finally:
-            self._close_clients()
+        _logger.debug("extended agent-sandbox '%s' to %s", sandbox_id, shutdown_time)
+        return True
 
     def terminate(self, sandbox_id: str) -> None:
         """
