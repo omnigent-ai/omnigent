@@ -5434,6 +5434,17 @@ async def _stop_if_archived_while_provisioning(
         return
     if conv is None or not conv.archived:
         return
+    # The first turn may have archived its own session, leaving a turn-aware
+    # teardown pending on some replica; a plain one here would cut that turn short.
+    try:
+        activity = await asyncio.to_thread(conversation_store.get_session_activity, [session_id])
+        row = activity.get(session_id)
+        after_turn = (
+            row is not None
+            and _session_status_from_cache(session_id, row.live_status) == "running"
+        )
+    except Exception:  # noqa: BLE001 — unknown, so never cut a turn short
+        after_turn = True
     _logger.info(
         "Session %s was archived while its sandbox was provisioning; scheduling its teardown",
         session_id,
@@ -5446,6 +5457,7 @@ async def _stop_if_archived_while_provisioning(
         host_registry,
         host_store=host_store,
         sandbox_config=sandbox_config,
+        after_turn=after_turn,
     )
 
 

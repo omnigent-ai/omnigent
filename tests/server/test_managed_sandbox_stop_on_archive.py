@@ -430,6 +430,28 @@ async def test_a_relaunch_of_an_archived_session_does_not_schedule_a_teardown(
     assert fake.stopped == []
 
 
+async def test_a_turn_running_when_the_host_binds_finishes_before_the_teardown(
+    db_uri, no_undo_grace, monkeypatch
+):
+    host_store = HostStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    fake = _registering_launcher(host_store)
+    conv = conversations.create_conversation()
+    # The first turn archived its own session and is still running.
+    conversations.update_conversation(conv.id, archived=True)
+    conversations.set_session_live_status(conv.id, "running")
+    monkeypatch.setattr(orchestration, "_SELF_ARCHIVE_TURN_POLL_S", 0.01)
+
+    await _launch_for(conversations, host_store, fake, conv.id)
+    teardown = orchestration._pending_archive_stops[conv.id]
+    await asyncio.sleep(0.2)
+    assert not teardown.done() and fake.stopped == []
+
+    conversations.set_session_live_status(conv.id, "idle")
+    await asyncio.wait_for(teardown, timeout=5)
+    assert len(fake.stopped) == 1
+
+
 async def test_moving_an_archived_session_to_a_sandbox_does_not_schedule_a_teardown(
     db_uri, no_undo_grace
 ):
