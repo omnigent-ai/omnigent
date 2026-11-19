@@ -20,13 +20,16 @@ narrow it further. Relevant wire events:
 - ``{"type": "context.append_loop_event", "event": {"type": "content.part",
   "part": {"type": "text", "text": …}, "uuid": …}}`` → an assistant message.
   (``part.type == "think"`` is reasoning, mirrored as a transient
-  ``external_output_reasoning_delta`` from ``part["think"]``; ``tool.call`` /
-  ``tool.result`` events are never posted — the embedded terminal shows them —
-  but are tracked so a long-running tool doesn't look like an orphaned turn.)
+  ``external_output_reasoning_delta`` from ``part["think"]``.)
+- ``tool.call`` / ``tool.result`` loop events → a paired ``function_call`` /
+  ``function_call_output`` history item sharing the call's response and call
+  ids; they also keep the in-flight tool count for the hung-tool watchdog.
 - ``{"type": "turn.ended", "reason": "completed" | "failed" | "cancelled", …}``
-  → the authoritative terminal record for a turn. Failed and cancelled turns
-  emit no ``step.end`` at all (see ``tests/fixtures/kimi_wire``), so ``step.end``
-  finish reasons are never treated as turn edges.
+  → the authoritative terminal record for a turn, posted with an explicit
+  ``turn_outcome`` (any other reason is reported as failed). Failed and
+  cancelled turns emit no ``step.end`` at all (see ``tests/fixtures/kimi_wire``),
+  so ``step.end`` finish reasons are never treated as turn edges. A quiet wire
+  never ends a turn; only pane death or a hung tool closes one without a record.
 - ``{"type": "usage.record", "model": …, "usage": {"inputOther", "output",
   "inputCacheRead", "inputCacheCreation"}, "usageScope": "turn"}`` → token
   usage for one LLM call. Accumulated into per-session cumulative totals and
@@ -73,6 +76,7 @@ from omnigent.native._native_forwarder_health import (
 from omnigent.native._native_forwarder_health import (
     record_post_failure as record_native_post_failure,
 )
+from omnigent.runtime.tool_output import cap_tool_output
 
 _logger = logging.getLogger(__name__)
 
@@ -94,18 +98,16 @@ _POISON_MAX_ATTEMPTS = 3
 #: 4xx statuses that are transient (auth lapse, rate limit, contention), never
 #: poison: the item is retried with backoff instead of being discarded.
 _TRANSIENT_POST_STATUSES = frozenset({401, 403, 408, 409, 425, 429})
-#: Quiet-wire window before an in-flight turn is closed as idle. Deliberately
-#: long: kimi appends wire rows only at part/step boundaries, so a slow model
-#: step can be legitimately silent for minutes — closing a live turn early
-#: would falsely complete a sub-agent, which is worse than closing late.
-_TURN_QUIESCENCE_S = 300.0
-#: Ceiling on wire silence while a tool call is in flight. A tool may
-#: legitimately run for many minutes, but a wire with NO row of any kind for
-#: this long means the tool (or kimi itself) hung — fail the turn instead of
-#: suppressing quiescence forever against an alive-but-wedged pane. Accepted
-#: tradeoff: a zero-row tool can strand a turn for up to this long; per-tool
-#: heartbeats/limits are deliberately not implemented.
+#: Ceiling on wire silence while a tool call is in flight: no row of any kind
+#: for this long means the tool (or kimi itself) hung in an alive pane, so the
+#: turn fails. A quiet turn with no tool in flight is never closed by silence.
 _TOOL_QUIESCENCE_S = 1800.0
+_TOOL_HUNG_DETAIL = (
+    "Kimi wrote nothing to its session log for 30 minutes while a tool was running."
+)
+_PANE_DEATH_DETAIL = "Kimi exited before reporting how the turn ended."
+#: Session status posted for each explicit turn outcome.
+_OUTCOME_STATUS = {"completed": "idle", "cancelled": "idle", "failed": "failed"}
 #: Continuous edge-delivery failure past this long logs an error (rate-limited
 #: to the same interval) so the outage is visible without extra plumbing.
 _EDGE_FAILURE_ALERT_S = 300.0
@@ -135,8 +137,8 @@ def _warn_once(key: str, msg: str, *args: object) -> None:
 class _ForwardState:
     """Durable cursor for the wire-log tail plus the mirrored turn lifecycle.
 
-    ``turn_open``/``tools_in_flight`` keep the pane-death and quiescence
-    fallbacks armed (or suppressed) across a forwarder restart mid-turn;
+    ``turn_open``/``tools_in_flight`` keep the pane-death and hung-tool
+    fallbacks armed across a forwarder restart mid-turn;
     ``last_edge_id`` dedupes a turn-edge POST replayed after a crash landed
     between the POST and the cursor persist.
     """
@@ -147,6 +149,7 @@ class _ForwardState:
     turn_open: bool = False
     tools_in_flight: int = 0
     last_edge_id: str | None = None
+    # Wire outcome (completed/cancelled/failed) of a poison-dropped turn edge.
     dropped_edge_status: str | None = None
     dropped_edge_output: str = ""
     # The in-flight turn's latest assistant text, persisted so a restart
@@ -158,7 +161,7 @@ class _ForwardState:
     # POSTs freeze last_line, and a line-only id would collide across turns).
     turn_seq: int = 0
     # Wall-clock of the last genuine wire activity, so a restart resumes the
-    # quiescence timers instead of re-arming their full windows.
+    # hung-tool timer instead of re-arming its full window.
     last_activity_ts: float | None = None
     # High-water of wire bytes observed (>= the delivery cursor), so a crash
     # loop replaying undelivered rows can't refresh the timers every restart.
@@ -219,10 +222,12 @@ class KimiWireItem:
     # "message" (a user/assistant turn → external_conversation_item),
     # "reasoning" (a think block → external_output_reasoning_delta),
     # "turn_end" (turn.ended completed/cancelled → external_session_status:
-    # idle), "turn_failed" (turn.ended failed → status: failed),
-    # "tool_call"/"tool_result" (never posted; in-flight tool bookkeeping),
-    # "usage" (a per-call token record → coalesced external_session_usage), or
-    # "model" (an llm.request's effective model → deduped external_model_change).
+    # idle with that turn_outcome), "turn_failed" (turn.ended failed or an
+    # unknown reason → status: failed), "tool_call"/"tool_result" (a
+    # function_call / function_call_output history item; ``text`` holds the
+    # arguments JSON / capped output), "usage" (a per-call token record →
+    # coalesced external_session_usage), or "model" (an llm.request's
+    # effective model → deduped external_model_change).
     kind: str = "message"
     # Byte offset just past this item's wire line; the tail cursor after it posts.
     offset_after: int = 0
@@ -236,6 +241,14 @@ class KimiWireItem:
     # ``time`` in epoch ms, so the forwarder can skip history that predates
     # this Omnigent session (billing floor / historical-edge gate).
     time_ms: int | None = None
+    # For the turn-edge kinds: completed / cancelled / failed, and the
+    # failure detail a failed edge reports.
+    outcome: str | None = None
+    failure_detail: str | None = None
+    # For the tool kinds: the native tool call id (None for a row missing its
+    # identity, which is counted but never posted) and the called tool's name.
+    call_id: str | None = None
+    tool_name: str | None = None
 
 
 _MirrorItem = KimiWireItem
@@ -278,6 +291,9 @@ def _read_state(bridge_dir: Path) -> _ForwardState | None:
     wire_ino = data.get("wire_ino")
     last_observed_size = data.get("last_observed_size")
     last_prompt_id = data.get("last_prompt_id")
+    if dropped_edge_status == "idle":
+        # Older forwarders persisted "idle", which they delivered as completed.
+        dropped_edge_status = "completed"
     if isinstance(wire_path, str) and isinstance(last_line, int) and isinstance(offset, int):
         return _ForwardState(
             wire_path=wire_path,
@@ -287,7 +303,7 @@ def _read_state(bridge_dir: Path) -> _ForwardState | None:
             tools_in_flight=tools_in_flight if isinstance(tools_in_flight, int) else 0,
             last_edge_id=last_edge_id if isinstance(last_edge_id, str) else None,
             dropped_edge_status=(
-                dropped_edge_status if isinstance(dropped_edge_status, str) else None
+                dropped_edge_status if dropped_edge_status in _OUTCOME_STATUS else None
             ),
             dropped_edge_output=(
                 dropped_edge_output if isinstance(dropped_edge_output, str) else ""
@@ -759,38 +775,44 @@ def _row_to_item(line_no: int, row: dict[str, object]) -> KimiWireItem | None:
                 response_id=f"kimi:turn_end:{line_no}",
                 kind="turn_end",
                 time_ms=edge_time_ms,
+                outcome=reason,
             )
+        error = row.get("error")
+        code = error.get("code") if isinstance(error, dict) else None
+        message = error.get("message") if isinstance(error, dict) else None
+        code = code if isinstance(code, str) else ""
+        message = message if isinstance(message, str) else ""
+        error_text = f"{code}: {message}" if code and message else code or message
         if reason == "failed":
-            error = row.get("error")
-            message = error.get("message") if isinstance(error, dict) else None
-            return KimiWireItem(
-                line_no=line_no,
-                role="assistant",
-                text=message if isinstance(message, str) else "",
-                response_id=f"kimi:turn_failed:{line_no}",
-                kind="turn_failed",
-                time_ms=edge_time_ms,
+            failure_detail = error_text or None
+        else:
+            # An authoritative end that is not a success: report it as failed
+            # with its reason rather than leave the turn open forever.
+            _logger.warning(
+                "kimi forwarder: turn.ended reason %r reported as failed (line %d)",
+                reason,
+                line_no,
             )
-        # Unknown vocabulary: never guess "failed" — leave the turn open for
-        # the pane-death/quiescence fallbacks to close.
-        _logger.warning("kimi forwarder: unknown turn.ended reason %r (line %d)", reason, line_no)
-        return None
+            failure_detail = f"Kimi turn ended with reason '{reason}'"
+            if error_text:
+                failure_detail += f": {error_text}"
+        return KimiWireItem(
+            line_no=line_no,
+            role="assistant",
+            text=message,
+            response_id=f"kimi:turn_failed:{line_no}",
+            kind="turn_failed",
+            time_ms=edge_time_ms,
+            outcome="failed",
+            failure_detail=failure_detail,
+        )
     if row_type == "context.append_loop_event":
         event = row.get("event")
         if not isinstance(event, dict):
             return None
         event_type = event.get("type")
         if event_type in ("tool.call", "tool.result"):
-            # Bookkeeping only (never posted): an open tool call keeps the wire
-            # legitimately silent, which must suppress the quiescence fallback.
-            kind = "tool_call" if event_type == "tool.call" else "tool_result"
-            return KimiWireItem(
-                line_no=line_no,
-                role="assistant",
-                text="",
-                response_id=f"kimi:{kind}:{line_no}",
-                kind=kind,
-            )
+            return _tool_item(line_no, event)
         if event_type != "content.part":
             return None
         part = event.get("part")
@@ -825,6 +847,57 @@ def _row_to_item(line_no: int, row: dict[str, object]) -> KimiWireItem | None:
             )
         return None
     return None
+
+
+def _tool_item(line_no: int, event: dict[str, object]) -> KimiWireItem:
+    """Map a ``tool.call`` / ``tool.result`` loop event to a tool item.
+
+    A call and its result share ``kimi:<call event uuid>`` as response id and
+    the native ``toolCallId`` as call id. A row missing either is returned
+    without a ``call_id``: still counted in flight, never posted.
+    """
+    is_call = event.get("type") == "tool.call"
+    kind = "tool_call" if is_call else "tool_result"
+    event_uuid = event.get("uuid" if is_call else "parentUuid")
+    call_id = event.get("toolCallId")
+    name = event.get("name")
+    if not (
+        isinstance(event_uuid, str)
+        and event_uuid
+        and isinstance(call_id, str)
+        and call_id
+        and (not is_call or (isinstance(name, str) and name))
+    ):
+        return KimiWireItem(
+            line_no=line_no,
+            role="assistant",
+            text="",
+            response_id=f"kimi:{kind}:{line_no}",
+            kind=kind,
+        )
+    if is_call:
+        text = json.dumps(event.get("args", {}), ensure_ascii=False)
+    else:
+        result = event.get("result")
+        output = result.get("output") if isinstance(result, dict) else None
+        if output is None:
+            text = ""
+        elif isinstance(output, str):
+            text = output
+        else:
+            text = json.dumps(output, ensure_ascii=False)
+        if isinstance(result, dict) and result.get("isError") is True:
+            text = f"Error: {text}"
+        text = cap_tool_output(text)
+    return KimiWireItem(
+        line_no=line_no,
+        role="assistant",
+        text=text,
+        response_id=f"kimi:{event_uuid}",
+        kind=kind,
+        call_id=call_id,
+        tool_name=name if is_call and isinstance(name, str) else None,
+    )
 
 
 def read_kimi_wire_items(wire_path: Path, last_line: int) -> list[KimiWireItem]:
@@ -951,22 +1024,37 @@ async def _post_conversation_item(
     item: KimiWireItem,
     agent_name: str,
 ) -> None:
-    """POST one mirrored turn as an external conversation item."""
-    content_type = "input_text" if item.role == "user" else "output_text"
-    item_data: dict[str, object] = {
-        "role": item.role,
-        "content": [{"type": content_type, "text": item.text}],
-    }
-    if item.role == "assistant":
-        item_data["agent"] = agent_name
-    body = {
-        "type": "external_conversation_item",
-        "data": {
-            "item_type": "message",
-            "item_data": item_data,
+    """POST one mirrored message or tool item as an external conversation item."""
+    data: dict[str, object]
+    if item.kind == "tool_call":
+        data = {
+            "item_type": "function_call",
+            "item_data": {
+                "agent": agent_name,
+                "name": item.tool_name,
+                "arguments": item.text,
+                "call_id": item.call_id,
+            },
             "response_id": item.response_id,
-        },
-    }
+            "source_id": f"{item.response_id}:call",
+        }
+    elif item.kind == "tool_result":
+        data = {
+            "item_type": "function_call_output",
+            "item_data": {"call_id": item.call_id, "output": item.text},
+            "response_id": item.response_id,
+            "source_id": f"{item.response_id}:output",
+        }
+    else:
+        content_type = "input_text" if item.role == "user" else "output_text"
+        item_data: dict[str, object] = {
+            "role": item.role,
+            "content": [{"type": content_type, "text": item.text}],
+        }
+        if item.role == "assistant":
+            item_data["agent"] = agent_name
+        data = {"item_type": "message", "item_data": item_data, "response_id": item.response_id}
+    body = {"type": "external_conversation_item", "data": data}
     url = f"{base_url.rstrip('/')}/v1/sessions/{session_id}/events"
     resp = await client.post(url, headers=headers, json=body)
     resp.raise_for_status()
@@ -980,22 +1068,26 @@ async def _post_external_session_status(
     session_id: str,
     status: str,
     output: str,
+    turn_outcome: str,
+    failure_detail: str | None = None,
 ) -> None:
-    """POST one ``external_session_status`` event to the Sessions API.
+    """POST one terminal ``external_session_status`` event to the Sessions API.
 
-    For a sub-agent conversation the server maps an ``idle`` edge to a terminal
-    completion that wakes the parent orchestrator's inbox — the SAME contract
-    claude-/codex-/opencode-/cursor-native use. ``output`` carries the turn's
-    final assistant text, since the runner delivers an empty result when an idle
-    edge forwards none.
+    ``turn_outcome`` (completed / cancelled / failed) is what a sub-agent's
+    parent inbox and wake report; a completed edge also confirms the turn with
+    ``turn_completed``. ``output`` carries the turn's final assistant text, and
+    a failed edge adds its ``failure_detail`` when one is known.
 
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     """
+    data: dict[str, object] = {"status": status, "output": output, "turn_outcome": turn_outcome}
+    if turn_outcome == "completed":
+        data["turn_completed"] = True
+    if turn_outcome == "failed" and failure_detail:
+        data["failure_detail"] = failure_detail
     url = f"{base_url.rstrip('/')}/v1/sessions/{session_id}/events"
     resp = await client.post(
-        url,
-        headers=headers,
-        json={"type": "external_session_status", "data": {"status": status, "output": output}},
+        url, headers=headers, json={"type": "external_session_status", "data": data}
     )
     resp.raise_for_status()
 
@@ -1455,7 +1547,6 @@ async def forward_kimi_wire_to_session(
     agent_name: str = "kimi-native-ui",
     auth: httpx.Auth | None = None,
     pane_alive: Callable[[], bool] | None = None,
-    quiescence_s: float = _TURN_QUIESCENCE_S,
     tool_quiescence_s: float = _TOOL_QUIESCENCE_S,
     poll_interval_s: float = _POLL_INTERVAL_S,
     post_backoff_initial_s: float = _BACKOFF_INITIAL_S,
@@ -1467,13 +1558,13 @@ async def forward_kimi_wire_to_session(
     POSTing each new user/assistant turn and advancing the cursor per post.
 
     Besides mirroring, this owns the session's turn-status edges: the top-level
-    ``turn.ended`` wire record posts idle (completed/cancelled) or failed; a
-    dead kimi pane mid-turn posts failed; a turn whose wire has been quiet
-    for *quiescence_s* with no tool call in flight is closed as idle; and a
-    turn silent past *tool_quiescence_s* WITH a tool in flight is failed (the
-    tool hung), so a crashed or wedged kimi never strands the session
-    'running'. The turn lifecycle is persisted alongside the tail cursor, so
-    the fallbacks stay armed across a forwarder restart mid-turn.
+    ``turn.ended`` wire record posts its explicit outcome (completed,
+    cancelled or failed); a dead kimi pane mid-turn posts failed; and a turn
+    silent past *tool_quiescence_s* WITH a tool in flight is failed (the tool
+    hung). A quiet turn with no tool in flight stays open: silence is never
+    read as completion. Fallback edges fire only once every row read so far
+    has been delivered or dropped. The turn lifecycle is persisted alongside
+    the tail cursor, so the fallbacks stay armed across a forwarder restart.
 
     :param auth: Optional refresh-capable httpx Auth so long sessions survive
         bearer-token expiry (mirrors the qwen forwarder).
@@ -1517,7 +1608,7 @@ async def forward_kimi_wire_to_session(
     # and the turn edge doesn't post an empty output to the parent.
     last_assistant_text = state.last_assistant_text if state is not None else ""
     # True from an observed user prompt until a terminal edge posts; gates the
-    # pane-death and quiescence fallbacks to turns that actually started.
+    # pane-death and hung-tool fallbacks to turns that actually started.
     turn_open = state.turn_open if state is not None else False
     # Open tool calls in the current turn; a positive count means a silent wire
     # is a tool still running, not an orphaned turn.
@@ -1525,8 +1616,8 @@ async def forward_kimi_wire_to_session(
     # Id of the last terminal edge POSTed, persisted so a restart or wire
     # replay never double-fires the same edge at the server.
     last_edge_id = state.last_edge_id if state is not None else None
-    # Terminal status of an edge the server permanently rejected (poison-drop):
-    # the fallback close posts THIS status so a failed turn isn't closed idle.
+    # Wire outcome of an edge the server permanently rejected (poison-drop):
+    # the fallback close posts THIS outcome instead of its own.
     dropped_edge_status = state.dropped_edge_status if state is not None else None
     dropped_edge_output = state.dropped_edge_output if state is not None else ""
     # Per-turn discriminator for fallback edge ids (see _ForwardState).
@@ -1551,8 +1642,7 @@ async def forward_kimi_wire_to_session(
         # but floor the remaining window at a short grace so a wall-clock jump
         # (sleep/wake, NTP step) can't fire a watchdog on the spot.
         elapsed = max(0.0, time.time() - state.last_activity_ts)
-        window = tool_quiescence_s if tools_in_flight > 0 else quiescence_s
-        elapsed = min(elapsed, max(0.0, window - _RESTART_GRACE_S))
+        elapsed = min(elapsed, max(0.0, tool_quiescence_s - _RESTART_GRACE_S))
         last_wire_activity = time.monotonic() - elapsed
         last_wire_activity_wall = time.time() - elapsed
     # High-water of wire bytes actually observed: a redelivery retry (in this
@@ -1607,13 +1697,24 @@ async def forward_kimi_wire_to_session(
             await asyncio.sleep(post_backoff)
             post_backoff = min(post_backoff * 2, _BACKOFF_MAX_S)
 
-        async def _close_turn(status: str, edge: str) -> None:
+        def _note_tool_consumed(item: KimiWireItem) -> None:
+            """Count a tool row once, where the cursor moves past it."""
+            nonlocal tools_in_flight
+            if item.kind == "tool_call":
+                tools_in_flight += 1
+            elif item.kind == "tool_result":
+                tools_in_flight = max(0, tools_in_flight - 1)
+
+        async def _close_turn(outcome: str, edge: str, failure_detail: str) -> None:
             """Post the terminal edge for a turn that will write no more wire rows."""
             nonlocal turn_open, last_assistant_text, tools_in_flight, last_edge_id, post_backoff
             nonlocal dropped_edge_status, dropped_edge_output, edge_failing_since, last_edge_alert
             # A wire edge the server permanently rejected already told us how
-            # this turn ended; the fallback must not soften a failure to idle.
-            status = dropped_edge_status or status
+            # this turn ended; the fallback reports that instead of its own.
+            detail: str | None = failure_detail
+            if dropped_edge_status is not None:
+                outcome = dropped_edge_status
+                detail = dropped_edge_output or None
             # Turn+line anchored id: a restart retrying this fallback dedupes
             # against the already-posted edge (turn_seq and last_line persist
             # together), while a later turn gets a fresh id EVEN when failed
@@ -1632,8 +1733,10 @@ async def forward_kimi_wire_to_session(
                     base_url=base_url,
                     headers=headers,
                     session_id=session_id,
-                    status=status,
+                    status=_OUTCOME_STATUS[outcome],
                     output=last_assistant_text or dropped_edge_output,
+                    turn_outcome=outcome,
+                    failure_detail=detail,
                 )
             except httpx.HTTPError as exc:
                 # An undelivered edge is a delivery outage whatever the cause;
@@ -1668,7 +1771,7 @@ async def forward_kimi_wire_to_session(
                 usage_sync.note_turn_boundary()
                 _persist()
                 # The turn is over and no further wire rows are coming (pane
-                # death / quiescence): deliver the final usage totals promptly,
+                # death / hung tool): deliver the final usage totals promptly,
                 # matching the wire-edge branch.
                 await usage_sync.sync(client)
 
@@ -1765,7 +1868,7 @@ async def forward_kimi_wire_to_session(
                 if new_offset > last_seen_offset or new_offset < offset:
                     # Genuinely new rows (or a truncated/recreated wire) refresh
                     # the silence timers; a redelivery retry re-reading the same
-                    # unposted tail must NOT defer the quiescence fallbacks.
+                    # unposted tail must NOT defer the hung-tool fallback.
                     # Persisted immediately (cursor untouched) so a crash loop
                     # can't refresh the timers with the same rows every restart.
                     if new_offset < offset:
@@ -1792,8 +1895,8 @@ async def forward_kimi_wire_to_session(
                     # The SAME wire path was recreated/compacted below the
                     # observed high-water (delivery cursor still under the new
                     # size, so the read didn't restart): the stale high-water
-                    # would blind the refresh gate and quiescence could falsely
-                    # close a live turn. Restart the tail like the truncation
+                    # would blind the refresh gate and the hung-tool timer
+                    # could falsely fail a live turn. Restart the tail like the truncation
                     # branch does and re-read next poll.
                     offset = 0
                     last_line = 0
@@ -1823,12 +1926,8 @@ async def forward_kimi_wire_to_session(
                     last_wire_activity_wall = time.time()
                     _persist()
                 for item in items:
-                    if item.kind in ("tool_call", "tool_result"):
-                        tools_in_flight = (
-                            tools_in_flight + 1
-                            if item.kind == "tool_call"
-                            else max(0, tools_in_flight - 1)
-                        )
+                    if item.kind in ("tool_call", "tool_result") and item.call_id is None:
+                        _note_tool_consumed(item)
                         _advance_past(item)
                         continue
                     if item.kind == "message" and item.role == "user":
@@ -1852,6 +1951,7 @@ async def forward_kimi_wire_to_session(
                         if not historical_prompt and new_prompt:
                             turn_open = True
                             tools_in_flight = 0
+                            last_assistant_text = ""
                             dropped_edge_status = None
                             dropped_edge_output = ""
                             turn_seq += 1
@@ -1905,10 +2005,12 @@ async def forward_kimi_wire_to_session(
                                 base_url=base_url,
                                 headers=headers,
                                 session_id=session_id,
-                                status="idle" if item.kind == "turn_end" else "failed",
+                                status=_OUTCOME_STATUS[item.outcome or "failed"],
                                 # A failed turn.ended carries the provider error
                                 # message; surface it when no assistant text ran.
                                 output=last_assistant_text or item.text,
+                                turn_outcome=item.outcome or "failed",
+                                failure_detail=item.failure_detail,
                             )
                             last_assistant_text = ""
                             turn_open = False
@@ -1936,7 +2038,7 @@ async def forward_kimi_wire_to_session(
                                 item=item,
                                 agent_name=agent_name,
                             )
-                            if item.role == "assistant":
+                            if item.kind == "message" and item.role == "assistant":
                                 last_assistant_text = item.text
                     except httpx.HTTPError as exc:
                         event_type = (
@@ -1977,15 +2079,13 @@ async def forward_kimi_wire_to_session(
                                     exc,
                                 )
                                 if item.kind in ("turn_end", "turn_failed"):
-                                    # The turn's true terminal status is known;
-                                    # hand it to the fallback close instead of
-                                    # letting quiescence report idle.
-                                    dropped_edge_status = (
-                                        "idle" if item.kind == "turn_end" else "failed"
-                                    )
+                                    # The turn's true outcome is known; hand it
+                                    # to the fallback close.
+                                    dropped_edge_status = item.outcome or "failed"
                                     dropped_edge_output = item.text
                                     tools_in_flight = 0
                                     usage_sync.note_turn_boundary()
+                                _note_tool_consumed(item)
                                 poison_id, poison_attempts = None, 0
                                 _advance_past(item)
                                 continue
@@ -1997,6 +2097,7 @@ async def forward_kimi_wire_to_session(
                         post_backoff = post_backoff_initial_s
                         if poison_id == item.response_id:
                             poison_id, poison_attempts = None, 0
+                        _note_tool_consumed(item)
                         _advance_past(item)
                 if all_posted and new_offset != offset:
                     # Consume trailing non-item lines so the next poll skips them.
@@ -2009,36 +2110,29 @@ async def forward_kimi_wire_to_session(
             # that has since vanished (the totals are already persisted, so a
             # missing log must not orphan an undelivered post forever).
             await usage_sync.sync(client)
-            if turn_open and pane_is_alive is False and not dead_tail_pending:
+            # Fallbacks wait for the ordered pass to drain, so a retried history
+            # row (or a real turn.ended behind it) is never overtaken.
+            drained = all_posted and not dead_tail_pending
+            if drained and turn_open and pane_is_alive is False:
                 # The pane died mid-turn: no further wire rows are coming, so
                 # post the failed edge instead of stranding the session. Give
                 # a final unterminated row its stable-size acceptance poll first.
-                await _close_turn("failed", "pane-death")
+                await _close_turn("failed", "pane-death", _PANE_DEATH_DETAIL)
             elif (
-                turn_open
-                and tools_in_flight == 0
-                and time.monotonic() - last_wire_activity > quiescence_s
-            ):
-                # Turns that end without any wire edge (wedged kimi, lost edge
-                # row): a long-quiet wire means the turn is over; close it as
-                # idle. A silent wire mid-tool is a long tool call, not an
-                # orphan — then only pane death (above) closes the turn.
-                await _close_turn("idle", "quiescence")
-            elif (
-                turn_open
+                drained
+                and turn_open
                 and tools_in_flight > 0
                 and time.monotonic() - last_wire_activity > tool_quiescence_s
             ):
-                # Ceiling on the mid-tool suppression: no wire row of any kind
-                # for this long means the tool (or kimi) hung in an alive pane —
-                # fail the turn rather than suppress quiescence forever.
+                # No wire row of any kind for this long with a tool in flight
+                # means the tool (or kimi) hung in an alive pane.
                 _logger.error(
                     "kimi forwarder: %d tool call(s) in flight but wire silent > %.0fs; "
                     "failing the turn as hung",
                     tools_in_flight,
                     tool_quiescence_s,
                 )
-                await _close_turn("failed", "tool-quiescence")
+                await _close_turn("failed", "tool-quiescence", _TOOL_HUNG_DETAIL)
             if not all_posted:
                 await _backoff_after_post_failure()
             await asyncio.sleep(poll_interval_s)
