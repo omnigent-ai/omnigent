@@ -286,7 +286,10 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
     cloneMutation.mutate(task.id, {
       onSuccess: (clone) => {
         showToast(cloneCreatedMessage(task));
-        navigate(`/tasks/${encodeURIComponent(clone.id)}`);
+        // Without detail pages the copy stays here, on the refreshed list.
+        if (isFeatureEnabled(info, "automations_v2")) {
+          navigate(`/tasks/${encodeURIComponent(clone.id)}`);
+        }
       },
       onError: (err) => showToast(cloneFailedMessage(err)),
     });

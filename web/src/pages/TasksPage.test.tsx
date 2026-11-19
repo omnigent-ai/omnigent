@@ -793,7 +793,11 @@ describe("row actions", () => {
 });
 
 describe("cloning from the row menu", () => {
-  const CLONE_INFO = { ...TRIGGER_INFO, scheduled_task_clone: true };
+  const CLONE_INFO = {
+    ...TRIGGER_INFO,
+    scheduled_task_clone: true,
+    features: { ...TRIGGER_INFO.features, automations_v2: true },
+  };
 
   it("offers Clone only on a server that can clone", () => {
     setTasks([task()]);
@@ -816,6 +820,18 @@ describe("cloning from the row menu", () => {
       "Automation cloned. Pause or delete the original so they don't both run.",
     );
     expect(screen.getByTestId("task-detail-route")).toBeInTheDocument();
+  });
+
+  it("stays on the list when the server has no automation pages", () => {
+    setTasks([task({ id: "st_1" })]);
+    renderPage("/tasks", "", { ...TRIGGER_INFO, scheduled_task_clone: true });
+    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Clone" }));
+
+    act(() => cloneMutate.mock.calls[0][1].onSuccess(task({ id: "st_2" })));
+    expect(showToast).toHaveBeenCalledOnce();
+    expect(screen.queryByTestId("task-detail-route")).toBeNull();
+    expect(screen.getByTestId("tasks-list")).toBeInTheDocument();
   });
 
   it("stays on the list and shows the server's reason when the clone is refused", () => {

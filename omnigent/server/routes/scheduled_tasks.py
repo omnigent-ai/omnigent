@@ -482,10 +482,20 @@ def _inbox_cursor_task_id(task_id: str) -> str:
         return task_id
 
 
+# The scheduled_tasks.name column's length.
+_TASK_NAME_MAX_CHARS = 256
+_CLONE_NAME_SUFFIX = " (copy)"
+
+
+def _clone_name(name: str) -> str:
+    """*name* with the copy suffix, shortened to fit the name column."""
+    return name[: _TASK_NAME_MAX_CHARS - len(_CLONE_NAME_SUFFIX)] + _CLONE_NAME_SUFFIX
+
+
 def _clone_request(task: ScheduledTask) -> CreateScheduledTaskRequest:
     """The create body that copies *task*'s settings, leaving its continued session behind."""
     return CreateScheduledTaskRequest(
-        name=f"{task.name} (copy)",
+        name=_clone_name(task.name),
         prompt=task.prompt,
         rrule=task.rrule,
         agent_id=task.agent_id,
@@ -1255,6 +1265,9 @@ def create_scheduled_tasks_router(
                         if cloned_from is not None and cloned_from.state == "paused"
                         else "active"
                     ),
+                    # An interval schedule's phase follows the creation time, so a
+                    # clone keeps the original's to run on the same days.
+                    schedule_anchor=cloned_from.created_at if cloned_from is not None else None,
                 )
             except Exception as exc:
                 if source_copy is not None:

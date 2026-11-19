@@ -53,8 +53,9 @@ runs' sessions in their own Omnigent Automation folder.
   are shared with you yet.
 - `clone`: on a server advertising `scheduled_task_clone`, Clone on an
   automation's page (left of Edit) and in its row's ⋯ and right-click menus makes
-  a new automation named after it with (copy), with its settings and schedule and
-  none of its runs, and opens it. The copy has its own ID, so it can be shared
+  a new automation named after it with (copy), with its settings and schedule
+  (on the same days for an every-other-day rule) and none of its runs, and opens
+  it; without automation pages (`automations_v2` off) the list stays open. The copy has its own ID, so it can be shared
   where the original can't. A continue-session automation's copy starts its own
   session on its first run. The copy is paused when the original is (toast: The
   copy is paused like the original.); otherwise the toast says to pause or delete
@@ -139,7 +140,7 @@ uses, because the session Share button is disabled on a local server.
   `test_session_permissions_name_the_automation_that_manages_them` cover the
   routes, refusals, capability and the managed-session marker. The tests from
   `test_clone_copies_an_automations_settings_under_a_new_id` to
-  `test_clone_is_advertised_with_automations` cover cloning. The tests from
+  `test_a_reminder_cannot_be_cloned` cover cloning. The tests from
   `test_recipients_read_an_automation_its_runs_and_their_steps` to
   `test_a_shared_run_session_lists_with_its_run_labels` cover recipients' reads,
   refused changes, agents, the capability, the shared list and the run labels;

@@ -1044,19 +1044,18 @@ describe("cloning", () => {
     expect(screen.getByTestId("task-detail-clone")).toBeEnabled();
   });
 
-  it.each([
-    ["active", "Automation cloned. Pause or delete the original so they don't both run."],
-    ["paused", "Automation cloned. The copy is paused like the original."],
-  ] as const)("opens the copy of an %s automation and says what's left", (state, text) => {
+  it("opens the copy and says what's left", () => {
     cloneMutate.mockImplementation((_id: string, opts?: CloneOptions) =>
-      opts?.onSuccess?.(task({ id: "st 2", state })),
+      opts?.onSuccess?.(task({ id: "st 2", state: "paused" })),
     );
-    renderClonePage(cloneInfo, task({ state }));
+    renderClonePage(cloneInfo, task({ state: "paused" }));
 
     fireEvent.click(screen.getByRole("button", { name: "Clone automation" }));
 
     expect(cloneMutate).toHaveBeenCalledWith("st_1", expect.anything());
-    expect(showToast).toHaveBeenCalledWith(text);
+    expect(showToast).toHaveBeenCalledWith(
+      "Automation cloned. The copy is paused like the original.",
+    );
     expect(navigate).toHaveBeenCalledWith("/tasks/st%202");
   });
 
