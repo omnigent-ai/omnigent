@@ -913,21 +913,6 @@ function validCost(value) {
     : null;
 }
 
-// Fingerprint one assistant message so its re-emission on later lifecycle events counts once.
-// Identity fields come first: two distinct calls can report identical token counts,
-// so the usage-count fingerprint is a last resort for messages without one.
-function usageMessageKey(message, usage) {
-  if (message && typeof message === "object") {
-    if (typeof message.id === "string" && message.id)
-      return `id:${message.id}`;
-    if (typeof message.responseId === "string" && message.responseId)
-      return `rid:${message.responseId}`;
-    if (typeof message.timestamp === "number")
-      return `ts:${message.timestamp}`;
-  }
-  return `u:${usage.input}-${usage.output}-${usage.cacheRead}-${usage.cacheWrite}-${usage.total}-${usage.model || ""}`;
-}
-
 function headers(config) {
   return {
     "content-type": "application/json",
@@ -1184,7 +1169,6 @@ function writeJsonAtomic(filePath, value) {
   }
 }
 
-// Pi stores delegated sessions below the parent session directory.
 const _CHILD_POLL_MS = 2_000;
 // A child whose last reply ended its turn this long ago is reported idle.
 const _CHILD_QUIET_MS = 20_000;
@@ -1192,7 +1176,7 @@ const _CHILD_READ_CHUNK_BYTES = 1024 * 1024;
 // A longer record is skipped unbuffered: usage-bearing replies are far smaller, while
 // tool results carrying images can reach megabytes.
 const _CHILD_RECORD_MAX_BYTES = 16 * 1024 * 1024;
-// Each synchronous read pass stops starting new chunks after this long.
+// Each regular poll's synchronous read pass stops starting new chunks after this long.
 const _CHILD_READ_BUDGET_MS = 500;
 const _CHILD_TITLE_MAX_CHARS = 80;
 const _CHILD_HEADER_BYTES = 64 * 1024;
@@ -1279,7 +1263,7 @@ function validChildEntry(child) {
 
 // Register Pi subagent sessions as Omnigent children under their Pi session id and SET each one's
 // cumulative usage; cursors and totals persist together, so a relaunch never double counts.
-function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
+function createChildSessionWatcher(config, { sessionFile, now = Date.now, shutdownTimeoutMs = _HISTORY_SHUTDOWN_TIMEOUT_MS }) {
   const enabled = Boolean(config && config.serverUrl && config.sessionId && config.bridgeDir);
   const statePath = enabled ? path.join(config.bridgeDir, "pi_subagent_children.json") : null;
   const ignoredFiles = new Set();
@@ -1289,10 +1273,11 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
 
   function readState() {
     try {
-      const saved = JSON.parse(fs.readFileSync(statePath, "utf8"));
-      return { roots: saved.roots.filter(root => typeof root === "string"), children: saved.children.filter(validChildEntry) };
+      const text = fs.readFileSync(statePath, "utf8");
+      const saved = JSON.parse(text);
+      return { text, roots: saved.roots.filter(root => typeof root === "string"), children: saved.children.filter(validChildEntry) };
     } catch (_err) {
-      return { roots: [], children: [] };
+      return { text: null, roots: [], children: [] };
     }
   }
   const { roots, children } = readState();
@@ -1307,14 +1292,14 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
       if (!child) children.push(entry);
       else if (entry.offset > child.offset) Object.assign(child, entry, { childId: entry.childId || child.childId });
     }
-    writeJsonAtomic(statePath, {
-      roots,
-      children: children.map(({ postedKey: _postedKey, postedStatus: _status, ...child }) => child),
-    });
+    const state = { roots, children: children.map(({ postedKey: _postedKey, postedStatus: _status, ...child }) => child) };
+    // An unchanged checkpoint is not rewritten.
+    if (JSON.stringify(state) !== saved.text) writeJsonAtomic(statePath, state);
   }
 
   function discover(final) {
     for (const root of roots) {
+      // Pi stores delegated sessions below the parent session directory.
       const files = [];
       listSessionFiles(path.join(path.dirname(root), path.basename(root, ".jsonl")), 0, files);
       for (const file of files) {
@@ -1460,7 +1445,8 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
     const flush = ready => {
       // Once shutdown aborts this poll, it neither posts nor writes state.
       if (signal.aborted) return;
-      const readUntil = Math.min(Date.now() + _CHILD_READ_BUDGET_MS, readDeadline);
+      // The final poll reads until the shutdown deadline so no ready child is left unread.
+      const readUntil = final ? readDeadline : Math.min(Date.now() + _CHILD_READ_BUDGET_MS, readDeadline);
       ready.forEach(child => readNew(child, readUntil));
       persist();
       reports.push(...ready.map(child => report(child, final, signal)));
@@ -1502,11 +1488,11 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
       timer = null;
       // A hung request in the in-flight poll must not consume the final poll's budget.
       if (polling) pollAbort.abort();
-      const deadlineAt = Date.now() + _HISTORY_SHUTDOWN_TIMEOUT_MS;
+      const deadlineAt = Date.now() + shutdownTimeoutMs;
       const final = Promise.resolve(polling).catch(() => {})
         .then(() => Date.now() < deadlineAt && this.poll(true, deadlineAt));
       const bound = new AbortController();
-      await Promise.race([final.catch(() => {}), sleep(_HISTORY_SHUTDOWN_TIMEOUT_MS, bound.signal)]);
+      await Promise.race([final.catch(() => {}), sleep(shutdownTimeoutMs, bound.signal)]);
       bound.abort();
       // Nothing posts or writes state after shutdown returns.
       if (polling) pollAbort.abort();
@@ -2349,6 +2335,30 @@ module.exports = function (pi) {
   let completeCost = true;
   let usageModel = null;
   let lastPostedUsageKey = "";
+
+  // Build a stable fingerprint for one assistant message so the same message
+  // arriving on multiple lifecycle events is only counted once. Pi's
+  // ``AssistantMessage`` (``@earendil-works/pi-ai``) carries NO ``id`` field
+  // but DOES carry an optional provider ``responseId`` and a required numeric
+  // ``timestamp`` — both stable across the same message's re-emission on
+  // ``message_end`` / ``turn_end`` / ``agent_end``. Prefer those identity
+  // fields (plus a forward-compat ``id``) over the usage-count fingerprint:
+  // hashing counts alone collides two DISTINCT LLM calls that happen to report
+  // identical token counts (e.g. two identical short acks under prompt
+  // caching), which would silently drop the second call's tokens (undercount).
+  // The usage-count fingerprint stays only as a last resort for a message that
+  // carries no identity field at all.
+  function usageMessageKey(message, usage) {
+    if (message && typeof message === "object") {
+      if (typeof message.id === "string" && message.id)
+        return `id:${message.id}`;
+      if (typeof message.responseId === "string" && message.responseId)
+        return `rid:${message.responseId}`;
+      if (typeof message.timestamp === "number")
+        return `ts:${message.timestamp}`;
+    }
+    return `u:${usage.input}-${usage.output}-${usage.cacheRead}-${usage.cacheWrite}-${usage.total}-${usage.model || ""}`;
+  }
 
   // Fold one assistant message's usage into the cumulative session totals,
   // deduped by fingerprint. Returns true when it counted (totals advanced).

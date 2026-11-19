@@ -730,7 +730,7 @@ async function testQueuedPromptDuringStartupStaysRunningUntilAgentEnd() {
 // A parent session file with child session files beneath it, watched by the real module.
 // Posts are recorded once answered; an infinite delay never answers, and a stalled post
 // fails only when aborted, recording why and how many posts had arrived by then.
-function childFixture({ responseDelayMs = 0, postTimeoutMs, stalls = () => false } = {}) {
+function childFixture({ responseDelayMs = 0, postTimeoutMs, shutdownTimeoutMs, stalls = () => false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-children-"));
   harnesses.push({ pi: {}, fixtureRoot: root });
   const sessions = path.join(root, "sessions");
@@ -762,8 +762,23 @@ function childFixture({ responseDelayMs = 0, postTimeoutMs, stalls = () => false
   delete require.cache[EXT_PATH];
   const { createChildSessionWatcher } = require(EXT_PATH);
   const watcher = (now = Date.now) =>
-    createChildSessionWatcher(config, { sessionFile: () => parentFile, now });
+    createChildSessionWatcher(config, { sessionFile: () => parentFile, now, shutdownTimeoutMs });
   return { sessions, bridgeDir, parentFile, posts, stalled, watcher };
+}
+
+function writeChildFile(f, relative, text) {
+  const file = path.join(f.sessions, path.basename(f.parentFile, ".jsonl"), relative);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, text);
+  return file;
+}
+
+function childStatePath(f) {
+  return path.join(f.bridgeDir, "pi_subagent_children.json");
+}
+
+function toolResultLine(kib) {
+  return JSON.stringify({ type: "message", message: { role: "toolResult", content: "x".repeat(kib * 1024) } });
 }
 
 function childSessionLines({ id, parentFile, agent, startedAt = 1000 }) {
@@ -773,12 +788,12 @@ function childSessionLines({ id, parentFile, agent, startedAt = 1000 }) {
   ].map((line) => JSON.stringify(line) + "\n").join("");
 }
 
-function assistantLine(model, timestamp, input, output, stopReason = "toolUse") {
+function assistantLine(model, timestamp, input, output, stopReason = "toolUse", cost = 0) {
   return JSON.stringify({
     type: "message",
     message: {
       role: "assistant", model, timestamp, responseId: `r-${timestamp}`, stopReason,
-      usage: { input, output, cacheRead: 10, cacheWrite: 0, totalTokens: input + output + 10, cost: { total: 0 } },
+      usage: { input, output, cacheRead: 10, cacheWrite: 0, totalTokens: input + output + 10, cost: { total: cost } },
     },
   }) + "\n";
 }
@@ -790,11 +805,7 @@ function childUsage(posts, sessionId) {
 
 async function testChildSessionsAreRegisteredWithTheirOwnModels() {
   const f = childFixture();
-  const childDir = path.join(f.sessions, path.basename(f.parentFile, ".jsonl"));
-  const writeChild = (relative, text) => {
-    fs.mkdirSync(path.dirname(path.join(childDir, relative)), { recursive: true });
-    fs.writeFileSync(path.join(childDir, relative), text);
-  };
+  const writeChild = (relative, text) => writeChildFile(f, relative, text);
   writeChild("run-a/run-0/session.jsonl",
     // Launched in the same millisecond: the UUIDv7 ids differ only at the end.
     childSessionLines({ id: "01a1f1a6-6b58-7306-959e-c50b9edd4745", parentFile: f.parentFile, agent: "worker" }) +
@@ -846,10 +857,8 @@ async function testChildSessionsAreRegisteredWithTheirOwnModels() {
 
 async function testChildReadsIncrementallyAndSurvivesRestart() {
   const f = childFixture();
-  const file = path.join(f.sessions, path.basename(f.parentFile, ".jsonl"), "run", "session.jsonl");
-  fs.mkdirSync(path.dirname(file), { recursive: true });
   const second = assistantLine("model-a", 3000, 20, 2, "stop");
-  fs.writeFileSync(file,
+  const file = writeChildFile(f, "run/session.jsonl",
     childSessionLines({ id: "child", parentFile: f.parentFile, agent: "worker" }) +
     assistantLine("model-a", 2000, 100, 10) + second.slice(0, 30));
 
@@ -871,19 +880,50 @@ async function testChildReadsIncrementallyAndSurvivesRestart() {
   assert("a quiet child that ended its turn reports idle without a terminal edge",
     f.posts.some((p) => p.sessionId === "conv_child" && p.body.type === "subagent.status") &&
       !f.posts.some((p) => p.body.type === "external_session_status" && p.body.data.status !== "running"));
-  const state = JSON.parse(fs.readFileSync(path.join(f.bridgeDir, "pi_subagent_children.json"), "utf8"));
+  const state = JSON.parse(fs.readFileSync(childStatePath(f), "utf8"));
   assert("the cursor covers exactly the consumed bytes", state.children[0].offset === fs.statSync(file).size);
+  const renameSync = fs.renameSync;
+  let rewrites = 0;
+  fs.renameSync = (...args) => {
+    rewrites += 1;
+    return renameSync(...args);
+  };
+  try {
+    await f.watcher(later).poll();
+  } finally {
+    fs.renameSync = renameSync;
+  }
+  assert("an idle poll does not rewrite the checkpoint", rewrites === 0, String(rewrites));
 }
 
-function writeChildFile(f, relative, text) {
-  const file = path.join(f.sessions, path.basename(f.parentFile, ".jsonl"), relative);
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file, text);
-  return file;
-}
-
-function childStatePath(f) {
-  return path.join(f.bridgeDir, "pi_subagent_children.json");
+async function testTheFinalPollReadsEveryReadyChild() {
+  const f = childFixture();
+  const watcher = f.watcher();
+  const ids = ["one", "two", "three"];
+  const files = ids.map((id) => writeChildFile(f, `${id}/session.jsonl`,
+    childSessionLines({ id, parentFile: f.parentFile, agent: "worker" }) + assistantLine("model-a", 2000, 100, 10, "toolUse", 0.25)));
+  await watcher.poll();
+  files.forEach((file) => fs.appendFileSync(file, toolResultLine(1100) + "\n" + assistantLine("model-a", 3000, 20, 2, "stop", 0.25)));
+  // Whichever child is read first outlasts one regular read pass, well within the shutdown budget.
+  const readSync = fs.readSync;
+  const realNow = Date.now;
+  let skew = 0;
+  fs.readSync = (...args) => {
+    if (args[3] === 1024 * 1024) skew += 600;
+    return readSync(...args);
+  };
+  Date.now = () => realNow() + skew;
+  try {
+    await watcher.stop();
+  } finally {
+    fs.readSync = readSync;
+    Date.now = realNow;
+  }
+  const finalUsage = ids.map((id) => childUsage(f.posts, `conv_${id}`).at(-1));
+  assert("the final poll delivers every ready child's usage past one read pass",
+    finalUsage.every((data) => data?.cumulative_input_tokens === 140), JSON.stringify(finalUsage));
+  assert("a fully priced child reports its cumulative cost",
+    finalUsage.every((data) => data?.cost_complete === true && data.cumulative_cost_usd === 0.5), JSON.stringify(finalUsage));
 }
 
 async function testShutdownDrainsPastAStalledRegistration() {
@@ -927,7 +967,7 @@ async function testChildrenWrittenAfterTheLastPollAreReportedAtShutdown() {
   const watcher = f.watcher();
   await watcher.poll();
   // A tool result longer than one read chunk precedes the final usage.
-  const bigLine = JSON.stringify({ type: "message", message: { role: "toolResult", content: "x".repeat(1100 * 1024) } }) + "\n";
+  const bigLine = toolResultLine(1100) + "\n";
   writeChildFile(f, "run/session.jsonl",
     childSessionLines({ id: "late", parentFile: f.parentFile, agent: "worker" }) +
     bigLine + assistantLine("model-a", 2000, 100, 10));
@@ -1081,7 +1121,7 @@ async function testAnOversizedRecordIsSkippedWithoutBuffering() {
   const f = childFixture();
   const file = writeChildFile(f, "run/session.jsonl",
     childSessionLines({ id: "child", parentFile: f.parentFile, agent: "worker" }) + assistantLine("model-a", 2000, 100, 10) +
-    JSON.stringify({ type: "message", message: { role: "toolResult", content: "x".repeat(17 * 1024 * 1024) } }));
+    toolResultLine(17 * 1024));
   const concat = Buffer.concat;
   let largestBuffer = 0;
   Buffer.concat = (list, ...rest) => {
@@ -1111,7 +1151,7 @@ async function testShutdownStopsReadingAtItsDeadline() {
   const file = writeChildFile(f, "run/session.jsonl",
     childSessionLines({ id: "child", parentFile: f.parentFile, agent: "worker" }) + assistantLine("model-a", 2000, 100, 10));
   await watcher.poll();
-  const bigLine = JSON.stringify({ type: "message", message: { role: "toolResult", content: "x".repeat(1100 * 1024) } }) + "\n";
+  const bigLine = toolResultLine(1100) + "\n";
   fs.appendFileSync(file,
     bigLine + assistantLine("model-a", 3000, 20, 2) + bigLine + assistantLine("model-a", 4000, 30, 3));
   // Each full-chunk read appears to outlast the whole shutdown budget.
@@ -1162,16 +1202,14 @@ async function testShutdownStopsReadingAtItsDeadline() {
 }
 
 async function testShutdownIsBoundedWhenTheServerNeverResponds() {
-  const f = childFixture({ postTimeoutMs: 60_000, stalls: () => true });
-  const file = path.join(f.sessions, path.basename(f.parentFile, ".jsonl"), "run", "session.jsonl");
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file,
+  const f = childFixture({ postTimeoutMs: 60_000, shutdownTimeoutMs: 300, stalls: () => true });
+  writeChildFile(f, "run/session.jsonl",
     childSessionLines({ id: "hung", parentFile: f.parentFile, agent: "worker" }) + assistantLine("model-a", 2000, 1, 1));
   const watcher = f.watcher();
   watcher.poll();
   const startedAt = Date.now();
   await watcher.stop();
-  assert("shutdown stops waiting for a server that never responds", Date.now() - startedAt < 6_000);
+  assert("shutdown stops waiting for a server that never responds", Date.now() - startedAt < 1_000);
   assert("shutdown leaves no post of its final poll in flight",
     f.stalled.length === 2 && f.stalled.every((post) => post.reason === "AbortError"), JSON.stringify(f.stalled));
 }
@@ -1180,6 +1218,7 @@ async function testShutdownIsBoundedWhenTheServerNeverResponds() {
   try {
     await testChildSessionsAreRegisteredWithTheirOwnModels();
     await testChildReadsIncrementallyAndSurvivesRestart();
+    await testTheFinalPollReadsEveryReadyChild();
     await testShutdownDrainsPastAStalledRegistration();
     await testChildrenWrittenAfterTheLastPollAreReportedAtShutdown();
     await testAnAbortedPollStartsNoFurtherPosts();
