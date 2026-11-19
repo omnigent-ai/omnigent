@@ -2173,6 +2173,7 @@ const LANDING_IMPORT_DISMISSED_STORAGE_KEY = "omnigent:landing-import-dismissed"
 interface LandingDraftState {
   draft: LandingDraft | null;
   revision: number;
+  nestedProvisional?: ReturnType<typeof newTempConversation>;
 }
 const landingDrafts = new Map<string | null, LandingDraftState>();
 
@@ -2389,7 +2390,7 @@ function NewChatLandingContent({
   projectHomeName?: string;
   onSessionStarted?: () => void;
 }) {
-  const [draftState] = useState(() => {
+  const [draftState] = useState<LandingDraftState>(() => {
     const state = landingDrafts.get(siblingSourceId) ?? { draft: null, revision: 0 };
     landingDrafts.set(siblingSourceId, state);
     return state;
@@ -2722,9 +2723,14 @@ function NewChatLandingContent({
   // A draft parked at link consumption is the only copy a same-commit remount can
   // read, so it follows every edit; a submitted draft stays spent.
   useEffect(() => {
-    if (!syncsParkedDraftRef.current || submittedRef.current) return;
+    if (
+      !syncsParkedDraftRef.current ||
+      submittedRef.current ||
+      (siblingSourceId && draftState.nestedProvisional !== nestedProvisionalRef.current)
+    )
+      return;
     writeLandingDraft(draftState, { ...draftRef.current, fromLink: true });
-  }, [message, draftState]);
+  }, [message, draftState, siblingSourceId]);
   const [checkingDbcert, setCheckingDbcert] = useState(false);
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
@@ -3144,21 +3150,31 @@ function NewChatLandingContent({
 
   // Mirror the current draft fields into a ref every render so the unmount
   // cleanup below can snapshot the latest values without re-subscribing.
-  // `submittedRef` is flipped once the draft is sent to a create, so the
+  // `submittedRef` is flipped once the draft is submitted, so the
   // snapshot is dropped instead of resurrected.
   const submittedRef = useRef(false);
-  const [nestedProvisional, setNestedProvisional] = useState(newTempConversation);
+  const [nestedProvisional, setNestedProvisional] = useState(
+    () => (draftState.nestedProvisional ??= newTempConversation()),
+  );
+  const nestedProvisionalRef = useRef(nestedProvisional);
+  nestedProvisionalRef.current = nestedProvisional;
+  const clearNestedDraft = useCallback(
+    (id: string) => {
+      if (draftState.nestedProvisional?.id !== id) return;
+      draftState.nestedProvisional = undefined;
+      writeLandingDraft(draftState, null);
+      forgetKeptLinkedPrompt(siblingSourceId, null);
+    },
+    [draftState, siblingSourceId],
+  );
   const siblingSourceRef = useRef(siblingSource);
   siblingSourceRef.current = siblingSource;
   const siblingSourceKey = siblingSource?.id;
   useEffect(() => {
     const source = siblingSourceRef.current;
-    if (!source || submittedRef.current) return;
-    addNestedSessionDraft(queryClient, nestedProvisional.id, source);
-    return () => {
-      if (!submittedRef.current) removeNestedSessionDraft(queryClient, nestedProvisional.id);
-    };
-  }, [queryClient, nestedProvisional, siblingSourceKey]);
+    if (!source || draftState.nestedProvisional !== nestedProvisional) return;
+    addNestedSessionDraft(queryClient, nestedProvisional.id, source, clearNestedDraft);
+  }, [queryClient, nestedProvisional, siblingSourceKey, clearNestedDraft, draftState]);
   const submittedDraftRevisionRef = useRef<number | null>(null);
   // Whether this composer is still on screen. The create POST can outlive
   // it — the user opens another session while the session bootstraps — and
@@ -3200,12 +3216,14 @@ function NewChatLandingContent({
     return () => {
       onScreenRef.current = false;
       if (!submittedRef.current) {
-        writeLandingDraft(draftState, draftRef.current);
+        if (!siblingSourceId || draftState.nestedProvisional === nestedProvisionalRef.current) {
+          writeLandingDraft(draftState, draftRef.current);
+        }
       } else if (submittedDraftRevisionRef.current === draftState.revision) {
         writeLandingDraft(draftState, null);
       }
     };
-  }, [draftState]);
+  }, [draftState, siblingSourceId]);
 
   const { recent, addRecent } = useRecentWorkspaces(selectedHostId);
   const { addRecentHarness } = useRecentHarnesses();
@@ -6199,6 +6217,12 @@ function NewChatLandingContent({
   // including when they navigated away and the unmount cleanup already
   // dropped it on the strength of the submit.
   function returnDraftToUser(temporaryConversationId?: string) {
+    if (
+      siblingSource &&
+      !submittedRef.current &&
+      draftState.nestedProvisional !== nestedProvisional
+    )
+      return;
     submittedRef.current = false;
     if (submittedLinkedPromptRef.current !== null) {
       submittedKeptPromptIds.delete(submittedLinkedPromptRef.current.id);
@@ -6206,8 +6230,10 @@ function NewChatLandingContent({
     }
     submittedDraftRevisionRef.current = null;
     removeNestedSessionDraft(queryClient, nestedProvisional.id);
-    if (siblingSource && onScreenRef.current) {
-      setNestedProvisional(newTempConversation());
+    if (siblingSource) {
+      const provisional = (draftState.nestedProvisional ??= newTempConversation());
+      addNestedSessionDraft(queryClient, provisional.id, siblingSource, clearNestedDraft);
+      if (onScreenRef.current) setNestedProvisional(provisional);
     }
     const originalDraft =
       temporaryConversationId && !hasPendingLocalMessage(temporaryConversationId)
@@ -6230,6 +6256,7 @@ function NewChatLandingContent({
   }
 
   async function handleCreate() {
+    if (siblingSource && draftState.nestedProvisional !== nestedProvisional) return;
     // Captured before any await: a newer prompt link can replace the kept record
     // while an earlier submit is still waiting on a pre-create check.
     const submittedLinkedPrompt = keptLinkedRef.current;
@@ -6324,11 +6351,13 @@ function NewChatLandingContent({
         setDbcertRequired(needsDbcert);
         if (needsDbcert) return;
       }
+      if (siblingSource && draftState.nestedProvisional !== nestedProvisional) return;
       // Spend the draft only once provisioning starts, after the laptop credential check.
       // A composer remounted in this commit would otherwise restore the submitted text.
       if (draftState.draft !== null) writeLandingDraft(draftState, null);
       submittedDraftRevisionRef.current = draftState.revision;
       submittedRef.current = true;
+      draftState.nestedProvisional = undefined;
       submittedLinkedPromptRef.current = submittedLinkedPrompt;
       if (submittedLinkedPrompt !== null) submittedKeptPromptIds.add(submittedLinkedPrompt.id);
       if (siblingSource) updateNestedSessionDraft(queryClient, nestedProvisional.id);
