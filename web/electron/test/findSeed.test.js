@@ -48,13 +48,19 @@ describe("FIND_SELECTION_SCRIPT", () => {
     assert.equal(window.eval(FIND_SELECTION_SCRIPT), "migration");
   });
 
-  it("reads the selected range of a focused text field", (t) => {
-    const window = page(t, `<textarea id="draft">please retry the build</textarea>`);
-    const draft = window.document.getElementById("draft");
-    draft.focus();
-    draft.setSelectionRange(7, 12);
-    assert.equal(window.eval(FIND_SELECTION_SCRIPT), "retry");
-  });
+  for (const [name, field] of [
+    ["textarea", `<textarea id="draft">please retry the build</textarea>`],
+    ["text input", `<input id="draft" type="text" value="please retry the build" />`],
+  ]) {
+    it(`reads the selected range of a focused ${name}`, (t) => {
+      const window = page(t, `<p id="reply">migration</p>${field}`);
+      window.getSelection().selectAllChildren(window.document.getElementById("reply"));
+      const draft = window.document.getElementById("draft");
+      draft.focus();
+      draft.setSelectionRange(7, 12);
+      assert.equal(window.eval(FIND_SELECTION_SCRIPT), "retry");
+    });
+  }
 
   it("never reads a password field, even through the document selection", (t) => {
     const window = page(t, `<input id="secret" type="password" value="hunter2" />`);

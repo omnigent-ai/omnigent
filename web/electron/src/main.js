@@ -3049,6 +3049,8 @@ function attachContextMenu(win) {
 const findBars = new Map();
 /** Count of find opens per shell window, so only the latest selection read applies. */
 const findOpenGenerations = new WeakMap();
+/** Per find bar, resolves once it has shown and its page can take a prefill. */
+const findBarsShown = new WeakMap();
 
 /**
  * Anchor a find bar to its parent's top-right content corner. Called at
@@ -3087,7 +3089,7 @@ function openFindBar(target) {
     isOpen && existing.isFocused() ? Promise.resolve(null) : readFindSeed(target.webContents);
   // A later open, even from inside the bar, supersedes a read still in flight.
   const prefill = (bar) =>
-    seed.then((text) => {
+    Promise.all([seed, findBarsShown.get(bar)]).then(([text]) => {
       if (findOpenGenerations.get(target) === generation) prefillFindBar(bar, text);
     });
   // The menu item opens the bar without a page keydown; the page must still
@@ -3096,9 +3098,7 @@ function openFindBar(target) {
   if (isOpen) {
     existing.focus();
     existing.webContents.send("omnigent:find-activate");
-    // A bar still loading can't receive the prefill until it first shows.
-    if (existing.isVisible()) void prefill(existing);
-    else existing.once("ready-to-show", () => void prefill(existing));
+    void prefill(existing);
     return;
   }
   const bar = new BrowserWindow({
@@ -3119,6 +3119,12 @@ function openFindBar(target) {
     },
   });
   findBars.set(target, bar);
+  findBarsShown.set(
+    bar,
+    new Promise((resolve) => {
+      bar.once("ready-to-show", resolve);
+    }),
+  );
   void bar.loadFile(FIND_PAGE);
 
   const reposition = () => positionFindBar(target, bar);
@@ -3142,8 +3148,8 @@ function openFindBar(target) {
   bar.once("ready-to-show", () => {
     reposition();
     bar.show();
-    void prefill(bar);
   });
+  void prefill(bar);
   bar.on("closed", () => {
     findBars.delete(target);
     if (target.isDestroyed()) return;

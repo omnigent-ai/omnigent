@@ -384,11 +384,7 @@ function loadNavigationHarness({
             focus: () => {
               bar.focused = true;
             },
-            visible: false,
-            isVisible: () => bar.visible,
-            show: () => {
-              bar.visible = true;
-            },
+            show: () => {},
             setBounds: () => {},
             isDestroyed: () => destroyed,
             close() {

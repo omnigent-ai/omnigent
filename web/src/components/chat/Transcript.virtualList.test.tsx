@@ -238,30 +238,31 @@ it("recognizes unhandled native find keyboard shortcuts", () => {
   ).toBe(false);
 });
 
-it("renders every bubble in normal flow after native find is detected", () => {
-  const scrollEl = document.createElement("div");
-
-  const view = render(list(false, scrollEl, vi.fn(), true));
-
-  expect(view.container.querySelector('[data-index="0"]')).toBeNull();
-  expect(view.container.querySelectorAll('[data-testid="message-bubble"]')).toHaveLength(1);
-});
-
-it("keeps a selection in mounted rows when native find turns virtualization off", () => {
+it("renders every bubble in normal flow after native find, keeping the selected row", () => {
   const scrollEl = document.createElement("div");
   const bubbles = [bubble, assistantBubble];
-  const view = render(list(false, scrollEl, vi.fn(), false, bubbles));
-  const reply = within(view.container).getByText("hello back");
-  const selected = reply.firstChild!;
-  const selection = window.getSelection()!;
-  selection.setBaseAndExtent(selected, 0, selected, 5);
+  // Mount only the reply, so turning virtualization off inserts a row before it.
+  const passThrough = vi.mocked(useVirtualizer).getMockImplementation()!;
+  vi.mocked(useVirtualizer).mockImplementation((options) => {
+    const row = { index: 1, key: options.getItemKey!(1), start: 0, size: 200, end: 200, lane: 0 };
+    return { ...passThrough(options), getVirtualItems: () => [row] } as never;
+  });
+  try {
+    const view = render(list(false, scrollEl, vi.fn(), false, bubbles));
+    expect(view.container.querySelectorAll('[data-testid="message-bubble"]')).toHaveLength(1);
+    const selected = within(view.container).getByText("hello back").firstChild!;
+    const selection = window.getSelection()!;
+    selection.setBaseAndExtent(selected, 0, selected, 5);
 
-  view.rerender(list(false, scrollEl, vi.fn(), true, bubbles));
+    view.rerender(list(false, scrollEl, vi.fn(), true, bubbles));
 
-  expect(view.container.querySelector('[data-index="0"]')).toBeNull();
-  expect(selected.isConnected).toBe(true);
-  expect(within(view.container).getByText("hello back").firstChild).toBe(selected);
-  expect(selection.toString()).toBe("hello");
+    expect(view.container.querySelector("[data-index]")).toBeNull();
+    expect(view.container.querySelectorAll('[data-testid="message-bubble"]')).toHaveLength(2);
+    expect(within(view.container).getByText("hello back").firstChild).toBe(selected);
+    expect(selection.toString()).toBe("hello");
+  } finally {
+    vi.mocked(useVirtualizer).mockImplementation(passThrough);
+  }
 });
 
 it("keeps actions visible only on a final assistant message while idle", () => {
