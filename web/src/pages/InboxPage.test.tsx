@@ -1600,7 +1600,7 @@ describe("InboxPage bulk actions", () => {
     const items = await screen.findAllByRole("menuitem");
     expect(items[0]).toHaveTextContent("Mark done as readNo completed sessions");
     expect(items[0]).toHaveAttribute("aria-disabled", "true");
-    expect(items[1]).toHaveTextContent("3 unread items, including errors and comments");
+    expect(items[1]).toHaveTextContent("Mark all as read2 errors and 1 comment");
     fireEvent.keyDown(items[0]!, { key: "Escape" });
 
     fireEvent.click(await screen.findByRole("button", { name: "Undo" }));
@@ -1613,7 +1613,7 @@ describe("InboxPage bulk actions", () => {
 
     openBulkMenu();
     const markAll = await screen.findByRole("menuitem", { name: /Mark all as read/ });
-    expect(markAll).toHaveTextContent("4 unread items, including errors and comments");
+    expect(markAll).toHaveTextContent("4 unread items, including 2 errors and 1 comment");
     fireEvent.click(markAll);
 
     await waitFor(() => expect(unreadKinds()).toEqual([]));

@@ -630,9 +630,12 @@ export function InboxPage() {
     ({ row }) => replyStatuses[row.id]?.state !== "sending" && !replyDrafts[row.id]?.trim(),
   );
   const doneTargets = bulkUnread.filter((item) => item.kind === "done");
-  const hasErrorTargets = bulkUnread.length > doneTargets.length || visibleAutomations.length > 0;
+  const errorTargetCount = bulkUnread.length - doneTargets.length + visibleAutomations.length;
   const allReadCount = bulkUnread.length + visibleComments.length + visibleAutomations.length;
-  const allReadIncludes = [hasErrorTargets && "errors", visibleComments.length > 0 && "comments"]
+  const allReadIncludes = [
+    errorTargetCount > 0 && countOf(errorTargetCount, "error", "errors"),
+    visibleComments.length > 0 && countOf(visibleComments.length, "comment", "comments"),
+  ]
     .filter(Boolean)
     .join(" and ");
   const bulkLoadedOnly = hasNextPage || (showUnread && automationInbox.hasNextPage);
@@ -1496,7 +1499,7 @@ function InboxBulkActions({
   showRead: boolean;
   doneCount: number;
   allCount: number;
-  /** What the wider read action adds beyond Done, e.g. "errors and comments". */
+  /** What the wider read action adds beyond Done, e.g. "1 error and 2 comments". */
   allIncludes: string;
   /** The tab lists awaiting responses. */
   showDecline: boolean;
@@ -1548,7 +1551,11 @@ function InboxBulkActions({
         {showReadItems && extraCount > 0 && (
           <BulkMenuItem
             label="Mark all as read"
-            detail={`${countOf(allCount, "unread item", "unread items")}, including ${allIncludes}`}
+            detail={
+              doneCount > 0
+                ? `${countOf(allCount, "unread item", "unread items")}, including ${allIncludes}`
+                : allIncludes
+            }
             onSelect={select("inbox.bulk.mark_all_read", onMarkAllRead)}
           />
         )}
