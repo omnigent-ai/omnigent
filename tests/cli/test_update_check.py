@@ -774,8 +774,8 @@ def test_read_wheel_info_repairs_redacted_ssh_user(
     # runnable form — not the broken ``****@`` URL.
     assert suggestion.runnable is True
     assert (
-        suggestion.command
-        == f"uv tool install --reinstall --link-mode copy{_UV_PY} git+ssh://git@github.com/omnigent-ai/omnigent.git"
+        suggestion.command == f"uv tool install --reinstall --link-mode copy{_UV_PY} "
+        "git+ssh://git@github.com/omnigent-ai/omnigent.git"
     )
 
 

@@ -2598,11 +2598,7 @@ async def test_launch_discards_previous_exit_diagnostics_before_starting(
     monkeypatch.setattr(
         terminal_mod,
         "asyncio",
-        SimpleNamespace(
-            create_subprocess_exec=spawn,
-            subprocess=asyncio.subprocess,
-            to_thread=asyncio.to_thread,
-        ),
+        SimpleNamespace(**{**vars(asyncio), "create_subprocess_exec": spawn}),
     )
     if launch_fails:
         with pytest.raises(RuntimeError, match="tmux launch failed"):
@@ -3409,7 +3405,7 @@ async def test_terminal_desktop_session_follows_sandbox_policy(
     monkeypatch.setattr(
         terminal_mod,
         "asyncio",
-        SimpleNamespace(create_subprocess_exec=spawn, subprocess=terminal_mod.asyncio.subprocess),
+        SimpleNamespace(**{**vars(asyncio), "create_subprocess_exec": spawn}),
     )
     monkeypatch.setattr(terminal_mod, "create_exec_launcher", lambda *_: "/test/launcher")
     instance = TerminalInstance(

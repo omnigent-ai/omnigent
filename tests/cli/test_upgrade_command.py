@@ -498,7 +498,8 @@ def test_upgrade_git_install_repulls_and_verifies_commit(
 
     assert result.exit_code == 0, result.output
     assert ran == [
-        f"uv tool install --reinstall --link-mode copy{_UV_PY} git+https://github.com/omnigent-ai/omnigent.git"
+        f"uv tool install --reinstall --link-mode copy{_UV_PY} "
+        "git+https://github.com/omnigent-ai/omnigent.git"
     ]
     assert "Updated to git bbbbbbbbb" in result.output
 
