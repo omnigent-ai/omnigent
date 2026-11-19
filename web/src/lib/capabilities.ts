@@ -267,6 +267,12 @@ export interface ServerInfo {
    */
   session_search_scope?: boolean;
   /**
+   * True when the server keeps the ``omnigent.muted`` label per viewer. Older
+   * servers would store it as a label every collaborator sees, so the client
+   * offers Mute only when this is set. Fails to ``false``.
+   */
+  session_mute?: boolean;
+  /**
    * True when scheduled tasks accept ``session_mode`` and ``session_id``.
    * Older servers reject the fields, so the automation dialog hides its
    * Session control there. Fails to ``false``.
@@ -541,6 +547,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   archive_worktree_cleanup: false,
   automations_enabled: true,
   session_search_scope: false,
+  session_mute: false,
   scheduled_task_session_modes: false,
   session_create_permission_modes: false,
   session_create_workflow_id: false,
@@ -732,6 +739,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
           automations_enabled: data.automations_enabled !== false,
           session_search_scope: data.session_search_scope === true,
+          session_mute: data.session_mute === true,
           scheduled_task_session_modes: data.scheduled_task_session_modes === true,
           session_create_permission_modes: data.session_create_permission_modes === true,
           session_create_workflow_id: data.session_create_workflow_id === true,
