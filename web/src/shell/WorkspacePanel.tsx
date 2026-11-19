@@ -163,6 +163,14 @@ function WorkspaceTabTooltip({
   );
 }
 
+/** Outcome callbacks for a shell close, which first waits on the user's confirmation. */
+export interface ShellCloseCallbacks {
+  /** The user confirmed; the shells' kill requests are on their way. */
+  onConfirmed?: () => void;
+  /** The kill request for this shell's tab failed, so the tab stays. */
+  onFailed?: (key: string) => void;
+}
+
 /** Close commands for an open tab; an absent command shows disabled. */
 interface OpenTabCloseActions {
   close?: () => void;
@@ -618,6 +626,7 @@ function FileTabsStrip({
               ref={active ? activeTabRef : undefined}
               role="button"
               tabIndex={0}
+              aria-label={name}
               aria-current={active}
               title={compact ? undefined : path}
               onClick={() => onFileSelect(path)}
@@ -750,6 +759,7 @@ function TerminalTabsStrip({
               ref={active ? activeTabRef : undefined}
               role="button"
               tabIndex={closing ? -1 : 0}
+              aria-label={name}
               aria-current={active}
               aria-busy={closing}
               title={compact ? undefined : name}
@@ -962,9 +972,9 @@ interface WorkspacePanelProps {
    *  non-interactive until it disappears. Null when no close is pending. */
   closingTerminalKey?: string | null;
   /** Close a single open shell tab by key. */
-  onCloseTerminal: (key: string) => void;
+  onCloseTerminal: (key: string, callbacks?: ShellCloseCallbacks) => void;
   /** Close several shell tabs at once, behind a single confirmation. */
-  onCloseTerminals: (keys: string[]) => void;
+  onCloseTerminals: (keys: string[], callbacks?: ShellCloseCallbacks) => void;
   /** Whether the rail is maximized (occupies the full content area). */
   maximized: boolean;
   /** Toggle the rail's maximized state. */
@@ -1157,8 +1167,9 @@ function WorkspacePanelImpl({
   const { browserSelected, sideChatSelected } = activeView;
   const terminalShown = activeView.terminalKey !== null;
   const returnPointRef = useRef<ReturnPoint | null>(null);
-  // Set when the user closes a tab, so closing the last one hides the rail (see below).
-  const userClosedTabRef = useRef(false);
+  // Tabs the user is closing, by strip key, mapped to whether the rail hides if their
+  // departure leaves no open tabs. Entries go once their tab leaves or its close fails.
+  const closeIntentsRef = useRef(new Map<string, boolean>());
   // The latest returnFrom, so a close that finishes later uses the tabs open by then.
   const returnFromRef = useRef<(point: ReturnPoint) => void>(() => {});
   // Bumped when the session changes or this rail unmounts, so late work can tell it left.
@@ -1178,10 +1189,11 @@ function WorkspacePanelImpl({
     target: "address" | "page";
   } | null>(null);
   const clearBrowserFocus = useCallback(() => setBrowserFocus(null), []);
-  const closeBrowserTab = async (tabId: string) => {
+  const closeBrowserTab = async (tabId: string, hideWhenLast = true) => {
     const viewId = browserViewId(conversationId, tabId);
     if (closingBrowserViews.has(viewId)) return;
-    userClosedTabRef.current = true;
+    const intentKey = `browser:${tabId}`;
+    closeIntentsRef.current.set(intentKey, hideWhenLast);
     closingBrowserViews.add(viewId);
     const order = nextCloseOrder();
     const returnPoint = returnPointRef.current?.tabId === tabId ? returnPointRef.current : null;
@@ -1194,11 +1206,15 @@ function WorkspacePanelImpl({
         },
       });
       if (result === "failed") {
+        closeIntentsRef.current.delete(intentKey);
         toast.error("Couldn't close browser tab. Try again.");
         return;
       }
       // "kept": an agent navigation reused the tab, so nothing closed.
-      if (result === "kept") return;
+      if (result === "kept") {
+        closeIntentsRef.current.delete(intentKey);
+        return;
+      }
       rememberClosedTab(conversationId, { kind: "browser", url }, order);
       // Switching tabs while the close was pending forgot the point; don't undo that switch.
       if (returnPoint && returnPointRef.current === returnPoint) returnFromRef.current(returnPoint);
@@ -1495,9 +1511,9 @@ function WorkspacePanelImpl({
     );
   };
   const selectedSideChatPane = renderSelectedSideChatPane();
-  const closeSideChat = (childId: string) =>
+  const closeSideChat = (childId: string, hideWhenLast = true) =>
     stopSideChat(childId, () => {
-      userClosedTabRef.current = true;
+      closeIntentsRef.current.set(`sidechat:${childId}`, hideWhenLast);
       sideChats.close(childId);
     });
 
@@ -1508,8 +1524,8 @@ function WorkspacePanelImpl({
   // identity each render and thrash the effect's add/remove cycle.
   // Closes a file tab without asking its viewer about unsaved edits.
   const closeFileNow = useCallback(
-    (path: string) => {
-      userClosedTabRef.current = true;
+    (path: string, hideWhenLast = true) => {
+      closeIntentsRef.current.set(`file:${path}`, hideWhenLast);
       rememberClosedTab(conversationId, { kind: "file", path });
       onCloseFile(path);
     },
@@ -1529,8 +1545,8 @@ function WorkspacePanelImpl({
   const handleCloseTab = useCallback(() => {
     if (selectedFilePath !== null) closeFile(selectedFilePath);
   }, [closeFile, selectedFilePath]);
-  const closePanel = (tab: DefaultWorkspaceTab) => {
-    userClosedTabRef.current = true;
+  const closePanel = (tab: DefaultWorkspaceTab, hideWhenLast = true) => {
+    closeIntentsRef.current.set(tab, hideWhenLast);
     rememberClosedTab(conversationId, { kind: "panel", tab });
     onClosePanel(tab);
   };
@@ -1560,35 +1576,48 @@ function WorkspacePanelImpl({
   ];
   const unpinnedTabs = availablePanels.filter((tab) => !pinnedTabs.includes(tab));
   const visibleOpenPanels = openPanels.filter((tab) => unpinnedTabs.includes(tab));
-  const closeTerminal = (key: string) => {
-    userClosedTabRef.current = true;
-    onCloseTerminal(key);
-  };
+  // Shells close only once the user confirms and their kill succeeds.
+  const shellCloseCallbacks = (keys: string[], hideWhenLast: boolean): ShellCloseCallbacks => ({
+    onConfirmed: () => {
+      for (const key of keys) closeIntentsRef.current.set(key, hideWhenLast);
+    },
+    onFailed: (key) => closeIntentsRef.current.delete(key),
+  });
+  const closeTerminal = (key: string) => onCloseTerminal(key, shellCloseCallbacks([key], true));
   const activePanelRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     scrollTabIntoView(activePanelRef.current);
   }, [rightRailTab]);
-  const openTabCount =
-    visibleOpenPanels.length +
-    openFiles.length +
-    openTerminals.length +
-    (showBrowserTab ? browsers.tabs.length : 0) +
-    sideChats.tabs.length;
-  // Closing the last open tab hides the rail rather than falling back to a fixed page.
-  // Tabs leaving any other way (a session switch, an agent closing its browser) don't.
-  const tabCountRef = useRef({ conversationId, count: openTabCount });
+  const openTabKeys = [
+    ...visibleOpenPanels,
+    ...openFiles.map((path) => `file:${path}`),
+    ...openTerminals,
+    ...(showBrowserTab ? browsers.tabs : []).map((tabId) => `browser:${tabId}`),
+    ...sideChats.tabs.map((childId) => `sidechat:${childId}`),
+  ];
+  const openTabCount = openTabKeys.length;
+  const openTabsSignature = JSON.stringify(openTabKeys);
+  // Closing the last open tab hides the rail rather than falling back to a fixed page, but
+  // only when every tab that just left was closed by the user with hiding allowed. Tabs
+  // leaving any other way (a session switch, an agent closing its shell) keep the rail.
+  const previousTabsRef = useRef({ conversationId, signature: openTabsSignature });
   useEffect(() => {
-    const previous = tabCountRef.current;
-    tabCountRef.current = { conversationId, count: openTabCount };
-    if (previous.conversationId !== conversationId || openTabCount > previous.count) {
-      userClosedTabRef.current = false;
+    const previous = previousTabsRef.current;
+    previousTabsRef.current = { conversationId, signature: openTabsSignature };
+    const intents = closeIntentsRef.current;
+    if (previous.conversationId !== conversationId) {
+      intents.clear();
       return;
     }
-    if (openTabCount === 0 && previous.count > 0 && userClosedTabRef.current) {
-      userClosedTabRef.current = false;
-      onHide?.();
-    }
-  }, [conversationId, openTabCount, onHide]);
+    const current: string[] = JSON.parse(openTabsSignature);
+    const removed = (JSON.parse(previous.signature) as string[]).filter(
+      (key) => !current.includes(key),
+    );
+    if (removed.length === 0) return;
+    const hide = current.length === 0 && removed.every((key) => intents.get(key) === true);
+    for (const key of removed) intents.delete(key);
+    if (hide) onHide?.();
+  }, [conversationId, openTabsSignature, onHide]);
   const showOpenTabs =
     !pending &&
     (visibleOpenPanels.length > 0 ||
@@ -1857,19 +1886,30 @@ function WorkspacePanelImpl({
   // Tabs that "Close other tabs" and "Close all tabs" close, in strip order. Shells
   // kill their processes, so they close together after one confirmation.
   const canCloseShells = isEditorLevel(permissionLevel);
-  const bulkClosableTabs: { key: string; closeNow: () => void; shell?: true }[] = [
-    ...visibleOpenPanels.map((tab) => ({ key: tab, closeNow: () => closePanel(tab) })),
-    ...openFiles.map((path) => ({ key: `file:${path}`, closeNow: () => closeFileNow(path) })),
+  // `closeNow` takes whether the rail may hide once the batch leaves no open tabs.
+  const bulkClosableTabs: {
+    key: string;
+    closeNow: (hideWhenLast: boolean) => void;
+    shell?: true;
+  }[] = [
+    ...visibleOpenPanels.map((tab) => ({
+      key: tab,
+      closeNow: (hide: boolean) => closePanel(tab, hide),
+    })),
+    ...openFiles.map((path) => ({
+      key: `file:${path}`,
+      closeNow: (hide: boolean) => closeFileNow(path, hide),
+    })),
     ...(canCloseShells ? openTerminals : [])
       .filter((key) => key !== closingTerminalKey)
       .map((key) => ({ key, closeNow: () => {}, shell: true as const })),
     ...(showBrowserTab ? browsers.tabs : []).map((tabId) => ({
       key: `browser:${tabId}`,
-      closeNow: () => void closeBrowserTab(tabId),
+      closeNow: (hide: boolean) => void closeBrowserTab(tabId, hide),
     })),
     ...sideChats.tabs.map((childId) => ({
       key: `sidechat:${childId}`,
-      closeNow: () => void closeSideChat(childId),
+      closeNow: (hide: boolean) => void closeSideChat(childId, hide),
     })),
   ];
   // The tab a bulk close keeps, selected once the closed tabs (and any file viewer among
@@ -1883,19 +1923,20 @@ function WorkspacePanelImpl({
     const option = panelOptionsRef.current.find((candidate) => candidate.key === pendingSelectKey);
     if (option && !option.active) option.select();
   }, [pendingSelectKey]);
-  // Closes every bulk-closable tab except `keepKey`, which is then shown.
+  // Closes every bulk-closable tab except `keepKey`, which is then shown. Only Close all
+  // (no keeper) may hide the rail: a kept pinned page leaves no open tab but stays shown.
   const closeTabsExcept = (keepKey: string | null) => {
     const closing = bulkClosableTabs.filter((tab) => tab.key !== keepKey);
     if (closing.length === 0) return;
+    const hideWhenLast = keepKey === null;
     const commit = () => {
       const shellKeys: string[] = [];
       for (const tab of closing) {
         if (tab.shell) shellKeys.push(tab.key);
-        else tab.closeNow();
+        else tab.closeNow(hideWhenLast);
       }
       if (shellKeys.length > 0) {
-        userClosedTabRef.current = true;
-        onCloseTerminals(shellKeys);
+        onCloseTerminals(shellKeys, shellCloseCallbacks(shellKeys, hideWhenLast));
       }
       setPendingSelectKey(keepKey);
     };

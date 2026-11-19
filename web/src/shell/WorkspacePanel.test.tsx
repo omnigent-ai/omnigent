@@ -31,6 +31,7 @@ import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import { subagentTabId } from "@/lib/subagentTabs";
 import type { Session } from "@/lib/types";
 import { type FileNavigationGuard, FileViewerContext } from "./FileViewerContext";
+import type { ShellCloseCallbacks } from "./WorkspacePanel";
 import type { ChangedSort } from "./FlatFileList";
 import type { RightRailTab } from "./railTabs";
 import {
@@ -468,7 +469,9 @@ describe("WorkspacePanel surface presentation", () => {
     expect(onClosePanel).toHaveBeenCalledWith("changes");
     expect(onCloseFile.mock.calls).toEqual([["README.md"]]);
     // Shells close together behind one confirmation.
-    expect(onCloseTerminals.mock.calls).toEqual([[["terminal:zsh", "terminal:bash"]]]);
+    expect(onCloseTerminals.mock.calls.map(([keys]) => keys)).toEqual([
+      ["terminal:zsh", "terminal:bash"],
+    ]);
     await waitFor(() => expect(openFileViewer).toHaveBeenCalledWith("notes.md"));
 
     onClosePanel.mockClear();
@@ -479,7 +482,7 @@ describe("WorkspacePanel surface presentation", () => {
     fireEvent.click(await screen.findByRole("menuitem", { name: "Close other tabs" }));
     expect(onClosePanel).toHaveBeenCalledWith("changes");
     expect(onCloseFile.mock.calls).toEqual([["README.md"], ["notes.md"]]);
-    expect(onCloseTerminals.mock.calls).toEqual([[["terminal:bash"]]]);
+    expect(onCloseTerminals.mock.calls.map(([keys]) => keys)).toEqual([["terminal:bash"]]);
     await waitFor(() => expect(openTerminalTab).toHaveBeenCalledWith("terminal:zsh"));
 
     onCloseFile.mockClear();
@@ -487,7 +490,9 @@ describe("WorkspacePanel surface presentation", () => {
     fireEvent.contextMenu(screen.getByTitle("bash"));
     fireEvent.click(await screen.findByRole("menuitem", { name: "Close all tabs" }));
     expect(onCloseFile.mock.calls).toEqual([["README.md"], ["notes.md"]]);
-    expect(onCloseTerminals.mock.calls).toEqual([[["terminal:zsh", "terminal:bash"]]]);
+    expect(onCloseTerminals.mock.calls.map(([keys]) => keys)).toEqual([
+      ["terminal:zsh", "terminal:bash"],
+    ]);
   });
 
   it("hides the rail when the user closes the last open tab", () => {
@@ -510,22 +515,97 @@ describe("WorkspacePanel surface presentation", () => {
     expect(onHide).toHaveBeenCalledOnce();
   });
 
+  it("keeps the rail when Close other tabs keeps a pinned page", async () => {
+    writePinnedWorkspaceTabs(["files", "subagents"]);
+    const { rerender, onCloseFile, onHide } = renderWorkspace({
+      rightRailTab: "files",
+      openFiles: ["README.md"],
+    });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Close other tabs" }));
+    expect(onCloseFile).toHaveBeenCalledWith("README.md");
+    rerender({ openFiles: [] });
+    expect(onHide).not.toHaveBeenCalled();
+  });
+
+  it("hides the rail only for shells the user confirmed closing", () => {
+    writePinnedWorkspaceTabs(["files", "subagents"]);
+    const { rerender, onCloseTerminal, onHide } = renderWorkspace({
+      openTerminals: ["terminal:zsh"],
+    });
+
+    // Cancelled: the shell's later removal by the agent keeps the rail.
+    fireEvent.click(screen.getByRole("button", { name: "Close zsh" }));
+    expect(onCloseTerminal).toHaveBeenCalledOnce();
+    rerender({ openTerminals: [] });
+    expect(onHide).not.toHaveBeenCalled();
+
+    rerender({ openTerminals: ["terminal:zsh"] });
+    fireEvent.click(screen.getByRole("button", { name: "Close zsh" }));
+    const callbacks = onCloseTerminal.mock.calls[1][1] as ShellCloseCallbacks;
+    callbacks.onConfirmed?.();
+    rerender({ openTerminals: [] });
+    expect(onHide).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the rail when the last tab leaves after an earlier tab was closed", () => {
+    writePinnedWorkspaceTabs(["files", "subagents"]);
+    const { rerender, onHide } = renderWorkspace({
+      openFiles: ["README.md"],
+      openTerminals: ["terminal:zsh"],
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "Close README.md" }));
+    rerender({ openFiles: [] });
+    // The agent closing the remaining shell is not a user close.
+    rerender({ openTerminals: [] });
+    expect(onHide).not.toHaveBeenCalled();
+  });
+
+  it("names icon-only file and shell tabs once crowded tabs compact", () => {
+    writePinnedWorkspaceTabs(["files", "subagents"]);
+    // A narrow strip whose tabs can't fit even at their narrowest labelled width.
+    vi.spyOn(Element.prototype, "clientWidth", "get").mockImplementation(function (this: Element) {
+      return this.hasAttribute("data-workspace-tabs-viewport") ? 100 : 0;
+    });
+    vi.spyOn(Element.prototype, "scrollWidth", "get").mockImplementation(function (this: Element) {
+      return this.parentElement?.hasAttribute("data-workspace-tabs-viewport") ? 400 : 0;
+    });
+    renderWorkspace({
+      selectedFilePath: "README.md",
+      openFiles: ["README.md", "notes.md"],
+      openTerminals: ["terminal:zsh"],
+    });
+
+    expect(document.querySelector("[data-compact]")).not.toBeNull();
+    expect(screen.queryByText("notes.md")).toBeNull();
+    expect(screen.getByRole("button", { name: "notes.md" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "zsh" })).toBeInTheDocument();
+    // The active tab keeps its own name alongside its close button.
+    expect(screen.getByRole("button", { name: "README.md" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Close README.md" })).toBeInTheDocument();
+  });
+
   it("asks the file on screen once before closing all tabs, and keeps them when declined", async () => {
     writePinnedWorkspaceTabs(["files", "subagents"]);
     let allowLeave = false;
     const fileGuard = vi.fn<FileNavigationGuard>((_path, _options, commit) => {
       if (allowLeave) commit();
     });
-    const { onCloseFile } = renderWorkspace({
+    const { onCloseFile, onClosePanel } = renderWorkspace({
       selectedFilePath: "README.md",
       openFiles: ["README.md", "notes.md"],
+      openPanels: ["changes"],
       fileGuard,
     });
 
     fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
     fireEvent.click(await screen.findByRole("menuitem", { name: "Close all tabs" }));
     expect(fileGuard).toHaveBeenCalledOnce();
+    // Declining keeps the whole batch, other kinds included.
     expect(onCloseFile).not.toHaveBeenCalled();
+    expect(onClosePanel).not.toHaveBeenCalled();
 
     allowLeave = true;
     fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
@@ -1118,7 +1198,7 @@ describe("WorkspacePanel shell tabs", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Close zsh · u-g9qopr" }));
 
-    expect(onCloseTerminal).toHaveBeenCalledWith(termKey);
+    expect(onCloseTerminal).toHaveBeenCalledWith(termKey, expect.any(Object));
     expect(openTerminalTab).not.toHaveBeenCalled();
   });
 
@@ -1718,6 +1798,34 @@ describe("WorkspacePanel browser tab", () => {
     await waitFor(() =>
       expect(toast.error).toHaveBeenCalledWith("Couldn't close browser tab. Try again."),
     );
+  });
+});
+
+describe("WorkspacePanel bulk close with browser tabs", () => {
+  it("keeps the rail and the browser tab when its close fails during Close all tabs", async () => {
+    writePinnedWorkspaceTabs(["files", "subagents"]);
+    const { rerender, onCloseFile, onHide } = renderWorkspace({
+      showBrowserTab: true,
+      openFiles: ["README.md"],
+    });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), {
+      button: 0,
+      ctrlKey: false,
+    });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Browser" }));
+
+    Object.assign(window, {
+      omnigentDesktop: { browserClose: vi.fn().mockRejectedValue(new Error("disconnected")) },
+    });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Close all tabs" }));
+    expect(onCloseFile).toHaveBeenCalledWith("README.md");
+    rerender({ openFiles: [] });
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith("Couldn't close browser tab. Try again."),
+    );
+    expect(screen.getByRole("tab", { name: "Browser 1" })).toBeInTheDocument();
+    expect(onHide).not.toHaveBeenCalled();
   });
 });
 
@@ -2401,7 +2509,7 @@ describe("WorkspacePanel desktop menu commands", () => {
     });
     focusRail();
     close();
-    expect(onCloseTerminal).toHaveBeenCalledWith("terminal:zsh");
+    expect(onCloseTerminal).toHaveBeenCalledWith("terminal:zsh", expect.any(Object));
   });
 
   it("leaves a shell open for a viewer, who has no close button either", () => {

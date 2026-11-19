@@ -80,6 +80,9 @@ with their own terminal retain the switcher.
   In the Electron desktop app, Cmd/Ctrl+W also closes the selected visible
   workspace tab, using the same terminal confirmation. A read-only viewer's
   terminal stays open. Cmd/Ctrl+Shift+W closes the window.
+- Right-click any open workspace tab, or open the rail's panel picker (⌄), and
+  choose Close other tabs or Close all tabs. Shells in the batch close together
+  after one confirmation ("Close N shells?"); cancelling keeps them open.
 
 **After the session moves:** open the host badge, choose "Switch host…", pick
 another host or a new sandbox, then look at both the terminal strip and the

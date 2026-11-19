@@ -80,7 +80,12 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   // network-backed hooks are replaced.
   ...(await importOriginal<typeof UseTerminalsModule>()),
   useTerminals: vi.fn(() => ({ terminals: [], isLoading: false, error: null })),
-  useDeleteTerminal: vi.fn(() => ({ mutate: vi.fn(), isPending: false, isError: false })),
+  useDeleteTerminal: vi.fn(() => ({
+    mutate: vi.fn(),
+    mutateAsync: vi.fn(() => Promise.resolve()),
+    isPending: false,
+    isError: false,
+  })),
   useCreateTerminal: vi.fn(() => ({ mutate: vi.fn(), launch: vi.fn(), isPending: false })),
 }));
 
@@ -766,10 +771,10 @@ beforeEach(() => {
     isLoading: false,
     error: null,
   });
-  deleteTerminalMutate = vi.fn();
+  deleteTerminalMutate = vi.fn(() => Promise.resolve());
   useDeleteTerminalMock.mockReset();
   useDeleteTerminalMock.mockReturnValue({
-    mutate: deleteTerminalMutate,
+    mutateAsync: deleteTerminalMutate,
     isPending: false,
     isError: false,
   } as unknown as ReturnType<typeof useDeleteTerminal>);
@@ -2050,6 +2055,46 @@ describe("Chat-mode terminal panel layout", () => {
     // No delete, and the shell's xterm is still mounted.
     expect(deleteTerminalMutate).not.toHaveBeenCalled();
     expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent("terminal_main");
+  });
+
+  it("confirms a bulk shell close once and moves the selection to the kept shell", async () => {
+    writeSessionWorkspaceState("conv_abc", {
+      open: true,
+      selectedTerminalKey: "terminal:terminal_a",
+    });
+    useEnvironmentMock.mockReturnValue({
+      data: { available: true, root: null },
+      isLoading: false,
+    } as unknown as ReturnType<typeof useWorkspaceEnvironment>);
+    mockConversations([{ id: "conv_abc", permission_level: 4 }]);
+    useTerminalsMock.mockReturnValue({
+      terminals: [
+        { id: "terminal_a", name: "a", session: "u-1", running: true },
+        { id: "terminal_b", name: "b", session: "u-1", running: true },
+        { id: "terminal_c", name: "c", session: "u-1", running: true },
+      ],
+      isLoading: false,
+      error: null,
+    });
+
+    renderShell("/c/conv_abc");
+
+    const closeOthersOf = async (label: string) => {
+      fireEvent.contextMenu(screen.getByTitle(label));
+      fireEvent.click(await screen.findByRole("menuitem", { name: "Close other tabs" }));
+    };
+    // Cancelling the single confirmation kills nothing.
+    await closeOthersOf("c · u-1");
+    expect(screen.getByRole("dialog")).toHaveTextContent("Close 2 shells?");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(deleteTerminalMutate).not.toHaveBeenCalled();
+
+    await closeOthersOf("c · u-1");
+    fireEvent.click(screen.getByRole("button", { name: "Close shells" }));
+    expect(deleteTerminalMutate.mock.calls).toEqual([["terminal_a"], ["terminal_b"]]);
+    await waitFor(() =>
+      expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent("terminal_c"),
+    );
   });
 
   it("hides the shell close affordance from a read-only viewer", () => {

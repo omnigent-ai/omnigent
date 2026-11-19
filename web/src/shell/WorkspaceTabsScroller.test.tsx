@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { act, render, screen } from "@testing-library/react";
 
-import { scrollTabIntoView, shouldCompactTabs } from "./WorkspaceTabsScroller";
+import {
+  scrollTabIntoView,
+  shouldCompactTabs,
+  useCompactWorkspaceTabs,
+  WorkspaceTabsScroller,
+} from "./WorkspaceTabsScroller";
 
 function rect(left: number, width: number): DOMRect {
   return { left, right: left + width, width, top: 0, bottom: 20, height: 20 } as DOMRect;
@@ -92,5 +98,66 @@ describe("shouldCompactTabs", () => {
     expect(
       shouldCompactTabs({ compact: true, contentWidth: 0, viewportWidth: 0, fullWidth: 300 }),
     ).toBe(true);
+  });
+});
+
+describe("WorkspaceTabsScroller compact mode", () => {
+  function CompactProbe() {
+    return <span data-testid="probe">{useCompactWorkspaceTabs() ? "icons" : "labels"}</span>;
+  }
+
+  it("compacts crowded tabs, restores labels when they fit, and remeasures on a tab change", () => {
+    const resizeCallbacks: ResizeObserverCallback[] = [];
+    vi.stubGlobal(
+      "ResizeObserver",
+      class {
+        constructor(callback: ResizeObserverCallback) {
+          resizeCallbacks.push(callback);
+        }
+        observe() {}
+        disconnect() {}
+      },
+    );
+    let viewportWidth = 100;
+    // Labelled tabs at their narrowest; icon-only tabs are narrower still.
+    let labelledWidth = 300;
+    const compactWidth = 80;
+    vi.spyOn(Element.prototype, "clientWidth", "get").mockImplementation(function (this: Element) {
+      return this.hasAttribute("data-workspace-tabs-viewport") ? viewportWidth : 0;
+    });
+    vi.spyOn(Element.prototype, "scrollWidth", "get").mockImplementation(function (this: Element) {
+      if (!this.parentElement?.hasAttribute("data-workspace-tabs-viewport")) return 0;
+      return this.hasAttribute("data-compact") ? compactWidth : labelledWidth;
+    });
+    const resize = () =>
+      act(() => {
+        for (const callback of resizeCallbacks) callback([], {} as ResizeObserver);
+      });
+
+    const view = render(
+      <WorkspaceTabsScroller tabCount={3}>
+        <CompactProbe />
+      </WorkspaceTabsScroller>,
+    );
+    expect(screen.getByTestId("probe")).toHaveTextContent("icons");
+
+    // Wide enough for the labelled tabs again.
+    viewportWidth = 300;
+    resize();
+    expect(screen.getByTestId("probe")).toHaveTextContent("labels");
+
+    viewportWidth = 100;
+    resize();
+    expect(screen.getByTestId("probe")).toHaveTextContent("icons");
+
+    // Closing tabs remeasures with labels, which now fit the narrow strip.
+    labelledWidth = 90;
+    view.rerender(
+      <WorkspaceTabsScroller tabCount={1}>
+        <CompactProbe />
+      </WorkspaceTabsScroller>,
+    );
+    expect(screen.getByTestId("probe")).toHaveTextContent("labels");
+    vi.unstubAllGlobals();
   });
 });

@@ -67,7 +67,7 @@ import {
 } from "@/shell/FileViewerContext";
 import type { RightRailTab } from "@/shell/railTabs";
 import type { ChangedSort } from "@/shell/FlatFileList";
-import { WorkspacePanel } from "@/shell/WorkspacePanel";
+import { type ShellCloseCallbacks, WorkspacePanel } from "@/shell/WorkspacePanel";
 import { revealFolderInFilesPanel } from "@/shell/FilesPanel";
 import { selectPullRequestInPanel } from "@/shell/PullRequestPanel";
 import { citedFilePosition } from "@/shell/filePositionState";
@@ -234,9 +234,12 @@ export function GridSessionPane({
   }, [sessionId]);
   const deleteTerminal = useDeleteTerminal(sessionId);
   const closingTerminal = terminals.find((terminal) => terminal.id === deleteTerminal.variables);
-  const [pendingClose, setPendingClose] = useState<string[] | null>(null);
+  const [pendingClose, setPendingClose] = useState<{
+    keys: string[];
+    callbacks?: ShellCloseCallbacks;
+  } | null>(null);
   const terminalsToClose = terminals.filter((terminal) =>
-    pendingClose?.includes(terminalTabKey(terminal)),
+    pendingClose?.keys.includes(terminalTabKey(terminal)),
   );
   const [workspace, setWorkspace] = useState<SessionWorkspaceState>(() => {
     const saved = readSessionWorkspaceState(sessionId);
@@ -518,18 +521,21 @@ export function GridSessionPane({
           )}
           <CloseShellDialog
             open={pendingClose !== null}
-            shellCount={pendingClose?.length}
+            shellCount={pendingClose?.keys.length}
             shellLabel={terminalsToClose.length === 1 ? terminalsToClose[0].name : null}
             onCancel={() => setPendingClose(null)}
             onConfirm={() => {
+              pendingClose?.callbacks?.onConfirmed?.();
               for (const terminal of terminalsToClose) {
                 const key = terminalTabKey(terminal);
-                deleteTerminal.mutate(terminal.id, {
-                  onSuccess: () => {
+                // mutateAsync settles per call; mutate's own callbacks fire only for the last one.
+                deleteTerminal.mutateAsync(terminal.id).then(
+                  () => {
                     if (workspace.selectedTerminalKey === key)
                       updateWorkspace({ selectedTerminalKey: null });
                   },
-                });
+                  () => pendingClose?.callbacks?.onFailed?.(key),
+                );
               }
               setPendingClose(null);
             }}
@@ -599,8 +605,10 @@ export function GridSessionPane({
                     ? terminalTabKey(closingTerminal)
                     : null
                 }
-                onCloseTerminal={(key) => setPendingClose([key])}
-                onCloseTerminals={(keys) => keys.length > 0 && setPendingClose(keys)}
+                onCloseTerminal={(key, callbacks) => setPendingClose({ keys: [key], callbacks })}
+                onCloseTerminals={(keys, callbacks) => {
+                  if (keys.length > 0) setPendingClose({ keys, callbacks });
+                }}
                 maximized={selected && workspacePanel.maximized}
                 permissionLevel={permissionLevel}
                 filesPanelSort={sort}
