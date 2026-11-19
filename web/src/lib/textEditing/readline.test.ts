@@ -12,7 +12,7 @@ import {
 /** The offset of `|` in `marked`, and the text without it. */
 function caret(marked: string): [string, number] {
   const offset = marked.indexOf("|");
-  return [marked.replace("|", ""), offset];
+  return [marked.slice(0, offset) + marked.slice(offset + 1), offset];
 }
 
 describe("readline boundaries", () => {
