@@ -212,6 +212,8 @@ async function send(request: DesignRequest, agentId: string): Promise<void> {
   let failure: string | null = null;
   let refused = false;
   let denied = false;
+  // Held back at the last moment, after the upload: back to waiting, or the account changed.
+  let heldBack: "wait" | "account" | null = null;
   try {
     await useChatStore.getState().send(request.text, agentId, [...request.files], {
       stableId: request.id,
@@ -228,6 +230,7 @@ async function send(request: DesignRequest, agentId: string): Promise<void> {
       },
       // Stopped while its POST was out, which then went through: it arrived.
       onAcceptedLate: () => delivered(request.id),
+      beforePost: () => postableNow(request, (why) => (heldBack = why)),
     });
   } catch (error) {
     failure = error instanceof Error ? error.message : String(error);
@@ -241,7 +244,16 @@ async function send(request: DesignRequest, agentId: string): Promise<void> {
     if (!denied && failure === null) delivered(request.id);
     return;
   }
-  if (denied) {
+  if (heldBack === "account") {
+    update(request.id, {
+      status: "failed",
+      slow: false,
+      error: ACCOUNT_CHANGED,
+      delivery: "refused",
+    });
+  } else if (heldBack === "wait") {
+    update(request.id, { status: "waiting", slow: false });
+  } else if (denied) {
     update(request.id, { status: "denied", slow: false, error: DENIED });
   } else if (failure !== null && !arrived.has(request.id)) {
     // Refused: it never reached the agent. Otherwise it may have (an unanswered POST).
@@ -252,6 +264,28 @@ async function send(request: DesignRequest, agentId: string): Promise<void> {
     markSent(request);
   }
   schedule();
+}
+
+/**
+ * Checked once its files are uploaded, just before it posts: a turn may have started from
+ * elsewhere, or another account signed in, meanwhile. Null when it may go; else why not.
+ */
+async function postableNow(
+  request: DesignRequest,
+  holdBack: (why: "wait" | "account") => void,
+): Promise<string | null> {
+  if (sessionState(request.conversationId)?.sessionStatus === "running") {
+    holdBack("wait");
+    return "A turn started while it was uploading";
+  }
+  const owner = owners.get(request.id);
+  if (owner === undefined) return null;
+  const signedIn = await fetchSignedInUserId();
+  if (signedIn === owner) return null;
+  // Can't tell who's signed in: wait, asking again before the next try.
+  if (signedIn === undefined) ownerConfirmedAt.delete(request.id);
+  holdBack(signedIn === undefined ? "wait" : "account");
+  return ACCOUNT_CHANGED;
 }
 
 /** Why a send failed, for the user: refused (it never reached the agent), or maybe arrived. */

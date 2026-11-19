@@ -234,6 +234,45 @@ describe("an external send that stops short", () => {
     expect(useChatStore.getState().status).toBe("idle");
   });
 
+  it("asks its caller once the upload is done, and posts only if nothing holds it back", async () => {
+    let finishUpload = () => {};
+    answerUpload(
+      () =>
+        new Promise<Response>((resolve) => {
+          finishUpload = () => resolve(jsonResponse({ id: "file_1", filename: "element.png" }));
+        }),
+      () => Promise.resolve(jsonResponse({ queued: true, item_id: "ci_mock" })),
+    );
+    const beforePost = vi.fn(async (): Promise<string | null> => "Another account is signed in");
+    const onError = vi.fn();
+    const uploads = () => fetchMock.mock.calls.filter(([url]) => String(url).endsWith(FILES));
+    const sendHeld = async (stableId: string) => {
+      const before = uploads().length;
+      const sending = useChatStore.getState().send("design request", "agent_xyz", shot(), {
+        external: true,
+        stableId,
+        onError,
+        beforePost,
+      });
+      await vi.waitFor(() => expect(uploads().length).toBe(before + 1));
+      expect(beforePost).not.toHaveBeenCalled();
+      finishUpload();
+      await sending;
+    };
+    await sendHeld("6".repeat(32));
+    expect(beforePost).toHaveBeenCalledOnce();
+    expect(onError).toHaveBeenCalledWith("Another account is signed in", true);
+    expect(posted()).toBe(false);
+    expect(useChatStore.getState().status).toBe("idle");
+    // Once nothing holds it back, the same request posts.
+    beforePost.mockClear();
+    beforePost.mockResolvedValue(null);
+    onError.mockClear();
+    await sendHeld("6".repeat(32));
+    expect(onError).not.toHaveBeenCalled();
+    expect(posted()).toBe(true);
+  });
+
   it("is refused when its upload fails before the POST", async () => {
     answerUpload(
       () => Promise.reject(new TypeError("Failed to fetch")),

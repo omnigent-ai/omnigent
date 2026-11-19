@@ -108,6 +108,23 @@ describe("design outbox", () => {
     expect(statusOf(id)).toBe("sent");
   });
 
+  it("waits again when a turn starts elsewhere while its screenshot uploads", async () => {
+    // The chat store asks once the upload is done, just before it would post.
+    send.mockImplementationOnce(async (_text, _agent, _files, opts) => {
+      setSession({ sessionStatus: "running" });
+      const heldBack = await opts?.beforePost?.();
+      if (heldBack) opts?.onError?.(heldBack, true);
+    });
+    const id = queueDesignRequest({ tabId: TAB, label: "Draw", text: "Green" });
+    await flush();
+    expect(send).toHaveBeenCalledOnce();
+    expect(statusOf(id)).toBe("waiting");
+    setSession({ sessionStatus: "idle" });
+    await flush();
+    expect(sentIds()).toEqual([id, id]);
+    expect(statusOf(id)).toBe("sent");
+  });
+
   it("waits behind the composer's queue, a model switch and a starting session", async () => {
     setSession({
       queuedMessages: [{ queueId: "q1", text: "first", conversationId: SESSION }] as never,

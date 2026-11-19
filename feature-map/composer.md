@@ -459,8 +459,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   enable Design mode instead, click an element, type an instruction in the
   floating popup, and use Send or Enter.
 - Change Settings → Always steer (on by default) to choose whether
-  busy-session follow-ups queue or send immediately. Existing queued messages
-  retain FIFO ordering.
+  busy-session Design-mode follow-ups queue or send immediately. Existing queued
+  messages retain FIFO ordering. Annotate/Draw requests ignore it: they wait above
+  the composer (Send/Enter, then Retry or Remove) until the turn ends.
 
 **New-session composer** (landing page, or New session):
 

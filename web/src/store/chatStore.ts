@@ -279,6 +279,8 @@ export interface SendOptions {
   external?: boolean;
   /** An external send resending one the server refused, so an item under its id proves nothing. */
   retriesRefused?: boolean;
+  /** Asked once uploads are done, just before posting: a reason given fails the send unposted. */
+  beforePost?: () => Promise<string | null>;
 }
 
 // Who hears of each send the runner takes, by its committed item's id and by the pending
@@ -3072,6 +3074,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ...(text.trim() ? [{ type: "input_text" as const, text }] : []),
       ];
       if (initialDraft && !initialSendPending()) return;
+      opts?.signal?.throwIfAborted();
+      const heldBack = opts?.beforePost ? await opts.beforePost() : null;
+      if (heldBack !== null) throw new Error(heldBack);
       opts?.signal?.throwIfAborted();
 
       // Promote "pending:<filename>" to real file_ids. Claude-native's

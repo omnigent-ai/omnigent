@@ -1,7 +1,7 @@
 import "fake-indexeddb/auto";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { browserViewId } from "@/hooks/useBrowserTabs";
-import { useChatStore } from "@/store/chatStore";
+import { useChatStore, type SendOptions } from "@/store/chatStore";
 import type * as Identity from "@/lib/identity";
 
 const identity = vi.hoisted(() => ({
@@ -578,6 +578,43 @@ describe("design outbox storage", () => {
     retryDesignRequest(id);
     await vi.waitFor(() => expect(status()?.status).not.toBe("failed"));
     expect(status()?.error).toBeUndefined();
+  });
+
+  it("doesn't post a request when another account signs in while its screenshot uploads", async () => {
+    const posts: string[] = [];
+    // Like the chat store: asks once the upload is done, and posts only if nothing holds it back.
+    const send = vi.fn(
+      async (text: string, _agent: string, _files?: File[], opts?: SendOptions) => {
+        if (posts.length === 0 && identity.signedIn === undefined) identity.signedIn = "bob";
+        const heldBack = await opts?.beforePost?.();
+        if (heldBack) opts?.onError?.(heldBack, true);
+        else posts.push(text);
+      },
+    );
+    useChatStore.setState({
+      conversationId: SESSION,
+      boundAgentId: "agent_1",
+      status: "idle",
+      sessionStatus: "idle",
+      startupPending: false,
+      queuedMessages: [],
+      pendingUserMessages: [],
+      pendingModelChange: null,
+      send,
+    });
+    const id = queueDesignRequest({ tabId: TAB, label: "Annotate", text: "Alice's" });
+    const status = () => useDesignOutbox.getState().requests.find((r) => r.id === id);
+    await vi.waitFor(() =>
+      expect(status()).toMatchObject({ status: "failed", delivery: "refused" }),
+    );
+    expect(status()?.error).toContain("Another account is signed in");
+    expect(posts).toEqual([]);
+    await designOutboxSaved();
+    expect((await records())[0]).toMatchObject({ id, userId: "alice" });
+    // Alice again: a Retry posts it.
+    identity.signedIn = "alice";
+    retryDesignRequest(id);
+    await vi.waitFor(() => expect(posts).toEqual(["Alice's"]));
   });
 
   it("makes a request queued before anyone was known the signed-in account's before it goes", async () => {
