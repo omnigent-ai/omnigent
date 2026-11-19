@@ -344,7 +344,10 @@ beside "Updated …", asks the agent to continue the plan from where it left off
 Continue, Run and Retry also ask it to resume or restart needed background
 tasks, agents and Omnigent sessions recursively, checking their state to avoid
 duplicating live or completed work. The header's Stop remains available while
-background tasks or child agents run after the main turn ends. A run's row on a
+background tasks or child agents run after the main turn ends. Once pressed, it
+shows a disabled **Stopping…** until the session stops working, then the play
+button. A stop message that doesn't go through brings Stop back, and so does
+another message the session takes, such as Continue. A run's row on a
 workflow's or an automation's page has the same buttons, and its strip and its
 graph the same task menus, which message the run's session. A summary line and a strip
 count the tasks in each state, and stay at the top as you scroll: hover a

@@ -116,6 +116,7 @@ import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSe
 import { applyJournalEntry } from "@/hooks/useSessionJournal";
 import { isFirstPlan } from "@/lib/sessionJournal";
 import { showTasksTabBesideChat } from "@/store/sessionTasksActions";
+import { notePlanStopReceipt, supersedePlanStop } from "@/store/planStops";
 import { noteSessionStreamClosed, noteSessionStreamOpen } from "@/lib/sessionStreamSignals";
 import { invalidateAgentCosts } from "@/hooks/useAgentCosts";
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
@@ -637,6 +638,8 @@ export interface PendingUserMessage {
   posted?: boolean;
   /** The send's POST has gone unanswered for {@link SEND_STILL_SENDING_AFTER_MS}. */
   stillSending?: boolean;
+  /** Replayed from the snapshot's `pending_inputs`: the session accepted it, though this page didn't post it. */
+  replayed?: boolean;
   /**
    * The server's pending-input id from the accepted POST. The bubble keeps
    * `tempId` as its React key, so this is its only link to the entry a
@@ -2956,6 +2959,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // target afterward would leak the message into the now-active session.
     // An explicit pin (navigate-first background POST) wins over the visible id.
     const submitConversationId = pinnedId ?? get().conversationId;
+    // The run's Stop in progress, which this message ends once the session takes it.
+    const endPlanStop = supersedePlanStop(submitConversationId);
     // Only the composer on screen takes back a send cut off by a reload (see
     // `unsentSendToRestore`); a side chat posts to its child beside the parent.
     const sentOnScreen = pinnedId === null || pinnedId === get().conversationId;
@@ -3087,6 +3092,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           return patch;
         });
       } else {
+        endPlanStop();
         // POST accepted: the server can now account for this message
         // (native: pending_inputs replay until the round-trip commits it;
         // non-native: already persisted). Mark the bubble settled — that is
@@ -3328,6 +3334,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // Pin the destination at submit time — see `send` above for why a late
     // resolve mis-routes to the session the user has since switched to.
     const submitConversationId = pinnedId ?? get().conversationId;
+    const endPlanStop = supersedePlanStop(submitConversationId);
 
     const { waitForPrior, rekey, releaseSend } = enterSendChain(submitConversationId);
 
@@ -3375,6 +3382,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           return patch;
         });
       } else {
+        endPlanStop();
         // POST accepted: the server persisted the visible receipt, so
         // navigation can rely on the snapshot — mark the echo settled
         // and drop any stash copy. Without this, an echo stashed by a
@@ -5501,6 +5509,7 @@ async function bindStream(
       const toPending = (p: PendingInput): PendingUserMessage => ({
         tempId: p.pendingId,
         content: p.content,
+        replayed: true,
         ...(p.createdBy !== undefined ? { author: p.createdBy } : {}),
       });
       let candidatePending: PendingUserMessage[];
@@ -9341,6 +9350,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
     }
     case "session_input_consumed": {
       applyToConversation({ startupPending: false });
+      // A native Stop's receipt places its message in the transcript.
+      if (sourceConversationId && event.clearedPendingId) {
+        notePlanStopReceipt(sourceConversationId, event.clearedPendingId, event.itemId);
+      }
       // A retry from another client may have delivered an undelivered message: clear
       // it now when the receipt names it (native ones do), and re-read either way,
       // superseding any failure read still in flight from before the delivery.

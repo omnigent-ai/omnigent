@@ -17,6 +17,7 @@ import { Button } from "@/components/ui/button";
 import { WorkflowGraphOverlay } from "@/components/workflows/WorkflowStepsGraph";
 import { useConversationEntryValue } from "@/hooks/useConversationEntryState";
 import { useNow } from "@/hooks/useNow";
+import { usePlanStopping } from "@/hooks/usePlanStopping";
 import { useSessionWorking } from "@/hooks/useSessionWorking";
 import { useWorkflowRunDescendants, useWorkflowRuns } from "@/hooks/useWorkflow";
 import { Link } from "@/lib/routing";
@@ -32,7 +33,7 @@ import {
   type WorkflowRunStarter,
   type WorkflowRunState,
 } from "@/lib/workflowRuns";
-import { planRunControl } from "@/shell/PlanRunButton";
+import { planRunButtonState, planRunControl } from "@/shell/PlanRunButton";
 import { StepGlyph } from "@/shell/TasksPanel";
 
 // A run's glyph: the Tasks tab's, for the step state its run state matches.
@@ -86,8 +87,12 @@ export function WorkflowRunRow({
   const nested = parentSessionId !== undefined;
   // Stop while the run's session works; play once it stopped with tasks left.
   const canAct = run.isCurrent && !run.archived && owned;
+  const stopping = usePlanStopping(canAct ? run.sessionId : null, sessionWorking);
   const control = canAct
-    ? planRunControl(progress, run.statuses, sessionWorking, run.planGraphRevision)
+    ? planRunButtonState(
+        planRunControl(progress, run.statuses, sessionWorking, run.planGraphRevision),
+        stopping,
+      )
     : null;
   // An action refreshes the list showing the row, and the run's own workflow's.
   const refreshKeys = [
@@ -95,7 +100,7 @@ export function WorkflowRunRow({
     ["workflow-run-descendants", workflowId],
     ...(run.workflowId && run.workflowId !== workflowId ? [["workflow-runs", run.workflowId]] : []),
   ];
-  const taskMenus = useRunTaskMenus(canAct ? run.sessionId : null, refreshKeys, run.id);
+  const taskMenus = useRunTaskMenus(canAct ? run.sessionId : null, refreshKeys, run.id, stopping);
   const [graphOpen, setGraphOpen] = useState(false);
   const sessionPath = `/c/${encodeURIComponent(run.sessionId)}`;
   const title = run.title || "Untitled session";
