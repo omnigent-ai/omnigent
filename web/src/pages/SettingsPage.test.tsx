@@ -2032,6 +2032,11 @@ describe("SettingsPage", () => {
     ).toBe("settings-always-steer-label");
   });
 
+  it("renders the General terminal clipboard row from its Settings catalog entry", () => {
+    renderPage("/settings/general");
+    expect(document.querySelector('[data-settings-item="terminal-clipboard"]')).not.toBeNull();
+  });
+
   it("renders the Sandbox Integrations rows from their Settings catalog entries", async () => {
     mocks.enabledConnections = ["github", "databricks"];
     renderPage("/settings/integrations");

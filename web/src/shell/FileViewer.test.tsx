@@ -269,6 +269,7 @@ interface RenderProps {
   /** Spy for the close affordance; defaults to a throwaway mock. */
   onClose?: () => void;
   onCloseTab?: () => void;
+  onExitFullScreen?: () => void;
   /** Sort order for the prev/next navigation; defaults to the component default. */
   sort?: ChangedSort;
   /** Enables the prev/next nav header when provided. */
@@ -299,6 +300,7 @@ function viewerTree({
   initialSearch = "",
   onClose = vi.fn(),
   onCloseTab,
+  onExitFullScreen,
   sort,
   onNavigateTo,
   escapeCloses = false,
@@ -323,6 +325,7 @@ function viewerTree({
           path={path}
           onClose={onClose}
           onCloseTab={onCloseTab ?? (escapeCloses ? onClose : undefined)}
+          onExitFullScreen={onExitFullScreen}
           sort={sort}
           onNavigateTo={onNavigateTo}
           onShare={onShare}
@@ -2733,6 +2736,76 @@ describe("FileViewer Escape closes the active tab", () => {
     fireEvent.keyDown(window, { key: "Escape" });
     window.removeEventListener("keydown", swallow, { capture: true });
     expect(onCloseTab).not.toHaveBeenCalled();
+  });
+});
+
+describe("FileViewer Escape exits full screen", () => {
+  it("exits full screen and keeps the tab open", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    const onCloseTab = vi.fn();
+    const onExitFullScreen = vi.fn();
+    render(viewerTree({ open: true, frameless: true, onCloseTab, onExitFullScreen }));
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onExitFullScreen).toHaveBeenCalledTimes(1);
+    expect(onCloseTab).not.toHaveBeenCalled();
+  });
+
+  it("keeps unsaved edits without a prompt, and a later Escape still guards them", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    const onCloseTab = vi.fn();
+    const onExitFullScreen = vi.fn();
+    const props = { open: true, frameless: true, path: "file1.md", onCloseTab };
+    const { rerender } = render(viewerTree({ ...props, onExitFullScreen }));
+    const draft = screen.getByRole("textbox", { name: "Draft text" });
+    fireEvent.change(draft, { target: { value: "Unsaved draft" } });
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onExitFullScreen).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Unsaved changes")).toBeNull();
+
+    rerender(viewerTree(props));
+    expect(draft).toHaveValue("Unsaved draft");
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+    expect(onCloseTab).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(onCloseTab).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps Escape after a click outside the viewer, since full screen hides the chat", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    const onExitFullScreen = vi.fn();
+    render(
+      <>
+        {viewerTree({
+          open: true,
+          frameless: true,
+          syncUrl: false,
+          onCloseTab: vi.fn(),
+          onExitFullScreen,
+        })}
+        <button type="button">Exit full screen</button>
+      </>,
+    );
+    fireEvent.mouseDown(screen.getByRole("button", { name: "Exit full screen" }));
+    // Page-wide Escape handlers, such as declining an approval, yield to the viewer.
+    expect(screen.getByTestId("file-viewer")).toHaveAttribute("data-escape-owner");
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(onExitFullScreen).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores Escape while focus is in a text field", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    const onExitFullScreen = vi.fn();
+    render(
+      <>
+        {viewerTree({ open: true, frameless: true, onCloseTab: vi.fn(), onExitFullScreen })}
+        <input aria-label="Notes" />
+      </>,
+    );
+    const input = screen.getByRole("textbox", { name: "Notes" });
+    input.focus();
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(onExitFullScreen).not.toHaveBeenCalled();
   });
 });
 
