@@ -436,7 +436,10 @@ describe("createGlobalShortcuts", () => {
    * refuses a chord already registered in any spelling. `pressed` counts each action; `ids`
    * picks which shortcuts the app builds.
    */
-  function shortcuts(settings = {}, { isMac = true, ids = ["show", "floatingComposer"] } = {}) {
+  function shortcuts(
+    settings = {},
+    { isMac = true, ids = ["show", "floatingComposer"], active } = {},
+  ) {
     let stored = structuredClone(settings);
     const live = new Map();
     const pressed = { show: 0, floatingComposer: 0 };
@@ -455,6 +458,7 @@ describe("createGlobalShortcuts", () => {
       },
       isMac,
       presses: Object.fromEntries(ids.map((id) => [id, () => (pressed[id] += 1)])),
+      active,
     });
     return {
       ...built,
@@ -486,6 +490,57 @@ describe("createGlobalShortcuts", () => {
     assert.deepEqual(s.pressed, { show: 1, floatingComposer: 0 });
     s.press("CommandOrControl+Shift+Space");
     assert.deepEqual(s.pressed, { show: 1, floatingComposer: 1 });
+  });
+
+  it("holds its chord only while active, and lets go when it isn't", () => {
+    let on = false;
+    const s = shortcuts({}, { active: { floatingComposer: () => on } });
+    s.floatingComposer.apply();
+    assert.deepEqual(s.registered(), []);
+    assert.equal(s.floatingComposer.current().error, undefined);
+    on = true;
+    s.floatingComposer.apply();
+    s.press("CommandOrControl+Shift+Space");
+    assert.deepEqual(s.pressed, { show: 0, floatingComposer: 1 });
+    on = false;
+    s.floatingComposer.apply();
+    assert.deepEqual(s.registered(), []);
+  });
+
+  it("keeps no chord from another shortcut while inactive, and loses it once active", async () => {
+    let on = false;
+    const s = shortcuts({}, { active: { floatingComposer: () => on } });
+    const taken = await s.show.set(
+      { enabled: true, accelerator: "CommandOrControl+Shift+Space" },
+      async () => true,
+    );
+    assert.equal(taken.ok, true);
+    on = true;
+    s.floatingComposer.apply();
+    assert.deepEqual(s.registered(), ["CommandOrControl+Shift+Space"]);
+    assert.match(s.floatingComposer.current().error, /Another Omnigent shortcut/);
+    s.press("CommandOrControl+Shift+Space");
+    assert.deepEqual(s.pressed, { show: 1, floatingComposer: 0 });
+  });
+
+  it("saves a chord while inactive without holding it, and holds it once active", async () => {
+    let on = false;
+    const s = shortcuts({}, { active: { floatingComposer: () => on } });
+    const result = await s.floatingComposer.set(
+      { enabled: true, accelerator: "Alt+Shift+K" },
+      async () => true,
+    );
+    assert.equal(result.ok, true);
+    assert.deepEqual(s.registered(), []);
+    assert.deepEqual(s.saved().floating_composer_shortcut, {
+      enabled: true,
+      accelerator: "Alt+Shift+K",
+    });
+    on = true;
+    s.floatingComposer.apply();
+    assert.deepEqual(s.registered(), ["Alt+Shift+K"]);
+    s.press("Alt+Shift+K");
+    assert.deepEqual(s.pressed, { show: 0, floatingComposer: 1 });
   });
 
   it("lets a shortcut the app doesn't build leave its default chord free", async () => {
