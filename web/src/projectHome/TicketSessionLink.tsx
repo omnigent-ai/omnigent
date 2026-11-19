@@ -2,7 +2,6 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { BotIcon, ChevronRightIcon } from "lucide-react";
 import { NeedsResponseBadge } from "@/components/NeedsResponseBadge";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
-import { Button } from "@/components/ui/button";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { fetchConversationById } from "@/hooks/useOpenSessionRow";
 import { useSessionBadgeStates } from "@/hooks/useSessionBadgeStates";
@@ -25,29 +24,6 @@ function useTicketSessionMetadata(sessionId: string, refresh: boolean) {
   const session = query.data;
   const title = session ? conversationDisplayLabel(session) : `Session ${sessionId.slice(0, 8)}`;
   return { query, title };
-}
-
-export function TicketResponseLink({
-  sessionId,
-  ticketId,
-}: {
-  sessionId: string;
-  ticketId: string;
-}) {
-  const { title } = useTicketSessionMetadata(sessionId, false);
-  return (
-    <Button
-      asChild
-      size="sm"
-      variant="outline"
-      className="h-auto min-h-8 max-w-full justify-start whitespace-normal text-left"
-    >
-      <Link to={ticketSessionSearch(ticketId, sessionId)} aria-label={`Respond to: ${title}`}>
-        <span className="min-w-0 wrap-anywhere">Respond to {title}</span>
-        <ChevronRightIcon aria-hidden className="shrink-0" />
-      </Link>
-    </Button>
-  );
 }
 
 export function TicketSessionLink({

@@ -259,8 +259,7 @@ describe("Project ticket board", () => {
         onCreated={vi.fn()}
       />,
     );
-    await screen.findByText("Needs response");
-    expect(screen.getByText("approval")).toBeInTheDocument();
+    expect(await screen.findByText("Needs response")).toHaveAttribute("title", "approval");
     fireEvent.click(screen.getByRole("button", { name: "Edit tags" }));
     fireEvent.click(screen.getByRole("button", { name: "Remove tag needs-human" }));
     await waitFor(() => expect(screen.queryByText("Needs response")).toBeNull());
@@ -707,15 +706,17 @@ describe("Project ticket board", () => {
           onCreated={vi.fn()}
         />,
       );
-      const request = await screen.findByRole("region", { name: "Response needed" });
-      const chat = await within(request).findByRole("link", {
+      const agents = await screen.findByRole("list", { name: "Involved agents" });
+      const chat = await within(agents).findByRole("link", {
         name: "Respond to: Design the board",
       });
-      const agents = screen.getByRole("list", { name: "Involved agents" });
-      const contact = within(agents).getByRole("link", { name: "Respond to: Design the board" });
-      expect(contact).toHaveTextContent("Needs response");
-      expect(contact).toHaveTextContent("Idle");
-      expect(within(contact).queryByRole("img", { name: /approval prompt/ })).toBeNull();
+      expect(screen.queryByText("Your response is needed")).toBeNull();
+      expect(screen.queryByRole("region", { name: "Response needed" })).toBeNull();
+      expect(screen.getAllByText("Needs response")).toHaveLength(2);
+      expect(chat).toHaveClass("bg-tag-pink");
+      expect(chat).toHaveTextContent("Needs response");
+      expect(chat).toHaveTextContent("Idle");
+      expect(within(chat).queryByRole("img", { name: /approval prompt/ })).toBeNull();
       expect(
         vi.mocked(fetchConversationById).mock.calls.filter(([id]) => id === "planner"),
       ).toHaveLength(1);
@@ -767,12 +768,12 @@ describe("Project ticket board", () => {
     );
     const agents = await screen.findByRole("region", { name: "Agents" });
     expect(await within(agents).findByText("Investigating the approach")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "More agents" }));
     expect(
-      await within(screen.getByRole("region", { name: "Response needed" })).findByRole("link", {
+      await within(agents).findByRole("link", {
         name: "Respond to: Verify the result",
       }),
     ).toHaveAttribute("href", "/?ticket=ticket&session=reviewer");
-    fireEvent.click(screen.getByRole("button", { name: "More agents" }));
     expect(await within(agents).findByText("Verifying the result")).toBeInTheDocument();
     expect(within(agents).getAllByRole("link", { name: /Shipping orchestrator/ })).toHaveLength(1);
     expect(
@@ -882,11 +883,9 @@ describe("Project ticket board", () => {
     ).toHaveAttribute("href", "/?ticket=ticket&session=worker");
     expect(screen.queryByRole("button", { name: "Edit agent involvement" })).toBeNull();
     expect(api.setTicketSessionInvolvement).not.toHaveBeenCalled();
-    expect(screen.getByRole("region", { name: "Response needed" })).toHaveTextContent(
-      "No response contact is recorded",
-    );
+    expect(screen.queryByRole("region", { name: "Response needed" })).toBeNull();
     expect(
-      screen.getByRole("link", { name: "Ask orchestrator to route response" }),
+      await screen.findByRole("link", { name: "Open chat with: Shipping orchestrator" }),
     ).toHaveAttribute("href", "/?ticket=ticket&session=orchestrator");
   });
 
@@ -914,7 +913,6 @@ describe("Project ticket board", () => {
     const agents = await screen.findByRole("region", { name: "Agents" });
     const respond = await within(agents).findByRole("link", { name: "Respond to: Plan the work" });
     expect(respond).toHaveTextContent("Needs response");
-    expect(agents).toHaveTextContent("a ticket comment does not answer it");
     fireEvent.change(screen.getByLabelText("Add a comment"), { target: { value: "I approve" } });
     await user.click(screen.getByRole("button", { name: "Comment" }));
     await waitFor(() =>

@@ -10,7 +10,7 @@ import { getProject } from "@/lib/projectsApi";
 import { Link } from "@/lib/routing";
 import { ticketSessionSearch } from "./projectHomeNavigation";
 import { TicketError } from "./TicketControls";
-import { TicketResponseLink, TicketSessionLink } from "./TicketSessionLink";
+import { TicketSessionLink } from "./TicketSessionLink";
 import {
   useTicketActions,
   useTicketInvolvementEnabled,
@@ -33,34 +33,7 @@ export function TicketAgents({ projectId, ticket }: { projectId: string; ticket:
   return (
     <section aria-label="Agents" className="space-y-2">
       <h3 className="text-sm font-medium">Agents</h3>
-      {responseTag ? (
-        <section
-          aria-label="Response needed"
-          className="space-y-2 rounded-lg border border-brand-accent/20 bg-tag-pink p-3 text-sm"
-        >
-          <p className="font-medium">Your response is needed</p>
-          {responseTag.value && <p className="wrap-anywhere">{responseTag.value}</p>}
-          {responseSessionId ? (
-            <TicketResponseLink sessionId={responseSessionId} ticketId={ticket.id} />
-          ) : (
-            <>
-              <p className="text-muted-foreground">
-                No response contact is recorded. Use an agent’s Respond action below for an open
-                prompt, or ask the orchestrator to route your response.
-              </p>
-              <Button asChild variant="outline" size="sm">
-                <Link to={ticketSessionSearch(ticket.id, orchestratorId ?? undefined)}>
-                  Ask orchestrator to route response
-                </Link>
-              </Button>
-            </>
-          )}
-          <p className="text-muted-foreground">
-            Answer any open approval prompt in its agent’s chat; a ticket comment does not answer
-            it.
-          </p>
-        </section>
-      ) : (
+      {!responseTag && (
         <p className="text-sm text-muted-foreground">
           Open a chat to discuss this ticket or answer an agent’s prompt.
         </p>
