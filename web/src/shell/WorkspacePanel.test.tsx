@@ -1428,7 +1428,7 @@ describe("WorkspacePanel maximize", () => {
     expect(onToggleMaximized).toHaveBeenCalledTimes(1);
     expect(onCloseFile).not.toHaveBeenCalled();
 
-    // Outside full screen, Escape goes back to closing the tab.
+    // Outside full screen the viewer gets no exit-full-screen handler.
     rerender({ maximized: false });
     expect(screen.queryByRole("button", { name: "Viewer Escape" })).toBeNull();
   });

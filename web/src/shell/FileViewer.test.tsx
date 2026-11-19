@@ -2750,6 +2750,27 @@ describe("FileViewer Escape exits full screen", () => {
     expect(onCloseTab).not.toHaveBeenCalled();
   });
 
+  it("keeps unsaved edits without a prompt, and a later Escape still guards them", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    const onCloseTab = vi.fn();
+    const onExitFullScreen = vi.fn();
+    const props = { open: true, frameless: true, path: "file1.md", onCloseTab };
+    const { rerender } = render(viewerTree({ ...props, onExitFullScreen }));
+    const draft = screen.getByRole("textbox", { name: "Draft text" });
+    fireEvent.change(draft, { target: { value: "Unsaved draft" } });
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onExitFullScreen).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Unsaved changes")).toBeNull();
+
+    rerender(viewerTree(props));
+    expect(draft).toHaveValue("Unsaved draft");
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+    expect(onCloseTab).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(onCloseTab).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps Escape after a click outside the viewer, since full screen hides the chat", () => {
     useCommentsMock.mockReturnValue(makeCommentsQuery([]));
     const onExitFullScreen = vi.fn();
