@@ -31,6 +31,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.session_journal_store import SessionJournalStore
+from omnigent.stores.workflow_store import WorkflowStore
 from omnigent.tools.builtins.journal import JOURNAL_TOOLS
 from tests.debug_log_helpers import capture_debug_rows
 from tests.server.conftest import ControllableMockClient
@@ -751,7 +752,7 @@ async def test_a_runs_descendants_continue_page_by_page_in_order(
 
 
 async def test_a_session_filter_lists_its_current_run_for_anyone_who_can_read_it(
-    client: httpx.AsyncClient, db_uri: str
+    client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     stack = await _save_workflow(client, "Land a stack")
     other = await _save_workflow(client, "Ready a PR")
@@ -779,9 +780,19 @@ async def test_a_session_filter_lists_its_current_run_for_anyone_who_can_read_it
     assert run_ids(moved) == []
     # Bob doesn't own the workflow, so only the session he can read lists its run.
     assert (await client.get(url, headers=_headers(BOB))).status_code == 404
-    assert (
-        run_ids(await client.get(url, params={"session_id": shared}, headers=_headers(BOB))) == own
-    )
+    read: list[str] = []
+    get_many = WorkflowStore.get_many
+
+    def recording_get_many(self: WorkflowStore, workflow_ids: list[str]) -> object:
+        read.extend(workflow_ids)
+        return get_many(self, workflow_ids)
+
+    monkeypatch.setattr(WorkflowStore, "get_many", recording_get_many)
+    bobs = await client.get(url, params={"session_id": shared}, headers=_headers(BOB))
+    assert run_ids(bobs) == own
+    # Nor is it shared with him, so naming the run never reads the workflow.
+    assert bobs.json()["data"][0]["workflow_name"] is None
+    assert stack["id"] not in read
     for session_id in (private, uuid4().hex, "not-a-session"):
         refused = await client.get(url, params={"session_id": session_id}, headers=_headers(BOB))
         assert refused.status_code == 404, session_id
