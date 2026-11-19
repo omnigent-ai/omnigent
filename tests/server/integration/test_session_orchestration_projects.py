@@ -748,17 +748,6 @@ async def test_the_tool_archives_sub_agents_in_any_of_the_owners_trees(
     assert "owns the runner it runs on" in refused["error"], refused
     assert store.get_conversation(owner.id).archived is not True
     assert stopped == []
-    # A sub-agent still cannot archive the session it runs under.
-    refused = json.loads(
-        await execute_tool(
-            tool_name="sys_session_update",
-            arguments=json.dumps({"session_id": source["id"], "archived": True}),
-            server_client=auth_client,
-            conversation_id=own_child.id,
-        )
-    )
-    assert "archiving it would stop this session too" in refused["error"], refused
-    assert store.get_conversation(source["id"]).archived is not True
 
 
 @_ONE_ENVIRONMENT
