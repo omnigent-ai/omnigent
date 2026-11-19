@@ -3,14 +3,14 @@
 On a phone the end-of-thread "Working…" shimmer is the first thing to leave the
 viewport (scrolling up to re-read, the keyboard opening), and a typed draft keeps
 the composer's Send arrow instead of its Stop square. Once a background shell
-outlives a turn, the ``N background task`` tally in the composer workspace bar is
-the only persistent status surface at the bottom of the screen, so it must look
-and read differently while a turn runs than while the session is idle.
+outlives a turn, the ``N background task`` tally in the phone header is the only
+persistent status surface on screen, so it must look and read differently while a
+turn runs than while the session is idle.
 
 Journeys (the reporter's, claude-native on a phone):
 
 1. ask Claude Code to run a shell in the background and let the turn finish ->
-   the ``1 background task`` tally appears above the composer,
+   the ``1 background task`` tally appears in the phone header,
 2. type a follow-up draft (not sent) and scroll up to re-read earlier messages,
    so the shimmer is off screen -> a new turn starts on the session (sent from a
    second client, which keeps the draft) -> the tally must carry the working
@@ -72,8 +72,6 @@ _DESKTOP_VIEWPORT = {"width": 1280, "height": 800}
 _WORKING = '[data-testid="working-indicator"]'
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _TALLY = '[data-testid="background-task-pill"]'
-_TASK_INDICATORS = '[data-testid="composer-task-indicators"]'
-_WORKSPACE_BAR = '[data-testid="composer-workspace-controls"]'
 _TERMINAL_VIEW = '[data-testid="terminal-view"]'
 
 _BACKGROUND_COMMAND = "sleep 600"
@@ -309,23 +307,22 @@ def _in_viewport(locator: Locator) -> bool | None:
 
 
 def _capture_bottom_chrome(page: Page, evidence_dir: Path, label: str) -> dict[str, Any]:
-    """Record what the bottom of the phone screen shows: tally, composer and pixels."""
+    """Record the phone's tally, its header mount, the composer region and their pixels."""
     page.evaluate("() => document.activeElement && document.activeElement.blur()")
     page.wait_for_timeout(300)
-    bar = page.locator(_WORKSPACE_BAR)
     tally = _tally(page)
     composer = page.get_by_label("Message the agent")
     viewport = page.viewport_size
     assert viewport is not None
-    bar_box = bar.bounding_box()
+    composer_box = composer.bounding_box()
     tally_box = tally.bounding_box()
-    assert bar_box is not None and tally_box is not None
+    assert composer_box is not None and tally_box is not None
     bottom_png = page.screenshot(
         clip={
             "x": 0,
-            "y": bar_box["y"],
+            "y": composer_box["y"],
             "width": viewport["width"],
-            "height": viewport["height"] - bar_box["y"],
+            "height": viewport["height"] - composer_box["y"],
         }
     )
     tally_png = page.screenshot(clip=tally_box)
@@ -334,8 +331,9 @@ def _capture_bottom_chrome(page: Page, evidence_dir: Path, label: str) -> dict[s
     state = {
         "tally_name": tally.get_attribute("aria-label"),
         "tally_text": tally.inner_text(),
-        "indicators_html": page.locator(_TASK_INDICATORS).inner_html(),
-        "indicators_aria": page.locator(_TASK_INDICATORS).aria_snapshot(),
+        # The phone mounts the tally in the header portal, so read the mount point it renders into.
+        "indicators_html": tally.evaluate("element => element.parentElement?.outerHTML ?? ''"),
+        "indicators_aria": tally.locator("xpath=..").aria_snapshot(),
         "status_texts": [
             text.strip()
             for text in page.get_by_role("status").all_text_contents()
@@ -370,7 +368,7 @@ def _assert_tally_carries_working_state(idle: dict[str, Any], working: dict[str,
             f"the tally's accessible name is {working['tally_name']!r} both while the agent "
             "works and while idle"
         )
-    assert not failures, "no working cue at the bottom of the phone screen:\n- " + "\n- ".join(
+    assert not failures, "no working cue on the phone's background-task tally:\n- " + "\n- ".join(
         failures
     )
 
