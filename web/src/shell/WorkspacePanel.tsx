@@ -2057,124 +2057,146 @@ function WorkspacePanelImpl({
           tabIndex={-1}
           className="relative flex min-h-0 flex-1 flex-col overflow-hidden focus:outline-none"
         >
-          {/* Phones use AppShell's drawer instead; one mounted panel keeps the input state single-owner. */}
-          {showContentSearch && showFilesPanel && !pending && !isMobile && (
-            <div
-              className={cn(
-                "min-h-0 flex-1 flex-col",
-                rightRailTab === "content-search" && selectedFilePath === null && !terminalShown
-                  ? "flex"
-                  : "hidden",
-              )}
-            >
-              <ContentSearchPanel
-                inputRef={contentSearchInputRef}
-                key={conversationId}
-                conversationId={conversationId}
-                onFileSelect={openFileViewer}
-              />
-            </div>
-          )}
-          {filesPanelMounted && (
-            <div
-              className={cn(
-                "flex min-h-0 flex-1 flex-col",
-                // Not display:none: hidden rows would measure 0px and collapse
-                // the virtualized tree's height, losing its scroll position.
-                !filesPanelActive && "invisible absolute inset-0",
-              )}
-            >
-              <FilesPanel
-                conversationId={contained ? conversationId : undefined}
-                frameless
-                onFileSelect={openFileViewer}
-                flatView={activeView.flat}
-                showHidden={filesPanelShowHidden}
-                onShowHiddenChange={onShowHiddenChange}
-                sort={filesPanelSort}
-                onSortChange={onSortChange}
-              />
-            </div>
-          )}
-          {pending ? (
-            <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
-              <Spinner />
-              <span className="text-ui">Starting workspace…</span>
-            </div>
-          ) : frontTerminalKey !== null ? (
-            // Show the selected shell's xterm only while its terminal is actually
-            // present. The selection is sticky (AppShell never prunes it off the
-            // list), so during a transient terminals-list churn this falls back to
-            // the default view and the xterm reappears when the terminal returns.
-            <RailTerminalView
-              conversationId={conversationId}
-              terminalKey={frontTerminalKey}
-              readOnly={!isOwnerLevel(permissionLevel)}
-              autoFocus={autoFocusSelectedTerminal}
-            />
-          ) : frontFilePath !== null ? (
-            <ResponsiveViewerSlot mobile={isMobile} mobileTarget={mobileFileTarget}>
-              <FileViewer
-                syncUrl={!contained}
-                agentId={agentId}
-                mobileOverlay={isMobile}
-                frameless
-                open
-                mediaActive={isMobile ? mobileFileTarget != null : open}
-                conversationId={conversationId}
-                path={frontFilePath}
-                position={filePosition}
-                onClose={isMobile && onMobileFileClose ? onMobileFileClose : onShowScopeView}
-                onCloseTab={isMobile && onMobileFileClose ? onMobileFileClose : handleCloseTab}
-                onNavigateTo={openFileViewer}
-                permissionLevel={permissionLevel}
-                onCommentsOpenChange={onCommentsOpenChange}
-                onShare={onShareFile}
-                shareDisabledReason={shareDisabledReason}
-                sort={filesPanelSort}
-              />
-            </ResponsiveViewerSlot>
-          ) : scopeView === "sidechat" ? (
-            // A side chat: a forked child conversation streamed here in its own
-            // scoped surface, beside the still-active main chat. Phones show it
-            // in the side-chats drawer instead, so it never mounts twice.
-            selectedSideChatPane
-          ) : scopeView === "browser" ? (
-            // Browser soft tab — BrowserPane self-gates and measures this rail
-            // slot to position the native view over it.
-            <BrowserPane
-              key={browsers.viewId}
-              conversationId={browsers.viewId!}
-              agentBrowser={browsers.agentBrowser}
-              active={open}
-              focus={browserFocus?.viewId === browsers.viewId ? browserFocus.target : null}
-              onFocused={clearBrowserFocus}
-              className="min-h-0 flex-1"
-            />
-          ) : scopeView === "github" ? (
-            <RenderErrorBoundary name="pull requests" resetKey={conversationId}>
-              <PullRequestPanel conversationId={conversationId} active={open && !inert} />
-            </RenderErrorBoundary>
-          ) : scopeView === "tasks" && conversationId ? (
-            <RenderErrorBoundary name="tasks" resetKey={conversationId}>
-              <TasksPanel
-                conversationId={conversationId}
-                active={open && !inert}
-                renderWorkflowRuns={(workflowId) => (
-                  <SessionDescendantRuns sessionId={conversationId} workflowId={workflowId} />
+          <RenderErrorBoundary
+            name="this workspace pane"
+            resetKey={JSON.stringify([
+              conversationId,
+              rightRailTab,
+              frontFilePath,
+              frontTerminalKey,
+              sideChats.selected,
+              browsers.viewId,
+            ])}
+          >
+            {/* Phones use AppShell's drawer instead; one mounted panel keeps the input state single-owner. */}
+            {showContentSearch && showFilesPanel && !pending && !isMobile && (
+              <div
+                className={cn(
+                  "min-h-0 flex-1 flex-col",
+                  rightRailTab === "content-search" && selectedFilePath === null && !terminalShown
+                    ? "flex"
+                    : "hidden",
                 )}
+              >
+                <RenderErrorBoundary
+                  name="this workspace pane"
+                  resetKey={JSON.stringify([conversationId, rightRailTab === "content-search"])}
+                >
+                  <ContentSearchPanel
+                    inputRef={contentSearchInputRef}
+                    key={conversationId}
+                    conversationId={conversationId}
+                    onFileSelect={openFileViewer}
+                  />
+                </RenderErrorBoundary>
+              </div>
+            )}
+            {filesPanelMounted && (
+              <div
+                className={cn(
+                  "flex min-h-0 flex-1 flex-col",
+                  // Not display:none: hidden rows would measure 0px and collapse
+                  // the virtualized tree's height, losing its scroll position.
+                  !filesPanelActive && "invisible absolute inset-0",
+                )}
+              >
+                <RenderErrorBoundary
+                  name="this workspace pane"
+                  resetKey={JSON.stringify([conversationId, activeView.flat])}
+                >
+                  <FilesPanel
+                    conversationId={contained ? conversationId : undefined}
+                    frameless
+                    onFileSelect={openFileViewer}
+                    flatView={activeView.flat}
+                    showHidden={filesPanelShowHidden}
+                    onShowHiddenChange={onShowHiddenChange}
+                    sort={filesPanelSort}
+                    onSortChange={onSortChange}
+                  />
+                </RenderErrorBoundary>
+              </div>
+            )}
+            {pending ? (
+              <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
+                <Spinner />
+                <span className="text-ui">Starting workspace…</span>
+              </div>
+            ) : frontTerminalKey !== null ? (
+              // Show the selected shell's xterm only while its terminal is actually
+              // present. The selection is sticky (AppShell never prunes it off the
+              // list), so during a transient terminals-list churn this falls back to
+              // the default view and the xterm reappears when the terminal returns.
+              <RailTerminalView
+                conversationId={conversationId}
+                terminalKey={frontTerminalKey}
+                readOnly={!isOwnerLevel(permissionLevel)}
+                autoFocus={autoFocusSelectedTerminal}
               />
-            </RenderErrorBoundary>
-          ) : scopeView === "subagents" && rootSessionId ? (
-            <SubagentPanelOpenerContext.Provider value={subagentPanelOpener ?? null}>
-              <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
-            </SubagentPanelOpenerContext.Provider>
-          ) : scopeView === "empty" ? (
-            <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center text-muted-foreground">
-              <PlusIcon className="size-6" />
-              <p className="text-sm">Open a Workspace tab from the + menu.</p>
-            </div>
-          ) : null}
+            ) : frontFilePath !== null ? (
+              <ResponsiveViewerSlot mobile={isMobile} mobileTarget={mobileFileTarget}>
+                <FileViewer
+                  syncUrl={!contained}
+                  agentId={agentId}
+                  mobileOverlay={isMobile}
+                  frameless
+                  open
+                  mediaActive={isMobile ? mobileFileTarget != null : open}
+                  conversationId={conversationId}
+                  path={frontFilePath}
+                  position={filePosition}
+                  onClose={isMobile && onMobileFileClose ? onMobileFileClose : onShowScopeView}
+                  onCloseTab={isMobile && onMobileFileClose ? onMobileFileClose : handleCloseTab}
+                  onNavigateTo={openFileViewer}
+                  permissionLevel={permissionLevel}
+                  onCommentsOpenChange={onCommentsOpenChange}
+                  onShare={onShareFile}
+                  shareDisabledReason={shareDisabledReason}
+                  sort={filesPanelSort}
+                />
+              </ResponsiveViewerSlot>
+            ) : scopeView === "sidechat" ? (
+              // A side chat: a forked child conversation streamed here in its own
+              // scoped surface, beside the still-active main chat. Phones show it
+              // in the side-chats drawer instead, so it never mounts twice.
+              selectedSideChatPane
+            ) : scopeView === "browser" ? (
+              // Browser soft tab — BrowserPane self-gates and measures this rail
+              // slot to position the native view over it.
+              <BrowserPane
+                key={browsers.viewId}
+                conversationId={browsers.viewId!}
+                agentBrowser={browsers.agentBrowser}
+                active={open}
+                focus={browserFocus?.viewId === browsers.viewId ? browserFocus.target : null}
+                onFocused={clearBrowserFocus}
+                className="min-h-0 flex-1"
+              />
+            ) : scopeView === "github" ? (
+              <RenderErrorBoundary name="pull requests" resetKey={conversationId}>
+                <PullRequestPanel conversationId={conversationId} active={open && !inert} />
+              </RenderErrorBoundary>
+            ) : scopeView === "tasks" && conversationId ? (
+              <RenderErrorBoundary name="tasks" resetKey={conversationId}>
+                <TasksPanel
+                  conversationId={conversationId}
+                  active={open && !inert}
+                  renderWorkflowRuns={(workflowId) => (
+                    <SessionDescendantRuns sessionId={conversationId} workflowId={workflowId} />
+                  )}
+                />
+              </RenderErrorBoundary>
+            ) : scopeView === "subagents" && rootSessionId ? (
+              <SubagentPanelOpenerContext.Provider value={subagentPanelOpener ?? null}>
+                <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+              </SubagentPanelOpenerContext.Provider>
+            ) : scopeView === "empty" ? (
+              <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center text-muted-foreground">
+                <PlusIcon className="size-6" />
+                <p className="text-sm">Open a Workspace tab from the + menu.</p>
+              </div>
+            ) : null}
+          </RenderErrorBoundary>
         </div>
       </div>
     </aside>

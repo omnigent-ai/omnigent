@@ -122,10 +122,24 @@ export function continuePlanMessage(planName: string | null): string {
   return `Continue ${plan} from where you left off, and work through the tasks that are left.\n\n${RESUME_WORKFLOW_WORK}`;
 }
 
+const STOP_PLAN_INSTRUCTIONS =
+  "Stop all background tasks, subagents, and other Omnigent sessions working on this workflow run. Tell each worker to stop its own background tasks, agents, and Omnigent sessions recursively, verify their shutdown, and report back before it stops. Cancel background commands through their original task/terminal handles and wait for their exit results. A missing handle or an empty process list in another sandbox is not proof of shutdown. Cancel this run's timers and queued follow-ups that could restart the work. Keep this main session available while you coordinate and verify that the work has stopped; report anything you could not stop or verify. Preserve completed results and record the worker/session IDs and what remains so the workflow can resume. Leave unfinished steps that were started as started, not done or failed. Do not ask for confirmation or resume the workflow until I explicitly tell you to continue.";
+
 /** Keep the main agent available to stop delegated work and record how to resume it. */
 export function stopPlanMessage(planName: string | null): string {
   const plan = planName ? `the plan "${planName}"` : "the plan";
-  return `Stop ${plan} now. Stop all background tasks, subagents, and other Omnigent sessions working on this workflow run. Tell each worker to stop its own background tasks, agents, and Omnigent sessions recursively, verify their shutdown, and report back before it stops. Cancel background commands through their original task/terminal handles and wait for their exit results. A missing handle or an empty process list in another sandbox is not proof of shutdown. Cancel this run's timers and queued follow-ups that could restart the work. Keep this main session available while you coordinate and verify that the work has stopped; report anything you could not stop or verify. Preserve completed results and record the worker/session IDs and what remains so the workflow can resume. Leave unfinished steps that were started as started, not done or failed. Do not ask for confirmation or resume the workflow until I explicitly tell you to continue.`;
+  return `Stop ${plan} now. ${STOP_PLAN_INSTRUCTIONS}`;
+}
+
+const STOP_PLAN_OPENING = /^Stop the plan(?: "[\s\S]*")? now\. $/;
+
+/** Whether *text* is a {@link stopPlanMessage}, whatever plan it names. */
+export function isStopPlanMessage(text: string): boolean {
+  const trimmed = text.trim();
+  return (
+    trimmed.endsWith(STOP_PLAN_INSTRUCTIONS) &&
+    STOP_PLAN_OPENING.test(trimmed.slice(0, -STOP_PLAN_INSTRUCTIONS.length))
+  );
 }
 
 /**

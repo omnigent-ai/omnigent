@@ -1613,8 +1613,16 @@ class ConversationStore(ABC):
         """Persist the Plan snapshot and return its update; missing metadata returns None."""
         raise NotImplementedError
 
-    def add_new_sibling(self, source_id: str, session_id: str, *, user_id: str | None) -> None:
+    def add_new_sibling(
+        self, source_id: str, session_id: str, *, user_id: str | None, move_existing: bool = False
+    ) -> None:
         """Assign a freshly created session to its source's family before launch."""
+        raise NotImplementedError
+
+    def set_session_nest(
+        self, session_id: str, source_id: str | None, *, user_id: str | None
+    ) -> None:
+        """Move one independent session into a nest, or detach it with ``None``."""
         raise NotImplementedError
 
     def get_session_family(self, session_id: str) -> list[Conversation]:

@@ -63,9 +63,10 @@ def test_move_session_into_project_regroups_sidebar_row(
 
         # Context menu → "Add to project" flyout → pick the seeded project.
         row.click(button="right")
-        submenu = page.get_by_role("menuitem", name="Add to project")
+        submenu = page.get_by_role("menuitem", name="Move session", exact=True)
         expect(submenu).to_be_visible()
         submenu.hover()
+        page.get_by_role("menuitem", name="Projects", exact=True).hover()
         target = page.get_by_role("menuitem", name=project_name)
         expect(target).to_be_visible()
         target.click()

@@ -59,7 +59,7 @@ import {
   RunWorkflowButton,
   useRunTaskMenus,
 } from "@/components/workflows/RunTasks";
-import { planRunControl } from "@/shell/PlanRunButton";
+import { planRunButtonState, planRunControl } from "@/shell/PlanRunButton";
 import { WorkflowGraphOverlay } from "@/components/workflows/WorkflowStepsGraph";
 import {
   useDeleteScheduledTask,
@@ -79,6 +79,7 @@ import {
 import { useNow } from "@/hooks/useNow";
 import { useSession } from "@/hooks/useSession";
 import { useViewerId } from "@/hooks/useViewerId";
+import { usePlanStopping } from "@/hooks/usePlanStopping";
 import { useSessionWorking } from "@/hooks/useSessionWorking";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
@@ -943,10 +944,14 @@ function RunRow({
     ? (steps?.workflowId ?? null)
     : null;
   // Stop while the run's session works; play once it stopped with tasks left.
-  const control =
-    showTasks && steps?.isCurrent && steps.planId
-      ? planRunControl(progress, steps.statuses, sessionWorking, steps.planGraphRevision)
-      : null;
+  const canAct = showTasks && steps?.isCurrent === true && !!steps.planId;
+  const stopping = usePlanStopping(canAct ? (sessionId ?? null) : null, sessionWorking);
+  const control = canAct
+    ? planRunButtonState(
+        planRunControl(progress, steps.statuses, sessionWorking, steps.planGraphRevision),
+        stopping,
+      )
+    : null;
   // What the run's buttons and task menus refresh once its session takes them.
   const refreshKeys = [
     scheduledTaskRunsKey(run.scheduledTaskId),
@@ -957,10 +962,13 @@ function RunRow({
     steps?.isCurrent ? sessionId : null,
     refreshKeys,
     steps?.planId ?? null,
+    stopping,
   );
-  // Room on the row's link for the buttons over its right end.
-  const buttonPadding = ["", "pr-11", "pr-18", "pr-25"][
-    1 + (workflowId ? 1 : 0) + (control ? 1 : 0)
+  // Room on the row's link for the buttons over its right end, in icon widths;
+  // "Stopping…" takes about four.
+  const controlWidth = control === "stopping" ? 4 : Number(control !== null);
+  const buttonPadding = ["", "pr-11", "pr-18", "pr-25", "pr-32", "pr-39", "pr-46"][
+    1 + (workflowId ? 1 : 0) + controlWidth
   ];
   const duration = formatRunDuration(run.firedAt, run.finishedAt);
   // Unread only applies to a succeeded run that produced a conversation.
