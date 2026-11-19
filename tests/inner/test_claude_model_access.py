@@ -35,7 +35,7 @@ from omnigent.inner.egress.ca import ensure_ca, ensure_ca_bundle
 from omnigent.inner.egress.certs import HostCertCache
 from omnigent.inner.egress.proxy import EgressProxy
 from omnigent.inner.egress.rules import parse_rules
-from omnigent.inner.model_signer_service import _parse_strict_request_headers
+from omnigent.inner.model_signer_service import _VALIDATION_BEARER, _parse_strict_request_headers
 from omnigent.inner.model_signing import SigningRejected
 from omnigent.inner.sandbox import SandboxPolicy, _default_sandbox_for_platform
 from omnigent.inner.terminal import TerminalInstance
@@ -817,6 +817,38 @@ def _response_relay(tmp_path: Path, **timeouts: float) -> _ClaudeRelay:
     relay = access.create_proxy([], cert, key, upstream_ca_bundle=bundle)
     assert isinstance(relay, _ClaudeRelay)
     return relay
+
+
+def test_relay_transforms_once_and_rejects_expanded_model_request(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.inner import claude_model_access as module
+
+    relay = _response_relay(tmp_path)
+    monkeypatch.setattr(module, "_MAX_REQUEST_BODY_BYTES", 64)
+    transform = Mock(return_value=b"x" * 65)
+    relay._request_body_transform = transform
+    body = b'{"model":"claude-test","messages":[]}'
+    request = {
+        "method": "POST",
+        "connect_host": "model.test",
+        "sni_host": "model.test",
+        "request_host": "model.test",
+        "target": "/gateway/v1/messages",
+        "headers": [
+            ("Authorization", f"Bearer {relay._access.placeholder}"),
+            ("Content-Type", "application/json"),
+        ],
+        "body": body,
+    }
+
+    validated = relay._reconstruct_request(bearer_token=_VALIDATION_BEARER, **request)
+    assert validated.body == body
+    transform.assert_not_called()
+
+    with pytest.raises(SigningRejected, match="model request body is too large"):
+        relay._reconstruct_request(bearer_token="parent-only-key", **request)
+    transform.assert_called_once()
 
 
 @pytest.mark.parametrize(

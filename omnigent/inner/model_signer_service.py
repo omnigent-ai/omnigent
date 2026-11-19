@@ -351,16 +351,20 @@ class _SignerRelay(EgressProxy):
         except ProviderAuthRequired:
             await self._send_auth_required(client_writer)
             return False
-        signed = self._reconstruct_request(
-            bearer_token=bearer_token,
-            method=method,
-            connect_host=host,
-            sni_host=sni_host or "",
-            request_host=request_host,
-            target=path,
-            headers=headers,
-            body=body,
-        )
+        try:
+            signed = self._reconstruct_request(
+                bearer_token=bearer_token,
+                method=method,
+                connect_host=host,
+                sni_host=sni_host or "",
+                request_host=request_host,
+                target=path,
+                headers=headers,
+                body=body,
+            )
+        except SigningRejected:
+            await self._send_forbidden(client_writer, "")
+            return False
         if port != 443:
             await self._send_forbidden(client_writer, "")
             return False

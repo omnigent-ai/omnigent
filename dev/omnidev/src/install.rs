@@ -89,9 +89,8 @@ fn preflight() -> Result<()> {
     Ok(())
 }
 
-/// Install omnigent from git per `config`. `reinstall` forces uv past its cache
-/// so a moving ref (e.g. `main`) actually re-resolves.
-pub fn run_uv_install(config: &InstallConfig, reinstall: bool) -> Result<()> {
+/// Install omnigent from git per `config`, replacing existing hard-linked packages.
+pub fn run_uv_install(config: &InstallConfig) -> Result<()> {
     preflight()?;
     let spec = config.spec();
 
@@ -100,14 +99,12 @@ pub fn run_uv_install(config: &InstallConfig, reinstall: bool) -> Result<()> {
         "tool",
         "install",
         "--force",
+        "--reinstall",
         "--link-mode",
         "copy",
         "--python",
         PYTHON_VERSION,
     ]);
-    if reinstall {
-        cmd.arg("--reinstall");
-    }
     cmd.arg(&spec);
 
     eprintln!("omnidev: uv tool install {spec}");
@@ -123,7 +120,7 @@ pub fn run_uv_install(config: &InstallConfig, reinstall: bool) -> Result<()> {
 /// `install` subcommand: persist intent, install, then record the resolved sha.
 pub fn install(config: &InstallConfig) -> Result<()> {
     config.save()?;
-    run_uv_install(config, false)?;
+    run_uv_install(config)?;
     record_installed_sha(config);
     println!("omnidev: installed omnigent ({})", config.spec());
     Ok(())
@@ -134,7 +131,7 @@ pub fn install(config: &InstallConfig) -> Result<()> {
 pub fn update() -> Result<()> {
     let config = InstallConfig::load()?.unwrap_or_default();
     config.save()?;
-    run_uv_install(&config, true)?;
+    run_uv_install(&config)?;
     record_installed_sha(&config);
     println!("omnidev: updated omnigent ({})", config.spec());
     Ok(())

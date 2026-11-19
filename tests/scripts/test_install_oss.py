@@ -382,6 +382,7 @@ def test_install_target_selects_extras_and_python(
         "tool",
         "install",
         "--force",
+        "--reinstall",
         "-q",
         "--link-mode",
         "copy",

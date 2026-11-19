@@ -45,6 +45,7 @@ from .model_auth import (
 )
 from .model_egress import FrozenModelRoute
 from .model_signer_service import (
+    _VALIDATION_BEARER,
     _parse_strict_header_lines,
     _parse_strict_request_headers,
     _SignerRelay,
@@ -794,8 +795,10 @@ class _ClaudeRelay(_SignerRelay):
             headers=headers,
             body=body,
         )
-        if self._request_body_transform is not None:
+        if self._request_body_transform is not None and bearer_token != _VALIDATION_BEARER:
             transformed = self._request_body_transform(method, connect_host, 443, target, body)
+            if len(transformed) > _MAX_REQUEST_BODY_BYTES:
+                raise SigningRejected("model request body is too large")
             signed = replace(
                 signed,
                 body=transformed,
