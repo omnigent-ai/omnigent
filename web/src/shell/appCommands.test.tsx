@@ -97,6 +97,8 @@ const HOTKEYS_WITHOUT_COMMANDS: Partial<Record<ShortcutId, string>> = {
   "pane.next": WHERE_PRESSED,
   "terminal.splitRight": WHERE_PRESSED,
   "terminal.splitDown": WHERE_PRESSED,
+  "transcript.reply": WHERE_PRESSED,
+  "transcript.askInSideChat": WHERE_PRESSED,
 };
 
 // The New chat row spells out Shift off macOS, as its tooltip does.
