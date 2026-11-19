@@ -5847,19 +5847,16 @@ describe("Composer native shell mode", () => {
     expect(screen.queryByTestId("composer-highlight-overlay")).toBeNull();
   });
 
+  // Only codex refuses a non-owner's shell input; the claude-native level-2 row above runs it.
   it.each([
-    // Only codex refuses a non-owner's shell input; claude-native runs it for anyone who can edit.
-    { harness: "claude-native", draft: "!git status", shell: true },
-    { harness: "pi", draft: "!git status", shell: false },
-    { harness: "codex-native", draft: "git status", shell: false },
-  ])("sends a non-owner's $draft on $harness as typed", ({ harness, draft, shell }) => {
+    { harness: "pi", draft: "!git status" },
+    { harness: "codex-native", draft: "git status" },
+  ])("sends a non-owner's $draft on $harness as typed", ({ harness, draft }) => {
     useChatStore.setState({ sessionHarness: harness });
     const props = composerProps({ isNativeWrapper: true, permissionLevel: 2 });
     render(<Composer {...props} />);
     fireEvent.change(textarea(), { target: { value: draft } });
-    expect(screen.queryByTestId("composer-shell-mode-indicator")?.textContent ?? null).toBe(
-      shell ? "Shell command" : null,
-    );
+    expect(screen.queryByTestId("composer-shell-mode-indicator")).toBeNull();
 
     fireEvent.keyDown(textarea(), { key: "Enter" });
     expect(props.onSend).toHaveBeenCalledExactlyOnceWith(draft, undefined);
