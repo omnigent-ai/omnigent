@@ -7,6 +7,8 @@ import { authenticatedFetch } from "@/lib/identity";
 import { buildAgentBundle } from "@/lib/agentBundle";
 import type { AgentConfig } from "@/lib/agentsApi";
 import type { ManagedAgent } from "@/hooks/useCustomAgents";
+import { useAppCommands } from "@/shell/appCommands";
+import { clearSettingsSearchFocus } from "@/shell/settingsSearch/settingsSearchFocus";
 
 const flags = vi.hoisted(() => ({
   install: true,
@@ -59,6 +61,21 @@ let failSave: boolean;
 let failDelete: boolean;
 let inUse: boolean;
 
+/** ⌘K's "Search settings…", run from wherever the router is. */
+function SearchSettingsCommand() {
+  const commands = useAppCommands({
+    onToggleLeftSidebar: () => {},
+    onToggleRightSidebar: () => {},
+    rightSidebarShortcutEnabled: true,
+  });
+  const search = commands.find((command) => command.id === "settings-search")!;
+  return (
+    <button type="button" onClick={search.run}>
+      Run Search settings
+    </button>
+  );
+}
+
 function mount(path = "/settings/custom-agents") {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
@@ -67,6 +84,7 @@ function mount(path = "/settings/custom-agents") {
     <QueryClientProvider client={client}>
       <MemoryRouter initialEntries={[path]}>
         <SettingsCustomAgentsSection />
+        <SearchSettingsCommand />
       </MemoryRouter>
     </QueryClientProvider>,
   );
@@ -581,6 +599,25 @@ describe("editing custom agents", () => {
     fireEvent.click((await screen.findAllByRole("link", { name: "research" }))[0]);
     expect(await screen.findByLabelText("Instructions")).toHaveValue(" literal\n");
     expect(screen.getByRole("button", { name: "Save changes" })).toBeDisabled();
+  });
+  it("keeps an unsaved create draft when ⌘K opens Settings search", async () => {
+    mount("/settings/custom-agents/new");
+    fireEvent.change(await screen.findByLabelText("System instructions"), {
+      target: { value: "Keep this draft." },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Run Search settings" }));
+    clearSettingsSearchFocus();
+    expect(screen.getByLabelText("System instructions")).toHaveValue("Keep this draft.");
+    expect(screen.queryByRole("heading", { name: "Custom agents" })).toBeNull();
+  });
+  it("keeps an unsaved edit when ⌘K opens Settings search from the agent's page", async () => {
+    configResponses();
+    await openEditor();
+    fireEvent.change(screen.getByLabelText("Description"), { target: { value: "Unsaved" } });
+    fireEvent.click(screen.getByRole("button", { name: "Run Search settings" }));
+    clearSettingsSearchFocus();
+    expect(screen.getByLabelText("Description")).toHaveValue("Unsaved");
+    expect(screen.queryByRole("dialog")).toBeNull();
   });
   it("confirms a dirty draft before returning to the list", async () => {
     configResponses();

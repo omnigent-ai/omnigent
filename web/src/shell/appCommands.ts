@@ -19,7 +19,7 @@ import {
   sidebarToggleShortcutKeys,
 } from "@/components/KeyboardShortcut";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { useNavigate } from "@/lib/routing";
+import { useLocation, useNavigate } from "@/lib/routing";
 import { useSettingsRoute } from "@/shell/settingsNav";
 import { settingsSearchCommand } from "@/shell/settingsSearch/settingsSearchCommand";
 
@@ -51,7 +51,8 @@ export function useAppCommands({
   rightSidebarShortcutEnabled,
 }: AppCommandOptions): ActionCommand[] {
   const navigate = useNavigate();
-  const { section, inSettings } = useSettingsRoute();
+  const { inSettings } = useSettingsRoute();
+  const { pathname, search } = useLocation();
   const mobile = useIsMobileViewport();
   return useMemo<ActionCommand[]>(
     () => [
@@ -85,7 +86,11 @@ export function useAppCommands({
         run: () => navigate("/settings"),
         shortcut: settingsShortcutKeys(),
       },
-      settingsSearchCommand({ currentSection: inSettings ? section : null, mobile, navigate }),
+      settingsSearchCommand({
+        settingsLocation: inSettings ? { pathname, search } : null,
+        mobile,
+        navigate,
+      }),
       {
         id: "toggle-left-sidebar",
         label: "Toggle conversations sidebar",
@@ -105,7 +110,8 @@ export function useAppCommands({
     ],
     [
       navigate,
-      section,
+      pathname,
+      search,
       inSettings,
       mobile,
       onToggleLeftSidebar,
