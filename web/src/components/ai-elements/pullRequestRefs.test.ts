@@ -160,6 +160,23 @@ describe("remarkPullRequestRefs", () => {
     ]);
   });
 
+  it.each(["<a>", "<a/>", '<a\nhref="https://example.com/raw">'])(
+    "skips text after a raw %j anchor tag",
+    (tag) => {
+      const anchored = [
+        { type: "html", value: tag },
+        { type: "text", value: "#2468" },
+        { type: "html", value: "</a>" },
+      ];
+      const tree = {
+        type: "root",
+        children: [{ type: "paragraph", children: structuredClone(anchored) }],
+      };
+      remarkPullRequestRefs()(tree);
+      expect(tree.children[0].children).toEqual(anchored);
+    },
+  );
+
   it("links text nested in emphasis and headings", () => {
     const tree = {
       type: "root",

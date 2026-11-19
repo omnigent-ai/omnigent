@@ -47,7 +47,7 @@ interface MarkdownNode {
 // Their text is already a link. Code and raw HTML carry a `value`, not text children.
 const LINK_NODE_TYPES = new Set(["link", "linkReference"]);
 // Inline raw HTML parses as separate tag and text siblings: `<a href>`, `#1234`, `</a>`.
-const HTML_ANCHOR_OPEN = /^<a[\s>]/i;
+const HTML_ANCHOR_OPEN = /^<a[\s/>]/i;
 const HTML_ANCHOR_CLOSE = /^<\/a\s*>/i;
 
 /** Remark plugin parking every pull request reference in a text node on a fragment link. */
