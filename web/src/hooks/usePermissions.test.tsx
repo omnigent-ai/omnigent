@@ -15,16 +15,36 @@ vi.mock("@/hooks/useSidebarData", () => ({ useLoadedConversations: () => useTest
 // and the loading-is-permissive invariant directly, without standing
 // up a QueryClient or re-testing the resolution order.
 
-import { renderHook } from "@testing-library/react";
+import type { ReactNode } from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { act, renderHook } from "@testing-library/react";
 import type { Conversation } from "./useConversations";
+import type * as ConversationsModule from "./useConversations";
+import type * as PermissionsApiModule from "@/lib/permissionsApi";
 import type { Session } from "@/lib/types";
 
-vi.mock("./useConversations", () => ({ useConversations: vi.fn() }));
+vi.mock("./useConversations", async (importOriginal) => ({
+  ...(await importOriginal<typeof ConversationsModule>()),
+  useConversations: vi.fn(),
+}));
 vi.mock("./useSession", () => ({ useSession: vi.fn() }));
+vi.mock("@/lib/permissionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof PermissionsApiModule>()),
+  grantPermission: vi.fn().mockResolvedValue({}),
+  revokePermission: vi.fn().mockResolvedValue(undefined),
+  grantSharePermission: vi.fn().mockResolvedValue({}),
+  revokeSharePermission: vi.fn().mockResolvedValue(undefined),
+}));
 
-import { useConversations } from "./useConversations";
+import { PINNED_CONVERSATIONS_KEY, useConversations } from "./useConversations";
+import { grantSharePermission, revokeSharePermission } from "@/lib/permissionsApi";
 import { useSession } from "./useSession";
-import { useCanEdit } from "./usePermissions";
+import {
+  useCanEdit,
+  useCanStartSideChat,
+  useGrantPermission,
+  useRevokePermission,
+} from "./usePermissions";
 
 const useConversationsMock = vi.mocked(useConversations);
 const useSessionMock = vi.mocked(useSession);
@@ -131,5 +151,89 @@ describe("useCanEdit — safe defaults", () => {
     // sidebar settles. derivePermissionLevel returns null → permissive.
     setHooks({ session: null, sessionLoading: false, conversations: undefined });
     expect(renderHook(() => useCanEdit("conv_1")).result.current).toBe(true);
+  });
+});
+
+describe("useCanStartSideChat", () => {
+  it.each([null, 4])("waits for the server before offering creation (level: %s)", (level) => {
+    setHooks({ session: null, sessionLoading: true });
+    expect(renderHook(() => useCanStartSideChat("conv_1", level)).result.current).toBe(false);
+  });
+  it("follows the server, even against an admin's owner level", () => {
+    setHooks({ session: { ...makeSession(4), sideChatAllowed: false } });
+    expect(renderHook(() => useCanStartSideChat("conv_1", 4)).result.current).toBe(false);
+
+    setHooks({ session: { ...makeSession(2), sideChatAllowed: true } });
+    expect(renderHook(() => useCanStartSideChat("conv_1", 2)).result.current).toBe(true);
+  });
+
+  it("falls back to the owner level when the server doesn't say", () => {
+    setHooks({ session: makeSession(4) });
+    expect(renderHook(() => useCanStartSideChat("conv_1", 4)).result.current).toBe(true);
+    expect(renderHook(() => useCanStartSideChat("conv_1", 3)).result.current).toBe(false);
+    // Single-user mode resolves no level and treats the viewer as the owner.
+    setHooks({ session: null });
+    expect(renderHook(() => useCanStartSideChat("conv_1", null)).result.current).toBe(true);
+  });
+});
+
+describe("share mutations refresh the session lists", () => {
+  function renderWithClient<T>(hook: () => T) {
+    const qc = new QueryClient();
+    const invalidate = vi.spyOn(qc, "invalidateQueries");
+    const wrapper = ({ children }: { children: ReactNode }) => (
+      <QueryClientProvider client={qc}>{children}</QueryClientProvider>
+    );
+    return { invalidate, result: renderHook(hook, { wrapper }).result };
+  }
+  // The server owns `shared_with_others`; refetching the lists is how rows pick it up.
+  const expectedKeys = [
+    ["permissions", "conv_1"],
+    ["conversations"],
+    ["project-sessions"],
+    PINNED_CONVERSATIONS_KEY,
+  ];
+
+  it("grant invalidates the grants and every session list", async () => {
+    const { invalidate, result } = renderWithClient(() =>
+      useGrantPermission({ kind: "session", id: "conv_1" }),
+    );
+    await act(() => result.current.mutateAsync({ userId: "bob", level: 1 }));
+    expect(invalidate.mock.calls.map(([filters]) => filters?.queryKey)).toEqual(expectedKeys);
+  });
+
+  it("revoke invalidates the grants and every session list", async () => {
+    const { invalidate, result } = renderWithClient(() =>
+      useRevokePermission({ kind: "session", id: "conv_1" }),
+    );
+    await act(() => result.current.mutateAsync("bob"));
+    expect(invalidate.mock.calls.map(([filters]) => filters?.queryKey)).toEqual(expectedKeys);
+  });
+
+  // The server shares a continued session at once, which can also change
+  // whether the automation manages that session's sharing.
+  const automationKeys = [
+    ["automation-permissions", "st_1"],
+    ["permissions"],
+    ["conversations"],
+    ["project-sessions"],
+    PINNED_CONVERSATIONS_KEY,
+  ];
+
+  it("an automation share change also refreshes session grants and managers", async () => {
+    const target = { kind: "automation", id: "st_1" } as const;
+    const grant = renderWithClient(() => useGrantPermission(target));
+    await act(() => grant.result.current.mutateAsync({ userId: "bob", level: 1 }));
+    expect(grantSharePermission).toHaveBeenCalledWith(target, "bob", 1);
+    expect(grant.invalidate.mock.calls.map(([filters]) => filters?.queryKey)).toEqual(
+      automationKeys,
+    );
+
+    const revoke = renderWithClient(() => useRevokePermission(target));
+    await act(() => revoke.result.current.mutateAsync("bob"));
+    expect(revokeSharePermission).toHaveBeenCalledWith(target, "bob");
+    expect(revoke.invalidate.mock.calls.map(([filters]) => filters?.queryKey)).toEqual(
+      automationKeys,
+    );
   });
 });

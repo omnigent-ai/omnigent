@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, cast
 if TYPE_CHECKING:
     from omnigent.llms.client import Client as LLMClient
     from omnigent.runner.mcp_manager import RunnerMcpManager
+    from omnigent.runner.tool_dispatch import AsyncResultWake
     from omnigent.runtime.filesystem_registry import FilesystemRegistry
     from omnigent.terminals.registry import TerminalRegistry
 
@@ -26,6 +27,7 @@ from omnigent.llms.summarize import (
     build_summarization_prompt,
     extract_summary_text,
 )
+from omnigent.models.model_override import is_databricks_model_id
 from omnigent.runner.app_support import (
     SpecResolver,
     _BodyRequest,
@@ -99,6 +101,7 @@ def register_mcp_routes(
     server_client: httpx.AsyncClient,
     spec_resolver: SpecResolver | None,
     terminal_registry: TerminalRegistry | None,
+    wake_on_async_result: AsyncResultWake | None,
 ) -> None:
     """Register ``/mcp/execute``, ``/v1/summarize``, and ``/v1/elicitations`` on *app*.
 
@@ -350,6 +353,7 @@ def register_mcp_routes(
                         publish_event=_publish_event,
                         filesystem_registry=filesystem_registry,
                         effective_harness=_session_harness_name(session_id),
+                        wake_on_async_result=wake_on_async_result,
                     )
                 except Exception as exc:
                     _logger.exception(
@@ -417,7 +421,7 @@ def register_mcp_routes(
                     conn["base_url"] = global_auth.base_url
                 return conn
 
-        if model.startswith(("databricks/", "databricks-")):
+        if is_databricks_model_id(model):
             _db_profile = (
                 spec.executor.profile or (spec.executor.config or {}).get("profile") or "DEFAULT"
             )
@@ -455,7 +459,7 @@ def register_mcp_routes(
             if family.base_url:
                 conn["base_url"] = family.base_url
             return conn or None
-        except Exception:  # noqa: BLE001
+        except Exception:
             _logger.warning(
                 "/v1/summarize: failed to resolve provider %r",
                 provider_name,

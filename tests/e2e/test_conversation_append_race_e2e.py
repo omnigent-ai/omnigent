@@ -56,7 +56,6 @@ factories).
 from __future__ import annotations
 
 import os
-import socket
 import subprocess
 import tempfile
 import threading
@@ -71,17 +70,9 @@ from omnigent.entities import MessageData, NewConversationItem
 from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
+from tests._helpers.live_server import find_free_port
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
-
-
-def _find_free_port() -> int:
-    """Pick a free TCP port for the Omnigent subprocess to bind."""
-    s = socket.socket()
-    s.bind(("", 0))
-    port: int = s.getsockname()[1]
-    s.close()
-    return port
 
 
 @pytest.fixture
@@ -100,7 +91,7 @@ def ap_server_with_shared_db() -> Iterator[tuple[str, str]]:
     :yields: ``(base_url, db_uri)`` — server URL and SQLite URI
         pointing at the shared DB.
     """
-    port = _find_free_port()
+    port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     tmp_root = Path(tempfile.mkdtemp(prefix="ap-append-race-e2e-"))
     db_path = tmp_root / "ap.db"

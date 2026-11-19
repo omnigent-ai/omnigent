@@ -78,7 +78,7 @@ describe("customTheme", () => {
       }),
     );
 
-    expect(readCustomTheme().darkAccent).toBe("#238636");
+    expect(readCustomTheme().darkAccent).toBe("#58a6ff");
   });
 
   it("creates one editable configuration from a built-in palette", () => {
@@ -87,8 +87,8 @@ describe("customTheme", () => {
 
     expect(createCustomThemeFromPalette(github!)).toEqual({
       basePalette: "github",
-      accent: "#1f883d",
-      darkAccent: "#238636",
+      accent: "#0969da",
+      darkAccent: "#58a6ff",
       tint: "#f6f8fa",
       darkTint: "#0d1117",
       contrast: 50,
@@ -140,9 +140,9 @@ describe("customTheme", () => {
     const theme = createCustomThemeFromPalette(PALETTES[0]);
     const variants = deriveCustomTheme({ ...theme, contrast: 53 });
 
-    expect(variants.light.selectionBackground).toBe("rgba(240, 1, 150, 0.1)");
+    expect(variants.light.selectionBackground).toBe("rgba(223, 60, 133, 0.1)");
     expect(variants.light.selectionForeground).toBe("#651249");
-    expect(variants.dark.selectionBackground).toBe("rgba(240, 1, 150, 0.15)");
+    expect(variants.dark.selectionBackground).toBe("rgba(223, 60, 133, 0.15)");
     expect(variants.dark.selectionForeground).toBe("#f9a8d4");
   });
 
@@ -160,10 +160,10 @@ describe("customTheme", () => {
     const theme = createCustomThemeFromPalette(PALETTES[0]);
     const variants = deriveCustomTheme({ ...theme, contrast: 53 });
 
-    expect(variants.light.sidebarActive).toBe("rgba(240, 1, 150, 0.1)");
-    expect(variants.light.sidebarActiveForeground).toBe("#651249");
-    expect(variants.dark.sidebarActive).toBe("rgba(240, 1, 150, 0.15)");
-    expect(variants.dark.sidebarActiveForeground).toBe("#f472b6");
+    expect(variants.light.sidebarActive).toContain("var(--primary)");
+    expect(variants.light.sidebarActiveForeground).toBe("var(--primary)");
+    expect(variants.dark.sidebarActive).toContain("var(--primary)");
+    expect(variants.dark.sidebarActiveForeground).toBe("var(--primary)");
   });
 
   it("tints the sidebar active highlight with a custom accent", () => {
@@ -178,11 +178,8 @@ describe("customTheme", () => {
     expect(variants.light.sidebarActive).toBe("rgba(37, 99, 235, 0.12)");
     expect(variants.dark.sidebarActive).toBe("rgba(245, 158, 11, 0.12)");
 
-    // Foreground reuses the rebased sidebar foreground (the default token
-    // model's `var(--sidebar-foreground)`), so it stays legible whatever
-    // format the base sidebar uses — not a hex-only-parser white fallback.
-    expect(variants.light.sidebarActiveForeground).toBe(variants.light.sidebarForeground);
-    expect(variants.dark.sidebarActiveForeground).toBe(variants.dark.sidebarForeground);
+    expect(variants.light.sidebarActiveForeground).toBe("#2563eb");
+    expect(variants.dark.sidebarActiveForeground).toBe("#f59e0b");
   });
 
   it.each(PALETTES)("keeps the exact $label preview at contrast 50", (palette) => {
@@ -222,8 +219,20 @@ describe("customTheme", () => {
     expect(variants.light.primaryForeground).toBe("#ffffff");
     expect(variants.dark.primaryForeground).toBe("#ffffff");
     expect(variants.light.foreground).not.toBe(variants.dark.foreground);
-    expect(variants.light.shellBackground).toBe(PALETTES[0].tokens.light.shellBackground);
-    expect(variants.dark.shellBackground).toBe(PALETTES[0].tokens.dark.shellBackground);
+    expect(variants.light.shellBackground).toBe(variants.light.background);
+    expect(variants.dark.shellBackground).toBe(variants.dark.background);
+    expect(variants.light.sidebarBackground).toBe(variants.light.sidebar);
+    expect(variants.dark.sidebarBackground).toBe(variants.dark.sidebar);
+  });
+
+  it("derives each mode from its own tint", () => {
+    const theme = createCustomThemeFromPalette(PALETTES[0]);
+    const first = deriveCustomTheme({ ...theme, tint: "#dbeafe", darkTint: "#160e24" });
+    const second = deriveCustomTheme({ ...theme, tint: "#fee2e2", darkTint: "#160e24" });
+
+    expect(first.light.foreground).not.toBe(second.light.foreground);
+    expect(first.dark.foreground).toBe(second.dark.foreground);
+    expect(first.dark.background).toBe("#160e24");
   });
 
   it("keeps helper text and links readable across custom contrast settings", () => {

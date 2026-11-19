@@ -5,8 +5,26 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from omnigent.inner.executor import NativeTurnAcceptance
 from omnigent.inner.os_env import OSEnvironment
 from omnigent.inner.terminal import TerminalInstance
+from omnigent.runner import subagent_work
+
+
+def accept_subagent_turn(
+    child_id: str, *, thread_id: str, response_id: str, now: float | None = None
+) -> None:
+    """Finish one delivery with caller-supplied authoritative native identity."""
+    request = subagent_work.begin_subagent_child_acceptance(child_id)
+    try:
+        subagent_work.arm_subagent_child_start_timeout(
+            child_id,
+            acceptance=NativeTurnAcceptance(child_id, thread_id, response_id),
+            request=request,
+            now=now,
+        )
+    finally:
+        subagent_work.finish_subagent_child_acceptance(request)
 
 
 class NullServerClient:

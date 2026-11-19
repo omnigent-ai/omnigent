@@ -40,6 +40,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests.e2e.conftest import get_mock_requests
 from tests.e2e_ui.conftest import _server_state, reset_mock_llm, set_fallback_mock_llm
 
 # Reuse the custom-agent suite's helpers — both surfaces render from the same
@@ -185,6 +186,25 @@ def test_native_claude_message_render_parity(
     # --- Assert all three properties over every turn. ---
     _assert_no_duplicate_render(page, user_markers, assistant_tokens)
     _assert_transcript_parity(base_url, session_id, user_markers, assistant_tokens)
+
+    # A live model can echo these reply tokens too; prove our prompts reached the mock.
+    user_texts: list[str] = []
+    for captured in get_mock_requests(mock_llm_server_url, key=_CLAUDE_MOCK_MODEL):
+        for message in captured.get("messages", []):
+            if message.get("role") != "user":
+                continue
+            content = message.get("content", [])
+            if isinstance(content, str):
+                user_texts.append(content)
+            else:
+                user_texts.extend(
+                    block["text"] for block in content if block.get("type") == "text"
+                )
+    for user_marker in user_markers:
+        assert any(user_marker in text for text in user_texts), (
+            f"Mock received no {_CLAUDE_MOCK_MODEL} user prompt containing {user_marker}; "
+            "rendered replies alone do not prove mock routing"
+        )
     _log.info("all turns verified: render parity + no-duplicate-render + transcript parity")
 
 
@@ -436,7 +456,7 @@ def _send_composer_turn(
     user_marker: str,
     assistant_token: str,
     expected_user_bubbles: int,
-    steer_queued: bool = False,
+    steer_if_queued: bool = False,
 ) -> None:
     """Send one composer turn and assert it landed as a chat turn, answered.
 
@@ -454,20 +474,22 @@ def _send_composer_turn(
     :param assistant_token: Unique token the agent must echo back.
     :param expected_user_bubbles: How many user bubbles the transcript must
         hold once this turn has landed.
-    :param steer_queued: Explicitly send a queued turn while a native dialog
-        keeps the session busy.
+    :param steer_if_queued: When a native dialog makes the session report busy
+        and the message queues, send it from the queue explicitly.
     """
     set_fallback_mock_llm(mock_llm_server_url, "default", assistant_token)
     set_fallback_mock_llm(mock_llm_server_url, _CLAUDE_MOCK_MODEL, assistant_token)
-    if steer_queued:
-        expect(page.locator(_WORKING)).to_be_visible(timeout=30_000)
     _send(page, _turn_prompt(index, user_marker, assistant_token))
-    if steer_queued:
-        queued = page.get_by_test_id("composer-queued-strip")
-        expect(queued).to_contain_text(user_marker, timeout=30_000)
-        expect(page.locator(_USER)).to_have_count(expected_user_bubbles - 1)
-        queued.get_by_role("button", name="Send queued message now", exact=True).click()
-        expect(queued).to_be_hidden(timeout=30_000)
+    if steer_if_queued:
+        # Some Claude Code releases report the rewind dialog as busy, which queues
+        # the message; others stay idle, and the bridge delivers it directly.
+        queued = page.get_by_test_id("composer-queued-strip").filter(has_text=user_marker)
+        sent = page.locator(_USER, has_text=user_marker)
+        expect(queued.or_(sent).first).to_be_visible(timeout=30_000)
+        if queued.is_visible():
+            expect(page.locator(_USER)).to_have_count(expected_user_bubbles - 1)
+            queued.get_by_role("button", name="Send queued message now", exact=True).click()
+            expect(queued).to_be_hidden(timeout=30_000)
     expect(page.locator(_ASSISTANT, has_text=assistant_token).first).to_be_visible(
         timeout=_MOCK_TURN_TIMEOUT_MS
     )
@@ -493,8 +515,8 @@ def test_native_claude_composer_delivers_into_an_occupied_tui(
     bridge now reclaims the input box first. Each case opens its surface with
     real keystrokes through the xterm, verifies the TUI actually rendered it,
     then sends from the chat composer and asserts the message arrived as a
-    user turn and was answered. Rewind reports a busy session, so its message
-    is explicitly steered from the queue to exercise bridge delivery.
+    user turn and was answered. If the rewind dialog makes the session report
+    busy, its message is steered from the queue so it still exercises the bridge.
     """
     base_url, session_id = native_claude_mock_session
     _log.info("occupied-composer journey: base_url=%s session_id=%s", base_url, session_id)
@@ -549,7 +571,7 @@ def test_native_claude_composer_delivers_into_an_occupied_tui(
             user_marker=user_marker,
             assistant_token=assistant_token,
             expected_user_bubbles=index,
-            steer_queued=label == "rewind dialog",
+            steer_if_queued=label == "rewind dialog",
         )
         _log.info("%s: message delivered as a user turn and answered", label)
 
@@ -862,6 +884,9 @@ def test_native_claude_lost_message_does_not_duplicate_the_next_one(
     expect(
         page.get_by_test_id("error-headline").filter(has_text=_UNDELIVERED_HEADLINE)
     ).to_have_count(1)
+    # At settlement, the undelivered notice must not count as an assistant reply.
+    expect(page.locator(_ASSISTANT).filter(has_text=_UNDELIVERED_HEADLINE)).to_have_count(0)
+    expect(page.locator(_ASSISTANT)).to_have_count(2)
 
     # The canonical transcript agrees: each message once, in send order.
     user_texts = [

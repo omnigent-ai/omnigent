@@ -2,23 +2,36 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   applyMacElectronShellAttribute,
+  checkDbcert,
+  closeDesktopWindow,
+  confirmDesktopQuit,
+  onDesktopCommand,
+  setDesktopCommandState,
+  startSystemDictation,
+  supportsDesktopCommands,
+  supportsSystemDictation,
   getServerPicker,
+  hasDbcertPreflightBridge,
   isAndroidShell,
   isElectronShell,
   isIOSShell,
   isNativeShell,
   nativeNotify,
+  refreshDbcert,
   onNativeNotificationActivated,
   onNativeSidebarDrag,
   PRE_MANIFEST_BASELINE,
+  resetOnboardingRunnerForTests,
   type ServerManifest,
   serverManifestOf,
   setBadgeCount as bridgeSetBadge,
   setNativeServerSwitcherHidden,
   setThemeSource,
   supportsNativeServerPicker,
+  supportsArcaConnect,
   supportsBrowser,
   switchServer,
+  takeOnboardingRunner,
 } from "./nativeBridge";
 
 // The Electron preload bridge mock, installed on window.omnigentDesktop.
@@ -141,6 +154,125 @@ afterEach(() => {
   setElectron(false);
   setIOS(false);
   setAndroid(false);
+});
+
+describe("dbcert preflight bridge", () => {
+  it("forwards local-only renewal options without changing ordinary refresh calls", async () => {
+    const nativeRefresh = vi.fn().mockResolvedValue({ ok: true });
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      refreshDbcert: nativeRefresh,
+    };
+    expect(await refreshDbcert({ skipArcaSync: true })).toEqual({ ok: true });
+    expect(nativeRefresh).toHaveBeenLastCalledWith({ skipArcaSync: true });
+    expect(await refreshDbcert()).toEqual({ ok: true });
+    expect(nativeRefresh).toHaveBeenLastCalledWith();
+  });
+
+  it("detects older shells and browsers without the new method", async () => {
+    setElectron(false);
+    expect(hasDbcertPreflightBridge()).toBe(false);
+    expect((await checkDbcert()).ok).toBe(false);
+    setElectron(true);
+    expect(hasDbcertPreflightBridge()).toBe(false);
+    expect((await checkDbcert()).ok).toBe(false);
+  });
+
+  it.each(["checkDbcert", "refreshDbcert", "ensureDbcert"])(
+    "requires both checking and refresh, not just %s",
+    (method) => {
+      (window as unknown as Record<string, unknown>).omnigentDesktop = {
+        kind: "electron",
+        [method]: vi.fn(),
+      };
+      expect(hasDbcertPreflightBridge()).toBe(false);
+    },
+  );
+
+  it("passes through the native result and turns an IPC failure into a retryable error", async () => {
+    const nativeCheck = vi.fn().mockResolvedValue({ ok: true, valid: false });
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      checkDbcert: nativeCheck,
+      refreshDbcert: vi.fn(),
+    };
+    expect(hasDbcertPreflightBridge()).toBe(true);
+    expect(await checkDbcert()).toEqual({ ok: true, valid: false });
+    nativeCheck.mockResolvedValueOnce({ ok: true, valid: true });
+    expect(await checkDbcert()).toEqual({ ok: true, valid: true });
+    nativeCheck.mockRejectedValue(new Error("IPC channel closed"));
+    expect(await checkDbcert()).toEqual({
+      ok: false,
+      error: "Couldn't check your laptop's dbcert. Try again.",
+    });
+  });
+});
+
+describe("supportsArcaConnect", () => {
+  it("is true only when the desktop shell offers the Arca connect", () => {
+    setElectron(false);
+    expect(supportsArcaConnect()).toBe(false);
+    // An older desktop shell without the method.
+    setElectron(true);
+    expect(supportsArcaConnect()).toBe(false);
+    (
+      window as unknown as { omnigentDesktop: Record<string, unknown> }
+    ).omnigentDesktop.connectArcaHost = () => Promise.resolve({ ok: true });
+    expect(supportsArcaConnect()).toBe(true);
+  });
+});
+
+describe("takeOnboardingRunner", () => {
+  const shellTake = vi.fn<() => Promise<"local" | "remote" | null>>();
+
+  beforeEach(() => {
+    resetOnboardingRunnerForTests();
+    // Like the shell, answer once and then report nothing.
+    shellTake.mockReset().mockResolvedValueOnce("remote").mockResolvedValue(null);
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      takeOnboardingRunner: () => shellTake(),
+    };
+  });
+
+  it("shares one shell read between consumers", async () => {
+    expect(await takeOnboardingRunner("hostPicker")).toBe("remote");
+    expect(await takeOnboardingRunner("importReview")).toBe("remote");
+    expect(shellTake).toHaveBeenCalledOnce();
+  });
+
+  it("shares a read still in flight", async () => {
+    let answer: (runner: "local" | "remote" | null) => void = () => {};
+    shellTake.mockReset().mockReturnValueOnce(
+      new Promise((resolve) => {
+        answer = resolve;
+      }),
+    );
+    const picker = takeOnboardingRunner("hostPicker");
+    const review = takeOnboardingRunner("importReview");
+    answer("local");
+    expect(await Promise.all([picker, review])).toEqual(["local", "local"]);
+    expect(shellTake).toHaveBeenCalledOnce();
+  });
+
+  it("hands each consumer the runner only once per page load", async () => {
+    expect(await takeOnboardingRunner("importReview")).toBe("remote");
+    expect(await takeOnboardingRunner("importReview")).toBeNull();
+    expect(await takeOnboardingRunner("hostPicker")).toBe("remote");
+    expect(await takeOnboardingRunner("hostPicker")).toBeNull();
+  });
+
+  it("resolves null when the shell read fails or there's no shell", async () => {
+    shellTake.mockReset().mockRejectedValue(new Error("ipc down"));
+    expect(await takeOnboardingRunner("hostPicker")).toBeNull();
+    resetOnboardingRunnerForTests();
+    // An older shell without the handoff.
+    (window as unknown as Record<string, unknown>).omnigentDesktop = { kind: "electron" };
+    expect(await takeOnboardingRunner("hostPicker")).toBeNull();
+    resetOnboardingRunnerForTests();
+    setElectron(false);
+    expect(await takeOnboardingRunner("hostPicker")).toBeNull();
+  });
 });
 
 describe("isNativeShell / isElectronShell", () => {
@@ -624,5 +756,138 @@ describe("getServerPicker / switchServer over the iOS bridge", () => {
     setIOS(true, true, true);
     iosGetServerPicker.mockRejectedValueOnce(new Error("bridge down"));
     await expect(getServerPicker()).resolves.toBeNull();
+  });
+});
+
+describe("desktop command bridge", () => {
+  type CommandListener = (event: {
+    command: string;
+    browserViewId: string | null;
+    closingQuits?: boolean;
+    quitDetail?: string | null;
+  }) => void;
+
+  function installDesktop(api: Record<string, unknown>): void {
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      setBadgeCount: () => {},
+      notify: async () => false,
+      ...api,
+    };
+  }
+
+  afterEach(() => {
+    delete (window as unknown as Record<string, unknown>).omnigentDesktop;
+  });
+
+  it("needs both the subscription and the state report", () => {
+    expect(supportsDesktopCommands()).toBe(false);
+    installDesktop({ onDesktopCommand: () => () => {} });
+    expect(supportsDesktopCommands()).toBe(false);
+    installDesktop({ onDesktopCommand: () => () => {}, setDesktopCommandState: () => {} });
+    expect(supportsDesktopCommands()).toBe(true);
+  });
+
+  it("forwards known commands and drops ones this page doesn't know", () => {
+    let listener: CommandListener = () => {};
+    const unsubscribe = vi.fn();
+    installDesktop({
+      onDesktopCommand: (callback: CommandListener) => {
+        listener = callback;
+        return unsubscribe;
+      },
+    });
+    const received = vi.fn();
+    const stop = onDesktopCommand(received);
+
+    listener({ command: "close", browserViewId: "browser-tab:s:t", closingQuits: true });
+    listener({ command: "open-everything", browserViewId: null });
+    listener({ command: "new-terminal", browserViewId: null });
+    listener({ command: "quit", browserViewId: null, quitDetail: "The local server will stop." });
+    expect(received.mock.calls).toEqual([
+      [
+        {
+          command: "close",
+          browserViewId: "browser-tab:s:t",
+          closingQuits: true,
+          quitDetail: null,
+        },
+      ],
+      [{ command: "new-terminal", browserViewId: null, closingQuits: false, quitDetail: null }],
+      [
+        {
+          command: "quit",
+          browserViewId: null,
+          closingQuits: false,
+          quitDetail: "The local server will stop.",
+        },
+      ],
+    ]);
+    stop();
+    expect(unsubscribe).toHaveBeenCalled();
+  });
+
+  it("degrades to no-ops outside a supporting shell", async () => {
+    expect(onDesktopCommand(() => {})).toBeTypeOf("function");
+    expect(() =>
+      setDesktopCommandState({ commands: [], sessionPinned: false, sessionArchived: false }),
+    ).not.toThrow();
+    await expect(closeDesktopWindow()).resolves.toBe(false);
+    await expect(confirmDesktopQuit(false)).resolves.toBe(false);
+  });
+
+  it("confirms a quit with the Don't ask again choice", async () => {
+    const confirmQuit = vi.fn().mockResolvedValue(true);
+    installDesktop({ confirmQuit });
+    await expect(confirmDesktopQuit(true)).resolves.toBe(true);
+    expect(confirmQuit).toHaveBeenCalledWith({ dontAskAgain: true });
+
+    confirmQuit.mockRejectedValueOnce(new Error("bridge down"));
+    await expect(confirmDesktopQuit(false)).resolves.toBe(false);
+  });
+
+  it("reports state and asks the shell to close the window", async () => {
+    const setState = vi.fn();
+    const closeWindow = vi.fn().mockResolvedValue(true);
+    installDesktop({ setDesktopCommandState: setState, closeWindow });
+    const state = { commands: ["close" as const], sessionPinned: true, sessionArchived: false };
+
+    setDesktopCommandState(state);
+    expect(setState).toHaveBeenCalledWith(state);
+    await expect(closeDesktopWindow()).resolves.toBe(true);
+
+    closeWindow.mockRejectedValueOnce(new Error("bridge down"));
+    await expect(closeDesktopWindow()).resolves.toBe(false);
+  });
+});
+
+describe("system dictation bridge", () => {
+  afterEach(() => {
+    delete (window as unknown as Record<string, unknown>).omnigentDesktop;
+  });
+
+  it("is unsupported outside a shell that exposes it", async () => {
+    expect(supportsSystemDictation()).toBe(false);
+    await expect(startSystemDictation()).resolves.toBe(false);
+
+    (window as unknown as Record<string, unknown>).omnigentDesktop = { kind: "electron" };
+    expect(supportsSystemDictation()).toBe(false);
+  });
+
+  it("resolves whether the shell started macOS Dictation", async () => {
+    const start = vi.fn().mockResolvedValue(true);
+    (window as unknown as Record<string, unknown>).omnigentDesktop = {
+      kind: "electron",
+      startSystemDictation: start,
+    };
+    expect(supportsSystemDictation()).toBe(true);
+    await expect(startSystemDictation()).resolves.toBe(true);
+
+    start.mockResolvedValueOnce(false);
+    await expect(startSystemDictation()).resolves.toBe(false);
+
+    // A rejected IPC call reads as not started, so the mic can report it.
+    start.mockRejectedValueOnce(new Error("ipc down"));
+    await expect(startSystemDictation()).resolves.toBe(false);
   });
 });

@@ -576,8 +576,8 @@ def candidate_models(
         catalog has no row for.
     :param allow_static_fallback: Whether the static :func:`infer_models` table
         may fill a harness the catalog has no row for. Off the Unity Gateway it may
-        not: every id in that table is a ``databricks-*`` endpoint the spawn
-        could not reach, so the catalog is the only provider-accurate source.
+        not: every id in that table is a Unity Catalog endpoint the spawn could
+        not reach, so the catalog is the only provider-accurate source.
     :returns: Harness → model ids, cheapest first, empty entries dropped.
     """
     from omnigent.server.smart_routing import (
@@ -712,7 +712,7 @@ async def resolve_subagent_route(
         external router out of play and the built-in judge answers instead.
     :param allow_static_fallback: Whether the static :func:`infer_models` table
         may supply candidates. Callers pass ``gateway_backed``: off the gateway
-        its ``databricks-*`` ids are unreachable from the spawn.
+        its Unity Catalog ids are unreachable from the spawn.
     :param persist: Coroutine that records the decision in the
         transcript. ``None`` skips persistence (unit tests, dry runs).
     :returns: The verdict the hook script enforces.
@@ -801,7 +801,7 @@ async def _decide(
     result = None
     try:
         call = await route_with_fallback(backends, task, candidates, gateway_backed=gateway_backed)
-    except Exception as exc:  # noqa: BLE001 — router outages are a normal path here
+    except Exception as exc:  # router outages are a normal path here
         _logger.warning(
             "route-subagent: router call failed for session=%s", session_id, exc_info=True
         )
@@ -866,11 +866,25 @@ def _decision_from_result(
 ) -> SubagentRouteDecision:
     model = result.model
     rationale = getattr(result, "rationale", "") or ""
+    # The external router still returns the legacy ``databricks-*`` spelling,
+    # while Unity Catalog candidates use ``system.ai.*``. Resolve a same-arm
+    # pick onto the exact offered id before enforcing the offer boundary.
+    from omnigent.server.smart_routing import _bare_id
+
+    offered_model = next(
+        (
+            candidate
+            for models in candidates.values()
+            for candidate in models
+            if _bare_id(candidate) == _bare_id(model)
+        ),
+        None,
+    )
+    if offered_model is not None:
+        model = offered_model
     # Only report a raw pick that actually differs from the resolved model, so
     # the raw_model field means "the router asked for something else". A
     # prefix-only spelling difference is the same arm, not a substitution.
-    from omnigent.server.smart_routing import _bare_id
-
     raw = _opt_str(getattr(result, "raw_model", None))
     raw_model = raw if raw and _bare_id(raw) != _bare_id(model) else None
     offered = {m for models in candidates.values() for m in models}
@@ -895,7 +909,7 @@ def _decision_from_result(
     note = _ask_note(req, model)
 
     if target == req.harness:
-        if req.parent_model is not None and model == req.parent_model:
+        if req.parent_model is not None and _bare_id(model) == _bare_id(req.parent_model):
             return SubagentRouteDecision(
                 action="allow",
                 rationale=(rationale or "Router kept the parent model") + note,
@@ -1160,7 +1174,7 @@ def _handler_factory(
                     _awaited(resolver(session_id, req)), loop
                 )
                 decision = future.result(timeout=request_timeout_s)
-            except Exception:  # noqa: BLE001 — never wedge the spawn path
+            except Exception:  # never wedge the spawn path
                 _logger.warning(
                     "route-subagent: resolver failed for session=%s", session_id, exc_info=True
                 )
@@ -1226,7 +1240,7 @@ def make_server_relay_resolver(
             )
             resp.raise_for_status()
             payload = resp.json()
-        except Exception:  # noqa: BLE001 — server hop failures are expected
+        except Exception:  # server hop failures are expected
             _logger.warning(
                 "route-subagent: server relay failed for session=%s", session_id, exc_info=True
             )

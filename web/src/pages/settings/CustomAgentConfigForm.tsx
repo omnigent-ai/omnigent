@@ -25,6 +25,9 @@ import {
 import type { AgentConfigRevision } from "@/lib/agentsApi";
 import { randomUUID } from "@/lib/randomUUID";
 import { ApiError } from "@/lib/sessionsApi";
+import { CUSTOM_AGENT_DETAIL_ENTRY } from "./search/catalog/customAgents";
+import { settingsControlProps } from "./search/settingsControl";
+import { settingsOverlayProps } from "./search/settingsOwnership";
 
 export function CustomAgentConfigForm({
   id,
@@ -93,7 +96,7 @@ export function CustomAgentConfigForm({
   }
   async function submit(event: React.FormEvent) {
     event.preventDefault();
-    if (!revision?.etag || !dirty || validation || conflict || busy) return;
+    if (!revision || !dirty || validation || conflict || busy) return;
     setError(null);
     try {
       const result = await save.mutateAsync({ etag: revision.etag, patch });
@@ -102,10 +105,14 @@ export function CustomAgentConfigForm({
       setDraft(agentConfigDraft(result.config));
       save.reset();
     } catch (err) {
-      if (err instanceof ApiError && [412, 428].includes(err.status)) {
+      if (err instanceof ApiError && err.status === 412) {
         setConflict(true);
         setError(
-          "This agent changed or its revision is unavailable. Reload the latest configuration before saving. Your draft is still here.",
+          "This agent changed. Reload the latest configuration before saving. Your draft is still here.",
+        );
+      } else if (err instanceof ApiError && err.status === 428) {
+        setError(
+          "This server needs an update before it can save these changes. Your draft is still here. Try saving again after the update.",
         );
       } else setError(err instanceof Error ? err.message : "Could not save the agent.");
       // Mutation variables can contain replacement credentials; only the local draft retains them.
@@ -136,11 +143,11 @@ export function CustomAgentConfigForm({
         componentId="settings.custom_agents.back"
       />
       <div className="mb-6 flex items-start justify-between gap-4">
-        <h1 className="min-w-0 break-words text-2xl font-semibold">{name}</h1>
+        <h1 className="min-w-0 break-words text-2xl font-medium">{name}</h1>
         <Button
+          {...settingsControlProps(CUSTOM_AGENT_DETAIL_ENTRY, "delete")}
           variant="ghost"
           size="icon"
-          aria-label="Delete agent"
           disabled={busy}
           onClick={onDelete}
         >
@@ -167,7 +174,12 @@ export function CustomAgentConfigForm({
           <fieldset disabled={busy} className="flex min-w-0 flex-col gap-5">
             <label className="space-y-1 text-ui">
               Name
-              <Input aria-label="Name" value={name} readOnly aria-describedby="agent-name-note" />
+              <Input
+                {...settingsControlProps(CUSTOM_AGENT_DETAIL_ENTRY, "name")}
+                value={name}
+                readOnly
+                aria-describedby="agent-name-note"
+              />
               <p id="agent-name-note" className="text-xs text-muted-foreground">
                 The agent name cannot be changed.
               </p>
@@ -175,7 +187,7 @@ export function CustomAgentConfigForm({
             <label className="space-y-1 text-ui">
               Description
               <Textarea
-                aria-label="Description"
+                {...settingsControlProps(CUSTOM_AGENT_DETAIL_ENTRY, "description")}
                 maxLength={4096}
                 value={draft.description}
                 onChange={(e) => setDraft({ ...draft, description: e.target.value })}
@@ -185,7 +197,7 @@ export function CustomAgentConfigForm({
               <label className="space-y-1 text-ui">
                 Harness
                 <select
-                  aria-label="Harness"
+                  {...settingsControlProps(CUSTOM_AGENT_DETAIL_ENTRY, "harness")}
                   className="h-9 w-full rounded-md border border-input bg-background px-3"
                   value={draft.harness}
                   onChange={(e) => setDraft({ ...draft, harness: e.target.value })}
@@ -203,7 +215,7 @@ export function CustomAgentConfigForm({
               <label className="space-y-1 text-ui">
                 Model
                 <Input
-                  aria-label="Model"
+                  {...settingsControlProps(CUSTOM_AGENT_DETAIL_ENTRY, "model")}
                   value={draft.model}
                   onChange={(e) => setDraft({ ...draft, model: e.target.value })}
                 />
@@ -212,7 +224,7 @@ export function CustomAgentConfigForm({
             <label className="space-y-1 text-ui">
               Instructions
               <Textarea
-                aria-label="Instructions"
+                {...settingsControlProps(CUSTOM_AGENT_DETAIL_ENTRY, "instructions")}
                 className="min-h-32"
                 value={draft.instructions}
                 onChange={(e) => setDraft({ ...draft, instructions: e.target.value })}
@@ -221,6 +233,7 @@ export function CustomAgentConfigForm({
             <div className="flex items-center justify-between">
               <h3 className="font-medium">MCP servers</h3>
               <Button
+                {...settingsControlProps(CUSTOM_AGENT_DETAIL_ENTRY, "addServer")}
                 type="button"
                 variant="outline"
                 size="sm"
@@ -273,17 +286,13 @@ export function CustomAgentConfigForm({
               {error || validation}
             </p>
           )}
-          {!revision?.etag && (
-            <p role="alert">
-              The server did not provide a configuration revision. Reload before saving.
-            </p>
-          )}
           <div className="sticky bottom-0 z-10 flex flex-wrap items-center justify-end gap-2 border-t border-border bg-background py-4">
             <p className="mr-auto w-full text-xs text-muted-foreground @lg:w-auto">
               Changes apply to sessions on their next turn.
             </p>
-            {(conflict || !revision?.etag) && (
+            {conflict && (
               <Button
+                {...settingsControlProps(CUSTOM_AGENT_DETAIL_ENTRY, "reloadLatest")}
                 type="button"
                 variant="outline"
                 disabled={busy}
@@ -292,13 +301,20 @@ export function CustomAgentConfigForm({
                 Reload latest
               </Button>
             )}
-            <Button type="button" variant="ghost" disabled={busy} onClick={() => request("back")}>
+            <Button
+              {...settingsControlProps(CUSTOM_AGENT_DETAIL_ENTRY, "cancel")}
+              type="button"
+              variant="ghost"
+              disabled={busy}
+              onClick={() => request("back")}
+            >
               Cancel
             </Button>
             <Button
+              {...settingsControlProps(CUSTOM_AGENT_DETAIL_ENTRY, "save")}
               type="submit"
               loading={save.isPending}
-              disabled={busy || !dirty || Boolean(validation) || conflict || !revision?.etag}
+              disabled={busy || !dirty || Boolean(validation) || conflict || !revision}
             >
               Save changes
             </Button>
@@ -311,7 +327,7 @@ export function CustomAgentConfigForm({
           if (!open) setConfirm(null);
         }}
       >
-        <DialogContent>
+        <DialogContent {...settingsOverlayProps(CUSTOM_AGENT_DETAIL_ENTRY, "cancel")}>
           <DialogHeader>
             <DialogTitle>Discard unsaved changes?</DialogTitle>
             <DialogDescription>
@@ -321,10 +337,15 @@ export function CustomAgentConfigForm({
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
-            <Button variant="ghost" onClick={() => setConfirm(null)}>
+            <Button
+              data-settings-dialog-action="Keep editing"
+              variant="ghost"
+              onClick={() => setConfirm(null)}
+            >
               Keep editing
             </Button>
             <Button
+              {...settingsControlProps(CUSTOM_AGENT_DETAIL_ENTRY, "discard")}
               variant="destructive"
               onClick={() => {
                 if (confirm === "reload") void reload();

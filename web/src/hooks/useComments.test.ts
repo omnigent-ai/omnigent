@@ -7,7 +7,11 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { renderHook, waitFor } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { CapabilitiesContext } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { useChatStore } from "@/store/chatStore";
+import { requestLocalReviewContext } from "@/lib/localReviewContext";
+import { clearSessionDrafts, getSessionDraft } from "@/lib/sessionDrafts";
 import {
   commentsQueryKey,
   fetchComments,
@@ -48,11 +52,18 @@ beforeEach(() => {
 
 afterEach(() => {
   vi.unstubAllGlobals();
+  clearSessionDrafts();
 });
 
-function wrapperWith(queryClient: QueryClient) {
+function wrapperWith(queryClient: QueryClient, gridEnabled = false) {
   return ({ children }: { children: ReactNode }) =>
-    createElement(QueryClientProvider, { client: queryClient }, children);
+    createElement(
+      CapabilitiesContext.Provider,
+      {
+        value: { ...FALLBACK_SERVER_INFO, features: { grid_sessions_display_ui: gridEnabled } },
+      },
+      createElement(QueryClientProvider, { client: queryClient }, children),
+    );
 }
 
 function makeComment(overrides: Partial<Comment> & { id: string; path: string }): Comment {
@@ -80,10 +91,12 @@ describe("commentsQueryKey", () => {
 });
 
 describe("fetchComments", () => {
-  it("GETs the session list endpoint with no path query", async () => {
-    fetchMock.mockResolvedValueOnce(mockResponse([]));
+  it("opts into PR comments without a path filter", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ comments: [], next_cursor: null }));
     await fetchComments("conv_1");
-    expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/conv_1/comments");
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/v1/sessions/conv_1/comments?include_pr_comments=true&limit=100",
+    );
   });
 
   it("appends an encoded path query when filtering to one file", async () => {
@@ -92,14 +105,43 @@ describe("fetchComments", () => {
     fetchMock.mockResolvedValueOnce(mockResponse([]));
     await fetchComments("conv with space", "src/a b.ts");
     expect(fetchMock.mock.calls[0][0]).toBe(
-      "/v1/sessions/conv%20with%20space/comments?path=src%2Fa%20b.ts",
+      "/v1/sessions/conv%20with%20space/comments?path=src%2Fa%20b.ts&include_pr_comments=true&limit=100",
     );
   });
 
-  it("returns the parsed comment array", async () => {
+  it("accepts a legacy server's comment array", async () => {
     const comments = [makeComment({ id: "c1", path: "a.ts" })];
     fetchMock.mockResolvedValueOnce(mockResponse(comments));
     await expect(fetchComments("conv_1")).resolves.toEqual(comments);
+  });
+
+  it("follows cursors through empty filtered pages and restores chronological order", async () => {
+    const earlier = makeComment({ id: "c3", path: "a.ts", created_at: 1 });
+    const later = makeComment({ id: "c1", path: "a.ts", created_at: 2 });
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ comments: [later], next_cursor: "c1" }))
+      .mockResolvedValueOnce(mockResponse({ comments: [], next_cursor: "c2" }))
+      .mockResolvedValueOnce(mockResponse({ comments: [earlier], next_cursor: null }));
+    const controller = new AbortController();
+    await expect(fetchComments("conv_1", "a.ts", controller.signal)).resolves.toEqual([
+      earlier,
+      later,
+    ]);
+    const url = "/v1/sessions/conv_1/comments?path=a.ts&include_pr_comments=true&limit=100";
+    expect(fetchMock.mock.calls.map(([request]) => request)).toEqual([
+      url,
+      `${url}&after=c1`,
+      `${url}&after=c2`,
+    ]);
+    expect(fetchMock.mock.calls.every(([, init]) => init.signal === controller.signal)).toBe(true);
+  });
+
+  it("rejects a failed continuation rather than returning a partial list", async () => {
+    fetchMock
+      .mockResolvedValueOnce(mockResponse({ comments: [], next_cursor: "c1" }))
+      .mockResolvedValueOnce(mockResponse({}, { ok: false, status: 500 }));
+    await expect(fetchComments("conv_1")).rejects.toThrow(/500/);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
   it("throws on non-2xx", async () => {
@@ -128,7 +170,9 @@ describe("useComments", () => {
     });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
     expect(result.current.data).toEqual(comments);
-    expect(fetchMock.mock.calls[0][0]).toBe("/v1/sessions/conv_1/comments");
+    expect(fetchMock.mock.calls[0][0]).toBe(
+      "/v1/sessions/conv_1/comments?include_pr_comments=true&limit=100",
+    );
   });
 });
 
@@ -185,10 +229,10 @@ describe("useDeleteComment", () => {
     return renderHook(() => useDeleteComment("conv_1"), { wrapper: wrapperWith(queryClient) });
   }
 
-  it("DELETEs the encoded comment endpoint and invalidates the session list", async () => {
+  it.each([204, 404])("DELETE %s invalidates the session list", async (status) => {
     // The comment id is url-encoded so ids with reserved chars hit the
     // right route; success refreshes the session-wide list.
-    fetchMock.mockResolvedValueOnce(mockResponse(undefined));
+    fetchMock.mockResolvedValueOnce(mockResponse(undefined, { status, ok: status === 204 }));
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
     const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
     const { result } = renderDelete(queryClient);
@@ -201,12 +245,15 @@ describe("useDeleteComment", () => {
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["comments", "conv_1"] });
   });
 
-  it("throws on non-2xx", async () => {
-    fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status: 404 }));
+  it.each([403, 500])("preserves the cache when deletion fails with %s", async (status) => {
+    fetchMock.mockResolvedValueOnce(mockResponse({}, { ok: false, status }));
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
     const { result } = renderDelete(queryClient);
     result.current.mutate("c1");
     await waitFor(() => expect(result.current.isError).toBe(true));
+    expect(result.current.error?.message).toContain(String(status));
+    expect(invalidateSpy).not.toHaveBeenCalled();
   });
 });
 
@@ -214,6 +261,58 @@ describe("useUpdateComment", () => {
   function renderUpdate(queryClient: QueryClient) {
     return renderHook(() => useUpdateComment("conv_1"), { wrapper: wrapperWith(queryClient) });
   }
+
+  it.each([undefined, null])(
+    "preserves attached coordinates after a legacy PATCH with %s anchor",
+    async (anchor_metadata) => {
+      const comment = makeComment({
+        id: "c1",
+        path: "a.ts",
+        anchor_metadata: {
+          pr_url: "https://github.com/acme/app/pull/1",
+          side: "LEFT",
+          line: 9,
+          start_line: 7,
+          head_sha: "a".repeat(40),
+          base_sha: "b".repeat(40),
+        },
+      });
+      requestLocalReviewContext(comment);
+      fetchMock.mockResolvedValueOnce(
+        mockResponse({ ...comment, body: "Updated", anchor_metadata }),
+      );
+      const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+      const { result } = renderUpdate(queryClient);
+      result.current.mutate({ commentId: comment.id, body: "Updated" });
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      expect(getSessionDraft("conv_1")?.reviewComments).toEqual([{ ...comment, body: "Updated" }]);
+
+      fetchMock.mockResolvedValueOnce(
+        mockResponse({
+          ...comment,
+          anchor_metadata: { ...comment.anchor_metadata!, line: 10 },
+        }),
+      );
+      result.current.mutate({ commentId: comment.id, body: "Another edit" });
+      await waitFor(() => expect(result.current.isError).toBe(true));
+      expect(result.current.error?.message).toContain("Your attached comment is unchanged");
+      expect(getSessionDraft("conv_1")?.reviewComments).toEqual([{ ...comment, body: "Updated" }]);
+    },
+  );
+
+  it.each([{ id: "another-comment" }, { conversation_id: "another-session" }])(
+    "rejects a response with a different identity: %j",
+    async (changes) => {
+      fetchMock.mockResolvedValueOnce(
+        mockResponse(makeComment({ id: "c1", path: "a.ts", ...changes })),
+      );
+      const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+      const { result } = renderUpdate(queryClient);
+      result.current.mutate({ commentId: "c1", body: "Updated" });
+      await waitFor(() => expect(result.current.isError).toBe(true));
+      expect(result.current.error?.message).toContain("a different comment");
+    },
+  );
 
   it("PATCHes only the mutable fields, excluding commentId from the body", async () => {
     // commentId belongs in the URL, not the body; leaking it into the
@@ -250,9 +349,9 @@ describe("useUpdateComment", () => {
 });
 
 describe("useSendCommentsToAgent", () => {
-  function renderSend(queryClient: QueryClient) {
+  function renderSend(queryClient: QueryClient, gridEnabled = false) {
     return renderHook(() => useSendCommentsToAgent("conv_1", "ag_1"), {
-      wrapper: wrapperWith(queryClient),
+      wrapper: wrapperWith(queryClient, gridEnabled),
     });
   }
 
@@ -271,7 +370,7 @@ describe("useSendCommentsToAgent", () => {
     expect(JSON.parse(init.body as string)).toEqual({ comment_ids: ["c1"], instruction: "fix" });
   });
 
-  it("dispatches the formatted message to the agent via the chat store on success", async () => {
+  it.each([false, true])("dispatches comments with grid flag %s", async (gridEnabled) => {
     // The whole point of this hook: the server-formatted message is sent
     // to the agent immediately, no manual send. Regressing this leaves
     // comments queued but never delivered.
@@ -280,11 +379,15 @@ describe("useSendCommentsToAgent", () => {
     );
     const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
     const invalidateSpy = vi.spyOn(queryClient, "invalidateQueries");
-    const { result } = renderSend(queryClient);
+    const { result } = renderSend(queryClient, gridEnabled);
     result.current.mutate({ comment_ids: ["c1"] });
     await waitFor(() => expect(result.current.isSuccess).toBe(true));
 
-    expect(sendMock).toHaveBeenCalledWith("please address these", "ag_1");
+    if (gridEnabled)
+      expect(sendMock).toHaveBeenCalledWith("please address these", "ag_1", undefined, {
+        pinnedConversationId: "conv_1",
+      });
+    else expect(sendMock).toHaveBeenCalledWith("please address these", "ag_1");
     expect(invalidateSpy).toHaveBeenCalledWith({ queryKey: ["comments", "conv_1"] });
   });
 

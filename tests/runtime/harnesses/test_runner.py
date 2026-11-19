@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 
+import httpx
 import pytest
 from fastapi import FastAPI
 
@@ -161,13 +162,30 @@ def test_create_uvicorn_config_for_unix_socket() -> None:
     assert config.log_level == _runner._UVICORN_LOG_LEVEL
 
 
-def test_create_uvicorn_config_for_tcp_bind() -> None:
-    config = _runner._create_uvicorn_config(FastAPI(), None, "127.0.0.1:8765")
+@pytest.mark.parametrize(
+    "bind, host",
+    [("127.0.0.1:8765", "127.0.0.1"), ("[::1]:8765", "::1"), ("::1:8765", "::1")],
+)
+def test_create_uvicorn_config_for_tcp_bind(bind: str, host: str) -> None:
+    config = _runner._create_uvicorn_config(FastAPI(), None, bind)
 
-    assert config.host == "127.0.0.1"
+    assert config.host == host
     assert config.port == 8765
     assert config.timeout_graceful_shutdown == _runner._GRACEFUL_SHUTDOWN_TIMEOUT_S
     assert config.log_level == _runner._UVICORN_LOG_LEVEL
+
+
+@pytest.mark.parametrize(
+    ("socket_path", "bind"), [("/tmp/runner.sock", None), (None, "127.0.0.1:8765")]
+)
+def test_create_uvicorn_config_outlives_the_runner_client_keepalive(
+    socket_path: str | None, bind: str | None
+) -> None:
+    # The runner's harness client drops an idle connection after httpx's default
+    # expiry; the harness closing it at the same moment races the next request.
+    config = _runner._create_uvicorn_config(FastAPI(), socket_path, bind)
+
+    assert config.timeout_keep_alive > httpx.Limits().keepalive_expiry
 
 
 def test_create_uvicorn_config_requires_endpoint() -> None:

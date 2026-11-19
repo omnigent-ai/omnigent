@@ -11,12 +11,15 @@ export function DisabledActionTooltip({
   children,
   label,
   className,
+  delayDuration,
 }: {
   reason?: string;
   children: ReactNode;
   /** Wraps one native button, handing focus to it when the reason clears. */
   label?: string;
   className?: string;
+  /** Hover delay in milliseconds; defaults to the shared tooltip delay. */
+  delayDuration?: number;
 }) {
   const triggerRef = useRef<HTMLSpanElement>(null);
   const [open, setOpen] = useState(false);
@@ -28,7 +31,7 @@ export function DisabledActionTooltip({
   }, [reason, label]);
 
   return (
-    <TooltipProvider>
+    <TooltipProvider delayDuration={delayDuration}>
       <Tooltip open={!!reason && open} onOpenChange={(value) => setOpen(!!reason && value)}>
         <TooltipTrigger asChild>
           <span

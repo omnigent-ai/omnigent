@@ -28,6 +28,9 @@ or `seed_transcript(...)` to generate Markdown/code turns. Use
 including setting `host_id=None` and `workspace=None`. Use `set_health(...)` to
 override per-session liveness fields such as `runner_online`.
 
+Use `seed_sidebar_sessions(titles)` before navigation to list more idle sessions
+in the sidebar after this one.
+
 Use `set_skills(...)` to replace the session's `/v1/skills` response. To exercise
 loading UI, call `release = hold_skills()` before navigation, then call
 `release()` after the request appears in `skill_requests`. Session PATCH bodies

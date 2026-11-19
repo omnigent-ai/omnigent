@@ -28,7 +28,6 @@ import copy
 import json
 import os
 import shutil
-import socket
 import subprocess
 import sys
 import time
@@ -40,6 +39,8 @@ import httpx
 import pytest
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page, expect
+
+from tests._helpers.live_server import find_free_port
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -172,12 +173,6 @@ if "-p" in ARGS:
 print("stub claude: unsupported invocation: " + " ".join(ARGS), file=sys.stderr)
 raise SystemExit(1)
 '''
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 def _wait_for(predicate: Callable[[], object], timeout_s: float, what: str) -> object:
@@ -360,7 +355,7 @@ def picker_rig(
         hidden_default=hidden_default,
     )
 
-    port = _free_port()
+    port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     server_log = root / "server.log"
     host_log = root / "host.log"

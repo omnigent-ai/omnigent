@@ -31,7 +31,7 @@ from playwright.sync_api import Browser, expect
 _MENU = '[data-slot="dropdown-menu-content"]'
 _KEBAB = '[data-testid="header-conversation-actions"]'
 
-# iPhone-13-like phone profile: below Tailwind's md breakpoint (768px) so the
+# iPhone-13-like phone profile: below Tailwind's md breakpoint (1181px) so the
 # mobile floating header renders, with touch so ``tap()`` drives real touches.
 _VIEWPORT = {"width": 390, "height": 664}
 
@@ -93,7 +93,7 @@ def test_outside_tap_dismisses_overflow_menu(
 
         # The seeded plan renders the tracker pinned at the top of the thread —
         # the same chat-surface state as the reported session.
-        expect(page.locator('[data-testid="plan-tracker"]')).to_be_visible(timeout=30_000)
+        expect(page.locator('[data-testid="tasks-preview"]')).to_be_visible(timeout=30_000)
         kebab = page.locator(_KEBAB)
         expect(kebab).to_be_visible()
         page.wait_for_timeout(500)

@@ -1,10 +1,19 @@
 import { act, cleanup, renderHook } from "@testing-library/react";
-import { afterEach, describe, expect, it } from "vitest";
-import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { useLayoutEffect } from "react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  readSessionWorkspaceState,
+  SESSION_WORKSPACE_STATE_KEY,
+  writeSessionWorkspaceState,
+} from "@/lib/sessionWorkspaceState";
+import { subagentTabId } from "@/lib/subagentTabs";
 import { useSideChats } from "./useSideChats";
+
+type SideChatsHook = ReturnType<typeof useSideChats>;
 
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
   localStorage.clear();
 });
 
@@ -78,13 +87,23 @@ describe("side-chat soft tabs", () => {
       openSideChats: ["conv_b1"],
       selectedSideChatId: "conv_b1",
     });
-    const { result, rerender } = renderHook(({ id }) => useSideChats(id), {
-      initialProps: { id: "session-a" },
-    });
+    // Every committed selection, so the switch can't commit session-a's tabs first.
+    const committed: (string | null)[] = [];
+    const { result, rerender } = renderHook(
+      ({ id }) => {
+        const sideChats = useSideChats(id);
+        useLayoutEffect(() => {
+          committed.push(sideChats.selected);
+        });
+        return sideChats;
+      },
+      { initialProps: { id: "session-a" } },
+    );
     expect(result.current.tabs).toEqual(["conv_a1"]);
     rerender({ id: "session-b" });
     expect(result.current.tabs).toEqual(["conv_b1"]);
     expect(result.current.selected).toBe("conv_b1");
+    expect(committed).toEqual(["conv_a1", "conv_b1"]);
   });
 
   it("persists tabs and selection across remount, isolated per session", () => {
@@ -127,6 +146,43 @@ describe("side-chat soft tabs", () => {
     expect(result.current.selected).toBe("conv_2");
   });
 
+  it("adds remote chats without duplicates or reopening locally closed tabs", () => {
+    const first = renderHook(() => useSideChats("session-a"));
+    act(() => first.result.current.open("local"));
+    act(() => first.result.current.open(subagentTabId("native")));
+    act(() => first.result.current.select("local"));
+    act(() => first.result.current.restore(["remote", "local", "native"]));
+    expect(first.result.current.tabs).toEqual(["local", "remote", subagentTabId("native")]);
+    expect(first.result.current.selected).toBe("local");
+    act(() => first.result.current.close("remote"));
+    act(() => first.result.current.close(subagentTabId("native")));
+    first.unmount();
+
+    const restored = renderHook(() => useSideChats("session-a"));
+    act(() => restored.result.current.restore(["remote", "new-remote", "native"]));
+    expect(restored.result.current.tabs).toEqual(["local", "new-remote"]);
+    expect(restored.result.current.selected).toBe("local");
+    act(() => restored.result.current.open("remote"));
+    expect(readSessionWorkspaceState("session-a").closedSideChats).toEqual(["native"]);
+    restored.unmount();
+
+    localStorage.clear();
+    const otherDevice = renderHook(() => useSideChats("session-a"));
+    act(() => otherDevice.result.current.restore(["remote"]));
+    expect(otherDevice.result.current.tabs).toEqual(["remote"]);
+    expect(otherDevice.result.current.selected).toBe("remote");
+  });
+
+  it("keeps existing tabs when discovery would exceed the stored tab limit", () => {
+    const local = Array.from({ length: 19 }, (_, i) => `local-${i}`);
+    writeSessionWorkspaceState("session-a", { openSideChats: local, selectedSideChatId: local[0] });
+    const { result } = renderHook(() => useSideChats("session-a"));
+    act(() => result.current.restore(["remote-1", "remote-2"]));
+    expect(result.current.tabs).toEqual([...local, "remote-1"]);
+    expect(readSessionWorkspaceState("session-a").openSideChats).toEqual(result.current.tabs);
+    expect(result.current.selected).toBe(local[0]);
+  });
+
   it("select changes the active tab and can clear it", () => {
     const { result } = renderHook(() => useSideChats("session-a"));
     act(() => result.current.open("conv_1"));
@@ -137,5 +193,163 @@ describe("side-chat soft tabs", () => {
     expect(result.current.selected).toBeNull();
     // Tabs are untouched by selection changes.
     expect(result.current.tabs).toEqual(["conv_1", "conv_2"]);
+  });
+});
+
+describe("sub-agent tabs", () => {
+  const subagentTab = subagentTabId("conv_child");
+
+  it("restore after a reload, after the side chats, with the selection", () => {
+    const first = renderHook(() => useSideChats("session-a"));
+    act(() => first.result.current.open(subagentTab));
+    act(() => first.result.current.open("conv_a"));
+    act(() => first.result.current.select(subagentTab));
+    first.unmount();
+
+    const reloaded = renderHook(() => useSideChats("session-a"));
+    expect(reloaded.result.current.tabs).toEqual(["conv_a", subagentTab]);
+    expect(reloaded.result.current.selected).toBe(subagentTab);
+  });
+
+  it("stay out of the side-chat list older clients read", () => {
+    const { result } = renderHook(() => useSideChats("session-a"));
+    act(() => result.current.open("conv_a"));
+    act(() => result.current.open(subagentTab));
+    expect(readSessionWorkspaceState("session-a")).toEqual({
+      openSideChats: ["conv_a"],
+      openSubagentTabs: [subagentTab],
+      selectedSideChatId: subagentTab,
+    });
+
+    // Closing a native side chat opened as a sub-agent must also survive discovery.
+    act(() => result.current.close(subagentTab));
+    expect(readSessionWorkspaceState("session-a")).toEqual({
+      openSideChats: ["conv_a"],
+      closedSideChats: ["conv_child"],
+      selectedSideChatId: "conv_a",
+    });
+  });
+
+  it.each([
+    ["opened", (hook: SideChatsHook) => hook.open("conv_b"), ["conv_a", "conv_b"], [subagentTab]],
+    ["closed", (hook: SideChatsHook) => hook.close(subagentTab), ["conv_a"], undefined],
+  ])("keep a tab another window %s", (_change, change, sideChats, subagentTabs) => {
+    const first = renderHook(() => useSideChats("session-a"));
+    act(() => first.result.current.open("conv_a"));
+    act(() => first.result.current.open(subagentTab));
+    const second = renderHook(() => useSideChats("session-a"));
+
+    act(() => change(second.result.current));
+    act(() => first.result.current.select("conv_a"));
+
+    expect(readSessionWorkspaceState("session-a").openSideChats).toEqual(sideChats);
+    expect(readSessionWorkspaceState("session-a").openSubagentTabs).toEqual(subagentTabs);
+  });
+
+  it("are the only tabs lost when an older client rewrites the store", () => {
+    const first = renderHook(() => useSideChats("session-a"));
+    act(() => first.result.current.open("conv_a"));
+    act(() => first.result.current.open(subagentTab));
+    first.unmount();
+    // An older client keeps only the fields it knows when it rewrites the store.
+    const raw = JSON.parse(localStorage.getItem(SESSION_WORKSPACE_STATE_KEY)!) as {
+      id: string;
+      state: Record<string, unknown>;
+    }[];
+    const olderClientStore = raw.map(({ id, state }) => ({
+      id,
+      state: { openSideChats: state.openSideChats, selectedSideChatId: state.selectedSideChatId },
+    }));
+    localStorage.setItem(SESSION_WORKSPACE_STATE_KEY, JSON.stringify(olderClientStore));
+
+    const reloaded = renderHook(() => useSideChats("session-a"));
+    expect(reloaded.result.current.tabs).toEqual(["conv_a"]);
+    expect(reloaded.result.current.selected).toBeNull();
+  });
+
+  it("let a pending side chat rekey in place beside them", () => {
+    const { result } = renderHook(() => useSideChats("session-a"));
+    act(() => result.current.open(subagentTab));
+    let pendingId = "";
+    act(() => {
+      pendingId = result.current.openPending();
+    });
+    act(() => result.current.rekey(pendingId, "conv_real"));
+    expect(result.current.tabs).toEqual(["conv_real", subagentTab]);
+    expect(result.current.selected).toBe("conv_real");
+  });
+
+  it("hand the selection to the strip's left neighbour on close", () => {
+    const { result } = renderHook(() => useSideChats("session-a"));
+    act(() => result.current.open("conv_a"));
+    act(() => result.current.open(subagentTab));
+    act(() => result.current.close(subagentTab));
+    expect(result.current.tabs).toEqual(["conv_a"]);
+    expect(result.current.selected).toBe("conv_a");
+  });
+});
+
+describe("side-chat tabs when storage writes fail", () => {
+  it("keep one chat's unsaved changes out of the next chat", () => {
+    const hook = renderHook(({ id }) => useSideChats(id), { initialProps: { id: "session-a" } });
+    const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("Quota exceeded", "QuotaExceededError");
+    });
+    act(() => hook.result.current.open("conv_unsaved"));
+    setItem.mockRestore();
+
+    hook.rerender({ id: "session-b" });
+    act(() => hook.result.current.open("conv_b"));
+
+    expect(hook.result.current.tabs).toEqual(["conv_b"]);
+    expect(readSessionWorkspaceState("session-b").openSideChats).toEqual(["conv_b"]);
+    expect(readSessionWorkspaceState("session-a")).toEqual({});
+  });
+
+  it.each([
+    ["closes a tab", (hook: SideChatsHook) => hook.close("conv_z"), ["conv_x"]],
+    ["opens a tab", (hook: SideChatsHook) => hook.open("conv_y"), ["conv_z", "conv_y", "conv_x"]],
+  ])(
+    "replay an unsaved change on top of what another window then %s",
+    (_change, otherWindowChange, sideChats) => {
+      const subagentTab = subagentTabId("conv_child");
+      const first = renderHook(() => useSideChats("session-a"));
+      act(() => first.result.current.open("conv_z"));
+      act(() => first.result.current.open(subagentTab));
+      const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+        throw new DOMException("Quota exceeded", "QuotaExceededError");
+      });
+      act(() => first.result.current.open("conv_x"));
+      setItem.mockRestore();
+
+      const second = renderHook(() => useSideChats("session-a"));
+      act(() => otherWindowChange(second.result.current));
+      act(() => first.result.current.select(subagentTab));
+
+      expect(readSessionWorkspaceState("session-a")).toEqual({
+        openSideChats: sideChats,
+        ...(_change === "closes a tab" ? { closedSideChats: ["conv_z"] } : {}),
+        openSubagentTabs: [subagentTab],
+        selectedSideChatId: subagentTab,
+      });
+    },
+  );
+
+  it("keep opening, selecting and closing, then save once storage works", () => {
+    const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("Quota exceeded", "QuotaExceededError");
+    });
+    const subagentTab = subagentTabId("conv_child");
+    const { result } = renderHook(() => useSideChats("session-a"));
+    act(() => result.current.open("conv_a"));
+    act(() => result.current.open(subagentTab));
+    act(() => result.current.select("conv_a"));
+    act(() => result.current.close(subagentTab));
+    expect(result.current.tabs).toEqual(["conv_a"]);
+    expect(result.current.selected).toBe("conv_a");
+
+    setItem.mockRestore();
+    act(() => result.current.open("conv_b"));
+    expect(readSessionWorkspaceState("session-a").openSideChats).toEqual(["conv_a", "conv_b"]);
   });
 });

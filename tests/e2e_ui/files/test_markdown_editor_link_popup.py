@@ -1,10 +1,8 @@
-"""E2E: a link in the Markdown editor shows a popup with an Open action.
+"""E2E: Markdown editor links open directly, with a keyboard-accessible popup.
 
-In edit mode a plain click on a link places the caret instead of following it.
-The popup under the caret is the visible way to open the link: a web link opens
-in a new page while the app stays on its session, and a workspace-relative link
-opens in the FileViewer. Alt+Enter moves focus to the popup's Open action, and
-the popup follows its link when the FileViewer is resized.
+Plain clicks open web links in a new page and workspace-relative links in the
+FileViewer. Alt-click places the caret for editing instead. Alt+Enter moves
+focus to the popup's Open action, and the popup follows its link on resize.
 Seeded via the filesystem PUT endpoint (no agent run); the linked site is a
 routed stub, so the test never reaches the network.
 """
@@ -108,7 +106,7 @@ def test_editor_link_popup_opens_web_link_in_new_page(
     page: Page,
     seeded_link_popup_session: tuple[str, str],
 ) -> None:
-    """Clicking a web link shows the popup; its Open opens a new page."""
+    """Alt-click keeps the link editable; the popup can still open a new page."""
     base_url, session_id = seeded_link_popup_session
     page.context.route("https://tracker.external.example/**", _fulfill_external_page)
     page.goto(f"{base_url}/c/{session_id}?file={_MARKDOWN_FILE_PATH}")
@@ -119,7 +117,7 @@ def test_editor_link_popup_opens_web_link_in_new_page(
     link = editor.get_by_role("link", name="ES-1")
     expect(link).to_be_visible()
 
-    link.click()
+    link.click(modifiers=["Alt"])
     popup = page.locator("[data-link-bubble]")
     expect(popup).to_be_visible()
     expect(popup).to_contain_text(_LINK_URL)
@@ -176,7 +174,7 @@ def test_editor_link_popup_opens_relative_link_from_keyboard(
     editor = file_viewer.locator("[contenteditable='true']")
     expect(editor).to_be_visible(timeout=10_000)
 
-    editor.get_by_role("link", name="the plan").click()
+    editor.get_by_role("link", name="the plan").click(modifiers=["Alt"])
     popup = page.locator("[data-link-bubble]")
     expect(popup).to_contain_text(_LINKED_FILE_PATH)
     page.keyboard.press("Alt+Enter")
@@ -186,3 +184,56 @@ def test_editor_link_popup_opens_relative_link_from_keyboard(
 
     expect(page).to_have_url(re.compile(rf"file={re.escape(_LINKED_FILE_PATH)}"))
     expect(file_viewer.get_by_text("Steps for the rollout.")).to_be_visible(timeout=10_000)
+
+
+@pytest.mark.browser_context_args(has_touch=True)
+@pytest.mark.parametrize("mobile", [False, True], ids=["desktop", "mobile-touch"])
+def test_editor_links_open_with_one_click(
+    page: Page,
+    seeded_link_popup_session: tuple[str, str],
+    mobile: bool,
+) -> None:
+    """One click/tap follows table and relative links without a popup action."""
+    page.set_viewport_size({"width": 390 if mobile else 1600, "height": 900})
+    base_url, session_id = seeded_link_popup_session
+    page.context.route("https://tracker.external.example/**", _fulfill_external_page)
+    page.goto(f"{base_url}/c/{session_id}?file={_MARKDOWN_FILE_PATH}")
+    file_viewer = page.locator('[data-testid="file-viewer"]:visible')
+    editor = file_viewer.locator("[contenteditable='true']")
+    expect(editor).to_be_visible(timeout=10_000)
+    link = editor.get_by_role("link", name="ES-1")
+
+    if not mobile:
+        # Selecting a link's text must not follow it on mouseup.
+        box = link.bounding_box()
+        assert box is not None
+        y = box["y"] + box["height"] / 2
+        page.mouse.move(box["x"] + 1, y)
+        page.mouse.down()
+        page.mouse.move(box["x"] + box["width"] - 1, y, steps=10)
+        page.mouse.up()
+        assert page.evaluate("window.getSelection().toString()") == "ES-1"
+        assert len(page.context.pages) == 1
+
+    with page.context.expect_page(timeout=10_000) as new_page_info:
+        link.tap() if mobile else link.click()
+    new_page = new_page_info.value
+    expect(new_page).to_have_url(_LINK_URL)
+    expect(new_page.get_by_role("heading", name="ES-1")).to_be_visible()
+    new_page.close()
+    expect(page).to_have_url(re.compile(rf"/c/{session_id}"))
+
+    relative_link = editor.get_by_role("link", name="the plan")
+    relative_link.tap() if mobile else relative_link.click()
+    expect(page).to_have_url(re.compile(rf"file={re.escape(_LINKED_FILE_PATH)}"))
+    expect(file_viewer.get_by_text("Steps for the rollout.")).to_be_visible(timeout=10_000)
+    assert len(page.context.pages) == 1
+
+    # Navigation and selection must not rewrite the markdown through autosave.
+    response = httpx.get(
+        f"{base_url}/v1/sessions/{session_id}/resources/environments/default/filesystem"
+        f"/{_MARKDOWN_FILE_PATH}",
+        timeout=10.0,
+    )
+    response.raise_for_status()
+    assert response.json()["content"] == _MARKDOWN_CONTENT

@@ -19,10 +19,17 @@ const UNPIN_UNDO_TOAST_ID = "unpin-undo";
 type WritePin = (vars: { id: string; pinned: boolean; pinnedAt?: number }) => Promise<unknown>;
 
 /** Whether the session is pinned now, in the server pinned cache or legacy local pins. */
-function isPinnedNow(queryClient: QueryClient, id: string): boolean {
+function isPinnedNow(queryClient: QueryClient, id: string, previousPersonalPin?: string): boolean {
   const pins = queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY);
   return (
-    (pins?.conversations.some((c) => c.id === id) ?? false) ||
+    (pins?.conversations.some(
+      (c) =>
+        c.id === id &&
+        ((c.family?.pinned ?? true) ||
+          (c.labels?.[PINNED_LABEL_KEY] !== undefined &&
+            c.labels[PINNED_LABEL_KEY] !== previousPersonalPin)),
+    ) ??
+      false) ||
     readPinnedConversationIds().includes(id)
   );
 }
@@ -44,9 +51,9 @@ export function unpinWithUndo(
   queryClient: QueryClient,
   writePin: WritePin,
   id: string,
-  before: Pick<Conversation, "title" | "labels"> | undefined,
+  before: Pick<Conversation, "title" | "labels" | "family"> | undefined,
 ): void {
-  const previous = Number(before?.labels?.[PINNED_LABEL_KEY]);
+  const previous = Number(before?.family?.pinned_at ?? before?.labels?.[PINNED_LABEL_KEY]);
   const pinnedAt = Number.isFinite(previous) && previous > 0 ? previous : undefined;
   writePin({ id, pinned: false })
     .then(() => {
@@ -57,7 +64,7 @@ export function unpinWithUndo(
         action: {
           label: "Undo",
           onClick: () => {
-            if (isPinnedNow(queryClient, id)) return;
+            if (isPinnedNow(queryClient, id, before?.labels?.[PINNED_LABEL_KEY])) return;
             void writePin({ id, pinned: true, pinnedAt }).catch(() => {});
           },
         },

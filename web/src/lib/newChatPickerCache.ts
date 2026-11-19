@@ -1,3 +1,5 @@
+import { isAdminViewEnabled } from "@/lib/adminView";
+import { modelOptionSchema } from "./modelCatalogCache";
 import { z } from "zod";
 import { readRecentWorkspaces } from "@/hooks/useRecentWorkspaces";
 import { readLastAgentId } from "./agentPreferences";
@@ -39,24 +41,6 @@ const pickerAgentSchema = agentSchema.extend({
   acpHarness: z.boolean().optional(),
   mine: z.literal(true).optional(),
 });
-const modelOptionSchema = z.object({
-  id: z.string(),
-  model: z.string().optional(),
-  displayName: z.string().optional(),
-  isDefault: z.boolean().optional(),
-  defaultReasoningEffort: z.string().optional(),
-  supportedReasoningEfforts: z
-    .array(z.object({ reasoningEffort: z.string(), description: z.string().optional() }))
-    .optional(),
-  source: z
-    .object({
-      kind: z.string(),
-      label: z.string(),
-      name: z.string().optional(),
-      host: z.string().optional(),
-    })
-    .optional(),
-});
 const pickerOptionsSchema = z.object({
   agent: pickerAgentSchema,
   agents: z.array(pickerAgentSchema),
@@ -84,7 +68,7 @@ export function getNewChatPickerCacheKey(project?: string, userId?: string | nul
   const server = getOmnigentServerIdentity();
   const user = userId === undefined ? getCurrentUserId() : userId;
   if (server === null || user === null) return null;
-  return `omnigent:new-chat-picker:v2:${JSON.stringify([server, user, project])}`;
+  return `omnigent:new-chat-picker:v2:${JSON.stringify([server, user, project, isAdminViewEnabled()])}`;
 }
 
 function preferenceSignature(preview: { agent: NewChatPickerPreview["agent"] }): string {

@@ -23,6 +23,7 @@ from omnigent.server.routes._sessions.orchestration import (
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.stores.conversation_store import ConversationStore
+from tests.budgets import budget
 from tests.runner.conftest import (
     _drain_session_event_queue,
     _FakeProcessManager,
@@ -125,7 +126,7 @@ async def test_damaged_stop_marker_recovers_parent_delivery(
                     poll_interval_s=0.01,
                 )
             )
-            async with asyncio.timeout(2):
+            async with asyncio.timeout(budget(2)):
                 while cursor_status.read_posted_count(tmp_path) != 2:
                     await asyncio.sleep(0.01)
             assert [(r["status"], r["output"]) for r in results] == [

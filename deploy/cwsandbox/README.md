@@ -258,16 +258,16 @@ guide](../modal/README.md#git-credentials-private-repositories).
   Cross-user isolation rides on CoreWeave's sandbox boundaries, and the shared key
   can enumerate and delete any sandbox — the same single-tenant-org shape as the
   Modal and Daytona providers. Scope the org to this workload and nothing else.
-- **The launch token's lifetime tracks the sandbox lifetime.** CW Sandbox's
-  lifetime is operator-overridable (`OMNIGENT_CWSANDBOX_MAX_LIFETIME_S`, 24h
-  default), so the per-launch host token TTL is derived from it — always above the
-  cap, so a live sandbox can re-authenticate across reconnects while a leaked
-  token can't outlive the sandbox it came from. A relaunch mints a fresh one.
+- **The default host token window derives from the sandbox lifetime.**
+  `OMNIGENT_CWSANDBOX_MAX_LIFETIME_S` defaults to 24h. Admins can override the
+  token window with [`sandbox.token_ttl_s`](../README.md#run-hosts-in-cloud-sandboxes).
+  Connected hosts renew the same token halfway through its window, extending
+  the validity of any leaked copy too. A relaunch mints a fresh token.
 
 ## Notes / limits
 
 - Sandboxes are reaped at `max_lifetime_seconds` (24h default; override with
-  `OMNIGENT_CWSANDBOX_MAX_LIFETIME_S`). The managed launch-token TTL is set above
+  `OMNIGENT_CWSANDBOX_MAX_LIFETIME_S`). The default managed token window is above
   that so reconnects keep working.
 - Egress defaults to none on CW Sandbox; the launcher requests `egress_mode:
   internet` so the host can reach the server and the agent can reach its model
@@ -294,7 +294,7 @@ guide](../modal/README.md#git-credentials-private-repositories).
 | `CWSANDBOX_BASE_URL` | CLI machine / server | Non-default CW Sandbox API endpoint (default `https://api.cwsandbox.com`) |
 | `OMNIGENT_CWSANDBOX_HOST_IMAGE` | CLI machine / server | Override the host image ref (`sandbox.cwsandbox.image` takes precedence for managed) |
 | `OMNIGENT_CWSANDBOX_SANDBOX_ENV` | CLI machine / server | Comma-separated launcher-side env var names to inject (`sandbox.cwsandbox.env` takes precedence for managed) |
-| `OMNIGENT_CWSANDBOX_MAX_LIFETIME_S` | CLI machine / server | Sandbox lifetime cap in seconds (default 24h); also derives the managed launch-token TTL |
+| `OMNIGENT_CWSANDBOX_MAX_LIFETIME_S` | CLI machine / server | Sandbox lifetime cap in seconds (default 24h); also derives the default managed token window |
 | `OMNIGENT_RUNNER_ENV_PASSTHROUGH` | inside the sandbox (injected) | Extra env var names the host forwards to runners |
 | `GIT_TOKEN` / `GIT_USERNAME` | inside the sandbox (injected) | HTTPS credentials for private repository clone / fetch / push |
 

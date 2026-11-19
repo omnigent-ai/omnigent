@@ -144,11 +144,8 @@ def test_validate_bundle_accepts_clean_agent() -> None:
 def test_validate_bundle_allows_custom_handler_when_not_enforced() -> None:
     """``enforce_handler_allowlist=False`` accepts a custom handler.
 
-    This is the trusted single-user / local-server path: ``omnigent
-    run`` uploads the operator's own bundle through this same function,
-    so an unregistered custom handler must still load. The routes pass
-    ``enforce_handler_allowlist=not local_single_user_enabled()``, so
-    this mode is what a local server uses.
+    Direct trusted callers retain an explicit opt-out. HTTP routes never
+    select it, including on local single-user servers.
     """
     spec = validate_agent_bundle(
         _single_file_yaml_bundle(
@@ -337,8 +334,8 @@ def test_validate_agent_bundle_allows_contained_relative_cwd(ok_cwd: str) -> Non
     assert spec.name == "uploaded-agent"
 
 
-def test_validate_agent_bundle_allows_absolute_cwd_for_trusted_local_server() -> None:
-    """The trusted single-user/local path keeps the documented absolute-cwd
+def test_validate_agent_bundle_allows_absolute_cwd_for_direct_trusted_caller() -> None:
+    """Direct trusted in-process validation keeps the absolute-cwd
     behavior.
 
     With ``enforce_handler_allowlist=False`` the operator uploads their OWN
@@ -390,7 +387,7 @@ def test_validate_bundle_rejects_server_callable_tool() -> None:
 def test_validate_bundle_allows_server_callable_tool_when_not_enforced() -> None:
     """``enforce_handler_allowlist=False`` accepts a server ``callable:`` tool.
 
-    The trusted single-user / local-server path uploads the operator's own
+    A direct trusted in-process caller loads the operator's own
     bundle through this same function; Python callable tools are the intended
     operator feature there (the operator already has code execution), so the
     guard must not block them — mirroring the handler-allowlist exemption.
@@ -593,3 +590,81 @@ def test_agent_for_user_creates_no_row_when_the_bundle_is_missing(
 
     assert excinfo.value.code == ErrorCode.SESSION_AGENT_MISSING
     assert agents.list_user_agents("bob@example.com").data == []
+
+
+class _UncheckableArtifactStore(LocalArtifactStore):
+    """A store whose existence check fails, as a remote store's can mid-request."""
+
+    def __init__(self, root: str, *, put_error: Exception | None = None) -> None:
+        super().__init__(root)
+        self.puts: list[str] = []
+        self._put_error = put_error
+
+    def exists(self, key: str) -> bool:
+        raise ConnectionError("artifact store unavailable")
+
+    def put(self, key: str, data: bytes) -> None:
+        self.puts.append(key)
+        if self._put_error is not None:
+            raise self._put_error
+        super().put(key, data)
+
+
+def _bind_orion(db_uri: str, root: str) -> tuple[SqlAlchemyAgentStore, bytes]:
+    """Bind one upload through a healthy store; returns the agent store and bundle."""
+    from omnigent.server.bundles import uploaded_agent_for
+
+    agents = SqlAlchemyAgentStore(db_uri)
+    bundle = _make_bundle_bytes({"config.yaml": _MIN_CONFIG.format(name="orion")})
+    bound = uploaded_agent_for(
+        agents,
+        LocalArtifactStore(root),
+        owner="alice@example.com",
+        spec=validate_agent_bundle(bundle),
+        bundle_bytes=bundle,
+    )
+    assert bound is not None
+    return agents, bundle
+
+
+def test_uploaded_agent_rewrites_its_bundle_when_the_store_cannot_confirm_it(
+    db_uri: str, tmp_path: Path
+) -> None:
+    from omnigent.server.bundles import uploaded_agent_for
+
+    root = str(tmp_path / "artifacts")
+    agents, bundle = _bind_orion(db_uri, root)
+    artifacts = _UncheckableArtifactStore(root)
+
+    agent = uploaded_agent_for(
+        agents,
+        artifacts,
+        owner="alice@example.com",
+        spec=validate_agent_bundle(bundle),
+        bundle_bytes=bundle,
+    )
+
+    assert agent is not None
+    assert artifacts.puts == [agent.bundle_location]
+    assert LocalArtifactStore(root).get(agent.bundle_location) == bundle
+
+
+def test_uploaded_agent_reports_the_rewrite_failure_when_the_store_is_down(
+    db_uri: str, tmp_path: Path
+) -> None:
+    from omnigent.server.bundles import uploaded_agent_for
+
+    root = str(tmp_path / "artifacts")
+    agents, bundle = _bind_orion(db_uri, root)
+    put_error = PermissionError("no write access to the artifact store")
+
+    with pytest.raises(PermissionError) as excinfo:
+        uploaded_agent_for(
+            agents,
+            _UncheckableArtifactStore(root, put_error=put_error),
+            owner="alice@example.com",
+            spec=validate_agent_bundle(bundle),
+            bundle_bytes=bundle,
+        )
+
+    assert excinfo.value is put_error

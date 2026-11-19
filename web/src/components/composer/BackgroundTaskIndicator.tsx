@@ -74,11 +74,12 @@ function TaskCommand({ command, label }: { command: string; label: string }) {
 }
 
 /**
- * Running shells and monitors; the count is authoritative. While the agent's
- * turn is active the badge doubles as the working cue (spinner + accessible
- * name) — on a phone the end-of-thread shimmer scrolls off screen.
+ * Running shells and monitors, independent of foreground work; the count is
+ * authoritative. While the agent's turn is active the badge doubles as the
+ * working cue (spinner + accessible name), since on a phone the end-of-thread
+ * shimmer scrolls off screen.
  */
-export function BackgroundTaskIndicator() {
+export function BackgroundTaskIndicator({ className }: { className?: string }) {
   const bgCount = useChatStore((s) => s.backgroundTaskCount);
   const bgTasks = useChatStore((s) => s.backgroundTasks);
   const conversationId = useChatStore((s) => s.conversationId);
@@ -136,7 +137,10 @@ export function BackgroundTaskIndicator() {
             size="xs"
             data-testid="background-task-pill"
             aria-label={statusLabel}
-            className="shrink-0 gap-1 px-1 font-normal tabular-nums text-muted-foreground md:px-2"
+            className={cn(
+              "shrink-0 gap-1 px-1 font-normal tabular-nums text-muted-foreground md:px-2",
+              className,
+            )}
           >
             {agentWorking ? (
               <Loader2Icon

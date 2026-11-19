@@ -24,7 +24,12 @@ _WAKE_NETWORK_DELAY_S = 2.0
 
 @pytest.mark.timeout(900)
 @pytest.mark.parametrize(
-    ("harness", "phase", "outage_s"), contract.cases(_PHASES, contract.outages([10], [60, 300]))
+    ("harness", "phase", "outage_s"),
+    [
+        *contract.cases(_PHASES, contract.outages([10], [60, 300])),
+        # The connection carrying an in-flight model call dies while the lid is closed.
+        *contract.cases([contract.MODEL_CALL_UNANSWERED], [120], harnesses=("claude",)),
+    ],
 )
 def test_s4_host_sleep(
     lab_factory: Callable[..., Lab], harness: Harness, phase: str, outage_s: int

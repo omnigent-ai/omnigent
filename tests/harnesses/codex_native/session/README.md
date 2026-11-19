@@ -10,7 +10,7 @@ parameterization produces additional collected cases.
 | [test_auth.py](test_auth.py) | Auth | 22 |
 | [test_compaction.py](test_compaction.py) | Compaction | 11 |
 | [test_deltas.py](test_deltas.py) | Deltas | 12 |
-| [test_elicitation.py](test_elicitation.py) | Elicitation | 8 |
+| [test_elicitation.py](test_elicitation.py) | Elicitation | 13 |
 | [test_launch_config.py](test_launch_config.py) | Launch config | 18 |
 | [test_local_sessions.py](test_local_sessions.py) | Local sessions | 11 |
 | [test_plan_implementation.py](test_plan_implementation.py) | Plan implementation | 4 |
@@ -18,7 +18,7 @@ parameterization produces additional collected cases.
 | [test_resume_rollouts.py](test_resume_rollouts.py) | Resume rollouts | 18 |
 | [test_session_rotation.py](test_session_rotation.py) | Session rotation | 4 |
 | [test_subagents.py](test_subagents.py) | Subagents | 10 |
-| [test_subscription.py](test_subscription.py) | Subscription | 17 |
+| [test_subscription.py](test_subscription.py) | Subscription | 29 |
 | [test_terminal_attach.py](test_terminal_attach.py) | Terminal attach | 9 |
 | [test_terminal_prepare.py](test_terminal_prepare.py) | Terminal prepare | 13 |
 | [test_tools.py](test_tools.py) | Tools | 19 |

@@ -43,6 +43,8 @@ export interface UseSlashCompletionOptions {
   commands: Record<string, string>;
   /** Explicit skill inventory, including names that collide with built-ins. */
   skills: Record<string, string>;
+  /** Built-in names that also occur in the leading skill inventory. */
+  builtinNames?: ReadonlySet<string>;
   /** Skill display names by prefixed command; a query may match either. */
   labels?: Readonly<Record<string, string>>;
   textareaRef?: RefObject<HTMLTextAreaElement | null>;
@@ -112,6 +114,7 @@ export function useSlashCompletion({
   text,
   commands,
   skills,
+  builtinNames: leadingBuiltinNames,
   labels = NO_LABELS,
   textareaRef,
   prefix,
@@ -143,7 +146,11 @@ export function useSlashCompletion({
   const builtinNames = new Set(
     Object.keys(commands).filter((name) => !Object.hasOwn(skills, name)),
   );
+  if (!inline) leadingBuiltinNames?.forEach((name) => builtinNames.add(name));
   const menuCommands = inline ? skills : commands;
+  const menuLabels = inline
+    ? labels
+    : Object.fromEntries(Object.entries(labels).filter(([name]) => !builtinNames.has(name)));
   const baseOpen = Boolean(hasPrefix) && caret === selectionEnd && /^[\w:-]*$/.test(tokenSuffix);
   const isDismissed =
     dismissed?.text === text && dismissed.start === start && dismissed.end === end;
@@ -160,7 +167,7 @@ export function useSlashCompletion({
   // Kept in sync with what the menu renders so keyboard nav indexes into
   // the same list.
   const baseMatches = baseOpen
-    ? rankedSlashCommandNames(menuCommands, baseQuery, builtinNames, labels)
+    ? rankedSlashCommandNames(menuCommands, baseQuery, builtinNames, menuLabels)
     : [];
   const query = open ? baseQuery : "";
   const matches = open ? baseMatches : [];
@@ -273,7 +280,7 @@ export function useSlashCompletion({
     commands: menuCommands,
     inline,
     builtinNames,
-    labels,
+    labels: menuLabels,
     onSelectionChange,
     complete: (cmd) => {
       const consumedContinuation = commandContinuationLength(token, tokenSuffix, cmd);

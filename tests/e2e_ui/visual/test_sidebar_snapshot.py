@@ -33,7 +33,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from playwright.sync_api import Page, expect
@@ -229,7 +229,7 @@ def test_populated_sidebar_matches_baseline(
 
     # Pin the clock to a fixed "now" so the rows' relative-time pills ("2h",
     # "1d") render a constant string instead of drifting each second.
-    page.clock.set_fixed_time(datetime.fromtimestamp(_NOW_S, tz=timezone.utc))
+    page.clock.set_fixed_time(datetime.fromtimestamp(_NOW_S, tz=UTC))
 
     # Silence the session-updates socket: accept the upgrade and never push a
     # frame, so no live patch mutates a row's badge or timestamp mid-capture.
