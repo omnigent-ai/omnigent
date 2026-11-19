@@ -66,6 +66,7 @@ import {
 } from "lucide-react";
 import { useSearchParams, useRebasePath } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
+import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import {
   Dialog,
   DialogContent,
@@ -1969,108 +1970,113 @@ function FileViewerBody({
           onScroll={handleContentScroll}
           className="flex-1 overflow-y-auto min-w-0"
         >
-          {isDeletedFile && viewMode !== "diff" ? (
-            <div className="flex flex-col items-center justify-center gap-2 p-8 text-ui text-muted-foreground">
-              <Trash2Icon className="size-5 opacity-40" />
-              <span>This file has been deleted.</span>
-              {isDiffAvailable && (
-                <span className="text-sm">
-                  Click <FileDiffIcon className="inline size-3.5 align-text-bottom" /> to view its
-                  previous content.
-                </span>
-              )}
-            </div>
-          ) : viewMode === "diff" ? (
-            // A failed diff fetch (e.g. the diff endpoint returned a
-            // git_status_failed 500) surfaces the server's reason instead of
-            // hanging on "Loading diff…" forever — diffQuery.data stays
-            // undefined on error, which would otherwise read as still-loading.
-            diffQuery.isError ? (
-              <div className="flex items-center justify-center p-8 text-destructive text-ui">
-                Failed to load:{" "}
-                {diffQuery.error instanceof Error
-                  ? diffQuery.error.message
-                  : String(diffQuery.error)}
+          <RenderErrorBoundary
+            name="this file"
+            resetKey={JSON.stringify([conversationId, path, viewMode])}
+          >
+            {isDeletedFile && viewMode !== "diff" ? (
+              <div className="flex flex-col items-center justify-center gap-2 p-8 text-ui text-muted-foreground">
+                <Trash2Icon className="size-5 opacity-40" />
+                <span>This file has been deleted.</span>
+                {isDiffAvailable && (
+                  <span className="text-sm">
+                    Click <FileDiffIcon className="inline size-3.5 align-text-bottom" /> to view its
+                    previous content.
+                  </span>
+                )}
               </div>
-            ) : // Wait for the diff payload before mounting Monaco. useFileDiff uses
-            // null to mean new (before=null) / deleted (after=null) file, so
-            // collapsing the not-yet-loaded state into null would mount with the
-            // wrong content and mis-set EOL (onMount runs once). Once data is
-            // present, pass the real before/after through (legitimate nulls and all).
-            !diffQuery.data ? (
-              <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
-                Loading diff…
-              </div>
-            ) : diffQuery.data.baseline_state === "unknown" ? (
-              <div
-                role="status"
-                className="flex items-center justify-center p-8 text-muted-foreground text-ui"
-              >
-                Original content unavailable
-              </div>
-            ) : (
-              // Keep viewer state on resize without computing the CSS-hidden copy's diff.
-              isActiveViewport && (
-                <Suspense
-                  fallback={
-                    <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
-                      Loading diff…
-                    </div>
-                  }
+            ) : viewMode === "diff" ? (
+              // A failed diff fetch (e.g. the diff endpoint returned a
+              // git_status_failed 500) surfaces the server's reason instead of
+              // hanging on "Loading diff…" forever — diffQuery.data stays
+              // undefined on error, which would otherwise read as still-loading.
+              diffQuery.isError ? (
+                <div className="flex items-center justify-center p-8 text-destructive text-ui">
+                  Failed to load:{" "}
+                  {diffQuery.error instanceof Error
+                    ? diffQuery.error.message
+                    : String(diffQuery.error)}
+                </div>
+              ) : // Wait for the diff payload before mounting Monaco. useFileDiff uses
+              // null to mean new (before=null) / deleted (after=null) file, so
+              // collapsing the not-yet-loaded state into null would mount with the
+              // wrong content and mis-set EOL (onMount runs once). Once data is
+              // present, pass the real before/after through (legitimate nulls and all).
+              !diffQuery.data ? (
+                <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
+                  Loading diff…
+                </div>
+              ) : diffQuery.data.baseline_state === "unknown" ? (
+                <div
+                  role="status"
+                  className="flex items-center justify-center p-8 text-muted-foreground text-ui"
                 >
-                  {/* key={path} remounts per file so onMount re-runs (EOL + comment
+                  Original content unavailable
+                </div>
+              ) : (
+                // Keep viewer state on resize without computing the CSS-hidden copy's diff.
+                isActiveViewport && (
+                  <Suspense
+                    fallback={
+                      <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
+                        Loading diff…
+                      </div>
+                    }
+                  >
+                    {/* key={path} remounts per file so onMount re-runs (EOL + comment
                   wiring re-applied) and `ready` resets while the new grammar loads. */}
-                  <MonacoDiffViewer
-                    position={filePosition}
-                    key={path}
-                    before={diffQuery.data.before}
-                    after={diffQuery.data.after}
-                    path={path}
-                    layout={diffLayout}
-                    hideWhitespace={hideWhitespace}
-                    wrapLines={wrapLines}
-                    conversationId={conversationId}
-                    comments={openComments}
-                    activeSelection={activeSelection}
-                    onSetActiveSelection={handleSetActiveSelection}
-                    pendingBodyRef={pendingBodyRef}
-                    attachToAgent={attachToAgent}
-                    searchOpen={searchOpen}
-                    searchFocusNonce={searchFocusNonce}
-                    onSearchHandled={handleSearchHandled}
-                  />
-                </Suspense>
+                    <MonacoDiffViewer
+                      position={filePosition}
+                      key={path}
+                      before={diffQuery.data.before}
+                      after={diffQuery.data.after}
+                      path={path}
+                      layout={diffLayout}
+                      hideWhitespace={hideWhitespace}
+                      wrapLines={wrapLines}
+                      conversationId={conversationId}
+                      comments={openComments}
+                      activeSelection={activeSelection}
+                      onSetActiveSelection={handleSetActiveSelection}
+                      pendingBodyRef={pendingBodyRef}
+                      attachToAgent={attachToAgent}
+                      searchOpen={searchOpen}
+                      searchFocusNonce={searchFocusNonce}
+                      onSearchHandled={handleSearchHandled}
+                    />
+                  </Suspense>
+                )
               )
-            )
-          ) : (
-            <CodeViewer
-              position={filePosition}
-              conversationId={conversationId}
-              path={path}
-              fileQuery={fileQuery}
-              onDirtyChange={handleDirtyChange}
-              onSaveStatusChange={setSaveStatus}
-              comments={openComments}
-              addressedComments={addressedComments}
-              activeSelection={activeSelection}
-              onSetActiveSelection={handleSetActiveSelection}
-              pendingBodyRef={pendingBodyRef}
-              panelOpen={open}
-              mediaActive={onScreen}
-              searchOpen={searchOpen}
-              setSearchOpen={setSearchOpen}
-              ownsFindShortcut={ownsFindShortcut}
-              searchFocusNonce={searchFocusNonce}
-              searchInputRef={searchInputRef}
-              viewMode={viewMode}
-              markdownSourceFallback={markdownSourceFallback ?? false}
-              wrapLines={wrapLines}
-              tocOpen={tocOpen}
-              onTocToggle={() => setTocOpen((prev) => !prev)}
-              onRequestEditMode={lang === "markdown" ? handleRequestEditMode : undefined}
-              attachToAgent={attachToAgent}
-            />
-          )}
+            ) : (
+              <CodeViewer
+                position={filePosition}
+                conversationId={conversationId}
+                path={path}
+                fileQuery={fileQuery}
+                onDirtyChange={handleDirtyChange}
+                onSaveStatusChange={setSaveStatus}
+                comments={openComments}
+                addressedComments={addressedComments}
+                activeSelection={activeSelection}
+                onSetActiveSelection={handleSetActiveSelection}
+                pendingBodyRef={pendingBodyRef}
+                panelOpen={open}
+                mediaActive={onScreen}
+                searchOpen={searchOpen}
+                setSearchOpen={setSearchOpen}
+                ownsFindShortcut={ownsFindShortcut}
+                searchFocusNonce={searchFocusNonce}
+                searchInputRef={searchInputRef}
+                viewMode={viewMode}
+                markdownSourceFallback={markdownSourceFallback ?? false}
+                wrapLines={wrapLines}
+                tocOpen={tocOpen}
+                onTocToggle={() => setTocOpen((prev) => !prev)}
+                onRequestEditMode={lang === "markdown" ? handleRequestEditMode : undefined}
+                attachToAgent={attachToAgent}
+              />
+            )}
+          </RenderErrorBoundary>
         </div>
         {commentsOpen && (
           <CommentsPanel
