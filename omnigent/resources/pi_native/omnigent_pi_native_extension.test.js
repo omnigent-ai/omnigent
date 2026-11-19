@@ -854,10 +854,29 @@ async function testChildReadsIncrementallyAndSurvivesRestart() {
   assert("the cursor covers exactly the consumed bytes", state.children[0].offset === fs.statSync(file).size);
 }
 
+async function testChildWrittenAfterTheLastPollIsReportedAtShutdown() {
+  const f = childFixture();
+  const watcher = f.watcher();
+  watcher.start();
+  await watcher.poll();
+  const file = path.join(f.sessions, path.basename(f.parentFile, ".jsonl"), "run", "session.jsonl");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file,
+    childSessionLines({ id: "late", parentFile: f.parentFile, agent: "worker" }) +
+    assistantLine("model-a", 2000, 100, 10));
+
+  await watcher.stop();
+  assert("a child written after the last poll is registered and reported at shutdown",
+    f.posts.some((p) => p.body.type === "external_acp_subagent_start" && p.body.data.subagent_id === "late") &&
+      childUsage(f.posts, "conv_late").at(-1)?.cumulative_input_tokens === 110,
+    JSON.stringify(f.posts));
+}
+
 (async () => {
   try {
     await testChildSessionsAreRegisteredWithTheirOwnModels();
     await testChildReadsIncrementallyAndSurvivesRestart();
+    await testChildWrittenAfterTheLastPollIsReportedAtShutdown();
     await testSessionStartupDoesNotCompleteATurn();
     await testSessionStartMarksInputReady();
     await testQueuedPromptDuringStartupStaysRunningUntilAgentEnd();

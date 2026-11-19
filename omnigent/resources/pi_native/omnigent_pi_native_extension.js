@@ -913,6 +913,30 @@ function validCost(value) {
     : null;
 }
 
+// Build a stable fingerprint for one assistant message so the same message
+// arriving on multiple lifecycle events is only counted once. Pi's
+// ``AssistantMessage`` (``@earendil-works/pi-ai``) carries NO ``id`` field
+// but DOES carry an optional provider ``responseId`` and a required numeric
+// ``timestamp`` — both stable across the same message's re-emission on
+// ``message_end`` / ``turn_end`` / ``agent_end``. Prefer those identity
+// fields (plus a forward-compat ``id``) over the usage-count fingerprint:
+// hashing counts alone collides two DISTINCT LLM calls that happen to report
+// identical token counts (e.g. two identical short acks under prompt
+// caching), which would silently drop the second call's tokens (undercount).
+// The usage-count fingerprint stays only as a last resort for a message that
+// carries no identity field at all.
+function usageMessageKey(message, usage) {
+  if (message && typeof message === "object") {
+    if (typeof message.id === "string" && message.id)
+      return `id:${message.id}`;
+    if (typeof message.responseId === "string" && message.responseId)
+      return `rid:${message.responseId}`;
+    if (typeof message.timestamp === "number")
+      return `ts:${message.timestamp}`;
+  }
+  return `u:${usage.input}-${usage.output}-${usage.cacheRead}-${usage.cacheWrite}-${usage.total}-${usage.model || ""}`;
+}
+
 function headers(config) {
   return {
     "content-type": "application/json",
@@ -1327,7 +1351,7 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
   function addUsage(child, message) {
     const usage = extractPiUsage(message);
     child.seen ||= new Set();
-    const key = usage && `${message.responseId || ""}:${message.timestamp}`;
+    const key = usage && usageMessageKey(message, usage);
     if (!usage || child.seen.has(key)) return;
     child.seen.add(key);
     // Same input accounting as the parent's accumulateUsage.
@@ -1421,9 +1445,14 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
       timer = setInterval(() => this.poll().catch(() => {}), _CHILD_POLL_MS);
       timer?.unref?.();
     },
-    stop() {
+    // A last poll, after any in-flight one, captures the final window within one post timeout.
+    async stop() {
       clearInterval(timer);
       timer = null;
+      const final = Promise.resolve(polling).catch(() => {}).then(() => this.poll());
+      const bound = new AbortController();
+      await Promise.race([final.catch(() => {}), sleep(assistantItemPostTimeoutMs(config), bound.signal)]);
+      bound.abort();
     },
   };
 }
@@ -1952,9 +1981,9 @@ module.exports = function (pi) {
   const childSessions = createChildSessionWatcher(config, {
     sessionFile: () => latestContext?.sessionManager?.getSessionFile?.() || null,
   });
-  pi.on("session_shutdown", () => {
-    childSessions.stop();
-    return history.close();
+  pi.on("session_shutdown", async () => {
+    const [, closed] = await Promise.all([childSessions.stop(), history.close()]);
+    return closed;
   });
   pi.on("session_compact", async (_event, ctx) => {
     const manager = ctx?.sessionManager;
@@ -2263,30 +2292,6 @@ module.exports = function (pi) {
   let completeCost = true;
   let usageModel = null;
   let lastPostedUsageKey = "";
-
-  // Build a stable fingerprint for one assistant message so the same message
-  // arriving on multiple lifecycle events is only counted once. Pi's
-  // ``AssistantMessage`` (``@earendil-works/pi-ai``) carries NO ``id`` field
-  // but DOES carry an optional provider ``responseId`` and a required numeric
-  // ``timestamp`` — both stable across the same message's re-emission on
-  // ``message_end`` / ``turn_end`` / ``agent_end``. Prefer those identity
-  // fields (plus a forward-compat ``id``) over the usage-count fingerprint:
-  // hashing counts alone collides two DISTINCT LLM calls that happen to report
-  // identical token counts (e.g. two identical short acks under prompt
-  // caching), which would silently drop the second call's tokens (undercount).
-  // The usage-count fingerprint stays only as a last resort for a message that
-  // carries no identity field at all.
-  function usageMessageKey(message, usage) {
-    if (message && typeof message === "object") {
-      if (typeof message.id === "string" && message.id)
-        return `id:${message.id}`;
-      if (typeof message.responseId === "string" && message.responseId)
-        return `rid:${message.responseId}`;
-      if (typeof message.timestamp === "number")
-        return `ts:${message.timestamp}`;
-    }
-    return `u:${usage.input}-${usage.output}-${usage.cacheRead}-${usage.cacheWrite}-${usage.total}-${usage.model || ""}`;
-  }
 
   // Fold one assistant message's usage into the cumulative session totals,
   // deduped by fingerprint. Returns true when it counted (totals advanced).
