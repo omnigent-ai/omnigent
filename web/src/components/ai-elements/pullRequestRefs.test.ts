@@ -181,6 +181,21 @@ describe("remarkPullRequestRefs", () => {
     expect(tree.children[0].children).toEqual(anchored);
   });
 
+  it("keeps linking after a raw HTML block that closes its own tags", () => {
+    const tree = {
+      type: "root",
+      children: [
+        { type: "html", value: "<pre>\n<code>#1111</code>\n</pre>" },
+        { type: "paragraph", children: [{ type: "text", value: "See #4321" }] },
+      ],
+    };
+    remarkPullRequestRefs()(tree);
+    expect(tree.children[1].children?.[1]).toMatchObject({
+      type: "link",
+      url: `${PULL_REQUEST_REF_HREF_PREFIX}4321`,
+    });
+  });
+
   it("ignores a raw closing tag that closes nothing open", () => {
     const opaque = [
       { type: "html", value: "<code>" },

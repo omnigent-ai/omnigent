@@ -47,9 +47,9 @@ interface MarkdownNode {
 
 // Their text is already a link. Code and raw HTML carry a `value`, not text children.
 const LINK_NODE_TYPES = new Set(["link", "linkReference"]);
-// Track raw anchor and code-like tags; their text parses as sibling nodes. As in a
-// browser, `<a/>` still opens its element.
-const HTML_OPAQUE_TAG = /^<(\/?)(a|code|pre|kbd|samp)(?=[\s/>])/i;
+// Track raw anchor and code-like tags; their text parses as sibling nodes, while an
+// HTML block holds its own closers. As in a browser, `<a/>` still opens its element.
+const HTML_OPAQUE_TAG = /<(\/?)(a|code|pre|kbd|samp)(?=[\s/>])/gi;
 
 // Tokens of a text node's source, in order. Each `#` of the value is a literal `#`
 // or an escaped one; other escapes and references (`&#1234;`) hold no `#`.
@@ -85,11 +85,10 @@ function linkifyChildren(node: MarkdownNode, source?: string): void {
   const openOpaqueTags = new Map<string, number>();
   node.children = node.children.flatMap((child) => {
     if (child.type === "html" && typeof child.value === "string") {
-      const tag = child.value.match(HTML_OPAQUE_TAG);
-      if (tag) {
-        const name = tag[2].toLowerCase();
+      for (const [, closing, tagName] of child.value.matchAll(HTML_OPAQUE_TAG)) {
+        const name = tagName.toLowerCase();
         const open = openOpaqueTags.get(name) ?? 0;
-        openOpaqueTags.set(name, tag[1] ? Math.max(0, open - 1) : open + 1);
+        openOpaqueTags.set(name, closing ? Math.max(0, open - 1) : open + 1);
       }
       return [child];
     }
