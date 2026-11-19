@@ -327,6 +327,9 @@ class ServerInfoResponse(BaseModel):
     archive_worktree_cleanup: bool = True
     # GET /v1/sessions accepts ``search_scope``; older servers ignore it.
     session_search_scope: bool = True
+    # PATCH stores the ``omnigent.muted`` label per viewer; older servers would
+    # store it as an ordinary label every collaborator sees.
+    session_mute: bool = True
     # GET /v1/sessions applies ``include_archived`` to ``visibility=mine`` and
     # ``shared``; older servers drop archived rows there.
     session_list_scoped_archives: bool = True
@@ -4163,6 +4166,7 @@ def create_app(
                 "scheduled_task_worktrees": True,
                 "archive_worktree_cleanup": True,
                 "session_search_scope": True,
+                "session_mute": True,
                 "session_list_scoped_archives": True,
                 "scripted_sessions": app.state.feature_flags.enabled(Feature.SCRIPTED_SESSIONS),
                 "sibling_sessions": frontend_features[Feature.SIBLING_SESSIONS.value],
