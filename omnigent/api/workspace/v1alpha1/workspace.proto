@@ -239,7 +239,7 @@ message SearchFilesRequest {
   repeated string exclude = 6;
 
   // Also search files Git ignores.
-  bool include_ignored = 7;
+  bool include_git_ignored = 7;
 
   // Workspace-relative directories: results come only from beneath an
   // include (when any) and never from beneath an exclude.
@@ -317,7 +317,7 @@ message SearchTextRequest {
   uint32 maximum_results = 7;
 
   // Also search files Git ignores.
-  bool include_ignored = 8;
+  bool include_git_ignored = 8;
 
   // Workspace-relative directories. The search starts only at the includes
   // (the whole root when there are none) and never enters an exclude, so

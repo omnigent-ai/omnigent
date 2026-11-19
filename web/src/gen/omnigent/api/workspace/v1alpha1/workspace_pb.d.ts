@@ -378,9 +378,9 @@ export declare type SearchFilesRequest = Message<"omnigent.api.workspace.v1alpha
   /**
    * Also search files Git ignores.
    *
-   * @generated from field: bool include_ignored = 7;
+   * @generated from field: bool include_git_ignored = 7;
    */
-  includeIgnored: boolean;
+  includeGitIgnored: boolean;
 
   /**
    * Workspace-relative directories: results come only from beneath an
@@ -549,9 +549,9 @@ export declare type SearchTextRequest = Message<"omnigent.api.workspace.v1alpha1
   /**
    * Also search files Git ignores.
    *
-   * @generated from field: bool include_ignored = 8;
+   * @generated from field: bool include_git_ignored = 8;
    */
-  includeIgnored: boolean;
+  includeGitIgnored: boolean;
 
   /**
    * Workspace-relative directories. The search starts only at the includes

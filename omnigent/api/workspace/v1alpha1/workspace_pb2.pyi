@@ -263,14 +263,14 @@ class StatPathResponse(_message.Message):
     def __init__(self, entry: _Optional[_Union[Entry, _Mapping]] = ...) -> None: ...
 
 class SearchFilesRequest(_message.Message):
-    __slots__ = ("query", "mode", "maximum_results", "path", "include", "exclude", "include_ignored", "include_directories", "exclude_directories", "retry_untracked")
+    __slots__ = ("query", "mode", "maximum_results", "path", "include", "exclude", "include_git_ignored", "include_directories", "exclude_directories", "retry_untracked")
     QUERY_FIELD_NUMBER: _ClassVar[int]
     MODE_FIELD_NUMBER: _ClassVar[int]
     MAXIMUM_RESULTS_FIELD_NUMBER: _ClassVar[int]
     PATH_FIELD_NUMBER: _ClassVar[int]
     INCLUDE_FIELD_NUMBER: _ClassVar[int]
     EXCLUDE_FIELD_NUMBER: _ClassVar[int]
-    INCLUDE_IGNORED_FIELD_NUMBER: _ClassVar[int]
+    INCLUDE_GIT_IGNORED_FIELD_NUMBER: _ClassVar[int]
     INCLUDE_DIRECTORIES_FIELD_NUMBER: _ClassVar[int]
     EXCLUDE_DIRECTORIES_FIELD_NUMBER: _ClassVar[int]
     RETRY_UNTRACKED_FIELD_NUMBER: _ClassVar[int]
@@ -280,11 +280,11 @@ class SearchFilesRequest(_message.Message):
     path: str
     include: _containers.RepeatedScalarFieldContainer[str]
     exclude: _containers.RepeatedScalarFieldContainer[str]
-    include_ignored: bool
+    include_git_ignored: bool
     include_directories: _containers.RepeatedScalarFieldContainer[str]
     exclude_directories: _containers.RepeatedScalarFieldContainer[str]
     retry_untracked: bool
-    def __init__(self, query: _Optional[str] = ..., mode: _Optional[_Union[FileSearchMode, str]] = ..., maximum_results: _Optional[int] = ..., path: _Optional[str] = ..., include: _Optional[_Iterable[str]] = ..., exclude: _Optional[_Iterable[str]] = ..., include_ignored: _Optional[bool] = ..., include_directories: _Optional[_Iterable[str]] = ..., exclude_directories: _Optional[_Iterable[str]] = ..., retry_untracked: _Optional[bool] = ...) -> None: ...
+    def __init__(self, query: _Optional[str] = ..., mode: _Optional[_Union[FileSearchMode, str]] = ..., maximum_results: _Optional[int] = ..., path: _Optional[str] = ..., include: _Optional[_Iterable[str]] = ..., exclude: _Optional[_Iterable[str]] = ..., include_git_ignored: _Optional[bool] = ..., include_directories: _Optional[_Iterable[str]] = ..., exclude_directories: _Optional[_Iterable[str]] = ..., retry_untracked: _Optional[bool] = ...) -> None: ...
 
 class FileSearchResult(_message.Message):
     __slots__ = ("entry", "score", "matched_indices")
@@ -313,7 +313,7 @@ class SearchFilesResponse(_message.Message):
     def __init__(self, results: _Optional[_Iterable[_Union[FileSearchResult, _Mapping]]] = ..., truncated: _Optional[bool] = ..., indexed_paths: _Optional[int] = ..., index_incomplete: _Optional[bool] = ..., refreshing: _Optional[bool] = ..., untracked_unavailable: _Optional[bool] = ...) -> None: ...
 
 class SearchTextRequest(_message.Message):
-    __slots__ = ("query", "case_sensitive", "regular_expression", "whole_word", "include", "exclude", "maximum_results", "include_ignored", "include_directories", "exclude_directories", "order", "focused_paths", "changed_against")
+    __slots__ = ("query", "case_sensitive", "regular_expression", "whole_word", "include", "exclude", "maximum_results", "include_git_ignored", "include_directories", "exclude_directories", "order", "focused_paths", "changed_against")
     QUERY_FIELD_NUMBER: _ClassVar[int]
     CASE_SENSITIVE_FIELD_NUMBER: _ClassVar[int]
     REGULAR_EXPRESSION_FIELD_NUMBER: _ClassVar[int]
@@ -321,7 +321,7 @@ class SearchTextRequest(_message.Message):
     INCLUDE_FIELD_NUMBER: _ClassVar[int]
     EXCLUDE_FIELD_NUMBER: _ClassVar[int]
     MAXIMUM_RESULTS_FIELD_NUMBER: _ClassVar[int]
-    INCLUDE_IGNORED_FIELD_NUMBER: _ClassVar[int]
+    INCLUDE_GIT_IGNORED_FIELD_NUMBER: _ClassVar[int]
     INCLUDE_DIRECTORIES_FIELD_NUMBER: _ClassVar[int]
     EXCLUDE_DIRECTORIES_FIELD_NUMBER: _ClassVar[int]
     ORDER_FIELD_NUMBER: _ClassVar[int]
@@ -334,13 +334,13 @@ class SearchTextRequest(_message.Message):
     include: str
     exclude: str
     maximum_results: int
-    include_ignored: bool
+    include_git_ignored: bool
     include_directories: _containers.RepeatedScalarFieldContainer[str]
     exclude_directories: _containers.RepeatedScalarFieldContainer[str]
     order: SearchOrder
     focused_paths: _containers.RepeatedScalarFieldContainer[str]
     changed_against: ComparisonKind
-    def __init__(self, query: _Optional[str] = ..., case_sensitive: _Optional[bool] = ..., regular_expression: _Optional[bool] = ..., whole_word: _Optional[bool] = ..., include: _Optional[str] = ..., exclude: _Optional[str] = ..., maximum_results: _Optional[int] = ..., include_ignored: _Optional[bool] = ..., include_directories: _Optional[_Iterable[str]] = ..., exclude_directories: _Optional[_Iterable[str]] = ..., order: _Optional[_Union[SearchOrder, str]] = ..., focused_paths: _Optional[_Iterable[str]] = ..., changed_against: _Optional[_Union[ComparisonKind, str]] = ...) -> None: ...
+    def __init__(self, query: _Optional[str] = ..., case_sensitive: _Optional[bool] = ..., regular_expression: _Optional[bool] = ..., whole_word: _Optional[bool] = ..., include: _Optional[str] = ..., exclude: _Optional[str] = ..., maximum_results: _Optional[int] = ..., include_git_ignored: _Optional[bool] = ..., include_directories: _Optional[_Iterable[str]] = ..., exclude_directories: _Optional[_Iterable[str]] = ..., order: _Optional[_Union[SearchOrder, str]] = ..., focused_paths: _Optional[_Iterable[str]] = ..., changed_against: _Optional[_Union[ComparisonKind, str]] = ...) -> None: ...
 
 class TextSearchMatch(_message.Message):
     __slots__ = ("path", "line", "column", "text", "match_start", "match_end")
