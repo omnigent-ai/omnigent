@@ -7,8 +7,11 @@
 
 import type { PullRequestInfo } from "@/hooks/usePullRequests";
 
-/** Href prefix of a parked reference: `#omnigent-pr-1234` or `#omnigent-pr-owner/repo/12`. */
-export const PULL_REQUEST_REF_HREF_PREFIX = "#omnigent-pr-";
+/**
+ * Href prefix of a parked reference, then `1234` or `owner/repo/12`. The per-load
+ * nonce keeps a hand-written `#omnigent-pr-…` link, on any surface, from resolving.
+ */
+export const PULL_REQUEST_REF_HREF_PREFIX = `#omnigent-pr-${Math.random().toString(36).slice(2, 10)}-`;
 
 export interface PullRequestRef {
   /** `owner/repo` written with the number, or null for a bare `#1234`. */

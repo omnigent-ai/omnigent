@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { PullRequestInfo } from "@/hooks/usePullRequests";
 import {
   PULL_REQUEST_REF,
+  PULL_REQUEST_REF_HREF_PREFIX,
   gitHubPullRequestUrl,
   parsePullRequestRefHref,
   pullRequestRefUrl,
@@ -33,14 +34,14 @@ describe("splitPullRequestRefs", () => {
       { type: "text", value: "Fixed in " },
       {
         type: "link",
-        url: "#omnigent-pr-4242",
+        url: `${PULL_REQUEST_REF_HREF_PREFIX}4242`,
         title: null,
         children: [{ type: "text", value: "#4242" }],
       },
       { type: "text", value: ", see " },
       {
         type: "link",
-        url: "#omnigent-pr-acme/app/12",
+        url: `${PULL_REQUEST_REF_HREF_PREFIX}acme/app/12`,
         title: null,
         children: [{ type: "text", value: "acme/app#12" }],
       },
@@ -48,7 +49,7 @@ describe("splitPullRequestRefs", () => {
       { type: "text", value: " (" },
       {
         type: "link",
-        url: "#omnigent-pr-1234",
+        url: `${PULL_REQUEST_REF_HREF_PREFIX}1234`,
         title: null,
         children: [{ type: "text", value: "#1234" }],
       },
@@ -57,14 +58,17 @@ describe("splitPullRequestRefs", () => {
   });
 
   it.each([
-    ["(#1234)", ["#omnigent-pr-1234"]],
-    ["#1234, #5678", ["#omnigent-pr-1234", "#omnigent-pr-5678"]],
-    ["PR #1234: done", ["#omnigent-pr-1234"]],
-    ["omnigent-ai/omnigent#9882", ["#omnigent-pr-omnigent-ai/omnigent/9882"]],
-    ["octocat/hello-world#5", ["#omnigent-pr-octocat/hello-world/5"]],
-    ["octo-org/.github#12", ["#omnigent-pr-octo-org/.github/12"]],
+    ["(#1234)", [`${PULL_REQUEST_REF_HREF_PREFIX}1234`]],
+    [
+      "#1234, #5678",
+      [`${PULL_REQUEST_REF_HREF_PREFIX}1234`, `${PULL_REQUEST_REF_HREF_PREFIX}5678`],
+    ],
+    ["PR #1234: done", [`${PULL_REQUEST_REF_HREF_PREFIX}1234`]],
+    ["omnigent-ai/omnigent#9882", [`${PULL_REQUEST_REF_HREF_PREFIX}omnigent-ai/omnigent/9882`]],
+    ["octocat/hello-world#5", [`${PULL_REQUEST_REF_HREF_PREFIX}octocat/hello-world/5`]],
+    ["octo-org/.github#12", [`${PULL_REQUEST_REF_HREF_PREFIX}octo-org/.github/12`]],
     // Accepted: an all-digit hex color reads the same as a PR number.
-    ["#123456", ["#omnigent-pr-123456"]],
+    ["#123456", [`${PULL_REQUEST_REF_HREF_PREFIX}123456`]],
   ])("links %j", (text, hrefs) => {
     expect(refHrefs(text)).toEqual(hrefs);
   });
@@ -158,7 +162,7 @@ describe("remarkPullRequestRefs", () => {
       { type: "text", value: " then " },
       {
         type: "link",
-        url: "#omnigent-pr-4321",
+        url: `${PULL_REQUEST_REF_HREF_PREFIX}4321`,
         title: null,
         children: [{ type: "text", value: "#4321" }],
       },
@@ -201,7 +205,10 @@ describe("remarkPullRequestRefs", () => {
       ],
     };
     remarkPullRequestRefs()(tree);
-    expect(tree.children[0].children[1]).toMatchObject({ type: "link", url: "#omnigent-pr-2468" });
+    expect(tree.children[0].children[1]).toMatchObject({
+      type: "link",
+      url: `${PULL_REQUEST_REF_HREF_PREFIX}2468`,
+    });
   });
 
   it("links text nested in emphasis and headings", () => {
@@ -216,25 +223,30 @@ describe("remarkPullRequestRefs", () => {
     };
     remarkPullRequestRefs()(tree);
     expect(tree.children[0].children[0].children).toMatchObject([
-      { type: "link", url: "#omnigent-pr-4321" },
+      { type: "link", url: `${PULL_REQUEST_REF_HREF_PREFIX}4321` },
     ]);
   });
 });
 
 describe("parsePullRequestRefHref", () => {
   it("reads back what the plugin parks and rejects anything else", () => {
-    expect(parsePullRequestRefHref("#omnigent-pr-1234")).toEqual({ repo: null, number: "1234" });
-    expect(parsePullRequestRefHref("#omnigent-pr-acme/app/12")).toEqual({
+    expect(parsePullRequestRefHref(`${PULL_REQUEST_REF_HREF_PREFIX}1234`)).toEqual({
+      repo: null,
+      number: "1234",
+    });
+    expect(parsePullRequestRefHref(`${PULL_REQUEST_REF_HREF_PREFIX}acme/app/12`)).toEqual({
       repo: "acme/app",
       number: "12",
     });
     for (const href of [
       undefined,
       "#omnigent-file",
-      "#omnigent-pr-12",
-      "#omnigent-pr-a/b/c/12",
-      "#omnigent-pr-a/../12",
+      `${PULL_REQUEST_REF_HREF_PREFIX}12`,
+      `${PULL_REQUEST_REF_HREF_PREFIX}a/b/c/12`,
+      `${PULL_REQUEST_REF_HREF_PREFIX}a/../12`,
       "https://github.com/acme/app/pull/12",
+      // A hand-written fragment can't forge a parked reference.
+      "#omnigent-pr-1234",
     ]) {
       expect(parsePullRequestRefHref(href)).toBeNull();
     }

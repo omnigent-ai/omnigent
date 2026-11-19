@@ -166,6 +166,12 @@ describe("pull request references in chat markdown", () => {
     expect(screen.getByText("#1357").closest("code")).not.toBeNull();
   });
 
+  it.each([true, false])("leaves a hand-written parked fragment alone (opted in: %s)", (optIn) => {
+    seed(githubInfo());
+    renderMarkdown("[section](#omnigent-pr-4242)", optIn);
+    expect(hrefs()).toEqual(["#omnigent-pr-4242"]);
+  });
+
   it("keeps references as text when the session isn't on GitHub", () => {
     seed(
       githubInfo({
