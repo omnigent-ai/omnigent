@@ -188,6 +188,9 @@ function FileEditApproval({
   );
 }
 
+// Touch layouts have no hover tooltip, so the label wraps there to show the whole rule.
+const WRAP_ON_TOUCH_CLASS = "mobile-app:overflow-visible mobile-app:whitespace-normal";
+
 // One-line "commands starting with <prefix>" button: a long prefix shrinks first
 // and ends in an ellipsis; the full prefix stays in the title and accessible name.
 function CommandPrefixButton({
@@ -202,6 +205,7 @@ function CommandPrefixButton({
 } & Omit<ComponentProps<typeof Button>, "children" | "size" | "variant">) {
   // Flex items drop the spaces between them from the computed name.
   const name = [lead, prefix, trail].filter(Boolean).join(" ");
+  const wordsClass = cn("truncate", WRAP_ON_TOUCH_CLASS);
   return (
     <Button
       size="sm"
@@ -211,12 +215,18 @@ function CommandPrefixButton({
       className={cn("max-w-full", MOBILE_CHOICE_CLASS, buttonProps.className)}
     >
       <CheckIcon className="mr-1 size-3.5 shrink-0" />
-      <span className="flex min-w-0 items-baseline gap-1">
-        <span className="truncate">{lead}</span>
-        <code className="min-w-0 shrink-[1000] truncate rounded bg-muted px-1 font-mono">
+      <span className="flex min-w-0 items-baseline gap-1 mobile-app:flex-wrap">
+        <span className={wordsClass}>{lead}</span>
+        <code
+          className={cn(
+            "min-w-0 shrink-[1000] truncate rounded bg-muted px-1 font-mono",
+            WRAP_ON_TOUCH_CLASS,
+            "mobile-app:break-all",
+          )}
+        >
           {prefix}
         </code>
-        {trail && <span className="truncate">{trail}</span>}
+        {trail && <span className={wordsClass}>{trail}</span>}
       </span>
     </Button>
   );

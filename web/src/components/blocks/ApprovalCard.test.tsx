@@ -28,6 +28,18 @@ import { parseEventLines } from "@/lib/sse";
 import { useChatStore } from "@/store/chatStore";
 import { ApprovalCard, ElicitationCard } from "./ApprovalCard";
 
+// jsdom has no layout or media queries, so check the classes that set the button's
+// shape: one line with the prefix shrinking first, wrapping in touch layouts.
+function expectOneLinePrefixButton(button: HTMLElement, prefix: string) {
+  expect(button).toHaveClass("whitespace-nowrap");
+  expect(button).not.toHaveClass("whitespace-normal", "h-auto");
+  const shownPrefix = within(button).getByText(prefix);
+  expect(shownPrefix).toHaveClass("truncate", "min-w-0", "shrink-[1000]");
+  expect(shownPrefix).toHaveClass("mobile-app:whitespace-normal", "mobile-app:break-all");
+  expect(shownPrefix.parentElement).toHaveClass("min-w-0", "mobile-app:flex-wrap");
+  expect(shownPrefix.parentElement).not.toHaveClass("flex-wrap");
+}
+
 afterEach(() => {
   cleanup();
 });
@@ -376,12 +388,7 @@ describe("ApprovalCard — binary approve/reject", () => {
       "title",
       `Approve and remember commands starting with ${prefix}`,
     );
-    // jsdom has no layout, so check the classes that keep the button one line tall.
-    expect(remember).not.toHaveClass("whitespace-normal");
-    expect(remember).not.toHaveClass("h-auto");
-    const shownPrefix = within(remember).getByText(prefix);
-    expect(shownPrefix).toHaveClass("truncate");
-    expect(shownPrefix).not.toHaveClass("break-all");
+    expectOneLinePrefixButton(remember, prefix);
     fireEvent.click(remember);
     expect(submitSpy).toHaveBeenCalledWith("elic_cmd_long", "accept", {
       remember: true,
@@ -923,11 +930,12 @@ describe("ApprovalCard — Antigravity permission prompt details", () => {
       name: `Always allow commands starting with ${pattern}`,
     });
     for (const button of [sessionAllow, alwaysAllow]) {
-      expect(button).not.toHaveClass("whitespace-normal");
-      expect(within(button).getByText(pattern)).toHaveClass("truncate");
+      expectOneLinePrefixButton(button, pattern);
     }
-    // The scope suffix is its own item, so truncating the pattern cannot cut it off.
-    expect(within(sessionAllow).getByText("for this session")).toBeVisible();
+    // The scope suffix is a separate item that does not shrink ahead of the pattern.
+    const scope = within(sessionAllow).getByText("for this session");
+    expect(scope).not.toHaveClass("shrink-[1000]");
+    expect(scope).toHaveClass("mobile-app:whitespace-normal");
   });
 
   it("offers no persist choice when agy's prompt advertises none", () => {
