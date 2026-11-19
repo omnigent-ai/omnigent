@@ -31,7 +31,7 @@ export const GOLDEN_GROUP_FLAGS = {
   General: ["native", "siblingSessions", "desktopCommands"],
   "In chats": ["submitWithModEnter", "preventsKeyboardSubmit"],
   Navigation: ["electron", "native"],
-  View: ["native", "browser", "contentSearch", "desktopCommands"],
+  View: ["native", "browser", "contentSearch", "desktopCommands", "preventsKeyboardSubmit"],
   Panes: ["grids", "splitTerminal"],
   "Slash commands": [],
 } as const;
@@ -182,6 +182,55 @@ export const GOLDEN_GROUPS: Record<string, GoldenGroup | null> = {
   "View: native+browser+contentSearch+desktopCommands": {
     title: "View",
     rows: [24, 34, 35, 42, 43, 59, 28, 56, 57, 58, 60, 61, 63],
+  },
+  "View: preventsKeyboardSubmit": { title: "View", rows: [24, 25, 26, 27, 28] },
+  "View: native+preventsKeyboardSubmit": { title: "View", rows: [24, 34, 35, 27, 28] },
+  "View: browser+preventsKeyboardSubmit": { title: "View", rows: [24, 25, 26, 27, 28] },
+  "View: native+browser+preventsKeyboardSubmit": { title: "View", rows: [24, 34, 35, 27, 28] },
+  "View: contentSearch+preventsKeyboardSubmit": { title: "View", rows: [24, 25, 26, 42, 43, 28] },
+  "View: native+contentSearch+preventsKeyboardSubmit": {
+    title: "View",
+    rows: [24, 34, 35, 42, 43, 28],
+  },
+  "View: browser+contentSearch+preventsKeyboardSubmit": {
+    title: "View",
+    rows: [24, 25, 26, 42, 43, 28],
+  },
+  "View: native+browser+contentSearch+preventsKeyboardSubmit": {
+    title: "View",
+    rows: [24, 34, 35, 42, 43, 28],
+  },
+  "View: desktopCommands+preventsKeyboardSubmit": {
+    title: "View",
+    rows: [24, 25, 26, 27, 28, 56, 57, 58],
+  },
+  "View: native+desktopCommands+preventsKeyboardSubmit": {
+    title: "View",
+    rows: [24, 34, 35, 27, 28, 56, 57, 58],
+  },
+  "View: browser+desktopCommands+preventsKeyboardSubmit": {
+    title: "View",
+    rows: [24, 25, 26, 27, 59, 28, 56, 57, 58, 60, 61],
+  },
+  "View: native+browser+desktopCommands+preventsKeyboardSubmit": {
+    title: "View",
+    rows: [24, 34, 35, 27, 59, 28, 56, 57, 58, 60, 61],
+  },
+  "View: contentSearch+desktopCommands+preventsKeyboardSubmit": {
+    title: "View",
+    rows: [24, 25, 26, 42, 43, 28, 56, 57, 58],
+  },
+  "View: native+contentSearch+desktopCommands+preventsKeyboardSubmit": {
+    title: "View",
+    rows: [24, 34, 35, 42, 43, 28, 56, 57, 58],
+  },
+  "View: browser+contentSearch+desktopCommands+preventsKeyboardSubmit": {
+    title: "View",
+    rows: [24, 25, 26, 42, 43, 59, 28, 56, 57, 58, 60, 61],
+  },
+  "View: native+browser+contentSearch+desktopCommands+preventsKeyboardSubmit": {
+    title: "View",
+    rows: [24, 34, 35, 42, 43, 59, 28, 56, 57, 58, 60, 61],
   },
   "Panes: -": null,
   "Panes: grids": { title: "Panes", note: "in grids and split terminals", rows: [44, 45] },
