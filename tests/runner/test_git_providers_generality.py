@@ -665,6 +665,7 @@ def test_other_provider_warnings_do_not_override_a_successful_empty_lookup(
     assert info["available"] and info["pr"] is None
     assert not info.get("warnings")
     assert any("discovery failed" in warning for warning in info["discovery_warnings"])
+    assert info["discovery_incomplete"] is True
 
 
 @pytest.mark.parametrize("outcome", ["success", "removed", "failure"])
@@ -711,6 +712,8 @@ def test_tracked_pr_does_not_wait_for_discovery_and_later_includes_its_result(
             info = pending.result(timeout=budget(1))
             assert info["selected_pr_url"] == selected
             assert [pr["url"] for pr in info["prs"]] == [selected]
+            # A read that missed discovery does not cover the turn the server refreshes for.
+            assert info["discovery_incomplete"] is True
             assert (
                 pr_resource.pr_info(repo, session_id="slow-discovery")["selected_pr_url"]
                 == selected
@@ -728,6 +731,7 @@ def test_tracked_pr_does_not_wait_for_discovery_and_later_includes_its_result(
     assert {pr["url"] for pr in info["prs"]} == (
         {selected, MR} if outcome == "success" else {selected}
     )
+    assert info.get("discovery_incomplete") is (True if outcome == "failure" else None)
     if outcome == "failure":
         assert info["discovery_warnings"] == [
             "gitlab pull request discovery failed. Refresh to retry."
@@ -736,6 +740,7 @@ def test_tracked_pr_does_not_wait_for_discovery_and_later_includes_its_result(
         recovered = pr_resource.pr_info(repo, session_id="slow-discovery")
         assert {pr["url"] for pr in recovered["prs"]} == {selected, MR}
         assert not recovered.get("discovery_warnings")
+        assert "discovery_incomplete" not in recovered
 
 
 def test_a_checkout_outside_the_workspace_infers_its_pushed_branch_pr(

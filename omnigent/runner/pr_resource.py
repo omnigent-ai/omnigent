@@ -317,15 +317,10 @@ def _reference_info(root: str, reference: PullRequestRef) -> dict[str, Any]:
         }
 
 
-# When a summary last read each PR (monotonic), so budget-cut summaries rotate.
-_SUMMARY_READ_AT: OrderedDict[str, float] = OrderedDict()
-_SUMMARY_READ_LIMIT = 256
-_SUMMARY_READ_LOCK = Lock()
-
-
 def _summary_info(
     root: str,
-    reference: PullRequestRef,
+    reference: SessionPullRequest,
+    registry: SessionPrRegistry,
     entries: list[SessionPullRequest],
     request_deadline: float,
 ) -> dict[str, Any]:
@@ -341,28 +336,35 @@ def _summary_info(
 
     tracked = {entry.url: entry for entry in entries}
     tracked.setdefault(reference.url, reference)
-    with _SUMMARY_READ_LOCK:
-        # The longest-unread PR goes first, so the budget never skips the same ones.
-        order = sorted(
-            tracked.values(),
-            key=lambda pr: (_SUMMARY_READ_AT.get(pr.url, -1.0), pr.url != reference.url),
-        )
+    # The longest-unchecked PR goes first, so the budget never skips the same ones. The
+    # check times live in the session's registry, so other sessions cannot evict them.
+    order = sorted(
+        tracked.values(), key=lambda pr: (pr.title_checked_at, pr.url != reference.url)
+    )
+    now = time.time()
     selected: dict[str, Any] | None = None
     states: list[dict[str, Any]] = []
+    titles: dict[str, str | None] = {}
     with github_resource._gh_deadline_scope(request_deadline):
         for entry in order:
             if time.monotonic() >= request_deadline:
                 break  # The rest keep their stored states until the next refresh.
-            with _SUMMARY_READ_LOCK:
-                _SUMMARY_READ_AT.pop(entry.url, None)
-                _SUMMARY_READ_AT[entry.url] = time.monotonic()
-                while len(_SUMMARY_READ_AT) > _SUMMARY_READ_LIMIT:
-                    _SUMMARY_READ_AT.popitem(last=False)
             state = github_pr_state.reference_state(root, entry)
+            title = state.get("title") if state is not None else None
+            titles[entry.url] = title if isinstance(title, str) else None
             if entry.url == reference.url:
                 selected = state
             elif state is not None:
                 states.append(state)
+    try:
+        # A failed read counts as a timed-out title lookup, which a full read retries soon.
+        registry.update_titles(
+            titles,
+            timestamp=now,
+            timed_out_urls=[url for url, title in titles.items() if title is None],
+        )
+    except (OSError, ValueError, FileLockTimeout):
+        _logger.debug("Could not cache session PR titles", exc_info=True)
     return {
         "object": "session.github.info",
         "available": True,
@@ -371,6 +373,10 @@ def _summary_info(
         "pr": selected,
         "pr_states": states,
     }
+
+
+# Marks a discovery result whose provider failed; ``pr_info`` removes it before answering.
+_DISCOVERY_FAILED = "discovery_failed"
 
 
 def _discovery_info(root: str, resolution: ProviderResolution) -> dict[str, Any]:
@@ -384,6 +390,7 @@ def _discovery_info(root: str, resolution: ProviderResolution) -> dict[str, Any]
             "warnings": [
                 f"{resolution.provider} pull request discovery failed. Refresh to retry."
             ],
+            _DISCOVERY_FAILED: True,
         }
 
 
@@ -635,7 +642,7 @@ def pr_info(
         and reference is not None
         and all(entry.provider == "github" for entry in [reference, *entries])
     ):
-        return _summary_info(root, reference, entries, request_deadline)
+        return _summary_info(root, reference, registry, entries, request_deadline)
     tracked_providers = {entry.provider for entry in entries}
     if reference is not None:
         tracked_providers.add(reference.provider)
@@ -649,6 +656,7 @@ def pr_info(
         ]
     )
     discovered: list[dict[str, Any]] = []
+    discovery_incomplete = False
     if not resolutions:
         assert reference is not None
         info = _reference_info(root, reference)
@@ -666,6 +674,7 @@ def pr_info(
                     key = (root, session_id, resolution.provider)
                     if _DISCOVERY_JOBS.get(key) is future:
                         del _DISCOVERY_JOBS[key]
+        discovery_incomplete = len(discovered) < len(pending)
     elif len(resolutions) == 1:
         discovered = [_discovery_info(root, resolutions[0])]
         info = discovered[0]
@@ -682,8 +691,13 @@ def pr_info(
     if reference is None:
         info = next((candidate for candidate in discovered if candidate.get("pr")), info)
     for candidate in discovered:
+        if candidate.pop(_DISCOVERY_FAILED, False):
+            discovery_incomplete = True
         if candidate is not info:
             info.setdefault("discovery_warnings", []).extend(candidate.get("warnings", []))
+    if discovery_incomplete:
+        # The server then retries discovery on its next refresh instead of a summary.
+        info["discovery_incomplete"] = True
     info["prs"] = _session_prs_with_titles(root, info, registry, entries, request_deadline)
     info["tracking_available"] = True
     provider_id = info.get("provider")

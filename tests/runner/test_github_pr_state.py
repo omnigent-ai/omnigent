@@ -19,7 +19,7 @@ import pytest
 from omnigent.host import frames
 from omnigent.host.connect import HostProcess
 from omnigent.runner import github_pr_state, github_resource, pr_resource
-from omnigent.runner.session_prs import PullRequestRef
+from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
 from omnigent.server import session_pull_requests as server_prs
 from omnigent.workspace_fs import WorkspaceReader
 
@@ -99,12 +99,10 @@ class GhCalls:
 @pytest.fixture(autouse=True)
 def _github(monkeypatch: pytest.MonkeyPatch) -> None:
     github_pr_state._CACHE.clear()
-    pr_resource._SUMMARY_READ_AT.clear()
     monkeypatch.setattr(github_resource, "_in_sandbox", lambda *_: True)
     monkeypatch.setattr(github_resource, "_pr_token", lambda *_: None)
     yield
     github_pr_state._CACHE.clear()
-    pr_resource._SUMMARY_READ_AT.clear()
 
 
 def _read(monkeypatch: pytest.MonkeyPatch, gh: GhCalls, url: str = URL) -> dict[str, Any] | None:
@@ -263,6 +261,9 @@ class _Registry:
     def list(self) -> list[Any]:
         return []
 
+    def update_titles(self, *_: Any, **__: Any) -> None:
+        pass
+
 
 def _pr_info(monkeypatch: pytest.MonkeyPatch, url: str, **kwargs: Any) -> dict[str, Any]:
     monkeypatch.setattr(pr_resource, "SessionPrRegistry", _Registry)
@@ -378,37 +379,68 @@ def test_a_summary_past_the_request_deadline_reads_no_pr(
 
 
 class _Clock:
-    def __init__(self) -> None:
-        self.now = 0.0
+    def __init__(self, now: float = 0.0) -> None:
+        self.now = now
 
     def monotonic(self) -> float:
+        return self.now
+
+    def time(self) -> float:
         return self.now
 
 
 @pytest.mark.parametrize("seconds_per_read", [1.0, 3.0, 9.0])
 def test_summaries_cut_by_the_budget_read_every_tracked_pr_in_turn(
-    monkeypatch: pytest.MonkeyPatch, seconds_per_read: float
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, seconds_per_read: float
 ) -> None:
-    urls = [f"https://github.com/example/repo/pull/{number}" for number in range(42, 46)]
-    entries = [_tracked(url) for url in urls]
-    _track(monkeypatch, entries)
-    monkeypatch.setattr(pr_resource, "_selected_pr", lambda *_: entries[0])
-    clock = _Clock()
+    # More sessions and PRs than any history shared between sessions would keep.
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    sessions = {
+        f"{index:032x}": [f"https://github.com/example/repo/pull/{2 * index + n}" for n in (42, 43)]
+        for index in range(150)
+    }
+    for session_id, urls in sessions.items():
+        references = [PullRequestRef.from_url(url) for url in urls]
+        SessionPrRegistry(session_id).record(
+            references, relationship="created", source="runner", timestamp=0
+        )
+    clock = _Clock(1_000.0)
     monkeypatch.setattr(pr_resource, "time", clock)
-    read: list[str] = []
+    read: dict[str, list[str]] = {session_id: [] for session_id in sessions}
+    reading = ""
 
     def reference_state(_: str, reference: PullRequestRef) -> dict[str, Any]:
-        read.append(reference.url)
+        read[reading].append(reference.url)
         clock.now += seconds_per_read
         return {"number": reference.number, "url": reference.url, "title": "T", "state": "OPEN"}
 
     monkeypatch.setattr(github_pr_state, "reference_state", reference_state)
-    for _ in urls:
-        with pr_resource.server_tracking(True, urls[0]):
-            pr_resource.pr_info("/workspace", session_id=SESSION, summary=True)
-        clock.now += 300.0
+    for _ in range(2):
+        for session_id, urls in sessions.items():
+            reading = session_id
+            with pr_resource.server_tracking(True, urls[0]):
+                pr_resource.pr_info("/workspace", session_id=session_id, summary=True)
+            clock.now += 300.0
 
-    assert set(read) == set(urls)
+    for session_id, urls in sessions.items():
+        assert set(read[session_id]) == set(urls)
+
+
+def test_a_failed_summary_read_is_retried_as_a_timed_out_title(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    registry = SessionPrRegistry(SESSION)
+    registry.record(
+        [PullRequestRef.from_url(URL)], relationship="created", source="runner", timestamp=0
+    )
+    monkeypatch.setattr(pr_resource, "time", _Clock(1_000.0))
+    monkeypatch.setattr(github_pr_state, "reference_state", lambda *_: None)
+    with pr_resource.server_tracking(True, URL):
+        pr_resource.pr_info("/workspace", session_id=SESSION, summary=True)
+
+    [entry] = registry.list()
+    assert (entry.title_checked_at, entry.title_lookup_timed_out) == (1_000.0, True)
 
 
 def test_a_summary_bounds_each_github_call_by_its_request_budget(
@@ -482,7 +514,7 @@ def test_a_summary_updates_only_the_stored_state(monkeypatch: pytest.MonkeyPatch
             self.call = (args, kwargs)
 
     store = Store()
-    state = {"number": 7, "url": URL, "title": "T", "state": "MERGED", "is_draft": False}
+    state = {"number": 42, "url": URL, "title": "T", "state": "MERGED", "is_draft": False}
     monkeypatch.setattr(github_pr_state, "reference_state", lambda *_: state)
     info = _pr_info(monkeypatch, URL, summary=True)
     server_prs.ingest_info(store, SESSION, info, requested_at=5.0)  # type: ignore[arg-type]
@@ -491,7 +523,7 @@ def test_a_summary_updates_only_the_stored_state(monkeypatch: pytest.MonkeyPatch
     assert args == (SESSION, [])
     assert kwargs["complete"] is False
     assert kwargs["fetched"] == [
-        server_prs.FetchedState(url=URL, number=7, state="MERGED", is_draft=False, title="T")
+        server_prs.FetchedState(url=URL, number=42, state="MERGED", is_draft=False, title="T")
     ]
 
 

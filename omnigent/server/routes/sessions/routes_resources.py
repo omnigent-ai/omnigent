@@ -3574,7 +3574,9 @@ def register_resources_routes(
                 extra={"session_id": session_id},
             )
             return info
-        if pull_request_refresher is not None and covers_turn:
+        # A read whose discovery failed or is still running may miss PRs the turn opened.
+        discovered = info.get("discovery_incomplete") is not True
+        if pull_request_refresher is not None and covers_turn and discovered:
             pull_request_refresher.note_read(session_id, requested_at)
         return server_prs.answer(info, stored)
 

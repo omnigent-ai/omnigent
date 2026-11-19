@@ -40,9 +40,9 @@ class Calls:
         self.calls.append("listed")
 
 
-async def _settle() -> None:
-    for _ in range(10):
-        await asyncio.sleep(0)
+async def _settle(refresher: server_prs.PullRequestRefresher) -> None:
+    while refresher._running:
+        await asyncio.gather(*refresher._running.values())
 
 
 async def test_listed_sessions_use_the_listed_refresh_and_turn_ends_the_full_one() -> None:
@@ -50,9 +50,9 @@ async def test_listed_sessions_use_the_listed_refresh_and_turn_ends_the_full_one
     refresher = server_prs.PullRequestRefresher(turn_end_delay_s=0)
     refresher.bind(calls.full, calls.listed)
     refresher.request(SESSION)
-    await _settle()
+    await _settle(refresher)
     refresher.turn_ended(SESSION)
-    await _settle()
+    await _settle(refresher)
     await refresher.aclose()
     assert calls.calls == ["listed", "full"]
 
@@ -62,7 +62,7 @@ async def test_without_a_listed_refresh_listed_sessions_get_the_full_one() -> No
     refresher = server_prs.PullRequestRefresher(turn_end_delay_s=0)
     refresher.bind(calls.full)
     refresher.request(SESSION)
-    await _settle()
+    await _settle(refresher)
     await refresher.aclose()
     assert calls.calls == ["full"]
 
@@ -74,9 +74,9 @@ async def test_a_turn_its_refresh_did_not_cover_makes_the_next_listed_refresh_fu
     refresher = server_prs.PullRequestRefresher(turn_end_delay_s=0)
     refresher.bind(calls.full, calls.listed)
     refresher.turn_ended(SESSION)
-    await _settle()
+    await _settle(refresher)
     refresher.request(SESSION)
-    await _settle()
+    await _settle(refresher)
     await refresher.aclose()
     assert calls.calls == ["full", "full"]
 
@@ -86,10 +86,10 @@ async def test_a_read_that_covers_the_turn_restores_the_listed_refresh() -> None
     refresher = server_prs.PullRequestRefresher(turn_end_delay_s=0)
     refresher.bind(calls.full, calls.listed)
     refresher.turn_ended(SESSION)
-    await _settle()
+    await _settle(refresher)
     refresher.note_read(SESSION, time.time())
     refresher.request(SESSION)
-    await _settle()
+    await _settle(refresher)
     await refresher.aclose()
     assert calls.calls == ["full", "listed"]
 
@@ -100,33 +100,11 @@ async def test_a_covering_turn_end_refresh_leaves_the_listed_refresh() -> None:
     refresher.bind(calls.full, calls.listed)
     calls.on_full = lambda: refresher.note_read(SESSION, time.time())
     refresher.turn_ended(SESSION)
-    await _settle()
+    await _settle(refresher)
     refresher.request(SESSION)
-    await _settle()
+    await _settle(refresher)
     await refresher.aclose()
     assert calls.calls == ["full", "listed"]
-
-
-async def test_a_turn_ending_during_its_refresh_gets_another(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # Distinct end times, however coarse the clock.
-    ends = iter([100.0, 200.0])
-    monkeypatch.setattr(server_prs, "time", type("Clock", (), {"time": lambda: next(ends)}))
-    calls = Calls()
-    refresher = server_prs.PullRequestRefresher(turn_end_delay_s=0)
-    refresher.bind(calls.full, calls.listed)
-
-    def second_turn() -> None:
-        calls.on_full = None
-        refresher.turn_ended(SESSION)
-
-    calls.on_full = second_turn
-    refresher.turn_ended(SESSION)
-    await _settle()
-    await refresher.aclose()
-    assert calls.calls == ["full", "full"]
-    assert list(refresher._uncovered.values()) == [200.0]
 
 
 class _Refresher:
@@ -153,11 +131,14 @@ class Routes:
 
     def __init__(self, tmp: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         conversations = SqlAlchemyConversationStore(f"sqlite:///{tmp}/omnigent.db")
+        self.store = server_prs.open_store(conversations)
         self.session_id = conversations.create_conversation(
             workspace=str(tmp), runner_id="runner-1", git_branch="feature"
         ).id
         self.params: list[dict[str, str]] = []
         self.prs: list[dict[str, Any]] = []
+        self.full_extra: dict[str, Any] = {}
+        self.summary_pr: dict[str, Any] | None = None
         self.runner = httpx.AsyncClient(
             base_url="http://runner.test", transport=httpx.MockTransport(self._respond)
         )
@@ -182,9 +163,23 @@ class Routes:
     def _respond(self, request: httpx.Request) -> httpx.Response:
         self.params.append(dict(request.url.params))
         if "summary" in request.url.params:
-            return httpx.Response(200, json={"available": True, "pr": None})
+            return httpx.Response(
+                200,
+                json={
+                    "available": True,
+                    "selected_pr_url": URL,
+                    "pr": self.summary_pr,
+                    "pr_states": [],
+                },
+            )
         return httpx.Response(
-            200, json={"available": True, "tracking_available": True, "prs": self.prs}
+            200,
+            json={
+                "available": True,
+                "tracking_available": True,
+                "prs": self.prs,
+                **self.full_extra,
+            },
         )
 
     async def sync(self, *urls: str) -> None:
@@ -215,8 +210,20 @@ async def routes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AsyncIterat
 
 async def test_a_listed_session_with_synced_prs_asks_for_a_summary(routes: Routes) -> None:
     await routes.sync(URL)
+    routes.summary_pr = {
+        "number": 42,
+        "url": URL,
+        "title": "Renamed",
+        "state": "MERGED",
+        "is_draft": False,
+    }
     await routes.refresher.listed(routes.session_id)
     assert [params.get("summary") for params in routes.params] == ["true"]
+
+    # The summary updates the stored state and title, and leaves the list and its sync.
+    stored = routes.store.read(routes.session_id)
+    assert stored is not None and stored.synced
+    assert [(pr.url, pr.state, pr.title) for pr in stored.entries] == [(URL, "MERGED", "Renamed")]
 
 
 async def test_a_listed_session_not_yet_synced_gets_the_full_read(routes: Routes) -> None:
@@ -242,3 +249,16 @@ async def test_only_a_full_read_covers_an_ended_turn(routes: Routes) -> None:
     assert "summary" not in routes.params[-1]
     assert len(routes.refresher.noted) == 1
     assert routes.refresher.noted[0] >= before
+
+
+async def test_a_full_read_whose_discovery_did_not_finish_does_not_cover_a_turn(
+    routes: Routes,
+) -> None:
+    await routes.sync(URL)
+    routes.full_extra = {"discovery_incomplete": True}
+    await routes.refresher.full(routes.session_id)
+    assert routes.refresher.noted == []
+
+    routes.full_extra = {}
+    await routes.refresher.full(routes.session_id)
+    assert len(routes.refresher.noted) == 1

@@ -523,16 +523,16 @@ export function computePullRequestPollInterval(
  * server tracks polls every 10 s in the states
  * {@link computePullRequestPollInterval} polls. An open PR whose checks
  * settled still gets pushes, reviews and merges from outside the session, so
- * it keeps polling at the list cadence; only a merged or closed PR rests.
- * Each poll is a full PR read with checks, reviews and comments.
+ * it keeps polling at the list cadence. A merged or closed PR rests, even
+ * while its details are partial, since each poll is a full PR read.
  */
 export function computePanelPullRequestPollInterval(
   info: PullRequestInfo | undefined,
 ): number | false {
   const interval = computePullRequestPollInterval(info);
   if (!info?.tracking_available) return interval;
-  if (interval !== false) return 10_000;
-  return info.pr?.state === "OPEN" ? PULL_REQUEST_LIST_POLL_MS : false;
+  if (info.pr && info.pr.state !== "OPEN") return false;
+  return interval === false ? PULL_REQUEST_LIST_POLL_MS : 10_000;
 }
 
 /** Poll linked PRs until all known states are terminal; unknown states keep refreshing. */
