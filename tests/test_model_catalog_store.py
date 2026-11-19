@@ -10,6 +10,7 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -487,3 +488,85 @@ def test_binary_identity_resolves_a_bare_name_through_path(
 
     assert identity is not None
     assert identity[0] == str(binary.resolve())
+
+
+@pytest.mark.parametrize("publication", [_ROWS, []])
+@pytest.mark.parametrize("outcome", ["current", "invalidated", "cancelled"])
+async def test_publication_guard_keeps_the_original_probe(
+    publication: list[dict[str, object]], outcome: str
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    checked = asyncio.Event()
+    local_rows = [{"id": "local"}]
+    current = True
+    probes = 0
+    cancelled = False
+
+    async def probe() -> list[dict[str, Any]]:
+        nonlocal probes, cancelled
+        probes += 1
+        started.set()
+        try:
+            await release.wait()
+            return local_rows
+        except asyncio.CancelledError:
+            cancelled = True
+            raise
+
+    def is_current() -> bool:
+        checked.set()
+        return current
+
+    request = asyncio.create_task(
+        store.ensure_catalog("claude-native", "abc123", probe, is_fingerprint_current=is_current)
+    )
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        current = outcome == "current"
+        store.write_catalog("claude-native", "abc123", publication)
+        await asyncio.wait_for(checked.wait(), timeout=1)
+        if current:
+            assert await asyncio.wait_for(request, timeout=1) == publication
+        else:
+            assert not request.done()
+            if outcome == "cancelled":
+                request.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await request
+        assert not release.is_set()
+        assert not cancelled
+        release.set()
+        if outcome == "invalidated":
+            assert await asyncio.wait_for(request, timeout=1) == local_rows
+        else:
+            assert await store.reprobe_catalog("claude-native", "abc123", probe) == local_rows
+        assert probes == 1
+        assert not cancelled
+        assert store.read_catalog("claude-native", "abc123") == local_rows
+    finally:
+        release.set()
+        await asyncio.gather(request, return_exceptions=True)
+        await store.shutdown_catalog_probes()
+
+
+@pytest.mark.parametrize("initial_hit", [False, True])
+async def test_publication_guard_does_not_change_initial_hits_or_completed_probes(
+    initial_hit: bool,
+) -> None:
+    if initial_hit:
+        store.write_catalog("claude-native", "abc123", _ROWS)
+
+    async def probe() -> list[dict[str, Any]]:
+        assert not initial_hit
+        return _ROWS
+
+    def is_current() -> bool:
+        raise AssertionError("Only a publication found while waiting needs validation")
+
+    assert (
+        await store.ensure_catalog(
+            "claude-native", "abc123", probe, is_fingerprint_current=is_current
+        )
+        == _ROWS
+    )

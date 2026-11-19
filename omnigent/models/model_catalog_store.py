@@ -196,6 +196,8 @@ async def ensure_catalog(
     harness: str,
     fingerprint: str,
     resolve: Callable[[], Awaitable[list[dict[str, Any]] | None]],
+    *,
+    is_fingerprint_current: Callable[[], bool] | None = None,
 ) -> list[dict[str, Any]] | None:
     """Store-first catalog access with a single probe in flight per key.
 
@@ -209,6 +211,8 @@ async def ensure_catalog(
     :param harness: Canonical harness name.
     :param fingerprint: The launch-config fingerprint.
     :param resolve: Probe coroutine factory producing verbatim rows.
+    :param is_fingerprint_current: Validate a publication found while waiting;
+        if false, await the original local probe instead.
     :returns: Catalog rows, or ``None`` when no catalog could be obtained.
     """
     cached = read_catalog(harness, fingerprint)
@@ -239,6 +243,8 @@ async def ensure_catalog(
             return task.result()
         cached = read_catalog(harness, fingerprint)
         if cached is not None and not catalog_is_stale(harness, fingerprint):
+            if is_fingerprint_current is not None and not is_fingerprint_current():
+                return await asyncio.shield(task)
             return cached
 
 

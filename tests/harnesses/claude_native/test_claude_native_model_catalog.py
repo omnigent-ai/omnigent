@@ -183,6 +183,84 @@ async def test_catalog_runs_wrapper_bootstrap_before_discovery(
     assert launches.read_text() == refreshed_log
 
 
+@pytest.mark.parametrize("picker_changes", [False, True])
+async def test_launch_catalog_checks_managed_picker_before_accepting_publication(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, picker_changes: bool
+) -> None:
+    isolate_provider_resolution(monkeypatch, tmp_path / "config")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setenv("HOME", str(tmp_path))
+    managed_settings = tmp_path / "managed-settings.json"
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,)
+    )
+    options = [{"model": "model-a"}, {"model": "model-b"}]
+    picker = {
+        "modelPicker": {
+            "replaceBuiltInOptions": True,
+            "options": options,
+        }
+    }
+    managed_settings.write_text(json.dumps(picker))
+    external_rows: list[dict[str, Any]] = [
+        {"id": "model-a", "isDefault": True},
+        {"id": "model-b"},
+    ]
+    local_rows = external_rows[:1] if picker_changes else external_rows
+    started = asyncio.Event()
+    release = asyncio.Event()
+    checked = asyncio.Event()
+    probes = 0
+    original_fingerprint = claude_native.claude_catalog_fingerprint
+    fingerprint = original_fingerprint(None)
+
+    def observe_fingerprint(config: None) -> str:
+        current = original_fingerprint(config)
+        if started.is_set():
+            checked.set()
+        return current
+
+    # Native enumeration is the external boundary; use the real launch/store and
+    # fingerprint code while controlling when that enumeration can finish.
+    async def probe(_config: None) -> list[dict[str, Any]]:
+        nonlocal probes
+        probes += 1
+        started.set()
+        await release.wait()
+        return local_rows
+
+    monkeypatch.setattr(claude_native, "claude_catalog_fingerprint", observe_fingerprint)
+    monkeypatch.setattr(claude_native, "claude_model_catalog", probe)
+    request = asyncio.create_task(claude_native.claude_launch_catalog(None))
+    checked_task = asyncio.create_task(checked.wait())
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        if picker_changes:
+            options.pop()
+            managed_settings.write_text(json.dumps(picker))
+        model_catalog_store.write_catalog("claude-native", fingerprint, external_rows)
+        await asyncio.wait_for(
+            asyncio.wait({request, checked_task}, return_when=asyncio.FIRST_COMPLETED), timeout=1
+        )
+        if picker_changes:
+            assert original_fingerprint(None) != fingerprint
+            assert not request.done()
+            release.set()
+            assert await asyncio.wait_for(request, timeout=1) == local_rows
+        else:
+            assert await asyncio.wait_for(request, timeout=1) == external_rows
+            assert not release.is_set()
+            release.set()
+            assert await claude_native.claude_reprobed_launch_catalog(None) == local_rows
+        assert probes == 1
+        assert model_catalog_store.read_catalog("claude-native", fingerprint) == local_rows
+    finally:
+        release.set()
+        checked_task.cancel()
+        await asyncio.gather(request, checked_task, return_exceptions=True)
+        await model_catalog_store.shutdown_catalog_probes()
+
+
 @pytest.mark.posix_only
 @pytest.mark.parametrize("probe", ["enumeration", "alias"])
 @pytest.mark.parametrize("cancel", [False, True], ids=["timeout", "cancel"])
