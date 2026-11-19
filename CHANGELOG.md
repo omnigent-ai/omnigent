@@ -289,7 +289,7 @@ under `/releases`.
 - [Bug fix] A session's cost now includes reported usage from failed and stopped turns. ([#14164](https://github.com/omnigent-ai/omnigent/pull/14164), [@omni-resolve-agent[bot]](https://github.com/apps/omni-resolve-agent))
 - [UI / Bug fix] fix: keep offering a newer workflow description after an unchanged or unloaded save ([#14166](https://github.com/omnigent-ai/omnigent/pull/14166), [@dbczumar](https://github.com/dbczumar))
 - [Bug fix] fix(runner): resume sys_session_list and sys_agent_list from the server's page cursor ([#14177](https://github.com/omnigent-ai/omnigent/pull/14177), [@bbqiu](https://github.com/bbqiu))
-- [Feature / Chore] This pull request and its description were written by Isaac. ([#14181](https://github.com/omnigent-ai/omnigent/pull/14181), [@aravind-segu](https://github.com/aravind-segu))
+- [Feature / Chore] A sandbox provider can record its own MCP selection. ([#14181](https://github.com/omnigent-ai/omnigent/pull/14181), [@aravind-segu](https://github.com/aravind-segu))
 - [Bug fix] fix(sandboxes): relaunch a reset automation on the default profile when its host has none ([#14184](https://github.com/omnigent-ai/omnigent/pull/14184), [@bbqiu](https://github.com/bbqiu))
 - [UI / Feature] feat(web): remember code block word wrap across blocks, sessions and refreshes ([#14186](https://github.com/omnigent-ai/omnigent/pull/14186), [@omni-resolve-agent[bot]](https://github.com/apps/omni-resolve-agent))
 - [Chore] perf(server): load the spawn tree once per usage flush ([#14192](https://github.com/omnigent-ai/omnigent/pull/14192), [@daniellok-db](https://github.com/daniellok-db))
