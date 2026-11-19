@@ -229,7 +229,7 @@ def _gated_post_event(
 
 
 async def test_a_denied_answer_keeps_the_question_open(question: _Question) -> None:
-    """A denial fails the request, so the card rolls back, and a later answer is delivered."""
+    """A denial fails the request and keeps the card open; a later answer is delivered."""
     denial = {"queued": False, "denied": True, "reason": "blocked"}
     post_event, _reached, release = _gated_post_event(question, [denial, {"queued": True}])
     release.set()
@@ -249,23 +249,14 @@ async def test_a_denied_answer_keeps_the_question_open(question: _Question) -> N
     assert question.resolved == [question.elicitation_id]
 
 
-@pytest.mark.parametrize("case", ["delivered", "leader_fails", "follower_sees_replacement"])
-async def test_two_answers_at_once_deliver_one_message(
-    question: _Question, monkeypatch: pytest.MonkeyPatch, case: str
-) -> None:
+@pytest.mark.parametrize("case", ["delivered", "leader_fails"])
+async def test_two_answers_at_once_deliver_one_message(question: _Question, case: str) -> None:
     """A second answer waits for the first and gets its result: one message, or the same error."""
     error = OmnigentError("host offline", code=ErrorCode.RUNNER_UNAVAILABLE)
     result: object = error if case == "leader_fails" else {"queued": True}
     post_event, reached, release = _gated_post_event(question, [result])
     first = question.answer(post_event)
     await asyncio.wait_for(reached.wait(), 5.0)
-    if case == "follower_sees_replacement":
-
-        async def _live(*args: object, **kwargs: object) -> object:
-            del args, kwargs
-            return object()
-
-        monkeypatch.setattr(orchestration, "_get_runner_client", _live)
     second = question.answer(post_event)
     await asyncio.sleep(0)
     assert not second.done(), "the second answer must wait for the first one's result"

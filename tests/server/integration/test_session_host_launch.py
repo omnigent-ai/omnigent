@@ -6154,6 +6154,40 @@ async def test_an_answer_waits_only_until_the_host_reports_the_runner_dead(
     assert len(_message_texts(runner_posts)) == 1, runner_posts
 
 
+async def test_a_policy_denied_answer_fails_and_keeps_the_question_open(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    app: FastAPI,
+) -> None:
+    """The message path's input policy denies the answer: a 403, no launch, the card stays open."""
+    from omnigent.runtime import pending_elicitations, set_runner_client
+    from omnigent.server.routes.sessions import routes_events
+
+    comm, session_id, hook_task, elicitation_id = await _park_on_claude_session(client, app)
+    runner_posts: list[tuple[str, dict[str, Any]]] = []
+    fake_runner = _recording_runner(runner_posts)
+
+    async def _deny(*args: Any, **kwargs: Any) -> dict[str, str]:
+        del args, kwargs
+        return {"verdict": "deny", "reason": "answers are blocked"}
+
+    set_runner_client(None)
+    _stage_relaunched_runner(monkeypatch, fake_runner)
+    monkeypatch.setattr(routes_events, "_evaluate_input_policy", _deny)
+    try:
+        response = await _resolve_answer(client, session_id, elicitation_id)
+    finally:
+        hook_task.cancel()
+        await asyncio.gather(hook_task, return_exceptions=True)
+        await fake_runner.aclose()
+
+    assert response.status_code == 403, response.text
+    assert "answers are blocked" in response.json()["error"]["message"]
+    assert pending_elicitations.lookup(elicitation_id, conversation_id=session_id) is not None
+    assert _message_texts(runner_posts) == []
+    assert not await _expect_no_launch(comm, budget_s=budget(0.2))
+
+
 @pytest.mark.parametrize("action", ["decline", "cancel"])
 async def test_decline_on_a_stopped_claude_session_does_not_relaunch(
     client: httpx.AsyncClient,
@@ -6210,7 +6244,7 @@ async def test_answer_while_the_host_is_offline_keeps_the_question_open(
         assert _message_texts(runner_posts) == []
 
         comm = await _connect_host(app)
-        # A replacement runner always has a new binding; the asking runner never came back.
+        # A replacement runner always has a new runner id; the asking runner never came back.
         SqlAlchemyConversationStore(db_uri).replace_runner_id(session_id, "runner_replacement")
         _stage_live_runner(monkeypatch, fake_runner)
         retried = await _resolve_answer(client, session_id, elicitation_id)
