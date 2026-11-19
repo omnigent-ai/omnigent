@@ -670,3 +670,15 @@ def test_run_with_remote_server_records_launch_after_create(
     )
 
     assert order == ["ensure-daemon", "prepare", "record", "attach"]
+
+
+def test_opencode_cli_and_host_e2e_have_no_v1_attach_wording() -> None:
+    repo = Path(__file__).resolve().parents[1]
+    for relative in (
+        "omnigent/harnesses/opencode_native/main.py",
+        "omnigent/cli_native.py",
+        "tests/e2e/test_host_opencode_native_e2e.py",
+    ):
+        text = (repo / relative).read_text(encoding="utf-8")
+        assert "opencode attach" not in text, f"{relative} still describes the v1 attach TUI"
+        assert "this PR" not in text, f"{relative} references a PR instead of the scenario"

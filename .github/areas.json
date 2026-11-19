@@ -54,7 +54,8 @@
   "assignment_paused": [
     "bbqiu",
     "aravind-segu",
-    "Edwinhe03"
+    "Edwinhe03",
+    "PattaraS"
   ],
   "areas": [
     {
@@ -68,7 +69,6 @@
         ".github/"
       ],
       "owners": [
-        "PattaraS",
         "dhruv0811",
         "TomeHirata"
       ]
@@ -302,7 +302,7 @@
       ],
       "owners": [
         "dhruv0811",
-        "PattaraS"
+        "TomeHirata"
       ]
     },
     {
@@ -483,7 +483,6 @@
       ],
       "owners": [
         "dhruv0811",
-        "PattaraS",
         "dbczumar"
       ]
     },
@@ -585,7 +584,7 @@
       ],
       "owners": [
         "TomeHirata",
-        "PattaraS"
+        "fanzeyi"
       ]
     },
     {
@@ -602,7 +601,7 @@
       ],
       "owners": [
         "dhruv0811",
-        "PattaraS"
+        "TomeHirata"
       ]
     },
     {
@@ -652,7 +651,6 @@
         "omnigent/kiro_native"
       ],
       "owners": [
-        "PattaraS",
         "TomeHirata",
         "dhruv0811"
       ]
@@ -671,7 +669,6 @@
       ],
       "owners": [
         "dhruv0811",
-        "PattaraS",
         "TomeHirata",
         "dbczumar"
       ]
@@ -721,7 +718,6 @@
         "omnigent/onboarding/copilot_auth.py"
       ],
       "owners": [
-        "PattaraS",
         "TomeHirata",
         "dhruv0811"
       ]

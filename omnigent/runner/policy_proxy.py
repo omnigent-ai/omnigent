@@ -150,7 +150,7 @@ async def _evaluate_policy_via_omnigent(
                 _default_action,
                 extra={"session_id": conversation_id},
             )
-    except Exception:  # noqa: BLE001 — fail-open (LLM phases) / fail-closed (tool phases)
+    except Exception:  # fail-open (LLM phases) / fail-closed (tool phases)
         _logger.warning(
             "AP policy evaluate failed for %s; defaulting to %s",
             evaluation_id,
@@ -192,7 +192,7 @@ async def _evaluate_policy_via_omnigent(
                 extra={"session_id": conversation_id},
             )
             continue
-        except Exception:  # noqa: BLE001 — non-transport: no retry, but still signal
+        except Exception:  # non-transport: no retry, but still signal
             failure_reason = "unexpected"
             _logger.warning(
                 "Failed to deliver policy verdict %s to harness (unexpected error)",

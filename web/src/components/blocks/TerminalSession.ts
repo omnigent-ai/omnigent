@@ -6,7 +6,8 @@
 //
 // Wire protocol (mirrors `omnigent/server/routes/terminal_attach.py`):
 //   - Server → client: binary pane output → `term.write`; text frames for
-//     JSON control messages (currently tmux clipboard writes).
+//     JSON control messages (tmux clipboard writes and the queries tmux
+//     answers itself).
 //   - Client → server: binary frames for keystrokes (`term.onData`);
 //     text frames for JSON control messages (currently only resize).
 
@@ -16,16 +17,14 @@ import { type FontWeight, type ITheme, Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { withBasePath } from "@/lib/basePath";
 import { type CodeFont, codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
+import { parseHttpUrl } from "@/lib/openLinkInApp";
+import { terminalSurfaceColors } from "@/lib/terminalPalette";
 import { splitWorkspaceFileCitation } from "@/components/ai-elements/streamdown-security";
 import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
 import { CodexTerminalPalette, codexTerminalTheme } from "./CodexTerminalPalette";
 import { TerminalLinkProvider } from "./TerminalLinkProvider";
+import { parseTmuxRepliesMessage, suppressRepliesTmuxSends } from "./TerminalQueryReplies";
 
-// Card background colors derived from the app's CSS palette.
-// Light: --card: oklch(1.000 0 0) = pure white.
-// Dark:  --card: oklch(0.195 0.004 240) ≈ rgb(19, 21, 23) via OKLab → sRGB.
-const CARD_LIGHT = "#ffffff";
-const CARD_DARK = "#131517";
 const TERMINAL_BOLD_WEIGHT_OFFSET = 300;
 
 function terminalFontOptions({ sizePx, family, weight }: CodeFont) {
@@ -47,23 +46,23 @@ export const WS_CLOSE_WRONG_REPLICA = 4400;
  * Return an xterm `ITheme` object matched to the app's light or dark palette.
  */
 export function terminalTheme(isDark: boolean): ITheme {
-  const bg = isDark ? CARD_DARK : CARD_LIGHT;
+  const { background: bg, foreground, selection } = terminalSurfaceColors(isDark);
   return isDark
     ? {
         background: bg,
-        foreground: "#e4e4e7",
+        foreground,
         cursor: "#22d3ee",
         cursorAccent: bg,
-        selectionBackground: "#22d3ee33",
+        selectionBackground: selection,
         black: "#09090b",
         brightBlack: "#71717a",
       }
     : {
         background: bg,
-        foreground: "#18181b",
+        foreground,
         cursor: "#0891b2",
         cursorAccent: bg,
-        selectionBackground: "#0891b233",
+        selectionBackground: selection,
         black: "#18181b",
         brightBlack: "#e4e4e7",
         // CLIs that assume a dark terminal paint primary text with ANSI
@@ -98,6 +97,7 @@ export type TerminalFileLinkListener = (uri: string) => boolean;
 export interface TerminalWorkspaceFileTarget {
   path: string;
   line: number | null;
+  endLine?: number;
 }
 
 /** Resolve an OSC 8 local-file URI to a workspace-relative viewer target. */
@@ -122,7 +122,8 @@ export function resolveTerminalWorkspaceFileLink(
   const citation = splitWorkspaceFileCitation(`${decodedPath}${url.hash}`);
   if (url.hash && !citation.hasPosition) return null;
   const path = resolveChatFilePath(citation.path, root, home)?.path ?? null;
-  return path === null || path.startsWith("/") ? null : { path, line: citation.line };
+  if (path === null || path.startsWith("/")) return null;
+  return { path, line: citation.line, ...(citation.endLine ? { endLine: citation.endLine } : {}) };
 }
 
 export function openTerminalLink(
@@ -140,19 +141,23 @@ export function openTerminalLink(
     const target = withBasePath(sameOriginSessionPath);
     const currentPath = `${window.location.pathname}${window.location.search}${window.location.hash}`;
     if (target !== currentPath) {
-      window.history.pushState(null, "", target);
+      window.history.pushState(nextRouterHistoryState(), "", target);
       window.dispatchEvent(new PopStateEvent("popstate", { state: window.history.state }));
     }
     return;
   }
-  let url: URL;
-  try {
-    url = new URL(uri, window.location.href);
-  } catch {
-    return;
-  }
-  if (url.protocol !== "http:" && url.protocol !== "https:") return;
+  if (!parseHttpUrl(uri)) return;
   window.open(uri, "_blank", "noopener,noreferrer");
+}
+
+/**
+ * A history entry in React Router's format, one past the current one, so the router
+ * (and Back's first-entry boundary) still know where this entry sits.
+ */
+function nextRouterHistoryState(): { usr: null; key: string; idx: number } | null {
+  const index = (window.history.state as { idx?: unknown } | null)?.idx;
+  if (typeof index !== "number") return null;
+  return { usr: null, key: Math.random().toString(36).slice(2, 10), idx: index + 1 };
 }
 
 function sameOriginSessionLink(uri: string): string | null {
@@ -645,6 +650,8 @@ export class TerminalSession {
   private readonly resizeObserver: ResizeObserver;
   private readonly dataDispose: { dispose: () => void };
   private readonly osc52Dispose: { dispose: () => void };
+  /** Drops xterm's replies to the queries tmux answers, once the runner lists them. */
+  private queryReplies: { dispose: () => void } | null = null;
   private readonly codexPalette: CodexTerminalPalette | null;
   private readonly onClipboardRequest?: TerminalClipboardListener;
   /** Whether this visible, interactive attach may write the local clipboard. */
@@ -810,6 +817,11 @@ export class TerminalSession {
         } else if (typeof ev.data === "string") {
           const text = parseTerminalClipboardMessage(ev.data);
           if (text !== null) this.requestClipboardWrite(text);
+          const tmuxAnswers = parseTmuxRepliesMessage(ev.data);
+          if (tmuxAnswers !== null) {
+            this.queryReplies?.dispose();
+            this.queryReplies = suppressRepliesTmuxSends(this.term, tmuxAnswers);
+          }
           // Unknown text frames stay ignored for protocol forward compatibility.
         }
       },
@@ -987,6 +999,50 @@ export class TerminalSession {
     this.term.focus();
   }
 
+  /** Paste without Enter, waiting briefly for safe multiline input support. */
+  pasteCommand(text: string, onResult: (error: string | null) => void): () => void {
+    const command = text.replace(/\r\n/g, "\n").replace(/\n$/, "");
+    const hasControlCharacters = Array.from(command).some((char) => {
+      const code = char.charCodeAt(0);
+      return (code < 32 && code !== 9 && code !== 10) || (code >= 127 && code <= 159);
+    });
+    if (hasControlCharacters || this.disposed || this.ws.readyState !== WebSocket.OPEN) {
+      onResult(
+        hasControlCharacters
+          ? "This command contains terminal control characters."
+          : "The shell is not connected. Nothing was sent.",
+      );
+      return () => {};
+    }
+    let finished = false;
+    let listener: { dispose: () => void } | undefined;
+    let timer: number | undefined;
+    const cancel = () => {
+      finished = true;
+      listener?.dispose();
+      window.clearTimeout(timer);
+      this.listenerCtl.signal.removeEventListener("abort", cancel);
+    };
+    const tryPaste = () => {
+      if (finished || (/[\n\t]/.test(command) && !this.term.modes.bracketedPasteMode)) return;
+      cancel();
+      if (this.ws.readyState !== WebSocket.OPEN) {
+        onResult("The shell disconnected. Nothing was sent.");
+        return;
+      }
+      this.term.paste(command);
+      onResult(null);
+    };
+    listener = this.term.onWriteParsed(tryPaste);
+    timer = window.setTimeout(() => {
+      cancel();
+      onResult("The shell is not ready to safely paste this command. Nothing was sent.");
+    }, 5000);
+    this.listenerCtl.signal.addEventListener("abort", cancel, { once: true });
+    tryPaste();
+    return cancel;
+  }
+
   /**
    * Update the terminal's code font without reconnecting —
    * mirrors {@link setTheme}, mutating options in place. A new glyph size
@@ -1017,6 +1073,7 @@ export class TerminalSession {
     this.resizeObserver.disconnect();
     this.dataDispose.dispose();
     this.osc52Dispose.dispose();
+    this.queryReplies?.dispose();
     try {
       this.ws.close();
     } catch {

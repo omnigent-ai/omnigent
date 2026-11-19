@@ -1,6 +1,5 @@
 // What each harness on a user-connected host already brings to Omnigent: login
-// state, user-level skills, plugins, and MCP servers. Read-only; nothing here
-// changes the host's configuration.
+// state, user-level skills, plugins, and MCP servers.
 
 import { skipToken, useQueries, useQuery } from "@tanstack/react-query";
 import { useMemo } from "react";
@@ -11,15 +10,24 @@ import { authenticatedFetch } from "@/lib/identity";
 import { ApiError } from "@/lib/sessionsApi";
 import type { SkillSummary } from "@/lib/types";
 
-/** The native spelling each brand family reports readiness and skills under. */
-export const INVENTORY_HARNESS_IDS: Record<BrandHarness, string> = {
+/**
+ * Families the host inventory covers. Pi has no brand glyph, so onboarding import
+ * keeps to `BRAND_HARNESSES`; Settings lists every family here.
+ */
+export type InventoryHarness = BrandHarness | "pi";
+
+export const INVENTORY_HARNESSES: readonly InventoryHarness[] = [...BRAND_HARNESSES, "pi"];
+
+/** The native spelling each family reports readiness and skills under. */
+export const INVENTORY_HARNESS_IDS: Record<InventoryHarness, string> = {
   claude: "claude-native",
   codex: "codex-native",
   cursor: "cursor-native",
+  pi: "pi-native",
 };
 
 export interface InventoryCredential {
-  harness: BrandHarness;
+  harness: InventoryHarness;
   /** Where the login comes from, or "Signed in" when the host doesn't say. */
   source: string;
 }
@@ -27,18 +35,20 @@ export interface InventoryCredential {
 export interface InventoryMcpServer {
   id: string;
   name: string;
-  harness: BrandHarness;
+  harness: InventoryHarness;
   /** Secondary label, e.g. the bundling plugin or a remote server's hostname. */
   detail?: string;
   /** Plugin that bundles the server, e.g. ``"figma"``. */
   plugin?: string;
   sourceId?: string;
+  enabled?: boolean | null;
+  locked?: boolean;
 }
 
 export interface InventorySkill {
   id: string;
   name: string;
-  harness: BrandHarness;
+  harness: InventoryHarness;
   description?: string;
 }
 
@@ -50,7 +60,7 @@ export interface PluginAsset {
 export interface InventoryPlugin {
   id: string;
   name: string;
-  harness: BrandHarness;
+  harness: InventoryHarness;
   /** Its skill names, without the ``plugin:`` prefix. */
   skills: string[];
   skill_entries?: PluginAsset[] | null;
@@ -87,24 +97,36 @@ export interface HarnessInventory {
 }
 
 /** Wire shape of `GET /v1/hosts/{host_id}/mcp-servers`. */
-interface McpServerWire {
+export interface HostMcpServer {
   name: string;
   harness: string;
   transport: "stdio" | "http";
   scope: "user";
+  /** Pinned for every user on the host by an organization; not the user's to edit. */
+  managed?: boolean;
+  enabled?: boolean | null;
+  locked?: boolean;
   plugin?: string | null;
   source_id?: string | null;
   url_host?: string | null;
+  /** Account state from the host's sign-in manager; absent when nothing reports one. */
+  auth_status?: "connected" | "sign_in_required" | null;
+  /** Where to finish signing in; only present with `sign_in_required`. */
+  sign_in_url?: string | null;
 }
 
-async function fetchMcpServers(hostId: string, signal: AbortSignal): Promise<McpServerWire[]> {
+export function hostMcpServersQueryKey(hostId: string | null | undefined) {
+  return ["host-mcp-servers", hostId] as const;
+}
+
+async function fetchMcpServers(hostId: string, signal: AbortSignal): Promise<HostMcpServer[]> {
   const response = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}/mcp-servers`, {
     signal,
   });
   if (!response.ok) {
     throw new ApiError(`${response.status} ${response.statusText}`, response.status, null);
   }
-  const body = (await response.json()) as { mcp_servers?: McpServerWire[] };
+  const body = (await response.json()) as { mcp_servers?: HostMcpServer[] };
   if (!Array.isArray(body.mcp_servers)) throw new Error("Invalid host MCP servers response");
   return body.mcp_servers;
 }
@@ -122,17 +144,20 @@ async function fetchPlugins(hostId: string, signal: AbortSignal): Promise<Plugin
   return body.plugins;
 }
 
-/** Harness families installed on the host; every family when readiness is unknown. */
-export function installedHarnesses(host: Host): BrandHarness[] {
+/** Which of *families* the host has installed; all of them when readiness is unknown. */
+export function installedHarnesses(
+  host: Host,
+  families: readonly InventoryHarness[] = BRAND_HARNESSES,
+): InventoryHarness[] {
   const configured = host.configured_harnesses;
-  if (!configured) return [...BRAND_HARNESSES];
-  return BRAND_HARNESSES.filter((harness) => {
+  if (!configured) return [...families];
+  return families.filter((harness) => {
     const readiness = configured[INVENTORY_HARNESS_IDS[harness]];
     return readiness !== undefined && readiness !== "binary-missing";
   });
 }
 
-function isBrandHarness(value: string): value is BrandHarness {
+export function isBrandHarness(value: string): value is BrandHarness {
   return (BRAND_HARNESSES as readonly string[]).includes(value);
 }
 
@@ -155,9 +180,9 @@ function splitPluginSkills(skills: SkillSummary[]) {
 /** Assemble the per-harness context from the host's readiness, skills, and MCPs. */
 export function buildInventoryContext(
   host: Host,
-  harnesses: BrandHarness[],
-  skillsByHarness: Partial<Record<BrandHarness, SkillSummary[]>>,
-  mcpServers: McpServerWire[],
+  harnesses: InventoryHarness[],
+  skillsByHarness: Partial<Record<InventoryHarness, SkillSummary[]>>,
+  mcpServers: HostMcpServer[],
 ): HarnessInventoryContext {
   const context: HarnessInventoryContext = { credentials: [], mcps: [], skills: [], plugins: [] };
   for (const harness of harnesses) {
@@ -188,6 +213,8 @@ export function buildInventoryContext(
         detail: detail || undefined,
         plugin: server.plugin ?? undefined,
         sourceId: server.source_id ?? undefined,
+        enabled: server.enabled,
+        locked: server.locked,
       });
     }
     for (const [name, skills] of plugins) {
@@ -195,6 +222,22 @@ export function buildInventoryContext(
     }
   }
   return context;
+}
+
+/** Read the user-level MCP servers a connected host exposes to its native harnesses. */
+export function useHostMcpServers(
+  hostId: string | null,
+  enabled = true,
+  /** Re-read while this says so, judged from the servers last read (default: never). */
+  refetchInterval: (servers: HostMcpServer[] | undefined) => number | false = () => false,
+) {
+  return useQuery({
+    queryKey: hostMcpServersQueryKey(hostId),
+    queryFn:
+      enabled && hostId !== null ? ({ signal }) => fetchMcpServers(hostId, signal) : skipToken,
+    staleTime: 30_000,
+    refetchInterval: (query) => refetchInterval(query.state.data),
+  });
 }
 
 /** The server answers 409 while the host's tunnel isn't connected yet. */
@@ -226,6 +269,8 @@ interface HarnessInventoryOptions {
    * loading, for a host that's expected to connect shortly.
    */
   awaitConnection?: boolean;
+  /** Families to read; keep it a stable reference. Defaults to `BRAND_HARNESSES`. */
+  families?: readonly InventoryHarness[];
 }
 
 /** Discover what each harness on *host* carries into Omnigent sessions. */
@@ -235,11 +280,15 @@ export function useHarnessInventory(
     enabled = true,
     awaitConnection = false,
     includePluginMetadata = false,
+    families = BRAND_HARNESSES,
   }: HarnessInventoryOptions = {},
 ): HarnessInventory {
   const retry = awaitConnection ? retryWhileConnecting : false;
   const online = enabled && host != null && host.status === "online";
-  const harnesses = useMemo(() => (online ? installedHarnesses(host) : []), [online, host]);
+  const harnesses = useMemo(
+    () => (online ? installedHarnesses(host, families) : []),
+    [online, host, families],
+  );
   const skills = useQueries({
     queries: harnesses.map((harness) => {
       const target: SkillsTarget = {
@@ -263,7 +312,7 @@ export function useHarnessInventory(
     }),
   });
   const mcpQuery = useQuery({
-    queryKey: ["host-mcp-servers", host?.host_id],
+    queryKey: hostMcpServersQueryKey(host?.host_id),
     queryFn: online ? ({ signal }) => fetchMcpServers(host.host_id, signal) : skipToken,
     staleTime: 30_000,
     retry,
@@ -292,11 +341,13 @@ export function useHarnessInventory(
   const skillData = skills.data;
   const context = useMemo(() => {
     if (!online) return EMPTY_CONTEXT;
-    const skillsByHarness: Partial<Record<BrandHarness, SkillSummary[]>> = {};
+    const skillsByHarness: Partial<Record<InventoryHarness, SkillSummary[]>> = {};
     harnesses.forEach((harness, index) => {
-      skillsByHarness[harness] = skillData[index];
+      skillsByHarness[harness] = skillData[index]?.skills;
     });
-    const servers = (mcpData ?? []).filter((server) => isBrandHarness(server.harness));
+    const servers = (mcpData ?? []).filter((server) =>
+      (harnesses as readonly string[]).includes(server.harness),
+    );
     const assembled = buildInventoryContext(host, harnesses, skillsByHarness, servers);
     // The metadata endpoint covers Claude; other families keep their existing inventory.
     if (!legacyPlugins) {

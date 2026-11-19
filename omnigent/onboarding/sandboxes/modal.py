@@ -66,7 +66,7 @@ maximum (24 hours). There is no way to extend a sandbox past it."""
 
 HOST_IMAGE_ENV_VAR: str = "OMNIGENT_MODAL_HOST_IMAGE"
 """Environment variable overriding :data:`DEFAULT_HOST_IMAGE`, e.g. for
-an org-internal copy of the host image
+a private copy of the host image
 (``ghcr.io/<your-org>/omnigent-host:latest``)."""
 
 REGISTRY_SECRET_ENV_VAR: str = "OMNIGENT_MODAL_REGISTRY_SECRET"
@@ -278,7 +278,7 @@ class ModalSandboxLauncher(SandboxLauncher):
     """
 
     provider: ClassVar[str] = "modal"
-    # Public PyPI is reachable from the local wheel build (no corp-proxy
+    # PyPI is reachable from the local wheel build (no proxy
     # requirement for Modal users); ambient uv config applies.
     wheel_build_index_url: ClassVar[str | None] = None
     # Modal tunnels are sandbox→public only; there is no local→sandbox

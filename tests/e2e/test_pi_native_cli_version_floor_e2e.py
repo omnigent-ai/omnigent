@@ -35,9 +35,11 @@ from tests.e2e.conftest import configure_mock_llm, get_mock_requests
 _ROOT = Path(__file__).resolve().parents[2]
 _MODEL = "pi-version-journey"
 _OBSERVER = """const fs = require('fs');
-module.exports = function() {
+module.exports = function(pi) {
+  pi.on('session_start', (_event, ctx) => {
   fs.writeFileSync(require('path').join(process.cwd(), 'pi-started.json'),
-    JSON.stringify({pid: process.pid, argv: process.argv}));
+    JSON.stringify({pid: process.pid, argv: process.argv, prompt: ctx.getSystemPrompt()}));
+  });
 };
 """
 
@@ -295,6 +297,10 @@ def test_real_pi_cli_version_floor(
                     started = stack.workspace / "pi-started.json"
                     _wait(started.exists, "real Pi extension initialization")
                     evidence["pi_process"] = json.loads(started.read_text())
+                    assert (
+                        "Pi is running in the session terminal."
+                        in evidence["pi_process"]["prompt"]
+                    )
                     assert str(Path(evidence["pi_process"]["argv"][1]).resolve()) == str(
                         Path(binary).resolve()
                     )

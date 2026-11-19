@@ -232,9 +232,7 @@ async def test_policy_hook_command_runs_python_isolated() -> None:
     ``omnigent`` directory shadows the installed package and the policy gate
     dies on an import error codex never reports.
     """
-    import shlex
-
     from omnigent.harnesses.codex_native.app_server import _codex_policy_hook_command
 
-    argv = shlex.split(_codex_policy_hook_command(Path("/b"), "/venv/bin/python"))
-    assert argv[1:3] == ["-I", "-m"]
+    command = _codex_policy_hook_command(Path("/b"), "/venv/bin/python")
+    assert "/venv/bin/python -I -m omnigent.harnesses.codex_native.hook evaluate-policy" in command

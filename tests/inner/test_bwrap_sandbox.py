@@ -43,15 +43,20 @@ from omnigent.inner.bwrap_sandbox import (
     _ALLOWED_SOCKET_FAMILIES,
     _CLONE_NEW_FLAG_BITS,
     _DEFAULT_CWD_ALLOW_HIDDEN,
-    _HOST_SANDBOX_BACKEND_ENV,
     _PROC_BIND_HOST_BACKENDS,
     BwrapSandboxBackend,
     _bwrap_extra_seccomp_rules,
     _detect_host_sandbox_backend,
+    _resolve_grant,
+    _resolve_root,
     _should_bind_host_proc,
 )
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
-from omnigent.inner.sandbox import SandboxPolicy, with_denied_unix_sockets
+from omnigent.inner.sandbox import (
+    HOST_SANDBOX_BACKEND_ENV,
+    SandboxPolicy,
+    with_denied_unix_sockets,
+)
 
 BWRAP_AVAILABLE = shutil.which("bwrap") is not None
 
@@ -257,6 +262,34 @@ def _repo_root() -> Path:
 # ---------------------------------------------------------------------------
 
 
+def test_bwrap_grant_through_symlink_out_of_cwd_is_rejected(tmp_path: Path) -> None:
+    cwd = (tmp_path / "ws").resolve()
+    cwd.mkdir()
+    outside = (tmp_path / "outside").resolve()
+    outside.mkdir()
+    (cwd / "linked").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ValueError, match="outside its working directory"):
+        _resolve_grant(cwd, "linked/secret")
+
+
+def test_bwrap_mask_through_symlink_out_of_cwd_still_resolves(tmp_path: Path) -> None:
+    """Masks only deny access, so a symlink that leaves cwd must not fail resolution."""
+    cwd = (tmp_path / "ws").resolve()
+    cwd.mkdir()
+    outside = (tmp_path / "outside").resolve()
+    outside.mkdir()
+    (cwd / "linked").symlink_to(outside, target_is_directory=True)
+    assert _resolve_root(cwd, "linked/secret") == outside / "secret"
+
+
+def test_bwrap_grant_inside_cwd_resolves_through_contained_symlink(tmp_path: Path) -> None:
+    cwd = (tmp_path / "ws").resolve()
+    target = cwd / "target"
+    target.mkdir(parents=True)
+    (cwd / "linked").symlink_to(target, target_is_directory=True)
+    assert _resolve_grant(cwd, "linked/secret") == target / "secret"
+
+
 @pytestmark_bwrap
 def test_resolve_default_keeps_cwd_read_only() -> None:
     """
@@ -344,6 +377,23 @@ def test_resolve_explicit_cwd_allow_hidden_overrides_default() -> None:
     assert policy.cwd_allow_hidden == [".cache", ".npmrc"]
 
 
+@pytestmark_bwrap
+@pytest.mark.parametrize(
+    ("allow_hidden", "warns"), [([".git"], True), (["*"], True), (None, False)]
+)
+def test_resolve_warns_when_cwd_allow_hidden_exposes_git(
+    allow_hidden: list[str] | None, warns: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Exposing ``.git`` to the agent is logged; the default allowlist is silent."""
+    spec = OSEnvSpec(
+        type="caller_process",
+        sandbox=OSEnvSandboxSpec(type="linux_bwrap", cwd_allow_hidden=allow_hidden),
+    )
+    with caplog.at_level("WARNING", logger="omnigent.inner.bwrap_sandbox"):
+        _make_backend().resolve(spec, Path.cwd())
+    assert any(".git" in record.message for record in caplog.records) is warns
+
+
 def test_resolve_raises_on_non_linux() -> None:
     """
     The resolver hard-errors on non-Linux hosts. The bwrap backend
@@ -414,6 +464,193 @@ def test_wrap_launcher_argv_starts_with_bwrap_and_ends_with_command(
     ]
 
 
+def test_launch_fingerprint_tracks_new_and_replaced_masked_dotfiles(tmp_path: Path) -> None:
+    """A new dotfile, or one atomically replaced under its mask, changes the fingerprint."""
+    backend = _make_backend()
+    policy = _make_policy(tmp_path)
+    argv = [sys.executable, "-c", "pass"]
+    (tmp_path / ".env").write_text("old")
+    launched = backend.launch_fingerprint(argv, policy, tmp_path)
+    assert backend.launch_fingerprint(argv, policy, tmp_path) == launched
+
+    replacement = tmp_path / "env.new"
+    replacement.write_text("new")
+    os.replace(replacement, tmp_path / ".env")
+    replaced = backend.launch_fingerprint(argv, policy, tmp_path)
+    assert replaced != launched
+
+    masked = tmp_path / ".env"
+    before = masked.stat()
+    masked.chmod(before.st_mode ^ 0o100)
+    after = masked.stat()
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+    assert after.st_ctime_ns != before.st_ctime_ns
+    changed = backend.launch_fingerprint(argv, policy, tmp_path)
+    assert changed != replaced
+
+    (tmp_path / ".npmrc").write_text("token")
+    assert backend.launch_fingerprint(argv, policy, tmp_path) != changed
+
+
+@pytest.mark.parametrize("parent_change", ["directory", "symlink", "symlink-target"])
+def test_launch_fingerprint_tracks_masked_ancestors(tmp_path: Path, parent_change: str) -> None:
+    """A changed mask ancestor invalidates even when its leaf identity is unchanged."""
+    cwd = tmp_path / "workspace"
+    parent = cwd / "parent"
+    parent.mkdir(parents=True)
+    staged = cwd / "staged" if parent_change == "symlink" else tmp_path / "staged"
+    staged.mkdir()
+    secret = parent / "secret"
+    secret.write_text("synthetic masked contents")
+    (staged / "secret").hardlink_to(secret)
+    masked = secret
+    if parent_change != "directory":
+        link = cwd / "link"
+        link.symlink_to(parent, target_is_directory=True)
+        masked = link / "secret"
+
+    policy = _make_policy(cwd, mask_paths=[masked])
+    backend = _make_backend()
+    argv = [sys.executable, "-c", "pass"]
+    before = masked.stat()
+    launched = backend.launch_fingerprint(argv, policy, cwd)
+    (parent / "visible").write_text("ordinary directory content churn")
+    assert backend.launch_fingerprint(argv, policy, cwd) == launched
+
+    if parent_change == "symlink":
+        link.unlink()
+        link.symlink_to(staged, target_is_directory=True)
+    else:
+        parent.rename(tmp_path / "displaced")
+        staged.rename(parent)
+    after = masked.stat()
+    assert (after.st_dev, after.st_ino, after.st_ctime_ns) == (
+        before.st_dev,
+        before.st_ino,
+        before.st_ctime_ns,
+    )
+    assert backend.launch_fingerprint(argv, policy, cwd) != launched
+
+
+def test_launch_fingerprint_tracks_explicit_mask_replacement(tmp_path: Path) -> None:
+    from dataclasses import replace
+
+    cwd = tmp_path / "workspace"
+    cwd.mkdir()
+    target = tmp_path / "masked-target"
+    target.write_text("old")
+    policy = replace(_make_policy(cwd), deny_unix_socket_paths=[target])
+    backend = _make_backend()
+    argv = [sys.executable, "-c", "pass"]
+    launched = backend.launch_fingerprint(argv, policy, cwd)
+    assert backend.launch_fingerprint(argv, policy, cwd) == launched
+
+    replacement = tmp_path / "replacement"
+    replacement.write_text("new")
+    replacement.replace(target)
+    assert backend.launch_fingerprint(argv, policy, cwd) != launched
+
+
+def test_launch_fingerprint_tracks_granted_roots_but_not_scratch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Retargeted roots and replaced default files count; per-launch scratch churn does not."""
+    import dataclasses
+
+    import omnigent.inner.bwrap_sandbox as bwrap_module
+
+    etc_file = tmp_path / "resolv.conf"
+    etc_file.write_text("nameserver 192.0.2.1\n")
+    monkeypatch.setattr(bwrap_module, "_DEFAULT_ETC_FILES", (str(etc_file),))
+    default_ro = tmp_path / "toolchain"
+    default_etc = tmp_path / "certificates"
+    default_ro.mkdir()
+    default_etc.mkdir()
+    monkeypatch.setattr(bwrap_module, "_DEFAULT_RO_DIRS", (str(default_ro),))
+    monkeypatch.setattr(bwrap_module, "_DEFAULT_ETC_DIRS", (str(default_etc),))
+    backend = _make_backend()
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    granted = tmp_path / "granted"
+    granted.symlink_to(tmp_path / "a")
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    cwd = tmp_path / "cwd"
+    cwd.mkdir()
+    policy = dataclasses.replace(
+        _make_policy(cwd, read_roots=[granted], write_roots=[scratch]),
+        mask_scan_skip_roots=[scratch],
+    )
+    argv = [sys.executable, "-c", "pass"]
+    launched = backend.launch_fingerprint(argv, policy, cwd)
+
+    (scratch / ".cache").mkdir()
+    (scratch / "replaced").mkdir()
+    (default_ro / "installed-file").touch()
+    (default_etc / "certificate").touch()
+    assert backend.launch_fingerprint(argv, policy, cwd) == launched
+
+    for directory in (default_ro, default_etc):
+        directory.rename(directory.with_suffix(".old"))
+        directory.mkdir()
+        replaced = backend.launch_fingerprint(argv, policy, cwd)
+        assert replaced != launched
+        launched = replaced
+
+    replacement = tmp_path / "resolv.conf.new"
+    replacement.write_text("nameserver 192.0.2.2\n")
+    os.replace(replacement, etc_file)
+    refreshed = backend.launch_fingerprint(argv, policy, cwd)
+    assert refreshed != launched
+
+    granted.unlink()
+    granted.symlink_to(tmp_path / "b")
+    assert backend.launch_fingerprint(argv, policy, cwd) != refreshed
+
+
+@pytest.mark.parametrize("inside_mask", [False, True])
+def test_launch_fingerprint_tracks_interpreter_mounts(tmp_path: Path, inside_mask: bool) -> None:
+    """Implicit interpreter grants track directory replacement and symlink retargeting."""
+    from omnigent.inner.bwrap_sandbox import (
+        _ensure_executable_visible,
+        _interpreter_reexpose_after_mask,
+    )
+
+    cwd = tmp_path / "workspace"
+    cwd.mkdir()
+    installs = cwd / ".local" if inside_mask else tmp_path / "installs"
+    version = installs / "version-a"
+    (version / "bin").mkdir(parents=True)
+    (version / "bin" / "python").touch()
+    current = installs / "current"
+    current.symlink_to(version, target_is_directory=True)
+    argv = [str(current / "bin" / "python")]
+    if inside_mask:
+        assert not _ensure_executable_visible(argv, cwd)
+        assert _interpreter_reexpose_after_mask(argv, [installs])
+    else:
+        assert _ensure_executable_visible(argv, cwd)
+
+    backend = _make_backend()
+    policy = _make_policy(cwd)
+    launched = backend.launch_fingerprint(argv, policy, cwd)
+    (version / "bin" / "ordinary-content").touch()
+    assert backend.launch_fingerprint(argv, policy, cwd) == launched
+
+    version.rename(installs / "previous")
+    (version / "bin").mkdir(parents=True)
+    (version / "bin" / "python").touch()
+    replaced = backend.launch_fingerprint(argv, policy, cwd)
+    assert replaced != launched
+
+    other = installs / "version-b"
+    (other / "bin").mkdir(parents=True)
+    (other / "bin" / "python").touch()
+    current.unlink()
+    current.symlink_to(other, target_is_directory=True)
+    assert backend.launch_fingerprint(argv, policy, cwd) != replaced
+
+
 def test_wrap_launcher_argv_includes_required_mounts_and_chdir(
     tmp_path: Path,
 ) -> None:
@@ -466,24 +703,22 @@ def test_wrap_launcher_argv_binds_etc_alternatives(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    "allow_network,should_unshare",
-    [(True, False), (False, True)],
-    ids=["network_shared", "network_isolated"],
+    "allow_network,broker_socket,should_unshare",
+    [(True, False, False), (False, False, True), (True, True, True)],
+    ids=["network_shared", "network_isolated", "tcp_broker"],
 )
 def test_wrap_launcher_argv_unshare_net_follows_allow_network(
-    tmp_path: Path, allow_network: bool, should_unshare: bool
+    tmp_path: Path, allow_network: bool, broker_socket: bool, should_unshare: bool
 ) -> None:
     """
-    ``--unshare-net`` is emitted iff ``policy.allow_network`` is
-    False. With ``allow_network=True`` the helper sees the host
-    network namespace; with ``False`` bwrap creates a fresh empty
-    namespace (no host interfaces).
+    Direct networking is isolated when disallowed or when a TCP broker owns it.
 
     Direction of the flag matters — flipping it would silently
     invert network policy for every spec.
     """
     backend = _make_backend()
     policy = _make_policy(tmp_path, allow_network=allow_network)
+    policy.tcp_egress_socket_path = str(tmp_path / "broker.sock") if broker_socket else None
     argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
     assert ("--unshare-net" in argv) is should_unshare
 
@@ -1057,7 +1292,7 @@ def _clear_host_backend_signals(monkeypatch: pytest.MonkeyPatch, tmp_path: Path)
     path that does not exist, isolating the test from the machine it runs
     on — which must not be assumed to be (or not to be) a lakebox microVM.
     """
-    monkeypatch.delenv(_HOST_SANDBOX_BACKEND_ENV, raising=False)
+    monkeypatch.delenv(HOST_SANDBOX_BACKEND_ENV, raising=False)
     monkeypatch.setattr(bwrap_sandbox, "_LAKEBOX_MARKER", tmp_path / "no-such-marker")
 
 
@@ -1074,17 +1309,18 @@ def test_detect_host_backend_none_without_signals(
     assert _should_bind_host_proc() is False
 
 
-def test_detect_host_backend_env_declaration_is_normalised(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("declared", ["  LakeBox  ", "PHOENIX-KUBERNETES"])
+def test_detect_host_backend_env_declaration_is_normalised_and_vetted(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, declared: str
 ) -> None:
     """
     ``OMNIGENT_HOST_SANDBOX_BACKEND`` is the explicit, authoritative
-    signal; it is trimmed and lower-cased so callers don't have to match
-    an exact casing, and ``lakebox`` is on the proc-bind allow-list.
+    signal; it is trimmed and lower-cased before checking the proc-bind
+    allow-list.
     """
     _clear_host_backend_signals(monkeypatch, tmp_path)
-    monkeypatch.setenv(_HOST_SANDBOX_BACKEND_ENV, "  LakeBox  ")
-    assert _detect_host_sandbox_backend() == "lakebox"
+    monkeypatch.setenv(HOST_SANDBOX_BACKEND_ENV, declared)
+    assert _detect_host_sandbox_backend() == declared.strip().lower()
     assert _should_bind_host_proc() is True
 
 
@@ -1099,7 +1335,7 @@ def test_detect_host_backend_env_non_lakebox_keeps_fresh_proc(
     marker = tmp_path / "run-lakebox"
     marker.mkdir()
     monkeypatch.setattr(bwrap_sandbox, "_LAKEBOX_MARKER", marker)
-    monkeypatch.setenv(_HOST_SANDBOX_BACKEND_ENV, "modal")
+    monkeypatch.setenv(HOST_SANDBOX_BACKEND_ENV, "modal")
     assert _detect_host_sandbox_backend() == "modal"
     assert "modal" not in _PROC_BIND_HOST_BACKENDS
     assert _should_bind_host_proc() is False
@@ -1109,14 +1345,11 @@ def test_detect_host_backend_marker_autodetects_lakebox(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """
-    When no env var is set, the ``/run/lakebox`` marker directory
-    autodetects lakebox. This is the prune-proof fallback the re-exec
-    launcher path relies on (the env var may be stripped by the spawn
-    allow-list, but the filesystem marker survives).
+    Without an env declaration, the ``/run/lakebox`` marker detects lakebox.
     """
     marker = tmp_path / "run-lakebox"
     marker.mkdir()
-    monkeypatch.delenv(_HOST_SANDBOX_BACKEND_ENV, raising=False)
+    monkeypatch.delenv(HOST_SANDBOX_BACKEND_ENV, raising=False)
     monkeypatch.setattr(bwrap_sandbox, "_LAKEBOX_MARKER", marker)
     assert _detect_host_sandbox_backend() == "lakebox"
     assert _should_bind_host_proc() is True
@@ -1137,27 +1370,33 @@ def test_wrap_launcher_argv_fresh_proc_by_default(
     assert not _has_pair(argv, "--bind", "/proc", "/proc")
 
 
-def test_wrap_launcher_argv_binds_proc_on_lakebox(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize(
+    ("frozen", "declared", "expected_bind"),
+    [
+        (None, "phoenix-kubernetes", True),
+        (None, "lakebox", True),
+        (False, "phoenix-kubernetes", False),
+        (False, "lakebox", False),
+        (True, None, True),
+    ],
+)
+def test_wrap_launcher_argv_respects_proc_choice(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    frozen: bool | None,
+    declared: str | None,
+    expected_bind: bool,
 ) -> None:
-    """
-    On a lakebox host the wrap binds the existing ``/proc`` instead of
-    mounting a fresh procfs (lakebox's masked ``/proc`` overmounts make
-    the fresh mount fail under ``--unshare-pid``). ``/dev`` and ``/tmp``
-    are unaffected.
-    """
+    """A frozen choice wins over host detection, even without a host signal."""
     _clear_host_backend_signals(monkeypatch, tmp_path)
-    monkeypatch.setenv(_HOST_SANDBOX_BACKEND_ENV, "lakebox")
+    if declared is not None:
+        monkeypatch.setenv(HOST_SANDBOX_BACKEND_ENV, declared)
     backend = _make_backend()
     policy = _make_policy(tmp_path)
+    policy.bind_host_proc = frozen
     argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
-    assert _has_pair(argv, "--bind", "/proc", "/proc"), (
-        "lakebox host must bind the existing /proc; got no `--bind /proc /proc`."
-    )
-    assert not _has_pair_single_dest(argv, "--proc", "/proc"), (
-        "lakebox host must NOT also mount a fresh procfs — the two would "
-        "conflict at the same mountpoint."
-    )
+    assert _has_pair(argv, "--bind", "/proc", "/proc") is expected_bind
+    assert _has_pair_single_dest(argv, "--proc", "/proc") is not expected_bind
     assert _has_pair_single_dest(argv, "--dev", "/dev")
     assert "--tmpfs" in argv
 

@@ -12,6 +12,7 @@ Tool authors see::
 
     from omnigent_client import tool, ToolState
 
+
     @tool
     def add_task(desc: str, state: ToolState) -> str:
         with state.transaction("queue") as q:
