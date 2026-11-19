@@ -5,8 +5,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { showToast } from "@/components/ui/toast";
 import { copyText } from "@/lib/clipboard";
+import { HARNESS_CREDENTIAL_COPY } from "@/lib/harnessSetup";
 import { authenticatedFetch } from "@/lib/identity";
 import { HarnessFixDialog, type HarnessFixDialogProps } from "./HarnessFixDialog";
+import { HARNESS_DETAIL_ENTRIES } from "./search/catalog/harnesses";
+import { SettingsOverlayOwner } from "./search/settingsOwnership";
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
@@ -173,7 +176,14 @@ describe("HarnessFixDialog", () => {
     const user = userEvent.setup();
 
     expect(screen.getByRole("heading", { name: "Reconfigure Codex" })).toBeVisible();
-    expect(screen.getByRole("radio", { name: /Isaac/ })).toHaveAttribute("aria-checked", "true");
+    const [firstCredential] = Object.values(HARNESS_CREDENTIAL_COPY);
+    expect(screen.getByRole("radio", { name: firstCredential.label })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(screen.getByRole("radio", { name: firstCredential.label })).toHaveAccessibleDescription(
+      firstCredential.description,
+    );
     await user.click(screen.getByRole("button", { name: "Authenticate" }));
 
     expect(
@@ -290,6 +300,153 @@ describe("HarnessFixDialog", () => {
         gatewayInference: null,
       }),
     );
+  });
+
+  it("guides tmux repair without the CLI installer and finishes after Check again", async () => {
+    const refreshed = [
+      { "claude-native": "tmux-unavailable" },
+      { "claude-native": true, "claude-sdk": true },
+    ];
+    vi.mocked(authenticatedFetch).mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url === "/v1/harnesses") return json(catalog);
+      if (url.endsWith("/harnesses/refresh")) {
+        expect(init).toEqual({ method: "POST" });
+        return json({ configured_harnesses: refreshed.shift(), gateway_inference: null });
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    const props = renderDialog({
+      mode: "tmux",
+      harness: "claude-native",
+      harnessLabel: "Claude Code",
+    });
+    const user = userEvent.setup();
+
+    expect(screen.getByRole("heading", { name: "Set up tmux on Local laptop" })).toBeVisible();
+    expect(screen.getByText("brew install tmux")).toBeVisible();
+    expect(screen.getByText("brew upgrade tmux")).toBeVisible();
+    expect(screen.getByText(/quit and reopen the Omnigent app/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Install" })).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "Check again" }));
+    expect(await screen.findByText("Claude Code still isn’t ready on Local laptop.")).toBeVisible();
+    expect(props.onFixed).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "Check again" }));
+    await waitFor(() =>
+      expect(props.onFixed).toHaveBeenCalledWith({
+        configuredHarnesses: { "claude-native": true, "claude-sdk": true },
+        credentialKind: undefined,
+        gatewayInference: null,
+      }),
+    );
+    expect(
+      vi.mocked(authenticatedFetch).mock.calls.some(([url]) => String(url).includes("install")),
+    ).toBe(false);
+  });
+
+  it("moves from tmux repair to sign-in when Check again reports needs-auth", async () => {
+    const refreshed = [{ "claude-native": "needs-auth" }, { "claude-native": true }];
+    vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "/v1/harnesses") return json(catalog);
+      if (url.endsWith("/harnesses/refresh")) {
+        return json({ configured_harnesses: refreshed.shift(), gateway_inference: null });
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    const props = renderDialog({
+      mode: "tmux",
+      harness: "claude-native",
+      harnessLabel: "Claude Code",
+    });
+    const user = userEvent.setup();
+
+    await user.click(screen.getByRole("button", { name: "Check again" }));
+    await user.click(await screen.findByRole("radio", { name: /Personal subscription/ }));
+    expect(screen.queryByText(/still isn’t ready/)).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Authenticate" }));
+    expect(screen.getByText("claude auth login --claudeai")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Check again" }));
+
+    await waitFor(() =>
+      expect(props.onFixed).toHaveBeenCalledWith({
+        configuredHarnesses: { "claude-native": true },
+        credentialKind: "personal",
+        gatewayInference: null,
+      }),
+    );
+    expect(
+      vi.mocked(authenticatedFetch).mock.calls.some(([url]) => String(url).endsWith("/install")),
+    ).toBe(false);
+  });
+
+  it("enters tmux repair when an install leaves the harness waiting on tmux", async () => {
+    vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "/v1/harnesses") return json(catalog);
+      if (url.endsWith("/install")) {
+        return json({
+          object: "harness_install",
+          harness: "claude-native",
+          configured_harnesses: { "claude-native": "tmux-unavailable" },
+          version: "2.0.0",
+        });
+      }
+      if (url.endsWith("/harnesses/refresh")) {
+        return json({ configured_harnesses: { "claude-native": true }, gateway_inference: null });
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    const props = renderDialog({
+      mode: "install",
+      harness: "claude-native",
+      harnessLabel: "Claude Code",
+    });
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("button", { name: "Install" }));
+    expect(
+      await screen.findByRole("heading", { name: "Set up tmux on Local laptop" }),
+    ).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Check again" }));
+
+    await waitFor(() =>
+      expect(props.onFixed).toHaveBeenCalledWith({
+        configuredHarnesses: { "claude-native": true },
+        credentialKind: undefined,
+        gatewayInference: null,
+      }),
+    );
+    const installCalls = vi
+      .mocked(authenticatedFetch)
+      .mock.calls.filter(([url]) => String(url).endsWith("/install"));
+    expect(installCalls).toHaveLength(1);
+  });
+
+  it("offers Update instead of re-running setup when tmux repair reveals an outdated CLI", async () => {
+    vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
+      const url = String(input);
+      if (url === "/v1/harnesses") return json(catalog);
+      if (url.endsWith("/harnesses/refresh")) {
+        return json({
+          configured_harnesses: { "claude-native": "version-too-low" },
+          gateway_inference: null,
+        });
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    renderDialog({ mode: "tmux", harness: "claude-native", harnessLabel: "Claude Code" });
+    const user = userEvent.setup();
+
+    await user.click(screen.getByRole("button", { name: "Check again" }));
+
+    expect(await screen.findByRole("heading", { name: "Update Claude Code" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Update" })).toBeVisible();
+    expect(
+      vi.mocked(authenticatedFetch).mock.calls.some(([url]) => String(url).endsWith("/install")),
+    ).toBe(false);
   });
 
   it("shows persistent guidance when copying a command fails", async () => {
@@ -426,6 +583,45 @@ describe("HarnessFixDialog", () => {
     expect(showToast).toHaveBeenCalledWith(
       "Codex is ready on Local laptop. Signed in as codex@example.com · Plus.",
     );
+  });
+
+  it("continues to the tmux step when sign-in leaves tmux as the blocker", async () => {
+    vi.mocked(authenticatedFetch).mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url === "/v1/harnesses") return json(catalog);
+      if (url.endsWith("/login") && init?.method === "POST") {
+        return json({
+          login_id: "login/1",
+          verification_url: "https://auth.example.test/device",
+          user_code: "WQ7K-3XPM",
+          expires_at: Math.floor(Date.now() / 1000) + 15 * 60,
+        });
+      }
+      if (url.endsWith("/login/login%2F1")) {
+        return json({
+          status: "succeeded",
+          error: null,
+          configured_harnesses: { "codex-native": "tmux-unavailable" },
+          harness_accounts: {},
+        });
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    const props = renderDialog();
+    const user = userEvent.setup();
+
+    await user.click(screen.getByRole("radio", { name: /Personal subscription/ }));
+    vi.useFakeTimers();
+    fireEvent.click(screen.getByRole("button", { name: "Authenticate" }));
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+    await act(async () => vi.advanceTimersByTime(2_000));
+
+    expect(screen.getByRole("heading", { name: "Set up tmux on Local laptop" })).toBeVisible();
+    expect(props.onFixed).not.toHaveBeenCalled();
+    expect(showToast).not.toHaveBeenCalled();
   });
 
   it("cancels an active Codex device login", async () => {
@@ -768,6 +964,7 @@ describe("HarnessFixDialog", () => {
     const email = screen.getByRole("textbox", { name: "Account to sign in with" });
     expect(email).toHaveValue("");
     expect(email).toHaveAttribute("placeholder", "name@example.com");
+    expect(email).toHaveAccessibleName("Account to sign in with");
     await user.type(email, "new@example.com");
     await user.click(screen.getByRole("button", { name: "Sign out and switch" }));
 
@@ -1426,7 +1623,7 @@ describe("HarnessFixDialog", () => {
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: "Use an API key or gateway URL instead" }));
     await user.type(screen.getByPlaceholderText("Paste an API key"), "secret");
-    await user.click(screen.getAllByRole("button", { name: "Save" })[0]);
+    await user.click(screen.getAllByRole("button", { name: /^Save/ })[0]);
 
     await waitFor(() =>
       expect(props.onFixed).toHaveBeenCalledWith({
@@ -1441,6 +1638,38 @@ describe("HarnessFixDialog", () => {
         .mocked(authenticatedFetch)
         .mock.calls.every(([input]) => !String(input).endsWith("/refresh")),
     ).toBe(true);
+  });
+
+  it("continues from a saved credential to tmux repair when tmux is the remaining blocker", async () => {
+    vi.mocked(authenticatedFetch).mockImplementation(async (input, init) => {
+      const url = String(input);
+      if (url === "/v1/harnesses") return json(catalog);
+      if (url.endsWith("/credentials/detected")) return json({ credentials: [] });
+      if (url.endsWith("/credential")) {
+        expect(init?.method).toBe("POST");
+        return json({
+          object: "harness_credential",
+          harness: "codex-native",
+          configured_harnesses: { "codex-native": "tmux-unavailable" },
+        });
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    });
+    const props = renderDialog();
+    const user = userEvent.setup();
+    await user.click(screen.getByRole("button", { name: "Use an API key or gateway URL instead" }));
+    await user.type(screen.getByPlaceholderText("Paste an API key"), "secret");
+    await user.click(screen.getAllByRole("button", { name: /^Save/ })[0]);
+
+    expect(
+      await screen.findByRole("heading", { name: "Set up tmux on Local laptop" }),
+    ).toBeVisible();
+    expect(screen.getByText("brew install tmux")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Check again" })).toBeVisible();
+    expect(props.onFixed).not.toHaveBeenCalled();
+    expect(showToast).toHaveBeenCalledWith(
+      "Saved. Codex still needs tmux 3.3 or newer on Local laptop.",
+    );
   });
 
   it("disables Check again while the readiness request is in flight", async () => {
@@ -1478,5 +1707,74 @@ describe("HarnessFixDialog", () => {
     renderDialog({ harness: "native-codex", harnessLabel: "Codex" });
     expect(screen.getByRole("radio", { name: /Isaac/ })).toBeVisible();
     expect(screen.getByRole("radio", { name: /Personal subscription/ })).toBeVisible();
+  });
+});
+
+describe("HarnessFixDialog as a Settings overlay", () => {
+  it("names its controls as the parts of the control that opened it, with no tooltip", () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <SettingsOverlayOwner
+          entry={HARNESS_DETAIL_ENTRIES.entry("cursor-native")}
+          opener="fixAction"
+        >
+          <HarnessFixDialog
+            {...baseProps}
+            mode="install"
+            harness="cursor-native"
+            harnessLabel="Cursor"
+          />
+        </SettingsOverlayOwner>
+      </QueryClientProvider>,
+    );
+
+    expect(screen.getByRole("dialog")).toHaveAttribute(
+      "data-settings-overlay-owner",
+      "harness-cursor-native-detail:fixAction",
+    );
+    const check = screen.getByRole("button", { name: "Check again" });
+    expect(check).toHaveAttribute(
+      "data-settings-control",
+      "harness-cursor-native-detail:checkAgain",
+    );
+    expect(check).toHaveAttribute("title", "");
+    expect(screen.getByRole("button", { name: "Copy omni setup" })).toHaveAttribute(
+      "data-settings-control",
+      "harness-cursor-native-detail:copyOmniSetup",
+    );
+    const footerClose = screen
+      .getAllByRole("button", { name: "Close" })
+      .find((button) => button.textContent === "Close");
+    expect(footerClose).toHaveAttribute("data-settings-dialog-action", "Close");
+  });
+});
+
+describe("HarnessFixDialog's credential step as a Settings overlay", () => {
+  it("names the credential form's controls through the control that opened the dialog", async () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <SettingsOverlayOwner
+          entry={HARNESS_DETAIL_ENTRIES.entry("codex-native")}
+          opener="fixAction"
+        >
+          <HarnessFixDialog {...baseProps} mode="reconfigure" />
+        </SettingsOverlayOwner>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Use an API key or gateway URL instead" }),
+    );
+
+    expect(screen.getByLabelText("API key")).toHaveAttribute(
+      "data-settings-control",
+      "harness-codex-native-detail:apiKey",
+    );
   });
 });

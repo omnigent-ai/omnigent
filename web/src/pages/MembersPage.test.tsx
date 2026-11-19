@@ -7,28 +7,33 @@
 // table + actions), and useServerInfo (accounts_enabled toggles the
 // manage-vs-read-only surface — the latter is the OIDC case).
 
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MembersPage } from "./MembersPage";
 import type { AccountListEntry } from "@/lib/accountsApi";
 import * as accountsApi from "@/lib/accountsApi";
 import * as identity from "@/lib/identity";
+import { SERVER_INFO_OFFLINE_FALLBACK } from "@/lib/bootCapabilities";
 
 const mocks = vi.hoisted(() => ({
   accountsEnabled: true,
   loginUrl: null as string | null,
   serverVersion: "0.3.0.dev0" as string | null,
   singleUser: false,
+  bootFallback: false,
 }));
 
 vi.mock("@/lib/CapabilitiesContext", () => ({
-  useServerInfo: () => ({
-    accounts_enabled: mocks.accountsEnabled,
-    login_url: mocks.loginUrl,
-    server_version: mocks.serverVersion,
-    single_user: mocks.singleUser,
-  }),
+  useServerInfo: () =>
+    mocks.bootFallback
+      ? SERVER_INFO_OFFLINE_FALLBACK
+      : {
+          accounts_enabled: mocks.accountsEnabled,
+          login_url: mocks.loginUrl,
+          server_version: mocks.serverVersion,
+          single_user: mocks.singleUser,
+        },
 }));
 vi.mock("@/lib/identity", () => ({
   resolveIdentity: vi.fn(),
@@ -65,6 +70,7 @@ beforeEach(() => {
   mocks.loginUrl = null;
   mocks.serverVersion = "0.3.0.dev0";
   mocks.singleUser = false;
+  mocks.bootFallback = false;
   vi.mocked(identity.resolveIdentity).mockResolvedValue("admin");
   vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(true);
   vi.mocked(accountsApi.listUsers).mockResolvedValue([]);
@@ -89,6 +95,24 @@ afterEach(() => {
 });
 
 describe("MembersPage gating", () => {
+  it("waits through the boot fallback before reading admin access", async () => {
+    mocks.bootFallback = true;
+    vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(false);
+    const page = renderPage();
+    await act(async () => {});
+    expect(identity.getCurrentIsAdmin).not.toHaveBeenCalled();
+    expect(accountsApi.listUsers).not.toHaveBeenCalled();
+
+    mocks.bootFallback = false;
+    vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(true);
+    page.rerender(
+      <MemoryRouter>
+        <MembersPage />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(accountsApi.listUsers).toHaveBeenCalledOnce());
+  });
+
   it("shows a loading state until the identity probe resolves", () => {
     vi.mocked(identity.resolveIdentity).mockReturnValue(new Promise(() => {})); // never resolves
     renderPage();
@@ -163,6 +187,7 @@ describe("MembersPage actions", () => {
     await waitFor(() => expect(accountsApi.resetUserPassword).toHaveBeenCalledWith("bob"));
     // The new password renders in a readonly, copyable input.
     expect(await screen.findByDisplayValue("fresh-pw-123")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("fresh-pw-123")).toHaveAccessibleName("New password for bob");
   });
 
   it("deletes a user through the confirmation dialog and refreshes the list", async () => {
@@ -193,6 +218,23 @@ describe("MembersPage actions", () => {
     await waitFor(() => expect(accountsApi.createInvite).toHaveBeenCalledWith(false));
     // The single-use invite URL renders in a readonly, copyable input.
     expect(await screen.findByDisplayValue(/register\?invite=tok/)).toBeInTheDocument();
+    expect(screen.getByDisplayValue(/register\?invite=tok/)).toHaveAccessibleName("Invite URL");
+  });
+
+  it("renders the invite and member rows from their Settings catalog entries", async () => {
+    vi.mocked(accountsApi.listUsers).mockResolvedValue([user({ id: "bob" })]);
+    renderPage();
+    await screen.findByText("bob");
+
+    expect(document.querySelector('[data-settings-item="members-invite"]')).not.toBeNull();
+    expect(document.querySelector('[data-settings-item="members-list"]')).not.toBeNull();
+    expect(
+      document.querySelector('[data-settings-control="members-invite:invite"]'),
+    ).toHaveAttribute("aria-label", "Invite member");
+    const bobRow = screen.getByText("bob").closest("tr")!;
+    expect(bobRow.querySelector('[data-settings-row-action="resetPassword"]')).not.toBeNull();
+    expect(bobRow.querySelector('[data-settings-row-action="remove"]')).not.toBeNull();
+    expect(document.querySelector('[data-settings-region="members-list:members"]')).not.toBeNull();
   });
 });
 
@@ -238,8 +280,9 @@ describe("MembersPage under OIDC (read-only)", () => {
 
     // No invite button, no per-row Reset/Remove, and a read-only notice.
     expect(screen.queryByRole("button", { name: /Invite member/ })).toBeNull();
+    expect(document.querySelector('[data-settings-item="members-invite"]')).toBeNull();
     expect(within(bobRow).queryByRole("button", { name: /Reset/ })).toBeNull();
     expect(within(bobRow).queryByRole("button", { name: /Remove/ })).toBeNull();
-    expect(screen.getByText(/provisioned automatically on first sign-in/)).toBeInTheDocument();
+    expect(screen.getByText(/added on first sign-in/)).toBeInTheDocument();
   });
 });

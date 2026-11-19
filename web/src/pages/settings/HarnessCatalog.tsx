@@ -1,16 +1,42 @@
+import { Switch } from "@/components/ui/switch";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+import { useSetMcpServerEnabled } from "@/hooks/useSetMcpServerEnabled";
 import * as AccordionPrimitive from "radix-ui/accordion";
 import { useMcpServerTools, type McpServerTools } from "@/hooks/useMcpServerTools";
-import { useEffect, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { ArrowLeftIcon, ChevronRightIcon, PlugIcon, SparkleIcon } from "lucide-react";
 import { Link, useSearchParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { mcpServerDisplayName } from "@/lib/mcpServerName";
 import { Button } from "@/components/ui/button";
+import {
+  HARNESS_DETAIL_ENTRIES,
+  HARNESS_PLUGIN_ENTRIES,
+  HARNESS_SKILL_ENTRIES,
+  type InventoryPageEntries,
+  type HarnessPluginEntry,
+  type HarnessSkillEntry,
+  INVENTORY_COUNT_SEPARATOR,
+  INVENTORY_KIND_LABELS,
+  type InventoryPageHarnessId,
+  type McpServerListEntry,
+  isSkillPageHarness,
+  MCP_SERVER_LIST_ENTRIES,
+  SKILL_PAGE_FAMILIES,
+  type SkillPageHarnessId,
+} from "./search/catalog/harnesses";
+import { settingsControlProps } from "./search/settingsControl";
+import { SettingsItem } from "./search/SettingsItem";
+import {
+  SettingsContent,
+  SettingsDataRegion,
+  SettingsOwner,
+  useSettingsOwnership,
+} from "./search/settingsOwnership";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
-import type { BrandHarness } from "@/components/onboarding/harnessBrand";
 import type { Host } from "@/hooks/useHosts";
 import {
-  INVENTORY_HARNESS_IDS,
+  type InventoryHarness,
   type InventoryMcpServer,
   type InventoryPlugin,
   useHarnessInventory,
@@ -24,16 +50,16 @@ import { Spinner } from "../../components/ui/spinner";
 
 type CatalogKind = "mcps" | "skills" | "plugins";
 
-const KINDS: { id: CatalogKind; label: string; noun: string }[] = [
-  { id: "mcps", label: "MCP servers", noun: "MCP servers" },
-  { id: "skills", label: "Skills", noun: "skills" },
-  { id: "plugins", label: "Plugins", noun: "plugins" },
-];
+// The server probes MCP tools and reads skill contents for these families only.
+const DETAILED_HARNESSES: ReadonlySet<InventoryHarness> = new Set<InventoryHarness>(
+  SKILL_PAGE_FAMILIES,
+);
 
-interface OpenPlugin {
-  plugin: InventoryPlugin;
-  mcps: InventoryMcpServer[];
-}
+const KINDS: { id: CatalogKind; label: string; noun: string }[] = [
+  { id: "mcps", label: INVENTORY_KIND_LABELS.mcps, noun: "MCP servers" },
+  { id: "skills", label: INVENTORY_KIND_LABELS.skills, noun: "skills" },
+  { id: "plugins", label: INVENTORY_KIND_LABELS.plugins, noun: "plugins" },
+];
 
 /** "← label" row above a page title: a link when `to` is set, else a button. */
 export function BackButton({
@@ -47,25 +73,32 @@ export function BackButton({
   onClick?: () => void;
   componentId?: string;
 }) {
-  return (
+  // Inside a Settings owner, named and found as its part, around its label where the part is
+  // named by a template; elsewhere, by its visible label.
+  const owned = useSettingsOwnership();
+  const className = "mb-4 -ml-2.5 font-normal";
+  // A link renders as the button when it goes somewhere; otherwise the button acts itself.
+  return to !== undefined ? (
+    <Button asChild variant="ghost" size="sm" className={className} onClick={onClick}>
+      <Link
+        to={to}
+        componentId={componentId}
+        {...owned.control({ name: { runtime: label }, outside: {} })}
+      >
+        <ArrowLeftIcon />
+        {label}
+      </Link>
+    </Button>
+  ) : (
     <Button
-      asChild={to !== undefined}
       variant="ghost"
       size="sm"
-      className="mb-4 -ml-2.5 font-normal"
+      className={className}
       onClick={onClick}
+      {...owned.control({ name: { runtime: label }, outside: {} })}
     >
-      {to !== undefined ? (
-        <Link to={to} componentId={componentId}>
-          <ArrowLeftIcon />
-          {label}
-        </Link>
-      ) : (
-        <>
-          <ArrowLeftIcon />
-          {label}
-        </>
-      )}
+      <ArrowLeftIcon />
+      {label}
     </Button>
   );
 }
@@ -79,65 +112,86 @@ export function HarnessCatalog({
   header,
   settings,
   host,
-  family,
+  entries,
   defaultTab = "mcps",
 }: {
   header: ReactNode;
   settings: ReactNode;
   host: Host;
-  family: BrandHarness;
+  entries: InventoryPageEntries;
   defaultTab?: CatalogKind | "settings";
 }) {
+  const family = entries.family;
   // `?tab=settings` (the grid card's gear) opens on Settings; otherwise MCP servers.
   const [searchParams] = useSearchParams();
   const [tab, setTab] = useState<CatalogKind | "settings">(
     searchParams.get("tab") === "settings" ? "settings" : defaultTab,
   );
-  const [open, setOpen] = useState<OpenPlugin | null>(null);
+  const [open, setOpen] = useState<InventoryPlugin | null>(null);
   const [selectedSkill, setSelectedSkill] = useState<{ name: string; sourceId?: string } | null>(
     null,
   );
-  const [contentSupported, setContentSupported] = useState(true);
-  const inventory = useHarnessInventory(host, { includePluginMetadata: family === "claude" });
+  const [contentSupported, setContentSupported] = useState(DETAILED_HARNESSES.has(family));
+  const families = useMemo(() => [family], [family]);
+  const inventory = useHarnessInventory(host, {
+    includePluginMetadata: family === "claude",
+    families,
+  });
   const back = () => setOpen(null);
 
   const { context, unavailable } = inventory;
-  const mine = <T extends { harness: BrandHarness }>(items: T[]) =>
+  const mine = <T extends { harness: InventoryHarness }>(items: T[]) =>
     items.filter((item) => item.harness === family);
   const own = {
     mcps: mine(context.mcps),
     skills: mine(context.skills),
     plugins: mine(context.plugins),
   };
-  const pluginMcps = (plugin: InventoryPlugin) =>
-    plugin.mcp_entries?.map(({ id, name }) => ({
-      id,
-      name,
-      sourceId: id,
-      harness: family,
-      plugin: plugin.name,
-    })) ??
-    plugin.mcp_servers?.map((name) => ({
-      id: `${plugin.id}:${name}`,
-      name,
-      harness: family,
-      plugin: plugin.name,
-    })) ??
-    own.mcps.filter((server) => server.plugin === plugin.name);
+  const pluginMcps = (plugin: InventoryPlugin): InventoryMcpServer[] => {
+    const enablement = (name: string, sourceId?: string) => {
+      const matches = own.mcps.filter(
+        (server) =>
+          server.plugin === plugin.name &&
+          server.name === name &&
+          (sourceId === undefined || server.sourceId === sourceId),
+      );
+      const match = matches.length === 1 ? matches[0] : undefined;
+      return { enabled: match?.enabled, locked: match?.locked };
+    };
+    return (
+      plugin.mcp_entries?.map(({ id, name }) => ({
+        id,
+        name,
+        sourceId: id,
+        harness: family,
+        plugin: plugin.name,
+        ...enablement(name, id),
+      })) ??
+      plugin.mcp_servers?.map((name) => ({
+        id: `${plugin.id}:${name}`,
+        name,
+        harness: family,
+        plugin: plugin.name,
+        ...enablement(name),
+      })) ??
+      own.mcps.filter((server) => server.plugin === plugin.name)
+    );
+  };
   const loading = inventory.status === "loading";
   const failed = (kind: CatalogKind) =>
     kind === "plugins" && family !== "claude"
       ? unavailable.includes("skills") && unavailable.includes("mcps")
       : unavailable.includes(kind);
 
-  if (selectedSkill !== null)
+  if (selectedSkill !== null && entries.skill && isSkillPageHarness(entries.harness))
     return (
       <SkillPage
         host={host}
-        harness={INVENTORY_HARNESS_IDS[family]}
+        entry={entries.skill}
+        harness={entries.harness}
         name={selectedSkill.name}
         sourceId={selectedSkill.sourceId}
-        backLabel={open ? open.plugin.name : "Skills"}
+        backLabel={open ? open.name : "Skills"}
         onBack={() => setSelectedSkill(null)}
         onUnavailable={() => {
           setContentSupported(false);
@@ -149,8 +203,10 @@ export function HarnessCatalog({
     return (
       <PluginPage
         host={host}
-        plugin={open.plugin}
-        mcps={open.mcps}
+        entry={entries.plugin}
+        harness={entries.harness}
+        plugin={open}
+        mcps={pluginMcps(open)}
         onBack={back}
         onSkillOpen={
           contentSupported ? (name, sourceId) => setSelectedSkill({ name, sourceId }) : undefined
@@ -187,7 +243,11 @@ export function HarnessCatalog({
         componentId="settings.harnesses.tab"
         className="mt-8 gap-4"
       >
-        <TabsList variant="line" className="w-full justify-start border-b border-border px-0">
+        <TabsList
+          variant="line"
+          className="w-full justify-start border-b border-border px-0"
+          {...settingsControlProps(HARNESS_DETAIL_ENTRIES.entry(entries.harness), "tab")}
+        >
           {KINDS.map((k) => (
             <TabsTrigger
               key={k.id}
@@ -195,7 +255,7 @@ export function HarnessCatalog({
               className="flex-none"
               data-testid={`harness-tab-${k.id}`}
             >
-              {loading ? k.label : `${k.label} · ${own[k.id].length}`}
+              {loading ? k.label : `${k.label}${INVENTORY_COUNT_SEPARATOR}${own[k.id].length}`}
             </TabsTrigger>
           ))}
           <TabsTrigger value="settings" className="flex-none" data-testid="harness-tab-settings">
@@ -204,47 +264,61 @@ export function HarnessCatalog({
         </TabsList>
         <TabsContent value="settings">{settings}</TabsContent>
         <TabsContent value="mcps">
-          {ownList("mcps", own.mcps.length, <McpList host={host} servers={own.mcps} />)}
+          {ownList(
+            "mcps",
+            own.mcps.length,
+            <McpList host={host} harness={entries.harness} servers={own.mcps} />,
+          )}
         </TabsContent>
         <TabsContent value="skills">
           {ownList(
             "skills",
             own.skills.length,
-            <ul className="flex flex-col gap-2">
-              {own.skills.map((skill) => (
-                <CatalogRow
-                  key={skill.id}
-                  icon={<SparkleIcon className="size-4 text-muted-foreground" />}
-                  name={skill.name}
-                  detail={skill.description}
-                  onOpen={
-                    contentSupported ? () => setSelectedSkill({ name: skill.name }) : undefined
-                  }
-                />
-              ))}
-            </ul>,
+            <SettingsDataRegion
+              entry={HARNESS_DETAIL_ENTRIES.entry(entries.harness)}
+              region="skills"
+            >
+              <ul className="flex flex-col gap-2">
+                {own.skills.map((skill) => (
+                  <CatalogRow
+                    key={skill.id}
+                    icon={<SparkleIcon className="size-4 text-muted-foreground" />}
+                    name={skill.name}
+                    detail={skill.description}
+                    onOpen={
+                      contentSupported ? () => setSelectedSkill({ name: skill.name }) : undefined
+                    }
+                  />
+                ))}
+              </ul>
+            </SettingsDataRegion>,
           )}
         </TabsContent>
         <TabsContent value="plugins">
           {ownList(
             "plugins",
             own.plugins.length,
-            <ul className="flex flex-col gap-2">
-              {own.plugins.map((plugin) => {
-                const mcps = pluginMcps(plugin);
-                return (
-                  <CatalogRow
-                    key={plugin.id}
-                    icon={<PlugIcon className="size-4 text-muted-foreground" />}
-                    name={plugin.name}
-                    detail={[pluginDetail(plugin, mcps.length), plugin.description]
-                      .filter(Boolean)
-                      .join(" · ")}
-                    onOpen={() => setOpen({ plugin, mcps })}
-                  />
-                );
-              })}
-            </ul>,
+            <SettingsDataRegion
+              entry={HARNESS_DETAIL_ENTRIES.entry(entries.harness)}
+              region="plugins"
+            >
+              <ul className="flex flex-col gap-2">
+                {own.plugins.map((plugin) => {
+                  const mcps = pluginMcps(plugin);
+                  return (
+                    <CatalogRow
+                      key={plugin.id}
+                      icon={<PlugIcon className="size-4 text-muted-foreground" />}
+                      name={plugin.name}
+                      detail={[pluginDetail(plugin, mcps.length), plugin.description]
+                        .filter(Boolean)
+                        .join(" · ")}
+                      onOpen={() => setOpen(plugin)}
+                    />
+                  );
+                })}
+              </ul>
+            </SettingsDataRegion>,
           )}
         </TabsContent>
       </Tabs>
@@ -268,6 +342,8 @@ function CatalogRow({
   label = name,
   detail,
   onOpen,
+  trailing,
+  dimmed,
 }: {
   icon: ReactNode;
   name: string;
@@ -275,17 +351,23 @@ function CatalogRow({
   label?: string;
   detail?: string;
   onOpen?: () => void;
+  trailing?: ReactNode;
+  dimmed?: boolean;
 }) {
   const main = (
     <>
       <span className="flex shrink-0 items-center">{icon}</span>
       <span className="shrink-0 text-ui font-medium text-foreground">{label}</span>
-      {detail && <span className="min-w-0 truncate text-ui text-muted-foreground">{detail}</span>}
+      {detail && <span className="min-w-0 truncate text-sm text-muted-foreground">{detail}</span>}
     </>
   );
-  const mainClass = "flex min-w-0 flex-1 items-center gap-2 px-4 py-2.5 text-left";
+  const mainClass = cn(
+    "flex min-w-0 flex-1 items-center gap-2 px-4 py-2.5 text-left",
+    dimmed && "opacity-50",
+  );
   return (
     <li
+      data-settings-region-row={onOpen ? true : undefined}
       className={cn(
         "flex items-center rounded-xl border border-border transition-colors",
         onOpen && "hover:bg-muted/50",
@@ -294,6 +376,7 @@ function CatalogRow({
       {onOpen ? (
         <button
           type="button"
+          data-settings-row-action="open"
           onClick={onOpen}
           className={cn(mainClass, "cursor-pointer")}
           data-testid={`catalog-row-${name}`}
@@ -305,6 +388,7 @@ function CatalogRow({
           {main}
         </div>
       )}
+      {trailing}
     </li>
   );
 }
@@ -336,12 +420,16 @@ function pluginDetail(plugin: InventoryPlugin, mcpCount: number) {
 
 function PluginPage({
   host,
+  entry,
+  harness,
   plugin,
   mcps,
   onBack,
   onSkillOpen,
 }: {
   host: Host;
+  entry: HarnessPluginEntry;
+  harness: InventoryPageHarnessId;
   plugin: InventoryPlugin;
   mcps: InventoryMcpServer[];
   onBack: () => void;
@@ -350,22 +438,28 @@ function PluginPage({
   const needsUpdate = plugin.marketplace !== undefined && !plugin.skill_entries;
   const skills = plugin.skill_entries ?? plugin.skills.map((name) => ({ name, id: undefined }));
   return (
-    <>
-      <BackButton label="Plugins" onClick={onBack} />
+    <SettingsItem entry={entry}>
+      <SettingsOwner entry={HARNESS_PLUGIN_ENTRIES.entry(harness)} part="back">
+        <BackButton label="Plugins" onClick={onBack} />
+      </SettingsOwner>
       <div className="flex min-w-0 items-center gap-3">
         <span className="flex size-10 shrink-0 items-center justify-center rounded-lg border border-border">
           <PlugIcon className="size-5 text-muted-foreground" />
         </span>
         <div className="flex min-w-0 flex-col">
-          <h1 className="settings-page-title truncate text-2xl font-medium">{plugin.name}</h1>
-          <span className="text-ui text-muted-foreground">{pluginDetail(plugin, mcps.length)}</span>
+          <h1 className="truncate text-2xl font-medium">{plugin.name}</h1>
+          <span className="text-sm text-muted-foreground">{pluginDetail(plugin, mcps.length)}</span>
         </div>
       </div>
       {plugin.description && (
-        <p className="mt-4 text-ui text-muted-foreground">{plugin.description}</p>
+        <p className="mt-4 text-sm text-muted-foreground">{plugin.description}</p>
       )}
       <Tabs defaultValue="skills" className="mt-6 gap-4">
-        <TabsList variant="line" className="w-full justify-start border-b border-border pb-1">
+        <TabsList
+          variant="line"
+          className="w-full justify-start border-b border-border pb-1"
+          {...settingsControlProps(HARNESS_PLUGIN_ENTRIES.entry(harness), "tab")}
+        >
           <TabsTrigger value="skills" className="flex-none">
             Skills · {plugin.skills.length}
           </TabsTrigger>
@@ -375,25 +469,28 @@ function PluginPage({
         </TabsList>
         <TabsContent value="skills">
           {needsUpdate && <Notice>Update {host.name} to read installed plugin skills.</Notice>}
-          <ul className="flex flex-col gap-2">
-            {plugin.skills.length === 0 && <Notice>No skills found.</Notice>}
-            {skills.map(({ name, id }) => (
-              <CatalogRow
-                key={id ?? name}
-                icon={<SparkleIcon className="size-4 text-muted-foreground" />}
-                name={name}
-                onOpen={
-                  onSkillOpen && !needsUpdate
-                    ? () => onSkillOpen(`${plugin.name}:${name}`, id)
-                    : undefined
-                }
-              />
-            ))}
-          </ul>
+          <SettingsDataRegion entry={entry} region="skills">
+            <ul className="flex flex-col gap-2">
+              {plugin.skills.length === 0 && <Notice>No skills found.</Notice>}
+              {skills.map(({ name, id }) => (
+                <CatalogRow
+                  key={id ?? name}
+                  icon={<SparkleIcon className="size-4 text-muted-foreground" />}
+                  name={name}
+                  onOpen={
+                    onSkillOpen && !needsUpdate
+                      ? () => onSkillOpen(`${plugin.name}:${name}`, id)
+                      : undefined
+                  }
+                />
+              ))}
+            </ul>
+          </SettingsDataRegion>
         </TabsContent>
         <TabsContent value="mcps">
           <McpList
             host={host}
+            harness={harness}
             servers={mcps}
             unavailableReason={
               plugin.enabled === false
@@ -405,12 +502,13 @@ function PluginPage({
           />
         </TabsContent>
       </Tabs>
-    </>
+    </SettingsItem>
   );
 }
 
 function SkillPage({
   host,
+  entry,
   harness,
   name,
   sourceId,
@@ -419,7 +517,8 @@ function SkillPage({
   onUnavailable,
 }: {
   host: Host;
-  harness: string;
+  entry: HarnessSkillEntry;
+  harness: SkillPageHarnessId;
   name: string;
   sourceId?: string;
   backLabel: string;
@@ -432,9 +531,11 @@ function SkillPage({
     if (missingRoute) onUnavailable();
   }, [missingRoute, onUnavailable]);
   return (
-    <>
-      <BackButton label={backLabel} onClick={onBack} />
-      <h1 className="settings-page-title truncate text-2xl font-medium">{name}</h1>
+    <SettingsItem entry={entry}>
+      <SettingsOwner entry={HARNESS_SKILL_ENTRIES.entry(harness)} part="back">
+        <BackButton label={backLabel} onClick={onBack} />
+      </SettingsOwner>
+      <h1 className="truncate text-2xl font-medium">{name}</h1>
       {query.isPending ? (
         <Notice>Loading skill contents…</Notice>
       ) : query.error ? (
@@ -446,22 +547,24 @@ function SkillPage({
       ) : query.data ? (
         <>
           {query.data.description && (
-            <p className="mt-4 text-ui text-muted-foreground">{query.data.description}</p>
+            <p className="mt-4 text-sm text-muted-foreground">{query.data.description}</p>
           )}
           <h2 className="mt-6 text-ui font-medium">Contents</h2>
           {query.data.truncated && <Notice>Contents truncated (256 KiB limit).</Notice>}
-          <div className="prose prose-sm mt-2 max-w-none overflow-x-auto rounded-xl border border-border p-5 dark:prose-invert">
-            <ReactMarkdown
-              remarkPlugins={[remarkGfm]}
-              skipHtml
-              components={SKILL_MARKDOWN_COMPONENTS}
-            >
-              {query.data.content}
-            </ReactMarkdown>
-          </div>
+          <SettingsContent entry={entry} area="skill">
+            <div className="prose prose-sm mt-2 max-w-none overflow-x-auto rounded-xl border border-border p-5 dark:prose-invert">
+              <ReactMarkdown
+                remarkPlugins={[remarkGfm]}
+                skipHtml
+                components={SKILL_MARKDOWN_COMPONENTS}
+              >
+                {query.data.content}
+              </ReactMarkdown>
+            </div>
+          </SettingsContent>
         </>
       ) : null}
-    </>
+    </SettingsItem>
   );
 }
 
@@ -480,31 +583,32 @@ const SKILL_MARKDOWN_COMPONENTS: Components = {
 
 function McpList({
   host,
+  harness,
   servers,
   unavailableReason,
 }: {
   host: Host;
+  /** The harness whose MCP list this is, which names its rows' switches and opens. */
+  harness: InventoryPageHarnessId;
   servers: InventoryMcpServer[];
   unavailableReason?: string;
 }) {
+  const entry = MCP_SERVER_LIST_ENTRIES.entry(harness) as McpServerListEntry;
   const [expanded, setExpanded] = useState<string[]>([]);
   const [supported, setSupported] = useState(true);
   if (servers.length === 0) return <Notice>No MCPs found.</Notice>;
-  if (!supported || unavailableReason)
+  const probed = servers.every((server) => DETAILED_HARNESSES.has(server.harness));
+  if (!supported || unavailableReason || !probed)
     return (
       <>
         {unavailableReason && <Notice>{unavailableReason}</Notice>}
-        <ul className="flex flex-col gap-2">
-          {servers.map((server) => (
-            <CatalogRow
-              key={server.id}
-              icon={<LetterAvatar name={server.name} />}
-              name={server.name}
-              label={mcpServerDisplayName(server.name)}
-              detail={server.detail}
-            />
-          ))}
-        </ul>
+        <SettingsDataRegion entry={MCP_SERVER_LIST_ENTRIES.entry(harness)} region="listed">
+          <ul className="flex flex-col gap-2">
+            {servers.map((server) => (
+              <McpFallbackRow key={server.id} host={host} entry={entry} server={server} />
+            ))}
+          </ul>
+        </SettingsDataRegion>
       </>
     );
   // Leading chevron and instant expansion match the harness catalog.
@@ -515,16 +619,97 @@ function McpList({
       onValueChange={setExpanded}
       className="flex flex-col rounded-xl border border-border"
     >
-      {servers.map((server) => (
-        <McpRow
-          key={server.id}
-          host={host}
-          server={server}
-          expanded={expanded.includes(server.id)}
-          onUnavailable={() => setSupported(false)}
-        />
-      ))}
+      <SettingsDataRegion
+        entry={MCP_SERVER_LIST_ENTRIES.entry(harness)}
+        region="servers"
+        className="contents"
+      >
+        {servers.map((server) => (
+          <div key={server.id} data-settings-region-row className="not-last:border-b">
+            <McpRow
+              host={host}
+              entry={entry}
+              server={server}
+              expanded={expanded.includes(server.id)}
+              onUnavailable={() => setSupported(false)}
+              onDisabled={() => setExpanded((current) => current.filter((id) => id !== server.id))}
+            />
+          </div>
+        ))}
+      </SettingsDataRegion>
     </AccordionPrimitive.Root>
+  );
+}
+
+function McpSwitch({
+  entry,
+  server,
+  enabled,
+  mutation,
+}: {
+  entry: McpServerListEntry;
+  server: InventoryMcpServer;
+  enabled: boolean | null | undefined;
+  mutation: ReturnType<typeof useSetMcpServerEnabled>;
+}) {
+  const harness = server.harness;
+  if ((harness !== "claude" && harness !== "codex") || enabled === null || enabled === undefined)
+    return null;
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <span className="flex items-center px-4">
+          <Switch
+            {...settingsControlProps(entry, "enabled", {
+              runtime: mcpServerDisplayName(server.name),
+            })}
+            checked={enabled}
+            disabled={server.locked || mutation.isPending}
+            onCheckedChange={(checked) =>
+              mutation.mutate({
+                harness,
+                server: server.name,
+                plugin: server.plugin,
+                source_id: server.sourceId,
+                enabled: checked,
+              })
+            }
+          />
+        </span>
+      </TooltipTrigger>
+      <TooltipContent>
+        {server.locked ? "Managed by your organization" : "Omnigent sessions only"}
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+function useMcpEnabledState(hostId: string, server: InventoryMcpServer) {
+  const mutation = useSetMcpServerEnabled(hostId);
+  // Keep this row pending even when another row settles and refetches inventory.
+  const enabled = mutation.isPending ? mutation.variables.enabled : server.enabled;
+  return { mutation, enabled };
+}
+
+function McpFallbackRow({
+  host,
+  entry,
+  server,
+}: {
+  host: Host;
+  entry: McpServerListEntry;
+  server: InventoryMcpServer;
+}) {
+  const { mutation, enabled } = useMcpEnabledState(host.host_id, server);
+  return (
+    <CatalogRow
+      icon={<LetterAvatar name={server.name} />}
+      name={server.name}
+      label={mcpServerDisplayName(server.name)}
+      detail={[server.detail, enabled === false && "Off"].filter(Boolean).join(" · ")}
+      dimmed={enabled === false}
+      trailing={<McpSwitch entry={entry} server={server} enabled={enabled} mutation={mutation} />}
+    />
   );
 }
 
@@ -547,17 +732,26 @@ const CONNECTION_STATUS: Record<McpServerTools["connection"], { label: string; c
 
 function McpRow({
   host,
+  entry,
   server,
   expanded,
   onUnavailable,
+  onDisabled,
 }: {
   host: Host;
+  entry: McpServerListEntry;
   server: InventoryMcpServer;
   expanded: boolean;
   onUnavailable: () => void;
+  onDisabled: () => void;
 }) {
+  const { mutation, enabled } = useMcpEnabledState(host.host_id, server);
+  const off = enabled === false;
+  useEffect(() => {
+    if (off && expanded) onDisabled();
+  }, [off, expanded, onDisabled]);
   const query = useMcpServerTools(host.host_id, server.harness, server.name, server.plugin, {
-    enabled: expanded,
+    enabled: expanded && !off,
     sourceId: server.sourceId,
   });
   const missingRoute = query.error instanceof ApiError && query.error.status === 404;
@@ -567,10 +761,14 @@ function McpRow({
   const data = query.data;
   const status = data && CONNECTION_STATUS[data.connection];
   return (
-    <AccordionPrimitive.Item value={server.id} className="not-last:border-b">
+    <AccordionPrimitive.Item value={server.id} disabled={off}>
       <AccordionPrimitive.Header className="flex">
         <AccordionPrimitive.Trigger
-          className="group flex min-w-0 flex-1 cursor-pointer items-center gap-2 px-4 py-2.5 text-left text-ui outline-none hover:bg-muted/50 focus-visible:ring-3 focus-visible:ring-ring/50"
+          data-settings-row-action="open"
+          className={cn(
+            "group flex min-w-0 flex-1 cursor-pointer items-center gap-2 px-4 py-2.5 text-left text-ui outline-none hover:bg-muted/50 focus-visible:ring-3 focus-visible:ring-ring/50",
+            off && "opacity-50",
+          )}
           data-testid={`catalog-row-${server.name}`}
         >
           <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground group-aria-expanded:rotate-90" />
@@ -578,7 +776,7 @@ function McpRow({
           <span className="shrink-0 font-medium text-foreground">
             {mcpServerDisplayName(server.name)}
           </span>
-          {data?.connection === "connected" && (
+          {!off && data?.connection === "connected" && (
             <span className="shrink-0 text-muted-foreground">
               · {data.tools.length}
               {data.truncated ? "+" : ""} {data.tools.length === 1 ? "tool" : "tools"}
@@ -587,58 +785,62 @@ function McpRow({
           {server.detail && (
             <span className="min-w-0 truncate text-muted-foreground">{server.detail}</span>
           )}
-          {status && (
+          {off && <span className="ml-auto text-muted-foreground">Off</span>}
+          {!off && status && (
             <span role="status" className="ml-auto flex shrink-0 items-center gap-1.5 text-xs">
               <span aria-hidden="true" className={cn("size-2 rounded-full", status.color)} />
               {status.label}
             </span>
           )}
         </AccordionPrimitive.Trigger>
+        <McpSwitch entry={entry} server={server} enabled={enabled} mutation={mutation} />
       </AccordionPrimitive.Header>
-      <AccordionPrimitive.Content className="pr-4 pb-2.5 pl-10">
-        {query.isPending ? (
-          <div className="flex items-center gap-2 mt-1">
-            <Spinner />
-            <Notice>Loading tools...</Notice>
-          </div>
-        ) : query.error ? (
-          <Notice>
-            {query.error instanceof ApiError && query.error.status === 501
-              ? `Update ${host.name} to list tools.`
-              : query.error instanceof ApiError && query.error.status === 503
-                ? "Host is busy probing other MCP servers. Collapse and reopen to retry."
-                : `Couldn't reach ${mcpServerDisplayName(server.name)}.`}
-          </Notice>
-        ) : data ? (
-          data.connection !== "connected" ? (
-            <Notice>{CONNECTION_DETAILS[data.connection]}</Notice>
-          ) : (
-            <>
-              {data.tools.length === 0 && <Notice>No tools reported.</Notice>}
-              {data.truncated && <Notice>Showing the first 500 tools.</Notice>}
-              <ul className="flex flex-col gap-1 text-xs text-muted-foreground my-2">
-                {data.tools.map((tool, index) => (
-                  // Capped names can collide; these display-only rows have no state.
-                  // eslint-disable-next-line react/no-array-index-key
-                  <li key={`${tool.name}-${index}`}>
-                    {tool.description ? (
-                      <details className="group">
-                        <summary className="flex cursor-pointer list-none items-center gap-1 [&::-webkit-details-marker]:hidden">
-                          <span className="font-mono">{tool.name}</span>
-                          <ChevronRightIcon className="size-3 shrink-0 group-open:rotate-90" />
-                        </summary>
-                        <div className="my-1">{tool.description}</div>
-                      </details>
-                    ) : (
-                      <span className="pl-4 font-mono">{tool.name}</span>
-                    )}
-                  </li>
-                ))}
-              </ul>
-            </>
-          )
-        ) : null}
-      </AccordionPrimitive.Content>
+      {!off && (
+        <AccordionPrimitive.Content className="pr-4 pb-2.5 pl-10">
+          {query.isPending ? (
+            <div className="flex items-center gap-2 mt-1">
+              <Spinner />
+              <Notice>Loading tools...</Notice>
+            </div>
+          ) : query.error ? (
+            <Notice>
+              {query.error instanceof ApiError && query.error.status === 501
+                ? `Update ${host.name} to list tools.`
+                : query.error instanceof ApiError && query.error.status === 503
+                  ? "Host is busy probing other MCP servers. Collapse and reopen to retry."
+                  : `Couldn't reach ${mcpServerDisplayName(server.name)}.`}
+            </Notice>
+          ) : data ? (
+            data.connection !== "connected" ? (
+              <Notice>{CONNECTION_DETAILS[data.connection]}</Notice>
+            ) : (
+              <>
+                {data.tools.length === 0 && <Notice>No tools reported.</Notice>}
+                {data.truncated && <Notice>Showing the first 500 tools.</Notice>}
+                <ul className="flex flex-col gap-1 text-xs text-muted-foreground my-2">
+                  {data.tools.map((tool, index) => (
+                    // Capped names can collide; these display-only rows have no state.
+                    // eslint-disable-next-line react/no-array-index-key
+                    <li key={`${tool.name}-${index}`}>
+                      {tool.description ? (
+                        <details className="group">
+                          <summary className="flex cursor-pointer list-none items-center gap-1 [&::-webkit-details-marker]:hidden">
+                            <span className="font-mono">{tool.name}</span>
+                            <ChevronRightIcon className="size-3 shrink-0 group-open:rotate-90" />
+                          </summary>
+                          <div className="my-1">{tool.description}</div>
+                        </details>
+                      ) : (
+                        <span className="pl-4 font-mono">{tool.name}</span>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </>
+            )
+          ) : null}
+        </AccordionPrimitive.Content>
+      )}
     </AccordionPrimitive.Item>
   );
 }

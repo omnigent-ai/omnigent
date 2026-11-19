@@ -69,13 +69,13 @@ def test_reconstructs_authority_and_bearer_from_frozen_inputs() -> None:
             "databricks-ucode-v1",
             "workspace.cloud.databricks.com",
             "/ai-gateway/codex/v1/responses",
-            "omnigent, omnigent-desktop, ug",
+            "omnigent-desktop, ug",
         ),
         (
             "databricks-ucode-v1",
             "workspace.ai-gateway.cloud.databricks.com",
             "/v1/responses",
-            "omnigent, omnigent-desktop, ug",
+            "omnigent-desktop, ug",
         ),
         ("databricks-ucode-v1", _HOST, _PATH, None),
         (

@@ -421,6 +421,39 @@ def test_session_resources_e2e(
             assert resp.status_code == 200
             assert resp.json()["content"] == "hello e2e"
 
+            # Media loads seek through the server and the runner tunnel.
+            download_url = f"{fs}/_e2e_test.txt?download=true"
+            partial = client.get(download_url, headers={"Range": "bytes=6-8"})
+            assert partial.status_code == 206, partial.text
+            assert partial.content == b"e2e"
+            assert partial.headers["content-range"] == "bytes 6-8/9"
+            assert partial.headers["content-length"] == "3"
+            assert partial.headers["accept-ranges"] == "bytes"
+            assert "content-encoding" not in partial.headers
+
+            unsatisfiable = client.get(download_url, headers={"Range": "bytes=9-"})
+            assert unsatisfiable.status_code == 416, unsatisfiable.text
+            assert unsatisfiable.headers["content-range"] == "bytes */9"
+
+            complete = client.get(download_url)
+            assert complete.status_code == 200
+            assert complete.content == b"hello e2e"
+
+            unicode_path = f"{fs}/_e2e_unicode.txt"
+            written = client.put(unicode_path, json={"content": "é", "encoding": "utf-8"})
+            assert written.status_code == 200
+            unicode_download = f"{unicode_path}?download=true"
+            complete = client.get(unicode_download)
+            assert complete.status_code == 200
+            assert complete.content == b"\xc3\xa9"
+
+            partial = client.get(unicode_download, headers={"Range": "bytes=0-0"})
+            assert partial.status_code == 206
+            assert partial.content == b"\xc3"
+            assert partial.headers["content-length"] == "1"
+            assert partial.headers["content-range"] == "bytes 0-0/2"
+            assert client.delete(unicode_path).status_code == 200
+
             # Edit
             resp = client.patch(
                 f"{fs}/_e2e_test.txt",

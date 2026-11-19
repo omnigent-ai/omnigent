@@ -249,7 +249,7 @@ async def test_diagnostic_key_collisions_cannot_override_or_block_terminal_failu
     caplog.set_level(logging.INFO)
     released = asyncio.Event()
 
-    async def release(_self, session_id: str) -> None:
+    async def release(_self, session_id: str, **_kwargs: object) -> None:
         assert session_id == _SESSION
         released.set()
 
@@ -262,6 +262,7 @@ async def test_diagnostic_key_collisions_cannot_override_or_block_terminal_failu
             terminal_id="terminal_claude_main",
             terminal_name="claude",
             session_key="main",
+            terminal_instance_id=launch.instance.diagnostic_id,
             lifecycle=TerminalLifecycle.REQUIRED,
             command="claude",
             exit_status=1,

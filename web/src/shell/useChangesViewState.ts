@@ -3,21 +3,61 @@
 
 import { useMemo, useSyncExternalStore } from "react";
 
+export interface FindState {
+  open: boolean;
+  query: string;
+  matchCase: boolean;
+  regex: boolean;
+}
+
+/** What the Changes tab shows: the PR's changed files, its commit list, or one commit's patch. */
+export type ChangesMode = "changes" | "commits" | "commit";
+
 interface ChangesView {
   pathFilter: string;
   hideViewed: boolean;
+  /** The commit list's search, kept while the reader moves between commits and the list. */
+  commitQuery: string;
+  /** The Changes tab's source; `commit` needs `commitSha`. */
+  mode: ChangesMode;
+  commitSha: string | null;
+  /** In `changes` mode, show only the changes after this PR commit, up to the head. */
+  sinceSha: string | null;
   /** Files expanded temporarily (find, deep links), apart from the reader's collapse state. */
   revealedPaths: ReadonlySet<string>;
+  shownEarlierCommentPaths: ReadonlySet<string>;
+  find: FindState;
+  /** The head whose "changed files lost their viewed marks" notice the reader dismissed. */
+  dismissedResetHead: string | null;
 }
 
 export interface ChangesViewState extends ChangesView {
   setPathFilter: (query: string) => void;
+  setCommitQuery: (query: string) => void;
   setHideViewed: (hide: boolean) => void;
   reveal: (path: string) => void;
   clearReveal: (path: string) => void;
+  setEarlierCommentsShown: (path: string, shown: boolean) => void;
+  setFind: (patch: Partial<FindState>) => void;
+  setDismissedResetHead: (head: string | null) => void;
+  /** Shows the changed files or the commit list, leaving any open commit. */
+  setMode: (mode: "changes" | "commits") => void;
+  openCommit: (commitSha: string) => void;
+  setSinceSha: (sinceSha: string | null) => void;
 }
 
-const EMPTY_VIEW: ChangesView = { pathFilter: "", hideViewed: false, revealedPaths: new Set() };
+const EMPTY_VIEW: ChangesView = {
+  pathFilter: "",
+  hideViewed: false,
+  commitQuery: "",
+  mode: "changes",
+  commitSha: null,
+  sinceSha: null,
+  revealedPaths: new Set(),
+  shownEarlierCommentPaths: new Set(),
+  find: { open: false, query: "", matchCase: false, regex: false },
+  dismissedResetHead: null,
+};
 // Never evicted: records are small and per PR; add eviction if this grows.
 const views = new Map<string, ChangesView>();
 const listeners = new Set<() => void>();
@@ -50,9 +90,23 @@ export function useChangesViewState(conversationId: string, prUrl: string): Chan
   const actions = useMemo<Omit<ChangesViewState, keyof ChangesView>>(
     () => ({
       setPathFilter: (pathFilter) => update(key, () => ({ pathFilter })),
+      setCommitQuery: (commitQuery) => update(key, () => ({ commitQuery })),
       setHideViewed: (hideViewed) => update(key, () => ({ hideViewed })),
       reveal: (path) => update(key, (current) => withRevealed(current, path, true)),
       clearReveal: (path) => update(key, (current) => withRevealed(current, path, false)),
+      setEarlierCommentsShown: (path, shown) =>
+        update(key, (current) => {
+          if (current.shownEarlierCommentPaths.has(path) === shown) return null;
+          const shownEarlierCommentPaths = new Set(current.shownEarlierCommentPaths);
+          if (shown) shownEarlierCommentPaths.add(path);
+          else shownEarlierCommentPaths.delete(path);
+          return { shownEarlierCommentPaths };
+        }),
+      setFind: (patch) => update(key, (current) => ({ find: { ...current.find, ...patch } })),
+      setDismissedResetHead: (dismissedResetHead) => update(key, () => ({ dismissedResetHead })),
+      setMode: (mode) => update(key, () => ({ mode, commitSha: null })),
+      openCommit: (commitSha) => update(key, () => ({ mode: "commit", commitSha })),
+      setSinceSha: (sinceSha) => update(key, () => ({ sinceSha })),
     }),
     [key],
   );

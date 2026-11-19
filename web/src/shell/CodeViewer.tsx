@@ -39,7 +39,6 @@ import {
   XIcon,
 } from "lucide-react";
 import { useChatStore } from "@/store/chatStore";
-import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 import type { BundledLanguage, ThemedToken } from "shiki";
 import { highlightCode } from "@/components/ai-elements/code-block";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
@@ -69,6 +68,7 @@ import {
   detectLang,
   getSelectionOffsets,
   indexToLine,
+  hasRawHtmlNode,
   isBinaryPath,
   isImageFile,
   isModelFile,
@@ -77,6 +77,8 @@ import {
   lineOverlapsSelection,
 } from "./codeViewerHelpers";
 import { NotebookPreview } from "./NotebookPreview";
+import { DataTablePreview } from "./DataTablePreview";
+import { isDataTablePath } from "./dataTable";
 import { useScrollRestore } from "./useScrollRestore";
 import { PreviewSearchBar } from "./PreviewSearchBar";
 import { renderLineTokens } from "./codeViewerRendering";
@@ -86,6 +88,7 @@ import { TruncatedBanner } from "./TruncatedBanner";
 import { useLightbox } from "@/components/ImageLightbox";
 import { getEmbedRoot } from "@/lib/host";
 import { hasCommandModifier } from "@/lib/hotkeys";
+import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { MarkdownTableOfContents } from "./MarkdownTableOfContents";
 import { VideoPlayer } from "@/components/VideoPlayer";
 import { isVideoFile } from "@/lib/video";
@@ -151,6 +154,13 @@ const MARKDOWN_SANITIZE_SCHEMA = {
   },
 };
 
+/** rehype-raw re-parses the whole tree through parse5, so skip it when there is no raw HTML. */
+function rehypeRawWhenPresent() {
+  const transform = rehypeRaw();
+  return (tree: Parameters<typeof transform>[0], file: Parameters<typeof transform>[1]) =>
+    hasRawHtmlNode(tree) ? transform(tree, file) : tree;
+}
+
 // Markdown files routinely embed raw HTML that GitHub renders — <details>,
 // <sub>/<sup>, <kbd>, <br>, <div align>, inline <img> — which react-markdown
 // drops by default, showing the escaped tags as literal text. rehype-raw parses
@@ -160,7 +170,7 @@ const MARKDOWN_SANITIZE_SCHEMA = {
 // headings, and sanitize runs after raw parsing and GFM — only KaTeX comes
 // later, rendering math from the already-sanitized tree.
 const MARKDOWN_REHYPE_PLUGINS: Options["rehypePlugins"] = [
-  rehypeRaw,
+  rehypeRawWhenPresent,
   rehypeSlug,
   rehypeGithubAlerts,
   [rehypeSanitize, MARKDOWN_SANITIZE_SCHEMA],
@@ -270,8 +280,11 @@ function MarkdownPreview({
   onScroll,
   tocOpen,
   onTocOpenChange,
+  deferOffscreen = false,
 }: {
   content: string;
+  /** Skip layout of off-screen blocks; large documents otherwise lay out in full on open. */
+  deferOffscreen?: boolean;
   /** Workspace path of the previewed file, e.g. ``"docs/README.md"``. */
   path: string | null;
   rootRef?: RefObject<HTMLDivElement | null>;
@@ -279,26 +292,34 @@ function MarkdownPreview({
   tocOpen: boolean;
   onTocOpenChange: (open: boolean) => void;
 }) {
-  // Rewrite explicit TeX delimiters (`\(…\)`, `\[…\]`) to `$$…$$` before
-  // rendering, the same as chat, so agent-authored formulas render here too;
-  // remark-math only honours `$` delimiters. Safe outside code/existing math.
-  const rendered = useMemo(() => normalizeExplicitMathDelimiters(content), [content]);
+  // Rewrite `\(…\)`/`\[…\]` to `$$…$$` as chat does; remark-math only honours `$`.
+  // Memoized so resizes and toolbar re-renders skip re-parsing the document.
+  const markdown = useMemo(
+    () => (
+      <ReactMarkdown
+        remarkPlugins={MARKDOWN_REMARK_PLUGINS}
+        rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
+        components={MARKDOWN_COMPONENTS}
+      >
+        {normalizeExplicitMathDelimiters(content)}
+      </ReactMarkdown>
+    ),
+    [content],
+  );
   return (
     <div className="flex h-full">
       <div
         ref={rootRef}
         data-preview-scroll
         onScroll={onScroll}
-        className="markdown-preview flex-1 px-6 py-4 overflow-auto prose dark:prose-invert prose-sm max-w-none"
+        className={cn(
+          "markdown-preview flex-1 px-6 py-4 overflow-auto prose dark:prose-invert prose-sm max-w-none",
+          deferOffscreen &&
+            "[&>*]:[content-visibility:auto] [&>*]:[contain-intrinsic-size:auto_2.5rem]",
+        )}
       >
         <MarkdownPreviewPathContext.Provider value={path}>
-          <ReactMarkdown
-            remarkPlugins={MARKDOWN_REMARK_PLUGINS}
-            rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
-            components={MARKDOWN_COMPONENTS}
-          >
-            {rendered}
-          </ReactMarkdown>
+          {markdown}
         </MarkdownPreviewPathContext.Provider>
       </div>
       {tocOpen && (
@@ -315,14 +336,15 @@ function MarkdownPreview({
   );
 }
 
-// Markdown / notebook preview with find-in-file. The preview is React-owned
+// Markdown / notebook / data-table preview with find-in-file. The preview is React-owned
 // DOM, so PreviewSearchBar highlights matches via the CSS Custom Highlight API
 // (no node mutation). `contentVersion` = content string, so the match ranges
 // recompute when the rendered document changes.
 function PreviewWithSearch({
   content,
   path,
-  isNotebook,
+  kind,
+  encoding = "utf-8",
   truncated,
   searchOpen,
   onSearchHandled,
@@ -332,11 +354,15 @@ function PreviewWithSearch({
   tocOpen,
   onTocOpenChange,
   commentHint,
+  deferOffscreen,
 }: {
   content: string;
+  deferOffscreen?: boolean;
   /** Workspace path of the previewed file, for resolving relative links. */
   path: string | null;
-  isNotebook: boolean;
+  kind: "markdown" | "notebook" | "table";
+  /** How the server sent *content*; only a data table decodes base64. */
+  encoding?: "utf-8" | "base64";
   truncated: boolean;
   searchOpen: boolean;
   onSearchHandled: () => void;
@@ -358,27 +384,51 @@ function PreviewWithSearch({
   // The preview div (not the FileViewer content area) is the real scroller
   // here, so scroll persistence attaches to it directly.
   const handleScroll = useScrollRestore(previewRef, scrollKey, scrollReady);
+  // A table re-renders its rows on sort and filter without new content, so it
+  // says when find must look again.
+  const [tableRowsVersion, setTableRowsVersion] = useState(0);
+  // New content (even emptied, with no rows left to report) also invalidates find.
+  const tableSearchVersion = useMemo(
+    () => [content, tableRowsVersion],
+    [content, tableRowsVersion],
+  );
+  const handleTableRowsChange = useCallback(
+    () => setTableRowsVersion((version) => version + 1),
+    [],
+  );
   const bar = (
     <PreviewSearchBar
       containerRef={previewRef}
-      contentVersion={content}
+      contentVersion={kind === "table" ? tableSearchVersion : content}
       open={searchOpen}
       onClose={onSearchHandled}
       inputRef={searchInputRef}
     />
   );
-  const preview = isNotebook ? (
-    <NotebookPreview content={content} rootRef={previewRef} onScroll={handleScroll} />
-  ) : (
-    <MarkdownPreview
-      content={content}
-      path={path}
-      rootRef={previewRef}
-      onScroll={handleScroll}
-      tocOpen={tocOpen}
-      onTocOpenChange={onTocOpenChange}
-    />
-  );
+  const preview =
+    kind === "table" ? (
+      <DataTablePreview
+        content={content}
+        encoding={encoding}
+        path={path ?? ""}
+        truncated={truncated}
+        rootRef={previewRef}
+        onScroll={handleScroll}
+        onRowsChange={handleTableRowsChange}
+      />
+    ) : kind === "notebook" ? (
+      <NotebookPreview content={content} rootRef={previewRef} onScroll={handleScroll} />
+    ) : (
+      <MarkdownPreview
+        content={content}
+        path={path}
+        rootRef={previewRef}
+        onScroll={handleScroll}
+        tocOpen={tocOpen}
+        onTocOpenChange={onTocOpenChange}
+        deferOffscreen={deferOffscreen}
+      />
+    );
   // The find bar sits above the preview; a truncated preview also shows the
   // banner. The bar renders nothing when closed, so layout is unchanged then.
   return (
@@ -497,6 +547,11 @@ export interface CodeViewerProps {
   searchOpen: boolean;
   setSearchOpen: (open: boolean) => void;
   /**
+   * Whether the viewer is the surface the user is working in, so Cmd+F opens
+   * this file's find rather than the chat's. Unset means always.
+   */
+  ownsFindShortcut?: () => boolean;
+  /**
    * Bumped by FileViewer on each Cmd+F. Forwarded to the Monaco editor so a
    * press with the find widget already open refocuses its input.
    */
@@ -526,6 +581,8 @@ export interface CodeViewerProps {
    * itself can't anchor text-selection comments).
    */
   onRequestEditMode?: () => void;
+  /** Whether the session's agent opens an attached workspace path. */
+  attachToAgent?: boolean;
 }
 
 export function CodeViewer({
@@ -541,6 +598,7 @@ export function CodeViewer({
   mediaActive = panelOpen,
   searchOpen,
   setSearchOpen,
+  ownsFindShortcut,
   searchFocusNonce,
   searchInputRef,
   viewMode,
@@ -552,6 +610,7 @@ export function CodeViewer({
   tocOpen = false,
   onTocToggle,
   onRequestEditMode,
+  attachToAgent = false,
 }: CodeViewerProps) {
   const canEdit = useCanEdit(conversationId);
   const activeCommentId = activeSelection?.comment_id;
@@ -601,15 +660,15 @@ export function CodeViewer({
   // must drop to read-only when this is set.
   const truncated = fileQuery.data?.truncated ?? false;
   const lang = detectLang(path);
-  // Large Markdown shares the virtualized code editor and its save/permission rules.
-  const showMonaco = markdownSourceFallback || (lang !== "markdown" && viewMode !== "preview");
+  // Large Markdown edits in the virtualized code editor and shares its save/permission rules.
+  const showMonaco = viewMode !== "preview" && (markdownSourceFallback || lang !== "markdown");
   // HTML, markdown, and notebook previews render through their own surfaces and
   // never read the Shiki tokens, so skipping them avoids a wasted full-file pass.
   const isHtmlPreview = viewMode === "preview" && lang === "html";
   const isMarkdownOrNotebookPreview =
-    viewMode === "preview" &&
-    ((lang === "markdown" && !markdownSourceFallback) || isNotebookPath(path));
-  const isRenderedPreview = isHtmlPreview || isMarkdownOrNotebookPreview;
+    viewMode === "preview" && (lang === "markdown" || isNotebookPath(path));
+  const isDataTablePreview = viewMode === "preview" && isDataTablePath(path);
+  const isRenderedPreview = isHtmlPreview || isMarkdownOrNotebookPreview || isDataTablePreview;
   // Only the Shiki DOM path needs the per-line split; skip it for Monaco and
   // rendered previews, which never render these lines.
   const rawLines = useMemo(
@@ -644,13 +703,12 @@ export function CodeViewer({
   }, [position, showMonaco, viewMode, fileQuery.data, rawLines]);
 
   // "Attach to agent" delivers a "[Attached: path:start-end]" marker the
-  // composer reads — only the native coding-agent harnesses act on it, so
-  // gate the button to them (same set as the "@"-mention feature).
-  const sessionHarness = useChatStore((s) => s.sessionHarness);
+  // composer reads - FileViewer passes ``attachToAgent`` only for sessions
+  // whose agent opens that path (same gate as the "@"-mention feature).
   // ``!!path`` mirrors the Monaco hook's guard: without it an empty path would
   // emit a malformed ``[Attached: :start-end]`` marker. ``path`` is typed
   // non-optional here, but the guard keeps the two surfaces in lockstep.
-  const canAttachToAgent = !!path && nativeCodingAgentForHarness(sessionHarness) !== undefined;
+  const canAttachToAgent = !!path && attachToAgent;
 
   // Kick off Shiki highlighting whenever content or language changes.
   useEffect(() => {
@@ -710,6 +768,7 @@ export function CodeViewer({
     if (!panelOpen || !isMarkdownEditor) return;
     const handler = (e: KeyboardEvent) => {
       if (hasCommandModifier(e) && e.key === "f") {
+        if (ownsFindShortcut && !ownsFindShortcut()) return;
         e.preventDefault();
         setSearchOpen(true);
         setTimeout(() => searchInputRef.current?.focus(), 0);
@@ -720,7 +779,7 @@ export function CodeViewer({
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [panelOpen, isMarkdownEditor, searchOpen, setSearchOpen, searchInputRef]);
+  }, [panelOpen, isMarkdownEditor, searchOpen, setSearchOpen, searchInputRef, ownsFindShortcut]);
 
   // Open search on Cmd+F / Ctrl+F in the Shiki source view.
   useEffect(() => {
@@ -729,6 +788,8 @@ export function CodeViewer({
     if (!panelOpen || isMarkdownEditor || showMonaco) return;
     const handler = (e: KeyboardEvent) => {
       if (hasCommandModifier(e) && e.key === "f") {
+        // Beside the chat, Cmd+F belongs to whichever surface the user is in.
+        if (ownsFindShortcut && !ownsFindShortcut()) return;
         e.preventDefault();
         setSearchOpen(true);
         setTimeout(() => searchInputRef.current?.focus(), 0);
@@ -754,7 +815,15 @@ export function CodeViewer({
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [panelOpen, isMarkdownEditor, showMonaco, searchOpen, setSearchOpen, searchInputRef]);
+  }, [
+    panelOpen,
+    isMarkdownEditor,
+    showMonaco,
+    searchOpen,
+    setSearchOpen,
+    searchInputRef,
+    ownsFindShortcut,
+  ]);
 
   // In Monaco mode the custom search bar isn't rendered; the editor mirrors its
   // native find widget to `searchOpen` (open when set, close when cleared). This
@@ -937,6 +1006,26 @@ export function CodeViewer({
       </Suspense>
     );
   }
+  // Before the binary notice: a data file in another encoding arrives as base64.
+  if (isDataTablePreview && fileQuery.data) {
+    return (
+      <PreviewWithSearch
+        key={`${conversationId}:${path}`}
+        content={content}
+        path={path}
+        kind="table"
+        encoding={fileQuery.data.encoding}
+        truncated={truncated}
+        searchOpen={searchOpen}
+        onSearchHandled={handleSearchHandled}
+        searchInputRef={searchInputRef}
+        scrollKey={conversationId && path ? `viewer-preview:${conversationId}:${path}` : null}
+        scrollReady
+        tocOpen={false}
+        onTocOpenChange={() => {}}
+      />
+    );
+  }
   if (fileQuery.data?.encoding === "base64" || isBinaryPath(path)) {
     return (
       <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
@@ -976,6 +1065,7 @@ export function CodeViewer({
         // A different file, or the same path in another conversation, starts at 100% zoom.
         key={`${conversationId}:${path}`}
         conversationId={conversationId}
+        scrollKey={conversationId && path ? `html-preview:${conversationId}:${path}` : null}
         content={content}
         truncated={truncated}
         comments={previewComments}
@@ -991,7 +1081,7 @@ export function CodeViewer({
       <PreviewWithSearch
         content={content}
         path={path}
-        isNotebook={isNotebook}
+        kind={isNotebook ? "notebook" : "markdown"}
         truncated={truncated}
         searchOpen={searchOpen}
         onSearchHandled={handleSearchHandled}
@@ -1000,6 +1090,7 @@ export function CodeViewer({
         scrollReady={fileQuery.data !== undefined}
         tocOpen={tocOpen}
         onTocOpenChange={(open) => !open && onTocToggle?.()}
+        deferOffscreen={markdownSourceFallback}
         commentHint={
           !isNotebook && onRequestEditMode
             ? { conversationId, onSwitchToEdit: onRequestEditMode }
@@ -1036,6 +1127,7 @@ export function CodeViewer({
           activeSelection={activeSelection}
           onSetActiveSelection={onSetActiveSelection}
           pendingBodyRef={pendingBodyRef}
+          attachToAgent={attachToAgent}
         />
       </Suspense>
     );
@@ -1080,6 +1172,8 @@ export function CodeViewer({
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             onKeyDown={(e) => {
+              // IME composition keys (CJK input) confirm text, not find.
+              if (isImeCompositionKeyEvent(e)) return;
               if (e.key === "Enter" && matches.length > 0) {
                 e.preventDefault();
                 if (e.shiftKey) {

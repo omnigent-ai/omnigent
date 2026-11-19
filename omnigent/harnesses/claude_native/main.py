@@ -97,6 +97,7 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeNativeHookInterpreterMismatchError,
     augment_claude_args,
     bridge_dir_for_bridge_id,
+    claude_terminal_relay_env,
     prepare_bridge_dir,
     read_active_session_id,
     resolve_launch_effort_level,
@@ -269,6 +270,9 @@ _CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK_ENV = "CLAUDE_CODE_DISABLE_REFUSAL_FALLBAC
 # tool's `tmux kill-session` or `kill-server` ends Claude itself.
 _CLAUDE_CODE_ENV_FILE_ENV = "CLAUDE_ENV_FILE"
 _CLAUDE_TOOL_ENV_SCRIPT = "claude_tool_env.sh"
+# Claude Code waits 10 minutes by default for response headers, so a request
+# whose connection died silently (e.g. across host sleep) stalls the turn.
+_CLAUDE_CODE_API_TIMEOUT_ENV = "API_TIMEOUT_MS"
 # Claude Code env vars that pin each model-tier alias to a provider-specific
 # model ID.  When set, the /model picker shows these IDs as options rather
 # than normalising to canonical Anthropic names (which the Databricks gateway
@@ -1050,8 +1054,12 @@ def _claude_model_probe_launch(
     if not claude_code_managed_mcp_present():
         args.extend(["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}'])
     args.extend(["--no-session-persistence", *extra_args])
+    # The user's SessionStart hooks would otherwise run for this headless call
+    # and push it past the probe timeout.
+    probe_settings: dict[str, object] = {"disableAllHooks": True}
     if claude_config is not None and claude_config.api_key_helper:
-        args.extend(("--settings", json.dumps({"apiKeyHelper": claude_config.api_key_helper})))
+        probe_settings["apiKeyHelper"] = claude_config.api_key_helper
+    args.extend(("--settings", json.dumps(probe_settings)))
     cfg = load_effective_config()
     command = resolve_harness_command("claude-native", default="claude", cfg=cfg)
     launch_args = resolve_harness_args("claude-native", tuple(args), cfg=cfg)
@@ -1675,7 +1683,9 @@ def build_native_claude_terminal_env(
     which a web-driven session cannot see or answer (see
     :data:`_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV`). Custom Anthropic
     endpoints keep the selected model when it refuses, since their catalogs
-    may not serve Claude Code's canonical refusal-fallback target.
+    may not serve Claude Code's canonical refusal-fallback target. Model
+    requests default to :class:`RetryPolicy`'s per-request timeout so an
+    unanswered request is retried (see :data:`_CLAUDE_CODE_API_TIMEOUT_ENV`).
 
     :param claude_config: Optional provider/ucode launch config, e.g.
         one carrying ``{"ANTHROPIC_BASE_URL": "https://example.com"}``.
@@ -1714,6 +1724,13 @@ def build_native_claude_terminal_env(
         _CLAUDE_CODE_ENV_FILE_ENV
     ):
         terminal_env[_CLAUDE_CODE_ENV_FILE_ENV] = claude_tool_env_file()
+    if _CLAUDE_CODE_API_TIMEOUT_ENV not in terminal_env and not os.environ.get(
+        _CLAUDE_CODE_API_TIMEOUT_ENV
+    ):
+        from omnigent.spec.types import RetryPolicy
+
+        retry_env = RetryPolicy().claude_cli.env()
+        terminal_env[_CLAUDE_CODE_API_TIMEOUT_ENV] = retry_env[_CLAUDE_CODE_API_TIMEOUT_ENV]
     # A raw credential can override the helper or open Claude's API-key menu.
     for name in native_claude_auth_env_unset(claude_config):
         if name in terminal_env:
@@ -2793,6 +2810,28 @@ def _carries_any_payload(text: str, payloads: list[str]) -> bool:
     return any(item in compact or item.rstrip("=") in compact for item in payloads)
 
 
+def _blank_read_file_payload(value: object, payloads: list[str]) -> object:
+    """
+    Blank a duplicated payload in Claude Code's own Read metadata.
+
+    Image and PDF Read results store ``{"type": ..., "file": {"base64": ...}}``;
+    current Claude Code writes ``base64`` empty, the shape its renderer expects.
+
+    :param value: A record's ``toolUseResult`` object.
+    :param payloads: Base64 payloads present in the structured content.
+    :returns: *value* with ``file.base64`` emptied, or *value* unchanged.
+    """
+    if not isinstance(value, dict):
+        return value
+    file_meta = value.get("file")
+    if not isinstance(file_meta, dict):
+        return value
+    data = file_meta.get("base64")
+    if not isinstance(data, str) or not _carries_any_payload(data, payloads):
+        return value
+    return {**value, "file": {**file_meta, "base64": ""}}
+
+
 def _repair_cloned_tool_use_result(
     payload: _JsonObject,
     blocks: list[_JsonObject],
@@ -2805,7 +2844,8 @@ def _repair_cloned_tool_use_result(
     structured content. Matching is spelling-insensitive: the content blocks hold
     canonical base64 while the metadata may hold the producer's wrapped or
     unpadded original, so an exact substring test would miss the duplicate it is
-    meant to find. A redacted passthrough is preferred; when the payload survives
+    meant to find. A redacted passthrough is preferred, keeping Claude Code's Read
+    metadata shape via :func:`_blank_read_file_payload`; when the payload survives
     that (a JSON string literal wrapping mixed text-plus-image, which structured
     redaction cannot reach), the canonical redacted block list replaces it.
 
@@ -2826,7 +2866,7 @@ def _repair_cloned_tool_use_result(
     if isinstance(tool_use_result, str):
         candidate: object = _json_safe_tool_use_result(tool_use_result)
     else:
-        candidate = _redact_binary_blocks(tool_use_result)
+        candidate = _redact_binary_blocks(_blank_read_file_payload(tool_use_result, payloads))
     candidate_text = candidate if isinstance(candidate, str) else json.dumps(candidate)
     if _carries_any_payload(candidate_text, payloads):
         candidate = json.dumps(_redact_binary_blocks(blocks), separators=(",", ":"))
@@ -3381,7 +3421,7 @@ def _provider_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcod
 def _bedrock_config_for_native_claude(entry: ProviderEntry) -> ClaudeNativeUcodeConfig | None:
     """Build native Claude Code launch config for Bedrock-style gateways.
 
-    AWS Bedrock and Bedrock-compatible gateways (like corporate AI gateways)
+    AWS Bedrock and Bedrock-compatible gateways (like enterprise AI gateways)
     use a different set of environment variables than the standard Anthropic API:
     - ``ANTHROPIC_BEDROCK_BASE_URL`` instead of ``ANTHROPIC_BASE_URL``
     - ``AWS_BEARER_TOKEN_BEDROCK`` for the credential (a static ``api_key``
@@ -3876,8 +3916,8 @@ def _materialize_claude_agent_spec(tmpdir: Path) -> Path:
     return yaml_path
 
 
-def _wrapper_spec_raw_instructions(spec_path: Path) -> str | None:
-    """Resolve raw author instructions from the wrapper's agent spec.
+def _wrapper_spec_startup_instructions(spec_path: Path) -> str:
+    """Compose author instructions and stable guidance for the wrapper's session.
 
     Reuses :func:`omnigent.spec.load` (the same loader
     :func:`~omnigent.cli._bundle` and the server use for both an agent-image
@@ -3888,23 +3928,21 @@ def _wrapper_spec_raw_instructions(spec_path: Path) -> str | None:
 
     :param spec_path: The generated/current wrapper agent spec (a
         standalone YAML file or an agent-image directory).
-    :returns: The verbatim instructions text, or ``None`` if unresolvable
-        or absent/whitespace-only. Best-effort: a malformed spec must not
-        block the terminal launch, so load failures degrade to ``None``.
+    :returns: Startup instructions, with framework guidance if the spec fails.
     """
-    from omnigent.runtime.prompt import raw_author_instructions
+    from omnigent.runtime.prompt import build_native_startup_instructions
     from omnigent.spec import load as load_agent_spec
 
     try:
         spec = load_agent_spec(spec_path, expand_env=False)
     except Exception:
         _logger.warning(
-            "Could not resolve raw instructions from wrapper spec %s",
+            "Could not resolve instructions from wrapper spec %s",
             spec_path,
             exc_info=True,
         )
-        return None
-    return raw_author_instructions(spec)
+        return build_native_startup_instructions(None)
+    return build_native_startup_instructions(spec)
 
 
 def _run_with_local_server(
@@ -4006,7 +4044,7 @@ def _run_with_local_server(
                     claude_config=claude_config,
                     startup_profiler=startup_profiler,
                     startup_progress=progress,
-                    append_system_prompt=_wrapper_spec_raw_instructions(spec_path),
+                    append_system_prompt=_wrapper_spec_startup_instructions(spec_path),
                 )
             )
             _mark_startup_step(
@@ -5146,7 +5184,7 @@ def _run_with_remote_server(
     # long-lived transcript-forwarder client survives the ~1h Databricks
     # OAuth token TTL.
     startup_profiler.mark("remote auth resolving")
-    forwarder_auth = _server_auth(server_url=base_url, session_id=None)
+    forwarder_auth = _server_auth(server_url=base_url)
     startup_profiler.mark("remote auth resolved")
     prepared: PreparedClaudeTerminal | None = None
     # Bound before the attach call so the ``finally`` can read it even
@@ -5352,7 +5390,7 @@ async def _prepare_claude_terminal(
         marks. ``None`` disables output.
     :param startup_progress: Optional user-visible progress renderer,
         e.g. a handle from :func:`runner_startup_progress`.
-    :param append_system_prompt: Raw author instructions for
+    :param append_system_prompt: Session startup instructions for
         ``--append-system-prompt``, applied on fresh launch and cold
         resume only — the hot-reattach fast path below returns before
         this is used, so it never relaunches or duplicates the flag.
@@ -6808,9 +6846,8 @@ async def _launch_claude_terminal(
     :param bridge_dir: Bridge directory shared with Claude's MCP
         MCP server and the web-chat harness.
     :param claude_config: Optional ucode-derived Claude Code config.
-    :param append_system_prompt: Optional raw ``AgentSpec.instructions``
-        (author-supplied, not framework-composed) for this fresh native
-        session.
+    :param append_system_prompt: Optional author instructions and stable
+        framework guidance for this fresh native session.
     :param allowed_tools: Optional narrowly scoped Claude tools preapproved
         for this native session.
     :returns: Terminal resource id.
@@ -6987,9 +7024,8 @@ def _claude_terminal_request(
     :param ap_auth_headers: Auth headers for the
         ``PermissionRequest`` command hook.
     :param claude_config: Optional ucode-derived Claude Code config.
-    :param append_system_prompt: Optional raw ``AgentSpec.instructions``
-        (author-supplied, not framework-composed) to append to Claude
-        Code's system prompt.
+    :param append_system_prompt: Optional author instructions and stable
+        framework guidance to append to Claude Code's system prompt.
     :param allowed_tools: Optional narrowly scoped Claude tools preapproved
         for this native session.
     :returns: JSON body for ``POST /resources/terminals``.
@@ -7009,7 +7045,7 @@ def _claude_terminal_request(
         append_system_prompt=append_system_prompt,
         allowed_tools=allowed_tools,
     )
-    # Let a registered launcher plugin (e.g. Databricks' isaac) rewrite the
+    # Let a registered launcher plugin (e.g. a wrapper such as isaac) rewrite the
     # command/args to wrap the same fully-augmented Claude launch. Identity by
     # default. See omnigent.claude_launcher.
     command, args = resolve_claude_launch(command, args)
@@ -7036,7 +7072,10 @@ def _claude_terminal_request(
         "scrollback": _CLAUDE_TERMINAL_SCROLLBACK_LINES,
     }
     # This wrapper is the CLI; don't trust a surface inherited from a session's shell.
-    spec["env"] = build_native_claude_terminal_env(claude_config, client_surface="cli")
+    spec["env"] = {
+        **build_native_claude_terminal_env(claude_config, client_surface="cli"),
+        **claude_terminal_relay_env(bridge_dir),
+    }
     if claude_config is not None:
         # The runner's terminal layer inherits the parent process env.
         # Remove credentials that override the selected auth and the
@@ -7215,6 +7254,7 @@ def _websocket_connect(
 
     from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
     from omnigent.session_host import session_routing_headers
+    from omnigent.telemetry.request_headers import pop_client_user_agent
     from omnigent.util.tls import client_ssl_context
 
     # Identify as a first-party client so the server's WebSocket origin
@@ -7226,6 +7266,8 @@ def _websocket_connect(
         **session_routing_headers(attach_url),
         "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
     }
+    # websockets adds its own User-Agent on top of the handshake headers; send only ours.
+    user_agent = pop_client_user_agent(handshake_headers)
     # A remote (https) workspace yields a wss:// attach URL; build a verifying
     # SSL context from a real CA bundle so verification works on interpreters
     # whose OpenSSL default cert path is empty. ws:// passes ssl=None (the
@@ -7239,6 +7281,7 @@ def _websocket_connect(
                 additional_headers=handshake_headers,
                 close_timeout=_CLAUDE_ATTACH_WS_CLOSE_TIMEOUT_S,
                 ssl=ssl_ctx,
+                user_agent_header=user_agent,
             ),
         )
     except TypeError:
@@ -7249,6 +7292,7 @@ def _websocket_connect(
                 extra_headers=handshake_headers,
                 close_timeout=_CLAUDE_ATTACH_WS_CLOSE_TIMEOUT_S,
                 ssl=ssl_ctx,
+                user_agent_header=user_agent,
             ),
         )
 

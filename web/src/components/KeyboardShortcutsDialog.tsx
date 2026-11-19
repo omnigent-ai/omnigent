@@ -1,30 +1,10 @@
-// A read-only "Keyboard shortcuts" overlay listing the shortcuts that already
-// exist in the chat surface. It is intentionally a mirror of the live
-// behavior — every row here corresponds to a handler that ships today
-// (composer `handleKeyDown`, the global session-switch / message-nav hotkeys,
-// and the approve hotkey). Nothing here binds new behavior except the dialog's
-// own opener (⌘/Ctrl + /), which this component registers.
-//
-// Self-contained: it owns its open state and listens for its opener directly
-// (a window keydown for ⌘/Ctrl+/, plus a custom event so a menu entry can open
-// it without prop-drilling). Mount it once near the app shell.
+// Read-only "Keyboard shortcuts" overlay; rows come from the registry-backed shortcutPage.
+// It binds only its own opener (⌘/Ctrl + /) and the menu event that opens it.
+// Mount it once near the app shell.
 
-import { Fragment, useEffect, useState } from "react";
+import { useEffect, useState } from "react";
 
-import {
-  ALT_KEY,
-  composerNewLineShortcutKeys,
-  composerSendShortcutKeys,
-  composerSteerAllShortcutKeys,
-  CTRL_KEY,
-  ENTER_KEY,
-  Kbd,
-  MOD_KEY,
-  newSessionShortcutKeys,
-  SHIFT_KEY,
-  SPLIT_TERMINAL_KEYS,
-  VIEW_MODE_TOGGLE_KEYS,
-} from "@/components/KeyboardShortcut";
+import { Kbd } from "@/components/KeyboardShortcut";
 import {
   Dialog,
   DialogContent,
@@ -32,13 +12,19 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { hasCommandModifier } from "@/lib/hotkeys";
-import { isElectronShell, isNativeShell, supportsBrowser } from "@/lib/nativeBridge";
+import {
+  isElectronShell,
+  isNativeShell,
+  supportsBrowser,
+  supportsDesktopCommands,
+} from "@/lib/nativeBridge";
+import { matchesShortcut } from "@/lib/shortcuts/registry";
+import { type ShortcutPageGroup, shortcutPageGroups } from "@/lib/shortcuts/shortcutPage";
+import { ShortcutSettingsRow } from "@/pages/settings/search/ShortcutSettingsRow";
 
 // Custom event the dialog listens for, so non-adjacent surfaces (e.g. the
 // account menu) can open it without threading state through the tree.
@@ -50,220 +36,37 @@ export function openKeyboardShortcuts(): void {
   window.dispatchEvent(new Event(KEYBOARD_SHORTCUTS_EVENT));
 }
 
-// Glyphs match the in-app tooltips (e.g. UserMessageNav's "⌘⌥↑").
-const UP = "↑";
-const DOWN = "↓";
-const BRACKET_LEFT = "[";
-const BRACKET_RIGHT = "]";
-
-interface Shortcut {
-  label: string;
-  /** Keys rendered left→right as chips. A chord (held together) or, for the
-   *  arrow-pairs, the two interchangeable keys for that action. */
-  keys: string[];
-  lastKeySeparator?: string;
-  /** Another chord for the same action, shown after "or". */
-  alternateKeys?: string[];
-}
-
-interface ShortcutGroup {
-  title: string;
-  /** Optional qualifier shown next to the group title. */
-  note?: string;
-  items: Shortcut[];
-}
-
-// ONLY shortcuts that exist today (see file header). Keep in sync with the
-// composer's `handleKeyDown` and the global hotkey hooks.
-const SHORTCUT_GROUPS: ShortcutGroup[] = [
-  {
-    title: "General",
-    items: [
-      { label: "Open command palette", keys: [MOD_KEY, "K"] },
-      { label: "Find a session by name", keys: [MOD_KEY, ALT_KEY, "S"] },
-      { label: "Rename current session", keys: [MOD_KEY, ALT_KEY, "R"] },
-      { label: "Open Settings", keys: [MOD_KEY, ALT_KEY, ","] },
-      { label: "Show keyboard shortcuts", keys: [MOD_KEY, "/"] },
-    ],
-  },
-  {
-    title: "In chats",
-    items: [
-      { label: "Recall previous prompt", keys: [UP] },
-      { label: "Recall next prompt", keys: [DOWN] },
-      { label: "Accept approval prompt", keys: [MOD_KEY, ENTER_KEY] },
-      { label: "Open model picker", keys: [CTRL_KEY, SHIFT_KEY, "M"] },
-      { label: "Cycle model", keys: [CTRL_KEY, ALT_KEY, "M"] },
-      { label: "Cycle reasoning effort", keys: [CTRL_KEY, ALT_KEY, "E"] },
-      { label: "Cycle permission mode (in session)", keys: [SHIFT_KEY, "Tab"] },
-      { label: "Focus chat input", keys: [CTRL_KEY, SHIFT_KEY, "L"] },
-      { label: "Toggle voice dictation", keys: [MOD_KEY, ALT_KEY, "V"] },
-      { label: "Stop response", keys: ["Esc"] },
-    ],
-  },
-  {
-    title: "Navigation",
-    items: [
-      { label: "Previous session", keys: [MOD_KEY, BRACKET_LEFT] },
-      { label: "Next session", keys: [MOD_KEY, BRACKET_RIGHT] },
-    ],
-  },
-  {
-    title: "View",
-    items: [
-      { label: "Toggle Chat / Terminal view", keys: [...VIEW_MODE_TOGGLE_KEYS] },
-      { label: "Toggle conversations sidebar", keys: [MOD_KEY, ALT_KEY, "["] },
-      { label: "Focus or close workspace sidebar", keys: [MOD_KEY, ALT_KEY, "]"] },
-      { label: "Search workspace contents", keys: [MOD_KEY, SHIFT_KEY, "F"] },
-      {
-        label: "Select a workspace tab",
-        keys: [MOD_KEY, ALT_KEY, "]", "1…4"],
-        lastKeySeparator: "+",
-      },
-      { label: "Open a new browser tab", keys: [MOD_KEY, ALT_KEY, "B"] },
-      { label: "Open a new shell", keys: [MOD_KEY, ALT_KEY, "T"] },
-    ],
-  },
-  {
-    title: "Panes",
-    note: "in grids and split terminals",
-    items: [
-      { label: "Focus previous pane", keys: [MOD_KEY, ALT_KEY, SHIFT_KEY, BRACKET_LEFT] },
-      { label: "Focus next pane", keys: [MOD_KEY, ALT_KEY, SHIFT_KEY, BRACKET_RIGHT] },
-    ],
-  },
-  {
-    title: "Slash commands",
-    note: "while the suggestions menu is open",
-    items: [
-      { label: "Navigate suggestions", keys: [UP, DOWN] },
-      { label: "Apply highlighted command", keys: ["Tab"] },
-      { label: "Dismiss menu", keys: ["Esc"] },
-    ],
-  },
-];
-
-// Numeric pinned-session jump. The chord is platform-aware (see
-// usePinnedSessionHotkeys): plain Cmd/Ctrl+digit in the Electron shell, but
-// Cmd/Ctrl+Alt+digit in a browser tab, where plain Cmd+digit is reserved for
-// native tab-switching. Shown in both, with the matching glyphs.
-function pinnedSessionShortcut(native: boolean): Shortcut {
-  return {
-    label: "Jump to pinned session (1–10)",
-    keys: native ? [MOD_KEY, "1…0"] : [MOD_KEY, ALT_KEY, "1…0"],
-  };
-}
-
-/** Shortcut groups for the current runtime and composer preference. */
-function shortcutGroupsFor(
-  native: boolean,
-  electron: boolean,
-  browser: boolean,
-  submitWithModEnter: boolean,
-  preventsKeyboardSubmit: boolean,
-  contentSearch: boolean,
-  grids: boolean,
-  splitTerminal: boolean,
-): ShortcutGroup[] {
-  const groups = SHORTCUT_GROUPS.map((group) => {
-    if (group.title === "General") {
-      return {
-        ...group,
-        items: [
-          { label: "Start a new session", keys: newSessionShortcutKeys(native) },
-          ...group.items,
-        ],
-      };
-    }
-    if (group.title === "In chats" && !preventsKeyboardSubmit) {
-      return {
-        ...group,
-        items: [
-          { label: "Send message", keys: composerSendShortcutKeys(submitWithModEnter) },
-          {
-            label: "Send now, with all queued messages",
-            keys: composerSteerAllShortcutKeys(submitWithModEnter),
-          },
-          {
-            label: "New line in message",
-            keys: composerNewLineShortcutKeys(submitWithModEnter),
-            // Alt+Enter is a newline in both modes; plain Enter already is in alternate mode.
-            alternateKeys: submitWithModEnter ? undefined : [ALT_KEY, ENTER_KEY],
-          },
-          ...group.items,
-        ],
-      };
-    }
-    if (group.title === "Navigation") {
-      return {
-        ...group,
-        items: [
-          ...(electron ? [{ label: "Switch recent sessions", keys: [CTRL_KEY, "Tab"] }] : []),
-          ...group.items,
-          pinnedSessionShortcut(native),
-        ],
-      };
-    }
-    if (group.title === "View") {
-      return {
-        ...group,
-        items: group.items
-          .filter(
-            (item) =>
-              (browser || item.label !== "Open a new browser tab") &&
-              (contentSearch || item.label !== "Search workspace contents"),
-          )
-          .map((item) =>
-            contentSearch && item.label === "Select a workspace tab"
-              ? { ...item, keys: [MOD_KEY, ALT_KEY, "]", "1…5"] }
-              : item,
-          ),
-      };
-    }
-    if (group.title === "Panes") {
-      return {
-        ...group,
-        items: [
-          ...(grids || splitTerminal ? group.items : []),
-          ...(splitTerminal
-            ? [
-                { label: "Split terminal right", keys: SPLIT_TERMINAL_KEYS.columns },
-                { label: "Split terminal down", keys: SPLIT_TERMINAL_KEYS.rows },
-              ]
-            : []),
-        ],
-      };
-    }
-    return group;
-  });
-  return groups.filter((group) => group.items.length > 0);
-}
-
 /**
  * The shortcut reference shared by the dialog and Settings page. The dialog
  * keeps the compact inline list; Settings uses section headings with bordered
  * list cards to match the rest of its content.
  */
+/** The Keyboard shortcuts page's groups here, computed at render so tests can vary the runtime. */
+export function useShortcutPageGroups(): ShortcutPageGroup[] {
+  // Feature-based, stable per session; computed at render so tests can vary it.
+  const isMobileViewport = useIsMobileViewport();
+  const preventsKeyboardSubmit = isMobileViewport;
+  const serverInfo = useServerInfo();
+  return shortcutPageGroups({
+    native: isNativeShell(),
+    electron: isElectronShell(),
+    browser: supportsBrowser(),
+    submitWithModEnter: readSubmitWithModEnter(),
+    preventsKeyboardSubmit,
+    contentSearch: !isMobileViewport && isFeatureEnabled(serverInfo, "workspace_content_search"),
+    grids: !isMobileViewport && isFeatureEnabled(serverInfo, "grid_sessions_display_ui"),
+    splitTerminal: !isMobileViewport && isFeatureEnabled(serverInfo, "splittable_terminal_view_ui"),
+    desktopCommands: supportsDesktopCommands(),
+    siblingSessions: serverInfo !== "loading" && serverInfo.sibling_sessions === true,
+  });
+}
+
 export function KeyboardShortcutsList({
   variant = "compact",
 }: {
   variant?: "compact" | "settings";
 }) {
-  // Feature-based, stable per session; computed at render so tests can vary it.
-  const isMobileViewport = useIsMobileViewport();
-  const isCoarsePointer = useIsCoarsePointer();
-  const preventsKeyboardSubmit = isMobileViewport || isCoarsePointer;
-  const serverInfo = useServerInfo();
-  const groups = shortcutGroupsFor(
-    isNativeShell(),
-    isElectronShell(),
-    supportsBrowser(),
-    readSubmitWithModEnter(),
-    preventsKeyboardSubmit,
-    !isMobileViewport && isFeatureEnabled(serverInfo, "workspace_content_search"),
-    !isMobileViewport && isFeatureEnabled(serverInfo, "grid_sessions_display_ui"),
-    !isMobileViewport && isFeatureEnabled(serverInfo, "splittable_terminal_view_ui"),
-  );
+  const groups = useShortcutPageGroups();
   const settings = variant === "settings";
   return (
     <div className={settings ? "flex flex-col gap-10" : undefined}>
@@ -282,38 +85,44 @@ export function KeyboardShortcutsList({
             ) : null}
           </h3>
           <ul className={settings ? "rounded-xl border border-border bg-card px-4" : undefined}>
-            {group.items.map((item) => (
-              <li
-                key={item.label}
-                className={
-                  settings
-                    ? "flex items-center justify-between gap-4 border-b border-border py-4 last:border-b-0"
-                    : "flex items-center justify-between gap-4 border-b border-border/60 py-2.5 last:border-b-0"
-                }
-              >
-                <span className="text-ui text-foreground">{item.label}</span>
-                <span className="flex shrink-0 items-center gap-1">
-                  {item.keys.map((key, index) => (
-                    <Fragment key={`${item.label}-${key}`}>
-                      {index === item.keys.length - 1 && item.lastKeySeparator ? (
-                        <span aria-hidden="true" className="text-muted-foreground/70">
-                          {item.lastKeySeparator}
-                        </span>
-                      ) : null}
-                      <Kbd>{key}</Kbd>
-                    </Fragment>
-                  ))}
-                  {item.alternateKeys ? (
-                    <>
-                      <span className="px-0.5 text-sm text-muted-foreground/70">or</span>
-                      {item.alternateKeys.map((key) => (
-                        <Kbd key={`${item.label}-alternate-${key}`}>{key}</Kbd>
-                      ))}
-                    </>
-                  ) : null}
-                </span>
-              </li>
-            ))}
+            {group.items.map((item) => {
+              const className = settings
+                ? "flex items-center justify-between gap-4 border-b border-border py-4 last:border-b-0"
+                : "flex items-center justify-between gap-4 border-b border-border/60 py-2.5 last:border-b-0";
+              const content = (
+                <>
+                  <span className="text-ui text-foreground">{item.label}</span>
+                  <span className="flex shrink-0 items-center gap-1">
+                    {item.keys.map((key) => (
+                      <Kbd key={`${item.label}-${key}`}>{key}</Kbd>
+                    ))}
+                    {item.alternateKeys ? (
+                      <>
+                        <span className="px-0.5 text-sm text-muted-foreground/70">or</span>
+                        {item.alternateKeys.map((key) => (
+                          <Kbd key={`${item.label}-alternate-${key}`}>{key}</Kbd>
+                        ))}
+                      </>
+                    ) : null}
+                  </span>
+                </>
+              );
+              // Settings lists each row so search can reveal it; the shortcut dialog doesn't.
+              return settings ? (
+                <ShortcutSettingsRow
+                  key={item.label}
+                  row={item}
+                  group={group}
+                  className={className}
+                >
+                  {content}
+                </ShortcutSettingsRow>
+              ) : (
+                <li key={item.label} className={className}>
+                  {content}
+                </li>
+              );
+            })}
           </ul>
         </section>
       ))}
@@ -329,7 +138,7 @@ export function KeyboardShortcutsDialog() {
       // ⌘/Ctrl + / toggles the panel. Plain `/` is the composer's slash-menu
       // trigger, so require the platform command modifier and no Shift/Alt to
       // avoid clashing (only ⌘/ on macOS, only Ctrl+/ on Win/Linux).
-      if (hasCommandModifier(e) && !e.altKey && !e.shiftKey && e.key === "/") {
+      if (matchesShortcut(e, "shortcuts.show")) {
         e.preventDefault();
         setOpen((prev) => !prev);
       }

@@ -56,8 +56,12 @@ function useMenuInteractionProps(configOpen = false) {
     "data-initial-selection": interaction.showInitialSelection || undefined,
     onPointerEnter: interaction.onPointerInteraction,
     onPointerLeave: interaction.onPointerInteraction,
+    onPointerOutCapture: (event: SyntheticEvent<HTMLElement>) => {
+      if (event.currentTarget.dataset.state === "closed") event.preventDefault();
+    },
     onPointerDownCapture: interaction.onPointerInteraction,
     onPointerMoveCapture: (event: SyntheticEvent<HTMLElement>) => {
+      if (event.currentTarget.dataset.state === "closed") return event.preventDefault();
       interaction.onPointerInteraction();
       if (configOpen && event.currentTarget.contains(event.target as Node)) event.preventDefault();
     },

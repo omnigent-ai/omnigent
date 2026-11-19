@@ -15,12 +15,18 @@ from tests.e2e_ui.conftest import _build_hello_world_bundle
 
 
 def _stub_server_info(
-    page: Page, *, canvas: bool, usage: bool = False, session_pull_requests: bool = False
+    page: Page,
+    *,
+    canvas: bool,
+    usage: bool = False,
+    session_pull_requests: bool = False,
+    comment_anchor_metadata: bool = False,
 ) -> None:
     """Advertise one deterministic ``canvas`` release-feature value.
 
     :param session_pull_requests: Whether the server stores session PRs, so
         Canvas cards read them from the session list rather than each runner.
+    :param comment_anchor_metadata: Whether session comments preserve PR anchors.
     """
     body = json.dumps(
         {
@@ -32,6 +38,7 @@ def _stub_server_info(
             "harness_install_enabled": False,
             "installable_harnesses": [],
             "session_pull_requests": session_pull_requests,
+            "comment_anchor_metadata": comment_anchor_metadata,
         }
     )
     page.route(
@@ -141,7 +148,7 @@ def test_canvas_page_groups_sessions_by_project_and_opens_them(
     page.route("**/v1/sessions/projects", lambda route: route.fulfill(json=projects))
 
     page.goto(live_server)
-    if width < 768:
+    if width < 1181:
         page.get_by_role("button", name="Open sidebar", exact=True).click()
     expect(page.get_by_text("Main session 0", exact=True).first).to_be_visible()
     page.get_by_test_id("canvas-nav").click()
@@ -173,7 +180,7 @@ def test_canvas_page_groups_sessions_by_project_and_opens_them(
 
     # Leaving and coming back through the sidebar reopens the last selected canvas.
     page.goto(live_server)
-    if width < 768:
+    if width < 1181:
         page.get_by_role("button", name="Open sidebar", exact=True).click()
     expect(page.get_by_text("Main session 0", exact=True).first).to_be_visible()
     page.get_by_test_id("canvas-nav").click()
@@ -185,7 +192,7 @@ def test_canvas_page_groups_sessions_by_project_and_opens_them(
 
     cards.click()
     expect(page).to_have_url(re.compile(r"/canvas/c/project-session\?canvas=project-release$"))
-    if width < 768:
+    if width < 1181:
         page.get_by_role("button", name="Back to canvas", exact=True).click()
         expect(cards).to_have_count(1)
     expect(page.get_by_role("region", name="Canvas pane", exact=True)).to_be_visible()

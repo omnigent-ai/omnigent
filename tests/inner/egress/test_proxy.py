@@ -17,10 +17,16 @@ from unittest.mock import Mock
 import pytest
 
 from omnigent.inner.credential_proxy import (
+    CODEX_GATEWAY_TOKEN_ENV,
     SYNTHETIC_CREDENTIAL_PREFIX,
     CredentialRewriteRule,
     RefreshingSecretProvider,
     prepare_credential_proxy_runtime,
+)
+from omnigent.inner.datamodel import (
+    CredentialProxyEntry,
+    CredentialProxySpec,
+    CredentialSourceSpec,
 )
 from omnigent.inner.egress.ca import ensure_ca, ensure_ca_bundle
 from omnigent.inner.egress.certs import HostCertCache
@@ -2145,13 +2151,18 @@ async def test_credential_rewrite_swaps_via_refreshing_provider(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("tls", [False, True])
+@pytest.mark.parametrize(
+    "tls,brokered",
+    [(False, False), (True, False), (True, True)],
+    ids=["http", "https", "brokered"],
+)
 async def test_running_proxy_refreshes_after_idle_and_recovers_from_source_failure(
     ca_paths: tuple[Path, Path, Path],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     tls: bool,
+    brokered: bool,
 ) -> None:
     cert_path, key_path, bundle_path = ca_paths
     token_file = tmp_path / "private-source-marker"
@@ -2161,8 +2172,13 @@ async def test_running_proxy_refreshes_after_idle_and_recovers_from_source_failu
         "omnigent.inner.credential_proxy.RefreshingSecretProvider",
         partial(RefreshingSecretProvider, clock=clock),
     )
+    binding = (
+        {"type": "https_bearer", "target": "model.example.com", "env": CODEX_GATEWAY_TOKEN_ENV}
+        if brokered
+        else {"type": "gh_basic"}
+    )
     spec = _parse_credential_proxy(
-        [{"type": "gh_basic", "source": {"file": str(token_file), "refresh_interval_seconds": 60}}]
+        [{**binding, "source": {"file": str(token_file), "refresh_interval_seconds": 60}}]
     )
     policy = SandboxPolicy(
         backend_type="linux_bwrap",
@@ -2176,11 +2192,15 @@ async def test_running_proxy_refreshes_after_idle_and_recovers_from_source_failu
     placeholders = dict(runtime.helper_env_updates)
     captured: list[_CapturedRequest] = []
     upstreams: dict[str, asyncio.Server] = {}
-    for host in ("github.com", "api.github.com"):
+    for host in ("model.example.com",) if brokered else ("github.com", "api.github.com"):
         context = HostCertCache(cert_path, key_path).get_ssl_context(host) if tls else None
         upstreams[host] = await _start_capturing_upstream(captured, context)
     proxy = EgressProxy(
-        parse_rules(["* github.com/**", "* api.github.com/**"]),
+        parse_rules(
+            ["POST model.example.com/v1/responses"]
+            if brokered
+            else ["* github.com/**", "* api.github.com/**"]
+        ),
         cert_path,
         key_path,
         upstream_ca_bundle=bundle_path,
@@ -2188,19 +2208,28 @@ async def test_running_proxy_refreshes_after_idle_and_recovers_from_source_failu
         credential_rewrites=runtime.rewrites,
     )
     port = await proxy.start_tcp()
-    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", _resolve_to_loopback())
+    resolve = _resolve_to_loopback()
 
-    async def request(host: str) -> bytes:
-        upstream_port = upstreams[host].sockets[0].getsockname()[1]
-        target = "/probe" if tls else f"http://{host}:{upstream_port}/probe"
-        auth = (
-            f"Authorization: token {placeholders['GH_TOKEN']}\r\n"
-            if host.startswith("api.")
-            else ""
-        )
+    async def resolve_upstream(host: str, port: int, *args: object, **kwargs: object) -> list:
+        if brokered and host in upstreams and port == 443:
+            port = upstreams[host].sockets[0].getsockname()[1]
+        return await resolve(host, port, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", resolve_upstream)
+
+    async def request(host: str, path: str | None = None, *, bare: bool = False) -> bytes:
+        upstream_port = 443 if brokered else upstreams[host].sockets[0].getsockname()[1]
+        path = path or ("/v1/responses" if brokered else "/probe")
+        target = path if tls else f"http://{host}:{upstream_port}{path}"
+        auth = ""
+        if brokered and not bare:
+            auth = f"Authorization: Bearer {placeholders[CODEX_GATEWAY_TOKEN_ENV]}\r\n"
+        elif host.startswith("api."):
+            auth = f"Authorization: token {placeholders['GH_TOKEN']}\r\n"
+        method = "POST" if brokered else "GET"
         headers = (
-            f"GET {target} HTTP/1.1\r\nHost: {host}:{upstream_port}\r\n"
-            f"{auth}Connection: close\r\n\r\n"
+            f"{method} {target} HTTP/1.1\r\nHost: {host}:{upstream_port}\r\n"
+            f"{auth}Content-Length: 0\r\nConnection: close\r\n\r\n"
         ).encode()
         if tls:
             return await asyncio.wait_for(
@@ -2224,26 +2253,33 @@ async def test_running_proxy_refreshes_after_idle_and_recovers_from_source_failu
             await writer.wait_closed()
 
     try:
+        if brokered:
+            assert b"200 OK" in await request("model.example.com", bare=True)
+            assert captured[-1].authorization is None
+            assert b"403 Forbidden" in await request("model.example.com", "/v1/models")
+            assert len(captured) == 1
+            captured.clear()
         clock.return_value = 4 * 3600.0
         token_file.write_text("after-idle")
         for host in upstreams:
             assert b"200 OK" in await request(host)
         expected_basic = base64.b64encode(b"x-access-token:after-idle").decode()
-        assert [capture.authorization for capture in captured] == [
-            f"Basic {expected_basic}",
-            "token after-idle",
-        ]
+        assert [capture.authorization for capture in captured] == (
+            ["Bearer after-idle"] if brokered else [f"Basic {expected_basic}", "token after-idle"]
+        )
         token_file.unlink()
         clock.return_value += 60
         for host in upstreams:
             response = await request(host)
             assert b"502 Bad Gateway" in response
             assert b"private-source-marker" not in response
-        assert len(captured) == 2
+        assert len(captured) == len(upstreams)
         assert "private-source-marker" not in caplog.text
         token_file.write_text("recovered")
-        assert b"200 OK" in await request("api.github.com")
-        assert captured[-1].authorization == "token recovered"
+        assert b"200 OK" in await request("model.example.com" if brokered else "api.github.com")
+        assert captured[-1].authorization == (
+            "Bearer recovered" if brokered else "token recovered"
+        )
         assert runtime.helper_env_updates == placeholders
     finally:
         await proxy.stop()
@@ -2489,6 +2525,85 @@ async def test_credential_rewrite_injects_on_access_without_header(
     # The proxy synthesized the Authorization header from the rule — the
     # client sent none.
     assert captured[0].authorization == "Bearer real-secret-value"
+
+
+@pytest.mark.asyncio
+async def test_brokered_rule_needs_placeholder_and_https(
+    ca_paths: tuple[Path, Path, Path],
+    tmp_path: Path,
+) -> None:
+    cert_path, key_path, _ = ca_paths
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    token_file = tmp_path / "model-token"
+    token_file.write_text("real-secret-value")
+    runtime = prepare_credential_proxy_runtime(
+        CredentialProxySpec(
+            entries=[
+                CredentialProxyEntry(
+                    host="127.0.0.1",
+                    scheme="bearer",
+                    source=CredentialSourceSpec(
+                        kind="file", path=str(token_file), refresh_interval_seconds=300
+                    ),
+                    inject_env=[CODEX_GATEWAY_TOKEN_ENV],
+                )
+            ]
+        ),
+        parent_env={},
+        sandbox=SandboxPolicy(
+            backend_type="darwin_seatbelt",
+            active=True,
+            read_roots=[workspace],
+            write_roots=[],
+            write_files=[],
+            allow_network=False,
+        ),
+        cwd=workspace,
+    )
+    rule = runtime.rewrites[0]
+    assert not rule.inject_on_missing
+    assert rule.https_only
+    assert rule.required_tls_port == 443
+    assert rule.synthetic == runtime.helper_env_updates[CODEX_GATEWAY_TOKEN_ENV]
+    captured: list[_CapturedRequest] = []
+    upstream = await _start_capturing_upstream(captured)
+    upstream_port = upstream.sockets[0].getsockname()[1]
+    proxy = EgressProxy(
+        parse_rules(["POST 127.0.0.1/v1/responses"]),
+        cert_path,
+        key_path,
+        block_private_destinations=False,
+        credential_rewrites=[rule],
+    )
+    proxy_port = await proxy.start_tcp()
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
+        request = (
+            f"POST http://127.0.0.1:{upstream_port}/v1/responses HTTP/1.1\r\n"
+            f"Host: 127.0.0.1:{upstream_port}\r\n"
+            f"Authorization: Bearer {rule.synthetic}\r\n"
+            "Content-Length: 0\r\n\r\n"
+        )
+        writer.write(request.encode())
+        await writer.drain()
+        response = await reader.read()
+        writer.close()
+        await writer.wait_closed()
+        assert b"403 Forbidden" in response
+        assert captured == []
+        reader, writer = await asyncio.open_connection("127.0.0.1", proxy_port)
+        writer.write(b"CONNECT 127.0.0.1:80 HTTP/1.1\r\nHost: 127.0.0.1:80\r\n\r\n")
+        await writer.drain()
+        response = await reader.read()
+        writer.close()
+        await writer.wait_closed()
+        assert b"403 Forbidden" in response
+        assert captured == []
+    finally:
+        await proxy.stop()
+        upstream.close()
+        await upstream.wait_closed()
 
 
 # ---------------------------------------------------------------------------

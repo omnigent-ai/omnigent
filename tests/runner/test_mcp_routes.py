@@ -173,6 +173,7 @@ class Harness:
             server_client=httpx.AsyncClient(base_url="http://server"),
             spec_resolver=spec_resolver,  # type: ignore[arg-type]
             terminal_registry=None,
+            wake_on_async_result=None,
         )
 
     @asynccontextmanager

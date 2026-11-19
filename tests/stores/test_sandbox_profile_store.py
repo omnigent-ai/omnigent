@@ -6,7 +6,13 @@ import pytest
 from sqlalchemy import inspect
 
 from omnigent.db.db_models import workspace_scope
-from omnigent.stores.sandbox_profile_store import SandboxProfileStore, profile_labels
+from omnigent.stores.sandbox_profile_store import (
+    PROFILE_HOST_PAGE_SIZE,
+    PROFILE_HOST_SESSION_LIMIT,
+    PROFILE_LABEL_KEYS,
+    SandboxProfileStore,
+    profile_labels,
+)
 
 PROFILE = {
     "provider": "company",
@@ -19,34 +25,46 @@ PROFILE = {
 }
 
 
+def _seed_host_history(store, host_id: str, count: int) -> None:
+    from uuid import uuid4
+
+    from sqlalchemy import insert
+
+    from omnigent.db.db_models import SqlConversationMetadata
+
+    with store._session_immediate("seed_large_host_history") as session:
+        session.execute(
+            insert(SqlConversationMetadata),
+            [
+                {"id": uuid4().hex, "host_id": host_id, "workspace": "/workspace"}
+                for _ in range(count)
+            ],
+        )
+
+
 def test_host_recovery_has_a_fixed_work_bound_and_skips_ordinary_hosts(store, monkeypatch):
     from unittest.mock import Mock
     from uuid import UUID, uuid4
 
-    from sqlalchemy import event, insert
+    from sqlalchemy import event
 
-    from omnigent.db.db_models import SqlConversationMetadata
     from omnigent.server.sandbox_profiles import SandboxProfileCatalog
     from omnigent.stores.host_store import HostStore
 
     host_id = uuid4().hex
     hosts = HostStore(store.storage_location)
     hosts.upsert_on_connect(host_id, "ordinary", "alice")
-    with store._session_immediate("seed_large_host_history") as session:
-        session.execute(
-            insert(SqlConversationMetadata),
-            [
-                {"id": uuid4().hex, "host_id": host_id, "workspace": "/workspace"}
-                for _ in range(250)
-            ],
-        )
+    _seed_host_history(store, host_id, 250)
     catalog = SandboxProfileCatalog(store, None, hosts)
     lookup = Mock(wraps=store.list_host_conversation_ids)
     monkeypatch.setattr(store, "list_host_conversation_ids", lookup)
     assert catalog.get_host_snapshot(host_id) is None
     lookup.assert_not_called()
 
-    reference = store.create_conversation(host_id=host_id, workspace="/workspace")
+    # The reference sorts last, so the full scan finds its profile on the final page.
+    reference = store.create_conversation(
+        conversation_id="f" * 32, host_id=host_id, workspace="/workspace"
+    )
     profiles = SandboxProfileStore(store)
     profiles.bind_session(reference.id, PROFILE)
     for supplied_host in (host_id, f"host_{host_id}", str(UUID(host_id))):
@@ -55,31 +73,66 @@ def test_host_recovery_has_a_fixed_work_bound_and_skips_ordinary_hosts(store, mo
         )
     lookup.assert_not_called()
 
+    assert profiles.get_host_snapshot(host_id) == PROFILE
+    _seed_host_history(store, host_id, PROFILE_HOST_SESSION_LIMIT - 251)
+    assert profiles.get_host_snapshot(host_id) == PROFILE
+    _seed_host_history(store, host_id, 1)
     hydrate = Mock(side_effect=AssertionError("Overflow must not hydrate session history"))
     monkeypatch.setattr(store, "get_conversation", hydrate)
+    engines = {store._engine, store._conv_engine}
     queries = []
 
-    def capture(_conn, _cursor, statement, parameters, _context, _many):
+    def capture(conn, _cursor, statement, parameters, _context, _many):
         if statement.lstrip().upper().startswith("SELECT"):
-            queries.append((statement, parameters))
+            queries.append((conn.engine, statement, parameters))
 
-    event.listen(store._engine, "before_cursor_execute", capture)
+    for engine in engines:
+        event.listen(engine, "before_cursor_execute", capture)
     try:
         with pytest.raises(ValueError, match="lookup limit"):
             SandboxProfileStore(store).get_host_snapshot(host_id)
     finally:
-        event.remove(store._engine, "before_cursor_execute", capture)
-    assert len(queries) == 1
-    statement, parameters = queries[0]
-    with store._engine.connect() as connection:
-        assert len(connection.exec_driver_sql(statement, parameters).all()) == 201
-        if store._engine.dialect.name == "sqlite":
-            plan = str(
-                connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
-            )
-            assert "ix_conversation_metadata_host_id" in plan
-            assert "SCAN" not in plan and "TEMP B-TREE" not in plan
+        for engine in engines:
+            event.remove(engine, "before_cursor_execute", capture)
+    pages = PROFILE_HOST_SESSION_LIMIT // PROFILE_HOST_PAGE_SIZE
+    assert len(queries) == 2 * pages + 1
+    for engine, statement, parameters in queries:
+        reads_host_page = "conversation_metadata" in statement
+        # A fully profiled page returns every profile key for each of its sessions.
+        row_limit = PROFILE_HOST_PAGE_SIZE * (1 if reads_host_page else len(PROFILE_LABEL_KEYS))
+        with engine.connect() as connection:
+            assert len(connection.exec_driver_sql(statement, parameters).all()) <= row_limit
+            if engine.dialect.name == "sqlite":
+                plan = str(
+                    connection.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all()
+                )
+                assert "SCAN" not in plan and "TEMP B-TREE" not in plan
+                if reads_host_page:
+                    assert "ix_conversation_metadata_host_id" in plan
     hydrate.assert_not_called()
+
+
+def test_host_recovery_reads_saved_profiles_past_the_first_page(store):
+    from uuid import uuid4
+
+    host_id = uuid4().hex
+    profiles = SandboxProfileStore(store)
+    legacy = store.create_conversation(host_id=host_id, workspace="/workspace")
+    _seed_host_history(store, host_id, PROFILE_HOST_PAGE_SIZE)
+    assert profiles.get_host_snapshot(host_id, reference_session_id=legacy.id) is None
+
+    last = store.create_conversation(
+        conversation_id="f" * 32, host_id=host_id, workspace="/workspace"
+    )
+    profiles.bind_session(last.id, PROFILE)
+    assert profiles.get_host_snapshot(host_id, reference_session_id=legacy.id) == PROFILE
+
+    first = store.create_conversation(
+        conversation_id="0" * 32, host_id=host_id, workspace="/workspace"
+    )
+    profiles.bind_session(first.id, {**PROFILE, "revision": "v2"})
+    with pytest.raises(ValueError, match="conflicting"):
+        profiles.get_host_snapshot(host_id, reference_session_id=legacy.id)
 
 
 @pytest.fixture(params=["conversation_store", "split_db_conversation_store"])
@@ -99,8 +152,39 @@ def test_reference_survives_restart_without_schema_changes(store):
         for index in inspect(store._engine).get_indexes("omnigent_conversation_metadata")
     )
     assert all(len(value) <= 256 for value in store.get_conversation(session.id).labels.values())
+    assert store.get_profile_labels([session.id]) == {session.id: profile_labels(PROFILE)}
     with workspace_scope(42):
         assert profiles.get_session_snapshot(session.id) is None
+        assert store.get_profile_labels([session.id]) == {}
+
+
+def test_profiled_host_binding_and_its_rollback_reset_the_background_flag(store):
+    """
+    Binding a profiled host's runner, and rolling that back, reset the flag.
+
+    Each runner's reports are compared only with its own, so the bound runner's
+    first report is accepted whatever its time.
+    """
+    from uuid import uuid4
+
+    conversation = store.create_conversation()
+    store.set_background_work_running(conversation.id, True, reported_at=4_000)
+    host_id = uuid4().hex
+
+    def flag():
+        return store.get_conversation(conversation.id).background_work_running
+
+    previous = store.bind_profiled_host(
+        conversation.id, host_id, "/workspace", PROFILE, runner_id="attempt"
+    )
+    assert flag() is None
+    store.set_background_work_running(conversation.id, True, runner_id="attempt", reported_at=10)
+    assert flag() is True
+
+    assert store.rollback_profiled_host(
+        previous, expected_host_id=host_id, expected_runner_id="attempt"
+    )
+    assert flag() is None
 
 
 def test_profile_binding_queries_stay_bounded_with_many_unrelated_labels(store):

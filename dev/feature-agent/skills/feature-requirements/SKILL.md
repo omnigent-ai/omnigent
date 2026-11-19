@@ -14,10 +14,19 @@ description: Turn the ticket into requirements and CUJs, and stop with a split p
    …), the actor, the steps, the expected result, and its surface (`web`, `cli`,
    `terminal`, `mobile`, `desktop`, or `api`). Include every way a user reaches
    the feature that the requirements imply.
-4. **Check the scope.** This run builds one feature. Stop with `needs_split`
-   **before any design or implementation** when the ticket holds several
-   independently shippable features, or is too large for one reviewable PR.
-   Do not build any part of it. In the handoff:
+4. **Check the scope.** This run builds one feature, and a feature can have
+   several parts. Build it unless one PR would be hard to review. Parts that
+   serve the same request and touch the same area stay together, even when each
+   could ship alone. For example, keep new arguments on a tool, a small
+   companion tool, and a filter on a related tool in one feature. That a part
+   could ship alone is not a reason to split. Stop with `needs_split`
+   **before any design or implementation** only when:
+   - the ticket bundles unrelated requests with different goals or users, or
+   - the work is clearly too large for one reviewable PR, for example several
+     new subsystems or a broad change across many surfaces.
+
+   When in doubt, build it. Do not build any part of it when you split. In the
+   handoff:
    - `ticket_comment` explains why the scope is too big and proposes the split.
    - `proposed_children` lists each child ticket's title, description, CUJs, and
      the other children it depends on, in a sensible order.

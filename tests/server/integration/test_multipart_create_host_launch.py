@@ -74,6 +74,7 @@ def app(
     db_uri: str,
     tmp_path: Path,
     conv_store: SqlAlchemyConversationStore,
+    request: pytest.FixtureRequest,
 ) -> FastAPI:
     """FastAPI app wired WITH ``host_store`` so host launches can run.
 
@@ -87,7 +88,15 @@ def app(
     :returns: A configured FastAPI app with host routes mounted.
     """
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+
+    gate = getattr(request, "param", "off") == "on"
+    from omnigent.server.feature_flags import Feature, FeatureFlags
+
     return create_app(
+        mcp_disabled_servers=gate,
+        feature_flags=FeatureFlags(
+            frozenset({Feature.MCP_DISABLED_SERVERS_CLAUDE, Feature.MCP_DISABLED_SERVERS_CODEX})
+        ),
         agent_store=SqlAlchemyAgentStore(db_uri),
         file_store=SqlAlchemyFileStore(db_uri),
         conversation_store=conv_store,
@@ -233,10 +242,12 @@ async def _multipart_create(
     )
 
 
+@pytest.mark.parametrize("app", ["on", "off"], indirect=True)
 async def test_multipart_create_with_host_id_binds_and_launches(
     register_host: RegisterHost,
     client: httpx.AsyncClient,
     conv_store: SqlAlchemyConversationStore,
+    request: pytest.FixtureRequest,
 ) -> None:
     """
     A multipart create carrying ``metadata.host_id`` binds the session
@@ -253,6 +264,7 @@ async def test_multipart_create_with_host_id_binds_and_launches(
     session_id = resp.json()["session_id"]
     accepted = next(row for row in rows if row["event_name"] == "session_creation_accepted")
     assert float(accepted["attributes"]["create_acl_ms"]) >= 0
+    assert float(accepted["attributes"]["create_host_launch_ms"]) >= 0
 
     conv = conv_store.get_conversation(session_id)
     assert conv is not None
@@ -267,6 +279,9 @@ async def test_multipart_create_with_host_id_binds_and_launches(
     assert len(cap.launch) == 1, f"expected one launch frame, got {len(cap.launch)}"
     assert cap.launch[0].session_id == session_id
     assert cap.launch[0].workspace == _WORKSPACE
+    assert cap.launch[0].mcp_disabled_servers_active_harnesses == (
+        ["claude", "codex"] if request.node.callspec.params["app"] == "on" else None
+    )
     # Workspace validation ran against the host (host.stat round-trip).
     assert any(frame.path == _WORKSPACE for frame in cap.stats)
 

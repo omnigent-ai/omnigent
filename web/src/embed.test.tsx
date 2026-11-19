@@ -109,6 +109,13 @@ describe("macOS Electron embed", () => {
       expect(scope.querySelector(`.${className}`)!.matches(selector), className).toBe(expected);
     }
 
+    let smoothingSelector = "";
+    css.walkDecls("-webkit-font-smoothing", (declaration) => {
+      smoothingSelector = (declaration.parent as Rule).selector;
+    });
+    expect(smoothingSelector).not.toBe("");
+    expect(scope.matches(smoothingSelector)).toBe(true);
+
     const controlsSelector = selectorFor(":is(");
     expect(controlsSelector).not.toContain(":has(");
     expect(getByRole("button", { name: "Header action" }).matches(controlsSelector)).toBe(expected);

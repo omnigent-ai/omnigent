@@ -1,16 +1,22 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ComponentProps } from "react";
+import type { Conversation } from "@/hooks/useConversations";
+import type { ComponentProps, ReactNode } from "react";
 
+import { ALT_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
+import * as commandPaletteModule from "./CommandPalette";
 import { CommandPalette } from "./CommandPalette";
 
 const navigate = vi.fn();
 vi.mock("@/lib/routing", () => ({
   useNavigate: () => navigate,
+  useLocation: () => ({ pathname: "/", search: "", hash: "", state: null, key: "default" }),
 }));
 
 const useConversations = vi.fn();
 const useSessionSearch = vi.fn();
+const useProjects = vi.fn();
 const serverInfo = vi.fn();
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => serverInfo(),
@@ -18,6 +24,7 @@ vi.mock("@/lib/CapabilitiesContext", () => ({
 vi.mock("@/hooks/useConversations", () => ({
   useConversations: (...args: unknown[]) => useConversations(...args),
   useSessionSearch: (...args: unknown[]) => useSessionSearch(...args),
+  useProjects: (...args: unknown[]) => useProjects(...args),
 }));
 
 function conv(
@@ -29,7 +36,10 @@ function conv(
   return { id, title, agent_name, archived: false, search_snippet };
 }
 
-function setSessions(sessions: ReturnType<typeof conv>[], isFetching = false) {
+function setSessions(
+  sessions: (ReturnType<typeof conv> & Partial<Conversation>)[],
+  isFetching = false,
+) {
   useConversations.mockReturnValue({ data: { pages: [{ data: sessions }] }, isFetching });
 }
 
@@ -52,7 +62,7 @@ function setSearchGroups({
   }));
 }
 
-function searchPages(...pages: ReturnType<typeof conv>[][]) {
+function searchPages(...pages: (ReturnType<typeof conv> & Partial<Conversation>)[][]) {
   return { data: { pages: pages.map((data) => ({ data })) } };
 }
 
@@ -64,7 +74,10 @@ function labelRow(text: string) {
   return screen.getByText((_content, el) => el?.tagName === "SPAN" && el.textContent === text);
 }
 
-function renderPalette(overrides: Partial<ComponentProps<typeof CommandPalette>> = {}) {
+function renderPalette(
+  overrides: Partial<ComponentProps<typeof CommandPalette>> = {},
+  queryClient = new QueryClient(),
+) {
   const props = {
     open: true,
     onOpenChange: vi.fn(),
@@ -72,19 +85,34 @@ function renderPalette(overrides: Partial<ComponentProps<typeof CommandPalette>>
     onToggleRightSidebar: vi.fn(),
     ...overrides,
   };
-  render(<CommandPalette {...props} />);
+  render(<CommandPalette {...props} />, { wrapper: withQueryClient(queryClient) });
   return props;
+}
+
+function withQueryClient(queryClient = new QueryClient()) {
+  return ({ children }: { children: ReactNode }) => (
+    <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
+  );
 }
 
 beforeEach(() => {
   navigate.mockClear();
   useConversations.mockReset();
   useSessionSearch.mockReset();
+  useProjects.mockReturnValue({ data: [] });
   serverInfo.mockReturnValue({ session_search_scope: true });
   setSessions([]);
   setSearchGroups({});
 });
 afterEach(cleanup);
+
+/** Every non-empty live region's text, so both palettes' status messages read the same. */
+const announced = () =>
+  screen
+    .getAllByRole("status")
+    .map((region) => region.textContent)
+    .filter(Boolean)
+    .join(" ");
 
 describe("CommandPalette — sessions", () => {
   it.each([false, true])(
@@ -104,6 +132,93 @@ describe("CommandPalette — sessions", () => {
       expect(screen.queryByText("Archived session")).toBeNull();
     },
   );
+
+  it.each([false, true])(
+    "shows project and parent context without needing the parent in results (sessionsOnly=%s)",
+    (sessionsOnly) => {
+      useProjects.mockReturnValue({ data: [{ id: "project", name: "App redesign" }] });
+      setSessions([
+        {
+          ...conv("nested", "Implement search"),
+          project_id: "project",
+          labels: {},
+          family: {
+            id: "family",
+            representative_id: "parent",
+            representative_title: "Search experience",
+            pinned: false,
+          },
+        },
+        { ...conv("standalone", "Standalone task"), labels: {} },
+      ]);
+      const { onOpenChange } = renderPalette({ sessionsOnly });
+      expect(
+        screen.getByRole("option", {
+          name: /Implement search.*Project:\s*App redesign.*Nested under:\s*Search experience/,
+        }),
+      ).toBeTruthy();
+      expect(
+        labelRow("Standalone task").closest('[role="option"]')!.querySelector("[title]"),
+      ).toBeNull();
+      fireEvent.click(labelRow("Implement search"));
+      expect(navigate).toHaveBeenCalledWith("/c/nested");
+      expect(onOpenChange).toHaveBeenCalledWith(false);
+    },
+  );
+
+  it.each(["recent", "title", "content"])(
+    "uses a parent loaded in %s against older servers without title metadata",
+    (parentSource) => {
+      const parent = conv("parent", "Planning");
+      const nested = {
+        ...conv("nested", "Follow-up"),
+        family: { id: "family", representative_id: "parent", pinned: false },
+      };
+      if (parentSource === "recent") {
+        setSessions([parent, nested]);
+      } else {
+        setSearchGroups({
+          title: searchPages(parentSource === "title" ? [parent] : [nested]),
+          content: searchPages(parentSource === "content" ? [parent] : [nested]),
+        });
+      }
+      renderPalette();
+      if (parentSource !== "recent") {
+        vi.useFakeTimers();
+        try {
+          fireEvent.change(screen.getByTestId("command-palette-input"), {
+            target: { value: "Follow-up" },
+          });
+          act(() => vi.advanceTimersByTime(300));
+        } finally {
+          vi.useRealTimers();
+        }
+      }
+      expect(
+        screen.getByRole("option", { name: /Follow-up.*Nested under:\s*Planning/ }),
+      ).toBeTruthy();
+    },
+  );
+
+  it("uses legacy project labels and omits the parent breadcrumb on the representative", () => {
+    setSessions([
+      {
+        ...conv("parent", "Planning"),
+        labels: { omni_project: "Legacy project" },
+        family: {
+          id: "family",
+          representative_id: "parent",
+          representative_title: "Planning",
+          pinned: false,
+        },
+      },
+    ]);
+    renderPalette();
+    expect(
+      screen.getByRole("option", { name: /Planning.*Project:\s*Legacy project/ }),
+    ).toBeTruthy();
+    expect(screen.queryByText(/Nested under/)).toBeNull();
+  });
 
   it("fuzzy-matches session names without showing unrelated actions", () => {
     setSessions([
@@ -137,7 +252,9 @@ describe("CommandPalette — sessions", () => {
       onToggleLeftSidebar: vi.fn(),
       onToggleRightSidebar: vi.fn(),
     };
-    const { rerender } = render(<CommandPalette {...props} />);
+    const { rerender } = render(<CommandPalette {...props} />, {
+      wrapper: withQueryClient(),
+    });
     expect(useConversations).toHaveBeenCalledWith("", false, { enabled: true });
     expect(fetchNextPage).toHaveBeenCalledOnce();
     useConversations.mockReturnValue({
@@ -164,7 +281,7 @@ describe("CommandPalette — sessions", () => {
     });
     renderPalette({ sessionsOnly: true });
     expect(fetchNextPage).not.toHaveBeenCalled();
-    expect(screen.getByRole("status").textContent).toContain("Couldn't load");
+    expect(announced()).toContain("Couldn't load");
     expect(screen.queryByText("No results found")).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     expect(fetchNextPage).toHaveBeenCalledOnce();
@@ -176,7 +293,7 @@ describe("CommandPalette — sessions", () => {
       const refetch = vi.fn();
       useConversations.mockReturnValue({ isError: true, isFetching: false, refetch });
       renderPalette({ sessionsOnly });
-      expect(screen.getByRole("status").textContent).toContain("Couldn't load sessions.");
+      expect(announced()).toContain("Couldn't load sessions.");
       expect(screen.queryByText("No results found")).toBeNull();
       fireEvent.click(screen.getByRole("button", { name: "Retry" }));
       expect(refetch).toHaveBeenCalledOnce();
@@ -186,7 +303,7 @@ describe("CommandPalette — sessions", () => {
   it("shows only one loading message during the initial session fetch", () => {
     setSessions([], true);
     renderPalette({ sessionsOnly: true });
-    expect(screen.getByRole("status").textContent).toBe("Loading sessions…");
+    expect(announced()).toBe("Loading sessions…");
     expect(screen.queryByText("Searching…")).toBeNull();
     expect(screen.queryByText("No results found")).toBeNull();
   });
@@ -208,11 +325,37 @@ describe("CommandPalette — sessions", () => {
     expect(fetchNextPage).toHaveBeenCalledOnce();
   });
 
+  it("keeps the match cap visible beside a load error", () => {
+    useConversations.mockReturnValue({
+      data: {
+        pages: [{ data: Array.from({ length: 60 }, (_, i) => conv(`c${i}`, `Session ${i}`)) }],
+      },
+      isFetching: false,
+      hasNextPage: true,
+      isFetchNextPageError: true,
+      fetchNextPage: vi.fn(),
+    });
+    renderPalette({ sessionsOnly: true });
+    expect(screen.getByText("Couldn't load more sessions.")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Retry" })).toBeTruthy();
+    expect(screen.getByText(/Showing 50 of 60 matches\./)).toBeTruthy();
+  });
+
+  it("keeps the match cap visible while sessions reload", () => {
+    setSessions(
+      Array.from({ length: 60 }, (_, i) => conv(`c${i}`, `Session ${i}`)),
+      true,
+    );
+    renderPalette({ sessionsOnly: true });
+    expect(screen.getByText("Loading sessions…")).toBeTruthy();
+    expect(screen.getByText(/Showing 50 of 60 matches\./)).toBeTruthy();
+  });
+
   it("bounds rendered rows while searching every loaded session", () => {
     setSessions(Array.from({ length: 100 }, (_, i) => conv(`c${i}`, `Session ${i}`)));
     renderPalette({ sessionsOnly: true });
     expect(screen.getAllByRole("option")).toHaveLength(50);
-    expect(screen.getByRole("status").textContent).toContain("Showing 50 of 100 matches.");
+    expect(announced()).toContain("Showing 50 of 100 matches.");
     fireEvent.change(screen.getByTestId("command-palette-input"), { target: { value: "Session" } });
     expect(screen.getAllByRole("option")).toHaveLength(50);
     expect(document.querySelector("mark")?.textContent).toBe("Session");
@@ -223,6 +366,25 @@ describe("CommandPalette — sessions", () => {
     fireEvent.keyDown(screen.getByTestId("command-palette-input"), { key: "Enter" });
     expect(navigate).toHaveBeenCalledWith("/c/c99");
   });
+  it("shows each action's chord beside its row, and hides the workspace chord on grid routes", () => {
+    const chordsFor = (label: string) =>
+      Array.from(
+        screen
+          .getByText(label)
+          .closest('[role="option"]')!
+          .querySelectorAll<HTMLElement>('[data-slot="kbd"]'),
+      ).map((key) => key.textContent);
+    renderPalette();
+    expect(chordsFor("Go to Settings")).toEqual([MOD_KEY, ALT_KEY, ","]);
+    expect(chordsFor("Toggle conversations sidebar")).toEqual([MOD_KEY, ALT_KEY, "["]);
+    expect(chordsFor("Toggle workspace sidebar")).toEqual([MOD_KEY, ALT_KEY, "]"]);
+    expect(chordsFor("Go to Inbox")).toEqual([]);
+    cleanup();
+
+    renderPalette({ rightSidebarShortcutEnabled: false });
+    expect(chordsFor("Toggle workspace sidebar")).toEqual([]);
+  });
+
   it("lists sessions by display label with their agent type", () => {
     setSessions([conv("c1", "Fix the parser", "research-agent"), conv("c2", null)]);
     renderPalette();
@@ -309,6 +471,31 @@ describe("CommandPalette — sessions", () => {
     }
   });
 
+  it("lists recent sessions newest first after a pushed update reorders them", () => {
+    // The updates stream patches updated_at in place without refetching, so
+    // the cached page can hold a just-bumped session below older ones.
+    useConversations.mockReturnValue({
+      data: {
+        pages: [
+          {
+            data: [
+              { ...conv("older", "Older session"), updated_at: 1 },
+              { ...conv("bumped", "Bumped session"), updated_at: 3 },
+              { ...conv("middle", "Middle session"), updated_at: 2 },
+            ],
+          },
+        ],
+      },
+      isFetching: false,
+    });
+    renderPalette();
+    const rows = screen
+      .getAllByRole("option")
+      .map((option) => option.textContent ?? "")
+      .filter((text) => text.includes(" session"));
+    expect(rows.map((text) => text.split(" session")[0])).toEqual(["Bumped", "Middle", "Older"]);
+  });
+
   it("dedupes sessions that appear on overlapping pages", () => {
     useConversations.mockReturnValue({
       data: {
@@ -322,16 +509,20 @@ describe("CommandPalette — sessions", () => {
     expect(screen.getByText("Two")).toBeTruthy();
   });
 
-  it("indents session rows so their label aligns with the icon-prefixed actions", () => {
-    setSessions([conv("c1", "Fix the parser")]);
-    renderPalette();
+  // The QuickPick palette aligns them with a blank icon slot; its own test covers that.
+  it.skipIf("QUICK_PICK_PALETTE" in commandPaletteModule)(
+    "indents session rows so their label aligns with the icon-prefixed actions",
+    () => {
+      setSessions([conv("c1", "Fix the parser")]);
+      renderPalette();
 
-    // Session items carry no leading icon, so they're padded to line up with
-    // the Action rows' icon + gap. Assert the class so the alignment can't
-    // silently regress.
-    const item = screen.getByText("Fix the parser").closest("[data-slot=command-item]");
-    expect(item?.className).toContain("pl-6");
-  });
+      // Session items carry no leading icon, so they're padded to line up with
+      // the Action rows' icon + gap. Assert the class so the alignment can't
+      // silently regress.
+      const item = screen.getByText("Fix the parser").closest("[data-slot=command-item]");
+      expect(item?.className).toContain("pl-6");
+    },
+  );
 });
 
 describe("CommandPalette — match preview", () => {
@@ -345,6 +536,34 @@ describe("CommandPalette — match preview", () => {
 
   beforeEach(() => vi.useFakeTimers());
   afterEach(() => vi.useRealTimers());
+
+  it("keeps parent and project context alongside archived content matches", () => {
+    useProjects.mockReturnValue({ data: [{ id: "project", name: "Search project" }] });
+    setSearchGroups({
+      content: searchPages([
+        {
+          ...conv("content", "Investigation", "codex", "The matcher uses a shared index"),
+          project_id: "project",
+          archived: true,
+          family: {
+            id: "family",
+            representative_id: "parent",
+            representative_title: "Search planning",
+            pinned: false,
+          },
+        },
+      ]),
+    });
+    renderPalette();
+    search("matcher");
+    expect(
+      screen.getByRole("option", {
+        name: /Investigation.*Project:\s*Search project.*Nested under:\s*Search planning/,
+      }),
+    ).toBeTruthy();
+    expect(screen.getByText("Archived")).toBeTruthy();
+    expect(labelRow("The matcher uses a shared index")).toBeTruthy();
+  });
 
   it("shows the content snippet as a second line when the match is in the body", () => {
     setSearchGroups({
@@ -392,7 +611,7 @@ describe("CommandPalette — input", () => {
 });
 
 describe("CommandPalette — mobile full-screen sheet", () => {
-  // useIsMobileViewport reads window.matchMedia("(max-width: 767.98px)").matches.
+  // useIsMobileViewport reads window.matchMedia("(max-width: 1180.98px)").matches.
   // The global test-setup stubs matchMedia to always report false (desktop);
   // flip it here so the palette renders its keyboard-safe mobile layout.
   function setMobile(isMobile: boolean) {
@@ -520,6 +739,24 @@ describe("CommandPalette — title and content groups", () => {
     expect(onOpenChange).toHaveBeenCalledWith(false);
   });
 
+  it("keeps the picked search row, with its owner, for the sidebar to list", () => {
+    const sharedRetro = {
+      ...conv("retro", "Kestrel retro"),
+      archived: true,
+      owner: "teammate",
+      permission_level: 2,
+    };
+    setSearchGroups({ title: searchPages([sharedRetro]) });
+    const queryClient = new QueryClient();
+    renderPalette({}, queryClient);
+    search("kestrel");
+
+    fireEvent.click(labelRow("Kestrel retro"));
+
+    expect(navigate).toHaveBeenCalledWith("/c/retro");
+    expect(queryClient.getQueryData(["conversation-backfill", "retro"])).toEqual(sharedRetro);
+  });
+
   it("does not search while the palette is closed or listing sessions only", () => {
     renderPalette({ open: false });
     expect(useSessionSearch).toHaveBeenCalledWith("", "title", { enabled: false, limit: 8 });
@@ -544,7 +781,9 @@ describe("CommandPalette — title and content groups", () => {
       onToggleLeftSidebar: vi.fn(),
       onToggleRightSidebar: vi.fn(),
     };
-    const { rerender } = render(<CommandPalette {...props} />);
+    const { rerender } = render(<CommandPalette {...props} />, {
+      wrapper: withQueryClient(),
+    });
     search("kestrel");
     setSearchGroups({
       title: searchPages([conv("title", "Kestrel plan")]),
@@ -570,7 +809,9 @@ describe("CommandPalette — title and content groups", () => {
       onToggleLeftSidebar: vi.fn(),
       onToggleRightSidebar: vi.fn(),
     };
-    const { rerender } = render(<CommandPalette {...props} />);
+    const { rerender } = render(<CommandPalette {...props} />, {
+      wrapper: withQueryClient(),
+    });
     search("kestrel");
     const input = screen.getByTestId("command-palette-input");
     fireEvent.keyDown(input, { key: "ArrowDown" });
@@ -595,7 +836,9 @@ describe("CommandPalette — title and content groups", () => {
       onToggleLeftSidebar: vi.fn(),
       onToggleRightSidebar: vi.fn(),
     };
-    const { rerender } = render(<CommandPalette {...props} />);
+    const { rerender } = render(<CommandPalette {...props} />, {
+      wrapper: withQueryClient(),
+    });
     fireEvent.keyDown(screen.getByTestId("command-palette-input"), { key: "ArrowDown" });
     rerender(<CommandPalette {...props} open={false} />);
     rerender(<CommandPalette {...props} />);
@@ -615,7 +858,9 @@ describe("CommandPalette — title and content groups", () => {
       onToggleLeftSidebar: vi.fn(),
       onToggleRightSidebar: vi.fn(),
     };
-    const { rerender } = render(<CommandPalette {...props} />);
+    const { rerender } = render(<CommandPalette {...props} />, {
+      wrapper: withQueryClient(),
+    });
     search("kestrel");
     fireEvent.pointerMove(screen.getByText("In messages"));
     setSearchGroups({
@@ -643,7 +888,9 @@ describe("CommandPalette — title and content groups", () => {
       onToggleLeftSidebar: vi.fn(),
       onToggleRightSidebar: vi.fn(),
     };
-    const { rerender } = render(<CommandPalette {...props} />);
+    const { rerender } = render(<CommandPalette {...props} />, {
+      wrapper: withQueryClient(),
+    });
     search("deploy");
     fireEvent.click(screen.getByText("Show more"));
     expect(fetchContentPage).toHaveBeenCalledOnce();
@@ -658,6 +905,49 @@ describe("CommandPalette — title and content groups", () => {
     expect(navigate).toHaveBeenCalledWith("/c/c3");
   });
 
+  it("offers no Show more for a group whose matches all appear under Sessions", () => {
+    setSearchGroups({
+      title: searchPages([conv("same", "Deploy plan")]),
+      content: {
+        ...searchPages([conv("same", "Deploy plan", null, "deploy on Friday")]),
+        hasNextPage: true,
+        fetchNextPage: vi.fn(),
+      },
+    });
+    renderPalette();
+    search("deploy");
+    expect(screen.queryByText("In messages")).toBeNull();
+    expect(screen.queryByText("Show more")).toBeNull();
+    expect(screen.getAllByRole("option")).toHaveLength(1);
+  });
+
+  it("starts from the top row again after Show more and a reopen", () => {
+    setSessions([conv("recent", "Recent session"), conv("parked", "Deploy plan")]);
+    setSearchGroups({
+      title: {
+        ...searchPages([conv("parked", "Deploy plan")]),
+        hasNextPage: true,
+        fetchNextPage: vi.fn(),
+      },
+    });
+    const props = {
+      open: true,
+      onOpenChange: vi.fn(),
+      onToggleLeftSidebar: vi.fn(),
+      onToggleRightSidebar: vi.fn(),
+    };
+    const { rerender } = render(<CommandPalette {...props} />, { wrapper: withQueryClient() });
+    search("deploy");
+    fireEvent.click(screen.getByText("Show more"));
+    rerender(<CommandPalette {...props} open={false} />);
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
+    rerender(<CommandPalette {...props} />);
+    fireEvent.keyDown(screen.getByTestId("command-palette-input"), { key: "Enter" });
+    expect(navigate).toHaveBeenCalledWith("/c/recent");
+  });
+
   it("holds the search until server info loads, then sends only the grouped requests", () => {
     serverInfo.mockReturnValue("loading");
     const props = {
@@ -666,7 +956,9 @@ describe("CommandPalette — title and content groups", () => {
       onToggleLeftSidebar: vi.fn(),
       onToggleRightSidebar: vi.fn(),
     };
-    const { rerender } = render(<CommandPalette {...props} />);
+    const { rerender } = render(<CommandPalette {...props} />, {
+      wrapper: withQueryClient(),
+    });
     search("deploy");
 
     // Nothing is enabled yet, and the palette shows it is still searching.
@@ -692,7 +984,9 @@ describe("CommandPalette — title and content groups", () => {
       onToggleLeftSidebar: vi.fn(),
       onToggleRightSidebar: vi.fn(),
     };
-    const { rerender } = render(<CommandPalette {...props} />);
+    const { rerender } = render(<CommandPalette {...props} />, {
+      wrapper: withQueryClient(),
+    });
     search("deploy");
     const enabledScopes = () =>
       new Set(
@@ -789,7 +1083,7 @@ describe("CommandPalette — title and content groups", () => {
     renderPalette();
     search("deploy");
 
-    expect(screen.getByRole("status").textContent).toContain("Couldn't load more sessions.");
+    expect(announced()).toContain("Couldn't load more sessions.");
     // A slow content request doesn't block retrying the failed title page.
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     expect(fetchTitlePage).toHaveBeenCalledOnce();
@@ -806,7 +1100,7 @@ describe("CommandPalette — title and content groups", () => {
     renderPalette();
     search("deploy");
 
-    expect(screen.getByRole("status").textContent).toContain("Couldn't load sessions.");
+    expect(announced()).toContain("Couldn't load sessions.");
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
     expect(refetchContent).toHaveBeenCalledOnce();
     expect(refetchTitle).not.toHaveBeenCalled();
@@ -853,8 +1147,8 @@ describe("CommandPalette — actions", () => {
       target: { value: "settings" },
     });
 
-    expect(screen.getByText("Go to Settings")).toBeTruthy();
-    expect(screen.queryByText("New chat")).toBeNull();
+    expect(screen.getByRole("option", { name: /Go to Settings/ })).toBeTruthy();
+    expect(screen.queryByRole("option", { name: /New chat/ })).toBeNull();
   });
 });
 

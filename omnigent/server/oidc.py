@@ -57,6 +57,14 @@ def parse_reauth_max_age(raw: str | None) -> int:
     return seconds
 
 
+def _parse_strict_flag(name: str) -> bool:
+    """Read an on-by-default env flag: ``0``/``false``/``no`` disable it; typos raise."""
+    raw = os.environ.get(name, "").strip().lower()
+    if raw not in {"", "1", "true", "yes", "0", "false", "no"}:
+        raise RuntimeError(f"{name} must be 1/true/yes or 0/false/no")
+    return raw not in {"0", "false", "no"}
+
+
 # ── PKCE helpers (RFC 7636) ──────────────────────────────────────
 
 
@@ -224,10 +232,14 @@ class OIDCConfig:
     :param reauth_max_age_seconds: ``max_age`` sent on a forced re-auth,
         from ``OMNIGENT_OIDC_REAUTH_MAX_AGE``, e.g. ``300``.
     :param require_reauth: When ``False``, forced re-authentication
-        logins (CLI tickets, device consent) still send
-        ``prompt=login`` and ``max_age`` but skip verifying the
-        id_token's ``auth_time``. Validated for every provider, but
-        GitHub never forces re-authentication, so it has no effect there.
+        logins (CLI tickets, device consent) skip verifying the
+        id_token's ``auth_time``; they still send ``prompt=login`` and
+        ``max_age`` unless ``reauth_prompt`` is also ``False``. Validated
+        for every provider, but GitHub never forces re-authentication, so
+        it has no effect there.
+    :param reauth_prompt: When ``False``, forced re-authentication logins
+        omit ``prompt=login`` and ``max_age`` for IdPs that fail such
+        requests. Requires ``require_reauth`` to be ``False``.
     """
 
     issuer: str
@@ -249,6 +261,7 @@ class OIDCConfig:
     email_claim: str = "email"
     reauth_max_age_seconds: int = DEFAULT_REAUTH_MAX_AGE_SECONDS
     require_reauth: bool = True
+    reauth_prompt: bool = True
 
     @property
     def base_url(self) -> str:
@@ -415,12 +428,24 @@ class OIDCConfig:
 
         # Some IdPs (e.g. Cloudflare Access) omit auth_time or ignore
         # max_age, so forced re-authentication can never be verified.
-        # Only an explicit false value waives the check; typos fail startup.
-        raw_require_reauth = os.environ.get("OMNIGENT_OIDC_REQUIRE_REAUTH", "").strip().lower()
-        if raw_require_reauth not in {"", "1", "true", "yes", "0", "false", "no"}:
-            raise RuntimeError("OMNIGENT_OIDC_REQUIRE_REAUTH must be 1/true/yes or 0/false/no")
-        require_reauth = raw_require_reauth not in {"0", "false", "no"}
-        if not require_reauth and not is_github:
+        require_reauth = _parse_strict_flag("OMNIGENT_OIDC_REQUIRE_REAUTH")
+        # Some IdPs (e.g. GitLab) fail authorization requests that carry
+        # prompt=login or max_age, so they must not be sent at all.
+        reauth_prompt = _parse_strict_flag("OMNIGENT_OIDC_REAUTH_PROMPT")
+        if require_reauth and not reauth_prompt:
+            raise RuntimeError(
+                "OMNIGENT_OIDC_REAUTH_PROMPT=0 requires OMNIGENT_OIDC_REQUIRE_REAUTH=0: "
+                "without prompt=login the IdP cannot confirm re-authentication"
+            )
+        if not reauth_prompt and not is_github:
+            _logger.warning(
+                "OMNIGENT_OIDC_REAUTH_PROMPT is disabled: CLI, host, and "
+                "device-approval logins do not ask %s to re-authenticate, so "
+                "an existing IdP session is reused and only the consent "
+                "screen confirms the request.",
+                issuer,
+            )
+        elif not require_reauth and not is_github:
             _logger.warning(
                 "OMNIGENT_OIDC_REQUIRE_REAUTH is disabled: CLI, host, and "
                 "device-approval logins still ask %s to re-authenticate, but "
@@ -489,6 +514,7 @@ class OIDCConfig:
                 allow_invites=allow_invites,
                 skip_email_verification=skip_email_verification,
                 require_reauth=require_reauth,
+                reauth_prompt=reauth_prompt,
             )
 
         # Standard OIDC: fetch discovery document.
@@ -537,4 +563,5 @@ class OIDCConfig:
             email_claim=email_claim,
             reauth_max_age_seconds=reauth_max_age_seconds,
             require_reauth=require_reauth,
+            reauth_prompt=reauth_prompt,
         )

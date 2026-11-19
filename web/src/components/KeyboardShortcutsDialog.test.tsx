@@ -1,5 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { MemoryRouter } from "react-router-dom";
 
 import {
   KeyboardShortcutsDialog,
@@ -13,11 +14,14 @@ import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPr
 const isNativeShell = vi.fn(() => false);
 const isElectronShell = vi.fn(() => false);
 const supportsBrowser = vi.fn(() => false);
+const supportsDesktopCommands = vi.fn(() => false);
 const contentSearchEnabled = vi.fn(() => false);
 const gridsEnabled = vi.fn(() => false);
 const splitTerminalEnabled = vi.fn(() => false);
+const siblingSessionsEnabled = vi.fn(() => false);
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
+    sibling_sessions: siblingSessionsEnabled(),
     features: {
       workspace_content_search: contentSearchEnabled(),
       grid_sessions_display_ui: gridsEnabled(),
@@ -29,6 +33,7 @@ vi.mock("@/lib/nativeBridge", () => ({
   isNativeShell: () => isNativeShell(),
   isElectronShell: () => isElectronShell(),
   supportsBrowser: () => supportsBrowser(),
+  supportsDesktopCommands: () => supportsDesktopCommands(),
   // DialogContent (rendered here) reads isIOSShell to size modals for the iOS
   // keyboard; this suite exercises the browser path, so it's always false.
   isIOSShell: () => false,
@@ -38,9 +43,11 @@ beforeEach(() => {
   isNativeShell.mockReturnValue(false);
   isElectronShell.mockReturnValue(false);
   supportsBrowser.mockReturnValue(false);
+  supportsDesktopCommands.mockReturnValue(false);
   contentSearchEnabled.mockReturnValue(false);
   gridsEnabled.mockReturnValue(false);
   splitTerminalEnabled.mockReturnValue(false);
+  siblingSessionsEnabled.mockReturnValue(false);
   localStorage.clear();
 });
 afterEach(() => {
@@ -77,11 +84,11 @@ describe("KeyboardShortcutsList composer rows", () => {
     expect(keysFor("New line in message")).toEqual(["↵"]);
   });
 
-  it("does not advertise inactive composer chords on touch-primary devices", () => {
+  it("does not advertise inactive composer chords in the mobile layout", () => {
     const matchMedia = window.matchMedia;
     vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
       ...matchMedia(query),
-      matches: query.includes("pointer: coarse"),
+      matches: query.includes("max-width"),
     }));
     render(<KeyboardShortcutsList />);
 
@@ -92,7 +99,11 @@ describe("KeyboardShortcutsList composer rows", () => {
 
 describe("KeyboardShortcutsList settings layout", () => {
   it("groups shortcut rows into settings cards", () => {
-    render(<KeyboardShortcutsList variant="settings" />);
+    render(
+      <MemoryRouter>
+        <KeyboardShortcutsList variant="settings" />
+      </MemoryRouter>,
+    );
 
     const heading = screen.getByRole("heading", { name: "General" });
     const list = heading.closest("section")?.querySelector("ul");
@@ -133,12 +144,27 @@ describe("KeyboardShortcutsDialog", () => {
     expect(keysFor("Find a session by name")).toEqual(["Ctrl", "Alt", "S"]);
   });
 
+  it("shows Add nested agent only when sibling sessions are available", () => {
+    const { rerender } = render(<KeyboardShortcutsList />);
+    expect(screen.queryByText("Add nested agent")).toBeNull();
+    siblingSessionsEnabled.mockReturnValue(true);
+    rerender(<KeyboardShortcutsList />);
+    expect(keysFor("Add nested agent")).toEqual(["Ctrl", "Alt", "A"]);
+  });
+
   it("keeps native new-session keys and updates the Settings reference", () => {
-    const { rerender } = render(<KeyboardShortcutsList variant="settings" />);
+    const settingsList = () => (
+      <MemoryRouter>
+        <KeyboardShortcutsList variant="settings" />
+      </MemoryRouter>
+    );
+    const { rerender } = render(settingsList());
     expect(keysFor("Start a new session")).toEqual(["Ctrl", "Shift", "O"]);
     isNativeShell.mockReturnValue(true);
-    rerender(<KeyboardShortcutsList variant="settings" />);
-    expect(keysFor("Start a new session")).toEqual(["Ctrl", "Alt", "N"]);
+    rerender(settingsList());
+    expect(keysFor("Start a new session")).toEqual(["Ctrl", "N"]);
+    expect(keysFor("Toggle conversations sidebar")).toEqual(["Ctrl", "B"]);
+    expect(keysFor("Toggle workspace sidebar")).toEqual(["Ctrl", "⇧", "B"]);
   });
 
   it("renders nothing until opened", () => {
@@ -157,32 +183,38 @@ describe("KeyboardShortcutsDialog", () => {
     expect(screen.getByText("Open command palette")).toBeTruthy();
     expect(keysFor("Open Settings")).toEqual(["Ctrl", "Alt", ","]);
     expect(keysFor("Rename current session")).toEqual(["Ctrl", "Alt", "R"]);
+    expect(keysFor("Mark current session unread or read")).toEqual(["Ctrl", "Alt", "U"]);
     expect(screen.getByText("Show keyboard shortcuts")).toBeTruthy();
     expect(screen.getByText("Send message")).toBeTruthy();
     expect(keysFor("Open model picker")).toEqual(["Ctrl", "⇧", "M"]);
     expect(keysFor("Cycle permission mode (in session)")).toEqual(["⇧", "Tab"]);
     expect(screen.getByText("Recall previous prompt")).toBeTruthy();
-    expect(screen.getByText("Previous session")).toBeTruthy();
-    expect(keysFor("Previous session")).toEqual(["Ctrl", "["]);
-    expect(keysFor("Next session")).toEqual(["Ctrl", "]"]);
+    // A browser tab keeps its own Back and Forward.
+    expect(screen.queryByText("Go back")).toBeNull();
+    expect(screen.queryByText("Go forward")).toBeNull();
     expect(keysFor("Toggle Chat / Terminal view")).toEqual(["Ctrl", "Alt", "\\"]);
     expect(screen.getByText("Toggle conversations sidebar")).toBeTruthy();
-    expect(screen.getByText("Focus or close workspace sidebar")).toBeTruthy();
+    expect(screen.getByText("Toggle workspace sidebar")).toBeTruthy();
     expect(screen.queryByText("Open a new browser tab")).toBeNull();
     expect(screen.getByText("Open a new shell")).toBeTruthy();
-    const workspaceTabRow = screen.getByText("Select a workspace tab").closest("li");
-    expect(keysFor("Select a workspace tab")).toEqual(["Ctrl", "Alt", "]", "1…4"]);
-    expect(workspaceTabRow?.textContent?.match(/\+/g)).toHaveLength(1);
+    expect(keysFor("Toggle conversations sidebar")).toEqual(["Ctrl", "Alt", "["]);
+    expect(keysFor("Toggle workspace sidebar")).toEqual(["Ctrl", "Alt", "]"]);
+    // Ctrl+digit opens sidebar sessions off macOS, so the tab chord takes Alt.
+    expect(keysFor("Select a workspace tab")).toEqual(["Alt", "1…4"]);
     expect(screen.getByText("Navigate suggestions")).toBeTruthy();
   });
 
-  it("shows the Browser shortcut only when the desktop bridge supports it", () => {
+  it("shows the Browser shortcut only when the desktop menu owns ⌘T", () => {
     const { rerender } = render(<KeyboardShortcutsList />);
     expect(screen.queryByText("Open a new browser tab")).toBeNull();
 
     supportsBrowser.mockReturnValue(true);
     rerender(<KeyboardShortcutsList />);
-    expect(keysFor("Open a new browser tab")).toEqual(["Ctrl", "Alt", "B"]);
+    expect(screen.queryByText("Open a new browser tab")).toBeNull();
+
+    supportsDesktopCommands.mockReturnValue(true);
+    rerender(<KeyboardShortcutsList />);
+    expect(keysFor("Open a new browser tab")).toEqual(["Ctrl", "T"]);
   });
 
   it("toggles closed on a second hotkey press", async () => {
@@ -204,7 +236,7 @@ describe("KeyboardShortcutsDialog", () => {
   it("shows the pinned-session shortcut with the Alt chord in a plain browser", () => {
     render(<KeyboardShortcutsDialog />);
     toggleViaHotkey();
-    const row = screen.getByText("Jump to pinned session (1–10)").closest("li");
+    const row = screen.getByText("Jump to a sidebar session (1–10)").closest("li");
     expect(row).toBeTruthy();
     // Browser chord adds Alt (jsdom navigator is non-mac → "Alt") + the 1…0 chip.
     expect(within(row!).getByText("Alt")).toBeTruthy();
@@ -215,13 +247,13 @@ describe("KeyboardShortcutsDialog", () => {
     isNativeShell.mockReturnValue(true);
     render(<KeyboardShortcutsDialog />);
     toggleViaHotkey();
-    const row = screen.getByText("Jump to pinned session (1–10)").closest("li");
+    const row = screen.getByText("Jump to a sidebar session (1–10)").closest("li");
     expect(row).toBeTruthy();
     expect(within(row!).queryByText("Alt")).toBeNull();
     expect(within(row!).getByText("1…0")).toBeTruthy();
   });
 
-  it("shows the recent-session switcher only in Electron", () => {
+  it("shows the recent-session switcher and Back/Forward only in Electron", () => {
     const { rerender } = render(<KeyboardShortcutsList />);
     expect(screen.queryByText("Switch recent sessions")).toBeNull();
 
@@ -229,8 +261,63 @@ describe("KeyboardShortcutsDialog", () => {
     isElectronShell.mockReturnValue(true);
     rerender(<KeyboardShortcutsList />);
     expect(keysFor("Switch recent sessions")).toEqual(["Ctrl", "Tab"]);
+    expect(keysFor("Go back")).toEqual(["Ctrl", "["]);
+    expect(keysFor("Go forward")).toEqual(["Ctrl", "]"]);
     expect(
       screen.getByRole("heading", { name: "Navigation" }).closest("section")?.querySelector("li"),
     ).toHaveTextContent("Switch recent sessions");
+  });
+
+  it("lists ⌃` for a new shell", () => {
+    render(<KeyboardShortcutsList />);
+    expect(keysFor("Open a new shell")).toEqual(["Ctrl", "`"]);
+  });
+
+  it("lists the desktop menu commands only when the shell hands them to the page", () => {
+    supportsBrowser.mockReturnValue(true);
+    const { rerender } = render(<KeyboardShortcutsList />);
+    expect(screen.queryByText("Close tab, or leave the session")).toBeNull();
+    expect(screen.queryByText("Quit Omnigent")).toBeNull();
+    expect(screen.queryByText("Reload the browser tab")).toBeNull();
+    expect(screen.queryByText("Open a new browser tab")).toBeNull();
+    expect(keysFor("Open Settings")).toEqual(["Ctrl", "Alt", ","]);
+
+    supportsDesktopCommands.mockReturnValue(true);
+    rerender(<KeyboardShortcutsList />);
+    expect(keysFor("Open Settings")).toEqual(["Ctrl", ","]);
+    expect(keysFor("Close tab, or leave the session")).toEqual(["Ctrl", "W"]);
+    expect(keysFor("Close window")).toEqual(["Ctrl", "⇧", "W"]);
+    expect(keysFor("Pin or unpin current session")).toEqual(["Ctrl", "Alt", "P"]);
+    expect(keysFor("Archive current session")).toEqual(["Ctrl", "⇧", "A"]);
+    expect(keysFor("Fork current session")).toEqual(["Ctrl", "Alt", "F"]);
+    expect(keysFor("Quit Omnigent")).toEqual(["Ctrl", "Q"]);
+    expect(keysFor("Open a new browser tab")).toEqual(["Ctrl", "T"]);
+    expect(keysFor("Reload the browser tab")).toEqual(["Ctrl", "R"]);
+    expect(keysFor("Focus the browser address bar")).toEqual(["Ctrl", "L"]);
+    expect(keysFor("Show the next workspace tab")).toEqual(["Ctrl", "⇧", "]"]);
+    expect(keysFor("Reopen the last closed tab")).toEqual(["Ctrl", "⇧", "T"]);
+  });
+});
+
+describe("KeyboardShortcutsList question rows", () => {
+  it("lists the question keys with the chat shortcuts on desktop", () => {
+    render(<KeyboardShortcutsList />);
+
+    expect(keysFor("Next question, or submit all answers")).toEqual(["↵"]);
+    expect(keysFor("Pick a question option by number")).toEqual(["1…9"]);
+    expect(keysFor("Cancel pending question")).toEqual(["Esc"]);
+  });
+
+  it("hides the question keys in the mobile layout", () => {
+    const matchMedia = window.matchMedia;
+    vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
+      ...matchMedia(query),
+      matches: query.includes("max-width"),
+    }));
+    render(<KeyboardShortcutsList />);
+
+    expect(screen.queryByText("Next question, or submit all answers")).toBeNull();
+    expect(screen.queryByText("Pick a question option by number")).toBeNull();
+    expect(screen.queryByText("Cancel pending question")).toBeNull();
   });
 });

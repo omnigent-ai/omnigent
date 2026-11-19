@@ -8,7 +8,7 @@ import json
 import logging
 import secrets
 import threading
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from typing import Any, Literal, cast, get_args
 
@@ -41,6 +41,7 @@ from omnigent.stores.conversation_store import ConversationAlreadyExistsError
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
+from omnigent.tools.browser_agent_tools import browser_agent_tools_creation_labels
 
 _logger = logging.getLogger(__name__)
 
@@ -377,6 +378,7 @@ def create_imports_router(
         host_id: str | None = None,
         archived: bool = False,
         replace_conversation_id: str | None = None,
+        request_headers: Mapping[str, str] | None = None,
     ) -> tuple[str, str | None]:
         """Create the conversation, append items, stamp import labels, grant owner.
 
@@ -389,7 +391,9 @@ def create_imports_router(
         resuming defaults to the machine the workspace lives on; bound only
         alongside a workspace (the ``ck_conversations_workspace_required_for_host``
         check constraint). ``archived`` files the session under Archived
-        sessions when the harness had archived it. Caller authorizes any
+        sessions when the harness had archived it. ``request_headers`` are the
+        import request's; the desktop app's browser-tool header labels the
+        session as on a create. Caller authorizes any
         ``replace_conversation_id``; replacement waits until validation
         succeeds. Returns ``(conversation id, title)``.
         """
@@ -434,8 +438,11 @@ def create_imports_router(
         workspace = resolved_create.body.workspace
         resolved_host_id = resolved_create.body.host_id
         title = (native_title or "").strip() or title_from_items(items)
-        if replace_conversation_id is not None:
-            await conversation_store.delete_conversation(replace_conversation_id)
+        conversation_id = _import_conversation_id(source, external_session_id)
+        if replace_conversation_id == conversation_id:
+            await conversation_store.delete_conversation(
+                conversation_id, preserve_host_binding=resolved_host_id
+            )
         try:
             conversation = await asyncio.to_thread(
                 conversation_store.create_conversation,
@@ -443,7 +450,7 @@ def create_imports_router(
                 agent_id=agent_id,
                 host_id=resolved_host_id,
                 workspace=workspace,
-                conversation_id=_import_conversation_id(source, external_session_id),
+                conversation_id=conversation_id,
                 project_id=resolved_create.project_id,
             )
         except ConversationAlreadyExistsError as exc:
@@ -464,6 +471,7 @@ def create_imports_router(
                 **native_agent.presentation_labels,
                 IMPORT_SOURCE_LABEL_KEY: source,
                 IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY: external_session_id,
+                **browser_agent_tools_creation_labels(request_headers or {}),
             }
             await asyncio.to_thread(conversation_store.set_labels, conversation.id, labels)
             if archived:
@@ -483,6 +491,8 @@ def create_imports_router(
         except Exception:
             await conversation_store.delete_conversation(conversation.id)
             raise
+        if replace_conversation_id is not None and replace_conversation_id != conversation.id:
+            await conversation_store.delete_conversation(replace_conversation_id)
         return conversation.id, title
 
     @router.post(
@@ -532,6 +542,7 @@ def create_imports_router(
             host_id=body.host_id,
             archived=body.archived,
             replace_conversation_id=existing.id if existing is not None else None,
+            request_headers=request.headers,
         )
 
         response.status_code = 201
@@ -573,6 +584,7 @@ def create_imports_router(
         host_conn: HostConnection,
         counts: dict[str, int],
         failures: list[ImportFailureRef],
+        request_headers: Mapping[str, str],
     ) -> AsyncIterator[ImportedSessionRef]:
         """Import the host's requested sessions, one at a time.
 
@@ -663,6 +675,7 @@ def create_imports_router(
                     native_title=native_title if isinstance(native_title, str) else None,
                     host_id=body.host_id,
                     archived=session.get("archived") is True,
+                    request_headers=request_headers,
                 )
             except OmnigentError as exc:
                 # A create that lost the dedup race collides on the deterministic
@@ -729,7 +742,9 @@ def create_imports_router(
         sessions: list[ImportedSessionRef] = []
         failures: list[ImportFailureRef] = []
         try:
-            async for ref in _import_local_core(body, user_id, host_conn, counts, failures):
+            async for ref in _import_local_core(
+                body, user_id, host_conn, counts, failures, request.headers
+            ):
                 sessions.append(ref)
         except OmnigentError as exc:
             error_id, message = _record_local_import_failure(exc)
@@ -783,7 +798,9 @@ def create_imports_router(
             failures: list[ImportFailureRef] = []
             error: tuple[str, str] | None = None
             try:
-                async for ref in _import_local_core(body, user_id, host_conn, counts, failures):
+                async for ref in _import_local_core(
+                    body, user_id, host_conn, counts, failures, request.headers
+                ):
                     yield _import_event_line(
                         {"event": "session", "session_id": ref.session_id, "title": ref.title}
                     )
