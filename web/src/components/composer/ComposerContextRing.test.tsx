@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { ComposerContextRing } from "./ComposerContextRing";
+import { ComposerContextRing, contextUsedPercent } from "./ComposerContextRing";
 
 function renderRing(contextWindow: number | null, tokensUsed: number | null) {
   return render(
@@ -66,5 +66,18 @@ describe("ComposerContextRing", () => {
     const ring = screen.getByTestId("composer-context-ring");
     expect(ring).toHaveClass("text-muted-foreground");
     expect(ring.className).not.toMatch(/text-(warning|destructive)/);
+  });
+});
+
+describe("contextUsedPercent", () => {
+  it("rounds usage to a whole percent and clamps it at 100", () => {
+    expect(contextUsedPercent(1000, 123)).toBe(12);
+    expect(contextUsedPercent(1000, 4000)).toBe(100);
+  });
+
+  it("returns null when either figure is unknown or the window is not positive", () => {
+    expect(contextUsedPercent(null, 100)).toBeNull();
+    expect(contextUsedPercent(0, 100)).toBeNull();
+    expect(contextUsedPercent(1000, null)).toBeNull();
   });
 });
