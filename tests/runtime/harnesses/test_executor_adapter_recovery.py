@@ -507,14 +507,17 @@ async def test_cleanup_cannot_enable_unsafe_retry(
     assert executor.close_session_calls == 1
     assert adapter._orphan_callback_count == 0
     assert adapter._resyncing is False
+    with pytest.raises(RuntimeError, match="shutting down"):
+        await adapter._ensure_executor_for_turn()
 
-    # Counter resets on a clean turn start: a single later orphan does not
-    # immediately re-trip the watchdog.
+    # A new adapter starts a clean turn after the old one shuts down.
     executor2 = _FakeExecutor(events=[TurnComplete(response="ok")])
-    adapter._executor_factory = lambda: executor2
-    await adapter.run_turn(_request(), _ctx("resp_after_reset"))
-    assert adapter._orphan_callback_count == 0
+    next_adapter = ExecutorAdapter(executor_factory=lambda: executor2)
+    next_adapter._orphan_callback_count = 1
+    await next_adapter.run_turn(_request(), _ctx("resp_after_reset"))
+    assert next_adapter._orphan_callback_count == 0
     assert executor2.interrupt_calls == []
+    await next_adapter.on_shutdown()
 
 
 class _InterruptScriptExecutor(_FakeExecutor):
