@@ -5402,6 +5402,60 @@ class _SessionReboundDuringProvision(Exception):
 _SESSION_REBOUND_REASON = "session was bound to another host while its sandbox was provisioning"
 
 
+async def _stop_if_archived_while_provisioning(
+    session_id: str,
+    *,
+    conversation_store: ConversationStore,
+    host_store: HostStore,
+    host_registry: HostRegistry | None,
+    sandbox_config: ManagedSandboxDeployment,
+) -> None:
+    """
+    Tear down a session that was archived before its managed launch bound a host.
+
+    A managed create returns before its sandbox exists, so an archive whose
+    Undo grace ends during provisioning finds no host on the row and stops
+    nothing; the launch then binds and starts the host for an archived session.
+    Rescheduling the normal deferred teardown once the host is bound gives that
+    archive the same outcome as one made afterwards: it waits out a fresh Undo
+    grace, re-reads the archived flag, and keeps the owner, provider and
+    shared-sandbox guards of :func:`stop_archived_session_sandbox`.
+
+    Best-effort: a failed read leaves the sandbox to its idle stop.
+
+    :param session_id: Session the launch just bound, e.g. ``"conv_abc123"``.
+    :param conversation_store: Store holding the session row.
+    :param host_store: Persistent host registrations.
+    :param host_registry: Live host tunnels, or ``None`` in minimal wirings.
+    :param sandbox_config: The deployment's sandbox config.
+    """
+    try:
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    except Exception:  # noqa: BLE001 — the launch already succeeded; never fail it here
+        _logger.warning(
+            "Could not check whether session %s was archived while provisioning",
+            session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return
+    if conv is None or not conv.archived:
+        return
+    _logger.info(
+        "Session %s was archived while its sandbox was provisioning; scheduling its teardown",
+        session_id,
+        extra={"session_id": session_id},
+    )
+    _spawn_archive_stop(
+        session_id,
+        conversation_store,
+        get_server_runner_router(),
+        host_registry,
+        host_store=host_store,
+        sandbox_config=sandbox_config,
+    )
+
+
 async def _bind_and_launch_managed_runner(
     *,
     session_id: str,
@@ -5586,6 +5640,16 @@ async def _bind_and_launch_managed_runner(
                 return
         tracker.finish(session_id)
         _publish_sandbox_status(session_id, "ready")
+        # A relaunch is kicked by a message to the session, so it must not stop the
+        # sandbox that message is waiting on.
+        if relaunch_host is None:
+            await _stop_if_archived_while_provisioning(
+                session_id,
+                conversation_store=conversation_store,
+                host_store=host_store,
+                host_registry=host_registry,
+                sandbox_config=sandbox_config,
+            )
     except asyncio.CancelledError:
         cancelled = True
         raise
