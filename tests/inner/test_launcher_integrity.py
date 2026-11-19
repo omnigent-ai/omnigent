@@ -646,14 +646,16 @@ def test_isolated_pth_roots_follow_cpython_venv_config_layout(
     assert venv_site in roots
 
 
-def test_editable_finder_accepts_installed_setuptools_without_executing_it(tmp_path: Path) -> None:
-    from setuptools.command.editable_wheel import _finder_template
-
+def test_editable_finder_accepts_setuptools_84_without_executing_it(tmp_path: Path) -> None:
     site_dir = tmp_path / "site-packages"
     site_dir.mkdir()
     finder = site_dir / "__editable___sample_finder.py"
+    # Setuptools 84.2.0 generated this fixture independently of the allowlist.
+    template = (
+        Path(__file__).parent / "fixtures" / "setuptools_84_editable_finder.txt"
+    ).read_text()
     finder.write_text(
-        _finder_template(
+        template.format(
             name="__editable__.sample.finder",
             mapping={"sample": str(tmp_path / "package")},
             namespaces={"sample.assets": [str(tmp_path / "assets")]},
