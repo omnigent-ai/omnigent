@@ -15,6 +15,13 @@ export type { PathStoreCompareEntry as FileTreeCompareEntry } from "./path-store
 /** Orders siblings; folders and files alike, so a comparator may put folders first. */
 export type FileTreeSortComparator = PathStorePathComparator;
 
+/** Text a row shows after its name; `parts` color pieces of it, `title` explains it. */
+export interface FileTreeRowDecoration {
+  text: string;
+  title?: string;
+  parts?: readonly { text: string; color: string }[];
+}
+
 /** One change for `FileTreeModel.batch`; a folder needs `recursive` to remove its contents. */
 export type FileTreeBatchOperation =
   { type: "add"; path: string } | { type: "remove"; path: string; recursive?: boolean };

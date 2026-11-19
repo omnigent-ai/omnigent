@@ -17,13 +17,16 @@ import {
   GIT_STATUS_TITLE,
 } from "./gitStatus";
 import { Icon } from "./Icon";
+import { MiddleTruncate } from "./MiddleTruncate";
 import { FILE_TREE_SPRITE_SHEET, resolveFileIcon } from "./icons";
 import { FileTreeModel } from "./model";
 import { computeFileTreeRowClickPlan } from "./rowClickPlan";
 import { computeScrollTarget, computeWindow } from "./scroll";
-import type { FileTreeOptions, FileTreeVisibleRow } from "./types";
+import type { FileTreeOptions, FileTreeRowDecoration, FileTreeVisibleRow } from "./types";
 
 export const FILE_TREE_ITEM_HEIGHT = 30;
+/** Matches a rendered tree's root element, which holds its rows. */
+export const FILE_TREE_ROOT_SELECTOR = "[data-file-tree]";
 const OVERSCAN = 10;
 const FALLBACK_VIEWPORT_HEIGHT = 420;
 
@@ -43,16 +46,31 @@ export interface FileTreeProps {
   className?: string;
   style?: CSSProperties;
   "aria-label"?: string;
+  /** Text after a row's name, such as line counts; rows repaint with the model. */
+  renderRowDecoration?: (row: FileTreeVisibleRow) => FileTreeRowDecoration | null;
+  /**
+   * Opens the host's menu for a row: from a right-click (anchored at the
+   * pointer), Shift+F10 or the context menu key, or the actions button that
+   * shows on the hovered or focused row.
+   */
+  onRowMenu?: (row: FileTreeVisibleRow, anchor: DOMRect) => void;
 }
 
 /**
  * A virtualized, read-only file tree. Rows are buttons in a roving-tabindex
  * `tree`, so one Tab stop enters the tree and arrow keys move within it.
  */
-export function FileTree({ model, className, style, "aria-label": ariaLabel }: FileTreeProps) {
+export function FileTree({
+  model,
+  className,
+  style,
+  "aria-label": ariaLabel,
+  renderRowDecoration,
+  onRowMenu,
+}: FileTreeProps) {
   const subscribe = useCallback((listener: () => void) => model.subscribe(listener), [model]);
   useSyncExternalStore(subscribe, () => model.getVersion());
-  useSharedSpriteSheet();
+  useFileTreeSpriteSheet();
 
   const scrollRef = useRef<HTMLDivElement>(null);
   const rowRefs = useRef(new Map<string, HTMLButtonElement>());
@@ -60,6 +78,8 @@ export function FileTree({ model, className, style, "aria-label": ariaLabel }: F
   const lastFocusedPath = useRef<string | null | undefined>(undefined);
   const [scrollTop, setScrollTop] = useState(0);
   const [viewportHeight, setViewportHeight] = useState(FALLBACK_VIEWPORT_HEIGHT);
+  const [hoveredPath, setHoveredPath] = useState<string | null>(null);
+  const [focusWithin, setFocusWithin] = useState(false);
 
   const itemHeight = FILE_TREE_ITEM_HEIGHT;
   const visibleCount = model.getVisibleCount();
@@ -148,6 +168,21 @@ export function FileTree({ model, className, style, "aria-label": ariaLabel }: F
   });
 
   const handleKeyDown = (event: KeyboardEvent<HTMLDivElement>) => {
+    const opensMenu = event.key === "ContextMenu" || (event.shiftKey && event.key === "F10");
+    if (opensMenu && onRowMenu) {
+      // Read focus as it is now: the key may arrive before a re-render.
+      const index = model.getFocusedIndex();
+      const path = model.getFocusedPath();
+      const row = index < 0 ? undefined : model.getVisibleRows(index, index)[0];
+      const element = path === null ? undefined : rowRefs.current.get(path);
+      if (row && element) {
+        event.preventDefault();
+        event.stopPropagation();
+        const box = element.getBoundingClientRect();
+        onRowMenu(row, new DOMRect(box.left, box.top, box.width, box.height));
+      }
+      return;
+    }
     if (handleTreeKey(model, event)) {
       event.preventDefault();
       event.stopPropagation();
@@ -159,7 +194,12 @@ export function FileTree({ model, className, style, "aria-label": ariaLabel }: F
     else rowRefs.current.delete(path);
   };
 
-  const rowProps = { model, itemHeight, registerRow };
+  // One actions button follows the hovered row, or the focused one while the tree has focus.
+  const menuRow = !onRowMenu
+    ? undefined
+    : (renderedRows.find((row) => targetPath(row) === hoveredPath) ??
+      (focusWithin ? focusedRow : undefined));
+  const rowProps = { model, itemHeight, registerRow, renderRowDecoration, onRowMenu };
   return (
     <div
       data-file-tree=""
@@ -168,10 +208,21 @@ export function FileTree({ model, className, style, "aria-label": ariaLabel }: F
       style={style}
       onFocus={() => {
         ownsFocus.current = true;
+        setFocusWithin(true);
       }}
       onBlur={(event) => {
-        if (!event.currentTarget.contains(event.relatedTarget)) ownsFocus.current = false;
+        if (event.currentTarget.contains(event.relatedTarget)) return;
+        ownsFocus.current = false;
+        setFocusWithin(false);
       }}
+      onPointerMove={(event) => {
+        if (!onRowMenu) return;
+        const target = event.target instanceof Element ? event.target : null;
+        if (target?.closest('[data-type="context-menu-trigger"]')) return;
+        const row = target?.closest<HTMLElement>('[role="treeitem"][data-item-path]');
+        setHoveredPath(row?.getAttribute("data-item-path") ?? null);
+      }}
+      onPointerLeave={() => setHoveredPath(null)}
     >
       <div
         ref={scrollRef}
@@ -199,6 +250,25 @@ export function FileTree({ model, className, style, "aria-label": ariaLabel }: F
               />
             ))}
           </div>
+          {menuRow && onRowMenu && (
+            <button
+              type="button"
+              data-type="context-menu-trigger"
+              aria-label={`Actions for ${rowLabel(menuRow)}`}
+              aria-haspopup="menu"
+              tabIndex={-1}
+              style={{ top: menuRow.index * itemHeight, height: itemHeight }}
+              // Keeps focus on the row, so the menu returns it there.
+              onMouseDown={(event) => event.preventDefault()}
+              onClick={(event) => {
+                event.preventDefault();
+                event.stopPropagation();
+                onRowMenu(menuRow, event.currentTarget.getBoundingClientRect());
+              }}
+            >
+              <Icon name="file-tree-icon-ellipsis" />
+            </button>
+          )}
         </div>
       </div>
     </div>
@@ -252,6 +322,8 @@ function FileTreeRow({
   parkedTop,
   activeGuidePath,
   registerRow,
+  renderRowDecoration,
+  onRowMenu,
 }: {
   model: FileTreeModel;
   row: FileTreeVisibleRow;
@@ -259,6 +331,8 @@ function FileTreeRow({
   parkedTop?: number;
   activeGuidePath?: string;
   registerRow: (path: string, element: HTMLButtonElement | null) => void;
+  renderRowDecoration?: FileTreeProps["renderRowDecoration"];
+  onRowMenu?: FileTreeProps["onRowMenu"];
 }) {
   const path = targetPath(row);
   const gitStatus = model.gitStatus;
@@ -267,7 +341,8 @@ function FileTreeRow({
     row.kind === "directory" &&
     status === null &&
     (gitStatus?.directoriesWithChanges.has(path) ?? false);
-  const label = row.flattenedSegments?.map((segment) => segment.name).join(" / ") ?? row.name;
+  const label = rowLabel(row);
+  const decoration = renderRowDecoration?.(row) ?? null;
 
   const handleClick = (event: MouseEvent<HTMLButtonElement>) => {
     const plan = computeFileTreeRowClickPlan(event, row.kind === "directory");
@@ -316,6 +391,15 @@ function FileTreeRow({
       }}
       onFocus={() => model.focusMountedPathFromInput(path)}
       onClick={handleClick}
+      onContextMenu={
+        onRowMenu &&
+        ((event) => {
+          event.preventDefault();
+          model.focusMountedPathFromInput(path);
+          if (!model.isSearchOpen()) event.currentTarget.focus({ preventScroll: true });
+          onRowMenu(row, new DOMRect(event.clientX, event.clientY, 0, 0));
+        })
+      }
     >
       {row.depth > 0 && (
         <span data-item-section="spacing">
@@ -346,9 +430,22 @@ function FileTreeRow({
             ))}
           </span>
         ) : (
-          row.name
+          <MiddleTruncate name={row.name} />
         )}
       </span>
+      {decoration && (
+        <span data-item-section="decoration">
+          <span title={decoration.title}>
+            {decoration.parts
+              ? decoration.parts.map((part) => (
+                  <span key={part.text} style={{ color: part.color }}>
+                    {part.text}
+                  </span>
+                ))
+              : decoration.text}
+          </span>
+        </span>
+      )}
       {gitStatus && <GitLane status={status} containsChange={containsChange} />}
     </button>
   );
@@ -377,6 +474,11 @@ function GitLane({
   );
 }
 
+// How a row reads aloud: its name, or a merged chain as "src / utils".
+function rowLabel(row: FileTreeVisibleRow): string {
+  return row.flattenedSegments?.map((segment) => segment.name).join(" / ") ?? row.name;
+}
+
 // A flattened row ("src / utils / deep") acts on its deepest directory.
 function targetPath(row: FileTreeVisibleRow): string {
   return row.isFlattened
@@ -388,8 +490,8 @@ let spriteSheetUsers = 0;
 let spriteSheetElement: Element | null = null;
 
 // Icons reference `<symbol>`s by id, so the sprite sheet is mounted once per
-// document and shared by every tree.
-function useSharedSpriteSheet() {
+// document and shared by every tree and every icon drawn outside one.
+export function useFileTreeSpriteSheet() {
   useLayoutEffect(() => {
     spriteSheetUsers += 1;
     if (!spriteSheetElement) {

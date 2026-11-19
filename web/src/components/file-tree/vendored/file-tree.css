@@ -89,7 +89,7 @@
   font-size: var(--trees-font-size);
 }
 
-/* Rows never truncate; long names scroll horizontally instead. */
+/* Long names truncate in the middle, so rows never scroll sideways. */
 [data-file-tree-scroll] {
   --trees-scrollbar-thumb-current: transparent;
   position: relative;
@@ -97,8 +97,8 @@
   /* Fills the root even when a host stylesheet makes it a block. */
   height: 100%;
   min-height: 0;
-  overflow: auto;
-  overscroll-behavior-x: contain;
+  overflow-x: hidden;
+  overflow-y: auto;
   scrollbar-gutter: stable;
   padding-inline: max(calc(var(--trees-padding-inline) - var(--trees-item-margin-x)), 0px)
     max(
@@ -136,8 +136,7 @@
 [data-file-tree-list] {
   position: relative;
   min-height: 100%;
-  width: max-content;
-  min-width: 100%;
+  width: 100%;
   overflow-anchor: none;
 }
 
@@ -255,10 +254,94 @@
     translate(calc(var(--trees-icon-nudge) / -2), calc(var(--trees-icon-nudge) / 2));
 }
 
+[data-file-tree] [data-item-section="content"] {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+}
+
 [data-file-tree] [data-item-flattened-subitems] {
   display: inline-flex;
   align-items: center;
   gap: 2px;
+}
+
+/* Middle truncation: each part ellipsizes itself; the start gives way first. */
+[data-file-tree] [data-truncate-group-container="middle"] {
+  display: flex;
+  min-width: 0;
+
+  > span {
+    min-width: 0;
+  }
+
+  > [data-truncate-segment-priority="1"] {
+    flex: 0 1 max-content;
+  }
+
+  > [data-truncate-segment-priority="2"] {
+    flex: 0 999999 max-content;
+  }
+}
+
+[data-file-tree] [data-truncate-container] {
+  display: block;
+  min-width: 0;
+}
+
+[data-file-tree] [data-truncate-content="visible"] {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The end clips from its start, so its ellipsis sits before what stays. */
+[data-file-tree] [data-truncate-container="fruncate"] [data-truncate-content] {
+  direction: rtl;
+
+  > span {
+    unicode-bidi: plaintext;
+  }
+}
+
+[data-file-tree] [data-item-section="decoration"] {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  margin-left: auto;
+  color: var(--trees-fg-muted);
+
+  > span {
+    display: inline-flex;
+    gap: 0.25em;
+  }
+
+  & ~ [data-item-section="git"] {
+    margin-left: 0;
+  }
+}
+
+/* One actions button follows the hovered or focused row. */
+[data-file-tree] [data-type="context-menu-trigger"] {
+  position: absolute;
+  right: var(--trees-item-margin-x);
+  z-index: 4;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--trees-row-height);
+  padding: 0;
+  border: none;
+  border-radius: var(--trees-border-radius);
+  color: var(--trees-fg-muted);
+  background-color: var(--trees-bg-muted);
+  fill: currentColor;
+  cursor: pointer;
+
+  &:hover {
+    color: var(--trees-fg);
+  }
 }
 
 [data-file-tree] [data-item-section="git"] {
