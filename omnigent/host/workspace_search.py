@@ -1,17 +1,23 @@
-"""The workspace API's file search on the host, in the REST file search's substring mode.
+"""The workspace API's file and text searches on the host.
 
-Candidates come from Git through the hardened runner (tracked, and untracked
-unignored files) and, when ignored files are wanted or there is no repository,
-from the REST search's budgeted walk. Directory scopes are literal workspace
-paths matched by whole components, never globs.
+SearchFiles answers in the REST file search's substring mode. Candidates come
+from Git through the hardened runner (tracked, and untracked unignored files)
+and, when ignored files are wanted or there is no repository, from the REST
+search's budgeted walk. SearchText runs the REST content search's ripgrep
+script and streams its matches. Directory scopes are literal workspace paths
+matched by whole components, never globs.
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+import logging
 import os
 import re
 import stat
-from collections.abc import Sequence
+import sys
+from collections.abc import AsyncGenerator, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -27,10 +33,18 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     FileSearchResult,
     SearchFilesRequest,
     SearchFilesResponse,
+    SearchTextRequest,
+    SearchTextResponse,
+    TextSearchMatch,
 )
 from omnigent.entities.environment_filesystem import FilesystemEntry, InvalidPath
 from omnigent.host.workspace_git.files import workspace_files
-from omnigent.host.workspace_git.runner import Deadline, GitError
+from omnigent.host.workspace_git.runner import (
+    Deadline,
+    GitError,
+    start_owned_process,
+    trusted_search_path,
+)
 from omnigent.inner.async_utils import run_sync_on_thread
 from omnigent.runner.environment_filesystem import (
     _SEARCH_SCAN_BUDGET,
@@ -41,12 +55,27 @@ from omnigent.runner.environment_filesystem import (
     paths_under,
     search_indexed_paths,
 )
+from omnigent.workspace_content_search import (
+    MAX_MATCHES,
+    MAX_SCRIPT_OUTPUT,
+    SCRIPT_TIMEOUT_S,
+    ContentSearchError,
+    content_search_script,
+    parse_record,
+)
 from omnigent.workspace_file_search import walk_search
+
+_logger = logging.getLogger(__name__)
 
 _DEFAULT_FILE_RESULTS = 500
 _MAX_FILE_RESULTS = 10_000
 # Covers discovery and every listing; the walk has its own entry budget.
 _FILE_SEARCH_DEADLINE_S = 20.0
+# Matching lines per SearchText message.
+_TEXT_MATCH_BATCH = 100
+# Backslash-escaped in an exclude, so ripgrep matches the directory's name literally;
+# a space too, since ripgrep reads globs as ignore lines, which drop a trailing one.
+_GLOB_METACHARACTERS = frozenset("\\*?[]{}! ")
 
 
 def _beneath(path: str, directory: str) -> bool:
@@ -261,3 +290,136 @@ async def search_files(root: Path, request: SearchFilesRequest) -> SearchFilesRe
         index_incomplete=walk_truncated or (listing is not None and listing.incomplete),
         untracked_unavailable=listing is not None and listing.untracked is None,
     )
+
+
+def _literal_glob(path: str) -> str:
+    return "".join(f"\\{c}" if c in _GLOB_METACHARACTERS else c for c in path)
+
+
+def text_search_arguments(
+    root: Path, request: SearchTextRequest
+) -> tuple[list[str], list[str]] | None:
+    """The ripgrep options and start paths for ``request``'s scopes and flags.
+
+    Includes become explicit start paths, which ripgrep would follow through a
+    link or read as a special file, so each must be a real directory. Excludes
+    become anchored, escaped globs placed after the user's, so they win.
+
+    :returns: Options and start paths, or ``None`` when no include exists.
+    :raises ConnectError: INVALID_ARGUMENT for a scope outside the workspace, or
+        an include that is a link, a file or a special file.
+    """
+    included = _outermost(
+        [_validated(d, "include_directories") for d in request.include_directories]
+    )
+    excluded = _outermost(
+        [
+            d
+            for d in (_validated(d, "exclude_directories") for d in request.exclude_directories)
+            if d
+        ]
+    )
+    if "" in included:
+        included = ()
+    present = [d for d in included if real_directory(root, d, "include_directories")]
+    if included and not present:
+        return None
+    options: list[str] = []
+    if request.whole_word:
+        options.append("-w")
+    if request.include_git_ignored:
+        options.append("--no-ignore-vcs")
+    for directory in excluded:
+        literal = _literal_glob(directory)
+        options += [f"--glob=!/{literal}", f"--glob=!/{literal}/**"]
+    return options, [f"./{d}" for d in present] or ["."]
+
+
+async def _content_search_records(root: Path, script: str) -> AsyncGenerator[dict[str, object]]:
+    """Run the content search script in ``root``, yielding its records.
+
+    Closing the iterator early kills and reaps the script and ripgrep.
+
+    :raises ContentSearchError: For ripgrep's own refusals, such as a bad regex.
+    :raises ConnectError: UNAVAILABLE when the search couldn't run or finish.
+    """
+    # Isolated (-I), as the runner launches it, so workspace files can't stand in
+    # for the script's imports. Its own session lets one signal stop ripgrep too.
+    process = await start_owned_process(
+        [sys.executable, "-I", "-u", "-c", script],
+        cwd=root,
+        env={**os.environ, "PATH": trusted_search_path()},
+        pipe_stderr=False,
+        limit=MAX_SCRIPT_OUTPUT,
+    )
+    received = 0
+    loop = asyncio.get_running_loop()
+    # Only the reads count: a client slow to take the matches doesn't end the search.
+    remaining = float(SCRIPT_TIMEOUT_S)
+    try:
+        while True:
+            started = loop.time()
+            async with asyncio.timeout(remaining):
+                line = await process.stdout.readline()
+            remaining -= loop.time() - started
+            if not line:
+                raise ValueError("Content search ended without a summary")
+            received += len(line)
+            if received > MAX_SCRIPT_OUTPUT:
+                raise ValueError("Content search output passed its limit")
+            record = parse_record(line)
+            if "error" in record:
+                raise ContentSearchError(str(record["error"]))
+            yield record
+            if "truncated" in record:
+                return
+    except (TimeoutError, ValueError) as exc:
+        _logger.warning("Workspace content search failed: %s", exc)
+        raise ConnectError(
+            Code.UNAVAILABLE, "Content search could not run in this workspace"
+        ) from exc
+    finally:
+        await process.close()
+
+
+async def search_text(
+    root: Path, request: SearchTextRequest
+) -> AsyncGenerator[SearchTextResponse]:
+    """Stream a SearchText's matches in batches, then a final ``done`` message.
+
+    ``order``, ``focused_paths`` and ``changed_against`` are ignored, as this
+    host doesn't offer the ``text_search_priority`` feature.
+    """
+    arguments = text_search_arguments(root, request)
+    if arguments is None:
+        yield SearchTextResponse(done=True)
+        return
+    options, start_paths = arguments
+    try:
+        script = content_search_script(
+            request.query,
+            case_sensitive=request.case_sensitive,
+            regex=request.regular_expression,
+            include=request.include,
+            exclude=request.exclude,
+            limit=min(request.maximum_results or MAX_MATCHES, MAX_MATCHES),
+            extra_args=options,
+            search_paths=start_paths,
+        )
+        batch: list[TextSearchMatch] = []
+        async with contextlib.aclosing(_content_search_records(root, script)) as records:
+            async for record in records:
+                if "match" not in record:
+                    yield SearchTextResponse(
+                        matches=batch,
+                        done=True,
+                        truncated=bool(record["truncated"]),
+                        warning=str(record["warning"] or ""),
+                    )
+                    return
+                batch.append(TextSearchMatch(**record["match"]))  # type: ignore[arg-type]
+                if len(batch) == _TEXT_MATCH_BATCH:
+                    yield SearchTextResponse(matches=batch)
+                    batch = []
+    except ContentSearchError as exc:
+        raise ConnectError(Code.INVALID_ARGUMENT, exc.message) from exc

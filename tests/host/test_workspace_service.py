@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import os
+import shutil
 import signal
 import socket
 import stat
@@ -42,6 +43,7 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     FILE_SEARCH_MODE_SUBSTRING,
     GetCapabilitiesRequest,
     ListDirectoryRequest,
+    ReadBaseFileRequest,
     ReadFileRequest,
     ReadLinkTextRequest,
     SearchFilesRequest,
@@ -73,6 +75,7 @@ from tests.server.routes.test_shell_permission_gate import _StubAgentStore, _Stu
 
 pytestmark = pytest.mark.asyncio
 
+_WITH_RG = {"SearchText"} if shutil.which("rg") else set()
 PROTOCOLS = pytest.mark.parametrize("protocol", [ProtocolType.CONNECT, ProtocolType.GRPC_WEB])
 _SESSION = "conv_ws"
 _SERVER_BASE = f"http://server/v1/sessions/{_SESSION}/workspace"
@@ -215,7 +218,8 @@ def client_for(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) 
 
     def make(root: Path) -> WorkspaceServiceClient:
         if route == "server":
-            return _connect(_server_app(root, monkeypatch), _SERVER_BASE, protocol)
+            app = _server_app(root, monkeypatch, content_search=True)
+            return _connect(app, _SERVER_BASE, protocol)
         reader = WorkspaceReader(root)
         app = WorkspaceServiceASGIApplication(WorkspaceService(lambda _ctx: reader))
         return _connect(app, "http://workspace.test", protocol)
@@ -492,18 +496,83 @@ async def test_search_files_matches_the_rest_file_search(
     assert response.truncated is bool(rest["has_more"])
 
 
+@pytest.mark.skipif(shutil.which("rg") is None, reason="needs ripgrep")
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {},
+        {"case_sensitive": True},
+        {"include": "*.{py,md}", "exclude": "big.txt"},
+        {"maximum_results": 1},
+    ],
+)
+async def test_search_text_matches_the_rest_content_search(
+    tmp_path: Path, client_for: ClientFor, fields: dict[str, Any]
+) -> None:
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.os_env import create_os_environment
+    from omnigent.runner.content_search import search_content
+
+    root = _workspace(tmp_path)
+    (root / "src" / "more.py").write_text("Title = 'title'\nnothing\n")
+    client = client_for(root)
+    # Unconfined, as the host's workspaces are.
+    spec = OSEnvSpec(type="caller_process", cwd=str(root), sandbox=OSEnvSandboxSpec(type="none"))
+    environment = create_os_environment(spec)
+    assert environment is not None
+
+    try:
+        responses = [
+            m async for m in client.search_text(SearchTextRequest(query="title", **fields))
+        ]
+        rest = await search_content(
+            environment,
+            "title",
+            case_sensitive=fields.get("case_sensitive", False),
+            include=fields.get("include", ""),
+            exclude=fields.get("exclude", ""),
+            limit=fields.get("maximum_results", 500),
+        )
+    finally:
+        environment.close()
+
+    matches = [
+        {
+            "path": m.path,
+            "line": m.line,
+            "column": m.column,
+            "text": m.text,
+            "match_start": m.match_start,
+            "match_end": m.match_end,
+        }
+        for response in responses
+        for m in response.matches
+    ]
+    assert rest["matches"]
+    if "maximum_results" in fields:
+        # ripgrep searches files in parallel, so which match comes first varies.
+        assert len(matches) == len(rest["matches"])
+    else:
+        assert sorted(matches, key=str) == sorted(rest["matches"], key=str)
+    assert responses[-1].done and not any(r.done for r in responses[:-1])
+    assert responses[-1].truncated is rest["truncated"]
+    assert (responses[-1].warning or None) == rest["warning"]
+
+
 async def test_capabilities_list_the_served_methods(tmp_path: Path, client_for: ClientFor) -> None:
     client = client_for(tmp_path)
 
     response = await client.get_capabilities(GetCapabilitiesRequest())
 
-    assert set(response.capabilities) == {
+    # SearchText is listed exactly where ripgrep is installed.
+    assert set(response.capabilities) ^ ({"SearchText"} - _WITH_RG) == {
         "ListDirectory",
         "ReadFile",
         "StatPath",
         "ReadLinkText",
         "SearchFiles",
         "search_files.substring",
+        "SearchText",
     }
 
 
@@ -516,8 +585,7 @@ async def test_capabilities_leave_out_methods_whose_tool_is_missing(
 
     response = await client.get_capabilities(GetCapabilitiesRequest())
 
-    assert "SearchFiles" not in response.capabilities
-    assert "search_files.substring" not in response.capabilities
+    assert set(response.capabilities) == {"ListDirectory", "ReadFile", "StatPath", "ReadLinkText"}
 
 
 async def test_methods_not_served_yet_answer_unimplemented(
@@ -527,9 +595,9 @@ async def test_methods_not_served_yet_answer_unimplemented(
     client = client_for(tmp_path)
 
     with pytest.raises(ConnectError) as unary:
-        await client.search_files(SearchFilesRequest(query="main"))
+        await client.search_files(SearchFilesRequest(query="main"))  # fuzzy, the default
     with pytest.raises(ConnectError) as streamed:
-        [m async for m in client.search_text(SearchTextRequest(query="main"))]
+        [m async for m in client.read_base_file(ReadBaseFileRequest(path="main"))]
 
     assert unary.value.code == streamed.value.code == Code.UNIMPLEMENTED
 

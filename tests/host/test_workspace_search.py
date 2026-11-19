@@ -1,12 +1,14 @@
-"""The host's SearchFiles: candidates, ignored files, literal scopes and failures.
+"""The host's SearchFiles and SearchText: candidates, ignored files, literal scopes and failures.
 
 Route and protocol parity with the REST search lives in ``test_workspace_service.py``.
 """
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
+import shutil
 import subprocess
 import sys
 from collections.abc import Iterator
@@ -23,10 +25,12 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     FILE_SEARCH_MODE_SUBSTRING,
     SearchFilesRequest,
     SearchFilesResponse,
+    SearchTextRequest,
+    SearchTextResponse,
 )
 from omnigent.host.workspace_git import files as files_module
-from omnigent.host.workspace_search import DirectoryScope, search_files
-from tests.host.test_workspace_git_runner import _fake_git, _git, _repository
+from omnigent.host.workspace_search import DirectoryScope, search_files, search_text
+from tests.host.test_workspace_git_runner import _alive, _fake_git, _git, _repository
 
 pytestmark = pytest.mark.skipif(
     sys.platform == "win32", reason="the runner signals POSIX process groups"
@@ -347,3 +351,212 @@ async def test_searching_runs_only_hardened_git_and_writes_nothing(
 
     assert state() == before
     assert any("ls-files" in argv for argv in started)
+
+
+async def _search_text(root: Path, query: str, **fields: object) -> list[SearchTextResponse]:
+    request = SearchTextRequest(query=query, **fields)  # type: ignore[arg-type]
+    return [response async for response in search_text(root, request)]
+
+
+def _lines(responses: list[SearchTextResponse]) -> list[str]:
+    return [f"{m.path}:{m.line}" for response in responses for m in response.matches]
+
+
+needs_rg = pytest.mark.skipif(shutil.which("rg") is None, reason="needs ripgrep")
+
+
+@needs_rg
+async def test_text_matches_arrive_in_batches_then_done(tmp_path: Path) -> None:
+    (tmp_path / "many.txt").write_text("needle\n" * 250)
+
+    responses = await _search_text(tmp_path, "needle")
+
+    assert [len(r.matches) for r in responses] == [100, 100, 50]
+    assert [r.done for r in responses] == [False, False, True]
+    assert not responses[-1].truncated
+
+
+@needs_rg
+async def test_text_scopes_are_literal_and_excludes_win(tmp_path: Path) -> None:
+    odd = "a*b?[c]{d}!e"
+    for directory in (odd, "aXb", "src", "srcx", "src/vendor", "other/src/vendor"):
+        (tmp_path / directory).mkdir(parents=True, exist_ok=True)
+        (tmp_path / directory / "hit.txt").write_text("needle\n")
+
+    literal = await _search_text(tmp_path, "needle", exclude_directories=[odd, "src", "other"])
+    scoped = await _search_text(
+        tmp_path,
+        "needle",
+        include_directories=["src", "src/vendor", "src"],
+        exclude_directories=["src/vendor"],
+        include="src/vendor/**, src/*",
+    )
+
+    assert sorted(_lines(literal)) == ["aXb/hit.txt:1", "srcx/hit.txt:1"]
+    assert _lines(scoped) == ["src/hit.txt:1"]
+
+
+@needs_rg
+async def test_text_flags_reach_ripgrep(tmp_path: Path) -> None:
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / ".gitignore").write_text("ignored.txt\n")
+    (tmp_path / "ignored.txt").write_text("needle\n")
+    (tmp_path / "words.txt").write_text("needles\nneedle\n")
+
+    plain = await _search_text(tmp_path, "needle")
+    word = await _search_text(tmp_path, "needle", whole_word=True)
+    ignored = await _search_text(tmp_path, "needle", whole_word=True, include_git_ignored=True)
+
+    assert _lines(plain) == ["words.txt:1", "words.txt:2"]
+    assert _lines(word) == ["words.txt:2"]
+    assert sorted(_lines(ignored)) == ["ignored.txt:1", "words.txt:2"]
+
+
+@needs_rg
+async def test_a_missing_include_directory_finds_nothing(tmp_path: Path) -> None:
+    (tmp_path / "a.txt").write_text("needle\n")
+
+    responses = await _search_text(tmp_path, "needle", include_directories=["gone"])
+
+    assert [(len(r.matches), r.done) for r in responses] == [(0, True)]
+
+
+@pytest.mark.parametrize(
+    ("fields", "code"),
+    [
+        ({"include_directories": ["outward"]}, Code.INVALID_ARGUMENT),
+        ({"include_directories": ["fifo"]}, Code.INVALID_ARGUMENT),
+        ({"include_directories": ["../x"]}, Code.INVALID_ARGUMENT),
+        ({"exclude_directories": ["/etc"]}, Code.INVALID_ARGUMENT),
+        ({"query": "needle\nsecond"}, Code.INVALID_ARGUMENT),
+    ],
+)
+async def test_text_scopes_and_queries_are_refused_before_ripgrep_starts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fields: dict[str, object], code: Code
+) -> None:
+    (tmp_path / "outside").mkdir()
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / "outward").symlink_to(tmp_path / "outside")
+    os.mkfifo(root / "fifo")
+
+    def refuse(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("a search process started")
+
+    monkeypatch.setattr(subprocess, "Popen", refuse)
+    with pytest.raises(ConnectError) as refused:
+        await _search_text(root, **{"query": "needle", **fields})  # type: ignore[arg-type]
+
+    assert refused.value.code == code
+
+
+@needs_rg
+async def test_an_invalid_pattern_is_the_users_to_fix(tmp_path: Path) -> None:
+    (tmp_path / "a.txt").write_text("needle\n")
+
+    with pytest.raises(ConnectError) as refused:
+        await _search_text(tmp_path, "[", regular_expression=True)
+
+    assert refused.value.code == Code.INVALID_ARGUMENT
+    assert "regex parse error" in refused.value.message
+
+
+async def test_closing_a_text_search_early_stops_ripgrep(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A client that goes away leaves no ripgrep or descendant running."""
+    pids = tmp_path / "pids"
+    bin_directory = tmp_path / "bin"
+    bin_directory.mkdir()
+    record = (
+        '{"type":"match","data":{"path":{"text":"./a.txt"},"lines":{"text":"needle\\n"},'
+        '"line_number":1,"submatches":[{"start":0,"end":6}]}}'
+    )
+    fake = bin_directory / "rg"
+    fake.write_text(
+        "#!/bin/sh\n"
+        f"echo $$ >> {pids}\nsleep 60 & echo $! >> {pids}\n"
+        f"i=0; while [ $i -lt 150 ]; do printf '%s\\n' '{record}'; i=$((i+1)); done\nwait\n"
+    )
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_directory}{os.pathsep}{os.environ['PATH']}")
+    root = tmp_path / "workspace"
+    root.mkdir()
+
+    stream = search_text(root, SearchTextRequest(query="needle"))
+    first = await anext(stream)
+    await stream.aclose()
+
+    assert len(first.matches) == 100
+    from omnigent.host.workspace_git import runner
+
+    await asyncio.gather(*runner._cleanups)
+    leftover = [int(pid) for pid in pids.read_text().split()]
+    assert len(leftover) == 2
+    assert not any(_alive(pid) for pid in leftover)
+
+
+def _fake_rg(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, body: str) -> None:
+    """Put a fake ``rg`` first on PATH."""
+    bin_directory = tmp_path / "rg-bin"
+    bin_directory.mkdir()
+    fake = bin_directory / "rg"
+    fake.write_text("#!/bin/sh\n" + body)
+    fake.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_directory}{os.pathsep}{os.environ['PATH']}")
+
+
+_RG_MATCH = (
+    '{"type":"match","data":{"path":{"text":"./a.txt"},"lines":{"text":"needle\\n"},'
+    '"line_number":1,"submatches":[{"start":0,"end":6}]}}'
+)
+
+
+async def test_a_slow_reader_does_not_use_up_the_search_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The time limit bounds ripgrep, not how long the client takes to read the matches."""
+    monkeypatch.setattr("omnigent.host.workspace_search.SCRIPT_TIMEOUT_S", 2)
+    matches = f"while [ $i -lt $n ]; do printf '%s\\n' '{_RG_MATCH}'; i=$((i+1)); done\n"
+    # The last matches come after the reader has held two batches past the limit.
+    _fake_rg(tmp_path, monkeypatch, f"i=0; n=200; {matches}sleep 2.6; n=250; {matches}")
+    root = tmp_path / "workspace"
+    root.mkdir()
+
+    responses = []
+    async for response in search_text(root, SearchTextRequest(query="needle")):
+        responses.append(response)
+        await asyncio.sleep(1.2)
+
+    assert [len(r.matches) for r in responses] == [100, 100, 50]
+    assert responses[-1].done
+
+
+@needs_rg
+async def test_an_rg_planted_in_the_workspace_never_runs_from_a_relative_path_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    marker = tmp_path / "planted-ran"
+    (tmp_path / "rg").write_text(f"#!/bin/sh\ntouch {marker}\n")
+    (tmp_path / "rg").chmod(0o755)
+    (tmp_path / "a.txt").write_text("needle\n")
+    monkeypatch.setenv("PATH", f".{os.pathsep}{os.environ['PATH']}")
+
+    responses = await _search_text(tmp_path, "needle")
+
+    assert _lines(responses) == ["a.txt:1"]
+    assert not marker.exists()
+
+
+@needs_rg
+async def test_an_excluded_directory_ending_in_a_space_is_the_one_excluded(
+    tmp_path: Path,
+) -> None:
+    """Ripgrep reads globs as ignore lines, which drop an unescaped trailing space."""
+    for directory in ("build ", "build"):
+        (tmp_path / directory).mkdir()
+        (tmp_path / directory / "hit.txt").write_text("needle\n")
+
+    responses = await _search_text(tmp_path, "needle", exclude_directories=["build "])
+
+    assert _lines(responses) == ["build/hit.txt:1"]
