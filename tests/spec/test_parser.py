@@ -2699,6 +2699,74 @@ def test_mcp_url_unresolved_var_raises(
         parse(agent_dir)
 
 
+def _write_optional_mcp(agent_dir: Path, **extra: object) -> None:
+    mcp_dir = agent_dir / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    mcp_config = {
+        "name": "knowledge",
+        "transport": "http",
+        "optional": True,
+        "url": "${OPT_MCP_URL}",
+        "headers": {"Authorization": "Bearer ${OPT_MCP_TOKEN}"},
+        **extra,
+    }
+    (mcp_dir / "knowledge.yaml").write_text(yaml.dump(mcp_config))
+
+
+def test_optional_mcp_server_is_skipped_when_its_variables_are_unset(
+    agent_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ``optional: true`` server with an unset variable is left out
+    instead of failing the agent."""
+    monkeypatch.delenv("OPT_MCP_URL", raising=False)
+    monkeypatch.setenv("OPT_MCP_TOKEN", "tok")
+    _write_optional_mcp(agent_dir)
+    assert parse(agent_dir).mcp_servers == []
+
+
+def test_optional_mcp_server_is_kept_when_its_variables_are_set(
+    agent_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With every variable set, an optional server loads like any other."""
+    monkeypatch.setenv("OPT_MCP_URL", "https://kb.example.com/mcp")
+    monkeypatch.setenv("OPT_MCP_TOKEN", "tok")
+    _write_optional_mcp(agent_dir)
+    (server,) = parse(agent_dir).mcp_servers
+    assert server.url == "https://kb.example.com/mcp"
+    assert server.headers == {"Authorization": "Bearer tok"}
+
+
+def test_optional_mcp_server_is_skipped_when_not_expanded(
+    agent_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parse without expansion (how the server reads uploaded and built-in
+    bundles) never keeps an optional server with a literal ``${VAR}`` url."""
+    monkeypatch.setenv("OPT_MCP_URL", "https://kb.example.com/mcp")
+    monkeypatch.setenv("OPT_MCP_TOKEN", "tok")
+    _write_optional_mcp(agent_dir)
+    assert parse(agent_dir, expand_env=False).mcp_servers == []
+
+
+def test_optional_mcp_server_still_checks_its_shape_when_skipped(
+    agent_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A skipped optional file is still validated, so a typo is not hidden."""
+    monkeypatch.delenv("OPT_MCP_URL", raising=False)
+    _write_optional_mcp(agent_dir, command="oops")
+    with pytest.raises(OmnigentError, match=r"command"):
+        parse(agent_dir)
+
+
+def test_optional_mcp_flag_must_be_boolean(agent_dir: Path) -> None:
+    _write_optional_mcp(agent_dir, optional="yes")
+    with pytest.raises(OmnigentError, match=r"'optional' must be true or false"):
+        parse(agent_dir)
+
+
 def test_mcp_env_expansion_mixed_set_and_unset_raises(
     agent_dir: Path,
     monkeypatch: pytest.MonkeyPatch,
