@@ -76,30 +76,30 @@ describe("New thingy", () => {
   });
 
   it("previews a template, names it, publishes it and opens it", async () => {
-    const created = thingyFixture({ id: "kanban-1", name: "Team board", version: "v0" });
+    const created = thingyFixture({ id: "map-1", name: "Team work map", version: "v0" });
     vi.mocked(createThingy).mockResolvedValue(created);
     vi.mocked(createThingyRevision).mockResolvedValue({ id: "rev-9" });
     vi.mocked(publishThingyRevision).mockResolvedValue(created);
     renderWithThingies(<ThingyStartPage />, { path: "/thingy/new" });
 
-    fireEvent.click(screen.getByRole("button", { name: "Kanban board" }));
-    const preview = await screen.findByRole("dialog", { name: "Kanban board" });
+    fireEvent.click(screen.getByRole("button", { name: "My work map" }));
+    const preview = await screen.findByRole("dialog", { name: "My work map" });
     expect(within(preview).getByTestId("thingy-frame")).toBeInTheDocument();
     fireEvent.click(within(preview).getByRole("button", { name: "Use template" }));
 
     const naming = await screen.findByRole("dialog", { name: "Name your thingy" });
     const name = within(naming).getByRole("textbox", { name: "Name" });
-    expect(name).toHaveValue("Kanban board");
-    fireEvent.change(name, { target: { value: "Team board" } });
+    expect(name).toHaveValue("My work map");
+    fireEvent.change(name, { target: { value: "Team work map" } });
     fireEvent.click(within(naming).getByRole("button", { name: "Create" }));
 
-    await waitFor(() => expect(location().pathname).toBe("/thingy/kanban-1"));
-    expect(createThingy).toHaveBeenCalledWith("Team board");
+    await waitFor(() => expect(location().pathname).toBe("/thingy/map-1"));
+    expect(createThingy).toHaveBeenCalledWith("Team work map");
     expect(createThingyRevision).toHaveBeenCalledWith(
-      "kanban-1",
+      "map-1",
       expect.objectContaining({ html: expect.any(String) }),
     );
-    expect(publishThingyRevision).toHaveBeenCalledWith("kanban-1", "rev-9", "v0");
+    expect(publishThingyRevision).toHaveBeenCalledWith("map-1", "rev-9", "v0");
   });
 
   it("starts a blank thingy in New session", async () => {

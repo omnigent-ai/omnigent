@@ -1,6 +1,8 @@
 // Reference thingy: a small kanban board uploaded as an ordinary revision. It is a
 // single self-contained HTML document that uses only `window.omnigent`; it gets no
-// host privileges the SDK does not give every app. Sample data is synthetic.
+// host privileges the SDK does not give every app. Sample data is synthetic. It is not a
+// template in the New thingy dialog; it stays as a full example of the SDK (collections with
+// rules, drag and drop, per-record actions) that its tests exercise end to end.
 //
 // The script is plain ES2018 inside a template literal: keep it free of backticks,
 // `${`, and backslashes. Characters that would need escapes are built with
