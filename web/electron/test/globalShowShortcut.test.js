@@ -582,11 +582,23 @@ describe("createGlobalShortcuts", () => {
       async () => true,
     );
     assert.equal(respelled.ok, true);
+    // The respelled save keeps the one registration, still pressing `show`.
+    assert.equal(s.registered().length, 1);
+    s.press("CommandOrControl+Shift+Space");
+    assert.deepEqual(s.pressed, { show: 1, floatingComposer: 0 });
     const off = await s.show.set(
       { enabled: false, accelerator: "CommandOrControl+Shift+Space" },
       async () => true,
     );
     assert.equal(off.ok, true);
+    assert.deepEqual(s.saved().global_shortcut, {
+      enabled: false,
+      accelerator: "CommandOrControl+Shift+Space",
+    });
+    // Turning off frees the chord for the shortcut that lost it.
+    assert.equal(s.floatingComposer.current().error, undefined);
+    s.press("CommandOrControl+Shift+Space");
+    assert.deepEqual(s.pressed, { show: 1, floatingComposer: 1 });
   });
 
   for (const [how, change] of [
