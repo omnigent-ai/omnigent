@@ -728,7 +728,7 @@ text and choose **Reply** to quote it in that chat's composer. On a keyboard,
 **Alt/Option+Enter** invokes Reply for selected text in either the parent or
 side-chat transcript. Keyboard actions use the live selection and leave focused
 inputs, controls, editors, terminals, and dialogs alone. Shortcut hints are hidden
-on touch and narrow layouts; the popup buttons remain available. Adding a quote
+on mobile layouts; the popup buttons remain available. Adding a quote
 keeps existing comments before that quote. Edit between quotes or after the last
 one, then send when ready. Paste an image into any reply text field after the
 side chat has started. The first question is text-only; an image paste there
@@ -1134,7 +1134,7 @@ plain `uv run pytest`, which starts a private server for the test.
   the side chat, then repeat both chords with a non-text input focused while
   transcript text stays selected; focus and selection should stay unchanged.
   `web/src/components/chat/SelectionPopup.test.tsx` covers the keyboard routes,
-  focused-control ownership, listener cleanup, and touch/narrow hint visibility.
+  focused-control ownership, listener cleanup, and mobile hint visibility.
 - **`side-chat-quotes`, mobile drawer Reply:**
   `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_side_chat_opens_in_a_drawer_on_mobile`
   checks that Reply stays on screen and interleaved comments with a pasted image

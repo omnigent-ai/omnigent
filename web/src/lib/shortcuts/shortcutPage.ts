@@ -83,6 +83,12 @@ export function shortcutPageGroups(
     bound("effort.cycle"),
     { label: "Cycle permission mode (in session)", keys: [shift, "Tab"] },
     bound("composer.focus"),
+    { ...bound("transcript.reply"), desktopOnly: true },
+    {
+      ...bound("transcript.askInSideChat"),
+      label: `${shortcutBinding("transcript.askInSideChat").label} (when available)`,
+      desktopOnly: true,
+    },
     bound("dictation.toggle"),
     { label: "Stop response", keys: ["Esc"] },
   ];

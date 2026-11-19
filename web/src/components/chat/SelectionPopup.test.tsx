@@ -4,15 +4,13 @@ import { afterEach, expect, it, vi } from "vitest";
 import { setEmbedRoot } from "@/lib/host";
 import { SelectionPopup } from "./SelectionPopup";
 
-const device = vi.hoisted(() => ({ mobile: false, coarse: false }));
+const device = vi.hoisted(() => ({ mobile: false }));
 vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => device.mobile }));
-vi.mock("@/hooks/useIsCoarsePointer", () => ({ useIsCoarsePointer: () => device.coarse }));
 
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
   device.mobile = false;
-  device.coarse = false;
   setEmbedRoot(null);
   window.getSelection()?.removeAllRanges();
 });
@@ -211,23 +209,30 @@ it("leaves modal and already-handled keys alone", () => {
   expect(onReply).not.toHaveBeenCalled();
 });
 
-it("preserves shortcuts on a focused popup button and still handles its click", () => {
-  const onAskInSideChat = vi.fn();
-  const { containerRef, onReply } = renderPopup(onAskInSideChat);
-  const button = screen.getByRole("button", { name: "Ask in side chat" });
-  button.focus();
-  selectText(containerRef.current!, false);
-  for (const shiftKey of [false, true]) {
-    expect(fireEvent.keyDown(button, { key: "Enter", altKey: true, shiftKey })).toBe(true);
-    expect(document.activeElement).toBe(button);
-    expect(window.getSelection()!.toString()).toBe("Selected message");
-  }
-  expect(onAskInSideChat).not.toHaveBeenCalled();
-  expect(onReply).not.toHaveBeenCalled();
-  fireEvent.click(button);
-  expect(onAskInSideChat).toHaveBeenCalledExactlyOnceWith("Selected message");
-  expect(onReply).not.toHaveBeenCalled();
-});
+it.each(["Reply", "Ask in side chat"])(
+  "preserves shortcuts on a focused %s button and clicks its cached selection",
+  (name) => {
+    const onAskInSideChat = vi.fn();
+    const { containerRef, onReply } = renderPopup(onAskInSideChat);
+    const button = screen.getByRole("button", { name });
+    button.focus();
+    selectText(containerRef.current!, false);
+    for (const shiftKey of [false, true]) {
+      expect(fireEvent.keyDown(button, { key: "Enter", altKey: true, shiftKey })).toBe(true);
+      expect(document.activeElement).toBe(button);
+      expect(window.getSelection()!.toString()).toBe("Selected message");
+    }
+    expect(onAskInSideChat).not.toHaveBeenCalled();
+    expect(onReply).not.toHaveBeenCalled();
+    window.getSelection()!.removeAllRanges();
+    expect(window.getSelection()!.toString()).toBe("");
+    fireEvent.click(button);
+    expect(name === "Reply" ? onReply : onAskInSideChat).toHaveBeenCalledExactlyOnceWith(
+      "Selected message",
+    );
+    expect(name === "Reply" ? onAskInSideChat : onReply).not.toHaveBeenCalled();
+  },
+);
 
 it("removes the shortcut listener when unmounted", () => {
   const add = vi.spyOn(document, "addEventListener");
@@ -239,17 +244,13 @@ it("removes the shortcut listener when unmounted", () => {
   expect(remove).toHaveBeenCalledWith("keydown", handler);
 });
 
-it.each([
-  { mobile: false, coarse: false },
-  { mobile: true, coarse: false },
-  { mobile: false, coarse: true },
-])("shows keyboard hints only on desktop layouts (%j)", (layout) => {
-  Object.assign(device, layout);
+it.each([false, true])("shows keyboard hints only on desktop layouts (mobile: %s)", (mobile) => {
+  device.mobile = mobile;
   const onAskInSideChat = vi.fn();
   const { onReply } = renderPopup(onAskInSideChat);
   const reply = screen.getByRole("button", { name: "Reply" });
   const ask = screen.getByRole("button", { name: "Ask in side chat" });
-  const hints = !layout.mobile && !layout.coarse;
+  const hints = !mobile;
   expect(reply.querySelectorAll("kbd")).toHaveLength(hints ? 2 : 0);
   expect(ask.querySelectorAll("kbd")).toHaveLength(hints ? 3 : 0);
   fireEvent.click(ask);

@@ -1,9 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { CornerUpLeftIcon, MessagesSquareIcon } from "lucide-react";
-import { ALT_KEY, CompactShortcutKeys, ENTER_KEY, SHIFT_KEY } from "@/components/KeyboardShortcut";
+import { CompactShortcutKeys } from "@/components/KeyboardShortcut";
 import { Button } from "@/components/ui/button";
-import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { getEmbedRoot } from "@/lib/host";
 import {
@@ -11,7 +10,7 @@ import {
   isFocusInDialogOrMenu,
   isKeyOwningOverlayOpen,
 } from "@/lib/hotkeys";
-import { matchesShortcut } from "@/lib/shortcuts/registry";
+import { matchesShortcut, shortcutKeys } from "@/lib/shortcuts/registry";
 
 function ownsSelectionHotkey(target: EventTarget | null): boolean {
   return (
@@ -34,8 +33,7 @@ export function SelectionPopup({
   const [popupPos, setPopupPos] = useState<{ x: number; y: number } | null>(null);
   const selectedTextRef = useRef("");
   const isMobileViewport = useIsMobileViewport();
-  const isCoarsePointer = useIsCoarsePointer();
-  const showKeyHints = !isMobileViewport && !isCoarsePointer;
+  const showKeyHints = !isMobileViewport;
 
   const getScopedSelection = useCallback(() => {
     const selection = window.getSelection();
@@ -147,7 +145,7 @@ export function SelectionPopup({
       >
         <CornerUpLeftIcon className="size-3.5" />
         Reply
-        {showKeyHints && <CompactShortcutKeys keys={[ALT_KEY, ENTER_KEY]} />}
+        {showKeyHints && <CompactShortcutKeys keys={shortcutKeys("transcript.reply")} />}
       </Button>
       {onAskInSideChat ? (
         <Button
@@ -165,7 +163,7 @@ export function SelectionPopup({
         >
           <MessagesSquareIcon className="size-3.5" />
           Ask in side chat
-          {showKeyHints && <CompactShortcutKeys keys={[ALT_KEY, SHIFT_KEY, ENTER_KEY]} />}
+          {showKeyHints && <CompactShortcutKeys keys={shortcutKeys("transcript.askInSideChat")} />}
         </Button>
       ) : null}
     </div>,

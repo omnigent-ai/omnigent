@@ -101,6 +101,10 @@ export const GOLDEN_ROWS: readonly GoldenRow[] = [
   /* 60 */ row("Reload the browser tab", "⌘ R", "Ctrl R"),
   /* 61 */ row("Focus the browser address bar", "⌘ L", "Ctrl L"),
   /* 62 */ row("Mark current session unread or read", "⌘ ⌥ U", "Ctrl Alt U"),
+  /* 63 */ row("Reply to selected chat text", "⌥ ↵", "Alt ↵", { desktopOnly: true }),
+  /* 64 */ row("Ask about selected chat text in side chat (when available)", "⌥ ⇧ ↵", "Alt ⇧ ↵", {
+    desktopOnly: true,
+  }),
 ];
 
 /**
@@ -130,11 +134,11 @@ export const GOLDEN_GROUPS: Record<string, GoldenGroup | null> = {
   },
   "In chats: -": {
     title: "In chats",
-    rows: [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22],
+    rows: [6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 63, 64, 21, 22],
   },
   "In chats: submitWithModEnter": {
     title: "In chats",
-    rows: [39, 40, 41, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22],
+    rows: [39, 40, 41, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 63, 64, 21, 22],
   },
   "In chats: preventsKeyboardSubmit": {
     title: "In chats",
