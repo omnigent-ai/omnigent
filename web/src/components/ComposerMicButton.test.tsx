@@ -24,8 +24,8 @@ import type { DictationSessionEvents } from "@/lib/dictation";
 import { isMacPlatform } from "@/lib/hotkeys";
 import { AskUserQuestionForm } from "./blocks/AskUserQuestionForm";
 import { useChatStore } from "@/store/chatStore";
-import { useRef } from "react";
-import { ComposerMicButton } from "./ComposerMicButton";
+import { createRef, useRef } from "react";
+import { ComposerMicButton, type ComposerMicButtonHandle } from "./ComposerMicButton";
 
 /** Hovers the mic button and returns the tooltip it opens. */
 async function hoverMicTooltip(button: HTMLElement): Promise<HTMLElement> {
@@ -75,6 +75,7 @@ let handlers: Record<string, (event: unknown) => void>;
 let constructSpy: Mock<() => void>;
 let startSpy: ReturnType<typeof vi.fn>;
 let stopSpy: ReturnType<typeof vi.fn>;
+let abortSpy: ReturnType<typeof vi.fn>;
 let recognitionLang: string | undefined;
 /** Original navigator.mediaDevices descriptor, restored after each test. */
 let originalMediaDevices: PropertyDescriptor | undefined;
@@ -86,6 +87,7 @@ function installSpeechRecognition() {
   constructSpy = vi.fn<() => void>();
   startSpy = vi.fn();
   stopSpy = vi.fn();
+  abortSpy = vi.fn();
   recognitionLang = undefined;
   // A class (not an arrow fn) so `new Ctor()` is constructable — the component
   // does `new Ctor()` in its mount effect.
@@ -105,6 +107,7 @@ function installSpeechRecognition() {
     interimResults = false;
     start = startSpy;
     stop = stopSpy;
+    abort = abortSpy;
     addEventListener(type: string, handler: (event: unknown) => void) {
       handlers[type] = handler;
     }
@@ -473,6 +476,29 @@ describe("ComposerMicButton", () => {
       expect(onVoiceDiscard).toHaveBeenCalledTimes(1);
       expect(startSpy).toHaveBeenCalledTimes(1);
       expect(button).toHaveAttribute("aria-pressed", "false");
+    });
+
+    it("endTake aborts the take, keeping the text and dropping later speech", () => {
+      const micRef = createRef<ComposerMicButtonHandle>();
+      const onTranscript = vi.fn();
+      const onVoiceDiscard = vi.fn();
+      const { button } = startTake({ ref: micRef, onTranscript, onVoiceDiscard });
+
+      act(() => micRef.current?.endTake());
+      act(() => handlers.result?.(resultEvent("after the send")));
+      now += 3_000;
+      act(() => handlers.end?.({}));
+
+      expect(abortSpy).toHaveBeenCalledTimes(1);
+      expect(stopSpy).not.toHaveBeenCalled();
+      expect(startSpy).toHaveBeenCalledTimes(1);
+      expect(onTranscript).not.toHaveBeenCalled();
+      expect(onVoiceDiscard).not.toHaveBeenCalled();
+      expect(button).toHaveAttribute("aria-pressed", "false");
+
+      // Idle again: nothing to end.
+      act(() => micRef.current?.endTake());
+      expect(abortSpy).toHaveBeenCalledTimes(1);
     });
 
     it("ends the take when the user stops while a restart is starting", () => {
@@ -1139,5 +1165,78 @@ describe("ComposerMicButton (server dictation)", () => {
     });
     expect(onInterim).not.toHaveBeenCalled();
     expect(onTranscript).not.toHaveBeenCalled();
+  });
+
+  it("endTake cancels a live server take without its tail or later results", async () => {
+    const micRef = createRef<ComposerMicButtonHandle>();
+    const onTranscript = vi.fn();
+    const onInterim = vi.fn();
+    renderServerMode({ ref: micRef, onTranscript, onInterim });
+    await clickMic();
+
+    act(() => micRef.current?.endTake());
+    act(() => {
+      sessionEvents?.onPartial("late partial");
+      sessionEvents?.onFinal("late final");
+    });
+
+    expect(sessionCancelMock).toHaveBeenCalledTimes(1);
+    expect(sessionStopMock).not.toHaveBeenCalled();
+    expect(onInterim).not.toHaveBeenCalled();
+    expect(onTranscript).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Voice dictation" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+  });
+
+  it("endTake during the handshake cancels the session once it connects", async () => {
+    let resolveStart!: (s: SessionStub) => void;
+    sessionStartMock = vi.fn(
+      () =>
+        new Promise<SessionStub>((resolve) => {
+          resolveStart = resolve;
+        }),
+    );
+    const micRef = createRef<ComposerMicButtonHandle>();
+    renderServerMode({ ref: micRef });
+    await clickMic();
+
+    act(() => micRef.current?.endTake());
+    await act(async () => {
+      resolveStart({ stop: sessionStopMock, cancel: sessionCancelMock });
+    });
+
+    const button = screen.getByRole("button", { name: "Voice dictation" });
+    expect(sessionCancelMock).toHaveBeenCalledTimes(1);
+    expect(button).toHaveAttribute("aria-pressed", "false");
+    expect(button).toHaveAttribute("aria-busy", "false");
+    expect(showToastMock).not.toHaveBeenCalled();
+  });
+
+  it("endTake while a stop is flushing drops the tail", async () => {
+    let resolveStop!: (tail: string) => void;
+    sessionStopMock = vi.fn(
+      () =>
+        new Promise<string>((resolve) => {
+          resolveStop = resolve;
+        }),
+    );
+    const micRef = createRef<ComposerMicButtonHandle>();
+    const onTranscript = vi.fn();
+    const onInterim = vi.fn();
+    renderServerMode({ ref: micRef, onTranscript, onInterim });
+    await clickMic();
+    await clickMic();
+
+    act(() => micRef.current?.endTake());
+    await act(async () => resolveStop("tail words"));
+
+    expect(onTranscript).not.toHaveBeenCalled();
+    expect(onInterim).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "Voice dictation" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
   });
 });

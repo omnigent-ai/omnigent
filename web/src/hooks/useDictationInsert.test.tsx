@@ -114,6 +114,16 @@ describe("useDictationInsert", () => {
     expect(result.current.value).toBe("Hello, world. next");
   });
 
+  it("commitPending keeps a pending interim out of the next take's revisions", () => {
+    // A send ends the take while its last partial is still pending; when the
+    // draft is kept, the next take must add to that text rather than replace it.
+    const { result } = renderDictation();
+    act(() => result.current.replaceInterim("sent but kept"));
+    act(() => result.current.commitPending());
+    act(() => result.current.replaceInterim("next"));
+    expect(result.current.value).toBe("sent but kept next");
+  });
+
   it("space-separates from an existing draft without doubling spaces", () => {
     const { result } = renderDictation("draft");
     act(() => result.current.replaceInterim("spoken"));

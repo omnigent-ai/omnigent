@@ -102,6 +102,8 @@ export function useDictationInsert(
   replaceInterim: (text: string) => void;
   /** Report that the composer has been focused, so its caret is real. */
   noteFocus: () => void;
+  /** Pin a pending interim region as text the next take must not revise. */
+  commitPending: () => void;
 } {
   // The draft as last seen. Refreshed on every render so external changes
   // win, and written on insert so a second transcript in the same batch
@@ -206,6 +208,10 @@ export function useDictationInsert(
     replaceInterim: useCallback((text: string) => insert(text, false), [insert]),
     noteFocus: useCallback(() => {
       focusedRef.current = true;
+    }, []),
+    commitPending: useCallback(() => {
+      const mine = producedRef.current;
+      if (mine?.region) producedRef.current = { ...mine, region: null };
     }, []),
   };
 }

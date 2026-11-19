@@ -15,7 +15,10 @@ import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 import type { ReactNode } from "react";
-import type { ComposerMicButtonProps } from "@/components/ComposerMicButton";
+import type {
+  ComposerMicButtonHandle,
+  ComposerMicButtonProps,
+} from "@/components/ComposerMicButton";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
@@ -44,13 +47,20 @@ vi.mock("@/store/chatStore", async (importOriginal) => ({
 }));
 
 vi.mock("@/components/composer/ComposerAddMenu", () => ({ ComposerAddMenu: () => null }));
-const mic = vi.hoisted(() => ({ current: null as ComposerMicButtonProps | null }));
-vi.mock("@/components/ComposerMicButton", () => ({
-  ComposerMicButton: (props: ComposerMicButtonProps) => {
-    mic.current = props;
-    return null;
-  },
+const mic = vi.hoisted(() => ({
+  current: null as ComposerMicButtonProps | null,
+  endTake: vi.fn<() => void>(),
 }));
+vi.mock("@/components/ComposerMicButton", async () => {
+  const { forwardRef, useImperativeHandle } = await import("react");
+  return {
+    ComposerMicButton: forwardRef<ComposerMicButtonHandle, ComposerMicButtonProps>((props, ref) => {
+      mic.current = props;
+      useImperativeHandle(ref, () => ({ endTake: mic.endTake }));
+      return null;
+    }),
+  };
+});
 const mockSession = vi.hoisted(() => ({
   labels: {} as Record<string, string>,
   snapshot: {} as Partial<Session>,
@@ -513,6 +523,22 @@ it.each(["confirmed", "rejected"])(
     expect(useChatStore.getState().conversationId).toBe("conv_main");
   },
 );
+
+describe("side-chat voice take", () => {
+  it.each([false, true])("ends when the dictated message is sent (pending: %s)", (pending) => {
+    mic.endTake.mockClear();
+    const onStart = vi.fn().mockResolvedValue(undefined);
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+    renderPane(<SideChatPane childId={pending ? "pending:side" : childId} onStart={onStart} />);
+    act(() => mic.current!.onTranscript("dictated question"));
+    expect(mic.endTake).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
+
+    expect(pending ? onStart : send).toHaveBeenCalledTimes(1);
+    expect(mic.endTake).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe("side chat opened from a text selection", () => {
   it.each([false, true])("preserves list indentation when sending (pending: %s)", (pending) => {
