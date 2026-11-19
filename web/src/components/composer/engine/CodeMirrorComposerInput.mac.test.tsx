@@ -1,7 +1,7 @@
 // The full CodeMirror composer as macOS runs it. CodeMirror reads the platform once, when it
 // loads, to pick its macOS bindings; vi.hoisted sets the platform before any import runs.
 
-import { act, fireEvent, render } from "@testing-library/react";
+import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { COMPOSER_EDITING_KEYMAP } from "./CodeMirrorComposerInput";
 import { CodeMirrorComposerInput } from "./testing/codeMirrorComposer";
@@ -34,9 +34,7 @@ function mount(value: string, caret: number) {
   return { target: () => box.target!, press };
 }
 
-afterEach(() => {
-  document.body.replaceChildren();
-});
+afterEach(cleanup);
 
 describe("CodeMirror composer keys on macOS", () => {
   it("installs no Control+Option binding, on any platform's key", () => {
@@ -74,6 +72,27 @@ describe("CodeMirror composer keys on macOS", () => {
     expect(press({ key: "∫", code: "KeyB", altKey: true })).toBe(true);
     expect(target().value).toBe("draft");
   });
+
+  it("yanks both words after two ⌃W kills in a row", () => {
+    const { target, press } = mount("git push origin", 15);
+
+    press({ key: "w", code: "KeyW", ctrlKey: true });
+    press({ key: "w", code: "KeyW", ctrlKey: true });
+    press({ key: "y", code: "KeyY", ctrlKey: true });
+
+    expect(target().value).toBe("git push origin");
+  });
+
+  it("yanks only the newest kill once the caret has moved between kills", () => {
+    const { target, press } = mount("git push origin", 15);
+
+    press({ key: "w", code: "KeyW", ctrlKey: true });
+    act(() => target().setSelectionRange(8, 8));
+    press({ key: "w", code: "KeyW", ctrlKey: true });
+    press({ key: "y", code: "KeyY", ctrlKey: true });
+
+    expect(target().value).toBe("git push ");
+  });
 });
 
 describe("a locked CodeMirror composer", () => {
@@ -96,7 +115,8 @@ describe("a locked CodeMirror composer", () => {
         />,
       );
       const content = container.querySelector<HTMLElement>(".cm-content")!;
-      act(() => box.target!.setSelectionRange(15, 15));
+      // Mid-text, so the deletions would change the draft if the lock didn't stop them.
+      act(() => box.target!.setSelectionRange(5, 5));
 
       for (const key of ["w", "k", "u", "y", "d", "h"]) {
         fireEvent.keyDown(content, { key, code: `Key${key.toUpperCase()}`, ctrlKey: true });
@@ -127,11 +147,16 @@ describe("a locked CodeMirror composer", () => {
       box.target!.focus();
       box.target!.setSelectionRange(15, 15);
     });
+    // Editable, so this ⌃W kills "draft" and puts it in the ring for the yank below.
+    fireEvent.keyDown(content, { key: "w", code: "KeyW", ctrlKey: true });
+    expect(box.target!.value).toBe("keep this ");
+    onChange.mockClear();
 
     rerender(view(true));
+    fireEvent.keyDown(content, { key: "y", code: "KeyY", ctrlKey: true });
     fireEvent.keyDown(content, { key: "w", code: "KeyW", ctrlKey: true });
 
-    expect(box.target!.value).toBe("keep this draft");
+    expect(box.target!.value).toBe("keep this ");
     expect(onChange).not.toHaveBeenCalled();
   });
 });

@@ -2,23 +2,6 @@
 // kill ring in lib/textEditing/readline. Off macOS none of these keys are claimed: Ctrl+W,
 // Ctrl+A and friends keep their platform meaning there.
 
-import {
-  cursorCharLeft,
-  cursorCharRight,
-  cursorLineDown,
-  cursorLineEnd,
-  cursorLineStart,
-  cursorLineUp,
-  deleteCharBackward,
-  deleteCharForward,
-  selectCharLeft,
-  selectCharRight,
-  selectLineDown,
-  selectLineEnd,
-  selectLineStart,
-  selectLineUp,
-  transposeChars,
-} from "@codemirror/commands";
 import { Annotation, StateField, type Extension, type StateCommand } from "@codemirror/state";
 import { keymap, type KeyBinding } from "@codemirror/view";
 import {
@@ -87,17 +70,11 @@ const yank: StateCommand = ({ state, dispatch }) => {
   return true;
 };
 
-/** The readline bindings, keyed in CodeMirror's notation. */
+/**
+ * The kill-ring keys. The Emacs motion and delete keys are already bound on macOS by the
+ * standard keymap; Ctrl-k overrides its line-end delete so the text can be yanked back.
+ */
 export const READLINE_BINDINGS: readonly KeyBinding[] = [
-  { key: "Ctrl-a", run: cursorLineStart, shift: selectLineStart },
-  { key: "Ctrl-e", run: cursorLineEnd, shift: selectLineEnd },
-  { key: "Ctrl-b", run: cursorCharLeft, shift: selectCharLeft },
-  { key: "Ctrl-f", run: cursorCharRight, shift: selectCharRight },
-  { key: "Ctrl-p", run: cursorLineUp, shift: selectLineUp },
-  { key: "Ctrl-n", run: cursorLineDown, shift: selectLineDown },
-  { key: "Ctrl-d", run: deleteCharForward },
-  { key: "Ctrl-h", run: deleteCharBackward },
-  { key: "Ctrl-t", run: transposeChars },
   { key: "Ctrl-k", run: kill(lineEndAfter) },
   { key: "Ctrl-u", run: kill(lineStartBefore) },
   { key: "Ctrl-w", run: kill(shellWordStartBefore) },
