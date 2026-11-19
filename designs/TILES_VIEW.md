@@ -101,6 +101,11 @@ registry eviction.
 - **Agent details.** Clicking a tile's title opens cards: Now, Where, Usage,
   Agent (with inline rename, as in the header) and Latest reply. Usage and the
   reply are fetched only while the details are open.
+- **Composing like Grid.** Every live tile uses the grid cell's composer: sends
+  queue or steer while the agent works, the draft is shared with the single agent
+  view, and the host, permission and model pickers come along. Terminal-first
+  sessions get the cell's Chat/Terminal switch; a tile showing its terminal
+  closes its chat stream, so it still holds one connection.
 - **Arranging.** Full screen (button, title double-click or F; Esc returns),
   per-tile text size (85–130%, applied as zoom on the body), drag to reorder by
   the handle or its arrow keys (tiles never moved keep their natural place), and

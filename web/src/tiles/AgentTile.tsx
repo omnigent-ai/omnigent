@@ -26,7 +26,6 @@ import {
   RadioTowerIcon,
   StarIcon,
 } from "lucide-react";
-import { SideChatPane } from "@/components/chat/SideChatPane";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { SessionStateBadge } from "@/components/SessionStateBadge";
 import { Button } from "@/components/ui/button";
@@ -42,6 +41,8 @@ import { getSessionState } from "@/hooks/useSessionState";
 import { cn } from "@/lib/utils";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
 import { TileColorPicker } from "./TileColorPicker";
+import { TileChat, TileTerminalProvider } from "./TileChat";
+import { ViewModeToggle } from "@/shell/ViewModeToggle";
 import { TileDetails } from "./TileDetails";
 import { TileRenameInput } from "./TileRenameInput";
 import { isQuiet } from "./tileStack";
@@ -151,7 +152,7 @@ function AgentTileComponent({
 
   const showConversation = live && variant !== "card";
 
-  return (
+  const tile = (
     <section
       data-testid="agent-tile"
       data-session-id={conversation.id}
@@ -305,6 +306,9 @@ function AgentTileComponent({
             <PencilIcon className="size-3" />
           </Button>
         )}
+        {showConversation && !detailsOpen && (
+          <ViewModeToggle alwaysVisible hotkeyEnabled={active} />
+        )}
         {variant !== "card" && (
           <DropdownMenu>
             <DropdownMenuTrigger asChild>
@@ -416,7 +420,7 @@ function AgentTileComponent({
       ) : showConversation ? (
         <div className="relative min-h-0 flex-1 overflow-hidden" style={bodyZoom}>
           <RenderErrorBoundary name="tile-chat" resetKey={conversation.id}>
-            <SideChatPane childId={conversation.id} fullSession readOnly={!active} />
+            <TileChat sessionId={conversation.id} active={active} />
           </RenderErrorBoundary>
         </div>
       ) : (
@@ -456,16 +460,14 @@ function AgentTileComponent({
         </div>
       )}
 
-      {!detailsOpen && !active && variant !== "card" && live && (
+      {!detailsOpen && !active && waiting && variant !== "card" && live && (
         <footer
           className={cn(
             "shrink-0 border-t px-3 py-1.5 text-center text-xs",
             waiting ? "text-amber-600 dark:text-amber-400" : "text-muted-foreground",
           )}
         >
-          {waiting
-            ? "Waiting for you. Click to answer."
-            : "View only. Click to make this the active agent."}
+          Waiting for you. Click to answer.
         </footer>
       )}
       {resize && (
@@ -477,6 +479,11 @@ function AgentTileComponent({
         />
       )}
     </section>
+  );
+  return showConversation ? (
+    <TileTerminalProvider sessionId={conversation.id}>{tile}</TileTerminalProvider>
+  ) : (
+    tile
   );
 }
 

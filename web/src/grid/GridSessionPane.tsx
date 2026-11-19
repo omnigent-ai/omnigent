@@ -354,7 +354,7 @@ export function GridSessionPane({
 }
 
 /** The cell session's permission mode; its owner can switch it as in the main composer. */
-function GridPermissionPicker({ permission }: { permission: GridPermissionControl }) {
+export function GridPermissionPicker({ permission }: { permission: GridPermissionControl }) {
   const { chip } = permission;
   if (chip === null) return null;
   return (
@@ -378,7 +378,7 @@ function GridPermissionPicker({ permission }: { permission: GridPermissionContro
  * hook as the full-screen composer. It reads and writes this session only; the
  * busy state is this cell's.
  */
-function GridSessionHarnessPicker({
+export function GridSessionHarnessPicker({
   sessionId,
   session,
   canEdit,

@@ -158,6 +158,8 @@ def test_search_stack_and_files_drawer(
     base_url, session_a, session_b = tiles_server
     page.goto(f"{base_url}/tiles?active={session_a}")
     expect(_tile(page, session_b)).to_be_visible(timeout=30_000)
+    # Every live tile composes like a grid cell, not only the active one.
+    expect(_tile(page, session_b).get_by_placeholder("Reply to this session...")).to_be_editable()
 
     search = page.get_by_role("searchbox", name="Search agents")
     search.fill("quick question")

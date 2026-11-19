@@ -96,9 +96,9 @@ describe("tilesToggleDestination", () => {
 });
 
 describe("tileStreamBudget", () => {
-  it("keeps two live tiles over HTTP/1.1 and the full budget over HTTP/2", () => {
-    expect(tileStreamBudget("serial", 4)).toBe(2);
-    expect(tileStreamBudget("serial", 1)).toBe(1);
-    expect(tileStreamBudget("multiplexed", 30)).toBe(30);
+  it("uses the registry budget grid cells share, never less than the active tile", () => {
+    expect(tileStreamBudget(4)).toBe(4);
+    expect(tileStreamBudget(30)).toBe(30);
+    expect(tileStreamBudget(0)).toBe(1);
   });
 });

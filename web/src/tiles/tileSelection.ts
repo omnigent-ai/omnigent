@@ -69,12 +69,13 @@ export function pickLiveIds(
 }
 
 /**
- * Live tiles allowed on this connection. Over HTTP/1.1 the browser holds ~6
- * connections per origin, shared with the updates socket and any open terminal,
- * so tiles keep two streams there; HTTP/2 can use the registry's full budget.
+ * Live tiles allowed on this connection: the conversation registry's budget,
+ * which grid cells share. Over HTTP/1.1 that is four streams, leaving the rest
+ * of the browser's ~6 connections per origin for ordinary requests; a tile
+ * showing its terminal closes its chat stream, so it still counts once.
  */
-export function tileStreamBudget(protocol: "multiplexed" | "serial", registryMax: number): number {
-  return protocol === "multiplexed" ? registryMax : Math.min(2, registryMax);
+export function tileStreamBudget(registryMax: number): number {
+  return Math.max(1, registryMax);
 }
 
 export function parseTilesView(value: string | null | undefined): TilesView | null {

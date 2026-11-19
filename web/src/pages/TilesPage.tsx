@@ -16,7 +16,7 @@ import { Button } from "@/components/ui/button";
 import type { Conversation } from "@/hooks/useConversations";
 import { useSidebarData } from "@/hooks/useSidebarData";
 import { cn } from "@/lib/utils";
-import { getConnectionProtocol, maxLiveConversations } from "@/store/conversationRegistry";
+import { maxLiveConversations } from "@/store/conversationRegistry";
 import { AgentTile, type AgentTileVariant, type TileReorder } from "@/tiles/AgentTile";
 import {
   applyTileOrder,
@@ -167,11 +167,7 @@ export function TilesPage() {
     () =>
       view === "cards"
         ? new Set<string>()
-        : pickLiveIds(
-            orderedIds,
-            activeId,
-            tileStreamBudget(getConnectionProtocol(), maxLiveConversations()),
-          ),
+        : pickLiveIds(orderedIds, activeId, tileStreamBudget(maxLiveConversations())),
     [view, orderedIds, activeId],
   );
   useReleaseIdleTileStreams(liveIds, activeId);

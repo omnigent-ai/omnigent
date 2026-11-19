@@ -1,3 +1,4 @@
+import type * as React from "react";
 import { act, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
@@ -5,15 +6,16 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import { AgentTile, type AgentTileVariant, type TileReorder } from "./AgentTile";
 
-// The chat pane has its own suite; the stub records how the tile configures it.
-vi.mock("@/components/chat/SideChatPane", () => ({
-  SideChatPane: ({ childId, readOnly }: { childId: string; readOnly?: boolean }) => (
-    <div data-testid="side-chat" data-child={childId} data-read-only={String(Boolean(readOnly))}>
+// A live tile's chat (the grid cell composer) has its own coverage; the stub
+// records which session it shows and whether the tile is active.
+vi.mock("./TileChat", () => ({
+  TileChat: ({ sessionId, active }: { sessionId: string; active: boolean }) => (
+    <div data-testid="tile-chat" data-session={sessionId} data-active={String(active)}>
       <p>transcript</p>
     </div>
   ),
+  TileTerminalProvider: ({ children }: { children: React.ReactNode }) => children,
 }));
-
 vi.mock("./TileRenameInput", () => ({
   TileRenameInput: ({ title }: { title: string }) => (
     <input aria-label="Session name" defaultValue={title} />
@@ -81,15 +83,15 @@ describe("AgentTile", () => {
     expect(screen.getByText(/codex · project/)).toBeInTheDocument();
   });
 
-  it("gives only the active tile a composer", () => {
+  it("gives every live tile the composer, active or not", () => {
     renderTile({ active: true });
-    expect(screen.getByTestId("side-chat")).toHaveAttribute("data-read-only", "false");
+    expect(screen.getByTestId("tile-chat")).toHaveAttribute("data-active", "true");
     expect(screen.queryByText(/View only/)).not.toBeInTheDocument();
   });
 
-  it("keeps an inactive live tile read-only until it is clicked", () => {
+  it("activates an inactive live tile when its chat is clicked", () => {
     const { onActivate } = renderTile();
-    expect(screen.getByTestId("side-chat")).toHaveAttribute("data-read-only", "true");
+    expect(screen.getByTestId("tile-chat")).toHaveAttribute("data-active", "false");
     fireEvent.click(screen.getByText("transcript"));
     expect(onActivate).toHaveBeenCalledWith("conv_1");
   });
@@ -110,7 +112,7 @@ describe("AgentTile", () => {
 
   it("renders cards and over-budget tiles without streaming", () => {
     renderTile({ variant: "card" });
-    expect(screen.queryByTestId("side-chat")).not.toBeInTheDocument();
+    expect(screen.queryByTestId("tile-chat")).not.toBeInTheDocument();
     expect(screen.getByText("/workspace/project")).toBeInTheDocument();
   });
 
