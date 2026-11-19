@@ -7641,12 +7641,11 @@ function NestPickerMenu({
         )}
       </div>
       {conversation.family && (
-        <>
-          <C.Separator />
+        <div className="border-t pt-1">
           <C.Item disabled={nests.saving} onSelect={() => select(null)}>
             Remove from nest
           </C.Item>
-        </>
+        </div>
       )}
     </>
   );
