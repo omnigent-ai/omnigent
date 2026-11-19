@@ -7,12 +7,14 @@ import json
 import threading
 from builtins import ExceptionGroup
 from contextlib import asynccontextmanager
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
+import yaml
 from fastapi import FastAPI
 from pydantic import ValidationError
 
@@ -810,3 +812,25 @@ async def test_refresh_locks_release_after_waiters_finish_or_cancel(registry, mo
     await asyncio.sleep(0)
     gc.collect()
     assert not registry._locks
+
+
+_EXAMPLES = Path(__file__).resolve().parents[2] / "examples" / "mcp-registry"
+
+
+@pytest.mark.parametrize("name", ["registry.yaml", "pipeshub.yaml"])
+def test_example_catalogs_are_valid(name: str) -> None:
+    """The shipped example catalogs load as a real server would load them."""
+    McpRegistryConfig.model_validate(yaml.safe_load((_EXAMPLES / name).read_text()))
+
+
+def test_pipeshub_example_signs_each_user_in_with_refresh() -> None:
+    """The PipesHub example uses per-user OAuth, asks for a refresh token, and
+    scopes its tokens to the MCP endpoint it calls."""
+    catalog = McpRegistryConfig.model_validate(
+        yaml.safe_load((_EXAMPLES / "pipeshub.yaml").read_text())
+    )
+    (service,) = catalog.services
+    assert service.auth == "oauth" and service.oauth is not None
+    assert "offline_access" in service.oauth.scopes
+    assert service.oauth.resource == service.url
+    assert service.oauth.client_secret_env
