@@ -190,9 +190,16 @@ def create_project_tickets_router(
         who = await actor(request, project_id)
         await asyncio.to_thread(store.get, project_id, ticket_id, user_id=who.user_id)
         session_id = await check_session(who, project_id, body.session_id)
-        result = await asyncio.to_thread(
-            store.link_session, project_id, ticket_id, session_id, body.action, who
-        )
+        with _storage_errors():
+            result = await asyncio.to_thread(
+                store.link_session,
+                project_id,
+                ticket_id,
+                session_id,
+                body.action,
+                who,
+                involvement=body.involvement,
+            )
         wake(request)
         return result
 

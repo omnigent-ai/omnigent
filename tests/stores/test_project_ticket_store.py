@@ -81,10 +81,12 @@ def test_atomic_edits_and_append_only_outputs(board):
     assert len(tickets.events(project.id, ticket["id"], user_id="alice")["data"]) == 8
 
 
-def test_failed_event_write_rolls_back_ticket_change(board, monkeypatch):
+def test_failed_event_write_rolls_back_ticket_and_link_changes(board, monkeypatch):
     tickets, _, project = board
     actor = TicketActor("alice")
     ticket = tickets.create(project.id, CreateTicket(title="Original"), actor)
+    worker = uuid4().hex
+    tickets.link_session(project.id, ticket["id"], worker, "attach", actor, involvement="Planning")
 
     def reject(*args, **kwargs):
         raise RuntimeError("event storage unavailable")
@@ -92,8 +94,16 @@ def test_failed_event_write_rolls_back_ticket_change(board, monkeypatch):
     monkeypatch.setattr(tickets, "_append", reject)
     with pytest.raises(RuntimeError, match="event storage"):
         tickets.update(project.id, ticket["id"], UpdateTicket(title="Lost edit"), actor)
+    with pytest.raises(RuntimeError, match="event storage"):
+        tickets.link_session(
+            project.id, ticket["id"], worker, "attach", actor, involvement="Building"
+        )
     assert tickets.get(project.id, ticket["id"], user_id="alice")["title"] == "Original"
-    assert len(tickets.events(project.id, ticket["id"], user_id="alice")["data"]) == 1
+    assert (
+        tickets.sessions(project.id, ticket["id"], user_id="alice")["data"][0]["involvement"]
+        == "Planning"
+    )
+    assert len(tickets.events(project.id, ticket["id"], user_id="alice")["data"]) == 2
 
 
 def test_storage_envelope_bound_rolls_back_the_event(board):
@@ -183,9 +193,44 @@ async def test_linked_session_deletion_preserves_ticket_and_history(board, db_ur
     session = conversations.create_conversation(project_id=project.id)
     actor = TicketActor("alice", session.id)
     ticket = tickets.create(project.id, CreateTicket(title="Persistent"), actor)
+    tickets.link_session(
+        project.id, ticket["id"], session.id, "attach", actor, involvement="Plan the work"
+    )
     tickets.link_session(project.id, ticket["id"], session.id, "attach", actor)
-    tickets.link_session(project.id, ticket["id"], session.id, "attach", actor)
+    tickets.link_session(
+        project.id, ticket["id"], session.id, "attach", actor, involvement="Plan the work"
+    )
     assert len(tickets.events(project.id, ticket["id"], user_id="alice")["data"]) == 2
+    assert (
+        tickets.sessions(project.id, ticket["id"], user_id="alice")["data"][0]["involvement"]
+        == "Plan the work"
+    )
+    tickets.link_session(
+        project.id, ticket["id"], session.id, "attach", actor, involvement="Implementing the plan"
+    )
+    assert (
+        tickets.sessions(project.id, ticket["id"], user_id="alice")["data"][0]["involvement"]
+        == "Implementing the plan"
+    )
+    tickets.link_session(project.id, ticket["id"], session.id, "attach", actor, involvement="")
+    assert (
+        tickets.sessions(project.id, ticket["id"], user_id="alice")["data"][0]["involvement"] == ""
+    )
+    history = tickets.events(project.id, ticket["id"], user_id="alice")["data"]
+    assert [event["payload"].get("action") for event in history] == [
+        None,
+        "attach",
+        "updated",
+        "updated",
+    ]
+    assert [event["payload"]["involvement"] for event in history[1:]] == [
+        "Plan the work",
+        "Implementing the plan",
+        "",
+    ]
+    assert all(
+        event["session_id"] == session.id and event["user_id"] == "alice" for event in history
+    )
     await conversations.delete_conversation(session.id)
     assert tickets.get(project.id, ticket["id"], user_id="alice")["status"] == "open"
     assert (
@@ -196,6 +241,9 @@ async def test_linked_session_deletion_preserves_ticket_and_history(board, db_ur
         tickets.sessions(project.id, ticket["id"], user_id="alice")["data"][0]["session_id"]
         == session.id
     )
+    tickets.link_session(project.id, ticket["id"], session.id, "remove", actor)
+    assert tickets.sessions(project.id, ticket["id"], user_id="alice")["data"] == []
+    assert tickets.events(project.id, ticket["id"], user_id="alice")["data"][:-1] == history
 
 
 def test_plan_review_and_feedback_change_atomically(board, monkeypatch):

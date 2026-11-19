@@ -57,6 +57,7 @@ async def test_project_creation_has_one_normal_orchestrator(project_client, db_u
     info = (await project_client.get("/v1/info")).json()
     assert info["project_tickets"] is True
     assert info["project_ticket_lifecycle"] is True
+    assert info["project_ticket_agent_involvement"] is True
     assert info["durable_initial_input"] is False
 
     worker = (
@@ -312,17 +313,32 @@ async def test_links_require_same_project_and_preserve_history(project_client, d
     source = store.create_conversation(project_id=project["id"])
     foreign = store.create_conversation()
     assert (
-        await project_client.post(path + "/sessions", json={"session_id": foreign.id})
+        await project_client.post(
+            path + "/sessions", json={"session_id": foreign.id, "involvement": "Not this project"}
+        )
     ).status_code == 400
     assert (
-        await project_client.post(path + "/sessions", json={"session_id": source.id})
+        await project_client.post(
+            path + "/sessions", json={"session_id": source.id, "involvement": " Plan the work "}
+        )
     ).status_code == 200
     assert (await project_client.get(path + "/sessions")).json()["data"][0][
         "session_id"
     ] == source.id
+    assert (await project_client.get(path + "/sessions")).json()["data"][0][
+        "involvement"
+    ] == "Plan the work"
+    assert (
+        await project_client.post(
+            path + "/sessions", json={"session_id": source.id, "involvement": "Build the plan"}
+        )
+    ).status_code == 200
+    assert (await project_client.get(path + "/sessions")).json()["data"][0][
+        "involvement"
+    ] == "Build the plan"
     await store.delete_conversation(source.id)
     assert (await project_client.get(path)).json()["status"] == "open"
-    assert len((await project_client.get(path + "/events")).json()["data"]) == 2
+    assert len((await project_client.get(path + "/events")).json()["data"]) == 3
 
 
 async def test_lifecycle_related_links_and_lead_api(project_client, db_uri):

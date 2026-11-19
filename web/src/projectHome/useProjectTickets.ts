@@ -10,6 +10,7 @@ import {
   listTicketSessions,
   listRelatedTickets,
   linkRelatedTicket,
+  setTicketSessionInvolvement,
   TICKET_STATUSES,
   updateTicket,
   type TicketChanges,
@@ -26,6 +27,11 @@ export function useProjectTicketsEnabled() {
 export function useTicketLifecycleEnabled() {
   const info = useServerInfo();
   return info !== "loading" && info.project_ticket_lifecycle === true;
+}
+
+export function useTicketInvolvementEnabled() {
+  const info = useServerInfo();
+  return info !== "loading" && info.project_ticket_agent_involvement === true;
 }
 
 export function useTicketStatuses() {
@@ -120,5 +126,10 @@ export function useTicketActions(projectId: string) {
     }) => linkRelatedTicket(projectId, id, relatedId, action),
     onSuccess: refresh,
   });
-  return { update, comment, link };
+  const involvement = useMutation({
+    mutationFn: ({ id, sessionId, text }: { id: string; sessionId: string; text: string }) =>
+      setTicketSessionInvolvement(projectId, id, sessionId, text),
+    onSuccess: refresh,
+  });
+  return { update, comment, link, involvement };
 }

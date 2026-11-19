@@ -7,6 +7,7 @@ import {
   EyeIcon,
 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
+import { NeedsResponseBadge } from "@/components/NeedsResponseBadge";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -48,21 +49,20 @@ export function TicketStatusIcon({ status }: { status: TicketStatus }) {
 export function TicketTags({ tags }: { tags: TicketTag[] }) {
   return (
     <div className="flex min-w-0 flex-wrap gap-1.5">
-      {tags.map((tag) => (
-        <Badge
-          key={tag.key}
-          variant="secondary"
-          title={tag.value || undefined}
-          className={cn(
-            "h-auto min-h-5 max-w-full whitespace-normal text-left wrap-anywhere",
-            tag.key === "needs-human" && "bg-warning/15 text-warning",
-          )}
-        >
-          {tag.key === "needs-human"
-            ? "Needs human input"
-            : `${tag.key}${tag.value ? `: ${tag.value}` : ""}`}
-        </Badge>
-      ))}
+      {tags.map((tag) =>
+        tag.key === "needs-human" ? (
+          <NeedsResponseBadge key={tag.key} title={tag.value || undefined} />
+        ) : (
+          <Badge
+            key={tag.key}
+            variant="secondary"
+            title={tag.value || undefined}
+            className="h-auto min-h-5 max-w-full whitespace-normal text-left wrap-anywhere"
+          >
+            {`${tag.key}${tag.value ? `: ${tag.value}` : ""}`}
+          </Badge>
+        ),
+      )}
     </div>
   );
 }

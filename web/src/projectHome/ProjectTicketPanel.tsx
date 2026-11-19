@@ -3,11 +3,9 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   BotIcon,
   CheckIcon,
-  ChevronRightIcon,
   ExternalLinkIcon,
   GitPullRequestIcon,
   LinkIcon,
-  MessageSquareIcon,
   PencilIcon,
   PlusIcon,
   TagsIcon,
@@ -15,7 +13,6 @@ import {
   XIcon,
 } from "lucide-react";
 import { ProseMarkdown } from "@/components/blocks/ChatMarkdown";
-import { SessionStateBadge } from "@/components/SessionStateBadge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
@@ -31,15 +28,11 @@ import {
 import { Spinner } from "@/components/ui/spinner";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useNow } from "@/hooks/useNow";
-import { fetchConversationById } from "@/hooks/useOpenSessionRow";
-import { useSessionBadgeStates } from "@/hooks/useSessionBadgeStates";
 import { useViewerId } from "@/hooks/useViewerId";
 import { parseHttpUrl } from "@/lib/openLinkInApp";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import { Link, useSearchParams, useReplaceSearchParams } from "@/lib/routing";
-import { findCachedListRow } from "@/lib/sessionListCache";
 import { cn } from "@/lib/utils";
-import { conversationDisplayLabel } from "@/shell/sidebarNav";
 import { getProject, initializeProjectOrchestrator } from "@/lib/projectsApi";
 import {
   createTicket,
@@ -53,11 +46,9 @@ import {
   type TicketTag,
 } from "@/lib/projectTicketsApi";
 import { ProjectSessionPanel } from "./ProjectSessionPanel";
-import {
-  projectSessionPanelSearch,
-  ticketPanelSearch,
-  ticketSessionSearch,
-} from "./projectHomeNavigation";
+import { ticketPanelSearch } from "./projectHomeNavigation";
+import { TicketAgents } from "./TicketAgents";
+import { TicketSessionLink } from "./TicketSessionLink";
 import {
   CompleteTicketDialog,
   ReviewTicketDialog,
@@ -72,7 +63,6 @@ import {
   useTicketActions,
   useTicketEvents,
   useTicketProject,
-  useTicketSessions,
   useTicketLifecycleEnabled,
   useTicketStatuses,
 } from "./useProjectTickets";
@@ -339,7 +329,6 @@ function TicketDetails({
   const chatting = !!chatSessionId || orchestratorChat;
   const closeChat = () => replaceSearchParams(new URLSearchParams({ ticket: ticketId }));
   const ticket = query.data;
-  const humanInput = ticket?.tags.find((tag) => tag.key === "needs-human")?.value;
   if (!ticket)
     return (
       <Panel title="Ticket" onClose={onClose}>
@@ -433,18 +422,7 @@ function TicketDetails({
                   onChange={(tags) => update.mutate({ id: ticketId, changes: { tags } })}
                 />
               </div>
-              {humanInput && (
-                <p className="text-sm leading-relaxed text-warning wrap-anywhere">{humanInput}</p>
-              )}
-              {lifecycle && (
-                <TicketAgentContact
-                  ticket={ticket}
-                  pending={update.isPending}
-                  onClear={() =>
-                    update.mutate({ id: ticketId, changes: { lead_session_id: null } })
-                  }
-                />
-              )}
+              <TicketAgents projectId={projectId} ticket={ticket} />
               {ticket.description ? (
                 <ProseMarkdown className="text-ui leading-relaxed">
                   {ticket.description}
@@ -472,7 +450,7 @@ function TicketDetails({
           {ticket.status === "review" && (
             <section
               aria-label="Human review"
-              className="space-y-3 rounded-lg border border-warning/30 bg-warning/5 p-3.5"
+              className="space-y-3 rounded-lg border border-brand-accent/20 bg-tag-pink p-3.5"
             >
               <h3 className="flex items-center gap-2 text-sm font-medium">
                 <TicketStatusIcon status="review" />
@@ -481,6 +459,9 @@ function TicketDetails({
               <ProseMarkdown className="text-ui leading-relaxed">
                 {ticket.review_summary ?? ""}
               </ProseMarkdown>
+              <p className="text-sm text-muted-foreground">
+                These actions update the ticket. Answer any open agent prompt in that agent’s chat.
+              </p>
               <div className="flex flex-wrap gap-2">
                 <Button
                   size="sm"
@@ -518,18 +499,6 @@ function TicketDetails({
           )}
           <TicketOutputs projectId={projectId} ticketId={ticketId} />
           {lifecycle && <TicketRelatedTickets projectId={projectId} ticketId={ticketId} />}
-          <LinkedSessions
-            projectId={projectId}
-            ticketId={ticketId}
-            leadSessionId={ticket.lead_session_id}
-            pending={update.isPending}
-            onLead={
-              lifecycle
-                ? (sessionId) =>
-                    update.mutate({ id: ticketId, changes: { lead_session_id: sessionId } })
-                : undefined
-            }
-          />
           <TicketActivity projectId={projectId} ticketId={ticketId} />
           {completing && (
             <CompleteTicketDialog
@@ -617,53 +586,6 @@ function TicketDetails({
         )
       )}
     </div>
-  );
-}
-
-function TicketAgentContact({
-  ticket,
-  pending,
-  onClear,
-}: {
-  ticket: ProjectTicket;
-  pending: boolean;
-  onClear: () => void;
-}) {
-  if (!ticket.lead_session_id)
-    return (
-      <Button asChild variant="outline" size="sm">
-        <Link to={ticketSessionSearch(ticket.id)}>
-          <MessageSquareIcon aria-hidden />
-          Ask orchestrator
-        </Link>
-      </Button>
-    );
-  return (
-    <section
-      aria-label="Responsible agent"
-      className="rounded-lg border border-border/60 bg-muted/20 p-1"
-    >
-      <div className="flex items-center justify-between px-2 pt-1">
-        <h3 className="text-sm font-medium text-muted-foreground">
-          {ticket.status === "planning" ? "Planning agent" : "Lead agent"}
-        </h3>
-        <Button
-          variant="ghost"
-          size="icon-sm"
-          disabled={pending}
-          aria-label="Clear lead agent"
-          onClick={onClear}
-        >
-          <XIcon aria-hidden />
-        </Button>
-      </div>
-      <SessionLink
-        sessionId={ticket.lead_session_id}
-        ticketId={ticket.id}
-        showStatus
-        actionLabel={ticket.status === "planning" ? "Discuss plan" : "Chat with agent"}
-      />
-    </section>
   );
 }
 
@@ -780,6 +702,9 @@ function TicketCommentComposer({
         );
       }}
     >
+      <p className="text-xs text-muted-foreground">
+        For a conversation or an approval prompt, open an agent’s chat above.
+      </p>
       <div className="rounded-xl border border-input bg-background focus-within:border-ring focus-within:ring-2 focus-within:ring-ring/30">
         <Textarea
           name="comment"
@@ -1040,160 +965,6 @@ function TicketOutputLink({ output, inline = false }: { output: TicketOutput; in
   );
 }
 
-function SessionLink({
-  sessionId,
-  showStatus = false,
-  ticketId,
-  actionLabel,
-  onMakeLead,
-  pending,
-}: {
-  sessionId: string;
-  showStatus?: boolean;
-  ticketId?: string;
-  actionLabel?: string;
-  onMakeLead?: () => void;
-  pending?: boolean;
-}) {
-  const mobile = useIsMobileViewport();
-  const client = useQueryClient();
-  const query = useQuery({
-    queryKey: ["conversation-backfill", sessionId],
-    queryFn: () => fetchConversationById(sessionId, client),
-    initialData: () => findCachedListRow(client, sessionId),
-    staleTime: 30_000,
-    refetchInterval: showStatus ? 15_000 : false,
-    retry: false,
-  });
-  const session = query.data;
-  const [state] = useSessionBadgeStates(session ? [session] : []);
-  const title = session ? conversationDisplayLabel(session) : `Session ${sessionId.slice(0, 8)}`;
-  const unavailable = query.isError || session === null;
-  const status = unavailable
-    ? "Unavailable"
-    : !session
-      ? "Loading…"
-      : session.archived
-        ? "Archived"
-        : state?.kind === "running" || state?.kind === "starting"
-          ? "Working"
-          : state?.kind === "error"
-            ? "Error"
-            : state?.kind === "disconnected"
-              ? "Disconnected"
-              : "Idle";
-  return (
-    <>
-      <Link
-        className={cn(
-          "rounded-sm text-foreground underline-offset-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-          showStatus
-            ? "flex min-w-0 flex-1 items-center gap-3 rounded-lg px-3 py-2.5 transition-colors hover:bg-muted/40 focus-visible:ring-inset"
-            : "inline-block max-w-full align-bottom wrap-anywhere hover:underline",
-        )}
-        title={`${title} (${sessionId})`}
-        aria-label={actionLabel ? `${actionLabel}: ${title}` : undefined}
-        to={
-          ticketId
-            ? ticketSessionSearch(ticketId, sessionId)
-            : mobile
-              ? `/c/${encodeURIComponent(sessionId)}`
-              : projectSessionPanelSearch(sessionId)
-        }
-      >
-        {showStatus && <BotIcon aria-hidden className="size-4 shrink-0 text-muted-foreground" />}
-        <span className={showStatus ? "min-w-0 flex-1 truncate text-sm font-medium" : undefined}>
-          {title}
-          {actionLabel && (
-            <span className="mt-0.5 block text-sm font-normal text-muted-foreground">
-              {actionLabel}
-            </span>
-          )}
-        </span>
-        {showStatus && (
-          <>
-            <span className="flex shrink-0 items-center gap-1.5 text-sm text-muted-foreground">
-              {!unavailable && !session?.archived && state && <SessionStateBadge state={state} />}
-              {state?.kind !== "awaiting" || unavailable || session?.archived ? (
-                <span>{status}</span>
-              ) : null}
-            </span>
-            <ChevronRightIcon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
-          </>
-        )}
-      </Link>
-      {onMakeLead && (
-        <Button
-          variant="ghost"
-          size="sm"
-          className="mr-1 shrink-0"
-          disabled={pending || !session || unavailable || session.archived}
-          aria-label={`Make ${title} lead`}
-          onClick={onMakeLead}
-        >
-          Make lead
-        </Button>
-      )}
-    </>
-  );
-}
-
-function LinkedSessions({
-  projectId,
-  ticketId,
-  leadSessionId,
-  pending,
-  onLead,
-}: {
-  projectId: string;
-  ticketId: string;
-  leadSessionId?: string | null;
-  pending: boolean;
-  onLead?: (id: string) => void;
-}) {
-  const query = useTicketSessions(projectId, ticketId);
-  const sessions = query.data?.pages.flatMap((page) => page.data) ?? [];
-  if (sessions.length === 0 && !query.error) return null;
-  return (
-    <section aria-label="Linked sessions" className="space-y-2 text-sm">
-      <h3 className="font-medium">Sessions</h3>
-      <TicketError error={query.error} />
-      {sessions.length > 0 && (
-        <ul className="divide-y divide-border/60 overflow-hidden rounded-lg border border-border/60">
-          {sessions.map((session) => (
-            <li key={session.session_id} className="flex min-w-0 items-center">
-              <SessionLink
-                sessionId={session.session_id}
-                ticketId={ticketId}
-                showStatus
-                pending={pending}
-                onMakeLead={
-                  onLead && session.session_id !== leadSessionId
-                    ? () => onLead(session.session_id)
-                    : undefined
-                }
-              />
-              {session.session_id === leadSessionId && (
-                <span className="mr-3 text-sm text-muted-foreground">Lead</span>
-              )}
-            </li>
-          ))}
-        </ul>
-      )}
-      {query.hasNextPage && (
-        <Button
-          variant="ghost"
-          size="sm"
-          loading={query.isFetchingNextPage}
-          onClick={() => void query.fetchNextPage()}
-        >
-          More sessions
-        </Button>
-      )}
-    </section>
-  );
-}
-
 function ActivityChange({ event }: { event: TicketEvent }) {
   if (event.kind === "created") return <>created this ticket</>;
   if (event.kind === "output") {
@@ -1203,8 +974,17 @@ function ActivityChange({ event }: { event: TicketEvent }) {
   if (typeof event.payload.session_id === "string")
     return (
       <>
-        {event.payload.action === "attach" ? "linked" : "unlinked"}{" "}
-        <SessionLink sessionId={event.payload.session_id} ticketId={event.ticket_id} />
+        {event.payload.action === "attach"
+          ? "linked"
+          : event.payload.action === "updated"
+            ? event.payload.involvement
+              ? "updated involvement for"
+              : "cleared involvement for"
+            : "unlinked"}{" "}
+        <TicketSessionLink sessionId={event.payload.session_id} ticketId={event.ticket_id} />
+        {typeof event.payload.involvement === "string" && event.payload.involvement && (
+          <> — {event.payload.involvement}</>
+        )}
       </>
     );
   if (typeof event.payload.related_ticket_id === "string")
@@ -1289,7 +1069,7 @@ function TicketActivityItem({
       ? "You"
       : (event.user_id ?? (agent ? "Agent" : "System"));
   const actor = event.session_id ? (
-    <SessionLink sessionId={event.session_id} ticketId={event.ticket_id} />
+    <TicketSessionLink sessionId={event.session_id} ticketId={event.ticket_id} />
   ) : (
     <span className="text-foreground">{author}</span>
   );

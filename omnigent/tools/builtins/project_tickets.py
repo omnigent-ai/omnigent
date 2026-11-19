@@ -1,6 +1,6 @@
 """Ticket tools share their validation contracts with the project board API."""
 
-from typing import Any, ClassVar, Literal
+from typing import Any, ClassVar
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -9,6 +9,7 @@ from omnigent.entities.project_ticket import (
     CreateTicket,
     LinkRelatedTicket,
     TicketEventKind,
+    TicketSessionLinkOptions,
     TicketStatus,
     UpdateTicket,
 )
@@ -40,11 +41,9 @@ class AddTicketComment(CommentOnTicket):
     ticket_id: str
 
 
-class LinkSessionTicket(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+class LinkSessionTicket(TicketSessionLinkOptions):
     ticket_id: str
     session_id: str | None = Field(default=None, description="Omit to link this session.")
-    action: Literal["attach", "remove"] = "attach"
 
 
 class LinkTickets(LinkRelatedTicket):
@@ -128,6 +127,8 @@ class SysSessionLinkTicketTool(_TicketTool):
     tool_name = "sys_session_link_ticket"
     help_text = (
         "Attach or remove an existing same-project session's association with a ticket. "
+        "Include involvement to explain its contribution; attach again to update it, "
+        "omit to preserve it, or use an empty string to clear it. "
         "Does not create or restart sessions."
     )
     arguments = LinkSessionTicket

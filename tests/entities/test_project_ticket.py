@@ -5,6 +5,7 @@ from omnigent.entities.project_ticket import (
     STATUS_CODES,
     CommentOnTicket,
     CreateTicket,
+    LinkTicketSession,
     TicketOutput,
     UpdateTicket,
 )
@@ -54,6 +55,21 @@ def test_lifecycle_preserves_status_codes_and_requires_review_evidence():
     assert "lead_session_id" in UpdateTicket(lead_session_id=None).model_fields_set
     with pytest.raises(ValidationError):
         UpdateTicket(comment=" ")
+
+
+def test_session_involvement_is_optional_bounded_and_only_changes_on_attach():
+    assert LinkTicketSession(session_id="worker").involvement is None
+    assert LinkTicketSession(session_id="worker", involvement=None).involvement is None
+    assert (
+        LinkTicketSession(session_id="worker", involvement=" Plan the work ").involvement
+        == "Plan the work"
+    )
+    assert LinkTicketSession(session_id="worker", involvement="  ").involvement == ""
+    assert LinkTicketSession(session_id="worker", action="remove").action == "remove"
+    with pytest.raises(ValidationError):
+        LinkTicketSession(session_id="worker", involvement="x" * 301)
+    with pytest.raises(ValidationError, match="only valid"):
+        LinkTicketSession(session_id="worker", action="remove", involvement="")
 
 
 @pytest.mark.parametrize("suffix", ["", "/files", "?view=1#discussion"])

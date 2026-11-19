@@ -30,7 +30,8 @@ header, new-session composer, session quick view and side chat, and UI primitive
 - R17: Automatically deliver ticket updates to that session, retaining pending
   delivery across restarts and avoiding notifications for its own writes.
 - R19: Tags have a key and optional value. The presence of `needs-human` shows
-  Needs human input. A comment explains the request; removing the tag resolves it.
+  the pink Needs response pill. A comment explains the request; removing the
+  tag resolves it. This is independent of a session's pending approval prompt.
 - R20: Done requires a completion summary. A finished session does not finish a ticket.
 - R21: Keep New ticket and New session. No search or tag-filter UI.
 - R22: Persist a concise plan containing the approach and acceptance criteria.
@@ -46,14 +47,26 @@ header, new-session composer, session quick view and side chat, and UI primitive
   same-project, and recorded on both tickets; no self-links or implied dependencies.
 - R26: An optional `lead_session_id` identifies the linked same-project session
   to contact, including while idle. Handoffs preserve prior session links/history.
-- R27: Show the lead near the phase with Discuss plan / Chat with agent; reuse
-  existing chat with Back to ticket and retained drafts. Without a lead, offer
-  Ask orchestrator. Other linked sessions remain available.
+- R27: Show one Agents section near the top: the project orchestrator and linked
+  sessions, with names, brief involvement, activity and explicit chat links.
+  Reuse existing chat with Back to ticket and retained drafts. No phase-dependent
+  contact card or duplicate Sessions section.
 - R28: Workers record chat decisions, plan changes and approvals back on the
   ticket. The orchestrator follows phases, related work, verification and human
   review without adding a new runtime or treating every discussion as approval.
 - R29: Hovering or keyboard-focusing a board ticket highlights its directly
   related visible tickets across lanes, without changing selection or phase.
+- R30: Store an optional short involvement description on each ticket/session
+  link. Updating it retains attributed history; do not infer roles from phase.
+- R31: When response is needed, explain how to respond near the top and show
+  a named Respond action for the saved contact, even when idle, as well as agents
+  with pending prompts. If no contact is recorded, say so and offer orchestrator
+  routing rather than inferring an owner. Open the exact session; comments and
+  ticket review actions do not resolve an elicitation or authorize auto-approval.
+- R32: The orchestrator must never initiate human elicitations or synchronously
+  wait for a worker's human answer. Workers own prompts. The orchestrator records
+  the question and worker, stays available for messages and independent work,
+  and can ask non-blocking questions in ordinary chat. Never bypass permission gates.
 
 ## Clarifications
 
@@ -95,11 +108,23 @@ header, new-session composer, session quick view and side chat, and UI primitive
 - AC33: GIVEN a linked lead WHEN its chat is opened and closed THEN the correct
   existing conversation and Back to ticket are available and ticket drafts survive.
 - AC34: GIVEN a handoff WHEN another linked session becomes lead THEN prior links
-  survive; clearing/unlinking the lead restores Ask orchestrator without launching work.
+  survive; the orchestrator remains accessible without launching work.
 - AC35: GIVEN planning or review WHEN workers follow the skill THEN they respect
   approval gates, record decisions/evidence and do not equate session exit with Done.
 - AC36: GIVEN related tickets on the board WHEN one is hovered or focused THEN
   its direct neighbors are highlighted; leaving clears the highlight.
+- AC37: GIVEN linked agents WHEN opening a ticket THEN one Agents section shows
+  the orchestrator once plus paginated linked sessions and their saved involvement.
+- AC38: GIVEN an existing link WHEN involvement changes or is cleared THEN the
+  update is attributed and transactional; omitted involvement preserves it.
+- AC39: GIVEN needs-human or an agent awaiting input WHEN opening a ticket THEN
+  the pink Needs response treatment and an explicit route to the relevant chat
+  make the response path clear, without resolving prompts through ticket comments.
+- AC40: GIVEN a designated orchestrator WHEN composing native or SDK instructions
+  THEN the non-blocking rule is included; ordinary workers do not inherit it.
+- AC41: GIVEN needs-human and a saved contact WHEN that agent is idle THEN the
+  ticket still names it as the response destination and highlights its row without
+  claiming a native prompt is pending; unknown contacts are explicit.
 
 ## Constraints
 
@@ -112,6 +137,8 @@ Keep schema changes separately reviewable from the application changes.
 Priorities, additional phases, filters, custom workflows, typed dependencies,
 automatic dependency scheduling/rollups, issue-tracker sync, PR unlinking,
 project sharing, file uploads and specialized agent builders.
+Typed agent roles, automatic interpretation of comment approvals, and automatic
+answers/dismissal of existing human prompts are also out of scope.
 
 ## Plan
 
@@ -126,6 +153,13 @@ and notification outbox. Update the board, shared phase controls and ticket draw
 keep ticket context in chat navigation. Teach the canonical orchestrator skill
 the lifecycle and include the same contract in worker briefs. Verify with focused
 entity/store/migration/route/tool and non-browser component tests.
+
+Add bounded nullable involvement to ticket/session links and the existing link
+API/tool. Replace the lead card and Sessions section with one named Agents list;
+retain lead metadata for compatibility, not as a separate UI role. Reuse the
+existing session badge and chat surfaces, with pink response pills, Running for
+session activity, and explicit Respond/Open chat actions. Strengthen the shared
+orchestrator role instruction and canonical skill; preserve mandatory tool approvals.
 
 ## Tasks
 
@@ -144,3 +178,14 @@ entity/store/migration/route/tool and non-browser component tests.
   After coordinated upgrade, link two tickets and check hover/focus highlighting;
   open the planning agent and return with a draft intact; request changes and
   approve a reviewed ticket.
+- [x] T25: Persist and expose ticket/session involvement with preserved history.
+- [x] T26: Unify Agents and make response routing and pink attention pills clear.
+- [x] T27: Encode mandatory non-blocking orchestration and worker-owned prompts.
+- [x] T-val3: Run focused migration/store/route/tool/UI/prompt checks; record limits.
+  Backend: 76 passed, one external-database check skipped. Focused UI/API checks:
+  51 passed, including response routing, drafts, involvement retries and pagination.
+  Skill structure validated. The role rule is instruction-level, not a new
+  harness-wide prompt interceptor; live model compliance and browser appearance
+  were not exercised. Existing human prompts remain open until answered directly.
+  To review, open a ticket, inspect Agents, use Respond to reach the owning chat,
+  return with a draft intact, and edit an involvement description.

@@ -133,6 +133,8 @@ export interface ServerInfo {
   project_tickets?: boolean;
   /** Five ticket phases, plans, related tickets and lead-session assignment. */
   project_ticket_lifecycle?: boolean;
+  /** Per-ticket descriptions of linked agents' contributions. */
+  project_ticket_agent_involvement?: boolean;
   /**
    * Short name of the backing sandbox provider (e.g. ``"modal"``,
    * ``"lakebox"``) used to label the new-session sandbox option per
@@ -693,6 +695,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           durable_initial_input: data.durable_initial_input === true,
           project_tickets: data.project_tickets === true,
           project_ticket_lifecycle: data.project_ticket_lifecycle === true,
+          project_ticket_agent_involvement: data.project_ticket_agent_involvement === true,
           sandbox_provider:
             typeof data.sandbox_provider === "string" ? data.sandbox_provider : null,
           sandbox_providers: Array.isArray(data.sandbox_providers)

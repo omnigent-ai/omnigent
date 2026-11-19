@@ -137,11 +137,30 @@ class CommentOnTicket(BaseModel):
         return value.strip()
 
 
-class LinkTicketSession(BaseModel):
+class TicketSessionLinkOptions(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    session_id: str
     action: Literal["attach", "remove"] = "attach"
+    involvement: str | None = Field(
+        default=None,
+        max_length=300,
+        description="Brief contribution to this ticket. Omit to retain it; empty clears it.",
+    )
+
+    @field_validator("involvement")
+    @classmethod
+    def trim_involvement(cls, value: str | None) -> str | None:
+        return value.strip() if value is not None else None
+
+    @model_validator(mode="after")
+    def involvement_only_on_attach(self) -> TicketSessionLinkOptions:
+        if self.action == "remove" and self.involvement is not None:
+            raise ValueError("involvement is only valid when attaching or updating a link")
+        return self
+
+
+class LinkTicketSession(TicketSessionLinkOptions):
+    session_id: str
 
 
 class LinkRelatedTicket(BaseModel):

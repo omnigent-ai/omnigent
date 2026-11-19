@@ -3,7 +3,7 @@
 // (incl. the approval count) lives in the tooltip.
 
 import { RunningDot } from "@/components/RunningDot";
-import { Badge } from "@/components/ui/badge";
+import { NeedsResponseBadge } from "@/components/NeedsResponseBadge";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { SessionState } from "@/hooks/useSessionState";
 import { TERMINAL_PROMPT_BLOCKED_ON } from "@/lib/events";
@@ -44,16 +44,14 @@ function describe(state: SessionState, inSidebar: boolean): Visual {
         ariaLabel: tooltip,
         tooltip,
         render: () => (
-          <Badge
+          <NeedsResponseBadge
             className={cn(
               "border-transparent",
-              inSidebar
-                ? "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)]"
-                : "bg-warning/15 text-warning",
+              inSidebar && "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)]",
             )}
           >
             {label}
-          </Badge>
+          </NeedsResponseBadge>
         ),
       };
     }

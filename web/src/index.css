@@ -76,10 +76,9 @@
   --color-warning: var(--warning);
   --color-info: var(--info);
   /* Dedicated blue for the sub-agent "session active / idle-alive" states
-     * (launching/idle/done) — distinct from the shared amber --warning (still
-     * used by the "Needs response" badge). */
+     * (launching/idle/done). */
   --color-session-active: var(--session-active);
-  /* Brand pink — reserved for brand moments, not status. */
+  /* Brand pink, also used by the shared Needs response pill. */
   --color-brand-accent: var(--brand-accent);
   /* Pink tag surface (translucent) — generates `bg-tag-pink`. */
   --color-tag-pink: var(--tag-pink);

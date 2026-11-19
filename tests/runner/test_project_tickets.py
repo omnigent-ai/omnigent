@@ -45,6 +45,20 @@ TICKET = "c" * 32
             {"session_id": SOURCE, "action": "attach"},
         ),
         (
+            "sys_session_link_ticket",
+            {"ticket_id": TICKET, "session_id": PROJECT, "involvement": " Plan the work "},
+            "POST",
+            f"/{TICKET}/sessions",
+            {"session_id": PROJECT, "action": "attach", "involvement": "Plan the work"},
+        ),
+        (
+            "sys_session_link_ticket",
+            {"ticket_id": TICKET, "involvement": ""},
+            "POST",
+            f"/{TICKET}/sessions",
+            {"session_id": SOURCE, "action": "attach", "involvement": ""},
+        ),
+        (
             "sys_ticket_link",
             {"ticket_id": TICKET, "related_ticket_id": SOURCE},
             "POST",
@@ -113,7 +127,9 @@ async def test_get_returns_paged_activity_outputs_and_sessions():
             assert request.url.params["after"] == "6" and request.url.params["kind"] == "output"
             return httpx.Response(200, json={"data": [], "has_more": False, "last_position": 6})
         if request.url.path.endswith("/sessions"):
-            return httpx.Response(200, json={"data": []})
+            return httpx.Response(
+                200, json={"data": [{"session_id": SOURCE, "involvement": "Plan the work"}]}
+            )
         if request.url.path.endswith("/related"):
             assert request.url.params["after"] == SOURCE
             return httpx.Response(200, json={"data": [], "has_more": False})
@@ -131,7 +147,8 @@ async def test_get_returns_paged_activity_outputs_and_sessions():
             )
         )
     assert result["ticket"]["id"] == TICKET
-    assert result["events"]["last_position"] == 6 and result["sessions"]["data"] == []
+    assert result["events"]["last_position"] == 6
+    assert result["sessions"]["data"] == [{"session_id": SOURCE, "involvement": "Plan the work"}]
     assert result["related"] == {"data": [], "has_more": False}
 
 
@@ -145,6 +162,7 @@ async def test_get_returns_paged_activity_outputs_and_sessions():
         ("sys_ticket_get", {"ticket_id": TICKET, "related_after": "../other"}),
         ("sys_ticket_get", {"ticket_id": "../../other"}),
         ("sys_ticket_list", {"limit": 101}),
+        ("sys_session_link_ticket", {"ticket_id": TICKET, "action": "remove", "involvement": ""}),
         ("sys_ticket_comment", {"ticket_id": TICKET, "text": "Hi", "notify_orchestrator": False}),
     ],
 )

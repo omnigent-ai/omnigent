@@ -329,7 +329,14 @@ class ProjectTicketStore:
             }
 
     def link_session(
-        self, project_id: str, ticket_id: str, session_id: str, action: str, actor: TicketActor
+        self,
+        project_id: str,
+        ticket_id: str,
+        session_id: str,
+        action: str,
+        actor: TicketActor,
+        *,
+        involvement: str | None = None,
     ) -> dict[str, Any]:
         def write(session: Session) -> dict[str, Any]:
             project = self._project(session, project_id, actor.user_id, write=True)
@@ -344,13 +351,22 @@ class ProjectTicketStore:
                         ticket_id=key[2],
                         session_id=key[3],
                         created_at=now_epoch(),
+                        involvement=involvement or None,
                     )
                 )
+            elif action == "attach" and link is not None and involvement is not None:
+                if (link.involvement or "") == involvement:
+                    return _ticket(ticket)
+                link.involvement = involvement or None
             elif action == "remove" and link is not None:
                 session.delete(link)
             else:
                 return _ticket(ticket)
             payload: dict[str, Any] = {"session_id": session_id, "action": action}
+            if involvement is not None:
+                payload["involvement"] = involvement
+                if link is not None and action == "attach":
+                    payload["action"] = "updated"
             if action == "remove" and ticket.lead_session_id == key[3]:
                 ticket.lead_session_id = None
                 payload["changes"] = {"lead_session_id": None}
@@ -482,7 +498,11 @@ class ProjectTicketStore:
             ).all()
             return {
                 "data": [
-                    {"session_id": row.session_id, "created_at": row.created_at}
+                    {
+                        "session_id": row.session_id,
+                        "created_at": row.created_at,
+                        "involvement": row.involvement or "",
+                    }
                     for row in rows[:limit]
                 ],
                 "has_more": len(rows) > limit,

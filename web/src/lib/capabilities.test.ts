@@ -571,6 +571,15 @@ describe("custom agents settings capability", () => {
   );
 });
 
+describe("ticket agent involvement capability", () => {
+  it.each([undefined, false, "true", true])("requires explicit support: %s", async (supported) => {
+    expect(
+      (await probe({ project_ticket_agent_involvement: supported }))
+        .project_ticket_agent_involvement,
+    ).toBe(supported === true);
+  });
+});
+
 describe("picker curation", () => {
   it("reads the names and the default off the probe", async () => {
     const parsed = await probe({

@@ -58,6 +58,7 @@ export interface EventPage {
 export interface TicketSession {
   session_id: string;
   created_at: number;
+  involvement?: string;
 }
 export type TicketChanges = Partial<
   Pick<
@@ -131,6 +132,19 @@ export function listTicketSessions(projectId: string, ticketId: string, after?: 
   const params = new URLSearchParams({ limit: "50" });
   if (after) params.set("after", after);
   return request<TicketPage<TicketSession>>(`${path(projectId, ticketId)}/sessions?${params}`);
+}
+
+export function setTicketSessionInvolvement(
+  projectId: string,
+  ticketId: string,
+  sessionId: string,
+  involvement: string,
+) {
+  return request<ProjectTicket>(`${path(projectId, ticketId)}/sessions`, "POST", {
+    session_id: sessionId,
+    action: "attach",
+    involvement,
+  });
 }
 
 export function listRelatedTickets(projectId: string, ticketId: string, after?: string) {

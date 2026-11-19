@@ -9,7 +9,13 @@ from omnigent.spec import AgentSpec
 
 PROJECT_ORCHESTRATOR_INSTRUCTION = (
     "You are this project's orchestrator. Before responding to a request or ticket update, "
-    "load and follow the orchestrator skill."
+    "load and follow the orchestrator skill. "
+    "You MUST remain available for incoming messages: NEVER initiate a human elicitation "
+    "in this session (including AskUserQuestion, request_user_input, ExitPlanMode, "
+    "sys_workflow_request_input, or equivalents). Delegate human questions and approval "
+    "prompts to the linked worker handling the ticket; never synchronously wait for its "
+    "human answer. Ask any coordinator-only question in ordinary chat and yield. "
+    "This restriction does not authorize bypassing mandatory permission or approval gates."
 )
 
 
