@@ -13,7 +13,7 @@ from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import require_active_account
 from omnigent.db.compression import decode, encode
-from omnigent.db.db_models import SqlPreference, SqlProject, current_workspace_id
+from omnigent.db.db_models import SqlPreference, SqlProject, SqlProjectTicket, current_workspace_id
 from omnigent.db.preference_rows import upsert_preference_row
 from omnigent.db.utils import (
     get_or_create_engine,
@@ -89,6 +89,7 @@ def _to_entity(row: SqlProject) -> Project:
         created_at=row.created_at,
         updated_at=row.updated_at,
         config=_decode_config(row.config),
+        orchestrator_session_id=row.orchestrator_session_id,
     )
 
 
@@ -329,13 +330,56 @@ class SqlAlchemyProjectStore(ProjectStore):
         """Delete an owned project. Idempotent; returns ``False`` if not found."""
 
         def write(session: Session) -> bool:
-            row = session.get(SqlProject, (current_workspace_id(), project_id))
+            row = session.scalar(
+                select(SqlProject)
+                .where(
+                    SqlProject.workspace_id == current_workspace_id(),
+                    SqlProject.id == project_id,
+                )
+                .with_for_update()
+            )
             if row is None or row.user_id != user_id:
                 return False
+            if (
+                session.scalar(
+                    select(SqlProjectTicket.id)
+                    .where(
+                        SqlProjectTicket.workspace_id == current_workspace_id(),
+                        SqlProjectTicket.project_id == project_id,
+                    )
+                    .limit(1)
+                )
+                is not None
+            ):
+                raise OmnigentError(
+                    "Projects with tickets cannot be deleted; ticket history is retained.",
+                    code=ErrorCode.CONFLICT,
+                )
             session.delete(row)
             return True
 
         return run_write_transaction(self._session_immediate, "delete_project", write)
+
+    def set_orchestrator(
+        self, project_id: str, session_id: str, *, user_id: str | None
+    ) -> Project:
+        def write(session: Session) -> Project:
+            row = session.scalar(
+                select(SqlProject)
+                .where(
+                    SqlProject.workspace_id == current_workspace_id(),
+                    SqlProject.id == project_id,
+                )
+                .with_for_update()
+            )
+            if row is None or row.user_id != user_id:
+                raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+            require_active_account(session, user_id)
+            if row.orchestrator_session_id is None:
+                row.orchestrator_session_id = session_id
+            return _to_entity(row)
+
+        return run_write_transaction(self._session_immediate, "set_project_orchestrator", write)
 
     def get_order(self, *, user_id: str | None) -> builtins.list[str] | None:
         """Return the active order used by project-list endpoints."""

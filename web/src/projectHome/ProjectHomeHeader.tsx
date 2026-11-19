@@ -1,5 +1,7 @@
 import {
   MessageCirclePlusIcon,
+  MessageSquareIcon,
+  PlusIcon,
   MoreHorizontalIcon,
   PencilIcon,
   SearchIcon,
@@ -22,13 +24,14 @@ import {
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { useProjectConfig, useProjects } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { useNavigate } from "@/lib/routing";
+import { Link, useNavigate } from "@/lib/routing";
 import { cn } from "@/lib/utils";
 import { MobileHeaderButton } from "@/shell/MobileHeaderButton";
 import { MOBILE_GLASS_SURFACE } from "@/shell/mobileGlass";
 import { SessionMenuHeader } from "@/shell/SessionMenuHeader";
 import { useProjectFolderMenu } from "@/shell/Sidebar";
 import { projectHomePath } from "./projectHomeNavigation";
+import { useProjectTicketsEnabled } from "./useProjectTickets";
 
 interface ProjectComposerState {
   open: boolean;
@@ -88,10 +91,28 @@ export function ProjectHomeTitle({ projectName }: { projectName: string }) {
 /** The header's right-hand actions; phones add the project actions as the session page's icon buttons. */
 export function ProjectHomeHeaderActions({ projectName }: { projectName: string }) {
   const isMobile = useIsMobileViewport();
+  const tickets = useProjectTicketsEnabled();
   return (
     <>
-      <ProjectBoardSearch />
+      {tickets ? (
+        <Button asChild variant="ghost" size={isMobile ? "icon" : "default"}>
+          <Link to="?orchestrator=1" aria-label="Orchestrator">
+            <MessageSquareIcon />
+            {!isMobile && "Orchestrator"}
+          </Link>
+        </Button>
+      ) : (
+        <ProjectBoardSearch />
+      )}
       <ProjectNewSessionButton projectName={projectName} />
+      {tickets && (
+        <Button asChild size={isMobile ? "icon" : "default"}>
+          <Link to="?ticket=new" aria-label="New ticket">
+            <PlusIcon />
+            {!isMobile && "New ticket"}
+          </Link>
+        </Button>
+      )}
       {isMobile && <ProjectHomeActions projectName={projectName} />}
     </>
   );

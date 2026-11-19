@@ -1090,6 +1090,7 @@ def register_events_routes(
     register_runner_ingest: Callable[[Callable[..., Awaitable[EventAckFrame]]], None]
     | None = None,
     register_startup_dispatch: Callable[[StartupDispatch], None] | None = None,
+    register_project_session_delete: Callable[..., None] | None = None,
     clear_session_into_fresh_session: Callable[
         [Request, Conversation, Callable[[], Awaitable[None]]], Awaitable[str]
     ]
@@ -1838,8 +1839,7 @@ def register_events_routes(
             if recoverer is not None:
                 await asyncio.to_thread(recoverer.stop_recovery, conv, only_pending=True)
             if startup is not None and await startup.retry(session_id):
-                if conv.host_id is not None:
-                    startup.host_changed(request.app, conv.host_id)
+                await startup.deliver_pending(request.app, session_id)
                 return {**result, "queued": True}
             return result
         # Refuse input the session's saved provider can't serve before saving it.
@@ -1880,8 +1880,7 @@ def register_events_routes(
             saved = await startup.enqueue(
                 session_id, body, user_id=user_id, headers=request.headers, first=False
             )
-            if current.host_id is not None:
-                startup.host_changed(request.app, current.host_id)
+            await startup.deliver_pending(request.app, session_id)
             return {
                 "queued": True,
                 "pending_id": pending_inputs.make_pending_id(session_id, saved.id),
@@ -4631,3 +4630,6 @@ def register_events_routes(
         except Exception:
             pass
         return ConversationDeleted(id=session_id)
+
+    if register_project_session_delete is not None:
+        register_project_session_delete(delete_session)

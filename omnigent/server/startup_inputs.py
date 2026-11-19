@@ -176,15 +176,23 @@ def wake_startup_worker(host_id: str) -> None:
 class ManagedStartupInputs:
     """Recover pending conversation items on the replica connected to their host."""
 
-    def __init__(self, conversations: ConversationStore, hosts: HostRegistry) -> None:
+    def __init__(
+        self,
+        conversations: ConversationStore,
+        hosts: HostRegistry,
+        *,
+        include_external_hosts: bool = False,
+    ) -> None:
         self.conversations = conversations
         self.hosts = hosts
+        self.include_external_hosts = include_external_hosts
         _services.add(self)
         self.dispatch: StartupDispatch | None = None
         self._workers: dict[
             tuple[int, str], tuple[HostConnection, asyncio.Task[None], asyncio.Event]
         ] = {}
         self._deliveries: dict[tuple[int, str], asyncio.Task[Any]] = {}
+        self._runner_workers: dict[tuple[int, str], tuple[asyncio.Task[None], asyncio.Event]] = {}
         self._receipt_watches: set[asyncio.Task[None]] = set()
 
     async def enqueue(
@@ -429,7 +437,9 @@ class ManagedStartupInputs:
                 wake.set()
                 return
             worker.cancel()
-        if connection is None or not connection.registered_with_managed_token:
+        if connection is None or (
+            not connection.registered_with_managed_token and not self.include_external_hosts
+        ):
             return
         wake = asyncio.Event()
 
@@ -464,12 +474,75 @@ class ManagedStartupInputs:
 
         task.add_done_callback(remove_worker)
 
+    async def deliver_pending(self, app: Any, session_id: str) -> bool:
+        """Schedule a saved input on an ordinary session; keep offline inputs queued."""
+        key = (current_workspace_id(), session_id)
+        if existing := self._runner_workers.get(key):
+            existing[1].set()
+            return True
+        if key in self._deliveries:
+            return True
+        conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
+        if conv is None or conv.archived or conv.agent_id is None:
+            return False
+        if conv.host_id is not None:
+            connection = self.hosts.get(conv.host_id)
+            if connection is None:
+                return False
+            self.host_changed(app, conv.host_id)
+            return True
+        if conv.runner_id is None or app.state.tunnel_registry.get(conv.runner_id) is None:
+            return False
+        wake = asyncio.Event()
+
+        async def drain() -> None:
+            try:
+                while True:
+                    wake.clear()
+                    try:
+                        current = await asyncio.to_thread(
+                            self.conversations.get_conversation, session_id
+                        )
+                        if (
+                            current is None
+                            or current.archived
+                            or current.host_id is not None
+                            or current.labels.get(STARTUP_LABEL) == "cancelled"
+                            or current.runner_id is None
+                            or app.state.tunnel_registry.get(current.runner_id) is None
+                        ):
+                            return
+                        items = await asyncio.to_thread(
+                            self.conversations.list_pending_inputs, session_id
+                        )
+                        head = next((item for item in items if item.status != "failed"), None)
+                        if head is None:
+                            await self._finish(session_id)
+                            # A writer can wake this task while it is finishing.
+                            if wake.is_set():
+                                continue
+                            return
+                        if head.status == "in_progress":
+                            await self._deliver(app, session_id, head)
+                    except Exception:
+                        _logger.exception("Unable to recover saved inputs for %s", session_id)
+                    with contextlib.suppress(TimeoutError):
+                        await asyncio.wait_for(wake.wait(), timeout=0.25)
+            finally:
+                self._runner_workers.pop(key, None)
+
+        self._runner_workers[key] = (
+            asyncio.create_task(drain(), name=f"session-inputs-{session_id}"),
+            wake,
+        )
+        return True
+
     async def _recover_session(
         self, app: Any, session_id: str, connection: HostConnection
     ) -> bool:
         """Advance one session's startup here; return whether work is in flight."""
         conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
-        if conv is None or conv.host_id != connection.host_id:
+        if conv is None or conv.archived or conv.host_id != connection.host_id:
             return False
         from omnigent.server.managed_hosts import is_move_claim, move_claim_is_live
 
@@ -796,6 +869,7 @@ class ManagedStartupInputs:
     async def shutdown(self) -> None:
         tasks = [
             *(task for _, task, _ in self._workers.values()),
+            *(task for task, _ in self._runner_workers.values()),
             *self._deliveries.values(),
             *self._receipt_watches,
         ]
@@ -803,3 +877,4 @@ class ManagedStartupInputs:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         self._workers.clear()
+        self._runner_workers.clear()

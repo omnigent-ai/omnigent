@@ -23,6 +23,11 @@ from fastapi import APIRouter, Query, Request
 from omnigent.entities import Project
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import AuthProvider
+from omnigent.server.project_orchestrator import (
+    ProjectSessionCreator,
+    ProjectSessionDeleter,
+    ensure_project_orchestrator,
+)
 from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes.sessions import announce_projects_changed
 from omnigent.server.schemas import (
@@ -32,6 +37,7 @@ from omnigent.server.schemas import (
     UpdateProjectRequest,
 )
 from omnigent.server.session_orchestration import require_named_source_private
+from omnigent.stores.agent_store import AgentStore
 from omnigent.stores.conversation_store import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectOrderPreference, ProjectStore, apply_project_order
@@ -53,6 +59,7 @@ def _to_response(project: Project) -> dict[str, Any]:
         "created_at": project.created_at,
         "updated_at": project.updated_at,
         "config": project.config,
+        "orchestrator_session_id": project.orchestrator_session_id,
     }
 
 
@@ -61,6 +68,9 @@ def create_projects_router(
     auth_provider: AuthProvider | None = None,
     conversation_store: ConversationStore | None = None,
     permission_store: PermissionStore | None = None,
+    agent_store: AgentStore | None = None,
+    create_session: ProjectSessionCreator | None = None,
+    delete_session: ProjectSessionDeleter | None = None,
 ) -> APIRouter:
     """Build the projects router (``/v1/projects``).
 
@@ -72,6 +82,18 @@ def create_projects_router(
     :returns: A configured :class:`APIRouter`.
     """
     router = APIRouter()
+
+    async def _orchestrator(request: Request, project: Project) -> Project:
+        if conversation_store is None:
+            return project
+        return await ensure_project_orchestrator(
+            request,
+            project,
+            projects=project_store,
+            agents=agent_store,
+            create_session=create_session,
+            delete_session=delete_session,
+        )
 
     async def _require_private_source(request: Request, user_id: str | None) -> None:
         """Refuse an agent-tool write whose calling session is shared with edit access."""
@@ -89,7 +111,7 @@ def create_projects_router(
         request: Request,
         body: CreateProjectRequest,
     ) -> dict[str, Any]:
-        """Create a new, empty project owned by the caller.
+        """Create a project and its ordinary orchestrator session for the caller.
 
         :param request: The incoming request, used to identify the user.
         :param body: Project payload (name).
@@ -106,8 +128,26 @@ def create_projects_router(
             user_id,
             body.config,
         )
+        try:
+            project = await _orchestrator(request, project)
+        except Exception:
+            # A refused launch must not leave an unusable project name behind.
+            await asyncio.to_thread(project_store.delete, project.id, user_id=user_id)
+            raise
         # Push the change to the owner's other connected clients so their
         # sidebars pick up the new folder without a reload.
+        announce_projects_changed(user_id)
+        return _to_response(project)
+
+    @router.post("/projects/{project_id}/orchestrator")
+    async def initialize_orchestrator(request: Request, project_id: str) -> dict[str, Any]:
+        """Initialize an existing project's ordinary session; repeated calls reuse it."""
+        user_id = require_user(request, auth_provider)
+        await _require_private_source(request, user_id)
+        project = await asyncio.to_thread(project_store.get, project_id, user_id=user_id)
+        if project is None:
+            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
+        project = await _orchestrator(request, project)
         announce_projects_changed(user_id)
         return _to_response(project)
 

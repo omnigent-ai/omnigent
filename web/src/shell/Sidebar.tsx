@@ -7301,7 +7301,7 @@ export function useProjectFolderMenu(
           </DialogHeader>
           {deleteProject.isError && (
             <p className="text-ui text-destructive" role="alert">
-              Some sessions couldn't be archived (you may not own them); the rest were archived.
+              {deleteProject.error.message}
             </p>
           )}
           <DialogFooter className="border-t-0 bg-transparent">

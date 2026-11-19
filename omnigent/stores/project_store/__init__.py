@@ -143,6 +143,12 @@ class ProjectStore(ABC):
         """
         ...
 
+    def set_orchestrator(
+        self, project_id: str, session_id: str, *, user_id: str | None
+    ) -> Project:
+        """Attach the project's first ordinary orchestrator session; retain an existing one."""
+        raise NotImplementedError
+
     @abstractmethod
     def get_order(self, *, user_id: str | None) -> builtins.list[str] | None:
         """Read saved IDs; None means alphabetical order."""

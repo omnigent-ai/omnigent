@@ -1,0 +1,366 @@
+import json
+from unittest.mock import AsyncMock
+from uuid import uuid4
+
+import pytest
+
+from omnigent.host.frames import (
+    HostHelloFrame,
+    HostLaunchRunnerFrame,
+    HostStatFrame,
+    decode_host_frame,
+)
+from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, RESERVED_USER_PUBLIC
+from omnigent.server.project_ticket_notifications import ProjectTicketNotifications
+from omnigent.server.sharing_settings import DefaultPublicSessions
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.host_store import HostStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+from tests._helpers.polling import poll_until_async
+from tests.server.helpers import register_test_runner
+from tests.server.integration.test_sessions_attribution import _bind_runner
+from tests.server.integration.test_sessions_permissions import _register_online_host
+from tests.server.integration.test_sessions_web_send_stable_id import _stub_runner
+from tests.server.routes.test_projects_crud import ALICE, BOB, PROJECT_AGENT_ID, _as_user
+from tests.server.routes.test_projects_crud import multi_user_app as multi_user_app
+from tests.server.routes.test_projects_crud import multi_user_client as multi_user_client
+from tests.server.routes.test_projects_crud import project_agents as project_agents
+from tests.server.routes.test_projects_crud import project_app as project_app
+from tests.server.routes.test_projects_crud import project_client as project_client
+
+
+async def test_project_creation_has_one_normal_orchestrator(project_client, db_uri):
+    project = (await project_client.post("/v1/projects", json={"name": "Shipping"})).json()
+    session_id = project["orchestrator_session_id"]
+    session = (await project_client.get(f"/v1/sessions/{session_id}")).json()
+    assert session["title"] == "Orchestrator"
+    assert session["project_id"] == project["id"]
+    assert SqlAlchemyConversationStore(db_uri).get_conversation(session_id).kind == "default"
+    again = await project_client.post(f"/v1/projects/{project['id']}/orchestrator")
+    assert again.json()["orchestrator_session_id"] == session_id
+    info = (await project_client.get("/v1/info")).json()
+    assert info["project_tickets"] is True
+    assert info["durable_initial_input"] is False
+
+
+async def test_orchestrator_inherits_defaults_but_not_public_sharing(
+    multi_user_client, multi_user_app, db_uri
+):
+    multi_user_app.state.default_public_sessions = lambda: DefaultPublicSessions.ALL
+    response = await multi_user_client.post(
+        "/v1/projects",
+        json={
+            "name": "Private board",
+            "config": {"agent_id": PROJECT_AGENT_ID, "workspace": "/work/board", "effort": "high"},
+        },
+        headers=_as_user(ALICE),
+    )
+    assert response.status_code == 200, response.text
+    project = response.json()
+    session_id = project["orchestrator_session_id"]
+    conversation = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conversation.agent_id == PROJECT_AGENT_ID
+    assert conversation.workspace == "/work/board"
+    assert conversation.reasoning_effort == "high"
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    assert permissions.get(ALICE, session_id).level == LEVEL_OWNER
+    assert permissions.get(RESERVED_USER_PUBLIC, session_id) is None
+    assert (
+        await multi_user_client.get(f"/v1/sessions/{session_id}", headers=_as_user(BOB))
+    ).status_code == 404
+
+
+async def test_empty_agent_catalog_leaves_no_broken_project(
+    project_client, project_agents, db_uri
+):
+    project_agents.delete(PROJECT_AGENT_ID)
+    response = await project_client.post("/v1/projects", json={"name": "Unconfigured"})
+    assert response.status_code == 400
+    assert "available project agent" in response.text
+    assert SqlAlchemyProjectStore(db_uri).list(user_id=None) == []
+    assert SqlAlchemyConversationStore(db_uri).list_conversations().data == []
+
+
+async def test_existing_project_can_initialize_its_orchestrator(project_client, db_uri):
+    project = SqlAlchemyProjectStore(db_uri).create(uuid4().hex, "Existing", None)
+    first = await project_client.post(f"/v1/projects/{project.id}/orchestrator")
+    second = await project_client.post(f"/v1/projects/{project.id}/orchestrator")
+    assert first.status_code == second.status_code == 200
+    assert first.json()["orchestrator_session_id"] == second.json()["orchestrator_session_id"]
+    assert len(SqlAlchemyConversationStore(db_uri).list_conversations().data) == 1
+
+
+async def test_concurrent_initializer_uses_normal_session_teardown(
+    project_client, db_uri, monkeypatch
+):
+    projects = SqlAlchemyProjectStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    project = projects.create(uuid4().hex, "Concurrent", None)
+    winner = conversations.create_conversation(project_id=project.id, agent_id=PROJECT_AGENT_ID)
+    attach = SqlAlchemyProjectStore.set_orchestrator
+
+    def attach_winner(store, project_id, session_id, *, user_id):
+        return attach(store, project_id, winner.id, user_id=user_id)
+
+    monkeypatch.setattr(SqlAlchemyProjectStore, "set_orchestrator", attach_winner)
+    response = await project_client.post(f"/v1/projects/{project.id}/orchestrator")
+    assert response.status_code == 200, response.text
+    assert response.json()["orchestrator_session_id"] == winner.id
+    assert [session.id for session in conversations.list_conversations().data] == [winner.id]
+
+
+@pytest.mark.parametrize("explicit_host", [False, True])
+async def test_name_only_project_uses_owned_host_home_and_normal_launch(
+    multi_user_client, multi_user_app, db_uri, monkeypatch, explicit_host
+):
+    app = multi_user_app
+    app.state.host_store = HostStore(db_uri)
+    foreign_host, own_host = uuid4().hex, uuid4().hex
+    _register_online_host(app, foreign_host, BOB)
+    _register_online_host(app, own_host, ALICE)
+    launches = []
+
+    def answer_host(connection, payload):
+        assert connection.host_id == own_host
+        frame = decode_host_frame(payload)
+        if isinstance(frame, HostStatFrame):
+            connection.pending_stats[frame.request_id].set_result(
+                {
+                    "status": "ok",
+                    "exists": True,
+                    "type": "directory",
+                    "canonical_path": "/home/owner",
+                }
+            )
+        elif isinstance(frame, HostLaunchRunnerFrame):
+            launches.append(frame)
+            connection.pending_launches[frame.request_id].set_result({"status": "launched"})
+        else:
+            pytest.fail(f"Unexpected host frame: {frame}")
+
+    monkeypatch.setattr(app.state.host_registry, "send_text", answer_host)
+    response = await multi_user_client.post(
+        "/v1/projects",
+        json={"name": "Home board", "config": {"host_id": own_host} if explicit_host else {}},
+        headers=_as_user(ALICE),
+    )
+    assert response.status_code == 200, response.text
+    session_id = response.json()["orchestrator_session_id"]
+    conversation = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conversation.host_id == own_host and conversation.workspace == "/home/owner"
+    assert conversation.runner_id and len(launches) == 1
+
+
+async def test_board_api_lifecycle_and_no_deletion(project_client):
+    project = (await project_client.post("/v1/projects", json={"name": "Shipping"})).json()
+    base = f"/v1/projects/{project['id']}/tickets"
+    created = await project_client.post(base, json={"title": "Ship"})
+    assert created.status_code == 201
+    ticket = created.json()
+    assert ticket["status"] == "open" and ticket["description"] == ""
+    path = base + f"/{ticket['id']}"
+    response = await project_client.patch(
+        path, json={"tags": [{"key": "needs-human", "value": "review"}], "status": "in_progress"}
+    )
+    assert response.status_code == 200
+    assert (await project_client.get(base, params={"status": "in_progress", "limit": 1})).json()[
+        "data"
+    ][0]["id"] == ticket["id"]
+    assert (await project_client.patch(path, json={"status": "done"})).status_code == 422
+    comment = await project_client.post(
+        path + "/comments",
+        json={
+            "text": "Review the PR",
+            "outputs": [
+                {"type": "pull_request", "url": "https://git.example.com/org/repo/pull/42/files"}
+            ],
+        },
+    )
+    assert comment.status_code == 201
+    outputs = (await project_client.get(path + "/events", params={"kind": "output"})).json()[
+        "data"
+    ]
+    assert outputs[0]["payload"] == {
+        "type": "pull_request",
+        "url": "https://git.example.com/org/repo/pull/42",
+    }
+    completed = await project_client.patch(
+        path, json={"status": "done", "completion_summary": "Tests passed"}
+    )
+    assert completed.json()["completion_summary"] == "Tests passed"
+    assert (await project_client.delete(path)).status_code in (404, 405)
+    assert (await project_client.delete(f"/v1/projects/{project['id']}")).status_code == 409
+    assert (await project_client.get(path)).status_code == 200
+    assert (await project_client.get(base, params={"limit": 101})).status_code == 422
+    assert (
+        await project_client.post(
+            path + "/comments", json={"text": "Hi", "notify_orchestrator": False}
+        )
+    ).status_code == 422
+
+
+async def test_agent_source_is_project_scoped_owned_bound_and_private(multi_user_client, db_uri):
+    client = multi_user_client
+    project = (
+        await client.post("/v1/projects", json={"name": "Private"}, headers=_as_user(ALICE))
+    ).json()
+    path = f"/v1/projects/{project['id']}/tickets"
+    store = SqlAlchemyConversationStore(db_uri)
+    source = store.create_conversation(project_id=project["id"])
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.grant(ALICE, source.id, LEVEL_OWNER)
+    headers = {
+        **_as_user(ALICE),
+        **_bind_runner(db_uri, source.id),
+        ORCHESTRATION_SOURCE_HEADER: source.id,
+    }
+    response = await client.post(path, json={"title": "Agent ticket"}, headers=headers)
+    assert response.status_code == 201, response.text
+    ticket_id = response.json()["id"]
+    events = (await client.get(f"{path}/{ticket_id}/events", headers=headers)).json()["data"]
+    assert events[0]["session_id"] == source.id and events[0]["user_id"] == ALICE
+    assert (await client.get(path, headers=_as_user(BOB))).status_code == 404
+    assert (
+        await client.get(path, headers={**_as_user(ALICE), ORCHESTRATION_SOURCE_HEADER: source.id})
+    ).status_code == 403
+    other = (
+        await client.post("/v1/projects", json={"name": "Other"}, headers=_as_user(ALICE))
+    ).json()
+    assert (
+        await client.get(f"/v1/projects/{other['id']}/tickets", headers=headers)
+    ).status_code == 403
+    permissions.ensure_user(BOB)
+    permissions.grant(BOB, source.id, LEVEL_EDIT)
+    assert (await client.get(path, headers=headers)).status_code == 403
+    assert (
+        await client.post(path, json={"title": "Shared writer"}, headers=headers)
+    ).status_code == 403
+
+
+async def test_links_require_same_project_and_preserve_history(project_client, db_uri):
+    project = (await project_client.post("/v1/projects", json={"name": "Links"})).json()
+    base = f"/v1/projects/{project['id']}/tickets"
+    ticket = (await project_client.post(base, json={"title": "Keep history"})).json()
+    path = f"{base}/{ticket['id']}"
+    store = SqlAlchemyConversationStore(db_uri)
+    source = store.create_conversation(project_id=project["id"])
+    foreign = store.create_conversation()
+    assert (
+        await project_client.post(path + "/sessions", json={"session_id": foreign.id})
+    ).status_code == 400
+    assert (
+        await project_client.post(path + "/sessions", json={"session_id": source.id})
+    ).status_code == 200
+    assert (await project_client.get(path + "/sessions")).json()["data"][0][
+        "session_id"
+    ] == source.id
+    await store.delete_conversation(source.id)
+    assert (await project_client.get(path)).json()["status"] == "open"
+    assert len((await project_client.get(path + "/events")).json()["data"]) == 2
+
+
+async def test_notification_enqueue_survives_crash_without_duplicate_message(
+    project_client, project_app, db_uri, monkeypatch
+):
+    project = (await project_client.post("/v1/projects", json={"name": "Outbox"})).json()
+    session_id = project["orchestrator_session_id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_host_id(session_id, uuid4().hex, "/tmp/project")
+    service = project_app.state.project_ticket_notifications
+    base = f"/v1/projects/{project['id']}/tickets"
+    ticket = (await project_client.post(base, json={"title": "Durable update"})).json()
+    mark = service.tickets.mark_notified
+
+    def crash(*args):
+        raise RuntimeError("crash after durable enqueue")
+
+    monkeypatch.setattr(service.tickets, "mark_notified", crash)
+    await service.flush_page(project_app)
+    queued = store.list_pending_inputs(session_id)
+    assert len(queued) == 1
+    assert "Durable update" in queued[0].data.content[0]["text"]
+    assert service.tickets.pending_notifications()
+    monkeypatch.setattr(service.tickets, "mark_notified", mark)
+    restarted = ProjectTicketNotifications(service.tickets, service.projects, service.inputs)
+    await restarted.flush_page(project_app)
+    assert len(store.list_pending_inputs(session_id)) == 1
+    assert service.tickets.pending_notifications() == []
+    await project_client.post(
+        f"{base}/{ticket['id']}/comments",
+        json={"text": "Own update"},
+        headers={ORCHESTRATION_SOURCE_HEADER: session_id},
+    )
+    assert service.tickets.pending_notifications() == []
+
+
+@pytest.mark.parametrize("external_host", [False, True])
+async def test_notifications_drain_through_normal_dispatch_after_reconnect(
+    project_client, project_app, db_uri, monkeypatch, external_host
+):
+    project = (await project_client.post("/v1/projects", json={"name": "Reconnect"})).json()
+    session_id = project["orchestrator_session_id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    host_id, runner_id = uuid4().hex, uuid4().hex
+    if external_host:
+        store.set_host_id(session_id, host_id, "/work/board")
+    store.set_runner_id(session_id, runner_id)
+    base = f"/v1/projects/{project['id']}/tickets"
+    ticket = (await project_client.post(base, json={"title": "Persisted task"})).json()
+    await project_client.post(f"{base}/{ticket['id']}/comments", json={"text": "First update"})
+    service = project_app.state.project_ticket_notifications
+    await service.flush_page(project_app)
+    assert len(store.list_pending_inputs(session_id)) == 2
+    assert len(service.tickets.pending_notifications()) == (0 if external_host else 2)
+
+    forwarded = []
+    runner = _stub_runner(monkeypatch, forwarded)
+    monkeypatch.setattr("omnigent.server.routes.sessions._ensure_runner_relay_ready", AsyncMock())
+    inputs = project_app.state.startup_inputs
+    finish = inputs._finish
+    late_update = False
+
+    async def finish_with_update(current_session_id):
+        nonlocal late_update
+        await finish(current_session_id)
+        if not late_update:
+            late_update = True
+            response = await project_client.post(
+                f"{base}/{ticket['id']}/comments", json={"text": "Arrived while draining"}
+            )
+            assert response.status_code == 201
+            await service.flush_page(project_app)
+
+    monkeypatch.setattr(inputs, "_finish", finish_with_update)
+    register_test_runner(project_app, runner_id)
+    try:
+        if external_host:
+            project_app.state.host_registry.register(
+                host_id,
+                AsyncMock(),
+                HostHelloFrame(version="test", frame_protocol_version=1, name="Ticket host"),
+                owner=None,
+                registered_with_managed_token=False,
+            )
+            inputs.host_changed(project_app, host_id)
+        else:
+            await service.flush_page(project_app)
+        await poll_until_async(
+            lambda: (
+                late_update
+                and sum(event.get("type") == "message" for event in forwarded) >= 3
+                and not store.list_pending_inputs(session_id)
+            ),
+            timeout_s=5,
+        )
+        turns = [event for event in forwarded if event.get("type") == "message"]
+        assert len(turns) == 3
+        assert len({turn["persisted_item_id"] for turn in turns}) == 3
+        assert "Persisted task" in json.dumps(turns[0])
+        assert "First update" in json.dumps(turns[1])
+        assert "Arrived while draining" in json.dumps(turns[2])
+        assert service.tickets.pending_notifications() == []
+    finally:
+        await inputs.shutdown()
+        await runner.aclose()

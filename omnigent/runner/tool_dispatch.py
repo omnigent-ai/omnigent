@@ -97,6 +97,7 @@ from omnigent.tools.builtins.os_env import (
     SysOsShellTool,
     SysOsWriteTool,
 )
+from omnigent.tools.builtins.project_tickets import TICKET_TOOL_CLASSES, TICKET_TOOLS
 from omnigent.tools.builtins.scheduled_tasks import (
     reminder_name,
     reminder_prompt,
@@ -361,6 +362,7 @@ _PROJECT_TOOLS = frozenset(
         SysSessionLinkPrTool.name(),
         SysSessionUpdateTool.name(),
         SysProjectUpdateTool.name(),
+        *TICKET_TOOLS,
     }
 )
 _UI_TOOLS = frozenset({UiOpenFileTool.name()})
@@ -695,6 +697,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
             SysSessionLinkPrTool,
             SysSessionUpdateTool,
             SysProjectUpdateTool,
+            *TICKET_TOOL_CLASSES,
             UiOpenFileTool,
             SysAgentGetTool,
             SysAgentListTool,
@@ -8282,6 +8285,10 @@ async def execute_tool(
             from omnigent.runner.session_link_pr import execute_link_pr_tool
 
             output = await execute_link_pr_tool(args, server_client, conversation_id)
+        elif tool_name in TICKET_TOOLS:
+            from omnigent.runner.project_tickets import execute_ticket_tool
+
+            output = await execute_ticket_tool(tool_name, args, server_client, conversation_id)
         elif tool_name in _PROJECT_TOOLS:
             from omnigent.runner.session_projects import (
                 execute_project_list,

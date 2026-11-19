@@ -2,6 +2,8 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { MemoryRouter, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import type * as ConversationsModule from "@/hooks/useConversations";
 import {
   ProjectBoardSearch,
@@ -156,6 +158,28 @@ describe("ProjectBoardSearch", () => {
 });
 
 describe("ProjectNewSessionButton", () => {
+  it("keeps New session beside New ticket and Orchestrator, with no filters", () => {
+    render(
+      <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, project_tickets: true }}>
+        <MemoryRouter initialEntries={["/projects/Payments"]}>
+          <ProjectHomeHeaderActions projectName="Payments" />
+        </MemoryRouter>
+      </CapabilitiesProvider>,
+    );
+    expect(screen.getByRole("link", { name: "Orchestrator" })).toHaveAttribute(
+      "href",
+      "/projects/Payments?orchestrator=1",
+    );
+    expect(screen.getByRole("link", { name: "New ticket" })).toHaveAttribute(
+      "href",
+      "/projects/Payments?ticket=new",
+    );
+    expect(screen.queryByRole("searchbox")).toBeNull();
+    expect(screen.queryByRole("combobox")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "New session" }));
+    expect(useProjectComposerStore.getState().open).toBe(true);
+  });
+
   it("shows and hides the floating composer", () => {
     renderButton();
     const button = screen.getByRole("button", { name: "New session" });

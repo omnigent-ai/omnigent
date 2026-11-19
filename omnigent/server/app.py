@@ -289,6 +289,7 @@ class ServerInfoResponse(BaseModel):
     databricks_features: bool
     managed_sandboxes_enabled: bool
     durable_initial_input: bool = False
+    project_tickets: bool = False
     sandbox_provider: str | None
     sandbox_providers: list[str]
     # UI-relevant capability flags per launchable provider, e.g.
@@ -2575,10 +2576,14 @@ def create_app(
                 await managed_sandbox_reaper.start()
 
         session_pull_requests.install_refresher(pull_request_refresher)
+        if project_ticket_notifications is not None:
+            project_ticket_notifications.start(app_inst)
         try:
             with monitor_event_loop():
                 yield
         finally:
+            if project_ticket_notifications is not None:
+                await project_ticket_notifications.stop()
             session_pull_requests.install_refresher(None)
             await pull_request_refresher.aclose()
             if scheduler_start_retry is not None:
@@ -2646,14 +2651,27 @@ def create_app(
     app.state.host_registry = host_registry
     from omnigent.server.startup_inputs import ManagedStartupInputs
 
-    # Only managed creates accept a durable first input, and only managed hosts
-    # need their startup recovered on the replica holding the tunnel.
+    # Managed creates and project ticket updates use the same durable input path.
     startup_inputs = (
-        ManagedStartupInputs(conversation_store, host_registry)
-        if sandbox_config is not None and sandbox_config.managed_launch_supported
+        ManagedStartupInputs(
+            conversation_store, host_registry, include_external_hosts=project_store is not None
+        )
+        if project_store is not None
+        or (sandbox_config is not None and sandbox_config.managed_launch_supported)
         else None
     )
     app.state.startup_inputs = startup_inputs
+    project_ticket_notifications = None
+    ticket_store = None
+    if project_store is not None and startup_inputs is not None:
+        from omnigent.server.project_ticket_notifications import ProjectTicketNotifications
+        from omnigent.stores.project_ticket_store import ProjectTicketStore
+
+        ticket_store = ProjectTicketStore(project_store.storage_location)
+        project_ticket_notifications = ProjectTicketNotifications(
+            ticket_store, project_store, startup_inputs
+        )
+    app.state.project_ticket_notifications = project_ticket_notifications
     app.state.permission_store = permission_store
     app.state.host_store = host_store
     app.state.scheduled_task_store = scheduled_task_store
@@ -4133,7 +4151,8 @@ def create_app(
                 "needs_setup": needs_setup,
                 "databricks_features": databricks_features,
                 "managed_sandboxes_enabled": managed_sandboxes_enabled,
-                "durable_initial_input": startup_inputs is not None,
+                "durable_initial_input": startup_inputs is not None and managed_sandboxes_enabled,
+                "project_tickets": ticket_store is not None,
                 "sandbox_provider": sandbox_provider,
                 "sandbox_providers": sandbox_providers,
                 "sandbox_provider_capabilities": sandbox_provider_capabilities,
@@ -4330,6 +4349,12 @@ def create_app(
             ),
             register_runner_ingest=lambda handler: setattr(
                 app.state, "runner_event_ingest", handler
+            ),
+            register_project_session_create=lambda handler: setattr(
+                app.state, "project_session_create", handler
+            ),
+            register_project_session_delete=lambda handler: setattr(
+                app.state, "project_session_delete", handler
             ),
         ),
         prefix="/v1",
@@ -4595,10 +4620,26 @@ def create_app(
                 auth_provider=auth_provider,
                 conversation_store=conversation_store,
                 permission_store=permission_store,
+                agent_store=agent_store,
+                create_session=app.state.project_session_create,
+                delete_session=app.state.project_session_delete,
             ),
             prefix="/v1",
             tags=["projects"],
         )
+        if ticket_store is not None:
+            from omnigent.server.routes.project_tickets import create_project_tickets_router
+
+            app.include_router(
+                create_project_tickets_router(
+                    ticket_store,
+                    conversation_store,
+                    auth_provider=auth_provider,
+                    permissions=permission_store,
+                ),
+                prefix="/v1",
+                tags=["project tickets"],
+            )
 
     if user_settings_store is not None:
         app.include_router(
@@ -5540,6 +5581,8 @@ def create_app(
                             generation=connection.generation,
                             store_slots=store_slots,
                         )
+                    if startup_inputs is not None:
+                        await startup_inputs.deliver_pending(app, conv.id)
                 except Exception as exc:
                     if tunnel_registry.get(runner_id) is not connection:
                         _logger.info(

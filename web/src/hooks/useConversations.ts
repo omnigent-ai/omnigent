@@ -74,6 +74,7 @@ import {
   updateProjectConfig as apiUpdateProjectConfig,
 } from "@/lib/projectsApi";
 import { releaseConversation, useChatStore } from "@/store/chatStore";
+import { listTickets } from "@/lib/projectTicketsApi";
 import type { Session, SessionFamily } from "@/lib/types";
 import type { SessionPullRequestSummary } from "@/hooks/useSessionPullRequests";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
@@ -2858,6 +2859,7 @@ export type DeleteProjectResult =
  */
 export function useDeleteProject() {
   const queryClient = useQueryClient();
+  const info = useServerInfo();
   return useMutation({
     mutationFn: async ({
       id,
@@ -2866,6 +2868,12 @@ export function useDeleteProject() {
     }: Pick<ProjectSummary, "id" | "name"> & {
       stopRunning?: boolean;
     }): Promise<DeleteProjectResult> => {
+      if (id !== null && info !== "loading" && info.project_tickets) {
+        const tickets = await listTickets(id, { limit: 1 });
+        if (tickets.data.length > 0) {
+          throw new Error("Projects with tickets cannot be deleted; ticket history is retained.");
+        }
+      }
       const members = await fetchAllProjectSessions(name);
       if (!stopRunning) {
         const runningCount = members.filter(isSessionWorking).length;

@@ -60,6 +60,7 @@ from omnigent.tools.builtins import (
     any_skill_has_resources,
     get_builtin_tool,
 )
+from omnigent.tools.builtins.project_tickets import TICKET_TOOL_CLASSES
 from omnigent.tools.client_specified import ClientSideTool, ClientSideToolSpec
 from omnigent.tools.local import load_local_python_tools
 
@@ -605,7 +606,7 @@ class ToolManager:
 
         They proxy the owner-gated projects and session PATCH endpoints the
         sidebar uses, so they grant no access the caller lacks;
-        ``tool_groups.projects: false`` drops the pair.
+        ``tool_groups.projects: false`` drops these tools, including ticket tools.
         """
         if not self._spec.tool_groups.projects:
             return
@@ -613,6 +614,8 @@ class ToolManager:
         self._tools[SysSessionLinkPrTool.name()] = SysSessionLinkPrTool()
         self._tools[SysSessionUpdateTool.name()] = SysSessionUpdateTool()
         self._tools[SysProjectUpdateTool.name()] = SysProjectUpdateTool()
+        for tool in TICKET_TOOL_CLASSES:
+            self._tools[tool.name()] = tool()
 
     def _register_task_lifecycle_tools(self) -> None:
         """

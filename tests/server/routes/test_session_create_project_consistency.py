@@ -88,11 +88,17 @@ async def _project(
 ) -> str:
     response = await client.post(
         "/v1/projects",
-        json={"name": f"project-{user}", "config": config},
+        json={"name": f"project-{user}"},
         headers=_headers(user),
     )
     assert response.status_code == 200, response.text
-    return response.json()["id"]
+    project_id = response.json()["id"]
+    # Defaults remain editable as opaque config; session creation validates them.
+    updated = await client.patch(
+        f"/v1/projects/{project_id}", json={"config": config}, headers=_headers(user)
+    )
+    assert updated.status_code == 200, updated.text
+    return project_id
 
 
 async def test_omitted_values_are_filled_and_membership_is_immediate(
@@ -580,10 +586,12 @@ async def test_a_project_default_cannot_bind_the_proactive_agent(
     assert response.status_code == 400, response.text
     assert "built-in schedule" in response.text
     listed = await project_create_client.get("/v1/sessions", headers=_headers())
-    assert listed.json()["data"] == []
     # Uploads and imports resolve project defaults through the same chokepoint.
     project = SqlAlchemyProjectStore(db_uri).get(project_id, user_id=ALICE)
     assert project is not None
+    assert [session["id"] for session in listed.json()["data"]] == [
+        project.orchestrator_session_id
+    ]
     with pytest.raises(OmnigentError, match="built-in schedule"):
         await resolve_project_session_create(
             body=ProjectSessionCreateRequest(project_id=project_id),

@@ -591,6 +591,7 @@ def register_core_routes(
     project_store: ProjectStore | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     pull_request_refresher: server_prs.PullRequestRefresher | None = None,
+    register_project_session_create: Callable[..., None] | None = None,
 ) -> ClearSessionIntoFreshSession:
     """Register the core session routes on router.
 
@@ -1471,9 +1472,14 @@ def register_core_routes(
     async def _create_session(
         request: Request,
         user_id: str | None,
+        payload_override: dict[str, Any] | None = None,
     ) -> SessionResponse | CreatedSessionResponse:
         """Create a session for *user_id*; see :func:`create_session`."""
-        content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
+        content_type = (
+            "application/json"
+            if payload_override is not None
+            else request.headers.get("content-type", "").split(";", 1)[0].lower()
+        )
         if (
             content_type == "multipart/form-data"
             and ORCHESTRATION_SOURCE_HEADER in request.headers
@@ -1496,6 +1502,8 @@ def register_core_routes(
             payload = (
                 json.loads(str(form.get("metadata", "{}")))
                 if form is not None
+                else payload_override
+                if payload_override is not None
                 else await request.json()
             )
             # Dispatch on the VALUE, not key presence: a null project_id is
@@ -1536,7 +1544,11 @@ def register_core_routes(
                 "Explicit host placement requires host_id and workspace on an external host",
                 code=ErrorCode.INVALID_INPUT,
             )
-        orchestration_source = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
+        orchestration_source = (
+            None
+            if payload_override is not None
+            else request.headers.get(ORCHESTRATION_SOURCE_HEADER)
+        )
         source = None
         if orchestration_source is not None:
             source = await asyncio.to_thread(
@@ -1874,6 +1886,7 @@ def register_core_routes(
             and body.parent_session_id is None
             and orchestration_source is None
             and body.sibling_source_id is None
+            and payload_override is None
         ):
             await _grant_default_public(
                 request.app.state,
@@ -1892,6 +1905,9 @@ def register_core_routes(
             resp.family = families.get(conv.id)
         add_audit_attrs(session_id=resp.id, agent=resp.agent_id)
         return resp
+
+    if register_project_session_create is not None:
+        register_project_session_create(_create_session)
 
     async def _create_bundled_session_from_multipart(
         request: Request,

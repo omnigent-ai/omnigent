@@ -70,6 +70,7 @@ export interface ProjectConfig {
 export interface Project {
   id: string;
   name: string;
+  orchestrator_session_id?: string | null;
   /** Owner user id; `null` in single-user / OSS mode. */
   user_id?: string | null;
   created_at?: number;
@@ -103,6 +104,15 @@ export async function listProjects(): Promise<Project[]> {
 /** Fetch a single project (including its `config`) by id. 404s if not owned. */
 export async function getProject(id: string): Promise<Project> {
   const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}`);
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  return (await res.json()) as Project;
+}
+
+/** Initialize an older project's ordinary orchestrator session, or reuse it. */
+export async function initializeProjectOrchestrator(id: string): Promise<Project> {
+  const res = await authenticatedFetch(`/v1/projects/${encodeURIComponent(id)}/orchestrator`, {
+    method: "POST",
+  });
   if (!res.ok) throw await apiErrorFromResponse(res);
   return (await res.json()) as Project;
 }

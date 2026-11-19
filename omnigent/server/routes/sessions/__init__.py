@@ -830,6 +830,8 @@ def create_sessions_router(
     register_runner_ingest: Callable[..., None] | None = None,
     register_startup_dispatch: Callable[..., None] | None = None,
     register_initial_file_upload: Callable[..., None] | None = None,
+    register_project_session_create: Callable[..., None] | None = None,
+    register_project_session_delete: Callable[..., None] | None = None,
 ) -> APIRouter:
     """
     Factory that builds the sessions router.
@@ -935,6 +937,7 @@ def create_sessions_router(
         project_store=project_store,
         background_title_coordinator=background_title_coordinator,
         pull_request_refresher=pull_request_refresher,
+        register_project_session_create=register_project_session_create,
     )
 
     register_hooks_routes(
@@ -1010,6 +1013,7 @@ def create_sessions_router(
         runner_tunnel_tokens=runner_tunnel_tokens,
         register_runner_ingest=register_runner_ingest,
         register_startup_dispatch=register_startup_dispatch,
+        register_project_session_delete=register_project_session_delete,
         clear_session_into_fresh_session=clear_session_into_fresh_session,
     )
 

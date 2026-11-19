@@ -60,6 +60,7 @@ from omnigent.tools.builtins.memory import (
 )
 from omnigent.tools.builtins.nimble_extract import NimbleExtractTool
 from omnigent.tools.builtins.nimble_research import NimbleResearchTool
+from omnigent.tools.builtins.project_tickets import TICKET_TOOLS
 from omnigent.tools.builtins.read_skill_file import (
     ReadSkillFileTool,
 )
@@ -334,6 +335,7 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     "browser_screenshot": None,
     **dict.fromkeys(sorted(ADVANCED_BROWSER_TOOL_NAMES)),
     "ui_open_file": None,
+    **dict.fromkeys(TICKET_TOOLS),
 }
 
 # Hindsight long-term memory (optional ``hindsight`` extra). Registered only

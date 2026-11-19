@@ -2,15 +2,46 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ProjectHomePage } from "./ProjectHomePage";
+import { useProjectComposerStore } from "@/projectHome/ProjectHomeHeader";
 
-const mocks = vi.hoisted(() => ({ isMobile: false }));
+const mocks = vi.hoisted(() => ({ isMobile: false, ticketsEnabled: false }));
 
 vi.mock(import("@/hooks/useIsMobileViewport"), async (importOriginal) => ({
   ...(await importOriginal()),
   useIsMobileViewport: () => mocks.isMobile,
 }));
 vi.mock("@/shell/Sidebar", () => ({ useProjectFolderMenu: vi.fn() }));
-vi.mock("@/shell/NewChatDialog", () => ({ NewChatLandingScreen: () => null }));
+vi.mock("@/shell/NewChatDialog", () => ({
+  NewChatLandingScreen: ({
+    projectName,
+    onSessionStarted,
+  }: {
+    projectName: string;
+    onSessionStarted: () => void;
+  }) => (
+    <button type="button" onClick={() => onSessionStarted()}>
+      Start session in {projectName}
+    </button>
+  ),
+}));
+vi.mock("@/projectHome/useProjectTickets", () => ({
+  useProjectTicketsEnabled: () => mocks.ticketsEnabled,
+}));
+vi.mock("@/projectHome/ProjectTicketBoard", () => ({
+  ProjectTicketBoard: () => <div data-testid="ticket-board" />,
+}));
+vi.mock("@/projectHome/ProjectTicketPanel", () => ({
+  ProjectTicketPanel: ({ ticketId, onClose }: { ticketId: string; onClose: () => void }) => (
+    <button type="button" onClick={onClose}>
+      Close ticket {ticketId}
+    </button>
+  ),
+  ProjectOrchestratorPanel: ({ onClose }: { onClose: () => void }) => (
+    <button type="button" onClick={onClose}>
+      Close orchestrator
+    </button>
+  ),
+}));
 
 vi.mock("@/projectHome/ProjectKanbanBoard", async () => {
   const { Link } = await import("@/lib/routing");
@@ -56,6 +87,31 @@ function renderPage(entry: string) {
 
 beforeEach(() => {
   mocks.isMobile = false;
+  mocks.ticketsEnabled = false;
+  useProjectComposerStore.setState({ open: false });
+});
+
+describe("ProjectHomePage tickets", () => {
+  it.each([
+    ["ticket=ticket-1", "Ticket details", "Close ticket ticket-1"],
+    ["orchestrator=1", "Orchestrator chat", "Close orchestrator"],
+    ["session=session-1", "Session quick view", "Close session-1"],
+  ])(
+    "opens %s beside the board and preserves the normal New session composer",
+    (search, panel, close) => {
+      mocks.ticketsEnabled = true;
+      renderPage(`/projects/Payments?${search}`);
+      expect(screen.getByTestId("ticket-board")).toBeInTheDocument();
+      expect(screen.getByRole("complementary", { name: panel })).toBeInTheDocument();
+      act(() => useProjectComposerStore.getState().setOpen(true));
+      fireEvent.click(screen.getByRole("button", { name: "Start session in Payments" }));
+      expect(screen.queryByTestId("project-floating-composer")).toBeNull();
+      expect(screen.getByTestId("location")).toHaveTextContent(`/projects/Payments?${search}`);
+      fireEvent.click(screen.getByRole("button", { name: close }));
+      expect(screen.queryByRole("complementary")).toBeNull();
+      expect(screen.getByTestId("location")).toHaveTextContent(/^\/projects\/Payments$/);
+    },
+  );
 });
 
 afterEach(cleanup);

@@ -41,9 +41,22 @@ from omnigent.stores.permission_store.sqlalchemy_store import (
     SqlAlchemyPermissionStore,
 )
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+from tests.server.helpers import build_agent_bundle
 
 ALICE = "alice@example.com"
 BOB = "bob@example.com"
+PROJECT_AGENT_ID = "187b7cb7ac30abf4debfaa578d052ec6"
+
+
+@pytest.fixture
+def project_agents(db_uri: str, tmp_path: Path) -> SqlAlchemyAgentStore:
+    store = SqlAlchemyAgentStore(db_uri)
+    bundle_key = f"{PROJECT_AGENT_ID}/bundle"
+    LocalArtifactStore(str(tmp_path / "artifacts")).put(
+        bundle_key, build_agent_bundle("project-agent")
+    )
+    store.create(PROJECT_AGENT_ID, "project-agent", bundle_key)
+    return store
 
 
 def _as_user(user: str) -> dict[str, str]:
@@ -52,11 +65,13 @@ def _as_user(user: str) -> dict[str, str]:
 
 
 @pytest.fixture()
-def project_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
+def project_app(
+    runtime_init: None, db_uri: str, tmp_path: Path, project_agents: SqlAlchemyAgentStore
+) -> FastAPI:
     """Build a FastAPI app that includes the project store."""
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     return create_app(
-        agent_store=SqlAlchemyAgentStore(db_uri),
+        agent_store=project_agents,
         file_store=SqlAlchemyFileStore(db_uri),
         conversation_store=SqlAlchemyConversationStore(db_uri),
         artifact_store=artifact_store,
@@ -192,7 +207,7 @@ async def test_create_defaults_to_empty_config(project_client: httpx.AsyncClient
 
 async def test_create_and_get_roundtrips_config(project_client: httpx.AsyncClient) -> None:
     """A config passed on create round-trips through the create + get responses."""
-    cfg = {"host_id": "host_abc", "workspace": "/work/repo", "model": "claude-opus-4-8"}
+    cfg = {"workspace": "/work/repo", "icon": "🔧"}
     created = (
         await project_client.post("/v1/projects", json={"name": "Configured", "config": cfg})
     ).json()
@@ -229,7 +244,9 @@ async def test_repository_config_is_stored_opaquely(
 async def test_patch_replaces_config(project_client: httpx.AsyncClient) -> None:
     """PATCH with a new config replaces the stored one and stamps updated_at."""
     created = (
-        await project_client.post("/v1/projects", json={"name": "P", "config": {"host_id": "old"}})
+        await project_client.post(
+            "/v1/projects", json={"name": "P", "config": {"workspace": "/work/old"}}
+        )
     ).json()
     resp = await project_client.patch(
         f"/v1/projects/{created['id']}", json={"config": {"host_id": "new", "model": "m"}}
@@ -244,18 +261,18 @@ async def test_patch_without_config_preserves_it(project_client: httpx.AsyncClie
     """A PATCH that omits config (e.g. a rename) leaves the stored config intact."""
     created = (
         await project_client.post(
-            "/v1/projects", json={"name": "P", "config": {"host_id": "keep"}}
+            "/v1/projects", json={"name": "P", "config": {"workspace": "/work/keep"}}
         )
     ).json()
     renamed = await project_client.patch(f"/v1/projects/{created['id']}", json={"name": "P2"})
-    assert renamed.json()["config"] == {"host_id": "keep"}
+    assert renamed.json()["config"] == {"workspace": "/work/keep"}
 
 
 async def test_patch_empty_config_clears_it(project_client: httpx.AsyncClient) -> None:
     """PATCH with config={} clears the stored defaults (distinct from omitting)."""
     created = (
         await project_client.post(
-            "/v1/projects", json={"name": "P", "config": {"host_id": "drop"}}
+            "/v1/projects", json={"name": "P", "config": {"workspace": "/work/drop"}}
         )
     ).json()
     resp = await project_client.patch(f"/v1/projects/{created['id']}", json={"config": {}})
@@ -311,7 +328,7 @@ async def test_session_projects_surfaces_config_icon(
     # A config without an icon key surfaces None (default folder glyph).
     plain = (
         await project_client.post(
-            "/v1/projects", json={"name": "Plain", "config": {"host_id": "h"}}
+            "/v1/projects", json={"name": "Plain", "config": {"workspace": "/work/plain"}}
         )
     ).json()
 
@@ -327,11 +344,13 @@ async def test_session_projects_surfaces_config_icon(
 
 
 @pytest.fixture()
-def multi_user_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
+def multi_user_app(
+    runtime_init: None, db_uri: str, tmp_path: Path, project_agents: SqlAlchemyAgentStore
+) -> FastAPI:
     """A project-enabled app with header auth, so each request has an owner."""
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     return create_app(
-        agent_store=SqlAlchemyAgentStore(db_uri),
+        agent_store=project_agents,
         file_store=SqlAlchemyFileStore(db_uri),
         conversation_store=SqlAlchemyConversationStore(db_uri),
         artifact_store=artifact_store,
@@ -485,7 +504,7 @@ async def test_project_mutations_announce_projects_changed_to_owner(
             "/v1/projects", json={"name": "Live folder"}, headers=_as_user(ALICE)
         )
         assert created.status_code == 200
-        await _wait_for_events(alice_events, 1)
+        await _wait_for_events(alice_events, 2)
 
         renamed = await multi_user_client.patch(
             f"/v1/projects/{created.json()['id']}",
@@ -493,15 +512,18 @@ async def test_project_mutations_announce_projects_changed_to_owner(
             headers=_as_user(ALICE),
         )
         assert renamed.status_code == 200
-        await _wait_for_events(alice_events, 2)
+        await _wait_for_events(alice_events, 3)
 
         deleted = await multi_user_client.delete(
             f"/v1/projects/{created.json()['id']}", headers=_as_user(ALICE)
         )
         assert deleted.status_code == 200
-        await _wait_for_events(alice_events, 3)
+        await _wait_for_events(alice_events, 4)
 
-        assert alice_events == [{"type": "projects_changed"}] * 3
+        assert alice_events == [
+            {"type": "session_added", "session_id": created.json()["orchestrator_session_id"]},
+            *[{"type": "projects_changed"}] * 3,
+        ]
         # Give any mis-keyed publish a chance to land before asserting silence.
         await asyncio.sleep(0.05)
         assert bob_events == []

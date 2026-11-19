@@ -82,6 +82,12 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         "sys_session_link_pr",
         "sys_session_update",
         "sys_project_update",
+        "sys_ticket_list",
+        "sys_ticket_get",
+        "sys_ticket_create",
+        "sys_ticket_update",
+        "sys_ticket_comment",
+        "sys_session_link_ticket",
         # Policy tools are always auto-registered so agents can
         # browse the registry and add policies at runtime.
         "sys_add_policy",
@@ -1757,7 +1763,18 @@ _TOOL_GROUP_MEMBERS: dict[str, frozenset[str]] = {
     "policies": frozenset({"sys_add_policy", "sys_policy_registry"}),
     "agent_discovery": frozenset({"sys_agent_get", "sys_agent_download", "sys_agent_list"}),
     "projects": frozenset(
-        {"sys_project_list", "sys_session_update", "sys_project_update", "sys_session_link_pr"}
+        {
+            "sys_project_list",
+            "sys_session_update",
+            "sys_project_update",
+            "sys_session_link_pr",
+            "sys_ticket_list",
+            "sys_ticket_get",
+            "sys_ticket_create",
+            "sys_ticket_update",
+            "sys_ticket_comment",
+            "sys_session_link_ticket",
+        }
     ),
 }
 
@@ -1773,7 +1790,7 @@ def _grouped_spec(**groups: bool) -> AgentSpec:
 
 
 def test_tool_groups_default_registers_every_group() -> None:
-    """An absent ``tool_groups:`` block changes nothing: all 19 register."""
+    """An absent ``tool_groups:`` block registers every group."""
     names = _tool_names(_grouped_spec())
     for group, members in _TOOL_GROUP_MEMBERS.items():
         assert members <= names, f"{group} members missing by default: {members - names}"
@@ -1791,13 +1808,13 @@ def test_tool_groups_false_drops_only_that_group(group: str) -> None:
 
 def test_tool_groups_all_false_keeps_the_load_bearing_tools() -> None:
     """
-    With every group off, the 20 gated tools are gone but the session
+    With every group off, the gated tools are gone but the session
     reads, ``sys_session_rename`` and ``sys_cancel_task`` stay: multi-agent
     participation and async handles depend on them, so they have no key.
     """
     names = _tool_names(_grouped_spec(**dict.fromkeys(_TOOL_GROUP_MEMBERS, False)))
     gated = frozenset().union(*_TOOL_GROUP_MEMBERS.values())
-    assert len(gated) == 21
+    assert len(gated) == 27
     assert not (gated & names)
     assert {
         "sys_session_list",

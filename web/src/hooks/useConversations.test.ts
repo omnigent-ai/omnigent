@@ -52,6 +52,8 @@ import { PINNED_LABEL_KEY, PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { SidebarConfigContext, sidebarConfig } from "@/lib/sidebarConfig";
 import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "@/shell/sidebarNav";
 import { useScopeCache } from "./useScopeCache";
+import { CapabilitiesContext } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 
 vi.mock("./useSessionUpdatesConnected", () => ({ useSessionUpdatesConnected: vi.fn() }));
 
@@ -4107,6 +4109,30 @@ describe("useArchiveConversation", () => {
 });
 
 describe("useDeleteProject", () => {
+  it("rejects a project containing tickets before touching any sessions", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ data: [{ id: "ticket" }], has_more: false }));
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(
+        QueryClientProvider,
+        { client: queryClient },
+        createElement(
+          CapabilitiesContext.Provider,
+          { value: { ...FALLBACK_SERVER_INFO, project_tickets: true } },
+          children,
+        ),
+      );
+    const { result } = renderHook(() => useDeleteProject(), { wrapper });
+
+    result.current.mutate({ id: "p_1", name: "Sprint 42", stopRunning: true });
+    await waitFor(() => expect(result.current.isError).toBe(true));
+
+    expect(result.current.error?.message).toContain("Projects with tickets cannot be deleted");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0][0]).toBe("/v1/projects/p_1/tickets?limit=1");
+    expect(fetchMock.mock.calls[0][1].method).toBe("GET");
+  });
+
   function archivedConv(id: string) {
     return mockResponse({
       id,

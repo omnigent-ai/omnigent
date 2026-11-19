@@ -40,3 +40,4 @@ class Project:
     created_at: int
     updated_at: int | None = None
     config: dict[str, Any] = field(default_factory=dict)
+    orchestrator_session_id: str | None = None
