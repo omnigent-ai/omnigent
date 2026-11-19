@@ -2068,20 +2068,22 @@ html[data-electron-mac] .breadcrumb-folder {
   max-width: var(--chat-prose-width, 80ch);
 }
 
-.chat-markdown :is(ul, ol) {
+/* Streamdown puts list markers inside the text, so a wrapped line starts under the
+   marker. Chat messages and step descriptions hang their items instead. */
+:is(.chat-markdown, .step-description) :is(ul, ol) {
   list-style-position: outside;
   padding-inline-start: 1.5em;
 }
 
-.chat-markdown li {
+:is(.chat-markdown, .step-description) li {
   padding-block: 0.2em;
 }
 
-.chat-markdown li::marker {
+:is(.chat-markdown, .step-description) li::marker {
   color: var(--muted-foreground);
 }
 
-.chat-markdown li > :is(ul, ol) {
+:is(.chat-markdown, .step-description) li > :is(ul, ol) {
   margin-block: 0.35em;
 }
 
