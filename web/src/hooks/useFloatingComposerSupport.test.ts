@@ -15,6 +15,13 @@ function stubShell(shell: Record<string, unknown> | undefined): void {
   (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop = shell;
 }
 
+/** Lets every pending promise callback run, however many hops the shell's answer takes. */
+function settle(): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, 0);
+  });
+}
+
 function flag(on: boolean): void {
   vi.mocked(useServerInfo).mockReturnValue({
     ...FALLBACK_SERVER_INFO,
@@ -45,17 +52,19 @@ afterEach(() => {
 
 describe("useFloatingComposerSupport", () => {
   it("announces version 1 once with the flag on in a shell that can show the panel", async () => {
-    const { rerender } = renderHook(() => useFloatingComposerSupport());
+    // StrictMode mounts the effect twice, as the app does in development.
+    const { rerender } = renderHook(() => useFloatingComposerSupport(), { reactStrictMode: true });
     await waitFor(() => expect(announceSupport).toHaveBeenCalledWith(1));
     rerender();
-    await Promise.resolve();
+    await settle();
+    expect(getDesktopFeatures).toHaveBeenCalledTimes(2);
     expect(announceSupport).toHaveBeenCalledTimes(1);
   });
 
   it("announces nothing while the flag is off", async () => {
     flag(false);
     renderHook(() => useFloatingComposerSupport());
-    await Promise.resolve();
+    await settle();
     expect(getDesktopFeatures).not.toHaveBeenCalled();
     expect(announceSupport).not.toHaveBeenCalled();
   });
@@ -63,7 +72,7 @@ describe("useFloatingComposerSupport", () => {
   it("announces nothing while server info is loading", async () => {
     vi.mocked(useServerInfo).mockReturnValue("loading");
     renderHook(() => useFloatingComposerSupport());
-    await Promise.resolve();
+    await settle();
     expect(announceSupport).not.toHaveBeenCalled();
   });
 
@@ -72,7 +81,7 @@ describe("useFloatingComposerSupport", () => {
     renderHook(() => useFloatingComposerSupport());
     stubShell({ kind: "electron", getDesktopFeatures });
     renderHook(() => useFloatingComposerSupport());
-    await Promise.resolve();
+    await settle();
     expect(getDesktopFeatures).not.toHaveBeenCalled();
     expect(announceSupport).not.toHaveBeenCalled();
   });
@@ -84,7 +93,7 @@ describe("useFloatingComposerSupport", () => {
     getDesktopFeatures.mockResolvedValue(features);
     renderHook(() => useFloatingComposerSupport());
     await waitFor(() => expect(getDesktopFeatures).toHaveBeenCalled());
-    await Promise.resolve();
+    await settle();
     expect(announceSupport).not.toHaveBeenCalled();
   });
 
@@ -93,7 +102,7 @@ describe("useFloatingComposerSupport", () => {
     getDesktopFeatures.mockRejectedValue(new Error("shell gone"));
     renderHook(() => useFloatingComposerSupport());
     await waitFor(() => expect(getDesktopFeatures).toHaveBeenCalled());
-    await Promise.resolve();
+    await settle();
     expect(announceSupport).not.toHaveBeenCalled();
   });
 
@@ -107,8 +116,21 @@ describe("useFloatingComposerSupport", () => {
     const { unmount } = renderHook(() => useFloatingComposerSupport());
     unmount();
     answer({ floatingComposer: true });
-    await Promise.resolve();
-    await Promise.resolve();
+    await settle();
     expect(announceSupport).not.toHaveBeenCalled();
+  });
+
+  it("logs instead of rejecting when the shell's announce call throws", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    announceSupport.mockImplementation(() => {
+      throw new Error("preload gone");
+    });
+    renderHook(() => useFloatingComposerSupport());
+    await waitFor(() =>
+      expect(warn).toHaveBeenCalledWith(
+        "[floatingComposer] couldn't announce support:",
+        expect.any(Error),
+      ),
+    );
   });
 });

@@ -18,11 +18,14 @@ export function useFloatingComposerSupport(): void {
     const bridge = floatingComposerBridge();
     if (!enabled || !bridge) return;
     let cancelled = false;
-    void getDesktopFeatures().then((features) => {
-      if (!cancelled && features?.floatingComposer === true) {
-        bridge.announceSupport(FLOATING_COMPOSER_VERSION);
-      }
-    });
+    void getDesktopFeatures()
+      .then((features) => {
+        if (!cancelled && features?.floatingComposer === true) {
+          bridge.announceSupport(FLOATING_COMPOSER_VERSION);
+        }
+      })
+      // The bridge call can throw while the page or its preload is going away.
+      .catch((err: unknown) => console.warn("[floatingComposer] couldn't announce support:", err));
     return () => {
       cancelled = true;
     };
