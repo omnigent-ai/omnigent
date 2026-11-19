@@ -322,6 +322,11 @@ import {
 } from "./sidebarNav";
 import { SidebarServerPicker } from "./SidebarServerPicker";
 import { isRowFullyVisible } from "./sidebarRowVisibility";
+import {
+  type VirtualRowPlacement,
+  VirtualSessionRows,
+  virtualRowStyle,
+} from "./VirtualSessionRows";
 import { useHarnessLabels } from "@/lib/agentLabels";
 import { NATIVE_CODING_AGENTS, nativeCodingAgentForSession } from "@/lib/nativeCodingAgents";
 import { usePullRequestInfo } from "@/hooks/usePullRequests";
@@ -441,6 +446,8 @@ const SidebarShowContext = createContext<readonly SidebarShowField[]>([]);
 const IsMobileContext = createContext<boolean>(false);
 const ViewerIdContext = createContext<string | null>(null);
 const ServerInfoContext = createContext<ReturnType<typeof useServerInfo>>("loading");
+// The sidebar scroller that session lists window their rows against; null mounts every row.
+const WindowedRowsScrollerContext = createContext<RefObject<HTMLElement | null> | null>(null);
 const RowActivationContext = createContext<
   (id: string, event: MouseEvent<HTMLAnchorElement>) => void
 >(() => {});
@@ -489,6 +496,7 @@ function SidebarRowDataProvider({
   onActivate,
   onReorder,
   nestMoves,
+  rowsScroller,
   children,
 }: {
   projectNamesById: Map<string, string>;
@@ -501,6 +509,7 @@ function SidebarRowDataProvider({
   onActivate: (id: string, event: MouseEvent<HTMLAnchorElement>) => void;
   onReorder: (fromId: string, toId: string) => void;
   nestMoves: ContextType<typeof NestMoveContext>;
+  rowsScroller: RefObject<HTMLElement | null> | null;
   children: ReactNode;
 }) {
   return (
@@ -514,7 +523,9 @@ function SidebarRowDataProvider({
                   <RowActivationContext.Provider value={onActivate}>
                     <SessionReorderContext.Provider value={onReorder}>
                       <NestMoveContext.Provider value={nestMoves}>
-                        {children}
+                        <WindowedRowsScrollerContext.Provider value={rowsScroller}>
+                          {children}
+                        </WindowedRowsScrollerContext.Provider>
                       </NestMoveContext.Provider>
                     </SessionReorderContext.Provider>
                   </RowActivationContext.Provider>
@@ -1884,6 +1895,10 @@ function ProjectFolder({
       project_draft_name: name,
     };
   }, [active, archived, selectionMode, name, projectId]);
+  const folderRows = useMemo(
+    () => (draftRow ? [draftRow, ...display.rows] : display.rows),
+    [draftRow, display.rows],
+  );
   const headerActive = (active && draftRow === null) || homeActive;
   // A Show more click records the list's size; the rows it adds slide in once
   // they render (after the next server page, when one is needed).
@@ -2034,7 +2049,7 @@ function ProjectFolder({
         }
         active={headerActive}
         marker={marker}
-        conversations={draftRow ? [draftRow, ...display.rows] : display.rows}
+        conversations={folderRows}
         heldConversations={
           expanded
             ? undefined
@@ -2043,7 +2058,8 @@ function ProjectFolder({
                 ...conversations.filter((_row, index) => index === heldIndex),
               ]
         }
-        listRef={listRef}
+        // Only a paginated folder slides rows open; an unpaginated one can be windowed.
+        listRef={pageSize === undefined ? undefined : listRef}
         activeConversationId={activeConversationId}
         pinnedConversationIds={pinnedConversationIds}
         sessionShortcutSlots={sessionShortcutSlots}
@@ -3531,6 +3547,9 @@ function ConversationList({
       onActivate={activateRow}
       onReorder={reorderSessions}
       nestMoves={nestMoveValue}
+      rowsScroller={
+        isFeatureEnabled(serverInfo, "sidebar_windowed_rows") ? scrollContainerRef : null
+      }
     >
       <DndContext
         sensors={sensors}
@@ -4830,12 +4849,12 @@ function ConversationSection({
   onProjectAssigned?: (projectName: string) => void;
   /** The list rows reorder within in the Custom order; unset takes no reorders. */
   reorderGroup?: string;
-  /** The rows list, for a project folder's Show more slide. */
+  /** The rows list, for a project folder's Show more slide; keeps every row mounted. */
   listRef?: RefObject<HTMLUListElement | null>;
 }) {
   // An untitled section is always open — there's no header to collapse it.
   const isCollapsed = title != null && collapsed;
-  const rows = isCollapsed ? (heldConversations ?? []) : conversations;
+  const rows = isCollapsed ? (heldConversations ?? EMPTY_CONVERSATIONS) : conversations;
   const families = sessionFamilyGroups(rows);
   const familyRepresentative = (row: Conversation) =>
     row.family ? families.get(row.family.id)?.[0] : undefined;
@@ -4861,8 +4880,19 @@ function ConversationSection({
     families.get(row.family.id)!.length > 1
       ? !collapsedFamilies.has(row.family.id)
       : undefined;
-  const visibleFamilyRows = orderSessionFamilies(rows, collapsedFamilies);
+  // Stable while the rows are, so a windowed list doesn't re-key every row each render.
+  const visibleFamilyRows = useMemo(
+    () => orderSessionFamilies(rows, collapsedFamilies),
+    [rows, collapsedFamilies],
+  );
   const reorderRows = visibleFamilyRows.filter((row) => !isNestedFamilyRow(row));
+  const windowScroller = useContext(WindowedRowsScrollerContext);
+  // The Show more slide animates each appended row, so it needs them all mounted.
+  const rowsScroller = listRef === undefined ? windowScroller : null;
+  const isRowActive = (row: Conversation) =>
+    row.id === activeConversationId ||
+    !!row.nested_draft_source_id ||
+    row.project_draft_name !== undefined;
 
   const groupingEmptyState = isFeatureEnabled(useContext(ServerInfoContext), "sidebar_grouping_ui");
   const grids = useGridSessions();
@@ -4870,6 +4900,34 @@ function ConversationSection({
   // A provisional row has no server id yet, so it can't be a Move up/down target.
   const reorderNeighbour = (row: Conversation | undefined) =>
     reorderGroup && row && !row.provisional ? row.id : undefined;
+  const renderRow = (conv: Conversation, placement?: VirtualRowPlacement) => (
+    <ConversationRow
+      key={nestedSessionSidebarKey(conv.id)}
+      conversation={conv}
+      placement={placement}
+      familyIndented={isNestedFamilyRow(conv)}
+      familyNestedCount={familyNestedCount(conv)}
+      familyParentTitle={familyParentTitle(conv)}
+      familyExpanded={familyExpandedState(conv)}
+      onToggleFamily={() => onToggleFamily(conv.family!.id)}
+      isActive={isRowActive(conv)}
+      inActiveGrid={gridMembers.has(conv.id)}
+      gridSelected={conv.id === grids?.selectedSessionId}
+      gridsEnabled={grids?.enabled ?? false}
+      isPinned={isSessionPinned(conv, new Set(pinnedConversationIds))}
+      shortcutSlot={sessionShortcutSlots?.get(conv.id)}
+      onClick={onRowClick}
+      onTogglePinned={onTogglePinned}
+      selectionMode={selectionMode}
+      isSelected={selectedIds.has(conv.id)}
+      onToggleSelected={onToggleSelected}
+      onProjectAssigned={onProjectAssigned}
+      reorderGroup={isNestedFamilyRow(conv) ? undefined : reorderGroup}
+      previousId={reorderNeighbour(reorderRows[reorderRows.indexOf(conv) - 1])}
+      nextId={reorderNeighbour(reorderRows[reorderRows.indexOf(conv) + 1])}
+      reorderIndex={reorderGroup ? reorderRows.indexOf(conv) : undefined}
+    />
+  );
   const protectsCollapsedBadge = isCollapsed && marker != null;
   return (
     <section className="group/section relative">
@@ -4971,40 +5029,21 @@ function ConversationSection({
             ) : (
               <p className="px-2 py-1 text-ui text-muted-foreground">{emptyMessage}</p>
             )
+          ) : rowsScroller ? (
+            // Padding, not the list's own, since windowed rows are absolutely placed.
+            <div className={cn(indentRows && "pl-6")}>
+              <VirtualSessionRows
+                items={visibleFamilyRows}
+                scrollElementRef={rowsScroller}
+                // On a draft page no session is open; the draft row takes the reveal.
+                revealId={activeConversationId ?? visibleFamilyRows.find(isRowActive)?.id ?? null}
+                renderRow={renderRow}
+              />
+            </div>
           ) : (
             // Indent project chats a step under the project-folder name above.
             <ul ref={listRef} className={cn("flex flex-col gap-px", indentRows && "pl-6")}>
-              {visibleFamilyRows.map((conv) => (
-                <ConversationRow
-                  key={nestedSessionSidebarKey(conv.id)}
-                  conversation={conv}
-                  familyIndented={isNestedFamilyRow(conv)}
-                  familyNestedCount={familyNestedCount(conv)}
-                  familyParentTitle={familyParentTitle(conv)}
-                  familyExpanded={familyExpandedState(conv)}
-                  onToggleFamily={() => onToggleFamily(conv.family!.id)}
-                  isActive={
-                    conv.id === activeConversationId ||
-                    !!conv.nested_draft_source_id ||
-                    conv.project_draft_name !== undefined
-                  }
-                  inActiveGrid={gridMembers.has(conv.id)}
-                  gridSelected={conv.id === grids?.selectedSessionId}
-                  gridsEnabled={grids?.enabled ?? false}
-                  isPinned={isSessionPinned(conv, new Set(pinnedConversationIds))}
-                  shortcutSlot={sessionShortcutSlots?.get(conv.id)}
-                  onClick={onRowClick}
-                  onTogglePinned={onTogglePinned}
-                  selectionMode={selectionMode}
-                  isSelected={selectedIds.has(conv.id)}
-                  onToggleSelected={onToggleSelected}
-                  onProjectAssigned={onProjectAssigned}
-                  reorderGroup={isNestedFamilyRow(conv) ? undefined : reorderGroup}
-                  previousId={reorderNeighbour(reorderRows[reorderRows.indexOf(conv) - 1])}
-                  nextId={reorderNeighbour(reorderRows[reorderRows.indexOf(conv) + 1])}
-                  reorderIndex={reorderGroup ? reorderRows.indexOf(conv) : undefined}
-                />
-              ))}
+              {visibleFamilyRows.map((conv) => renderRow(conv))}
             </ul>
           )}
           {!isCollapsed && footer}
@@ -5930,8 +5969,11 @@ function ConversationRowImpl({
   previousId,
   nextId,
   reorderIndex,
+  placement,
 }: {
   conversation: Conversation;
+  /** Where the row sits in a windowed list; unset when every row is mounted. */
+  placement?: VirtualRowPlacement;
   familyIndented?: boolean;
   familyExpanded?: boolean;
   /** Loaded nested sessions under this family parent, for its tooltip. */
@@ -5982,13 +6024,27 @@ function ConversationRowImpl({
   const isMobile = useContext(IsMobileContext);
   // When this row becomes active (e.g. a new session navigated to via `/c/:id`),
   // center it if it is offscreen. A row already fully visible stays put, so
-  // clicking it does not slide the list.
+  // clicking it does not slide the list. A windowed list reveals its own rows,
+  // so an active row mounting just offscreen doesn't pull the list to it.
   const rowRef = useRef<HTMLLIElement>(null);
+  const windowed = placement !== undefined;
   useEffect(() => {
     const row = rowRef.current;
-    if (!isActive || !row || isRowFullyVisible(row)) return;
+    if (!isActive || windowed || !row || isRowFullyVisible(row)) return;
     row.scrollIntoView({ behavior: "smooth", block: "center" });
-  }, [isActive]);
+  }, [isActive, windowed]);
+  const measureRow = placement?.measureRef;
+  const setPlacedRowRef = useCallback(
+    (node: HTMLLIElement | null) => {
+      rowRef.current = node;
+      measureRow?.(node);
+    },
+    [measureRow],
+  );
+  const placementProps = placement && {
+    "data-index": placement.index,
+    style: virtualRowStyle(placement.top),
+  };
   const rename = useRenameConversation();
   // Settings → Appearance can keep Pin and Archive in the menus only.
   const showQuickActions = useSessionRowQuickActions();
@@ -6277,13 +6333,13 @@ function ConversationRowImpl({
   // Merge the drag/drop node refs with the row ref used for scroll-into-view.
   const setRowRef = useCallback(
     (node: HTMLLIElement | null) => {
-      rowRef.current = node;
+      setPlacedRowRef(node);
       setDragNodeRef(node);
       setPinOrderNodeRef(node);
       setSessionOrderNodeRef(node);
       setNestNodeRef(node);
     },
-    [setDragNodeRef, setPinOrderNodeRef, setSessionOrderNodeRef, setNestNodeRef],
+    [setPlacedRowRef, setDragNodeRef, setPinOrderNodeRef, setSessionOrderNodeRef, setNestNodeRef],
   );
   // Timestamps of the last two clicks this row received, for the dblclick
   // rename guard: the list can reorder between the two clicks of a
@@ -6305,7 +6361,7 @@ function ConversationRowImpl({
 
   if (isEditing) {
     return (
-      <li ref={rowRef}>
+      <li ref={setPlacedRowRef} {...placementProps}>
         <SidebarEditRow
           // Prefer the just-committed name so a rename reopened before the
           // prop catches up starts from what the row shows.
@@ -6525,7 +6581,8 @@ function ConversationRowImpl({
   if (isProvisionalRow) {
     return (
       <li
-        ref={rowRef}
+        ref={setPlacedRowRef}
+        {...placementProps}
         data-sidebar-session-id={conversation.family ? conversation.id : undefined}
         data-sibling-session={familyIndented ? "true" : undefined}
         className={cn("group relative", familyIndented && "ml-6")}
@@ -6544,6 +6601,7 @@ function ConversationRowImpl({
     // it. `setRowRef` merges the drag node ref with the scroll-into-view ref.
     <li
       ref={setRowRef}
+      {...placementProps}
       data-sidebar-session-id={conversation.id}
       onMouseDown={(event) => {
         // Portaled dialogs bubble through this row but must not start a drag.
@@ -6959,6 +7017,9 @@ const ConversationRow = memo(ConversationRowImpl, (prev, next) => {
     prev.previousId === next.previousId &&
     prev.nextId === next.nextId &&
     prev.reorderIndex === next.reorderIndex &&
+    prev.placement?.index === next.placement?.index &&
+    prev.placement?.top === next.placement?.top &&
+    prev.placement?.measureRef === next.placement?.measureRef &&
     conversationRenderEqual(prev.conversation, next.conversation)
   );
 });

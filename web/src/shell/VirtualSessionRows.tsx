@@ -23,14 +23,15 @@ export interface VirtualRowPlacement {
 
 /**
  * Inline style that places a windowed `<li>` inside its sized list. It sets `top`, not a
- * transform, because dnd-kit ignores transforms when it measures drop targets.
+ * transform, because dnd-kit ignores transforms when it measures drop targets. Both edges
+ * are pinned so a row's own left margin (a nested session's indent) narrows it.
  */
 export function virtualRowStyle(top: number) {
   return {
     position: "absolute",
     top,
     left: 0,
-    width: "100%",
+    right: 0,
   } as const;
 }
 

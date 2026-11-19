@@ -4,6 +4,8 @@ import { act, cleanup, fireEvent, render, waitFor } from "@testing-library/react
 import { useRef, type RefObject } from "react";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
+import { stubVirtualListLayout } from "@/test/virtualListLayout";
+
 import { VirtualSessionRows, virtualRowStyle } from "./VirtualSessionRows";
 
 vi.unmock("@tanstack/react-virtual");
@@ -15,86 +17,17 @@ const ITEM_COUNT = 2_000;
 const scrollIntoView = vi.fn();
 const items = Array.from({ length: ITEM_COUNT }, (_, index) => ({ id: `session-${index}` }));
 
-const restorers: (() => void)[] = [];
-function stub<Key extends keyof HTMLElement>(key: Key, descriptor: PropertyDescriptor): void {
-  const original = Object.getOwnPropertyDescriptor(HTMLElement.prototype, key);
-  Object.defineProperty(HTMLElement.prototype, key, { configurable: true, ...descriptor });
-  restorers.push(() => {
-    if (original) Object.defineProperty(HTMLElement.prototype, key, original);
-    else Reflect.deleteProperty(HTMLElement.prototype, key);
-  });
-}
-const isScroller = (element: HTMLElement) => element.dataset.testid === "scroller";
-
+let restoreLayout: () => void;
 beforeAll(() => {
-  // jsdom does no layout: give the scroller a viewport and every row a height.
-  stub("clientHeight", {
-    get(this: HTMLElement) {
-      return isScroller(this) ? VIEWPORT_HEIGHT : 0;
-    },
+  restoreLayout = stubVirtualListLayout({
+    isScroller: (element) => element.dataset.testid === "scroller",
+    viewportHeight: VIEWPORT_HEIGHT,
+    rowHeight: ROW_HEIGHT,
+    scrollIntoView,
   });
-  // The virtualizer measures rows by offsetHeight; keep it in step with their rects.
-  stub("offsetHeight", {
-    get(this: HTMLElement) {
-      if (isScroller(this)) return VIEWPORT_HEIGHT;
-      return this.tagName === "LI" ? ROW_HEIGHT : 0;
-    },
-  });
-  stub("offsetWidth", {
-    get(this: HTMLElement) {
-      return isScroller(this) ? 300 : 0;
-    },
-  });
-  stub("scrollHeight", {
-    get(this: HTMLElement) {
-      const list = this.querySelector<HTMLElement>("ul");
-      return Number.parseFloat(list?.style.height ?? "0") || 0;
-    },
-  });
-  stub("getBoundingClientRect", {
-    value(this: HTMLElement) {
-      if (isScroller(this)) {
-        return {
-          top: 0,
-          left: 0,
-          right: 300,
-          bottom: VIEWPORT_HEIGHT,
-          width: 300,
-          height: VIEWPORT_HEIGHT,
-          x: 0,
-          y: 0,
-        };
-      }
-      const height = this.tagName === "LI" ? ROW_HEIGHT : 0;
-      // Content moves up as its scroller scrolls; a row sits at its own offset in the list.
-      const scroller = this.closest<HTMLElement>("[data-testid=scroller]");
-      const scrolledBy = scroller?.scrollTop ?? 0;
-      const rowTop = this.tagName === "LI" ? Number.parseFloat(this.style.top || "0") : 0;
-      const top = (this.tagName === "UL" || this.tagName === "LI" ? -scrolledBy : 0) + rowTop;
-      return { top, left: 0, right: 300, bottom: top + height, width: 300, height, x: 0, y: top };
-    },
-  });
-  const scrollTops = new WeakMap<HTMLElement, number>();
-  stub("scrollTop", {
-    get(this: HTMLElement) {
-      return scrollTops.get(this) ?? 0;
-    },
-    set(this: HTMLElement, value: number) {
-      scrollTops.set(this, Math.max(0, value));
-    },
-  });
-  stub("scrollTo", {
-    value(this: HTMLElement, options: ScrollToOptions) {
-      this.scrollTop = options.top ?? this.scrollTop;
-      this.dispatchEvent(new Event("scroll"));
-    },
-  });
-  stub("scrollIntoView", { value: scrollIntoView });
 });
 
-afterAll(() => {
-  for (const restore of restorers.reverse()) restore();
-});
+afterAll(() => restoreLayout());
 
 afterEach(() => {
   cleanup();
