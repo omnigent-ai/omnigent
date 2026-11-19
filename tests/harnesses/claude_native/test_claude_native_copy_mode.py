@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from omnigent.harnesses.claude_native import bridge
+from tests._helpers.polling import poll_until
 
 pytestmark = [
     pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required"),
@@ -33,16 +34,37 @@ import tty
 from pathlib import Path
 
 received, delivered = map(Path, sys.argv[1:3])
+panel_kind = sys.argv[3] if len(sys.argv) > 3 else ""
+panel_open = panel_kind in {"btw", "transcript", "question"}
 tty.setraw(sys.stdin.fileno())
 sys.stdout.write("\x1b[?2004h")
 
 
 def render(draft=""):
-    sys.stdout.write("\x1b[H\x1b[2J" + "─" * 80 + "\r\n❯ " + draft + "\r\n" + "─" * 80 + "\r\n")
+    rule = "─" * min(80, os.get_terminal_size().columns)
+    sys.stdout.write("\x1b[H\x1b[2J" + rule + "\r\n❯ " + draft + "\r\n" + rule + "\r\n")
     sys.stdout.flush()
 
 
-render()
+if panel_kind == "question":
+    rule = "─" * os.get_terminal_size().columns
+    sys.stdout.write("\x1b[H\x1b[2J" + rule + "\r\n"
+        "Which bridge should we use?\r\n❯ 1. Keep overlay\r\n"
+        "  2. Try a different bridge\r\n  3. Type something.\r\n"
+        + rule + "\r\n  4. Chat about this\r\n"
+        "Enter to select · ↑/↓ to navigate · Esc to cancel\r\n")
+    sys.stdout.flush()
+elif panel_kind == "transcript":
+    sys.stdout.write("\x1b[H\x1b[2J" + "─" * os.get_terminal_size().columns + "\r\n"
+        "  Showing detailed transcript · ctrl+o to toggle · ? for shortcuts\r\n")
+    sys.stdout.flush()
+elif panel_open:
+    sys.stdout.write("\x1b[H\x1b[2J" + "▔" * os.get_terminal_size().columns + "\r\n"
+        "    /btw do the checks pass?\r\n      Yes, the checks pass.\r\n"
+        "    ↑/↓ to scroll · c to copy · f to fork · Esc to close\r\n")
+    sys.stdout.flush()
+else:
+    render()
 buffer = b""
 draft = None
 messages = []
@@ -51,6 +73,14 @@ while True:
     with received.open("ab") as log:
         log.write(chunk)
     buffer += chunk
+    if panel_open:
+        close_key = b"1\r" if panel_kind == "question" else (
+            b"\x0f" if panel_kind == "transcript" else b"\x1b")
+        if close_key in buffer or (panel_kind == "question" and b"\x1b" in buffer):
+            panel_open = False
+            buffer = b""
+            render()
+        continue
     if b"\x1b[200~" in buffer and b"\x1b[201~" in buffer:
         pasted, buffer = buffer.split(b"\x1b[200~", 1)[1].split(b"\x1b[201~", 1)
         draft = pasted.decode().strip()
@@ -97,6 +127,7 @@ def pane(
     request: pytest.FixtureRequest, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> Iterator[_Pane]:
     """Start the stand-in composer in tmux with the parametrized copy-mode key table."""
+    mode_keys, panel = request.param if isinstance(request.param, tuple) else (request.param, "")
     monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
     terminal = tmp_path / "terminal.py"
@@ -107,7 +138,7 @@ def pane(
     with tempfile.TemporaryDirectory(prefix="claude-copy-", dir="/tmp") as socket_dir:
         socket_path = Path(socket_dir) / "tmux.sock"
         tmux = ["tmux", "-S", str(socket_path)]
-        command = shlex.join([sys.executable, str(terminal), str(received), str(delivered)])
+        command = shlex.join([sys.executable, str(terminal), str(received), str(delivered), panel])
         try:
             subprocess.run(
                 [
@@ -119,7 +150,7 @@ def pane(
                     "-s",
                     "main",
                     "-x",
-                    "120",
+                    "46" if panel == "question" else "48" if panel else "120",
                     "-y",
                     "24",
                     command,
@@ -129,7 +160,7 @@ def pane(
                 timeout=5,
             )
             subprocess.run(
-                [*tmux, "set-option", "-g", "mode-keys", request.param],
+                [*tmux, "set-option", "-g", "mode-keys", mode_keys],
                 check=True,
                 capture_output=True,
                 timeout=5,
@@ -139,7 +170,16 @@ def pane(
             # Keys sent before the composer switches its tty to raw mode are
             # flushed by tcsetattr(TCSAFLUSH), so wait for its first render.
             deadline = time.monotonic() + 5.0
-            while "❯" not in bridge._capture_pane(str(socket_path), "main"):
+            marker = (
+                "Which bridge"
+                if panel == "question"
+                else "Showing detailed transcript"
+                if panel == "transcript"
+                else "▔"
+                if panel
+                else "❯"
+            )
+            while marker not in bridge._capture_pane(str(socket_path), "main"):
                 assert time.monotonic() < deadline, "The stand-in composer never rendered."
                 time.sleep(0.05)
             yield _Pane(tmux=tmux, bridge_dir=bridge_dir, received=received, delivered=delivered)
@@ -168,6 +208,61 @@ def test_message_from_web_ui_reaches_scrolled_back_pane(pane: _Pane) -> None:
 
     assert json.loads(pane.delivered.read_text()) == ["SENT_WHILE_SCROLLED_BACK"]
     assert not pane.in_mode(), "Delivery should return the pane to the live view."
+
+
+@pytest.mark.parametrize("pane", [("emacs", "transcript")], indirect=True)
+def test_message_leaves_detailed_transcript_before_pasting(pane: _Pane) -> None:
+    """The real pane receives one Ctrl+O and then exactly one submitted message."""
+    pane.scroll_back()
+
+    bridge.inject_user_message(pane.bridge_dir, content="SENT_AFTER_TRANSCRIPT", timeout_s=5.0)
+
+    received = pane.received.read_bytes()
+    assert received.count(b"\x0f") == 1
+    assert not received.startswith(b"\x1b")
+    assert json.loads(pane.delivered.read_text()) == ["SENT_AFTER_TRANSCRIPT"]
+    assert not pane.in_mode()
+
+
+@pytest.mark.parametrize("pane", [("emacs", "question")], indirect=True)
+@pytest.mark.parametrize("operation", ["message", "settings"])
+def test_question_with_a_footer_word_split_by_tmux_keeps_waiting(
+    pane: _Pane, operation: str
+) -> None:
+    """A wrapped native question receives no key until the person answers it."""
+    captured = bridge._capture_pane(pane.tmux[-1], "main")
+    assert "Esc to cancel" not in captured
+    assert "Esc to can\ncel" in captured
+    with pytest.raises(bridge.ClaudeUserPromptPending):
+        if operation == "message":
+            bridge.inject_user_message(pane.bridge_dir, content="AFTER_QUESTION", timeout_s=1.0)
+        else:
+            bridge.inject_slash_command(pane.bridge_dir, command="/effort high", timeout_s=1.0)
+    assert not pane.received.exists()
+
+    subprocess.run(
+        [*pane.tmux, "send-keys", "-t", "main", "1", "Enter"],
+        check=True,
+        capture_output=True,
+        timeout=5,
+    )
+    assert _wait_for_bytes(pane.received, b"1\r") == b"1\r"
+    poll_until(lambda: bridge.claude_pane_ready(pane.bridge_dir), timeout_s=5.0, interval_s=0.05)
+    bridge.inject_user_message(pane.bridge_dir, content="AFTER_QUESTION", timeout_s=1.0)
+    assert json.loads(pane.delivered.read_text()) == ["AFTER_QUESTION"]
+
+
+@pytest.mark.parametrize("pane", [("emacs", "btw")], indirect=True, ids=["narrow-quick-answer"])
+def test_quick_answer_can_be_read_and_closed_in_a_narrow_pane(pane: _Pane) -> None:
+    """A terminal-wrapped footer still relays the answer and lets the next message through."""
+    signals = bridge.read_pane_signals(pane.bridge_dir)
+    assert signals.btw_overlay is not None
+    assert signals.btw_overlay.answer == "Yes, the checks pass."
+
+    assert bridge.dismiss_btw_overlay(pane.bridge_dir) is True
+    assert _wait_for_bytes(pane.received, b"\x1b") == b"\x1b"
+    bridge.inject_user_message(pane.bridge_dir, content="SENT_AFTER_QUICK_ANSWER", timeout_s=5.0)
+    assert json.loads(pane.delivered.read_text()) == ["SENT_AFTER_QUICK_ANSWER"]
 
 
 def test_interrupt_reaches_scrolled_back_pane(pane: _Pane) -> None:

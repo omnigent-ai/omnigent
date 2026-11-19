@@ -219,6 +219,25 @@ def test_invalid_public_callback_url_is_rejected(url):
         McpRegistryConfig(public_url=url, services=[])
 
 
+def test_env_catalog_uses_the_credential_cipher(db_uri, tmp_path, monkeypatch):
+    from omnigent.server import mcp_registry
+
+    monkeypatch.delenv("OMNIGENT_MCP_REGISTRY", raising=False)
+    assert mcp_registry.build_mcp_registry_from_env(db_uri) is None
+
+    catalog = tmp_path / "mcp-registry.yaml"
+    catalog.write_text(json.dumps({"services": [service().model_dump()]}))
+    monkeypatch.setenv("OMNIGENT_MCP_REGISTRY", str(catalog))
+    monkeypatch.setattr(mcp_registry, "build_secret_cipher", lambda: None)
+    with pytest.raises(ValueError, match="cipher"):
+        mcp_registry.build_mcp_registry_from_env(db_uri)
+
+    monkeypatch.setattr(mcp_registry, "build_secret_cipher", _FakeCipher)
+    registry = mcp_registry.build_mcp_registry_from_env(db_uri)
+    assert isinstance(registry.store, CredentialStore)
+    assert list(registry.services) == ["tracker"]
+
+
 @pytest.mark.asyncio
 async def test_existing_provider_resolver_is_reused(registry):
     from omnigent.connections.github import GithubConnectionStore

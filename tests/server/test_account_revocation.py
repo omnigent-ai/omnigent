@@ -28,7 +28,7 @@ def create_session(client, *, guardrails=None):
 
 
 @pytest.fixture
-def setup_app(tmp_path, monkeypatch):
+def setup_app(tmp_path, monkeypatch, request):
     import omnigent.server.app as app_module
 
     # Tests add API routes after create_app; the SPA catch-all would hide them.
@@ -44,6 +44,20 @@ def setup_app(tmp_path, monkeypatch):
         kwargs["scheduled_task_store"] = SqlAlchemyScheduledTaskStore(
             str(kwargs["account_store"]._engine.url)
         )
+        from omnigent.server.feature_flags import resolve_feature_flags
+
+        persistent = getattr(request, "param", False)
+        kwargs["feature_flags"] = resolve_feature_flags(
+            {"OMNIGENT_FEATURES": "automations_v2" if persistent else "-automations_v2"}
+        )
+        if persistent:
+            from unittest.mock import AsyncMock
+
+            from omnigent.server.scheduled.dispatch_scheduler import ScheduledTaskDispatchHooks
+
+            kwargs["scheduled_task_dispatch"] = ScheduledTaskDispatchHooks(
+                AsyncMock(), AsyncMock(return_value=None)
+            )
         captured.update(kwargs)
         return original(**kwargs)
 
@@ -248,10 +262,10 @@ async def test_connected_host_cannot_launch_after_reset_until_it_reconnects(setu
     from asgiref.testing import ApplicationCommunicator
 
     from omnigent.errors import OmnigentError
+    from tests.server.helpers import wait_for_tunnel_registration
     from tests.server.integration.test_host_tunnel_route import (
         _make_hello,
         _managed_scope,
-        _wait_registered,
         _websocket_scope,
     )
 
@@ -286,7 +300,7 @@ async def test_connected_host_cannot_launch_after_reset_until_it_reconnects(setu
         response = await connection.receive_output(timeout=5)
         assert response["type"] == "websocket.accept", response
         await connection.send_input({"type": "websocket.receive", "text": _make_hello()})
-        await asyncio.wait_for(_wait_registered(registry, host_id), timeout=5)
+        await wait_for_tunnel_registration(connection, registry, host_id)
 
     async def disconnect(connection: ApplicationCommunicator) -> None:
         await connection.send_input({"type": "websocket.disconnect", "code": 1000})
@@ -540,9 +554,9 @@ async def test_accounts_host_handshake_revalidates_each_connection(setup_app):
 
     from asgiref.testing import ApplicationCommunicator
 
+    from tests.server.helpers import wait_for_tunnel_registration
     from tests.server.integration.test_host_tunnel_route import (
         _make_hello,
-        _wait_registered,
         _websocket_scope,
     )
 
@@ -569,7 +583,7 @@ async def test_accounts_host_handshake_revalidates_each_connection(setup_app):
         assert response["type"] == "websocket.accept", response
         await connection.send_input({"type": "websocket.receive", "text": _make_hello()})
         registry = admin.app.state.host_registry
-        await asyncio.wait_for(_wait_registered(registry, host_id), timeout=5)
+        await wait_for_tunnel_registration(connection, registry, host_id)
         assert registry.get(host_id).account_generation == generation
         assert checked == [generation]
     finally:
@@ -649,6 +663,55 @@ async def test_late_schedule_registration_stops_after_account_deletion(setup_app
     assert scheduler.job_count == 0
     assert timers.live() == []
     assert tasks.list_runs(task_id)[0] == []
+
+
+@pytest.mark.parametrize("setup_app", [True], indirect=True)
+def test_account_deletion_prevents_future_persistent_dispatch(setup_app, monkeypatch):
+    from unittest.mock import Mock
+
+    from omnigent.server.scheduled.dispatch_scheduler import PersistentTaskScheduler
+    from tests.server.scheduled.test_scheduler import FakeClock
+
+    admin, alice, stores, _ = setup_app
+    scheduler = admin.app.state.scheduled_task_scheduler
+    assert isinstance(scheduler, PersistentTaskScheduler)
+    assert admin.portal is not None
+    # Control polling and time while keeping the real flag-enabled app and routes.
+    admin.portal.call(scheduler.stop)
+    agent_id = create_session(alice).json()["agent_id"]
+    created = alice.post(
+        "/v1/scheduled-tasks",
+        json={
+            "name": "revoked schedule",
+            "prompt": "hello",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "agent_id": agent_id,
+            "timezone": "UTC",
+        },
+    )
+    assert created.status_code == 200, created.text
+    tasks = stores["scheduled_task_store"]
+    task = tasks.get(created.json()["id"])
+    assert task.next_run_at is not None
+    clock = FakeClock(task.next_run_at + 1)
+    dispatch = stores["scheduled_task_dispatch"]
+    scheduler = PersistentTaskScheduler(
+        tasks,
+        dispatch.on_fire,
+        dispatch.on_expired,
+        owned_hosts=dispatch.owned_hosts,
+        now=clock.now,
+    )
+    list_tasks = Mock(wraps=tasks.list)
+    monkeypatch.setattr(tasks, "list", list_tasks)
+    deleted = admin.delete("/auth/users/alice")
+    assert deleted.status_code == 204, deleted.text
+    list_tasks.assert_not_called()
+    assert tasks.list_due_tasks(int(clock.now())) == []
+    admin.portal.call(scheduler.poll_once)
+    admin.portal.call(scheduler.stop)
+    stores["scheduled_task_dispatch"].on_fire.assert_not_awaited()
+    assert tasks.list_runs(task.id)[0] == []
 
 
 def test_replica_cache_cannot_restore_account(setup_app):
@@ -1115,6 +1178,7 @@ def test_replacement_account_cannot_read_predecessor_tasks(setup_app):
         ),
         prefix="/v1",
     )
+    tasks.configure_dispatch(True)
     task = tasks.create(
         uuid.uuid4().hex,
         "private task",
@@ -1131,10 +1195,12 @@ def test_replacement_account_cannot_read_predecessor_tasks(setup_app):
         status="succeeded",
         scheduled_at=100,
     )
+    assert task.next_run_at is not None
     path = f"/v1/scheduled-tasks/{task.id}"
     assert alice.get(path).status_code == 200
     assert alice.get(path + "/runs").status_code == 200
     assert admin.delete("/auth/users/alice").status_code == 204
+    assert tasks.get(task.id).next_run_at is None
     invite = admin.post("/auth/invite", json={}).json()["token"]
     replacement = TestClient(admin.app)
     assert (
@@ -1148,6 +1214,10 @@ def test_replacement_account_cannot_read_predecessor_tasks(setup_app):
     assert listing.status_code == 200 and listing.json()["scheduled_tasks"] == []
     assert replacement.get(path).status_code == 404
     assert replacement.get(path + "/runs").status_code == 404
+    cursor = tasks.purge_deleted_tasks(limit=1)
+    while cursor is not None:
+        cursor = tasks.purge_deleted_tasks(after=cursor, limit=1)
+    assert tasks.get(task.id) is None
 
 
 @pytest.mark.parametrize("launch_kind", ["initial", "inline", "transfer", "admin_relaunch"])
@@ -1360,6 +1430,19 @@ async def test_existing_session_transfers_between_hosts(setup_app, workflow):
                     await comm.wait(timeout=10)
 
 
+def _replace_alice(admin: TestClient) -> TestClient:
+    """Delete alice and register a different account under the same name."""
+    assert admin.delete("/auth/users/alice").status_code == 204
+    invite = admin.post("/auth/invite", json={}).json()["token"]
+    replacement = TestClient(admin.app)
+    registered = replacement.post(
+        "/auth/register",
+        json={"invite": invite, "username": "alice", "password": "replacement-password-1234"},
+    )
+    assert registered.status_code == 200, registered.text
+    return replacement
+
+
 @pytest.mark.parametrize("operation", ["reset", "share_lookup", "share_ensure", "share_grant"])
 def test_target_write_cannot_cross_registration(setup_app, monkeypatch, operation):
     admin, _, stores, _ = setup_app
@@ -1396,20 +1479,7 @@ def test_target_write_cannot_cross_registration(setup_app, monkeypatch, operatio
             )
         try:
             assert reached.wait(15)
-            assert admin.delete("/auth/users/alice").status_code == 204
-            invite = admin.post("/auth/invite", json={}).json()["token"]
-            replacement = TestClient(admin.app)
-            assert (
-                replacement.post(
-                    "/auth/register",
-                    json={
-                        "invite": invite,
-                        "username": "alice",
-                        "password": "replacement-password-1234",
-                    },
-                ).status_code
-                == 200
-            )
+            replacement = _replace_alice(admin)
         finally:
             resume.set()
         response = pending.result(timeout=15)
@@ -1423,3 +1493,170 @@ def test_target_write_cannot_cross_registration(setup_app, monkeypatch, operatio
         == 200
     )
     assert stores["permission_store"].get("alice", session_id) is None
+
+
+def _create_schedule(admin: TestClient) -> str:
+    created = admin.post(
+        "/v1/scheduled-tasks",
+        json={
+            "name": "shared schedule",
+            "prompt": "hello",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "agent_id": create_session(admin).json()["agent_id"],
+            "timezone": "UTC",
+        },
+    )
+    assert created.status_code == 200, created.text
+    return created.json()["id"]
+
+
+def _replace_alice_during(admin, reached, resume, method, url, **kwargs):
+    """Send the request as *admin*, and replace alice once it sets *reached*."""
+    requester = TestClient(admin.app)
+    requester.cookies.update(admin.cookies)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        pending = pool.submit(requester.request, method, url, **kwargs)
+        try:
+            assert reached.wait(15)
+            _replace_alice(admin)
+        finally:
+            resume.set()
+        return pending.result(timeout=15)
+
+
+@pytest.mark.parametrize("setup_app", [True], indirect=True)
+@pytest.mark.parametrize("method", ["ensure_user", "grant_for_scheduled_task"])
+def test_automation_share_cannot_cross_registration(setup_app, monkeypatch, method):
+    admin, _, stores, _ = setup_app
+    task_id = _create_schedule(admin)
+    permissions = stores["permission_store"]
+    original = getattr(permissions, method)
+    reached, resume = Event(), Event()
+
+    def paused(user_id, *args, **kwargs):
+        if user_id == "alice":
+            reached.set()
+            assert resume.wait(15)
+        return original(user_id, *args, **kwargs)
+
+    monkeypatch.setattr(permissions, method, paused)
+    response = _replace_alice_during(
+        admin,
+        reached,
+        resume,
+        "PUT",
+        f"/v1/scheduled-tasks/{task_id}/permissions",
+        json={"user_id": "alice", "level": 1},
+    )
+    # The grant was meant for the deleted account, not the new one.
+    assert response.status_code == 409, response.text
+    assert permissions.list_for_scheduled_task(task_id) == ([], None)
+
+
+@pytest.mark.parametrize("setup_app", [True], indirect=True)
+@pytest.mark.parametrize("replaced_after", ["spelling_lookup", "grant_lookup", "grant_delete"])
+def test_a_failed_automation_revoke_restores_no_grant_to_a_replaced_account(
+    setup_app, monkeypatch, replaced_after
+):
+    admin, _, stores, _ = setup_app
+    task_id = _create_schedule(admin)
+    shared = admin.put(
+        f"/v1/scheduled-tasks/{task_id}/permissions", json={"user_id": "alice", "level": 1}
+    )
+    assert shared.status_code == 200, shared.text
+    permissions = stores["permission_store"]
+    reached, resume = Event(), Event()
+
+    def pause_once():
+        if not reached.is_set():
+            reached.set()
+            assert resume.wait(15)
+
+    lookup = permissions.resolve_scheduled_task_access
+    delete_grant = permissions.revoke_for_scheduled_task
+    lookups: list[object] = []
+
+    def lookup_then_pause(*args, **kwargs):
+        held = lookup(*args, **kwargs)
+        lookups.append(held)
+        # The DELETE's first lookup picks the spelling; its second finds the grant to delete.
+        if (replaced_after, len(lookups)) in {("spelling_lookup", 1), ("grant_lookup", 2)}:
+            pause_once()
+        return held
+
+    def delete_then_fail(user_id, scheduled_task_id):
+        delete_grant(user_id, scheduled_task_id)
+        if replaced_after == "grant_delete":
+            pause_once()
+        # Committed, but the route sees an error and puts the grant back.
+        raise RuntimeError("connection lost after commit")
+
+    monkeypatch.setattr(permissions, "resolve_scheduled_task_access", lookup_then_pause)
+    monkeypatch.setattr(permissions, "revoke_for_scheduled_task", delete_then_fail)
+    response = _replace_alice_during(
+        admin, reached, resume, "DELETE", f"/v1/scheduled-tasks/{task_id}/permissions/alice"
+    )
+    # Replaced before the grant lookup, the new account holds nothing to remove.
+    assert response.status_code == (204 if replaced_after == "spelling_lookup" else 500), (
+        response.text
+    )
+    # The grant being restored was the deleted account's, not the new one's.
+    assert permissions.list_for_scheduled_task(task_id) == ([], None)
+
+
+@pytest.mark.parametrize("startup_phase", ["unavailable", "loading"])
+def test_account_deletion_before_legacy_startup_finishes(setup_app, monkeypatch, startup_phase):
+    from unittest.mock import Mock
+
+    admin, alice, stores, _ = setup_app
+    scheduler = admin.app.state.scheduled_task_scheduler
+    assert admin.portal is not None
+    admin.portal.call(scheduler.stop)
+    monkeypatch.setattr(admin.app.state, "scheduled_task_scheduler", None)
+    agent_id = create_session(alice).json()["agent_id"]
+    created = alice.post(
+        "/v1/scheduled-tasks",
+        json={
+            "name": "created during outage",
+            "prompt": "hello",
+            "rrule": "FREQ=DAILY",
+            "agent_id": agent_id,
+            "timezone": "UTC",
+        },
+    )
+    assert created.status_code == 200, created.text
+    tasks = stores["scheduled_task_store"]
+    list_tasks = Mock(wraps=tasks.list)
+    monkeypatch.setattr(tasks, "list", list_tasks)
+    snapshot_taken, release = Event(), Event()
+    load = tasks.list_active_all_workspaces
+
+    def blocked_load():
+        snapshot = load()
+        snapshot_taken.set()
+        assert release.wait(10), "Startup snapshot was never released"
+        return snapshot
+
+    loading = None
+    try:
+        if startup_phase == "loading":
+            monkeypatch.setattr(tasks, "list_active_all_workspaces", blocked_load)
+            monkeypatch.setattr(admin.app.state, "scheduled_task_scheduler", scheduler)
+            loading = admin.portal.start_task_soon(scheduler.start)
+            assert snapshot_taken.wait(10)
+        deleted = admin.delete("/auth/users/alice")
+        assert deleted.status_code == 204, deleted.text
+        if startup_phase == "loading":
+            list_tasks.assert_called_once_with(owner_user_id="alice")
+        else:
+            list_tasks.assert_not_called()
+        assert tasks.get(created.json()["id"]).state == "deleted"
+    finally:
+        release.set()
+        if loading is not None:
+            loading.result(timeout=10)
+    if loading is None:
+        admin.portal.call(scheduler.start)
+    assert scheduler.is_started
+    assert scheduler.job_count == 0
+    assert tasks.list_runs(created.json()["id"])[0] == []

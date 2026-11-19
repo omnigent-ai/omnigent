@@ -184,6 +184,8 @@ export function MarkdownTableOfContents({
         "sticky top-0 h-screen border-l border-border bg-card flex flex-col overflow-hidden",
       )}
       aria-label="Table of contents"
+      // It closes on Escape, so page-wide Escape shortcuts leave keys inside it alone.
+      data-escape-owner={open && onClose ? "" : undefined}
     >
       {/* Header with search */}
       <div className="shrink-0 border-b border-border p-4">

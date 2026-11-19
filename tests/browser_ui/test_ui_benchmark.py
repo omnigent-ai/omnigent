@@ -58,6 +58,8 @@ def test_measure_scenario_rejects_failed_static_asset(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
 ) -> None:
     async def handler(route: Route) -> None:
+        if route.request.url.endswith("/pending.woff2"):
+            return  # Leave font loading pending while collecting failure evidence.
         if route.request.url.endswith("/missing.css"):
             if failure == "http-404":
                 await route.fulfill(status=404, content_type="text/css", body="")
@@ -67,7 +69,9 @@ def test_measure_scenario_rejects_failed_static_asset(
             assert route.request.url.endswith("/c/session")
             await route.fulfill(
                 content_type="text/html",
-                body='<html><head><link rel="stylesheet" href="/missing.css">'
+                body="<html><head><style>"
+                "@font-face {font-family: pending;src: url(/pending.woff2)}"
+                'body {font-family: pending}</style><link rel="stylesheet" href="/missing.css">'
                 '<script type="module">window.booted = true;</script></head>'
                 f"<body>{_BODY}</body></html>",
             )

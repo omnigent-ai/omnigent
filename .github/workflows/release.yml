@@ -64,7 +64,7 @@ jobs:
   # hand-kept list. `github.actor` on a dispatch is the dispatcher.
   authorize:
     if: github.repository == 'omnigent-ai/omnigent'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Require admin/maintain role
@@ -86,7 +86,7 @@ jobs:
   # (pure API reads) and also serves as the whole dry run.
   plan:
     needs: authorize
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
       version: ${{ steps.derive.outputs.version }}
@@ -271,7 +271,7 @@ jobs:
       !inputs.skip_benchmark &&
       needs.benchmark.result == 'success' &&
       needs.benchmark.outputs.regression == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     environment: benchmark-regression-gate
     steps:
@@ -291,7 +291,7 @@ jobs:
       needs.authorize.result == 'success' && needs.plan.result == 'success' &&
       contains(fromJSON('["success", "skipped"]'), needs.benchmark.result) &&
       contains(fromJSON('["success", "skipped"]'), needs.benchmark-approve.result) }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
       # Clean public resolution for `uv lock` — the committed lockfile must
@@ -321,7 +321,7 @@ jobs:
           python-version-file: ".python-version"
 
       - name: Install uv
-        uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
+        uses: omnigent-ai/omnigent/.github/actions/setup-uv@c144e4b1a1c2f9ed45aa6596b90c3672b3faf1c8 # self-contained setup
         with:
           enable-cache: false
 
@@ -408,7 +408,7 @@ jobs:
     # gate inherits that skip through `cut`, so this job silently vanished on
     # every cut but one. Depend on `cut` succeeding, not on the whole closure.
     if: ${{ !cancelled() && needs.cut.result == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       actions: write

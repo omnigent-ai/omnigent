@@ -36,7 +36,7 @@ export function PrimaryNavLink({
       variant="ghost"
       className={cn(
         SIDEBAR_ROW,
-        "w-full justify-start border-0 font-normal",
+        "w-full justify-start border-0 font-normal mobile-touch-target",
         HOVER_HIGHLIGHT,
         active && ACTIVE_HIGHLIGHT,
       )}

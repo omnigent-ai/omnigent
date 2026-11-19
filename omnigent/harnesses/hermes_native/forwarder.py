@@ -389,18 +389,15 @@ def _session_claimed_by_other(
 def _connect_ro(db_path: Path) -> sqlite3.Connection | None:
     """Open *db_path* read-only in a way that reads the live WAL, or ``None``.
 
-    ``mode=ro`` (not ``immutable=1``) so a live session's ``-wal`` sidecar is read
-    via the ``-shm``; a plain connection is the fallback for the rare window where
-    ``-shm`` is momentarily absent. Only SELECTs are issued.
+    ``mode=ro`` (not ``immutable=1``) reads the live WAL while leaving store
+    creation to Hermes. Retry transient read errors on the next poll.
     """
-    for uri, use_uri in ((f"file:{db_path}?mode=ro", True), (str(db_path), False)):
-        try:
-            if use_uri:
-                return sqlite3.connect(uri, timeout=5.0, uri=True)
-            return sqlite3.connect(uri, timeout=5.0)
-        except sqlite3.Error:
-            continue
-    return None
+    try:
+        if db_path.stat().st_size == 0:
+            return None
+        return sqlite3.connect(f"{db_path.resolve().as_uri()}?mode=ro", timeout=5.0, uri=True)
+    except (OSError, sqlite3.Error):
+        return None
 
 
 def _table_columns(con: sqlite3.Connection, table: str) -> frozenset[str]:
@@ -1234,7 +1231,7 @@ async def forward_hermes_store_to_session(
                                             status="running",
                                             response_id=action.response_id,
                                         )
-                                    except Exception:  # noqa: BLE001 — live-card edge is best-effort
+                                    except Exception:  # live-card edge is best-effort
                                         _logger.debug(
                                             "hermes forwarder running-edge post failed; "
                                             "cards may not go live; session=%s",
@@ -1301,7 +1298,7 @@ async def forward_hermes_store_to_session(
                                     hermes_session_id=hermes_session_id,
                                 )
                                 compaction_persisted = True
-                            except Exception:  # noqa: BLE001
+                            except Exception:
                                 _logger.warning(
                                     "Failed to persist hermes compaction item for %s",
                                     session_id,
@@ -1355,7 +1352,7 @@ async def forward_hermes_store_to_session(
                                         ),
                                     )
                                     continue
-                            except Exception:  # noqa: BLE001
+                            except Exception:
                                 _logger.warning(
                                     "hermes forwarder failed to re-pin to child session "
                                     "after compaction; staying on %s; session=%s",
@@ -1383,7 +1380,7 @@ async def forward_hermes_store_to_session(
                                     status="running",
                                     response_id=active_turn_id,
                                 )
-                            except Exception:  # noqa: BLE001 — live-card edge is best-effort
+                            except Exception:  # live-card edge is best-effort
                                 _logger.debug(
                                     "hermes forwarder running re-assert failed; "
                                     "card may settle early; session=%s",

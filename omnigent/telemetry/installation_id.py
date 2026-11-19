@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import threading
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from omnigent.version import VERSION
@@ -88,7 +88,7 @@ def _write_to_disk(installation_id: str) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         config = {
             _KEY_INSTALLATION_ID: installation_id,
-            "created_at": datetime.now(timezone.utc).isoformat(),
+            "created_at": datetime.now(UTC).isoformat(),
             "created_version": VERSION,
             "schema_version": 1,
         }

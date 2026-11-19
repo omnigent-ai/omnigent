@@ -1,5 +1,5 @@
-// Plain clicks on a link in the Markdown editor place the caret, so the link
-// stays editable; this popup makes following the link discoverable.
+// Alt-click or keyboard navigation places the caret in a Markdown link.
+// Keep the Open action available while editing it; plain clicks follow directly.
 
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { createPortal } from "react-dom";

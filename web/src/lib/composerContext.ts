@@ -21,6 +21,16 @@ export function isAbsoluteComposerPath(path: string): boolean {
   return path.startsWith("/") || /^[A-Za-z]:[\\/]/.test(path) || path.startsWith("\\\\");
 }
 
+/** `path` joined onto `root` with the root's separator; null when relative and `root` is unknown. */
+export function absoluteWorkspacePath(
+  path: string,
+  root: string | null | undefined,
+): string | null {
+  if (isAbsoluteComposerPath(path)) return path;
+  if (!root) return null;
+  return `${root.replace(/[\\/]+$/, "")}${root.includes("\\") ? "\\" : "/"}${path}`;
+}
+
 function normalizeWorkingDirectory(
   selection: WorkingDirectorySelection,
 ): WorkingDirectorySelection {

@@ -1,12 +1,14 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { PlugIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
-import { useMcpRegistryCatalog } from "@/hooks/useMcpRegistry";
+import { useMcpRegistryCatalog, useRegistrySignIn } from "@/hooks/useMcpRegistry";
 import { withBasePath } from "@/lib/basePath";
-import { authorizeRegistryService, registryRequest, type RegistryService } from "@/lib/mcpRegistry";
+import { registryRequest, type RegistryService } from "@/lib/mcpRegistry";
 import { cn } from "@/lib/utils";
+import { MCP_SERVICES_ENTRY } from "@/pages/settings/search/catalog/mcp";
+import { SettingsDataRegion } from "@/pages/settings/search/settingsOwnership";
 
 export function McpRegistryConnections() {
   const { services, error, loading, refresh } = useMcpRegistryCatalog();
@@ -16,11 +18,8 @@ export function McpRegistryConnections() {
   return (
     <div className="space-y-4">
       <div>
-        <h3 className="text-sm font-medium">Managed MCP services</h3>
-        <p className="text-sm text-muted-foreground">
-          Connect once, then add these tools to any session. Your accounts are reused across
-          sessions on local machines, remote hosts, and sandboxes in this workspace.
-        </p>
+        <h3 className="text-sm font-medium">{MCP_SERVICES_ENTRY.label}</h3>
+        <p className="text-sm text-muted-foreground">{MCP_SERVICES_ENTRY.description}</p>
       </div>
       {callbackFailed && (
         <p role="alert" className="text-sm text-destructive">
@@ -32,15 +31,17 @@ export function McpRegistryConnections() {
           {error}
         </p>
       )}
-      {services.map((service) => (
-        <ServiceConnection
-          key={service.id}
-          service={service}
-          onChanged={async () => {
-            await refresh();
-          }}
-        />
-      ))}
+      <SettingsDataRegion entry={MCP_SERVICES_ENTRY} region="services" className="space-y-4">
+        {services.map((service) => (
+          <ServiceConnection
+            key={service.id}
+            service={service}
+            onChanged={async () => {
+              await refresh();
+            }}
+          />
+        ))}
+      </SettingsDataRegion>
       {loading && <p className="text-sm text-muted-foreground">Loading MCP services…</p>}
       {!loading && !services.length && !error && (
         <p className="text-sm text-muted-foreground">
@@ -89,12 +90,19 @@ function ServiceConnection({
       <p className="text-xs text-muted-foreground">Available tools: {service.tools.join(", ")}</p>
       <div className="flex flex-wrap gap-2">
         {service.auth === "bearer" && (
-          <Button size="sm" variant="outline" disabled={busy} onClick={() => setEditing(!editing)}>
+          <Button
+            data-settings-row-action={service.connected ? "updateToken" : "connect"}
+            size="sm"
+            variant="outline"
+            disabled={busy}
+            onClick={() => setEditing(!editing)}
+          >
             {service.connected ? "Update token" : "Connect"}
           </Button>
         )}
         {service.auth === "oauth" && (
           <Button
+            data-settings-row-action={service.connected ? "reconnect" : "connect"}
             size="sm"
             variant="outline"
             disabled={busy}
@@ -110,13 +118,18 @@ function ServiceConnection({
         {(service.auth === "github" || service.auth === "databricks") && (
           <p className="text-sm text-muted-foreground">
             Uses your shared {service.auth === "github" ? "GitHub" : "Databricks"} connection.{" "}
-            <a className="underline" href={withBasePath("/settings/integrations")}>
+            <a
+              className="underline"
+              data-settings-row-action="manageAccount"
+              href={withBasePath("/settings/integrations")}
+            >
               Manage account in Sandbox Integrations
             </a>
           </p>
         )}
         {service.connected && (
           <Button
+            data-settings-row-action="test"
             size="sm"
             variant="outline"
             disabled={busy}
@@ -136,6 +149,7 @@ function ServiceConnection({
         )}
         {service.connected && (service.auth === "bearer" || service.auth === "oauth") && (
           <Button
+            data-settings-row-action="disconnect"
             size="sm"
             variant="ghost"
             disabled={busy}
@@ -170,6 +184,7 @@ function ServiceConnection({
           }}
         >
           <Input
+            data-settings-row-field="token"
             type="password"
             aria-label={`Token for ${service.title}`}
             autoComplete="off"
@@ -177,7 +192,12 @@ function ServiceConnection({
             onChange={(e) => setToken(e.target.value)}
             placeholder="Personal access token"
           />
-          <Button size="sm" disabled={busy || !token.trim()} type="submit">
+          <Button
+            data-settings-row-action="saveToken"
+            size="sm"
+            disabled={busy || !token.trim()}
+            type="submit"
+          >
             Save token
           </Button>
         </form>
@@ -213,23 +233,16 @@ export function McpRegistryPicker({
 }) {
   const ownCatalog = useMcpRegistryCatalog(!catalog);
   const { services, error, loading, refresh } = catalog ?? ownCatalog;
-  const [authorizing, setAuthorizing] = useState<string | null>(null);
-  const [connectionError, setConnectionError] = useState<{ id: string; message: string } | null>(
-    null,
-  );
-  const authorization = useRef<AbortController | null>(null);
+  const { signIn, authorizing, error: connectionError, clearError } = useRegistrySignIn(refresh);
   const [workspaceService, setWorkspaceService] = useState<string | null>(null);
   const [workspace, setWorkspace] = useState("");
-  useEffect(
-    () => () => {
-      authorization.current?.abort();
-      onAuthorizingChange?.(false);
-    },
-    [onAuthorizingChange],
-  );
+  useEffect(() => {
+    onAuthorizingChange?.(authorizing !== null);
+  }, [authorizing, onAuthorizingChange]);
+  useEffect(() => () => onAuthorizingChange?.(false), [onAuthorizingChange]);
 
   async function enable(service: RegistryService, workspaceUrl?: string) {
-    setConnectionError(null);
+    clearError();
     if (service.connected) {
       onToggle(service.id, true);
       return;
@@ -238,31 +251,9 @@ export function McpRegistryPicker({
       setWorkspaceService(service.id);
       return;
     }
-    const controller = new AbortController();
-    authorization.current = controller;
-    setAuthorizing(service.id);
-    onAuthorizingChange?.(true);
-    try {
-      await authorizeRegistryService(service, controller.signal, workspaceUrl);
-      setWorkspaceService(null);
-      const updated = await refresh();
-      if (!updated?.find((s) => s.id === service.id)?.connected) {
-        throw new Error("Account is not connected. Please try again.");
-      }
-      if (!controller.signal.aborted && !attached.includes(service.id)) onToggle(service.id, true);
-    } catch (e) {
-      if (!controller.signal.aborted) {
-        setConnectionError({
-          id: service.id,
-          message: e instanceof Error ? e.message : "Sign-in failed",
-        });
-      }
-    } finally {
-      if (!controller.signal.aborted) {
-        setAuthorizing(null);
-        onAuthorizingChange?.(false);
-      }
-    }
+    if (!(await signIn(service, workspaceUrl))) return;
+    setWorkspaceService(null);
+    if (!attached.includes(service.id)) onToggle(service.id, true);
   }
 
   const unavailable = attached.filter((id) => !services.some((s) => s.id === id));
@@ -309,9 +300,7 @@ export function McpRegistryPicker({
                         : authorizing === service.id
                           ? "Authorizing…"
                           : service.connected
-                            ? service.auth === "none"
-                              ? "Ready"
-                              : "Connected"
+                            ? "Connected"
                             : tokenNeeded
                               ? "Connect your account in settings"
                               : "Needs sign-in"}

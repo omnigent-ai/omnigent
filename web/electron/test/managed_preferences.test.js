@@ -80,7 +80,7 @@ describe("managed server preferences", () => {
     );
   });
 
-  it("reads the Databricks-internal-features boolean on macOS", () => {
+  it("reads the managed-features boolean on macOS", () => {
     const calls = [];
     const enabled = getDatabricksInternalFeaturesEnabled({
       platform: "darwin",

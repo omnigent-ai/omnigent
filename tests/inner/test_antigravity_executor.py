@@ -221,7 +221,7 @@ class _FakeLocalAgentConfig:
         self,
         *,
         system_instructions: str | None = None,
-        model: str | None | object = _MODEL_NOT_PROVIDED,
+        model: str | object | None = _MODEL_NOT_PROVIDED,
         api_key: str | None = None,
         vertex: bool | None = None,
         project: str | None = None,

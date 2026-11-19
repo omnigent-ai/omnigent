@@ -32,12 +32,15 @@ watchdog to reproduce the boundary deterministically; a marker file written at
 only be the premature watchdog. The assertions encode the DESIRED behavior —
 the first turn completes with no startup-timeout error — so this test FAILS
 while the bug is live and passes once configured commands get their larger
-bounded allowance.
+bounded allowance. PR coverage uses a 2s direct-launch budget with a 4s
+setup delay; nightly retains the production 30s budget and 45s delay.
+The configured-command allowance remains 120s in both variants.
 """
 
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import secrets
 import shutil
@@ -126,24 +129,34 @@ def _clean_env() -> dict[str, str]:
     return env
 
 
-@pytest.fixture
+@pytest.fixture(
+    params=[
+        pytest.param((2.0, 4.0), id="short-startup-budget"),
+        pytest.param(
+            (None, _WRAPPER_SETUP_DELAY_S),
+            id="production-startup-budget",
+            marks=pytest.mark.nightly,
+        ),
+    ]
+)
 def wrapped_codex_session(
     built_spa: None,
     mock_llm_server_url: str,
     tmp_path_factory: pytest.TempPathFactory,
-) -> Iterator[tuple[str, str, Path]]:
+    request: pytest.FixtureRequest,
+) -> Iterator[tuple[str, str, Path, float, float | None]]:
     """A codex-native session launched through a slow configured wrapper command.
 
     Spawns a dedicated server + runner whose ``OMNIGENT_CONFIG_HOME`` carries
     (a) a mock openai Responses provider (so the codex launch routes with a
     usable credential and arms the thread-start watchdog, not the login
     fail-fast path) and (b) ``harness.codex-native.command`` pointing at a
-    wrapper that sleeps ``_WRAPPER_SETUP_DELAY_S`` (simulated cold-start
+    wrapper that sleeps past the direct-launch budget (simulated cold-start
     setup) before ``exec``-ing the real Codex CLI with the runner's launch
     args. The wrapper stamps marker files so the test can prove the launch
     was healthy (Codex really started, just late).
 
-    :returns: ``(base_url, session_id, markers_dir)``.
+    :returns: Server, session, startup markers, setup delay and optional direct budget.
     """
     codex_path = shutil.which("codex")
     assert codex_path is not None  # pytestmark guards this
@@ -157,6 +170,7 @@ def wrapped_codex_session(
     markers = work / "markers"
     for path in (config_home, codex_home, home_dir, state_dir, artifacts, markers):
         path.mkdir(parents=True, exist_ok=True)
+    direct_timeout_s, setup_delay_s = request.param
 
     wrapper = work / "codex-setup-wrapper.sh"
     wrapper.write_text(
@@ -166,7 +180,8 @@ def wrapped_codex_session(
 # so the timing boundary is deterministic; the launch itself is healthy.
 set -eu
 date +%s > "{markers}/wrapper-started"
-sleep {_WRAPPER_SETUP_DELAY_S}
+while [ ! -f "{markers}/startup-wait" ] || [ ! -f "{markers}/message-sent" ]; do sleep 0.05; done
+sleep {setup_delay_s}
 date +%s > "{markers}/codex-exec"
 exec "{codex_path}" "$@"
 """,
@@ -225,6 +240,25 @@ harness:
     server_proc: subprocess.Popen[bytes] | None = None
     runner_proc: subprocess.Popen[bytes] | None = None
     session_id: str | None = None
+    runner_bootstrap = (
+        "import json, time\n"
+        "from pathlib import Path\n"
+        "from omnigent.harnesses.codex_native import bridge\n"
+        f"direct_timeout_s = {direct_timeout_s!r}\n"
+        "if direct_timeout_s is not None:\n"
+        "    bridge.CODEX_NATIVE_DIRECT_THREAD_START_TIMEOUT_SECONDS = direct_timeout_s\n"
+        "from omnigent.harnesses.codex_native import forwarder\n"
+        "original_wait = forwarder.wait_for_thread_started\n"
+        "direct_budget = original_wait.__kwdefaults__['timeout']\n"
+        "async def observe_wait(client, *, timeout=direct_budget):\n"
+        f"    Path({str(markers / 'startup-wait')!r}).write_text(json.dumps(\n"
+        "        {'started_at': time.monotonic(), 'timeout_s': timeout, "
+        "'direct_budget_s': direct_budget}))\n"
+        "    return await original_wait(client, timeout=timeout)\n"
+        "forwarder.wait_for_thread_started = observe_wait\n"
+        "from omnigent.runner._entry import main\n"
+        "main()\n"
+    )
     try:
         server_proc = subprocess.Popen(
             [
@@ -247,7 +281,7 @@ harness:
             cwd=str(_REPO_ROOT),
         )
         runner_proc = subprocess.Popen(
-            [sys.executable, "-m", "omnigent.runner._entry"],
+            [sys.executable, "-c", runner_bootstrap],
             env=runner_env,
             stdout=runner_handle,
             stderr=subprocess.STDOUT,
@@ -276,7 +310,7 @@ harness:
             )
 
         session_id = _create_native_codex_session(base_url, runner_id)
-        yield (base_url, session_id, markers)
+        yield (base_url, session_id, markers, setup_delay_s, direct_timeout_s)
     finally:
         if session_id is not None:
             with contextlib.suppress(httpx.HTTPError):
@@ -298,7 +332,7 @@ harness:
 @pytest.mark.timeout(600)
 def test_configured_codex_command_setup_survives_startup_watchdog(
     page: Page,
-    wrapped_codex_session: tuple[str, str, Path],
+    wrapped_codex_session: tuple[str, str, Path, float, float | None],
     mock_llm_server_url: str,
 ) -> None:
     """A healthy wrapped codex launch must not die at the 30s watchdog.
@@ -312,7 +346,7 @@ def test_configured_codex_command_setup_survives_startup_watchdog(
     rendered by the SPA as an error pill — even though the wrapper execs
     Codex a few seconds later (proven via the marker file).
     """
-    base_url, session_id, markers = wrapped_codex_session
+    base_url, session_id, markers, setup_delay_s, direct_timeout_s = wrapped_codex_session
 
     nonce = uuid.uuid4().hex[:8]
     user_marker = f"wrapped-start-{nonce}"
@@ -339,6 +373,7 @@ def test_configured_codex_command_setup_survives_startup_watchdog(
         f"Context marker {user_marker}. Reply with exactly: {assistant_token}",
     )
     sent_at = time.monotonic()
+    (markers / "message-sent").touch()
 
     # Wait for the first turn to reach a terminal, user-visible outcome:
     # either an assistant reply (thread started, model responded) or an
@@ -352,14 +387,13 @@ def test_configured_codex_command_setup_survives_startup_watchdog(
     # error could come from a broken wrapper instead of the premature
     # watchdog, and the regression assertion below would be meaningless.
     exec_marker = markers / "codex-exec"
-    marker_deadline = time.monotonic() + _WRAPPER_SETUP_DELAY_S + 90.0
+    marker_deadline = time.monotonic() + setup_delay_s + 90.0
     while not exec_marker.exists() and time.monotonic() < marker_deadline:
         time.sleep(1.0)
     assert exec_marker.exists(), (
         "the configured wrapper never exec'd Codex — the rig is broken "
         f"(wrapper markers: {sorted(p.name for p in markers.iterdir())})"
     )
-
     # THE BUG: the durable assertion runs against the canonical transcript.
     # No error item of this turn may be the thread-start watchdog timeout —
     # the launch was healthy, merely slower than the direct-launch budget.
@@ -386,3 +420,7 @@ def test_configured_codex_command_setup_survives_startup_watchdog(
     # serves the first turn once the allowance covers the setup delay.
     reply = page.locator(_ASSISTANT, has_text=assistant_token)
     expect(reply.first).to_be_visible(timeout=120_000)
+    observed = json.loads((markers / "startup-wait").read_text())
+    assert observed["direct_budget_s"] == (30.0 if direct_timeout_s is None else direct_timeout_s)
+    assert observed["timeout_s"] == 120.0
+    assert time.monotonic() - observed["started_at"] >= setup_delay_s > observed["direct_budget_s"]

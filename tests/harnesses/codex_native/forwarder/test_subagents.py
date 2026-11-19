@@ -467,7 +467,9 @@ class CodexChildForwarderTest(unittest.IsolatedAsyncioTestCase):
                 {
                     "hook_event_name": "PostToolUse",
                     "tool_name": "apply_patch",
-                    "tool_input": {"changes": [{"path": path, "kind": {"type": "add"}}]},
+                    "tool_input": {
+                        "changes": [{"path": path, "kind": {"type": "add"}, "diff": "new\n"}]
+                    },
                     "tool_response": {"type": "success"},
                 },
             )
