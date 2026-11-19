@@ -1,3 +1,4 @@
+import { LEVEL_OWNER } from "@/lib/permissionsApi";
 import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
 import { formatLocalReviewComments } from "@/lib/localReviewComments";
 import { requestLocalReviewContext, updateLocalReviewContext } from "@/lib/localReviewContext";
@@ -5765,22 +5766,26 @@ describe("Composer native shell mode", () => {
   it.each([
     { harness: "claude-native", permissionLevel: 2 },
     { harness: "codex-native", permissionLevel: null },
-  ])("marks a `!` draft as a shell command on $harness and sends it unchanged", (row) => {
-    useChatStore.setState({ sessionHarness: row.harness });
-    const props = composerProps({ isNativeWrapper: true, permissionLevel: row.permissionLevel });
-    render(<Composer {...props} />);
-    fireEvent.change(textarea(), { target: { value: "!git log -1 --oneline" } });
+    { harness: "codex-native", permissionLevel: LEVEL_OWNER },
+  ])(
+    "marks a `!` draft as a shell command on $harness (level $permissionLevel) and sends it unchanged",
+    (row) => {
+      useChatStore.setState({ sessionHarness: row.harness });
+      const props = composerProps({ isNativeWrapper: true, permissionLevel: row.permissionLevel });
+      render(<Composer {...props} />);
+      fireEvent.change(textarea(), { target: { value: "!git log -1 --oneline" } });
 
-    const overlay = screen.getByTestId("composer-highlight-overlay");
-    expect(overlay).toHaveTextContent("!git log -1 --oneline");
-    expect(within(overlay).getByText("!")).toHaveClass("text-brand-accent");
-    expect(textarea()).toHaveAttribute("data-shell-command", "true");
-    expect(textarea()).toHaveAccessibleDescription("Shell command");
-    expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+      const overlay = screen.getByTestId("composer-highlight-overlay");
+      expect(overlay).toHaveTextContent("!git log -1 --oneline");
+      expect(within(overlay).getByText("!")).toHaveClass("text-brand-accent");
+      expect(textarea()).toHaveAttribute("data-shell-command", "true");
+      expect(textarea()).toHaveAccessibleDescription("Shell command");
+      expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
 
-    fireEvent.keyDown(textarea(), { key: "Enter" });
-    expect(props.onSend).toHaveBeenCalledExactlyOnceWith("!git log -1 --oneline", undefined);
-  });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(props.onSend).toHaveBeenCalledExactlyOnceWith("!git log -1 --oneline", undefined);
+    },
+  );
 
   it.each([
     { label: "an unsupported harness", harness: "pi", permissionLevel: null },
@@ -5843,52 +5848,49 @@ describe("Composer native shell mode", () => {
     },
   );
 
-  it("refuses a `!` send that carries a tag, keeps the draft, then sends once it is gone", () => {
-    useChatStore.setState({ sessionHarness: "codex-native" });
-    const props = composerProps({ isNativeWrapper: true, permissionLevel: null });
-    render(<Composer {...props} />);
-    fireEvent.change(textarea(), { target: { value: "!cat" } });
-    act(() =>
-      useChatStore.setState({
-        pendingComposerAttachments: [{ path: "src/example.ts", isDir: false }],
-      }),
-    );
-    const tagged = textarea().value;
-    expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+  it.each([
+    {
+      label: "a codex-native draft",
+      harness: "codex-native",
+      permissionLevel: null,
+      draft: "!cat",
+      untagged: "!cat src/example.ts",
+    },
+    {
+      // Classified by the text the terminal receives: claude-native drops the \x05.
+      label: "a claude-native draft behind a control character",
+      harness: "claude-native",
+      permissionLevel: 2,
+      draft: "\x05!echo ok",
+      untagged: "\x05!echo ok",
+    },
+  ])(
+    "refuses a `!` send of $label that carries a tag, keeps the draft, then sends once it is gone",
+    ({ harness, permissionLevel, draft, untagged }) => {
+      useChatStore.setState({ sessionHarness: harness });
+      const props = composerProps({ isNativeWrapper: true, permissionLevel });
+      render(<Composer {...props} />);
+      fireEvent.change(textarea(), { target: { value: draft } });
+      expect(textarea()).toHaveAttribute("data-shell-command", "true");
+      expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
 
-    fireEvent.keyDown(textarea(), { key: "Enter" });
-    expect(props.onSend).not.toHaveBeenCalled();
-    expect(screen.getByText(SHELL_MENTION_REFUSAL)).toBeVisible();
-    expect(textarea()).toHaveValue(tagged);
+      act(() =>
+        useChatStore.setState({
+          pendingComposerAttachments: [{ path: "src/example.ts", isDir: false }],
+        }),
+      );
+      const tagged = textarea().value;
+      expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(props.onSend).not.toHaveBeenCalled();
+      expect(screen.getByText(SHELL_MENTION_REFUSAL)).toBeVisible();
+      expect(textarea()).toHaveValue(tagged);
 
-    fireEvent.change(textarea(), { target: { value: "!cat src/example.ts" } });
-    fireEvent.keyDown(textarea(), { key: "Enter" });
-    expect(props.onSend).toHaveBeenCalledExactlyOnceWith("!cat src/example.ts", undefined);
-  });
-
-  it("classifies a claude-native draft by the text the terminal receives", () => {
-    useChatStore.setState({ sessionHarness: "claude-native" });
-    const props = composerProps({ isNativeWrapper: true, permissionLevel: 2 });
-    render(<Composer {...props} />);
-    fireEvent.change(textarea(), { target: { value: "\x05!echo ok" } });
-    expect(textarea()).toHaveAttribute("data-shell-command", "true");
-    expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
-
-    act(() =>
-      useChatStore.setState({
-        pendingComposerAttachments: [{ path: "src/example.ts", isDir: false }],
-      }),
-    );
-    const tagged = textarea().value;
-    fireEvent.keyDown(textarea(), { key: "Enter" });
-    expect(props.onSend).not.toHaveBeenCalled();
-    expect(screen.getByText(SHELL_MENTION_REFUSAL)).toBeVisible();
-    expect(textarea()).toHaveValue(tagged);
-
-    fireEvent.change(textarea(), { target: { value: "\x05!echo ok" } });
-    fireEvent.keyDown(textarea(), { key: "Enter" });
-    expect(props.onSend).toHaveBeenCalledExactlyOnceWith("\x05!echo ok", undefined);
-  });
+      fireEvent.change(textarea(), { target: { value: untagged } });
+      fireEvent.keyDown(textarea(), { key: "Enter" });
+      expect(props.onSend).toHaveBeenCalledExactlyOnceWith(untagged, undefined);
+    },
+  );
 
   it("classifies a bare `!` by the review context it sends with", () => {
     useChatStore.setState({ sessionHarness: "codex-native" });
