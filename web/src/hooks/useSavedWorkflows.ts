@@ -151,10 +151,13 @@ export function useSavedWorkflows({
   });
   const shared = useSharedWorkflows({ enabled: enabled && includeShared });
   const { refetch } = query;
+  const refreshShared = shared.refresh;
   // refetch() ignores `enabled`, so a server without saved workflows is never asked.
+  // The shared list reloads too, e.g. one shared since the "+" menu last opened.
   const refresh = useCallback(() => {
     if (enabled && supported) void refetch();
-  }, [enabled, supported, refetch]);
+    if (includeShared) refreshShared();
+  }, [enabled, supported, refetch, includeShared, refreshShared]);
   const owned = useMemo(
     () => query.data?.pages.flatMap((page) => page.data) ?? NO_WORKFLOWS,
     [query.data],

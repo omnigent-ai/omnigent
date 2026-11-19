@@ -175,6 +175,33 @@ describe("workflows shared with the user", () => {
   });
 
   it.each([
+    ["empty", Response.json({ data: [], next_cursor: null })],
+    ["failed", new Response(null, { status: 500, statusText: "Server Error" })],
+  ])(
+    "refreshes both lists when the mounted combined list is refreshed (shared list %s)",
+    async (_label, first) => {
+      vi.mocked(useServerInfo).mockReturnValue(SHARING);
+      let sharedCalls = 0;
+      vi.mocked(authenticatedFetch).mockImplementation(async (url) => {
+        if (!String(url).startsWith("/v1/workflows/shared")) return respond(String(url));
+        sharedCalls += 1;
+        return sharedCalls === 1
+          ? first.clone()
+          : Response.json({ data: [shared], next_cursor: null });
+      });
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const { result } = renderWithClient(() => useSavedWorkflows({ includeShared: true }), client);
+      await waitFor(() => expect(sharedCalls).toBe(1));
+      await waitFor(() => expect(result.current.workflows).toEqual([own]));
+
+      // Shared since the list loaded, or the service recovered: a refresh shows it.
+      act(() => result.current.refresh());
+      await waitFor(() => expect(result.current.workflows).toEqual([own, shared]));
+      expect(sharedCalls).toBe(2);
+    },
+  );
+
+  it.each([
     ["a server that doesn't share workflows", { ...SHARING, workflow_sharing: false }],
     ["a single-user server", { ...SHARING, single_user: true }],
   ])("asks nothing of %s", async (_label, info) => {
