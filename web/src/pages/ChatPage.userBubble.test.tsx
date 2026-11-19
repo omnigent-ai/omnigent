@@ -898,6 +898,35 @@ describe("UserBubble command tint", () => {
     expect(token.closest("p")).toHaveTextContent("/team fix the bug");
   });
 
+  it.each([
+    ["a reply quote", userBubble("/team fix it\n\n> the quoted line")],
+    [
+      "a file",
+      userBubble("", {
+        content: [
+          { type: "input_text", text: "/team fix it" },
+          { type: "input_file", file_id: "file_1", filename: "notes.txt" },
+        ],
+      }),
+    ],
+    [
+      "an image",
+      userBubble("", {
+        content: [
+          { type: "input_text", text: "/team fix it" },
+          { type: "input_image", file_id: "file_2", filename: "shot.png" },
+        ],
+      }),
+    ],
+  ])(
+    "leaves a command untinted when the send carries %s, as the composer does",
+    (_label, bubble) => {
+      renderScoped(bubble, <PublishCommands />);
+      expect(screen.getByTestId("user-message-content")).toHaveTextContent("/team fix it");
+      expect(document.querySelector(".text-brand-accent")).toBeNull();
+    },
+  );
+
   it("follows the catalog as it is replaced and removed under an existing bubble", () => {
     const bubble = userBubble("/team fix it");
     const view = renderScoped(bubble, <PublishCommands />);

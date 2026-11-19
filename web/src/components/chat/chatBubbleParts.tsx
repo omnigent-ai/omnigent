@@ -1045,6 +1045,9 @@ function useMessageActionVisibility(persistentOnMobile = false, persistentOnDesk
   };
 }
 
+// How a composer reply quote is serialized into the sent text (see serializeReplyDraft).
+const REPLY_QUOTE_PARAGRAPH = /(^|\n\n)> /;
+
 function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   // Scoped so a side-chat bubble builds attachment URLs against the CHILD, not
   // the main conversation the root store projects.
@@ -1100,9 +1103,15 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
   const visibleText = isCollapsed
     ? omitIncompleteLocalReviewComment(sliceByCodePoint(renderedText, COLLAPSE_THRESHOLD))
     : renderedText;
-  // Another session's message reaches the agent as plain input, so it is never a command.
+  // Another session's message reaches the agent as plain input, and attachments or a reply
+  // quote make a send an ordinary message, so none of these is a command.
   const command =
-    !isShellCommand && origin === null && published
+    !isShellCommand &&
+    origin === null &&
+    published &&
+    images.length === 0 &&
+    fileChips.length === 0 &&
+    !REPLY_QUOTE_PARAGRAPH.test(renderedText)
       ? splitKnownSlashCommand(visibleText, published.commandNames)
       : null;
   // Runtime-injected `[System: ...]` notifications ride in on role=user. When
