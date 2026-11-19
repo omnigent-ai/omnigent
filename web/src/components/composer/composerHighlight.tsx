@@ -53,10 +53,7 @@ function claudeDeliveredText(value: string): string {
   return value.replace(CLAUDE_DROPPED_CONTROLS, "");
 }
 
-/**
- * Mirror each native harness's leading-`!` rule (codex: `shell_command_from_content`; claude: a
- * `!` opening the text the TUI receives); the command must be non-blank.
- */
+/** Mirror each harness's non-blank leading-`!` rule (codex's `shell_command_from_content`). */
 export function splitNativeShellCommand(
   value: string,
   harness: string,
@@ -107,10 +104,7 @@ export interface ShellSendContext {
   reviewComments?: readonly unknown[];
 }
 
-/**
- * Why a `!` send carrying `context` can't go out, or null: its tags and review comments would
- * reach the shell.
- */
+/** Why shell input can't carry `context`, or null: its tags and review comments reach the shell. */
 function shellSendRefusal(context: ShellSendContext): string | null {
   if (context.mentions.length > 0) return SHELL_MENTION_REFUSAL;
   return (context.reviewComments?.length ?? 0) > 0 ? SHELL_REVIEW_COMMENT_REFUSAL : null;

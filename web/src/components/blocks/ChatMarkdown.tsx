@@ -793,10 +793,7 @@ interface MarkdownTextNode extends MarkdownNode {
   data?: { hName?: string };
 }
 
-/**
- * Mark a leading token without reparsing the rest of the paragraph. Raw HTML renders as text
- * and sanitize strips classes, so this plugin is the bubble's only way to tint it.
- */
+/** Tag the leading token in mdast, as sanitize strips classes from raw HTML. */
 function remarkLeadingCommand(token: string) {
   return (tree: MarkdownTextNode) => {
     const paragraph = tree.children?.[0];

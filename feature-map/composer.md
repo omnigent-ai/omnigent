@@ -159,22 +159,16 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   harness as text. A claude-sdk `/clear` continues in a new, empty session on
   the same machine and the view follows it. States: loading, error/retry,
   unavailable while disconnected, and an incomplete catalog.
-- `command-and-shell-tint`: a draft that opens with a known command or skill
-  shows that token tinted, leaving its arguments plain; an unknown `/word`
-  stays plain. The main chat, the new-session composer and side chats all do
-  this, on the textarea and on the CodeMirror editor alike, and the sent user
-  bubble keeps the command tint (a message relayed from another session
-  doesn't). In a Claude Code or Codex native session, a draft that opens with
-  `!` tints the `!`, rings the composer and shows a "Shell command" hint,
-  because it will run in the session's shell (Codex: owner only; the
-  new-session composer follows the chosen agent's harness). A `!` draft
-  carrying an @-tag is refused with a notice and the draft is kept. States:
-  known command, unknown command, quotes or attachments present (no tint),
-  shell mode, shell mode with a tag (refused), codex non-owner (no shell
-  mode), pending side-chat tab (no shell mode). What runs after the send is in
-  the [native shell
-  recipes](native-harnesses.md#driving-it-with-the-repro-environment) (the
-  `chat-render` shell-command bullets for Claude and Codex).
+- `command-and-shell-tint`: in the main chat, side chats and the new-session
+  composer (textarea or CodeMirror), a leading known command or skill is tinted
+  and an unknown `/word` is not; the sent bubble keeps the tint. In Claude Code
+  and Codex native sessions a leading `!` is tinted with a "Shell command" hint
+  (Codex skips leading whitespace and treats `!!` as text). States: known or
+  unknown command; quotes or attachments (no tint); shell mode; refused shell
+  send with the reason as the hint (an @-tag, review comments, or a Codex
+  non-owner, whom the server would reject); permission still loading or a
+  pending side-chat tab (no shell mode). See the [native shell
+  recipes](native-harnesses.md#driving-it-with-the-repro-environment).
 - `goal-command`: in sessions with a Goal control, bare `/goal` or its slash-menu
   row opens the same dialog as **+ → Goal**. `/goal <objective>` keeps its
   existing message path. Sessions without the control keep sending the text

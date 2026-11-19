@@ -3208,8 +3208,6 @@ function ComposerImpl(
       }).text,
     [draft, fullText, liveMentions, localReviewComments],
   );
-  // One mirror paints the command or `!` tint and inline mention pills. Quotes
-  // and files are sent ahead of the text, so it no longer starts with the token.
   const highlight = useComposerHighlight({
     value,
     commandNames: slashCommandNames,
