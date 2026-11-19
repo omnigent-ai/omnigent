@@ -104,6 +104,8 @@ describe("splitPullRequestRefs", () => {
     "origin/main#1",
     "upstream/main#12",
     "24/7#1234",
+    "src/schema.graphql#1234",
+    "cache/build.tsbuildinfo#1234",
   ])("leaves %j as text", (text) => {
     expect(splitPullRequestRefs(text)).toEqual([{ type: "text", value: text }]);
   });
