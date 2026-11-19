@@ -225,6 +225,7 @@ class ExecutorAdapter(HarnessApp):
         self._executor_factory = executor_factory
         self._executor_factory_on_thread = executor_factory_on_thread
         self._executor_factory_lock = asyncio.Lock()
+        self._shutdown_started = False
         self._session_key = session_key or uuid.uuid4().hex
         # Harness label used in elicitation messages, e.g. "Claude wants to call **Bash**".
         self._harness_label = harness_label
@@ -1224,14 +1225,20 @@ class ExecutorAdapter(HarnessApp):
 
         :returns: The per-conversation inner :class:`Executor`.
         """
+        if self._shutdown_started:
+            raise RuntimeError("Executor adapter is shutting down")
         if self._executor is None:
             self._executor = self._executor_factory()
         return self._executor
 
     async def _ensure_executor_for_turn(self) -> Executor:
+        if self._shutdown_started:
+            raise RuntimeError("Executor adapter is shutting down")
         if not self._executor_factory_on_thread:
             return self._ensure_executor()
         async with self._executor_factory_lock:
+            if self._shutdown_started:
+                raise RuntimeError("Executor adapter is shutting down")
             if self._executor is not None:
                 return self._executor
             build_task = asyncio.create_task(asyncio.to_thread(self._executor_factory))
@@ -1250,6 +1257,13 @@ class ExecutorAdapter(HarnessApp):
                     except BaseException:
                         _logger.exception("Failed to close executor built for a cancelled turn")
                 raise
+            if self._shutdown_started:
+                cleanup_task = asyncio.create_task(executor.close())
+                try:
+                    await await_cleanup_task(cleanup_task)
+                except BaseException:
+                    _logger.exception("Failed to close executor built during shutdown")
+                raise RuntimeError("Executor adapter is shutting down")
             self._executor = executor
             return executor
 
@@ -1521,6 +1535,7 @@ class ExecutorAdapter(HarnessApp):
 
     async def on_shutdown(self) -> None:
         """Drain background interrupt tasks, then close the executor session and executor."""
+        self._shutdown_started = True
 
         async def release_owned_resources() -> None:
             first_error: BaseException | None = None
@@ -1531,7 +1546,8 @@ class ExecutorAdapter(HarnessApp):
                     first_error = exc
                 finally:
                     self._bg_tasks.clear()
-            executor, self._executor = self._executor, None
+            async with self._executor_factory_lock:
+                executor, self._executor = self._executor, None
             if executor is not None:
                 try:
                     await executor.close_session(self._session_key)

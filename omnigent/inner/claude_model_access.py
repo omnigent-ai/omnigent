@@ -81,6 +81,7 @@ _ALTERNATE_TRANSPORT_FLAGS = (
 _BETA = re.compile(r"[a-z0-9][a-z0-9.-]{0,100}(?:,[a-z0-9][a-z0-9.-]{0,100})*\Z")
 # Match the Messages API request limit so attachments the provider accepts still pass.
 _MAX_REQUEST_BODY_BYTES = 32 * 1024 * 1024
+_CODING_AGENT_MODE_HOST_SUFFIXES = (".databricks.com", ".azuredatabricks.net")
 _DEFAULT_RESPONSE_HEADER_TIMEOUT_SECONDS = 150.0
 _DEFAULT_RESPONSE_IDLE_TIMEOUT_SECONDS = 5 * 60.0
 _DEFAULT_RESPONSE_TOTAL_TIMEOUT_SECONDS = 60 * 60.0
@@ -540,7 +541,7 @@ class ClaudeModelAccess:
             ("Content-Length", str(len(body))),
             ("anthropic-version", "2023-06-01"),
         ]
-        if self.host.endswith(".databricks.com") or self.host.endswith(".azuredatabricks.net"):
+        if self.host.endswith(_CODING_AGENT_MODE_HOST_SUFFIXES):
             rebuilt.append(("x-databricks-use-coding-agent-mode", "true"))
         if self.oauth:
             rebuilt.append(("x-app", "cli"))

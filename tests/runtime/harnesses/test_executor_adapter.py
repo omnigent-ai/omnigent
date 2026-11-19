@@ -71,6 +71,42 @@ async def test_threaded_executor_factory_cancellation_closes_completed_startup(
         release.set()
 
 
+async def test_shutdown_closes_executor_built_after_shutdown_begins() -> None:
+    """Shutdown must wait for a factory already building the first executor."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    started = threading.Event()
+    release = threading.Event()
+    executor = AsyncMock(spec=Executor)
+
+    def build_executor() -> Executor:
+        started.set()
+        assert release.wait(timeout=5)
+        return executor
+
+    adapter = ExecutorAdapter(executor_factory=build_executor, executor_factory_on_thread=True)
+    startup = asyncio.create_task(adapter._ensure_executor_for_turn())
+    shutdown: asyncio.Task[None] | None = None
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        shutdown = asyncio.create_task(adapter.on_shutdown())
+        await asyncio.sleep(0)
+        assert adapter._shutdown_started
+        assert not shutdown.done()
+        release.set()
+        with pytest.raises(RuntimeError, match="shutting down"):
+            await asyncio.wait_for(startup, 5)
+        await asyncio.wait_for(shutdown, 5)
+        executor.close.assert_awaited_once()
+        executor.close_session.assert_not_awaited()
+        assert adapter._executor is None
+    finally:
+        release.set()
+        await asyncio.gather(startup, return_exceptions=True)
+        if shutdown is not None:
+            await asyncio.gather(shutdown, return_exceptions=True)
+
+
 async def test_threaded_executor_factory_is_shared_by_overlapping_first_turns() -> None:
     """Only one Claude executor may own the first turn's proxy and launcher."""
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter

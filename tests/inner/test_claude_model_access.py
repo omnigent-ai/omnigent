@@ -98,7 +98,7 @@ def test_reconstructs_only_model_headers(header: str, client_header: str) -> Non
     ("base_url", "coding_agent_mode"),
     [
         ("https://gateway.example.test/anthropic", None),
-        ("https://docs.databricks.com/anthropic", "true"),
+        ("https://api.coding.example.test/anthropic", "true"),
     ],
 )
 def test_gateway_attribution_comes_from_parent_metadata(
@@ -109,6 +109,7 @@ def test_gateway_attribution_comes_from_parent_metadata(
 ) -> None:
     from omnigent.inner import claude_model_access as module
 
+    monkeypatch.setattr(module, "_CODING_AGENT_MODE_HOST_SUFFIXES", (".coding.example.test",))
     monkeypatch.setattr(module, "is_databricks_ai_gateway_url", lambda _: gateway)
     via_ug = Mock(return_value=True)
     monkeypatch.setattr(module, "is_ug_route", via_ug)
