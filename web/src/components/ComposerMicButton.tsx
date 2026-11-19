@@ -598,6 +598,8 @@ function ComposerMicButtonImpl(
           started: false,
         };
         recognition.start();
+        // start() throws until the previous take's end, so its late events are gone.
+        discardingRef.current = false;
       }
     } catch {
       // InvalidStateError from a double-call — drop the guard so the
@@ -616,7 +618,7 @@ function ComposerMicButtonImpl(
   ]);
 
   // Like Esc without the revert: the composer keeps its text, and nothing heard
-  // afterwards is inserted.
+  // afterwards is inserted. Listening ends now so Esc can't revert the sent text.
   const endTake = useCallback(() => {
     const session = sessionRef.current;
     if (session) {
@@ -629,11 +631,13 @@ function ComposerMicButtonImpl(
     // A server take still connecting or flushing its tail; toggleServer drops it.
     if (serverBusyRef.current) {
       discardingRef.current = true;
+      setIsListening(false);
       return;
     }
     if (!webSpeechTakeRef.current && !isListeningRef.current) return;
     discardingRef.current = true;
     webSpeechTakeRef.current = null;
+    setIsListening(false);
     try {
       recognitionRef.current?.abort();
     } catch {

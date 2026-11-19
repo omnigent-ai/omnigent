@@ -485,6 +485,10 @@ describe("ComposerMicButton", () => {
       const { button } = startTake({ ref: micRef, onTranscript, onVoiceDiscard });
 
       act(() => micRef.current?.endTake());
+      expect(button).toHaveAttribute("aria-pressed", "false");
+      act(() => {
+        window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+      });
       act(() => handlers.result?.(resultEvent("after the send")));
       now += 3_000;
       act(() => handlers.end?.({}));
@@ -1225,18 +1229,45 @@ describe("ComposerMicButton (server dictation)", () => {
     const micRef = createRef<ComposerMicButtonHandle>();
     const onTranscript = vi.fn();
     const onInterim = vi.fn();
-    renderServerMode({ ref: micRef, onTranscript, onInterim });
+    const onVoiceDiscard = vi.fn();
+    renderServerMode({ ref: micRef, onTranscript, onInterim, onVoiceDiscard });
     await clickMic();
     await clickMic();
 
     act(() => micRef.current?.endTake());
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+    });
     await act(async () => resolveStop("tail words"));
 
     expect(onTranscript).not.toHaveBeenCalled();
     expect(onInterim).not.toHaveBeenCalled();
+    expect(onVoiceDiscard).not.toHaveBeenCalled();
     expect(screen.getByRole("button", { name: "Voice dictation" })).toHaveAttribute(
       "aria-pressed",
       "false",
     );
+  });
+
+  it("falls back to the server on the next take after endTake", async () => {
+    const micRef = createRef<ComposerMicButtonHandle>();
+    render(
+      <CapabilitiesContext.Provider value={DICTATION_INFO}>
+        <ComposerMicButton ref={micRef} onTranscript={vi.fn()} />
+      </CapabilitiesContext.Provider>,
+    );
+    const button = screen.getByRole("button", { name: "Voice dictation" });
+    fireEvent.click(button);
+    await act(async () => handlers.error?.({ error: "network" }));
+    act(() => micRef.current?.endTake());
+
+    // The next Web Speech take fails before the recognizer reports start.
+    fireEvent.click(button);
+    await act(async () => handlers.error?.({ error: "network" }));
+
+    expect(startSpy).toHaveBeenCalledTimes(2);
+    expect(sessionStartMock).toHaveBeenCalledTimes(2);
+    expect(button).toHaveAttribute("aria-pressed", "true");
+    expect(showToastMock).not.toHaveBeenCalled();
   });
 });

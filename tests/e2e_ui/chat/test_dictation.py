@@ -239,11 +239,25 @@ def test_send_button_ends_the_take(
         composer = page.get_by_placeholder("Send a message…")
         expect(composer).to_be_visible()
         composer.fill("")
+        # Keep each mic track so the test can check Send releases the microphone.
+        page.evaluate(
+            """() => {
+              const devices = navigator.mediaDevices;
+              const getUserMedia = devices.getUserMedia.bind(devices);
+              window.micTracks = [];
+              devices.getUserMedia = async (constraints) => {
+                const stream = await getUserMedia(constraints);
+                window.micTracks.push(...stream.getTracks());
+                return stream;
+              };
+            }"""
+        )
 
         mic = page.get_by_role("button", name="Voice dictation")
         mic.click()
         expect(mic).to_have_attribute("aria-pressed", "true")
         expect(composer).to_have_value(_FAKE_SCRIPT, timeout=_TRANSCRIPT_TIMEOUT_MS)
+        assert page.evaluate("window.micTracks.some((track) => track.readyState === 'live')")
 
         page.get_by_role("button", name="Send", exact=True).click()
         expect(
@@ -255,6 +269,10 @@ def test_send_button_ends_the_take(
         # An enabled mic rules out the auto-stop for a disabled composer.
         expect(mic).to_be_enabled()
         expect(mic).to_have_attribute("aria-pressed", "false")
+        page.wait_for_function(
+            "window.micTracks.every((track) => track.readyState === 'ended')",
+            timeout=_TRANSCRIPT_TIMEOUT_MS,
+        )
     finally:
         context.close()
 
