@@ -1,3 +1,4 @@
+import type { ClipboardEvent } from "react";
 import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import Markdown from "react-markdown";
@@ -6,6 +7,7 @@ import rehypeSanitize from "rehype-sanitize";
 import remarkGfm from "remark-gfm";
 
 import { copyRichText, copyText } from "./clipboard";
+import { selectionToMarkdown } from "./selectionMarkdown";
 
 // The slice of hast this module walks. @types/hast isn't a direct dependency,
 // and the rehype pass below only needs elements, their href/alt, and children.
@@ -105,4 +107,29 @@ export async function copyMarkdown(markdown: string): Promise<void> {
     return;
   }
   await copyRichText({ html, text: markdown });
+}
+
+/**
+ * `onCopy` handler for rendered agent markdown: when the selection includes a
+ * list, writes it as markdown plus its rendered HTML so bullets and numbering
+ * survive the paste, mirroring {@link copyMarkdown}. Other selections keep the
+ * browser's default copy.
+ */
+export function handleMarkdownSelectionCopy(event: ClipboardEvent<HTMLElement>): void {
+  const selection = window.getSelection();
+  // Multiple ranges (Firefox's ctrl-select) have no single markdown reading.
+  if (!selection || selection.isCollapsed || selection.rangeCount !== 1) return;
+  let markdown: string | null;
+  let html: string;
+  try {
+    markdown = selectionToMarkdown(selection.getRangeAt(0), event.currentTarget);
+    if (!markdown) return;
+    html = markdownToHtml(markdown);
+  } catch {
+    // A conversion failure must not cost the user their copy.
+    return;
+  }
+  event.preventDefault();
+  event.clipboardData.setData("text/plain", markdown);
+  event.clipboardData.setData("text/html", html);
 }
