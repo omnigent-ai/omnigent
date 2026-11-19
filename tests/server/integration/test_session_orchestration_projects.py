@@ -721,6 +721,33 @@ async def test_the_tool_archives_sub_agents_in_any_of_the_owners_trees(
     unchanged = store.get_conversation(lead.id)
     assert unchanged.archived is not True and unchanged.title == "Lead"
     assert "omnigent.closed" not in unchanged.labels
+    # Siblings left on the caller's runner after their parent was rebound: the
+    # host-bound one owns it, so archiving it would stop the caller; it is refused.
+    rebound = store.create_conversation(
+        agent_id=source["agent_id"], parent_conversation_id=target["id"], title="Rebound"
+    )
+    owner = store.create_conversation(
+        agent_id=source["agent_id"], parent_conversation_id=rebound.id, title="Owner"
+    )
+    sibling = store.create_conversation(
+        agent_id=source["agent_id"], parent_conversation_id=rebound.id, title="Sibling"
+    )
+    assert store.set_runner_id(rebound.id, "rebound-runner") is True
+    store.set_host_id(owner.id, "c1b2c3d4e5f61234567890abcdef0123", workspace="/tmp/ws")
+    for session_id in (owner.id, sibling.id):
+        assert store.set_runner_id(session_id, runner_id) is True
+    stopped.clear()
+    refused = json.loads(
+        await execute_tool(
+            tool_name="sys_session_update",
+            arguments=json.dumps({"session_id": owner.id, "archived": True}),
+            server_client=auth_client,
+            conversation_id=sibling.id,
+        )
+    )
+    assert "owns the runner it runs on" in refused["error"], refused
+    assert store.get_conversation(owner.id).archived is not True
+    assert stopped == []
     # A sub-agent still cannot archive the session it runs under.
     refused = json.loads(
         await execute_tool(

@@ -605,8 +605,8 @@ async def execute_session_update(
                 "runs it closes it",
             }
         )
-    # The server never stops an ancestor's runner for a sub-agent's archive, so
-    # only a top-level session (such as a side chat) on this runner is refused.
+    # A sub-agent's archive leaves an ancestor's runner up, and the server refuses
+    # one whose runner it owns, so only a top-level session is checked here.
     if (
         changes.get("archived") is True
         and not archives_itself
