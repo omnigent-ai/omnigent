@@ -237,12 +237,13 @@ def start_egress_proxy(
     loop = asyncio.new_event_loop()
     started = threading.Event()
     timeout_requested = threading.Event()
+    serving = threading.Event()
+    startup_task = loop.create_task(proxy.start_unix(str(socket_path)))
 
     startup_errors: list[BaseException] = []
 
     def _run_proxy() -> None:
         asyncio.set_event_loop(loop)
-        startup_task = loop.create_task(proxy.start_unix(str(socket_path)))
         try:
             loop.run_until_complete(startup_task)
         except BaseException as exc:  # noqa: BLE001 — propagate thread startup failures to the caller
@@ -250,7 +251,12 @@ def start_egress_proxy(
         finally:
             started.set()
         if not startup_errors and not timeout_requested.is_set():
-            loop.run_forever()
+            serving.set()
+            try:
+                if not timeout_requested.is_set():
+                    loop.run_forever()
+            finally:
+                serving.clear()
         # A readiness timeout stops the loop before listener startup finishes.
         if not startup_task.done():
             startup_task.cancel()
@@ -262,8 +268,15 @@ def start_egress_proxy(
     thread.start()
     if not started.wait(timeout=10):
         timeout_requested.set()
+
+        def stop_startup_or_serving() -> None:
+            if serving.is_set():
+                loop.stop()
+            elif not startup_task.done():
+                startup_task.cancel()
+
         try:
-            loop.call_soon_threadsafe(loop.stop)
+            loop.call_soon_threadsafe(stop_startup_or_serving)
         except RuntimeError:
             if not loop.is_closed():
                 raise

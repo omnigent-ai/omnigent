@@ -95,6 +95,33 @@ def test_auth_runtime_rejects_writable_hardlink_alias(
         _validate_auth_runtime(pinned, policy)
 
 
+@pytest.mark.parametrize("failure_call", [1, 3])
+def test_auth_runtime_hides_symlink_chain_errors_during_variant_expansion(
+    trusted_python_helper: tuple[_TrustedExecutable, Path, Path, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    failure_call: int,
+) -> None:
+    from omnigent.inner import sandbox
+
+    executable, _, _, _ = trusted_python_helper
+    pinned = _pin_auth_python_runtime(executable)
+    original_variants = sandbox._launcher_path_variants
+    calls = 0
+
+    def fail_variant(path: Path) -> set[Path]:
+        nonlocal calls
+        calls += 1
+        if calls == failure_call:
+            raise OSError("private symlink path")
+        return original_variants(path)
+
+    monkeypatch.setattr(sandbox, "_launcher_path_variants", fail_variant)
+    policy = SandboxPolicy("linux_bwrap", True, None, [], [], False)
+    with pytest.raises(ValueError, match="outside sandbox-writable paths") as error:
+        _validate_auth_runtime(pinned, policy)
+    assert "private symlink path" not in str(error.value)
+
+
 @pytest.mark.parametrize("trusted_source", ["site", "shared_runtime"])
 def test_auth_runtime_rejects_copied_interpreter_base_runtime_alias_before_probe(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, trusted_source: str

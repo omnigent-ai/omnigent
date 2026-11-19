@@ -266,6 +266,7 @@ def test_controller_rejects_unauthenticated_credential_rewrites_before_setup(
         "readiness-timeout",
         "startup-completes-at-deadline",
         "listener-fails-at-deadline",
+        "cleanup-overlaps-timeout",
     ],
 )
 def test_controller_startup_failure_reaches_caller_and_releases_resources(
@@ -285,8 +286,19 @@ def test_controller_startup_failure_reaches_caller_and_releases_resources(
     worker_threads: list[threading.Thread] = []
     loops: list[asyncio.AbstractEventLoop] = []
     listener_error = OSError("listener unavailable")
+    cleanup_entered = threading.Event()
+    cleanup_release = asyncio.Event()
+    original_stop = proxy.stop
+    startup_pending_future: asyncio.Future[None] | None = None
+
+    async def stop_proxy() -> None:
+        if failure == "cleanup-overlaps-timeout":
+            cleanup_entered.set()
+            await cleanup_release.wait()
+        await original_stop()
 
     async def start_listener(_path: str) -> None:
+        nonlocal startup_pending_future
         loop = asyncio.get_running_loop()
         loops.append(loop)
         worker_threads.append(threading.current_thread())
@@ -295,20 +307,12 @@ def test_controller_startup_failure_reaches_caller_and_releases_resources(
         startup_tasks.append(task)
         # A partially started listener must also be closed on startup failure.
         proxy._servers.append(listener)
-        if failure in ("listener-error", "listener-fails-at-deadline"):
+        if failure in ("listener-error", "listener-fails-at-deadline", "cleanup-overlaps-timeout"):
             entered_start.set()
             raise listener_error
         startup_pending = loop.create_future()
         if failure == "startup-completes-at-deadline":
-            stop = loop.stop
-
-            def complete_before_stop() -> None:
-                # Complete startup in the same loop iteration that consumes stop.
-                monkeypatch.setattr(loop, "stop", stop)
-                task.add_done_callback(lambda _task: stop())
-                startup_pending.set_result(None)
-
-            monkeypatch.setattr(loop, "stop", complete_before_stop)
+            startup_pending_future = startup_pending
         entered_start.set()
         await startup_pending
 
@@ -316,9 +320,23 @@ def test_controller_startup_failure_reaches_caller_and_releases_resources(
         if failure == "listener-error":
             return ready.wait(timeout)
         assert entered_start.wait(1), "proxy thread did not enter listener startup"
+        if failure == "startup-completes-at-deadline":
+            assert startup_pending_future is not None
+            loops[0].call_soon_threadsafe(startup_pending_future.set_result, None)
+            assert ready.wait(1)
         if failure == "listener-fails-at-deadline":
             worker_threads[0].join(timeout=1)
             assert loops[0].is_closed()
+        if failure == "cleanup-overlaps-timeout":
+            assert cleanup_entered.wait(1)
+            loop = loops[0]
+            call_soon_threadsafe = loop.call_soon_threadsafe
+
+            def release_after_timeout(callback, *args) -> None:
+                call_soon_threadsafe(callback, *args)
+                call_soon_threadsafe(cleanup_release.set)
+
+            monkeypatch.setattr(loop, "call_soon_threadsafe", release_after_timeout)
         return False
 
     # The listener is stubbed, so exercise the lifecycle on every host.
@@ -327,6 +345,7 @@ def test_controller_startup_failure_reaches_caller_and_releases_resources(
     monkeypatch.setattr(controller, "ensure_ca_bundle", lambda _cert: bundle_path)
     monkeypatch.setattr(controller, "EgressProxy", Mock(return_value=proxy))
     monkeypatch.setattr(proxy, "start_unix", start_listener)
+    monkeypatch.setattr(proxy, "stop", stop_proxy)
     # Keep Thread's own bootstrap event real; only the controller's wait expires.
     monkeypatch.setattr(
         controller,
@@ -336,6 +355,7 @@ def test_controller_startup_failure_reaches_caller_and_releases_resources(
             Event=Mock(
                 side_effect=[
                     SimpleNamespace(set=ready.set, wait=readiness_wait),
+                    threading.Event(),
                     threading.Event(),
                 ]
             ),

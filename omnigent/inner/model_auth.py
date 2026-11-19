@@ -269,18 +269,18 @@ def _validate_auth_runtime(executable: _TrustedExecutable, policy: SandboxPolicy
         _validate_trusted_hardlink_aliases,
     )
 
-    entries = _launcher_path_variants(executable.path)
-    trees: set[Path] = set()
     if executable.interpreter is None:
         raise ValueError("profile authentication requires a pinned Python runtime")
-    for interpreter in _launcher_path_variants(executable.interpreter):
-        entries.add(interpreter)
-        entries.add(interpreter.parent / "pyvenv.cfg")
-        entries.add(interpreter.parent.parent / "pyvenv.cfg")
-        trees.update(interpreter.parent.parent / name for name in ("lib", "lib64"))
-    entries = {variant for path in entries for variant in _launcher_path_variants(path)}
-    trees = {variant for path in trees for variant in _launcher_path_variants(path)}
     try:
+        entries = _launcher_path_variants(executable.path)
+        trees: set[Path] = set()
+        for interpreter in _launcher_path_variants(executable.interpreter):
+            entries.add(interpreter)
+            entries.add(interpreter.parent / "pyvenv.cfg")
+            entries.add(interpreter.parent.parent / "pyvenv.cfg")
+            trees.update(interpreter.parent.parent / name for name in ("lib", "lib64"))
+        entries = {variant for path in entries for variant in _launcher_path_variants(path)}
+        trees = {variant for path in trees for variant in _launcher_path_variants(path)}
         _validate_launcher_write_grants(policy, entries, trees)
         # The venv library container can hold unrelated unreadable data.
         _validate_trusted_hardlink_aliases(policy, entries, set())
@@ -310,10 +310,10 @@ def _validate_auth_runtime(executable: _TrustedExecutable, policy: SandboxPolicy
         import_trees = {variant for root in roots for variant in _launcher_path_variants(root)}
         _validate_launcher_write_grants(policy, set(), import_trees)
         _validate_trusted_hardlink_aliases(policy, set(), import_trees)
-    except OSError as exc:
+    except (OSError, RuntimeError):
         raise ValueError(
             "model auth executable and runtime must stay outside sandbox-writable paths"
-        ) from exc
+        ) from None
 
 
 def _profile_token_argv(executable: Path, *, host: str, profile: str) -> list[str]:
@@ -386,7 +386,7 @@ async def mint_profile_token(
         executable = _executable or _resolve_auth_executable()
         current = executable.path.stat()
         if (current.st_dev, current.st_ino) != executable.identity:
-            raise PermissionError("trusted ucode executable changed before launch")
+            raise PermissionError("trusted authentication executable changed before launch")
         helper_argv = _profile_token_argv(executable.path, host=host, profile=profile)
         if executable.interpreter is not None:
             target = _validate_auth_executable_path(executable.interpreter)

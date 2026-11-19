@@ -2329,9 +2329,13 @@ def prepare_tight_cli_process(
         raise OSError("Default Claude CLI sandbox resolved to an inactive policy")
     sandbox = with_additional_write_roots(sandbox, _claude_internal_write_roots())
     sandbox = with_additional_write_files(sandbox, _claude_internal_write_files())
-    launcher: str | None = None
     try:
         launcher = create_exec_launcher(real_cli_path, sandbox)
+        return PreparedClaudeCli(
+            cli_path=launcher,
+            enable_native_tools=False,
+            sandbox=sandbox,
+        )
     except OSError as exc:
         if "mutable hard-link alias" in str(exc):
             raise OSError(
@@ -2344,13 +2348,6 @@ def prepare_tight_cli_process(
                 "Python startup hook."
             ) from exc
         raise
-    if launcher is None:
-        raise OSError("Default Claude CLI sandbox launcher was not created")
-    return PreparedClaudeCli(
-        cli_path=launcher,
-        enable_native_tools=False,
-        sandbox=sandbox,
-    )
 
 
 def _claude_managed_config_dirs() -> list[pathlib.Path]:
