@@ -25,7 +25,6 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from threading import Lock
 from typing import Any
-from urllib.parse import urlsplit
 
 from filelock import Timeout as FileLockTimeout
 
@@ -181,42 +180,15 @@ def _workspace_providers(root: str) -> list[ProviderResolution]:
     ]
 
 
-def _remote_path(url: str) -> str:
-    """Return a remote URL's lower-cased repository path without ``.git``."""
-    candidate = url.strip()
-    if "://" in candidate:
-        try:
-            path = urlsplit(candidate).path
-        except ValueError:
-            return ""
-    else:
-        path = candidate.partition(":")[2]
-    return path.removesuffix(".git").strip("/").lower()
-
-
-def _is_ssh_host_alias(url: str) -> bool:
-    """Whether ``url`` is an ssh remote whose host can only be an ssh config alias.
-
-    DNS names end in an alphabetic label, so ``gh-work`` and ``github.com-work`` are
-    aliases while ``ghe.example.com`` is a real, unrecognized host.
-    """
-    host = host_of(url)
-    if host is None or url.strip().lower().startswith(("http://", "https://")):
-        return False
-    return not host.rpartition(".")[2].isalpha()
-
-
-def _keeps_provider_workspace_repo(
-    workspace_repo: Any, url: str, preferred: ParsedRemote | None
-) -> bool:
-    """Whether a provider-named workspace repo belongs to the preferred remote ``url``."""
-    if not isinstance(workspace_repo, dict):
-        return False
-    if preferred is not None:
-        # The same host can name another repo, e.g. a fork's upstream.
-        return str(workspace_repo.get("host") or "").lower() == preferred.host
-    name = str(workspace_repo.get("name_with_owner") or "").lower()
-    return _is_ssh_host_alias(url) and bool(name) and _remote_path(url) == name
+def _keeps_provider_workspace_repo(workspace_repo: Any, preferred: ParsedRemote | None) -> bool:
+    """Whether a provider-named workspace repo is on the preferred remote's host."""
+    # An unrecognized preferred remote (ssh alias, IP, unknown host) can't vouch for
+    # it; the same host can name another repo, e.g. a fork's upstream.
+    return (
+        isinstance(workspace_repo, dict)
+        and preferred is not None
+        and str(workspace_repo.get("host") or "").lower() == preferred.host
+    )
 
 
 def _add_workspace_repo(root: str, info: dict[str, Any]) -> None:
@@ -236,12 +208,11 @@ def _add_workspace_repo(root: str, info: dict[str, Any]) -> None:
         return
     resolved = local_git.remote_settings(run, "gh-resolved")
     base_url = next((url for name, url in urls if resolved.get(name) == "base"), None)
-    preferred_url = base_url or urls[0][1]
     # Origin comes first; if unrecognized, a recognized upstream must not stand in for it.
-    preferred = resolve_remote(preferred_url)
+    preferred = resolve_remote(base_url or urls[0][1])
     if "workspace_repo" in info:
         # gh falls back to a github.com remote when it doesn't know origin's host.
-        if not _keeps_provider_workspace_repo(info["workspace_repo"], preferred_url, preferred):
+        if not _keeps_provider_workspace_repo(info["workspace_repo"], preferred):
             del info["workspace_repo"]
         return
     if preferred is None:

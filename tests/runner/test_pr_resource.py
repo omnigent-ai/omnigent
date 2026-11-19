@@ -325,10 +325,10 @@ def test_an_unrecognized_origin_names_no_workspace_repo(
         ("https://github.com/owner/app.git", ("owner/app", "github.com")),
         # A fork checkout: gh resolves the upstream on origin's own host.
         (GITHUB_FORK, ("owner/app", "github.com")),
-        # ssh config aliases only gh resolves; the path still has to name gh's repo.
-        ("git@gh-work:owner/app.git", ("owner/app", "github.com")),
-        ("git@github.com-work:owner/app.git", ("owner/app", "github.com")),
-        ("git@gh-work:me/app.git", None),
+        # gh may not resolve an ssh alias or IP either and fall back to the upstream.
+        ("git@gh-work:owner/app.git", None),
+        ("git@corp-ghe:owner/app.git", None),
+        ("git@10.0.0.5:owner/app.git", None),
         (ENTERPRISE_ORIGIN, None),
         ("https://gitserver/owner/app.git", None),
     ],
