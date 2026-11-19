@@ -572,7 +572,8 @@
         padding var(--composer-morph-duration) var(--composer-morph-easing);
     }
 
-    > [data-composer-input-area] > textarea {
+    /* The input element of either engine: the textarea or the CodeMirror host. */
+    > [data-composer-input-area] > [data-composer-engine] {
       display: block;
       min-height: 1lh;
     }
@@ -624,7 +625,8 @@
       display: none;
     }
 
-    &[data-composer-hint-placeholder] > [data-composer-input-area] > textarea::placeholder {
+    &[data-composer-hint-placeholder] > [data-composer-input-area] > textarea::placeholder,
+    &[data-composer-hint-placeholder] > [data-composer-input-area] .cm-placeholder {
       color: transparent;
     }
 
@@ -646,7 +648,7 @@
         pointer-events: none;
       }
 
-      > [data-composer-input-area] > textarea {
+      > [data-composer-input-area] > [data-composer-engine] {
         min-height: 1lh;
         height: 1lh !important;
         overflow: hidden;
@@ -654,11 +656,12 @@
         pointer-events: auto;
       }
 
-      > [data-composer-input-area] > :not(textarea) {
+      > [data-composer-input-area] > :not([data-composer-engine]) {
         visibility: hidden;
       }
 
-      > [data-composer-input-area] > textarea::placeholder {
+      > [data-composer-input-area] > textarea::placeholder,
+      > [data-composer-input-area] .cm-placeholder {
         color: var(--muted-foreground);
       }
 

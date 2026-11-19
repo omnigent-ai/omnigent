@@ -243,6 +243,30 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    */
   getDesktopFeatures: () => ipcRenderer.invoke("omnigent:get-desktop-features"),
   /**
+   * The floating New Agent panel, usable when getDesktopFeatures() reports
+   * `floatingComposer` (macOS). A main window's page announces it can render the panel;
+   * the panel's own page dismisses itself and opens what it launched in a main window.
+   */
+  floatingComposer: {
+    /** From a main window: this document can render the panel (version 1) for its server. */
+    announceSupport: (version) => ipcRenderer.send("omnigent:floating-composer:announce", version),
+    /** From the panel: hide it, keeping its draft. */
+    dismiss: () => ipcRenderer.send("omnigent:floating-composer:dismiss"),
+    /**
+     * From the panel: open `/c/<id>` or a page it links to in a main window of its server,
+     * then hide. Resolves `{ ok: true }` or
+     * `{ ok: false, error: "not-composer" | "bad-path" | "window-loading" }`.
+     */
+    openInMainWindow: (path) =>
+      ipcRenderer.invoke("omnigent:floating-composer:open-in-main-window", path),
+    /** From the panel: its native file picker opened or closed. */
+    filePicker: (state) =>
+      ipcRenderer.send(
+        "omnigent:floating-composer:file-picker",
+        state === "open" ? "open" : "closed",
+      ),
+  },
+  /**
    * Connect the user's Arca instance to the window's
    * server as a host, via `arca ssh`. Native consent is asked in the main
    * process. Resolves a `{ ok, error?, authError? }` result.

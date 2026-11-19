@@ -100,6 +100,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "automations_v2": True,
         "splittable_terminal_view_ui": False,
         "sidebar_windowed_rows": False,
+        "chat_composer_codemirror": False,
         "workflows": False,
         "session_overview": False,
         "project_kanban": True,

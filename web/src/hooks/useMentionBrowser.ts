@@ -1,5 +1,8 @@
-import { type KeyboardEvent, type RefObject, useEffect, useRef, useState } from "react";
-import type { ComposerTextTarget } from "@/components/composer/engine/composerInput";
+import { type RefObject, useEffect, useRef, useState } from "react";
+import type {
+  ComposerKeyboardEvent,
+  ComposerTextTarget,
+} from "@/components/composer/engine/composerInput";
 
 import {
   detectMentionAt,
@@ -100,9 +103,9 @@ export interface MentionBrowser {
   /** Tokens of everything tagged so far, for highlighting and Backspace. */
   mentionTokens: string[];
   /** Backspace at or inside a token deletes it whole; returns true when it did. */
-  handleTokenBackspace: (e: KeyboardEvent<HTMLTextAreaElement>) => boolean;
+  handleTokenBackspace: (e: ComposerKeyboardEvent) => boolean;
   /** Handle a key event for the open menu; returns true when it consumed it. */
-  handleKeyDown: (e: KeyboardEvent<HTMLTextAreaElement>) => boolean;
+  handleKeyDown: (e: ComposerKeyboardEvent) => boolean;
   /** Dismiss the menu (e.g. on blur). */
   dismiss: () => void;
 }
@@ -252,7 +255,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     insertToken(mention, token);
   };
 
-  const handleTokenBackspace = (e: KeyboardEvent<HTMLTextAreaElement>): boolean => {
+  const handleTokenBackspace = (e: ComposerKeyboardEvent): boolean => {
     if (e.key !== "Backspace" || e.altKey || e.metaKey || e.ctrlKey) return false;
     const ta = e.currentTarget;
     if (ta.selectionStart !== ta.selectionEnd) return false;
@@ -321,7 +324,7 @@ export function useMentionBrowser(params: MentionBrowserParams): MentionBrowser 
     textareaRef.current?.focus();
   };
 
-  const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>): boolean => {
+  const handleKeyDown = (e: ComposerKeyboardEvent): boolean => {
     if (!mentionOpen) return false;
     if (e.key === "Escape" && level !== null) {
       e.preventDefault();

@@ -68,6 +68,7 @@ export type FeatureKey =
   | "automations_v2"
   | "splittable_terminal_view_ui"
   | "sidebar_windowed_rows"
+  | "chat_composer_codemirror"
   | "session_orchestration"
   | "workflows"
   | "session_overview"
