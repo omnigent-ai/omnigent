@@ -5,8 +5,11 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { showToast } from "@/components/ui/toast";
 import { copyText } from "@/lib/clipboard";
+import { HARNESS_CREDENTIAL_COPY } from "@/lib/harnessSetup";
 import { authenticatedFetch } from "@/lib/identity";
 import { HarnessFixDialog, type HarnessFixDialogProps } from "./HarnessFixDialog";
+import { HARNESS_DETAIL_ENTRIES } from "./search/catalog/harnesses";
+import { SettingsOverlayOwner } from "./search/settingsOwnership";
 
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
@@ -173,7 +176,14 @@ describe("HarnessFixDialog", () => {
     const user = userEvent.setup();
 
     expect(screen.getByRole("heading", { name: "Reconfigure Codex" })).toBeVisible();
-    expect(screen.getByRole("radio", { name: /Isaac/ })).toHaveAttribute("aria-checked", "true");
+    const [firstCredential] = Object.values(HARNESS_CREDENTIAL_COPY);
+    expect(screen.getByRole("radio", { name: firstCredential.label })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(screen.getByRole("radio", { name: firstCredential.label })).toHaveAccessibleDescription(
+      firstCredential.description,
+    );
     await user.click(screen.getByRole("button", { name: "Authenticate" }));
 
     expect(
@@ -954,6 +964,7 @@ describe("HarnessFixDialog", () => {
     const email = screen.getByRole("textbox", { name: "Account to sign in with" });
     expect(email).toHaveValue("");
     expect(email).toHaveAttribute("placeholder", "name@example.com");
+    expect(email).toHaveAccessibleName("Account to sign in with");
     await user.type(email, "new@example.com");
     await user.click(screen.getByRole("button", { name: "Sign out and switch" }));
 
@@ -1612,7 +1623,7 @@ describe("HarnessFixDialog", () => {
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: "Use an API key or gateway URL instead" }));
     await user.type(screen.getByPlaceholderText("Paste an API key"), "secret");
-    await user.click(screen.getAllByRole("button", { name: "Save" })[0]);
+    await user.click(screen.getAllByRole("button", { name: /^Save/ })[0]);
 
     await waitFor(() =>
       expect(props.onFixed).toHaveBeenCalledWith({
@@ -1648,7 +1659,7 @@ describe("HarnessFixDialog", () => {
     const user = userEvent.setup();
     await user.click(screen.getByRole("button", { name: "Use an API key or gateway URL instead" }));
     await user.type(screen.getByPlaceholderText("Paste an API key"), "secret");
-    await user.click(screen.getAllByRole("button", { name: "Save" })[0]);
+    await user.click(screen.getAllByRole("button", { name: /^Save/ })[0]);
 
     expect(
       await screen.findByRole("heading", { name: "Set up tmux on Local laptop" }),
@@ -1696,5 +1707,74 @@ describe("HarnessFixDialog", () => {
     renderDialog({ harness: "native-codex", harnessLabel: "Codex" });
     expect(screen.getByRole("radio", { name: /Isaac/ })).toBeVisible();
     expect(screen.getByRole("radio", { name: /Personal subscription/ })).toBeVisible();
+  });
+});
+
+describe("HarnessFixDialog as a Settings overlay", () => {
+  it("names its controls as the parts of the control that opened it, with no tooltip", () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <SettingsOverlayOwner
+          entry={HARNESS_DETAIL_ENTRIES.entry("cursor-native")}
+          opener="fixAction"
+        >
+          <HarnessFixDialog
+            {...baseProps}
+            mode="install"
+            harness="cursor-native"
+            harnessLabel="Cursor"
+          />
+        </SettingsOverlayOwner>
+      </QueryClientProvider>,
+    );
+
+    expect(screen.getByRole("dialog")).toHaveAttribute(
+      "data-settings-overlay-owner",
+      "harness-cursor-native-detail:fixAction",
+    );
+    const check = screen.getByRole("button", { name: "Check again" });
+    expect(check).toHaveAttribute(
+      "data-settings-control",
+      "harness-cursor-native-detail:checkAgain",
+    );
+    expect(check).toHaveAttribute("title", "");
+    expect(screen.getByRole("button", { name: "Copy omni setup" })).toHaveAttribute(
+      "data-settings-control",
+      "harness-cursor-native-detail:copyOmniSetup",
+    );
+    const footerClose = screen
+      .getAllByRole("button", { name: "Close" })
+      .find((button) => button.textContent === "Close");
+    expect(footerClose).toHaveAttribute("data-settings-dialog-action", "Close");
+  });
+});
+
+describe("HarnessFixDialog's credential step as a Settings overlay", () => {
+  it("names the credential form's controls through the control that opened the dialog", async () => {
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={client}>
+        <SettingsOverlayOwner
+          entry={HARNESS_DETAIL_ENTRIES.entry("codex-native")}
+          opener="fixAction"
+        >
+          <HarnessFixDialog {...baseProps} mode="reconfigure" />
+        </SettingsOverlayOwner>
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Use an API key or gateway URL instead" }),
+    );
+
+    expect(screen.getByLabelText("API key")).toHaveAttribute(
+      "data-settings-control",
+      "harness-codex-native-detail:apiKey",
+    );
   });
 });

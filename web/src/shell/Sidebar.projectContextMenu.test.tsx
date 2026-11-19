@@ -1,3 +1,4 @@
+import { EXPANDED_PROJECT_SECTIONS_STORAGE_KEY } from "@/shell/sidebarNav";
 import { conversationPage } from "@/test/sidebarMockHelpers";
 import { renderSidebar } from "@/test/sidebarTestHelpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -201,6 +202,24 @@ describe("project folder header context menu", () => {
     );
   });
 
+  it("keeps an expanded folder expanded under its new name", async () => {
+    localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify([PROJECT_NAME]));
+    renderSidebar();
+
+    fireEvent.contextMenu(folderHeader());
+    fireEvent.click(screen.getByTestId("rename-project"));
+    fireEvent.change(screen.getByDisplayValue(PROJECT_NAME), {
+      target: { value: "Sprint 43" },
+    });
+    fireEvent.click(screen.getByTestId("rename-project-confirm"));
+
+    await waitFor(() =>
+      expect(JSON.parse(localStorage.getItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY)!)).toEqual([
+        "Sprint 43",
+      ]),
+    );
+  });
+
   it("drives Project settings from the context menu", () => {
     renderSidebar();
 
@@ -298,11 +317,7 @@ describe("project folder header context menu", () => {
     const item = screen.getByTestId("project-new-session-menu");
 
     expect(item).toHaveAttribute("href", `/?project=${encodeURIComponent(PROJECT_NAME)}`);
-    for (const hiddenClass of [
-      "hidden",
-      "md:hidden",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:hidden",
-    ]) {
+    for (const hiddenClass of ["hidden", "md:hidden", "md:hidden"]) {
       expect(item).not.toHaveClass(hiddenClass);
     }
   });

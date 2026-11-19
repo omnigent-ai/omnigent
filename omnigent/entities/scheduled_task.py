@@ -44,7 +44,7 @@ class ScheduledTask:
 
     A task's trigger is a required recurring ``rrule``.
 
-    :param id: UUID primary key (bare 32-char hex string, no dashes).
+    :param id: Primary key from the store's allocator; by default a bare 32-char hex UUID.
     :param workspace_id: Tenant partition key that owns this row.
     :param name: Human-readable task name, e.g. ``"nightly triage"``.
     :param prompt: The instruction dispatched to the agent on each firing.
@@ -64,6 +64,10 @@ class ScheduledTask:
     :param permission_mode: Harness-specific permission or execution mode.
         The fire path translates it into that harness's launch options.
         ``None`` means use the agent's configured default.
+    :param mcp_services: MCP services every fired session starts with, as the
+        deployment's service names, e.g. ``("github", "linear")``. The server's
+        session MCP selection turns them into session labels at fire time.
+        Empty means fired sessions get no MCP selection.
     :param max_cost_usd: Optional per-firing cost budget in USD. When set, the
         fire path attaches a ``cost_budget`` policy to each spawned session that
         blocks all models once cumulative spend reaches this limit. ``None``
@@ -94,6 +98,9 @@ class ScheduledTask:
         firing, or ``None``.
     :param updated_at: Unix epoch seconds of the last write, or ``None`` if the
         row has never been updated.
+    :param kind: ``"automation"``, or ``"reminder"`` for a one-time message an
+        agent set for its own session. Clients list reminders apart from
+        automations; scheduling and firing ignore it.
     """
 
     id: str
@@ -108,8 +115,10 @@ class ScheduledTask:
     model_override: str | None = None
     reasoning_effort: str | None = None
     permission_mode: str | None = None
+    mcp_services: tuple[str, ...] = ()
     max_cost_usd: float | None = None
     session_mode: str = "new"
+    kind: str = "automation"
     session_id: str | None = None
     source_session_id: str | None = None
     workspace: str | None = None
@@ -138,8 +147,8 @@ class ScheduledTaskRun:
     table.
 
     :param id: UUID primary key (bare 32-char hex string, no dashes).
-    :param scheduled_task_id: The task this run belongs to (a bare 32-char hex
-        UUID string).
+    :param scheduled_task_id: The ID of the task this run belongs to; by default a
+        bare 32-char hex UUID.
     :param status: Lifecycle state — one of ``"scheduled"``, ``"starting"``, ``"running"``,
         ``"succeeded"``, ``"failed"``, ``"skipped"``.
     :param scheduled_at: Unix epoch seconds. Persistent dispatch records the

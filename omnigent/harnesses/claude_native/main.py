@@ -1054,8 +1054,12 @@ def _claude_model_probe_launch(
     if not claude_code_managed_mcp_present():
         args.extend(["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}'])
     args.extend(["--no-session-persistence", *extra_args])
+    # The user's SessionStart hooks would otherwise run for this headless call
+    # and push it past the probe timeout.
+    probe_settings: dict[str, object] = {"disableAllHooks": True}
     if claude_config is not None and claude_config.api_key_helper:
-        args.extend(("--settings", json.dumps({"apiKeyHelper": claude_config.api_key_helper})))
+        probe_settings["apiKeyHelper"] = claude_config.api_key_helper
+    args.extend(("--settings", json.dumps(probe_settings)))
     cfg = load_effective_config()
     command = resolve_harness_command("claude-native", default="claude", cfg=cfg)
     launch_args = resolve_harness_args("claude-native", tuple(args), cfg=cfg)
@@ -2806,6 +2810,28 @@ def _carries_any_payload(text: str, payloads: list[str]) -> bool:
     return any(item in compact or item.rstrip("=") in compact for item in payloads)
 
 
+def _blank_read_file_payload(value: object, payloads: list[str]) -> object:
+    """
+    Blank a duplicated payload in Claude Code's own Read metadata.
+
+    Image and PDF Read results store ``{"type": ..., "file": {"base64": ...}}``;
+    current Claude Code writes ``base64`` empty, the shape its renderer expects.
+
+    :param value: A record's ``toolUseResult`` object.
+    :param payloads: Base64 payloads present in the structured content.
+    :returns: *value* with ``file.base64`` emptied, or *value* unchanged.
+    """
+    if not isinstance(value, dict):
+        return value
+    file_meta = value.get("file")
+    if not isinstance(file_meta, dict):
+        return value
+    data = file_meta.get("base64")
+    if not isinstance(data, str) or not _carries_any_payload(data, payloads):
+        return value
+    return {**value, "file": {**file_meta, "base64": ""}}
+
+
 def _repair_cloned_tool_use_result(
     payload: _JsonObject,
     blocks: list[_JsonObject],
@@ -2818,7 +2844,8 @@ def _repair_cloned_tool_use_result(
     structured content. Matching is spelling-insensitive: the content blocks hold
     canonical base64 while the metadata may hold the producer's wrapped or
     unpadded original, so an exact substring test would miss the duplicate it is
-    meant to find. A redacted passthrough is preferred; when the payload survives
+    meant to find. A redacted passthrough is preferred, keeping Claude Code's Read
+    metadata shape via :func:`_blank_read_file_payload`; when the payload survives
     that (a JSON string literal wrapping mixed text-plus-image, which structured
     redaction cannot reach), the canonical redacted block list replaces it.
 
@@ -2839,7 +2866,7 @@ def _repair_cloned_tool_use_result(
     if isinstance(tool_use_result, str):
         candidate: object = _json_safe_tool_use_result(tool_use_result)
     else:
-        candidate = _redact_binary_blocks(tool_use_result)
+        candidate = _redact_binary_blocks(_blank_read_file_payload(tool_use_result, payloads))
     candidate_text = candidate if isinstance(candidate, str) else json.dumps(candidate)
     if _carries_any_payload(candidate_text, payloads):
         candidate = json.dumps(_redact_binary_blocks(blocks), separators=(",", ":"))
@@ -5157,7 +5184,7 @@ def _run_with_remote_server(
     # long-lived transcript-forwarder client survives the ~1h Databricks
     # OAuth token TTL.
     startup_profiler.mark("remote auth resolving")
-    forwarder_auth = _server_auth(server_url=base_url, session_id=None)
+    forwarder_auth = _server_auth(server_url=base_url)
     startup_profiler.mark("remote auth resolved")
     prepared: PreparedClaudeTerminal | None = None
     # Bound before the attach call so the ``finally`` can read it even
@@ -7227,6 +7254,7 @@ def _websocket_connect(
 
     from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
     from omnigent.session_host import session_routing_headers
+    from omnigent.telemetry.request_headers import pop_client_user_agent
     from omnigent.util.tls import client_ssl_context
 
     # Identify as a first-party client so the server's WebSocket origin
@@ -7238,6 +7266,8 @@ def _websocket_connect(
         **session_routing_headers(attach_url),
         "Origin": OMNIGENT_INTERNAL_WS_ORIGIN,
     }
+    # websockets adds its own User-Agent on top of the handshake headers; send only ours.
+    user_agent = pop_client_user_agent(handshake_headers)
     # A remote (https) workspace yields a wss:// attach URL; build a verifying
     # SSL context from a real CA bundle so verification works on interpreters
     # whose OpenSSL default cert path is empty. ws:// passes ssl=None (the
@@ -7251,6 +7281,7 @@ def _websocket_connect(
                 additional_headers=handshake_headers,
                 close_timeout=_CLAUDE_ATTACH_WS_CLOSE_TIMEOUT_S,
                 ssl=ssl_ctx,
+                user_agent_header=user_agent,
             ),
         )
     except TypeError:
@@ -7261,6 +7292,7 @@ def _websocket_connect(
                 extra_headers=handshake_headers,
                 close_timeout=_CLAUDE_ATTACH_WS_CLOSE_TIMEOUT_S,
                 ssl=ssl_ctx,
+                user_agent_header=user_agent,
             ),
         )
 

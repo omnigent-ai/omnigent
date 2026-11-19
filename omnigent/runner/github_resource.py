@@ -82,6 +82,7 @@ from omnigent.runner.git_providers import (
     PR_LABELS_OBJECT,
     PR_MERGE_OBJECT,
     PR_REVIEWERS_OBJECT,
+    PullRequestStatus,
     ReviewerRef,
     local_git,
 )
@@ -1208,6 +1209,33 @@ def _pr_title_before(
     with _gh_deadline_scope(deadline):
         data = _pr_json(root, reference, "title")
         return _pr_title(data), data is None and _gh_timed_out.get()
+
+
+# What a title refresh reads: the state and draft flag come with the title in one call.
+_PR_STATUS_FIELDS = "title,state,isDraft"
+
+
+def _pr_status_before(
+    root: str, reference: PullRequestRef, deadline: float
+) -> tuple[PullRequestStatus | None, bool]:
+    """Look up one PR's title, state and draft flag in the ``gh`` call a title lookup makes.
+
+    :param deadline: A ``time.monotonic()`` value.
+    :returns: ``(status, timed_out)``, as :func:`_pr_title_before` returns.
+    """
+    with _gh_deadline_scope(deadline):
+        data = _pr_json(root, reference, _PR_STATUS_FIELDS)
+        if data is None:
+            return None, _gh_timed_out.get()
+    state = data.get("state")
+    return (
+        PullRequestStatus(
+            title=_pr_title(data),
+            state=state if state in ("OPEN", "MERGED", "CLOSED") else None,
+            is_draft=data.get("isDraft") is True,
+        ),
+        False,
+    )
 
 
 def _verify_pr_access(root: str, reference: PullRequestRef) -> None:

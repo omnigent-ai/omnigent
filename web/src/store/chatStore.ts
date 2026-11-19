@@ -82,6 +82,8 @@ import {
   OLDER_HISTORY_PAGE_ITEMS,
   openSessionStream,
   postEvent,
+  rewindSession,
+  type RewindAttachment,
   SIGN_IN_EXPIRED_CODE,
   type SessionItemsPage,
   updateSession,
@@ -100,6 +102,7 @@ import { describeSendFailure } from "@/lib/sendFailure";
 import { isRetryableRequestError, queryRetryDelay } from "@/lib/queryRetry";
 import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
 import { createInitialConversationState, isConversationStateKey } from "./conversationState";
+import { fetchConversationSnapshot } from "./conversationSnapshot";
 import { getStreamSlotManager, type StreamSlot } from "./streamSlots";
 import {
   SSE_STALL_TIMEOUT_MS,
@@ -110,6 +113,12 @@ import {
 } from "@/lib/sse";
 import { clearSseLog, pushSseEvent } from "@/lib/sseEventLog";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
+import { applyJournalEntry } from "@/hooks/useSessionJournal";
+import { isFirstPlan } from "@/lib/sessionJournal";
+import { showTasksTabBesideChat } from "@/store/sessionTasksActions";
+import { notePlanStopReceipt, supersedePlanStop } from "@/store/planStops";
+import { noteSessionStreamClosed, noteSessionStreamOpen } from "@/lib/sessionStreamSignals";
+import { invalidateAgentCosts } from "@/hooks/useAgentCosts";
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
 import {
@@ -122,7 +131,13 @@ import {
   type ConversationsInfiniteData,
 } from "@/lib/sessionListCache";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
-import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+import {
+  getSessionDraft,
+  sessionDraftRevision,
+  sessionDraftWasWritten,
+  setSessionDraft,
+  type SessionDraft,
+} from "@/lib/sessionDrafts";
 import {
   forgetUnsentSend,
   peekQueuedSends,
@@ -158,8 +173,9 @@ import type {
   Session,
   SessionStatus,
 } from "@/lib/types";
-import { uploadFile } from "@/lib/filesApi";
+import { downloadSessionFile, uploadFile } from "@/lib/filesApi";
 import { attachmentKey } from "@/lib/attachments";
+import { sendVerdictFromServer, snapshotRefusesSend } from "@/lib/userInputDelivery";
 import type { ActiveResponse } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { fetchHarnessCatalog, type HarnessCatalog } from "@/lib/agentLabels";
@@ -622,6 +638,8 @@ export interface PendingUserMessage {
   posted?: boolean;
   /** The send's POST has gone unanswered for {@link SEND_STILL_SENDING_AFTER_MS}. */
   stillSending?: boolean;
+  /** Replayed from the snapshot's `pending_inputs`: the session accepted it, though this page didn't post it. */
+  replayed?: boolean;
   /**
    * The server's pending-input id from the accepted POST. The bubble keeps
    * `tempId` as its React key, so this is its only link to the entry a
@@ -1056,6 +1074,8 @@ export interface ConversationState {
    * tokens, total cost) is derived from this map on the frontend.
    */
   sessionUsageByModel: Record<string, ModelUsage> | null;
+  /** True while this conversation's first separate usage read is in flight. */
+  sessionUsageLoading: boolean;
   /**
    * Worktree branch checked out for the active session, surfaced in the
    * composer status line. Seeded from the session snapshot on bind
@@ -1184,6 +1204,11 @@ export interface SideChatComposerDraft {
  *  fresh object per render would re-render every subscriber). */
 export const EMPTY_SIDE_CHAT_COMPOSER: SideChatComposerDraft = { text: "", files: [] };
 
+/** The composer entry a grid cell edits; a sub-agent tab of the same session has its own. */
+export function gridCellComposerKey(sessionId: string): string {
+  return `grid:${sessionId}`;
+}
+
 export interface AppChatState {
   /** The conversation currently on screen. `null` on `/`. */
   conversationId: string | null;
@@ -1197,6 +1222,12 @@ export interface AppChatState {
    * the old conversation renders the persisted notice instead.
    */
   redirectToConversationId: string | null;
+  /**
+   * The prompt `/rewind` returned for its new session's composer. The
+   * composer can open before the rewind responds (the stream redirect may win),
+   * so an open, untouched composer for that session takes it, then clears it.
+   */
+  rewindPrefill: (SessionDraft & { conversationId: string }) | null;
   /**
    * Side-chat child to open as a soft tab in the Workspace rail, or null.
    * `AppShell` observes it, opens/selects that child's side-chat tab on the
@@ -1383,9 +1414,10 @@ export interface ChatActions {
     conversationId?: string,
   ) => Promise<void>;
   /**
-   * Set the active session's effort. ``null`` clears the override.
+   * Set the effort of *sessionId*, or of the active session when omitted.
+   * ``null`` clears the override.
    */
-  setEffort: (effort: string | null) => Promise<void>;
+  setEffort: (effort: string | null, sessionId?: string) => Promise<void>;
   /**
    * Set the active session's model. For claude-native, the server also injects
    * ``/model`` into the tmux pane so the in-binary picker tracks the change.
@@ -1393,15 +1425,20 @@ export interface ChatActions {
    * ``expectConfirmation`` marks the pick pending until the harness's own
    * report (or a not-applied error) settles it — pass it for sessions
    * whose chip renders the reported model (claude-/codex-native).
+   * ``sessionId`` targets that session instead of the active one.
    */
-  setModel: (model: string | null, opts?: { expectConfirmation?: boolean }) => Promise<void>;
+  setModel: (
+    model: string | null,
+    opts?: { expectConfirmation?: boolean; sessionId?: string },
+  ) => Promise<void>;
   /**
    * Set the active session's cost-control switch — optimistic local
    * flip, then PATCH; the server's canonical value (or a rollback on
    * failure) settles the state. ``null`` clears back to the spec
-   * default. No-ops when there is no active conversation.
+   * default. Targets *sessionId* when given; otherwise no-ops when there is
+   * no active conversation.
    */
-  setCostControlMode: (mode: "on" | "off" | null) => Promise<void>;
+  setCostControlMode: (mode: "on" | "off" | null, sessionId?: string) => Promise<void>;
   /**
    * Set the active session's sub-agent routing switch — optimistic local
    * write, then PATCH; the server's canonical value (or a rollback on
@@ -1431,16 +1468,16 @@ export interface ChatActions {
    * Switch a running claude-native session's permission mode (e.g. to
    * ``"auto"``). Rejects when the live TUI could not reach the mode, so
    * callers surface the error rather than assuming the switch landed.
-   * No-ops when there is no active conversation.
+   * Targets *sessionId* when given, else the active conversation (no-op without one).
    */
-  setClaudePermissionMode: (mode: string) => Promise<void>;
+  setClaudePermissionMode: (mode: string, sessionId?: string) => Promise<void>;
   /**
    * Switch a running codex-native session's approval/sandbox mode (e.g. to
    * ``"full-access"``). Rejects when the live Codex thread could not accept the
    * update, so callers surface the error rather than assuming it landed.
-   * No-ops when there is no active conversation.
+   * Targets *sessionId* when given, else the active conversation (no-op without one).
    */
-  setCodexApprovalMode: (mode: string) => Promise<void>;
+  setCodexApprovalMode: (mode: string, sessionId?: string) => Promise<void>;
   /**
    * Fetch the next page of older messages and prepend them to `blocks`.
    *
@@ -1455,8 +1492,8 @@ export interface ChatActions {
   /** Drain the queued composer attachments (called by the composer). */
   clearPendingComposerAttachments: () => void;
   /** Stamp {@link ChatState.runnerLaunchedAt} now — call right after a
-   *  successful `launchRunner` for the open session. */
-  markRunnerLaunched: () => void;
+   *  successful `launchRunner`, for `sessionId` or the open session when omitted. */
+  markRunnerLaunched: (sessionId?: string) => void;
   /**
    * Compact the active session's context. Posts a ``compact`` event to the
    * server, which summarises the conversation history in-place. No-ops when
@@ -1465,6 +1502,12 @@ export interface ChatActions {
   compact: () => Promise<void>;
   /** Run the harness's /clear; the view follows the session that continues the work. */
   clearContext: () => Promise<void>;
+  /**
+   * Rewind the active session to just before the prompt `itemId`: the server
+   * forks the earlier history onto the same machine, and this opens the fork
+   * with the prompt back in its composer.
+   */
+  rewindToPrompt: (itemId: string) => Promise<void>;
   /**
    * Refetch runner-backed session state for the active conversation.
    *
@@ -1516,6 +1559,10 @@ conversationRegistry.subscribeDisposed((id) => {
 
 // Reconnects share a binding; only one usage request may hydrate it at a time.
 const sessionUsageHydrations = new WeakSet<AbortController>();
+// An entry's latest first usage read: only it clears `sessionUsageLoading`. Once a read
+// settles, later background reads keep the known answer on screen.
+const firstSessionUsageHydration = new WeakMap<ConversationEntry, AbortController>();
+const settledSessionUsage = new WeakSet<ConversationEntry>();
 const sessionUsageRevisions = new WeakMap<ConversationEntry, { cost: number; models: number }>();
 
 // Snapshot reconciliation must teach the already-running stream pump which
@@ -1939,6 +1986,49 @@ async function uploadFileBlock(sessionId: string, file: File): Promise<ContentBl
   return block;
 }
 
+/** Build a file from a base64 `data:` URI, e.g. an image or document a prompt carried inline. */
+function fileFromDataUri(dataUri: string, filename: string): File {
+  const match = dataUri.match(/^data:([^;,]+)(?:;[^;,]+=[^;,]*)*;base64,(.*)$/s);
+  if (!match) throw new Error("Not a base64 data URI");
+  const binary = atob(match[2]!);
+  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0));
+  return new File([bytes], filename, { type: match[1] });
+}
+
+/** Downloads rewind attachments, reuses copied file IDs, and warns about failed downloads. */
+async function rewindAttachmentFiles(
+  sessionId: string,
+  attachments: readonly RewindAttachment[],
+): Promise<File[]> {
+  const downloads = await Promise.all(
+    attachments.map(async (attachment) => {
+      try {
+        // An inline attachment has no stored copy; it uploads on send like a new one.
+        const inline = attachment.imageUrl ?? attachment.fileData;
+        if (inline) return fileFromDataUri(inline, attachment.filename);
+        if (!attachment.fileId) return null;
+        const file = await downloadSessionFile(sessionId, attachment.fileId, attachment.filename);
+        const block: ContentBlock = {
+          type: attachment.type,
+          file_id: attachment.fileId,
+          filename: attachment.filename,
+        };
+        uploadedFileBlockCache.set(file, new Map([[sessionId, block]]));
+        return file;
+      } catch (err) {
+        console.warn("Couldn't restore a rewound prompt's attachment", err);
+        return null;
+      }
+    }),
+  );
+  const missing = attachments.filter((_attachment, index) => downloads[index] === null);
+  if (missing.length > 0) {
+    const names = missing.map((attachment) => attachment.filename).join(", ");
+    toast.warning(`Couldn't restore ${names} to the composer. Attach again to send.`);
+  }
+  return downloads.filter((file): file is File => file !== null);
+}
+
 async function uploadFileBlocks(
   sessionId: string,
   files: readonly File[],
@@ -2203,6 +2293,7 @@ function cachedEffortFamilyForSession(
 export const useChatStore = create<ChatState>((_rootSet, get) => ({
   conversationId: null,
   redirectToConversationId: null,
+  rewindPrefill: null,
   blocks: [],
   pendingUserMessages: [],
   settledShellInputs: [],
@@ -2256,6 +2347,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   tokensUsed: null,
   sessionCostUsd: null,
   sessionUsageByModel: null,
+  sessionUsageLoading: false,
   gitBranch: null,
   todos: [],
   codexModelOptions: [],
@@ -2867,6 +2959,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // target afterward would leak the message into the now-active session.
     // An explicit pin (navigate-first background POST) wins over the visible id.
     const submitConversationId = pinnedId ?? get().conversationId;
+    // The run's Stop in progress, which this message ends once the session takes it.
+    const endPlanStop = supersedePlanStop(submitConversationId);
     // Only the composer on screen takes back a send cut off by a reload (see
     // `unsentSendToRestore`); a side chat posts to its child beside the parent.
     const sentOnScreen = pinnedId === null || pinnedId === get().conversationId;
@@ -2998,6 +3092,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           return patch;
         });
       } else {
+        endPlanStop();
         // POST accepted: the server can now account for this message
         // (native: pending_inputs replay until the round-trip commits it;
         // non-native: already persisted). Mark the bubble settled — that is
@@ -3239,6 +3334,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // Pin the destination at submit time — see `send` above for why a late
     // resolve mis-routes to the session the user has since switched to.
     const submitConversationId = pinnedId ?? get().conversationId;
+    const endPlanStop = supersedePlanStop(submitConversationId);
 
     const { waitForPrior, rekey, releaseSend } = enterSendChain(submitConversationId);
 
@@ -3286,6 +3382,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           return patch;
         });
       } else {
+        endPlanStop();
         // POST accepted: the server persisted the visible receipt, so
         // navigation can rely on the snapshot — mark the echo settled
         // and drop any stash copy. Without this, an echo stashed by a
@@ -3611,7 +3708,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         blocks: s.blocks.map((b) =>
           b.type === "elicitation" &&
           b.elicitationId === elicitationId &&
-          (!b.nativeDelivery || (b.status === "pending" && b.response === responseValue))
+          b.response === responseValue
             ? {
                 ...b,
                 status: "pending",
@@ -3662,7 +3759,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
-  markRunnerLaunched: () => setActive({ runnerLaunchedAt: Date.now() }),
+  markRunnerLaunched: (sessionId) =>
+    (sessionId === undefined ? setActive : setterFor(sessionId))({ runnerLaunchedAt: Date.now() }),
 
   compact: async () => {
     const { conversationId } = get();
@@ -3684,6 +3782,34 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     );
   },
 
+  rewindToPrompt: async (itemId) => {
+    const { conversationId } = get();
+    if (!conversationId) return;
+    const rewound = await rewindSession(conversationId, itemId);
+    if (rewound.attachmentsIncomplete) {
+      toast.warning("Some attachments couldn't be restored. Attach them again before sending.");
+    }
+    const target = rewound.sessionId;
+    // A draft the user has edited, cleared or sent in the new session since
+    // it opened, here or offscreen, wins over the prompt.
+    const untouched = !sessionDraftWasWritten(target);
+    const text: SessionDraft = { text: rewound.prompt, files: [] };
+    if (untouched) setSessionDraft(target, text);
+    useChatStore.setState((s) => ({
+      ...(untouched ? { rewindPrefill: { ...text, conversationId: target } } : {}),
+      ...(s.conversationId === conversationId ? { redirectToConversationId: target } : {}),
+    }));
+    if (!untouched || rewound.attachments.length === 0) return;
+    // The text is in; the attachments follow once they download, unless the
+    // draft has changed since.
+    const revision = sessionDraftRevision(target);
+    const files = await rewindAttachmentFiles(target, rewound.attachments);
+    if (files.length === 0 || sessionDraftRevision(target) !== revision) return;
+    const draft: SessionDraft = { ...text, files };
+    setSessionDraft(target, draft);
+    useChatStore.setState({ rewindPrefill: { ...draft, conversationId: target } });
+  },
+
   refreshSessionState: async (conversationId) => {
     const id = conversationId ?? get().conversationId;
     if (!id) return;
@@ -3693,9 +3819,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     });
   },
 
-  setEffort: async (effort) => {
-    const { conversationId, sessionReasoningEffort: previous } = get();
-    setActive({ sessionReasoningEffort: effort });
+  setEffort: async (effort, sessionId) => {
+    const target = sessionId === undefined ? get() : setterForState(sessionId);
+    if (target === null) return;
+    const conversationId = sessionId ?? target.conversationId;
+    const previous = target.sessionReasoningEffort;
+    (sessionId === undefined ? setActive : setterFor(sessionId))({
+      sessionReasoningEffort: effort,
+    });
     if (conversationId) {
       if (queryClient === null) {
         throw new Error("chatStore.setEffort: queryClient not initialized");
@@ -3732,8 +3863,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   },
 
   setModel: async (model, opts) => {
-    const { conversationId, sessionModelOverride: previous } = get();
-    setActive({ sessionModelOverride: model });
+    const sessionId = opts?.sessionId;
+    const target = sessionId === undefined ? get() : setterForState(sessionId);
+    if (target === null) return;
+    const conversationId = sessionId ?? target.conversationId;
+    const previous = target.sessionModelOverride;
+    (sessionId === undefined ? setActive : setterFor(sessionId))({ sessionModelOverride: model });
     if (conversationId) {
       const expectConfirmation = opts?.expectConfirmation === true && model !== null;
       if (expectConfirmation) {
@@ -3782,10 +3917,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
-  setCostControlMode: async (mode) => {
-    const { conversationId } = get();
-    if (!conversationId) return;
-    const previous = get().costControlModeOverride;
+  setCostControlMode: async (mode, sessionId) => {
+    const target = sessionId === undefined ? get() : setterForState(sessionId);
+    const conversationId = sessionId ?? target?.conversationId;
+    if (!target || !conversationId) return;
+    const previous = target.costControlModeOverride;
     // Routing and a pinned model are mutually exclusive: the server's routing
     // guard skips whenever model_override is set, so turning routing ON must
     // also clear this session's pinned model (in the SAME PATCH) — otherwise
@@ -3793,7 +3929,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // would never run. Mirrors the new-chat dialog's mutual exclusion. Only
     // clear when a model is actually pinned, so toggling routing on a
     // model-less (e.g. SDK) session doesn't emit a spurious model-cleared change.
-    const previousModel = get().sessionModelOverride;
+    const previousModel = target.sessionModelOverride;
     const clearModel = mode === "on" && previousModel != null;
     // Pin the target: these are this conversation's switches, and the PATCH can
     // outlive a switch away. Resolving the target afterwards would leave a
@@ -3886,10 +4022,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
-  setClaudePermissionMode: async (mode) => {
-    const { conversationId } = get();
+  setClaudePermissionMode: async (mode, sessionId) => {
+    const conversationId = sessionId ?? get().conversationId;
     if (!conversationId) return;
-    const previous = get().claudePermissionMode;
+    const previous = (sessionId ? setterForState(sessionId) : get())?.claudePermissionMode ?? "";
     // Pinned for the same reason as `setCostControlMode` — see there.
     const patchSet = setterFor(conversationId);
     // Optimistic, then reconciled against the mode the server confirms the
@@ -3904,10 +4040,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
-  setCodexApprovalMode: async (mode) => {
-    const { conversationId } = get();
+  setCodexApprovalMode: async (mode, sessionId) => {
+    const conversationId = sessionId ?? get().conversationId;
     if (!conversationId) return;
-    const previous = get().codexApprovalMode;
+    const previous = (sessionId ? setterForState(sessionId) : get())?.codexApprovalMode ?? "";
     // Pinned for the same reason as `setCostControlMode` — see there.
     const patchSet = setterFor(conversationId);
     // Optimistic, then reconciled against the mode the server confirms the
@@ -4570,6 +4706,17 @@ function scheduleEntryFlush(id: string): void {
   });
 }
 conversationRegistry.subscribe(scheduleEntryFlush);
+// A moved total (live event, usage read or reconnect) means some agent's cost moved.
+useChatStore.subscribe((state, previous) => {
+  if (
+    queryClient === null ||
+    state.conversationId !== previous.conversationId ||
+    state.sessionCostUsd === previous.sessionCostUsd
+  ) {
+    return;
+  }
+  invalidateAgentCosts(queryClient);
+});
 // Queue edits (release, delete, reorder, a failed send's return) land on the root, not the entry.
 useChatStore.subscribe((state, previous) => {
   if (state.queuedMessages === previous.queuedMessages) return;
@@ -5269,54 +5416,10 @@ async function bindStream(
     // One larger page, so opening a session is a single round trip that then
     // stays still — rather than a small page followed by background growth
     // the reader sees as the transcript shifting seconds after it settled.
-    const client = queryClient;
-    // Each request retries on its own, so a failed one doesn't repeat the other.
-    // Set once a session read times out, and kept set through later failures: the shared
-    // read it may have joined is still the one that never answers.
-    let sessionReadTimedOut = false;
-    const [session, page] = await Promise.all([
-      withSnapshotRetries(id, (attempt) =>
-        withReadTimeout((signal) => {
-          const queryKey = ["session", id];
-          const joinsSharedRead = client.isFetching({ queryKey, exact: true }) > 0;
-          // A retry after a timeout reads directly rather than rejoin a shared read that
-          // may never answer, and its result seeds the shared cache.
-          if (sessionReadTimedOut && joinsSharedRead) {
-            return getSessionSlim(id, { refreshState: true, signal }).then((fresh) => {
-              client.setQueryData(queryKey, fresh);
-              return fresh;
-            });
-          }
-          // An attempt that starts the request drops it on timeout, so the retry reads
-          // afresh. One that joins another caller's read leaves that read to its caller.
-          if (!joinsSharedRead) {
-            signal.addEventListener(
-              "abort",
-              () => void client.cancelQueries({ queryKey, exact: true }),
-              { once: true },
-            );
-          }
-          return client.fetchQuery({
-            queryKey,
-            queryFn: ({ signal: querySignal }) =>
-              getSessionSlim(id, { refreshState: true, signal: querySignal }),
-            staleTime: 0,
-            retry: false,
-          });
-        }, snapshotLoadDeadlineMs(attempt)).catch((error: unknown) => {
-          if (error instanceof DOMException && error.name === "TimeoutError") {
-            sessionReadTimedOut = true;
-          }
-          throw error;
-        }),
-      ),
-      withSnapshotRetries(id, (attempt) =>
-        withReadTimeout(
-          (signal) => fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS, signal }),
-          snapshotLoadDeadlineMs(attempt),
-        ),
-      ),
-    ]);
+    const { session, page } = await fetchConversationSnapshot(queryClient, id, {
+      withRetries: (read) => withSnapshotRetries(id, read),
+      withDeadline: (read, attempt) => withReadTimeout(read, snapshotLoadDeadlineMs(attempt)),
+    });
     if (isConversationDisposed(id)) return;
     const items = page.items;
     const snapshotNativeMessageIds = nativeCompletedMessageIds(items);
@@ -5406,6 +5509,7 @@ async function bindStream(
       const toPending = (p: PendingInput): PendingUserMessage => ({
         tempId: p.pendingId,
         content: p.content,
+        replayed: true,
         ...(p.createdBy !== undefined ? { author: p.createdBy } : {}),
       });
       let candidatePending: PendingUserMessage[];
@@ -5519,11 +5623,15 @@ async function bindStream(
         sessionCostUsd:
           state.sessionCostUsd !== stateBeforeFetch.sessionCostUsd
             ? state.sessionCostUsd
-            : (session.totalCostUsd ?? state.sessionCostUsd),
+            : session.costHidden
+              ? null
+              : (session.totalCostUsd ?? state.sessionCostUsd),
         sessionUsageByModel:
           state.sessionUsageByModel !== stateBeforeFetch.sessionUsageByModel
             ? state.sessionUsageByModel
-            : (session.usageByModel ?? state.sessionUsageByModel),
+            : session.costHidden
+              ? withoutModelCosts(session.usageByModel ?? state.sessionUsageByModel)
+              : (session.usageByModel ?? state.sessionUsageByModel),
         todos: (session.todos ?? []) as {
           content: string;
           status: "pending" | "in_progress" | "completed";
@@ -5531,6 +5639,7 @@ async function bindStream(
         }[],
       };
     });
+    if (session.costHidden && queryClient !== null) invalidateAgentCosts(queryClient, true);
     if (session.usageIncluded === false) void hydrateSessionUsage(id);
     racedNativeModelOptions.delete(id);
   } catch (err) {
@@ -5540,6 +5649,16 @@ async function bindStream(
       conversationLoadError: err instanceof Error ? err : new Error(String(err)),
     });
   }
+}
+
+/** Drop per-model USD while keeping token counts, once the server hides cost. */
+function withoutModelCosts(
+  usageByModel: Record<string, ModelUsage> | null,
+): Record<string, ModelUsage> | null {
+  if (usageByModel === null) return null;
+  return Object.fromEntries(
+    Object.entries(usageByModel).map(([model, usage]) => [model, { ...usage, totalCostUsd: null }]),
+  );
 }
 
 /** Hydrate display-only subtree totals without delaying session reconciliation. */
@@ -5558,6 +5677,10 @@ async function hydrateSessionUsage(id: string): Promise<void> {
     return;
   }
   sessionUsageHydrations.add(controller);
+  if (!settledSessionUsage.has(entry)) {
+    firstSessionUsageHydration.set(entry, controller);
+    entrySetter(entry)({ sessionUsageLoading: true });
+  }
   const revisionsBeforeFetch = sessionUsageRevisions.get(entry) ?? { cost: 0, models: 0 };
   try {
     const usage = await getSessionUsage(id, { signal: controller.signal });
@@ -5569,22 +5692,34 @@ async function hydrateSessionUsage(id: string): Promise<void> {
     ) {
       return;
     }
+    if (usage.costHidden && queryClient !== null) invalidateAgentCosts(queryClient, true);
     const revisions = sessionUsageRevisions.get(entry) ?? { cost: 0, models: 0 };
     // A live cost/model update during the read wins independently for each field.
     entrySetter(entry)((state) => ({
       ...(revisions.cost === revisionsBeforeFetch.cost &&
       state.sessionCostUsd === before.sessionCostUsd
-        ? { sessionCostUsd: usage.totalCostUsd ?? state.sessionCostUsd }
+        ? {
+            sessionCostUsd: usage.costHidden ? null : (usage.totalCostUsd ?? state.sessionCostUsd),
+          }
         : {}),
       ...(revisions.models === revisionsBeforeFetch.models &&
       state.sessionUsageByModel === before.sessionUsageByModel
-        ? { sessionUsageByModel: usage.usageByModel ?? state.sessionUsageByModel }
+        ? {
+            sessionUsageByModel: usage.costHidden
+              ? withoutModelCosts(usage.usageByModel ?? state.sessionUsageByModel)
+              : (usage.usageByModel ?? state.sessionUsageByModel),
+          }
         : {}),
     }));
   } catch {
     // Usage is optional display data; retain known totals or leave them unknown.
   } finally {
     sessionUsageHydrations.delete(controller);
+    if (firstSessionUsageHydration.get(entry) === controller) {
+      firstSessionUsageHydration.delete(entry);
+      if (!controller.signal.aborted) settledSessionUsage.add(entry);
+      entrySetter(entry)({ sessionUsageLoading: false });
+    }
   }
 }
 
@@ -5767,8 +5902,14 @@ function reconnectStatusPatch(
   patch.backgroundAgents = snapshotBackgroundAgents(session);
   if (session.contextWindow != null) patch.contextWindow = session.contextWindow;
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
-  if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
-  if (session.usageByModel != null) patch.sessionUsageByModel = session.usageByModel;
+  if (session.costHidden) {
+    if (queryClient !== null) invalidateAgentCosts(queryClient, true);
+    patch.sessionCostUsd = null;
+    patch.sessionUsageByModel = withoutModelCosts(session.usageByModel ?? s.sessionUsageByModel);
+  } else {
+    if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
+    if (session.usageByModel != null) patch.sessionUsageByModel = session.usageByModel;
+  }
   if (!settleTurn) return patch;
   patch.sessionStatus = session.status;
   // `waiting` is a TURN-END snapshot (the turn finished; only background work
@@ -6090,6 +6231,17 @@ function reconcileElicitationBlocks(
       return { ...currentDelivery, ctx: b.ctx };
     }
     if (
+      currentDelivery !== undefined &&
+      !b.nativeDelivery &&
+      preGapCards.get(b.elicitationId) === b &&
+      currentDelivery.codexCommand?.requestFingerprint &&
+      currentDelivery.codexCommand.requestFingerprint !== b.codexCommand?.requestFingerprint
+    ) {
+      // A reused id now carries a different Codex command request.
+      changed = true;
+      return { ...currentDelivery, ctx: b.ctx };
+    }
+    if (
       b.status === "pending" &&
       preGapPendingIds.has(b.elicitationId) &&
       !pendingNow.has(b.elicitationId)
@@ -6312,6 +6464,7 @@ async function rehydrateWindowOnReconnect(
       historyGeneration: s.historyGeneration + 1,
     };
   });
+  if (session.usageIncluded === false) void hydrateSessionUsage(id);
   queueAnsweredElicitationRechecks(id, snapshotPending, get().blocks);
   return "applied";
 }
@@ -6392,7 +6545,6 @@ async function reconcileOnReconnect(
     return "failed";
   }
   if (stale()) return "skipped";
-  if (session.usageIncluded === false) void hydrateSessionUsage(id);
   // A live turn edge or send latch change during these reads owns the turn lifecycle.
   const statusPatchFor = (s: ChatState): Partial<ChatState> =>
     settleStatus
@@ -6529,6 +6681,7 @@ async function reconcileOnReconnect(
     if (nextBlocks !== s.blocks) patch.blocks = nextBlocks;
     return patch;
   });
+  if (session.usageIncluded === false) void hydrateSessionUsage(id);
   queueAnsweredElicitationRechecks(id, snapshotPending, get().blocks);
   return "applied";
 }
@@ -6753,6 +6906,8 @@ export async function startStreamPump(
       openedHost = getSessionHost(id);
       liveAttempt = attempt;
       let maxAgeTimer: ReturnType<typeof setTimeout> | null = null;
+      // Whether this attempt opened, so its close is signaled exactly once.
+      let streamOpened = false;
       try {
         const idle = presenceIdle.idleNow();
         let streamRes: Response;
@@ -6848,6 +7003,8 @@ export async function startStreamPump(
         const streamEpoch = streamRes.headers.get("x-omnigent-stream-epoch");
         if (!hasConnected) clearSseLog(id);
         hasConnected = true;
+        streamOpened = true;
+        noteSessionStreamOpen(id, reconnecting);
         hostReaddressed = false;
         failedOpens = 0;
         consecutive404s = 0;
@@ -6936,6 +7093,7 @@ export async function startStreamPump(
           markLivePreviewsInterrupted(id, set);
         }
       } finally {
+        if (streamOpened) noteSessionStreamClosed(id);
         if (maxAgeTimer !== null) clearTimeout(maxAgeTimer);
         liveAttempt = null;
         controller.signal.removeEventListener("abort", onOuterAbort);
@@ -7533,6 +7691,20 @@ function revivePendingElicitationBlock(
       const updated = { ...incoming, ctx: target.ctx };
       return { blocks: [...s.blocks.slice(0, idx), updated, ...s.blocks.slice(idx + 1)] };
     }
+    // A reused id carrying a different Codex command request replaces the card,
+    // including a pending card or one with an in-flight verdict for the old request.
+    const changedCodexRequest =
+      incoming.codexCommand?.requestFingerprint &&
+      incoming.codexCommand.requestFingerprint !== target.codexCommand?.requestFingerprint;
+    if (changedCodexRequest) {
+      const updated: ElicitationBlock = {
+        ...incoming,
+        ctx: target.ctx,
+        status: "pending",
+        response: null,
+      };
+      return { blocks: [...s.blocks.slice(0, idx), updated, ...s.blocks.slice(idx + 1)] };
+    }
     if (!isRevivableElicitation(target)) return {};
     // Rebuilt from the incoming request: a recurring id can carry a different
     // request, and the reopened card must show what an answer would approve.
@@ -7757,16 +7929,15 @@ export async function pumpStreamEvents(
       // not persisted items), so the dedupe above can't see them. The
       // server re-publishes the same id whenever a severed harness wait
       // re-parks (hook retries reuse their id), so an already-rendered
-      // id must not append a second card: a pending card (or one
-      // carrying an in-flight user verdict) stays untouched, and a
-      // responded card is revived to answerable in place.
+      // id must not append a second card. A re-publish replaces a
+      // buffered card; a rendered card is revived or refreshed in place.
       if (block.type === "elicitation") {
         const eid = block.elicitationId;
         const buffered = buffer.findIndex(
           (b) => b.type === "elicitation" && b.elicitationId === eid,
         );
         if (buffered !== -1) {
-          if (block.nativeDelivery) buffer[buffered] = { ...block, ctx: buffer[buffered].ctx };
+          buffer[buffered] = { ...block, ctx: buffer[buffered].ctx };
           continue;
         }
         if (get().blocks.some((b) => b.type === "elicitation" && b.elicitationId === eid)) {
@@ -8117,47 +8288,6 @@ function retractDeliveredSendDraft(
     if (delivered(owner)) patch.pendingRetryStableId = null;
   }
   return patch;
-}
-
-/**
- * Whether a session snapshot records the runner refusing the send `stableId`.
- *
- * An attributed rejection names its item and holds whatever the session is
- * doing now; the unattributed record of a server predating the item id stands
- * for any send, but only while the session is still `failed` by it.
- *
- * @param session - A session snapshot.
- * @param stableId - The send's stable id (its persisted item id).
- * @returns `true` when the snapshot's `runner_rejected_event` applies to it.
- */
-function snapshotRefusesSend(session: Session, stableId: string): boolean {
-  const rejection = session.lastTaskError;
-  if (rejection?.code !== "runner_rejected_event") return false;
-  if (rejection.item_id !== undefined) return rejection.item_id === stableId;
-  return session.status === "failed";
-}
-
-/**
- * Ask the server what became of a send whose POST got no answer.
- *
- * The server records a runner rejection before it answers the POST, so a
- * snapshot fetched after the failure is conclusive where one merged during the
- * send may not be.
- *
- * @param sessionId - The session the send was posted to.
- * @param stableId - The send's stable id.
- * @returns `"refused"` or `"delivered"`, or `null` when the fetch itself fails.
- */
-async function sendVerdictFromServer(
-  sessionId: string,
-  stableId: string,
-): Promise<"refused" | "delivered" | null> {
-  try {
-    const session = await getSessionSlim(sessionId);
-    return snapshotRefusesSend(session, stableId) ? "refused" : "delivered";
-  } catch {
-    return null;
-  }
 }
 
 /**
@@ -8739,7 +8869,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       const patch: {
         tokensUsed?: number;
         contextWindow?: number;
-        sessionCostUsd?: number;
+        sessionCostUsd?: number | null;
         sessionUsageByModel?: Record<string, ModelUsage>;
       } = {};
       if (event.contextTokens !== undefined) {
@@ -8748,13 +8878,17 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       if (event.contextWindow !== undefined) {
         patch.contextWindow = event.contextWindow;
       }
-      if (event.totalCostUsd !== undefined) {
+      if (event.costHidden) {
+        patch.sessionCostUsd = null;
+      } else if (event.totalCostUsd !== undefined) {
         patch.sessionCostUsd = event.totalCostUsd;
       }
       if (event.usageByModel !== undefined) {
         patch.sessionUsageByModel = event.usageByModel;
       }
-      if (event.totalCostUsd !== undefined || event.usageByModel !== undefined) {
+      const costChanged = event.totalCostUsd !== undefined || event.costHidden === true;
+      const modelsChanged = event.usageByModel !== undefined || event.costHidden === true;
+      if (costChanged || modelsChanged) {
         const entry =
           sourceConversationId === null
             ? undefined
@@ -8763,12 +8897,18 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // A same-value receipt is still newer than an in-flight usage read.
           const revisions = sessionUsageRevisions.get(entry);
           sessionUsageRevisions.set(entry, {
-            cost: (revisions?.cost ?? 0) + (event.totalCostUsd !== undefined ? 1 : 0),
-            models: (revisions?.models ?? 0) + (event.usageByModel !== undefined ? 1 : 0),
+            cost: (revisions?.cost ?? 0) + (costChanged ? 1 : 0),
+            models: (revisions?.models ?? 0) + (modelsChanged ? 1 : 0),
           });
         }
       }
-      if (Object.keys(patch).length > 0) {
+      if (event.costHidden) {
+        if (queryClient !== null) invalidateAgentCosts(queryClient, true);
+        applyToConversation((s) => ({
+          ...patch,
+          sessionUsageByModel: withoutModelCosts(event.usageByModel ?? s.sessionUsageByModel),
+        }));
+      } else if (Object.keys(patch).length > 0) {
         applyToConversation(patch);
       }
       return;
@@ -9143,10 +9283,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           );
           if (settled !== null) patch.blocks = settled;
         }
-        // A `runner_disconnected` card is an observation ("can't reach the
-        // runner"), not a turn result: any live status edge from the runner
-        // proves it is reachable again, so the stale card goes.
-        if (event.status !== "failed") {
+        // A live runner makes its disconnect card stale. Automatic resume
+        // failure supersedes it too, including its manual resume action.
+        if (event.status !== "failed" || statusError?.code === "session_recovery_failed") {
           const current = patch.blocks ?? s.blocks;
           const reachable = current.filter(
             (b) => !(b.type === "error" && b.code === "runner_disconnected"),
@@ -9211,6 +9350,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
     }
     case "session_input_consumed": {
       applyToConversation({ startupPending: false });
+      // A native Stop's receipt places its message in the transcript.
+      if (sourceConversationId && event.clearedPendingId) {
+        notePlanStopReceipt(sourceConversationId, event.clearedPendingId, event.itemId);
+      }
       // A retry from another client may have delivered an undelivered message: clear
       // it now when the receipt names it (native ones do), and re-read either way,
       // superseding any failure read still in flight from before the delivery.
@@ -9561,6 +9704,17 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         queryClient?.invalidateQueries({
           queryKey: childSessionsQueryKey(event.conversationId),
         });
+      }
+      return;
+    case "session_journal_appended":
+      // A new journal entry for the Tasks tab; the cache drops duplicates by ID.
+      if (queryClient) applyJournalEntry(queryClient, event.conversationId, event.entry);
+      // The agent's first plan, arriving while its session is on screen, opens the tab.
+      if (
+        isFirstPlan(event.entry) &&
+        event.conversationId === useChatStore.getState().conversationId
+      ) {
+        showTasksTabBesideChat(event.conversationId);
       }
       return;
     case "session_changed_files_invalidated":

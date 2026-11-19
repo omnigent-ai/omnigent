@@ -399,6 +399,12 @@ def write_mcp_bridge_config(bridge_dir: Path) -> None:
             os.unlink(tmp_name)
 
 
+# Omnigent's tools can wait a day for a person, such as a workflow question;
+# Codex otherwise ends an MCP tool call after 60 seconds. A little over the
+# runner's wait, so the runner's own "no answer" reaches the agent first.
+OMNIGENT_MCP_TOOL_TIMEOUT_S = 86400 + 600
+
+
 def codex_mcp_config_overrides(
     bridge_dir: Path,
     *,
@@ -437,6 +443,7 @@ def codex_mcp_config_overrides(
     return [
         f'mcp_servers.omnigent.command="{python}"',
         f"mcp_servers.omnigent.args={args_toml}",
+        f"mcp_servers.omnigent.tool_timeout_sec={OMNIGENT_MCP_TOOL_TIMEOUT_S}",
         f"mcp_servers.omnigent.env.{DATA_DIR_ENV_VAR}={json.dumps(str(native_bridge_common.native_bridge_data_dir()))}",
     ]
 
@@ -1606,6 +1613,31 @@ def settle_pending_mcp_startup(bridge_dir: Path) -> tuple[dict[str, dict[str, st
         return servers, False
     for name in pending:
         servers.pop(name, None)
+    _write_mcp_startup(bridge_dir, servers)
+    return servers, True
+
+
+def fail_pending_mcp_startup(
+    bridge_dir: Path, error: str
+) -> tuple[dict[str, dict[str, str | None]], bool]:
+    """
+    Mark every still-``starting`` MCP server as ``failed``.
+
+    For when the round can no longer finish (the app-server is going away), so
+    unlike :func:`settle_pending_mcp_startup` the outcome is known.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param error: Failure detail recorded on each pending server, e.g.
+        ``"Codex app-server connection ended before MCP startup finished"``.
+    :returns: ``(map_after, changed)`` — the updated map and whether any
+        entry was marked failed.
+    """
+    servers = read_mcp_startup(bridge_dir)
+    pending = pending_mcp_servers(servers)
+    if not pending:
+        return servers, False
+    for name in pending:
+        servers[name] = {"status": MCP_STARTUP_FAILED, "error": error}
     _write_mcp_startup(bridge_dir, servers)
     return servers, True
 

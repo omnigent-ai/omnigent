@@ -717,6 +717,25 @@ class SandboxLifecycle(ABC):
         """
         raise self._capability_error("stop a sandbox without deleting it")
 
+    def stop_when_archived(self, *, owner: str, configured: bool) -> bool:
+        """
+        Whether to :meth:`stop` a managed sandbox whose session was archived.
+
+        Asked only for a sandbox this provider can resume. If this returns
+        ``True``, the server then checks that no other session uses the sandbox
+        before it stops it. The default follows the provider's
+        ``stop_on_archive`` server setting. Override it to decide per owner at
+        archive time, for example from a feature flag, so a rollout or rollback
+        needs no server restart. Runs in a worker thread, after the archive
+        request has returned. An exception leaves the sandbox running.
+
+        :param owner: The host owner (the session creator), e.g.
+            ``"alice@example.com"``.
+        :param configured: The provider's ``stop_on_archive`` setting.
+        :returns: ``True`` to stop the sandbox.
+        """
+        return configured
+
     def resume(self, sandbox_id: str) -> None:
         """
         Resume a stopped sandbox in place, reattaching its persistent

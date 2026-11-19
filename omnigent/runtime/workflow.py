@@ -6,6 +6,7 @@ All durably checkpointed for crash recovery.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -395,9 +396,9 @@ def _configure_brokered_codex_with_ucode(
         else:
             # In place, so the session's OS tools share the worker's sandbox.
             spec.os_env.sandbox = sandbox
-    if sandbox.egress_rules:
+    if sandbox.egress_rules or sandbox.tcp_egress:
         raise OmnigentError(
-            "signer-backed Codex does not support os_env.sandbox.egress_rules; "
+            "signer-backed Codex does not support os_env.sandbox.egress_rules or tcp_egress; "
             "brokered sessions are model-only",
             code=ErrorCode.INVALID_INPUT,
         )
@@ -1587,6 +1588,24 @@ def _bind_codex_gateway_credential(env: dict[str, str], spec: AgentSpec) -> None
     env["HARNESS_CODEX_DISABLE_NATIVE_TOOLS"] = "true"
 
 
+def _apply_codex_tool_switches(env: dict[str, str], spec: AgentSpec) -> None:
+    """Apply the spec's Codex tool switches on every route.
+
+    The switches only restrict: ``web_search: true`` or
+    ``disable_native_tools: false`` never re-enables tools the operator disabled.
+    """
+    config = spec.executor.config
+    for key in ("web_search", "disable_native_tools"):
+        if config.get(key) is not None and not isinstance(config[key], bool):
+            raise OmnigentError(
+                f"executor.config.{key} must be a boolean", code=ErrorCode.INVALID_INPUT
+            )
+    if config.get("web_search") is False:
+        env["HARNESS_CODEX_ENABLE_WEB_SEARCH"] = "false"
+    if config.get("disable_native_tools") is True:
+        env["HARNESS_CODEX_DISABLE_NATIVE_TOOLS"] = "true"
+
+
 def _build_codex_spawn_env(
     spec: AgentSpec,
     *,
@@ -1622,6 +1641,7 @@ def _build_codex_spawn_env(
     # unchanged.
     provider = _resolve_provider_for_build(spec, harness_type="codex", for_launch=True)
     _apply_codex_provider_env(env, spec, provider)
+    _apply_codex_tool_switches(env, spec)
     # Skills bridge — same shape as the claude-sdk variant. Always
     # set so the harness wrap doesn't fall back to its ``"all"``
     # default and override an explicit ``skills: none`` spec.
@@ -1857,6 +1877,11 @@ def _build_acp_cli_spawn_env(
         # Omnigent MCP server.
         "HARNESS_ACP_OMNIGENT_MCP": "1" if row.omnigent_mcp else "0",
     }
+    # A vendor CLI authenticating from its own key reads it out of the spawn
+    # env, which forwards only passthrough-named vars, so a row that
+    # advertises one has to name it or the key never reaches the CLI.
+    if row.env_passthrough:
+        env["HARNESS_ACP_ENV_PASSTHROUGH"] = ",".join(sorted(set(row.env_passthrough)))
     # Session workspace (selected working folder). ``None`` lets the wrap fall
     # back to OMNIGENT_RUNNER_WORKSPACE — see HARNESS_ACP_CWD.
     if cwd is not None:
@@ -3213,7 +3238,7 @@ async def compact_conversation_now(
         task_id=task_id,
         llm_client=_get_llm_client(),
         connection=compaction_state.connection,
-        runner_client=_get_runner_client_for_compaction(conversation_id),
+        runner_client=await asyncio.to_thread(_get_runner_client_for_compaction, conversation_id),
         force=True,
         fail_on_summary_error=True,
         conversation_id=conversation_id,

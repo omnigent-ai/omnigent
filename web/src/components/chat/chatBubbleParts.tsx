@@ -56,7 +56,7 @@ import {
   RoutingDecisionCard,
 } from "@/components/blocks/StatusBlocks";
 import { SystemMessageView } from "@/components/blocks/SystemMessage";
-import { SubagentActivityMessage } from "@/components/blocks/SubagentActivityMessage";
+import { ActivityNotice } from "@/components/blocks/TaskActivityMessage";
 import {
   isSystemUserContent,
   parseSystemMessage,
@@ -65,6 +65,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
 import { RunningDot } from "@/components/RunningDot";
+import { formatMessageTimestamp } from "@/lib/relativeTime";
 import { cn } from "@/lib/utils";
 import { readableSentText, replaceSentMentions } from "@/lib/composerMentions";
 import { mentionPillMarkdown } from "@/lib/mentionPills";
@@ -87,6 +88,7 @@ import { QueryClientContext } from "@tanstack/react-query";
 import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
 import { useChatStore, withoutFailedInputs, type PendingUserMessage } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
+import { supersedePlanStop } from "@/store/planStops";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import {
   ConversationScopeContext,
@@ -837,21 +839,7 @@ function CompactionLoadingIndicator({ createdAtS }: { createdAtS?: number }) {
 
 function formatBubbleTimestamp(epochSeconds: number | undefined): string | null {
   if (epochSeconds === undefined || epochSeconds === 0) return null;
-  const d = new Date(epochSeconds * 1000);
-  const now = new Date();
-  const time = d.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
-  if (
-    d.getFullYear() === now.getFullYear() &&
-    d.getMonth() === now.getMonth() &&
-    d.getDate() === now.getDate()
-  ) {
-    return time;
-  }
-  const date = d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
-  if (d.getFullYear() !== now.getFullYear()) {
-    return `${d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" })}, ${time}`;
-  }
-  return `${date}, ${time}`;
+  return formatMessageTimestamp(epochSeconds);
 }
 
 // Memoized so a streaming delta (which rebuilds the whole bubble array) only
@@ -878,7 +866,7 @@ export const BubbleView = memo(
     }
     if (bubble.kind === "compaction") return <CompactionMarker />;
     if (bubble.kind === "subagent_activity") {
-      return <SubagentActivityMessage data={bubble.data} />;
+      return <ActivityNotice data={bubble.data} />;
     }
     if (bubble.kind === "routing_decision") {
       return (
@@ -1048,7 +1036,7 @@ function useMessageActionVisibility(persistentOnMobile = false, persistentOnDesk
       ? "opacity-100"
       : isMobile
         ? "invisible opacity-0"
-        : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100 mobile-app:[@media(hover:none)]:opacity-40 mobile-app:[@media(pointer:coarse)]:opacity-40",
+        : "opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100",
   };
 }
 
@@ -1335,7 +1323,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
               <MessageAction
                 tooltip="Copy"
                 size="icon-xxs"
-                className="[@media(pointer:coarse)]:size-8"
+                className="max-md:size-8"
                 onClick={handleCopy}
                 componentId="chat.message.copy_user"
               >
@@ -1346,7 +1334,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
               <MessageAction
                 tooltip="Edit and resend"
                 size="icon-xxs"
-                className="[@media(pointer:coarse)]:size-8"
+                className="max-md:size-8"
                 onClick={() =>
                   editSentMessage({
                     text: isShellCommand ? text : userMessageBody(bubble.content),
@@ -1360,7 +1348,7 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             <MessageAction
               tooltip={isLinkCopied ? "Copied!" : "Copy link"}
               size="icon-xxs"
-              className="[@media(pointer:coarse)]:size-8"
+              className="max-md:size-8"
               data-testid="copy-message-link"
               disabled={bubble.pending}
               onClick={handleCopyLink}
@@ -1446,7 +1434,9 @@ function AssistantBubble({
         ) {
           throw new Error("Wait for the current turn to finish before retrying");
         }
+        const endPlanStop = supersedePlanStop(conversationId);
         await continueFailedTurn(conversationId);
+        endPlanStop();
         return;
       }
       try {
@@ -1583,7 +1573,7 @@ function AssistantBubble({
                   <MessageAction
                     tooltip="Copy"
                     size="icon-xxs"
-                    className="[@media(pointer:coarse)]:size-8"
+                    className="max-md:size-8"
                     onClick={handleCopy}
                     componentId="chat.message.copy_assistant"
                   >
@@ -1635,7 +1625,7 @@ function AssistantBubble({
         )}
         {trailingNotices.map((notice, index) =>
           notice.kind === "subagent_activity" ? (
-            <SubagentActivityMessage
+            <ActivityNotice
               key={notice.itemId ?? `subagent-activity-${index}`}
               data={notice.data}
             />

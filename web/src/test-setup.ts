@@ -1,6 +1,11 @@
 import "@testing-library/jest-dom/vitest";
+import { configure } from "@testing-library/react";
 import type * as ReactVirtualModule from "@tanstack/react-virtual";
 import { vi } from "vitest";
+
+// Tooltip surfaces intentionally wait 1s; leave enough margin for async queries
+// to observe them without racing Testing Library's matching default timeout.
+configure({ asyncUtilTimeout: 2000 });
 
 // The @lobehub icon packages have broken nested-module resolution
 // under vitest; stub presentational glyphs so component modules that
@@ -44,6 +49,12 @@ if (!Element.prototype.releasePointerCapture) {
 }
 if (!Element.prototype.scrollIntoView) {
   Element.prototype.scrollIntoView = () => {};
+}
+
+// jsdom has no layout. CodeMirror measures its text through Range.getClientRects, so an
+// empty list lets it measure without a rect. Tests that need a rect stub it themselves.
+if (typeof Range.prototype.getClientRects !== "function") {
+  Range.prototype.getClientRects = () => [] as unknown as DOMRectList;
 }
 
 // jsdom doesn't implement IntersectionObserver (used by the sidebar's

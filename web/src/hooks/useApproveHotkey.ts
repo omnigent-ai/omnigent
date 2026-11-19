@@ -25,24 +25,24 @@ import { useEffect } from "react";
 import { create } from "zustand";
 
 import { schemaFields } from "@/components/blocks/ElicitationSchemaForm";
-import { ENTER_KEY, ESC_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { useIsEmbedded } from "@/lib/embedded";
 import { getEmbedRoot } from "@/lib/host";
 import {
-  hasCommandModifier,
   isFocusInDialogOrMenu,
   isEscapeOwnerOpen,
   isKeyOwningOverlayOpen,
   isMacPlatform,
   isTextEntry,
 } from "@/lib/hotkeys";
+import { composerTargetOf } from "@/components/composer/engine/composerInput";
 import type { AnyBlock, ElicitationBlock } from "@/lib/blocks";
+import { matchesShortcut, shortcutKeys } from "@/lib/shortcuts/registry";
 import { useChatStore } from "@/store/chatStore";
 
 /** Glyphs for the chord this hook matches; shown on the Approve button it would press. */
-export const APPROVE_KEYS = [MOD_KEY, ENTER_KEY] as const;
+export const APPROVE_KEYS = shortcutKeys("approval.accept");
 /** Glyph for the key that declines; shown on the Reject button it would press. */
-export const DECLINE_KEYS = [ESC_KEY] as const;
+export const DECLINE_KEYS = shortcutKeys("approval.decline");
 
 /**
  * Whether Esc belongs to something else: an open dialog or modal, menu, composer
@@ -125,6 +125,9 @@ export function isDraftingTarget(target: EventTarget | null): boolean {
   // Complete send intent (text OR attachments OR mentions), as declared by
   // the field itself — a bare value check can't see non-text drafts.
   if (target.dataset.hasDraft === "true") return true;
+  // A composer input of any engine, textarea included.
+  const composer = composerTargetOf(target);
+  if (composer) return composer.value.length > 0;
   if (target instanceof HTMLTextAreaElement) return target.value.length > 0;
   if (target instanceof HTMLInputElement) {
     // Only text-like inputs carry a typed draft; a checkbox/radio value is a
@@ -143,7 +146,7 @@ export function useApproveHotkey(isMac = isMacPlatform()): void {
       const embedRoot = getEmbedRoot();
       if (isEmbedded && (!embedRoot || !e.composedPath().includes(embedRoot))) return;
       if (e.key === "Escape") {
-        if (e.repeat || e.isComposing || e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return;
+        if (e.repeat || e.isComposing || !matchesShortcut(e, "approval.decline")) return;
         if (escapeBelongsElsewhere(e.target)) return;
         const { blocks, submitApproval } = useChatStore.getState();
         const target = approveHotkeyTarget(blocks);
@@ -156,8 +159,7 @@ export function useApproveHotkey(isMac = isMacPlatform()): void {
       }
       // Platform command modifier, not Alt/Shift (mirrors the session-switch guard):
       // only ⌘↵ on macOS and only Ctrl+↵ on Win/Linux.
-      if (!hasCommandModifier(e, isMac) || e.altKey || e.shiftKey) return;
-      if (e.key !== "Enter") return;
+      if (!matchesShortcut(e, "approval.accept", { mac: isMac })) return;
 
       // Mid-composition chord — a send intent aimed at the draft, not a
       // verdict. Leave the event for the composer's own handler (whose

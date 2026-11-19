@@ -1316,25 +1316,81 @@ async def test_permission_asked_dedupes() -> None:
     assert len(opencode.permission_replies) == 1
 
 
-async def test_permission_reply_failure_is_surfaced() -> None:
-    """OpenCode blocks the turn until answered, so a failed reply must be visible."""
+@pytest.mark.parametrize(
+    "turn_state",
+    [
+        "active",
+        "next_step",
+        "interrupted",
+        "interrupted_flushing",
+        "replacement",
+        "replacement_before_task",
+    ],
+)
+async def test_permission_reply_failure_is_surfaced(turn_state: str) -> None:
+    """A failed reply blocks only the turn that requested permission."""
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
+    flush_started, release_flush = asyncio.Event(), asyncio.Event()
 
     async def failing_reply(*_args: Any, **_kwargs: Any) -> bool:
-        raise OpenCodeClientError("reply failed: 500")
+        if turn_state == "next_step":
+            await fwd.handle_event(_step_started("msg_2"))
+        elif turn_state == "interrupted_flushing":
+            await asyncio.wait_for(flush_started.wait(), timeout=5)
+        elif turn_state in {"interrupted", "replacement"}:
+            await fwd.handle_event(_event("session.execution.interrupted", reason="user"))
+            if turn_state == "replacement":
+                await fwd.handle_event(_step_started("msg_2"))
+        raise OpenCodeClientError("reply failed: 404")
 
     opencode.reply_permission = failing_reply  # type: ignore[method-assign]
     fwd = _forwarder(server, opencode)
     await fwd.handle_event(_step_started("msg_1"))
+    if turn_state == "interrupted_flushing":
+        original_flush = fwd._flush_pending_text
+
+        async def held_flush(turn: fwd_mod._SessionTurn) -> None:
+            flush_started.set()
+            await release_flush.wait()
+            await original_flush(turn)
+
+        fwd._flush_pending_text = held_flush  # type: ignore[method-assign]
     await fwd.handle_event(_asked("per_err"))
-    await _drain(fwd)
+    if turn_state == "replacement_before_task":
+        await fwd.handle_event(_event("session.execution.interrupted", reason="user"))
+        await fwd.handle_event(_step_started("msg_2"))
+    terminal = (
+        asyncio.create_task(
+            fwd.handle_event(_event("session.execution.interrupted", reason="user"))
+        )
+        if turn_state == "interrupted_flushing"
+        else None
+    )
+    try:
+        await _drain(fwd)
+        if terminal is not None:
+            assert flush_started.is_set()
+            assert not terminal.done()
+    finally:
+        if terminal is not None:
+            release_flush.set()
+            await terminal
     statuses = _datas(server.posts, "external_session_status")
-    assert statuses[-1]["status"] == "running"
-    assert statuses[-1]["blocked_on"] == "permission reply failed for per_err"
+    if turn_state in {"active", "next_step"}:
+        assert statuses[-1]["status"] == "running"
+        assert statuses[-1]["blocked_on"] == "permission reply failed for per_err"
+    else:
+        assert all("blocked_on" not in status for status in statuses)
+        assert statuses[-1] == (
+            {"status": "idle", "response_id": "msg_1"}
+            if turn_state in {"interrupted", "interrupted_flushing"}
+            else {"status": "running", "response_id": "msg_2"}
+        )
 
 
-async def test_late_tui_permission_answer_clears_blocked_on() -> None:
-    """The TUI answering after our reply failed means OpenCode is no longer blocked."""
+@pytest.mark.parametrize("replacement", [False, True])
+async def test_late_tui_permission_answer_clears_blocked_on(replacement: bool) -> None:
+    """A late TUI answer clears its turn's failure, never a replacement's."""
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
 
     async def failing_reply(*_args: Any, **_kwargs: Any) -> bool:
@@ -1346,10 +1402,23 @@ async def test_late_tui_permission_answer_clears_blocked_on() -> None:
     await fwd.handle_event(_asked("per_late"))
     await _drain(fwd)
     assert _datas(server.posts, "external_session_status")[-1]["blocked_on"]
+    if replacement:
+        await fwd.handle_event(_event("session.execution.interrupted", reason="user"))
+        await fwd.handle_event(_step_started("msg_2"))
+        await fwd.handle_event(_asked("per_current"))
+        await _drain(fwd)
+        assert _datas(server.posts, "external_session_status")[-1]["blocked_on"] == (
+            "permission reply failed for per_current"
+        )
+    before_resolution = len(server.posts)
     await fwd.handle_event(_event("permission.replied", requestID="per_late", reply="once"))
     last = _datas(server.posts, "external_session_status")[-1]
     assert last["status"] == "running"
-    assert "blocked_on" not in last
+    if replacement:
+        assert len(server.posts) == before_resolution
+        assert last["blocked_on"] == "permission reply failed for per_current"
+    else:
+        assert "blocked_on" not in last
 
 
 async def test_tui_permission_answer_during_failed_reply_skips_blocked_on() -> None:
@@ -1655,22 +1724,42 @@ async def test_form_created_dedupes() -> None:
     assert opencode.form_replies == [(_SESSION, "frm_1", {"q0": "Tabs"})]
 
 
-async def test_form_reply_failure_cancels_and_logs() -> None:
-    """A failed reply must still cancel the form and surface a blocked status."""
+@pytest.mark.parametrize("turn_state", ["active", "interrupted", "replacement_before_task"])
+async def test_form_reply_failure_cancels_and_logs(turn_state: str) -> None:
+    """Cancel a failed form reply, surfacing it only while its turn is current."""
     server, opencode = _RecordingServerClient(), _FakeOpenCodeClient()
     server.hook_response = {"action": "accept", "content": {"q0": "Tabs"}}
 
     async def failing_reply(*_args: Any, **_kwargs: Any) -> bool:
-        raise OpenCodeClientError("reply failed: 500")
+        raise OpenCodeClientError("reply failed: 404")
+
+    async def cancel_form(session_id: str, form_id: str) -> bool:
+        opencode.form_cancels.append((session_id, form_id))
+        if turn_state == "interrupted":
+            await fwd.handle_event(_event("session.execution.interrupted", reason="user"))
+        return True
 
     opencode.reply_form = failing_reply  # type: ignore[method-assign]
+    opencode.cancel_form = cancel_form  # type: ignore[method-assign]
     fwd = _forwarder(server, opencode)
+    await fwd.handle_event(_step_started("msg_1"))
     await fwd.handle_event(_form_event("frm_1", _SINGLE))
+    if turn_state == "replacement_before_task":
+        await fwd.handle_event(_event("session.execution.interrupted", reason="user"))
+        await fwd.handle_event(_step_started("msg_2"))
     await _drain(fwd)
     assert opencode.form_cancels == [(_SESSION, "frm_1")]
     statuses = _datas(server.posts, "external_session_status")
-    assert statuses[-1]["status"] == "running"
-    assert statuses[-1]["blocked_on"] == "form reply failed for frm_1"
+    if turn_state == "active":
+        assert statuses[-1]["status"] == "running"
+        assert statuses[-1]["blocked_on"] == "form reply failed for frm_1"
+    else:
+        assert all("blocked_on" not in status for status in statuses)
+        assert statuses[-1] == (
+            {"status": "idle", "response_id": "msg_1"}
+            if turn_state == "interrupted"
+            else {"status": "running", "response_id": "msg_2"}
+        )
 
 
 async def test_form_unexpected_error_cancels_and_surfaces(

@@ -14,6 +14,14 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 
 ## Sub-features
 
+- `codemirror-input`: behind the `chat_composer_codemirror` release flag (off by
+  default; enable it with `OMNIGENT_FEATURES=chat_composer_codemirror` on the
+  server), the main chat's message box is a CodeMirror editor. It takes plain
+  text, scrolls inside the box when the draft is taller than the cap, and keeps
+  the same send, history, and completion keys. Side chats and New Chat follow
+  the same choice. Mobile widths always use the plain text box. It also stays
+  while the editor loads, and stays if loading fails; a failed load retries on
+  window focus, at most once a minute.
 - `touch-targets`: native iOS/Android apps and browsers with a coarse primary
   pointer and no hover use at least 44 CSS-pixel composer controls and menu rows.
   The layout adapts at phone, tablet, and desktop widths; mouse browsers retain
@@ -25,7 +33,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   **Copy message to new session** opens it with a one-time `?handoff=` token
   instead, naming an in-memory copy of the message's text and attachments. That
   copy replaces the whole parked draft, even with no text or no attachments; the
-  token leaves the URL and is released once the composer takes it.
+  token leaves the URL and is released once the composer takes it. An agent
+  suggestion's action button in the Inbox uses the same handoff with the action's
+  prompt, so the viewer edits and sends it.
 - `offline-hosts`: the new-session host picker keeps other offline hosts collapsed,
   revealing five at a time in server recency order in a scrollable list. The selected
   offline host and desktop reconnect action stay visible. Closing the menu resets it.
@@ -76,7 +86,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - `project-session-defaults`: Project settings store a default agent and, for
   Claude Code, Codex, and Pi, a default model and reasoning effort; the
   new-session composer opened in that project (`/?project=<name>`) starts with
-  them. The Fork dialog and CLI, API, and scheduled creates don't apply model
+  them. A project created with a repository seeds its sandbox provider and
+  repository into a sandbox pick, and a managed create without those fields takes
+  them from the project. A malformed saved repository (for example a legacy bare
+  string) is ignored. The Fork dialog and CLI, API, and scheduled creates don't apply model
   or effort. States: no default, a Codex
   effort the pinned model lacks (or, with no project model, the remembered
   model lacks), an explicit composer pick, remembered Smart Routing, another
@@ -135,14 +148,74 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   The main composer lists its full built-in set and the session's skills; a live
   side chat offers a narrower menu — `/help` plus the session's skills. A built-in
   such as `/help` is handled locally; a recognised skill routes through
-  `slash_command` so it runs on an in-process harness. A native terminal side
-  chat shows no menu and sends slash text to the vendor TUI. Claude Code and
-  Codex native sessions offer `/clear` only when `/v1/info` lists `clear` in
-  `session_event_types`; claude-sdk sessions only when it reports
-  `session_claude_sdk_clear`. Otherwise a typed `/clear` goes to the harness
-  as text. A claude-sdk `/clear` continues in a new, empty session on the same
-  machine and the view follows it. States: loading, error/retry,
+  `slash_command` so it runs on an in-process harness. A built-in the session
+  doesn't offer (e.g. `/compact` or `/model` where gated off) is not handled
+  locally: a skill of the same name runs, otherwise the text is sent. `/side`
+  is the exception: outside Codex native it always opens a side chat. A native
+  terminal side chat shows no menu and sends slash text to the vendor TUI.
+  Claude Code and Codex native sessions offer `/clear` only when `/v1/info`
+  lists `clear` in `session_event_types`; claude-sdk sessions only when it
+  reports `session_claude_sdk_clear`. Otherwise a typed `/clear` goes to the
+  harness as text. A claude-sdk `/clear` continues in a new, empty session on
+  the same machine and the view follows it. States: loading, error/retry,
   unavailable while disconnected, and an incomplete catalog.
+- `goal-command`: in sessions with a Goal control, bare `/goal` or its slash-menu
+  row opens the same dialog as **+ → Goal**. `/goal <objective>` keeps its
+  existing message path. Sessions without the control keep sending the text
+  or invoking a same-named skill. States: no goal, existing goal, read-only.
+  Drafts with attachments are sent as ordinary messages and do not set a goal.
+  Leading `/goal` takes precedence over a same-named slash skill; inline goal
+  skills and Codex native `$goal` skills remain available. For plain-text drafts
+  without quotes, mentions or review comments, mixed-case and newline-separated
+  goal commands use the same canonical message path. Drafts carrying that
+  context retain their existing handling.
+  In Codex native Chat, the goal indicator follows commands and native goal
+  changes without reopening the dialog. Sending an objective or resuming native
+  activity promptly retries the goal while setup finishes. Automatic refresh
+  runs while the runner is online and Chat is visible, without starting an idle
+  native session. Failed or unavailable reads keep the last goal and slow down
+  refreshes; returning to the tab retries immediately. Confirmed deletion clears
+  the indicator. Opening the dialog shows read errors, and goal creation and
+  editing remain available while runner status is offline or unknown.
+  Refreshes preserve edited dialog fields while untouched fields follow current
+  goal state. Reopening or switching sessions discards old drafts, including when
+  the opening read fails. Earlier reads and updates cannot replace another
+  session's goal fields. Reconnecting retains this session's last goal, edited
+  fields and operation errors in the same open dialog. A fresh goal response
+  releases opening-read loading even if an earlier read is still pending.
+  A pending Save, Clear, Pause or Resume stays busy after closing and reopening
+  the same session until the request and its refresh attempt finish. An
+  acknowledged Clear removes the indicator even if the dialog was closed and
+  the next refresh fails. Other sessions remain independently editable.
+  A timed-out update may already have taken effect; refresh the goal before
+  retrying.
+  Older runner versions may leave the indicator stale after clearing a goal
+  in the native terminal, or show a read error when no goal exists. Inspect the
+  native goal, then update and reconnect the session's owning runner on its
+  existing host/workspace binding and refresh. Repeating refresh against the
+  same older runner cannot resolve this ambiguity. With older servers, an
+  unavailable session can also appear to have no goal. See the
+  [Goal API compatibility notes](../omnigent/server/codex-API.md) for version
+  requirements. In Claude Code native sessions, **+ → Goal** and `/goal`
+  send Claude Code's built-in `/goal <condition>`; the composer shows no goal
+  indicator, and progress appears as ordinary agent work in the conversation.
+- `slash-rewind`: in claude-sdk and Claude Code native sessions, `/rewind` opens
+  a searchable list of the session's prompts, newest first. Choosing one
+  continues the conversation in a new session holding only the history before
+  that prompt, on the same host, workspace and runner, with the prompt back in
+  the composer to edit, attachments included; the original session keeps
+  everything and links to the new one. Workspace files are not rolled back.
+  The picker reads the newest prompts first and offers **Load older prompts**,
+  which stays while searching. Offered only when `/v1/info` reports
+  `session_rewind`; otherwise a typed `/rewind` is sent as text, or runs a
+  custom command of that name (likewise `/clear`). States: loading prompts,
+  prompts failed to load, no prompts, older prompts loading or failed, refused
+  while a turn runs or with neither a usable runner nor a saved host binding
+  (error under the composer), prompt arriving after the new session opened
+  (filled unless the user has typed, cleared or sent a draft there), an
+  attachment that could not be restored (a warning asks the user to attach it
+  again, including missing files and failed server lookups; failed downloads
+  name the affected files).
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited
@@ -259,8 +332,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   original message, which the agent already has. The transcript is unchanged.
   Sending is a new message, steered or queued like any mid-turn send, and Edit
   never stops the agent. A non-empty draft asks "Replace your draft?" first.
-  Side chats, grid session panes, and writable sub-agent Workspace tabs edit
-  into their own composer, where "@"-mentions return as attachment markers. Edit
+  Side chats and writable sub-agent Workspace tabs edit into their own composer,
+  where "@"-mentions return as attachment markers. A grid session pane edits its
+  session's shared draft, where "@"-mentions return as tokens. Edit
   is hidden on messages the server hasn't accepted yet, messages with no text,
   other contributors' messages (shared session or not), and read-only composers.
 - `delivered-send-recovery`: a sent message stays out of the composer when its
@@ -300,6 +374,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   overlapping the stop button.
 
 ## How to get to it (user POV)
+
+- In a Codex native chat, a Claude Code native chat, or a Polly session with a
+  Goal control, send `/goal`, choose `/goal` from the slash menu, or open
+  **+ → Goal**.
 
 **In-session composer** (open any session):
 
@@ -363,6 +441,12 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   as "Waiting for host" until the host reconnects.
 - Type `/n`, press Tab to complete `/new`, then Enter to open the new-session
   page in the same project. Selecting **/new** in Commands also opens it.
+- In a claude-sdk session, type `/cl` and click **/clear**, or type the whole
+  `/clear` and press Enter; either opens a new, empty chat on the same machine.
+- In a claude-sdk or Claude Code native session with a few prompts sent,
+  type `/rew` and click **/rewind**, or type `/rewind` and press Enter, then
+  pick a prompt (search, or **Load older prompts** in a long session). The new
+  chat opens with that prompt, and its attachments, in the composer.
 
 **Desktop browser pointer** (open a session in the desktop app):
 
@@ -388,6 +472,11 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   deployment stays under its mount path. Browser proof:
   `tests/browser_ui/chat/test_prompt_url.py`; router and draft edge cases:
   `web/src/shell/NewChatDialog.test.tsx` (`prompt URL handoff`).
+- From the Inbox, expand an Omni Advisor suggestion and click one of its action
+  buttons. The New Chat composer opens with the action's prompt as an editable
+  draft, through the same one-time handoff token; nothing is sent until Send.
+  Component proof: `web/src/pages/InboxPage.test.tsx` (`takes an agent action
+and opens the composer with its prompt`).
 
 - In the managed desktop app, choose **Arclet Sandbox** and submit a task with
   missing or expired laptop credentials. Click **Refresh dbcert** in the yellow
@@ -432,6 +521,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   `tests/e2e_ui/start_session/test_sandbox_gateway_models_without_binding.py`,
   `tests/e2e_ui/start_session/test_sandbox_model_selection.py::test_optional_gateway_preview_without_a_host`
   and `tests/e2e_ui/start_session/test_sandbox_model_selection.py::test_sandbox_harness_without_reachable_models_blocks_launch`.
+  With no sandbox catalog for the harness (no model capability, or discovery
+  reports it `unconfigured`), Codex, Devin and Pi offer one "Default" row that
+  launches the harness's own default, while Claude Code lists its built-in
+  models.
 - Open a project's actions menu in the sidebar → **Project settings**, pick
   Claude Code, Codex, or Pi as the agent, then set **Model** and **Effort**.
   Click **New session in project** and check the pill shows both.
@@ -501,6 +594,34 @@ for draft persistence and parent-isolation checks. The microphone beside
 **Ask a side question...** starts dictation. Edit and resend (pencil) on a sent
 side-chat message loads it into that side chat's composer, not the main one.
 
+**Grid cell** (desktop session grids, see [Sessions](sessions.md)): each cell's
+one-row composer shares its session's draft with the full-screen composer, sends
+its tags and review comments as the full-screen composer does, and shows the
+review comments as chips. Sending while the session works queues the message on
+that session, as the full-screen composer does: it waits in the cell's queue strip
+(edit, steer, remove) and sends when the turn ends. With Always steer on it steers
+into the running turn instead, and Mod+Enter steers the whole queue. Editing a
+queued message brings its tags back as tokens. The queue belongs to the session, so
+the full-screen view shows and flushes the same messages; a reload drops a cell's
+queued messages, where the full-screen composer restores its own. Escape does not
+stop a cell's turn, and Interrupt shows only while the draft is empty, so a draft
+sends. Typing "@" opens the full-screen "@" picker over that session: its sessions,
+and its workspace files when the harness opens them. A picked tag is kept in the
+shared draft, so it carries to the full-screen view, and is sent as its marker.
+Enter picks from the open picker and never sends while it is open, and Mod+Enter
+waits for it too. Tags are picked only in the cell's main text, not in quote cards,
+and show as plain `@name` text, not as pills. It also shows the session's host,
+permission mode (switchable by the owner), and the same model and effort picker as
+the full-screen composer, which changes only that session (Smart Routing too, where
+eligible). Shift+Tab in the cell's composer steps that session's mode too, even with
+the "@" picker open; side chats and subagent tabs keep Shift+Tab for focus.
+Switch the host from the cell's host menu when you can edit the session. The model picker
+is hidden along with the composer for a viewer who can't edit the session. It is
+inert while the session is unreachable or structurally read-only, such as a Claude
+Code sub-agent. A cell whose managed sandbox is still launching lists no models until
+its host is bound, unlike the full-screen composer, which previews the sandbox's
+catalog.
+
 ## Driving it with the repro environment
 
 Preconditions: a running instance (`verify-env start`, then `verify-env
@@ -526,6 +647,13 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/browser_ui/chat/test_composer_geometry_contract.py::test_landing_and_live_cards_share_the_geometry_contract`
   uses the built SPA with mocked APIs (no server required), comparing touch and
   mouse input at phone, tablet, and desktop widths.
+
+- **`prompt-link`, Inbox action handoff:** with an Omni Advisor suggestion in
+  the Inbox, expand it and click an action. The New Chat composer should open
+  with the action's prompt filled in and editable, the handoff token gone from
+  the URL, and no session created until Send. Component coverage:
+  `web/src/pages/InboxPage.test.tsx` (`takes an agent action and opens the
+composer with its prompt`).
 
 - **`blocked-start`:** on a fresh new-session page with no working directory,
   enter a prompt or attach a file. Hover disabled Start, click it, then move
@@ -582,6 +710,16 @@ Other connection providers alone do not enable the managed MCP picker.
   reply once, with no model-change error. Requires Claude Code and tmux. Use
   a clean container when machine-managed Claude settings override the mock
   endpoint; this does not establish live gateway compatibility.
+- **`model-picker`, paused Pi after server restart (own environment):**
+  Start a Pi session on a host with a configured local catalog, pause the
+  session, restart only the server, and reload the session. Open the model
+  picker through the gear, model pill, and Ctrl+Shift+M; the host models must
+  appear while the runner remains offline. Repeat for a sub-agent that inherits
+  its host from an ancestor. The component scenario
+  `tests/server/routes/test_sessions_snapshot.py::test_session_snapshot_fills_cold_pi_catalog_from_host`
+  covers direct and inherited hosts, concurrent reads and refresh publication.
+  Direct-host browser evidence is in the PR Demo; inherited-host browser and
+  live-provider resume checks remain manual gaps.
 - **`model-picker`, row hover (both composers):** no browser-level coverage;
   `web/src/lib/composerModelLabel.test.ts`. Manually: hover a row labeled with
   a family name and expect its full model ID; the Fusion row shows none.
@@ -705,22 +843,57 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/browser_ui/chat/test_slash_menu.py::test_new_command_deleted_project_opens_unfiled`
   covers deleted projects with dangling session membership.
   No running agent is needed.
+- **`slash-menu` (claude-sdk `/clear`) and `slash-rewind`:** the browser
+  scenarios select the command from the menu against a real Claude CLI on the
+  mock LLM:
+  `tests/e2e_ui/chat/test_claude_sdk_clear.py::test_claude_sdk_clear_follows_a_new_empty_session`
+  and
+  `tests/e2e_ui/chat/test_claude_sdk_rewind.py::test_claude_sdk_rewind_follows_the_truncated_session`.
+  At the process boundary, with a real Claude login, Claude Code native
+  `/rewind` is covered by
+  `tests/e2e/test_host_claude_native_fork_e2e.py::test_rewind_claude_native_resumes_only_the_earlier_history`
+  (opt in with `OMNIGENT_E2E_CLAUDE_NATIVE=1`) and claude-sdk `/rewind` by
+  `tests/e2e/test_host_claude_sdk_e2e.py::test_rewind_claude_sdk_keeps_only_the_earlier_turns`
+  (opt in with `OMNIGENT_E2E_CLAUDE_SDK=1`). The typed
+  full command, the fallback to text or a custom command, and a prompt that
+  arrives after the redirect are component-covered in
+  `web/src/pages/ChatPage.composer.test.tsx`; the picker's older-prompt
+  loading, retry and stale replies in `web/src/components/RewindPicker.test.tsx`.
+  Manually, repeat both entry routes (menu click; whole command plus Enter)
+  for SDK `/clear`, SDK `/rewind` and native `/rewind`, and rewind to a prompt
+  with an attachment. Each `/clear` moves the view to an empty chat on the
+  same machine, and the original chat ends with a notice linking to it. The
+  capability gate is also in `web/src/pages/ChatPage.composer.test.tsx`.
 - **`slash-menu`:**
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`,
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_shows_full_skill_description`,
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_shows_a_long_single_match_from_the_keyboard`,
-  `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_highlight_opens_no_tooltip_on_a_touch_screen`,
+  `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_highlight_opens_no_tooltip_in_the_mobile_layout`,
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_bounds_a_very_long_skill_description`,
   `tests/e2e_ui/chat/test_side_chat_slash_command.py::test_side_chat_slash_menu_and_skill_invocation`;
   incomplete catalog:
   `tests/e2e_ui/chat/test_codex_skills_menu_inventory_failure.py::test_failed_plugin_inventory_is_not_shown_as_an_empty_catalog`.
-  claude-sdk `/clear` from the menu, with a real Claude CLI on the mock model:
-  `tests/e2e_ui/chat/test_claude_sdk_clear.py::test_claude_sdk_clear_follows_a_new_empty_session`.
-  Manually, in a claude-sdk session with one finished turn, type `/cle` and
-  pick **/clear**, then repeat in a new session by typing `/clear` and pressing
-  Enter. Each time the view moves to an empty chat on the same machine, and the
-  original chat ends with a notice linking to it. Menu and typed entry, and the
-  capability gate, are in `web/src/pages/ChatPage.composer.test.tsx`.
+  claude-sdk `/clear` is in the `/clear` and `slash-rewind` recipe above.
+- **`goal-command`:**
+  `tests/e2e_ui/chat/test_codex_goal_mode.py::test_codex_goal_mode_processes_first_message_with_untrusted_hooks`
+  drives a real Codex native session through **+ → Goal**, bare `/goal`, and
+  the slash-menu row. Component coverage in `web/src/pages/ChatPage.composer.test.tsx`
+  also checks Polly's command-backed dialog, full objective forwarding, and
+  same-named skills when Goal is unavailable. New-session and side-chat
+  composers do not expose this session Goal dialog.
+  `web/src/components/goal/useGoalState.test.tsx` covers external goal changes,
+  session switches, and polling races; `GoalDialog.test.tsx` in that directory
+  covers preserving drafts during background updates. Manually, in a started
+  Codex native Chat, send `/goal <objective>` while idle and during work. The
+  goal indicator should appear within a few seconds without reopening controls.
+  Open Goal, change the objective, budget, and mode, and wait ten seconds:
+  the unsaved edits should remain. Pause or resume the goal and confirm the
+  indicator follows its status; then delete the test goal. During a temporary
+  goal-read failure, the indicator should remain. Restore connectivity and
+  return to the tab to confirm it refreshes without reopening Goal.
+  If goal setup times out or loses its reply, the goal may already have been
+  saved even though the objective message was not delivered. Inspect Goal
+  before resending: another `/goal <objective>` sets that objective again.
 - **`session-mcp-status`, in-session composer:** component coverage lives in
   `web/src/pages/ChatPage.composer.test.tsx`. Manually open a started session,
   select `/mcp`, and expect the effective MCP names and descriptions under
@@ -818,7 +991,7 @@ Other connection providers alone do not enable the managed MCP picker.
   `web/electron/e2e/desktop_dictation_availability.e2e.js` (new-session
   composer only), run from `web/electron` after building the SPA
   (`OMNIGENT_PW_NO_SANDBOX=1 OMNIGENT_PYTHON=../../.venv/bin/python xvfb-run -a
-  node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
+node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
   server without dictation (on macOS, the macOS Dictation mic instead), then
   the mic dictating through a fake-engine server. Manually, for the in-session,
   new-session and side-chat composers: connect the desktop app to a default
@@ -865,8 +1038,8 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/chat/test_composer_bulk_steer.py::test_bulk_steer_retries_the_whole_queue`.
   The native mid-turn notice has component coverage in
   `web/src/pages/ChatPage.userBubble.test.tsx`.
-  `tests/browser_ui/chat/test_status_indicators.py::test_touch_screens_reveal_timestamps_and_pending_steering`
-  verifies phone and tablet touch visibility without hover.
+  `tests/browser_ui/chat/test_status_indicators.py::test_mobile_layout_reveals_timestamps_and_pending_steering`
+  verifies their visibility without hover in the mobile layout.
 - **`host-offline-hold`:** no browser-level coverage.
   `tests/server/integration/test_session_host_launch.py::test_offline_host_send_held_by_client_records_nothing`
   (plain `uv run pytest`) checks that a held send is refused with nothing
@@ -904,9 +1077,11 @@ Other connection providers alone do not enable the managed MCP picker.
   `web/src/pages/ChatPage.composer.test.tsx`, and
   `web/src/components/chat/SideChatPane.test.tsx`. Grid session panes and
   sub-agent Workspace tabs render the same `SideChatPane`, whose Edit logic has
-  component coverage; their own wiring is checked by hand: open
-  a grid pane or a writable Workspace tab, click Edit on a message you sent
-  there, and confirm that pane's composer fills while the main one stays empty.
+  component coverage; their own wiring is checked by hand. Open a writable
+  Workspace tab, click Edit on a message you sent there, and confirm that tab's
+  composer fills while the main one stays empty. In a grid pane, Edit fills that
+  cell's composer, which shares the session's draft: after switching to the
+  full-screen view, the same text, tags and review comments show in its composer.
 - **`delivered-send-recovery`, in-session composer (desktop and mobile):**
   `tests/e2e_ui/mobile/test_composer_after_unacked_send.py::test_composer_stays_empty_after_delivered_but_unacked_send`
   runs with a phone viewport. Run the same lost-ack journey at a desktop viewport

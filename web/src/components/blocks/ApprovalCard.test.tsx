@@ -28,6 +28,19 @@ import { parseEventLines } from "@/lib/sse";
 import { useChatStore } from "@/store/chatStore";
 import { ApprovalCard, ElicitationCard } from "./ApprovalCard";
 
+// jsdom has no layout or media queries, so check the classes that set the button's
+// shape: one line with the prefix shrinking first, wrapping in the narrow layout.
+function expectOneLinePrefixButton(button: HTMLElement, prefix: string) {
+  expect(button).toHaveClass("whitespace-nowrap");
+  expect(button).not.toHaveClass("whitespace-normal");
+  expect(button).not.toHaveClass("h-auto");
+  const shownPrefix = within(button).getByText(prefix);
+  expect(shownPrefix).toHaveClass("truncate", "min-w-0", "shrink-[1000]");
+  expect(shownPrefix).toHaveClass("mobile-app:whitespace-normal", "mobile-app:break-all");
+  expect(shownPrefix.parentElement).toHaveClass("min-w-0", "mobile-app:flex-wrap");
+  expect(shownPrefix.parentElement).not.toHaveClass("flex-wrap");
+}
+
 afterEach(() => {
   cleanup();
 });
@@ -302,7 +315,7 @@ describe("ApprovalCard — binary approve/reject", () => {
     expect(screen.getByRole("button", { name: /reject/i })).toBeDefined();
   });
 
-  it("submits Codex execpolicy amendments when the remember option is clicked", () => {
+  it("shows the exact Codex rule prefix and binds the remember choice to this request", () => {
     const submitSpy = vi.fn().mockResolvedValue(undefined);
     useChatStore.setState({ submitApproval: submitSpy } as Partial<
       ReturnType<typeof useChatStore.getState>
@@ -323,18 +336,92 @@ describe("ApprovalCard — binary approve/reject", () => {
           cwd: "/Users/example/project",
           reason: "Run the focused pytest suite.",
           execPolicyAmendment: [".venv/bin/python", "-m", "pytest"],
+          requestFingerprint: "displayed-request",
         }}
       />,
     );
 
-    const rememberButton = screen.getByRole("button", { name: /approve and remember/i });
-    expect(rememberButton.getAttribute("data-variant")).toBe("outline");
-
-    fireEvent.click(rememberButton);
-
-    expect(submitSpy).toHaveBeenCalledWith("elic_cmd_policy", "accept", {
-      execpolicy_amendment: [".venv/bin/python", "-m", "pytest"],
+    const remember = screen.getByRole("button", {
+      name: /approve and remember commands starting with/i,
     });
+    expect(within(remember).getByText('[".venv/bin/python","-m","pytest"]')).toBeVisible();
+    fireEvent.click(remember);
+    expect(submitSpy).toHaveBeenCalledWith("elic_cmd_policy", "accept", {
+      remember: true,
+      request_fingerprint: "displayed-request",
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Approve" }));
+    expect(submitSpy).toHaveBeenLastCalledWith("elic_cmd_policy", "accept", undefined);
+  });
+
+  it("keeps a long Codex rule prefix on one line with the full prefix in the name and title", () => {
+    const submitSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ submitApproval: submitSpy } as Partial<
+      ReturnType<typeof useChatStore.getState>
+    >);
+    const heredoc = "ssh build-host python3.12 - <<'PY'\nimport json\nprint(json.dumps({}))\nPY";
+    const prefix = JSON.stringify(["/bin/zsh", "-lc", heredoc]);
+
+    render(
+      <ApprovalCard
+        elicitationId="elic_cmd_long"
+        message="Codex wants to run a remote script"
+        phase="codex_command_approval"
+        policyName="codex_native_command_approval"
+        contentPreview=""
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+        codexCommand={{
+          command: `/bin/zsh -lc "${heredoc}"`,
+          cwd: null,
+          reason: null,
+          execPolicyAmendment: ["/bin/zsh", "-lc", heredoc],
+          requestFingerprint: "long-request",
+        }}
+      />,
+    );
+
+    const remember = screen.getByRole("button", {
+      name: `Approve and remember commands starting with ${prefix}`,
+    });
+    expect(remember).toHaveAttribute(
+      "title",
+      `Approve and remember commands starting with ${prefix}`,
+    );
+    expectOneLinePrefixButton(remember, prefix);
+    fireEvent.click(remember);
+    expect(submitSpy).toHaveBeenCalledWith("elic_cmd_long", "accept", {
+      remember: true,
+      request_fingerprint: "long-request",
+    });
+  });
+
+  it("shows the remembered command prefix after approval", () => {
+    render(
+      <ApprovalCard
+        elicitationId="elic_cmd_policy"
+        message="Codex wants to run pytest"
+        phase="codex_command_approval"
+        policyName="codex_native_command_approval"
+        contentPreview=""
+        requestedSchema={{}}
+        status="responded"
+        response={{ action: "accept", content: { remember: true } }}
+        codexCommand={{
+          command: ".venv/bin/python -m pytest -q",
+          cwd: null,
+          reason: null,
+          execPolicyAmendment: [".venv/bin/python", "-m", "pytest"],
+        }}
+      />,
+    );
+
+    expect(screen.getByText("Approved and remembered")).toBeVisible();
+    const prefix = screen.getByText('[".venv/bin/python","-m","pytest"]');
+    expect(prefix).toBeVisible();
+    // The compact JSON has no spaces, so without break-all a long prefix overflows the card.
+    expect(prefix).toHaveClass("break-all");
   });
 });
 
@@ -825,6 +912,33 @@ describe("ApprovalCard — Antigravity permission prompt details", () => {
     });
   });
 
+  it("keeps long persist patterns on one line without hiding the session scope", () => {
+    const pattern = "python3 -c 'import sys; print(sys.version)' && ".repeat(6).trim();
+    render(
+      <ApprovalCard
+        {...baseProps}
+        status="pending"
+        response={null}
+        agyPermission={{ actionDescription: "Running a script", alwaysAllowPattern: pattern }}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    const sessionAllow = screen.getByRole("button", {
+      name: `Allow commands starting with ${pattern} for this session`,
+    });
+    const alwaysAllow = screen.getByRole("button", {
+      name: `Always allow commands starting with ${pattern}`,
+    });
+    for (const button of [sessionAllow, alwaysAllow]) {
+      expectOneLinePrefixButton(button, pattern);
+    }
+    // The scope suffix is a separate item that does not shrink ahead of the pattern.
+    const scope = within(sessionAllow).getByText("for this session");
+    expect(scope).not.toHaveClass("shrink-[1000]");
+    expect(scope).toHaveClass("mobile-app:whitespace-normal");
+  });
+
   it("offers no persist choice when agy's prompt advertises none", () => {
     render(
       <ApprovalCard
@@ -1164,6 +1278,34 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
     );
 
     expect(screen.getByText("Codex needs input")).toBeDefined();
+    expect(screen.queryByText("Claude has questions")).toBeNull();
+  });
+
+  it("titles a workflow question with the task waiting on it, on any harness", () => {
+    render(
+      <ApprovalCard
+        elicitationId="elicit_journal_1"
+        message="Waiting for you on Review and approve the plan"
+        phase="workflow_request_input"
+        policyName=""
+        contentPreview=""
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+        askUserQuestion={{
+          questions: [
+            {
+              question: "Approve this plan?",
+              header: "Plan approval",
+              options: [{ label: "Approve (recommended)" }, { label: "Request changes" }],
+              multiSelect: false,
+            },
+          ],
+        }}
+      />,
+    );
+
+    expect(screen.getByText("Waiting for you on Review and approve the plan")).toBeDefined();
     expect(screen.queryByText("Claude has questions")).toBeNull();
   });
 
