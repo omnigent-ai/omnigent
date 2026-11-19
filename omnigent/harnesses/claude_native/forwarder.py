@@ -503,11 +503,7 @@ async def _surface_missing_transcript(
     """
     Report a finished turn whose hook-reported transcript file still does not exist.
 
-    Claude Code keeps reporting ``transcript_path`` when it cannot create the
-    file (an unwritable ``~/.claude``) and still ends the turn with ``Stop``,
-    so nothing it mirrored explains the empty history. Logs once per path,
-    posts an error item into the session, and returns the text the idle edge
-    carries as ``output`` so the parent learns the result could not be read.
+    Report a missing or unreadable Stop transcript to chat and parent, logging once per path.
 
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
@@ -555,9 +551,13 @@ async def _surface_missing_transcript(
     payload: dict[str, object] = {
         "type": "external_conversation_item",
         "data": {
-            # Stable per hook record, so a retried or re-seen Stop cannot
-            # duplicate the notice.
-            "source_id": f"missing-transcript:{record.event_cursor}:{record.byte_offset}",
+            # Stable per hook record, so a retried or re-seen Stop cannot duplicate
+            # the notice. The timestamp also separates hook-log generations, since
+            # a cold resume rewrites the log and can reuse the same cursor.
+            "source_id": (
+                f"missing-transcript:{record.event_cursor}:{record.byte_offset}"
+                f":{record.recorded_at}"
+            ),
             "item_type": "error",
             "item_data": {
                 "source": "harness",

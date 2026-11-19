@@ -1035,3 +1035,55 @@ async def test_unreadable_transcript_is_surfaced_through_the_forwarder_loop(
     warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
     assert len(warnings) == 1
     assert "exists but could not be read" in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_diagnostic_ids_differ_across_hook_log_generations(tmp_path: Path) -> None:
+    """A cold resume rewrites the hook log; equal cursors must not reuse a diagnostic id.
+
+    The two generations use the same payload and serialized length, so the cursor
+    and byte offset match and only the recorded timestamps differ.
+    """
+    transcript_path = tmp_path / "never-written.jsonl"
+
+    def generation(name: str, recorded_at: float) -> Path:
+        bridge_dir = tmp_path / name
+        bridge_dir.mkdir()
+        (bridge_dir / "claude-settings.json").write_text("{}", encoding="utf-8")
+        lines = [
+            json.dumps(
+                {
+                    "recorded_at": recorded_at,
+                    "payload": {
+                        "hook_event_name": event_name,
+                        "session_id": "claude-session",
+                        "transcript_path": str(transcript_path),
+                    },
+                },
+                separators=(",", ":"),
+            )
+            for event_name in ("UserPromptSubmit", "Stop")
+        ]
+        (bridge_dir / forwarder._HOOKS_FILE).write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return bridge_dir
+
+    async def diagnostic_ids(bridge_dir: Path) -> list[str]:
+        requests: list[dict[str, Any]] = []
+        async with httpx.AsyncClient(
+            transport=_recording_transport(requests), base_url="http://test"
+        ) as client:
+            await _forward_stop_edge(client, bridge_dir, "conv_generations")
+        return [
+            request["data"]["source_id"]
+            for request in requests
+            if request["type"] == "external_conversation_item"
+        ]
+
+    first = generation("gen-first", 1700000000.1)
+    second = generation("gen-second", 1700000999.9)
+    first_ids = await diagnostic_ids(first)
+    second_ids = await diagnostic_ids(second)
+    assert len(first_ids) == len(second_ids) == 1
+    assert first_ids[0] != second_ids[0]
+    # A retry of the same generation re-posts the same notice id.
+    assert await diagnostic_ids(first) == first_ids
