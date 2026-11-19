@@ -40,7 +40,6 @@ import re
 import stat
 import subprocess
 import threading
-from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -48,7 +47,6 @@ from typing import TypeAlias, TypedDict, cast
 
 from omnigent.entities.environment_filesystem import FilesystemEntry, InvalidPath
 from omnigent.entities.pagination import PagedList, paginate_in_memory
-from omnigent.inner._cwd_scan import _DEFAULT_DEPRIORITIZED_DIRS
 from omnigent.runner import pr_resource
 from omnigent.runner.environment_filesystem import (
     _SEARCH_SCAN_BUDGET,
@@ -64,6 +62,7 @@ from omnigent.runtime.filesystem_registry import (
     GitStatusUnavailable,
     create_filesystem_registry,
 )
+from omnigent.workspace_file_search import walk_search
 
 # Match the runner's caps so a host-served read is truncated identically.
 _MAX_READ_BYTES = 10 * 1024 * 1024  # 10 MiB
@@ -583,122 +582,9 @@ class WorkspaceReader:
             limit=limit,
         )
 
-        results: list[FilesystemEntry] = []
-        # State the two-pass walk mutates via closures (rebound through the
-        # `nonlocal` in scan()). deferred is a FIFO of noise-dir roots to drain
-        # in pass 2.
-        deferred: deque[str] = deque()
-        scanned = 0
-        truncated = False
-        stop = False
-
-        # os.walk is handed the absolute root, so an entry's path relative to
-        # it is a slice of dirpath -- no per-entry relpath(), whose abspath()
-        # work used to dominate the walk's runtime.
-        # rstrip: a bare root ("/", "C:\\") already ends in the separator the
-        # slice skips.
-        cut = len(str(self._root).rstrip(os.sep)) + 1
-
-        def rel(dirpath: str, name: str) -> str:
-            # Entries always use '/', like the git-index paths they merge with.
-            rel_dir = dirpath[cut:]
-            if os.sep != "/":
-                rel_dir = rel_dir.replace(os.sep, "/")
-            return f"{rel_dir}/{name}" if rel_dir else name
-
-        def match(dirpath: str, name: str, *, is_dir: bool) -> None:
-            # A directory carries no byte size; a file stats for size + mtime.
-            p = rel(dirpath, name)
-            if exc and any(r.match(p) for r in exc):
-                return
-            if inc and not any(r.match(p) for r in inc):
-                return
-            if q not in name.lower() and q not in p.lower():
-                return
-            try:
-                st = (Path(dirpath) / name).stat()
-                size: int | None = None if is_dir else st.st_size
-                mtime: int | None = int(st.st_mtime)
-            except OSError:
-                size = None
-                mtime = None
-            results.append(
-                FilesystemEntry(
-                    id=p,
-                    name=name,
-                    path=p,
-                    type="directory" if is_dir else "file",
-                    bytes=size,
-                    modified_at=mtime,
-                )
-            )
-
-        def scan(root: str, defer: bool) -> None:
-            # A query matching little or nothing never fills the result cap, so
-            # the walk needs its own bound. Counted per entry: a per-directory
-            # check lets one huge directory overshoot before `truncated` trips.
-            nonlocal scanned, truncated, stop
-            for dirpath, dirnames, filenames in os.walk(root):
-                kept = []
-                for d in sorted(dirnames):
-                    if d == ".git":
-                        # Git's own store is never a search target, and in a
-                        # plain clone its reflogs alone can outnumber the tree.
-                        continue
-                    full = os.path.join(dirpath, d)
-                    dp = rel(dirpath, d)
-                    if any(r.match(dp) for r in exc):
-                        continue
-                    if defer and d in _DEFAULT_DEPRIORITIZED_DIRS:
-                        # Match the dir now, but walk its subtree later (pass 2)
-                        # so it can't starve the real tree of scan budget. Never
-                        # defer a symlinked dir: os.walk(root) follows a top-level
-                        # symlink, so a committed 'node_modules -> ..' would let
-                        # pass 2 escape the workspace. os.walk(followlinks=False)
-                        # never crosses symlinks mid-tree; deferring only real
-                        # dirs keeps that boundary intact.
-                        if not os.path.islink(full):
-                            deferred.append(full)
-                    kept.append(d)
-                dirnames[:] = [d for d in kept if not (defer and d in _DEFAULT_DEPRIORITIZED_DIRS)]
-                for dname in kept:
-                    # Count then check `> budget`, not `>= budget`: a tree of
-                    # exactly `budget` entries is fully enumerable and must not
-                    # report truncated.
-                    scanned += 1
-                    if scanned > _SEARCH_SCAN_BUDGET:
-                        truncated = True
-                        stop = True
-                        return
-                    match(dirpath, dname, is_dir=True)
-                    if len(results) >= limit:
-                        stop = True
-                        return
-                for fname in sorted(filenames):
-                    scanned += 1
-                    if scanned > _SEARCH_SCAN_BUDGET:
-                        truncated = True
-                        stop = True
-                        return
-                    match(dirpath, fname, is_dir=False)
-                    if len(results) >= limit:
-                        stop = True
-                        return
-
-        # Pass 1 walks the real tree and defers dependency/cache subtrees;
-        # reordering siblings isn't enough, because a deep node_modules nested
-        # under an earlier-sorted real dir would still swallow the whole budget
-        # before the walk reached a later top-level dir. Pass 2 drains the
-        # deferred roots only if budget remains. Mirrors the runner's walk.
-        scan(str(self._root), True)
-        while deferred and not stop:
-            scan(deferred.popleft(), False)
-        # When the walk stops early it is always because scan() tripped the
-        # budget (which sets truncated) or the result limit (signaled by
-        # has_more); the loop exits only once deferred is drained or stop is
-        # set, so no extra truncation flag is needed here.
-
-        results.sort(key=lambda entry: entry.path)
+        results, truncated = walk_search(
+            self._root, q, inc, exc, limit, budget=_SEARCH_SCAN_BUDGET
+        )
         if indexed is not None:
             results = merge_entries(indexed, results, limit)
         return self._search_payload(results, limit, truncated=truncated)
