@@ -469,18 +469,41 @@ describe("a switch deferred when the session changes", () => {
   }
 
   it.each([
-    ["an IME composition", (input: HTMLElement) => fireEvent.compositionStart(input)],
-    ["a drag selection", (input: HTMLElement) => fireEvent.pointerDown(input)],
-  ])("runs once the new session drops %s left from the old one", async (_name, interrupt) => {
+    [
+      "an IME composition",
+      (input: HTMLElement) => fireEvent.compositionStart(input),
+      (input: HTMLElement) => fireEvent.compositionEnd(input),
+    ],
+    [
+      "a drag selection",
+      (input: HTMLElement) => fireEvent.pointerDown(input),
+      () => fireEvent.pointerUp(window),
+    ],
+  ])(
+    "keeps waiting through a session change during %s, and runs once it ends",
+    async (_name, start, end) => {
+      await loadedCodeMirror();
+      const { rerender } = render(<Keyed engine="textarea" draftKey="session-a" />);
+      start(composerInput());
+
+      rerender(<Keyed engine="codemirror" draftKey="session-a" />);
+      expect(engineOf(composerInput())).toBe("textarea");
+
+      // The requested engine stays the same; only the session changes.
+      rerender(<Keyed engine="codemirror" draftKey="session-b" />);
+      expect(engineOf(composerInput())).toBe("textarea");
+
+      end(composerInput());
+      expect(engineOf(composerInput())).toBe("codemirror");
+    },
+  );
+
+  it("ignores a secondary-button press, which would never release a drag", async () => {
     await loadedCodeMirror();
     const { rerender } = render(<Keyed engine="textarea" draftKey="session-a" />);
-    interrupt(composerInput());
+    fireEvent.pointerDown(composerInput(), { button: 2 });
 
     rerender(<Keyed engine="codemirror" draftKey="session-a" />);
-    expect(engineOf(composerInput())).toBe("textarea");
-
-    // The requested engine stays the same; only the session changes.
-    rerender(<Keyed engine="codemirror" draftKey="session-b" />);
 
     expect(engineOf(composerInput())).toBe("codemirror");
   });

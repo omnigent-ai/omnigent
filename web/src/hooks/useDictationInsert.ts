@@ -195,7 +195,7 @@ export function useDictationInsert(
       if (spliced.next === current) {
         producedRef.current = mine === null ? null : settled;
         // No draft render follows, so the pinned region must re-render on its own.
-        setInterimPending(producedRef.current?.region != null);
+        setInterimPending((producedRef.current?.region ?? null) !== null);
         return;
       }
 

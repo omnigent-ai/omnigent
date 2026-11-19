@@ -9792,22 +9792,8 @@ describe("saved sandbox inference policy", () => {
 
 describe("Composer with the CodeMirror release flag on", () => {
   const codeMirrorInfo = { ...FALLBACK_SERVER_INFO, features: { chat_composer_codemirror: true } };
-  let originalClientRects: PropertyDescriptor | undefined;
-  beforeEach(() => {
-    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
-    // jsdom lacks Range.getClientRects, which CodeMirror's measurement frame needs.
-    originalClientRects = Object.getOwnPropertyDescriptor(Range.prototype, "getClientRects");
-    Object.defineProperty(Range.prototype, "getClientRects", {
-      configurable: true,
-      value: () => [],
-    });
-  });
-  afterEach(() => {
-    resetCodeMirrorComposerLoadForTests();
-    if (originalClientRects)
-      Object.defineProperty(Range.prototype, "getClientRects", originalClientRects);
-    else Reflect.deleteProperty(Range.prototype, "getClientRects");
-  });
+  beforeEach(() => resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule));
+  afterEach(() => resetCodeMirrorComposerLoadForTests());
 
   it("renders the main composer on CodeMirror and sends a typed message", async () => {
     const props = composerProps();

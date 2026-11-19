@@ -3923,10 +3923,10 @@ function ComposerImpl(
 
   const clearComposerAfterSend = (resetNativeInputSession: boolean) => {
     const textarea = textareaRef.current;
-    if (resetNativeInputSession && textarea !== null && isComposerTextarea(textarea)) {
+    if (resetNativeInputSession && textarea !== null) {
       // End the emptied text-input session so native keyboards drop predictions.
       textarea.focus({ preventScroll: true });
-      textarea.value = "";
+      if (isComposerTextarea(textarea)) textarea.value = "";
       textarea.setSelectionRange(0, 0);
       textarea.blur();
     } else if (textarea !== null && isComposerTargetFocused(textarea)) {

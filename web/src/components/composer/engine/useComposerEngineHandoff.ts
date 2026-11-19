@@ -110,11 +110,10 @@ export function useComposerEngineHandoff(
     switchWaiting.current = requested !== rendered;
   });
 
-  // Another draft starts with nothing remembered from the last one.
+  // Another draft starts with nothing remembered from the last one. A live composition or drag
+  // still belongs to the DOM, so it isn't cleared here.
   useLayoutEffect(() => {
     lastFocusedId.current = null;
-    composing.current = false;
-    dragging.current = false;
     pending.current = null;
   }, [draftKey]);
 
@@ -133,6 +132,8 @@ export function useComposerEngineHandoff(
       settle();
     };
     const onPointerDown = (event: PointerEvent) => {
+      // A secondary-button press opens a context menu and never sends its pointerup.
+      if (event.button !== 0) return;
       if (event.target instanceof Element && event.target.closest(COMPOSER_INPUT_SELECTOR)) {
         dragging.current = true;
       }
