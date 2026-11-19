@@ -23,6 +23,8 @@ import { Button } from "@/components/ui/button";
 import { TabsContent } from "@/components/ui/tabs";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useComments } from "@/hooks/useComments";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
 import type { usePullRequestReviewThreads } from "@/hooks/usePullRequestReviewThreads";
 import { RunnerOfflineError } from "@/hooks/useWorkspaceChangedFiles";
@@ -41,6 +43,7 @@ import {
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { gitProviderCopy } from "@/lib/gitProviders";
 import { hasCommandModifier } from "@/lib/hotkeys";
+import { consumeLocalReviewNavigation, useLocalReviewNavigation } from "@/lib/localReviewContext";
 import { PULL_REQUEST_DIFF_THEME, type ReviewThread } from "@/lib/pullRequestReviewThreads";
 import { patchFileHashes, useViewedFiles, type PullRequestIdentity } from "@/lib/pullRequestViewed";
 import { cn } from "@/lib/utils";
@@ -61,6 +64,7 @@ import { PullRequestFindBar } from "./PullRequestFindBar";
 import { PullRequestPathFilter } from "./PullRequestPathFilter";
 import { PullRequestReviewThread, type ReviewThreadContext } from "./PullRequestReviewThread";
 import { PullRequestViewedProgress, PullRequestViewedToggle } from "./PullRequestViewedControls";
+import { LocalReviewComment } from "./LocalReviewComment";
 import {
   buildSearchCorpus,
   changedFilesFromPatch,
@@ -498,8 +502,132 @@ export function PullRequestChangesTab({
   const headSha = pr.head_sha;
   const baseSha = pr.base_sha;
   const mobile = useIsMobileViewport();
+  const serverInfo = useServerInfo();
+  const sessionComments = useComments(selected ? conversationId : undefined);
+  const selectedPrUrl = data.selected_pr_url ?? pr.url;
+  const localComments = useMemo(
+    () =>
+      (sessionComments.data ?? []).filter(
+        (comment) => comment.anchor_metadata?.pr_url === selectedPrUrl,
+      ),
+    [sessionComments.data, selectedPrUrl],
+  );
+  const earlierLocalCommentIds = useMemo(
+    () =>
+      new Set(
+        localComments
+          .filter(
+            (comment) =>
+              comment.anchor_metadata?.head_sha !== prDiff.data?.head_sha ||
+              comment.anchor_metadata?.base_sha !== prDiff.data?.base_sha,
+          )
+          .map((comment) => comment.id),
+      ),
+    [localComments, prDiff.data?.head_sha, prDiff.data?.base_sha],
+  );
   const view = useChangesViewState(conversationId, data.selected_pr_url ?? pr.url);
-  const { revealedPaths, reveal, clearReveal, find } = view;
+  const {
+    revealedPaths,
+    reveal,
+    clearReveal,
+    find,
+    setPathFilter,
+    setHideViewed,
+    setMode,
+    setSinceSha,
+    shownEarlierCommentPaths,
+    setEarlierCommentsShown,
+  } = view;
+  const shownLocalComments = localComments.filter(
+    (comment) =>
+      !earlierLocalCommentIds.has(comment.id) || shownEarlierCommentPaths.has(comment.path),
+  );
+  const navigationTarget = useLocalReviewNavigation(conversationId);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const commentHighlight = useRef<Animation | null>(null);
+  useEffect(
+    () => () => commentHighlight.current?.cancel(),
+    [conversationId, selectedPrUrl, selected],
+  );
+  useEffect(() => {
+    if (
+      !selected ||
+      !navigationTarget ||
+      changes.isLoading ||
+      changes.isFetching ||
+      prDiff.isLoading ||
+      prDiff.isFetching ||
+      sessionComments.isFetching ||
+      !sessionComments.isSuccess ||
+      navigationTarget.anchor_metadata?.pr_url !== selectedPrUrl
+    )
+      return;
+    if (view.mode !== "changes" || view.sinceSha) {
+      setMode("changes");
+      setSinceSha(null);
+      return;
+    }
+    if (!localComments.some((comment) => comment.id === navigationTarget.id)) {
+      toast.error("This review comment is no longer available.");
+      consumeLocalReviewNavigation(conversationId);
+      return;
+    }
+    setPathFilter("");
+    setHideViewed(false);
+    if (earlierLocalCommentIds.has(navigationTarget.id)) {
+      setEarlierCommentsShown(navigationTarget.path, true);
+    }
+    reveal(navigationTarget.path);
+    // Tabs can mount their content after this effect; diff slots also settle asynchronously.
+    let frame = 0;
+    const focusComment = () => {
+      const element = scrollRef.current?.querySelector<HTMLElement>(
+        `[data-local-review-comment="${CSS.escape(navigationTarget.id)}"]`,
+      );
+      if (element?.getClientRects().length) {
+        element.focus({ preventScroll: true });
+        if ((element.getRootNode() as Document | ShadowRoot).activeElement === element) {
+          element.scrollIntoView({ block: "center" });
+          commentHighlight.current?.cancel();
+          const reducedMotion = window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
+          commentHighlight.current =
+            element.animate?.(
+              [
+                { borderColor: "var(--ring)", offset: 0 },
+                { borderColor: "var(--ring)", offset: reducedMotion ? 1 : 0.8 },
+              ],
+              { duration: 3000, easing: "ease-out" },
+            ) ?? null;
+          consumeLocalReviewNavigation(conversationId);
+          return;
+        }
+      }
+      frame = requestAnimationFrame(focusComment);
+    };
+    frame = requestAnimationFrame(focusComment);
+    return () => cancelAnimationFrame(frame);
+  }, [
+    changes.isLoading,
+    changes.isFetching,
+    prDiff.isLoading,
+    prDiff.isFetching,
+    conversationId,
+    navigationTarget,
+    reveal,
+    selected,
+    selectedPrUrl,
+    setHideViewed,
+    setPathFilter,
+    setMode,
+    setSinceSha,
+    view.mode,
+    view.sinceSha,
+    localComments,
+    sessionComments.isSuccess,
+    sessionComments.isFetching,
+    earlierLocalCommentIds,
+    setEarlierCommentsShown,
+  ]);
   // The filter input shows in the sidebar; while the sidebar is collapsed it opens inline.
   const [filterOpen, setFilterOpen] = useState(false);
   // The revision the displayed list reports. Open uses only this pinned revision, so a newer
@@ -541,12 +669,10 @@ export function PullRequestChangesTab({
   const nextCommit =
     commitIndex >= 0 && commitIndex < commitList.length - 1 ? commitList[commitIndex + 1] : null;
   // The open commit left the loaded list (the head moved), so there is nothing to step from.
-  const { setMode } = view;
   useEffect(() => {
     if (commitView && commits.data && commitIndex < 0) setMode("commits");
   }, [commitView, commits.data, commitIndex, setMode]);
   // A picked start that left the loaded list (the head moved) falls back to the PR base.
-  const { setSinceSha } = view;
   useEffect(() => {
     if (sinceSha && commits.data && !commitList.some((commit) => commit.sha === sinceSha)) {
       setSinceSha(null);
@@ -882,7 +1008,6 @@ export function PullRequestChangesTab({
 
   // The stacked diff scrolls as one; the sidebar highlights the file at the top
   // of the viewport and jumps to a file on click.
-  const scrollRef = useRef<HTMLDivElement>(null);
   const sectionEls = useRef<Map<string, HTMLElement>>(new Map());
   const [activePath, setActivePath] = useState<string | null>(null);
 
@@ -1082,6 +1207,11 @@ export function PullRequestChangesTab({
       ? `Search covers the fetched patch: ${patchFileCount} of ${listing.data?.total_count ?? files.length} files${withoutText > 0 ? `, ${withoutText} without text` : ""}`
       : null;
 
+  const earlierCommentsControl = (path: string) => ({
+    shown: shownEarlierCommentPaths.has(path),
+    onToggle: () => setEarlierCommentsShown(path, !shownEarlierCommentPaths.has(path)),
+  });
+
   // Header actions for one file. Deleted files open at the base revision; others
   // at the rendered head, so a newer polled head never changes the link. A commit's
   // files open at that commit, and a file the commit deletes has no page to open.
@@ -1105,6 +1235,15 @@ export function PullRequestChangesTab({
         previousPath={renamedFrom}
         openLabel={`Open in ${providerLabel}`}
         openUrl={openUrl}
+        earlierComments={
+          reviewing &&
+          (threadsByFile.get(file.path)?.some((thread) => thread.outdated) ||
+            localComments.some(
+              (comment) => comment.path === file.path && earlierLocalCommentIds.has(comment.id),
+            ))
+            ? earlierCommentsControl(file.path)
+            : undefined
+        }
         openUnavailableReason={
           patchView && file.status === "deleted"
             ? commitView
@@ -1150,8 +1289,8 @@ export function PullRequestChangesTab({
       pr.base_sha === prDiff.data?.base_sha &&
       reviews.page
     ),
-    headSha: pr.head_sha,
-    baseSha: pr.base_sha,
+    headSha: prDiff.data?.head_sha,
+    baseSha: prDiff.data?.base_sha,
     loadComments: reviews.loadComments,
     loadingComments: reviews.loadingComments,
   };
@@ -1182,6 +1321,22 @@ export function PullRequestChangesTab({
     else if (visibleFiles.includes(file))
       threadsByFile.set(file.path, [...(threadsByFile.get(file.path) ?? []), thread]);
   }
+  const localReviewReady =
+    reviewing &&
+    !listing.isLoading &&
+    !shownDiff.isLoading &&
+    !listing.error &&
+    !shownDiff.error &&
+    !parseError;
+  const unavailableLocalComments = localReviewReady
+    ? localComments.filter(
+        (comment) => !canShowFiles || !files.some((file) => file.path === comment.path),
+      )
+    : [];
+  const unavailableCommentPaths = new Set([
+    ...earlierThreads.map((thread) => thread.path),
+    ...unavailableLocalComments.map((comment) => comment.path),
+  ]);
   const unresolved = threads.filter((thread) => !thread.resolved);
   const navigateThread = (direction: number) => {
     const index = unresolved.findIndex((thread) => thread.id === focusedThread?.id);
@@ -1191,6 +1346,7 @@ export function PullRequestChangesTab({
     const file = files.find(
       (entry) => entry.path === next.path || filesByPath.get(entry.path)?.prevName === next.path,
     );
+    if (next.outdated) setEarlierCommentsShown(file?.path ?? next.path, true);
     if (file) {
       // A thread on a file a filter hides has no mounted section, so clear that filter first.
       // The path filter goes only when it hides the file; hide-viewed goes only for a viewed one.
@@ -1477,7 +1633,11 @@ export function PullRequestChangesTab({
                 registerRef={registerRef}
                 collapsed={pane.collapsedPaths.has(file.path)}
                 forceExpanded={pane.revealedPaths.has(file.path)}
-                forceMount={pendingReveal?.path === file.path || activeFilePath === file.path}
+                forceMount={
+                  pendingReveal?.path === file.path ||
+                  activeFilePath === file.path ||
+                  navigationTarget?.path === file.path
+                }
                 bypassLargeDiffGate={!!highlight && activeFilePath === file.path}
                 highlight={activeFilePath === file.path ? highlight : null}
                 onToggleCollapsed={() => toggleOne(file.path)}
@@ -1493,25 +1653,95 @@ export function PullRequestChangesTab({
                     />
                   ) : undefined
                 }
-                threads={threadsByFile.get(file.path) ?? []}
+                threads={(threadsByFile.get(file.path) ?? []).filter(
+                  (thread) => !thread.outdated || shownEarlierCommentPaths.has(file.path),
+                )}
                 threadContext={threadContext}
                 matchingRevision={matchingRevision}
+                localComments={
+                  localReviewReady
+                    ? shownLocalComments.filter((comment) => comment.path === file.path)
+                    : []
+                }
+                canCommentLocally={
+                  serverInfo !== "loading" &&
+                  serverInfo.comment_anchor_metadata === true &&
+                  !!(canEdit && prDiff.data?.head_sha && prDiff.data?.base_sha)
+                }
               />
             ))
           )}
-          {earlierThreads.length > 0 && (
+          {unavailableCommentPaths.size > 0 && (
             <div className="p-3">
               <p className="text-ui font-medium">Earlier conversations and unavailable diffs</p>
-              {earlierThreads.map((thread) => (
-                <div key={thread.id}>
-                  <p className="mt-3 break-all text-xs text-muted-foreground">{thread.path}</p>
-                  <PullRequestReviewThread thread={thread} context={threadContext} showContext />
+              {[...unavailableCommentPaths].map((path) => (
+                <div key={path}>
+                  <div className="mt-3 flex items-center justify-between gap-2">
+                    <p className="break-all text-xs text-muted-foreground">{path}</p>
+                    <PullRequestFileActions
+                      path={path}
+                      previousPath={null}
+                      openLabel={`Open in ${providerLabel}`}
+                      openUrl={null}
+                      openUnavailableReason="Diff unavailable"
+                      earlierComments={
+                        earlierThreads.some((thread) => thread.path === path && thread.outdated) ||
+                        unavailableLocalComments.some(
+                          (comment) =>
+                            comment.path === path && earlierLocalCommentIds.has(comment.id),
+                        )
+                          ? earlierCommentsControl(path)
+                          : undefined
+                      }
+                    />
+                  </div>
+                  {earlierThreads
+                    .filter(
+                      (thread) =>
+                        thread.path === path &&
+                        (!thread.outdated || shownEarlierCommentPaths.has(path)),
+                    )
+                    .map((thread) => (
+                      <PullRequestReviewThread
+                        key={thread.id}
+                        thread={thread}
+                        context={threadContext}
+                        showContext
+                      />
+                    ))}
+                  {unavailableLocalComments
+                    .filter(
+                      (comment) =>
+                        comment.path === path &&
+                        (!earlierLocalCommentIds.has(comment.id) ||
+                          shownEarlierCommentPaths.has(path)),
+                    )
+                    .map((comment) => (
+                      <LocalReviewComment
+                        key={comment.id}
+                        comment={comment}
+                        canEdit={canEdit}
+                        outdated={earlierLocalCommentIds.has(comment.id)}
+                      />
+                    ))}
                 </div>
               ))}
             </div>
           )}
         </div>
       </div>
+      {sessionComments.isError && (
+        <p role="alert" className="p-3 text-ui">
+          Local comments could not be loaded.{" "}
+          <button
+            type="button"
+            className="underline"
+            onClick={() => void sessionComments.refetch()}
+          >
+            Retry
+          </button>
+        </p>
+      )}
     </TabsContent>
   );
 }

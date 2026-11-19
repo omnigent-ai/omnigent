@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import dataclasses
 
+COMMENT_ANCHOR_MAX_STORED_BYTES = 1_024
+
 
 @dataclasses.dataclass(frozen=True)
 class PullRequestCommentAnchor:

@@ -10,7 +10,12 @@
 //   └──────────────────────────────────┴──────────────────┘
 
 import { FileViewerContext, useWorkspacePaths, type FilePosition } from "./FileViewerContext";
-import { revealInFileManager, revealLabel, useRevealTarget } from "./RevealInFileManager";
+import {
+  revealInFileManager,
+  revealLabel,
+  useRevealTarget,
+  useSessionHostId,
+} from "./RevealInFileManager";
 import { OpenInSplitButton, useOpenInActions } from "./OpenInMenu";
 import {
   dismissFilePosition,
@@ -54,12 +59,14 @@ import {
   PencilLineIcon,
   RowsIcon,
   SearchIcon,
+  Share2Icon,
   SquareArrowOutUpRightIcon,
   Trash2Icon,
   WrapTextIcon,
 } from "lucide-react";
 import { useSearchParams, useRebasePath } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
+import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import {
   Dialog,
   DialogContent,
@@ -89,6 +96,10 @@ import {
 } from "@/components/KeyboardShortcut";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { downloadWorkspaceFile, useFileContent } from "@/hooks/useFileContent";
+import { useHostSshTarget } from "@/hooks/useHostSshTarget";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import { workspaceSocketBridge } from "@/lib/nativeBridge";
 import { isVideoFile } from "@/lib/video";
 import { useFileDiff } from "@/hooks/useFileDiff";
 import { useInertRef } from "@/hooks/useInertRef";
@@ -102,12 +113,15 @@ import {
 import { CommentSenderProvider, useOptionalCommentSender } from "@/hooks/CommentSenderContext";
 import { markCommentsSeen } from "@/hooks/useSeenComments";
 import { useChatStore } from "@/store/chatStore";
+import { useFileMentionHarnesses } from "@/lib/agentLabels";
+import { harnessSupportsFileMentions } from "@/lib/composerMentions";
 import { useResizablePanel } from "@/hooks/useResizablePanel";
 import { useIOSNativeKeyboardInset } from "@/hooks/useIOSNativeKeyboardInset";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
 import { cn } from "@/lib/utils";
 import { copyText } from "@/lib/clipboard";
 import { absoluteWorkspacePath } from "@/lib/composerContext";
+import { isFileComment } from "@/lib/localReviewComments";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileViewPreferences";
 import { hasCommandModifier } from "@/lib/hotkeys";
@@ -129,6 +143,7 @@ import {
   openHtmlArtifactInNewTab,
 } from "./codeViewerHelpers";
 import { CommentsPanel, type ActiveSelection } from "./CommentsPanel";
+import { isDataTablePath } from "./dataTable";
 import { useScrollRestore } from "./useScrollRestore";
 import { isPdfAnchor } from "./pdfCommentHelpers";
 
@@ -345,6 +360,9 @@ interface FileViewerProps {
 
   /** Called when the user navigates to a different file via the prev/next buttons. */
   onNavigateTo?: (path: string) => void;
+  /** Opens session sharing with a fullscreen link to this file. */
+  onShare?: () => void;
+  shareDisabledReason?: string;
   /**
    * Numeric permission level for the current user on this session
    * (1 = read, 2 = edit, 3 = manage, 4 = owner). ``null`` means
@@ -405,6 +423,8 @@ function FileViewerBody({
   onClose,
   onCloseTab,
   onNavigateTo,
+  onShare,
+  shareDisabledReason,
   permissionLevel,
   frameless,
   mobileOverlay = false,
@@ -415,6 +435,10 @@ function FileViewerBody({
   // null = single-user mode (no enforcement); undefined = prop not provided (treat as unrestricted).
   // LEVEL_EDIT = 2; levels below 2 are read-only.
   const canEdit = permissionLevel == null || permissionLevel >= 2;
+  // Same gate as the composer's "@"-mention menu, so "Attach to agent" only
+  // shows when the session's agent will open the attached path.
+  const sessionHarness = useChatStore((s) => s.sessionHarness);
+  const attachToAgent = harnessSupportsFileMentions(sessionHarness, useFileMentionHarnesses());
   const [searchParams, setSearchParams] = useSearchParams();
   const rebasePath = useRebasePath();
   const isMobile = useIsMobileViewport();
@@ -452,12 +476,19 @@ function FileViewerBody({
   const changedFiles = useWorkspaceChangedFiles(conversationId);
   const isDeletedFile =
     changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false;
+  const serverInfo = useServerInfo();
+  // The host's SSH alias lets the desktop read a host on another machine directly.
+  const directReads =
+    workspaceSocketBridge() !== null && isFeatureEnabled(serverInfo, "workspace_direct_access");
+  const sessionHostId = useSessionHostId(conversationId);
+  const sshTarget = useHostSshTarget(directReads ? sessionHostId : null, conversationId);
   // Video playback reads the complete binary on demand, never the capped JSON preview.
   const fileQuery = useFileContent(
     conversationId,
     isVideoFile(path) || isDeletedFile ? null : path,
     {
       visible: onScreen,
+      ...(sshTarget ? { sshTarget } : {}),
     },
   );
 
@@ -560,7 +591,7 @@ function FileViewerBody({
   // marked seen too.
   useEffect(() => {
     if (!open || !commentsOpen || commentsQuery.data === undefined) return;
-    markCommentsSeen(commentsQuery.data.map((c) => c.id));
+    markCommentsSeen(commentsQuery.data.filter(isFileComment).map((c) => c.id));
   }, [open, commentsOpen, commentsQuery.data]);
   // Notify parent when comments panel opens or closes (e.g. so the parent
   // can widen the inline panel to fit both the code viewer and comments).
@@ -648,7 +679,10 @@ function FileViewerBody({
 
   const sender = useOptionalCommentSender();
 
-  const allComments = useMemo(() => commentsQuery.data ?? [], [commentsQuery.data]);
+  const allComments = useMemo(
+    () => (commentsQuery.data ?? []).filter(isFileComment),
+    [commentsQuery.data],
+  );
   const fileContent = useMemo(() => fileQuery.data?.content ?? "", [fileQuery.data]);
   const [remapFormatted, setRemapFormatted] = useState<
     ((comment: Comment, content: string) => Comment) | null
@@ -677,14 +711,14 @@ function FileViewerBody({
     () => classifyAndRemapComments(allComments, fileContent, remapFormatted),
     [allComments, fileContent, remapFormatted],
   );
-  // Address All sends drafts from every file; this file's own query supplies its drafts.
+  // Address All sends Files drafts across paths; this file's own query supplies its drafts.
   // Until both lists load, a send would silently skip the unloaded list's drafts.
   const { ids: addressableCommentIds, fileCount: addressableFileCount } = useMemo(() => {
     if (!commentsQuery.data || !sessionCommentsQuery.data) return { ids: [], fileCount: 0 };
     const ids = new Set(openComments.map((c) => c.id));
     const paths = new Set(openComments.length > 0 ? [path] : []);
     for (const c of sessionCommentsQuery.data) {
-      if (c.status === "draft" && c.path !== path) {
+      if (isFileComment(c) && c.status === "draft" && c.path !== path) {
         ids.add(c.id);
         paths.add(c.path);
       }
@@ -835,7 +869,10 @@ function FileViewerBody({
     }
   }
   const isPreviewable =
-    (lang === "markdown" && !markdownPreviewFallback) || lang === "html" || isNotebookPath(path);
+    (lang === "markdown" && !markdownPreviewFallback) ||
+    lang === "html" ||
+    isNotebookPath(path) ||
+    isDataTablePath(path);
   // Images and PDFs render through CodeViewer's own viewers regardless of view
   // mode; they have no source/diff representation, so diff is suppressed for
   // them (Monaco would otherwise render the base64 payload as garbage text).
@@ -922,6 +959,14 @@ function FileViewerBody({
   const [deepLinkBiasPath, setDeepLinkBiasPath] = useState<string | null>(() =>
     initialCommentIdRef.current ? path : null,
   );
+  // A data table's pull toward Source (from a picked comment) belongs to one
+  // visit: opening another file or conversation ends it, so coming back opens the
+  // table again. Other files keep their deep-link bias as before.
+  const [biasVisit, setBiasVisit] = useState({ conversationId, path });
+  if (biasVisit.conversationId !== conversationId || biasVisit.path !== path) {
+    setBiasVisit({ conversationId, path });
+    if (deepLinkBiasPath !== null && isDataTablePath(deepLinkBiasPath)) setDeepLinkBiasPath(null);
+  }
 
   // Switch a markdown file to the rich-text editor — the surface where text-
   // selection commenting works. Used by the preview's "switch to edit mode"
@@ -963,6 +1008,7 @@ function FileViewerBody({
     largeMarkdown: markdownSourceFallback ?? false,
     largeMarkdownVisitMode,
     deepLinkedComment: deepLinkBiasPath === path,
+    previewHidesComments: isDataTablePath(path),
     preference: previewableViewMode,
   });
   // Local state triggers rendering; the WeakSet preserves dismissal across remounts.
@@ -1064,6 +1110,7 @@ function FileViewerBody({
   // file makes it active) and flipped by clicks / focus moves. When the user
   // works in the chat/composer, Cmd+F falls through to the browser's find.
   const viewerIsActiveSurfaceRef = useRef(true);
+  const ownsFindShortcut = useCallback(() => viewerIsActiveSurfaceRef.current, []);
   // Mirrors the ref for rendering, which marks the viewer as owning Escape.
   const [viewerIsActiveSurface, setViewerIsActiveSurface] = useState(true);
   useEffect(() => {
@@ -1213,6 +1260,8 @@ function FileViewerBody({
     icon: ReactNode;
     onSelect?: () => void;
     active?: boolean;
+    disabled?: boolean;
+    disabledLabel?: string;
     /** When set, render a picker (dropdown/submenu) over these mutually
      * exclusive choices instead of a single button. `onSelect` is ignored. */
     options?: ToolbarOption[];
@@ -1307,9 +1356,12 @@ function FileViewerBody({
       icon: activeMode.icon,
       options: modeOptions,
     });
-  } else if ((lang === "html" || isNotebookPath(path)) && viewMode !== "diff") {
-    // HTML and notebooks have no rich-text editor — a single toggle flips
-    // preview ↔ source.
+  } else if (
+    (lang === "html" || isNotebookPath(path) || isDataTablePath(path)) &&
+    viewMode !== "diff"
+  ) {
+    // HTML, notebooks and data tables have no rich-text editor — a single toggle
+    // flips preview ↔ source.
     toolbarActions.push({
       key: "preview",
       label: viewMode === "preview" ? "View source" : "View preview",
@@ -1320,11 +1372,14 @@ function FileViewerBody({
       // file) resolves to "preview" for HTML, so a functional updater keyed on
       // "editor" would no-op the first click. Keying on viewMode makes one click
       // always reach the other surface.
-      onSelect: () => {
-        dismissFilePosition(position);
-        setDismissedPosition(position);
-        setPreviewableViewMode(viewMode === "preview" ? "source" : "preview");
-      },
+      onSelect: () =>
+        guardDirty(() => {
+          dismissFilePosition(position);
+          setDismissedPosition(position);
+          // An explicit choice ends a ?comment= link's pull toward source.
+          setDeepLinkBiasPath(null);
+          setPreviewableViewMode(viewMode === "preview" ? "source" : "preview");
+        }),
     });
   }
   // HTML artifacts can be popped out into their own browser tab for full-window
@@ -1461,6 +1516,19 @@ function FileViewerBody({
     ),
     onSelect: copyFileLink,
   });
+  if (onShare) {
+    toolbarActions.push({
+      key: "share-file",
+      label: "Share file",
+      tooltip: shareDisabledReason ?? "Share file",
+      disabledLabel: shareDisabledReason
+        ? `Share file disabled: ${shareDisabledReason}`
+        : undefined,
+      icon: <Share2Icon className="size-4" />,
+      disabled: !!shareDisabledReason,
+      onSelect: onShare,
+    });
+  }
   if (openInActions.length) {
     toolbarActions.push({
       key: "open-in",
@@ -1493,6 +1561,23 @@ function FileViewerBody({
       `path:${path}`,
     ].join("|"),
   );
+
+  const renderActionButton = (action: ToolbarAction, interactive: boolean) => {
+    const button = (
+      <Button
+        type="button"
+        variant={action.active ? "default" : "ghost"}
+        size="icon-sm"
+        aria-label={action.disabledLabel ?? action.label}
+        disabled={action.disabled}
+        tabIndex={interactive ? undefined : -1}
+        onClick={interactive ? action.onSelect : undefined}
+      >
+        {action.icon}
+      </Button>
+    );
+    return action.disabled ? <span className="inline-flex">{button}</span> : button;
+  };
 
   // The expanded inline row — rendered both offscreen (for measurement) and,
   // when it fits, as the visible toolbar. `interactive` is false for the
@@ -1589,18 +1674,7 @@ function FileViewerBody({
       ) : (
         <TooltipProvider key={action.key}>
           <Tooltip>
-            <TooltipTrigger asChild>
-              <Button
-                type="button"
-                variant={action.active ? "default" : "ghost"}
-                size="icon-sm"
-                aria-label={action.label}
-                tabIndex={interactive ? undefined : -1}
-                onClick={interactive ? action.onSelect : undefined}
-              >
-                {action.icon}
-              </Button>
-            </TooltipTrigger>
+            <TooltipTrigger asChild>{renderActionButton(action, interactive)}</TooltipTrigger>
             <TooltipContent>{action.tooltip ?? action.label}</TooltipContent>
           </Tooltip>
         </TooltipProvider>
@@ -1817,6 +1891,24 @@ function FileViewerBody({
                               )}
                             </DropdownMenuItem>
                           ))
+                        ) : action.disabled ? (
+                          <TooltipProvider key={action.key}>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <span className="block">
+                                  <DropdownMenuItem
+                                    disabled
+                                    aria-label={action.disabledLabel ?? action.label}
+                                    className="whitespace-nowrap"
+                                  >
+                                    {action.icon}
+                                    {action.label}
+                                  </DropdownMenuItem>
+                                </span>
+                              </TooltipTrigger>
+                              <TooltipContent>{action.tooltip ?? action.label}</TooltipContent>
+                            </Tooltip>
+                          </TooltipProvider>
                         ) : (
                           <DropdownMenuItem
                             key={action.key}
@@ -1878,105 +1970,113 @@ function FileViewerBody({
           onScroll={handleContentScroll}
           className="flex-1 overflow-y-auto min-w-0"
         >
-          {isDeletedFile && viewMode !== "diff" ? (
-            <div className="flex flex-col items-center justify-center gap-2 p-8 text-ui text-muted-foreground">
-              <Trash2Icon className="size-5 opacity-40" />
-              <span>This file has been deleted.</span>
-              {isDiffAvailable && (
-                <span className="text-sm">
-                  Click <FileDiffIcon className="inline size-3.5 align-text-bottom" /> to view its
-                  previous content.
-                </span>
-              )}
-            </div>
-          ) : viewMode === "diff" ? (
-            // A failed diff fetch (e.g. the diff endpoint returned a
-            // git_status_failed 500) surfaces the server's reason instead of
-            // hanging on "Loading diff…" forever — diffQuery.data stays
-            // undefined on error, which would otherwise read as still-loading.
-            diffQuery.isError ? (
-              <div className="flex items-center justify-center p-8 text-destructive text-ui">
-                Failed to load:{" "}
-                {diffQuery.error instanceof Error
-                  ? diffQuery.error.message
-                  : String(diffQuery.error)}
+          <RenderErrorBoundary
+            name="this file"
+            resetKey={JSON.stringify([conversationId, path, viewMode])}
+          >
+            {isDeletedFile && viewMode !== "diff" ? (
+              <div className="flex flex-col items-center justify-center gap-2 p-8 text-ui text-muted-foreground">
+                <Trash2Icon className="size-5 opacity-40" />
+                <span>This file has been deleted.</span>
+                {isDiffAvailable && (
+                  <span className="text-sm">
+                    Click <FileDiffIcon className="inline size-3.5 align-text-bottom" /> to view its
+                    previous content.
+                  </span>
+                )}
               </div>
-            ) : // Wait for the diff payload before mounting Monaco. useFileDiff uses
-            // null to mean new (before=null) / deleted (after=null) file, so
-            // collapsing the not-yet-loaded state into null would mount with the
-            // wrong content and mis-set EOL (onMount runs once). Once data is
-            // present, pass the real before/after through (legitimate nulls and all).
-            !diffQuery.data ? (
-              <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
-                Loading diff…
-              </div>
-            ) : diffQuery.data.baseline_state === "unknown" ? (
-              <div
-                role="status"
-                className="flex items-center justify-center p-8 text-muted-foreground text-ui"
-              >
-                Original content unavailable
-              </div>
-            ) : (
-              // Keep viewer state on resize without computing the CSS-hidden copy's diff.
-              isActiveViewport && (
-                <Suspense
-                  fallback={
-                    <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
-                      Loading diff…
-                    </div>
-                  }
+            ) : viewMode === "diff" ? (
+              // A failed diff fetch (e.g. the diff endpoint returned a
+              // git_status_failed 500) surfaces the server's reason instead of
+              // hanging on "Loading diff…" forever — diffQuery.data stays
+              // undefined on error, which would otherwise read as still-loading.
+              diffQuery.isError ? (
+                <div className="flex items-center justify-center p-8 text-destructive text-ui">
+                  Failed to load:{" "}
+                  {diffQuery.error instanceof Error
+                    ? diffQuery.error.message
+                    : String(diffQuery.error)}
+                </div>
+              ) : // Wait for the diff payload before mounting Monaco. useFileDiff uses
+              // null to mean new (before=null) / deleted (after=null) file, so
+              // collapsing the not-yet-loaded state into null would mount with the
+              // wrong content and mis-set EOL (onMount runs once). Once data is
+              // present, pass the real before/after through (legitimate nulls and all).
+              !diffQuery.data ? (
+                <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
+                  Loading diff…
+                </div>
+              ) : diffQuery.data.baseline_state === "unknown" ? (
+                <div
+                  role="status"
+                  className="flex items-center justify-center p-8 text-muted-foreground text-ui"
                 >
-                  {/* key={path} remounts per file so onMount re-runs (EOL + comment
+                  Original content unavailable
+                </div>
+              ) : (
+                // Keep viewer state on resize without computing the CSS-hidden copy's diff.
+                isActiveViewport && (
+                  <Suspense
+                    fallback={
+                      <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
+                        Loading diff…
+                      </div>
+                    }
+                  >
+                    {/* key={path} remounts per file so onMount re-runs (EOL + comment
                   wiring re-applied) and `ready` resets while the new grammar loads. */}
-                  <MonacoDiffViewer
-                    position={filePosition}
-                    key={path}
-                    before={diffQuery.data.before}
-                    after={diffQuery.data.after}
-                    path={path}
-                    layout={diffLayout}
-                    hideWhitespace={hideWhitespace}
-                    wrapLines={wrapLines}
-                    conversationId={conversationId}
-                    comments={openComments}
-                    activeSelection={activeSelection}
-                    onSetActiveSelection={handleSetActiveSelection}
-                    pendingBodyRef={pendingBodyRef}
-                    searchOpen={searchOpen}
-                    searchFocusNonce={searchFocusNonce}
-                    onSearchHandled={handleSearchHandled}
-                  />
-                </Suspense>
+                    <MonacoDiffViewer
+                      position={filePosition}
+                      key={path}
+                      before={diffQuery.data.before}
+                      after={diffQuery.data.after}
+                      path={path}
+                      layout={diffLayout}
+                      hideWhitespace={hideWhitespace}
+                      wrapLines={wrapLines}
+                      conversationId={conversationId}
+                      comments={openComments}
+                      activeSelection={activeSelection}
+                      onSetActiveSelection={handleSetActiveSelection}
+                      pendingBodyRef={pendingBodyRef}
+                      attachToAgent={attachToAgent}
+                      searchOpen={searchOpen}
+                      searchFocusNonce={searchFocusNonce}
+                      onSearchHandled={handleSearchHandled}
+                    />
+                  </Suspense>
+                )
               )
-            )
-          ) : (
-            <CodeViewer
-              position={filePosition}
-              conversationId={conversationId}
-              path={path}
-              fileQuery={fileQuery}
-              onDirtyChange={handleDirtyChange}
-              onSaveStatusChange={setSaveStatus}
-              comments={openComments}
-              addressedComments={addressedComments}
-              activeSelection={activeSelection}
-              onSetActiveSelection={handleSetActiveSelection}
-              pendingBodyRef={pendingBodyRef}
-              panelOpen={open}
-              mediaActive={onScreen}
-              searchOpen={searchOpen}
-              setSearchOpen={setSearchOpen}
-              searchFocusNonce={searchFocusNonce}
-              searchInputRef={searchInputRef}
-              viewMode={viewMode}
-              markdownSourceFallback={markdownSourceFallback ?? false}
-              wrapLines={wrapLines}
-              tocOpen={tocOpen}
-              onTocToggle={() => setTocOpen((prev) => !prev)}
-              onRequestEditMode={lang === "markdown" ? handleRequestEditMode : undefined}
-            />
-          )}
+            ) : (
+              <CodeViewer
+                position={filePosition}
+                conversationId={conversationId}
+                path={path}
+                fileQuery={fileQuery}
+                onDirtyChange={handleDirtyChange}
+                onSaveStatusChange={setSaveStatus}
+                comments={openComments}
+                addressedComments={addressedComments}
+                activeSelection={activeSelection}
+                onSetActiveSelection={handleSetActiveSelection}
+                pendingBodyRef={pendingBodyRef}
+                panelOpen={open}
+                mediaActive={onScreen}
+                searchOpen={searchOpen}
+                setSearchOpen={setSearchOpen}
+                ownsFindShortcut={ownsFindShortcut}
+                searchFocusNonce={searchFocusNonce}
+                searchInputRef={searchInputRef}
+                viewMode={viewMode}
+                markdownSourceFallback={markdownSourceFallback ?? false}
+                wrapLines={wrapLines}
+                tocOpen={tocOpen}
+                onTocToggle={() => setTocOpen((prev) => !prev)}
+                onRequestEditMode={lang === "markdown" ? handleRequestEditMode : undefined}
+                attachToAgent={attachToAgent}
+              />
+            )}
+          </RenderErrorBoundary>
         </div>
         {commentsOpen && (
           <CommentsPanel
@@ -2006,6 +2106,9 @@ function FileViewerBody({
               sender.mutate({ comment_ids: addressableCommentIds });
             }}
             onClickComment={(comment) => {
+              // A data table can't show comment anchors, so picking a comment
+              // opens Source as a ?comment= link does; the toggle still reaches the table.
+              if (isDataTablePath(path)) setDeepLinkBiasPath(path);
               handleSetActiveSelection({
                 start_index: comment.start_index,
                 end_index: comment.end_index,

@@ -15,6 +15,7 @@ from omnigent.runner.git_providers import (
     ProviderCapabilities,
     PullRequestAuth,
     PullRequestFacet,
+    PullRequestStatus,
     ReviewerRef,
     ShellPrOp,
     ShellSegment,
@@ -39,6 +40,7 @@ _CAPABILITIES = ProviderCapabilities(
     details_editing=True,
     attachment_uploads=True,
     commit_history=True,
+    merge_as_account=True,
 )
 
 
@@ -152,6 +154,14 @@ class GitHubPullRequests:
         from omnigent.runner import github_resource
 
         return github_resource._pr_title_before(root, reference, deadline)
+
+    def pr_status(
+        self, root: str, reference: PullRequestRef, deadline: float
+    ) -> tuple[PullRequestStatus | None, bool]:
+        """Look up one PR's title, state and draft flag before ``deadline``."""
+        from omnigent.runner import github_resource
+
+        return github_resource._pr_status_before(root, reference, deadline)
 
     def verify_accessible(self, root: str, reference: PullRequestRef) -> None:
         """Raise unless ``gh`` on the host can read the PR."""
@@ -269,6 +279,26 @@ class GitHubPullRequests:
 
         return github_resource._merge_pr(
             root, reference, merge_method=merge_method, expected_head=expected_head
+        )
+
+    def merge_as(
+        self,
+        root: str,
+        reference: PullRequestRef,
+        *,
+        merge_method: str,
+        expected_head: str,
+        account: str,
+    ) -> dict[str, Any]:
+        """Merge with ``gh pr merge --match-head-commit`` as ``account``."""
+        from omnigent.runner import github_resource
+
+        return github_resource._merge_pr(
+            root,
+            reference,
+            merge_method=merge_method,
+            expected_head=expected_head,
+            account=account,
         )
 
     def disable_auto_merge(self, root: str, reference: PullRequestRef) -> dict[str, Any]:

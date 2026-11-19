@@ -52,6 +52,11 @@ from omnigent.stores.conversation_store import (
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
 )
+from tests.e2e._claude_host_support import (
+    _host_daemon,
+    _launch_runner,
+    _send_user_message,
+)
 from tests.e2e.conftest import (
     _OPENAI_CODER_DIR,
     configure_mock_llm,
@@ -69,10 +74,7 @@ from tests.e2e.test_host_claude_native_e2e import (
 )
 from tests.e2e.test_host_claude_native_fork_e2e import (
     _fork_session,
-    _host_daemon,
     _init_git_repo,
-    _launch_runner,
-    _send_user_message,
     _wait_for_external_session_id,
     _workspaces_trusted_in_claude_config,
 )

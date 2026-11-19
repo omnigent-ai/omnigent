@@ -15,15 +15,22 @@ const mocks = vi.hoisted(() => ({
   filterHonored: true,
   pinFn: vi.fn(),
   reorderPins: vi.fn(),
+  moveNest: vi.fn(),
+  moveProject: vi.fn(),
+  projects: [] as { id: string; name: string }[],
+  projectRows: [] as ReturnType<typeof conv>[],
 }));
 
 vi.mock("@/hooks/useConversations", async () => {
-  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
+  const { conversationHooksMock, conversationPage: projectPage } =
+    await import("@/test/sidebarMockHelpers");
   const { useMutation } = await import("@tanstack/react-query");
   const { PIN_WRITE_MUTATION_KEY } = await import("@/lib/sessionListCache");
   return {
     ...conversationHooksMock(),
-    useProjects: vi.fn(() => ({ data: [] })),
+    useProjects: () => ({ data: mocks.projects }),
+    useProjectSessions: () => projectPage(mocks.projectRows),
+    useMoveToProject: () => ({ mutate: mocks.moveProject }),
     usePinnedConversations: () => ({
       data: { conversations: mocks.pinned, filterHonored: mocks.filterHonored },
       isSuccess: true,
@@ -34,6 +41,7 @@ vi.mock("@/hooks/useConversations", async () => {
         mutationFn: (vars: unknown) => mocks.pinFn(vars),
       }),
     useReorderPinnedConversations: () => ({ mutate: mocks.reorderPins }),
+    useMoveToNest: () => ({ mutate: mocks.moveNest, isPending: false }),
   };
 });
 vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
@@ -42,6 +50,7 @@ import { useConversations } from "@/hooks/useConversations";
 import { Toaster } from "@/components/ui/sonner";
 import { toast } from "sonner";
 import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "./sidebarNav";
+import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 
 const ROW_HEIGHT = 30;
 
@@ -99,6 +108,8 @@ async function dropOnto(
 }
 
 beforeEach(() => {
+  mocks.projects = [];
+  mocks.projectRows = [];
   mocks.filterHonored = true;
   mocks.pinned = [
     conv("conv_a", { labels: { "omnigent.pinned": "1000" } }),
@@ -120,6 +131,104 @@ afterEach(async () => {
   vi.restoreAllMocks();
   vi.clearAllMocks();
 });
+
+it("joins at a nest's center and detaches into the session list or footer", async () => {
+  const family = { id: "conv_d", representative_id: "conv_d", pinned: false };
+  const otherFamily = { id: "conv_other", representative_id: "conv_other", pinned: false };
+  const destination = conv("conv_d", { family });
+  vi.mocked(useConversations).mockReturnValue(
+    conversationPage([
+      conv("conv_c"),
+      destination,
+      conv("conv_other", { family: otherFamily }),
+      conv("conv_member", { family: otherFamily }),
+    ]),
+  );
+  const rowRect = vi.mocked(Element.prototype.getBoundingClientRect).getMockImplementation()!;
+  vi.mocked(Element.prototype.getBoundingClientRect).mockImplementation(function (this: Element) {
+    if (this.matches('[data-testid="sidebar-chats-drop-zone"]')) {
+      const rows = [...this.querySelectorAll("li[data-sidebar-session-id]")];
+      if (!rows.length) return new DOMRect();
+      const first = rowRect.call(rows[0]);
+      const last = rowRect.call(rows[rows.length - 1]);
+      return new DOMRect(0, first.top - 12, 200, last.bottom - first.top + 24);
+    }
+    if (this.matches('[data-testid="detach-nest-target"]')) return new DOMRect(0, 500, 100, 30);
+    if (this.matches('[data-testid="sidebar-ungroup-drop-zone"]'))
+      return new DOMRect(110, 500, 100, 30);
+    return rowRect.call(this);
+  });
+  const view = renderSidebar({
+    info: { ...FALLBACK_SERVER_INFO, sibling_sessions: true, session_nest_moves: true },
+  });
+  await dropOnto("conv_c", "conv_d", { expectTarget: false, offsetY: ROW_HEIGHT / 2 - 2 });
+  expect(mocks.moveNest).not.toHaveBeenCalled();
+  await dropOnto("conv_c", "conv_d", { expectTarget: false });
+  expect(mocks.moveNest).toHaveBeenCalledWith({ id: "conv_c", destination });
+  mocks.moveNest.mockClear();
+  await dropOnto("conv_member", "conv_other", { expectTarget: false });
+  expect(mocks.moveNest).not.toHaveBeenCalled();
+  await dropOnto("conv_member", "conv_other", {
+    expectTarget: false,
+    offsetY: -ROW_HEIGHT / 2 - 2,
+  });
+  await dropOnto("conv_member", "conv_member", {
+    expectTarget: false,
+    offsetY: ROW_HEIGHT / 2 + 2,
+  });
+  await dropOnto("conv_member", "conv_c", { expectTarget: false });
+  expect(mocks.moveNest).toHaveBeenCalledTimes(3);
+  for (const [move] of mocks.moveNest.mock.calls)
+    expect(move).toEqual({ id: "conv_member", destination: null });
+  await dropOnto("conv_member", "conv_d", { expectTarget: false });
+  expect(mocks.moveNest).toHaveBeenLastCalledWith({ id: "conv_member", destination });
+  expect(mocks.moveProject).not.toHaveBeenCalled();
+  expect(mocks.pinFn).not.toHaveBeenCalled();
+  mocks.moveNest.mockClear();
+  await dropOnto("conv_other", "conv_d", { expectTarget: false, offsetY: ROW_HEIGHT / 2 - 2 });
+  expect(mocks.moveNest).not.toHaveBeenCalled();
+  const member = document.querySelector('li[data-sidebar-session-id="conv_member"]')!;
+  const rowsBefore = [...document.querySelectorAll("li[data-sidebar-session-id]")];
+  const start = rowCenter("conv_member");
+  fireEvent.mouseDown(member, { button: 0, ...start });
+  fireEvent.mouseMove(document, { clientX: start.clientX, clientY: start.clientY - 10 });
+  const target = await screen.findByTestId("detach-nest-target");
+  expect(target.parentElement).toHaveClass("absolute", "top-full");
+  expect(document.querySelector("nav")).not.toContainElement(target);
+  expect([...document.querySelectorAll("li[data-sidebar-session-id]")]).toEqual(rowsBefore);
+  const drop = { clientX: 50, clientY: 515 };
+  await act(async () => {
+    fireEvent.mouseMove(document, drop);
+  });
+  await act(async () => {
+    fireEvent.mouseUp(document, drop);
+  });
+  expect(mocks.moveNest).toHaveBeenLastCalledWith({ id: "conv_member", destination: null });
+  view.unmount();
+  mocks.projects = [{ id: "project", name: "Demo" }];
+  mocks.projectRows = [
+    conv("conv_d", { family, project_id: "project" }),
+    conv("conv_member", { family, project_id: "project" }),
+  ];
+  vi.mocked(useConversations).mockReturnValue(conversationPage([]));
+  renderSidebar({
+    info: { ...FALLBACK_SERVER_INFO, sibling_sessions: true, session_nest_moves: true },
+  });
+  fireEvent.click(screen.getByRole("button", { name: "Demo" }));
+  const head = document.querySelector('li[data-sidebar-session-id="conv_d"]')!;
+  const headStart = rowCenter("conv_d");
+  fireEvent.mouseDown(head, { button: 0, ...headStart });
+  fireEvent.mouseMove(document, { clientX: headStart.clientX, clientY: headStart.clientY - 10 });
+  expect(await screen.findByTestId("detach-nest-target")).toBeInTheDocument();
+  expect(screen.getByTestId("sidebar-ungroup-drop-zone")).toBeInTheDocument();
+  await act(async () => {
+    fireEvent.mouseMove(document, { clientX: 150, clientY: 515 });
+  });
+  await act(async () => {
+    fireEvent.mouseUp(document, { clientX: 150, clientY: 515 });
+  });
+  expect(mocks.moveProject).toHaveBeenLastCalledWith({ id: "conv_d", project: "" });
+}, 15_000);
 
 describe("dropping an unpinned session onto a pinned row", () => {
   it("pins it into that slot and renumbers the existing pins", async () => {
@@ -209,24 +318,18 @@ describe("dropping an unpinned session onto a pinned row", () => {
   });
 
   it.each([false, true])(
-    "reorders an individually pinned sibling (family pinned: %s)",
+    "does not reorder a nested member with a legacy pin (family pinned: %s)",
     async (pinned) => {
-      mocks.pinned[0].family = {
-        id: "family",
-        representative_id: "parent",
-        pinned,
-        pinned_at: pinned ? "500" : null,
-      };
+      const family = { id: "family", representative_id: "conv_b", pinned, pinned_at: "500" };
+      mocks.pinned = mocks.pinned.map((row) => ({ ...row, family }));
       renderSidebar();
-
-      await dropOnto("conv_a", "conv_b");
-
-      expect(mocks.reorderPins).toHaveBeenCalledExactlyOnceWith([{ id: "conv_a", pinnedAt: 1001 }]);
+      await dropOnto("conv_a", "conv_b", { expectTarget: false });
+      expect(mocks.reorderPins).not.toHaveBeenCalled();
       expect(mocks.pinFn).not.toHaveBeenCalled();
     },
   );
 
-  it("moves a local pin outside the pin order to the side of the row it's dropped on", async () => {
+  it("does not drag a nested member whose representative is outside the loaded window", async () => {
     mocks.pinned[1].labels = { "omnigent.pinned": "2000" };
     // A not-yet-migrated pin shown without its pinned family's representative.
     const family = { id: "family", representative_id: "parent", pinned: true, pinned_at: "500" };
@@ -236,13 +339,15 @@ describe("dropping an unpinned session onto a pinned row", () => {
     );
     renderSidebar();
 
+    const member = screen.getByText("conv_c").closest("li")!;
+    fireEvent.mouseEnter(member);
+    expect(member.querySelector('[data-testid="quick-pin-conversation"]')).toBeNull();
     await dropOnto("conv_c", "conv_b", {
       offsetY: ROW_HEIGHT / 4,
-      whileOver: () =>
-        expect(screen.getByTestId("pin-order-insertion")).toHaveAttribute("style", "bottom: 0px;"),
+      expectTarget: false,
     });
 
-    expect(mocks.reorderPins).toHaveBeenCalledExactlyOnceWith([{ id: "conv_c", pinnedAt: 2001 }]);
+    expect(mocks.reorderPins).not.toHaveBeenCalled();
     expect(mocks.pinFn).not.toHaveBeenCalled();
   });
 
@@ -332,19 +437,14 @@ describe("dropping an unpinned session onto a pinned row", () => {
 describe("unpinning from a sidebar row", () => {
   const row = (id: string) => screen.getByRole("link", { name: id }).closest("li")!;
 
-  it("unpins a sibling's individual pin while its family stays pinned", async () => {
+  it("hides pin and unpin controls on a nested member with an existing personal pin", () => {
     const family = { id: "conv_b", representative_id: "conv_b", pinned: true, pinned_at: "2000" };
     mocks.pinned = mocks.pinned.map((session) => ({ ...session, family }));
-    mocks.pinFn.mockResolvedValue({});
     renderSidebar();
-
+    expect(row("conv_a").querySelector('[data-testid="quick-pin-conversation"]')).toBeNull();
     fireEvent.contextMenu(screen.getByRole("link", { name: "conv_a" }));
-    const unpin = screen.getByTestId("pin-conversation");
-    expect(unpin).toHaveTextContent("Unpin");
-    fireEvent.click(unpin);
-    await waitFor(() =>
-      expect(mocks.pinFn).toHaveBeenCalledExactlyOnceWith({ id: "conv_a", pinned: false }),
-    );
+    expect(screen.queryByTestId("pin-conversation")).toBeNull();
+    expect(mocks.pinFn).not.toHaveBeenCalled();
   });
 
   // Sonner keeps toasts in module state across mounts.

@@ -16,7 +16,10 @@ import { findCachedListRow, LIST_ROW_QUERY_ROOTS } from "@/lib/sessionListCache"
  *
  * @param id - Session id, e.g. ``"conv_abc123"``.
  */
-export async function fetchConversationById(id: string): Promise<Conversation | null> {
+export async function fetchConversationById(
+  id: string,
+  queryClient?: QueryClient,
+): Promise<Conversation | null> {
   const params = new URLSearchParams({ include_items: "false", include_usage: "false" });
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}?${params}`);
   if (res.status === 404) return null;
@@ -35,7 +38,10 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
     labels: wire.labels ?? {},
     permission_level: wire.permission_level ?? null,
     family: wire.family,
-    owner: wire.owner ?? null,
+    owner:
+      wire.owner ??
+      queryClient?.getQueryData<Conversation | null>(["conversation-backfill", id])?.owner ??
+      null,
     runner_id: wire.runner_id ?? null,
     host_id: wire.host_id ?? null,
     workspace: wire.workspace ?? null,
@@ -107,17 +113,7 @@ export function useOpenSessionRow(id: string | null): Conversation | null {
     staleTime: 30_000,
     // A 404 resolves to null and is not retried; a failed request is.
     retry: 2,
-    queryFn: async () => {
-      const fetched = await fetchConversationById(id as string);
-      // The detail response has no owner, so keep the one a list row gave.
-      const knownOwner = queryClient.getQueryData<Conversation | null>([
-        "conversation-backfill",
-        id,
-      ])?.owner;
-      return fetched && fetched.owner === null && knownOwner
-        ? { ...fetched, owner: knownOwner }
-        : fetched;
-    },
+    queryFn: () => fetchConversationById(id as string, queryClient),
   });
   const row = listRow ?? data;
   if (id === null || !row || row.id !== id) return null;

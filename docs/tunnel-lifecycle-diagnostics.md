@@ -73,12 +73,21 @@ session impact or changes KPI eligibility.
 - `runner_connected`: `connection_id`, `reconnect` (an earlier connection on
   this process was accepted), `attempt` (ordinal within the reconnect
   streak), `downtime_s` (gap since the previous connection ended), `pid`.
+- `runner_tunnel_renewal_started`: `runner_id`, `connection_id`,
+  `connection_age_s`. One row before a scheduled close, after replacement
+  credentials are prepared. It records the renewal attempt; use the next
+  `runner_connected` and session-stream readiness to verify recovery.
+- `runner_tunnel_renewal_deferred`: `runner_id`, `connection_id`, `reason`
+  (`credential_unavailable` or `credential_refresh_failed`), `error_type`.
+  The working connection stays open. Failed preparation retries once per
+  minute while that connection remains alive.
 - `runner_tunnel_disconnected`: one row per attempt the runner retries,
   replacing the plain retry line. A fatal exit (persistent auth or protocol
   rejection, cancellation) raises out of the reconnect loop and is logged by
   the caller instead. `disconnect_reason` (the bounded classifier shared with
   the OTel counter; `local_shutdown` when the process is stopping, even if the
-  close handshake broke), `close_code`, `close_reason`, `close_rcvd_code` and
+  close handshake broke; `scheduled_renewal` for a planned renewal),
+  `close_code`, `close_reason`, `close_rcvd_code` and
   `close_sent_code` (which side sent a close frame; a 1006 has neither),
   `error_type`, `connected`, `connection_age_s`, `recycle`, `backoff_reset`,
   `delay_s`, `retry_in_s`. A clean 1000/1001 close ends the read loop without
@@ -486,6 +495,57 @@ loop delays suggest backpressure. Missing heartbeats with neither observation
 still leave the peer or network path unresolved; compare both sides before
 assigning a cause. These observations do not change liveness, retry, or turn
 failure decisions.
+
+## Planned connection renewal
+
+The runner renews its WebSocket after 23 hours 45–50 minutes, with a new
+jittered deadline on each connection. This leaves a margin before proxies
+with a 24-hour absolute connection lifetime. Traffic does not extend that
+deadline; the proxy limits themselves are unchanged.
+
+Credentials are resolved off the event loop while the current socket keeps
+serving traffic. A host-bootstrap bearer is replaced through the existing
+runner-local credential providers. If replacement fails, the bootstrap is
+retained and the planned close is deferred. A slow provider does not block
+the socket's receive loop. Shutdown or an earlier socket loss cancels the
+renewal task; an already-running synchronous credential call can still finish
+in its worker thread.
+
+A successful preparation closes the transport with code `1001` and reason
+`scheduled tunnel renewal`. The next handshake uses the prepared credential
+without another credential lookup in the disconnected interval. Its
+`runner_tunnel_disconnected` row reports `disconnect_reason = scheduled_renewal`
+and reconnects at the base delay, not as a server recycle. The runner
+and harness stay alive, and the usual session-stream recovery runs. Renewal
+does not run the idle-shutdown drain or mark sessions intentionally stopped.
+It still depends on working session recovery, including across replicas;
+a close handshake alone does not prove that the active turn survived.
+
+Set `OMNIGENT_RUNNER_TUNNEL_RENEWAL_S` in the **runner process environment** to
+change the maximum renewal age in seconds; its default is `85800`. Jitter
+subtracts up to the smaller of five minutes or one percent of the interval.
+Set it to `0` to disable scheduled renewal while keeping ordinary reconnects.
+Negative, non-finite, and non-numeric values log a warning and use the default.
+The interval must leave room before the deployment's shortest proxy lifetime.
+
+For a disposable development runner, use `OMNIGENT_RUNNER_TUNNEL_RENEWAL_S=120`
+and keep a turn in flight across a renewal. Verify a new connection ID with
+the same process ID, completed tool output and turn, and no duplicate tool
+effects or persisted disconnect failure. The automated test also sends the
+renewed connection to another replica and holds the tool past the old
+replica's disconnect grace. Its accelerated interval leaves time for that
+reconciliation before the next renewal. Repeated drops within the old
+replica's grace can still expose a server recovery race if its deadline lands
+during a later reconnect gap.
+
+Run the focused checks with:
+
+```sh
+uv run --no-sync pytest -q tests/runner/transports/ws_tunnel/test_tunnel_renewal.py \
+  tests/runner/test_runner_auth_renewal.py
+uv run --no-sync pytest -q tests/e2e/test_runner_tunnel_renewal_e2e.py \
+  --override-ini addopts=''
+```
 
 ## Build identity
 

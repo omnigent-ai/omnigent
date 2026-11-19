@@ -31,6 +31,7 @@ import {
   useAddDefaultPolicy,
   useUpdateDefaultPolicy,
   useDeleteDefaultPolicy,
+  PoliciesForbiddenError,
   type DefaultPolicy,
 } from "@/hooks/useDefaultPolicies";
 import { usePolicyRegistry, type PolicyRegistryEntry } from "@/hooks/usePolicies";
@@ -40,6 +41,14 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { isSingleUserMode } from "@/lib/capabilities";
 import { coercePolicyParams } from "@/lib/policyParams";
+import { SettingsItem } from "@/pages/settings/search/SettingsItem";
+import { POLICIES_ADD_ENTRY, POLICIES_LIST_ENTRY } from "@/pages/settings/search/catalog/policies";
+import { settingsControlProps } from "@/pages/settings/search/settingsControl";
+import {
+  SettingsDataRegion,
+  settingsOverlayProps,
+  settingsRowOverlayProps,
+} from "@/pages/settings/search/settingsOwnership";
 
 // ---------------------------------------------------------------------------
 // Add-policy dialog (registry-driven, same UX as session policies)
@@ -150,7 +159,10 @@ function AddDefaultPolicyDialog({
         onOpenChange(next);
       }}
     >
-      <DialogContent className="max-h-[80vh] overflow-y-auto sm:max-w-lg">
+      <DialogContent
+        className="max-h-[80vh] overflow-y-auto sm:max-w-lg"
+        {...settingsOverlayProps(POLICIES_ADD_ENTRY, "add")}
+      >
         <DialogHeader>
           <DialogTitle>Add Global Policy</DialogTitle>
           <DialogDescription>Choose a policy to apply globally to all sessions.</DialogDescription>
@@ -169,6 +181,7 @@ function AddDefaultPolicyDialog({
               return (
                 <>
                   <input
+                    {...settingsControlProps(POLICIES_ADD_ENTRY, "filter")}
                     type="text"
                     value={filter}
                     onChange={(e) => setFilter(e.target.value)}
@@ -176,10 +189,16 @@ function AddDefaultPolicyDialog({
                     className="w-full rounded border border-border bg-background px-2 py-1.5 text-ui placeholder:text-muted-foreground/60 focus:outline-none focus:ring-1 focus:ring-ring"
                     autoFocus
                   />
-                  <div className="flex max-h-52 flex-col divide-y divide-border overflow-y-auto rounded border border-border">
+                  <SettingsDataRegion
+                    entry={POLICIES_ADD_ENTRY}
+                    region="registry"
+                    className="flex max-h-52 flex-col divide-y divide-border overflow-y-auto rounded border border-border"
+                  >
                     {filtered.map((r) => (
                       <button
                         key={r.handler}
+                        data-settings-row-action="choose"
+                        data-settings-region-row
                         type="button"
                         onClick={() => handleSelect(r.handler)}
                         className="flex flex-col gap-0.5 px-2.5 py-2 text-left hover:bg-muted"
@@ -197,7 +216,7 @@ function AddDefaultPolicyDialog({
                         No policies match your filter.
                       </p>
                     )}
-                  </div>
+                  </SettingsDataRegion>
                 </>
               );
             })()}
@@ -206,6 +225,7 @@ function AddDefaultPolicyDialog({
               <div className="flex items-center justify-between">
                 <span className="text-ui font-medium">{entry.name}</span>
                 <button
+                  {...settingsControlProps(POLICIES_ADD_ENTRY, "change")}
                   type="button"
                   onClick={() => {
                     setSelected("");
@@ -229,6 +249,7 @@ function AddDefaultPolicyDialog({
                 <span className="font-medium text-foreground">name</span>
               </label>
               <input
+                {...settingsControlProps(POLICIES_ADD_ENTRY, "name")}
                 type="text"
                 value={policyName}
                 onChange={(e) => setPolicyName(e.target.value)}
@@ -237,7 +258,11 @@ function AddDefaultPolicyDialog({
             </div>
           )}
           {entry?.kind === "factory" && paramKeys.length > 0 && (
-            <div className="space-y-2">
+            <SettingsDataRegion
+              entry={POLICIES_ADD_ENTRY}
+              region="parameters"
+              className="space-y-2"
+            >
               {paramKeys.map((key) => {
                 const prop = properties[key];
                 const typeLabel =
@@ -263,6 +288,8 @@ function AddDefaultPolicyDialog({
                     )}
                     {prop?.type === "boolean" ? (
                       <select
+                        data-settings-row-field="value"
+                        aria-label={`Parameter ${key}`}
                         value={
                           factoryParams[key] ??
                           (prop?.default !== undefined ? String(prop.default) : "")
@@ -280,6 +307,8 @@ function AddDefaultPolicyDialog({
                       </select>
                     ) : prop?.type === "string" && prop.enum ? (
                       <select
+                        data-settings-row-field="value"
+                        aria-label={`Parameter ${key}`}
                         value={
                           factoryParams[key] ??
                           (prop?.default !== undefined
@@ -335,6 +364,11 @@ function AddDefaultPolicyDialog({
                               </div>
                             )}
                             <ModelValueCombobox
+                              inputProps={{
+                                ...settingsControlProps(POLICIES_ADD_ENTRY, "parameterValues", {
+                                  runtime: key,
+                                }),
+                              }}
                               options={prop.items.enum}
                               selected={current}
                               onToggle={(v) => {
@@ -352,6 +386,8 @@ function AddDefaultPolicyDialog({
                       })()
                     ) : (
                       <input
+                        data-settings-row-field="value"
+                        aria-label={`Parameter ${key}`}
                         type={
                           prop?.type === "integer" || prop?.type === "number" ? "number" : "text"
                         }
@@ -377,7 +413,7 @@ function AddDefaultPolicyDialog({
                   </div>
                 );
               })}
-            </div>
+            </SettingsDataRegion>
           )}
           {(paramError || addPolicy.isError) && (
             <div
@@ -406,6 +442,7 @@ function AddDefaultPolicyDialog({
               Cancel
             </Button>
             <Button
+              {...settingsControlProps(POLICIES_ADD_ENTRY, "submit")}
               type="button"
               onClick={handleAdd}
               loading={addPolicy.isPending}
@@ -432,7 +469,11 @@ export function PoliciesPage() {
   // / login_url:null shape) is NOT single-user and keeps its admin gate.
   const isSingleUser = isSingleUserMode(info);
   const [meIsAdmin, setMeIsAdmin] = useState<boolean | null>(null);
-  const { data: policies = [], refetch } = useDefaultPolicies();
+  const { data: policies = [], refetch, error } = useDefaultPolicies();
+  // The backend may restrict listing global policies (HTTP 403). Treat that
+  // like the non-admin case and hide the section rather than surfacing a raw
+  // fetch error.
+  const policiesForbidden = error instanceof PoliciesForbiddenError;
   const { data: registry = [] } = usePolicyRegistry();
   const updatePolicy = useUpdateDefaultPolicy();
   const deletePolicy = useDeleteDefaultPolicy();
@@ -467,14 +508,14 @@ export function PoliciesPage() {
     );
   }
 
-  if (!isSingleUser && meIsAdmin === false) {
+  if (policiesForbidden || (!isSingleUser && meIsAdmin === false)) {
     return (
       <PageScroll
         maxWidthClassName="max-w-4xl"
         contentClassName="px-4 md:px-8"
         extraBottom="2.5rem"
       >
-        <h1 className="settings-page-title mb-2 text-2xl font-medium">Global Policies</h1>
+        <h1 className="mb-2 text-2xl font-medium">Global Policies</h1>
         <p className="text-ui text-muted-foreground">
           You don't have permission to manage global policies.
         </p>
@@ -502,116 +543,135 @@ export function PoliciesPage() {
     <PageScroll maxWidthClassName="max-w-4xl" contentClassName="px-4 md:px-8" extraBottom="2.5rem">
       <div className="mb-6 flex items-center justify-between">
         <div>
-          <h1 className="settings-page-title text-2xl font-medium">Global Policies</h1>
+          <h1 className="text-2xl font-medium">Global Policies</h1>
           <p className="mt-1 text-sm text-muted-foreground max-md:hidden">
             Policies applied to all sessions.
           </p>
         </div>
-        <Button onClick={() => setAddOpen(true)}>
-          <PlusIcon /> Add policy
-        </Button>
+        <SettingsItem entry={POLICIES_ADD_ENTRY}>
+          <Button
+            {...settingsControlProps(POLICIES_ADD_ENTRY, "add")}
+            onClick={() => setAddOpen(true)}
+          >
+            <PlusIcon /> Add policy
+          </Button>
+        </SettingsItem>
       </div>
 
-      {policies.length > 0 && (
-        <div className="flex flex-col gap-3">
-          {policies.map((p) => {
-            const registryEntry = registryByHandler.get(p.handler);
-            const params = p.factory_params;
-            const hasParams = params != null && Object.keys(params).length > 0;
-            return (
-              <div
-                key={p.id ?? p.name}
-                className="rounded-lg border border-border bg-background p-4"
-              >
-                <div className="flex items-start justify-between gap-3">
-                  <div className="flex items-start gap-2.5 min-w-0">
-                    <ShieldCheckIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
-                    <div className="min-w-0">
-                      <div className="flex items-center gap-2">
-                        <span className="text-ui font-medium">{p.name}</span>
-                        {p.source === "config" && (
-                          <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
-                            Config
-                          </span>
-                        )}
-                        {!p.enabled && p.source !== "config" && (
-                          <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
-                            Disabled
-                          </span>
-                        )}
-                      </div>
-                      {registryEntry?.description && (
-                        <p className="mt-0.5 text-sm text-muted-foreground">
-                          {registryEntry.description}
-                        </p>
-                      )}
-                      <code className="mt-1 block text-sm text-muted-foreground/70">
-                        {p.handler}
-                      </code>
-                    </div>
-                  </div>
-                  <div className="flex shrink-0 items-center gap-2">
-                    {p.source !== "config" ? (
-                      <>
-                        <Switch
-                          checked={p.enabled}
-                          onCheckedChange={(checked) =>
-                            updatePolicy.mutate({
-                              policyId: p.id!,
-                              enabled: checked,
-                            })
-                          }
-                          aria-label={`Toggle ${p.name}`}
-                          componentId="settings.policies.toggle_enabled"
-                        />
-                        <Button
-                          variant="ghost"
-                          size="icon"
-                          className="size-8 text-muted-foreground hover:text-destructive"
-                          title="Remove policy"
-                          onClick={() => setDeleteCandidate(p)}
-                          disabled={pendingAction}
-                        >
-                          <TrashIcon className="size-3.5" />
-                        </Button>
-                      </>
-                    ) : null}
-                  </div>
-                </div>
-                {hasParams && (
-                  <div className="ml-6.5 mt-2 rounded-md border border-border/60 bg-muted/40 px-3 py-2">
-                    <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground/70">
-                      Parameters
-                    </span>
-                    <div className="mt-1 flex flex-col gap-0.5">
-                      {Object.entries(params).map(([key, value]) => (
-                        <div key={key} className="flex items-baseline gap-1.5 text-sm">
-                          <span className="font-medium text-foreground/80">{key}:</span>
-                          <span className="text-muted-foreground">
-                            {Array.isArray(value) ? value.join(", ") : String(value)}
-                          </span>
+      <SettingsItem entry={POLICIES_LIST_ENTRY}>
+        {policies.length > 0 && (
+          <SettingsDataRegion
+            entry={POLICIES_LIST_ENTRY}
+            region="policies"
+            className="flex flex-col gap-3"
+          >
+            {policies.map((p) => {
+              const registryEntry = registryByHandler.get(p.handler);
+              const params = p.factory_params;
+              const hasParams = params != null && Object.keys(params).length > 0;
+              return (
+                <div
+                  key={p.id ?? p.name}
+                  data-settings-region-row
+                  className="rounded-lg border border-border bg-background p-4"
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <div className="flex items-start gap-2.5 min-w-0">
+                      <ShieldCheckIcon className="mt-0.5 size-4 shrink-0 text-muted-foreground" />
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="text-ui font-medium">{p.name}</span>
+                          {p.source === "config" && (
+                            <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                              Config
+                            </span>
+                          )}
+                          {!p.enabled && p.source !== "config" && (
+                            <span className="rounded-full bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+                              Disabled
+                            </span>
+                          )}
                         </div>
-                      ))}
+                        {registryEntry?.description && (
+                          <p className="mt-0.5 text-sm text-muted-foreground">
+                            {registryEntry.description}
+                          </p>
+                        )}
+                        <code className="mt-1 block text-sm text-muted-foreground/70">
+                          {p.handler}
+                        </code>
+                      </div>
+                    </div>
+                    <div className="flex shrink-0 items-center gap-2">
+                      {p.source !== "config" ? (
+                        <>
+                          <Switch
+                            data-settings-row-action="toggle"
+                            checked={p.enabled}
+                            onCheckedChange={(checked) =>
+                              updatePolicy.mutate({
+                                policyId: p.id!,
+                                enabled: checked,
+                              })
+                            }
+                            aria-label={`Toggle ${p.name}`}
+                            componentId="settings.policies.toggle_enabled"
+                          />
+                          <Button
+                            data-settings-row-action="remove"
+                            variant="ghost"
+                            size="icon"
+                            className="size-8 text-muted-foreground hover:text-destructive"
+                            title="Remove policy"
+                            onClick={() => setDeleteCandidate(p)}
+                            disabled={pendingAction}
+                          >
+                            <TrashIcon className="size-3.5" />
+                          </Button>
+                        </>
+                      ) : null}
                     </div>
                   </div>
-                )}
-              </div>
-            );
-          })}
+                  {hasParams && (
+                    <div className="ml-6.5 mt-2 rounded-md border border-border/60 bg-muted/40 px-3 py-2">
+                      <span className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground/70">
+                        Parameters
+                      </span>
+                      <div className="mt-1 flex flex-col gap-0.5">
+                        {Object.entries(params).map(([key, value]) => (
+                          <div key={key} className="flex items-baseline gap-1.5 text-sm">
+                            <span className="font-medium text-foreground/80">{key}:</span>
+                            <span className="text-muted-foreground">
+                              {Array.isArray(value) ? value.join(", ") : String(value)}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </SettingsDataRegion>
+        )}
+
+        {policies.length === 0 && (
+          <p className="text-ui text-muted-foreground">
+            No global policies configured. Add one to apply it to all sessions.
+          </p>
+        )}
+
+        <div className="mt-3 flex items-center justify-end">
+          <Button
+            {...settingsControlProps(POLICIES_LIST_ENTRY, "refresh")}
+            variant="ghost"
+            size="sm"
+            onClick={refresh}
+          >
+            <RefreshCwIcon /> Refresh
+          </Button>
         </div>
-      )}
-
-      {policies.length === 0 && (
-        <p className="text-ui text-muted-foreground">
-          No global policies configured. Add one to apply it to all sessions.
-        </p>
-      )}
-
-      <div className="mt-3 flex items-center justify-end">
-        <Button variant="ghost" size="sm" onClick={refresh}>
-          <RefreshCwIcon /> Refresh
-        </Button>
-      </div>
+      </SettingsItem>
 
       <AddDefaultPolicyDialog registry={registry} open={addOpen} onOpenChange={setAddOpen} />
 
@@ -626,7 +686,7 @@ export function PoliciesPage() {
           }
         }}
       >
-        <DialogContent>
+        <DialogContent {...settingsRowOverlayProps(POLICIES_LIST_ENTRY, "policies", "remove")}>
           <DialogHeader>
             <DialogTitle>Remove {deleteCandidate?.name}?</DialogTitle>
             <DialogDescription>
@@ -644,6 +704,7 @@ export function PoliciesPage() {
           )}
           <DialogFooter>
             <Button
+              data-settings-row-action="cancel"
               variant="ghost"
               onClick={() => setDeleteCandidate(null)}
               disabled={pendingAction}
@@ -651,6 +712,7 @@ export function PoliciesPage() {
               Cancel
             </Button>
             <Button
+              data-settings-row-action="remove"
               variant="destructive"
               onClick={() => void onConfirmDelete()}
               loading={pendingAction}

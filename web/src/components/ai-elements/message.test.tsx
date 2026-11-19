@@ -12,6 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AskUserQuestionForm } from "@/components/blocks/AskUserQuestionForm";
 import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import type { AnyBlock } from "@/lib/blocks";
+import { CODE_BLOCK_WORD_WRAP_STORAGE_KEY, readCodeBlockWordWrap } from "@/lib/codeWrapPreferences";
 import { setEmbedRoot } from "@/lib/host";
 import { useChatStore } from "@/store/chatStore";
 import { MermaidPreview } from "@/shell/MermaidPreview";
@@ -30,6 +31,7 @@ const clipboardDescriptor = Object.getOwnPropertyDescriptor(Navigator.prototype,
 const execCommandDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, "execCommand");
 
 afterEach(() => {
+  localStorage.removeItem(CODE_BLOCK_WORD_WRAP_STORAGE_KEY);
   setEmbedRoot(null);
   vi.unstubAllGlobals();
   cleanup();
@@ -182,6 +184,52 @@ describe("MessageResponse", () => {
       render(<MessageResponse>{`![shot](${asset})`}</MessageResponse>);
 
       expect(await screen.findByText("[Image blocked: shot]")).toBeTruthy();
+    });
+
+    it.each([
+      ["its own paragraph", `Demo:\n\n${asset}\n\nAfter`],
+      ["its own line", `Demo:\n${asset}\nAfter`],
+    ])("plays a bare GitHub attachment URL on %s as a video", async (_case, markdown) => {
+      render(<MessageResponse allowGitHubAttachmentImages>{markdown}</MessageResponse>);
+
+      await screen.findByText(/Demo:/);
+      const video = document.querySelector("video");
+      expect(video).toHaveAttribute("src", asset);
+      expect(video).toHaveAttribute("controls");
+      expect(video).toHaveAttribute("preload", "metadata");
+      expect(screen.queryByRole("link")).toBeNull();
+    });
+
+    it.each([
+      ["a titled link", `[clip](${asset})`],
+      ["a URL inside a sentence", `See ${asset} for the clip`],
+      ["another host", "https://attacker.example/clip.mp4"],
+      ["a query string", `${asset}?q=secret`],
+    ])("leaves %s a link", async (_case, markdown) => {
+      render(<MessageResponse allowGitHubAttachmentImages>{markdown}</MessageResponse>);
+
+      expect(await screen.findByRole("link")).toBeTruthy();
+      expect(document.querySelector("video")).toBeNull();
+    });
+
+    it("doesn't treat a raw parked-video tag as a GitHub video", async () => {
+      render(
+        <MessageResponse allowGitHubAttachmentImages>
+          {
+            'before <omnigent-github-video src="https://evil.example/x.mp4"></omnigent-github-video>'
+          }
+        </MessageResponse>,
+      );
+
+      await screen.findByText(/before/);
+      expect(document.querySelector("video")).toBeNull();
+    });
+
+    it("leaves a bare GitHub attachment URL a link without the option", async () => {
+      render(<MessageResponse>{asset}</MessageResponse>);
+
+      expect(await screen.findByRole("link", { name: asset })).toHaveAttribute("href", asset);
+      expect(document.querySelector("video")).toBeNull();
     });
 
     it("leaves links as the default renderer treats them", async () => {
@@ -581,6 +629,26 @@ describe("MessageResponse code-block copy", () => {
     fireEvent.click(toggle);
     expect(toggle).toHaveAttribute("aria-pressed", "true");
     expect(block).toHaveClass("chat-code-wrap");
+  });
+
+  it("applies one block's wrap toggle to every code block and keeps it after a remount", async () => {
+    const markdown = "```ts\nconst first = 1;\n```\n\n```py\nsecond = 2\n```";
+    const firstRender = render(<MessageResponse>{markdown}</MessageResponse>);
+    const toggles = await screen.findAllByRole("button", { name: "Toggle word wrap" });
+    expect(toggles).toHaveLength(2);
+
+    fireEvent.click(toggles[0]!);
+    for (const toggle of toggles) expect(toggle).toHaveAttribute("aria-pressed", "false");
+    for (const block of firstRender.container.querySelectorAll(".chat-code-block")) {
+      expect(block).not.toHaveClass("chat-code-wrap");
+    }
+
+    // A fresh render stands in for a refresh or another session's transcript.
+    firstRender.unmount();
+    render(<MessageResponse>{"```sh\necho later\n```"}</MessageResponse>);
+    const laterToggle = await screen.findByRole("button", { name: "Toggle word wrap" });
+    expect(laterToggle).toHaveAttribute("aria-pressed", "false");
+    expect(readCodeBlockWordWrap()).toBe(false);
   });
 
   it("copies the exact fenced code text through the fallback path", async () => {

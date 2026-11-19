@@ -26,7 +26,9 @@ MCP independent creation.
   another session". `sys_session_list` and `sys_session_get_info` expose
   `created_by_session_id` so managers can identify their workers across restarts;
   `sys_session_list` with `include_archived` also lists archived workers, each
-  marked `archived`.
+  marked `archived`. With `created_by_this_session`, the runner pages the global
+  `sessions` view itself and returns only the caller's workers in one call, up to
+  a scan limit; the `sub_agents` view is then empty.
 - `list-scope`: `sys_session_list`'s global `sessions` view lists only the
   caller's own sessions by default, like the sidebar's My view. Sessions other
   users shared with the caller appear only with `visibility: "shared"` (or
@@ -44,7 +46,15 @@ MCP independent creation.
   Neither side can override a disable on the other. Child messaging and already
   accepted work continue; session creation keeps its separate orchestration gate.
 - `create`: `sys_session_create` retains child creation by default; `same_host`
-  and `managed` placements create independent, initially private sessions.
+  and `managed` placements create independent, initially private sessions,
+  except that a shared automation's run shares them (see `scheduled`).
+  An optional `permission_mode` starts the session in a mode of its harness;
+  modes that skip approval are refused, and on a server that doesn't advertise
+  `session_create_permission_modes` the tool refuses the call before creating anything.
+  An optional `workflow_id` (agent_id only) starts the session as a run of one
+  of the owner's saved workflows, with that workflow's plan already in its
+  journal. With workflows disabled, or on a server that doesn't advertise
+  `session_create_workflow_id`, the tool refuses it before creating anything.
   With `sibling_sessions` enabled they share one sidebar family and do not appear
   as child agents; with it disabled they remain standalone.
   Managed creation uses the server's configured default sandbox provider. A
@@ -58,7 +68,14 @@ MCP independent creation.
   `project_name`. Project defaults do not override the worker's agent or placement.
 - `destinations`: Settings → Admin → General → **Nested agent destinations** limits new
   agents to the current host, the current host or a fresh managed sandbox, or
-  any available host. The server enforces the same choice for the composer,
+  any available host. The Admin → General page itself appears whenever the
+  server offers nested agents or Omni Advisor; on an Advisor-only deploy it
+  carries the Advisor workspace switch and no destinations group. Settings →
+  Admin → General → **Omni Advisor** turns the agent off for the whole
+  workspace: every viewer's Settings → General → **Omni Advisor** switch then
+  shows off and locked with a note that an admin turned it off, and the Inbox
+  drops its Omni Advisor tab. Turning it back on restores each viewer's own
+  choice. The server enforces the same choice for the composer,
   uploaded custom agents, direct API calls, MCP, later host launches, and runner reassignment. Failed
   relaunches retain the prior host so restricted sessions can retry. Any available host is the
   behavior-preserving default. For a standalone session in another project, the policy
@@ -74,7 +91,14 @@ MCP independent creation.
   independent creates like any private session their owner owns, so an
   automation can message the owner's other sessions or start workers. The
   Automations page's Jira/Slack/GitHub trigger templates rely on this: their
-  kept session starts one worker per match (`docs/AUTOMATIONS.md`).
+  kept session starts one worker per match (`docs/AUTOMATIONS.md`). A worker
+  started from a run's session tree, or from a worker started that way, is
+  labeled `omnigent.scheduled_task_launch` with the automation and shared at
+  read access, before it starts, with the automation's current grantees who can
+  still see the session it was launched from; a fork of a run's session shares
+  nothing. Covered by
+  `tests/server/integration/test_session_orchestration.py::test_launches_from_a_run_tree_are_shared_with_the_automation_grantees`
+  and `tests/server/scheduled/test_run_sharing.py`.
 - `projects`: `sys_project_list` pages the owner's projects oldest first and
   their own sessions with each one's project, marking the calling session; a
   legacy label folder shows only as a session's project. It also forwards the
@@ -176,6 +200,44 @@ MCP independent creation.
   Pick a template, fill in the trigger builder, and save: the polling automation's kept session starts one worker per new match
   with `sys_session_create`. Covered by
   `tests/e2e_ui/scheduled/test_scheduled_tasks_page.py::test_scheduled_task_trigger_template_creates_polling_manager_task`.
+
+### Scripted review sessions
+
+With the server release flag `scripted_sessions` enabled (default off),
+`sys_session_create` also accepts `placement="host"`, an owned connected
+`host_id`, an absolute `workspace`, and optional
+`git: {branch_name, base_branch}`. The workspace is the source repository;
+the session starts in the new worktree. The caller can be hostless. Source
+privacy, host ownership, workspace validation and destination policy still
+apply. Omit the new fields to retain existing child, same-host or managed
+placement. Older servers refuse the tool's new options through the
+`/v1/info` capability check before creating a session. Dedicated orchestrated
+host-create and PR-link routes also reject requests that reach older replicas
+in a mixed-version deployment.
+
+Independent creates can use an existing owned `project_id` instead of
+`project_name`; never supply both. Project defaults do not replace the
+explicit agent, workspace or git selection. `sys_session_link_pr` takes
+`url`, optional `session_id` (defaults to this session), and `action` (`attach`
+or `remove`, default `attach`). It uses the target session's host and requires
+edit access there and an authorized private or read-only-shared source. The
+host or runner must be online and able to read the PR. An uncertain response
+requires checking the session before retrying.
+
+`sys_session_list(project="Reviews")` filters the global sessions view without
+creating a project; `project=""` lists unfiled sessions. Keep the same filter
+when continuing a cursor. The sub-agent view is unchanged.
+
+For a manual check, enable `scripted_sessions` on a test server and obtain an
+owned host ID from a session's `sys_session_get_info` response. Create a review
+session with `placement="host"`, that host ID, the repository path,
+`git={"branch_name":"review-example","base_branch":"main"}` and a project ID.
+Confirm the session starts in the new worktree and appears under that project.
+Link a PR with `sys_session_link_pr`, then remove it and confirm the PR panel
+updates. Coverage is in `tests/runner/test_session_orchestration.py`,
+`tests/runner/test_discovery_list_pagination.py`,
+`tests/server/integration/test_session_orchestration.py`, and
+`tests/server/integration/test_session_orchestration_projects.py`.
 
 ## Driving it with the repro environment
 
@@ -312,8 +374,8 @@ tests/server/integration/test_session_orchestration.py --reruns 0` checks the
   normal destination permissions and policy checks. The check and subsequent
   dispatch/save are not one atomic transaction. Unsharing does not erase history.
 - For peer messages, an explicit wrong-replica refusal permits a bounded re-address.
-  If the subsequent host lookup fails, the task was not delivered. A successful
-  lookup with no host may still attempt legacy keyless delivery; uncertainty on
+  A failed or hostless lookup permits one legacy keyless delivery attempt.
+  Only its final outcome determines delivery; uncertainty on
   that POST remains uncertain. Timeouts,
   other refusals and unparseable delivery acknowledgements are never retried.
 - Scheduled origin is recorded before launch, cannot be edited by clients, and

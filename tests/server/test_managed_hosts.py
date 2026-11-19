@@ -21,7 +21,7 @@ import click
 import pytest
 from fastapi import FastAPI, HTTPException
 from httpx import ASGITransport, AsyncClient
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter
 
 from omnigent.db.utils import builtin_agent_id, generate_agent_id, now_epoch
 from omnigent.entities.agent import Agent
@@ -62,6 +62,7 @@ from omnigent.server.managed_hosts import (
     host_resume_supported,
     launch_managed_host,
     managed_repo_labels,
+    parse_project_repository,
     parse_repo_workspace,
     parse_sandbox_config,
     read_managed_repo_workspaces,
@@ -2274,6 +2275,54 @@ def test_parse_repo_workspace_rejects_malformed(workspace: str, expected_fragmen
 
 
 @pytest.mark.parametrize(
+    ("repository", "expected_url", "expected_branch"),
+    [
+        (
+            {"url": " https://git.example.com/team/app.git ", "branch": " main "},
+            "https://git.example.com/team/app.git",
+            "main",
+        ),
+        (
+            {"url": "https://git.example.com/team/app.git"},
+            "https://git.example.com/team/app.git",
+            None,
+        ),
+        (
+            {"url": "git@git.example.com:team/app.git", "branch": "  "},
+            "git@git.example.com:team/app.git",
+            None,
+        ),
+    ],
+)
+def test_parse_project_repository_accepts_url_and_optional_branch(
+    repository: dict[str, object], expected_url: str, expected_branch: str | None
+) -> None:
+    """A saved repository is trimmed and split into its URL and branch."""
+    parsed = parse_project_repository(repository)
+    assert (parsed.url, parsed.branch) == (expected_url, expected_branch)
+
+
+@pytest.mark.parametrize(
+    "repository",
+    [
+        "https://git.example.com/team/app.git",
+        ["https://git.example.com/team/app.git"],
+        {"branch": "main"},
+        {"url": "https://git.example.com/team/app.git", "depth": 1},
+        {"url": 3},
+        {"url": "https://git.example.com/team/app.git", "branch": 7},
+        {"url": "https://git.example.com/team/app.git#main"},
+        {"url": "https://git.example.com/team/app.git", "branch": "-upload-pack=x"},
+        {"url": "org/repo"},
+    ],
+)
+def test_parse_project_repository_rejects_malformed_values(repository: object) -> None:
+    """Anything other than an object with a valid URL and optional branch is refused."""
+    with pytest.raises(ValueError):
+        parse_project_repository(repository)
+
+
+@pytest.mark.parametrize(
     "workspace",
     [
         "https://x-access-token:s3cr3t@github.com/org/repo",
@@ -2281,6 +2330,9 @@ def test_parse_repo_workspace_rejects_malformed(workspace: str, expected_fragmen
         # (the credential check runs before any URL-echoing error).
         "https://user:s3cr3t@github.com",
         "git@x-access-token:s3cr3t@github.com:org/repo.git",
+        # Unrecognised schemes take the generic branch, which must not echo either.
+        "HTTPS://user:s3cr3t@github.com/org/repo",
+        "ftp://user:s3cr3t@github.com/org/repo",
     ],
 )
 def test_credential_rejection_does_not_echo_the_token(workspace: str) -> None:
@@ -2362,6 +2414,48 @@ def test_provider_ui_capabilities_reports_multi_repo_per_provider() -> None:
     assert deployment.provider_ui_capabilities() == {
         "single": {"multi_repo": False, "accepts_session_move": True},
         "multi": {"multi_repo": True, "accepts_session_move": True},
+    }
+
+
+class _NoticeLauncher(FakeSandboxLauncher):
+    """A provider whose unattended runs need the owner to keep a credential fresh."""
+
+    automation_notice = "Keep your laptop's credentials fresh."
+
+
+def test_provider_automation_notices_list_only_launchable_providers_that_set_one() -> None:
+    """A launchable provider's automation notice reaches /v1/info for the automation
+    form; a provider without one, or one that can't launch, is absent."""
+
+    def unlaunchable_factory() -> _NoticeLauncher:
+        raise AssertionError("a provider that can't launch must not be instantiated")
+
+    deployment = ManagedSandboxDeployment(
+        configs=(
+            *(
+                ManagedSandboxConfig(
+                    server_url="https://s",
+                    provider=provider,
+                    token_ttl_s=3600,
+                    launcher_factory=factory,
+                )
+                for provider, factory in (
+                    ("noted", _NoticeLauncher),
+                    ("plain", FakeSandboxLauncher),
+                )
+            ),
+            ManagedSandboxConfig(
+                server_url="https://s",
+                provider="unlaunchable",
+                token_ttl_s=3600,
+                launcher_factory=unlaunchable_factory,
+                managed_launch_supported=False,
+            ),
+        )
+    )
+
+    assert deployment.provider_automation_notices() == {
+        "noted": "Keep your laptop's credentials fresh."
     }
 
 
@@ -2620,6 +2714,33 @@ async def test_info_reports_enabled_for_injected_custom_launcher(
     # No provider set on the injected config → the UI keeps the generic
     # label rather than inventing a name.
     assert body["sandbox_provider"] is None
+
+
+async def test_info_reports_a_providers_automation_notice_apart_from_its_flags(
+    db_uri: str,
+    tmp_path: Path,
+) -> None:
+    """``GET /v1/info`` reports a provider's text notice in its own map, so the
+    capability map keeps its boolean-valued contract."""
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://s.example.com",
+            provider="noted",
+            launcher_factory=_NoticeLauncher,
+            token_ttl_s=3600,
+        )
+    )
+    app = _capability_probe_app(db_uri, tmp_path, config)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        resp = await client.get("/v1/info")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["sandbox_provider_automation_notices"] == {
+        "noted": "Keep your laptop's credentials fresh."
+    }
+    capabilities = body["sandbox_provider_capabilities"]
+    assert capabilities == {"noted": {"multi_repo": False, "accepts_session_move": True}}
+    TypeAdapter(dict[str, dict[str, bool]]).validate_python(capabilities, strict=True)
 
 
 # ── launch_managed_host ─────────────────────────────────────

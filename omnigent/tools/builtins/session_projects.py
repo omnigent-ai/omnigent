@@ -208,3 +208,45 @@ class SysProjectUpdateTool(Tool):
                 },
             },
         }
+
+
+class SysSessionLinkPrTool(Tool):
+    @classmethod
+    def name(cls) -> str:
+        return "sys_session_link_pr"
+
+    @classmethod
+    def description(cls) -> str:
+        return (
+            "Link or unlink a GitHub pull request in a session's PR panel. "
+            "Defaults to the current session; another session requires edit access. "
+            "Its host or runner must be online and able to read the PR. "
+            "Requires scripted sessions enabled on the server and a private or "
+            "read-only-shared calling session. This updates the association only."
+        )
+
+    def get_schema(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name(),
+                "description": self.description(),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "session_id": {
+                            "type": "string",
+                            "description": "Target session; omit for this session.",
+                        },
+                        "url": {"type": "string", "description": "GitHub pull request URL."},
+                        "action": {
+                            "type": "string",
+                            "enum": ["attach", "remove"],
+                            "description": "Defaults to attach.",
+                        },
+                    },
+                    "required": ["url"],
+                    "additionalProperties": False,
+                },
+            },
+        }

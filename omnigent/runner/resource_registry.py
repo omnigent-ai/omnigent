@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Literal, Protocol
 
 from cachetools import TTLCache
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.entities.pagination import PagedList
 from omnigent.entities.session_resources import (
@@ -41,7 +42,7 @@ from omnigent.entities.session_resources import (
     terminal_resource_view,
 )
 from omnigent.inner.async_utils import run_sync_cleanup
-from omnigent.inner.sandbox import contained_realpath, containment_prefix
+from omnigent.inner.sandbox import contained_realpath, containment_prefix, resolve_sandbox
 from omnigent.inner.terminal_lifecycle import lifecycle_log_attributes
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 from omnigent.native.native_dispatch import resolve_hook_for_key
@@ -54,16 +55,14 @@ if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.inner.os_env import OSEnvironment
+    from omnigent.inner.sandbox import SandboxPolicy
     from omnigent.inner.terminal import TerminalInstance
     from omnigent.spec.types import AgentSpec
     from omnigent.terminals.registry import TerminalRegistry
 
 _logger = logging.getLogger(__name__)
 
-_DEFAULT_WORKSPACE_ROOT = os.path.join(
-    os.environ.get("TMPDIR", "/tmp"),
-    "omnigent-sessions",
-)
+_DEFAULT_WORKSPACE_PARENT = os.environ.get("TMPDIR", None if IS_WINDOWS else "/tmp")
 
 CODEX_NATIVE_TERMINAL_ROLE = "codex-native"
 CLAUDE_NATIVE_TERMINAL_ROLE = "claude-native"
@@ -238,6 +237,34 @@ class TerminalExitEvent:
     closed_outside_omnigent: bool = False
     terminal_instance_id: str | None = None
     lifecycle_context: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(eq=False)
+class ToolEnvironmentLease:
+    """A session's reusable ``sys_os_*`` environment, leased to one call at a time.
+
+    :param registry: Registry that owns the environment.
+    :param session_id: Owning session/conversation identifier.
+    :param spec: Effective spec the environment was built from.
+    :param sandbox: Sandbox policy resolved from *spec* when it was built.
+    :param environment: The live environment; its helper stays warm between calls.
+    :param leased: Whether a call currently holds the environment.
+    """
+
+    registry: SessionResourceRegistry
+    session_id: str
+    spec: OSEnvSpec
+    sandbox: SandboxPolicy
+    environment: OSEnvironment
+    leased: bool = False
+
+    async def release(self, *, reusable: bool) -> None:
+        """End the call's hold; close the environment unless it stays reusable.
+
+        :param reusable: ``False`` after shell, failed or cancelled calls,
+            whose descendants may still be running.
+        """
+        await self.registry._release_tool_environment(self, reusable=reusable)
 
 
 def _terminal_lifecycle_context(
@@ -529,10 +556,12 @@ def _session_workspace(session_id: str) -> str:
     :returns: Absolute path to the session workspace directory.
     :raises ValueError: If the session id escapes the workspace root.
     """
-    root = os.environ.get(
-        "OMNIGENT_RUNNER_OS_ENV_ROOT",
-        _DEFAULT_WORKSPACE_ROOT,
-    )
+    root = os.environ.get("OMNIGENT_RUNNER_OS_ENV_ROOT")
+    if root is None:
+        workspace_parent = _DEFAULT_WORKSPACE_PARENT
+        if workspace_parent is None:
+            workspace_parent = tempfile.gettempdir()
+        root = os.path.join(workspace_parent, "omnigent-sessions")
     return os.path.join(_contained_session_dir(root, session_id), "workspace")
 
 
@@ -561,7 +590,8 @@ class SessionResourceRegistry:
     manages the primary :class:`OSEnvironment` per session.  The
     primary environment is lazily materialized on first
     :meth:`resolve_environment` call with
-    ``DEFAULT_ENVIRONMENT_ID``.
+    ``DEFAULT_ENVIRONMENT_ID``. Runner-local ``sys_os_*`` calls lease a
+    separate per-session environment keyed by their effective spec.
 
     :param terminal_registry: Existing terminal registry.
         ``None`` in test setups without terminals.
@@ -594,6 +624,7 @@ class SessionResourceRegistry:
         self._primary_envs: dict[str, OSEnvironment] = {}
         self._primary_env_specs: dict[str, OSEnvSpec | None] = {}
         self._client_surfaces: dict[str, str] = {}
+        self._tool_envs: dict[str, ToolEnvironmentLease] = {}
         self._codex_skills_dirs: dict[str, tempfile.TemporaryDirectory[str]] = {}
         self._terminal_roles: dict[tuple[str, str], str] = {}
         self._terminal_lifecycles: dict[tuple[str, str], TerminalLifecycle] = {}
@@ -1025,6 +1056,28 @@ class SessionResourceRegistry:
             except Exception as exc:  # noqa: BLE001 - diagnostics cannot affect status handling.
                 _logger.debug("Terminal status telemetry failed (%s)", type(exc).__name__)
 
+    def wake_session_terminal_watchers(self, session_id: str) -> None:
+        """Return native agent terminals' idle watchers to their base cadence.
+
+        A backed-off watcher polls tmux slowly; on a new turn the session
+        status must track Claude promptly, so wake the status-emitting
+        terminals' watchers at the turn edge. Generic terminals are left alone
+        — their backoff is governed by pane quiescence and keystroke sends.
+        """
+        if self._terminal_registry is None:
+            return
+        for entry in self._terminal_registry.list_for_conversation(session_id):
+            try:
+                terminal_id = terminal_resource_id(entry.terminal_name, entry.session_key)
+                if (
+                    self.terminal_resource_role(session_id, terminal_id)
+                    not in _STATUS_EMITTING_TERMINAL_ROLES
+                ):
+                    continue
+                entry.instance.wake_idle_watcher(expect_output=True)
+            except Exception as exc:  # noqa: BLE001 - waking is best-effort.
+                _logger.debug("Terminal watcher wake failed for %s: %s", entry.terminal_name, exc)
+
     def note_terminal_control_request(self, session_id: str, action: str) -> None:
         """Record explicit runner requests separately from process exit and cleanup."""
         if self._terminal_registry is None:
@@ -1239,6 +1292,80 @@ class SessionResourceRegistry:
                     return entry.instance.os_env
 
         raise ValueError(f"Environment {environment_id!r} not found for session {session_id!r}")
+
+    async def lease_tool_environment(
+        self, session_id: str, spec: OSEnvSpec
+    ) -> ToolEnvironmentLease | None:
+        """Lease the session's reusable ``sys_os_*`` environment for one call.
+
+        Reuse keeps the helper process warm across calls; a changed spec
+        replaces the environment.
+
+        :param session_id: Session/conversation identifier.
+        :param spec: Effective spec for this call, with a concrete cwd.
+        :returns: The lease, or ``None`` while another call holds it so
+            concurrent calls fall back to their own environment.
+        """
+        from omnigent.inner.os_env import create_os_environment
+
+        replaced: OSEnvironment | None = None
+        # Resolution follows symlinks in the spec's paths, so compare a fresh one.
+        cwd = Path(spec.cwd or ".").resolve(strict=False)
+        sandbox = resolve_sandbox(spec, cwd)
+        with self._lock:
+            lease = self._tool_envs.get(session_id)
+            if (
+                lease is None
+                or lease.spec != spec
+                or lease.environment.cwd != cwd
+                or lease.sandbox != sandbox
+            ):
+                environment = create_os_environment(
+                    spec,
+                    sandbox_policy=sandbox,
+                    additional_read_roots=[self._codex_skills_dir_locked(session_id)],
+                    relaunch_when_stale=True,
+                )
+                if environment is None:
+                    raise RuntimeError(f"Failed to create OS environment for {session_id!r}")
+                # A leased environment is closed by its holder on release.
+                if lease is not None and not lease.leased:
+                    replaced = lease.environment
+                lease = ToolEnvironmentLease(
+                    self, session_id, deepcopy(spec), deepcopy(sandbox), environment
+                )
+                self._tool_envs[session_id] = lease
+            elif lease.leased:
+                lease = None
+            if lease is not None:
+                lease.leased = True
+        if replaced is not None:
+            try:
+                await run_sync_cleanup(
+                    replaced.close, component="runner_tool_os_env", session_id=session_id
+                )
+            except BaseException:
+                # The caller never receives the lease; it may already be retired.
+                if lease is not None:
+                    await lease.release(reusable=False)
+                raise
+        return lease
+
+    async def _release_tool_environment(
+        self, lease: ToolEnvironmentLease, *, reusable: bool
+    ) -> None:
+        """Return *lease*; close its environment if stale or not reusable."""
+        with self._lock:
+            lease.leased = False
+            current = self._tool_envs.get(lease.session_id) is lease
+            if current and not reusable:
+                del self._tool_envs[lease.session_id]
+        if not (current and reusable):
+            await run_sync_cleanup(
+                lease.environment.close,
+                component="runner_tool_os_env",
+                session_id=lease.session_id,
+            )
 
     def uses_copy_on_write(self, session_id: str) -> bool:
         """Preserve disposable semantics if a later spec lookup is unavailable."""
@@ -1899,6 +2026,15 @@ class SessionResourceRegistry:
             with self._lock:
                 self._status_pollers[session_id] = status_poller
 
+        def _idle_poll_backoff_allowed() -> bool:
+            # Claude's OSC report or status file is authoritative, so back off
+            # tmux polling only once it reads idle, keeping the turn edge timely;
+            # without either, pane quiescence alone governs backoff.
+            if not _structured_status_active():
+                return True
+            assert status_poller is not None
+            return status_poller.reports_idle
+
         input_ready_probe = _native_input_ready_probe(resource_role)
         native_input_ready = False
         # Claude stays "busy" when a dialog opens while a reply streams, so only
@@ -2154,6 +2290,9 @@ class SessionResourceRegistry:
             on_idle=_on_idle,
             on_exit=_on_exit,
             on_tick=_on_tick,
+            idle_poll_backoff_allowed=(
+                _idle_poll_backoff_allowed if status_poller is not None else None
+            ),
             idle_threshold_s=_CLAUDE_NATIVE_STATUS_IDLE_THRESHOLD_SECONDS,
             poll_interval_s=_CLAUDE_NATIVE_STATUS_POLL_INTERVAL_SECONDS,
             replace=replace,
@@ -2629,6 +2768,9 @@ class SessionResourceRegistry:
             self._client_surfaces.pop(session_id, None)
             primary = self._primary_envs.pop(session_id, None)
             self._primary_env_specs.pop(session_id, None)
+            tool_lease = self._tool_envs.pop(session_id, None)
+            # A leased environment is closed by its holder on release.
+            tool_env = tool_lease.environment if tool_lease and not tool_lease.leased else None
             skills_directory = self._codex_skills_dirs.pop(session_id, None)
             stale_role_keys = [key for key in self._terminal_roles if key[0] == session_id]
             for key in stale_role_keys:
@@ -2638,11 +2780,14 @@ class SessionResourceRegistry:
             ]
             for key in stale_lifecycle_keys:
                 self._terminal_lifecycles.pop(key, None)
+        cancelled: asyncio.CancelledError | None = None
         if self._terminal_registry is not None:
             try:
                 await self._terminal_registry.cleanup_conversation(
                     session_id,
                 )
+            except asyncio.CancelledError as exc:
+                cancelled = exc
             except Exception:
                 _logger.exception(
                     "Error cleaning up terminals for session=%s",
@@ -2650,26 +2795,42 @@ class SessionResourceRegistry:
                 )
         _retire_closed_terminal_poller(status_poller)
 
-        if primary is not None:
+        for environment, component in (
+            (primary, "runner_primary_os_env"),
+            (tool_env, "runner_tool_os_env"),
+        ):
+            if environment is None:
+                continue
             try:
                 await run_sync_cleanup(
-                    primary.close,
-                    component="runner_primary_os_env",
+                    environment.close,
+                    component=component,
                     session_id=session_id,
                 )
+            except asyncio.CancelledError as exc:
+                cancelled = cancelled or exc
             except Exception:
                 _logger.exception(
-                    "Error closing primary env for session=%s",
+                    "Error closing %s for session=%s",
+                    component,
                     session_id,
                 )
         if skills_directory is not None:
             try:
-                await asyncio.to_thread(skills_directory.cleanup)
+                await run_sync_cleanup(
+                    skills_directory.cleanup,
+                    component="runner_codex_skills",
+                    session_id=session_id,
+                )
+            except asyncio.CancelledError as exc:
+                cancelled = cancelled or exc
             except OSError:
                 _logger.exception(
                     "Error cleaning up Codex skills for session=%s",
                     session_id,
                 )
+        if cancelled is not None:
+            raise cancelled
 
     def has_primary_env(self, session_id: str) -> bool:
         """Check if a primary env has been materialized.

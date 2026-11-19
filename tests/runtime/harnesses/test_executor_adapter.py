@@ -188,9 +188,12 @@ def use_capture_messages(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Pat
 # ── Tests ──────────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize("native_acceptance", [False, True], ids=["legacy", "native-acceptance"])
 async def test_text_chunk_translates_to_output_text_delta(
     use_text_only: None,
     manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+    native_acceptance: bool,
 ) -> None:
     """A TextChunk from the inner executor → response.output_text.delta.
 
@@ -200,6 +203,15 @@ async def test_text_chunk_translates_to_output_text_delta(
     text-delta event followed by response.completed.
     """
     conv_id = "conv_text"
+    acceptance = {
+        "session_id": conv_id,
+        "thread_id": "thread_text",
+        "response_id": "codex_turn_text",
+    }
+    if native_acceptance:
+        monkeypatch.setenv("MOCK_EXECUTOR_NATIVE_ACCEPTANCE", json.dumps(acceptance))
+    else:
+        monkeypatch.delenv("MOCK_EXECUTOR_NATIVE_ACCEPTANCE", raising=False)
     client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
     events: list[_ParsedSSEEvent] = []
     async with client.stream(
@@ -225,6 +237,12 @@ async def test_text_chunk_translates_to_output_text_delta(
     # If a future change makes TurnComplete.response emit a
     # delta, this test should be updated.
     assert "response.completed" in event_names
+    assert events[0].data["response"]["id"] == events[-1].data["response"]["id"]
+    assert events[-1].data["response"]["id"] != acceptance["response_id"]
+    if native_acceptance:
+        assert events[-1].data["native_acceptance"] == acceptance
+    else:
+        assert "native_acceptance" not in events[-1].data
 
 
 async def test_tool_call_translates_to_paired_function_call_items(
@@ -543,11 +561,12 @@ async def test_turn_cancelled_terminates_with_response_cancelled(
     use_cancelled: None,
     manager: HarnessProcessManager,
 ) -> None:
-    """TurnCancelled -> response.cancelled terminal event.
+    """TurnCancelled -> response.cancelled terminal event, with the turn's usage.
 
     Provider-side cancellation is not driven by an inbound interrupt event, so
     the adapter must mark the turn context cancelled itself. Otherwise the
-    scaffold sees a clean return and emits response.completed.
+    scaffold sees a clean return and emits response.completed. The model calls
+    the turn made were spent, so their usage rides on the terminal event.
     """
     conv_id = "conv_cancelled"
     client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
@@ -562,9 +581,108 @@ async def test_turn_cancelled_terminates_with_response_cancelled(
     terminal_response = events[-1].data["response"]
     assert terminal_response["status"] == "cancelled"
     assert terminal_response.get("error") is None
+    assert terminal_response["usage"]["input_tokens"] == 300
+    assert terminal_response["usage"]["output_tokens"] == 40
 
 
 # ── Error-code classification ──────────────────────────────────
+
+
+@pytest.mark.parametrize("watchdog_enabled", [False, True])
+def test_executor_wait_does_not_report_progress_or_delivery(watchdog_enabled: bool) -> None:
+    import asyncio
+    from unittest.mock import Mock
+
+    from omnigent.inner.executor import ExecutorWait
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = TurnContext(
+        response_id="resp_wait", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+    hold_idle = Mock()
+    progress = Mock()
+    ctx._hold_idle_watchdog = hold_idle if watchdog_enabled else None
+    ctx._reset_idle_watchdog = progress
+
+    adapter._translate_event(ExecutorWait(), ctx)
+
+    assert hold_idle.call_count == int(watchdog_enabled)
+    progress.assert_not_called()
+    assert ctx._has_progress is False
+    assert ctx._event_queue.empty()
+
+
+@pytest.mark.parametrize("outcome", ["recovered", "absolute", "cancelled", "stalled_probe"])
+async def test_claude_disk_hold_keeps_only_the_idle_watchdog_alive(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, outcome: str
+) -> None:
+    """A checked capacity wait survives idle expiry without disabling other limits."""
+    import asyncio
+    from unittest.mock import Mock
+
+    from omnigent.inner import claude_native_executor
+    from omnigent.runtime.harnesses import _scaffold
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    monkeypatch.setattr(_scaffold, "_TURN_IDLE_TIMEOUT_S", 0.5)
+    monkeypatch.setattr(_scaffold, "_TURN_ABSOLUTE_TIMEOUT_S", 2.0)
+    monkeypatch.setattr(claude_native_executor, "_HOST_DISK_POLL_S", 0.05)
+    loop = asyncio.get_running_loop()
+    started = loop.time()
+    checked: list[float] = []
+    ctx = TurnContext(
+        response_id="resp_disk_wait", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+    )
+
+    def disk_full(bridge_dir: Path) -> bool:
+        del bridge_dir
+        elapsed = loop.time() - started
+        checked.append(elapsed)
+        if outcome == "cancelled" and elapsed >= 0.8:
+            loop.call_soon_threadsafe(ctx.cancelled.set)
+        return outcome != "recovered" or elapsed < 0.8
+
+    monkeypatch.setattr(claude_native_executor, "_transcript_disk_full", disk_full)
+    injected = Mock()
+    reaped = Mock()
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", injected)
+    monkeypatch.setattr(claude_native_executor, "kill_session", reaped)
+    executor = claude_native_executor.ClaudeNativeExecutor(tmp_path)
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    if outcome == "stalled_probe":
+        # No further capacity check completes within the idle window.
+        monkeypatch.setattr(claude_native_executor, "_HOST_DISK_POLL_S", 10.0)
+    request = CreateResponseRequest(model="test-agent", input="held original")
+    try:
+        if outcome in {"absolute", "stalled_probe"}:
+            expected = "absolute watchdog" if outcome == "absolute" else "idle watchdog"
+            with pytest.raises(RuntimeError, match=expected):
+                await adapter._guarded_run_turn(request, ctx)
+        else:
+            await adapter._guarded_run_turn(request, ctx)
+            assert checked[-1] >= 0.8
+        if outcome == "recovered":
+            injected.assert_called_once()
+            assert injected.call_args.kwargs["content"] == "held original"
+            reaped.assert_not_called()
+            assert adapter._executor is executor
+        else:
+            injected.assert_not_called()
+        if outcome == "cancelled":
+            assert ctx.cancelled.is_set()
+        deltas = []
+        while not ctx._event_queue.empty():
+            event = ctx._event_queue.get_nowait()
+            if event is not None:
+                deltas.append(event)
+        assert len(deltas) == 1
+        assert deltas[0].delta == claude_native_executor._HOST_DISK_WAIT_MESSAGE
+    finally:
+        await adapter.on_shutdown()
 
 
 def test_build_error_detail_keeps_inner_executor_error_fields() -> None:
@@ -2351,7 +2469,7 @@ class _AcceptingInjectionExecutor:
 
 
 class _OneInjectionCtx:
-    """TurnContext stand-in: yields one injection, then blocks; records emits.
+    """TurnContext stand-in: yields one injection, then blocks; records emits and pulls.
 
     :param injection: The single injection ``_watch_injections`` should
         pull before the queue goes quiet.
@@ -2363,6 +2481,7 @@ class _OneInjectionCtx:
 
         self._injection: Any = injection
         self.emitted: list[Any] = []
+        self.pulls = 0
         self.response_id = "resp_injection"
         self.session_id = "session_injection"
         # Mirror TurnContext: the watcher skips delivery once cancelled.
@@ -2377,6 +2496,7 @@ class _OneInjectionCtx:
         import asyncio as _aio
 
         del timeout
+        self.pulls += 1
         if self._injection is None:
             await _aio.sleep(3600)
         inj, self._injection = self._injection, None
@@ -2395,7 +2515,104 @@ class _OneInjectionCtx:
 @pytest.mark.parametrize(
     ("input_value", "multimodal", "expected_content"),
     [
-        ("steer me", False, "steer me"),
+        pytest.param("steer me", False, "steer me", id="string"),
+        pytest.param(
+            [{"type": "input_text", "text": "steer me"}], False, "steer me", id="flat_blocks"
+        ),
+        pytest.param(
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Status?"}],
+                }
+            ],
+            False,
+            "Status?",
+            id="message_item_blocks",
+        ),
+        pytest.param(
+            [{"type": "message", "role": "user", "content": "Status?"}],
+            False,
+            "Status?",
+            id="message_item_string",
+        ),
+        pytest.param(
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Status?"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,AA=="},
+                    ],
+                }
+            ],
+            False,
+            "Status?",
+            id="message_item_text_and_image",
+        ),
+        pytest.param(
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "older request"}],
+                },
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "older reply"}],
+                },
+                {"type": "function_call_output", "call_id": "call_1", "output": "tool output"},
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "Status?"},
+                        {"type": "input_text", "text": "Be brief."},
+                    ],
+                },
+            ],
+            False,
+            "Status?\nBe brief.",
+            id="history_newest_user_only",
+        ),
+        pytest.param(
+            [
+                {"type": "message", "role": "user", "content": "older request"},
+                {"type": "message", "role": "assistant", "content": "older reply"},
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "inspect this"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,AA=="},
+                    ],
+                },
+                {"type": "message", "role": "assistant", "content": "later reply"},
+            ],
+            True,
+            [
+                {"type": "input_text", "text": "inspect this"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AA=="},
+            ],
+            id="history_newest_user_multimodal",
+        ),
+        pytest.param(
+            [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_image", "image_url": "data:image/png;base64,AA=="},
+                    ],
+                }
+            ],
+            True,
+            [{"type": "input_image", "image_url": "data:image/png;base64,AA=="}],
+            id="message_image_only_multimodal",
+        ),
         (
             [{"type": "input_text", "text": "steer me"}],
             True,
@@ -2434,14 +2651,6 @@ class _OneInjectionCtx:
             "inspect this",
         ),
     ],
-    ids=[
-        "plain-text",
-        "text-block",
-        "text-only-blocks",
-        "image-only",
-        "bang-with-file",
-        "text-only-executor",
-    ],
 )
 async def test_watch_injections_emits_consumed_marker_on_accept(
     input_value: str | list[dict[str, Any]], multimodal: bool, expected_content: Any
@@ -2455,6 +2664,11 @@ async def test_watch_injections_emits_consumed_marker_on_accept(
     re-deliver it in a continuation turn (RUNNER_MESSAGE_INGEST.md
     Part B). A missing/empty marker is exactly what would let the
     duplication regress.
+
+    The runner forwards the message ``content`` verbatim, and the request
+    schema accepts a plain string, flat content blocks, or conversation-shaped
+    ``message`` items (block-list or string ``content``). Every shape must
+    deliver only the newest user message, retaining blocks for capable executors.
     """
     import asyncio as _aio
 
@@ -2490,10 +2704,91 @@ async def test_watch_injections_emits_consumed_marker_on_accept(
     assert marker.injection_id == "inj_x"
 
 
+_OLDER_REQUEST = {
+    "type": "message",
+    "role": "user",
+    "content": [{"type": "input_text", "text": "older request"}],
+}
+
+
+@pytest.mark.parametrize(
+    "injection_input",
+    [
+        pytest.param(
+            [
+                _OLDER_REQUEST,
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type": "input_image", "image_url": "data:image/png;base64,AA=="}
+                    ],
+                },
+            ],
+            id="image_only_newest_user",
+        ),
+        pytest.param(
+            [_OLDER_REQUEST, {"type": "message", "role": "user"}],
+            id="newest_user_without_content",
+        ),
+        pytest.param(
+            [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "older reply"}],
+                },
+                {"type": "function_call_output", "call_id": "call_1", "output": "tool output"},
+            ],
+            id="assistant_and_tool_only",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_watch_injections_skips_conversation_input_without_newest_user_text(
+    injection_input: list[dict[str, Any]],
+) -> None:
+    """Conversation-shaped input without steerable user text is skipped mid-turn.
+
+    Nothing older is steered in its place and no consumed marker is emitted, so the
+    runner keeps its buffered copy and re-delivers the message as the next turn.
+    """
+    import asyncio as _aio
+
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import CreateResponseRequest
+
+    executor = _AcceptingInjectionExecutor()
+    adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="sk")
+    ctx = _OneInjectionCtx(
+        CreateResponseRequest(model="m", input=injection_input, injection_id="inj_x")
+    )
+
+    task = _aio.create_task(adapter._watch_injections(ctx, executor))  # type: ignore[arg-type]
+    try:
+        # The watcher pulls the next injection only after finishing with this one.
+        for _ in range(200):
+            if ctx.pulls >= 2:
+                break
+            await _aio.sleep(0.01)
+    finally:
+        task.cancel()
+        with contextlib.suppress(_aio.CancelledError):
+            await task
+
+    # Processed and skipped outright: nothing is steered and no consumed marker is emitted.
+    assert ctx.pulls >= 2, "the watcher never processed the injection"
+    assert executor.received == [], (
+        f"an older request was replayed as the steer: {executor.received!r}"
+    )
+    assert ctx.emitted == [], f"unexpected consumed marker: {ctx.emitted!r}"
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("delivery", ["fresh-blocks", "fresh-history", "live"])
-async def test_codex_adapter_keeps_multiple_text_blocks_out_of_shell_mode(
-    delivery: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("goal_command", [False, True], ids=["shell-like-text", "goal-command"])
+async def test_codex_adapter_routes_multiple_text_blocks(
+    delivery: str, goal_command: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Real adapter/executor routing must classify the original content block list."""
     import asyncio
@@ -2524,13 +2819,18 @@ async def test_codex_adapter_keeps_multiple_text_blocks_out_of_shell_mode(
     )
     expected_method = "turn/steer" if live else "turn/start"
     client = AsyncMock()
+    text_parts = ["/goal Finish ", "the tests"] if goal_command else ["!printf FIRST", "more"]
 
     async def request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        if goal_command and method == "thread/goal/set":
+            assert params == {"threadId": "thread_blocks", "objective": "Finish the tests"}
+            return {"result": {}}
         assert method == expected_method, f"unexpected Codex request: {method}"
-        assert params["input"] == [
-            {"type": "text", "text": "!printf FIRST"},
-            {"type": "text", "text": "more"},
-        ]
+        assert params["input"] == (
+            [{"type": "text", "text": "Finish the tests"}]
+            if goal_command
+            else [{"type": "text", "text": part} for part in text_parts]
+        )
         return {"result": {"turnId": "turn_active", "turn": {"id": "turn_active"}}}
 
     client.request.side_effect = request
@@ -2539,10 +2839,7 @@ async def test_codex_adapter_keeps_multiple_text_blocks_out_of_shell_mode(
     )
     executor = codex_native_executor.CodexNativeExecutor(bridge_dir=tmp_path)
     adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="session_blocks")
-    blocks = [
-        {"type": "input_text", "text": "!printf FIRST"},
-        {"type": "input_text", "text": "more"},
-    ]
+    blocks = [{"type": "input_text", "text": part} for part in text_parts]
     input_value = (
         [{"type": "message", "role": "user", "content": blocks}]
         if delivery == "fresh-history"
@@ -2557,14 +2854,18 @@ async def test_codex_adapter_keeps_multiple_text_blocks_out_of_shell_mode(
             adapter._watch_injections(injection_ctx, executor)  # type: ignore[arg-type]
         )
         try:
-            await poll_until_async(lambda: injection_ctx.emitted, timeout_s=5)
+            await poll_until_async(lambda: injection_ctx.pulls >= 2, timeout_s=5)
         finally:
             watcher.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await watcher
-        assert len(injection_ctx.emitted) == 1
-        assert isinstance(injection_ctx.emitted[0], InjectionConsumedEvent)
-    else:
+        if goal_command:
+            assert injection_ctx.emitted == []
+            client.request.assert_not_awaited()
+        else:
+            assert len(injection_ctx.emitted) == 1
+            assert isinstance(injection_ctx.emitted[0], InjectionConsumedEvent)
+    if not live or goal_command:
         turn_ctx = TurnContext(
             response_id="response_blocks",
             event_queue=asyncio.Queue(),
@@ -2572,8 +2873,9 @@ async def test_codex_adapter_keeps_multiple_text_blocks_out_of_shell_mode(
         )
         await asyncio.wait_for(adapter.run_turn(native_request, turn_ctx), timeout=5)
 
-    assert client.request.await_count == 1
-    assert client.request.await_args.args[0] == expected_method
+    assert [call.args[0] for call in client.request.await_args_list] == (
+        ["thread/goal/set", expected_method] if goal_command else [expected_method]
+    )
 
 
 @pytest.mark.asyncio
@@ -2844,7 +3146,7 @@ async def test_watch_injections_no_marker_without_injection_id() -> None:
     assert ctx.emitted == []
 
 
-class _InterruptTrackingExecutor:
+class _InterruptTrackingExecutor(Executor):
     """Inner executor stub that records ``interrupt_session`` calls."""
 
     def __init__(self) -> None:
@@ -2895,6 +3197,371 @@ async def test_interrupt_drops_inner_session_synchronously() -> None:
         "interrupt must drop the inner session so the next turn rebuilds fresh "
         f"instead of resuming the abandoned generation; got {executor.interrupted!r}"
     )
+
+
+# Usage that an interrupted native turn reports as it ends, e.g. the Claude CLI's final result.
+_INTERRUPTED_TURN_USAGE = {"input_tokens": 2641, "output_tokens": 512, "total_tokens": 3153}
+
+
+class _KeptSessionExecutor(Executor):
+    """Executor that keeps its native session across an interrupt.
+
+    :param stop_outcome: What the native turn yields once interrupted.
+    :param blocking_close: Whether ``close_session`` waits for ``close_released``.
+    :param blocking_interrupt: Whether ``interrupt_session`` waits for ``interrupt_released``,
+        finishing normally even when cancelled, as Claude's forced client close does.
+    """
+
+    def __init__(
+        self, stop_outcome: str, *, blocking_close: bool = False, blocking_interrupt: bool = False
+    ) -> None:
+        import asyncio
+
+        super().__init__()
+        self.stop_outcome = stop_outcome
+        self.turn_started = asyncio.Event()
+        self.stop_requested = asyncio.Event()
+        self.turn_unwound = False
+        self.interrupted: list[str] = []
+        self.closed: list[str] = []
+        self.close_requested = asyncio.Event()
+        self.close_released = asyncio.Event()
+        self.turn_released = asyncio.Event()
+        self.interrupt_released = asyncio.Event()
+        self.interrupt_cancelled = False
+        if not blocking_close:
+            self.close_released.set()
+        if not blocking_interrupt:
+            self.interrupt_released.set()
+
+    def resumes_after_interrupt(self) -> bool:
+        return True
+
+    async def run_turn(self, messages, tools, system_prompt, config=None):
+        import asyncio
+
+        from omnigent.inner.executor import ExecutorError, TextChunk, TurnCancelled, TurnComplete
+
+        try:
+            self.turn_started.set()
+            yield TextChunk(text="partial")
+            if self.stop_outcome == "never_stops":
+                await asyncio.Event().wait()
+            await self.stop_requested.wait()
+            if self.stop_outcome == "completes":
+                yield TurnComplete(response="partial")
+            elif self.stop_outcome == "errors":
+                yield ExecutorError(message="native session crashed")
+            elif self.stop_outcome == "cancels_with_usage":
+                yield TurnCancelled(usage=dict(_INTERRUPTED_TURN_USAGE))
+            elif self.stop_outcome == "completes_with_usage":
+                yield TurnComplete(response="partial", usage=dict(_INTERRUPTED_TURN_USAGE))
+            elif self.stop_outcome == "errors_with_usage":
+                yield ExecutorError(
+                    message="native session crashed", usage=dict(_INTERRUPTED_TURN_USAGE)
+                )
+            elif self.stop_outcome == "streams_then_cancels_with_usage":
+                yield TextChunk(text=" more")
+                yield TurnCancelled(usage=dict(_INTERRUPTED_TURN_USAGE))
+            elif self.stop_outcome == "keeps_streaming":
+                yield TextChunk(text=" more")
+                await asyncio.Event().wait()
+            elif self.stop_outcome == "ends_after_close":
+                await self.close_requested.wait()
+                yield TextChunk(text=" more")
+            elif self.stop_outcome == "errors_on_release":
+                await self.turn_released.wait()
+                yield ExecutorError(message="native session crashed")
+            elif self.stop_outcome == "raises":
+                yield TextChunk(text=" more")
+                raise RuntimeError("native stream broke")
+        finally:
+            self.turn_unwound = True
+
+    async def interrupt_session(self, session_key: str) -> bool:
+        import asyncio
+
+        self.interrupted.append(session_key)
+        try:
+            await self.interrupt_released.wait()
+        except asyncio.CancelledError:
+            self.interrupt_cancelled = True
+        self.stop_requested.set()
+        return True
+
+    async def close_session(self, session_key: str) -> None:
+        self.close_requested.set()
+        await self.close_released.wait()
+        self.closed.append(session_key)
+
+
+class _DroppedSessionExecutor(_KeptSessionExecutor):
+    """Executor that drops its native session on an interrupt."""
+
+    def resumes_after_interrupt(self) -> bool:
+        return False
+
+
+async def _interrupt_kept_session_turn(
+    stop_outcome: str,
+    *,
+    blocking_close: bool = False,
+    blocking_interrupt: bool = False,
+    executor_type: type[_KeptSessionExecutor] = _KeptSessionExecutor,
+):
+    """Start a turn on a :class:`_KeptSessionExecutor`, interrupt it, and return the pieces."""
+    import asyncio
+
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    executor = executor_type(
+        stop_outcome, blocking_close=blocking_close, blocking_interrupt=blocking_interrupt
+    )
+    adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="sk")
+    ctx = TurnContext(response_id="resp_1", event_queue=asyncio.Queue(), cancelled=asyncio.Event())
+    adapter._in_flight["resp_1"] = ctx
+    run_task = asyncio.create_task(
+        adapter.run_turn(CreateResponseRequest(model="test-agent", input="hello"), ctx)
+    )
+    await asyncio.wait_for(executor.turn_started.wait(), timeout=5)
+
+    response = await asyncio.wait_for(adapter._handle_interrupt_event(), timeout=5)
+    return adapter, executor, run_task, response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stop_outcome", "executor_type"),
+    [
+        ("cancels_with_usage", _KeptSessionExecutor),
+        ("streams_then_cancels_with_usage", _KeptSessionExecutor),
+        ("completes_with_usage", _KeptSessionExecutor),
+        ("errors_with_usage", _KeptSessionExecutor),
+        ("cancels_with_usage", _DroppedSessionExecutor),
+    ],
+)
+async def test_interrupted_turn_keeps_the_usage_it_reports_as_it_ends(
+    stop_outcome: str, executor_type: type[_KeptSessionExecutor]
+) -> None:
+    """The usage that an interrupted turn reports as it ends reaches its terminal event.
+
+    A stop interrupts the turn; the native turn then ends, by cancelling, completing
+    or failing, with the usage of the model calls it made, at once or after more output.
+    Those calls were spent, so ``response.cancelled`` carries it, whether or not the
+    executor keeps its session.
+    """
+    adapter, _, run_task, response = await _interrupt_kept_session_turn(
+        stop_outcome, executor_type=executor_type
+    )
+    ctx = adapter._in_flight["resp_1"]
+
+    assert response.status_code == 204
+    await run_task
+    assert ctx.provider_usage == _INTERRUPTED_TURN_USAGE
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_outcome", ["completes", "returns"])
+async def test_interrupt_waits_for_kept_session_turn_to_end(stop_outcome: str) -> None:
+    """The interrupt returns once the native turn ends, and the next turn reuses its session."""
+    adapter, executor, run_task, response = await _interrupt_kept_session_turn(stop_outcome)
+
+    assert response.status_code == 204
+    assert executor.turn_unwound
+    await run_task
+    assert adapter._executor is executor
+    assert adapter._abandoned_executor_cleanup is None
+    assert executor.closed == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_outcome", ["errors", "raises", "keeps_streaming"])
+async def test_interrupted_turn_that_does_not_end_cleanly_detaches_executor(
+    stop_outcome: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A native turn that fails or keeps streaming after the interrupt is not resumed."""
+    monkeypatch.setattr(
+        "omnigent.runtime.harnesses._executor_adapter._INTERRUPT_SETTLE_TIMEOUT_S", 0.05
+    )
+    adapter, _executor, run_task, response = await _interrupt_kept_session_turn(stop_outcome)
+
+    assert response.status_code == 204
+    await run_task
+    assert adapter._executor is None
+    assert adapter._abandoned_executor_cleanup is not None
+    await adapter._abandoned_executor_cleanup
+
+
+@pytest.mark.asyncio
+async def test_interrupt_closes_kept_session_when_turn_never_stops(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unconfirmed stop drops the executor and returns before its slow cleanup ends."""
+    import asyncio
+
+    monkeypatch.setattr(
+        "omnigent.runtime.harnesses._executor_adapter._INTERRUPT_SETTLE_TIMEOUT_S", 0.05
+    )
+    adapter, executor, run_task, response = await _interrupt_kept_session_turn(
+        "never_stops", blocking_close=True
+    )
+
+    assert response.status_code == 204
+    assert adapter._executor is None
+    cleanup = adapter._abandoned_executor_cleanup
+    assert cleanup is not None
+    await asyncio.wait_for(executor.close_requested.wait(), timeout=5)
+    assert not cleanup.done()
+    executor.close_released.set()
+    assert await asyncio.wait_for(cleanup, timeout=5)
+    assert executor.closed == ["sk"]
+    assert not run_task.done()
+    run_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await run_task
+    assert adapter._executor is None
+
+
+@pytest.mark.asyncio
+async def test_interrupt_answers_by_deadline_without_cancelling_slow_native_interrupt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The response stays bounded, and a slow native interrupt is reaped, not cancelled."""
+    import asyncio
+
+    monkeypatch.setattr(
+        "omnigent.runtime.harnesses._executor_adapter._INTERRUPT_SETTLE_TIMEOUT_S", 0.05
+    )
+    adapter, executor, run_task, response = await _interrupt_kept_session_turn(
+        "never_stops", blocking_interrupt=True
+    )
+
+    assert response.status_code == 204
+    assert adapter._executor is None
+    cleanup = adapter._abandoned_executor_cleanup
+    assert cleanup is not None
+    assert not cleanup.done()
+    executor.interrupt_released.set()
+    assert await asyncio.wait_for(cleanup, timeout=5)
+    assert executor.interrupted == ["sk"]
+    assert not executor.interrupt_cancelled
+    assert executor.closed == ["sk"]
+    run_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await run_task
+
+
+@pytest.mark.asyncio
+async def test_turn_ending_after_unconfirmed_interrupt_detaches_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A turn ending after an unconfirmed interrupt leaves the next turn's executor attached."""
+    import asyncio
+
+    monkeypatch.setattr(
+        "omnigent.runtime.harnesses._executor_adapter._INTERRUPT_SETTLE_TIMEOUT_S", 0.05
+    )
+    adapter, executor, run_task, response = await _interrupt_kept_session_turn("ends_after_close")
+
+    assert response.status_code == 204
+    assert adapter._executor is None, (
+        "the executor whose native session the interrupt closes must not serve the next turn"
+    )
+    replacement = _KeptSessionExecutor("completes")
+    adapter._executor_factory = lambda: replacement
+    assert adapter._ensure_executor() is replacement
+    await asyncio.wait_for(run_task, timeout=5)
+    assert executor.turn_unwound
+    assert executor.closed == ["sk"]
+    assert adapter._executor is replacement
+    assert replacement.closed == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement_attached", [True, False])
+async def test_turn_failing_after_later_unconfirmed_interrupt_reaps_only_its_executor(
+    replacement_attached: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A turn that fails after a later turn's unconfirmed interrupt leaves later state alone."""
+    import asyncio
+
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    monkeypatch.setattr(
+        "omnigent.runtime.harnesses._executor_adapter._INTERRUPT_SETTLE_TIMEOUT_S", 0.05
+    )
+    first = _KeptSessionExecutor("errors_on_release")
+    second = _KeptSessionExecutor("never_stops")
+    replacement = _KeptSessionExecutor("completes")
+    executors = iter([first, second, replacement])
+    adapter = ExecutorAdapter(executor_factory=lambda: next(executors), session_key="sk")
+
+    async def start_unconfirmed_turn(executor: _KeptSessionExecutor, response_id: str):
+        ctx = TurnContext(
+            response_id=response_id, event_queue=asyncio.Queue(), cancelled=asyncio.Event()
+        )
+        adapter._in_flight[response_id] = ctx
+        task = asyncio.create_task(
+            adapter.run_turn(CreateResponseRequest(model="test-agent", input="hello"), ctx)
+        )
+        await asyncio.wait_for(executor.turn_started.wait(), timeout=5)
+        response = await asyncio.wait_for(adapter._handle_interrupt_event(), timeout=5)
+        assert response.status_code == 204
+        assert adapter._executor is None
+        return task
+
+    first_task = await start_unconfirmed_turn(first, "resp_1")
+    second_task = await start_unconfirmed_turn(second, "resp_2")
+    second_cleanup = adapter._abandoned_executor_cleanup
+    assert second_cleanup is not None
+    if replacement_attached:
+        assert adapter._ensure_executor() is replacement
+
+    first.turn_released.set()
+    await asyncio.wait_for(first_task, timeout=5)
+    assert adapter._executor is (replacement if replacement_attached else None)
+    assert adapter._abandoned_executor_cleanup is second_cleanup, (
+        "a retry must keep waiting on the second executor's reap, not a no-op"
+    )
+    assert await asyncio.wait_for(second_cleanup, timeout=5)
+    assert replacement.interrupted == []
+    assert replacement.closed == []
+    second_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await second_task
+
+
+@pytest.mark.asyncio
+async def test_turn_interrupted_before_it_starts_never_reaches_kept_session() -> None:
+    """An interrupt between turn registration and start leaves the kept session idle."""
+    import asyncio
+
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.runtime.harnesses._scaffold import TurnContext
+    from omnigent.server.schemas import CreateResponseRequest
+
+    executor = _KeptSessionExecutor("completes")
+    adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="sk")
+    assert adapter._ensure_executor() is executor
+    ctx = TurnContext(response_id="resp_1", event_queue=asyncio.Queue(), cancelled=asyncio.Event())
+    adapter._in_flight["resp_1"] = ctx
+
+    response = await asyncio.wait_for(adapter._handle_interrupt_event(), timeout=5)
+    await asyncio.wait_for(
+        adapter.run_turn(CreateResponseRequest(model="test-agent", input="hello"), ctx),
+        timeout=5,
+    )
+
+    assert response.status_code == 204
+    assert ctx.cancelled.is_set()
+    assert not executor.turn_started.is_set()
+    assert adapter._executor is executor
+    assert adapter._abandoned_executor_cleanup is None
+    assert adapter._turn_finished.is_set()
 
 
 def test_internal_errored_tool_complete_emits_output_with_real_call_id() -> None:

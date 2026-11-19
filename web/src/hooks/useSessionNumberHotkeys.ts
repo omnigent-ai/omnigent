@@ -12,29 +12,13 @@
 // native path matches on e.key. The shortcuts-dialog row mirrors the same split.
 
 import { useEffect, useRef } from "react";
-import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
+import { isMacPlatform } from "@/lib/hotkeys";
 import { useNavigate } from "@/lib/routing";
-import { isNativeShell } from "@/lib/nativeBridge";
+import { matchedShortcutChordIndex, SESSION_NUMBER_DIGITS } from "@/lib/shortcuts/registry";
 
-/** Index → the digit key that selects it (native path; matched against e.key).
- *  Single source of truth shared with the shortcuts dialog so binding and label
+/** Index → the digit that selects it. Shared with the sidebar's row hints so binding and label
  *  can't drift. */
-export const SESSION_HOTKEY_DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"] as const;
-
-/** Index → the physical key code (browser path; matched against e.code, since
- *  Alt rewrites e.key on macOS). Same order as {@link SESSION_HOTKEY_DIGITS}. */
-export const SESSION_HOTKEY_CODES = [
-  "Digit1",
-  "Digit2",
-  "Digit3",
-  "Digit4",
-  "Digit5",
-  "Digit6",
-  "Digit7",
-  "Digit8",
-  "Digit9",
-  "Digit0",
-] as const;
+export const SESSION_HOTKEY_DIGITS = SESSION_NUMBER_DIGITS;
 
 /**
  * @param orderedSessionIds Conversation ids the sidebar shows, in render order.
@@ -52,25 +36,10 @@ export function useSessionNumberHotkeys(
 
   useEffect(() => {
     const handler = (e: globalThis.KeyboardEvent): void => {
-      // Platform command modifier required; Shift left to other bindings.
-      if (e.shiftKey || !hasCommandModifier(e, isMac)) return;
-
-      let index: number;
-      if (isNativeShell()) {
-        // Desktop owns plain Cmd/Ctrl+digit (Alt+chord is the message hotkey).
-        if (e.altKey) return;
-        index = SESSION_HOTKEY_DIGITS.indexOf(e.key as (typeof SESSION_HOTKEY_DIGITS)[number]);
-      } else {
-        // Browser: plain Cmd/Ctrl+digit is the native tab-switch, so own the
-        // Cmd/Ctrl+Alt+digit chord instead. Alt rewrites e.key → match e.code.
-        if (!e.altKey) return;
-        // AltGr reports as Ctrl+Alt on Windows/Linux intl layouts — typing
-        // AltGr+digit must compose the character, not yank the user to a
-        // sidebar session. Same guard (and same feature-detect, so synthetic
-        // events without the method don't throw) as useSidebarToggleHotkeys.
-        if (typeof e.getModifierState === "function" && e.getModifierState("AltGraph")) return;
-        index = SESSION_HOTKEY_CODES.indexOf(e.code as (typeof SESSION_HOTKEY_CODES)[number]);
-      }
+      // Native: plain Cmd/Ctrl+digit (Alt+chord is the message hotkey). Browser:
+      // Cmd/Ctrl+Alt+digit, since plain Cmd/Ctrl+digit is the native tab-switch;
+      // AltGr+digit there composes a character instead. Shift is left to other bindings.
+      const index = matchedShortcutChordIndex(e, "session.number", { mac: isMac });
       if (index === -1) return;
 
       const { orderedSessionIds: ids, activeId: active } = latest.current;

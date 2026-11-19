@@ -116,6 +116,11 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 - [Automation failure visibility](./automation-failures.md) covers failed-run card
   warnings, Inbox surfacing, session deduplication and browser-local dismissal.
 
+- [Automation sharing](./automation-sharing.md) covers the owner's Share action on
+  the detail page and row menus, the read-only share dialog, the warning on a
+  session an automation manages, and what the people it is shared with see: the
+  Shared with me tab, the read-only automation page and the sidebar folder.
+
 - [Automation templates](./automation-templates.md) covers the gallery tabs,
   suggestions on Your automations, and direct template setup.
 
@@ -169,6 +174,8 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
   custom-agent targets, fork access checks, archive, reconnect, and resume.
 - [Video recordings](./video-rendering.md) covers inline chat playback, remote
   recording links, file previews, and download fallbacks.
+- [Data-file table preview](./data-table-preview.md) covers CSV and TSV files
+  opening as a sortable, filterable table, its row bounds, and encodings.
 - [Tool calls in chat](./tool-calls.md) covers tool-call rows and their edit
   counts, the expanded field, error and Raw views, and tool-run folding.
 - [Sandbox profiles](./sandbox-profiles.md) covers provider-owned discovery,
@@ -207,9 +214,11 @@ map an area, remove it here in the same change.
   discovery and idle-runner performance are mapped in Native harnesses)
 - Files and the workspace browser: `tests/e2e_ui/files/`, `tests/browser_ui/files/`
 - Comments: `tests/e2e_ui/comments/`
-- Sharing and session permissions: `tests/e2e_ui/collaboration/`
+- Sharing and session permissions: `tests/e2e_ui/collaboration/` (only automation
+  sharing and its managed-session warning are mapped)
 - GitHub integration: `tests/e2e_ui/github/`
 - Scheduled tasks: `tests/e2e_ui/scheduled/`
+- Saved workflows and cloning: `tests/e2e_ui/workflows/`
 - In-app browser: `tests/e2e_ui/browser/` (session cookie sharing is covered in
   Sessions; other browser behavior remains unmapped)
 - Desktop app: `tests/e2e_ui/desktop/`

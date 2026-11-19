@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 import httpx
+import yaml
 from fastapi import FastAPI, Query, Request
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
@@ -71,6 +72,7 @@ from omnigent.harness_plugins import (
 )
 from omnigent.host.launch_audit import request_client_audit_attributes
 from omnigent.resources import examples as _examples_resources
+from omnigent.resources import proactive as _proactive_resources
 from omnigent.runtime import (
     get_terminal_registry,
     pending_elicitations,
@@ -83,9 +85,11 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.server import (
     managed_host_keepalive,
+    session_journal,
     session_live_state,
     session_pull_requests,
     shutdown_state,
+    workflows,
 )
 from omnigent.server.auth import (
     RESERVED_USER_LOCAL,
@@ -101,6 +105,7 @@ from omnigent.server.background_session_titles import (
 )
 from omnigent.server.disconnect_evidence import DisconnectEvidence, drop_attributes
 from omnigent.server.feature_flags import (
+    DeploymentGate,
     Feature,
     FeatureFlags,
     deployment_gate_enabled,
@@ -111,6 +116,11 @@ from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
 from omnigent.server.mcp_gateway import McpGatewayBackend
 from omnigent.server.mcp_pool import ServerMcpPool
+from omnigent.server.openapi_request_bodies import (
+    SESSION_CREATE_BODY_MODELS,
+    register_component_models,
+)
+from omnigent.server.openapi_stream_events import install_stream_event_schemas
 from omnigent.server.performance_metrics import (
     ServerMetricsOtelPublisher,
     ServerPerformanceMetrics,
@@ -121,6 +131,8 @@ from omnigent.server.performance_metrics import (
     set_request_user_agent_for_access_log,
 )
 from omnigent.server.preference_requests import DEFAULT_PREFERENCE_POLICY, PreferencePolicy
+from omnigent.server.proactive_agent import PROACTIVE_AGENT_NAME, ProactiveProvisioner
+from omnigent.server.routes._host_launch import routed_slice_key
 from omnigent.server.routes.builtin_agents import create_builtin_agents_router
 from omnigent.server.routes.comments import create_comments_router
 from omnigent.server.routes.default_policies import create_default_policies_router
@@ -129,10 +141,17 @@ from omnigent.server.routes.extension_assets import create_extension_assets_rout
 from omnigent.server.routes.extensions import create_extensions_router
 from omnigent.server.routes.harnesses import create_harnesses_router
 from omnigent.server.routes.imports import create_imports_router
+from omnigent.server.routes.inbox_items import create_inbox_items_router
+from omnigent.server.routes.memory import create_memory_router
 from omnigent.server.routes.policy_registry import create_policy_registry_router
 from omnigent.server.routes.preferences import create_preferences_router
+from omnigent.server.routes.proactive_agent_admin import create_proactive_agent_admin_router
+from omnigent.server.routes.proactive_agent_settings import (
+    create_proactive_agent_settings_router,
+)
 from omnigent.server.routes.projects import create_projects_router
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
+from omnigent.server.routes.scheduled_task_permissions import scheduled_task_sharing_supported
 from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
 from omnigent.server.routes.session_mcp_servers import create_session_mcp_servers_router
 from omnigent.server.routes.session_policies import create_session_policies_router
@@ -149,6 +168,7 @@ from omnigent.server.routes.sharing import create_sharing_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.server.routes.usage import create_usage_router
 from omnigent.server.routes.user_settings import create_user_settings_router
+from omnigent.server.routes.workflow_permissions import stores_workflow_grants
 from omnigent.server.runner_session_init import (
     TRANSIENT_REJECTION_STATUSES,
     RunnerSessionInitializer,
@@ -185,9 +205,12 @@ from omnigent.stores.conversation_store import (
     runner_seen_is_fresh,
 )
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.inbox_item_store import InboxItemStore
+from omnigent.stores.memory_store import MemoryStore
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.policy_store import PolicyStore
 from omnigent.stores.preference_store import PreferenceStore
+from omnigent.stores.proactive_agent_settings_store import ProactiveAgentSettingsStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 from omnigent.stores.scheduled_task_store.dispatch import ScheduledTaskDispatchStore
@@ -195,11 +218,13 @@ from omnigent.stores.user_settings_store import (
     open_user_settings_store,
     session_owner_title_instructions,
 )
+from omnigent.tools.builtins.session_message import SESSION_MESSAGE_MAX_CHARS
 from omnigent.util.event_loop_watchdog import monitor_event_loop
 
 if TYPE_CHECKING:
-    from omnigent.entities import Conversation
+    from omnigent.entities import Agent, Conversation
     from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
+    from omnigent.onboarding.acp_auth import AcpAgentEntry
 
 _logger = logging.getLogger(__name__)
 
@@ -271,6 +296,10 @@ class ServerInfoResponse(BaseModel):
     # ``{"agent_sandbox": {"multi_repo": true}}``. The web branches on these
     # (multi-repo picker vs single). Providers absent from the map default off.
     sandbox_provider_capabilities: dict[str, dict[str, bool]] = {}
+    # What each launchable provider's unattended runs need from their owner, e.g.
+    # ``{"agent_sandbox": "Keep your laptop signed in."}``. The automation form
+    # shows the run target's notice. Providers without one are absent.
+    sandbox_provider_automation_notices: dict[str, str] = {}
     enabled_connections: list[str]
     sharing_mode: Literal["on", "read_only", "restricted_read_only", "off"]
     public_sharing_enabled: bool
@@ -286,6 +315,11 @@ class ServerInfoResponse(BaseModel):
     installable_harnesses: list[str]
     # Whether the scheduled-tasks routes are mounted and enabled for this caller.
     automations_enabled: bool = False
+    # Whether agents can post to this caller's Inbox (``/v1/inbox/items``).
+    inbox_items_available: bool = False
+    # Whether the deployment offers the proactive agent to this caller; each
+    # user's own on/off state is at ``GET /v1/proactive-agent/settings``.
+    proactive_agent_available: bool = False
     dictation_available: bool
     # Scheduled tasks accept the optional random-worktree base ref.
     scheduled_task_worktrees: bool = True
@@ -302,17 +336,35 @@ class ServerInfoResponse(BaseModel):
     # Scheduled tasks accept ``source_session_id``: each run starts from a copy
     # of a session. Older servers reject it.
     scheduled_task_source_sessions: bool = True
+    # Scheduled tasks accept ``mcp_services``; older servers reject it.
+    scheduled_task_mcp_services: bool = True
     # Connected hosts and continued sandbox sessions accept ten-minute schedules.
     scheduled_task_subhour: bool = True
+    # Scheduled tasks accept an explicit ``COUNT=1`` rule that fires once, such as
+    # a reminder, and ``first_run_at``. Needs the database scheduler and the
+    # ``one_time_automations`` release feature; absent on older servers.
+    scheduled_task_one_time: bool = False
+    # Scheduled-task runs drop a trigger prompt's ``<!-- omnigent-trigger ... -->`` header
+    # before dispatch; older servers would send it to the model.
+    scheduled_task_trigger_headers: bool = True
     automation_trigger_poll_minutes: int = 10
+    # Longest session message this server delivers; older servers omit it and
+    # deliver at most 8,000 characters.
+    session_message_max_chars: int = SESSION_MESSAGE_MAX_CHARS
     # Scheduled permissions use the selected native harness's vocabulary.
     scheduled_task_harness_settings: bool = True
+    # Session creates accept ``permission_mode``; older servers ignore it.
+    session_create_permission_modes: bool = True
+    # Session creates accept ``workflow_id``; older servers ignore it.
+    session_create_workflow_id: bool = True
+    scripted_sessions: bool = False
     # Scheduled tasks accept explicit modes that skip approval; servers that omit
     # this may reject them, so clients hide those modes.
     scheduled_task_approval_skipping_modes: bool = True
     scheduled_task_sandbox_workspaces: bool = True
     # Owner-private families and reuse of the source session's sandbox.
     sibling_sessions: bool = False
+    session_nest_moves: bool = False
     # Uploaded-agent sessions accept repository lists and worktree options.
     session_bundle_workspaces: bool = True
     # A managed create or fork accepts ``host_id`` naming its new sandbox host;
@@ -341,19 +393,45 @@ class ServerInfoResponse(BaseModel):
     # Declining a non-blocking Codex question card leaves the turn running; older
     # servers interrupt Codex, so the forwarder keeps those questions in the terminal.
     codex_nonblocking_decline: bool = False
+    # POST /v1/sessions/{id}/rewind and GET .../items?type=; absent on older servers,
+    # which clients treat as unsupported.
+    session_rewind: bool = False
     # GET/DELETE /v1/sessions/{id}/pull-requests and SessionListItem.pull_request;
     # absent on older servers, which clients treat as unsupported.
     session_pull_requests: bool = False
+    # GET/POST /v1/sessions/{id}/journal and session.journal.appended; absent on
+    # older servers, which clients treat as unsupported.
+    session_journal: bool = False
+    # /v1/workflows, the caller's saved workflows; absent on older servers, which
+    # clients treat as unsupported.
+    workflows: bool = False
+    # Workflows can be shared through ``/v1/workflows/{id}/permissions``, and
+    # ``GET /v1/workflows/shared`` lists those shared with the caller: needs
+    # ``workflows`` and a store that keeps workflow grants.
+    workflow_sharing: bool = False
     # GET/PUT /v1/settings/session-title-instructions; absent on older servers,
     # which clients treat as unsupported.
     session_title_instructions: bool = False
     admin_view: bool = False
+    # Session comments accept and preserve immutable PR coordinates.
+    comment_anchor_metadata: bool = True
     # Absent on older servers, which clients treat as the default extensions.
     filesystem_attachments: FilesystemAttachmentsInfo | None = None
     # Scheduled tasks accept ``project_id``; older servers reject it.
     scheduled_task_projects: bool = False
     # Bounded latest-failure feed for the Inbox.
     scheduled_task_inbox: bool = False
+    # Grants can be added through ``/v1/scheduled-tasks/{id}/permissions``: needs
+    # ``automations_v2`` and a store that keeps them. Listing and removing need only the
+    # store, through the API; the automation pages need the flag.
+    scheduled_task_sharing: bool = False
+    # ``GET /v1/scheduled-tasks/shared`` lists the automations shared with the caller,
+    # under the same conditions as ``scheduled_task_sharing``. Older servers that
+    # advertise sharing lack the route.
+    scheduled_task_shared_with_me: bool = False
+    # ``GET /v1/scheduled-tasks/{id}/run-pull-requests``, the PRs of each run, served
+    # beside ``session_pull_requests``. Older servers that store session PRs lack it.
+    scheduled_task_run_pull_requests: bool = False
     # Session PATCH and project create check the agent tool's calling session;
     # absent on older servers, where moves must not run.
     session_move_source_checks: bool = False
@@ -363,6 +441,8 @@ class ServerInfoResponse(BaseModel):
     # An agent's create that names a project other than its source's project makes a
     # standalone session; older servers refuse it while sibling sessions are on.
     sibling_other_project_standalone: bool = False
+    # ``/v1/memory`` is mounted and enabled; the runner offers the memory_* tools only then.
+    memory: bool = False
     branding: BrandingInfo
     picker: PickerInfo = PickerInfo()
 
@@ -733,10 +813,7 @@ def _wrong_replica_error_body(request: Request, exc: WrongReplicaError) -> dict[
         ``slice_key_header``, and ``slice_key`` to resend with (``None`` to
         resend without the header).
     """
-    request_slice_key = request.headers.get(OMNIGENT_SLICE_KEY_HEADER) or (
-        request.query_params.get("omnigent_slice_key")
-    )
-    if request_slice_key == exc.host_id:
+    if routed_slice_key(request) == exc.host_id:
         resend_slice_key = None
         remedy = (
             f"resend without the {OMNIGENT_SLICE_KEY_HEADER} header "
@@ -761,6 +838,8 @@ def _wrong_replica_error_body(request: Request, exc: WrongReplicaError) -> dict[
 # Windows checkout (where Git leaves it as a stub text file); a no-op elsewhere.
 _DEBBY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "debby")
 _POLLY_BUNDLE_SOURCE = resolve_repo_symlink(Path(_examples_resources.__file__).parent / "polly")
+# Kept out of the package directory so __init__.py and bytecode never enter the bundle hash.
+_PROACTIVE_BUNDLE_SOURCE = Path(_proactive_resources.__file__).parent / "bundle"
 
 
 class _FastAPICallNext(Protocol):
@@ -1154,6 +1233,62 @@ def _warn_on_empty_picker_restriction(
         )
 
 
+def _retired_builtin_agent_names(
+    agent_store: AgentStore, agent_cache: Any, owned: frozenset[str]
+) -> frozenset[str]:
+    """
+    Name the built-in rows an earlier version seeded that no current seeding owns.
+
+    A built-in row has a server-scope id derived from its name
+    (:func:`~omnigent.db.utils.builtin_agent_id`), which no other agent gets.
+    An operator's ``acp:`` agent is never one, even while its config can't be
+    read, and neither is a row whose bundle can't be read.
+
+    :param agent_store: Store for agent metadata.
+    :param agent_cache: Cache for loaded agent specs.
+    :param owned: Names this boot's seeding owns, e.g. ``{"polly", "devin-acp"}``.
+    :returns: The retired names, e.g. ``{"devin"}``.
+    """
+    from omnigent.db.utils import builtin_agent_id
+
+    retired: set[str] = set()
+    after: str | None = None
+    while True:
+        page = agent_store.list(limit=100, after=after, order="asc")
+        retired.update(
+            agent.name
+            for agent in page.data
+            if agent.session_id is None
+            and agent.id == builtin_agent_id(agent.name)
+            and agent.name not in owned
+            and not _may_be_operator_acp_agent(agent, agent_cache)
+        )
+        if not page.has_more or page.last_id is None:
+            return frozenset(retired)
+        after = page.last_id
+
+
+def _may_be_operator_acp_agent(agent: "Agent", agent_cache: Any) -> bool:
+    """
+    Whether a stored built-in row is an operator's ``acp:<slug>`` agent, or might be.
+
+    Packaged ACP rows run on their catalog id (e.g. ``devin``); configured ones
+    run on ``acp:<slug>``. A bundle that can't be read can't be told apart.
+
+    :param agent: The stored row.
+    :param agent_cache: Cache for loaded agent specs.
+    :returns: ``True`` unless its bundle loads and runs on another harness.
+    """
+    try:
+        loaded = agent_cache.load(
+            agent.id, agent.bundle_location, expand_env=agent.operator_authored
+        )
+    except Exception:
+        _logger.debug("could not read the bundle of built-in row %r", agent.name, exc_info=True)
+        return True
+    return loaded.spec.executor.harness_kind.startswith("acp:")
+
+
 def _ensure_default_agents(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
@@ -1171,8 +1306,10 @@ def _ensure_default_agents(
     ``OMNIGENT_SEEDED_AGENTS`` trims the packaged roster. Each helper
     returns the packaged names it owns (seeded or not), so whatever the
     allowlist leaves out is returned here and hidden from ``GET /v1/agents``
-    by the caller that stores it. A row seeded by an earlier boot is
-    suppressed rather than deleted: sessions look their agent up by
+    by the caller that stores it. A built-in row an earlier version seeded,
+    which no helper or configured ACP agent owns any more, counts as packaged
+    too. A row seeded by an earlier boot is suppressed rather than deleted:
+    sessions look their agent up by
     ``conversations.agent_id``, so dropping the row would leave them without one.
 
     Extras from ``OMNIGENT_BUILTIN_AGENT_DIRS`` are deliberately outside
@@ -1192,8 +1329,17 @@ def _ensure_default_agents(
         | _ensure_default_polly_agent(agent_store, artifact_store, agent_cache, allowlist)
     )
     extras = _ensure_extra_builtin_agents(agent_store, artifact_store, agent_cache)
+    # Outside the allowlist: only hidden tasks run it, and GET /v1/agents never lists it.
+    _ensure_default_proactive_agent(agent_store, artifact_store, agent_cache)
     if allowlist is None:
         return frozenset()
+    # Configured ACP agents and listed extras use built-in IDs but remain
+    # operator-owned, even when an extra fails to seed.
+    operator_owned = frozenset(agent.slug for agent in _configured_acp_agents()[0])
+    operator_owned |= _listed_extra_builtin_agent_names()
+    # The proactive agent's row is this boot's too; it is just never offered.
+    owned = packaged | extras | operator_owned | {PROACTIVE_AGENT_NAME}
+    packaged |= _retired_builtin_agent_names(agent_store, agent_cache, owned)
     unknown = allowlist - packaged
     if unknown:
         _logger.warning(
@@ -1223,6 +1369,20 @@ def _ensure_default_agents(
 # or an e2e fixture — ship custom always-available agents (e.g. a plain
 # claude-sdk chat agent that a fork can switch into).
 _EXTRA_BUILTIN_AGENTS_ENV = "OMNIGENT_BUILTIN_AGENT_DIRS"
+
+
+def _listed_extra_builtin_agent_names() -> frozenset[str]:
+    """
+    Name every agent :data:`_EXTRA_BUILTIN_AGENTS_ENV` lists, seeded or not.
+
+    A path that is missing this boot may still name a row an earlier boot
+    seeded, as its stem (``house.yaml`` → ``house``) or directory name.
+
+    :returns: Candidate names, e.g. ``{"house", "house.yaml"}``.
+    """
+    raw = os.environ.get(_EXTRA_BUILTIN_AGENTS_ENV, "")
+    entries = [Path(entry.strip()) for entry in raw.split(os.pathsep) if entry.strip()]
+    return frozenset({entry.stem for entry in entries} | {entry.name for entry in entries})
 
 
 def _ensure_extra_builtin_agents(
@@ -1266,6 +1426,16 @@ def _ensure_extra_builtin_agents(
         source = Path(entry)
         try:
             name = source.stem if source.is_file() else source.name
+            if name == PROACTIVE_AGENT_NAME:
+                # Its name-derived id is the built-in proactive agent's, which
+                # only framework-owned hidden tasks run.
+                _logger.warning(
+                    "Skipping extra built-in agent %r from %s: the name is reserved. Check %s.",
+                    name,
+                    source,
+                    _EXTRA_BUILTIN_AGENTS_ENV,
+                )
+                continue
             with tempfile.TemporaryDirectory() as tmpdir:
                 bundle_dir = materialize_bundle(source, Path(tmpdir) / "bundle")
                 bundle_bytes = _tar_gz_dir(bundle_dir)
@@ -1416,6 +1586,24 @@ def _build_acp_bundle(*, harness: str, name: str) -> bytes:
         return _tar_gz_dir(bundle_dir)
 
 
+def _configured_acp_agents() -> tuple[list["AcpAgentEntry"], frozenset[str]]:
+    """
+    Read the operator's ``acp:`` agents and the builtin ACP rows they shadow.
+
+    :returns: The configured agents, and the builtin ACP row keys they claim,
+        e.g. ``([AcpAgentEntry(slug="devin", ...)], {"devin"})``; empty when
+        the ``acp:`` block is unreadable, which must never break startup.
+    """
+    try:
+        from omnigent.onboarding.acp_auth import acp_agents, shadowed_builtin_acp_rows
+
+        configured = list(acp_agents())
+        return configured, shadowed_builtin_acp_rows(configured)
+    except Exception:
+        _logger.debug("acp agent seeding skipped (config unreadable)", exc_info=True)
+        return [], frozenset()
+
+
 def _ensure_default_acp_agents(
     agent_store: AgentStore,
     artifact_store: ArtifactStore,
@@ -1463,15 +1651,7 @@ def _ensure_default_acp_agents(
     owned: set[str] = set()
 
     # (1) User-configured acp:<slug> agents — "set up" == present in config.
-    try:
-        from omnigent.onboarding.acp_auth import acp_agents, shadowed_builtin_acp_rows
-
-        configured = list(acp_agents())
-        shadowed: frozenset[str] = shadowed_builtin_acp_rows(configured)
-    except Exception:  # a malformed acp: block must never break startup
-        _logger.debug("acp agent seeding skipped (config unreadable)", exc_info=True)
-        configured = []
-        shadowed = frozenset()
+    configured, shadowed = _configured_acp_agents()
     for agent in configured:
         # Key the built-in by the slug, not the display label: agent names must be
         # ``[a-zA-Z0-9_-]+`` (the spec validator rejects spaces/dots), and a label
@@ -1572,6 +1752,60 @@ def _ensure_default_debby_agent(
         bundle_bytes=_build_debby_bundle(),
     )
     return owned
+
+
+def _ensure_default_proactive_agent(
+    agent_store: AgentStore,
+    artifact_store: ArtifactStore,
+    agent_cache: Any,
+    *,
+    prompt_override: str | None = None,
+) -> None:
+    """Register the built-in proactive agent, which only hidden scheduled tasks run.
+
+    Always seeded, so a task created while the agent was enabled still finds
+    it; always hidden from the picker (see :func:`_ensure_default_agents`).
+    An operator agent that already uses the name is left as it is, and the
+    feature stays off: tasks, hiding, and provisioning all use the built-in id.
+
+    :param prompt_override: An admin's replacement for the bundled prompt. It
+        becomes a new bundle version, which the agent's next runs load.
+    """
+    import tempfile
+
+    from omnigent.server.proactive_agent import PROACTIVE_AGENT_ID
+    from omnigent.spec import materialize_bundle
+
+    existing = agent_store.get_by_name(PROACTIVE_AGENT_NAME)
+    if existing is not None and existing.id != PROACTIVE_AGENT_ID:
+        _logger.warning(
+            "Not seeding the built-in proactive agent: agent %s already uses the name %r",
+            existing.id,
+            PROACTIVE_AGENT_NAME,
+        )
+        return
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        bundle_dir = materialize_bundle(_PROACTIVE_BUNDLE_SOURCE, Path(tmpdir) / "bundle")
+        if prompt_override is not None:
+            config_path = bundle_dir / "config.yaml"
+            config = yaml.safe_load(config_path.read_text())
+            config["prompt"] = prompt_override
+            config_path.write_text(yaml.safe_dump(config, sort_keys=False))
+        bundle_bytes = _tar_gz_dir(bundle_dir)
+    _ensure_builtin_agent(
+        agent_store,
+        artifact_store,
+        agent_cache,
+        name=PROACTIVE_AGENT_NAME,
+        bundle_bytes=bundle_bytes,
+    )
+
+
+def proactive_agent_default_prompt() -> str:
+    """The proactive agent's bundled prompt, before any admin override."""
+    config = yaml.safe_load((_PROACTIVE_BUNDLE_SOURCE / "config.yaml").read_text())
+    return str(config["prompt"])
 
 
 def _build_polly_bundle() -> bytes:
@@ -1692,6 +1926,12 @@ def create_app(
     preference_policy: PreferencePolicy = DEFAULT_PREFERENCE_POLICY,
     scheduled_task_dispatch: ScheduledTaskDispatchHooks | None = None,
     scheduled_task_scheduler_config: ScheduledTaskSchedulerConfig | None = None,
+    inbox_item_store: InboxItemStore | None = None,
+    user_inbox: DeploymentGate | None = None,
+    proactive_agent: DeploymentGate | None = None,
+    host_session_recovery: DeploymentGate = False,
+    proactive_agent_settings_store: ProactiveAgentSettingsStore | None = None,
+    memory_store: MemoryStore | None = None,
 ) -> FastAPI:
     """
     Build and return the FastAPI application with all routes mounted.
@@ -1718,6 +1958,8 @@ def create_app(
         token-bound runner id, which is the shared remote-server
         behavior.
     :param comment_store: Store for per-conversation review comments.
+    :param inbox_item_store: Store for agent-posted Inbox items; ``None`` leaves
+        the Inbox item routes unmounted.
     :param policy_store: Store for server-persisted policies
         (session-scoped and server-wide defaults). ``None``
         disables both the session policy and default policy
@@ -1725,16 +1967,38 @@ def create_app(
     :param permission_store: Store for session-level access grants.
         ``None`` disables permission checks (all access allowed).
     :param scheduled_task_store: Store backing the recurring-task
-        scheduler. When provided, the FastAPI lifespan
-        starts an :class:`ScheduledTaskScheduler` that arms a timer per
-        active task and fires the injected ``on_fire`` callback on
-        schedule. ``None`` disables the scheduler entirely.
+        scheduler. When provided, the FastAPI lifespan starts the database
+        scheduler (:class:`PersistentTaskScheduler`), or with automations_v2 off,
+        a :class:`ScheduledTaskScheduler` that arms a timer per active task.
+        ``None`` disables the scheduler entirely, in either mode. The
+        ``automations`` release feature disables both schedulers and all
+        automation access without deleting saved tasks.
     :param preference_store: Optional shared-preference API; no launcher adoption.
+    :param memory_store: Optional long-term memory backend; mounts ``/v1/memory`` when set.
     :param automations: Whether this request's caller can use automations. A static
         bool or a zero-arg callable resolved per request; ``None`` enables them.
         When off, the ``/v1/scheduled-tasks`` routes return 404 and ``GET /v1/info``
         reports ``automations_enabled`` false. Scheduling of existing tasks is not
         affected.
+    :param user_inbox: Whether agents can post items to this request's caller's
+        Inbox. A static bool or a zero-arg callable resolved per request;
+        ``None`` follows the ``user_inbox`` release feature (on by default).
+        When off, ``/v1/inbox/items`` returns 404, runners drop the Inbox tools,
+        the proactive agent is off too, and ``GET /v1/info`` reports
+        ``inbox_items_available`` false.
+    :param host_session_recovery: Live permission for explicitly opted-in hosts
+        to continue interrupted tasks. Embedded deployments default to disabled.
+    :param proactive_agent: Whether the deployment offers the proactive agent to
+        this request's caller. A static bool or a zero-arg callable resolved per
+        request; ``None`` follows the ``proactive_agent`` release feature (off by
+        default). When off, ``/v1/proactive-agent/settings`` returns 404 and
+        ``GET /v1/info`` reports ``proactive_agent_available`` false.
+    :param proactive_agent_settings_store: The workspace and per-user on/off
+        settings. Where the deployment offers the agent, a user gets it only when
+        both are on, evaluated in the user's request when ``POST /v1/sessions``
+        creates their proactive task and as the task owner when a run starts.
+        ``None`` leaves the settings routes unmounted and turns the agent off,
+        whatever ``proactive_agent`` says.
     :param scheduled_task_dispatch: Overrides for automations_v2: host ownership,
         the owner identity fires act under, or a replacement executor. ``None``
         uses the built-in executor with every host owned by this replica.
@@ -1895,13 +2159,10 @@ def create_app(
         if mcp_disabled_servers is None
         else mcp_disabled_servers
     )
+    automations_enabled = resolved_feature_flags.enabled(Feature.AUTOMATIONS)
     automations_v2_enabled = resolved_feature_flags.enabled(Feature.AUTOMATIONS_V2)
-    if automations_v2_enabled:
-        if scheduled_task_store is None:
-            raise ValueError(
-                "automations_v2 requires a scheduled task store. Pass scheduled_task_store "
-                "to create_app(), or leave automations_v2 disabled until scheduling is configured."
-            )
+    # Without a store there are no automations, so neither mode starts a scheduler.
+    if automations_enabled and automations_v2_enabled and scheduled_task_store is not None:
         if not isinstance(scheduled_task_store, ScheduledTaskDispatchStore):
             raise TypeError(
                 "The configured scheduled task store does not implement the operations needed "
@@ -2132,6 +2393,11 @@ def create_app(
             app_inst.state.suppressed_agent_names = _ensure_default_agents(
                 agent_store, artifact_store, agent_cache
             )
+        # Seeding writes the bundled prompt; an admin's override replaces it.
+        try:
+            app_inst.state.reseed_proactive_agent(only_if_overridden=True)
+        except Exception:
+            _logger.exception("Could not apply the proactive agent's prompt override")
         # The roster exists either way, so the check does not depend on seeding here.
         _warn_on_empty_picker_restriction(
             agent_store, picker_curation, app_inst.state.suppressed_agent_names
@@ -2180,7 +2446,7 @@ def create_app(
         # The release flag selects one scheduler for the lifetime of this server.
         scheduler_start_retry: asyncio.Task[None] | None = None
         scheduled_task_scheduler: ScheduledTaskScheduler | PersistentTaskScheduler | None = None
-        if scheduled_task_store is not None:
+        if automations_enabled and scheduled_task_store is not None:
             from omnigent.server.scheduled.fire import (
                 ClaimedRunExecutor,
                 FireDeps,
@@ -2346,6 +2612,8 @@ def create_app(
             )
             if startup_inputs is not None:
                 await startup_inputs.shutdown()
+            if host_session_recoverer is not None:
+                await host_session_recoverer.shutdown()
             await background_title_coordinator.shutdown()
             _uninstall_subagent_block_notifier()
             set_resource_registry(None)
@@ -2394,6 +2662,7 @@ def create_app(
     app.state.startup_inputs = startup_inputs
     app.state.permission_store = permission_store
     app.state.host_store = host_store
+    app.state.scheduled_task_store = scheduled_task_store
     app.state.mcp_gateway_backend = mcp_gateway_backend
     app.state.mcp_registry = mcp_registry
     app.state.mcp_registry_auth = auth_provider
@@ -2418,14 +2687,13 @@ def create_app(
                 transfer_from_host_id,
                 require_account_owner=runner_account_store is not None,
             )
-        from omnigent.host.frames import CAP_MCP_REGISTRY
-        from omnigent.server.mcp_compatibility import require_session_registry_mcp_support
+        from omnigent.server.runtime_compatibility import require_session_runtime_support
 
         connection = host_registry.get(host_id)
-        if connection is not None and CAP_MCP_REGISTRY not in connection.hello.capabilities:
+        if connection is not None:
             conv = conversation_store.get_conversation(session_id)
             if conv is not None:
-                require_session_registry_mcp_support(
+                require_session_runtime_support(
                     conv,
                     connection.hello.capabilities,
                     component="host",
@@ -2442,14 +2710,100 @@ def create_app(
     app.state.harness_install = app_harness_install
     app.state.mcp_disabled_servers = app_mcp_disabled_servers
     app.state.automations = True if automations is None else automations
+    app.state.policy_modules = list(policy_modules or [])
 
     def automations_available() -> bool:
-        return scheduled_task_store is not None and deployment_gate_enabled(
-            app.state.automations, "automations"
+        return (
+            automations_enabled
+            and scheduled_task_store is not None
+            and deployment_gate_enabled(app.state.automations, "automations")
         )
 
     app.state.automations_available = automations_available
+    user_inbox_gate: DeploymentGate = (
+        resolved_feature_flags.enabled(Feature.USER_INBOX) if user_inbox is None else user_inbox
+    )
+    proactive_agent_gate: DeploymentGate = (
+        resolved_feature_flags.enabled(Feature.PROACTIVE_AGENT)
+        if proactive_agent is None
+        else proactive_agent
+    )
+
+    def inbox_items_available() -> bool:
+        """Whether agents can post to this request's caller's Inbox."""
+        return inbox_item_store is not None and deployment_gate_enabled(
+            user_inbox_gate, "user_inbox"
+        )
+
+    def inbox_items_enabled_for(_user_id: str) -> bool:
+        """Whether a user's sessions get the Inbox tools and their Inbox serves items.
+
+        There is no per-user setting: evaluate it in that user's request or
+        identity scope, since the deployment gate may read the current user.
+        """
+        return inbox_items_available()
+
+    def proactive_agent_available() -> bool:
+        """Whether the deployment offers the proactive agent to this request's caller.
+
+        The agent posts to the Inbox, so it needs agent Inbox items too, and
+        its settings routes, which the web client reads before showing its tab.
+        """
+        return (
+            inbox_items_available()
+            and proactive_agent_settings_store is not None
+            and deployment_gate_enabled(proactive_agent_gate, "proactive_agent")
+        )
+
+    def proactive_agent_enabled_for(user_id: str) -> bool:
+        """Whether the proactive agent runs for *user_id*: the deployment gate and both settings.
+
+        Other agents' Inbox items do not depend on it. Evaluated in that user's
+        request or identity scope, since the deployment gate may read the current user.
+        """
+        if not proactive_agent_available() or proactive_agent_settings_store is None:
+            return False
+        return all(proactive_agent_settings_store.read(user_id))
+
+    app.state.inbox_items_available = inbox_items_available
+    app.state.inbox_items_enabled_for = inbox_items_enabled_for
+    app.state.proactive_agent_available = proactive_agent_available
+    app.state.proactive_agent_enabled_for = proactive_agent_enabled_for
+
+    app.state.memory_available = lambda: (
+        memory_store is not None and app.state.feature_flags.enabled(Feature.MEMORY)
+    )
+    app.state.memory_search_available = lambda: (
+        app.state.memory_available() and memory_store is not None and memory_store.supports_search
+    )
     app.state.scheduled_task_dispatch_enabled = automations_v2_enabled
+    # Separate from dispatch: schedulers accept one-time rules from this release on,
+    # and creating them waits until every scheduler on the database does.
+    app.state.one_time_automations_enabled = automations_v2_enabled and (
+        resolved_feature_flags.enabled(Feature.ONE_TIME_AUTOMATIONS)
+    )
+
+    app.state.scheduled_task_store = scheduled_task_store
+    app.state.proactive_provisioner = ProactiveProvisioner()
+
+    def reseed_proactive_agent(*, only_if_overridden: bool = False) -> None:
+        """Rebuild the proactive agent's bundle with the workspace's prompt override.
+
+        :param only_if_overridden: Skip the rebuild when there is no override,
+            as at startup, where seeding already wrote the bundled prompt.
+        """
+        override = (
+            proactive_agent_settings_store.read_prompt_override()
+            if proactive_agent_settings_store is not None
+            else None
+        )
+        if override is None and only_if_overridden:
+            return
+        _ensure_default_proactive_agent(
+            agent_store, artifact_store, agent_cache, prompt_override=override
+        )
+
+    app.state.reseed_proactive_agent = reseed_proactive_agent
     # Deployment base path (e.g. "/proxy/6767"), so route handlers that build
     # a full-page redirect (not covered by BasePathMiddleware's inbound-only
     # strip) can prefix it themselves. "" for a root deployment.
@@ -2499,6 +2853,24 @@ def create_app(
         if _owner_credentials:
             sandbox_config = _dc_replace(sandbox_config, owner_credentials=_owner_credentials)
             app.state.sandbox_config = sandbox_config
+    from omnigent.server.host_session_recovery import HostSessionRecoverer
+
+    host_session_recoverer = (
+        HostSessionRecoverer(
+            conversation_store,
+            host_registry,
+            host_store,
+            runner_router,
+            runner_session_initializer,
+            sandbox_config=sandbox_config,
+            deployment_gate=host_session_recovery,
+            recovery_prompt=(server_config or {}).get("recovery_prompt"),
+        )
+        if host_store is not None and host_session_recovery is not False
+        else None
+    )
+    app.state.host_session_recoverer = host_session_recoverer
+
     from omnigent.server.sandbox_profiles import SandboxProfileCatalog
 
     sandbox_profiles = (
@@ -2720,7 +3092,9 @@ def create_app(
     # scheduled-task store additionally enables the event-driven
     # run-completion hook (persist_scheduled_run_completion) fired from
     # _publish_status when a fired conversation's turn reaches terminal.
-    session_live_state.configure(conversation_store, scheduled_task_store)
+    session_live_state.configure(
+        conversation_store, scheduled_task_store, host_session_recoverer=host_session_recoverer
+    )
     # Extend a managed sandbox while its runner tunnel is live (the managed-path
     # caller for SandboxHostLauncher.keep_alive); no-op without a sandbox config.
     managed_host_keepalive.configure(conversation_store, host_store, sandbox_config)
@@ -3679,11 +4053,13 @@ def create_app(
         sandbox_provider = None
         sandbox_providers: list[str] = []
         sandbox_provider_capabilities: dict[str, dict[str, bool]] = {}
+        sandbox_provider_automation_notices: dict[str, str] = {}
         if sandbox_config is not None and sandbox_config.managed_launch_supported:
             managed_sandboxes_enabled = True
             sandbox_provider = sandbox_config.default.provider
             sandbox_providers = list(sandbox_config.launchable_providers())
             sandbox_provider_capabilities = sandbox_config.provider_ui_capabilities()
+            sandbox_provider_automation_notices = sandbox_config.provider_automation_notices()
         # enabled_connections lists the connection providers this deploy has
         # wired (config + store present), in a stable order. The web UI shows
         # the Sandbox Integrations nav when the list is non-empty and renders
@@ -3752,6 +4128,13 @@ def create_app(
         dictation_available, _ = engine_availability()
         filesystem_attachment_policy = app.state.filesystem_attachment_policy()
         automations_enabled = app.state.automations_available()
+        automation_sharing = automations_enabled and scheduled_task_sharing_supported(
+            app.state, permission_store
+        )
+        workflows_available = (
+            frontend_features[Feature.WORKFLOWS.value]
+            and workflows.open_store(conversation_store) is not None
+        )
         return ServerInfoResponse.model_validate(
             {
                 "accounts_enabled": accounts_enabled,
@@ -3764,6 +4147,7 @@ def create_app(
                 "sandbox_provider": sandbox_provider,
                 "sandbox_providers": sandbox_providers,
                 "sandbox_provider_capabilities": sandbox_provider_capabilities,
+                "sandbox_provider_automation_notices": sandbox_provider_automation_notices,
                 "enabled_connections": enabled_connections,
                 "sharing_mode": sharing_mode.value,
                 "public_sharing_enabled": public_sharing_enabled,
@@ -3780,7 +4164,9 @@ def create_app(
                 "archive_worktree_cleanup": True,
                 "session_search_scope": True,
                 "session_list_scoped_archives": True,
+                "scripted_sessions": app.state.feature_flags.enabled(Feature.SCRIPTED_SESSIONS),
                 "sibling_sessions": frontend_features[Feature.SIBLING_SESSIONS.value],
+                "session_nest_moves": True,
                 "request_managed_sandbox_host_id": True,
                 "session_fork_workspaces": True,
                 "session_bundle_model_override": True,
@@ -3792,20 +4178,37 @@ def create_app(
                 "session_event_types": sorted(CLIENT_SESSION_EVENT_TYPES),
                 "session_claude_sdk_clear": True,
                 "codex_nonblocking_decline": True,
+                "session_rewind": True,
                 "session_pull_requests": session_pull_requests.open_store(conversation_store)
                 is not None,
+                "scheduled_task_run_pull_requests": session_pull_requests.open_store(
+                    conversation_store
+                )
+                is not None,
+                "session_journal": frontend_features[Feature.WORKFLOWS.value]
+                and session_journal.open_store(conversation_store) is not None,
+                "workflows": workflows_available,
+                "workflow_sharing": workflows_available
+                and stores_workflow_grants(permission_store),
                 "session_title_instructions": user_settings_store is not None,
                 "admin_view": admin_view_supported,
                 "filesystem_attachments": {
                     "extensions": sorted(filesystem_attachment_policy.extensions),
                     "all_types": filesystem_attachment_policy.all_types,
                 },
-                "scheduled_task_projects": project_store is not None,
+                "scheduled_task_projects": automations_enabled and project_store is not None,
                 "scheduled_task_inbox": automations_enabled,
+                "scheduled_task_one_time": automations_enabled
+                and bool(app.state.one_time_automations_enabled),
+                "scheduled_task_sharing": automation_sharing,
+                "scheduled_task_shared_with_me": automation_sharing,
                 "session_move_source_checks": True,
                 "session_organize_source_checks": True,
                 "sibling_other_project_standalone": True,
+                "memory": app.state.memory_available(),
                 "automations_enabled": automations_enabled,
+                "inbox_items_available": app.state.inbox_items_available(),
+                "proactive_agent_available": app.state.proactive_agent_available(),
                 "automation_trigger_poll_minutes": trigger_poll_minutes,
                 "branding": branding_snapshot.config(),
                 "picker": picker_curation.config(),
@@ -4065,6 +4468,60 @@ def create_app(
         prefix="/v1",
         tags=["session_mcp_servers"],
     )
+    app.include_router(
+        session_journal.create_session_journal_router(
+            conversation_store,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ),
+        prefix="/v1",
+        tags=["session_journal"],
+    )
+    app.include_router(
+        workflows.create_workflows_router(
+            conversation_store,
+            auth_provider=auth_provider,
+            permission_store=permission_store,
+        ),
+        prefix="/v1",
+        tags=["workflows"],
+    )
+    if inbox_item_store is not None:
+        app.include_router(
+            create_inbox_items_router(
+                inbox_item_store,
+                enabled=inbox_items_enabled_for,
+                conversation_store=conversation_store,
+                agent_store=agent_store,
+                agent_cache=agent_cache,
+                permission_store=permission_store,
+                auth_provider=auth_provider,
+            ),
+            prefix="/v1",
+            tags=["inbox_items"],
+        )
+        if proactive_agent_settings_store is not None:
+            app.include_router(
+                create_proactive_agent_settings_router(
+                    proactive_agent_settings_store,
+                    offered=proactive_agent_available,
+                    auth_provider=auth_provider,
+                    permission_store=permission_store,
+                ),
+                prefix="/v1",
+                tags=["proactive_agent"],
+            )
+            app.include_router(
+                create_proactive_agent_admin_router(
+                    proactive_agent_settings_store,
+                    offered=proactive_agent_available,
+                    default_prompt=proactive_agent_default_prompt,
+                    auth_provider=auth_provider,
+                    permission_store=permission_store,
+                ),
+                prefix="/v1",
+                tags=["proactive_agent"],
+            )
     if comment_store is not None:
         app.include_router(
             create_comments_router(
@@ -4113,11 +4570,22 @@ def create_app(
                 artifact_store=artifact_store,
                 file_store=file_store,
                 project_store=project_store,
-                automations=app.state.automations,
+                automations=app.state.automations_available,
                 liveness_lookup=_bulk_session_liveness,
             ),
             prefix="/v1",
             tags=["scheduled_tasks"],
+        )
+    if memory_store is not None:
+        app.include_router(
+            create_memory_router(
+                memory_store,
+                auth_provider=auth_provider,
+                conversation_store=conversation_store,
+                permission_store=permission_store,
+            ),
+            prefix="/v1",
+            tags=["memory"],
         )
     # Admin control for the server-wide sharing settings. Always mounted (the
     # handlers self-gate on admin); PUT is a no-op-reject unless this server
@@ -4255,6 +4723,7 @@ def create_app(
         # Event-driven: `register` resolves the wait the instant the runner
         # reconnects here. A non-positive grace collapses to an immediate
         # registry check, matching the sleep(0) behavior tests pin.
+        interrupted_at = reference_stamp if reference_stamp is not None else int(time.time())
         reconnected = await tunnel_registry.wait_for_runner(
             runner_id, timeout_s=RUNNER_DISCONNECT_GRACE_S
         )
@@ -4404,6 +4873,8 @@ def create_app(
             error,
             conversation_store,
             disconnect_evidence=drop_attributes(evidence, hold_s=hold_s, hold_outcome=hold),
+            host_session_recoverer=host_session_recoverer,
+            interrupted_at=interrupted_at,
         )
         if relaunch_host_id is not None:
             # Settlement must still own the old binding before a launch rotates it.
@@ -4449,6 +4920,12 @@ def create_app(
             return
         for conv in roots:
             try:
+                if (
+                    host_session_recoverer is not None
+                    and await asyncio.to_thread(host_session_recoverer.enabled, host_id)
+                    and host_conn.hello.recover_interrupted_sessions
+                ):
+                    continue
                 fresh = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
                 last_error = _last_task_error_from_labels(fresh.labels) if fresh else None
                 if (
@@ -4590,13 +5067,30 @@ def create_app(
         return _HostOfflineHold(outcome, mid_turn_sessions, owners)
 
     async def _relay_turn_held_for_host(runner_id: str, session_id: str) -> bool:
-        """Whether this replica's disconnect task holds a lost relay's turn for its host."""
+        """Whether host recovery owns the lost relay's outcome."""
         task = _disconnect_grace_tasks.get(runner_id)
-        if task is None or task.done():
+        if (task is None or task.done()) and host_session_recoverer is None:
             return False
         try:
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if (
+                conv is not None
+                and host_session_recoverer is not None
+                and await asyncio.to_thread(host_session_recoverer.enabled, conv.host_id)
+            ):
+                recovery = await asyncio.to_thread(
+                    conversation_store.get_session_recovery, session_id
+                )
+                if (
+                    recovery is not None
+                    and recovery.host_id == conv.host_id
+                    and recovery.runner_id == conv.runner_id
+                    and recovery.phase in {"pending", "launching", "dispatching", "submitted"}
+                ):
+                    return True
         except Exception:  # noqa: BLE001 — unreadable: the relay fails the turn as before
+            return False
+        if task is None or task.done():
             return False
         return conv is not None and await _host_offline(await _routing_host_id([conv])) is True
 
@@ -4746,6 +5240,8 @@ def create_app(
             ErrorDetail(code=failure_code, message=error),
             conversation_store,
             fail_idle_top_level=not runner_ran,
+            host_session_recoverer=host_session_recoverer,
+            interrupted_at=int(time.time()),
         )
 
     async def _on_runner_connect(runner_id: str, connection: RunnerSession) -> None:
@@ -4862,8 +5358,10 @@ def create_app(
                             "_on_runner_connect: matched %s (agent=%s)", conv.id, conv.agent_id
                         )
                         try:
-                            routed = runner_router.client_for_session_resources(
-                                conv.id, conversation=conv
+                            routed = await asyncio.to_thread(
+                                runner_router.client_for_session_resources,
+                                conv.id,
+                                conversation=conv,
                             )
                         except OmnigentError as exc:
                             if exc.code in (ErrorCode.RUNNER_UNAVAILABLE, ErrorCode.WRONG_REPLICA):
@@ -5023,6 +5521,16 @@ def create_app(
                             generation=connection.generation,
                             store_slots=store_slots,
                             trigger="runner_connect",
+                            suppress_recovery_turn=bool(
+                                host_session_recoverer is not None
+                                and await asyncio.to_thread(
+                                    host_session_recoverer.enabled, conv.host_id
+                                )
+                                and await asyncio.to_thread(
+                                    conversation_store.get_session_recovery, conv.id
+                                )
+                                is not None
+                            ),
                         )
                         # A removed agent was already logged as expected.
                         if is_session_agent_removed(response):
@@ -5160,6 +5668,12 @@ def create_app(
             if startup_inputs is not None:
                 startup_inputs.host_changed(app, _host_id)
 
+        async def _on_host_connected(host_id: str, owner: str | None) -> None:
+            await _on_hosts_changed(host_id, owner)
+            connection = host_registry.get(host_id)
+            if connection is not None and host_session_recoverer is not None:
+                host_session_recoverer.schedule_retirement(connection)
+
         app.include_router(
             create_host_tunnel_router(
                 host_registry,
@@ -5167,7 +5681,10 @@ def create_app(
                 auth_provider=auth_provider,
                 runner_exit_reports=runner_exit_reports,
                 on_runner_exited=_on_runner_exited,
-                on_host_connect=_on_hosts_changed,
+                on_session_recovery=(
+                    host_session_recoverer.recover if host_session_recoverer is not None else None
+                ),
+                on_host_connect=_on_host_connected,
                 on_host_disconnect=_on_hosts_changed,
                 on_host_update=_on_hosts_changed,
                 harness_install=app.state.harness_install,
@@ -5545,6 +6062,8 @@ def create_app(
         # no per-request cost.
         app.add_middleware(BasePathMiddleware, base_path=resolved_base_path)
 
+    install_stream_event_schemas(app)
+    register_component_models(app, SESSION_CREATE_BODY_MODELS)
     return app
 
 

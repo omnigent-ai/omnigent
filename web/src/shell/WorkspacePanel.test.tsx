@@ -47,6 +47,7 @@ import { WorkspacePanel } from "./WorkspacePanel";
 // Each stub renders a testid (plus, for FileViewer, the path it was asked to
 // show) so we can prove which child mounted without dragging in Monaco / hook
 // stacks / xterm.
+const paneRenders = vi.hoisted(() => vi.fn());
 vi.mock("./FileViewer", () => ({
   FileViewer: ({
     path,
@@ -56,30 +57,37 @@ vi.mock("./FileViewer", () => ({
     path: string;
     open: boolean;
     mediaActive: boolean;
-  }) => (
-    <div data-testid="file-viewer-stub" data-open={open} data-media-active={mediaActive}>
-      {path}
-    </div>
-  ),
+  }) => {
+    paneRenders("file");
+    return (
+      <div data-testid="file-viewer-stub" data-open={open} data-media-active={mediaActive}>
+        {path}
+      </div>
+    );
+  },
 }));
 vi.mock("./FilesPanel", () => ({
   // Echo the fixed scope so tests can prove the Files tab renders the tree
   // (flatView=false) and the Changes tab the changed-only list (flatView=true).
-  FilesPanel: ({ flatView, conversationId }: { flatView: boolean; conversationId: string }) => (
-    <div
-      data-testid="files-panel-stub"
-      data-session={conversationId}
-      data-flat-view={String(flatView)}
-    />
-  ),
+  FilesPanel: ({ flatView, conversationId }: { flatView: boolean; conversationId: string }) => {
+    paneRenders("files");
+    return (
+      <div
+        data-testid="files-panel-stub"
+        data-session={conversationId}
+        data-flat-view={String(flatView)}
+      />
+    );
+  },
 }));
 vi.mock("./SubagentsPanel", () => ({
   SubagentsPanel: () => <div data-testid="subagents-stub" />,
 }));
 vi.mock("./ContentSearchPanel", () => ({
-  ContentSearchPanel: ({ inputRef }: { inputRef: RefObject<HTMLInputElement | null> }) => (
-    <input data-testid="content-search-stub" ref={inputRef} />
-  ),
+  ContentSearchPanel: ({ inputRef }: { inputRef: RefObject<HTMLInputElement | null> }) => {
+    paneRenders("search");
+    return <input data-testid="content-search-stub" ref={inputRef} />;
+  },
 }));
 vi.mock("@/components/BrowserPane/BrowserPane", () => ({
   BrowserPane: ({
@@ -352,6 +360,51 @@ function renderWorkspace(
     view,
   };
 }
+
+describe("WorkspacePanel render failures", () => {
+  it.each([
+    ["file", { selectedFilePath: "results.csv", openFiles: ["results.csv"] }],
+    ["files", {}],
+    ["search", { rightRailTab: "content-search", showContentSearch: true }],
+    ["files", { selectedFilePath: "results.csv", openFiles: ["results.csv"] }],
+    ["search", { selectedFilePath: "results.csv", showContentSearch: true }],
+  ] satisfies [string, Parameters<typeof renderWorkspace>[0]][])(
+    "contains a %s failure while keeping pane navigation available (%j)",
+    (pane, overrides) => {
+      const error = new Error("Workspace content failed");
+      const suppressExpectedError = (event: ErrorEvent) => {
+        if (event.error === error) event.preventDefault();
+      };
+      window.addEventListener("error", suppressExpectedError);
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      paneRenders.mockImplementation((name) => {
+        if (name === pane) throw error;
+      });
+      try {
+        const { rerender, onRightRailTabChange } = renderWorkspace(overrides);
+        expect(screen.getByRole("alert")).toHaveTextContent(
+          "Unable to display this workspace pane.",
+        );
+        if (pane !== "file" && "selectedFilePath" in overrides) {
+          expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("results.csv");
+        }
+        const changesTab = screen.getByRole("tab", { name: "Changes" });
+        expect(changesTab).toBeEnabled();
+        fireEvent.mouseDown(changesTab, { button: 0, ctrlKey: false });
+        expect(onRightRailTabChange).toHaveBeenCalledWith("changes");
+
+        paneRenders.mockReset();
+        rerender({ rightRailTab: "changes", selectedFilePath: null });
+        expect(screen.getByTestId("files-panel-stub")).toBeInTheDocument();
+        if (pane === "search") rerender({ rightRailTab: "content-search" });
+        expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      } finally {
+        paneRenders.mockReset();
+        window.removeEventListener("error", suppressExpectedError);
+      }
+    },
+  );
+});
 
 describe("WorkspacePanel surface presentation", () => {
   it("offers unpinned pages in + without requiring shell or browser support", () => {
@@ -926,6 +979,22 @@ describe("WorkspacePanel shell tabs", () => {
     rerender({ openTerminals: [termKey] });
     expect(await screen.findByTestId("terminal-view-stub")).toHaveTextContent("terminal_zsh_s1");
     expect(screen.getByTestId("content-search-stub").parentElement).toHaveClass("hidden");
+  });
+
+  it("shows a selected shell over an open file, and the file while its terminal is missing", async () => {
+    useTerminalsMock.mockReturnValue({ terminals: [term], isLoading: false, error: null });
+    const { rerender } = renderWorkspace({
+      rightRailTab: "files",
+      selectedFilePath: "src/App.tsx",
+      selectedTerminalKey: termKey,
+      openTerminals: [termKey],
+    });
+    expect(await screen.findByTestId("terminal-view-stub")).toHaveTextContent("terminal_zsh_s1");
+    expect(screen.queryByTestId("file-viewer-stub")).toBeNull();
+
+    rerender({ openTerminals: [] });
+    expect(screen.queryByTestId("terminal-view-stub")).toBeNull();
+    expect(screen.getByTestId("file-viewer-stub")).toHaveTextContent("src/App.tsx");
   });
 
   it("keeps the Files tab panel mounted but hidden behind the active shell", async () => {
@@ -1616,6 +1685,49 @@ describe("WorkspacePanel restored side chats", () => {
   });
 });
 
+describe("WorkspacePanel side chat start", () => {
+  it("points a pending tab at the server-forked child and seeds its question", async () => {
+    const previousHarness = useChatStore.getState().sessionHarness;
+    useChatStore.setState({
+      sessionHarness: "openai-agents",
+      sideChatComposers: { "pending:one": { text: "question", files: [] } },
+      sideChatDrafts: {},
+    });
+    const create = vi
+      .spyOn(sessionsApi, "createSideChat")
+      .mockResolvedValueOnce({ childSessionId: "conv_fork" } as Awaited<
+        ReturnType<typeof sessionsApi.createSideChat>
+      >);
+    try {
+      writeSessionWorkspaceState("conv_ws", {
+        openSideChats: ["pending:one"],
+        selectedSideChatId: "pending:one",
+      });
+      renderWorkspace({ rightRailTab: "sidechat" });
+
+      fireEvent.click(screen.getByRole("button", { name: "Start side chat" }));
+
+      await waitFor(() =>
+        expect(screen.getByTestId("side-chat-pane-stub")).toHaveTextContent("conv_fork"),
+      );
+      expect(create).toHaveBeenCalledWith("conv_ws", undefined);
+      expect(useChatStore.getState().sideChatComposers["pending:one"]).toBeUndefined();
+      expect(useChatStore.getState().sideChatDrafts.conv_fork).toBe("question");
+      expect(readSessionWorkspaceState("conv_ws")).toMatchObject({
+        openSideChats: ["conv_fork"],
+        selectedSideChatId: "conv_fork",
+      });
+    } finally {
+      create.mockRestore();
+      useChatStore.setState({
+        sessionHarness: previousHarness,
+        sideChatComposers: {},
+        sideChatDrafts: {},
+      });
+    }
+  });
+});
+
 describe("WorkspacePanel mobile side chats", () => {
   const openTabs = () =>
     writeSessionWorkspaceState("conv_ws", {
@@ -1902,6 +2014,25 @@ describe("WorkspacePanel sub-agent tabs", () => {
 
     expect(screen.getByTestId("side-chat-pane-stub")).toHaveAttribute("data-read-only", "true");
     expect(screen.getByTestId("subagent-tab-read-only")).toHaveTextContent(reason);
+  });
+
+  it("allows a closed Codex side chat to resume in a sub-agent tab", () => {
+    writeSessionWorkspaceState("conv_ws", {
+      openSubagentTabs: [SUBAGENT_TAB],
+      selectedSideChatId: SUBAGENT_TAB,
+    });
+    renderWorkspace({
+      rightRailTab: "sidechat",
+      queryClient: clientWithSubagent("Side chat", {
+        "omnigent.closed": "true",
+        "omnigent.wrapper": "codex-native-ui-subagent",
+        "omnigent.codex_native.agent_nickname": "Side chat",
+        "omnigent.codex_native.side_chat_resume": "true",
+      }),
+    });
+
+    expect(screen.getByTestId("side-chat-pane-stub")).toHaveAttribute("data-read-only", "false");
+    expect(screen.queryByTestId("subagent-tab-read-only")).toBeNull();
   });
 
   it("selects a session's open side-chat tab instead of adding a sub-agent tab for it", () => {
