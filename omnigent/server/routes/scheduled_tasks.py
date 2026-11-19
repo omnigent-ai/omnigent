@@ -67,6 +67,7 @@ from omnigent.server.routes.scheduled_task_permissions import (
     register_scheduled_task_permissions_routes,
     request_from_agent,
     require_agent_keeps_shared_target,
+    scheduled_task_shareable,
     scheduled_task_sharing_supported,
     scheduled_task_viewer_role,
     without_legacy_sandbox_workspace,
@@ -276,6 +277,7 @@ def _next_run_at(task: ScheduledTask, request: Request) -> str | None:
 def _to_response(
     task: ScheduledTask,
     *,
+    shareable: bool,
     last_run_status: str | None = None,
     next_run_at: str | None = None,
     viewer_role: ScheduledTaskViewerRole = "owner",
@@ -283,6 +285,8 @@ def _to_response(
 ) -> dict[str, Any]:
     """Serialize a :class:`ScheduledTask` to a JSON-safe dict.
 
+    :param shareable: Whether the automation itself can be shared, from
+        :func:`scheduled_task_shareable`.
     :param last_run_status: The status of the task's most recent run
         (``succeeded`` / ``failed`` / ``skipped`` / ``running`` / ``scheduled``),
         or ``None`` when the task has never run. Surfaced so the Tasks list can
@@ -329,6 +333,7 @@ def _to_response(
         "updated_at": task.updated_at,
         "viewer_role": viewer_role,
         "owner_display_name": owner_display_name,
+        "shareable": shareable,
     }
 
 
@@ -1235,6 +1240,7 @@ def create_scheduled_tasks_router(
         # next_run_at comes from the legacy timer or the persisted schedule.
         return _to_response(
             task,
+            shareable=scheduled_task_shareable(permission_store, task.id),
             next_run_at=_next_run_at(task, request),
         )
 
@@ -1276,6 +1282,7 @@ def create_scheduled_tasks_router(
             "scheduled_tasks": [
                 _to_response(
                     t,
+                    shareable=scheduled_task_shareable(permission_store, t.id),
                     last_run_status=latest_status.get(t.id),
                     next_run_at=_next_run_at(t, request),
                 )
@@ -1382,6 +1389,7 @@ def create_scheduled_tasks_router(
             "scheduled_tasks": [
                 _to_response(
                     task,
+                    shareable=scheduled_task_shareable(permission_store, task.id),
                     last_run_status=latest_status.get(task.id),
                     next_run_at=_next_run_at(task, request),
                     viewer_role="viewer",
@@ -1411,6 +1419,7 @@ def create_scheduled_tasks_router(
             owner_name = (await _owner_display_names([task])).get(task.user_id or "", task.user_id)
         return _to_response(
             task,
+            shareable=scheduled_task_shareable(permission_store, task.id),
             last_run_status=latest_status.get(task.id),
             next_run_at=_next_run_at(task, request),
             viewer_role=role,
@@ -1982,6 +1991,7 @@ def create_scheduled_tasks_router(
         latest_status = store.list_latest_run_status_for_tasks([updated.id])
         return _to_response(
             updated,
+            shareable=scheduled_task_shareable(permission_store, updated.id),
             last_run_status=latest_status.get(updated.id),
             next_run_at=_next_run_at(updated, request),
         )

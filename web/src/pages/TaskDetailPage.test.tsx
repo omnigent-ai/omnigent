@@ -946,8 +946,12 @@ describe("header actions", () => {
 describe("sharing", () => {
   const sharingInfo: ServerInfo = { ...SERVER_INFO_OFFLINE_FALLBACK, scheduled_task_sharing: true };
 
-  function renderSharingPage(info: ServerInfo, entry = "/tasks/st_1") {
-    setTask(task({ ownerUserId: "alice@example.com", sessionMode: "continue" }));
+  function renderSharingPage(
+    info: ServerInfo,
+    entry = "/tasks/st_1",
+    overrides: Partial<ScheduledTask> = {},
+  ) {
+    setTask(task({ ownerUserId: "alice@example.com", sessionMode: "continue", ...overrides }));
     render(<CapabilitiesProvider info={info}>{pageTree([entry])}</CapabilitiesProvider>);
   }
 
@@ -966,9 +970,13 @@ describe("sharing", () => {
     expect(screen.queryByTestId("task-detail-share") !== null).toBe(offered);
   });
 
-  it("opens the share dialog for this automation", () => {
+  // An older server sends no `shareable`.
+  it.each([
+    ["shareable", { shareable: true }],
+    ["from an older server", {}],
+  ])("opens the share dialog for this automation (%s)", (_label, overrides) => {
     vi.mocked(useViewerId).mockReturnValue("alice@example.com");
-    renderSharingPage(sharingInfo);
+    renderSharingPage(sharingInfo, "/tasks/st_1", overrides);
     expect(screen.queryByTestId("share-dialog-open")).toBeNull();
 
     fireEvent.click(screen.getByRole("button", { name: "Share automation" }));
@@ -994,25 +1002,36 @@ describe("sharing", () => {
   });
 
   it.each([
-    ["the viewer cannot share", sharingInfo, "bob@example.com"],
-    ["sharing is off", { ...sharingInfo, sharing_mode: "off" as const }, "alice@example.com"],
-  ])("ignores the link's request when %s", (_label, info, viewerId) => {
+    ["the viewer cannot share", sharingInfo, "bob@example.com", {}],
+    ["sharing is off", { ...sharingInfo, sharing_mode: "off" as const }, "alice@example.com", {}],
+    ["the automation is legacy", sharingInfo, "alice@example.com", { shareable: false }],
+  ])("ignores the link's request when %s", (_label, info, viewerId, overrides) => {
     vi.mocked(useViewerId).mockReturnValue(viewerId);
-    renderSharingPage(info, "/tasks/st_1?share=1");
+    renderSharingPage(info, "/tasks/st_1?share=1", overrides);
     expect(screen.queryByTestId("share-dialog-open")).toBeNull();
   });
 
-  it("disables Share with the session Share's reason while sharing is off", () => {
+  const SHARING_OFF = "Sharing has been disabled for this Omnigent server.";
+  const LEGACY = "This is a legacy automation. Recreate it to share it.";
+  it.each([
+    ["while sharing is off", "off" as const, true, SHARING_OFF],
+    ["on a legacy automation", undefined, false, LEGACY],
+    // Sharing off wins.
+    ["on a legacy automation while sharing is off", "off" as const, false, SHARING_OFF],
+  ])("disables Share with its reason %s", async (_label, sharingMode, shareable, reason) => {
     vi.mocked(useViewerId).mockReturnValue("alice@example.com");
-    renderSharingPage({ ...sharingInfo, sharing_mode: "off" });
+    renderSharingPage(
+      { ...sharingInfo, ...(sharingMode && { sharing_mode: sharingMode }) },
+      "/tasks/st_1",
+      { shareable },
+    );
 
     const share = screen.getByRole("button", { name: "Share automation" });
     expect(share).toBeDisabled();
-    expect(
-      screen.getByLabelText(
-        "Share automation disabled: Sharing has been disabled for this Omnigent server.",
-      ),
-    ).toContainElement(share);
+    const wrapper = screen.getByLabelText(`Share automation disabled: ${reason}`);
+    expect(wrapper).toContainElement(share);
+    fireEvent.focus(wrapper);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(reason);
     fireEvent.click(share);
     expect(screen.queryByTestId("share-dialog-open")).toBeNull();
   });
