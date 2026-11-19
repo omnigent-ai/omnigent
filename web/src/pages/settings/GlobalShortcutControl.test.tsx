@@ -209,6 +209,18 @@ describe("GlobalShortcutControl", () => {
     expect(screen.getByRole("switch", { name: SWITCH_NAME })).toBeChecked();
   });
 
+  it("names no id for the show shortcut, so the call is the one every shell takes", async () => {
+    const bridge = installBridge();
+    const recordGlobalShortcut = vi.fn().mockResolvedValue(null);
+    Object.assign(bridge, { recordGlobalShortcut, cancelGlobalShortcutRecording: vi.fn() });
+    render(<GlobalShortcutControl />);
+
+    fireEvent.click(await screen.findByTestId(RECORDER_TEST_ID));
+
+    await waitFor(() => expect(recordGlobalShortcut).toHaveBeenCalledExactlyOnceWith());
+    expect(bridge.getGlobalShortcut).toHaveBeenCalledExactlyOnceWith();
+  });
+
   it("reads and saves the New Agent shortcut by its id, once the shell says it takes ids", async () => {
     const bridge = {
       ...installBridge({ enabled: true, accelerator: "CommandOrControl+Shift+Space" }),
