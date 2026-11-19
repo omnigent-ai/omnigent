@@ -39,6 +39,7 @@ import os
 import re
 import stat
 import subprocess
+import threading
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -59,6 +60,7 @@ from omnigent.runner.environment_filesystem import (
     split_glob_list,
 )
 from omnigent.runtime.filesystem_registry import (
+    FilesystemRegistry,
     GitStatusUnavailable,
     create_filesystem_registry,
 )
@@ -227,11 +229,23 @@ class WorkspaceReader:
 
     def __init__(self, root: Path) -> None:
         self._root = Path(root).resolve()
-        # The change registry (git or edit-tracking) is chosen the same
-        # way the runner chooses it, so git workspaces get git-status
-        # semantics and everything else degrades to an empty list.
-        self._registry = create_filesystem_registry(self._root)
-        self._registry.start()
+        self._started_registry: FilesystemRegistry | None = None
+        self._registry_lock = threading.Lock()
+
+    @property
+    def _registry(self) -> FilesystemRegistry:
+        """The change registry, started on first use by changes, diffs or search.
+
+        Chosen the way the runner chooses it, so git workspaces get git-status
+        semantics and everything else degrades to an empty list. Starting it
+        may write the repository's config, so readers that only list or read
+        files never start it.
+        """
+        with self._registry_lock:
+            if self._started_registry is None:
+                self._started_registry = create_filesystem_registry(self._root)
+                self._started_registry.start()
+            return self._started_registry
 
     # ── Path confinement ──────────────────────────────────────────
 

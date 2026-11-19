@@ -17,6 +17,7 @@ from pathlib import Path
 
 import pytest
 
+from omnigent import workspace_fs
 from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError, read_repository_branches
 
 
@@ -751,3 +752,27 @@ def test_search_from_filesystem_root_keeps_paths_intact(monkeypatch: pytest.Monk
     paths = [e["path"] for e in result["data"]]
     assert "etc" in paths, paths
     assert all((Path("/") / p).exists() for p in paths), paths
+
+
+def test_listing_and_reading_never_start_the_change_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Starting the registry may write Git config, so only changes, diffs and search start it."""
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    (tmp_path / "a.txt").write_text("a")
+    started: list[Path] = []
+    real = workspace_fs.create_filesystem_registry
+
+    def recording(root: Path) -> object:
+        started.append(root)
+        return real(root)
+
+    monkeypatch.setattr(workspace_fs, "create_filesystem_registry", recording)
+    reader = WorkspaceReader(tmp_path)
+
+    reader.list_directory("", limit=10, after=None)
+    reader.read_file_bytes("a.txt")
+    assert started == []
+    reader.changes("s1")
+    reader.changes("s1")
+    assert started == [tmp_path.resolve()]
