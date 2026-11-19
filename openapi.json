@@ -8305,6 +8305,11 @@
             "title": "Session Move Source Checks",
             "type": "boolean"
           },
+          "session_mute": {
+            "default": true,
+            "title": "Session Mute",
+            "type": "boolean"
+          },
           "session_nest_moves": {
             "default": false,
             "title": "Session Nest Moves",
