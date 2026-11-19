@@ -284,6 +284,29 @@ def test_tracked_pr_info_picks_the_workspace_remote_like_gh(
     assert info["workspace_repo"] == {"name_with_owner": name_with_owner, "host": host}
 
 
+@pytest.mark.parametrize("gh_resolved", [None, "origin"])
+@pytest.mark.parametrize("tracked", [True, False])
+def test_an_unrecognized_origin_names_no_workspace_repo(
+    repo: Path, monkeypatch: pytest.MonkeyPatch, tracked: bool, gh_resolved: str | None
+) -> None:
+    """A recognized public upstream must not stand in for an Enterprise origin's host."""
+    _git(repo, "remote", "add", "origin", ENTERPRISE_ORIGIN)
+    _git(repo, "remote", "add", "upstream", "https://github.com/owner/app.git")
+    if gh_resolved is not None:
+        _git(repo, "config", f"remote.{gh_resolved}.gh-resolved", "base")
+    if tracked:
+        SessionPrRegistry("session").record(
+            [PullRequestRef.from_url("https://github.com/owner/app/pull/7")],
+            relationship="created",
+            source="test",
+        )
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: None)
+
+    info = pr_resource.pr_info(str(repo), session_id="session")
+
+    assert "workspace_repo" not in info
+
+
 def test_a_directory_outside_git_reports_not_a_git_repo_from_github(tmp_path: Path) -> None:
     info = pr_resource.pr_info(str(tmp_path))
 

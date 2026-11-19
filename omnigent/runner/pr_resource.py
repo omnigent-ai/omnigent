@@ -193,14 +193,15 @@ def _add_workspace_repo(root: str, info: dict[str, Any]) -> None:
     def run(argv: list[str]) -> tuple[int | None, str]:
         return _git_output(argv, cwd=root)
 
-    remotes = [
-        (name, parsed)
-        for name, url in local_git.remote_urls(run)
-        if (parsed := resolve_remote(url)) is not None
-    ]
-    if not remotes:
+    urls = local_git.remote_urls(run)
+    if not urls:
         return
     resolved = local_git.remote_settings(run, "gh-resolved")
+    base_url = next((url for name, url in urls if resolved.get(name) == "base"), None)
+    # Origin comes first; if unrecognized, a recognized upstream must not stand in for it.
+    preferred = resolve_remote(base_url or urls[0][1])
+    if preferred is None:
+        return
     tracked = info.get("repo")
     tracked = tracked if isinstance(tracked, dict) else {}
     tracked_name = str(tracked.get("name_with_owner") or "").lower()
@@ -209,21 +210,20 @@ def _add_workspace_repo(root: str, info: dict[str, Any]) -> None:
     def is_tracked(parsed: ParsedRemote) -> bool:
         return parsed.repository.lower() == tracked_name and tracked_host in ("", parsed.host)
 
-    # remote_urls lists origin first, so the last fallback is origin when it parses.
-    # A tracked remote on another host must not move the workspace off origin's host,
-    # e.g. a github.com mirror of an Enterprise checkout.
-    fallback = remotes[0]
-    _, parsed = next(
-        (remote for remote in remotes if resolved.get(remote[0]) == "base"),
-        next(
+    parsed = preferred
+    if base_url is None:
+        # A tracked remote on another host must not move the workspace off origin's
+        # host, e.g. a github.com mirror of an Enterprise checkout.
+        parsed = next(
             (
                 remote
-                for remote in remotes
-                if remote[1].host == fallback[1].host and is_tracked(remote[1])
+                for _, url in urls
+                if (remote := resolve_remote(url)) is not None
+                and remote.host == preferred.host
+                and is_tracked(remote)
             ),
-            fallback,
-        ),
-    )
+            preferred,
+        )
     info["workspace_repo"] = {"name_with_owner": parsed.repository, "host": parsed.host}
 
 
