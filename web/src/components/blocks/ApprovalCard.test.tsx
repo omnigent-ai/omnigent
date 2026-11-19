@@ -341,6 +341,54 @@ describe("ApprovalCard — binary approve/reject", () => {
     expect(submitSpy).toHaveBeenLastCalledWith("elic_cmd_policy", "accept", undefined);
   });
 
+  it("keeps a long Codex rule prefix on one line with the full prefix in the name and title", () => {
+    const submitSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({ submitApproval: submitSpy } as Partial<
+      ReturnType<typeof useChatStore.getState>
+    >);
+    const heredoc = "ssh build-host python3.12 - <<'PY'\nimport json\nprint(json.dumps({}))\nPY";
+    const prefix = JSON.stringify(["/bin/zsh", "-lc", heredoc]);
+
+    render(
+      <ApprovalCard
+        elicitationId="elic_cmd_long"
+        message="Codex wants to run a remote script"
+        phase="codex_command_approval"
+        policyName="codex_native_command_approval"
+        contentPreview=""
+        requestedSchema={{}}
+        status="pending"
+        response={null}
+        codexCommand={{
+          command: `/bin/zsh -lc "${heredoc}"`,
+          cwd: null,
+          reason: null,
+          execPolicyAmendment: ["/bin/zsh", "-lc", heredoc],
+          requestFingerprint: "long-request",
+        }}
+      />,
+    );
+
+    const remember = screen.getByRole("button", {
+      name: `Approve and remember commands starting with ${prefix}`,
+    });
+    expect(remember).toHaveAttribute(
+      "title",
+      `Approve and remember commands starting with ${prefix}`,
+    );
+    // jsdom has no layout, so check the classes that keep the button one line tall.
+    expect(remember).not.toHaveClass("whitespace-normal");
+    expect(remember).not.toHaveClass("h-auto");
+    const shownPrefix = within(remember).getByText(prefix);
+    expect(shownPrefix).toHaveClass("truncate");
+    expect(shownPrefix).not.toHaveClass("break-all");
+    fireEvent.click(remember);
+    expect(submitSpy).toHaveBeenCalledWith("elic_cmd_long", "accept", {
+      remember: true,
+      request_fingerprint: "long-request",
+    });
+  });
+
   it("shows the remembered command prefix after approval", () => {
     render(
       <ApprovalCard
@@ -854,6 +902,32 @@ describe("ApprovalCard — Antigravity permission prompt details", () => {
     expect(submitSpy).toHaveBeenCalledWith("elic_agy_perm", "accept", undefined, {
       persist: "always",
     });
+  });
+
+  it("keeps long persist patterns on one line without hiding the session scope", () => {
+    const pattern = "python3 -c 'import sys; print(sys.version)' && ".repeat(6).trim();
+    render(
+      <ApprovalCard
+        {...baseProps}
+        status="pending"
+        response={null}
+        agyPermission={{ actionDescription: "Running a script", alwaysAllowPattern: pattern }}
+        onSubmit={vi.fn()}
+      />,
+    );
+
+    const sessionAllow = screen.getByRole("button", {
+      name: `Allow commands starting with ${pattern} for this session`,
+    });
+    const alwaysAllow = screen.getByRole("button", {
+      name: `Always allow commands starting with ${pattern}`,
+    });
+    for (const button of [sessionAllow, alwaysAllow]) {
+      expect(button).not.toHaveClass("whitespace-normal");
+      expect(within(button).getByText(pattern)).toHaveClass("truncate");
+    }
+    // The scope suffix is its own item, so truncating the pattern cannot cut it off.
+    expect(within(sessionAllow).getByText("for this session")).toBeVisible();
   });
 
   it("offers no persist choice when agy's prompt advertises none", () => {
