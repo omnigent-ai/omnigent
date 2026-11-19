@@ -1035,6 +1035,25 @@ tools:
       Authorization: Bearer ${TOKEN}
 ```
 
+An MCP server in its own `tools/mcp/*.yaml` file can be marked
+`optional: true`. If a `${VAR}` in its `url`, `headers` or `env` is unset,
+Omnigent skips that server instead of refusing to load the agent, and
+`omnigent run` leaves the file out of the upload. Use it for a connection
+that only some people configure:
+
+```yaml
+# tools/mcp/knowledge.yaml
+name: knowledge
+transport: http
+optional: true
+url: ${KNOWLEDGE_MCP_URL}
+headers:
+  Authorization: Bearer ${KNOWLEDGE_MCP_TOKEN}
+```
+
+Without `optional`, an unset variable still stops the agent with an error
+naming it.
+
 ### Python function tool
 
 ```yaml
