@@ -9,6 +9,7 @@ const http = require("node:http");
 const { desktopDepsAvailable, saveRecording } = require("./desktopHarness");
 const { startDesignBackend, eventually } = require("./desktopDesignPromptHarness");
 const { launchThisMachineDesktop, openSessionBrowserTab } = require("./desktopBrowserTabHarness");
+const { securityKeyVerifyPage } = require("./fixtures/fakeSecurityKeySignIn");
 
 const deps = desktopDepsAvailable();
 const FAKE_BROWSER = path.join(__dirname, "fixtures", "fakeSystemBrowser.cjs");
@@ -19,30 +20,6 @@ const pause = () =>
   new Promise((resolve) => {
     setTimeout(resolve, RECORDING ? 3_000 : 0);
   });
-
-// An Okta-style factor page that requests an assertion as soon as it loads.
-const VERIFY_PAGE = `<!doctype html><title>Sign In</title>
-<h2>Verify with Security Key or Biometric Authenticator</h2>
-<p id="status">You will be prompted to use a security key or biometric verification.</p>
-<script>
-window.verifyState = { outcome: "idle" };
-setTimeout(async () => {
-  window.verifyState.outcome = "pending";
-  try {
-    await navigator.credentials.get({ publicKey: {
-      challenge: crypto.getRandomValues(new Uint8Array(32)),
-      rpId: "localhost",
-      allowCredentials: [{ type: "public-key", id: crypto.getRandomValues(new Uint8Array(16)) }],
-      userVerification: "preferred",
-      timeout: 60000,
-    } });
-    window.verifyState.outcome = "signed-in";
-  } catch (error) {
-    window.verifyState.outcome = error.name;
-  }
-  document.getElementById("status").textContent = "Result: " + window.verifyState.outcome;
-}, 500);
-</script>`;
 
 it(
   "asks for the security key while a Browser tab page waits and can hand the page to the system browser",
@@ -59,7 +36,7 @@ it(
       : path.join(scratch, "recordings");
     const fixture = http.createServer((_request, response) => {
       response.writeHead(200, { "Content-Type": "text/html", "Cache-Control": "no-store" });
-      response.end(VERIFY_PAGE);
+      response.end(securityKeyVerifyPage({ timeoutMs: 60_000 }));
     });
     await new Promise((resolve) => {
       fixture.listen(0, "127.0.0.1", resolve);
