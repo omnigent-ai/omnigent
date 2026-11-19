@@ -386,6 +386,7 @@ function loadNavigationHarness({
           findBars.push(bar);
           return bar;
         }
+        (calls.windowOptions ??= []).push(options);
         return win;
       },
       {
@@ -454,7 +455,12 @@ function loadNavigationHarness({
       }),
     },
     "./update_overlay": {
-      createUpdateOverlay: () => ({ ensureOverlay: () => {}, registerIpc: () => {} }),
+      createUpdateOverlay: () => ({
+        ensureOverlay: () => {
+          calls.overlays = (calls.overlays ?? 0) + 1;
+        },
+        registerIpc: () => {},
+      }),
     },
     "./localhost_cors": {
       isLocalhostUrl: require("../src/localhost_cors").isLocalhostUrl,
@@ -707,6 +713,7 @@ function loadNavigationHarness({
   const source =
     fs.readFileSync(mainPath, "utf8") +
     "\nmodule.exports.sshHosts = sshHosts;" +
+    "\nmodule.exports.panelTestApi = { activeWindow, mainWindows, enqueueDeepLink };" +
     "\nmodule.exports.testApi = { handleDeepLink, buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, setBlockedHintDelayMs: (ms) => { blockedHintDelayMs = ms; }, blockedHintDelayMs: () => blockedHintDelayMs, setServerResponseTimeoutMs: (ms) => { serverResponseTimeoutMs = ms; }, serverResponseTimeoutMs: () => serverResponseTimeoutMs, cancelReconnect };";
   const module = { exports: {} };
   const sandbox = {
@@ -739,6 +746,7 @@ function loadNavigationHarness({
 
   vm.runInNewContext(source, sandbox, { filename: mainPath });
   const api = module.exports.testApi;
+  Object.assign(api, module.exports.panelTestApi);
   api.windows.set(win, {
     origin: new URL(serverUrl).origin,
     serverUrl,
@@ -2832,13 +2840,95 @@ describe("setup clipboard IPC wiring", () => {
 });
 
 describe("macOS activation wiring", () => {
-  it("counts tracked shell windows instead of utility windows", () => {
-    assert.match(liveCode, /app\.on\("activate"[\s\S]{0,500}windows\.size === 0/);
+  it("counts main shell windows instead of utility windows or panels", () => {
+    assert.match(liveCode, /app\.on\("activate"[\s\S]{0,500}mainWindows\(\)\.length === 0/);
     assert.doesNotMatch(
       liveCode,
       /app\.on\("activate"[\s\S]{0,500}BrowserWindow\.getAllWindows\(\)\.length === 0/,
     );
   });
+});
+
+describe("panel windows", () => {
+  const savedBounds = (h) =>
+    fs.existsSync(h.settingsPath)
+      ? JSON.parse(fs.readFileSync(h.settingsPath, "utf8")).window_bounds
+      : undefined;
+
+  it("builds a main window by default, which app-level actions target", (t) => {
+    const h = loadNavigationHarness();
+    t.after(h.cleanup);
+    h.api.createWindow();
+    h.electron.BrowserWindow.getFocusedWindow = () => h.win;
+    assert.equal(h.api.windows.get(h.win).role, "main");
+    assert.equal(h.api.mainWindows().length, 1);
+    assert.equal(h.api.mainWindows()[0], h.win);
+    assert.equal(h.api.activeWindow(), h.win);
+    assert.equal(h.calls.overlays, 1);
+    assert.equal(h.calls.windowOptions.at(-1).minWidth, 720);
+    h.emitWindow("close");
+    assert.deepEqual(savedBounds(h), { x: 0, y: 0, width: 1280, height: 860, maximized: false });
+  });
+
+  it("tracks a panel without targeting it or saving its bounds as the main window's", (t) => {
+    const h = loadNavigationHarness();
+    t.after(h.cleanup);
+    // The main window's saved place must neither size the panel nor be overwritten by it.
+    const mainBounds = { x: 40, y: 50, width: 1400, height: 900, maximized: false };
+    fs.writeFileSync(h.settingsPath, JSON.stringify({ window_bounds: mainBounds }));
+    h.api.createWindow("https://host.example/ml/omnigents", {
+      role: "panel",
+      windowOptions: {
+        type: "panel",
+        width: 560,
+        height: 300,
+        webPreferences: {
+          preload: "/tmp/other.js",
+          contextIsolation: false,
+          nodeIntegration: true,
+          webviewTag: true,
+        },
+      },
+    });
+    h.electron.BrowserWindow.getFocusedWindow = () => h.win;
+    assert.equal(h.api.windows.get(h.win).role, "panel");
+    assert.equal(h.api.windows.get(h.win).origin, "https://host.example");
+    assert.equal(h.api.mainWindows().length, 0);
+    assert.equal(h.api.activeWindow(), null);
+    // A caller's webPreferences must never weaken the shell's isolation.
+    const options = h.calls.windowOptions.at(-1);
+    assert.equal(options.type, "panel");
+    assert.equal(options.width, 560);
+    assert.equal(options.minWidth, undefined);
+    assert.equal(options.titleBarStyle, undefined);
+    assert.match(options.webPreferences.preload, /src[\\/]preload\.js$/);
+    assert.equal(options.webPreferences.contextIsolation, true);
+    assert.equal(options.webPreferences.nodeIntegration, false);
+    assert.equal(options.webPreferences.webviewTag, undefined);
+    assert.equal(options.x, undefined);
+    assert.equal(h.calls.overlays, undefined);
+    h.emitWindow("close");
+    assert.deepEqual(savedBounds(h), mainBounds);
+  });
+
+  for (const [platform, otherMain, destroysPanel] of [
+    ["linux", false, true],
+    ["linux", true, false],
+    ["darwin", false, false],
+  ]) {
+    const when = otherMain ? "while another main window stays open" : "with the last main window";
+    it(`${destroysPanel ? "destroys" : "keeps"} panels ${when} on ${platform}`, (t) => {
+      const h = loadNavigationHarness({ platform });
+      t.after(h.cleanup);
+      h.api.createWindow();
+      if (otherMain) h.api.windows.set({ isDestroyed: () => false }, { role: "main" });
+      let destroyed = 0;
+      const panel = { isDestroyed: () => false, destroy: () => (destroyed += 1) };
+      h.api.windows.set(panel, { origin: "https://host.example", role: "panel" });
+      h.emitWindow("closed");
+      assert.equal(destroyed, destroysPanel ? 1 : 0);
+    });
+  }
 });
 
 describe("managed server preference wiring", () => {
@@ -3612,6 +3702,59 @@ describe("CLI deep-link handoff", () => {
       );
       assert.deepEqual(h.calls.loadURL, []);
       h.api.disposeAuth();
+    });
+  }
+});
+
+describe("deep links with a panel open", () => {
+  it("open in the server's main window, not a focused panel of that server", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: "http://localhost:6767/",
+      deepLinks: { ...require("../src/deepLink"), acceptCliDeepLink: async () => true },
+    });
+    t.after(h.cleanup);
+    const panelSends = [];
+    const panel = {
+      isDestroyed: () => false,
+      webContents: {
+        getURL: () => "http://localhost:6767/compose/floating",
+        send: (channel) => panelSends.push(channel),
+      },
+    };
+    // The panel comes first in the window map and has focus.
+    const mainState = h.api.windows.get(h.win);
+    h.api.windows.delete(h.win);
+    h.api.windows.set(panel, { ...mainState, role: "panel" });
+    h.api.windows.set(h.win, mainState);
+    h.electron.BrowserWindow.getFocusedWindow = () => panel;
+    await h.api.handleDeepLink("omnigent://localhost:6767/");
+    assert.deepEqual(
+      h.calls.progress.filter(({ channel }) => channel === "omnigent:open-path"),
+      [{ channel: "omnigent:open-path", data: "/" }],
+    );
+    assert.deepEqual(panelSends, []);
+  });
+
+  for (const [mainOpen, opensDefault] of [
+    [false, true],
+    [true, false],
+  ]) {
+    const when = mainOpen ? "a main window is still open" : "only a panel and a utility window are";
+    it(`${opensDefault ? "open" : "don't open"} the default window after a cancelled link when ${when}`, async (t) => {
+      const h = loadNavigationHarness({
+        deepLinks: { ...require("../src/deepLink"), acceptCliDeepLink: async () => false },
+      });
+      t.after(h.cleanup);
+      if (!mainOpen) h.api.windows.delete(h.win);
+      const panel = { isDestroyed: () => false };
+      h.api.windows.set(panel, { origin: "https://host.example", role: "panel" });
+      // The utility window (a find bar, About) isn't in the window map.
+      h.electron.BrowserWindow.getAllWindows = () => [panel, { isDestroyed: () => false }];
+      h.electron.app.isReady = () => true;
+      const built = h.calls.windowOptions?.length ?? 0;
+      h.api.enqueueDeepLink("omnigent://localhost:6767/");
+      await new Promise(setImmediate);
+      assert.equal((h.calls.windowOptions?.length ?? 0) - built, opensDefault ? 1 : 0);
     });
   }
 });

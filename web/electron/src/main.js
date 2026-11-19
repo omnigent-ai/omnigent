@@ -1634,16 +1634,33 @@ function broadcastHostStatus() {
 }
 
 /**
+ * True for a regular shell window. A panel (see createWindow's `role`) is tracked too, but
+ * `activeWindow()` (and every command that targets through it), deep links, placement and the
+ * Dock skip it. Only code that reads `BrowserWindow.getFocusedWindow()` itself sees a panel.
+ *
+ * @param {BrowserWindow | null | undefined} win
+ */
+function isMainWindow(win) {
+  const state = win ? windows.get(win) : undefined;
+  return state !== undefined && (state.role ?? "main") === "main";
+}
+
+/** Open main windows in creation order. */
+function mainWindows() {
+  return [...windows.keys()].filter((win) => !win.isDestroyed() && isMainWindow(win));
+}
+
+/**
  * The window an OS-menu / app-level action should target: the currently
- * focused shell window, falling back to any open one (or null when none).
+ * focused main window, falling back to any open one (or null when none).
  * Per-window IPC (e.g. the setup page persisting a URL) instead resolves the
  * sender's own window via `BrowserWindow.fromWebContents`, not this.
  * @returns {BrowserWindow | null}
  */
 function activeWindow() {
   const focused = BrowserWindow.getFocusedWindow();
-  if (focused && windows.has(focused)) return focused;
-  return windows.keys().next().value ?? null;
+  if (isMainWindow(focused)) return focused;
+  return mainWindows()[0] ?? null;
 }
 
 /**
@@ -2214,8 +2231,8 @@ function trackWindowBounds(win) {
 function cascadeIfCovering(win) {
   const isCovering = () => {
     const [x, y] = win.getPosition();
-    for (const other of windows.keys()) {
-      if (other === win || other.isDestroyed()) continue;
+    for (const other of mainWindows()) {
+      if (other === win) continue;
       const [ox, oy] = other.getPosition();
       if (Math.abs(ox - x) < CASCADE_OFFSET_PX && Math.abs(oy - y) < CASCADE_OFFSET_PX) {
         return true;
@@ -2224,7 +2241,7 @@ function cascadeIfCovering(win) {
     return false;
   };
   // Bounded by the number of open windows, so this always terminates.
-  let shifts = windows.size;
+  let shifts = mainWindows().length;
   while (shifts-- > 0 && isCovering()) {
     const [x, y] = win.getPosition();
     win.setPosition(x + CASCADE_OFFSET_PX, y + CASCADE_OFFSET_PX);
@@ -2679,17 +2696,28 @@ function registerNavigationFallbacks(win) {
  * @param {string} [targetUrl] Explicit http(s) URL to load instead of the
  *   saved server. Anything not http(s) is ignored (we never load file:// or
  *   internal URLs from an untrusted caller).
- * @param {{ephemeral?: boolean, serverUrl?: string, path?: string}} [opts]
+ * @param {{
+ *   ephemeral?: boolean,
+ *   serverUrl?: string,
+ *   path?: string,
+ *   role?: string,
+ *   windowOptions?: Electron.BrowserWindowConstructorOptions,
+ * }} [opts]
  *   ``ephemeral: true`` creates a debug multi-server window: it opens on the
  *   setup page (ignoring the saved server) and a URL connected from it is
  *   pinned to this window only, never persisted to settings. ``serverUrl`` +
  *   ``path`` open a deep-link conversation (server identity vs. load URL).
+ *   A ``role`` other than ``"main"`` builds a panel from ``windowOptions``: it
+ *   loads and signs in like any window, but skips the main window's saved
+ *   bounds, placement and update overlay, and app-level actions skip it.
  * @returns {BrowserWindow}
  */
 function createWindow(targetUrl, opts = {}) {
   const ephemeral = opts.ephemeral === true;
-  const savedBounds = loadSavedWindowBounds();
-  const win = new BrowserWindow({
+  const role = opts.role ?? "main";
+  const isMain = role === "main";
+  const savedBounds = isMain ? loadSavedWindowBounds() : null;
+  const mainWindowOptions = {
     width: savedBounds?.width ?? 1280,
     height: savedBounds?.height ?? 860,
     // Without saved coordinates Electron centers the window.
@@ -2714,6 +2742,9 @@ function createWindow(targetUrl, opts = {}) {
           trafficLightPosition: { x: 16, y: 17 },
         }
       : {}),
+  };
+  const win = new BrowserWindow({
+    ...(isMain ? mainWindowOptions : opts.windowOptions),
     webPreferences: {
       // Security: the SPA is remote/untrusted relative to the shell, so we
       // keep Node out of the renderer and isolate the preload's context.
@@ -2763,7 +2794,8 @@ function createWindow(targetUrl, opts = {}) {
   // treated as "no server configured" rather than crashing window creation.
   const destinationOrigin = serverUrl ? originOf(serverUrl) : null;
   const destination = destinationOrigin ? loadUrl : null;
-  updateOverlay.ensureOverlay(win);
+  // The update overlay is a child window; a panel gets none, so it never surfaces one.
+  if (isMain) updateOverlay.ensureOverlay(win);
   windows.set(win, {
     // Pin to the destination's origin up front; setup-page windows stay
     // unpinned (null) until the user connects them.
@@ -2772,6 +2804,7 @@ function createWindow(targetUrl, opts = {}) {
     // commands; ``loadUrl`` (possibly /c/<id>) is what gets loaded below.
     serverUrl: destination ? serverUrl : null,
     ephemeral,
+    role,
     badgeCount: 0,
     // Per-conversation embedded-browser view registry for this window.
     browserRegistry: createBrowserRegistryForWindow(win),
@@ -2917,11 +2950,18 @@ function createWindow(targetUrl, opts = {}) {
     awayWatches.delete(win);
     windows.delete(win);
     updateBadge(); // drop this window's contribution from the app-wide badge
+    // Off macOS the app quits once every window has closed, so panels go with the last main
+    // one. Destroyed, not closed: a panel page's beforeunload must not keep the app running.
+    if (isMain && process.platform !== "darwin" && mainWindows().length === 0) {
+      for (const panel of [...windows.keys()]) if (!panel.isDestroyed()) panel.destroy();
+    }
   });
   attachContextMenu(win);
-  cascadeIfCovering(win);
-  if (savedBounds?.maximized) win.maximize();
-  trackWindowBounds(win);
+  if (isMain) {
+    cascadeIfCovering(win);
+    if (savedBounds?.maximized) win.maximize();
+    trackWindowBounds(win);
+  }
   return win;
 }
 
@@ -5933,7 +5973,8 @@ function closeFocused() {
     sendDesktopCommand(target, "close", {
       browserViewId: focusedBrowserViewId(target),
       // Off macOS, closing the last window quits; the page's confirmation says so.
-      closingQuits: process.platform !== "darwin" && windows.size === 1,
+      closingQuits:
+        process.platform !== "darwin" && isMainWindow(target) && mainWindows().length === 1,
     });
     return;
   }
@@ -6085,8 +6126,8 @@ function drainPendingDeepLinks() {
       deepLinkInFlight = false;
       if (pendingDeepLinks.length > 0) {
         drainPendingDeepLinks();
-      } else if (BrowserWindow.getAllWindows().length === 0) {
-        // A cancelled consent at cold start left no window — open the default.
+      } else if (mainWindows().length === 0) {
+        // A cancelled consent at cold start left no main window — open the default.
         createWindow();
       }
     });
@@ -6125,9 +6166,9 @@ async function handleDeepLink(raw) {
   const known = findKnownServerUrl(targetOrigin);
 
   // Snapshot the live windows (creation order) for the pure decision.
-  const winList = [...windows.keys()];
+  const winList = mainWindows();
   const focused = BrowserWindow.getFocusedWindow();
-  const focusedIndex = focused && windows.has(focused) ? winList.indexOf(focused) : -1;
+  const focusedIndex = isMainWindow(focused) ? winList.indexOf(focused) : -1;
   const decision = chooseDeepLinkStrategy({
     targetOrigin,
     windows: winList.map((win) => ({
@@ -6309,7 +6350,9 @@ if (!gotLock) {
       // open. Skip while a deep link is being handled (or queued) — it opens
       // its own window, and racing a default window here would double-open at
       // cold start (whenReady skipped its own createWindow for the pending link).
-      if (windows.size === 0 && !deepLinkInFlight && pendingDeepLinks.length === 0) createWindow();
+      if (mainWindows().length === 0 && !deepLinkInFlight && pendingDeepLinks.length === 0) {
+        createWindow();
+      }
     });
   });
 
