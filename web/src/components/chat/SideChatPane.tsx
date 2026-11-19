@@ -80,6 +80,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
+import { useDismissOnEscape } from "@/hooks/useDismissOnEscape";
 import { useSession } from "@/hooks/useSession";
 import type { Session } from "@/lib/types";
 import { useSkills } from "@/hooks/useSkills";
@@ -1010,6 +1011,7 @@ function SideChatComposer({
   const isMobile = useIsMobileViewport();
   const [inputFocused, setInputFocused] = useState(false);
   const [commandNotice, setCommandNotice] = useState<string | null>(null);
+  useDismissOnEscape(commandNotice !== null, () => setCommandNotice(null));
   const nativeSession = isNativeTerminalSession({ harness, labels: session?.labels });
   // A generic side chat has no host/workspace of its own: it forks the parent and
   // runs in the parent's workspace. Discover skills against the parent (the same
@@ -1227,6 +1229,12 @@ function SideChatComposer({
       event.preventDefault();
       return;
     }
+    // Esc closes slash-command output before it can reach the turn.
+    if (event.key === "Escape" && commandNotice !== null) {
+      event.preventDefault();
+      setCommandNotice(null);
+      return;
+    }
     // A grid pane is a whole session, so only side chats let Escape stop the turn.
     if (event.key === "Escape" && queues && !fullSession && busy) {
       event.preventDefault();
@@ -1262,7 +1270,7 @@ function SideChatComposer({
         />
       )}
       {commandNotice !== null && (
-        <ComposerFeedbackRow data-testid="side-chat-command-notice">
+        <ComposerFeedbackRow data-testid="side-chat-command-notice" data-escape-owner="">
           {commandNotice}
         </ComposerFeedbackRow>
       )}

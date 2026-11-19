@@ -972,6 +972,14 @@ agents. These restrictions apply on multi-user servers and, starting in 0.19.0,
 on local single-user servers too, including bundles uploaded by `omnigent run`.
 Loopback requests can originate from agents as well as the operator.
 
+Uploaded bundles also cannot declare absolute, `~`, or `..` entries in
+`os_env.sandbox` `read_paths`, `write_paths`, or `write_files`. A host that
+needs to expose paths outside the workspace lists absolute paths under
+`runner.sandbox_grants.read_paths` / `write_paths` in its own `config.yaml`
+(`$OMNIGENT_CONFIG_HOME/config.yaml`, default `~/.omnigent/config.yaml`). The
+runner adds them to every agent, terminal, and nested agent with an
+`os_env.sandbox` block that the host runs.
+
 Invalid uploads return HTTP 400 before tools or policy handlers are imported.
 Existing uploaded agents using these features also fail bundle validation when
 adding, updating, or deleting MCP-server settings; rejected edits leave the

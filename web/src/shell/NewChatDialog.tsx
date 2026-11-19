@@ -207,7 +207,7 @@ import {
 } from "@/store/chatStore";
 import { markSessionCreated } from "@/store/interactionTelemetry";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
-import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { DesktopWindowContext, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { MODEL_PICKER_KEYS, useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
 import { CliCommandBlock, renderTextWithInlineCode } from "./CliCommandBlock";
 import { isHostAbsolutePath, isNavigablePath } from "./WorkspacePicker";
@@ -2321,6 +2321,7 @@ export function NewChatLandingScreen({
   projectName,
   onSessionStarted,
 }: { projectName?: string; onSessionStarted?: () => void } = {}) {
+  const floating = useComposerPresentation().kind === "floating";
   const [params] = useSearchParams();
   const navigate = useNavigate();
   const siblingSourceId = params.get("sibling");
@@ -2358,7 +2359,7 @@ export function NewChatLandingScreen({
         </Button>
       </div>
     );
-  return (
+  const content = (
     <NewChatLandingContent
       key={siblingSourceId ?? "standalone"}
       siblingSourceId={siblingSourceId}
@@ -2366,6 +2367,12 @@ export function NewChatLandingScreen({
       projectHomeName={projectName}
       onSessionStarted={onSessionStarted}
     />
+  );
+  // The panel is a desktop window narrower than the mobile breakpoint by design.
+  return floating ? (
+    <DesktopWindowContext.Provider value>{content}</DesktopWindowContext.Provider>
+  ) : (
+    content
   );
 }
 
@@ -2403,7 +2410,7 @@ function NewChatLandingContent({
   const openAppPage = (page: ComposerAppPage) =>
     floating ? floating.openAppPage(page) : navigate(page);
   const [savedSubmitWithModEnter] = useState(() => readSubmitWithModEnter());
-  // The panel sends with ⌘↵, so plain ↵ adds a line to its prompt.
+  // A panel prompt is often drafted across lines, so only ⌘↵ sends there.
   const submitWithModEnter = floating !== null || savedSubmitWithModEnter;
   // Single send-telemetry point (see handleCreate). Emitting there rather than
   // via the Start button's componentId covers Enter-key sends too, which never
@@ -2879,9 +2886,11 @@ function NewChatLandingContent({
           : managedSandboxesEnabled || (hosts ?? []).some((host) => host.status === "online")));
   const noExecutionTargetSelected =
     !sandboxSelected && selectedHostId === null && !executionTargetSelectionPending;
-  // Desktop-shell host status for THIS machine (undefined until the shell answers, and
-  // outside Electron), so the picker can tag the current machine and offer to auto-connect it.
-  const [desktopHost, setDesktopHost] = useState<HostIdentity | null | undefined>(undefined);
+  // Desktop-shell host status for THIS machine (null outside Electron), so the
+  // picker can tag the current machine and offer to auto-connect it.
+  const [desktopHost, setDesktopHost] = useState<HostIdentity | null>(null);
+  // Whether the shell has answered, so the floating panel can wait for that answer.
+  const [desktopHostAnswered, setDesktopHostAnswered] = useState(false);
   // The runner picked during desktop onboarding, preselected once it's online.
   const onboardingHost = useOnboardingRunnerHost(hosts);
   // Applied (or given up) once, after the first prefill; later resets use the usual defaults.
@@ -3211,9 +3220,14 @@ function NewChatLandingContent({
     thisMachineHostId != null && allHosts.some((h) => h.host_id === thisMachineHostId);
   const canConnectThisMachine = Boolean(desktopHost?.cliInstalled);
   // The floating panel starts agents only on this Mac or in a new sandbox. In the desktop shell
-  // it waits for the shell to name this Mac's host; elsewhere only the loopback rule applies.
+  // only the shell's own answer names this Mac, never the loopback guess, and a missing
+  // identity names no host; outside the shell only the loopback rule applies.
   const panel = panelDestinations({
-    thisMacHostId: isElectronShell() && desktopHost === undefined ? undefined : thisMachineHostId,
+    thisMacHostId: !isElectronShell()
+      ? thisMachineHostId
+      : desktopHostAnswered
+        ? (desktopHost?.hostId ?? null)
+        : undefined,
     hosts: hostsLoading ? null : allHosts,
     sandboxesOffered: info === "loading" ? null : managedSandboxesEnabled,
   });
@@ -3221,8 +3235,10 @@ function NewChatLandingContent({
   const showConnectThisMachine =
     siblingMayUseOtherHosts &&
     canConnectThisMachine &&
-    !thisMachineInList &&
-    onlineHosts.length === 0;
+    (floating
+      ? // The panel trusts only the shell's identity, and can't start on other hosts.
+        !panel.pending && panel.thisMac === null
+      : !thisMachineInList && onlineHosts.length === 0);
 
   // Track this machine's host status from the desktop shell (no-op in a browser).
   useEffect(() => {
@@ -3230,7 +3246,9 @@ function NewChatLandingContent({
     let cancelled = false;
     const refresh = () => {
       void getHostIdentity().then((s) => {
-        if (!cancelled) setDesktopHost(s);
+        if (cancelled) return;
+        setDesktopHost(s);
+        setDesktopHostAnswered(true);
       });
     };
     refresh();
@@ -5473,7 +5491,7 @@ function NewChatLandingContent({
   const [inputFocused, setInputFocused] = useState(false);
   const skillPrefix = skillInvocationPrefix(skillsHarness);
   const canStartWorkflow = offersWorkflow(availableSkills);
-  const savedWorkflows = useSavedWorkflows({ enabled: canStartWorkflow });
+  const savedWorkflows = useSavedWorkflows({ enabled: canStartWorkflow, includeShared: true });
   const [workflowDialogOpen, setWorkflowDialogOpen] = useState(false);
   // Run a workflow starts from the draft, or from text typed in the saved-workflow search.
   const [workflowDialogDescription, setWorkflowDialogDescription] = useState<string | null>(null);
@@ -7001,7 +7019,7 @@ function NewChatLandingContent({
     !!host.sandbox_provider || host.name.toLowerCase().includes("cloud");
   const isReconnectRow = (host: Host) =>
     host.status === "offline" && host.host_id === thisMachineHostId && canConnectThisMachine;
-  // The panel lists only this Mac's host.
+  // The panel can launch only on this Mac, so other hosts aren't offered.
   const pickable = (host: Host) => !floating || panelAllowsHost(panel, host.host_id);
   // Keep the selected host and this machine's reconnect action above the fold.
   const listedHosts = [

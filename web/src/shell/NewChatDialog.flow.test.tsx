@@ -465,12 +465,12 @@ describe("NewChatLandingScreen in the floating panel", () => {
     };
   }
 
-  /** The desktop shell names this Mac's host, as it does in the panel. */
-  function inDesktopShell(hostId: string): void {
+  /** The desktop shell answers which host is this Mac, as it does in the panel. */
+  function inDesktopShell(identity: { cliInstalled: boolean; hostId: string | null } | null): void {
     const shell = window as unknown as { omnigentDesktop?: unknown };
     shell.omnigentDesktop = {
       kind: "electron",
-      getHostIdentity: async () => ({ cliInstalled: true, hostId }),
+      getHostIdentity: async () => identity,
     };
     onTestFinished(() => {
       delete shell.omnigentDesktop;
@@ -526,13 +526,23 @@ describe("NewChatLandingScreen in the floating panel", () => {
         ),
       );
       const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
-      expect(JSON.parse(init.body as string).host_type).toBe("managed");
+      const body = JSON.parse(init.body as string);
+      expect(body.host_type).toBe("managed");
+      // Accepted only when the create carried it.
+      expect(body.initial_input).toEqual(
+        durable
+          ? {
+              type: "message",
+              data: { role: "user", content: [{ type: "input_text", text: "start a sandbox" }] },
+            }
+          : undefined,
+      );
       expect(navigateMock).not.toHaveBeenCalled();
     },
   );
 
   it("offers only this Mac's host, and doesn't start on a remembered other host", async () => {
-    inDesktopShell("host_1");
+    inDesktopShell({ cliInstalled: true, hostId: "host_1" });
     setHosts([host(), host({ host_id: "host_2", name: "build-box" })]);
     writeLastHostChoice("host_2");
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
@@ -554,6 +564,37 @@ describe("NewChatLandingScreen in the floating panel", () => {
     const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string)).toMatchObject({ host_id: "host_1" });
   });
+
+  it.each([
+    ["a null identity", null],
+    ["an identity without a host", { cliInstalled: true, hostId: null }],
+  ])(
+    "never takes the only online host for this Mac when the shell gives %s",
+    async (_label, identity) => {
+      inDesktopShell(identity);
+      setHosts([host({ host_id: "host_other", name: "build-box" })]);
+      const panel = floatingPanel();
+
+      renderLanding([], {}, panel);
+      // Let the shell's answer land, so what follows isn't just the wait for it.
+      await act(async () => {});
+      typeMessage("inspect the repo");
+      fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+      expect(screen.queryByTestId("new-chat-landing-host-host_other")).toBeNull();
+      // With the CLI installed, this Mac isn't a host yet, so the panel offers to start it.
+      if (identity?.cliInstalled) {
+        expect(screen.getByTestId("new-chat-landing-run-on-this-machine")).toBeInTheDocument();
+      }
+      fireEvent.keyDown(document, { key: "Escape" });
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+      fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), {
+        key: "Enter",
+        metaKey: true,
+      });
+      expect(authenticatedFetch).not.toHaveBeenCalled();
+      expect(panel.launch).not.toHaveBeenCalled();
+    },
+  );
 
   it("starts nowhere until the desktop shell names this Mac's host", async () => {
     let answer!: (identity: { cliInstalled: boolean; hostId: string }) => void;
@@ -579,6 +620,39 @@ describe("NewChatLandingScreen in the floating panel", () => {
     expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
   });
 
+  it("keeps desktop controls in a window narrower than the page's mobile layout", async () => {
+    // The panel is narrower than the mobile breakpoint by design.
+    const real = window.matchMedia;
+    window.matchMedia = ((query: string) => ({
+      matches: /max-width/.test(query),
+      media: query,
+      onchange: null,
+      addListener: () => {},
+      removeListener: () => {},
+      addEventListener: () => {},
+      removeEventListener: () => {},
+      dispatchEvent: () => false,
+    })) as typeof window.matchMedia;
+    onTestFinished(() => {
+      window.matchMedia = real;
+    });
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const panel = floatingPanel();
+
+    renderLanding([], {}, panel);
+    await waitForWorkspaceSeed();
+    expect(screen.getByTestId("new-chat-landing-host-chip")).toBeInTheDocument();
+    typeMessage("inspect the repo");
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), {
+      key: "Enter",
+      metaKey: true,
+    });
+    await waitFor(() => expect(panel.launch).toHaveBeenCalled());
+  });
+
   it("sends with ⌘↵ and keeps plain ↵ for a new line", async () => {
     vi.mocked(authenticatedFetch).mockResolvedValueOnce({
       ok: true,
@@ -599,10 +673,13 @@ describe("NewChatLandingScreen in the floating panel", () => {
     await waitFor(() => expect(panel.launch).toHaveBeenCalled());
   });
 
-  it("tells the panel when the native file picker closes", async () => {
+  it("tells the panel when the native file picker opens and closes", async () => {
     const panel = floatingPanel();
 
     renderLanding([], {}, panel);
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-attach"), { button: 0 });
+    fireEvent.click(await screen.findByText("Files and images"));
+    expect(panel.onFilePicker).toHaveBeenCalledWith("open");
     const input = screen.getByTestId("new-chat-landing-file-input");
     fireEvent(input, new Event("cancel"));
     expect(panel.onFilePicker).toHaveBeenLastCalledWith("closed");
