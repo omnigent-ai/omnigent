@@ -3377,6 +3377,14 @@ function NewChatLandingContent({
       }
     }
     if (sandboxSelected) return;
+    if (floating && selectedHostId !== null && !allowed(selectedHostId)) {
+      // A restored draft may name a host the panel can't start on; it takes its default instead.
+      setSelectedHostId(null);
+      setWorkspace("");
+      workspaceFromConfigRef.current = false;
+      seededHostRef.current = null;
+      return;
+    }
     if (selectedHostId !== null) return;
 
     // Read the persisted pick once, as a mount-time seed — deliberately NOT a

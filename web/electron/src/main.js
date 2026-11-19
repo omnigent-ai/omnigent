@@ -127,7 +127,7 @@ const {
   settingsMenuItem,
 } = require("./settingsNavigation");
 const { createQuitConfirmation } = require("./quitConfirmation");
-const { acceleratorLabel, createGlobalShowShortcut } = require("./globalShowShortcut");
+const { acceleratorLabel, createGlobalShortcuts } = require("./globalShowShortcut");
 const {
   registerDesktopCommandStateReset,
   sanitizeDesktopCommandState,
@@ -1754,22 +1754,25 @@ const quitConfirmation = createQuitConfirmation({
 
 // "Show Omnigent from anywhere" (opt-in). macOS needs app-level activation to
 // come forward from another app.
-const globalShowShortcut = createGlobalShowShortcut({
+const globalShortcuts = createGlobalShortcuts({
   globalShortcut,
   loadSettings,
   saveSettings,
   isMac: process.platform === "darwin",
-  show: () => {
-    const win = activeWindow();
-    if (!win) {
-      createWindow();
-      return;
-    }
-    if (win.isMinimized()) win.restore();
-    win.focus();
-    if (process.platform === "darwin") app.focus({ steal: true });
+  presses: {
+    show: () => {
+      const win = activeWindow();
+      if (!win) {
+        createWindow();
+        return;
+      }
+      if (win.isMinimized()) win.restore();
+      win.focus();
+      if (process.platform === "darwin") app.focus({ steal: true });
+    },
   },
 });
+const globalShowShortcut = globalShortcuts.show;
 
 // Shell-owned About window: available from the native application menu even
 // while the parent is on setup or an external sign-in page.

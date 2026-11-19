@@ -22,12 +22,17 @@ export const SEND_UNKNOWN_ERROR =
 export const OPEN_FAILED_ERROR =
   "Your agent started, but Omnigent couldn't show it. Find it in the sidebar.";
 
-/** Open the launched session in a main window, then deliver its first message. */
+/**
+ * Open the launched session in a main window, then deliver its first message. Never rejects:
+ * the session already exists, so every failure becomes the panel's error.
+ */
 export async function launchFromPanel(request: FloatingLaunchRequest): Promise<LaunchOutcome> {
-  const opened = await floatingComposerBridge()
-    ?.openInMainWindow(`/c/${request.sessionId}`)
+  const opened = await Promise.resolve()
+    .then(() => floatingComposerBridge()?.openInMainWindow(`/c/${request.sessionId}`))
     .catch(() => null);
-  const delivery = request.inputAccepted ? "delivered" : await deliverFirstMessage(request);
+  const delivery: Delivery = request.inputAccepted
+    ? "delivered"
+    : await deliverFirstMessage(request).catch(() => "unknown" as const);
   if (delivery === "failed") return { error: SEND_FAILED_ERROR, freshComposer: false };
   if (delivery === "unknown") return { error: SEND_UNKNOWN_ERROR, freshComposer: false };
   return { error: opened?.ok ? null : OPEN_FAILED_ERROR, freshComposer: true };

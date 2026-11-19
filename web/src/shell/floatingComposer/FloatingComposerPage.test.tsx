@@ -9,10 +9,7 @@ const bridge = vi.hoisted(() => ({
   announceSupport: vi.fn(),
 }));
 vi.mock("@/lib/nativeBridge", () => ({ floatingComposerBridge: () => bridge }));
-vi.mock("./floatingLaunch", () => ({
-  launchFromPanel: vi.fn(),
-  SEND_UNKNOWN_ERROR: "Couldn't confirm it.",
-}));
+vi.mock("./floatingLaunch", () => ({ launchFromPanel: vi.fn() }));
 vi.mock("@/lib/branding", () => ({ useLogoUrl: () => null }));
 // New Chat's own behavior has its own suites; here it only types and launches.
 vi.mock("@/shell/NewChatDialog", async () => {
@@ -133,19 +130,6 @@ describe("FloatingComposerPage", () => {
 
     expect(prompt().value).toBe("");
     expect(screen.getByTestId("floating-launch-error")).toHaveTextContent("Couldn't show it.");
-  });
-
-  it("keeps the prompt when a launch throws", async () => {
-    vi.mocked(launchFromPanel).mockRejectedValue(new Error("unexpected"));
-    render(<FloatingComposerPage />);
-    fireEvent.change(prompt(), { target: { value: "Fix the build" } });
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole("button", { name: "Launch" }));
-    });
-
-    expect(screen.getByTestId("floating-launch-error")).toHaveTextContent("Couldn't confirm it.");
-    expect(prompt().value).toBe("Fix the build");
   });
 
   it.each([

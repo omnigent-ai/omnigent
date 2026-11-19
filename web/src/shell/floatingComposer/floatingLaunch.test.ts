@@ -175,6 +175,25 @@ describe("launchFromPanel", () => {
     });
   });
 
+  it("never rejects: a delivery step that throws comes back as unknown", async () => {
+    vi.mocked(postEvent).mockRejectedValue(new TypeError("Failed to fetch"));
+    vi.mocked(sendVerdictFromServer).mockRejectedValue(new Error("unexpected"));
+
+    await expect(launchFromPanel(request())).resolves.toEqual(unknown);
+  });
+
+  it("still sends the message when the shell throws while opening the session", async () => {
+    bridge.openInMainWindow.mockImplementation(() => {
+      throw new Error("gone");
+    });
+
+    expect(await launchFromPanel(request())).toEqual({
+      error: OPEN_FAILED_ERROR,
+      freshComposer: true,
+    });
+    expect(postEvent).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps the prompt when neither the open nor the send worked", async () => {
     bridge.openInMainWindow.mockRejectedValue(new Error("gone"));
     vi.mocked(postEvent).mockResolvedValue({ queued: false, denied: true } as Awaited<

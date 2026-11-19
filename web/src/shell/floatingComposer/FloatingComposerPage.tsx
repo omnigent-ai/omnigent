@@ -11,7 +11,7 @@ import {
 } from "@/shell/composerPresentation";
 import { NewChatLandingScreen } from "@/shell/NewChatDialog";
 import { FloatingComposerHeader } from "./FloatingComposerHeader";
-import { launchFromPanel, SEND_UNKNOWN_ERROR, type LaunchOutcome } from "./floatingLaunch";
+import { launchFromPanel } from "./floatingLaunch";
 
 export const OPEN_PAGE_ERROR = "Couldn't open that page. Open it from a main window.";
 
@@ -45,14 +45,12 @@ export function FloatingComposerPage() {
       launch: (request) => {
         const launchNumber = ++latestLaunch.current;
         setError(null);
-        void launchFromPanel(request)
-          // A throw it didn't expect still leaves the prompt, and says delivery is unknown.
-          .catch((): LaunchOutcome => ({ error: SEND_UNKNOWN_ERROR, freshComposer: false }))
-          .then((outcome) => {
-            if (launchNumber !== latestLaunch.current) return;
-            if (outcome.freshComposer) setGeneration((current) => current + 1);
-            setError(outcome.error);
-          });
+        // Never rejects: every failure comes back as the outcome's error.
+        void launchFromPanel(request).then((outcome) => {
+          if (launchNumber !== latestLaunch.current) return;
+          if (outcome.freshComposer) setGeneration((current) => current + 1);
+          setError(outcome.error);
+        });
       },
       onFilePicker: (state) => floatingComposerBridge()?.filePicker(state),
       openAppPage: (page) => {
