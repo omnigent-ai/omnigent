@@ -319,8 +319,8 @@ async def test_rest_terminal_cold_harness_override_keeps_bundle_and_credentials_
         assert access.base_url == "https://model.test/gateway"
         assert access.credential() == "parent-provider-secret"
         assert bundle.resolve() in access.source_paths
-        assert bundle / "config.yaml" in access.source_paths
-        assert bundle / ".mcp.json" in access.source_paths
+        assert bundle / "config.yaml" not in access.source_paths
+        assert bundle / ".mcp.json" not in access.source_paths
         assert bundle / "skills" / "SKILL.md" not in access.source_paths
         assert instance.sandbox_policy is not None
         assert bundle.resolve() in instance.sandbox_policy.credential_source_paths

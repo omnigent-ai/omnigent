@@ -309,7 +309,7 @@ async def test_callback_spawn_has_private_env_protected_bundle_and_authenticated
     policy = SandboxPolicy.from_jsonable(config["sandbox"])
     assert not policy.allow_network
     assert bundle in policy.credential_source_paths
-    assert bundle / "config.yaml" in policy.credential_source_paths
+    assert bundle / "config.yaml" not in policy.credential_source_paths
     from omnigent.inner.seatbelt_sandbox import _build_profile
 
     profile = _build_profile(policy, workspace)
