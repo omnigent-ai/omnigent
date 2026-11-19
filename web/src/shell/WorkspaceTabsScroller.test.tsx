@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { scrollTabIntoView } from "./WorkspaceTabsScroller";
+import { scrollTabIntoView, shouldCompactTabs } from "./WorkspaceTabsScroller";
 
 function rect(left: number, width: number): DOMRect {
   return { left, right: left + width, width, top: 0, bottom: 20, height: 20 } as DOMRect;
@@ -66,5 +66,31 @@ describe("scrollTabIntoView", () => {
     page.append(loose);
     expect(() => scrollTabIntoView(loose)).not.toThrow();
     scrollTabIntoView(null);
+  });
+});
+
+describe("shouldCompactTabs", () => {
+  it("compacts labelled tabs once they overflow the strip", () => {
+    expect(
+      shouldCompactTabs({ compact: false, contentWidth: 300, viewportWidth: 200, fullWidth: 300 }),
+    ).toBe(true);
+    expect(
+      shouldCompactTabs({ compact: false, contentWidth: 200, viewportWidth: 200, fullWidth: 200 }),
+    ).toBe(false);
+  });
+
+  it("shows labels again only when their measured width fits", () => {
+    expect(
+      shouldCompactTabs({ compact: true, contentWidth: 80, viewportWidth: 250, fullWidth: 300 }),
+    ).toBe(true);
+    expect(
+      shouldCompactTabs({ compact: true, contentWidth: 80, viewportWidth: 300, fullWidth: 300 }),
+    ).toBe(false);
+  });
+
+  it("keeps the current state while the strip has no layout", () => {
+    expect(
+      shouldCompactTabs({ compact: true, contentWidth: 0, viewportWidth: 0, fullWidth: 300 }),
+    ).toBe(true);
   });
 });

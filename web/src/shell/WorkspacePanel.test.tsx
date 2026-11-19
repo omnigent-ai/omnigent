@@ -269,6 +269,7 @@ function renderWorkspace(
   const onReveal = vi.fn();
   const openTerminalTab = vi.fn();
   const onCloseTerminal = vi.fn();
+  const onCloseTerminals = vi.fn();
   const onToggleMaximized = vi.fn();
   const onMobileSideChatsOpenChange = vi.fn();
   const queryClient =
@@ -317,6 +318,7 @@ function renderWorkspace(
         openTerminals={overrides.openTerminals ?? []}
         selectedTerminalKey={overrides.selectedTerminalKey ?? null}
         onCloseTerminal={onCloseTerminal}
+        onCloseTerminals={onCloseTerminals}
         maximized={overrides.maximized ?? false}
         onToggleMaximized={onToggleMaximized}
         permissionLevel={overrides.permissionLevel ?? null}
@@ -361,6 +363,7 @@ function renderWorkspace(
     onReveal,
     openTerminalTab,
     onCloseTerminal,
+    onCloseTerminals,
     onToggleMaximized,
     onMobileSideChatsOpenChange,
     onHide,
@@ -448,6 +451,87 @@ describe("WorkspacePanel surface presentation", () => {
     expect(onClosePanel).toHaveBeenCalledWith("changes");
     fireEvent.pointerDown(screen.getByRole("button", { name: "Open new" }), { button: 0 });
     expect(screen.getByRole("menuitem", { name: "Changes" })).toBeInTheDocument();
+  });
+
+  it("closes other tabs or all tabs of every kind from a tab's context menu", async () => {
+    writePinnedWorkspaceTabs(["files", "subagents"]);
+    const { onClosePanel, onCloseFile, onCloseTerminals, openFileViewer, openTerminalTab } =
+      renderWorkspace({
+        rightRailTab: "changes",
+        openPanels: ["changes"],
+        openFiles: ["README.md", "notes.md"],
+        openTerminals: ["terminal:zsh", "terminal:bash"],
+      });
+
+    fireEvent.contextMenu(screen.getByTitle("notes.md"));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Close other tabs" }));
+    expect(onClosePanel).toHaveBeenCalledWith("changes");
+    expect(onCloseFile.mock.calls).toEqual([["README.md"]]);
+    // Shells close together behind one confirmation.
+    expect(onCloseTerminals.mock.calls).toEqual([[["terminal:zsh", "terminal:bash"]]]);
+    await waitFor(() => expect(openFileViewer).toHaveBeenCalledWith("notes.md"));
+
+    onClosePanel.mockClear();
+    onCloseFile.mockClear();
+    onCloseTerminals.mockClear();
+    // A shell's menu closes the other kinds too, then shows that shell.
+    fireEvent.contextMenu(screen.getByTitle("zsh"));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Close other tabs" }));
+    expect(onClosePanel).toHaveBeenCalledWith("changes");
+    expect(onCloseFile.mock.calls).toEqual([["README.md"], ["notes.md"]]);
+    expect(onCloseTerminals.mock.calls).toEqual([[["terminal:bash"]]]);
+    await waitFor(() => expect(openTerminalTab).toHaveBeenCalledWith("terminal:zsh"));
+
+    onCloseFile.mockClear();
+    onCloseTerminals.mockClear();
+    fireEvent.contextMenu(screen.getByTitle("bash"));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Close all tabs" }));
+    expect(onCloseFile.mock.calls).toEqual([["README.md"], ["notes.md"]]);
+    expect(onCloseTerminals.mock.calls).toEqual([[["terminal:zsh", "terminal:bash"]]]);
+  });
+
+  it("hides the rail when the user closes the last open tab", () => {
+    writePinnedWorkspaceTabs(["files", "subagents"]);
+    const { rerender, onHide } = renderWorkspace({
+      selectedFilePath: "README.md",
+      openFiles: ["README.md"],
+    });
+
+    // Tabs leaving without a close, such as on a session switch, keep the rail.
+    rerender({ conversationId: "conv_other", openFiles: [], selectedFilePath: null });
+    expect(onHide).not.toHaveBeenCalled();
+
+    rerender({ openFiles: ["README.md", "notes.md"], selectedFilePath: "README.md" });
+    fireEvent.click(screen.getByRole("button", { name: "Close README.md" }));
+    rerender({ openFiles: ["notes.md"], selectedFilePath: "notes.md" });
+    expect(onHide).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Close notes.md" }));
+    rerender({ openFiles: [], selectedFilePath: null });
+    expect(onHide).toHaveBeenCalledOnce();
+  });
+
+  it("asks the file on screen once before closing all tabs, and keeps them when declined", async () => {
+    writePinnedWorkspaceTabs(["files", "subagents"]);
+    let allowLeave = false;
+    const fileGuard = vi.fn<FileNavigationGuard>((_path, _options, commit) => {
+      if (allowLeave) commit();
+    });
+    const { onCloseFile } = renderWorkspace({
+      selectedFilePath: "README.md",
+      openFiles: ["README.md", "notes.md"],
+      fileGuard,
+    });
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Close all tabs" }));
+    expect(fileGuard).toHaveBeenCalledOnce();
+    expect(onCloseFile).not.toHaveBeenCalled();
+
+    allowLeave = true;
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Close all tabs" }));
+    expect(fileGuard).toHaveBeenCalledTimes(2);
+    expect(onCloseFile.mock.calls).toEqual([["README.md"], ["notes.md"]]);
   });
 
   it("keeps + available with no pinned pages and hides unavailable pages", () => {
@@ -2408,7 +2492,7 @@ describe("WorkspacePanel desktop menu commands", () => {
     );
   });
 
-  it("closes an unpinned page tab, and hides the rail on a fixed page", () => {
+  it("closes an unpinned page tab, hiding the rail once it was the last tab", () => {
     writePinnedWorkspaceTabs(["files", "subagents"]);
     const { onClosePanel, onHide, rerender } = renderWorkspace({
       rightRailTab: "changes",
@@ -2420,6 +2504,12 @@ describe("WorkspacePanel desktop menu commands", () => {
     expect(onHide).not.toHaveBeenCalled();
 
     rerender({ rightRailTab: "files", openPanels: [] });
+    expect(onHide).toHaveBeenCalledTimes(1);
+  });
+
+  it("hides the rail on Close from a fixed page", () => {
+    writePinnedWorkspaceTabs(["files", "subagents"]);
+    const { onHide } = renderWorkspace({ rightRailTab: "files" });
     focusRail();
     close();
     expect(onHide).toHaveBeenCalledTimes(1);

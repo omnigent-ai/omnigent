@@ -15,8 +15,10 @@ import {
 } from "lucide-react";
 import { toast } from "sonner";
 import {
+  type ComponentType,
   type CSSProperties,
   type ReactElement,
+  type Ref,
   type RefObject,
   lazy,
   memo,
@@ -58,6 +60,13 @@ import {
   DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuSeparator,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
@@ -90,7 +99,11 @@ import {
 } from "@/hooks/useTerminals";
 import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { readPreferredShell, resolveDefaultShell, writePreferredShell } from "./preferredShell";
-import { scrollTabIntoView, WorkspaceTabsScroller } from "./WorkspaceTabsScroller";
+import {
+  scrollTabIntoView,
+  useCompactWorkspaceTabs,
+  WorkspaceTabsScroller,
+} from "./WorkspaceTabsScroller";
 import { FilesPanel } from "./FilesPanel";
 import { resolveWorkspaceActiveView } from "./workspaceActiveView";
 import { ContentSearchPanel } from "./ContentSearchPanel";
@@ -147,6 +160,126 @@ function WorkspaceTabTooltip({
         <span>{label}</span>
       </TooltipContent>
     </Tooltip>
+  );
+}
+
+/** Close commands for an open tab; an absent command shows disabled. */
+interface OpenTabCloseActions {
+  close?: () => void;
+  closeOthers?: () => void;
+  closeAll?: () => void;
+}
+
+const OPEN_TAB_ACTIVE_CLASS =
+  "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground";
+// Like browser tabs: labelled tabs shrink toward this floor, truncating their labels,
+// before the strip falls back to icons only.
+const OPEN_TAB_SIZE_CLASS = "min-w-16 shrink";
+const COMPACT_OPEN_TAB_SIZE_CLASS = "shrink-0";
+const OPEN_TAB_INACTIVE_CLASS =
+  "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground";
+
+/**
+ * Right-click menu for an open tab (Close / Close other tabs / Close all tabs). Icon-only
+ * tabs also get a tooltip naming them.
+ */
+function OpenTabMenu({
+  label,
+  actions,
+  children,
+}: {
+  label: string;
+  actions: OpenTabCloseActions;
+  children: ReactElement;
+}) {
+  const compact = useCompactWorkspaceTabs();
+  const menu = (
+    <ContextMenu>
+      <ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
+      {/* Focus returning to the tab would reopen its tooltip after the menu closes. */}
+      <ContextMenuContent onCloseAutoFocus={(event) => event.preventDefault()}>
+        {/* The native browser view would otherwise paint over the menu. */}
+        <SuppressBrowserView />
+        <ContextMenuItem disabled={!actions.close} onSelect={actions.close}>
+          Close
+        </ContextMenuItem>
+        <ContextMenuSeparator />
+        <ContextMenuItem disabled={!actions.closeOthers} onSelect={actions.closeOthers}>
+          Close other tabs
+        </ContextMenuItem>
+        <ContextMenuItem disabled={!actions.closeAll} onSelect={actions.closeAll}>
+          Close all tabs
+        </ContextMenuItem>
+      </ContextMenuContent>
+    </ContextMenu>
+  );
+  return compact ? <WorkspaceTabTooltip label={label}>{menu}</WorkspaceTabTooltip> : menu;
+}
+
+/**
+ * An open panel, browser or side-chat tab: icon, label and close button. When the strip
+ * is crowded only the icon shows, plus the close button on the active tab.
+ */
+function OpenTab({
+  label,
+  icon: Icon,
+  active,
+  tabRef,
+  labelClassName,
+  onSelect,
+  onClose,
+  closeActions,
+}: {
+  label: string;
+  icon: ComponentType<{ className?: string }>;
+  active: boolean;
+  tabRef?: Ref<HTMLDivElement>;
+  labelClassName?: string;
+  onSelect: () => void;
+  onClose: () => void;
+  closeActions: OpenTabCloseActions;
+}) {
+  const compact = useCompactWorkspaceTabs();
+  return (
+    <OpenTabMenu label={label} actions={{ ...closeActions, close: onClose }}>
+      <div
+        ref={tabRef}
+        className={cn(
+          "flex h-[24px] items-center gap-[6px] overflow-hidden rounded-md px-2 text-ui font-medium leading-5 transition-colors",
+          compact ? COMPACT_OPEN_TAB_SIZE_CLASS : OPEN_TAB_SIZE_CLASS,
+          active ? OPEN_TAB_ACTIVE_CLASS : OPEN_TAB_INACTIVE_CLASS,
+        )}
+      >
+        <button
+          type="button"
+          role="tab"
+          aria-label={label}
+          aria-selected={active}
+          title={compact ? undefined : label}
+          className="flex min-w-0 flex-1 items-center gap-1"
+          onClick={onSelect}
+          onAuxClick={(event) => {
+            if (event.button === 1) {
+              event.preventDefault();
+              onClose();
+            }
+          }}
+        >
+          <Icon className="size-4 shrink-0" />
+          {!compact && <span className={cn("min-w-0 truncate", labelClassName)}>{label}</span>}
+        </button>
+        {(!compact || active) && (
+          <button
+            type="button"
+            aria-label={`Close ${label}`}
+            className="flex size-4 shrink-0 items-center justify-center rounded hover:bg-muted"
+            onClick={onClose}
+          >
+            <XIcon className="size-3" />
+          </button>
+        )}
+      </div>
+    </OpenTabMenu>
   );
 }
 
@@ -424,11 +557,29 @@ function NewTabMenu({
 // or flex-1: the parent viewport scrolls the open tabs.
 // ---------------------------------------------------------------------------
 
+/** The inline close button an icon-only file or shell tab shows while active. */
+function CompactTabCloseButton({ label, onClose }: { label: string; onClose: () => void }) {
+  return (
+    <button
+      type="button"
+      aria-label={`Close ${label}`}
+      className="flex size-4 items-center justify-center rounded hover:bg-muted"
+      onClick={(event) => {
+        event.stopPropagation();
+        onClose();
+      }}
+    >
+      <XIcon className="size-3" />
+    </button>
+  );
+}
+
 function FileTabsStrip({
   openFiles,
   activeFilePath,
   onFileSelect,
   onCloseFile,
+  closeActionsFor,
 }: {
   /** Ordered list of open file paths. */
   openFiles: string[];
@@ -438,7 +589,10 @@ function FileTabsStrip({
   onFileSelect: (path: string) => void;
   /** Close a tab by path. */
   onCloseFile: (path: string) => void;
+  /** Bulk close commands for the tab with this strip key (``file:<path>``). */
+  closeActionsFor: (key: string) => OpenTabCloseActions;
 }) {
+  const compact = useCompactWorkspaceTabs();
   // Scroll the active tab into view when it changes (e.g. a newly opened file
   // appended past the visible edge).
   const activeTabRef = useRef<HTMLDivElement | null>(null);
@@ -450,69 +604,81 @@ function FileTabsStrip({
   // phantom gap before the next element.
   if (openFiles.length === 0) return null;
   return (
-    <div className="flex items-center gap-0.5">
+    <div className="contents">
       {openFiles.map((path) => {
         const name = path.split("/").pop() ?? path;
         const active = path === activeFilePath;
         return (
-          <div
+          <OpenTabMenu
             key={path}
-            ref={active ? activeTabRef : undefined}
-            role="button"
-            tabIndex={0}
-            aria-current={active}
-            title={path}
-            onClick={() => onFileSelect(path)}
-            onAuxClick={(e) => {
-              // Middle click (button 1) closes the tab, matching browser /
-              // editor tab conventions.
-              if (e.button === 1) {
-                e.preventDefault();
-                onCloseFile(path);
-              }
-            }}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault();
-                onFileSelect(path);
-              }
-            }}
-            className={cn(
-              // Match the fixed TabsTrigger pill's box metrics (h-24 / px-8 /
-              // rounded-8 / 13px medium) so file tabs and Files/Terminals tabs
-              // are the same height and the active chip lines up across both
-              // sets. `group/tab` drives the hover-revealed close overlay below.
-              // `overflow-hidden` clips the hover-close gradient overlay to the
-              // pill's rounded corners so its rectangular edges can't poke out.
-              "group/tab relative flex h-[24px] min-w-0 max-w-[320px] shrink-0 cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-md px-2 text-ui font-medium leading-5 transition-colors",
-              active
-                ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
-                : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
-            )}
+            label={path}
+            actions={{ ...closeActionsFor(`file:${path}`), close: () => onCloseFile(path) }}
           >
-            <FileIcon className="size-4 shrink-0" />
-            <span className="min-w-0 truncate">{name}</span>
-            {/* Close button: hidden until hover, then revealed over a gradient
+            <div
+              ref={active ? activeTabRef : undefined}
+              role="button"
+              tabIndex={0}
+              aria-current={active}
+              title={compact ? undefined : path}
+              onClick={() => onFileSelect(path)}
+              onAuxClick={(e) => {
+                // Middle click (button 1) closes the tab, matching browser /
+                // editor tab conventions.
+                if (e.button === 1) {
+                  e.preventDefault();
+                  onCloseFile(path);
+                }
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" || e.key === " ") {
+                  e.preventDefault();
+                  onFileSelect(path);
+                }
+              }}
+              className={cn(
+                // Match the fixed TabsTrigger pill's box metrics (h-24 / px-8 /
+                // rounded-8 / 13px medium) so file tabs and Files/Terminals tabs
+                // are the same height and the active chip lines up across both
+                // sets. `group/tab` drives the hover-revealed close overlay below.
+                // `overflow-hidden` clips the hover-close gradient overlay to the
+                // pill's rounded corners so its rectangular edges can't poke out.
+                "group/tab relative flex h-[24px] max-w-[320px] cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-md px-2 text-ui font-medium leading-5 transition-colors",
+                compact ? COMPACT_OPEN_TAB_SIZE_CLASS : OPEN_TAB_SIZE_CLASS,
+                active
+                  ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
+                  : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
+              )}
+            >
+              <FileIcon className="size-4 shrink-0" />
+              {compact ? (
+                active && <CompactTabCloseButton label={name} onClose={() => onCloseFile(path)} />
+              ) : (
+                <span className="min-w-0 truncate">{name}</span>
+              )}
+              {/* Close button: hidden until hover, then revealed over a gradient
                 that fades the truncated filename into the tab's background so
                 the "x" never collides with the text. The overlay only shows on
                 hover, where both active and inactive tabs share the same OPAQUE
                 selection surface — fade to that exact color. (A translucent
                 fade like var(--muted) would stack over the hover background and
                 darken the right edge into a visible gradient patch.) */}
-            <span className="absolute inset-y-0 right-0 flex items-center pl-[12px] pr-[4px] opacity-0 transition-opacity group-hover/tab:opacity-100 [background:linear-gradient(to_right,transparent,color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))_40%)]">
-              <button
-                type="button"
-                aria-label={`Close ${name}`}
-                className="flex size-6 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onCloseFile(path);
-                }}
-              >
-                <XIcon className="size-4" />
-              </button>
-            </span>
-          </div>
+              {!compact && (
+                <span className="absolute inset-y-0 right-0 flex items-center pl-[12px] pr-[4px] opacity-0 transition-opacity group-hover/tab:opacity-100 [background:linear-gradient(to_right,transparent,color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))_40%)]">
+                  <button
+                    type="button"
+                    aria-label={`Close ${name}`}
+                    className="flex size-6 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onCloseFile(path);
+                    }}
+                  >
+                    <XIcon className="size-4" />
+                  </button>
+                </span>
+              )}
+            </div>
+          </OpenTabMenu>
         );
       })}
     </div>
@@ -536,6 +702,7 @@ function TerminalTabsStrip({
   labelFor,
   onSelect,
   onClose,
+  closeActionsFor,
 }: {
   /** Ordered list of open terminal tab keys. */
   openTerminals: string[];
@@ -552,7 +719,10 @@ function TerminalTabsStrip({
   onSelect: (key: string) => void;
   /** Close a terminal tab by key. */
   onClose: (key: string) => void;
+  /** Bulk close commands for the tab with this key. */
+  closeActionsFor: (key: string) => OpenTabCloseActions;
 }) {
+  const compact = useCompactWorkspaceTabs();
   const activeTabRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     scrollTabIntoView(activeTabRef.current);
@@ -562,62 +732,76 @@ function TerminalTabsStrip({
   // phantom gap before the next element (e.g. the trailing "+").
   if (openTerminals.length === 0) return null;
   return (
-    <div className="flex items-center gap-0.5">
+    <div className="contents">
       {openTerminals.map((key) => {
         const name = labelFor(key);
         const active = key === activeTerminalKey;
         const closing = key === closingKey;
         return (
-          <div
+          <OpenTabMenu
             key={key}
-            ref={active ? activeTabRef : undefined}
-            role="button"
-            tabIndex={closing ? -1 : 0}
-            aria-current={active}
-            aria-busy={closing}
-            title={name}
-            onClick={() => !closing && onSelect(key)}
-            onAuxClick={(e) => {
-              if (e.button === 1 && !closing && canClose) {
-                e.preventDefault();
-                onClose(key);
-              }
+            label={name}
+            actions={{
+              ...closeActionsFor(key),
+              close: canClose && !closing ? () => onClose(key) : undefined,
             }}
-            onKeyDown={(e) => {
-              if (!closing && (e.key === "Enter" || e.key === " ")) {
-                e.preventDefault();
-                onSelect(key);
-              }
-            }}
-            className={cn(
-              // Match FileTabsStrip's pill metrics (h-24 / px-8 / rounded-md)
-              // so shell and file tabs line up in the same strip.
-              "group/tab relative flex h-[24px] min-w-0 max-w-[320px] shrink-0 cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-md px-2 text-ui font-medium leading-5 transition-colors",
-              active
-                ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
-                : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
-              // Closing: kill is in flight — dim and freeze the tab until it goes.
-              closing && "pointer-events-none opacity-50",
-            )}
           >
-            <TerminalIcon className="size-4 shrink-0" />
-            <span className="min-w-0 truncate text-sm">{name}</span>
-            {canClose && (
-              <span className="absolute inset-y-0 right-0 flex items-center pl-[12px] pr-[4px] opacity-0 transition-opacity group-hover/tab:opacity-100 [background:linear-gradient(to_right,transparent,color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))_40%)]">
-                <button
-                  type="button"
-                  aria-label={`Close ${name}`}
-                  className="flex size-6 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onClose(key);
-                  }}
-                >
-                  <XIcon className="size-4" />
-                </button>
-              </span>
-            )}
-          </div>
+            <div
+              ref={active ? activeTabRef : undefined}
+              role="button"
+              tabIndex={closing ? -1 : 0}
+              aria-current={active}
+              aria-busy={closing}
+              title={compact ? undefined : name}
+              onClick={() => !closing && onSelect(key)}
+              onAuxClick={(e) => {
+                if (e.button === 1 && !closing && canClose) {
+                  e.preventDefault();
+                  onClose(key);
+                }
+              }}
+              onKeyDown={(e) => {
+                if (!closing && (e.key === "Enter" || e.key === " ")) {
+                  e.preventDefault();
+                  onSelect(key);
+                }
+              }}
+              className={cn(
+                // Match FileTabsStrip's pill metrics (h-24 / px-8 / rounded-md)
+                // so shell and file tabs line up in the same strip.
+                "group/tab relative flex h-[24px] max-w-[320px] cursor-pointer items-center justify-center gap-[6px] overflow-hidden rounded-md px-2 text-ui font-medium leading-5 transition-colors",
+                compact ? COMPACT_OPEN_TAB_SIZE_CLASS : OPEN_TAB_SIZE_CLASS,
+                active
+                  ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
+                  : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
+                // Closing: kill is in flight — dim and freeze the tab until it goes.
+                closing && "pointer-events-none opacity-50",
+              )}
+            >
+              <TerminalIcon className="size-4 shrink-0" />
+              {compact ? (
+                active &&
+                canClose && <CompactTabCloseButton label={name} onClose={() => onClose(key)} />
+              ) : (
+                <span className="min-w-0 truncate text-sm">{name}</span>
+              )}
+              {canClose && !compact && (
+                <span className="absolute inset-y-0 right-0 flex items-center pl-[12px] pr-[4px] opacity-0 transition-opacity group-hover/tab:opacity-100 [background:linear-gradient(to_right,transparent,color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))_40%)]">
+                  <button
+                    type="button"
+                    aria-label={`Close ${name}`}
+                    className="flex size-6 items-center justify-center rounded-full text-muted-foreground transition-colors hover:bg-muted hover:text-foreground"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onClose(key);
+                    }}
+                  >
+                    <XIcon className="size-4" />
+                  </button>
+                </span>
+              )}
+            </div>
+          </OpenTabMenu>
         );
       })}
     </div>
@@ -779,6 +963,8 @@ interface WorkspacePanelProps {
   closingTerminalKey?: string | null;
   /** Close a single open shell tab by key. */
   onCloseTerminal: (key: string) => void;
+  /** Close several shell tabs at once, behind a single confirmation. */
+  onCloseTerminals: (keys: string[]) => void;
   /** Whether the rail is maximized (occupies the full content area). */
   maximized: boolean;
   /** Toggle the rail's maximized state. */
@@ -926,6 +1112,7 @@ function WorkspacePanelImpl({
   autoFocusSelectedTerminal = false,
   closingTerminalKey,
   onCloseTerminal,
+  onCloseTerminals,
   maximized,
   onToggleMaximized,
   permissionLevel,
@@ -970,6 +1157,8 @@ function WorkspacePanelImpl({
   const { browserSelected, sideChatSelected } = activeView;
   const terminalShown = activeView.terminalKey !== null;
   const returnPointRef = useRef<ReturnPoint | null>(null);
+  // Set when the user closes a tab, so closing the last one hides the rail (see below).
+  const userClosedTabRef = useRef(false);
   // The latest returnFrom, so a close that finishes later uses the tabs open by then.
   const returnFromRef = useRef<(point: ReturnPoint) => void>(() => {});
   // Bumped when the session changes or this rail unmounts, so late work can tell it left.
@@ -992,6 +1181,7 @@ function WorkspacePanelImpl({
   const closeBrowserTab = async (tabId: string) => {
     const viewId = browserViewId(conversationId, tabId);
     if (closingBrowserViews.has(viewId)) return;
+    userClosedTabRef.current = true;
     closingBrowserViews.add(viewId);
     const order = nextCloseOrder();
     const returnPoint = returnPointRef.current?.tabId === tabId ? returnPointRef.current : null;
@@ -1305,31 +1495,42 @@ function WorkspacePanelImpl({
     );
   };
   const selectedSideChatPane = renderSelectedSideChatPane();
-  const closeSideChat = (childId: string) => stopSideChat(childId, () => sideChats.close(childId));
+  const closeSideChat = (childId: string) =>
+    stopSideChat(childId, () => {
+      userClosedTabRef.current = true;
+      sideChats.close(childId);
+    });
 
   // Closing the file on screen asks its viewer first, which confirms before
   // dropping edits it hasn't saved. Other file tabs have no mounted editor.
   // Memoized so FileViewer's Escape-to-close effect doesn't re-subscribe its
   // window keydown listener on every render — an inline arrow would change
   // identity each render and thrash the effect's add/remove cycle.
+  // Closes a file tab without asking its viewer about unsaved edits.
+  const closeFileNow = useCallback(
+    (path: string) => {
+      userClosedTabRef.current = true;
+      rememberClosedTab(conversationId, { kind: "file", path });
+      onCloseFile(path);
+    },
+    [conversationId, onCloseFile],
+  );
   const closeFile = useCallback(
     (path: string) => {
-      const close = () => {
-        rememberClosedTab(conversationId, { kind: "file", path });
-        onCloseFile(path);
-      };
+      const close = () => closeFileNow(path);
       if (path === selectedFilePath && guardFileNavigation) {
         guardFileNavigation(null, undefined, close);
       } else {
         close();
       }
     },
-    [conversationId, guardFileNavigation, onCloseFile, selectedFilePath],
+    [closeFileNow, guardFileNavigation, selectedFilePath],
   );
   const handleCloseTab = useCallback(() => {
     if (selectedFilePath !== null) closeFile(selectedFilePath);
   }, [closeFile, selectedFilePath]);
   const closePanel = (tab: DefaultWorkspaceTab) => {
+    userClosedTabRef.current = true;
     rememberClosedTab(conversationId, { kind: "panel", tab });
     onClosePanel(tab);
   };
@@ -1359,10 +1560,35 @@ function WorkspacePanelImpl({
   ];
   const unpinnedTabs = availablePanels.filter((tab) => !pinnedTabs.includes(tab));
   const visibleOpenPanels = openPanels.filter((tab) => unpinnedTabs.includes(tab));
-  const activePanelRef = useRef<HTMLButtonElement | null>(null);
+  const closeTerminal = (key: string) => {
+    userClosedTabRef.current = true;
+    onCloseTerminal(key);
+  };
+  const activePanelRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     scrollTabIntoView(activePanelRef.current);
   }, [rightRailTab]);
+  const openTabCount =
+    visibleOpenPanels.length +
+    openFiles.length +
+    openTerminals.length +
+    (showBrowserTab ? browsers.tabs.length : 0) +
+    sideChats.tabs.length;
+  // Closing the last open tab hides the rail rather than falling back to a fixed page.
+  // Tabs leaving any other way (a session switch, an agent closing its browser) don't.
+  const tabCountRef = useRef({ conversationId, count: openTabCount });
+  useEffect(() => {
+    const previous = tabCountRef.current;
+    tabCountRef.current = { conversationId, count: openTabCount };
+    if (previous.conversationId !== conversationId || openTabCount > previous.count) {
+      userClosedTabRef.current = false;
+      return;
+    }
+    if (openTabCount === 0 && previous.count > 0 && userClosedTabRef.current) {
+      userClosedTabRef.current = false;
+      onHide?.();
+    }
+  }, [conversationId, openTabCount, onHide]);
   const showOpenTabs =
     !pending &&
     (visibleOpenPanels.length > 0 ||
@@ -1555,7 +1781,7 @@ function WorkspacePanelImpl({
         // Viewers can't close shells; the tab shows no close button for them either.
         if (!isEditorLevel(permissionLevel)) return true;
         // A terminal already closing gets no second request.
-        if (closingTerminalKey !== selectedTerminalKey) onCloseTerminal(selectedTerminalKey);
+        if (closingTerminalKey !== selectedTerminalKey) closeTerminal(selectedTerminalKey);
       } else if (selectedFilePath !== null) {
         handleCloseTab();
       } else if (scopeView === "sidechat" && sideChats.selected !== null) {
@@ -1628,6 +1854,64 @@ function WorkspacePanelImpl({
     if (target.key.startsWith("file:")) show();
     else leaveFileRef.current(null, show);
   };
+  // Tabs that "Close other tabs" and "Close all tabs" close, in strip order. Shells
+  // kill their processes, so they close together after one confirmation.
+  const canCloseShells = isEditorLevel(permissionLevel);
+  const bulkClosableTabs: { key: string; closeNow: () => void; shell?: true }[] = [
+    ...visibleOpenPanels.map((tab) => ({ key: tab, closeNow: () => closePanel(tab) })),
+    ...openFiles.map((path) => ({ key: `file:${path}`, closeNow: () => closeFileNow(path) })),
+    ...(canCloseShells ? openTerminals : [])
+      .filter((key) => key !== closingTerminalKey)
+      .map((key) => ({ key, closeNow: () => {}, shell: true as const })),
+    ...(showBrowserTab ? browsers.tabs : []).map((tabId) => ({
+      key: `browser:${tabId}`,
+      closeNow: () => void closeBrowserTab(tabId),
+    })),
+    ...sideChats.tabs.map((childId) => ({
+      key: `sidechat:${childId}`,
+      closeNow: () => void closeSideChat(childId),
+    })),
+  ];
+  // The tab a bulk close keeps, selected once the closed tabs (and any file viewer among
+  // them) have left the screen, so opening it doesn't ask about the closed file again.
+  const [pendingSelectKey, setPendingSelectKey] = useState<string | null>(null);
+  const panelOptionsRef = useRef(panelOptions);
+  panelOptionsRef.current = panelOptions;
+  useEffect(() => {
+    if (pendingSelectKey === null) return;
+    setPendingSelectKey(null);
+    const option = panelOptionsRef.current.find((candidate) => candidate.key === pendingSelectKey);
+    if (option && !option.active) option.select();
+  }, [pendingSelectKey]);
+  // Closes every bulk-closable tab except `keepKey`, which is then shown.
+  const closeTabsExcept = (keepKey: string | null) => {
+    const closing = bulkClosableTabs.filter((tab) => tab.key !== keepKey);
+    if (closing.length === 0) return;
+    const commit = () => {
+      const shellKeys: string[] = [];
+      for (const tab of closing) {
+        if (tab.shell) shellKeys.push(tab.key);
+        else tab.closeNow();
+      }
+      if (shellKeys.length > 0) {
+        userClosedTabRef.current = true;
+        onCloseTerminals(shellKeys);
+      }
+      setPendingSelectKey(keepKey);
+    };
+    // The file on screen confirms unsaved edits once for the whole batch.
+    const closesShownFile =
+      selectedFilePath !== null && closing.some((tab) => tab.key === `file:${selectedFilePath}`);
+    if (closesShownFile) leaveFileRef.current(null, commit);
+    else commit();
+  };
+  const closeActionsFor = (key: string): OpenTabCloseActions => ({
+    closeOthers: bulkClosableTabs.some((tab) => tab.key !== key)
+      ? () => closeTabsExcept(key)
+      : undefined,
+    closeAll: bulkClosableTabs.length > 0 ? () => closeTabsExcept(null) : undefined,
+  });
+  const activeTabKey = panelOptions.find((option) => option.active)?.key ?? null;
   // The session and what its rail shows, apart from the browser tab a reopen selects itself.
   const railView = [
     conversationId,
@@ -1821,50 +2105,24 @@ function WorkspacePanelImpl({
           {showOpenTabs && (
             <>
               {/* Open tabs fill the space before the pinned trailing controls. */}
-              <WorkspaceTabsScroller>
+              <WorkspaceTabsScroller tabCount={openTabCount}>
                 {visibleOpenPanels.map((tab) => {
-                  const { label, icon: Icon } = WORKSPACE_PANEL_TABS[tab];
+                  const { label, icon } = WORKSPACE_PANEL_TABS[tab];
                   const active =
                     rightRailTab === tab &&
                     selectedFilePath === null &&
                     selectedTerminalKey === null;
                   return (
-                    <div
+                    <OpenTab
                       key={tab}
-                      className={cn(
-                        "flex h-[24px] shrink-0 items-center gap-[6px] rounded-md px-2 text-ui font-medium leading-5 transition-colors",
-                        active
-                          ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
-                          : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
-                      )}
-                    >
-                      <button
-                        ref={active ? activePanelRef : null}
-                        type="button"
-                        role="tab"
-                        aria-label={label}
-                        aria-selected={active}
-                        className="flex items-center gap-1"
-                        onClick={() => selectPermanentTab(tab)}
-                        onAuxClick={(event) => {
-                          if (event.button === 1) {
-                            event.preventDefault();
-                            closePanel(tab);
-                          }
-                        }}
-                      >
-                        <Icon className="size-4" />
-                        {label}
-                      </button>
-                      <button
-                        type="button"
-                        aria-label={`Close ${label}`}
-                        className="flex size-4 items-center justify-center rounded hover:bg-muted"
-                        onClick={() => closePanel(tab)}
-                      >
-                        <XIcon className="size-3" />
-                      </button>
-                    </div>
+                      label={label}
+                      icon={icon}
+                      active={active}
+                      tabRef={active ? activePanelRef : undefined}
+                      onSelect={() => selectPermanentTab(tab)}
+                      onClose={() => closePanel(tab)}
+                      closeActions={closeActionsFor(tab)}
+                    />
                   );
                 })}
                 <FileTabsStrip
@@ -1872,6 +2130,7 @@ function WorkspacePanelImpl({
                   activeFilePath={selectedFilePath}
                   onFileSelect={openFileViewer}
                   onCloseFile={closeFile}
+                  closeActionsFor={closeActionsFor}
                 />
                 <TerminalTabsStrip
                   openTerminals={openTerminals}
@@ -1880,94 +2139,48 @@ function WorkspacePanelImpl({
                   canClose={isEditorLevel(permissionLevel)}
                   labelFor={terminalLabelFor}
                   onSelect={openTerminalTab}
-                  onClose={onCloseTerminal}
+                  onClose={closeTerminal}
+                  closeActionsFor={closeActionsFor}
                 />
                 {showBrowserTab &&
-                  browsers.tabs.map((tabId, index) => (
-                    <div
-                      key={tabId}
-                      ref={browserSelected && browsers.selected === tabId ? activeBrowserRef : null}
-                      className={cn(
-                        "flex h-[24px] shrink-0 items-center gap-[6px] rounded-md px-2 text-ui font-medium leading-5 transition-colors",
-                        browserSelected && browsers.selected === tabId
-                          ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
-                          : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
-                      )}
-                    >
-                      <button
-                        type="button"
-                        role="tab"
-                        aria-selected={browserSelected && browsers.selected === tabId}
-                        title={browsers.labelFor(tabId, index)}
-                        className="flex min-w-0 items-center gap-1"
-                        onAuxClick={(event) => {
-                          if (event.button === 1) {
-                            event.preventDefault();
-                            void closeBrowserTab(tabId);
-                          }
-                        }}
-                        onClick={() => {
+                  browsers.tabs.map((tabId, index) => {
+                    const active = browserSelected && browsers.selected === tabId;
+                    return (
+                      <OpenTab
+                        key={tabId}
+                        label={browsers.labelFor(tabId, index)}
+                        icon={GlobeIcon}
+                        active={active}
+                        tabRef={active ? activeBrowserRef : undefined}
+                        labelClassName="max-w-44"
+                        onSelect={() => {
                           browsers.select(tabId);
                           onRightRailTabChange("browser");
                         }}
-                      >
-                        <GlobeIcon className="size-4 shrink-0" />
-                        <span className="max-w-44 truncate">{browsers.labelFor(tabId, index)}</span>
-                      </button>
-                      <button
-                        type="button"
-                        aria-label={`Close ${browsers.labelFor(tabId, index)}`}
-                        className="flex size-4 items-center justify-center rounded hover:bg-muted"
-                        onClick={() => void closeBrowserTab(tabId)}
-                      >
-                        <XIcon className="size-3" />
-                      </button>
-                    </div>
-                  ))}
+                        onClose={() => void closeBrowserTab(tabId)}
+                        closeActions={closeActionsFor(`browser:${tabId}`)}
+                      />
+                    );
+                  })}
                 {sideChats.tabs.map((childId) => {
                   const active = sideChatSelected && sideChats.selected === childId;
-                  const label = chatTabLabels[childId] ?? childId;
-                  const TabIcon =
-                    subagentSessionIdFromTab(childId) === null ? MessagesSquareIcon : BotIcon;
                   return (
-                    <div
+                    <OpenTab
                       key={childId}
-                      ref={active ? activeSideChatRef : null}
-                      className={cn(
-                        "flex h-[24px] shrink-0 items-center gap-[6px] rounded-md px-2 text-ui font-medium leading-5 transition-colors",
-                        active
-                          ? "bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] text-foreground"
-                          : "text-muted-foreground hover:bg-[color-mix(in_srgb,var(--muted-foreground)_15%,var(--card))] hover:text-foreground",
-                      )}
-                    >
-                      <button
-                        type="button"
-                        role="tab"
-                        aria-selected={active}
-                        className="flex items-center gap-1"
-                        onAuxClick={(event) => {
-                          if (event.button === 1) {
-                            event.preventDefault();
-                            closeSideChat(childId);
-                          }
-                        }}
-                        onClick={() => {
-                          sideChats.select(childId);
-                          onRightRailTabChange("sidechat");
-                        }}
-                      >
-                        <TabIcon className="size-4 shrink-0" />
-                        <span className="max-w-[16ch] truncate">{label}</span>
-                      </button>
-                      <button
-                        type="button"
-                        aria-label={`Close ${label}`}
-                        className="flex size-4 items-center justify-center rounded hover:bg-muted"
-                        onClick={() => closeSideChat(childId)}
-                      >
-                        <XIcon className="size-3" />
-                      </button>
-                    </div>
+                      label={chatTabLabels[childId] ?? childId}
+                      icon={
+                        subagentSessionIdFromTab(childId) === null ? MessagesSquareIcon : BotIcon
+                      }
+                      active={active}
+                      tabRef={active ? activeSideChatRef : undefined}
+                      labelClassName="max-w-[16ch]"
+                      onSelect={() => {
+                        sideChats.select(childId);
+                        onRightRailTabChange("sidechat");
+                      }}
+                      onClose={() => void closeSideChat(childId)}
+                      closeActions={closeActionsFor(`sidechat:${childId}`)}
+                    />
                   );
                 })}
               </WorkspaceTabsScroller>
@@ -2028,6 +2241,20 @@ function WorkspacePanelImpl({
                       {option.active && <CheckIcon className="size-4" aria-hidden />}
                     </DropdownMenuItem>
                   ))}
+                  {bulkClosableTabs.length > 0 && (
+                    <>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem
+                        disabled={!bulkClosableTabs.some((tab) => tab.key !== activeTabKey)}
+                        onSelect={() => closeTabsExcept(activeTabKey)}
+                      >
+                        Close other tabs
+                      </DropdownMenuItem>
+                      <DropdownMenuItem onSelect={() => closeTabsExcept(null)}>
+                        Close all tabs
+                      </DropdownMenuItem>
+                    </>
+                  )}
                 </DropdownMenuContent>
               </DropdownMenu>
             )}

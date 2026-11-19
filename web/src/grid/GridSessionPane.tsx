@@ -234,8 +234,10 @@ export function GridSessionPane({
   }, [sessionId]);
   const deleteTerminal = useDeleteTerminal(sessionId);
   const closingTerminal = terminals.find((terminal) => terminal.id === deleteTerminal.variables);
-  const [pendingClose, setPendingClose] = useState<string | null>(null);
-  const terminalToClose = terminals.find((terminal) => terminalTabKey(terminal) === pendingClose);
+  const [pendingClose, setPendingClose] = useState<string[] | null>(null);
+  const terminalsToClose = terminals.filter((terminal) =>
+    pendingClose?.includes(terminalTabKey(terminal)),
+  );
   const [workspace, setWorkspace] = useState<SessionWorkspaceState>(() => {
     const saved = readSessionWorkspaceState(sessionId);
     return {
@@ -516,16 +518,19 @@ export function GridSessionPane({
           )}
           <CloseShellDialog
             open={pendingClose !== null}
-            shellLabel={terminalToClose?.name ?? null}
+            shellCount={pendingClose?.length}
+            shellLabel={terminalsToClose.length === 1 ? terminalsToClose[0].name : null}
             onCancel={() => setPendingClose(null)}
             onConfirm={() => {
-              if (terminalToClose)
-                deleteTerminal.mutate(terminalToClose.id, {
+              for (const terminal of terminalsToClose) {
+                const key = terminalTabKey(terminal);
+                deleteTerminal.mutate(terminal.id, {
                   onSuccess: () => {
-                    if (workspace.selectedTerminalKey === pendingClose)
+                    if (workspace.selectedTerminalKey === key)
                       updateWorkspace({ selectedTerminalKey: null });
                   },
                 });
+              }
               setPendingClose(null);
             }}
           />
@@ -594,7 +599,8 @@ export function GridSessionPane({
                     ? terminalTabKey(closingTerminal)
                     : null
                 }
-                onCloseTerminal={setPendingClose}
+                onCloseTerminal={(key) => setPendingClose([key])}
+                onCloseTerminals={(keys) => keys.length > 0 && setPendingClose(keys)}
                 maximized={selected && workspacePanel.maximized}
                 permissionLevel={permissionLevel}
                 filesPanelSort={sort}

@@ -991,7 +991,7 @@ function AppShellImpl() {
   const deleteTerminalMutation = useDeleteTerminal(conversationId ?? "");
   // Tab key awaiting a close confirmation, or null. Closing a tab kills the
   // terminal, so a user-initiated close routes through a confirm modal first.
-  const [terminalPendingClose, setTerminalPendingClose] = useState<string | null>(null);
+  const [terminalPendingClose, setTerminalPendingClose] = useState<string[] | null>(null);
   // While a close is in flight, grey the tab being killed so the delay between
   // confirming and the tab disappearing (the DELETE round-trip + its
   // ``resource.deleted``) reads as "closing", not frozen.
@@ -2243,15 +2243,18 @@ function AppShellImpl() {
   );
   const closeWorkspacePanel = useCallback(
     (tab: DefaultWorkspaceTab) => {
-      const remaining = openPanels.filter((panel) => panel !== tab);
-      setOpenPanels(remaining);
-      if (rightRailTab === tab) {
-        setRightRailTab(
-          remaining.filter((panel) => railTabsAvailable[panel]).at(-1) ?? fallbackWorkspaceTab,
+      // Functional updates, so closing several panels in one pass drops them all.
+      setOpenPanels((previous) => {
+        const remaining = previous.filter((panel) => panel !== tab);
+        setRightRailTab((current) =>
+          current === tab
+            ? (remaining.filter((panel) => railTabsAvailable[panel]).at(-1) ?? fallbackWorkspaceTab)
+            : current,
         );
-      }
+        return remaining;
+      });
     },
-    [openPanels, rightRailTab, fallbackWorkspaceTab, railTabsAvailable],
+    [fallbackWorkspaceTab, railTabsAvailable],
   );
 
   // Auto-open a Browser soft tab on a `navigate` action — agent-issued
@@ -2538,7 +2541,11 @@ function AppShellImpl() {
   // User clicked a tab's "x". Closing a tab kills the underlying terminal, so
   // confirm first rather than acting immediately.
   const requestCloseTerminal = useCallback((key: string) => {
-    setTerminalPendingClose(key);
+    setTerminalPendingClose([key]);
+  }, []);
+  // A bulk tab close asks once for all of its shells.
+  const requestCloseTerminals = useCallback((keys: string[]) => {
+    if (keys.length > 0) setTerminalPendingClose(keys);
   }, []);
   // Confirmed close: kill the terminal (DELETE). The `session.resource.deleted`
   // delta + the mutation's cache prune drop it from the list, so its tab
@@ -2546,18 +2553,24 @@ function AppShellImpl() {
   // previous, else the next) so the rail doesn't snap back to Files; when none
   // remain the selection clears.
   const confirmCloseTerminal = useCallback(() => {
-    const key = terminalPendingClose;
-    if (key === null) return;
+    const keys = terminalPendingClose;
+    if (keys === null) return;
     setTerminalPendingClose(null);
     setSelectedTerminalKey((active) => {
-      if (active !== key) return active;
-      const idx = openTerminals.indexOf(key);
-      const remaining = openTerminals.filter((k) => k !== key);
-      if (remaining.length === 0) return null;
-      return remaining[idx - 1] ?? remaining[idx] ?? remaining[0];
+      if (active === null || !keys.includes(active)) return active;
+      const idx = openTerminals.indexOf(active);
+      const kept = (key: string) => !keys.includes(key);
+      return (
+        openTerminals.slice(0, Math.max(idx, 0)).findLast(kept) ??
+        openTerminals.slice(idx + 1).find(kept) ??
+        null
+      );
     });
-    const info = terminals.find((t) => terminalTabKey(t) === key);
-    if (info && conversationId) deleteTerminalMutation.mutate(info.id);
+    if (!conversationId) return;
+    for (const key of keys) {
+      const info = terminals.find((t) => terminalTabKey(t) === key);
+      if (info) deleteTerminalMutation.mutate(info.id);
+    }
   }, [terminalPendingClose, openTerminals, terminals, conversationId, deleteTerminalMutation]);
 
   // The active shell selection is sticky: it changes only on explicit user
@@ -3359,6 +3372,7 @@ function AppShellImpl() {
                     }
                     closingTerminalKey={closingTerminalKey}
                     onCloseTerminal={requestCloseTerminal}
+                    onCloseTerminals={requestCloseTerminals}
                     maximized={rightPanelMaximized}
                     onToggleMaximized={toggleRightPanelMaximized}
                     permissionLevel={permissionLevel}
@@ -3461,9 +3475,10 @@ function AppShellImpl() {
           )}
           <CloseShellDialog
             open={terminalPendingClose !== null}
+            shellCount={terminalPendingClose?.length}
             shellLabel={(() => {
-              if (terminalPendingClose === null) return null;
-              const info = terminals.find((t) => terminalTabKey(t) === terminalPendingClose);
+              if (terminalPendingClose?.length !== 1) return null;
+              const info = terminals.find((t) => terminalTabKey(t) === terminalPendingClose[0]);
               if (!info) return null;
               return terminalDisplayLabel(info);
             })()}
