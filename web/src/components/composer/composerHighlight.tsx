@@ -108,7 +108,7 @@ export interface ShellSendContext {
   quotes?: readonly unknown[];
 }
 
-/** Why shell input can't carry `context`, or null: its tags and review comments reach the shell. */
+/** Why shell input can't carry `context`, or null: tags, quotes and review comments reach the shell. */
 function shellSendRefusal(context: ShellSendContext): string | null {
   if (context.mentions.length > 0) return SHELL_MENTION_REFUSAL;
   if ((context.quotes?.length ?? 0) > 0) return SHELL_QUOTE_REFUSAL;

@@ -167,8 +167,8 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   leading whitespace and treats `!!` as text). States: known or unknown
   command; quotes or attachments (no tint); shell mode; refused shell send,
   with the reason as the hint and the draft kept (an @-tag, review comments, a
-  reply quote, or a Codex non-owner, whom the server would reject); permission still loading or
-  a pending side-chat tab (no shell mode). See the [native shell
+  reply quote, or a Codex non-owner, whom the server would reject); permission
+  still loading or a pending side-chat tab (no shell mode). See the [native shell
   recipes](native-harnesses.md#driving-it-with-the-repro-environment).
 - `goal-command`: in sessions with a Goal control, bare `/goal` or its slash-menu
   row opens the same dialog as **+ → Goal**. `/goal <objective>` keeps its
