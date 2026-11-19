@@ -2119,6 +2119,43 @@ def test_init_restart_after_failure_is_terminal_with_previous_attempt_log(
     assert "could not resolve host: git.example.invalid" in message
 
 
+def test_running_retry_progress_does_not_hide_the_failed_attempt(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The failed attempt's error is the tail even while the retry prints progress.
+
+    The retry has already written a progress line, which must not stand in for
+    the fatal clone error the previous attempt printed.
+    """
+    core, _batch = fake_clients
+    monkeypatch.setattr(k8s, "_POD_READY_TIMEOUT_S", 0.01)
+    retrying = SimpleNamespace(
+        name="workspace-prep",
+        restart_count=1,
+        state=SimpleNamespace(running=SimpleNamespace(), waiting=None, terminated=None),
+        last_state=SimpleNamespace(terminated=SimpleNamespace(exit_code=128, reason="Error")),
+    )
+    pod = _pod(phase="Pending", init_statuses=[retrying])
+    core.pod_list_items = [pod]
+    core.read_default = pod
+    core.logs["workspace-prep"] = "Cloning into '/home/omnigent/workspace/omnigent'...\n"
+    core.previous_logs["workspace-prep"] = (
+        "fatal: unable to access 'https://github.com/x/y/': Could not resolve host: github.com\n"
+    )
+    with pytest.raises(click.ClickException) as excinfo:
+        _launcher().start_host(
+            "omnigent-job-init-progress",
+            token=_TOKEN,
+            host_id="host_init_progress",
+            host_name="managed-init-progress",
+            server_url="http://srv.example.com",
+        )
+    message = str(excinfo.value)
+    assert "Could not resolve host: github.com" in message
+    assert "Cloning into" not in message
+
+
 def test_init_retry_that_completes_is_not_terminal() -> None:
     """A transient clone failure that the retry recovers from must not fail the launch."""
     recovered = SimpleNamespace(

@@ -1204,6 +1204,26 @@ def _init_container_crash_looping(cs: object) -> bool:
     return last is not None and (getattr(last, "exit_code", 0) or 0) != 0 and restart_count >= 1
 
 
+def _container_failed_attempt(pod: object, name: str) -> bool:
+    """
+    Return whether a container's last attempt exited non-zero.
+
+    A retry that is running or still connecting shows no failure in its current
+    state, so the failed attempt is only visible in ``last_state``.
+
+    :param pod: A ``V1Pod`` read from the API.
+    :param name: The container's name.
+    :returns: ``True`` when ``last_state.terminated`` reports a non-zero exit.
+    """
+    for cs in _all_container_statuses(pod):
+        if getattr(cs, "name", None) != name:
+            continue
+        last = getattr(getattr(cs, "last_state", None), "terminated", None)
+        if last is not None and (getattr(last, "exit_code", 0) or 0) != 0:
+            return True
+    return False
+
+
 def _crash_loop_summary(kind: str, name: str, cs: object) -> str:
     """
     Describe a crash-looping container for the start-failure message.
@@ -1836,7 +1856,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                 container, summary = failure
                 raise click.ClickException(
                     self._pod_failure_message(
-                        namespace, pod_name, summary, log_container=container
+                        namespace, pod_name, summary, log_container=container, pod=pod
                     )
                 )
             phase = _pod_phase(pod)
@@ -1869,6 +1889,7 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         summary: str,
         *,
         log_container: str | None = None,
+        pod: object | None = None,
     ) -> str:
         """
         Build a pod-start failure message with recent events, an optional
@@ -1883,6 +1904,8 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         :param pod_name: The failed Pod.
         :param summary: What went wrong.
         :param log_container: Container whose log tail to append, or ``None``.
+        :param pod: The Pod as last read. When the container's last attempt
+            failed, its log is the tail, not the current attempt's progress.
         :returns: The full error message.
         """
         message = f"Kubernetes sandbox pod '{pod_name}' {summary}."
@@ -1890,7 +1913,10 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         if events:
             message += f" Recent events: {events}"
         if log_container is not None:
-            tail = self._pod_log_tail(namespace, pod_name, log_container).strip()
+            failed_attempt = pod is not None and _container_failed_attempt(pod, log_container)
+            tail = self._pod_log_tail(
+                namespace, pod_name, log_container, failed_attempt=failed_attempt
+            ).strip()
             if tail:
                 message += f" Container '{log_container}' log tail: {tail[-1500:]}"
         message += f" Inspect with `kubectl describe pod {pod_name} -n {namespace}`."
@@ -1924,25 +1950,34 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
                 parts.append(f"{reason or '?'}: {message or ''}".strip())
         return "; ".join(parts)
 
-    def _pod_log_tail(self, namespace: str, pod_name: str, container: str) -> str:
+    def _pod_log_tail(
+        self,
+        namespace: str,
+        pod_name: str,
+        container: str,
+        *,
+        failed_attempt: bool = False,
+    ) -> str:
         """
         Return the last :data:`_LOG_TAIL_LINES` lines of a container's log, or
         empty when unavailable.
 
-        A restarting container's current attempt can be empty while it is still
-        retrying, so the previous attempt's log is the fallback: that is where the
-        failure printed.
+        When the container's last attempt failed, the previous attempt's log is
+        the tail: a retry that is still connecting prints progress that hides the
+        fatal error. Otherwise the current attempt is read, falling back to the
+        previous one when it is still empty.
 
         :param namespace: Namespace the Pod lives in.
         :param pod_name: The Pod to read logs from.
         :param container: The container whose log to tail.
+        :param failed_attempt: Read the failed (previous) attempt first.
         :returns: The log tail, or ``""``.
         """
         from kubernetes.client.rest import ApiException
         from urllib3.exceptions import HTTPError
 
         core = self._load_core()
-        for previous in (None, True):
+        for previous in (True, None) if failed_attempt else (None, True):
             try:
                 log = cast(
                     str,

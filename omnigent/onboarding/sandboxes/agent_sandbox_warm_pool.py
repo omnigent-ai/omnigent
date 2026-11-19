@@ -665,6 +665,7 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
                             pod.metadata.name,
                             summary,
                             log_container=container,
+                            pod=pod,
                         )
                     )
                 if activated_uid is not None and pod.metadata.uid != activated_uid:
