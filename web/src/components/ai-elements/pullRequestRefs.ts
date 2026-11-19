@@ -1,9 +1,5 @@
-// Pull request references (`#1234`, `owner/repo#12`) in chat markdown.
-//
-// A remark pass turns each reference into a link parked on a named fragment;
-// the anchor override resolves it against the session's repo at render time.
-// Parsing can't resolve it: Streamdown never re-parses a settled message when
-// its plugins change, and the session's repo usually loads after first paint.
+// Parks PR references (`#1234`, `owner/repo#12`) on fragment links that the anchor
+// override resolves once session info loads; Streamdown won't re-parse a settled message.
 
 import type { PullRequestInfo } from "@/hooks/usePullRequests";
 
@@ -19,10 +15,8 @@ export interface PullRequestRef {
   number: string;
 }
 
-// The `#` must start a token: `&#1234;`, `a#1234`, `/x#1234` and `##1234` are
-// not references. Bare numbers need 4+ digits so prose like "step #3" stays
-// text; a trailing word character (`#1234abc`) rules the token out. The
-// boundary is a captured prefix, not a lookbehind, which Safari < 16.4 rejects.
+// `#` must start a token; bare numbers need 4+ digits. A captured prefix replaces
+// lookbehind for Safari < 16.4.
 export const PULL_REQUEST_REF =
   /(^|[^\w&/#.-])(?:([A-Za-z0-9][A-Za-z0-9-]{0,38})\/([A-Za-z0-9._-]{1,100}))?#(\d+)(?!\w)/g;
 const BARE_NUMBER = /^[1-9]\d{3,9}$/;
@@ -173,12 +167,8 @@ function canonicalRepo(nameWithOwner: string): string | null {
 }
 
 /**
- * The github.com repo a bare reference in this session points at, or null to
- * leave it as text. It is the workspace's own repo: `repo` names a tracked PR's,
- * which can live in another repo or on another host. Only github.com workspaces
- * link, as an Enterprise repo's name could land on an unrelated (possibly
- * squatted) github.com repo; older servers that don't report the workspace's
- * repo leave references as text.
+ * The workspace's github.com repo for bare references; null leaves them as text
+ * (Enterprise, other forges, older runners).
  */
 export function sessionPullRequestRepo(
   info: PullRequestInfo | undefined,

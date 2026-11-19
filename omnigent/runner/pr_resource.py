@@ -192,12 +192,10 @@ def _keeps_provider_workspace_repo(workspace_repo: Any, preferred: ParsedRemote 
 
 
 def _add_workspace_repo(root: str, info: dict[str, Any]) -> None:
-    """Name the checkout's own repo from a local config read, or vet the provider's.
+    """Name the checkout's own repo from local config, or vet the provider's.
 
-    ``repo`` names a tracked PR's repo, which can differ from the checkout's. In a
-    fork checkout ``origin`` is the fork, so gh's resolved base, then a remote of the
-    tracked repo on origin's host, take precedence over it. An unrecognized preferred
-    remote names no workspace repo.
+    Precedence: gh's resolved base, then a tracked PR's remote on origin's host, then
+    origin. An unrecognized preferred remote names no workspace repo.
     """
 
     def run(argv: list[str]) -> tuple[int | None, str]:
