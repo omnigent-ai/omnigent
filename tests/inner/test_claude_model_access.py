@@ -502,14 +502,49 @@ def test_bundle_sources_include_config_aliases_without_exporting_skills(tmp_path
     access = original.with_bundle_sources(bundle)
     assert set(access.source_paths) == {
         bundle,
-        bundle / "config.yaml",
-        bundle / ".mcp.json",
-        bundle / "linked-config.yaml",
+        exposed,
     }
     assert original.source_paths == ()
     policy = SandboxPolicy("linux_bwrap", True, [], [workspace], [], False)
     with pytest.raises(ValueError, match="outside sandbox"):
         access.protect_sources(policy, workspace)
+
+
+def test_large_bundle_keeps_launcher_and_seatbelt_payload_bounded(tmp_path: Path) -> None:
+    from omnigent.inner.sandbox import _launcher_inline_source
+    from omnigent.inner.seatbelt_sandbox import _build_profile
+
+    bundle = tmp_path / "bundle"
+    documents = bundle / "documents"
+    documents.mkdir(parents=True)
+    for index in range(1600):
+        (documents / f"configuration-{index:04d}.txt").write_text("private")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    access = ClaudeModelAccess("https://model.example.test", "authorization", lambda: "private")
+    access = access.with_bundle_sources(bundle)
+    assert access.source_paths == (bundle,)
+
+    linux_policy = SandboxPolicy("linux_bwrap", True, [], [workspace], [], False)
+    linux_policy = access.protect_sources(linux_policy, workspace)
+    launcher_source = _launcher_inline_source("/bin/true", linux_policy)
+    assert len(launcher_source.encode()) < 32 * 1024
+
+    mac_policy = SandboxPolicy("darwin_seatbelt", True, [], [workspace], [], False)
+    mac_policy = access.protect_sources(mac_policy, workspace)
+    profile = _build_profile(mac_policy, workspace)
+    assert len(profile.encode()) < 64 * 1024
+
+
+def test_bundle_rejects_hardlinked_configuration(tmp_path: Path) -> None:
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    config = bundle / "config.yaml"
+    config.write_text("private")
+    os.link(config, tmp_path / "outside-alias")
+    access = ClaudeModelAccess("https://model.example.test", "authorization", lambda: "private")
+    with pytest.raises(ValueError, match="hard-linked"):
+        access.with_bundle_sources(bundle)
 
 
 @pytest.mark.parametrize(
@@ -555,9 +590,10 @@ def test_bundle_directory_symlink_targets_cannot_be_granted(
     with pytest.raises(ValueError, match="outside sandbox") as error:
         access.protect_sources(policy, cwd)
 
-    assert repr(str(alias)) in str(error.value)
+    assert repr(str(external)) in str(error.value)
     assert repr(str(target)) in str(error.value)
-    assert alias in access.source_paths
+    assert external in access.source_paths
+    assert alias not in access.source_paths
 
 
 def test_create_proxy_requires_upstream_ca_bundle_before_loading_certificates(

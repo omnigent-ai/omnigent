@@ -383,12 +383,15 @@ class ClaudeModelAccess:
             return self
         root = bundle_dir.resolve()
         sources = [root]
-        sources.extend(
-            path
-            for path in root.rglob("*")
-            if (path.is_file() or path.is_symlink())
-            and path.relative_to(root).parts[0] != "skills"
-        )
+        for path in root.rglob("*"):
+            if path.relative_to(root).parts[0] == "skills":
+                continue
+            if path.is_symlink():
+                target = path.resolve()
+                if not target.is_relative_to(root):
+                    sources.append(target)
+            elif path.is_file() and path.stat().st_nlink != 1:
+                raise ValueError("original bundle files must not be hard-linked")
         return replace(self, source_paths=(*self.source_paths, *sources))
 
     def protect_sources(self, policy: SandboxPolicy, cwd: Path) -> SandboxPolicy:
