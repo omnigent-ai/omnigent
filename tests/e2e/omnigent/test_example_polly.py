@@ -24,6 +24,7 @@ from pathlib import Path
 import pytest
 
 from omnigent.spec import load
+from omnigent.spec.parser import parse
 from omnigent.spec.types import AgentSpec
 
 # tests/e2e/omnigent/test_example_polly.py -> repo root is 3 parents up.
@@ -464,3 +465,22 @@ def test_function_policies_have_nonempty_arguments(polly_spec: AgentSpec) -> Non
     # = 3; sub-agents: blast_radius x7 (claude_code, codex, opencode, cursor,
     # hermes, agy, pi) = 7 -> 10 total. Fewer = a policy dropped.
     assert checked == 10, f"expected 10 function policies in the bundle, inspected {checked}"
+
+
+def test_pipeshub_context_is_off_until_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without PIPESHUB_MCP_URL / PIPESHUB_MCP_TOKEN, Polly loads with no
+    PipesHub server, and so does the server's unexpanded built-in parse."""
+    monkeypatch.delenv("PIPESHUB_MCP_URL", raising=False)
+    monkeypatch.delenv("PIPESHUB_MCP_TOKEN", raising=False)
+    assert all(s.name != "pipeshub" for s in load(_POLLY_BUNDLE).mcp_servers)
+    assert all(s.name != "pipeshub" for s in parse(_POLLY_BUNDLE, expand_env=False).mcp_servers)
+
+
+def test_pipeshub_context_loads_read_only_when_configured(monkeypatch: pytest.MonkeyPatch) -> None:
+    """With both variables set, Polly gets PipesHub search and record reads only."""
+    monkeypatch.setenv("PIPESHUB_MCP_URL", "https://pipeshub.example.com/mcp")
+    monkeypatch.setenv("PIPESHUB_MCP_TOKEN", "phpat_test")
+    (server,) = [s for s in load(_POLLY_BUNDLE).mcp_servers if s.name == "pipeshub"]
+    assert server.url == "https://pipeshub.example.com/mcp"
+    assert server.headers == {"Authorization": "Bearer phpat_test"}
+    assert server.tools == ["pipeshub_search", "pipeshub_get_record_content"]

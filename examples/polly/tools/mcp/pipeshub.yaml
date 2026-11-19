@@ -1,0 +1,12 @@
+# Optional company-knowledge context through PipesHub: the tickets, design docs
+# and chat threads behind a task (Jira, Confluence, Slack, Drive, GitHub).
+# Loaded only when both variables are set; otherwise Polly runs as before.
+# Create the token in PipesHub under Developer settings -> Personal access tokens.
+name: pipeshub
+description: Search the company's tickets, design docs and chat threads, with sources.
+transport: http
+optional: true
+url: ${PIPESHUB_MCP_URL}
+headers:
+  Authorization: "Bearer ${PIPESHUB_MCP_TOKEN}"
+tools: [pipeshub_search, pipeshub_get_record_content]
