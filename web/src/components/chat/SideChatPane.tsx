@@ -1210,10 +1210,10 @@ function SideChatComposer({
     clearText: () => setText(""),
   });
   const menuCommandNames = useMemo(() => Object.keys(menuCommands), [menuCommands]);
-  // A pending tab's text seeds the fork rather than reaching the harness.
-  const nativeShell = pending
-    ? null
-    : nativeShellHarness(harness, session?.permissionLevel ?? null);
+  // A pending tab's text seeds the fork rather than reaching the harness. A null level means
+  // owner, so wait for the snapshot before offering codex's owner-only `!`.
+  const nativeShell =
+    pending || !session ? null : nativeShellHarness(harness, session.permissionLevel ?? null);
   const outgoingText = isSlashCommandText(text) ? text.trim() : text.trimEnd();
   const highlight = useComposerHighlight({
     value: text,

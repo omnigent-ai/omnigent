@@ -70,13 +70,15 @@ const mockSession = vi.hoisted(() => ({
 // A conversation id whose snapshot the mock should report as still loading.
 const loadingSession = vi.hoisted(() => ({ id: null as string | null }));
 const failedSession = vi.hoisted(() => ({ id: null as string | null }));
+// A conversation id whose snapshot hasn't arrived: like the real hook, it reports no session yet.
+const unfetchedSession = vi.hoisted(() => ({ id: null as string | null }));
 vi.mock("@/hooks/useSession", () => ({
   useSession: (id?: string | null) => ({
     session:
-      id && id === failedSession.id
+      id && (id === failedSession.id || id === unfetchedSession.id)
         ? null
         : { ...mockSession.snapshot, labels: mockSession.labels },
-    isLoading: id != null && id === loadingSession.id,
+    isLoading: id != null && (id === loadingSession.id || id === unfetchedSession.id),
     error: id && id === failedSession.id ? new Error("Snapshot unavailable") : null,
   }),
 }));
@@ -196,6 +198,7 @@ beforeEach(() => {
   mockSession.labels = {};
   mockSession.snapshot = {};
   loadingSession.id = null;
+  unfetchedSession.id = null;
   failedSession.id = null;
   conversationRegistry.clear();
   send.mockReset().mockResolvedValue(undefined);
@@ -2990,6 +2993,18 @@ describe("side-chat composer highlight", () => {
     expect(send).toHaveBeenCalledExactlyOnceWith("!", "agent_side", undefined, {
       pinnedConversationId: childId,
     });
+  });
+
+  it("waits for the session's permission level before offering shell mode", () => {
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+    unfetchedSession.id = childId;
+    const view = renderPane(<SideChatPane childId={childId} />);
+    fireEvent.change(screen.getByTestId("side-chat-input"), { target: { value: "!git status" } });
+    expect(screen.queryByTestId("composer-shell-mode-indicator")).toBeNull();
+
+    unfetchedSession.id = null;
+    view.rerender(<SideChatPane childId={childId} />);
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
   });
 
   it("does not offer shell mode to a codex-native non-owner", () => {
