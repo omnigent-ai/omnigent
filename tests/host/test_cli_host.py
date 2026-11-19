@@ -1100,10 +1100,9 @@ def test_host_background_fails_when_daemon_never_registers(
         lambda record, *, force: terminated.append(record.pid),
     )
 
-    result = CliRunner().invoke(
-        cli,
-        ["host", "--background", "--server", "https://example.databricksapps.com"],
-    )
+    server_url = "https://example.com"
+
+    result = CliRunner().invoke(cli, ["host", "--background", "--server", server_url])
 
     assert result.exit_code != 0
     assert expected_error in result.output
@@ -1112,17 +1111,14 @@ def test_host_background_fails_when_daemon_never_registers(
     assert terminated == expected_terminated
     if not expected_terminated:
         assert "still running (pid 4242)" in result.output
-        assert "host stop --server https://example.databricksapps.com" in result.output
+        assert f"host stop --server {server_url}" in result.output
         monkeypatch.setattr(
             "omnigent.cli._daemon_host_status_probe",
             lambda record, **kwargs: cli_module._HostHttpResult(
                 status_code=200, body={"status": "online"}
             ),
         )
-        rerun = CliRunner().invoke(
-            cli,
-            ["host", "--background", "--server", "https://example.databricksapps.com"],
-        )
+        rerun = CliRunner().invoke(cli, ["host", "--background", "--server", server_url])
         assert rerun.exit_code == 0, rerun.output
         assert "already running (pid 4242" in rerun.output
         assert len(spawned) == 1, "the rerun must adopt the pending daemon"
