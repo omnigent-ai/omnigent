@@ -1131,11 +1131,12 @@ def _terminal_failure(pod: object) -> tuple[str, str] | None:
 
     - The **Pod phase** is ``Failed`` (the Job controller gave up after
       exhausting ``backoffLimit``), OR
-    - Any container — an init container (Pod still ``Pending``, e.g. the
-      workspace-prep clone failing) or the host container (Pod ``Running``) —
-      is in ``CrashLoopBackOff`` (the kubelet is still retrying, but the
-      container is crash-looping and unlikely to self-heal during the launch
-      window).
+    - An init container is crash-looping (see :func:`_init_container_crash_looping`;
+      the Pod stays ``Pending``, e.g. the workspace-prep clone keeps failing), OR
+    - The host container is in ``CrashLoopBackOff`` (the Pod is ``Running``).
+
+    Either way the container is unlikely to self-heal during the launch window,
+    so the failure names it and the caller attaches its log tail.
 
     :param pod: A ``V1Pod`` read from the API.
     :returns: The failed container name + summary, or ``None``.
@@ -1165,32 +1166,61 @@ def _terminal_failure(pod: object) -> tuple[str, str] | None:
                 )
         return _CONTAINER_NAME, "entered terminal phase 'Failed'"
 
-    # A container in CrashLoopBackOff won't self-heal during the launch window.
-    # Init containers crash-loop with the Pod still Pending; the host container
-    # with the Pod Running.
-    for kind, default_name, statuses in (
-        (
-            "init container",
-            _INIT_CONTAINER_NAME,
-            getattr(status, "init_container_statuses", None) or [],
-        ),
-        (
-            "host container",
-            _CONTAINER_NAME,
-            getattr(status, "container_statuses", None) or [],
-        ),
-    ):
-        for cs in statuses:
-            waiting = getattr(getattr(cs, "state", None), "waiting", None)
-            if getattr(waiting, "reason", None) == "CrashLoopBackOff":
-                restart_count = getattr(cs, "restart_count", "?")
-                name = getattr(cs, "name", None) or default_name
-                return name, (
-                    f"{kind} '{name}' is crash-looping "
-                    f"(restarts: {restart_count}, CrashLoopBackOff)"
-                )
+    # A crash-looping container won't self-heal during the launch window. An init
+    # container crash-loops with the Pod still Pending; the host container with
+    # the Pod Running.
+    for cs in getattr(status, "init_container_statuses", None) or []:
+        if _init_container_crash_looping(cs):
+            name = getattr(cs, "name", None) or _INIT_CONTAINER_NAME
+            return name, _crash_loop_summary("init container", name, cs)
+    for cs in getattr(status, "container_statuses", None) or []:
+        waiting = getattr(getattr(cs, "state", None), "waiting", None)
+        if getattr(waiting, "reason", None) == "CrashLoopBackOff":
+            name = getattr(cs, "name", None) or _CONTAINER_NAME
+            return name, _crash_loop_summary("host container", name, cs)
 
     return None
+
+
+def _init_container_crash_looping(cs: object) -> bool:
+    """
+    Return whether an init container is crash-looping rather than retrying once.
+
+    Crash-looping means the kubelet is backing it off (``CrashLoopBackOff``), or
+    it has restarted after a non-zero exit and has not since completed. The second
+    case catches the window where the retry is running again, which the waiting
+    reason does not show. A container that exits 0 after a retry is done.
+
+    :param cs: A container status from ``status.init_container_statuses``.
+    :returns: ``True`` when the init container is crash-looping.
+    """
+    state = getattr(cs, "state", None)
+    if getattr(getattr(state, "waiting", None), "reason", None) == "CrashLoopBackOff":
+        return True
+    if getattr(getattr(state, "terminated", None), "exit_code", None) == 0:
+        return False
+    last = getattr(getattr(cs, "last_state", None), "terminated", None)
+    restart_count = getattr(cs, "restart_count", 0) or 0
+    return last is not None and (getattr(last, "exit_code", 0) or 0) != 0 and restart_count >= 1
+
+
+def _crash_loop_summary(kind: str, name: str, cs: object) -> str:
+    """
+    Describe a crash-looping container for the start-failure message.
+
+    :param kind: ``"init container"`` or ``"host container"``.
+    :param name: The container's name.
+    :param cs: The container status, read for its restart count and state.
+    :returns: A ``"<kind> '<name>' is crash-looping (...)"`` summary.
+    """
+    restart_count = getattr(cs, "restart_count", "?")
+    waiting = getattr(getattr(cs, "state", None), "waiting", None)
+    if getattr(waiting, "reason", None) == "CrashLoopBackOff":
+        detail = f"restarts: {restart_count}, CrashLoopBackOff"
+    else:
+        last = getattr(getattr(cs, "last_state", None), "terminated", None)
+        detail = f"restarts: {restart_count}, last exit {getattr(last, 'exit_code', '?')}"
+    return f"{kind} '{name}' is crash-looping ({detail})"
 
 
 def _fatal_waiting_reason(pod: object) -> str | None:
@@ -1899,6 +1929,10 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         Return the last :data:`_LOG_TAIL_LINES` lines of a container's log, or
         empty when unavailable.
 
+        A restarting container's current attempt can be empty while it is still
+        retrying, so the previous attempt's log is the fallback: that is where the
+        failure printed.
+
         :param namespace: Namespace the Pod lives in.
         :param pod_name: The Pod to read logs from.
         :param container: The container whose log to tail.
@@ -1907,20 +1941,25 @@ class KubernetesSandboxLauncher(SandboxHostLauncher):
         from kubernetes.client.rest import ApiException
         from urllib3.exceptions import HTTPError
 
-        try:
-            log = cast(
-                str,
-                self._load_core().read_namespaced_pod_log(
-                    pod_name,
-                    namespace,
-                    container=container,
-                    tail_lines=_LOG_TAIL_LINES,
-                    _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
-                ),
-            )
-        except (ApiException, HTTPError):
-            return ""
-        return log
+        core = self._load_core()
+        for previous in (None, True):
+            try:
+                log = cast(
+                    str,
+                    core.read_namespaced_pod_log(
+                        pod_name,
+                        namespace,
+                        container=container,
+                        previous=previous,
+                        tail_lines=_LOG_TAIL_LINES,
+                        _request_timeout=_POD_READY_REQUEST_TIMEOUT_S,
+                    ),
+                )
+            except (ApiException, HTTPError):
+                continue
+            if log.strip():
+                return log
+        return ""
 
     def _best_effort_delete(self, namespace: str, job_name: str, secret_name: str) -> None:
         """

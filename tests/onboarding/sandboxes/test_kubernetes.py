@@ -1317,6 +1317,7 @@ class _FakeCore:
         self.delete_pod_errors: list[Exception | None] = []
         self.events: list[object] = []
         self.logs: dict[str, str] = {}
+        self.previous_logs: dict[str, str] = {}
         self.read_queue: list[object] = []
         self.read_default: object = _pod(phase="Pending")
         self.create_secret_error: Exception | None = None
@@ -1360,9 +1361,16 @@ class _FakeCore:
         return SimpleNamespace(items=self.events)
 
     def read_namespaced_pod_log(
-        self, name, namespace, container=None, tail_lines=None, _request_timeout=None
+        self,
+        name,
+        namespace,
+        container=None,
+        previous=None,
+        tail_lines=None,
+        _request_timeout=None,
     ):
-        return self.logs.get(container, "")
+        logs = self.previous_logs if previous else self.logs
+        return logs.get(container, "")
 
 
 class _FakeBatch:
@@ -2071,6 +2079,70 @@ def test_init_crashloopbackoff_failure_carries_init_log_tail(
             server_url="http://srv.example.com",
         )
     assert clone_error in str(excinfo.value)
+
+
+def test_init_restart_after_failure_is_terminal_with_previous_attempt_log(
+    fake_clients: tuple[_FakeCore, _FakeBatch],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A restarted init container whose retry is running is crash-looping.
+
+    The waiting reason is not CrashLoopBackOff during the retry, so the
+    last exit is what shows the loop. The live attempt has printed nothing yet,
+    so the log tail must come from the previous attempt.
+    """
+    core, _batch = fake_clients
+    monkeypatch.setattr(k8s, "_POD_READY_TIMEOUT_S", 0.01)
+    retrying = SimpleNamespace(
+        name="workspace-prep",
+        restart_count=1,
+        state=SimpleNamespace(running=SimpleNamespace(), waiting=None, terminated=None),
+        last_state=SimpleNamespace(terminated=SimpleNamespace(exit_code=128, reason="Error")),
+    )
+    pod = _pod(phase="Pending", init_statuses=[retrying])
+    core.pod_list_items = [pod]
+    core.read_default = pod
+    core.previous_logs["workspace-prep"] = "fatal: could not resolve host: git.example.invalid\n"
+    with pytest.raises(click.ClickException) as excinfo:
+        _launcher().start_host(
+            "omnigent-job-init-restart",
+            token=_TOKEN,
+            host_id="host_init_restart",
+            host_name="managed-init-restart",
+            server_url="http://srv.example.com",
+        )
+    message = str(excinfo.value)
+    assert "did not start within" not in message
+    assert (
+        "init container 'workspace-prep' is crash-looping (restarts: 1, last exit 128)" in message
+    )
+    assert "could not resolve host: git.example.invalid" in message
+
+
+def test_init_retry_that_completes_is_not_terminal() -> None:
+    """A transient clone failure that the retry recovers from must not fail the launch."""
+    recovered = SimpleNamespace(
+        name="workspace-prep",
+        restart_count=1,
+        state=SimpleNamespace(
+            running=None,
+            waiting=None,
+            terminated=SimpleNamespace(exit_code=0, reason="Completed"),
+        ),
+        last_state=SimpleNamespace(terminated=SimpleNamespace(exit_code=128, reason="Error")),
+    )
+    assert k8s._terminal_failure(_pod(phase="Pending", init_statuses=[recovered])) is None
+
+
+def test_init_first_failure_without_restart_is_not_terminal() -> None:
+    """The first failed attempt has no restart yet; the kubelet still retries it."""
+    first = SimpleNamespace(
+        name="workspace-prep",
+        restart_count=0,
+        state=SimpleNamespace(running=SimpleNamespace(), waiting=None, terminated=None),
+        last_state=SimpleNamespace(terminated=SimpleNamespace(exit_code=128, reason="Error")),
+    )
+    assert k8s._terminal_failure(_pod(phase="Pending", init_statuses=[first])) is None
 
 
 def test_init_failure_pending_is_not_terminal(
