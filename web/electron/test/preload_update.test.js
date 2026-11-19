@@ -91,6 +91,8 @@ describe("security-key request observer", () => {
       assert.equal(String(func), String(paneObserver));
       args[0](true);
       assert.deepEqual(h.sends.at(-1), { channel: PENDING_CHANNEL, args: true });
+      args[0](false);
+      assert.deepEqual(h.sends.at(-1), { channel: PENDING_CHANNEL, args: false });
     }
     assert.deepEqual(loadPreload({ platform: "win32" }).mainWorldScripts, []);
   });

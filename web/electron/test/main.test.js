@@ -3565,6 +3565,15 @@ describe("window-open policy wiring (src/main.js)", () => {
     );
   });
 
+  it("keeps the popup preload empty, so sign-in popups get no bridge or security-key observer", () => {
+    const popupPreload = readFileSync(path.join(__dirname, "../src/popup_preload.js"), "utf8");
+    assert.equal(
+      popupPreload.replace(/\/\/.*$/gm, "").trim(),
+      '"use strict";',
+      "popup_preload.js now runs code in third-party sign-in popups; review its trust boundary.",
+    );
+  });
+
   it("hardens created popups via did-create-window → hardenOauthPopup as live code", () => {
     assert.match(
       liveCode,
