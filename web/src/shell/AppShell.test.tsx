@@ -2089,12 +2089,18 @@ describe("Chat-mode terminal panel layout", () => {
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(deleteTerminalMutate).not.toHaveBeenCalled();
 
+    // One kill fails; the other shell's kill still goes ahead.
+    deleteTerminalMutate.mockImplementation((id: string) =>
+      id === "terminal_a" ? Promise.reject(new Error("runner offline")) : Promise.resolve(),
+    );
     await closeOthersOf("c · u-1");
     fireEvent.click(screen.getByRole("button", { name: "Close shells" }));
     expect(deleteTerminalMutate.mock.calls).toEqual([["terminal_a"], ["terminal_b"]]);
     await waitFor(() =>
       expect(screen.getByTestId("terminal-view-stub")).toHaveTextContent("terminal_c"),
     );
+    // The failed shell's tab stays.
+    expect(screen.getByTitle("a · u-1")).toBeInTheDocument();
   });
 
   it("hides the shell close affordance from a read-only viewer", () => {

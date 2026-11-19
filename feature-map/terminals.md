@@ -83,6 +83,8 @@ with their own terminal retain the switcher.
 - Right-click any open workspace tab, or open the rail's panel picker (⌄), and
   choose Close other tabs or Close all tabs. Shells in the batch close together
   after one confirmation ("Close N shells?"); cancelling keeps them open.
+  Closing the last open tab yourself hides the rail; tabs the agent closes
+  leave it open.
 
 **After the session moves:** open the host badge, choose "Switch host…", pick
 another host or a new sandbox, then look at both the terminal strip and the

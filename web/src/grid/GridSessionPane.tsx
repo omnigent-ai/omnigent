@@ -318,18 +318,15 @@ export function GridSessionPane({
     },
     [navigateWorkspace, showTab],
   );
-  const closeFile = useCallback(
-    (path: string) => {
-      navigateWorkspace("", undefined, () =>
-        setWorkspace((previous) => ({
-          ...previous,
-          openFiles: previous.openFiles?.filter((file) => file !== path),
-          selectedFilePath: previous.selectedFilePath === path ? null : previous.selectedFilePath,
-        })),
-      );
-    },
-    [navigateWorkspace],
-  );
+  // The workspace panel already asks the file on screen about unsaved edits before closing
+  // it, and background tabs have no viewer, so closing a tab drops it without asking again.
+  const closeFile = useCallback((path: string) => {
+    setWorkspace((previous) => ({
+      ...previous,
+      openFiles: previous.openFiles?.filter((file) => file !== path),
+      selectedFilePath: previous.selectedFilePath === path ? null : previous.selectedFilePath,
+    }));
+  }, []);
   const openTerminal = useCallback(
     (key: string) => {
       navigateWorkspace("", undefined, () => {
@@ -558,19 +555,17 @@ export function GridSessionPane({
                 onRightRailTabChange={selectTab}
                 openPanels={workspace.openPanels ?? []}
                 onClosePanel={(tab) => {
-                  navigateWorkspace("", undefined, () =>
-                    setWorkspace((previous) => {
-                      const remaining = previous.openPanels?.filter((panel) => panel !== tab) ?? [];
-                      return {
-                        ...previous,
-                        openPanels: remaining,
-                        rightRailTab:
-                          previous.rightRailTab === tab
-                            ? (remaining.at(-1) ?? readInitialWorkspaceTab())
-                            : previous.rightRailTab,
-                      };
-                    }),
-                  );
+                  setWorkspace((previous) => {
+                    const remaining = previous.openPanels?.filter((panel) => panel !== tab) ?? [];
+                    return {
+                      ...previous,
+                      openPanels: remaining,
+                      rightRailTab:
+                        previous.rightRailTab === tab
+                          ? (remaining.at(-1) ?? readInitialWorkspaceTab())
+                          : previous.rightRailTab,
+                    };
+                  });
                 }}
                 showFilesPanel={showFiles}
                 showGithubTab={showFiles}

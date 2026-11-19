@@ -1900,8 +1900,10 @@ function WorkspacePanelImpl({
       key: `file:${path}`,
       closeNow: (hide: boolean) => closeFileNow(path, hide),
     })),
+    // A confirmed shell close stays recorded until its tab leaves, so a slow kill isn't
+    // requested again.
     ...(canCloseShells ? openTerminals : [])
-      .filter((key) => key !== closingTerminalKey)
+      .filter((key) => key !== closingTerminalKey && !closeIntentsRef.current.has(key))
       .map((key) => ({ key, closeNow: () => {}, shell: true as const })),
     ...(showBrowserTab ? browsers.tabs : []).map((tabId) => ({
       key: `browser:${tabId}`,

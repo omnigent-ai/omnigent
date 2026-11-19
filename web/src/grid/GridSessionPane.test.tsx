@@ -437,6 +437,29 @@ it("asks each cell's viewer before the shell's Close leaves the grid", () => {
   expect(leave).toHaveBeenCalledOnce();
 });
 
+it("closes workspace tabs without asking the viewer again", () => {
+  // The workspace panel asks the file on screen before it closes, once per batch, so the
+  // grid's own close must not ask again and replace that viewer's pending action.
+  render(
+    <MemoryRouter>
+      <TooltipProvider>
+        <RearrangeableGrid
+          grid={{ id: "close-unguarded", layout: splitGrid("first", "first", "second", "right")! }}
+        />
+      </TooltipProvider>
+    </MemoryRouter>,
+  );
+  const first = within(screen.getByRole("region", { name: "first (active)" }));
+  fireEvent.click(first.getByText("Open citation"));
+  const workspace = screen.getByTestId("workspace-first");
+  expect(workspace).toHaveTextContent("notes.md");
+  fireEvent.click(first.getByText("Edit file"));
+
+  fireEvent.click(within(workspace).getByText("Close file"));
+  expect(fixture.discardEdits).toBeNull();
+  expect(workspace).toHaveTextContent("No file");
+});
+
 it("opens chat-linked folders and PRs in that pane's workspace", () => {
   writeSessionWorkspaceState("first", { rightRailTab: "subagents" });
   render(

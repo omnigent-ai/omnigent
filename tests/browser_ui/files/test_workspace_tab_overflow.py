@@ -20,7 +20,9 @@ seeded_session = seeded_session_fixture
 
 @pytest.mark.parametrize("width", [240, 360, 472, 900])
 def test_workspace_tab_overflow(page: Page, seeded_session: BrowserSession, width: int) -> None:
-    files = {f"src/long-panel-name-{index}.md": f"# Panel {index}" for index in range(12)}
+    # Enough tabs that even icon-only tabs overflow the widest rail: labelled tabs
+    # shrink to fit first, so a handful no longer scrolls.
+    files = {f"src/long-panel-name-{index}.md": f"# Panel {index}" for index in range(24)}
     paths = list(files)
     _mock_markdown_files(page, seeded_session, files)
     state = [
@@ -81,7 +83,9 @@ def test_workspace_tab_overflow(page: Page, seeded_session: BrowserSession, widt
     )
     page.screenshot(path=f"/tmp/omnigent-tab-picker-{width}.png")
     page.get_by_role("menuitem", name=paths[-1], exact=True).click()
-    expect(page.locator('[data-testid="file-viewer"]:visible')).to_contain_text("Panel 11")
+    expect(page.locator('[data-testid="file-viewer"]:visible')).to_contain_text(
+        f"Panel {len(paths) - 1}"
+    )
     # Radix refocuses the trigger from a timer queued after the menu unmounts; a
     # mouse pick must skip that or the tooltip re-opens. Give that timer a short,
     # bounded window before asserting that focus and the tooltip stayed away.
