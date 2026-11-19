@@ -100,7 +100,9 @@ change against the requested outcome and the main scope rules. For each finding:
 
 - **Address it** when needed for a complete fix, regardless of severity. Fix the
   root cause, add focused regression coverage where useful, and run the affected
-  checks. Push using the current mode's branch authority. An unpushable fork can
+  checks. Rebuild the affected code rather than patching on top of it: rewrite it
+  as you would have written it knowing the finding, and remove guards, special
+  cases, or tests from earlier rounds that the rewrite makes unnecessary. Push using the current mode's branch authority. An unpushable fork can
   use the takeover procedure only in modes that permit it; review-remediation
   must preserve its fixed target.
 - **Record `invalid` or `not_needed`** only with a specific, evidenced reason:
@@ -129,7 +131,11 @@ proof and dispositions cannot establish readiness for a new head. A fork takeove
 starts the same loop on the replacement PR.
 
 Continue fix → test → push → both reviews → triage until no actionable findings
-remain. Follow the workflow-provided review budget when present; otherwise there is no fixed review-round cap. Repeated invalid findings can be
+remain. Follow the workflow-provided review budget when present; otherwise run at
+most three review rounds, where one round is one head reviewed by both. If
+blocking findings remain after round three, stop editing, reassess whether to
+keep, simplify, or replace the approach, and report the agent's partial outcome
+with that recommendation. Repeated invalid findings can be
 justified against current code; they do not require meaningless edits to appease
 a reviewer. For ambiguous design intent, use the agent's investigation procedure
 (Resolve: `resolve-investigate`) to prepare a

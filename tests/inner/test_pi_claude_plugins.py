@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-import pathlib
+import os
 from pathlib import Path
 
 import pytest
@@ -308,6 +308,17 @@ def test_no_plugins_leaves_settings_unchanged(claude_dir: Path, tmp_path: Path) 
 _KINDS = ("absolute", "tilde", "relative", "prefixed", "tilde_unknown_user", "symlink_loop", "nul")
 _LISTED = {"absolute", "tilde"}
 _UNRESOLVABLE = {"tilde_unknown_user", "symlink_loop", "nul"}
+
+
+def _loop_fails_to_resolve(tmp_path: Path) -> bool:
+    """Whether this Python raises when resolving the loop; 3.13+ may resolve it instead."""
+    try:
+        Path(_loop(tmp_path)).resolve()
+    except (OSError, RuntimeError):
+        return True
+    return False
+
+
 _CONSUMERS = {"skills": "skills", "packages": "packages", "commands": "prompts"}
 
 
@@ -357,7 +368,7 @@ def test_user_entry_table(
     else:
         bridged = str(root) in added
     assert bridged == (kind not in _LISTED), f"{kind} for {consumer}"
-    if kind in _UNRESOLVABLE:
+    if kind in _UNRESOLVABLE and (kind != "symlink_loop" or _loop_fails_to_resolve(tmp_path)):
         assert "Ignoring Pi resource path" in caplog.text
 
 
@@ -392,23 +403,33 @@ def test_native_provider_launch_writes_plugin_entries(claude_dir: Path, tmp_path
 def test_entries_read_per_directory_are_bounded_before_sorting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Entries read from one directory are capped before sorting, however many exist."""
+    """The directory listing is streamed: no more entries are read than the per-directory cap."""
     crowded = tmp_path / "crowded"
     crowded.mkdir()
     for index in range(module._MAX_ENTRIES_PER_DIR + 200):
         (crowded / f"f{index:05d}.txt").write_text("x", encoding="utf-8")
-    read = 0
-    original = pathlib.Path.iterdir
+    read = [0]
+    real_scandir = os.scandir
 
-    def counting(self: Path):  # type: ignore[no-untyped-def]
-        nonlocal read
-        for entry in original(self):
-            read += 1
-            yield entry
+    class Counted:
+        def __init__(self, path: Path) -> None:
+            self.scan = real_scandir(path)
 
-    monkeypatch.setattr(pathlib.Path, "iterdir", counting)
+        def __enter__(self) -> Counted:
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            self.scan.close()
+
+        def __iter__(self):  # type: ignore[no-untyped-def]
+            for entry in self.scan:
+                read[0] += 1
+                yield entry
+
+    monkeypatch.setattr(os, "scandir", Counted)
+
     assert module._walk(crowded, lambda n: n.endswith(".md"), MAX_PLUGIN_FILES) == []
-    assert read <= module._MAX_ENTRIES_PER_DIR
+    assert read[0] <= module._MAX_ENTRIES_PER_DIR
 
 
 def test_file_budget_caps_the_matches(tmp_path: Path) -> None:
@@ -451,3 +472,17 @@ def test_depth_budget_stops_descending(tmp_path: Path, monkeypatch: pytest.Monke
     }
 
     assert names == {"inside.md"}
+
+
+def test_frontmatter_name_renames_a_plugin_command(claude_dir: Path, tmp_path: Path) -> None:
+    """A command's frontmatter ``name`` replaces its filename, as plugin command discovery does."""
+    _install(
+        claude_dir,
+        "dp@market",
+        files={"commands/old.md": "---\nname: new\n---\nBody $ARGUMENTS\n"},
+    )
+    managed = tmp_path / "managed"
+
+    add_claude_plugin_resources({}, managed)
+
+    assert [p.name for p in _prompts(managed).iterdir()] == ["dp:new.md"]

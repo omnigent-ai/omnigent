@@ -188,9 +188,12 @@ def use_capture_messages(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Pat
 # ── Tests ──────────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize("native_acceptance", [False, True], ids=["legacy", "native-acceptance"])
 async def test_text_chunk_translates_to_output_text_delta(
     use_text_only: None,
     manager: HarnessProcessManager,
+    monkeypatch: pytest.MonkeyPatch,
+    native_acceptance: bool,
 ) -> None:
     """A TextChunk from the inner executor → response.output_text.delta.
 
@@ -200,6 +203,15 @@ async def test_text_chunk_translates_to_output_text_delta(
     text-delta event followed by response.completed.
     """
     conv_id = "conv_text"
+    acceptance = {
+        "session_id": conv_id,
+        "thread_id": "thread_text",
+        "response_id": "codex_turn_text",
+    }
+    if native_acceptance:
+        monkeypatch.setenv("MOCK_EXECUTOR_NATIVE_ACCEPTANCE", json.dumps(acceptance))
+    else:
+        monkeypatch.delenv("MOCK_EXECUTOR_NATIVE_ACCEPTANCE", raising=False)
     client = await manager.get_client(conv_id, _TEST_HARNESS_NAME)
     events: list[_ParsedSSEEvent] = []
     async with client.stream(
@@ -225,6 +237,12 @@ async def test_text_chunk_translates_to_output_text_delta(
     # If a future change makes TurnComplete.response emit a
     # delta, this test should be updated.
     assert "response.completed" in event_names
+    assert events[0].data["response"]["id"] == events[-1].data["response"]["id"]
+    assert events[-1].data["response"]["id"] != acceptance["response_id"]
+    if native_acceptance:
+        assert events[-1].data["native_acceptance"] == acceptance
+    else:
+        assert "native_acceptance" not in events[-1].data
 
 
 async def test_tool_call_translates_to_paired_function_call_items(

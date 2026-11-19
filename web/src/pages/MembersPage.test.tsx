@@ -187,6 +187,7 @@ describe("MembersPage actions", () => {
     await waitFor(() => expect(accountsApi.resetUserPassword).toHaveBeenCalledWith("bob"));
     // The new password renders in a readonly, copyable input.
     expect(await screen.findByDisplayValue("fresh-pw-123")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("fresh-pw-123")).toHaveAccessibleName("New password for bob");
   });
 
   it("deletes a user through the confirmation dialog and refreshes the list", async () => {
@@ -217,6 +218,23 @@ describe("MembersPage actions", () => {
     await waitFor(() => expect(accountsApi.createInvite).toHaveBeenCalledWith(false));
     // The single-use invite URL renders in a readonly, copyable input.
     expect(await screen.findByDisplayValue(/register\?invite=tok/)).toBeInTheDocument();
+    expect(screen.getByDisplayValue(/register\?invite=tok/)).toHaveAccessibleName("Invite URL");
+  });
+
+  it("renders the invite and member rows from their Settings catalog entries", async () => {
+    vi.mocked(accountsApi.listUsers).mockResolvedValue([user({ id: "bob" })]);
+    renderPage();
+    await screen.findByText("bob");
+
+    expect(document.querySelector('[data-settings-item="members-invite"]')).not.toBeNull();
+    expect(document.querySelector('[data-settings-item="members-list"]')).not.toBeNull();
+    expect(
+      document.querySelector('[data-settings-control="members-invite:invite"]'),
+    ).toHaveAttribute("aria-label", "Invite member");
+    const bobRow = screen.getByText("bob").closest("tr")!;
+    expect(bobRow.querySelector('[data-settings-row-action="resetPassword"]')).not.toBeNull();
+    expect(bobRow.querySelector('[data-settings-row-action="remove"]')).not.toBeNull();
+    expect(document.querySelector('[data-settings-region="members-list:members"]')).not.toBeNull();
   });
 });
 
@@ -262,6 +280,7 @@ describe("MembersPage under OIDC (read-only)", () => {
 
     // No invite button, no per-row Reset/Remove, and a read-only notice.
     expect(screen.queryByRole("button", { name: /Invite member/ })).toBeNull();
+    expect(document.querySelector('[data-settings-item="members-invite"]')).toBeNull();
     expect(within(bobRow).queryByRole("button", { name: /Reset/ })).toBeNull();
     expect(within(bobRow).queryByRole("button", { name: /Remove/ })).toBeNull();
     expect(screen.getByText(/added on first sign-in/)).toBeInTheDocument();

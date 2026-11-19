@@ -823,11 +823,29 @@ export function readTriggerMessageMaxChars(prompt: string): number | null {
   return parsed === null ? null : Number(parsed.match[6]);
 }
 
-/** Placement remains part of the authored instructions when the poller moves. */
+/** Where the generated creation call starts matching sessions, as authored. */
 export function readTriggerWorkerPlacement(prompt: string): "managed" | "same_host" | null {
   const parsed = workerSettingsMatch(prompt);
   if (parsed === null) return null;
   return parsed.match[2].startsWith('placement "managed"') ? "managed" : "same_host";
+}
+
+/** Change only the creation call's placement, preserving the rest of the authored prompt. */
+export function updateTriggerWorkerPlacement(prompt: string, placement: WorkerPlacement): string {
+  const parsed = workerSettingsMatch(prompt);
+  if (parsed === null) return prompt;
+  const { parts, match } = parsed;
+  const args = match[2].replace(/^placement "(?:same_host|managed)"/, `placement "${placement}"`);
+  if (args === match[2]) return prompt;
+  const call = withCreationCallPlacementArgs(match, args);
+  const systemPrompt = parts.systemPrompt!.replace(match[0], () => call);
+  return combineTriggerPrompt(parts.userPrompt, systemPrompt);
+}
+
+/** The creation call with its placement/title/workflow_id arguments replaced. */
+function withCreationCallPlacementArgs(match: RegExpMatchArray, args: string): string {
+  const start = `call sys_session_create with agent_id ${match[1]}, `.length;
+  return `${match[0].slice(0, start)}${args}${match[0].slice(start + match[2].length)}`;
 }
 
 /** Change only the creation-call settings, preserving the rest of the authored prompt. */
@@ -882,8 +900,7 @@ export function syncTriggerWorkflowId(prompt: string, workflowIdSupported: boole
     match[2].replace(WORKFLOW_ID_ARGUMENT, "") +
     (workflowId ? `, workflow_id ${JSON.stringify(workflowId)}` : "");
   if (placement === match[2]) return prompt;
-  const start = `call sys_session_create with agent_id ${match[1]}, `.length;
-  const call = `${match[0].slice(0, start)}${placement}${match[0].slice(start + match[2].length)}`;
+  const call = withCreationCallPlacementArgs(match, placement);
   // The call is the first of its text: it sits in the generated text, which opens the prompt.
   return prompt.replace(match[0], () => call);
 }
@@ -1883,8 +1900,9 @@ export function renderTriggerPrompt(
     ? `Stopping means sending no more matches in this run; ${managerPostsLink ? "still post link-backs for the matches you did send and write your reply." : "still write your reply."}`
     : `Stopping means starting no more sessions in this run; ${managerPostsLink ? "still post link-backs for the sessions you did start and write your reply." : "still write your reply."}`;
   // A manager reloading on-demand tools one search at a time spends a model turn on each.
-  // Naming no tool keeps the creation call the only sys_session_create the parser reads.
-  const toolLoading = `If your tools load on demand, load every tool this run needs in one tool search before your first call, naming them all: your ${service} tools and each sys_session tool the steps below use.`;
+  // Naming sys_session_create here would make the parser read a second creation call.
+  // sys_session_get_info returns the agent ID a blank worker agent needs, so it joins the search.
+  const toolLoading = `If your tools load on demand, load every tool this run needs in one tool search before your first call, naming them all: your ${service} tools and each sys_session tool the steps below use, and sys_session_get_info, which returns your session and agent IDs.`;
   const steps = [
     ...(source === "github" ? [GITHUB_ACCOUNT_INSTRUCTIONS] : []),
     `Read your state from your most recent reply in this session that has a "${CHECKED_THROUGH}" line: that check time, ${shared ? `the conversation_id on its "${TASK_SESSION}" line, ` : ""}and any ${pendingLines.join(" and ")} lines. ${text.watermark ? `Also read its "${WATCHING_SINCE}" line. ` : ""}On the first run, use ${text.watermark ? `the current time as both the check time and the "${WATCHING_SINCE}" time, so changes made before this automation existed don't count,` : `${initialLookback} ago`} and nothing pending. If you have no way to use ${service} here, or signing in to it fails, skip to your reply and say that this automation needs ${TRIGGER_TEMPLATES[source].toolsExample} where it runs.${shared ? " If sys_session_message isn't one of your tools, skip to your reply too and say that this automation needs messaging between sessions turned on." : ""}`,

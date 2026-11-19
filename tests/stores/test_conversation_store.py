@@ -1217,15 +1217,19 @@ def test_append_encodes_item_data_in_one_batch_call(db_uri: str) -> None:
     assert [item.data.content[0]["text"] for item in read_back] == texts
 
 
+@pytest.mark.parametrize("recovering", [False, True])
 def test_append_retry_reuses_prepared_id_and_encoded_payload(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    recovering: bool,
 ) -> None:
     """A serialization replay repeats SQL, not ID generation or encoding."""
     from contextlib import contextmanager
     from unittest.mock import MagicMock
 
     from sqlalchemy.exc import DBAPIError
+
+    from omnigent.session_recovery import RECOVERY_PROMPT, SessionRecovery
 
     class SerializationFailure(Exception):
         sqlstate = "40001"
@@ -1269,6 +1273,11 @@ def test_append_retry_reuses_prepared_id_and_encoded_payload(
     )
     store = RecordingStore(db_uri)
     conv = store.create_conversation()
+    recovery = SessionRecovery(
+        "a" * 32, "runner", 100, phase="dispatching", attempts=1, attempt_id="attempt"
+    )
+    if recovering:
+        assert store.replace_session_recovery(conv.id, None, recovery)
     retrying_maker = RetryOnceMaker(store._conv_session_immediate)
     store._conv_session_immediate = retrying_maker
     statements: list[str] = []
@@ -1293,7 +1302,12 @@ def test_append_retry_reuses_prepared_id_and_encoded_payload(
                     response_id="resp_retry",
                     data=MessageData(
                         role="user",
-                        content=[{"type": "input_text", "text": "retry once"}],
+                        content=[
+                            {
+                                "type": "input_text",
+                                "text": RECOVERY_PROMPT if recovering else "retry once",
+                            }
+                        ],
                     ),
                 )
             ],
@@ -1309,6 +1323,8 @@ def test_append_retry_reuses_prepared_id_and_encoded_payload(
     assert id_calls == 1
     assert store.encode_calls == 1
     assert persisted.id == item_id
+    assert persisted.data.is_meta is recovering
+    assert store.get_session_recovery(conv.id) == (recovery if recovering else None)
     assert [item.id for item in store.list_items(conv.id).data] == [item_id]
 
 
@@ -10412,10 +10428,12 @@ async def test_sibling_family_lifecycle(tmp_path, split_database, user_id, monke
     assert store.get_conversation(replacement.id).project_id is None
     assert all(member.project_id == project_id for member in store.get_session_family(later.id))
     candidate = store.create_conversation()
-    with pytest.raises(OmnigentError, match="another family"):
-        store.add_new_sibling(replacement.id, candidate.id, user_id=user_id)
-    assert store.get_conversation(replacement.id).family_id is None
-    assert store.get_conversation(candidate.id).family_id is None
+    store.add_new_sibling(replacement.id, candidate.id, user_id=user_id)
+    assert (
+        store.get_conversation(candidate.id).family_id
+        == store.get_conversation(replacement.id).family_id
+    )
+    assert store.get_conversation(candidate.id).family_id != source.id
 
     another = store.create_conversation()
     another_sibling = store.create_conversation(labels={"omni_project": "Other project"})
@@ -10549,6 +10567,66 @@ def test_failed_family_membership_preserves_source_pin(
         assert pinned_label_key("alice") not in member.labels
     store.set_family_pin(source.id, "", user_id="alice")
     assert not store.list_conversations(pinned=True, pinned_owner="alice").data
+
+
+@pytest.mark.parametrize("store_name", ["conversation_store", "split_db_conversation_store"])
+def test_move_one_session_between_nests(request, store_name, monkeypatch):
+    from omnigent.errors import OmnigentError
+    from omnigent.stores.conversation_store import family_pinned_label_key, pinned_label_key
+
+    store = request.getfixturevalue(store_name)
+    clock = [100]
+    monkeypatch.setattr(
+        "omnigent.stores.conversation_store.sqlalchemy_store.now_epoch", lambda: clock[0]
+    )
+    moved = store.create_conversation(host_id="b" * 32, runner_id="c" * 32, workspace="/workspace")
+    clock[0] = 200
+    head = store.create_conversation()
+    peer = store.create_conversation()
+    store.add_new_sibling(head.id, peer.id, user_id="owner")
+    store.set_conversation_project(head.id, "a" * 32)
+    store.set_family_pin(head.id, "123", user_id="owner")
+    store.set_session_nest(moved.id, head.id, user_id="owner")
+    saved = store.get_conversation(moved.id)
+    assert saved.family_id == head.id and saved.project_id == "a" * 32
+    assert saved.labels[family_pinned_label_key("owner")] == "123"
+    assert (saved.host_id, saved.runner_id, saved.root_conversation_id) == (
+        moved.host_id,
+        moved.runner_id,
+        moved.root_conversation_id,
+    )
+    assert store.get_session_family(moved.id)[0].id == head.id
+    store.set_family_pin(head.id, "234", user_id="owner")
+    store.set_conversation_project(head.id, "d" * 32)
+    assert store.get_conversation(moved.id).project_id == "d" * 32
+    assert store.get_conversation(moved.id).labels[family_pinned_label_key("owner")] == "234"
+    other = store.create_conversation()
+    store.set_session_nest(moved.id, other.id, user_id="owner")
+    assert {row.id for row in store.get_session_family(head.id)} == {head.id, peer.id}
+    assert family_pinned_label_key("owner") not in store.get_conversation(moved.id).labels
+    store.set_session_nest(other.id, None, user_id="owner")
+    assert store.get_conversation(other.id).family_id is None
+    store.set_labels(other.id, {pinned_label_key("owner"): "345"})
+    fresh = store.create_conversation()
+    store.add_new_sibling(other.id, fresh.id, user_id="owner")
+    assert store.get_conversation(fresh.id).labels[family_pinned_label_key("owner")] == "345"
+    assert store.get_conversation(fresh.id).family_id != store.get_conversation(moved.id).family_id
+    child = store.create_conversation(parent_conversation_id=head.id)
+    with pytest.raises(OmnigentError):
+        store.set_session_nest(child.id, head.id, user_id="owner")
+    assert store.get_conversation(child.id).family_id is None
+
+    # Another creation can commit after this caller reads the standalone source.
+    later = store.create_conversation()
+    get_conversation = store.get_conversation
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            store,
+            "get_conversation",
+            lambda session_id: head if session_id == head.id else get_conversation(session_id),
+        )
+        store.add_new_sibling(head.id, later.id, user_id="owner")
+    assert store.get_conversation(later.id).family_id == head.id
 
 
 @pytest.mark.parametrize("split_database", [False, True])

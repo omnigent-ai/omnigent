@@ -1664,7 +1664,7 @@ async def test_filesystem_changes_modified(
     resp = await client_with_registry.get(
         f"/v1/sessions/conv_test/resources/environments/{DEFAULT_ENVIRONMENT_ID}/changes"
     )
-    assert resp.status_code == 200
+    assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["object"] == "list"
     entries_by_path = {e["path"]: e for e in body["data"]}

@@ -346,7 +346,10 @@ async def test_update_patches_by_id(placement: dict[str, str | None]) -> None:
 
 
 @pytest.mark.asyncio
-async def test_update_forwards_agent_switch_cost_cap_and_project() -> None:
+@pytest.mark.parametrize("max_cost_usd", [2.5, None])
+async def test_update_forwards_agent_switch_cost_cap_and_project(
+    max_cost_usd: float | None,
+) -> None:
     """``agent_id`` / ``max_cost_usd`` / ``project_id`` reach the PATCH instead of being dropped.
 
     The dispatch allowlist is what an agent's ``sys_scheduled_task_update`` call
@@ -354,21 +357,28 @@ async def test_update_forwards_agent_switch_cost_cap_and_project() -> None:
     the update appears to succeed while changing nothing.
     """
     client = _RecordingClient(_Resp(body={"id": "t1"}))
+    arguments = {
+        **_REVIEW_FIELDS,
+        "scheduled_task_id": _TASK_ID,
+        "agent_id": "ag_pi",
+        "max_cost_usd": max_cost_usd,
+        "project_id": None,
+    }
+    jsonschema.validate(
+        arguments, SysScheduledTaskUpdateTool().get_schema()["function"]["parameters"]
+    )
     await _execute_scheduled_task_tool(
         "sys_scheduled_task_update",
-        json.dumps(
-            {
-                **_REVIEW_FIELDS,
-                "scheduled_task_id": _TASK_ID,
-                "agent_id": "ag_pi",
-                "max_cost_usd": 2.5,
-                "project_id": None,
-            }
-        ),
+        json.dumps(arguments),
         server_client=client,
     )
     _, _, body = client.calls[-1]
-    assert body == {**_REVIEW_FIELDS, "agent_id": "ag_pi", "max_cost_usd": 2.5, "project_id": None}
+    assert body == {
+        **_REVIEW_FIELDS,
+        "agent_id": "ag_pi",
+        "max_cost_usd": max_cost_usd,
+        "project_id": None,
+    }
 
 
 class _ProjectsClient(_RecordingClient):

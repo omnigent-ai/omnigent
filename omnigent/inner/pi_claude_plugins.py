@@ -4,6 +4,9 @@ Enabled plugins add their Pi packages, skill directories and generated command p
 to the managed ``settings.json``. Entries are only appended, and a resource the user
 already lists by the same resolved path is not added again. Excluding one resource of a
 plugin is not supported yet; disabling the plugin in Claude Code drops all of its resources.
+
+Command names follow the existing plugin command discovery, which matches Claude Code:
+``<plugin>:<path under commands/>``, where a frontmatter ``name`` replaces the filename.
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ from typing import TypeAlias
 from omnigent.server.feature_flags import Feature, resolve_feature_flags
 from omnigent.spec.skill_sources import (
     _enabled_plugin_keys,
+    _parse_command,
     _plugin_install_paths,
     _read_json,
     skill_source_context_from_env,
@@ -99,8 +103,10 @@ def _enabled_plugins() -> list[tuple[str, Path, bool]]:
 def _walk(root: Path, wanted: Callable[[str], bool], limit: int) -> list[_Walked]:
     """Regular files under *root* whose name satisfies *wanted*, as ``(relative dirs, file)``.
 
-    Symlinks and special files are not followed. Budgets bound the work: directories
-    visited, depth, entries read from one directory (before sorting), and matches.
+    Symlinks and special files are not followed. The listing of each directory is
+    streamed through :func:`os.scandir` and cut at :data:`_MAX_ENTRIES_PER_DIR` before
+    sorting, so a huge directory is never fully enumerated. The directory, depth, and
+    match budgets bound the rest of the walk.
     """
     found: list[_Walked] = []
     queue: deque[tuple[tuple[str, ...], Path]] = deque([((), root)])
@@ -109,18 +115,19 @@ def _walk(root: Path, wanted: Callable[[str], bool], limit: int) -> list[_Walked
         relative, directory = queue.popleft()
         visited += 1
         try:
-            entries = sorted(itertools.islice(directory.iterdir(), _MAX_ENTRIES_PER_DIR))
+            with os.scandir(directory) as scan:
+                listed = sorted(itertools.islice(scan, _MAX_ENTRIES_PER_DIR), key=lambda e: e.name)
         except OSError as exc:
             _logger.warning("Skipping unreadable Claude plugin dir %s: %s", directory, exc)
             continue
-        for entry in entries:
+        for entry in listed:
             if entry.is_symlink():
                 continue
             if entry.is_dir():
                 if len(relative) < _MAX_WALK_DEPTH:
-                    queue.append(((*relative, entry.name), entry))
+                    queue.append(((*relative, entry.name), Path(entry.path)))
             elif entry.is_file() and wanted(entry.name):
-                found.append((relative, entry))
+                found.append((relative, Path(entry.path)))
                 if len(found) >= limit:
                     break
     return found
@@ -137,11 +144,9 @@ def _skill_dirs(skills_dir: Path, listed: set[Path]) -> list[str]:
     return [str(d) for d in directories if d is not None and d not in listed]
 
 
-def _write_command(
-    name: str, root: Path, parts: tuple[str, ...], source: Path, prompts_dir: Path
-) -> bool:
-    """Write one command prompt named ``<plugin>:<command>``; returns ``False`` if skipped."""
-    command = ":".join((name, *parts))
+def _write_command(name: str, root: Path, suffix: str, source: Path, prompts_dir: Path) -> bool:
+    """Write one command prompt named ``<plugin>:<suffix>``; returns ``False`` if skipped."""
+    command = f"{name}:{suffix}"
     try:
         if len(f"{command}.md".encode()) > _MAX_FILENAME_BYTES:
             _logger.warning("Skipping Claude command %s: generated name is too long", command)
@@ -166,10 +171,15 @@ def _write_command(
 
 
 def _write_commands(name: str, root: Path, prompts_dir: Path, listed: set[Path]) -> bool:
-    """Write the plugin's ``commands/**/*.md``; returns whether any prompt was written.
+    """Write the plugin's ``commands/**/*.md`` as ``<plugin>:<command>`` prompt templates.
 
-    A commands directory or command file the user's ``prompts`` setting lists by resolved
-    path is not written again. Files are read only from inside the plugin root.
+    The command name matches the existing plugin command discovery: the path under
+    ``commands/`` with ``/`` as ``:``, where a frontmatter ``name`` replaces the last
+    segment. A commands directory, or a command file, that the user's ``prompts``
+    setting lists by resolved path is not written again. Files are read only from
+    inside the plugin root.
+
+    :returns: ``True`` when at least one prompt was written.
     """
     commands_dir = root / "commands"
     if commands_dir.is_symlink() or not commands_dir.is_dir() or _resolve(commands_dir) in listed:
@@ -179,7 +189,10 @@ def _write_commands(name: str, root: Path, prompts_dir: Path, listed: set[Path])
         resolved = _resolve(source)
         if resolved is None or resolved in listed:
             continue
-        written |= _write_command(name, root, (*relative, source.stem), source, prompts_dir)
+        spec = _parse_command(source, (*relative, source.stem), name_from_frontmatter=True)
+        if spec is None:
+            continue
+        written |= _write_command(name, root, spec.name, source, prompts_dir)
     return written
 
 

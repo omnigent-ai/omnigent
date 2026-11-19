@@ -41,7 +41,9 @@ implements them separately, so a fix for one harness does not reach the others.
   and Cursor; the user's own `~/.pi/agent/mcp.json` entries win and it is not written.
 - `pi-claude-plugins`: with `OMNIGENT_FEATURES=pi_claude_plugins` in the environment of
   the host or runner process that launches Pi, managed Pi sessions (pi-native and the
-  Pi gateway executor) load the skills, `/<plugin>:<command>`
+  Pi gateway executor) load the skills, `/<plugin>:<command>` (the command name is the
+  path under `commands/`, or the frontmatter `name` when set, as plugin command discovery
+  names them)
   prompts and Pi packages of the Claude Code plugins enabled for the user. Disabled
   plugins stay out, and a resource the user's Pi settings already list by the same
   path is not added again. Excluding one resource of a plugin is not supported yet:

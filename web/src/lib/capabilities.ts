@@ -71,9 +71,11 @@ export type FeatureKey =
   | "session_orchestration"
   | "workflows"
   | "session_overview"
+  | "project_kanban"
   | "project_repository_creation"
   | "workspace_direct_access"
-  | "workspace_api_server_access";
+  | "workspace_api_server_access"
+  | "quick_pick_palette";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
@@ -91,6 +93,7 @@ export interface ServerInfo {
   /** The server enforces the browser's Admin view cookie; absent on older servers. */
   admin_view?: boolean;
   sibling_sessions?: boolean;
+  session_nest_moves?: boolean;
   session_bundle_workspaces?: boolean;
   sibling_session_destinations?: SiblingSessionDestinations;
   accounts_enabled: boolean;
@@ -353,6 +356,12 @@ export interface ServerInfo {
    */
   workflows?: boolean;
   /**
+   * Owners can share saved workflows (``/v1/workflows/{id}/permissions``), and
+   * ``/v1/workflows/shared`` lists those shared with the viewer; absent on older
+   * servers (off).
+   */
+  workflow_sharing?: boolean;
+  /**
    * True when the server stores each user's session title instructions
    * (``/v1/settings/session-title-instructions``); absent on older servers (off).
    */
@@ -378,6 +387,11 @@ export interface ServerInfo {
    * absent on older servers (off), including some that advertise sharing.
    */
   scheduled_task_shared_with_me?: boolean;
+  /**
+   * True when `GET /v1/scheduled-tasks/{id}/run-pull-requests` lists each run's PRs;
+   * absent on older servers (off), including ones that store session PRs.
+   */
+  scheduled_task_run_pull_requests?: boolean;
   /**
    * The deployment offers the proactive agent (Omni Advisor) to this caller;
    * whether it is on for them is at ``GET /v1/proactive-agent/settings``.
@@ -669,6 +683,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
         const harnessInstallEnabled = data.harness_install_enabled === true;
         cachedServerInfo = {
           sibling_sessions: data.sibling_sessions === true,
+          session_nest_moves: data.session_nest_moves === true,
           sibling_session_destinations: parseSiblingSessionDestinations(
             data.sibling_session_destinations,
           ),
@@ -751,6 +766,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_pull_requests: data.session_pull_requests === true,
           session_journal: data.session_journal === true,
           workflows: data.workflows === true,
+          workflow_sharing: data.workflow_sharing === true,
           session_title_instructions: data.session_title_instructions === true,
           admin_view: data.admin_view === true,
           comment_anchor_metadata: data.comment_anchor_metadata === true,
@@ -760,6 +776,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           scheduled_task_sharing: data.scheduled_task_sharing === true,
           inbox_items_available: data.inbox_items_available === true,
           scheduled_task_shared_with_me: data.scheduled_task_shared_with_me === true,
+          scheduled_task_run_pull_requests: data.scheduled_task_run_pull_requests === true,
           proactive_agent_available: data.proactive_agent_available === true,
           scheduled_task_harness_settings: data.scheduled_task_harness_settings === true,
           scheduled_task_approval_skipping_modes:
