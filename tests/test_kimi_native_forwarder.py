@@ -20,6 +20,7 @@ import shutil
 import time
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -2277,56 +2278,84 @@ class TestForwardLoopEdges:
 
         assert self.statuses == [("idle", "")]
 
-    async def test_quiet_turn_stays_open_until_its_explicit_edge(self, tmp_path: Path) -> None:
-        """A long-quiet turn with no tool in flight is never closed by silence."""
+    async def test_quiet_turn_stays_open_until_its_explicit_edge(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A turn quiet past the former five-minute window, with no tool in
+        flight, is never closed by silence; only its explicit edge closes it."""
         rows = [_prompt_row(), _assistant_row("u1", "so far")]
         wire_ref: list[Path] = []
+        skew = 0.0
         quiet_polls = 0
+        # The forwarder's clock jumps; the event loop's own clock does not.
+        monkeypatch.setattr(
+            fwd,
+            "time",
+            SimpleNamespace(
+                monotonic=lambda: time.monotonic() + skew, time=lambda: time.time() + skew
+            ),
+        )
 
         def _capture(_bridge: Path, wire: Path) -> None:
             wire_ref.append(wire)
 
         def _done() -> bool:
-            nonlocal quiet_polls
-            if "kimi:u1" in self.items and quiet_polls < 50:
+            nonlocal skew, quiet_polls
+            if "kimi:u1" in self.items and quiet_polls < 20:
+                skew = 301.0
                 quiet_polls += 1
-                if quiet_polls == 50:
-                    # ~0.5s of silence with an alive pane posted nothing; now
-                    # kimi finally records the turn's end.
+                if quiet_polls == 20:
                     assert self.statuses == []
                     with wire_ref[0].open("a", encoding="utf-8") as fh:
                         fh.write(json.dumps(_turn_ended_row("completed")) + "\n")
             return bool(self.statuses)
 
         await _drive_loop_until(tmp_path, rows, _done, pane_alive=lambda: True, prepare=_capture)
-        assert quiet_polls == 50
+        assert quiet_polls == 20
         assert self.statuses == [("idle", "so far")]
         assert self.edges == [("completed", None)]
 
-    async def test_quiescence_suppressed_while_tool_in_flight(self, tmp_path: Path) -> None:
-        """A silent wire mid-tool is a long tool call; only pane death closes it."""
+    async def test_quiescence_suppressed_while_tool_in_flight(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A wire silent past the former five-minute window mid-tool is a long
+        tool call; only pane death closes it, with the pane-death detail."""
         pane_up = True
         rows = [_prompt_row(), _tool_call_row()]
+        bridge = tmp_path / "bridge"
+        skew = 0.0
         checks = 0
+        monkeypatch.setattr(
+            fwd,
+            "time",
+            SimpleNamespace(
+                monotonic=lambda: time.monotonic() + skew, time=lambda: time.time() + skew
+            ),
+        )
 
         def _done() -> bool:
-            nonlocal pane_up, checks
-            if self.statuses:
-                return True
+            nonlocal pane_up, skew, checks
+            if not pane_up:
+                return bool(self.statuses)
+            state = _read_state(bridge)
+            if state is None or state.tools_in_flight != 1:
+                return False
+            skew = 301.0
             checks += 1
-            # Staying edge-free for 20 checks (~200ms) proves silence alone
-            # closes nothing; then a pane death must close it.
             if checks == 20:
+                assert self.statuses == []
                 pane_up = False
-            return False
+            return bool(self.statuses)
 
         await _drive_loop_until(
             tmp_path,
             rows,
             _done,
             pane_alive=lambda: pane_up,
+            tool_quiescence_s=1800.0,
         )
         assert self.statuses == [("failed", "")]
+        assert self.edges == [("failed", "Kimi exited before reporting how the turn ended.")]
 
     async def test_hung_tool_watchdog_fails_turn_after_ceiling(self, tmp_path: Path) -> None:
         """Crash-mid-tool replay: the real completed-turn wire cut right after its
@@ -2760,6 +2789,7 @@ class TestForwardLoopPostFailures:
     ) -> None:
         """A permanently rejected turn_failed edge is what the pane-death fallback reports."""
         posted: list[tuple[str, str, object, object]] = []
+        rejected_details: list[object] = []
         edge_attempts = 0
 
         async def _fake_item(_client: object, **kwargs: object) -> None:
@@ -2769,6 +2799,7 @@ class TestForwardLoopPostFailures:
             nonlocal edge_attempts
             edge_attempts += 1
             if edge_attempts <= 3:
+                rejected_details.append(kwargs.get("failure_detail"))
                 request = httpx.Request("POST", "http://test")
                 raise httpx.HTTPStatusError(
                     "404", request=request, response=httpx.Response(404, request=request)
@@ -2788,7 +2819,11 @@ class TestForwardLoopPostFailures:
         rows = [_prompt_row(), _turn_ended_row("failed", error_message="boom")]
         await _drive_loop_until(tmp_path, rows, lambda: bool(posted), pane_alive=lambda: False)
         assert edge_attempts == 4
-        assert posted == [("failed", "boom", "failed", "boom")]
+        # The recovered edge keeps the coded detail the rejected direct post carried.
+        assert rejected_details == ["provider.auth_error: boom"] * 3
+        assert posted == [
+            ("failed", "provider.auth_error: boom", "failed", "provider.auth_error: boom")
+        ]
 
     async def test_redelivered_prompt_keeps_one_fallback_sequence(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
