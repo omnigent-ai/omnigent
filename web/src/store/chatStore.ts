@@ -3076,18 +3076,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       if (initialDraft && !initialSendPending()) return;
       opts?.signal?.throwIfAborted();
       const heldBack = opts?.beforePost ? await opts.beforePost() : null;
-      if (heldBack !== null) {
-        // Not a failure: nothing posted. Drop only this attempt's bubble and latch; a turn
-        // seen starting meanwhile isn't this send's to end.
-        setterFor(sessionId)((s) => ({
-          pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
-          ...(!alreadyStreaming && s.sessionStatus !== "running" && s.activeResponse === null
-            ? { status: "idle" as const, sendLatchedAt: null, sendLatchSeenRunning: null }
-            : {}),
-        }));
-        opts?.onError?.(heldBack, true);
-        return;
-      }
+      if (heldBack !== null) throw new Error(heldBack);
       opts?.signal?.throwIfAborted();
 
       // Promote "pending:<filename>" to real file_ids. Claude-native's
@@ -3202,6 +3191,19 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     } catch (err) {
       if (initialDraft && !initialDispatched && !initialSendPending()) return;
       const { message, code } = describeSendFailure(err);
+      if (opts?.external && !posting) {
+        // Never posted (held back, or its upload failed or was stopped): drop only this
+        // attempt's bubble and latch. A turn seen starting since isn't this send's to end.
+        const target = postedSessionId ?? submitConversationId;
+        (target === null ? setActive : setterFor(target))((s) => ({
+          pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
+          ...(!alreadyStreaming && s.sessionStatus !== "running" && s.activeResponse === null
+            ? { status: "idle" as const, sendLatchedAt: null, sendLatchSeenRunning: null }
+            : {}),
+        }));
+        opts.onError?.(message, true);
+        return;
+      }
       // A codex `/side` that armed the side-chat latch (line ~2103) but then
       // failed — e.g. the host is too old and the server refused — must disarm
       // it, or the next sub-agent created under this parent would wrongly open
