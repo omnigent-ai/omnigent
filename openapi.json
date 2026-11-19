@@ -1612,6 +1612,25 @@
         "title": "CloneRepositoryRequest",
         "type": "object"
       },
+      "CloneScheduledTaskRequest": {
+        "additionalProperties": false,
+        "description": "Optional body for `POST /v1/scheduled-tasks/{id}/clone`.",
+        "properties": {
+          "host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Id"
+          }
+        },
+        "title": "CloneScheduledTaskRequest",
+        "type": "object"
+      },
       "CodexGoalObject": {
         "description": "Current Codex goal state for a Codex-native session.\n\nMirrors Codex app-server's `ThreadGoal` shape using Omnigent's\nsnake-case API convention. `created_at` and `updated_at` are optional\nbecause older app-server documentation examples omit them even though the\ncurrent protocol includes them.",
         "properties": {
@@ -21588,7 +21607,7 @@
     },
     "/v1/scheduled-tasks/{scheduled_task_id}/clone": {
       "post": {
-        "description": "Create a new automation with an owned automation's settings and schedule.\n\nThe clone gets a new ID, which on some deployments is what lets it be shared,\nand none of the original's runs. A continued session isn't carried over: the\nclone's first run starts its own. A paused original gives a paused clone; an\nactive one keeps running until its owner pauses or deletes it.\n\nNeeds the database scheduler: the legacy timer re-anchors an interval\nschedule whenever it arms one, so it can't run the clone on the original's days.",
+        "description": "Copy an owned automation under a new ID, without its runs or continued session.\n\nNeeds the database scheduler: the legacy timer re-anchors an interval\nschedule whenever it arms one, so it can't run the clone on the original's days.",
         "operationId": "clone_scheduled_task_v1_scheduled_tasks__scheduled_task_id__clone_post",
         "parameters": [
           {
@@ -21601,6 +21620,23 @@
             }
           }
         ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/CloneScheduledTaskRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
         "responses": {
           "200": {
             "content": {

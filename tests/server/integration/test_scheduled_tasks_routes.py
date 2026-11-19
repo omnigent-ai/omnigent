@@ -7090,3 +7090,53 @@ async def test_a_reminder_cannot_be_cloned(auth_client: httpx.AsyncClient, db_ur
 
     assert resp.status_code == 400, resp.text
     assert "Only an automation can be cloned" in resp.text
+
+
+@_ON_DATABASE_SCHEDULER
+async def test_a_clone_of_an_automation_whose_project_is_gone_starts_unfiled(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    project_id = await _make_project(auth_client, "gone")
+    original = (
+        await auth_client.post(
+            "/v1/scheduled-tasks", json=_create_body(project_id=project_id), headers=_headers()
+        )
+    ).json()
+    # Paused, so no run clears the stale project first.
+    paused = await auth_client.patch(
+        f"/v1/scheduled-tasks/{original['id']}", json={"state": "paused"}, headers=_headers()
+    )
+    assert paused.status_code == 200, paused.text
+    deleted = await auth_client.delete(f"/v1/projects/{project_id}", headers=_headers())
+    assert deleted.status_code in (200, 204), deleted.text
+
+    resp = await auth_client.post(
+        f"/v1/scheduled-tasks/{original['id']}/clone", headers=_headers()
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["project_id"] is None
+
+
+@_ON_DATABASE_SCHEDULER
+@pytest.mark.parametrize(
+    ("host_id", "status"), [("4b653f6031f35d168cc0b37caa1306d1", 200), ("other-host", 400)]
+)
+async def test_a_clones_routing_host_must_be_the_originals(
+    auth_client: httpx.AsyncClient, db_uri: str, host_id: str, status: int
+) -> None:
+    original = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+
+    resp = await auth_client.post(
+        f"/v1/scheduled-tasks/{original['id']}/clone",
+        json={"host_id": host_id},
+        headers=_headers(),
+    )
+
+    assert resp.status_code == status, resp.text
+    if status == 200:
+        assert resp.json()["host_id"] == original["host_id"]
+    else:
+        assert len(SqlAlchemyScheduledTaskStore(db_uri).list()) == 1

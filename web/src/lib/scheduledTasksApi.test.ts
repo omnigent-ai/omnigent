@@ -437,10 +437,12 @@ describe("cloneScheduledTask", () => {
     fetchMock.mockResolvedValueOnce(
       mockResponse({ ...TASK_WIRE, id: "st_2", name: "Nightly triage (copy)" }),
     );
-    const clone = await cloneScheduledTask("st 1");
+    const clone = await cloneScheduledTask({ id: "st 1", hostId: "host_a" });
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe("/v1/scheduled-tasks/st%201/clone");
     expect(init.method).toBe("POST");
+    // The original's host routes the request to its replica.
+    expect(JSON.parse(init.body)).toEqual({ host_id: "host_a" });
     expect(new Headers(init.headers).get("x-omnigent-automation-source")).toBe("ui");
     expect(clone).toMatchObject({ id: "st_2", name: "Nightly triage (copy)" });
   });
@@ -451,8 +453,10 @@ describe("cloneScheduledTask", () => {
     win.omnigentDesktop = { browserTabs: () => undefined };
     try {
       fetchMock.mockResolvedValueOnce(mockResponse({ ...TASK_WIRE, id: "st_2" }));
-      await cloneScheduledTask("st_1");
+      await cloneScheduledTask({ id: "st_1", hostId: null });
       const [, init] = fetchMock.mock.calls[0];
+      // An unpinned automation names no host.
+      expect(JSON.parse(init.body)).toEqual({});
       expect(new Headers(init.headers).get("X-Omnigent-Browser-Agent-Tools")).toBe("on");
     } finally {
       win.omnigentDesktop = before;
@@ -466,7 +470,9 @@ describe("cloneScheduledTask", () => {
         { ok: false, status: 400 },
       ),
     );
-    const error = await cloneScheduledTask("st_1").catch((err: unknown) => err);
+    const error = await cloneScheduledTask({ id: "st_1", hostId: null }).catch(
+      (err: unknown) => err,
+    );
     expect(error).toMatchObject({ status: 400, message: "Only an automation can be cloned" });
     expect(cloneFailedMessage(error)).toBe(
       "Couldn't clone the automation: Only an automation can be cloned",

@@ -255,7 +255,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
         : runNowMutation.isPending
           ? (runNowMutation.variables as string | undefined)
           : cloneMutation.isPending
-            ? cloneMutation.variables
+            ? cloneMutation.variables?.id
             : undefined;
 
   function handlePauseToggle(task: ScheduledTask) {
@@ -287,7 +287,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   }
 
   function handleClone(task: ScheduledTask) {
-    cloneMutation.mutate(task.id, {
+    cloneMutation.mutate(task, {
       onSuccess: (clone) => {
         showToast(cloneCreatedMessage(clone));
         // Without detail pages the copy stays here, on the refreshed list.

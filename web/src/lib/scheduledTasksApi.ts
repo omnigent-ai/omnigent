@@ -657,14 +657,20 @@ export async function updateScheduledTask(
  * Create a copy of an automation, under a new ID, with its settings and schedule but
  * none of its runs. The copy is paused when the original is; otherwise both run.
  */
-export async function cloneScheduledTask(id: string): Promise<ScheduledTask> {
-  const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}/clone`, {
+export async function cloneScheduledTask(
+  task: Pick<ScheduledTask, "id" | "hostId">,
+): Promise<ScheduledTask> {
+  const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(task.id)}/clone`, {
     method: "POST",
     headers: {
+      "Content-Type": "application/json",
       "x-omnigent-automation-source": "ui",
       // A copied source session takes its browser tools mode from this request.
       ...browserAgentToolsRequestHeaders(),
     },
+    // The create checks the original's host over its tunnel, so the request
+    // routes to that host's replica by this host_id.
+    body: JSON.stringify(task.hostId ? { host_id: task.hostId } : {}),
   });
   return taskFromWire(await readJsonOrThrow<ScheduledTaskWire>(res));
 }

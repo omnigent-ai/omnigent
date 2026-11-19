@@ -487,6 +487,16 @@ def _inbox_cursor_task_id(task_id: str) -> str:
         return task_id
 
 
+class CloneScheduledTaskRequest(BaseModel):
+    """Optional body for ``POST /v1/scheduled-tasks/{id}/clone``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # The automation's own host, which clients send so the request routes to that
+    # host's replica; the copy keeps the original's host either way.
+    host_id: str | None = None
+
+
 # The scheduled_tasks.name column's length.
 _TASK_NAME_MAX_CHARS = 256
 _CLONE_NAME_SUFFIX = " (copy)"
@@ -1108,13 +1118,12 @@ def create_scheduled_tasks_router(
         return await _create_task(request, body)
 
     @router.post("/scheduled-tasks/{scheduled_task_id}/clone")
-    async def clone_scheduled_task(request: Request, scheduled_task_id: str) -> dict[str, Any]:
-        """Create a new automation with an owned automation's settings and schedule.
-
-        The clone gets a new ID, which on some deployments is what lets it be shared,
-        and none of the original's runs. A continued session isn't carried over: the
-        clone's first run starts its own. A paused original gives a paused clone; an
-        active one keeps running until its owner pauses or deletes it.
+    async def clone_scheduled_task(
+        request: Request,
+        scheduled_task_id: str,
+        body: CloneScheduledTaskRequest | None = None,
+    ) -> dict[str, Any]:
+        """Copy an owned automation under a new ID, without its runs or continued session.
 
         Needs the database scheduler: the legacy timer re-anchors an interval
         schedule whenever it arms one, so it can't run the clone on the original's days.
@@ -1128,14 +1137,27 @@ def create_scheduled_tasks_router(
         task = _require_owned(scheduled_task_id, None if owner == RESERVED_USER_LOCAL else owner)
         if task.kind != "automation":
             raise OmnigentError("Only an automation can be cloned", code=ErrorCode.INVALID_INPUT)
+        if body is not None and body.host_id is not None and body.host_id != task.host_id:
+            raise OmnigentError(
+                "host_id must be the automation's own host", code=ErrorCode.INVALID_INPUT
+            )
         try:
-            body = _clone_request(task)
+            create = _clone_request(task)
         except ValidationError as exc:
             raise OmnigentError(
                 f"This automation can't be cloned: {exc.errors()[0]['msg']}",
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
-        return await _create_task(request, body, cloned_from=task)
+        if create.project_id is not None and (
+            project_store is None
+            or await asyncio.to_thread(
+                project_store.get, create.project_id, user_id=_project_owner(owner)
+            )
+            is None
+        ):
+            # A run files nothing into a deleted project, so the copy starts unfiled.
+            create = create.model_copy(update={"project_id": None})
+        return await _create_task(request, create, cloned_from=task)
 
     async def _create_task(
         request: Request,

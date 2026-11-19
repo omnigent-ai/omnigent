@@ -812,7 +812,10 @@ describe("cloning from the row menu", () => {
     fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
     fireEvent.click(screen.getByRole("menuitem", { name: "Clone" }));
 
-    expect(cloneMutate).toHaveBeenCalledWith("st_1", expect.any(Object));
+    expect(cloneMutate).toHaveBeenCalledWith(
+      expect.objectContaining({ id: "st_1" }),
+      expect.any(Object),
+    );
     expect(showToast).not.toHaveBeenCalled();
 
     act(() =>

@@ -172,8 +172,8 @@ describe("mutations invalidate the list", () => {
     const { queryClient, wrapper } = makeWrapper();
     const spy = vi.spyOn(queryClient, "invalidateQueries");
     const { result } = renderHook(() => useCloneScheduledTask(), { wrapper });
-    await result.current.mutateAsync("st_1");
-    expect(api.cloneScheduledTask).toHaveBeenCalledWith("st_1");
+    await result.current.mutateAsync({ id: "st_1", hostId: "host_a" });
+    expect(api.cloneScheduledTask).toHaveBeenCalledWith({ id: "st_1", hostId: "host_a" });
     expect(spy).toHaveBeenCalledWith({ queryKey: SCHEDULED_TASKS_KEY });
     // The copy's source session joins the owner's session lists.
     for (const queryKey of [["conversations"], ["session", "conv_clone_copy"]]) {
