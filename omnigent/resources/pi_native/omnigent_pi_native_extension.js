@@ -1258,7 +1258,7 @@ function readChildHeader(file) {
     const entry = parseJsonLine(line);
     if (entry?.type !== "session_info" || typeof entry.name !== "string" || !entry.name) continue;
     // The Agents rail splits a child title at its first colon.
-    title = (_PI_SUBAGENTS_SESSION_NAME.exec(entry.name)?.[1] || entry.name).replace(/:/g, "-");
+    title = (entry.name.match(_PI_SUBAGENTS_SESSION_NAME)?.[1] || entry.name).replace(/:/g, "-");
     break;
   }
   return {
