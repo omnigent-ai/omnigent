@@ -3,7 +3,7 @@
 // Ctrl+A and friends keep their platform meaning there.
 
 import { Annotation, StateField, type Extension, type StateCommand } from "@codemirror/state";
-import { keymap, type KeyBinding } from "@codemirror/view";
+import { EditorView, keymap, type Command, type KeyBinding } from "@codemirror/view";
 import {
   EMPTY_KILL_RING,
   endKillRun,
@@ -28,19 +28,38 @@ const killRingField = StateField.define<KillRing>({
 
 type Boundary = (text: string, offset: number) => number;
 
+/** Grow `[from, to)` over every atomic range it overlaps, so a kill never splits a mention. */
+function coverAtomicRanges(view: EditorView, from: number, to: number): [number, number] {
+  let start = from;
+  let end = to;
+  for (const ranges of view.state.facet(EditorView.atomicRanges)) {
+    ranges(view).between(from, to, (rangeFrom, rangeTo) => {
+      if (rangeFrom < to && rangeTo > from) {
+        start = Math.min(start, rangeFrom);
+        end = Math.max(end, rangeTo);
+      }
+    });
+  }
+  return [start, end];
+}
+
 /** Kill from the caret to `boundary`, or kill the selection when there is one. */
-function kill(boundary: Boundary): StateCommand {
-  return ({ state, dispatch }) => {
+function kill(boundary: Boundary): Command {
+  return (view) => {
+    const { state } = view;
     // A read-only or disabled draft keeps its text; the key falls through unclaimed.
     if (state.readOnly) return false;
     const range = state.selection.main;
     const text = state.doc.toString();
     const end = range.empty ? boundary(text, range.head) : range.to;
-    const from = Math.min(range.empty ? range.head : range.from, end);
-    const to = Math.max(range.empty ? range.head : range.from, end);
+    const [from, to] = coverAtomicRanges(
+      view,
+      Math.min(range.empty ? range.head : range.from, end),
+      Math.max(range.empty ? range.head : range.from, end),
+    );
     if (from === to) return true;
     const backward = range.empty && to === range.head;
-    dispatch(
+    view.dispatch(
       state.update({
         changes: { from, to },
         selection: { anchor: from },

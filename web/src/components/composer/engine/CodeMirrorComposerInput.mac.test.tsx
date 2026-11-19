@@ -15,12 +15,13 @@ vi.hoisted(() => {
   Object.defineProperty(navigator, "userAgent", { configurable: true, get: () => mac });
 });
 
-function mount(value: string, caret: number) {
+function mount(value: string, caret: number, mentionTokens?: readonly string[]) {
   const box: { target: ComposerTextTarget | null } = { target: null };
   const { container } = render(
     <CodeMirrorComposerInput
       aria-label="Message the agent"
       defaultValue={value}
+      mentionTokens={mentionTokens}
       ref={(target) => {
         box.target = target;
       }}
@@ -72,6 +73,16 @@ describe("CodeMirror composer keys on macOS", () => {
 
     expect(press({ key: "∫", code: "KeyB", altKey: true })).toBe(true);
     expect(target().value).toBe("draft");
+  });
+
+  it("kills a multi-word mention whole on ⌃W, so ⌃Y brings all of it back", () => {
+    const draft = "ask @Alpha planning ";
+    const { target, press } = mount(draft, draft.length, ["@Alpha planning"]);
+
+    press({ key: "w", code: "KeyW", ctrlKey: true });
+    expect(target().value).toBe("ask ");
+    press({ key: "y", code: "KeyY", ctrlKey: true });
+    expect(target().value).toBe(draft);
   });
 
   it("yanks both words after two ⌃W kills in a row", () => {
