@@ -64,10 +64,6 @@ function formatAccelerator(accelerator: string): string {
   return parts.map((part) => (part === "Control" ? "Ctrl" : part)).join("+");
 }
 
-/**
- * Opt-in shortcut that brings the desktop app to the front from any app. The
- * shell registers it; this control reads and saves the setting.
- */
 /** Each shortcut's test and component ids; its name and copy come from its catalog entry. */
 const SHORTCUT_IDS: Record<GlobalShortcutId, { testIdPrefix: string; componentId: string }> = {
   show: { testIdPrefix: "global-shortcut", componentId: "settings.general.global_shortcut" },
@@ -77,6 +73,11 @@ const SHORTCUT_IDS: Record<GlobalShortcutId, { testIdPrefix: string; componentId
   },
 };
 
+/**
+ * A system-wide shortcut: by default the opt-in one that brings the desktop app to the front
+ * from any app, or the one that opens the New Agent panel. The shell registers it; this
+ * control reads and saves the setting.
+ */
 export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: GlobalShortcutId }) {
   const entry = GLOBAL_SHORTCUT_ENTRIES.entry(shortcutId);
   const ids = SHORTCUT_IDS[shortcutId];
