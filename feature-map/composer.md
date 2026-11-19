@@ -160,18 +160,21 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   the same machine and the view follows it. States: loading, error/retry,
   unavailable while disconnected, and an incomplete catalog.
 - `command-and-shell-tint`: a draft that opens with a known command or skill
-  shows that token tinted, leaving its arguments plain; an unknown `/word` stays
-  plain. The main chat, the new-session composer and side chats all do this, on
-  the textarea and on the CodeMirror editor alike, and the sent user bubble keeps
-  the command tint (a message relayed from another session doesn't). In a Claude Code or Codex native session, a draft that opens with
-  `!` tints the `!`, rings the composer and shows a "Shell command" hint, because
-  it will run in the session's shell (Codex: owner only; the new-session composer
-  follows the chosen agent's harness). A `!` draft carrying an @-tag is refused
-  with a notice and the draft is kept. States: known command, unknown command,
-  quotes or attachments present (no tint), shell mode, shell mode with a tag
-  (refused), codex non-owner (no shell mode), pending side-chat tab (no shell
-  mode). What runs after the send is in the
-  [native shell recipes](native-harnesses.md#driving-it-with-the-repro-environment).
+  shows that token tinted, leaving its arguments plain; an unknown `/word`
+  stays plain. The main chat, the new-session composer and side chats all do
+  this, on the textarea and on the CodeMirror editor alike, and the sent user
+  bubble keeps the command tint (a message relayed from another session
+  doesn't). In a Claude Code or Codex native session, a draft that opens with
+  `!` tints the `!`, rings the composer and shows a "Shell command" hint,
+  because it will run in the session's shell (Codex: owner only; the
+  new-session composer follows the chosen agent's harness). A `!` draft
+  carrying an @-tag is refused with a notice and the draft is kept. States:
+  known command, unknown command, quotes or attachments present (no tint),
+  shell mode, shell mode with a tag (refused), codex non-owner (no shell
+  mode), pending side-chat tab (no shell mode). What runs after the send is in
+  the [native shell
+  recipes](native-harnesses.md#driving-it-with-the-repro-environment) (the
+  `chat-render` shell-command bullets for Claude and Codex).
 - `goal-command`: in sessions with a Goal control, bare `/goal` or its slash-menu
   row opens the same dialog as **+ → Goal**. `/goal <objective>` keeps its
   existing message path. Sessions without the control keep sending the text
@@ -391,6 +394,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 - In a Codex native chat, a Claude Code native chat, or a Polly session with a
   Goal control, send `/goal`, choose `/goal` from the slash menu, or open
   **+ → Goal**.
+- In the in-session composer, a side chat, or the new-session composer, type a
+  known command or skill such as `/help`; in a Claude Code or Codex native
+  session (or with that agent chosen on the new-session composer), type a draft
+  that starts with `!`.
 
 **In-session composer** (open any session):
 
@@ -887,16 +894,18 @@ composer with its prompt`).
   incomplete catalog:
   `tests/e2e_ui/chat/test_codex_skills_menu_inventory_failure.py::test_failed_plugin_inventory_is_not_shown_as_an_empty_catalog`.
   claude-sdk `/clear` is in the `/clear` and `slash-rewind` recipe above.
-- **`command-and-shell-tint`:** component coverage, run with vitest from `web/`:
-  `web/src/components/composer/composerHighlight.test.ts` (classification,
-  including the harness-specific `!` rules), `web/src/pages/ChatPage.composer.test.tsx`
-  (`Composer native shell mode` and the CodeMirror release-flag cases),
-  `web/src/components/chat/SideChatPane.test.tsx`, `web/src/shell/NewChatDialog.test.tsx`
-  and `web/src/pages/ChatPage.userBubble.test.tsx` (sent-bubble tint). Manually, in
-  a Codex native session as owner, type `!echo hi`: the `!` is tinted and the hint
-  shows; add an @-tag and send to see the refusal. Repeat in a side chat and on
-  the new-session composer, with and without `chat_composer_codemirror`.
-
+- **`command-and-shell-tint`:** component coverage, run with vitest from
+  `web/`: `web/src/components/composer/composerHighlight.test.ts`
+  (classification, including the harness-specific `!` rules),
+  `web/src/pages/ChatPage.composer.test.tsx` (`Composer native shell mode` and
+  the CodeMirror release-flag cases),
+  `web/src/components/chat/SideChatPane.test.tsx`,
+  `web/src/shell/NewChatDialog.test.tsx` and
+  `web/src/pages/ChatPage.userBubble.test.tsx` (sent-bubble tint). Manually,
+  in a Codex native session as owner, type `!echo hi`: the `!` is tinted and
+  the hint shows; add an @-tag and send to see the refusal. Repeat in a side
+  chat and on the new-session composer, with and without
+  `chat_composer_codemirror`.
 - **`goal-command`:**
   `tests/e2e_ui/chat/test_codex_goal_mode.py::test_codex_goal_mode_processes_first_message_with_untrusted_hooks`
   drives a real Codex native session through **+ → Goal**, bare `/goal`, and
