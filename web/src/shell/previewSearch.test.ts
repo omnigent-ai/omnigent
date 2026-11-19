@@ -1,12 +1,8 @@
-// Unit tests for the rendered-preview find matcher (findTextRanges).
-//
-// The paint/clear helpers use the CSS Custom Highlight API, which jsdom doesn't
-// implement, so those are exercised in the app; here we cover the matcher — the
-// risk-bearing logic that walks the preview DOM into DOM Ranges. jsdom provides
-// TreeWalker + Range, so ranges round-trip to their matched text.
+// Rendered-preview matching and painting; jsdom ranges and a Highlight double
+// cover the browser API without mounting a browser.
 
-import { afterEach, describe, expect, it } from "vitest";
-import { findTextMatches, findTextRanges } from "./previewSearch";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { findTextMatches, findTextRanges, paintPreviewHighlights } from "./previewSearch";
 
 let container: HTMLElement | null = null;
 
@@ -20,6 +16,31 @@ function mount(html: string): HTMLElement {
 afterEach(() => {
   container?.remove();
   container = null;
+  vi.unstubAllGlobals();
+});
+
+it("paints a table-sized match set without passing every range as a constructor argument", () => {
+  class TestHighlight {
+    ranges: Range[];
+    constructor(...ranges: Range[]) {
+      this.ranges = ranges;
+    }
+    add(range: Range) {
+      this.ranges.push(range);
+    }
+  }
+  const highlights = new Map<string, TestHighlight>();
+  vi.stubGlobal("Highlight", TestHighlight);
+  vi.stubGlobal("CSS", { highlights });
+  const ranges = Array.from({ length: 200_000 }, () => ({}) as Range);
+  const current = 100_000;
+  paintPreviewHighlights(ranges, current);
+  const all = highlights.get("md-preview-search")!.ranges;
+  expect(all).toHaveLength(ranges.length - 1);
+  expect(all[0]).toBe(ranges[0]);
+  expect(all.at(-1)).toBe(ranges.at(-1));
+  expect(all).not.toContain(ranges[current]);
+  expect(highlights.get("md-preview-search-current")!.ranges).toEqual([ranges[current]]);
 });
 
 describe("findTextRanges", () => {

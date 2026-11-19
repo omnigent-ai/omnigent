@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { useFileContent } from "@/hooks/useFileContent";
@@ -16,6 +17,23 @@ import { highlightCode } from "@/components/ai-elements/code-block";
 
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn() }));
 const slugRuns = vi.hoisted(() => ({ count: 0 }));
+const tableEditorProps = vi.hoisted(() => vi.fn());
+vi.mock("./DelimitedTableEditor", async () => {
+  const { DataTablePreview } = await import("./DataTablePreview");
+  return {
+    DelimitedTableEditor: (
+      props: Parameters<typeof DataTablePreview>[0] & {
+        conversationId: string;
+        canEdit: boolean;
+        onDirtyChange?: (dirty: boolean) => void;
+        onSaveStatusChange?: (status: string) => void;
+      },
+    ) => {
+      tableEditorProps(props);
+      return <DataTablePreview {...props} />;
+    },
+  };
+});
 vi.mock("rehype-slug", async (importOriginal) => {
   const actual = await importOriginal<typeof rehypeSlugModule>();
   return {
@@ -80,6 +98,7 @@ vi.mock("./ModelViewer", () => ({
 
 import * as permissions from "@/hooks/usePermissions";
 import { isMacPlatform } from "@/lib/hotkeys";
+import { saveScrollTop } from "./useScrollRestore";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -1275,6 +1294,13 @@ describe("CodeViewer data-file routing", () => {
     expect(screen.getByRole("table", { name: "sales.csv" })).toBeDefined();
     expect(screen.getByRole("cell", { name: "Oslo" })).toBeDefined();
     expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
+    expect(tableEditorProps).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        conversationId: "conv_1",
+        path: "sales.csv",
+        canEdit: true,
+      }),
+    );
   });
 
   it("keeps the raw text in source mode", async () => {
@@ -1292,7 +1318,7 @@ describe("CodeViewer data-file routing", () => {
     expect(screen.queryByText(/Preview not available/)).toBeNull();
   });
 
-  it("opens find in the table and finds again after filtering, sorting or emptying", () => {
+  it("opens find in the table and finds again after filtering, sorting or emptying", async () => {
     // jsdom has neither layout nor the CSS Custom Highlight API the find bar uses.
     const rangeRect = Object.getOwnPropertyDescriptor(Range.prototype, "getBoundingClientRect");
     const scrollBy = Object.getOwnPropertyDescriptor(Element.prototype, "scrollBy");
@@ -1347,6 +1373,17 @@ describe("CodeViewer data-file routing", () => {
       view.rerender(viewerElement("", true, "sales.csv", options));
       expect(screen.getByText(/This file has no rows/)).toBeDefined();
       expect(screen.getByText("No results")).toBeDefined();
+
+      // A workbook refreshed into one the preview can't read leaves no stale matches.
+      const book = { ...options, encoding: "base64" } as const;
+      const workbook = readFileSync("src/shell/__fixtures__/sales.xlsx").toString("base64");
+      view.rerender(viewerElement(workbook, true, "sales.xlsx", book));
+      await screen.findByRole("tab", { name: "Sales" });
+      fireEvent.change(screen.getByPlaceholderText("Find…"), { target: { value: "West" } });
+      expect(screen.getByText("1 / 1")).toBeDefined();
+      view.rerender(viewerElement(btoa("not a zip"), true, "sales.xlsx", book));
+      await screen.findByRole("alert");
+      expect(screen.getByText("No results")).toBeDefined();
     } finally {
       vi.unstubAllGlobals();
       for (const [target, name, original] of [
@@ -1357,6 +1394,34 @@ describe("CodeViewer data-file routing", () => {
         else Reflect.deleteProperty(target, name);
       }
     }
+  });
+
+  it("reads a workbook the server sent as UTF-8 text because its bytes allowed it", async () => {
+    // A stored workbook whose every byte is ASCII, so the file API returns it as text.
+    const workbook = readFileSync("src/shell/__fixtures__/ascii-stored.xlsx", "utf8");
+    renderViewer(workbook, true, "plain.xlsx", { viewMode: "preview", encoding: "utf-8" });
+    expect(await screen.findByRole("cell", { name: "pens" })).toBeDefined();
+    expect(screen.queryByRole("alert")).toBeNull();
+  });
+
+  it("restores a workbook's saved scroll position once its table has loaded", async () => {
+    // The preview first shows "Reading the file…" (no scroller); the restore
+    // must wait for the table rather than give up on the placeholder.
+    saveScrollTop("viewer-preview:conv_1:sales.xlsx", 300);
+    const workbook = readFileSync("src/shell/__fixtures__/sales.xlsx").toString("base64");
+    renderViewer(workbook, true, "sales.xlsx", { viewMode: "preview", encoding: "base64" });
+    expect(screen.getByText(/Reading the file/)).toBeDefined();
+    await screen.findByRole("tab", { name: "Sales" });
+    const scroller = document.querySelector<HTMLElement>("[data-preview-scroll]");
+    await waitFor(() => expect(scroller?.scrollTop).toBe(300));
+  });
+
+  it("opens an Excel workbook on its table even in source mode", async () => {
+    const workbook = readFileSync("src/shell/__fixtures__/sales.xlsx").toString("base64");
+    renderViewer(workbook, true, "sales.xlsx", { viewMode: "source", encoding: "base64" });
+    expect(await screen.findByRole("tab", { name: "Sales" })).toBeDefined();
+    expect(screen.queryByText(/Preview not available/)).toBeNull();
+    expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
   });
 
   it("shows the shared truncation banner for a partial file", () => {

@@ -2000,6 +2000,22 @@ describe("FileViewer markdown preview/edit/source modes", () => {
     },
   );
 
+  it.each(["results.csv", "export.tsv"])(
+    "guards unsaved table edits before opening Source for %s",
+    (path) => {
+      renderViewer({ open: true, path });
+      expect(viewModeOf()).toBe("preview");
+      fireEvent.click(screen.getByRole("button", { name: "make dirty" }));
+      fireEvent.click(screen.getByRole("button", { name: "View source" }));
+      expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+      expect(viewModeOf()).toBe("preview");
+      fireEvent.click(screen.getByRole("button", { name: "View source" }));
+      fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+      expect(viewModeOf()).toBe("source");
+    },
+  );
+
   it("opens a ?comment= link to a CSV in source, then lets the toggle reach the table", () => {
     renderViewer({ open: true, path: "results.csv", initialSearch: "comment=c1" });
     expect(viewModeOf()).toBe("source");
@@ -2883,6 +2899,32 @@ describe("FileViewer 3D model files", () => {
     renderViewer({ open: true, path: "widget.stl" });
     expect(viewModeOf()).toBe("source");
   });
+
+  it.each(["sales.xlsx", "events.parquet"])(
+    "opens %s on its table, with no source toggle, even from a line link",
+    (path) => {
+      renderViewer({ open: true, path, position: { line: 3 } });
+      expect(viewModeOf()).toBe("preview");
+      expect(screen.queryByRole("button", { name: "View source" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "View preview" })).toBeNull();
+    },
+  );
+
+  it.each(["sales.xlsx", "events.parquet"])(
+    "opens a changed %s on its table even when the link asks for the diff",
+    (path) => {
+      vi.mocked(useWorkspaceChangedFiles).mockReturnValue({
+        data: {
+          available: true,
+          data: [{ path, bytes: 10, modified_at: null, name: path, status: "modified" }],
+        },
+      } as ReturnType<typeof useWorkspaceChangedFiles>);
+      renderViewer({ open: true, path, initialSearch: "diff=1" });
+      expect(viewModeOf()).toBe("preview");
+      expect(screen.queryByTestId("diff-viewer")).toBeNull();
+      expect(screen.queryByRole("button", { name: "Show diff" })).toBeNull();
+    },
+  );
 
   it("suppresses the diff toggle for a model file even when it is a changed file", () => {
     // Report the model as a changed file — an ordinary changed file would get a

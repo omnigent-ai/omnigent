@@ -143,7 +143,7 @@ import {
   openHtmlArtifactInNewTab,
 } from "./codeViewerHelpers";
 import { CommentsPanel, type ActiveSelection } from "./CommentsPanel";
-import { isDataTablePath } from "./dataTable";
+import { isDataTablePath, isSpreadsheetPath } from "./dataTable";
 import { useScrollRestore } from "./useScrollRestore";
 import { isPdfAnchor } from "./pdfCommentHelpers";
 
@@ -890,6 +890,8 @@ function FileViewerBody({
   // they have no meaningful source/diff/preview text representation, so diff is
   // suppressed and they always resolve to the (viewer-owning) source surface.
   const isModel = isModelFile(path, fileQuery.data?.content_type);
+  // Excel and Parquet open only on the table: no source, diff or line view.
+  const isSpreadsheet = isSpreadsheetPath(path);
   // Binary/base64 files render CodeViewer's "Preview not available" notice, not
   // Monaco — mirrors CodeViewer's own base64/binary-path check.
   const isBinary = fileQuery.data?.encoding === "base64" || isBinaryPath(path);
@@ -899,6 +901,7 @@ function FileViewerBody({
     !isPdf &&
     !isVideo &&
     !isModel &&
+    !isSpreadsheet &&
     (changedFiles.data?.data.some((f) => f.path === path) ?? false);
   const revealTarget = useRevealTarget(path);
   const openInActions = useOpenInActions(isDeletedFile ? null : path);
@@ -1032,7 +1035,13 @@ function FileViewerBody({
       : undefined;
   // Citations preserve diff mode; previewable files need source to expose line numbers.
   const viewMode: "editor" | "preview" | "source" | "diff" =
-    effectiveDiffActive && isDiffAvailable ? "diff" : filePosition ? "source" : fileViewMode;
+    effectiveDiffActive && isDiffAvailable
+      ? "diff"
+      : isSpreadsheet
+        ? "preview"
+        : filePosition
+          ? "source"
+          : fileViewMode;
   const diffViewActive = viewMode === "diff";
   // A citation opens large Markdown in editable source; keep source for the visit
   // so clearing the citation cannot drop unsaved edits by returning to Preview.
@@ -1047,7 +1056,10 @@ function FileViewerBody({
   useLayoutEffect(() => {
     if (!open || !registerNavigationGuard) return;
     return registerNavigationGuard((destination, options, navigate) => {
-      if (destination !== path || (options?.line && viewMode === "editor")) {
+      if (
+        destination !== path ||
+        (options?.line && (viewMode === "editor" || isDataTablePath(path)))
+      ) {
         guardDirty(navigate);
       } else {
         navigate();
@@ -1065,7 +1077,7 @@ function FileViewerBody({
     // Switching out of the rich-text editor must preserve its unsaved-edit guard.
     if (
       position &&
-      viewMode === "editor" &&
+      (viewMode === "editor" || (viewMode === "preview" && isDataTablePath(path))) &&
       last.path === path &&
       last.conversationId === conversationId
     ) {
@@ -1198,14 +1210,15 @@ function FileViewerBody({
   const splitToggleAvailable =
     contentWidth === null || contentWidth === 0 || contentWidth >= MONACO_SPLIT_BREAKPOINT;
   useEffect(() => {
-    if (viewMode !== "editor") handleDirtyChange(false);
+    if (viewMode !== "editor" && !(viewMode === "preview" && isDataTablePath(path)))
+      handleDirtyChange(false);
     // Skip on mount — only clear when the user actively switches modes.
     // Clearing on mount would race with the linked-comment effect.
     if (viewModeInitializedRef.current && (viewMode === "editor" || viewMode === "preview")) {
       setActiveSelection(null);
     }
     viewModeInitializedRef.current = true;
-  }, [viewMode, handleDirtyChange]);
+  }, [viewMode, path, handleDirtyChange]);
 
   // Sync diff state to URL. Skip when already in sync to avoid clobbering ?file=
   // that AppShell writes (React Router v7 BrowserRouter defers via startTransition,

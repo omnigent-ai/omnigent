@@ -10,7 +10,13 @@ import {
   type RefObject,
   type UIEvent,
 } from "react";
-import { ArrowDownIcon, ArrowUpIcon, ArrowUpDownIcon, CopyIcon } from "lucide-react";
+import {
+  ArrowDownIcon,
+  ArrowUpIcon,
+  ArrowUpDownIcon,
+  CopyIcon,
+  PencilLineIcon,
+} from "lucide-react";
 import { toast } from "sonner";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -102,13 +108,14 @@ export function DataTablePreview({
   );
 }
 
-function DataTableView({
+export function DataTableView({
   table,
   path,
   truncated,
   rootRef,
   onScroll,
   onRowsChange,
+  onEditCell,
 }: {
   table: DataTable;
   path: string;
@@ -116,6 +123,8 @@ function DataTableView({
   rootRef?: RefObject<HTMLDivElement | null>;
   onScroll?: (event: UIEvent<HTMLElement>) => void;
   onRowsChange?: () => void;
+  /** Original file-order row and column, independent of sorting and filters. */
+  onEditCell?: (row: number, column: number) => void;
 }) {
   const [sort, setSort] = useState<{ column: number; direction: SortDirection } | null>(null);
   const [filters, setFilters] = useState<string[]>(() => table.header.map(() => ""));
@@ -211,6 +220,10 @@ function DataTableView({
     (row: string[], column: number) => setPicked({ rows: table.rows, row, column }),
     [table.rows],
   );
+  const edit = useCallback(
+    (row: string[], column: number) => onEditCell?.(table.rows.indexOf(row), column),
+    [table.rows, onEditCell],
+  );
   // One cell is a tab stop: the selected one while it's on screen, else the first.
   const selectedIndex = selected ? visibleRows.indexOf(selected.row) : -1;
   const tabStop =
@@ -221,6 +234,11 @@ function DataTableView({
     const cell = (event.target as HTMLElement).closest<HTMLElement>("td[data-cell]");
     if (!cell) return;
     const [index, column] = cell.dataset.cell!.split(":").map(Number);
+    if (onEditCell && (event.key === "Enter" || event.key === "F2")) {
+      event.preventDefault();
+      edit(visibleRows[index], column);
+      return;
+    }
     const last = { index: visibleRows.length - 1, column: table.header.length - 1 };
     const next = {
       ArrowUp: [Math.max(0, index - 1), column],
@@ -258,12 +276,17 @@ function DataTableView({
         <span data-testid="data-table-summary">
           {rowCount} · {table.totalColumns.toLocaleString()}{" "}
           {table.totalColumns === 1 ? "column" : "columns"}
-          {table.encoding !== "utf-8" ? ` · ${table.encoding}` : ""}
+          {table.description ? ` · ${table.description}` : ""}
         </span>
         {filtered && <span>{visibleRows.length.toLocaleString()} matching</span>}
         {selected && selectedIndex >= 0 && (
           // The selection is only an outline on screen, so the buttons name what they copy.
           <span className="ml-auto flex gap-1">
+            {onEditCell && (
+              <Button variant="ghost" size="xs" onClick={() => edit(selected.row, selected.column)}>
+                <PencilLineIcon /> Edit cell
+              </Button>
+            )}
             <Button
               variant="ghost"
               size="xs"
@@ -283,11 +306,17 @@ function DataTableView({
           </span>
         )}
       </div>
-      {notes.length > 0 && (
+      {(notes.length > 0 || table.textCut) && (
         // A truncated file also gets the viewer's shared truncation banner.
         <div role="note" className="border-b bg-muted/40 px-4 py-1.5 text-sm text-muted-foreground">
-          {`Showing ${notes.join(" and ")}.`}
-          {truncated ? "" : ` Download the file to see ${columnsCut ? "all of it" : "every row"}.`}
+          {[
+            notes.length > 0 && `Showing ${notes.join(" and ")}.`,
+            table.textCut && "Text past the preview's limit is cut short.",
+            !truncated &&
+              `Download the file to see ${columnsCut || table.textCut ? "all of it" : "every row"}.`,
+          ]
+            .filter(Boolean)
+            .join(" ")}
         </div>
       )}
       {/* Only the table scrolls, so the summary and its copy buttons stay in view. */}
@@ -374,6 +403,7 @@ function DataTableView({
                 selectedColumn={selected?.row === row ? selected.column : null}
                 tabColumn={tabStop.index === index ? tabStop.column : null}
                 onPick={pick}
+                onEdit={onEditCell ? edit : undefined}
               />
             ))}
           </tbody>
@@ -392,6 +422,7 @@ const TableRow = memo(function TableRow({
   selectedColumn,
   tabColumn,
   onPick,
+  onEdit,
 }: {
   row: string[];
   index: number;
@@ -402,6 +433,7 @@ const TableRow = memo(function TableRow({
   /** The column of the table's single tab stop, when it is in this row. */
   tabColumn: number | null;
   onPick: (row: string[], column: number) => void;
+  onEdit?: (row: string[], column: number) => void;
 }) {
   return (
     <tr className="hover:bg-muted/40">
@@ -415,6 +447,7 @@ const TableRow = memo(function TableRow({
             tabIndex={tabColumn === column ? 0 : -1}
             onClick={() => onPick(row, column)}
             onFocus={() => onPick(row, column)}
+            onDoubleClick={onEdit ? () => onEdit(row, column) : undefined}
             data-selected={isSelected || undefined}
             style={{ maxWidth: widths[column] ?? DEFAULT_MAX_COLUMN_WIDTH }}
             className={cn(

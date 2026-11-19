@@ -78,7 +78,9 @@ import {
 } from "./codeViewerHelpers";
 import { NotebookPreview } from "./NotebookPreview";
 import { DataTablePreview } from "./DataTablePreview";
-import { isDataTablePath } from "./dataTable";
+import { DelimitedTableEditor } from "./DelimitedTableEditor";
+import { isDataTablePath, isSpreadsheetPath } from "./dataTable";
+import { SpreadsheetPreview } from "./SpreadsheetPreview";
 import { useScrollRestore } from "./useScrollRestore";
 import { PreviewSearchBar } from "./PreviewSearchBar";
 import { renderLineTokens } from "./codeViewerRendering";
@@ -336,7 +338,7 @@ function MarkdownPreview({
   );
 }
 
-// Markdown / notebook / data-table preview with find-in-file. The preview is React-owned
+// Markdown / notebook / data-table / spreadsheet preview with find-in-file. The preview is React-owned
 // DOM, so PreviewSearchBar highlights matches via the CSS Custom Highlight API
 // (no node mutation). `contentVersion` = content string, so the match ranges
 // recompute when the rendered document changes.
@@ -355,13 +357,18 @@ function PreviewWithSearch({
   onTocOpenChange,
   commentHint,
   deferOffscreen,
+  tableEditing,
 }: {
   content: string;
   deferOffscreen?: boolean;
+  tableEditing?: Pick<
+    CodeViewerProps,
+    "conversationId" | "onDirtyChange" | "onSaveStatusChange"
+  > & { canEdit: boolean };
   /** Workspace path of the previewed file, for resolving relative links. */
   path: string | null;
-  kind: "markdown" | "notebook" | "table";
-  /** How the server sent *content*; only a data table decodes base64. */
+  kind: "markdown" | "notebook" | "table" | "spreadsheet";
+  /** How the server sent *content*; a data table or spreadsheet decodes base64. */
   encoding?: "utf-8" | "base64";
   truncated: boolean;
   searchOpen: boolean;
@@ -381,9 +388,15 @@ function PreviewWithSearch({
   commentHint?: { conversationId: string; onSwitchToEdit: () => void };
 }) {
   const previewRef = useRef<HTMLDivElement>(null);
+  // A spreadsheet reads its file before its table (the scroller) mounts.
+  const [spreadsheetScroller, setSpreadsheetScroller] = useState(false);
   // The preview div (not the FileViewer content area) is the real scroller
   // here, so scroll persistence attaches to it directly.
-  const handleScroll = useScrollRestore(previewRef, scrollKey, scrollReady);
+  const handleScroll = useScrollRestore(
+    previewRef,
+    scrollKey,
+    scrollReady && (kind !== "spreadsheet" || spreadsheetScroller),
+  );
   // A table re-renders its rows on sort and filter without new content, so it
   // says when find must look again.
   const [tableRowsVersion, setTableRowsVersion] = useState(0);
@@ -399,15 +412,15 @@ function PreviewWithSearch({
   const bar = (
     <PreviewSearchBar
       containerRef={previewRef}
-      contentVersion={kind === "table" ? tableSearchVersion : content}
+      contentVersion={kind === "table" || kind === "spreadsheet" ? tableSearchVersion : content}
       open={searchOpen}
       onClose={onSearchHandled}
       inputRef={searchInputRef}
     />
   );
   const preview =
-    kind === "table" ? (
-      <DataTablePreview
+    kind === "spreadsheet" ? (
+      <SpreadsheetPreview
         content={content}
         encoding={encoding}
         path={path ?? ""}
@@ -415,7 +428,31 @@ function PreviewWithSearch({
         rootRef={previewRef}
         onScroll={handleScroll}
         onRowsChange={handleTableRowsChange}
+        onScrollerChange={setSpreadsheetScroller}
       />
+    ) : kind === "table" ? (
+      tableEditing ? (
+        <DelimitedTableEditor
+          {...tableEditing}
+          content={content}
+          encoding={encoding}
+          path={path ?? ""}
+          truncated={truncated}
+          rootRef={previewRef}
+          onScroll={handleScroll}
+          onRowsChange={handleTableRowsChange}
+        />
+      ) : (
+        <DataTablePreview
+          content={content}
+          encoding={encoding}
+          path={path ?? ""}
+          truncated={truncated}
+          rootRef={previewRef}
+          onScroll={handleScroll}
+          onRowsChange={handleTableRowsChange}
+        />
+      )
     ) : kind === "notebook" ? (
       <NotebookPreview content={content} rootRef={previewRef} onScroll={handleScroll} />
     ) : (
@@ -434,7 +471,8 @@ function PreviewWithSearch({
   return (
     <div className="flex h-full flex-col">
       {bar}
-      {truncated && <TruncatedBanner />}
+      {/* A spreadsheet can't show part of a file, and says so itself. */}
+      {truncated && kind !== "spreadsheet" && <TruncatedBanner />}
       {/* A truncated file can't be edited (or commented on) in the editor
           either, so the hint would send the user to a dead end — suppress it. */}
       {commentHint && !truncated && (
@@ -668,7 +706,10 @@ export function CodeViewer({
   const isMarkdownOrNotebookPreview =
     viewMode === "preview" && (lang === "markdown" || isNotebookPath(path));
   const isDataTablePreview = viewMode === "preview" && isDataTablePath(path);
-  const isRenderedPreview = isHtmlPreview || isMarkdownOrNotebookPreview || isDataTablePreview;
+  // Excel and Parquet have no text to show, so they open on the table in every mode but diff.
+  const isSpreadsheetPreview = viewMode !== "diff" && isSpreadsheetPath(path);
+  const isRenderedPreview =
+    isHtmlPreview || isMarkdownOrNotebookPreview || isDataTablePreview || isSpreadsheetPreview;
   // Only the Shiki DOM path needs the per-line split; skip it for Monaco and
   // rendered previews, which never render these lines.
   const rawLines = useMemo(
@@ -1006,7 +1047,27 @@ export function CodeViewer({
       </Suspense>
     );
   }
-  // Before the binary notice: a data file in another encoding arrives as base64.
+  // Before the binary notice: a data file in another encoding, or a workbook or
+  // Parquet file, usually arrives as base64 (but may arrive as UTF-8 text).
+  if (isSpreadsheetPreview && fileQuery.data) {
+    return (
+      <PreviewWithSearch
+        key={`${conversationId}:${path}`}
+        content={content}
+        path={path}
+        kind="spreadsheet"
+        encoding={fileQuery.data.encoding}
+        truncated={truncated}
+        searchOpen={searchOpen}
+        onSearchHandled={handleSearchHandled}
+        searchInputRef={searchInputRef}
+        scrollKey={conversationId && path ? `viewer-preview:${conversationId}:${path}` : null}
+        scrollReady
+        tocOpen={false}
+        onTocOpenChange={() => {}}
+      />
+    );
+  }
   if (isDataTablePreview && fileQuery.data) {
     return (
       <PreviewWithSearch
@@ -1014,6 +1075,7 @@ export function CodeViewer({
         content={content}
         path={path}
         kind="table"
+        tableEditing={{ conversationId, canEdit, onDirtyChange, onSaveStatusChange }}
         encoding={fileQuery.data.encoding}
         truncated={truncated}
         searchOpen={searchOpen}
