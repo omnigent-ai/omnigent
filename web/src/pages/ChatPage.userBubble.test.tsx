@@ -970,21 +970,10 @@ describe("UserBubble command tint", () => {
     expect(screen.getByTestId("message-bubble")).toHaveTextContent(text.trim());
   });
 
-  // Alone, these args would parse as a link definition and render nothing.
-  const linkDefinitionArgs = " [docs]: https://example.com";
-
-  // The tint wraps the token without changing how the rest of the text parses.
-  it.each([
-    linkDefinitionArgs,
-    " # x",
-    " - x",
-    " - first\n- second",
-    " ---",
-    " $$\nx^2\n$$",
-    " <details>more</details>",
-    "\n    const x = 1",
-  ])("renders /team%j like the untinted text", (args) => {
-    const text = `/team${args}`;
+  // The parse-equivalence matrix lives with FilePathAwareMessageResponse; this one goes through
+  // the bubble, whose raw HTML renders as text.
+  it("renders a tinted command with raw HTML args like the untinted text", () => {
+    const text = "/team <details>more</details>";
     const plain = renderScoped(userBubble(text), null);
     const untinted = screen.getByTestId("user-message-content").innerHTML;
     plain.unmount();
@@ -993,9 +982,7 @@ describe("UserBubble command tint", () => {
     const tinted = screen.getByTestId("user-message-content").innerHTML;
     expect(tinted).toContain(TINTED_TEAM);
     expect(tinted.replace(TINTED_TEAM, "/team")).toBe(untinted);
-    if (args === linkDefinitionArgs) {
-      expect(screen.getByTestId("message-bubble")).toHaveTextContent(text);
-    }
+    expect(screen.getByTestId("message-bubble")).toHaveTextContent(text);
   });
 
   it.each([
