@@ -1088,6 +1088,7 @@ class _ClaudeClientState:
     client: _ClaudeClient
     model: str | None
     static_key_file: PrivateStaticKeyFile | None = None
+    settings_file: pathlib.Path | None = None
     loop: asyncio.AbstractEventLoop | None = None
     task: asyncio.Task[None] | None = None
     effort: str | None = None
@@ -1130,22 +1131,32 @@ async def _close_managed_mcp_relay(state: _ClaudeClientState) -> None:
     """Release a gone CLI's auxiliary resources; relay shutdown blocks briefly."""
     relay, launcher = state.mcp_relay, state.cli_launcher
     key_file, state.static_key_file = state.static_key_file, None
+    settings_file, state.settings_file = state.settings_file, None
     state.mcp_relay = state.cli_launcher = None
     try:
         if key_file is not None:
             key_file.close()
     finally:
-        await asyncio.to_thread(_release_client_cli, relay, launcher)
+        await asyncio.to_thread(_release_client_cli, relay, launcher, settings_file)
 
 
-def _release_client_cli(relay: _ManagedMcpRelay | None, launcher: str | None) -> None:
+def _release_client_cli(
+    relay: _ManagedMcpRelay | None,
+    launcher: str | None,
+    settings_file: pathlib.Path | None = None,
+) -> None:
     try:
         if relay is not None:
             relay.close()
     finally:
-        if launcher is not None:
-            with suppress(OSError):
-                os.unlink(launcher)
+        try:
+            if launcher is not None:
+                with suppress(OSError):
+                    os.unlink(launcher)
+        finally:
+            if settings_file is not None:
+                with suppress(OSError):
+                    settings_file.unlink(missing_ok=True)
 
 
 def _claude_mcp_auth_statuses() -> dict[str, str]:
@@ -2829,10 +2840,15 @@ class ClaudeSDKExecutor(Executor):
         if state is None:
             mcp_auth = _claude_mcp_auth_statuses()
             await self._route_options_through_gateway_shim(options)
+            settings_file: pathlib.Path | None = None
             if self._prepared_cli is not None:
                 options.settings = self._prepared_cli.settings_for_cli(
                     getattr(options, "settings", None)
                 )
+                handle = self._prepared_cli._egress_handle
+                if handle is not None and handle.auth_token is not None:
+                    assert options.settings is not None
+                    settings_file = pathlib.Path(options.settings)
             # Tee CLI stderr so the connect timeout error carries the
             # tail; ``_on_stderr`` alone only logs at DEBUG.
             connect_stderr: list[str] = []
@@ -2863,8 +2879,11 @@ class ClaudeSDKExecutor(Executor):
                 client = sdk.ClaudeSDKClient(options)
             except BaseException:
                 options.stderr = original_stderr
-                if key_file is not None:
-                    key_file.close()
+                try:
+                    if key_file is not None:
+                        key_file.close()
+                finally:
+                    _release_client_cli(None, None, settings_file)
                 raise
             connected = False
             try:
@@ -2946,8 +2965,11 @@ class ClaudeSDKExecutor(Executor):
                     try:
                         await self._force_close_client(client)
                     finally:
-                        if key_file is not None:
-                            key_file.close()
+                        try:
+                            if key_file is not None:
+                                key_file.close()
+                        finally:
+                            _release_client_cli(None, None, settings_file)
             current_task: asyncio.Task[None] | None = cast(
                 "asyncio.Task[None] | None", asyncio.current_task()
             )
@@ -2955,6 +2977,7 @@ class ClaudeSDKExecutor(Executor):
                 client=client,
                 model=model,
                 static_key_file=key_file,
+                settings_file=settings_file,
                 loop=asyncio.get_running_loop(),
                 task=current_task,
                 effort=getattr(options, "effort", None),

@@ -5063,11 +5063,16 @@ async def test_sandboxed_managed_cli_sees_its_own_relay_and_the_managed_config_o
             shared_roots = {str(Path(own_bridge).parent), str(socket_root.resolve())}
             assert not shared_roots & (reads | writes)
         launcher = Path(clients["one"].options.cli_path)
+        one_settings = Path(clients["one"].options.settings)
+        two_settings = Path(clients["two"].options.settings)
         own_bridge, own_socket = relay_dirs(clients["one"])
         await executor.close_session("one")
         assert not launcher.exists()
+        assert not one_settings.exists()
+        assert two_settings.exists()
         assert not Path(own_bridge).exists() and not Path(own_socket).exists()
         await executor.close_session("two")
+        assert not two_settings.exists()
 
 
 @pytest.mark.skipif(
@@ -5577,6 +5582,54 @@ def test_to_anthropic_content_blocks_plain_text_uses_text_source() -> None:
 # ---------------------------------------------------------------------------
 # Tests: connect-failure stderr surfacing
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fail_at", ["constructor", "connect"])
+async def test_failed_brokered_cli_client_removes_settings_file(
+    tmp_path: Path, fail_at: str
+) -> None:
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, PreparedClaudeCli
+
+    class StubClient:
+        def __init__(self, options: object) -> None:
+            if fail_at == "constructor":
+                raise RuntimeError("client construction failed")
+
+        async def connect(self) -> None:
+            raise TimeoutError("client connection failed")
+
+    class StubSDK:
+        ClaudeSDKClient = StubClient
+
+    executor = ClaudeSDKExecutor()
+    executor._prepared_cli = PreparedClaudeCli(
+        cli_path=None,
+        enable_native_tools=False,
+        _runtime_tmpdir=tmp_path,
+        _egress_handle=SimpleNamespace(
+            auth_token="synthetic-relay-token",
+            relay_port=1234,
+            ca_bundle_path=tmp_path / "ca.pem",
+            stop=Mock(),
+        ),
+    )
+    options = SimpleNamespace(env={}, settings=None, stderr=None)
+    try:
+        with (
+            pytest.raises((RuntimeError, TimeoutError)),
+            patch.object(executor, "_force_close_client", new_callable=AsyncMock),
+        ):
+            await executor._get_or_create_client(
+                StubSDK,  # type: ignore[arg-type]
+                session_key="test-session",
+                options=options,
+                model=None,
+            )
+        assert not list(tmp_path.glob("cli-settings-*.json"))
+        assert not executor._clients
+    finally:
+        await executor.close()
 
 
 @pytest.mark.asyncio
