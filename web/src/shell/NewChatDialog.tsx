@@ -5686,6 +5686,10 @@ function NewChatLandingContent({
     textareaNode,
     sendContext: { mentions: taggedMentions },
   });
+  // However the tag goes (an edit, Backspace over its token), its refusal goes with it.
+  useEffect(() => {
+    if (highlight.refusal === null && createError === SHELL_MENTION_REFUSAL) setCreateError(null);
+  }, [highlight.refusal, createError]);
 
   const workspaceTarget = JSON.stringify([projectParam, selectedHostId, sandboxSelected]);
   const [workspaceReadyTarget, setWorkspaceReadyTarget] = useState<string | null>(null);
@@ -6255,10 +6259,6 @@ function NewChatLandingContent({
       handleBlockedSubmit();
       return;
     }
-    const liveMentions = presentMentions(
-      composerInlineMentions(mentionedItems, mentionedSessions, selectedAgent?.harness ?? null),
-      [message],
-    );
     if (highlight.refusal !== null) {
       setCreateError(highlight.refusal);
       return;
@@ -6451,8 +6451,8 @@ function NewChatLandingContent({
       // Computed BEFORE the create so `smart_routing_message` classifies the
       // prompt the agent actually receives, not the raw textarea value.
       const initialPrompt = withSessionMentionHint(
-        expandMentionTokens(sanitizeInitialPrompt(message), liveMentions),
-        liveMentions.some((m) => m.marker.startsWith("[Session: ")),
+        expandMentionTokens(sanitizeInitialPrompt(message), taggedMentions),
+        taggedMentions.some((m) => m.marker.startsWith("[Session: ")),
       );
       // Native terminal agents open terminal-first: `omnigent.ui: terminal`
       // tells the UI to render the terminal wrapper, and `omnigent.wrapper`

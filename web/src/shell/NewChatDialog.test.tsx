@@ -14385,6 +14385,12 @@ describe("NewChatLandingScreen composer highlight", () => {
     expect(setPendingInitialPromptMock).not.toHaveBeenCalled();
     expect(authenticatedFetchMock).not.toHaveBeenCalledWith("/v1/sessions", expect.anything());
 
+    // Backspace over the token drops the tag without an edit event; the refusal goes with it.
+    (input() as HTMLTextAreaElement).setSelectionRange(15, 15);
+    fireEvent.keyDown(input(), { key: "Backspace" });
+    expect(input()).toHaveValue("!cat  ");
+    expect(screen.queryByTestId("new-chat-landing-error")).toBeNull();
+
     type("!cat README.md");
     expect(screen.queryByTestId("new-chat-landing-error")).toBeNull();
     fireEvent.click(submit);
