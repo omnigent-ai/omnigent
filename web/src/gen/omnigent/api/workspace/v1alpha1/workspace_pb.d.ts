@@ -2,14 +2,20 @@
 // @generated from file omnigent/api/workspace/v1alpha1/workspace.proto (package omnigent.api.workspace.v1alpha1, syntax proto3)
 /* eslint-disable */
 
-// Workspace API: read a session's workspace files.
+// Workspace API: read, search and compare a session's workspace files.
 //
 // One implementation serves every route: directly from the desktop app over a
 // local socket, and through the server for every other client. Which session
 // and workspace a call reads comes from its credentials, never from a message.
-// Paths in messages are always relative to the workspace root.
 //
-// v1alpha1 may still change incompatibly.
+// Paths in messages are relative to the workspace root (search results: to
+// the request's `path`), use "/" separators, and are empty for the root. A
+// path that is absolute, contains "..", or resolves through symlinks outside
+// the root is refused with INVALID_ARGUMENT or PERMISSION_DENIED.
+//
+// Clients call GetCapabilities first and skip what a server doesn't list, so a
+// newer client works with an older server. v1alpha1 may still change
+// incompatibly, except that ListDirectory and ReadFile keep their wire shapes.
 
 import type { GenEnum, GenFile, GenMessage, GenService } from "@bufbuild/protobuf/codegenv2";
 import type { Message } from "@bufbuild/protobuf";
@@ -37,8 +43,9 @@ export declare const GetCapabilitiesRequestSchema: GenMessage<GetCapabilitiesReq
  */
 export declare type GetCapabilitiesResponse = Message<"omnigent.api.workspace.v1alpha1.GetCapabilitiesResponse"> & {
   /**
-   * Supported method names, e.g. "ListDirectory". Clients treat a missing
-   * name as unsupported and use another route.
+   * Supported method names, e.g. "ListDirectory", and optional features in
+   * lower snake case, e.g. "search_files.fuzzy". Clients treat a missing name
+   * as unsupported and use another route.
    *
    * @generated from field: repeated string capabilities = 1;
    */
@@ -76,6 +83,23 @@ export declare type ListDirectoryRequest = Message<"omnigent.api.workspace.v1alp
    * @generated from field: string page_token = 3;
    */
   pageToken: string;
+
+  /**
+   * Leave out entries Git ignores. By default they are listed, with
+   * `Entry.ignored` set. Offered with the "gitignore" feature.
+   *
+   * @generated from field: bool hide_ignored = 4;
+   */
+  hideIgnored: boolean;
+
+  /**
+   * Fill each directory entry's `leaf_directory_path`, so a tree can show
+   * "a/b/c" on one row without a request per level. Hosts that don't support
+   * it leave `leaf_directory_path` empty.
+   *
+   * @generated from field: bool collapse_single_child_directories = 5;
+   */
+  collapseSingleChildDirectories: boolean;
 };
 
 /**
@@ -140,9 +164,33 @@ export declare type Entry = Message<"omnigent.api.workspace.v1alpha1.Entry"> & {
   size?: bigint | undefined;
 
   /**
+   * Seconds precision. For a broken symlink, the link's own time.
+   *
    * @generated from field: google.protobuf.Timestamp modify_time = 5;
    */
   modifyTime?: Timestamp | undefined;
+
+  /**
+   * @generated from field: bool is_symlink = 6;
+   */
+  isSymlink: boolean;
+
+  /**
+   * Excluded by .gitignore, .git/info/exclude or the global excludes file,
+   * with Git's semantics. Always false outside a Git repository.
+   *
+   * @generated from field: bool ignored = 7;
+   */
+  ignored: boolean;
+
+  /**
+   * With `collapse_single_child_directories`: the deepest directory reached
+   * by following this one while its only entry is another directory. Empty
+   * unless this directory's only entry is a directory.
+   *
+   * @generated from field: string leaf_directory_path = 8;
+   */
+  leafDirectoryPath: string;
 };
 
 /**
@@ -161,6 +209,14 @@ export declare type ReadFileRequest = Message<"omnigent.api.workspace.v1alpha1.R
    * @generated from field: string path = 1;
    */
   path: string;
+
+  /**
+   * Bytes to read at most; 0 means the server's limit. Values above it are
+   * lowered to it. Older hosts ignore this field.
+   *
+   * @generated from field: uint64 maximum_bytes = 2;
+   */
+  maximumBytes: bigint;
 };
 
 /**
@@ -226,6 +282,13 @@ export declare type FileMetadata = Message<"omnigent.api.workspace.v1alpha1.File
    * @generated from field: string content_type = 4;
    */
   contentType: string;
+
+  /**
+   * When the file was last modified, when known.
+   *
+   * @generated from field: google.protobuf.Timestamp modify_time = 5;
+   */
+  modifyTime?: Timestamp | undefined;
 };
 
 /**
@@ -233,6 +296,1162 @@ export declare type FileMetadata = Message<"omnigent.api.workspace.v1alpha1.File
  * Use `create(FileMetadataSchema)` to create a new message.
  */
 export declare const FileMetadataSchema: GenMessage<FileMetadata>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.StatPathRequest
+ */
+export declare type StatPathRequest = Message<"omnigent.api.workspace.v1alpha1.StatPathRequest"> & {
+  /**
+   * Path to describe. Empty for the workspace root.
+   *
+   * @generated from field: string path = 1;
+   */
+  path: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.StatPathRequest.
+ * Use `create(StatPathRequestSchema)` to create a new message.
+ */
+export declare const StatPathRequestSchema: GenMessage<StatPathRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.StatPathResponse
+ */
+export declare type StatPathResponse = Message<"omnigent.api.workspace.v1alpha1.StatPathResponse"> & {
+  /**
+   * @generated from field: omnigent.api.workspace.v1alpha1.Entry entry = 1;
+   */
+  entry?: Entry | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.StatPathResponse.
+ * Use `create(StatPathResponseSchema)` to create a new message.
+ */
+export declare const StatPathResponseSchema: GenMessage<StatPathResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.SearchFilesRequest
+ */
+export declare type SearchFilesRequest = Message<"omnigent.api.workspace.v1alpha1.SearchFilesRequest"> & {
+  /**
+   * A blank query returns nothing.
+   *
+   * @generated from field: string query = 1;
+   */
+  query: string;
+
+  /**
+   * @generated from field: omnigent.api.workspace.v1alpha1.FileSearchMode mode = 2;
+   */
+  mode: FileSearchMode;
+
+  /**
+   * 0 means 500; at most 10,000.
+   *
+   * @generated from field: uint32 maximum_results = 3;
+   */
+  maximumResults: number;
+
+  /**
+   * Directory to search under. Empty for the workspace root. Result paths
+   * are relative to it.
+   *
+   * @generated from field: string path = 4;
+   */
+  path: string;
+
+  /**
+   * Globs, one per entry, with the REST file search's syntax, e.g. "*.ts" or
+   * "src/**". When any are set, only matching paths are returned.
+   *
+   * @generated from field: repeated string include = 5;
+   */
+  include: string[];
+
+  /**
+   * @generated from field: repeated string exclude = 6;
+   */
+  exclude: string[];
+
+  /**
+   * Also search files Git ignores.
+   *
+   * @generated from field: bool include_git_ignored = 7;
+   */
+  includeGitIgnored: boolean;
+
+  /**
+   * Workspace-relative directories: results come only from beneath an
+   * include (when any) and never from beneath an exclude.
+   *
+   * @generated from field: repeated string include_directories = 8;
+   */
+  includeDirectories: string[];
+
+  /**
+   * @generated from field: repeated string exclude_directories = 9;
+   */
+  excludeDirectories: string[];
+
+  /**
+   * Look for untracked files again now, even if a search just did. Send it
+   * once, for the user's retry, not on follow-up requests.
+   *
+   * @generated from field: bool retry_untracked = 10;
+   */
+  retryUntracked: boolean;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.SearchFilesRequest.
+ * Use `create(SearchFilesRequestSchema)` to create a new message.
+ */
+export declare const SearchFilesRequestSchema: GenMessage<SearchFilesRequest>;
+
+/**
+ * One match. The entry's path is relative to the request's `path`, and is
+ * what the query matched against.
+ *
+ * @generated from message omnigent.api.workspace.v1alpha1.FileSearchResult
+ */
+export declare type FileSearchResult = Message<"omnigent.api.workspace.v1alpha1.FileSearchResult"> & {
+  /**
+   * @generated from field: omnigent.api.workspace.v1alpha1.Entry entry = 1;
+   */
+  entry?: Entry | undefined;
+
+  /**
+   * Higher is better. Zero in substring mode.
+   *
+   * @generated from field: uint32 score = 2;
+   */
+  score: number;
+
+  /**
+   * Indices, in UTF-16 code units, of the entry's path characters that matched,
+   * for highlighting.
+   *
+   * @generated from field: repeated uint32 matched_indices = 3;
+   */
+  matchedIndices: number[];
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.FileSearchResult.
+ * Use `create(FileSearchResultSchema)` to create a new message.
+ */
+export declare const FileSearchResultSchema: GenMessage<FileSearchResult>;
+
+/**
+ * The statuses describe the file list the results came from.
+ *
+ * @generated from message omnigent.api.workspace.v1alpha1.SearchFilesResponse
+ */
+export declare type SearchFilesResponse = Message<"omnigent.api.workspace.v1alpha1.SearchFilesResponse"> & {
+  /**
+   * @generated from field: repeated omnigent.api.workspace.v1alpha1.FileSearchResult results = 1;
+   */
+  results: FileSearchResult[];
+
+  /**
+   * More results matched than were returned.
+   *
+   * @generated from field: bool truncated = 2;
+   */
+  truncated: boolean;
+
+  /**
+   * Paths in the list that was searched.
+   *
+   * @generated from field: uint64 indexed_paths = 3;
+   */
+  indexedPaths: bigint;
+
+  /**
+   * The list stopped at its size limit, so some files weren't searched.
+   *
+   * @generated from field: bool index_incomplete = 4;
+   */
+  indexIncomplete: boolean;
+
+  /**
+   * A newer list is being built or was published since; ask again shortly.
+   *
+   * @generated from field: bool refreshing = 5;
+   */
+  refreshing: boolean;
+
+  /**
+   * Untracked files couldn't be listed, so new files not yet in Git may be
+   * missing. Ask again with `retry_untracked`.
+   *
+   * @generated from field: bool untracked_unavailable = 6;
+   */
+  untrackedUnavailable: boolean;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.SearchFilesResponse.
+ * Use `create(SearchFilesResponseSchema)` to create a new message.
+ */
+export declare const SearchFilesResponseSchema: GenMessage<SearchFilesResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.SearchTextRequest
+ */
+export declare type SearchTextRequest = Message<"omnigent.api.workspace.v1alpha1.SearchTextRequest"> & {
+  /**
+   * One line, 1 to 4096 characters, and not blank.
+   *
+   * @generated from field: string query = 1;
+   */
+  query: string;
+
+  /**
+   * @generated from field: bool case_sensitive = 2;
+   */
+  caseSensitive: boolean;
+
+  /**
+   * Interpret `query` as a regular expression, not a literal.
+   *
+   * @generated from field: bool regular_expression = 3;
+   */
+  regularExpression: boolean;
+
+  /**
+   * @generated from field: bool whole_word = 4;
+   */
+  wholeWord: boolean;
+
+  /**
+   * Comma-separated globs, as the REST content search takes them, e.g.
+   * "*.{js,ts}, src/**". An include also searches files ignore rules skip.
+   *
+   * @generated from field: string include = 5;
+   */
+  include: string;
+
+  /**
+   * @generated from field: string exclude = 6;
+   */
+  exclude: string;
+
+  /**
+   * Matching lines to return at most; 0 means 500.
+   *
+   * @generated from field: uint32 maximum_results = 7;
+   */
+  maximumResults: number;
+
+  /**
+   * Also search files Git ignores.
+   *
+   * @generated from field: bool include_git_ignored = 8;
+   */
+  includeGitIgnored: boolean;
+
+  /**
+   * Workspace-relative directories. The search starts only at the includes
+   * (the whole root when there are none) and never enters an exclude, so
+   * scoping a search in a large repository also makes it faster.
+   *
+   * @generated from field: repeated string include_directories = 9;
+   */
+  includeDirectories: string[];
+
+  /**
+   * @generated from field: repeated string exclude_directories = 10;
+   */
+  excludeDirectories: string[];
+
+  /**
+   * @generated from field: omnigent.api.workspace.v1alpha1.SearchOrder order = 11;
+   */
+  order: SearchOrder;
+
+  /**
+   * Workspace-relative files, the most important first; at most 16 are used.
+   *
+   * @generated from field: repeated string focused_paths = 12;
+   */
+  focusedPaths: string[];
+
+  /**
+   * What changed directories are measured against; unspecified means the
+   * last commit.
+   *
+   * @generated from field: omnigent.api.workspace.v1alpha1.ComparisonKind changed_against = 13;
+   */
+  changedAgainst: ComparisonKind;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.SearchTextRequest.
+ * Use `create(SearchTextRequestSchema)` to create a new message.
+ */
+export declare const SearchTextRequestSchema: GenMessage<SearchTextRequest>;
+
+/**
+ * One matching line, for its first match, as the REST content search reports
+ * it. Column and offsets count UTF-16 code units.
+ *
+ * @generated from message omnigent.api.workspace.v1alpha1.TextSearchMatch
+ */
+export declare type TextSearchMatch = Message<"omnigent.api.workspace.v1alpha1.TextSearchMatch"> & {
+  /**
+   * Path from the workspace root, e.g. "src/main.py".
+   *
+   * @generated from field: string path = 1;
+   */
+  path: string;
+
+  /**
+   * 1-based.
+   *
+   * @generated from field: uint64 line = 2;
+   */
+  line: bigint;
+
+  /**
+   * 1-based.
+   *
+   * @generated from field: uint32 column = 3;
+   */
+  column: number;
+
+  /**
+   * At most 400 characters of the line around the match, with "…" marking
+   * where it was cut.
+   *
+   * @generated from field: string text = 4;
+   */
+  text: string;
+
+  /**
+   * Where the match starts and ends in `text`.
+   *
+   * @generated from field: uint32 match_start = 5;
+   */
+  matchStart: number;
+
+  /**
+   * @generated from field: uint32 match_end = 6;
+   */
+  matchEnd: number;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.TextSearchMatch.
+ * Use `create(TextSearchMatchSchema)` to create a new message.
+ */
+export declare const TextSearchMatchSchema: GenMessage<TextSearchMatch>;
+
+/**
+ * Matches arrive in batches; concatenate every response's `matches`. The
+ * last response has `done` set and carries the search's status.
+ *
+ * @generated from message omnigent.api.workspace.v1alpha1.SearchTextResponse
+ */
+export declare type SearchTextResponse = Message<"omnigent.api.workspace.v1alpha1.SearchTextResponse"> & {
+  /**
+   * @generated from field: repeated omnigent.api.workspace.v1alpha1.TextSearchMatch matches = 1;
+   */
+  matches: TextSearchMatch[];
+
+  /**
+   * @generated from field: bool done = 2;
+   */
+  done: boolean;
+
+  /**
+   * The search stopped early, so more lines may match.
+   *
+   * @generated from field: bool truncated = 3;
+   */
+  truncated: boolean;
+
+  /**
+   * Why results may be incomplete, for the user. Empty when there is nothing
+   * to say.
+   *
+   * @generated from field: string warning = 4;
+   */
+  warning: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.SearchTextResponse.
+ * Use `create(SearchTextResponseSchema)` to create a new message.
+ */
+export declare const SearchTextResponseSchema: GenMessage<SearchTextResponse>;
+
+/**
+ * What to compare.
+ *
+ * @generated from message omnigent.api.workspace.v1alpha1.Comparison
+ */
+export declare type Comparison = Message<"omnigent.api.workspace.v1alpha1.Comparison"> & {
+  /**
+   * Unspecified means COMPARISON_KIND_LAST_COMMIT.
+   *
+   * @generated from field: omnigent.api.workspace.v1alpha1.ComparisonKind kind = 1;
+   */
+  kind: ComparisonKind;
+
+  /**
+   * For COMPARISON_KIND_REVISIONS: any revision Git resolves to a commit. An
+   * empty base means the default branch, else HEAD.
+   *
+   * @generated from field: string base_revision = 2;
+   */
+  baseRevision: string;
+
+  /**
+   * Empty compares with the working copy.
+   *
+   * @generated from field: string head_revision = 3;
+   */
+  headRevision: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.Comparison.
+ * Use `create(ComparisonSchema)` to create a new message.
+ */
+export declare const ComparisonSchema: GenMessage<Comparison>;
+
+/**
+ * Why no comparison could be made.
+ *
+ * @generated from message omnigent.api.workspace.v1alpha1.ComparisonUnavailable
+ */
+export declare type ComparisonUnavailable = Message<"omnigent.api.workspace.v1alpha1.ComparisonUnavailable"> & {
+  /**
+   * @generated from field: omnigent.api.workspace.v1alpha1.ComparisonProblem problem = 1;
+   */
+  problem: ComparisonProblem;
+
+  /**
+   * For NO_BRANCH_POINT: the ref compared with, and whether the clone is
+   * shallow.
+   *
+   * @generated from field: string reference = 2;
+   */
+  reference: string;
+
+  /**
+   * @generated from field: bool shallow = 3;
+   */
+  shallow: boolean;
+
+  /**
+   * For GIT_FAILED: Git's last error line, or the signal that stopped it.
+   *
+   * @generated from field: string detail = 4;
+   */
+  detail: string;
+
+  /**
+   * @generated from field: omnigent.api.workspace.v1alpha1.ComparisonField field = 5;
+   */
+  field: ComparisonField;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ComparisonUnavailable.
+ * Use `create(ComparisonUnavailableSchema)` to create a new message.
+ */
+export declare const ComparisonUnavailableSchema: GenMessage<ComparisonUnavailable>;
+
+/**
+ * A resolved comparison. Commits are full object names.
+ *
+ * @generated from message omnigent.api.workspace.v1alpha1.WorkingCopyBase
+ */
+export declare type WorkingCopyBase = Message<"omnigent.api.workspace.v1alpha1.WorkingCopyBase"> & {
+  /**
+   * @generated from field: omnigent.api.workspace.v1alpha1.ComparisonKind kind = 1;
+   */
+  kind: ComparisonKind;
+
+  /**
+   * @generated from field: string head = 2;
+   */
+  head: string;
+
+  /**
+   * @generated from field: string base = 3;
+   */
+  base: string;
+
+  /**
+   * For the branch point: the ref, e.g. "origin/main", and its commit.
+   *
+   * @generated from field: string reference = 4;
+   */
+  reference: string;
+
+  /**
+   * @generated from field: string reference_commit = 5;
+   */
+  referenceCommit: string;
+
+  /**
+   * Set when no comparison could be made; the other fields are then empty.
+   *
+   * @generated from field: omnigent.api.workspace.v1alpha1.ComparisonUnavailable unavailable = 6;
+   */
+  unavailable?: ComparisonUnavailable | undefined;
+
+  /**
+   * For COMPARISON_KIND_REVISIONS: `base` is the merge base, also in
+   * `merge_base`, and the displays are the revisions as asked for, or as
+   * defaulted.
+   *
+   * @generated from field: string merge_base = 7;
+   */
+  mergeBase: string;
+
+  /**
+   * @generated from field: string base_display = 8;
+   */
+  baseDisplay: string;
+
+  /**
+   * @generated from field: string head_display = 9;
+   */
+  headDisplay: string;
+
+  /**
+   * @generated from field: bool head_is_working_copy = 10;
+   */
+  headIsWorkingCopy: boolean;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.WorkingCopyBase.
+ * Use `create(WorkingCopyBaseSchema)` to create a new message.
+ */
+export declare const WorkingCopyBaseSchema: GenMessage<WorkingCopyBase>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.ResolveWorkingCopyBaseRequest
+ */
+export declare type ResolveWorkingCopyBaseRequest = Message<"omnigent.api.workspace.v1alpha1.ResolveWorkingCopyBaseRequest"> & {
+  /**
+   * @generated from field: omnigent.api.workspace.v1alpha1.Comparison comparison = 1;
+   */
+  comparison?: Comparison | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ResolveWorkingCopyBaseRequest.
+ * Use `create(ResolveWorkingCopyBaseRequestSchema)` to create a new message.
+ */
+export declare const ResolveWorkingCopyBaseRequestSchema: GenMessage<ResolveWorkingCopyBaseRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.ResolveWorkingCopyBaseResponse
+ */
+export declare type ResolveWorkingCopyBaseResponse = Message<"omnigent.api.workspace.v1alpha1.ResolveWorkingCopyBaseResponse"> & {
+  /**
+   * @generated from field: omnigent.api.workspace.v1alpha1.WorkingCopyBase base = 1;
+   */
+  base?: WorkingCopyBase | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ResolveWorkingCopyBaseResponse.
+ * Use `create(ResolveWorkingCopyBaseResponseSchema)` to create a new message.
+ */
+export declare const ResolveWorkingCopyBaseResponseSchema: GenMessage<ResolveWorkingCopyBaseResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.ChangedFile
+ */
+export declare type ChangedFile = Message<"omnigent.api.workspace.v1alpha1.ChangedFile"> & {
+  /**
+   * Relative to the workspace root.
+   *
+   * @generated from field: string path = 1;
+   */
+  path: string;
+
+  /**
+   * @generated from field: omnigent.api.workspace.v1alpha1.ChangeStatus status = 2;
+   */
+  status: ChangeStatus;
+
+  /**
+   * @generated from field: omnigent.api.workspace.v1alpha1.GitEntryKind base_kind = 3;
+   */
+  baseKind: GitEntryKind;
+
+  /**
+   * @generated from field: omnigent.api.workspace.v1alpha1.GitEntryKind working_kind = 4;
+   */
+  workingKind: GitEntryKind;
+
+  /**
+   * The base blob, for ReadBaseFile. Empty for added files.
+   *
+   * @generated from field: string base_object = 5;
+   */
+  baseObject: string;
+
+  /**
+   * @generated from field: optional uint64 base_size = 6;
+   */
+  baseSize?: bigint | undefined;
+
+  /**
+   * @generated from field: optional uint64 lines_added = 7;
+   */
+  linesAdded?: bigint | undefined;
+
+  /**
+   * @generated from field: optional uint64 lines_removed = 8;
+   */
+  linesRemoved?: bigint | undefined;
+
+  /**
+   * @generated from field: bool binary = 9;
+   */
+  binary: boolean;
+
+  /**
+   * @generated from field: omnigent.api.workspace.v1alpha1.ChangedFileProblem problem = 10;
+   */
+  problem: ChangedFileProblem;
+
+  /**
+   * Absent when there is no working file (deleted).
+   *
+   * @generated from field: omnigent.api.workspace.v1alpha1.WorkingFileMetadata working = 11;
+   */
+  working?: WorkingFileMetadata | undefined;
+
+  /**
+   * For a committed head: the file's blob there, read with ReadBaseFile at
+   * that commit. Absent when the head is the working copy, or the file was
+   * deleted.
+   *
+   * @generated from field: omnigent.api.workspace.v1alpha1.CommittedFile committed = 12;
+   */
+  committed?: CommittedFile | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ChangedFile.
+ * Use `create(ChangedFileSchema)` to create a new message.
+ */
+export declare const ChangedFileSchema: GenMessage<ChangedFile>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.CommittedFile
+ */
+export declare type CommittedFile = Message<"omnigent.api.workspace.v1alpha1.CommittedFile"> & {
+  /**
+   * @generated from field: string object = 1;
+   */
+  object: string;
+
+  /**
+   * @generated from field: optional uint64 size = 2;
+   */
+  size?: bigint | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.CommittedFile.
+ * Use `create(CommittedFileSchema)` to create a new message.
+ */
+export declare const CommittedFileSchema: GenMessage<CommittedFile>;
+
+/**
+ * A working file's own metadata at listing time, by lstat: a symlink's, not
+ * its target's. Any field changing means the file changed since the listing.
+ *
+ * @generated from message omnigent.api.workspace.v1alpha1.WorkingFileMetadata
+ */
+export declare type WorkingFileMetadata = Message<"omnigent.api.workspace.v1alpha1.WorkingFileMetadata"> & {
+  /**
+   * @generated from field: uint64 size = 1;
+   */
+  size: bigint;
+
+  /**
+   * @generated from field: int64 modified_unix_nanos = 2;
+   */
+  modifiedUnixNanos: bigint;
+
+  /**
+   * @generated from field: int64 changed_unix_nanos = 3;
+   */
+  changedUnixNanos: bigint;
+
+  /**
+   * @generated from field: uint64 inode = 4;
+   */
+  inode: bigint;
+
+  /**
+   * @generated from field: uint64 device = 5;
+   */
+  device: bigint;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.WorkingFileMetadata.
+ * Use `create(WorkingFileMetadataSchema)` to create a new message.
+ */
+export declare const WorkingFileMetadataSchema: GenMessage<WorkingFileMetadata>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.ListWorkingCopyChangesRequest
+ */
+export declare type ListWorkingCopyChangesRequest = Message<"omnigent.api.workspace.v1alpha1.ListWorkingCopyChangesRequest"> & {
+  /**
+   * @generated from field: omnigent.api.workspace.v1alpha1.Comparison comparison = 1;
+   */
+  comparison?: Comparison | undefined;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ListWorkingCopyChangesRequest.
+ * Use `create(ListWorkingCopyChangesRequestSchema)` to create a new message.
+ */
+export declare const ListWorkingCopyChangesRequestSchema: GenMessage<ListWorkingCopyChangesRequest>;
+
+/**
+ * Files sorted by path, by byte value; at most 10,000.
+ *
+ * @generated from message omnigent.api.workspace.v1alpha1.ListWorkingCopyChangesResponse
+ */
+export declare type ListWorkingCopyChangesResponse = Message<"omnigent.api.workspace.v1alpha1.ListWorkingCopyChangesResponse"> & {
+  /**
+   * @generated from field: omnigent.api.workspace.v1alpha1.WorkingCopyBase base = 1;
+   */
+  base?: WorkingCopyBase | undefined;
+
+  /**
+   * @generated from field: repeated omnigent.api.workspace.v1alpha1.ChangedFile files = 2;
+   */
+  files: ChangedFile[];
+
+  /**
+   * Changed files left out because their names aren't valid UTF-8.
+   *
+   * @generated from field: uint32 unrepresentable_names = 3;
+   */
+  unrepresentableNames: number;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ListWorkingCopyChangesResponse.
+ * Use `create(ListWorkingCopyChangesResponseSchema)` to create a new message.
+ */
+export declare const ListWorkingCopyChangesResponseSchema: GenMessage<ListWorkingCopyChangesResponse>;
+
+/**
+ * A file's content at `commit`, if its tree entry there is the blob `object`.
+ * FAILED_PRECONDITION when it isn't; NOT_FOUND when the clone lacks the blob.
+ *
+ * @generated from message omnigent.api.workspace.v1alpha1.ReadBaseFileRequest
+ */
+export declare type ReadBaseFileRequest = Message<"omnigent.api.workspace.v1alpha1.ReadBaseFileRequest"> & {
+  /**
+   * A full commit name, e.g. a WorkingCopyBase's `base`.
+   *
+   * @generated from field: string commit = 1;
+   */
+  commit: string;
+
+  /**
+   * @generated from field: string path = 2;
+   */
+  path: string;
+
+  /**
+   * The blob, e.g. a ChangedFile's `base_object`.
+   *
+   * @generated from field: string object = 3;
+   */
+  object: string;
+
+  /**
+   * Bytes to read at most; 0 means the server's limit. A larger blob sends
+   * only metadata, with `truncated` set.
+   *
+   * @generated from field: uint64 maximum_bytes = 4;
+   */
+  maximumBytes: bigint;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ReadBaseFileRequest.
+ * Use `create(ReadBaseFileRequestSchema)` to create a new message.
+ */
+export declare const ReadBaseFileRequestSchema: GenMessage<ReadBaseFileRequest>;
+
+/**
+ * As ReadFileResponse: metadata first, then the bytes in order.
+ *
+ * @generated from message omnigent.api.workspace.v1alpha1.ReadBaseFileResponse
+ */
+export declare type ReadBaseFileResponse = Message<"omnigent.api.workspace.v1alpha1.ReadBaseFileResponse"> & {
+  /**
+   * Set on the first message only.
+   *
+   * @generated from field: omnigent.api.workspace.v1alpha1.FileMetadata metadata = 1;
+   */
+  metadata?: FileMetadata | undefined;
+
+  /**
+   * The next part of the content. Concatenate every message's `data`.
+   *
+   * @generated from field: bytes data = 2;
+   */
+  data: Uint8Array;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ReadBaseFileResponse.
+ * Use `create(ReadBaseFileResponseSchema)` to create a new message.
+ */
+export declare const ReadBaseFileResponseSchema: GenMessage<ReadBaseFileResponse>;
+
+/**
+ * FAILED_PRECONDITION when the path isn't a symlink.
+ *
+ * @generated from message omnigent.api.workspace.v1alpha1.ReadLinkTextRequest
+ */
+export declare type ReadLinkTextRequest = Message<"omnigent.api.workspace.v1alpha1.ReadLinkTextRequest"> & {
+  /**
+   * @generated from field: string path = 1;
+   */
+  path: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ReadLinkTextRequest.
+ * Use `create(ReadLinkTextRequestSchema)` to create a new message.
+ */
+export declare const ReadLinkTextRequestSchema: GenMessage<ReadLinkTextRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.ReadLinkTextResponse
+ */
+export declare type ReadLinkTextResponse = Message<"omnigent.api.workspace.v1alpha1.ReadLinkTextResponse"> & {
+  /**
+   * The link's target as stored, which may not be valid UTF-8.
+   *
+   * @generated from field: bytes target = 1;
+   */
+  target: Uint8Array;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ReadLinkTextResponse.
+ * Use `create(ReadLinkTextResponseSchema)` to create a new message.
+ */
+export declare const ReadLinkTextResponseSchema: GenMessage<ReadLinkTextResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.ListRepositoryRefsRequest
+ */
+export declare type ListRepositoryRefsRequest = Message<"omnigent.api.workspace.v1alpha1.ListRepositoryRefsRequest"> & {
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ListRepositoryRefsRequest.
+ * Use `create(ListRepositoryRefsRequestSchema)` to create a new message.
+ */
+export declare const ListRepositoryRefsRequestSchema: GenMessage<ListRepositoryRefsRequest>;
+
+/**
+ * Short branch and tag names, local branches first. At most 1,000.
+ *
+ * @generated from message omnigent.api.workspace.v1alpha1.ListRepositoryRefsResponse
+ */
+export declare type ListRepositoryRefsResponse = Message<"omnigent.api.workspace.v1alpha1.ListRepositoryRefsResponse"> & {
+  /**
+   * @generated from field: repeated string refs = 1;
+   */
+  refs: string[];
+
+  /**
+   * @generated from field: bool truncated = 2;
+   */
+  truncated: boolean;
+
+  /**
+   * The default branch's short name, e.g. "origin/main"; empty when unknown.
+   *
+   * @generated from field: string default_branch_ref = 3;
+   */
+  defaultBranchRef: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ListRepositoryRefsResponse.
+ * Use `create(ListRepositoryRefsResponseSchema)` to create a new message.
+ */
+export declare const ListRepositoryRefsResponseSchema: GenMessage<ListRepositoryRefsResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.ListBranchCommitsRequest
+ */
+export declare type ListBranchCommitsRequest = Message<"omnigent.api.workspace.v1alpha1.ListBranchCommitsRequest"> & {
+  /**
+   * Any revision Git resolves to a commit; empty means the default branch,
+   * else HEAD.
+   *
+   * @generated from field: string base_revision = 1;
+   */
+  baseRevision: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ListBranchCommitsRequest.
+ * Use `create(ListBranchCommitsRequestSchema)` to create a new message.
+ */
+export declare const ListBranchCommitsRequestSchema: GenMessage<ListBranchCommitsRequest>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.BranchCommit
+ */
+export declare type BranchCommit = Message<"omnigent.api.workspace.v1alpha1.BranchCommit"> & {
+  /**
+   * The full object name.
+   *
+   * @generated from field: string object = 1;
+   */
+  object: string;
+
+  /**
+   * @generated from field: string subject = 2;
+   */
+  subject: string;
+
+  /**
+   * @generated from field: string author_name = 3;
+   */
+  authorName: string;
+
+  /**
+   * @generated from field: int64 author_time_unix = 4;
+   */
+  authorTimeUnix: bigint;
+
+  /**
+   * It has no parent; compare it with the empty tree, which a revision
+   * comparison accepts as its base.
+   *
+   * @generated from field: bool root = 5;
+   */
+  root: boolean;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.BranchCommit.
+ * Use `create(BranchCommitSchema)` to create a new message.
+ */
+export declare const BranchCommitSchema: GenMessage<BranchCommit>;
+
+/**
+ * At most 200 commits, newest first. Feature "branch_commits".
+ *
+ * @generated from message omnigent.api.workspace.v1alpha1.ListBranchCommitsResponse
+ */
+export declare type ListBranchCommitsResponse = Message<"omnigent.api.workspace.v1alpha1.ListBranchCommitsResponse"> & {
+  /**
+   * The comparison of the base with HEAD, as for COMPARISON_KIND_REVISIONS;
+   * `unavailable` says why no commits could be listed.
+   *
+   * @generated from field: omnigent.api.workspace.v1alpha1.WorkingCopyBase base = 1;
+   */
+  base?: WorkingCopyBase | undefined;
+
+  /**
+   * @generated from field: repeated omnigent.api.workspace.v1alpha1.BranchCommit commits = 2;
+   */
+  commits: BranchCommit[];
+
+  /**
+   * @generated from field: bool truncated = 3;
+   */
+  truncated: boolean;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ListBranchCommitsResponse.
+ * Use `create(ListBranchCommitsResponseSchema)` to create a new message.
+ */
+export declare const ListBranchCommitsResponseSchema: GenMessage<ListBranchCommitsResponse>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.ResolveRepositoryContextRequest
+ */
+export declare type ResolveRepositoryContextRequest = Message<"omnigent.api.workspace.v1alpha1.ResolveRepositoryContextRequest"> & {
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ResolveRepositoryContextRequest.
+ * Use `create(ResolveRepositoryContextRequestSchema)` to create a new message.
+ */
+export declare const ResolveRepositoryContextRequestSchema: GenMessage<ResolveRepositoryContextRequest>;
+
+/**
+ * A remote, as the host, owner and repository its URL names.
+ *
+ * @generated from message omnigent.api.workspace.v1alpha1.RepositoryRemote
+ */
+export declare type RepositoryRemote = Message<"omnigent.api.workspace.v1alpha1.RepositoryRemote"> & {
+  /**
+   * @generated from field: string name = 1;
+   */
+  name: string;
+
+  /**
+   * @generated from field: string host = 2;
+   */
+  host: string;
+
+  /**
+   * @generated from field: string owner = 3;
+   */
+  owner: string;
+
+  /**
+   * @generated from field: string repo = 4;
+   */
+  repo: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.RepositoryRemote.
+ * Use `create(RepositoryRemoteSchema)` to create a new message.
+ */
+export declare const RepositoryRemoteSchema: GenMessage<RepositoryRemote>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.PushTarget
+ */
+export declare type PushTarget = Message<"omnigent.api.workspace.v1alpha1.PushTarget"> & {
+  /**
+   * @generated from field: string remote_name = 1;
+   */
+  remoteName: string;
+
+  /**
+   * The destination branch on the remote, without "refs/heads/".
+   *
+   * @generated from field: string branch = 2;
+   */
+  branch: string;
+
+  /**
+   * The repository the branch pushes to, from its push URLs.
+   *
+   * @generated from field: string host = 3;
+   */
+  host: string;
+
+  /**
+   * @generated from field: string owner = 4;
+   */
+  owner: string;
+
+  /**
+   * @generated from field: string repo = 5;
+   */
+  repo: string;
+
+  /**
+   * The local tracking ref's commit, or empty when there is none or it
+   * describes a different repository than the push target.
+   *
+   * @generated from field: string tracking_sha = 6;
+   */
+  trackingSha: string;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.PushTarget.
+ * Use `create(PushTargetSchema)` to create a new message.
+ */
+export declare const PushTargetSchema: GenMessage<PushTarget>;
+
+/**
+ * @generated from message omnigent.api.workspace.v1alpha1.ResolveRepositoryContextResponse
+ */
+export declare type ResolveRepositoryContextResponse = Message<"omnigent.api.workspace.v1alpha1.ResolveRepositoryContextResponse"> & {
+  /**
+   * @generated from field: omnigent.api.workspace.v1alpha1.RepositoryContextProblem problem = 1;
+   */
+  problem: RepositoryContextProblem;
+
+  /**
+   * Without "refs/heads/"; empty when HEAD is detached.
+   *
+   * @generated from field: string branch = 2;
+   */
+  branch: string;
+
+  /**
+   * Empty in a repository without commits.
+   *
+   * @generated from field: string head_sha = 3;
+   */
+  headSha: string;
+
+  /**
+   * Absent when the branch doesn't push, or not unambiguously.
+   *
+   * @generated from field: omnigent.api.workspace.v1alpha1.PushTarget push = 4;
+   */
+  push?: PushTarget | undefined;
+
+  /**
+   * @generated from field: omnigent.api.workspace.v1alpha1.PushUnresolved push_unresolved = 5;
+   */
+  pushUnresolved: PushUnresolved;
+
+  /**
+   * The upstream's local tracking ref, only for telling contexts apart; never
+   * evidence of where the branch pushes.
+   *
+   * @generated from field: string upstream_ref = 6;
+   */
+  upstreamRef: string;
+
+  /**
+   * At most 8; remotes whose URL isn't supported are counted, not listed.
+   *
+   * @generated from field: repeated omnigent.api.workspace.v1alpha1.RepositoryRemote remotes = 7;
+   */
+  remotes: RepositoryRemote[];
+
+  /**
+   * @generated from field: uint32 unsupported_remote_count = 8;
+   */
+  unsupportedRemoteCount: number;
+
+  /**
+   * @generated from field: bool truncated_remotes = 9;
+   */
+  truncatedRemotes: boolean;
+};
+
+/**
+ * Describes the message omnigent.api.workspace.v1alpha1.ResolveRepositoryContextResponse.
+ * Use `create(ResolveRepositoryContextResponseSchema)` to create a new message.
+ */
+export declare const ResolveRepositoryContextResponseSchema: GenMessage<ResolveRepositoryContextResponse>;
 
 /**
  * @generated from enum omnigent.api.workspace.v1alpha1.EntryType
@@ -289,6 +1508,440 @@ export enum ContentEncoding {
 export declare const ContentEncodingSchema: GenEnum<ContentEncoding>;
 
 /**
+ * @generated from enum omnigent.api.workspace.v1alpha1.FileSearchMode
+ */
+export enum FileSearchMode {
+  /**
+   * The default: FILE_SEARCH_MODE_FUZZY.
+   *
+   * @generated from enum value: FILE_SEARCH_MODE_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * Ranked fuzzy match over file paths, best first. Feature "search_files.fuzzy".
+   *
+   * @generated from enum value: FILE_SEARCH_MODE_FUZZY = 1;
+   */
+  FUZZY = 1,
+
+  /**
+   * Files and directories whose path contains the query, ignoring case,
+   * sorted by path, as the REST file search returns them. Feature
+   * "search_files.substring".
+   *
+   * @generated from enum value: FILE_SEARCH_MODE_SUBSTRING = 2;
+   */
+  SUBSTRING = 2,
+}
+
+/**
+ * Describes the enum omnigent.api.workspace.v1alpha1.FileSearchMode.
+ */
+export declare const FileSearchModeSchema: GenEnum<FileSearchMode>;
+
+/**
+ * @generated from enum omnigent.api.workspace.v1alpha1.SearchOrder
+ */
+export enum SearchOrder {
+  /**
+   * The default: SEARCH_ORDER_WALK.
+   *
+   * @generated from enum value: SEARCH_ORDER_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * One walk of the scope, in no particular order.
+   *
+   * @generated from enum value: SEARCH_ORDER_WALK = 1;
+   */
+  WALK = 1,
+
+  /**
+   * `focused_paths` first, then their directories, then the directories with
+   * the most changes against `changed_against`, then the rest. Feature
+   * "text_search_priority".
+   *
+   * @generated from enum value: SEARCH_ORDER_PRIORITY = 2;
+   */
+  PRIORITY = 2,
+}
+
+/**
+ * Describes the enum omnigent.api.workspace.v1alpha1.SearchOrder.
+ */
+export declare const SearchOrderSchema: GenEnum<SearchOrder>;
+
+/**
+ * @generated from enum omnigent.api.workspace.v1alpha1.ComparisonKind
+ */
+export enum ComparisonKind {
+  /**
+   * @generated from enum value: COMPARISON_KIND_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * The last commit (HEAD).
+   *
+   * @generated from enum value: COMPARISON_KIND_LAST_COMMIT = 1;
+   */
+  LAST_COMMIT = 1,
+
+  /**
+   * The merge base of HEAD and the default branch: the tracked remote's
+   * default branch, else an upstream naming another branch, else origin/HEAD.
+   *
+   * @generated from enum value: COMPARISON_KIND_BRANCH_POINT = 2;
+   */
+  BRANCH_POINT = 2,
+
+  /**
+   * The merge base of `base_revision` and `head_revision`, compared with that
+   * head. Feature "revision_comparison".
+   *
+   * @generated from enum value: COMPARISON_KIND_REVISIONS = 3;
+   */
+  REVISIONS = 3,
+}
+
+/**
+ * Describes the enum omnigent.api.workspace.v1alpha1.ComparisonKind.
+ */
+export declare const ComparisonKindSchema: GenEnum<ComparisonKind>;
+
+/**
+ * @generated from enum omnigent.api.workspace.v1alpha1.ComparisonProblem
+ */
+export enum ComparisonProblem {
+  /**
+   * @generated from enum value: COMPARISON_PROBLEM_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: COMPARISON_PROBLEM_NOT_A_REPOSITORY = 1;
+   */
+  NOT_A_REPOSITORY = 1,
+
+  /**
+   * @generated from enum value: COMPARISON_PROBLEM_NO_COMMITS = 2;
+   */
+  NO_COMMITS = 2,
+
+  /**
+   * @generated from enum value: COMPARISON_PROBLEM_NO_DEFAULT_BRANCH = 3;
+   */
+  NO_DEFAULT_BRANCH = 3,
+
+  /**
+   * @generated from enum value: COMPARISON_PROBLEM_NO_BRANCH_POINT = 4;
+   */
+  NO_BRANCH_POINT = 4,
+
+  /**
+   * @generated from enum value: COMPARISON_PROBLEM_MISSING_OBJECT = 5;
+   */
+  MISSING_OBJECT = 5,
+
+  /**
+   * @generated from enum value: COMPARISON_PROBLEM_PARTIAL_CLONE_NEEDS_NEWER_GIT = 6;
+   */
+  PARTIAL_CLONE_NEEDS_NEWER_GIT = 6,
+
+  /**
+   * @generated from enum value: COMPARISON_PROBLEM_TIMEOUT = 7;
+   */
+  TIMEOUT = 7,
+
+  /**
+   * @generated from enum value: COMPARISON_PROBLEM_TOO_MANY_FILES = 8;
+   */
+  TOO_MANY_FILES = 8,
+
+  /**
+   * @generated from enum value: COMPARISON_PROBLEM_LISTING_TOO_LARGE = 9;
+   */
+  LISTING_TOO_LARGE = 9,
+
+  /**
+   * @generated from enum value: COMPARISON_PROBLEM_GIT_UNAVAILABLE = 10;
+   */
+  GIT_UNAVAILABLE = 10,
+
+  /**
+   * @generated from enum value: COMPARISON_PROBLEM_GIT_FAILED = 11;
+   */
+  GIT_FAILED = 11,
+
+  /**
+   * A repository nested inside the workspace's own, untracked by it.
+   *
+   * @generated from enum value: COMPARISON_PROBLEM_MULTIPLE_REPOSITORIES = 12;
+   */
+  MULTIPLE_REPOSITORIES = 12,
+
+  /**
+   * A revision Git must not be asked about, such as one starting with "-".
+   *
+   * @generated from enum value: COMPARISON_PROBLEM_INVALID_REVISION = 13;
+   */
+  INVALID_REVISION = 13,
+
+  /**
+   * @generated from enum value: COMPARISON_PROBLEM_BASE_NOT_FOUND = 14;
+   */
+  BASE_NOT_FOUND = 14,
+
+  /**
+   * @generated from enum value: COMPARISON_PROBLEM_HEAD_NOT_FOUND = 15;
+   */
+  HEAD_NOT_FOUND = 15,
+
+  /**
+   * The base and head share no commit.
+   *
+   * @generated from enum value: COMPARISON_PROBLEM_NO_COMMON_HISTORY = 16;
+   */
+  NO_COMMON_HISTORY = 16,
+}
+
+/**
+ * Describes the enum omnigent.api.workspace.v1alpha1.ComparisonProblem.
+ */
+export declare const ComparisonProblemSchema: GenEnum<ComparisonProblem>;
+
+/**
+ * Which requested revision a problem is about.
+ *
+ * @generated from enum omnigent.api.workspace.v1alpha1.ComparisonField
+ */
+export enum ComparisonField {
+  /**
+   * The problem isn't about either revision.
+   *
+   * @generated from enum value: COMPARISON_FIELD_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: COMPARISON_FIELD_BASE = 1;
+   */
+  BASE = 1,
+
+  /**
+   * @generated from enum value: COMPARISON_FIELD_HEAD = 2;
+   */
+  HEAD = 2,
+
+  /**
+   * @generated from enum value: COMPARISON_FIELD_BOTH = 3;
+   */
+  BOTH = 3,
+}
+
+/**
+ * Describes the enum omnigent.api.workspace.v1alpha1.ComparisonField.
+ */
+export declare const ComparisonFieldSchema: GenEnum<ComparisonField>;
+
+/**
+ * @generated from enum omnigent.api.workspace.v1alpha1.ChangeStatus
+ */
+export enum ChangeStatus {
+  /**
+   * @generated from enum value: CHANGE_STATUS_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: CHANGE_STATUS_ADDED = 1;
+   */
+  ADDED = 1,
+
+  /**
+   * @generated from enum value: CHANGE_STATUS_MODIFIED = 2;
+   */
+  MODIFIED = 2,
+
+  /**
+   * @generated from enum value: CHANGE_STATUS_DELETED = 3;
+   */
+  DELETED = 3,
+
+  /**
+   * @generated from enum value: CHANGE_STATUS_TYPE_CHANGED = 4;
+   */
+  TYPE_CHANGED = 4,
+
+  /**
+   * @generated from enum value: CHANGE_STATUS_CONFLICTED = 5;
+   */
+  CONFLICTED = 5,
+}
+
+/**
+ * Describes the enum omnigent.api.workspace.v1alpha1.ChangeStatus.
+ */
+export declare const ChangeStatusSchema: GenEnum<ChangeStatus>;
+
+/**
+ * @generated from enum omnigent.api.workspace.v1alpha1.GitEntryKind
+ */
+export enum GitEntryKind {
+  /**
+   * No entry on this side, e.g. the base of an added file.
+   *
+   * @generated from enum value: GIT_ENTRY_KIND_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: GIT_ENTRY_KIND_FILE = 1;
+   */
+  FILE = 1,
+
+  /**
+   * @generated from enum value: GIT_ENTRY_KIND_SYMLINK = 2;
+   */
+  SYMLINK = 2,
+
+  /**
+   * @generated from enum value: GIT_ENTRY_KIND_SUBMODULE = 3;
+   */
+  SUBMODULE = 3,
+}
+
+/**
+ * Describes the enum omnigent.api.workspace.v1alpha1.GitEntryKind.
+ */
+export declare const GitEntryKindSchema: GenEnum<GitEntryKind>;
+
+/**
+ * @generated from enum omnigent.api.workspace.v1alpha1.ChangedFileProblem
+ */
+export enum ChangedFileProblem {
+  /**
+   * The file can be compared.
+   *
+   * @generated from enum value: CHANGED_FILE_PROBLEM_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * A Git filter, such as LFS, changes how this file is stored.
+   *
+   * @generated from enum value: CHANGED_FILE_PROBLEM_FILTERED = 1;
+   */
+  FILTERED = 1,
+
+  /**
+   * The file's base version isn't in this clone.
+   *
+   * @generated from enum value: CHANGED_FILE_PROBLEM_MISSING_OBJECT = 2;
+   */
+  MISSING_OBJECT = 2,
+}
+
+/**
+ * Describes the enum omnigent.api.workspace.v1alpha1.ChangedFileProblem.
+ */
+export declare const ChangedFileProblemSchema: GenEnum<ChangedFileProblem>;
+
+/**
+ * @generated from enum omnigent.api.workspace.v1alpha1.RepositoryContextProblem
+ */
+export enum RepositoryContextProblem {
+  /**
+   * The context was read.
+   *
+   * @generated from enum value: REPOSITORY_CONTEXT_PROBLEM_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * @generated from enum value: REPOSITORY_CONTEXT_PROBLEM_NOT_A_REPOSITORY = 1;
+   */
+  NOT_A_REPOSITORY = 1,
+
+  /**
+   * URL rewrites, or remotes and branches defined outside the repository's
+   * own configuration, which the server doesn't resolve.
+   *
+   * @generated from enum value: REPOSITORY_CONTEXT_PROBLEM_UNSUPPORTED_CONFIG = 2;
+   */
+  UNSUPPORTED_CONFIG = 2,
+
+  /**
+   * The repository changed while it was read, twice; ask again.
+   *
+   * @generated from enum value: REPOSITORY_CONTEXT_PROBLEM_REPOSITORY_CHANGING = 3;
+   */
+  REPOSITORY_CHANGING = 3,
+
+  /**
+   * @generated from enum value: REPOSITORY_CONTEXT_PROBLEM_TIMEOUT = 4;
+   */
+  TIMEOUT = 4,
+
+  /**
+   * @generated from enum value: REPOSITORY_CONTEXT_PROBLEM_GIT_UNAVAILABLE = 5;
+   */
+  GIT_UNAVAILABLE = 5,
+
+  /**
+   * @generated from enum value: REPOSITORY_CONTEXT_PROBLEM_GIT_FAILED = 6;
+   */
+  GIT_FAILED = 6,
+}
+
+/**
+ * Describes the enum omnigent.api.workspace.v1alpha1.RepositoryContextProblem.
+ */
+export declare const RepositoryContextProblemSchema: GenEnum<RepositoryContextProblem>;
+
+/**
+ * Why a branch that may push somewhere has no push target.
+ *
+ * @generated from enum omnigent.api.workspace.v1alpha1.PushUnresolved
+ */
+export enum PushUnresolved {
+  /**
+   * Not unresolved: there is a push target, or the branch doesn't push.
+   *
+   * @generated from enum value: PUSH_UNRESOLVED_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * Refspecs don't give one destination, or Git reports a different one.
+   *
+   * @generated from enum value: PUSH_UNRESOLVED_REFSPEC = 1;
+   */
+  REFSPEC = 1,
+
+  /**
+   * The push URLs don't name one supported repository.
+   *
+   * @generated from enum value: PUSH_UNRESOLVED_PUSH_URL = 2;
+   */
+  PUSH_URL = 2,
+
+  /**
+   * push.default=matching, which can push many branches.
+   *
+   * @generated from enum value: PUSH_UNRESOLVED_PUSH_DEFAULT = 3;
+   */
+  PUSH_DEFAULT = 3,
+}
+
+/**
+ * Describes the enum omnigent.api.workspace.v1alpha1.PushUnresolved.
+ */
+export declare const PushUnresolvedSchema: GenEnum<PushUnresolved>;
+
+/**
  * @generated from service omnigent.api.workspace.v1alpha1.WorkspaceService
  */
 export declare const WorkspaceService: GenService<{
@@ -321,6 +1974,109 @@ export declare const WorkspaceService: GenService<{
     methodKind: "server_streaming";
     input: typeof ReadFileRequestSchema;
     output: typeof ReadFileResponseSchema;
+  },
+  /**
+   * Describes one path, as ListDirectory describes its entries.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.StatPath
+   */
+  statPath: {
+    methodKind: "unary";
+    input: typeof StatPathRequestSchema;
+    output: typeof StatPathResponseSchema;
+  },
+  /**
+   * Finds files by path: ranked fuzzy matches for Go to File, or the REST
+   * file search's case-insensitive substring matches.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.SearchFiles
+   */
+  searchFiles: {
+    methodKind: "unary";
+    input: typeof SearchFilesRequestSchema;
+    output: typeof SearchFilesResponseSchema;
+  },
+  /**
+   * Streams the lines of workspace files that match a query, in batches.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.SearchText
+   */
+  searchText: {
+    methodKind: "server_streaming";
+    input: typeof SearchTextRequestSchema;
+    output: typeof SearchTextResponseSchema;
+  },
+  /**
+   * Resolves a comparison's base and head commits.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.ResolveWorkingCopyBase
+   */
+  resolveWorkingCopyBase: {
+    methodKind: "unary";
+    input: typeof ResolveWorkingCopyBaseRequestSchema;
+    output: typeof ResolveWorkingCopyBaseResponseSchema;
+  },
+  /**
+   * Lists the files a comparison changes.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.ListWorkingCopyChanges
+   */
+  listWorkingCopyChanges: {
+    methodKind: "unary";
+    input: typeof ListWorkingCopyChangesRequestSchema;
+    output: typeof ListWorkingCopyChangesResponseSchema;
+  },
+  /**
+   * Streams a file's content at a commit, as ReadFile streams a working file.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.ReadBaseFile
+   */
+  readBaseFile: {
+    methodKind: "server_streaming";
+    input: typeof ReadBaseFileRequestSchema;
+    output: typeof ReadBaseFileResponseSchema;
+  },
+  /**
+   * Reads a symlink's own text, without following it.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.ReadLinkText
+   */
+  readLinkText: {
+    methodKind: "unary";
+    input: typeof ReadLinkTextRequestSchema;
+    output: typeof ReadLinkTextResponseSchema;
+  },
+  /**
+   * Lists branch and tag names to offer as a comparison's base or head.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.ListRepositoryRefs
+   */
+  listRepositoryRefs: {
+    methodKind: "unary";
+    input: typeof ListRepositoryRefsRequestSchema;
+    output: typeof ListRepositoryRefsResponseSchema;
+  },
+  /**
+   * Lists the commits HEAD has beyond its merge base with a base, newest first.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.ListBranchCommits
+   */
+  listBranchCommits: {
+    methodKind: "unary";
+    input: typeof ListBranchCommitsRequestSchema;
+    output: typeof ListBranchCommitsResponseSchema;
+  },
+  /**
+   * The checked-out branch, its commit, where it pushes, and the remotes, so a
+   * client can find the branch's pull request. Configuration values and remote
+   * URLs never appear in the answer.
+   *
+   * @generated from rpc omnigent.api.workspace.v1alpha1.WorkspaceService.ResolveRepositoryContext
+   */
+  resolveRepositoryContext: {
+    methodKind: "unary";
+    input: typeof ResolveRepositoryContextRequestSchema;
+    output: typeof ResolveRepositoryContextResponseSchema;
   },
 }>;
 

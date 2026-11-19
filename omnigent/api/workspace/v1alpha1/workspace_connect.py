@@ -21,7 +21,7 @@ from connectrpc.protocol import ProtocolType
 from connectrpc.server import ConnectASGIApplication, ConnectWSGIApplication, DEFAULT_READ_MAX_BYTES, Endpoint, EndpointSync
 from pyqwest import Client, SyncClient
 
-from .workspace_pb2 import GetCapabilitiesRequest, GetCapabilitiesResponse, ListDirectoryRequest, ListDirectoryResponse, ReadFileRequest, ReadFileResponse
+from .workspace_pb2 import GetCapabilitiesRequest, GetCapabilitiesResponse, ListBranchCommitsRequest, ListBranchCommitsResponse, ListDirectoryRequest, ListDirectoryResponse, ListRepositoryRefsRequest, ListRepositoryRefsResponse, ListWorkingCopyChangesRequest, ListWorkingCopyChangesResponse, ReadBaseFileRequest, ReadBaseFileResponse, ReadFileRequest, ReadFileResponse, ReadLinkTextRequest, ReadLinkTextResponse, ResolveRepositoryContextRequest, ResolveRepositoryContextResponse, ResolveWorkingCopyBaseRequest, ResolveWorkingCopyBaseResponse, SearchFilesRequest, SearchFilesResponse, SearchTextRequest, SearchTextResponse, StatPathRequest, StatPathResponse
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator, Iterable, Iterator, Mapping
@@ -53,6 +53,69 @@ class WorkspaceService(Protocol):
     def read_file(self, request: ReadFileRequest, ctx: RequestContext[ReadFileRequest, ReadFileResponse], /) -> AsyncIterator[ReadFileResponse]:
         """
         Streams a file: metadata first, then its bytes in order.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def stat_path(self, request: StatPathRequest, ctx: RequestContext[StatPathRequest, StatPathResponse], /) -> StatPathResponse:
+        """
+        Describes one path, as ListDirectory describes its entries.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def search_files(self, request: SearchFilesRequest, ctx: RequestContext[SearchFilesRequest, SearchFilesResponse], /) -> SearchFilesResponse:
+        """
+        Finds files by path: ranked fuzzy matches for Go to File, or the REST
+        file search's case-insensitive substring matches.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def search_text(self, request: SearchTextRequest, ctx: RequestContext[SearchTextRequest, SearchTextResponse], /) -> AsyncIterator[SearchTextResponse]:
+        """
+        Streams the lines of workspace files that match a query, in batches.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def resolve_working_copy_base(self, request: ResolveWorkingCopyBaseRequest, ctx: RequestContext[ResolveWorkingCopyBaseRequest, ResolveWorkingCopyBaseResponse], /) -> ResolveWorkingCopyBaseResponse:
+        """
+        Resolves a comparison's base and head commits.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def list_working_copy_changes(self, request: ListWorkingCopyChangesRequest, ctx: RequestContext[ListWorkingCopyChangesRequest, ListWorkingCopyChangesResponse], /) -> ListWorkingCopyChangesResponse:
+        """
+        Lists the files a comparison changes.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def read_base_file(self, request: ReadBaseFileRequest, ctx: RequestContext[ReadBaseFileRequest, ReadBaseFileResponse], /) -> AsyncIterator[ReadBaseFileResponse]:
+        """
+        Streams a file's content at a commit, as ReadFile streams a working file.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def read_link_text(self, request: ReadLinkTextRequest, ctx: RequestContext[ReadLinkTextRequest, ReadLinkTextResponse], /) -> ReadLinkTextResponse:
+        """
+        Reads a symlink's own text, without following it.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def list_repository_refs(self, request: ListRepositoryRefsRequest, ctx: RequestContext[ListRepositoryRefsRequest, ListRepositoryRefsResponse], /) -> ListRepositoryRefsResponse:
+        """
+        Lists branch and tag names to offer as a comparison's base or head.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def list_branch_commits(self, request: ListBranchCommitsRequest, ctx: RequestContext[ListBranchCommitsRequest, ListBranchCommitsResponse], /) -> ListBranchCommitsResponse:
+        """
+        Lists the commits HEAD has beyond its merge base with a base, newest first.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    async def resolve_repository_context(self, request: ResolveRepositoryContextRequest, ctx: RequestContext[ResolveRepositoryContextRequest, ResolveRepositoryContextResponse], /) -> ResolveRepositoryContextResponse:
+        """
+        The checked-out branch, its commit, where it pushes, and the remotes, so a
+        client can find the branch's pull request. Configuration values and remote
+        URLs never appear in the answer.
         """
         raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
 
@@ -102,6 +165,116 @@ class WorkspaceServiceASGIApplication(ConnectASGIApplication[WorkspaceService]):
                         stream_type=StreamType.SERVER_STREAM,
                     ),
                     function=svc.read_file,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/StatPath": Endpoint.unary(
+                    method=MethodInfo(
+                        name="StatPath",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=StatPathRequest,
+                        output=StatPathResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.stat_path,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/SearchFiles": Endpoint.unary(
+                    method=MethodInfo(
+                        name="SearchFiles",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=SearchFilesRequest,
+                        output=SearchFilesResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.search_files,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/SearchText": Endpoint.server_stream(
+                    method=MethodInfo(
+                        name="SearchText",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=SearchTextRequest,
+                        output=SearchTextResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.SERVER_STREAM,
+                    ),
+                    function=svc.search_text,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/ResolveWorkingCopyBase": Endpoint.unary(
+                    method=MethodInfo(
+                        name="ResolveWorkingCopyBase",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=ResolveWorkingCopyBaseRequest,
+                        output=ResolveWorkingCopyBaseResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.resolve_working_copy_base,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/ListWorkingCopyChanges": Endpoint.unary(
+                    method=MethodInfo(
+                        name="ListWorkingCopyChanges",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=ListWorkingCopyChangesRequest,
+                        output=ListWorkingCopyChangesResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.list_working_copy_changes,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/ReadBaseFile": Endpoint.server_stream(
+                    method=MethodInfo(
+                        name="ReadBaseFile",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=ReadBaseFileRequest,
+                        output=ReadBaseFileResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.SERVER_STREAM,
+                    ),
+                    function=svc.read_base_file,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/ReadLinkText": Endpoint.unary(
+                    method=MethodInfo(
+                        name="ReadLinkText",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=ReadLinkTextRequest,
+                        output=ReadLinkTextResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.read_link_text,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/ListRepositoryRefs": Endpoint.unary(
+                    method=MethodInfo(
+                        name="ListRepositoryRefs",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=ListRepositoryRefsRequest,
+                        output=ListRepositoryRefsResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.list_repository_refs,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/ListBranchCommits": Endpoint.unary(
+                    method=MethodInfo(
+                        name="ListBranchCommits",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=ListBranchCommitsRequest,
+                        output=ListBranchCommitsResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.list_branch_commits,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/ResolveRepositoryContext": Endpoint.unary(
+                    method=MethodInfo(
+                        name="ResolveRepositoryContext",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=ResolveRepositoryContextRequest,
+                        output=ResolveRepositoryContextResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=svc.resolve_repository_context,
                 ),
             },
             interceptors=interceptors,
@@ -214,6 +387,255 @@ class WorkspaceServiceClient(ConnectClient):
             headers=headers,
             timeout_ms=timeout_ms,
         )
+    async def stat_path(
+        self,
+        request: StatPathRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> StatPathResponse:
+        """
+        Describes one path, as ListDirectory describes its entries.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="StatPath",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=StatPathRequest,
+                output=StatPathResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    async def search_files(
+        self,
+        request: SearchFilesRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> SearchFilesResponse:
+        """
+        Finds files by path: ranked fuzzy matches for Go to File, or the REST
+        file search's case-insensitive substring matches.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="SearchFiles",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=SearchFilesRequest,
+                output=SearchFilesResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    def search_text(
+        self,
+        request: SearchTextRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> AsyncIterator[SearchTextResponse]:
+        """
+        Streams the lines of workspace files that match a query, in batches.
+        """
+        return self.execute_server_stream(
+            request=request,
+            method=MethodInfo(
+                name="SearchText",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=SearchTextRequest,
+                output=SearchTextResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.SERVER_STREAM,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    async def resolve_working_copy_base(
+        self,
+        request: ResolveWorkingCopyBaseRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> ResolveWorkingCopyBaseResponse:
+        """
+        Resolves a comparison's base and head commits.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="ResolveWorkingCopyBase",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=ResolveWorkingCopyBaseRequest,
+                output=ResolveWorkingCopyBaseResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    async def list_working_copy_changes(
+        self,
+        request: ListWorkingCopyChangesRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> ListWorkingCopyChangesResponse:
+        """
+        Lists the files a comparison changes.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="ListWorkingCopyChanges",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=ListWorkingCopyChangesRequest,
+                output=ListWorkingCopyChangesResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    def read_base_file(
+        self,
+        request: ReadBaseFileRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> AsyncIterator[ReadBaseFileResponse]:
+        """
+        Streams a file's content at a commit, as ReadFile streams a working file.
+        """
+        return self.execute_server_stream(
+            request=request,
+            method=MethodInfo(
+                name="ReadBaseFile",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=ReadBaseFileRequest,
+                output=ReadBaseFileResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.SERVER_STREAM,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    async def read_link_text(
+        self,
+        request: ReadLinkTextRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> ReadLinkTextResponse:
+        """
+        Reads a symlink's own text, without following it.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="ReadLinkText",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=ReadLinkTextRequest,
+                output=ReadLinkTextResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    async def list_repository_refs(
+        self,
+        request: ListRepositoryRefsRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> ListRepositoryRefsResponse:
+        """
+        Lists branch and tag names to offer as a comparison's base or head.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="ListRepositoryRefs",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=ListRepositoryRefsRequest,
+                output=ListRepositoryRefsResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    async def list_branch_commits(
+        self,
+        request: ListBranchCommitsRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> ListBranchCommitsResponse:
+        """
+        Lists the commits HEAD has beyond its merge base with a base, newest first.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="ListBranchCommits",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=ListBranchCommitsRequest,
+                output=ListBranchCommitsResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    async def resolve_repository_context(
+        self,
+        request: ResolveRepositoryContextRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> ResolveRepositoryContextResponse:
+        """
+        The checked-out branch, its commit, where it pushes, and the remotes, so a
+        client can find the branch's pull request. Configuration values and remote
+        URLs never appear in the answer.
+        """
+        return await self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="ResolveRepositoryContext",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=ResolveRepositoryContextRequest,
+                output=ResolveRepositoryContextResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
 
 class WorkspaceServiceSync(Protocol):
     def get_capabilities(self, request: GetCapabilitiesRequest, ctx: RequestContext[GetCapabilitiesRequest, GetCapabilitiesResponse], /) -> GetCapabilitiesResponse:
@@ -231,6 +653,69 @@ class WorkspaceServiceSync(Protocol):
     def read_file(self, request: ReadFileRequest, ctx: RequestContext[ReadFileRequest, ReadFileResponse], /) -> Iterator[ReadFileResponse]:
         """
         Streams a file: metadata first, then its bytes in order.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def stat_path(self, request: StatPathRequest, ctx: RequestContext[StatPathRequest, StatPathResponse], /) -> StatPathResponse:
+        """
+        Describes one path, as ListDirectory describes its entries.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def search_files(self, request: SearchFilesRequest, ctx: RequestContext[SearchFilesRequest, SearchFilesResponse], /) -> SearchFilesResponse:
+        """
+        Finds files by path: ranked fuzzy matches for Go to File, or the REST
+        file search's case-insensitive substring matches.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def search_text(self, request: SearchTextRequest, ctx: RequestContext[SearchTextRequest, SearchTextResponse], /) -> Iterator[SearchTextResponse]:
+        """
+        Streams the lines of workspace files that match a query, in batches.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def resolve_working_copy_base(self, request: ResolveWorkingCopyBaseRequest, ctx: RequestContext[ResolveWorkingCopyBaseRequest, ResolveWorkingCopyBaseResponse], /) -> ResolveWorkingCopyBaseResponse:
+        """
+        Resolves a comparison's base and head commits.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def list_working_copy_changes(self, request: ListWorkingCopyChangesRequest, ctx: RequestContext[ListWorkingCopyChangesRequest, ListWorkingCopyChangesResponse], /) -> ListWorkingCopyChangesResponse:
+        """
+        Lists the files a comparison changes.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def read_base_file(self, request: ReadBaseFileRequest, ctx: RequestContext[ReadBaseFileRequest, ReadBaseFileResponse], /) -> Iterator[ReadBaseFileResponse]:
+        """
+        Streams a file's content at a commit, as ReadFile streams a working file.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def read_link_text(self, request: ReadLinkTextRequest, ctx: RequestContext[ReadLinkTextRequest, ReadLinkTextResponse], /) -> ReadLinkTextResponse:
+        """
+        Reads a symlink's own text, without following it.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def list_repository_refs(self, request: ListRepositoryRefsRequest, ctx: RequestContext[ListRepositoryRefsRequest, ListRepositoryRefsResponse], /) -> ListRepositoryRefsResponse:
+        """
+        Lists branch and tag names to offer as a comparison's base or head.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def list_branch_commits(self, request: ListBranchCommitsRequest, ctx: RequestContext[ListBranchCommitsRequest, ListBranchCommitsResponse], /) -> ListBranchCommitsResponse:
+        """
+        Lists the commits HEAD has beyond its merge base with a base, newest first.
+        """
+        raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
+
+    def resolve_repository_context(self, request: ResolveRepositoryContextRequest, ctx: RequestContext[ResolveRepositoryContextRequest, ResolveRepositoryContextResponse], /) -> ResolveRepositoryContextResponse:
+        """
+        The checked-out branch, its commit, where it pushes, and the remotes, so a
+        client can find the branch's pull request. Configuration values and remote
+        URLs never appear in the answer.
         """
         raise ConnectError(Code.UNIMPLEMENTED, 'Not implemented')
 
@@ -278,6 +763,116 @@ class WorkspaceServiceWSGIApplication(ConnectWSGIApplication):
                         stream_type=StreamType.SERVER_STREAM,
                     ),
                     function=service.read_file,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/StatPath": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="StatPath",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=StatPathRequest,
+                        output=StatPathResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.stat_path,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/SearchFiles": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="SearchFiles",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=SearchFilesRequest,
+                        output=SearchFilesResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.search_files,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/SearchText": EndpointSync.server_stream(
+                    method=MethodInfo(
+                        name="SearchText",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=SearchTextRequest,
+                        output=SearchTextResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.SERVER_STREAM,
+                    ),
+                    function=service.search_text,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/ResolveWorkingCopyBase": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="ResolveWorkingCopyBase",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=ResolveWorkingCopyBaseRequest,
+                        output=ResolveWorkingCopyBaseResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.resolve_working_copy_base,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/ListWorkingCopyChanges": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="ListWorkingCopyChanges",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=ListWorkingCopyChangesRequest,
+                        output=ListWorkingCopyChangesResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.list_working_copy_changes,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/ReadBaseFile": EndpointSync.server_stream(
+                    method=MethodInfo(
+                        name="ReadBaseFile",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=ReadBaseFileRequest,
+                        output=ReadBaseFileResponse,
+                        idempotency_level=IdempotencyLevel.UNKNOWN,
+                        stream_type=StreamType.SERVER_STREAM,
+                    ),
+                    function=service.read_base_file,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/ReadLinkText": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="ReadLinkText",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=ReadLinkTextRequest,
+                        output=ReadLinkTextResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.read_link_text,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/ListRepositoryRefs": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="ListRepositoryRefs",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=ListRepositoryRefsRequest,
+                        output=ListRepositoryRefsResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.list_repository_refs,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/ListBranchCommits": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="ListBranchCommits",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=ListBranchCommitsRequest,
+                        output=ListBranchCommitsResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.list_branch_commits,
+                ),
+                "/omnigent.api.workspace.v1alpha1.WorkspaceService/ResolveRepositoryContext": EndpointSync.unary(
+                    method=MethodInfo(
+                        name="ResolveRepositoryContext",
+                        service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                        input=ResolveRepositoryContextRequest,
+                        output=ResolveRepositoryContextResponse,
+                        idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                        stream_type=StreamType.UNARY,
+                    ),
+                    function=service.resolve_repository_context,
                 ),
             },
             interceptors=interceptors,
@@ -389,4 +984,253 @@ class WorkspaceServiceClientSync(ConnectClientSync):
             ),
             headers=headers,
             timeout_ms=timeout_ms,
+        )
+    def stat_path(
+        self,
+        request: StatPathRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> StatPathResponse:
+        """
+        Describes one path, as ListDirectory describes its entries.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="StatPath",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=StatPathRequest,
+                output=StatPathResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    def search_files(
+        self,
+        request: SearchFilesRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> SearchFilesResponse:
+        """
+        Finds files by path: ranked fuzzy matches for Go to File, or the REST
+        file search's case-insensitive substring matches.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="SearchFiles",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=SearchFilesRequest,
+                output=SearchFilesResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    def search_text(
+        self,
+        request: SearchTextRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> Iterator[SearchTextResponse]:
+        """
+        Streams the lines of workspace files that match a query, in batches.
+        """
+        return self.execute_server_stream(
+            request=request,
+            method=MethodInfo(
+                name="SearchText",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=SearchTextRequest,
+                output=SearchTextResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.SERVER_STREAM,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    def resolve_working_copy_base(
+        self,
+        request: ResolveWorkingCopyBaseRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> ResolveWorkingCopyBaseResponse:
+        """
+        Resolves a comparison's base and head commits.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="ResolveWorkingCopyBase",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=ResolveWorkingCopyBaseRequest,
+                output=ResolveWorkingCopyBaseResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    def list_working_copy_changes(
+        self,
+        request: ListWorkingCopyChangesRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> ListWorkingCopyChangesResponse:
+        """
+        Lists the files a comparison changes.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="ListWorkingCopyChanges",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=ListWorkingCopyChangesRequest,
+                output=ListWorkingCopyChangesResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    def read_base_file(
+        self,
+        request: ReadBaseFileRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+    ) -> Iterator[ReadBaseFileResponse]:
+        """
+        Streams a file's content at a commit, as ReadFile streams a working file.
+        """
+        return self.execute_server_stream(
+            request=request,
+            method=MethodInfo(
+                name="ReadBaseFile",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=ReadBaseFileRequest,
+                output=ReadBaseFileResponse,
+                idempotency_level=IdempotencyLevel.UNKNOWN,
+                stream_type=StreamType.SERVER_STREAM,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+        )
+    def read_link_text(
+        self,
+        request: ReadLinkTextRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> ReadLinkTextResponse:
+        """
+        Reads a symlink's own text, without following it.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="ReadLinkText",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=ReadLinkTextRequest,
+                output=ReadLinkTextResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    def list_repository_refs(
+        self,
+        request: ListRepositoryRefsRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> ListRepositoryRefsResponse:
+        """
+        Lists branch and tag names to offer as a comparison's base or head.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="ListRepositoryRefs",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=ListRepositoryRefsRequest,
+                output=ListRepositoryRefsResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    def list_branch_commits(
+        self,
+        request: ListBranchCommitsRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> ListBranchCommitsResponse:
+        """
+        Lists the commits HEAD has beyond its merge base with a base, newest first.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="ListBranchCommits",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=ListBranchCommitsRequest,
+                output=ListBranchCommitsResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
+        )
+    def resolve_repository_context(
+        self,
+        request: ResolveRepositoryContextRequest,
+        *,
+        headers: Headers | Mapping[str, str] | None = None, 
+        timeout_ms: int | None = None,
+        use_get: bool = False,
+    ) -> ResolveRepositoryContextResponse:
+        """
+        The checked-out branch, its commit, where it pushes, and the remotes, so a
+        client can find the branch's pull request. Configuration values and remote
+        URLs never appear in the answer.
+        """
+        return self.execute_unary(
+            request=request,
+            method=MethodInfo(
+                name="ResolveRepositoryContext",
+                service_name="omnigent.api.workspace.v1alpha1.WorkspaceService",
+                input=ResolveRepositoryContextRequest,
+                output=ResolveRepositoryContextResponse,
+                idempotency_level=IdempotencyLevel.NO_SIDE_EFFECTS,
+                stream_type=StreamType.UNARY,
+            ),
+            headers=headers,
+            timeout_ms=timeout_ms,
+            use_get=use_get,
         )

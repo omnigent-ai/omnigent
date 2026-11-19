@@ -45,7 +45,12 @@ import {
   type ComposerKeyIntent,
 } from "@/components/composer/ChatComposer";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
-import { isComposerInput } from "@/components/composer/engine/composerInput";
+import {
+  COMPOSER_TAIL_INPUT_ID,
+  composerTargetElement,
+  isComposerInput,
+} from "@/components/composer/engine/composerInput";
+import { useRequestedComposerEngine } from "@/components/composer/engine/composerEnginePolicy";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
 import {
@@ -225,8 +230,9 @@ function recallGridQueuedDraft(message: Pick<QueuedMessage, "text" | "replyDraft
 const TEXT_INPUT_TYPES = new Set(["text", "search", "email", "url", "password", "number", "tel"]);
 
 /** A text field other than `own`: typing there must not be interrupted by a focus request. */
-function isOtherTextInput(target: EventTarget | null, own: HTMLElement | null): boolean {
-  if (!(target instanceof HTMLElement) || target === own) return false;
+function isOtherTextInput(target: EventTarget | null, own: ComposerTextTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  if (own !== null && target === composerTargetElement(own)) return false;
   if (target instanceof HTMLInputElement) return TEXT_INPUT_TYPES.has(target.type);
   return (
     isComposerInput(target) ||
@@ -873,7 +879,7 @@ function SideChatComposer({
   );
   const [interrupting, setInterrupting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const tailTextareaRef = useRef<HTMLTextAreaElement>(null);
+  const tailTextareaRef = useRef<ComposerTextTarget | null>(null);
   const textareaRef = useRef<ComposerTextTarget | null>(null);
   const voiceEditsRef = useRef(
     new Map<string | null, { before: string; after: string; quoteIds: Set<string> }>(),
@@ -917,6 +923,11 @@ function SideChatComposer({
     [activeTextId, composerKey, editText, reconcileVoiceEdits],
   );
   const dictation = useDictationInsert(activeText, setActiveText, textareaRef);
+  const composerEngine = useRequestedComposerEngine();
+  // An engine switch replaces every input; keep the active one current even without focus.
+  const rebindActiveInput = useCallback((target: ComposerTextTarget) => {
+    textareaRef.current = target;
+  }, []);
 
   // This tab's seeded text: on a pending tab the "Ask in side chat" selection
   // to QUOTE, on a live tab the `/side` question to SEND.
@@ -970,7 +981,7 @@ function SideChatComposer({
     // this pane mounted; leave that field alone and just drop the request.
     const input = tailTextareaRef.current;
     const active = document.activeElement;
-    if (input && active !== input && !isOtherTextInput(active, input)) {
+    if (input && composerTargetElement(input) !== active && !isOtherTextInput(active, input)) {
       input.focus();
       // Continue a restored draft from its end, not before its first word.
       input.setSelectionRange(input.value.length, input.value.length);
@@ -1390,6 +1401,11 @@ function SideChatComposer({
         </TooltipProvider>
       )}
       <ChatComposer
+        engine={composerEngine}
+        dictating={dictation.hasInterim}
+        draftKey={childId}
+        activeInputId={activeTextId ?? COMPOSER_TAIL_INPUT_ID}
+        onActiveInputChange={rebindActiveInput}
         hasContent={!pending && files.length > 0}
         data-side-chat="true"
         keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
@@ -1398,13 +1414,13 @@ function SideChatComposer({
           value: text,
           onChange: (event) => {
             if (commandNotice !== null) setCommandNotice(null);
-            slashCompletion.onSelectionChange(event.target);
-            setText(event.target.value);
+            slashCompletion.onSelectionChange(event.currentTarget);
+            setText(event.currentTarget.value);
             if (gridCell)
               setTypedMention(
                 detectMentionAt(
-                  event.target.value,
-                  event.target.selectionStart ?? event.target.value.length,
+                  event.currentTarget.value,
+                  event.currentTarget.selectionStart ?? event.currentTarget.value.length,
                   sessionEntries.map((row) => row.title),
                 ),
               );
@@ -1421,6 +1437,7 @@ function SideChatComposer({
           },
           placeholder: fullSession ? "Reply to this session..." : "Ask a side question...",
           rows: gridComposer ? 1 : undefined,
+          heightMode: quotes.length ? "unbounded" : "compact",
           disabled: !ready,
           "data-testid": "side-chat-input",
           onKeyDown: handleKeyDown,
