@@ -9,7 +9,10 @@ const bridge = vi.hoisted(() => ({
   announceSupport: vi.fn(),
 }));
 vi.mock("@/lib/nativeBridge", () => ({ floatingComposerBridge: () => bridge }));
-vi.mock("./floatingLaunch", () => ({ launchFromPanel: vi.fn() }));
+vi.mock("./floatingLaunch", () => ({
+  launchFromPanel: vi.fn(),
+  SEND_UNKNOWN_ERROR: "Couldn't confirm it.",
+}));
 vi.mock("@/lib/branding", () => ({ useLogoUrl: () => null }));
 // New Chat's own behavior has its own suites; here it only types and launches.
 vi.mock("@/shell/NewChatDialog", async () => {
@@ -39,13 +42,21 @@ vi.mock("@/shell/NewChatDialog", async () => {
           >
             Launch
           </button>
+          <button
+            type="button"
+            onClick={() =>
+              presentation.kind === "floating" && presentation.openAppPage("/settings/integrations")
+            }
+          >
+            Integrations
+          </button>
         </>
       );
     },
   };
 });
 
-import { FloatingComposerPage } from "./FloatingComposerPage";
+import { FloatingComposerPage, OPEN_PAGE_ERROR } from "./FloatingComposerPage";
 import { launchFromPanel } from "./floatingLaunch";
 
 const prompt = () => screen.getByTestId("new-chat-landing-input") as HTMLTextAreaElement;
@@ -113,6 +124,46 @@ describe("FloatingComposerPage", () => {
 
     expect(screen.getByTestId("floating-launch-error")).toHaveTextContent("Couldn't send it.");
     expect(prompt().value).toBe("Fix the build");
+  });
+
+  it("starts a fresh composer and still says why the session couldn't be shown", async () => {
+    render(<FloatingComposerPage />);
+
+    await launch({ error: "Couldn't show it.", freshComposer: true });
+
+    expect(prompt().value).toBe("");
+    expect(screen.getByTestId("floating-launch-error")).toHaveTextContent("Couldn't show it.");
+  });
+
+  it("keeps the prompt when a launch throws", async () => {
+    vi.mocked(launchFromPanel).mockRejectedValue(new Error("unexpected"));
+    render(<FloatingComposerPage />);
+    fireEvent.change(prompt(), { target: { value: "Fix the build" } });
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Launch" }));
+    });
+
+    expect(screen.getByTestId("floating-launch-error")).toHaveTextContent("Couldn't confirm it.");
+    expect(prompt().value).toBe("Fix the build");
+  });
+
+  it.each([
+    [
+      "refuses",
+      () => bridge.openInMainWindow.mockResolvedValue({ ok: false, error: "window-loading" }),
+    ],
+    ["fails", () => bridge.openInMainWindow.mockRejectedValue(new Error("gone"))],
+  ])("says so when the shell %s to open a linked page", async (_case, arrange) => {
+    arrange();
+    render(<FloatingComposerPage />);
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Integrations" }));
+    });
+
+    expect(bridge.openInMainWindow).toHaveBeenCalledWith("/settings/integrations");
+    expect(screen.getByTestId("floating-launch-error")).toHaveTextContent(OPEN_PAGE_ERROR);
   });
 
   it("ignores an older launch that settles after a newer one", async () => {

@@ -16,7 +16,7 @@ export interface LaunchOutcome {
 type Delivery = "delivered" | "failed" | "unknown";
 
 export const SEND_FAILED_ERROR =
-  "The new agent didn't get your message. Its session is open in a window; your prompt is still here.";
+  "The new agent didn't get your message. Your prompt is still here; its session is in the sidebar.";
 export const SEND_UNKNOWN_ERROR =
   "Couldn't confirm the new agent got your message. Check its session before sending it again.";
 export const OPEN_FAILED_ERROR =

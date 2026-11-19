@@ -175,6 +175,17 @@ describe("launchFromPanel", () => {
     });
   });
 
+  it("keeps the prompt when neither the open nor the send worked", async () => {
+    bridge.openInMainWindow.mockRejectedValue(new Error("gone"));
+    vi.mocked(postEvent).mockResolvedValue({ queued: false, denied: true } as Awaited<
+      ReturnType<typeof postEvent>
+    >);
+
+    // The failure text points to the sidebar, so it holds whether or not a window opened.
+    expect(await launchFromPanel(request())).toEqual(failed);
+    expect(SEND_FAILED_ERROR).toMatch(/sidebar/);
+  });
+
   it.each([
     [
       "couldn't be shown",
