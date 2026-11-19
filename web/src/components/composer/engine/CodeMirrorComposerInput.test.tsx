@@ -156,6 +156,17 @@ describe("CodeMirrorComposerInput", () => {
     expect(box.target!.value).toBe("xdraft");
   });
 
+  it("stays editable inside a disabled fieldset's first legend, as a textarea does", () => {
+    const { container } = render(
+      <fieldset disabled>
+        <legend>
+          <CodeMirrorComposerInput aria-label="Message the agent" defaultValue="draft" />
+        </legend>
+      </fieldset>,
+    );
+    expect(container.querySelector(".cm-content")!.getAttribute("aria-disabled")).toBe("false");
+  });
+
   it("takes a caller's text size in place of the composer's own", () => {
     const host = (className?: string) => {
       const { container, unmount } = mount({ className });

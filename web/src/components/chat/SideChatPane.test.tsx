@@ -37,7 +37,10 @@ import { gridCellComposerKey, useChatStore, type ChatState } from "@/store/chatS
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import * as CodeMirrorModule from "@/components/composer/engine/codeMirrorComposerModule";
-import { resetCodeMirrorComposerLoadForTests } from "@/components/composer/engine/codeMirrorComposerLoader";
+import {
+  codeMirrorComposerLoad,
+  resetCodeMirrorComposerLoadForTests,
+} from "@/components/composer/engine/codeMirrorComposerLoader";
 import { composerTargetOf } from "@/components/composer/engine/composerInput";
 import { insertComposerText } from "@/lib/composerText";
 import { SideChatPane } from "./SideChatPane";
@@ -3296,5 +3299,6 @@ describe("side-chat composer engine", () => {
     renderPane(withFlag(false));
     expect(screen.getByTestId("side-chat-input").tagName).toBe("TEXTAREA");
     expect(document.querySelector('[data-composer-engine="codemirror"]')).toBeNull();
+    expect(codeMirrorComposerLoad().status).toBe("idle");
   });
 });

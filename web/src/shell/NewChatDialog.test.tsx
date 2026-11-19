@@ -1,5 +1,8 @@
 import * as CodeMirrorModule from "@/components/composer/engine/codeMirrorComposerModule";
-import { resetCodeMirrorComposerLoadForTests } from "@/components/composer/engine/codeMirrorComposerLoader";
+import {
+  codeMirrorComposerLoad,
+  resetCodeMirrorComposerLoadForTests,
+} from "@/components/composer/engine/codeMirrorComposerLoader";
 import { composerTargetOf } from "@/components/composer/engine/composerInput";
 import { insertComposerText } from "@/lib/composerText";
 import { testAgent } from "@/test/agentFixtures";
@@ -14310,5 +14313,6 @@ describe("New Chat composer engine", () => {
     renderLanding();
     expect(screen.getByTestId("new-chat-landing-input").tagName).toBe("TEXTAREA");
     expect(document.querySelector('[data-composer-engine="codemirror"]')).toBeNull();
+    expect(codeMirrorComposerLoad().status).toBe("idle");
   });
 });

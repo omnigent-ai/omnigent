@@ -111,7 +111,14 @@ function useFieldsetDisabled(hostRef: RefObject<HTMLElement | null>): boolean {
     for (let node = host.parentElement; node; node = node.parentElement) {
       if (node instanceof HTMLFieldSetElement) fieldsets.push(node);
     }
-    const sync = () => setDisabled(fieldsets.some((fieldset) => fieldset.disabled));
+    // Like a textarea, a disabled fieldset's first legend keeps its contents enabled.
+    const sync = () =>
+      setDisabled(
+        fieldsets.some(
+          (fieldset) =>
+            fieldset.disabled && !fieldset.querySelector(":scope > legend")?.contains(host),
+        ),
+      );
     const observer = new MutationObserver(sync);
     for (const fieldset of fieldsets) {
       observer.observe(fieldset, { attributes: true, attributeFilter: ["disabled"] });
