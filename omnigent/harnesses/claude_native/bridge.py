@@ -33,6 +33,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
+import binascii
 import contextlib
 import functools
 import hashlib
@@ -3814,9 +3816,10 @@ def read_transcript_items_since(
     while translating the user-visible semantic records into Omnigent
     item types the web UI already understands — ``thinking`` blocks
     become ``reasoning`` items so the chat surfaces the same
-    reasoning context the TUI shows. Some metadata is still
-    read for out-of-band mirroring rather than dropped outright — a
-    ``custom-title`` record surfaces on
+    reasoning context the TUI shows, except narration blocks, which the
+    TUI shows as prose and so become assistant ``message`` items. Some
+    metadata is still read for out-of-band mirroring rather than dropped
+    outright — a ``custom-title`` record surfaces on
     :attr:`TranscriptReadResult.latest_custom_title`.
 
     :param transcript_path: Claude transcript path, e.g.
@@ -11372,7 +11375,20 @@ def _assistant_transcript_items_from_entry(
             # same expandable reasoning context the TUI renders. Redacted
             # thinking carries no readable text anywhere, so it stays dropped.
             thinking = block.get("thinking")
-            if isinstance(thinking, str) and thinking.strip():
+            if not isinstance(thinking, str) or not thinking.strip():
+                continue
+            if _is_narration_thinking(block):
+                # The TUI shows narration as ordinary assistant prose ("· summary").
+                items.append(
+                    _assistant_message_item(
+                        source_key=source_key,
+                        item_index=item_index,
+                        agent_name=agent_name,
+                        response_id=response_id,
+                        text=thinking.strip(),
+                    )
+                )
+            else:
                 items.append(
                     ClaudeTranscriptItem(
                         source_id=_source_id(source_key, item_index, "reasoning"),
@@ -11604,6 +11620,90 @@ def _assistant_message_item(
         response_id=response_id,
         failure_context=failure_context,
     )
+
+
+# Claude Code reads a thinking block's display kind from this field path of
+# its base64 protobuf signature.
+_THINKING_KIND_SIGNATURE_PATH = (2, 1, 8)
+
+
+def _is_narration_thinking(block: Mapping[str, Any]) -> bool:
+    """
+    Report whether Claude Code displays a thinking block as narration.
+
+    Claude Code renders narration-kind thinking as visible assistant prose
+    marked ``· summary`` rather than as hidden reasoning.
+
+    :param block: Transcript thinking block, e.g. ``{"type": "thinking",
+        "thinking": "Checking the login.", "signature": "Eg0KC0IJbmFycmF0aW9u"}``.
+    :returns: ``True`` when the signature marks the block as narration.
+    """
+    signature = block.get("signature")
+    if not isinstance(signature, str) or not signature:
+        return False
+    try:
+        payload = base64.b64decode(signature, validate=True)
+    except (binascii.Error, ValueError):
+        return False
+    for field_number in _THINKING_KIND_SIGNATURE_PATH:
+        field_value = _protobuf_bytes_field(payload, field_number)
+        if field_value is None:
+            return False
+        payload = field_value
+    return payload == b"narration"
+
+
+def _protobuf_bytes_field(message: bytes, field_number: int) -> bytes | None:
+    """
+    Return the last length-delimited value of one protobuf field.
+
+    :param message: Serialized protobuf message.
+    :param field_number: Field to read, e.g. ``2``.
+    :returns: The field's bytes, or ``None`` when the field is absent or
+        the message is malformed.
+    """
+    value: bytes | None = None
+    position = 0
+    while position < len(message):
+        key, position = _protobuf_varint(message, position)
+        if key is None:
+            return None
+        wire_type = key & 0x7
+        if wire_type == 0:
+            varint, position = _protobuf_varint(message, position)
+            if varint is None:
+                return None
+        elif wire_type in (1, 5):
+            position += 8 if wire_type == 1 else 4
+            if position > len(message):
+                return None
+        elif wire_type == 2:
+            length, position = _protobuf_varint(message, position)
+            if length is None or length > len(message) - position:
+                return None
+            if key >> 3 == field_number:
+                value = message[position : position + length]
+            position += length
+        else:
+            return None
+    return value
+
+
+def _protobuf_varint(message: bytes, position: int) -> tuple[int | None, int]:
+    """
+    Decode one protobuf varint of at most ten bytes.
+
+    :param message: Serialized protobuf message.
+    :param position: Offset of the varint's first byte.
+    :returns: The decoded value (``None`` when truncated or overlong) and
+        the offset after it.
+    """
+    value = 0
+    for shift_index, byte in enumerate(message[position : position + 10]):
+        value |= (byte & 0x7F) << (7 * shift_index)
+        if not byte & 0x80:
+            return value, position + shift_index + 1
+    return None, position
 
 
 def _display_text(text: str, *, is_api_error: bool) -> str:

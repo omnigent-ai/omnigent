@@ -1278,6 +1278,78 @@ def test_read_transcript_items_since_mirrors_thinking_as_reasoning(tmp_path: Pat
     assert current_response_id == answer.response_id
 
 
+def _thinking_signature(kind: bytes, *, trailer: bytes = b"") -> str:
+    """Encode a thinking signature whose protobuf path 2 -> 1 -> 8 holds ``kind``."""
+    kind_field = b"\x42" + bytes([len(kind)]) + kind
+    inner = b"\x0a" + bytes([len(kind_field)]) + kind_field
+    return base64.b64encode(b"\x08\x96\x01\x12" + bytes([len(inner)]) + inner + trailer).decode()
+
+
+def test_read_transcript_items_since_mirrors_narration_thinking_as_message(
+    tmp_path: Path,
+) -> None:
+    """
+    Narration-signed thinking mirrors as visible assistant text.
+
+    Claude Code shows narration thinking as ``· summary`` prose, so chat
+    must render it as a message. Other kinds and malformed signatures
+    keep the hidden reasoning mirror.
+    """
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        json.dumps(
+            {
+                "type": "assistant",
+                "uuid": "assistant-1",
+                "message": {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "\nSign in first:\n\n```\n! databricks auth login\n```\n",
+                            "signature": _thinking_signature(b"narration"),
+                        },
+                        {
+                            "type": "thinking",
+                            "thinking": "private plan",
+                            "signature": _thinking_signature(b"reasoning"),
+                        },
+                        {
+                            "type": "thinking",
+                            "thinking": "unsupported wire type",
+                            "signature": _thinking_signature(b"narration", trailer=b"\x1b"),
+                        },
+                        {"type": "text", "text": "Done."},
+                    ],
+                },
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    _cursor, current_response_id, items = read_transcript_items_since(
+        transcript_path,
+        0,
+        agent_name="claude-native-ui",
+    )
+
+    assert [item.item_type for item in items] == ["message", "reasoning", "reasoning", "message"]
+    narration = items[0]
+    assert narration.data == {
+        "role": "assistant",
+        "agent": "claude-native-ui",
+        "content": [
+            {"type": "output_text", "text": "Sign in first:\n\n```\n! databricks auth login\n```"}
+        ],
+    }
+    assert narration.source_id.endswith(":0:message")
+    assert items[2].data["content"] == [
+        {"type": "reasoning_text", "text": "unsupported wire type"}
+    ]
+    assert {item.response_id for item in items} == {current_response_id}
+
+
 def test_read_transcript_items_since_skips_unreadable_thinking(tmp_path: Path) -> None:
     """
     Thinking with no readable text mirrors nothing.
