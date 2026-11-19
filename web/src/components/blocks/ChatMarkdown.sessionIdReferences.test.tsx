@@ -55,17 +55,29 @@ function LocationProbe() {
   return <span data-testid="location">{useLocation().pathname}</span>;
 }
 
-function renderMarkdown(markdown: string, client = new QueryClient()): QueryClient {
-  render(
+function markdownTree(markdown: string, client: QueryClient, isStreaming: boolean) {
+  return (
     <MemoryRouter initialEntries={["/c/coordinator"]}>
       <QueryClientProvider client={client}>
         <FileViewerContext.Provider value={FILE_VIEWER}>
-          <FilePathAwareMessageResponse>{markdown}</FilePathAwareMessageResponse>
+          <FilePathAwareMessageResponse isStreaming={isStreaming}>
+            {markdown}
+          </FilePathAwareMessageResponse>
         </FileViewerContext.Provider>
       </QueryClientProvider>
       <LocationProbe />
-    </MemoryRouter>,
+    </MemoryRouter>
   );
+}
+
+function renderMarkdown(markdown: string, client = new QueryClient()): QueryClient {
+  render(markdownTree(markdown, client, false));
+  return client;
+}
+
+function cachedWorker(): QueryClient {
+  const client = new QueryClient();
+  client.setQueryData(["session", WORKER], { title: "Build worker", parentSessionId: null });
   return client;
 }
 
@@ -93,9 +105,7 @@ describe("bare session ids in chat", () => {
   ])("opens the session in the same view in %s", async (_label, native) => {
     nativeShell.native = native;
     const openSpy = vi.spyOn(window, "open").mockReturnValue(null);
-    const client = new QueryClient();
-    client.setQueryData(["session", WORKER], { title: "Build worker", parentSessionId: null });
-    renderMarkdown(`Open \`${WORKER}\`.`, client);
+    renderMarkdown(`Open \`${WORKER}\`.`, cachedWorker());
 
     const pill = screen.getByTestId("mention-pill");
     // A plain click is cancelled and routed in-app: no page load, no new tab or window.
@@ -138,5 +148,31 @@ describe("bare session ids in chat", () => {
     );
     expect(screen.queryByTestId("mention-pill")).not.toBeInTheDocument();
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("waits for a streamed id at the end of the text to finish before looking it up", async () => {
+    // A longer hash that is still arriving starts with 32 hex characters too.
+    fetchMock.mockResolvedValue(
+      jsonResponse({ id: WORKER, object: "session", title: "Build worker" }),
+    );
+    const client = new QueryClient();
+    const { rerender } = render(markdownTree(`Open ${WORKER}`, client, true));
+    expect(screen.queryByTestId("mention-pill")).not.toBeInTheDocument();
+    expect(fetchMock).not.toHaveBeenCalled();
+
+    rerender(markdownTree(`Open ${WORKER}`, client, false));
+    expect((await screen.findByTestId("mention-pill")).textContent).toBe("@Build worker");
+  });
+
+  it("keeps an authored link that only borrows the reference title", () => {
+    renderMarkdown(
+      `[docs](https://example.com/run "omnigent-session-id:${WORKER}")`,
+      cachedWorker(),
+    );
+    expect(screen.queryByTestId("mention-pill")).not.toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "docs" })).toHaveAttribute(
+      "href",
+      "https://example.com/run",
+    );
   });
 });

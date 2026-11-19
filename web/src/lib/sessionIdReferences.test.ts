@@ -21,10 +21,14 @@ function marked(tree: Node): Node[] {
   return tree.children![0].children!;
 }
 
-function referencedIds(text: string): string[] {
+function references(text: string) {
   return marked(paragraph({ type: "text", value: text }))
     .filter((node) => node.type === "link")
-    .map((node) => parseSessionIdReferenceTitle(node.title) ?? "");
+    .map((node) => parseSessionIdReferenceTitle(node.title));
+}
+
+function referencedIds(text: string): string[] {
+  return references(text).map((reference) => reference?.id ?? "");
 }
 
 describe("remarkSessionIdReferences", () => {
@@ -38,9 +42,9 @@ describe("remarkSessionIdReferences", () => {
 
   it("wraps inline code that is exactly an id, keeping the code as its text", () => {
     const code = { type: "inlineCode", value: ID };
-    expect(marked(paragraph({ type: "text", value: "Open " }, code))).toEqual([
-      { type: "text", value: "Open " },
+    expect(marked(paragraph(code, { type: "text", value: " stopped." }))).toEqual([
       { type: "link", url: "#session-id", title: TITLE, children: [code] },
+      { type: "text", value: " stopped." },
     ]);
   });
 
@@ -49,6 +53,8 @@ describe("remarkSessionIdReferences", () => {
     [`(${ID})`, [ID]],
     [`ids: ${ID}, ${"a".repeat(32)}.`, [ID, "a".repeat(32)]],
     [`**${ID}**`, [ID]],
+    [`"${ID}": done`, [ID]],
+    [`first ${ID}\nsecond ${"b".repeat(32)}`, [ID, "b".repeat(32)]],
   ])("references the id in %j", (text, ids) => {
     expect(referencedIds(text)).toEqual(ids);
   });
@@ -64,8 +70,26 @@ describe("remarkSessionIdReferences", () => {
     ["a short hex id", ID.slice(0, 14)],
     ["a numeric id", "28772569657442"],
     ["a query value", `?id=${ID}`],
+    ["a later query value", `?ids=first,${ID}`],
+    ["a windows path", `C:\\runs\\${ID}\\out.log`],
+    ["an assignment", `session=${ID}`],
+    ["a fragment", `#${ID}`],
+    ["a handle", `@${ID}`],
+    ["a key", `key:${ID}`],
   ])("leaves %s alone", (_label, text) => {
     expect(referencedIds(text)).toEqual([]);
+  });
+
+  it("tags only the id that ends the block as trailing", () => {
+    const trailing = (text: string) => references(text).map((reference) => reference?.trailing);
+    expect(trailing(`Open ${ID}`)).toEqual([true]);
+    expect(trailing(`Open ${ID}.`)).toEqual([true]);
+    expect(trailing(`Open ${ID} and ${ID}`)).toEqual([false, true]);
+    expect(trailing(`Open ${ID} now`)).toEqual([false]);
+    const code = { type: "inlineCode", value: ID };
+    expect(marked(paragraph({ type: "text", value: "Open " }, code))[1]).toMatchObject({
+      title: `${TITLE}:end`,
+    });
   });
 
   it("leaves link text, partial inline code and fenced code alone", () => {
@@ -88,12 +112,13 @@ describe("remarkSessionIdReferences", () => {
 
 describe("parseSessionIdReferenceTitle", () => {
   it.each([
-    [TITLE, ID],
+    [TITLE, { id: ID, trailing: false }],
+    [`${TITLE}:end`, { id: ID, trailing: true }],
     [`omnigent-session-id:${ID}x`, null],
     ["omnigent-session-id:../x", null],
     [ID, null],
     [undefined, null],
   ])("parses %j", (title, expected) => {
-    expect(parseSessionIdReferenceTitle(title)).toBe(expected);
+    expect(parseSessionIdReferenceTitle(title)).toEqual(expected);
   });
 });

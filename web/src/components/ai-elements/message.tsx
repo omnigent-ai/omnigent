@@ -367,6 +367,11 @@ export function hasOpenCodeFence(text: string): boolean {
 
 const StreamingTextContext = createContext(false);
 
+/** Whether the markdown being rendered is still streaming in. */
+export function useIsStreamingText(): boolean {
+  return useContext(StreamingTextContext);
+}
+
 // Streamdown marks a block's open fence only while `isAnimating`, which also
 // disables its copy and download buttons, so mark it here for streaming text.
 function StreamingTextBlock(props: BlockProps) {

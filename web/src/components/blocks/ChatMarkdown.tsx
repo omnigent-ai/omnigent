@@ -26,7 +26,7 @@ import { toast } from "sonner";
 import { defaultRemarkPlugins } from "streamdown";
 import remarkBreaks from "remark-breaks";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
-import { MessageResponse } from "@/components/ai-elements/message";
+import { MessageResponse, useIsStreamingText } from "@/components/ai-elements/message";
 import {
   sameServerSessionPath,
   shortFileCitationLabel,
@@ -51,7 +51,12 @@ import { absoluteWorkspacePath } from "@/lib/composerContext";
 import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
 import { cn } from "@/lib/utils";
 import { parseMentionPillTitle } from "@/lib/mentionPills";
-import { parseSessionIdReferenceTitle, remarkSessionIdReferences } from "@/lib/sessionIdReferences";
+import {
+  SESSION_ID_REFERENCE_HREF,
+  parseSessionIdReferenceTitle,
+  remarkSessionIdReferences,
+  type SessionIdReferenceTarget,
+} from "@/lib/sessionIdReferences";
 import { useSessionLabel } from "@/hooks/useSessionLabel";
 import {
   useFileViewer,
@@ -613,9 +618,10 @@ function FileMentionPill({
 
 /** Links rendered as mention pills when their title carries the mention sentinel. */
 function MarkdownLink(props: WithHastNode<React.ComponentPropsWithoutRef<"a">>) {
-  const referencedSessionId = parseSessionIdReferenceTitle(props.title);
-  if (referencedSessionId) {
-    return <SessionIdReference id={referencedSessionId}>{props.children}</SessionIdReference>;
+  const reference =
+    props.href === SESSION_ID_REFERENCE_HREF ? parseSessionIdReferenceTitle(props.title) : null;
+  if (reference) {
+    return <SessionIdReference {...reference}>{props.children}</SessionIdReference>;
   }
   const target = parseMentionPillTitle(props.title);
   if (!target) return <WorkspaceFileLink {...props} />;
@@ -634,8 +640,14 @@ function MarkdownLink(props: WithHastNode<React.ComponentPropsWithoutRef<"a">>) 
 }
 
 /** A bare session id as a titled pill, or as written if it names no readable session. */
-function SessionIdReference({ id, children }: { id: string; children: React.ReactNode }) {
-  const label = useSessionLabel(id, useFileViewerConversationId() ?? null);
+function SessionIdReference({
+  id,
+  trailing,
+  children,
+}: SessionIdReferenceTarget & { children: React.ReactNode }) {
+  // While text streams in, an id that ends the text may be the start of a longer token.
+  const pending = useIsStreamingText() && trailing;
+  const label = useSessionLabel(pending ? null : id, useFileViewerConversationId() ?? null);
   if (!label) return children;
   return (
     <SessionMentionPill id={id} isSubagent={label.isSubagent} tooltip={`Session ${id}`}>
