@@ -238,6 +238,30 @@ def test_tracked_pr_info_names_the_workspace_repo(
     assert info.get("workspace_repo") == workspace_repo
 
 
+def test_an_explicit_pr_read_names_no_workspace_repo(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An explicit PR read must not touch local git; chat reads the base query instead."""
+    _git(repo, "remote", "add", "origin", "https://github.com/owner/app.git")
+    url = "https://github.com/owner/app/pull/7"
+    SessionPrRegistry("session").record(
+        [PullRequestRef.from_url(url)], relationship="created", source="test"
+    )
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: None)
+    calls: list[str] = []
+    original = pr_resource._add_workspace_repo
+    monkeypatch.setattr(
+        pr_resource,
+        "_add_workspace_repo",
+        lambda root, info: (calls.append(root), original(root, info))[1],
+    )
+
+    explicit = pr_resource.pr_info(str(repo), session_id="session", pr_url=url)
+    assert (calls, "workspace_repo" in explicit) == ([], False)
+    base = pr_resource.pr_info(str(repo), session_id="session")
+    assert (calls, base["workspace_repo"]["host"]) == ([str(repo)], "github.com")
+
+
 GITHUB_FORK = "https://github.com/me/app.git"
 ENTERPRISE_ORIGIN = "https://ghe.example.com/owner/app.git"
 
