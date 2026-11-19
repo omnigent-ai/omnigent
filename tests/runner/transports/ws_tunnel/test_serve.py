@@ -728,12 +728,14 @@ async def test_serve_tunnel_bounds_the_wait_for_a_pending_sign_in(
     assert attempts == _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
 
 
-class _ContendedSignInFactory:
-    """Token factory whose ``sign_in_pending`` waits on a lock a concurrent mint holds."""
+class _ContendedCredentialFactory:
+    """Token factory whose selected flag waits for a concurrent mint."""
 
-    def __init__(self) -> None:
+    def __init__(self, flag_name: str = "sign_in_pending") -> None:
+        self.flag_name = flag_name
         self.flag_requested = threading.Event()
         self.mint_finished = threading.Event()
+        self.flag_finished = threading.Event()
         self.loop_stayed_free = False
 
     def __call__(self) -> str | None:
@@ -741,22 +743,44 @@ class _ContendedSignInFactory:
 
     @property
     def sign_in_pending(self) -> bool:
+        return self._read_flag("sign_in_pending")
+
+    @property
+    def declined(self) -> bool:
+        return self._read_flag("declined") or self.flag_name == "declined_without_proxy_bearer"
+
+    @property
+    def declined_without_proxy_bearer(self) -> bool:
+        return self._read_flag("declined_without_proxy_bearer")
+
+    def _read_flag(self, name: str) -> bool:
+        if name != self.flag_name or self.flag_finished.is_set():
+            return False
         self.flag_requested.set()
         # The mint finishes from the event loop, so it can only do so while the loop is free.
         self.loop_stayed_free = self.mint_finished.wait(timeout=2.0)
+        self.flag_finished.set()
         return False
 
 
 @pytest.mark.asyncio
-async def test_serve_tunnel_reads_sign_in_pending_off_the_event_loop(
+@pytest.mark.parametrize(
+    "flag_name", ["sign_in_pending", "declined", "declined_without_proxy_bearer"]
+)
+@pytest.mark.parametrize("http_status", [401, 403])
+async def test_serve_tunnel_reads_credential_flags_off_the_event_loop(
     monkeypatch: pytest.MonkeyPatch,
+    flag_name: str,
+    http_status: int,
 ) -> None:
     """A flag read stuck behind the factory lock must not stall the runner's event loop."""
-    factory = _ContendedSignInFactory()
+    factory = _ContendedCredentialFactory(flag_name)
 
     async def _serve_once(app: Any, **_kwargs: Any) -> None:
         del app
-        raise asyncio.CancelledError
+        if factory.flag_requested.is_set():
+            raise asyncio.CancelledError
+        raise InvalidStatus(Response(http_status, "Unauthorized", [], b""))
 
     async def _finish_mint_once_the_flag_is_read() -> None:
         while not factory.flag_requested.is_set():
@@ -779,6 +803,44 @@ async def test_serve_tunnel_reads_sign_in_pending_off_the_event_loop(
         await asyncio.gather(mint, return_exceptions=True)
 
     assert factory.loop_stayed_free
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("flag_name", ["declined", "declined_without_proxy_bearer"])
+async def test_serve_tunnel_cancels_while_credential_flag_is_contended(
+    monkeypatch: pytest.MonkeyPatch, flag_name: str
+) -> None:
+    factory = _ContendedCredentialFactory(flag_name)
+    attempts = 0
+
+    async def _serve_once(app: Any, **_kwargs: Any) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise InvalidStatus(Response(401, "Unauthorized", [], b""))
+
+    monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
+    tunnel = asyncio.create_task(
+        serve_tunnel(
+            _noop_app,
+            server_url="https://server.example.test",
+            runner_id="runner_contended_auth_cancel",
+            runner_version="0.1.0",
+            auth_token_factory=factory,
+        )
+    )
+    try:
+        assert await asyncio.to_thread(factory.flag_requested.wait, 5)
+        assert not factory.flag_finished.is_set()
+        tunnel.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await tunnel
+    finally:
+        factory.mint_finished.set()
+        tunnel.cancel()
+        await asyncio.gather(tunnel, return_exceptions=True)
+        assert await asyncio.to_thread(factory.flag_finished.wait, 5)
+
+    assert attempts == 1
 
 
 @pytest.mark.asyncio
