@@ -210,8 +210,8 @@ const NO_FILE_MENTION_HARNESSES: ReadonlySet<string> = new Set<string>();
  * (``capabilities.workspace_file_mentions``). Native wrappers aren't catalog
  * rows; ``harnessSupportsFileMentions`` covers them via the native registry.
  */
-export function useFileMentionHarnesses(): ReadonlySet<string> {
-  return useHarnessCatalog((c) => c.fileMentionHarnesses, NO_FILE_MENTION_HARNESSES);
+export function useFileMentionHarnesses(enabled = true): ReadonlySet<string> {
+  return useHarnessCatalog((c) => c.fileMentionHarnesses, NO_FILE_MENTION_HARNESSES, enabled);
 }
 
 const NO_EFFORT_FAMILIES: Record<string, string> = {};
