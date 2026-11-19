@@ -1,7 +1,6 @@
-import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 import { ALT_KEY, CTRL_KEY, MOD_KEY, SHIFT_KEY } from "@/components/KeyboardShortcut";
-import { SettingsLabel } from "@/components/SettingsLabel";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import { isMacPlatform } from "@/lib/hotkeys";
@@ -16,6 +15,11 @@ import {
   setGlobalShortcut,
   shellRecordsGlobalShortcut,
 } from "@/lib/nativeBridge";
+import { GLOBAL_SHORTCUT_ENTRIES } from "./search/catalog/general";
+import { SettingsEntryLabel, SettingsItem } from "./search/SettingsItem";
+import { settingsControlProps, settingsDescriptionId } from "./search/settingsControl";
+
+const RECORDING_PROMPT = "Press a shortcut…";
 
 const MAC_MODIFIER_GLYPHS: Partial<Record<string, string>> = {
   Control: CTRL_KEY,
@@ -60,36 +64,25 @@ function formatAccelerator(accelerator: string): string {
   return parts.map((part) => (part === "Control" ? "Ctrl" : part)).join("+");
 }
 
-/** Each shortcut's row: what it's called, what it does, and its test and component ids. */
-const SHORTCUT_ROWS: Record<
-  GlobalShortcutId,
-  { label: string; description: string; testIdPrefix: string; componentId: string }
-> = {
-  show: {
-    label: "Show Omnigent from anywhere",
-    description: "Brings Omnigent to the front from any app.",
-    testIdPrefix: "global-shortcut",
-    componentId: "settings.general.global_shortcut",
-  },
+/**
+ * Opt-in shortcut that brings the desktop app to the front from any app. The
+ * shell registers it; this control reads and saves the setting.
+ */
+/** Each shortcut's test and component ids; its name and copy come from its catalog entry. */
+const SHORTCUT_IDS: Record<GlobalShortcutId, { testIdPrefix: string; componentId: string }> = {
+  show: { testIdPrefix: "global-shortcut", componentId: "settings.general.global_shortcut" },
   floatingComposer: {
-    label: "Open New Agent from anywhere",
-    description: "Opens the New Agent panel from any app to start a session.",
     testIdPrefix: "floating-composer-shortcut",
     componentId: "settings.general.floating_composer_shortcut",
   },
 };
 
-/**
- * A system-wide shortcut: by default the opt-in one that brings the desktop app to the
- * front from any app. The shell registers it; this control reads and saves the setting.
- */
 export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: GlobalShortcutId }) {
-  const row = SHORTCUT_ROWS[shortcutId];
+  const entry = GLOBAL_SHORTCUT_ENTRIES.entry(shortcutId);
+  const ids = SHORTCUT_IDS[shortcutId];
   const [setting, setSetting] = useState<GlobalShortcutSetting | null>(null);
   const [recording, setRecording] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const labelId = useId();
-  const descriptionId = useId();
 
   useEffect(() => {
     let cancelled = false;
@@ -178,30 +171,25 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
   if (setting === null) return null;
 
   return (
-    <div className="flex flex-col gap-3">
+    <SettingsItem entry={entry} className="flex flex-col gap-3">
       <div className="flex items-center justify-between gap-6">
-        <SettingsLabel
-          label={row.label}
-          labelId={labelId}
-          descriptionId={descriptionId}
-          className="flex-1"
-          description={row.description}
-          descriptionClassName="text-ui"
-        />
+        <SettingsEntryLabel entry={entry} className="flex-1" descriptionClassName="text-ui" />
         <div className="flex shrink-0 items-center gap-3">
           <Button
             variant="outline"
             size="sm"
-            aria-describedby={descriptionId}
-            data-testid={`${row.testIdPrefix}-recorder`}
+            aria-describedby={settingsDescriptionId(entry)}
+            {...settingsControlProps(entry, "recorder", {
+              runtime: recording ? RECORDING_PROMPT : formatAccelerator(setting.accelerator),
+            })}
+            data-testid={`${ids.testIdPrefix}-recorder`}
             onClick={startRecording}
             onBlur={stopRecording}
           >
-            {recording ? "Press a shortcut…" : formatAccelerator(setting.accelerator)}
+            {recording ? RECORDING_PROMPT : formatAccelerator(setting.accelerator)}
           </Button>
           <Switch
-            aria-labelledby={labelId}
-            aria-describedby={descriptionId}
+            {...settingsControlProps(entry)}
             checked={setting.enabled}
             onCheckedChange={(enabled) =>
               // Turning off names no chord, so a window showing an older one can't save it.
@@ -209,8 +197,8 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
                 enabled ? { enabled, accelerator: setting.accelerator } : { enabled: false },
               )
             }
-            data-testid={`${row.testIdPrefix}-toggle`}
-            componentId={row.componentId}
+            data-testid={`${ids.testIdPrefix}-toggle`}
+            componentId={ids.componentId}
           />
         </div>
       </div>
@@ -219,6 +207,6 @@ export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: Gl
           {error}
         </p>
       )}
-    </div>
+    </SettingsItem>
   );
 }

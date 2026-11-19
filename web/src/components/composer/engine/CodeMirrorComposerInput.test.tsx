@@ -1,6 +1,6 @@
 import { redo, undo } from "@codemirror/commands";
 import { EditorView } from "@codemirror/view";
-import { act, fireEvent, render } from "@testing-library/react";
+import { act, fireEvent, render, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { insertComposerText } from "@/lib/composerText";
 import { CodeMirrorComposerInput } from "./testing/codeMirrorComposer";
@@ -124,6 +124,47 @@ describe("CodeMirrorComposerInput", () => {
     expect(content.getAttribute("spellcheck")).toBe("true");
     expect(content.getAttribute("autocorrect")).toBe("on");
     expect(content.getAttribute("autocapitalize")).toBe("sentences");
+  });
+
+  it("locks while an ancestor fieldset is disabled, as a textarea does", async () => {
+    const box: { target: ComposerTextTarget | null } = { target: null };
+    const input = (fieldsetDisabled: boolean) => (
+      <fieldset disabled={fieldsetDisabled}>
+        <CodeMirrorComposerInput
+          aria-label="Message the agent"
+          defaultValue="draft"
+          ref={(target) => {
+            box.target = target;
+          }}
+        />
+      </fieldset>
+    );
+    const { container, rerender } = render(input(true));
+    const content = container.querySelector<HTMLElement>(".cm-content")!;
+    expect(content.getAttribute("aria-disabled")).toBe("true");
+    expect(insertComposerText(box.target!, "x", 0, 0)).toBe(false);
+    expect(box.target!.value).toBe("draft");
+
+    rerender(input(false));
+    await waitFor(() => expect(content.getAttribute("aria-disabled")).toBe("false"));
+    expect(insertComposerText(box.target!, "x", 0, 0)).toBe(true);
+    expect(box.target!.value).toBe("xdraft");
+
+    rerender(input(true));
+    await waitFor(() => expect(content.getAttribute("aria-disabled")).toBe("true"));
+    expect(insertComposerText(box.target!, "y", 0, 0)).toBe(false);
+    expect(box.target!.value).toBe("xdraft");
+  });
+
+  it("stays editable inside a disabled fieldset's first legend, as a textarea does", () => {
+    const { container } = render(
+      <fieldset disabled>
+        <legend>
+          <CodeMirrorComposerInput aria-label="Message the agent" defaultValue="draft" />
+        </legend>
+      </fieldset>,
+    );
+    expect(container.querySelector(".cm-content")!.getAttribute("aria-disabled")).toBe("false");
   });
 
   it("takes a caller's text size in place of the composer's own", () => {
