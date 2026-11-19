@@ -247,7 +247,8 @@ ENTERPRISE_ORIGIN = "https://ghe.example.com/owner/app.git"
         # gh's resolved base wins over a remote of the tracked repo.
         (GITHUB_FORK, "origin", "owner/app", ("me/app", "github.com")),
         (GITHUB_FORK, None, "owner/app", ("owner/app", "github.com")),
-        (GITHUB_FORK, None, "owner/other", ("me/app", "github.com")),
+        # Without one, gh ranks remotes upstream > github > origin on origin's host.
+        (GITHUB_FORK, None, "owner/other", ("owner/app", "github.com")),
         # A public mirror of the tracked repo must not move bare refs off Enterprise.
         (ENTERPRISE_ORIGIN, None, "owner/app", ("owner/app", "ghe.example.com")),
         # ``repo`` stays the tracked PR's; ``workspace_repo`` names the checkout's own.

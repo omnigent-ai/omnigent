@@ -191,11 +191,16 @@ def _keeps_provider_workspace_repo(workspace_repo: Any, preferred: ParsedRemote 
     )
 
 
+# gh's base-repo order among remotes when none is resolved; others follow in config order.
+_GH_REMOTE_RANK = {"upstream": 0, "github": 1, "origin": 2}
+
+
 def _add_workspace_repo(root: str, info: dict[str, Any]) -> None:
     """Name the checkout's own repo from local config, or vet the provider's.
 
     Precedence: gh's resolved base, then a tracked PR's remote on origin's host, then
-    origin. An unrecognized preferred remote names no workspace repo.
+    the remote gh would pick on that host. An unrecognized preferred remote names no
+    workspace repo.
     """
 
     def run(argv: list[str]) -> tuple[int | None, str]:
@@ -225,17 +230,16 @@ def _add_workspace_repo(root: str, info: dict[str, Any]) -> None:
 
     parsed = preferred
     if base_url is None:
-        # A tracked remote on another host must not move the workspace off origin's
-        # host, e.g. a github.com mirror of an Enterprise checkout.
+        # A remote on another host must not move the workspace off origin's host,
+        # e.g. a github.com upstream or mirror of an Enterprise checkout.
+        same_host = [
+            (name, remote)
+            for name, url in urls
+            if (remote := resolve_remote(url)) is not None and remote.host == preferred.host
+        ]
         parsed = next(
-            (
-                remote
-                for _, url in urls
-                if (remote := resolve_remote(url)) is not None
-                and remote.host == preferred.host
-                and is_tracked(remote)
-            ),
-            preferred,
+            (remote for _, remote in same_host if is_tracked(remote)),
+            min(same_host, key=lambda item: _GH_REMOTE_RANK.get(item[0].lower(), 3))[1],
         )
     info["workspace_repo"] = {"name_with_owner": parsed.repository, "host": parsed.host}
 
