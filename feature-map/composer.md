@@ -161,13 +161,14 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   unavailable while disconnected, and an incomplete catalog.
 - `command-and-shell-tint`: in the main chat, side chats and the new-session
   composer (textarea or CodeMirror), a leading known command or skill is tinted
-  and an unknown `/word` is not; the sent bubble keeps the tint. In Claude Code
-  and Codex native sessions a leading `!` is tinted with a "Shell command" hint
-  (Codex skips leading whitespace and treats `!!` as text). States: known or
-  unknown command; quotes or attachments (no tint); shell mode; refused shell
-  send with the reason as the hint (an @-tag, review comments, or a Codex
-  non-owner, whom the server would reject); permission still loading or a
-  pending side-chat tab (no shell mode). See the [native shell
+  and an unknown `/word` is not; the sent bubble keeps the tint, except for a
+  message relayed from another session. In Claude Code and Codex native
+  sessions a leading `!` is tinted with a "Shell command" hint (Codex skips
+  leading whitespace and treats `!!` as text). States: known or unknown
+  command; quotes or attachments (no tint); shell mode; refused shell send,
+  with the reason as the hint and the draft kept (an @-tag, review comments, or
+  a Codex non-owner, whom the server would reject); permission still loading or
+  a pending side-chat tab (no shell mode). See the [native shell
   recipes](native-harnesses.md#driving-it-with-the-repro-environment).
 - `goal-command`: in sessions with a Goal control, bare `/goal` or its slash-menu
   row opens the same dialog as **+ → Goal**. `/goal <objective>` keeps its
