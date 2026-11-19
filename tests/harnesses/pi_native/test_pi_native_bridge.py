@@ -23,6 +23,68 @@ def _inbox_files(bridge_dir: Path) -> list[str]:
     return sorted(p.name for p in (bridge_dir / "inbox").glob("*.json"))
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        None,
+        "not-json",
+        "[]",
+        '{"commands": {}}',
+        '{"commands": [null]}',
+        '{"commands": [{"name": "/review"}]}',
+        '{"commands": [{"name": "bad name"}]}',
+        '{"commands": [{"name": "review", "description": 42}]}',
+    ],
+)
+def test_command_catalog_unavailable_is_distinct_from_empty(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload: str | None
+) -> None:
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path)
+    directory = pi_native_bridge.prepare_bridge_dir("session")
+    if payload is not None:
+        (directory / "commands.json").write_text(payload)
+    assert pi_native_bridge.read_command_catalog("session") is None
+
+
+def test_command_catalog_is_session_scoped_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(pi_native_bridge, "_BRIDGE_ROOT", tmp_path)
+    directory = pi_native_bridge.prepare_bridge_dir("session")
+    catalog = directory / "commands.json"
+    catalog.write_text(
+        json.dumps(
+            {
+                "commands": [
+                    {
+                        "name": "review",
+                        "description": "Review changes",
+                        "sourceInfo": {"path": "/private"},
+                    },
+                    {"name": "review", "description": "Shadowed"},
+                    {"name": "skill:pdf"},
+                ]
+            }
+        )
+    )
+    assert pi_native_bridge.read_command_catalog("session") == [
+        {"name": "review", "description": "Review changes"},
+        {"name": "skill:pdf", "description": ""},
+    ]
+    assert pi_native_bridge.read_command_catalog("another-session") is None
+    catalog.write_text('{"commands": []}')
+    assert pi_native_bridge.read_command_catalog("session") == []
+    monkeypatch.setattr(pi_native_bridge, "_MAX_COMMAND_CATALOG_BYTES", 1)
+    assert pi_native_bridge.read_command_catalog("session") is None
+
+
+def test_relaunch_invalidates_command_catalog(tmp_path: Path) -> None:
+    catalog = tmp_path / "commands.json"
+    catalog.write_text('{"commands": []}')
+    pi_native_bridge.clear_inbox(tmp_path)
+    assert not catalog.exists()
+
+
 def test_enqueue_preserves_send_order_across_types(tmp_path: Path) -> None:
     """Inbox filenames sort in enqueue order regardless of payload type.
 
