@@ -7,6 +7,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import shlex
 import shutil
 import sys
@@ -2959,50 +2960,28 @@ async def test_auto_create_antigravity_forwards_launch_args_to_agy_argv(
     assert call["headless"] is False
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("authenticated", [False, True])
-async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
+def _kimi_launch_fakes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    authenticated: bool,
-) -> None:
-    """
-    Snapshot ``terminal_launch_args`` reach the launched kimi argv.
+    *,
+    session_id: str,
+    snapshot: dict[str, Any],
+) -> tuple[httpx.AsyncClient, SessionResourceRegistry, list[Any]]:
+    """Fakes for driving ``_auto_create_kimi_terminal`` up to its launch spec.
 
-    This is the seam the server-derived ``--yolo`` rides: a named kimi-native
-    sub-agent with ``yolo: true`` persists ``["--yolo"]`` on the session, and
-    the runner's auto-create must append it verbatim to the bare ``kimi`` TUI
-    command. A failure means the derived flag is dropped, the worker launches
-    as plain ``kimi``, and every risky tool call parks on an approval prompt
-    no headless pane can answer.
+    Returns a server client serving *snapshot*, a registry recording each
+    launched spec, and that spec list. The session home build and forwarder
+    are stubbed, and the user's global Kimi home is an empty temp dir.
     """
     import omnigent.harnesses.kimi_native.credentials as kimi_creds_mod
     import omnigent.harnesses.kimi_native.forwarder as kimi_fwd_mod
     import omnigent.harnesses.kimi_native.main as kimi_mod
     from omnigent.harnesses.kimi_native import bridge as kimi_bridge_mod
-    from omnigent.runner import app as runner_app_mod
-    from omnigent.runner.app import _auto_create_kimi_terminal
     from omnigent.runner.resource_registry import KIMI_NATIVE_TERMINAL_ROLE
 
-    session_id = "92c6f9222c7ac0f45ba2736b57b51f88"
-    workspace = tmp_path / "workspace"
-    workspace.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(kimi_bridge_mod, "_BRIDGE_ROOT", tmp_path / "kimi-native")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
-    loop = asyncio.get_running_loop()
-    auth_started = asyncio.Event()
-    auth_release = threading.Event()
-    loop_progressed: list[bool] = []
-
-    def auth_factory() -> str:
-        loop.call_soon_threadsafe(auth_started.set)
-        loop_progressed.append(auth_release.wait(timeout=1.0))
-        return "mock-hook-token"
-
-    monkeypatch.setattr(
-        "omnigent.runner._entry._make_auth_token_factory",
-        lambda: auth_factory if authenticated else None,
-    )
+    monkeypatch.setenv("KIMI_CODE_HOME", str(tmp_path / "user-kimi-home"))
     monkeypatch.setattr(kimi_mod, "resolve_kimi_executable", lambda: "/fake/bin/kimi")
     # Keep the session-home build off the user's real kimi config.
     monkeypatch.setattr(
@@ -3015,8 +2994,6 @@ async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
         await asyncio.Event().wait()
 
     monkeypatch.setattr(kimi_fwd_mod, "supervise_kimi_forwarder", _sleeping_forwarder)
-
-    snapshot = {"workspace": str(workspace), "terminal_launch_args": ["--yolo"]}
 
     class _SnapshotServerClient:
         """Server client returning the persisted session snapshot."""
@@ -3053,12 +3030,64 @@ async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
                 name="Kimi",
             )
 
+    return (
+        cast(httpx.AsyncClient, _SnapshotServerClient()),
+        cast(SessionResourceRegistry, _FakeResourceRegistry()),
+        launched_specs,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authenticated", [False, True])
+async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    authenticated: bool,
+) -> None:
+    """
+    Snapshot ``terminal_launch_args`` reach the launched kimi argv.
+
+    This is the seam the server-derived ``--yolo`` rides: a named kimi-native
+    sub-agent with ``yolo: true`` persists ``["--yolo"]`` on the session, and
+    the runner's auto-create must append it verbatim to the bare ``kimi`` TUI
+    command. A failure means the derived flag is dropped, the worker launches
+    as plain ``kimi``, and every risky tool call parks on an approval prompt
+    no headless pane can answer. The startup instructions land in the
+    session's private ``SYSTEM.md``.
+    """
+    from omnigent.harnesses.kimi_native import bridge as kimi_bridge_mod
+    from omnigent.runner import app as runner_app_mod
+    from omnigent.runner.app import _auto_create_kimi_terminal
+    from omnigent.runtime.prompt import build_native_startup_instructions
+
+    session_id = "92c6f9222c7ac0f45ba2736b57b51f88"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    snapshot = {"workspace": str(workspace), "terminal_launch_args": ["--yolo"]}
+    server_client, registry, launched_specs = _kimi_launch_fakes(
+        tmp_path, monkeypatch, session_id=session_id, snapshot=snapshot
+    )
+    loop = asyncio.get_running_loop()
+    auth_started = asyncio.Event()
+    auth_release = threading.Event()
+    loop_progressed: list[bool] = []
+
+    def auth_factory() -> str:
+        loop.call_soon_threadsafe(auth_started.set)
+        loop_progressed.append(auth_release.wait(timeout=1.0))
+        return "mock-hook-token"
+
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory",
+        lambda: auth_factory if authenticated else None,
+    )
+
     task = asyncio.create_task(
         _auto_create_kimi_terminal(
             session_id,
-            cast(SessionResourceRegistry, _FakeResourceRegistry()),
+            registry,
             lambda _sid, _event: None,
-            server_client=cast(httpx.AsyncClient, _SnapshotServerClient()),
+            server_client=server_client,
         )
     )
     try:
@@ -3073,9 +3102,8 @@ async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
         await runner_app_mod._cancel_auto_forwarder_task(session_id)
 
     assert loop_progressed == ([True] if authenticated else [])
-    hook_config = kimi_bridge_mod.read_hook_config(
-        kimi_bridge_mod.bridge_dir_for_session_id(session_id)
-    )
+    bridge_dir = kimi_bridge_mod.bridge_dir_for_session_id(session_id)
+    hook_config = kimi_bridge_mod.read_hook_config(bridge_dir)
     headers = hook_config["ap_auth_headers"]
     assert isinstance(headers, dict)
     assert headers.get("Authorization") == ("Bearer mock-hook-token" if authenticated else None)
@@ -3084,6 +3112,92 @@ async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
     # Bare ``kimi`` plus the persisted pass-through args, verbatim.
     assert spec.command == "/fake/bin/kimi"
     assert spec.args == ["--yolo"]
+    system_prompt = (bridge_dir / "kimi-code-home" / "SYSTEM.md").read_text(encoding="utf-8")
+    assert system_prompt == ("${base_prompt}\n\n" + build_native_startup_instructions(None) + "\n")
+
+
+_KIMI_RESUME_SESSION = "session_3f2b8c1e-4d5a-4b6c-8d7e-9f0a1b2c3d4e"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("prior", "launch_args", "expected_args"),
+    [
+        ("none", ["--yolo"], ["-m", "kimi-alias", "--yolo"]),
+        ("valid", ["--yolo"], ["-S", _KIMI_RESUME_SESSION, "-m", "kimi-alias", "--yolo"]),
+        ("valid", ["--model=user-alias"], ["-S", _KIMI_RESUME_SESSION, "--model=user-alias"]),
+        ("other-workspace", ["--yolo"], ["-m", "kimi-alias", "--yolo"]),
+        ("valid", ["-c"], ["-m", "kimi-alias", "-c"]),
+        ("valid", ["--agent", "custom"], ["-m", "kimi-alias", "--agent", "custom"]),
+    ],
+)
+async def test_auto_create_kimi_resumes_prior_session_and_pins_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    prior: str,
+    launch_args: list[str],
+    expected_args: list[str],
+) -> None:
+    """
+    A recreated kimi terminal resumes its prior private session and pins the model.
+
+    ``model_override`` rides as ``-m`` unless the pass-through args pin one. A
+    prior forwarder state naming a valid private session relaunches with
+    ``-S <id>`` and keeps the delivered cursor; an invalid one, or a user
+    session/agent selector, launches fresh and clears that cursor.
+    """
+    from omnigent.harnesses.kimi_native import bridge as kimi_bridge_mod
+    from omnigent.harnesses.kimi_native.forwarder import _ForwardState, _read_state, _write_state
+    from omnigent.runner import app as runner_app_mod
+    from omnigent.runner.app import _auto_create_kimi_terminal
+
+    session_id = "a3d7f9222c7ac0f45ba2736b57b51f99"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    snapshot = {
+        "workspace": str(workspace),
+        "terminal_launch_args": launch_args,
+        "model_override": "kimi-alias",
+    }
+    server_client, registry, launched_specs = _kimi_launch_fakes(
+        tmp_path, monkeypatch, session_id=session_id, snapshot=snapshot
+    )
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    bridge_dir = kimi_bridge_mod.bridge_dir_for_session_id(session_id)
+    if prior != "none":
+        session_dir = (
+            bridge_dir / "kimi-code-home" / "sessions" / "wd_workspace_0123456789ab"
+        ) / _KIMI_RESUME_SESSION
+        wire = session_dir / "agents" / "main" / "wire.jsonl"
+        wire.parent.mkdir(parents=True)
+        wire.write_text('{"type": "metadata"}\n', encoding="utf-8")
+        work_dir = str(tmp_path) if prior == "other-workspace" else os.path.realpath(workspace)
+        (bridge_dir / "kimi-code-home" / "session_index.jsonl").write_text(
+            json.dumps({"sessionDir": str(session_dir), "workDir": work_dir}) + "\n",
+            encoding="utf-8",
+        )
+        _write_state(
+            bridge_dir,
+            _ForwardState(wire_path=str(wire), last_line=1, offset=wire.stat().st_size),
+        )
+
+    try:
+        await _auto_create_kimi_terminal(
+            session_id,
+            registry,
+            lambda _sid, _event: None,
+            server_client=server_client,
+        )
+    finally:
+        await runner_app_mod._cancel_auto_forwarder_task(session_id)
+
+    assert [spec.args for spec in launched_specs] == [expected_args]
+    state = _read_state(bridge_dir)
+    if "-S" in expected_args:
+        assert state is not None
+        assert (state.last_line, state.replay_floor_line) == (1, 1)
+    else:
+        assert state is None
 
 
 @pytest.mark.asyncio

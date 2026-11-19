@@ -732,10 +732,10 @@ def register_resource_routes(
         the pane is already live. Reuses ``create_session_terminal``'s
         ``ensure_native_terminal`` path. Healing restores a live pane, not the
         CLI's in-context history: a harness that records a resumable chat id may
-        relaunch with its own ``--resume``, but continuity is best-effort, and a
-        harness without one (kimi — exempt from the reaper, so this only fires
-        for a crashed pane) always restarts a fresh TUI. Either way the prior
-        turns are guaranteed only in the server transcript.
+        relaunch with its own ``--resume`` (kimi resumes its prior private
+        session with ``-S``), but continuity is best-effort, and a harness
+        without one always restarts a fresh TUI. Either way the prior turns are
+        guaranteed only in the server transcript.
 
         Detect missing or dead panes and owned Codex panes whose app-server
         stopped. Probe only when a turn arrives, not on a poll. Every native
