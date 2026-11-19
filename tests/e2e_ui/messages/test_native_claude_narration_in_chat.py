@@ -96,15 +96,27 @@ def _ask(call_id: str, question: str, options: tuple[str, str]) -> dict[str, str
 
 
 def _answer_question(
-    page: Page, base_url: str, session_id: str, question: str, option: str, panes: list[str]
+    page: Page,
+    base_url: str,
+    session_id: str,
+    question: str,
+    option: str,
+    panes: list[str],
+    *,
+    shown_while_pending: tuple[Locator, ...] = (),
 ) -> None:
-    """Answer *question* from its chat card, sampling the TUI until the card appears."""
+    """Answer *question* from its chat card, sampling the TUI until the card appears.
+
+    Each *shown_while_pending* entry must be visible in chat before the answer.
+    """
     form = page.get_by_test_id("ask-user-question-form").filter(has_text=question)
     deadline = time.monotonic() + _TURN_TIMEOUT_MS / 1000
     while form.count() == 0 and time.monotonic() < deadline:
         panes.append(_pane_text(base_url, session_id))
         page.wait_for_timeout(250)
     expect(form).to_be_visible(timeout=10_000)
+    for entry in shown_while_pending:
+        expect(entry.filter(visible=True).first).to_be_visible(timeout=10_000)
     panes.append(_pane_text(base_url, session_id))
     form.get_by_role("radio", name=option).check()
     form.get_by_test_id("ask-user-question-submit").click()
@@ -213,14 +225,40 @@ def test_native_claude_narration_shows_in_chat_in_terminal_order(
     _log.info("TUI before the turn:\n%s", panes[0])
     assert "auto mode on" in panes[0], "Claude Code did not start in auto mode"
 
+    card = page.get_by_test_id("approval-card")
+    entries = {
+        "first narration": page.get_by_text(first_narration),
+        "first answered question": card.filter(has_text=first_question),
+        "second narration": page.get_by_text(second_narration),
+        "sign-in command block": page.locator("pre", has_text=_SIGN_IN_COMMAND.removeprefix("! ")),
+        "second answered question": card.filter(has_text=second_question),
+        "final message": page.locator(_ASSISTANT, has_text=final_marker),
+    }
+
     _ensure_chat_view(page)
     composer = page.get_by_role("textbox", name="Message the agent")
     expect(composer).to_be_visible(timeout=30_000)
     composer.fill(f"Move the app to a workspace that can host it ({user_marker}).")
     page.get_by_role("button", name="Send", exact=True).click()
 
-    _answer_question(page, base_url, session_id, first_question, "Alpha", panes)
-    _answer_question(page, base_url, session_id, second_question, "Done", panes)
+    _answer_question(
+        page,
+        base_url,
+        session_id,
+        first_question,
+        "Alpha",
+        panes,
+        shown_while_pending=(entries["first narration"],),
+    )
+    _answer_question(
+        page,
+        base_url,
+        session_id,
+        second_question,
+        "Done",
+        panes,
+        shown_while_pending=(entries["second narration"], entries["sign-in command block"]),
+    )
     final_bubble = page.locator(_ASSISTANT, has_text=final_marker).first
     expect(final_bubble).to_be_visible(timeout=_TURN_TIMEOUT_MS)
     expect(page.locator(_WORKING)).to_have_count(0, timeout=_TURN_TIMEOUT_MS)
@@ -246,15 +284,6 @@ def test_native_claude_narration_shows_in_chat_in_terminal_order(
     )
     _log.info("items API: %s", json.dumps(_item_summary(base_url, session_id), indent=1))
 
-    card = page.get_by_test_id("approval-card")
-    entries = {
-        "first narration": page.get_by_text(first_narration),
-        "first answered question": card.filter(has_text=first_question),
-        "second narration": page.get_by_text(second_narration),
-        "sign-in command block": page.locator("pre", has_text=_SIGN_IN_COMMAND.removeprefix("! ")),
-        "second answered question": card.filter(has_text=second_question),
-        "final message": page.locator(_ASSISTANT, has_text=final_marker),
-    }
     terminal_order = list(entries)
     layouts = {}
     for view in ("settled", "reloaded"):

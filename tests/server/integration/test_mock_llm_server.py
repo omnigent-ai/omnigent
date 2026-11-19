@@ -184,6 +184,54 @@ def test_responses_json_merges_partial_token_usage(monkeypatch: pytest.MonkeyPat
     }
 
 
+@pytest.mark.parametrize("stream", [False, True], ids=["json", "sse"])
+def test_messages_tool_call_sends_signed_thinking_before_tools(
+    monkeypatch: pytest.MonkeyPatch, stream: bool
+) -> None:
+    monkeypatch.setattr(mock_llm_server, "_state", MockState())
+    scripted = {
+        "thinking": "check the workspaces first",
+        "thinking_signature": "c2lnbmVk",
+        "tool_calls": [{"call_id": "toolu_1", "name": "Read", "arguments": "{}"}],
+    }
+    with TestClient(mock_llm_server.app) as client:
+        assert client.post("/mock/configure", json={"responses": [scripted]}).status_code == 200
+        response = client.post(
+            "/v1/messages",
+            json={
+                "model": "claude-mock",
+                "stream": stream,
+                "messages": [{"role": "user", "content": "hi"}],
+                "tools": [{"name": "Read", "input_schema": {"type": "object"}}],
+            },
+        )
+    assert response.status_code == 200
+    if stream:
+        events = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: ")
+        ]
+        blocks = {
+            event["index"]: dict(event["content_block"])
+            for event in events
+            if event["type"] == "content_block_start"
+        }
+        for event in events:
+            delta = event.get("delta", {})
+            if delta.get("type") == "thinking_delta":
+                blocks[event["index"]]["thinking"] += delta["thinking"]
+            elif delta.get("type") == "signature_delta":
+                blocks[event["index"]]["signature"] += delta["signature"]
+        content = [blocks[index] for index in sorted(blocks)]
+    else:
+        content = response.json()["content"]
+    assert [block["type"] for block in content] == ["thinking", "tool_use"]
+    assert content[0]["thinking"].strip() == scripted["thinking"]
+    assert content[0]["signature"] == scripted["thinking_signature"]
+    assert content[1]["id"] == "toolu_1"
+
+
 @pytest.mark.parametrize(
     "endpoint,tool",
     [
