@@ -67,11 +67,7 @@ function bannerSafe(status) {
   return status;
 }
 
-// Native integrations for the SPA: a dock/taskbar badge and OS notifications.
-// Numbers/strings only so the values survive contextBridge's structured-clone
-// boundary.
-// Annotate and Draw (designTools.js): open and stop a tool's overlay on a view, and its page
-// operations and captures. A test run can leave them out, to stand in for an older shell.
+// Annotate and Draw (designTools.js); a test run can leave them out, as an older shell.
 const designTools =
   process.env?.OMNIGENT_DESKTOP_LEGACY_DESIGN_MODE === "1"
     ? {}
@@ -110,6 +106,9 @@ function launchOfferSubscriber() {
   };
 }
 
+// Native integrations for the SPA: a dock/taskbar badge and OS notifications.
+// Numbers/strings only so the values survive contextBridge's structured-clone
+// boundary.
 contextBridge.exposeInMainWorld("omnigentDesktop", {
   kind: "electron",
   /** Paint the dock/taskbar badge; 0 clears it. Fire-and-forget. */
