@@ -3502,6 +3502,7 @@ function ConversationList({
   // alone (Linear-style) — no icons or counts in the headers, no divider
   // rules between groups.
   const removalTargetContainer = scrollContainerRef.current?.parentElement;
+  const detachIntoList = activeDrag?.canDetachNest === true && !activeDrag.canMoveProject;
   const showProjectRemoval =
     !showShared &&
     !grouped &&
@@ -3537,9 +3538,9 @@ function ConversationList({
                 if (target?.type === "detach-nest") return source?.canDetachNest === true;
                 if (target?.type === "session-nest")
                   return (
-                    source?.canMoveNest === true &&
-                    target.destination.id !== args.active.id &&
-                    target.destination.family?.id !== source.familyId
+                    source?.canMoveNest === true ||
+                    (source?.canDetachNest === true &&
+                      target.destination.family?.id === source.familyId)
                   );
                 // Only rows in the dragged session's own list are reorder targets.
                 if (target?.type === "session-order")
@@ -3547,9 +3548,7 @@ function ConversationList({
                 return source?.canManage !== false || target?.type === "session-grid";
               }),
             });
-            const detach = collisions.find(
-              (hit) => hit.data?.droppableContainer.data.current?.type === "detach-nest",
-            );
+            const detach = collisions.find((hit) => hit.id === "detach-nest");
             if (detach) return [detach];
             const nest = collisions.find((hit) => {
               const container = hit.data?.droppableContainer;
@@ -3561,7 +3560,14 @@ function ConversationList({
                 Math.abs(args.pointerCoordinates.y - (rect.top + rect.height / 2)) < rect.height / 4
               );
             });
-            if (nest) return [nest];
+            if (nest) {
+              const destination = nest.data?.droppableContainer.data.current?.destination;
+              return destination.family?.id === source?.familyId ? [] : [nest];
+            }
+            const detachToList = collisions.find(
+              (hit) => hit.data?.droppableContainer.data.current?.type === "detach-nest",
+            );
+            if (detachToList) return [detachToList];
             const targets = collisions.filter(
               (hit) => hit.data?.droppableContainer.data.current?.type !== "session-nest",
             );
@@ -3854,7 +3860,11 @@ function ConversationList({
                     // session (removes it from its project) or a pinned one (unpins
                     // it), since both have somewhere to land here.
                     <ChatsDropZone
-                      active={activeDrag != null && sessionsListAcceptsDrop(activeDrag, grouped)}
+                      active={
+                        activeDrag != null &&
+                        (detachIntoList || sessionsListAcceptsDrop(activeDrag, grouped))
+                      }
+                      detachNest={detachIntoList}
                     >
                       {sessionGroups ? (
                         // Grouped: one titled section per group; the first carries
@@ -3964,10 +3974,18 @@ function ConversationList({
     drops while a filed session is being dragged — at rest it's an inert
     wrapper. Outline-only highlight on drag-over (no background fill), matching
     the project folders. */
-function ChatsDropZone({ active, children }: { active: boolean; children: ReactNode }) {
+function ChatsDropZone({
+  active,
+  detachNest,
+  children,
+}: {
+  active: boolean;
+  detachNest: boolean;
+  children: ReactNode;
+}) {
   const { setNodeRef, isOver } = useDroppable({
     id: "chats-ungroup",
-    data: { type: "ungroup" },
+    data: { type: detachNest ? "detach-nest" : "ungroup" },
     disabled: !active,
   });
   return (
@@ -3975,7 +3993,7 @@ function ChatsDropZone({ active, children }: { active: boolean; children: ReactN
       ref={setNodeRef}
       data-testid="sidebar-chats-drop-zone"
       className={cn(
-        "rounded-[var(--radius-otto-sm)] transition-colors duration-200 ease-[var(--ease-otto)]",
+        "-my-3 rounded-[var(--radius-otto-sm)] py-3 transition-colors duration-200 ease-[var(--ease-otto)]",
         active && isOver && DROP_TARGET_HIGHLIGHT,
       )}
     >
@@ -6149,7 +6167,7 @@ function ConversationRowImpl({
   const { setNodeRef: setNestNodeRef, isOver: isNestTarget } = useDroppable({
     id: `nest:${conversation.id}`,
     data: { type: "session-nest", destination: conversation },
-    disabled: !canMoveNest || !conversation.family || !nestMoves.canJoin,
+    disabled: !canMoveNest || !conversation.family,
   });
   // Drag-and-drop: a row is grabbable when the viewer owns it (re-filing is
   // owner-only, like the Move-to-project kebab item), outside selection /
@@ -7608,9 +7626,9 @@ function NestPickerMenu({
           </C.Item>
         ))}
         {!destinations.length && !result.isFetching && query === search.trim() && (
-          <p className="px-2 py-1 text-sm text-muted-foreground">No other nests</p>
+          <p className="px-2 py-2 text-sm text-muted-foreground">No other nests</p>
         )}
-        {result.isFetching && <p className="px-2 py-1 text-sm text-muted-foreground">Searching…</p>}
+        {result.isFetching && <p className="px-2 py-2 text-sm text-muted-foreground">Searching…</p>}
         {(result.hasNextPage || result.isError) && (
           <C.Item
             onSelect={(event) => {

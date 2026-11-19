@@ -21,7 +21,8 @@ the header menu), and each place is a separate entry point.
   replaces it; leaving the composer without submitting removes the draft. Owned active sessions can move into an existing nest by dragging onto its center
   or choosing **Move session → Nests** in the sidebar menu. Choose a searchable
   destination, or **Remove from nest** to detach just that session. Dragging a
-  nested member shows a floating **Remove from nest** target without shifting rows.
+  nested member into the session list above or below a nest removes it; a floating
+  **Remove from nest** target is also available without shifting rows.
   Ordinary forks remain standalone and may reuse the source host.
 
 - `session-grid`: with `grid_sessions_display_ui` (on by default), drag sidebar sessions into a
@@ -373,7 +374,8 @@ caller, the session is deleted alone and its automation pauses at its next run.
 
 **Move session:** choose **Projects** or **Nests**, each with its own search.
 Nests also offers **Remove from nest**. Drag onto a nest row's center to join;
-row edges retain pin/custom ordering. Removal targets appear over the sidebar
+drop a nested session into the session list above or below a nest to remove it.
+Other rows retain pin/custom ordering. Removal targets appear over the sidebar
 footer, keeping session rows in place and available as drop targets.
 
 **Project folder:** right-click its header or open its three-dot menu, then

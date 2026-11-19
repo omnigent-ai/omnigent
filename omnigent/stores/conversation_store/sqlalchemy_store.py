@@ -2065,7 +2065,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         target = self.get_conversation(session_id) if move_existing else None
         if source.family_id is None:
             with self._session("prepare_sibling_membership") as session:
-                if self._family_member_ids(session, family_id):
+                members = self._family_member_ids(session, family_id)
+                if members and source_id not in members:
                     family_id = uuid.uuid4().hex
         pin_key = pinned_label_key(user_id)
         family_pin_key = family_pinned_label_key(user_id)

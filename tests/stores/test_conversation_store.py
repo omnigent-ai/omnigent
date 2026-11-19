@@ -10616,6 +10616,18 @@ def test_move_one_session_between_nests(request, store_name, monkeypatch):
         store.set_session_nest(child.id, head.id, user_id="owner")
     assert store.get_conversation(child.id).family_id is None
 
+    # Another creation can commit after this caller reads the standalone source.
+    later = store.create_conversation()
+    get_conversation = store.get_conversation
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            store,
+            "get_conversation",
+            lambda session_id: head if session_id == head.id else get_conversation(session_id),
+        )
+        store.add_new_sibling(head.id, later.id, user_id="owner")
+    assert store.get_conversation(later.id).family_id == head.id
+
 
 @pytest.mark.parametrize("split_database", [False, True])
 def test_failed_family_project_move_preserves_legacy_membership(

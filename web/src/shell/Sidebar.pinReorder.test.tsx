@@ -132,7 +132,7 @@ afterEach(async () => {
   vi.clearAllMocks();
 });
 
-it("joins a nest by dropping on its center and detaches through a floating target", async () => {
+it("joins at a nest's center and detaches into the session list or footer", async () => {
   const family = { id: "conv_d", representative_id: "conv_d", pinned: false };
   const otherFamily = { id: "conv_other", representative_id: "conv_other", pinned: false };
   const destination = conv("conv_d", { family });
@@ -146,6 +146,13 @@ it("joins a nest by dropping on its center and detaches through a floating targe
   );
   const rowRect = vi.mocked(Element.prototype.getBoundingClientRect).getMockImplementation()!;
   vi.mocked(Element.prototype.getBoundingClientRect).mockImplementation(function (this: Element) {
+    if (this.matches('[data-testid="sidebar-chats-drop-zone"]')) {
+      const rows = [...this.querySelectorAll("li[data-sidebar-session-id]")];
+      if (!rows.length) return new DOMRect();
+      const first = rowRect.call(rows[0]);
+      const last = rowRect.call(rows[rows.length - 1]);
+      return new DOMRect(0, first.top - 12, 200, last.bottom - first.top + 24);
+    }
     if (this.matches('[data-testid="detach-nest-target"]')) return new DOMRect(0, 500, 100, 30);
     if (this.matches('[data-testid="sidebar-ungroup-drop-zone"]'))
       return new DOMRect(110, 500, 100, 30);
@@ -158,6 +165,28 @@ it("joins a nest by dropping on its center and detaches through a floating targe
   expect(mocks.moveNest).not.toHaveBeenCalled();
   await dropOnto("conv_c", "conv_d", { expectTarget: false });
   expect(mocks.moveNest).toHaveBeenCalledWith({ id: "conv_c", destination });
+  mocks.moveNest.mockClear();
+  await dropOnto("conv_member", "conv_other", { expectTarget: false });
+  expect(mocks.moveNest).not.toHaveBeenCalled();
+  await dropOnto("conv_member", "conv_other", {
+    expectTarget: false,
+    offsetY: -ROW_HEIGHT / 2 - 2,
+  });
+  await dropOnto("conv_member", "conv_member", {
+    expectTarget: false,
+    offsetY: ROW_HEIGHT / 2 + 2,
+  });
+  await dropOnto("conv_member", "conv_c", { expectTarget: false });
+  expect(mocks.moveNest).toHaveBeenCalledTimes(3);
+  for (const [move] of mocks.moveNest.mock.calls)
+    expect(move).toEqual({ id: "conv_member", destination: null });
+  await dropOnto("conv_member", "conv_d", { expectTarget: false });
+  expect(mocks.moveNest).toHaveBeenLastCalledWith({ id: "conv_member", destination });
+  expect(mocks.moveProject).not.toHaveBeenCalled();
+  expect(mocks.pinFn).not.toHaveBeenCalled();
+  mocks.moveNest.mockClear();
+  await dropOnto("conv_other", "conv_d", { expectTarget: false, offsetY: ROW_HEIGHT / 2 - 2 });
+  expect(mocks.moveNest).not.toHaveBeenCalled();
   const member = document.querySelector('li[data-sidebar-session-id="conv_member"]')!;
   const rowsBefore = [...document.querySelectorAll("li[data-sidebar-session-id]")];
   const start = rowCenter("conv_member");
