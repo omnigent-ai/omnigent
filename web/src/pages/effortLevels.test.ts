@@ -3,11 +3,14 @@ import type { NativeModelOption } from "@/lib/types";
 
 import {
   effortLevelsForConv,
+  shouldShowEffortPicker,
+  shouldShowModelPicker,
+} from "@/lib/composerCapabilities";
+import {
   shouldShowCodexApprovalModeControl,
   shouldShowCodexPlanModeControl,
-  shouldShowEffortPicker,
   shouldShowGoalControl,
-  shouldShowModelPicker,
+  shouldShowClaudeNativeGoalControl,
   shouldShowPollyClaudeGoalControl,
   shouldShowPollyCodexGoalControl,
 } from "./ChatPage";
@@ -260,6 +263,21 @@ describe("shouldShowGoalControl", () => {
     );
     expect(shouldShowGoalControl({ labels: {} })).toBe(false);
     expect(shouldShowGoalControl(null)).toBe(false);
+  });
+});
+
+describe("shouldShowClaudeNativeGoalControl", () => {
+  it("returns true only for Claude Code native sessions", () => {
+    expect(
+      shouldShowClaudeNativeGoalControl({
+        labels: { "omnigent.wrapper": "claude-code-native-ui" },
+      }),
+    ).toBe(true);
+    expect(
+      shouldShowClaudeNativeGoalControl({ labels: { "omnigent.wrapper": "codex-native-ui" } }),
+    ).toBe(false);
+    expect(shouldShowClaudeNativeGoalControl({ labels: {} })).toBe(false);
+    expect(shouldShowClaudeNativeGoalControl(null)).toBe(false);
   });
 });
 

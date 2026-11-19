@@ -53,7 +53,7 @@ import asyncio
 import threading
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 from omnigent.db.workspace_cache import WorkspaceScopedCache
@@ -128,7 +128,7 @@ def _now_iso() -> str:
     :returns: Timestamp like ``"2026-06-10T17:00:00Z"``, matching
         the convention of :class:`SessionHeartbeatEvent.server_time`.
     """
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def snapshot(root_id: str, conversation_id: str) -> dict[str, Any]:

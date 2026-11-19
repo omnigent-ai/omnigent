@@ -27,6 +27,7 @@ function PickerFixture({
   tooltipVariant = "default",
   nested = false,
   active = true,
+  editable = true,
   modal,
 }: {
   modal?: boolean;
@@ -35,6 +36,7 @@ function PickerFixture({
   tooltipVariant?: "default" | "session-info";
   nested?: boolean;
   active?: boolean;
+  editable?: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
@@ -49,6 +51,7 @@ function PickerFixture({
       label="Claude Code"
       summary="Opus 4.8 (1M)"
       active={active}
+      editable={editable}
       isMobile={mobile}
       open={configOpen}
       onOpenChange={setConfigOpen}
@@ -123,7 +126,236 @@ function GraceAreaPicker() {
   );
 }
 
+function retainClosingMenus() {
+  const getComputedStyle = window.getComputedStyle.bind(window);
+  vi.spyOn(window, "getComputedStyle").mockImplementation((element, pseudo) => {
+    const styles = getComputedStyle(element, pseudo);
+    if (element.getAttribute("role") !== "menu") return styles;
+    // jsdom does not run the exit animation that keeps Radix content mounted.
+    return new Proxy(styles, {
+      get(target, property) {
+        if (property === "animationName")
+          return element.getAttribute("data-state") === "closed" ? "menu-exit" : "menu-enter";
+        const value = Reflect.get(target, property);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  });
+}
+
 describe("HarnessPicker", () => {
+  it.each(
+    [
+      { depth: 0, editable: false },
+      { depth: 0, editable: true },
+      { depth: 1, editable: true },
+      { depth: 2, editable: true },
+    ].flatMap((entry) =>
+      ["pointerout", "pointermove"].map((eventType) => ({ ...entry, eventType })),
+    ),
+  )(
+    "preserves outside input through a closing menu's late pointer event: %j",
+    async ({ depth, editable, eventType }) => {
+      retainClosingMenus();
+      const user = userEvent.setup({ skipHover: true });
+      const onBlur = vi.fn();
+      render(
+        <>
+          <input aria-label="Draft" defaultValue="9:3" onBlur={onBlur} />
+          <PickerFixture nested={depth === 2} editable={editable} />
+        </>,
+      );
+      fireEvent.pointerDown(screen.getByRole("button", { name: "Harness" }), { button: 0 });
+      if (depth === 2) fireEvent.click(screen.getByTestId("other"));
+      if (depth > 0) fireEvent.click(screen.getByTestId("edit"));
+      const departing = screen.getByTestId(depth > 0 ? "config-option" : "model");
+      const menu = departing.closest<HTMLElement>('[role="menu"]')!;
+      const draft = screen.getByRole("textbox", { name: "Draft" }) as HTMLInputElement;
+      // Create the event before closing; deliver it after the actual Radix state change.
+      const latePointer = new PointerEvent(eventType, {
+        bubbles: true,
+        cancelable: true,
+        pointerType: "mouse",
+        relatedTarget: draft,
+      });
+      await user.click(draft);
+      draft.setSelectionRange(3, 3);
+      expect(menu).toBeInTheDocument();
+      expect(menu).toHaveAttribute("data-state", "closed");
+      const focusMenu = vi.spyOn(menu, "focus");
+
+      fireEvent(departing, latePointer);
+
+      expect(draft).toHaveFocus();
+      expect(onBlur).not.toHaveBeenCalled();
+      expect(focusMenu).not.toHaveBeenCalled();
+      expect(draft.selectionStart).toBe(3);
+      await user.keyboard("7");
+      expect(draft).toHaveValue("9:37");
+      expect(draft.selectionStart).toBe(4);
+      fireEvent(
+        menu,
+        Object.assign(new Event("animationend", { bubbles: true }), { animationName: "menu-exit" }),
+      );
+      expect(menu).not.toBeInTheDocument();
+      expect(draft).toHaveFocus();
+    },
+  );
+
+  it.each(["pointerout", "pointermove"])(
+    "allows %s focus again after reopening a closing menu",
+    async (eventType) => {
+      retainClosingMenus();
+      const user = userEvent.setup({ skipHover: true });
+      render(
+        <>
+          <input aria-label="Draft" />
+          <PickerFixture editable={false} />
+        </>,
+      );
+      const trigger = screen.getByRole("button", { name: "Harness" });
+      await user.click(trigger);
+      const menu = screen.getByTestId("menu");
+      await user.click(screen.getByRole("textbox", { name: "Draft" }));
+      expect(menu).toHaveAttribute("data-state", "closed");
+      await user.click(trigger);
+      expect(screen.getByTestId("menu")).toBe(menu);
+      expect(menu).toHaveAttribute("data-state", "open");
+      act(() => screen.getByTestId("entry").focus());
+      const focusMenu = vi.spyOn(menu, "focus");
+
+      const pointer = new PointerEvent(eventType, {
+        bubbles: true,
+        cancelable: true,
+        pointerType: "mouse",
+        relatedTarget: document.body,
+      });
+      fireEvent(screen.getByTestId("model"), pointer);
+
+      expect(pointer.defaultPrevented).toBe(false);
+      expect(focusMenu).toHaveBeenCalledTimes(eventType === "pointerout" ? 1 : 0);
+      expect(screen.getByTestId("entry")).toHaveFocus();
+    },
+  );
+
+  it.each(["pointerout", "pointermove"])(
+    "keeps open cycle-preview %s behavior when the full picker is closed",
+    (eventType) => {
+      render(
+        <HarnessPicker
+          open={false}
+          onOpenChange={vi.fn()}
+          trigger={{ label: "Harness", model: "Opus" }}
+          testId="menu"
+          cyclePreview={{
+            testId: "preview-models",
+            header: "Models",
+            choices: [{ key: "opus", label: "Opus", checked: true }],
+          }}
+        >
+          <DropdownMenuItem>Full configuration</DropdownMenuItem>
+        </HarnessPicker>,
+      );
+      const menu = screen.getByTestId("menu");
+      const choice = screen.getByRole("menuitemcheckbox", { name: "Opus" });
+      act(() => choice.focus());
+      expect(menu).toHaveAttribute("data-state", "open");
+
+      const pointer = new PointerEvent(eventType, {
+        bubbles: true,
+        cancelable: true,
+        pointerType: "mouse",
+        relatedTarget: document.body,
+      });
+      fireEvent(choice, pointer);
+
+      expect(pointer.defaultPrevented).toBe(false);
+      expect(eventType === "pointerout" ? menu : choice).toHaveFocus();
+    },
+  );
+
+  it.each(["click", "Enter", " ", "ArrowDown"])(
+    "opens the full picker directly from a cycle preview with %s",
+    async (gesture) => {
+      function PreviewPicker() {
+        const [open, setOpen] = useState(false);
+        const [preview, setPreview] = useState(true);
+        return (
+          <HarnessPicker
+            open={open}
+            onOpenChange={setOpen}
+            trigger={{ label: "Harness", model: "Opus" }}
+            onDismissCyclePreview={() => setPreview(false)}
+            cyclePreview={
+              preview
+                ? {
+                    testId: "preview-models",
+                    header: "Models",
+                    choices: [{ key: "opus", label: "Opus", checked: true }],
+                  }
+                : undefined
+            }
+          >
+            <DropdownMenuItem data-active="true">Full configuration</DropdownMenuItem>
+          </HarnessPicker>
+        );
+      }
+      render(<PreviewPicker />);
+      const trigger = screen.getByRole("button", { name: "Harness" });
+      if (gesture === "click") fireEvent.pointerDown(trigger, { button: 0 });
+      else fireEvent.keyDown(trigger, { key: gesture });
+      await waitFor(() => expect(screen.getByText("Full configuration")).toHaveFocus());
+      expect(screen.queryByRole("menuitemcheckbox", { name: "Opus" })).toBeNull();
+    },
+  );
+
+  it.each(["preview choice", "outside input", "full menu"])(
+    "preserves the intended focus when leaving a cycle preview for %s",
+    async (destination) => {
+      const picker = (mode: "closed" | "preview" | "menu") => (
+        <>
+          <input aria-label="Draft" />
+          <input aria-label="Other input" />
+          <HarnessPicker
+            open={mode === "menu"}
+            onOpenChange={vi.fn()}
+            trigger={{ label: "Harness", model: "Opus" }}
+            cyclePreview={
+              mode === "preview"
+                ? {
+                    testId: "preview-models",
+                    header: "Models",
+                    choices: [{ key: "opus", label: "Opus", checked: true, onSelect: vi.fn() }],
+                  }
+                : undefined
+            }
+          >
+            <DropdownMenuItem data-active="true">Full configuration</DropdownMenuItem>
+          </HarnessPicker>
+        </>
+      );
+      const { rerender } = render(picker("closed"));
+      const draft = screen.getByRole("textbox", { name: "Draft" });
+      act(() => draft.focus());
+      rerender(picker("preview"));
+      const choice = await screen.findByRole("menuitemcheckbox", { name: "Opus" });
+      expect(draft).toHaveFocus();
+
+      if (destination === "full menu") {
+        rerender(picker("menu"));
+        await waitFor(() => expect(screen.getByText("Full configuration")).toHaveFocus());
+      } else {
+        const outside = screen.getByRole("textbox", { name: "Other input" });
+        act(() => (destination === "preview choice" ? choice : outside).focus());
+        rerender(picker("closed"));
+        await waitFor(() =>
+          expect(destination === "preview choice" ? draft : outside).toHaveFocus(),
+        );
+        expect(screen.queryByRole("menu")).toBeNull();
+      }
+    },
+  );
+
   it.each(["right", "left"])(
     "keeps a %s submenu open while crossing a harness row toward its lower items",
     (side) => {
@@ -132,6 +364,7 @@ describe("HarnessPicker", () => {
       const other = screen.getByTestId("other");
       fireEvent.click(other);
       const submenu = screen.getByTestId("other-menu");
+      expect(submenu).toHaveClass("menu-surface");
       // Mirror the diagonal path for flyouts flipped by viewport collisions.
       vi.spyOn(submenu, "getBoundingClientRect").mockReturnValue(
         new DOMRect(side === "right" ? 200 : 0, 0, 100, 300),
@@ -186,7 +419,12 @@ describe("HarnessPicker", () => {
   it.each([false, true])("shares row geometry and config navigation on mobile=%s", (mobile) => {
     render(<PickerFixture mobile={mobile} />);
     fireEvent.pointerDown(screen.getByRole("button", { name: "Harness" }), { button: 0 });
-    expect(screen.getByTestId("menu")).toHaveClass("w-[17.5rem]", "min-w-[17.5rem]", "p-2");
+    expect(screen.getByTestId("menu")).toHaveClass(
+      "menu-surface",
+      "w-[17.5rem]",
+      "min-w-[17.5rem]",
+      "p-2",
+    );
     expect(screen.getByTestId("entry").closest("[data-harness-menu-row]")).toHaveClass("min-h-8");
     expect(screen.getByTestId("entry")).toHaveAttribute("data-active", "true");
     expect(screen.getByTestId("model")).toHaveClass("text-right");

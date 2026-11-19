@@ -57,6 +57,7 @@ directly instead of going through `data_dir()`.
 | `attachments/` | Native harness attachment copies, grouped by an opaque session cache key. The original uploads remain in the server's configured artifact store. | `attachment_cache_dir()` in `omnigent/inner/native_attachments.py` |
 | `runners/` | Runner identity: `runner_id` (stable per-machine id), created by `identity.py`. Also holds per-runner workspace subdirs — `runner_<id>/` and, for token-bound remote `run --server` runners, `runner_token_<hash>/` — each with a `pending-tokens/` dir; those are created by the host/runner launch path, not `identity.py`. | `omnigent/runner/identity.py` (`runner_id`) |
 | `daemons/` | Daemon lifecycle registry, one JSON record per target. | `daemon_registry_dir()` in `omnigent/host/daemon_lifecycle.py` |
+| `session-env/` | Transient owner-only files carrying the variables a launching CLI forwarded with `OMNIGENT_SESSION_ENV_PASSTHROUGH`. Each is keyed by the session and a per-launch handoff ID; only the launch request carrying that ID consumes it. A file older than five minutes is never consumed and is deleted by the next launch that sweeps the directory, not on a timer. Not used on Windows. | `omnigent/host/session_env.py` |
 | `crashes/` | Crash reports, `crash-<timestamp>.md`. | `omnigent/crash_handler.py` |
 | `cache/` | Derived caches: `model-catalogs/` (per-harness model lists) and `codex-model-probe/` **†**. | `omnigent/models/model_catalog_store.py`, `omnigent/harnesses/codex_native/app_server.py` |
 | `models/` **†** | Downloaded models, e.g. `dictation/asr` and `dictation/punct`. | `omnigent/server/dictation.py` |
@@ -112,7 +113,9 @@ The cache key derives from the session's native bridge path. Claude Code and
 Codex can recreate copies from the artifact store when rebuilding session
 history. Native session cleanup removes the corresponding cache; the cache
 is not the durable copy of an upload. Other native harnesses use the same
-cache for their existing supported attachment types.
+cache for their existing supported attachment types. Claude Code sessions get a
+`Read` allow rule for their own cache directory, so reading an attachment does
+not ask for approval; Claude deny and ask rules still apply.
 
 Custom sandbox and provider configurations must allow the runner to write
 this cache and the harness's file-reading tools to read the emitted absolute

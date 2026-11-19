@@ -12,33 +12,53 @@ import { useSessionImportStore } from "@/store/sessionImport";
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
 vi.mock("@/lib/sessionsApi", () => ({ importLocalSessions: vi.fn() }));
 vi.mock("./HostLabel", () => ({
-  HostLabel: ({ host }: { host: { name: string } }) => <span>{host.name}</span>,
+  HostLabel: ({ host }: { host: { name: string } }) => host.name,
 }));
 // Radix Select uses a portal + pointer events jsdom can't drive; a native
 // <select> keeps the option list assertable.
-vi.mock("@/components/ui/select", () => ({
-  Select: ({
-    value,
-    onValueChange,
-    children,
-    disabled,
-  }: {
-    disabled?: boolean;
-    value: string;
-    onValueChange: (v: string) => void;
-    children: ReactNode;
-  }) => (
-    <select disabled={disabled} value={value} onChange={(e) => onValueChange(e.target.value)}>
-      {children}
-    </select>
-  ),
-  SelectTrigger: ({ children }: { children: ReactNode }) => children,
-  SelectValue: () => null,
-  SelectContent: ({ children }: { children: ReactNode }) => children,
-  SelectItem: ({ value, children }: { value: string; children: ReactNode }) => (
-    <option value={value}>{children}</option>
-  ),
-}));
+vi.mock("@/components/ui/select", async () => {
+  const { Children, isValidElement } = await import("react");
+  const SelectTrigger = ({ children }: { children: ReactNode }) => children;
+  return {
+    Select: ({
+      value,
+      onValueChange,
+      children,
+      disabled,
+    }: {
+      disabled?: boolean;
+      value: string;
+      onValueChange: (v: string) => void;
+      children: ReactNode;
+    }) => {
+      // The native select takes its name from the trigger's Settings props, which the mock drops otherwise.
+      const trigger = Children.toArray(children).find(
+        (child) => isValidElement(child) && child.type === SelectTrigger,
+      );
+      const triggerProps = (isValidElement(trigger) ? trigger.props : {}) as Record<
+        string,
+        unknown
+      >;
+      return (
+        <select
+          aria-label={triggerProps["aria-label"] as string | undefined}
+          aria-labelledby={triggerProps["aria-labelledby"] as string | undefined}
+          disabled={disabled}
+          value={value}
+          onChange={(e) => onValueChange(e.target.value)}
+        >
+          {children}
+        </select>
+      );
+    },
+    SelectTrigger,
+    SelectValue: () => null,
+    SelectContent: ({ children }: { children: ReactNode }) => children,
+    SelectItem: ({ value, children }: { value: string; children: ReactNode }) => (
+      <option value={value}>{children}</option>
+    ),
+  };
+});
 
 const useHostsMock = vi.mocked(useHosts);
 const importLocalSessionsMock = vi.mocked(importLocalSessions);
@@ -74,6 +94,32 @@ describe("ImportSessionsPanel", () => {
     renderPanel();
     expect(screen.getByTestId("import-no-hosts")).toBeInTheDocument();
     expect(screen.queryByTestId("import-submit")).toBeNull();
+  });
+
+  it("renders each row as its Settings catalog entry, in the recent-sessions mode", () => {
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_1", name: "mac-laptop", owner: "alice", status: "online" }],
+    } as unknown as ReturnType<typeof useHosts>);
+    renderPanel();
+    for (const id of [
+      "import-machine",
+      "import-mode",
+      "import-harness",
+      "import-recent-count",
+      "import-run",
+    ]) {
+      expect(document.querySelector(`[data-settings-item="${id}"]`)).not.toBeNull();
+    }
+    expect(document.querySelector('[data-settings-item="import-session-id"]')).toBeNull();
+  });
+
+  it("names the mode row as its catalog label, the same text the select shows", () => {
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_1", name: "mac-laptop", owner: "alice", status: "online" }],
+    } as unknown as ReturnType<typeof useHosts>);
+    renderPanel();
+    expect(screen.getByText("What to import")).toBeInTheDocument();
+    expect(screen.getByRole("combobox", { name: "What to import" })).toBeInTheDocument();
   });
 
   it("keeps a large batch compact and points to the existing session list", async () => {
@@ -138,6 +184,29 @@ describe("ImportSessionsPanel", () => {
     importLocalSessionsMock.mockClear();
     fireEvent.click(screen.getByTestId("import-retry"));
     await waitFor(() => expect(importLocalSessionsMock).toHaveBeenCalledTimes(1));
+  });
+
+  it("keeps imported progress visible when the import stops early", async () => {
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_1", name: "mac-laptop", owner: "alice", status: "online" }],
+    } as unknown as ReturnType<typeof useHosts>);
+    importLocalSessionsMock.mockImplementation(async (_host, _source, _limit, onSession) => {
+      onSession?.({ id: "c1", title: "First session" });
+      onSession?.({ id: "c2", title: "Second session" });
+      throw new Error(
+        "The import stopped before it could finish. 2 sessions were imported. " +
+          "Import again to pick up the rest.",
+      );
+    });
+
+    renderPanel();
+    fireEvent.click(screen.getByTestId("import-submit"));
+
+    await waitFor(() => expect(screen.getByTestId("import-error")).toBeInTheDocument());
+    expect(screen.getByTestId("import-error")).toHaveTextContent("2 sessions were imported");
+    expect(screen.getByText("Imported 2 before the import stopped.")).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "View sessions" })).toHaveAttribute("href", "/");
+    expect(screen.queryByTestId("import-result")).toBeNull();
   });
 
   it("keeps an in-flight import running and shows its progress after a remount", async () => {

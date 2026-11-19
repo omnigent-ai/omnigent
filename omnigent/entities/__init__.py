@@ -30,8 +30,14 @@ from omnigent.entities.databricks_connection import DatabricksConnection
 from omnigent.entities.device_grant import DeviceGrant
 from omnigent.entities.file import StoredFile
 from omnigent.entities.github_connection import GithubConnection
+from omnigent.entities.inbox_item import InboxItem
 from omnigent.entities.pagination import PagedList
-from omnigent.entities.permission import ResolvedAccess, SessionPermission
+from omnigent.entities.permission import (
+    ResolvedAccess,
+    ScheduledTaskPermission,
+    SessionPermission,
+    WorkflowPermission,
+)
 from omnigent.entities.policy import Policy
 from omnigent.entities.project import Project
 from omnigent.entities.scheduled_task import ScheduledTask, ScheduledTaskRun
@@ -62,6 +68,7 @@ __all__ = [
     "FunctionCallData",
     "FunctionCallOutputData",
     "GithubConnection",
+    "InboxItem",
     "ItemData",
     "LoadedAgent",
     "MessageData",
@@ -76,12 +83,14 @@ __all__ = [
     "ResourceEventData",
     "RoutingDecisionData",
     "ScheduledTask",
+    "ScheduledTaskPermission",
     "ScheduledTaskRun",
     "SessionPermission",
     "SessionResourceView",
     "SlashCommandData",
     "StoredFile",
     "TerminalCommandData",
+    "WorkflowPermission",
     "filter_resources_by_type",
     "get_resource_by_id",
     "parse_item_data",

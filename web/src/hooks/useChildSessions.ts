@@ -87,6 +87,44 @@ interface ChildSessionWire {
 interface ChildSessionsResponse {
   object: "list";
   data: ChildSessionWire[];
+  last_id?: string | null;
+  has_more?: boolean;
+}
+
+const CHILD_SESSIONS_PAGE_SIZE = "100";
+
+/** True for the server's 400 `stale_cursor`: the list changed under a page cursor. */
+export async function isStaleCursorResponse(res: Response): Promise<boolean> {
+  if (res.status !== 400) return false;
+  const body = (await res
+    .clone()
+    .json()
+    .catch(() => null)) as { error?: { code?: unknown } } | null;
+  return body?.error?.code === "stale_cursor";
+}
+
+async function fetchChildSessionRows(
+  sessionId: string,
+  after: string | null,
+  rows: ChildSessionWire[],
+  restarted: boolean,
+): Promise<ChildSessionWire[]> {
+  // The first page keeps the plain URL; later pages continue after its last row.
+  const query =
+    after === null ? "" : `?${new URLSearchParams({ limit: CHILD_SESSIONS_PAGE_SIZE, after })}`;
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/child_sessions${query}`,
+  );
+  // The list changed between pages: read it again once.
+  if (after !== null && !restarted && (await isStaleCursorResponse(res))) {
+    return fetchChildSessionRows(sessionId, null, [], true);
+  }
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  const json = (await res.json()) as ChildSessionsResponse;
+  rows.push(...json.data);
+  return json.has_more && json.last_id
+    ? fetchChildSessionRows(sessionId, json.last_id, rows, restarted)
+    : rows;
 }
 
 /**
@@ -198,22 +236,18 @@ interface UseChildSessionsResult {
 }
 
 /**
- * Fetch child sessions for a parent session.
+ * Fetch every child session of a parent session, following the pages.
  *
  * Exported for unit testing of the HTTP-shape contract; production
  * code should call ``useChildSessions``.
  */
 export async function fetchChildSessions(sessionId: string): Promise<ChildSessionInfo[]> {
-  const res = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}/child_sessions`,
-  );
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  const json = (await res.json()) as ChildSessionsResponse;
+  const rows = await fetchChildSessionRows(sessionId, null, [], false);
   // Children run on this session's runner: record the link so their
   // session-scoped requests key by this session's host before their own
   // snapshot loads.
-  for (const row of json.data) setSessionParent(row.id, sessionId);
-  return json.data.map((row) => ({
+  for (const row of rows) setSessionParent(row.id, sessionId);
+  return rows.map((row) => ({
     id: row.id,
     title: row.title,
     task_summary: row.task_summary ?? null,

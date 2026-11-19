@@ -8,13 +8,13 @@ import re
 from typing import Any
 
 import zstandard
-from sqlalchemy import asc, select, update
+from sqlalchemy import LargeBinary, asc, select, tuple_, type_coerce, update
 from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import require_active_account
 from omnigent.db.compression import decode, encode
 from omnigent.db.db_models import SqlPreference, SqlProject, current_workspace_id
-from omnigent.db.preferences import select_preference_value, upsert_preference
+from omnigent.db.preference_rows import upsert_preference_row
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -256,6 +256,29 @@ class SqlAlchemyProjectStore(ProjectStore):
             rows = session.execute(stmt).scalars().all()
             return [_to_entity(r) for r in rows]
 
+    def list_page(
+        self, *, user_id: str | None, limit: int, after_id: str | None = None
+    ) -> tuple[builtins.list[Project], bool]:
+        """Return a ``(created_at, id)`` keyset page served by ``ix_projects_user_id``."""
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        with self._session("list_projects_page") as session:
+            stmt = (
+                select(SqlProject)
+                .where(SqlProject.workspace_id == current_workspace_id())
+                .where(SqlProject.user_id == user_id)
+            )
+            if after_id is not None:
+                after = session.get(SqlProject, (current_workspace_id(), after_id))
+                if after is None or after.user_id != user_id:
+                    raise ValueError("after must be the id of one of your projects")
+                stmt = stmt.where(
+                    tuple_(SqlProject.created_at, SqlProject.id) > (after.created_at, after.id)
+                )
+            stmt = stmt.order_by(asc(SqlProject.created_at), asc(SqlProject.id)).limit(limit + 1)
+            rows = session.execute(stmt).scalars().all()
+            return [_to_entity(row) for row in rows[:limit]], len(rows) > limit
+
     def update(
         self,
         project_id: str,
@@ -323,7 +346,14 @@ class SqlAlchemyProjectStore(ProjectStore):
         """Read project ordering from the user's preferences."""
         preference_user_id = RESERVED_USER_LOCAL if user_id is None else user_id
         with self._session("read_project_order") as session:
-            raw = session.scalar(select_preference_value(preference_user_id, _PROJECT_ORDER_KEY))
+            # Decode raw bytes here so malformed values cannot fail in the ORM result processor.
+            raw = session.scalar(
+                select(type_coerce(SqlPreference.value, LargeBinary)).where(
+                    SqlPreference.workspace_id == current_workspace_id(),
+                    SqlPreference.user_id == preference_user_id,
+                    SqlPreference.key == _PROJECT_ORDER_KEY,
+                )
+            )
             return _decode_order(raw)
 
     def save_order(
@@ -337,9 +367,13 @@ class SqlAlchemyProjectStore(ProjectStore):
             workspace_id = current_workspace_id()
             if ids is None:
                 raw = session.scalar(
-                    select_preference_value(
-                        preference_user_id, _PROJECT_ORDER_KEY
-                    ).with_for_update()
+                    select(type_coerce(SqlPreference.value, LargeBinary))
+                    .where(
+                        SqlPreference.workspace_id == workspace_id,
+                        SqlPreference.user_id == preference_user_id,
+                        SqlPreference.key == _PROJECT_ORDER_KEY,
+                    )
+                    .with_for_update()
                 )
                 preference = _decode_order(raw)
                 preference["sort_mode"] = "alphabetical"
@@ -369,9 +403,8 @@ class SqlAlchemyProjectStore(ProjectStore):
                 "sort_mode": "manual",
                 "ordered_project_ids": ids,
             }
-            upsert_preference(
+            upsert_preference_row(
                 session,
-                dialect=self._engine.dialect.name,
                 user_id=preference_user_id,
                 key=_PROJECT_ORDER_KEY,
                 value=_encode_order(preference),

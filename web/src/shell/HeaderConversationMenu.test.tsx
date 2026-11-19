@@ -1,19 +1,23 @@
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as ConversationsModule from "@/hooks/useConversations";
 import type * as UnseenConversationsModule from "@/hooks/useUnseenConversations";
 import type * as UseFileContentModule from "@/hooks/useFileContent";
 import type * as SessionsApiModule from "@/lib/sessionsApi";
+import type * as ScheduledTasksApiModule from "@/lib/scheduledTasksApi";
+import { deleteScheduledTask } from "@/lib/scheduledTasksApi";
+import type { ServerInfo } from "@/lib/capabilities";
 import { setOmnigentHostConfig } from "@/lib/host";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
-import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
+import { PINNED_LABEL_KEY, PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
 import { toast } from "sonner";
 import { DropdownMenuItem } from "@/components/ui/dropdown-menu";
+import { resetDesktopCommandsForTests } from "@/lib/desktopCommands";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
 
 const mocks = vi.hoisted(() => ({
@@ -34,6 +38,18 @@ const mocks = vi.hoisted(() => ({
   exportTranscript: vi.fn(),
   triggerDownload: vi.fn(),
   toastError: vi.fn(),
+}));
+
+vi.mock("@/components/scheduled/CreateAutomationFromSessionDialog", () => ({
+  CreateAutomationFromSessionDialog: ({ conversation }: { conversation: { id: string } }) => (
+    <div data-testid="create-automation-dialog" data-conversation-id={conversation.id} />
+  ),
+}));
+// A session an automation runs from: its delete looks up and deletes the automation.
+vi.mock("@/lib/scheduledTasksApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof ScheduledTasksApiModule>()),
+  getScheduledTask: vi.fn(() => Promise.resolve({ id: "st_1", name: "Weekly rubric" })),
+  deleteScheduledTask: vi.fn(() => Promise.resolve()),
 }));
 
 vi.mock("@/hooks/useIsMobileViewport", () => ({
@@ -98,13 +114,27 @@ const SECOND_CONVERSATION: Conversation = {
   git_branch: "feature/release-planning",
 };
 
-function menuTree(overrides: Partial<Parameters<typeof HeaderConversationMenu>[0]> = {}) {
+function LocationProbe() {
+  const location = useLocation();
+  return <output data-testid="location">{`${location.pathname}${location.search}`}</output>;
+}
+
+function menuTree(
+  overrides: Partial<Parameters<typeof HeaderConversationMenu>[0]> = {},
+  capability: boolean | "missing" = true,
   // A QueryClientProvider is required: the menu reads useQueryClient() to hand
   // the post-archive Undo toast a client for unarchiving.
-  const queryClient = new QueryClient();
+  queryClient = new QueryClient(),
+) {
   return (
     <QueryClientProvider client={queryClient}>
-      <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, archive_worktree_cleanup: true }}>
+      <CapabilitiesProvider
+        info={{
+          ...FALLBACK_SERVER_INFO,
+          archive_worktree_cleanup: true,
+          ...(capability === "missing" ? {} : { sibling_sessions: capability }),
+        }}
+      >
         <MemoryRouter initialEntries={[`/c/${overrides.conversation?.id ?? CONVERSATION.id}`]}>
           <HeaderConversationMenu
             conversation={CONVERSATION}
@@ -115,14 +145,18 @@ function menuTree(overrides: Partial<Parameters<typeof HeaderConversationMenu>[0
             onFork={mocks.fork}
             {...overrides}
           />
+          <LocationProbe />
         </MemoryRouter>
       </CapabilitiesProvider>
     </QueryClientProvider>
   );
 }
 
-function renderMenu(overrides: Partial<Parameters<typeof HeaderConversationMenu>[0]> = {}) {
-  return render(menuTree(overrides));
+function renderMenu(
+  overrides: Partial<Parameters<typeof HeaderConversationMenu>[0]> = {},
+  queryClient?: QueryClient,
+) {
+  return render(menuTree(overrides, true, queryClient));
 }
 
 function openMenu() {
@@ -141,6 +175,25 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("HeaderConversationMenu", () => {
+  it.each([false, true])(
+    "offers sibling creation but prevents independent project moves (mobile=%s)",
+    (mobile) => {
+      mocks.isMobile = mobile;
+      renderMenu({
+        conversation: {
+          ...CONVERSATION,
+          family: { id: "family", representative_id: "another", pinned: false },
+        },
+      });
+      openMenu();
+      const addAgent = screen.getByTestId("add-sibling-session");
+      expect(addAgent).toBeVisible();
+      expect(screen.getAllByRole("menuitem")[0]).toBe(addAgent);
+      expect(addAgent.nextElementSibling).toHaveAttribute("role", "separator");
+      expect(screen.queryByTestId("header-move-to-project")).not.toBeInTheDocument();
+    },
+  );
+
   it("keeps an unsupported Fork visible without opening its dialog", () => {
     renderMenu({ forkDisabledReason: "Forking this sandbox session is not supported yet." });
     openMenu();
@@ -168,6 +221,7 @@ describe("HeaderConversationMenu", () => {
     // Rename and Move session live in the kebab on desktop too, alongside the
     // breadcrumb title (HeaderTitle) and folder tag (HeaderProjectTag) shortcuts.
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
+      "Add nested agent",
       "Pin",
       "Share",
       "Fork",
@@ -188,7 +242,63 @@ describe("HeaderConversationMenu", () => {
     trigger.focus();
     fireEvent.keyDown(trigger, { key: "ArrowDown" });
 
-    expect(screen.getByRole("menuitem", { name: "Pin" })).toHaveFocus();
+    expect(screen.getByRole("menuitem", { name: "Add nested agent" })).toHaveFocus();
+  });
+
+  it.each([false, "missing"] as const)(
+    "hides nested creation without capability %s",
+    (capability) => {
+      render(menuTree({}, capability));
+      openMenu();
+      expect(screen.queryByRole("menuitem", { name: "Add nested agent" })).toBeNull();
+      expect(screen.getByRole("menu").firstElementChild).toBe(
+        screen.getByRole("menuitem", { name: "Pin" }),
+      );
+    },
+  );
+
+  it("opens Add nested agent with Ctrl+Alt+A and ignores held, composing, and AltGraph keys", () => {
+    renderMenu();
+    const addAgentKey = (init: KeyboardEventInit = {}) =>
+      new KeyboardEvent("keydown", {
+        bubbles: true,
+        cancelable: true,
+        code: "KeyA",
+        ctrlKey: true,
+        altKey: true,
+        ...init,
+      });
+
+    fireEvent(window, addAgentKey({ repeat: true }));
+    fireEvent(window, addAgentKey({ isComposing: true }));
+    const altGraph = addAgentKey();
+    vi.spyOn(altGraph, "getModifierState").mockImplementation((key) => key === "AltGraph");
+    fireEvent(window, altGraph);
+    expect(screen.getByTestId("location")).toHaveTextContent("/c/conv-1");
+
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Rename" }));
+    screen.getByRole("dialog").querySelector("input")!.focus();
+    fireEvent(window, addAgentKey());
+    expect(screen.getByTestId("location")).toHaveTextContent("/c/conv-1");
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    const accepted = addAgentKey();
+    fireEvent(window, accepted);
+    expect(accepted.defaultPrevented).toBe(true);
+    expect(screen.getByTestId("location")).toHaveTextContent("/?sibling=conv-1");
+  });
+
+  it.each([false, true])("hides pin actions on nested sessions (legacy pin: %s)", (legacyPin) => {
+    renderMenu({
+      conversation: {
+        ...CONVERSATION,
+        labels: legacyPin ? { [PINNED_LABEL_KEY]: "1" } : {},
+        family: { id: "family", representative_id: "parent", pinned: false },
+      },
+    });
+    openMenu();
+    expect(screen.queryByTestId("header-pin-conversation")).toBeNull();
   });
 
   it("runs pin and mark-unread actions for the active session", () => {
@@ -309,6 +419,19 @@ describe("HeaderConversationMenu", () => {
     });
   });
 
+  it("asks before archiving a running session, and Cancel keeps it open", () => {
+    renderMenu({ conversation: { ...CONVERSATION, status: "running" } });
+
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
+    expect(screen.getByRole("dialog", { name: "Archive running session?" })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(screen.queryByRole("dialog")).toBeNull();
+    expect(mocks.archive).not.toHaveBeenCalled();
+    expect(screen.getByTestId("location")).toHaveTextContent("/c/conv-1");
+  });
+
   it("offers Unarchive on an archived session and unarchives in place", () => {
     // An archived session reopened by URL must not be re-offered the action
     // that was already taken; the item flips like the sidebar row's menu.
@@ -316,6 +439,7 @@ describe("HeaderConversationMenu", () => {
 
     openMenu();
     expect(screen.queryByRole("menuitem", { name: "Archive" })).toBeNull();
+    expect(screen.queryByRole("menuitem", { name: "Add nested agent" })).toBeNull();
     const item = screen.getByRole("menuitem", { name: "Unarchive" });
     expect(item.querySelector("svg")).toHaveClass("lucide-archive-restore");
 
@@ -471,7 +595,7 @@ describe("HeaderConversationMenu", () => {
     view.rerender(menuTree({ conversation: SECOND_CONVERSATION }));
 
     await waitFor(() => {
-      expect(screen.queryByRole("heading", { name: "Delete conversation?" })).toBeNull();
+      expect(screen.queryByRole("heading", { name: "Delete session?" })).toBeNull();
     });
     expect(mocks.deleteConversation).not.toHaveBeenCalled();
 
@@ -489,26 +613,33 @@ describe("HeaderConversationMenu", () => {
     // The mobile chat header shows no title of its own (the native shells hide
     // the breadcrumb), so the menu itself has to name the session.
     mocks.isMobile = true;
-    renderMenu();
+    renderMenu({ workingDirectory: "/Users/ajay/projects/omni" });
     openMenu();
     const label = screen.getByText("Quarterly planning");
     expect(label.closest('[data-slot="dropdown-menu-label"]')).toBeInTheDocument();
+    const directory = screen.getByLabelText("Working directory: /Users/ajay/projects/omni");
+    expect(directory).toHaveTextContent("omni");
+    expect(directory.querySelector("svg")).toHaveClass("lucide-folder");
+    expect(directory.closest('[data-slot="dropdown-menu-label"]')).toBeInTheDocument();
 
     fireEvent.click(screen.getByTestId("header-move-to-project"));
     expect(screen.queryByText("Quarterly planning")).toBeNull();
+    expect(screen.queryByText("omni")).toBeNull();
   });
 
   it("omits the title header on desktop, where the breadcrumb already shows it", () => {
-    renderMenu();
+    renderMenu({ workingDirectory: "/Users/ajay/projects/omni" });
     openMenu();
 
     expect(screen.queryByText("Quarterly planning")).toBeNull();
+    expect(screen.queryByText("omni")).toBeNull();
   });
 
   it("sizes the trigger and rows for touch on mobile only", () => {
     const view = renderMenu();
     const desktopTrigger = screen.getByRole("button", { name: "Conversation actions" });
     expect(desktopTrigger.querySelector("svg")).toHaveClass("size-3.5");
+    expect(desktopTrigger.querySelector(".glass-surface")).toBeNull();
     openMenu();
     expect(screen.getByRole("menuitem", { name: "Pin" })).not.toHaveClass("py-2");
 
@@ -519,6 +650,7 @@ describe("HeaderConversationMenu", () => {
     // 44px tap-target floor on phones, matching the sibling header controls.
     expect(mobileTrigger).toHaveClass("max-md:size-11");
     expect(mobileTrigger.querySelector("svg")).toHaveClass("size-5");
+    expect(mobileTrigger.querySelector(".glass-surface")).not.toBeNull();
     openMenu();
     expect(screen.getByRole("menuitem", { name: "Pin" })).toHaveClass("gap-2.5", "px-2.5", "py-2");
   });
@@ -531,6 +663,7 @@ describe("HeaderConversationMenu", () => {
     openMenu();
 
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
+      "Add nested agent",
       "Pin",
       "Share",
       "Fork",
@@ -548,11 +681,14 @@ describe("HeaderConversationMenu", () => {
     // and Delete must stay last so a mis-tap doesn't land on them.
     mocks.isMobile = true;
     renderMenu({
+      viewItems: <DropdownMenuItem>Terminal</DropdownMenuItem>,
       workspaceItems: <DropdownMenuItem data-testid="rail-files">Files</DropdownMenuItem>,
     });
     openMenu();
 
     expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
+      "Add nested agent",
+      "Terminal",
       "Pin",
       "Share",
       "Fork",
@@ -601,11 +737,11 @@ describe("HeaderConversationMenu", () => {
     expect(document.body.style.pointerEvents).toBe("none");
   });
 
-  it("keeps the trigger flat while retaining a legible mobile menu surface", () => {
+  it("keeps the trigger circular while retaining a legible mobile menu surface", () => {
     mocks.isMobile = true;
     renderMenu();
     const trigger = screen.getByRole("button", { name: "Conversation actions" });
-    expect(trigger).not.toHaveClass("max-md:rounded-full");
+    expect(trigger).toHaveClass("rounded-full");
 
     openMenu();
     expect(screen.getByRole("menu")).toHaveClass(
@@ -682,5 +818,202 @@ describe("HeaderConversationMenu", () => {
     const share = screen.getByRole("menuitem", { name: "Share" });
     expect(share).toHaveAttribute("data-disabled");
     expect(share).toHaveAttribute("title", "Sharing is unavailable from a local server.");
+  });
+});
+
+describe("HeaderConversationMenu desktop menu commands", () => {
+  type CommandListener = (event: { command: string; browserViewId: string | null }) => void;
+  let sendCommand: CommandListener = () => {};
+  const setDesktopCommandState = vi.fn();
+
+  beforeEach(() => {
+    Object.assign(window, {
+      omnigentDesktop: {
+        kind: "electron",
+        onDesktopCommand: (callback: CommandListener) => {
+          sendCommand = callback;
+          return () => {};
+        },
+        setDesktopCommandState,
+      },
+    });
+  });
+
+  afterEach(() => {
+    resetDesktopCommandsForTests();
+    Reflect.deleteProperty(window, "omnigentDesktop");
+  });
+
+  it("pins the shown session from Session → Pin and reports its pinned state", async () => {
+    const view = renderMenu();
+    sendCommand({ command: "toggle-pin-session", browserViewId: null });
+    expect(mocks.togglePinned).toHaveBeenCalledWith({ id: "conv-1", pinned: true });
+    await waitFor(() =>
+      expect(setDesktopCommandState).toHaveBeenLastCalledWith(
+        expect.objectContaining({ sessionPinned: false, sessionArchived: false }),
+      ),
+    );
+
+    view.rerender(
+      menuTree({ conversation: { ...CONVERSATION, labels: { [PINNED_LABEL_KEY]: "1" } } }),
+    );
+    await waitFor(() =>
+      expect(setDesktopCommandState).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          commands: ["archive-session", "fork-session", "toggle-pin-session"],
+          sessionPinned: true,
+        }),
+      ),
+    );
+    view.rerender(
+      menuTree({
+        conversation: {
+          ...CONVERSATION,
+          labels: { [PINNED_LABEL_KEY]: "1" },
+          family: { id: "family", representative_id: "parent", pinned: true },
+        },
+      }),
+    );
+    await waitFor(() =>
+      expect(setDesktopCommandState).toHaveBeenLastCalledWith(
+        expect.objectContaining({ commands: ["archive-session", "fork-session"] }),
+      ),
+    );
+    mocks.togglePinned.mockClear();
+    act(() => sendCommand({ command: "toggle-pin-session", browserViewId: null }));
+    expect(mocks.togglePinned).not.toHaveBeenCalled();
+  });
+
+  it("disables Session → Pin while a pin write is pending", async () => {
+    const queryClient = new QueryClient();
+    renderMenu({}, queryClient);
+    const reportsPin = (reported: boolean) =>
+      waitFor(() =>
+        expect(setDesktopCommandState).toHaveBeenLastCalledWith(
+          expect.objectContaining({
+            commands: [
+              "archive-session",
+              "fork-session",
+              ...(reported ? ["toggle-pin-session"] : []),
+            ],
+          }),
+        ),
+      );
+    await reportsPin(true);
+
+    let finishWrite = () => {};
+    const write = queryClient.getMutationCache().build(queryClient, {
+      mutationKey: PIN_WRITE_MUTATION_KEY,
+      mutationFn: () =>
+        new Promise<void>((resolve) => {
+          finishWrite = resolve;
+        }),
+    });
+    act(() => void write.execute(undefined));
+    await reportsPin(false);
+
+    await act(async () => finishWrite());
+    await reportsPin(true);
+  });
+
+  it.each([
+    { status: "idle", worktreeChoice: "Yes, delete worktree", deleteWorktree: true },
+    { status: "running", worktreeChoice: "No, archive only", deleteWorktree: false },
+  ] as const)(
+    "archives a $status session through the menu item's prompts from Session → Archive",
+    ({ status, worktreeChoice, deleteWorktree }) => {
+      renderMenu({ conversation: { ...CONVERSATION, status } });
+      act(() => sendCommand({ command: "archive-session", browserViewId: null }));
+      if (status === "running") fireEvent.click(screen.getByRole("button", { name: "Archive" }));
+      else expect(screen.queryByTestId("archive-running-dialog")).toBeNull();
+      expect(mocks.archive).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: worktreeChoice }));
+      expect(mocks.archive).toHaveBeenCalledWith({ id: "conv-1", archived: true, deleteWorktree });
+    },
+  );
+
+  it("shows the desktop chords on Pin, Archive and Fork", () => {
+    renderMenu();
+    openMenu();
+    const keycaps = (item: HTMLElement) =>
+      Array.from(item.querySelectorAll("kbd"), (key) => key.textContent);
+    expect(keycaps(screen.getByRole("menuitem", { name: "Pin" }))).toEqual(["Ctrl", "Alt", "P"]);
+    expect(keycaps(screen.getByRole("menuitem", { name: "Archive" }))).toEqual(["Ctrl", "⇧", "A"]);
+    expect(keycaps(screen.getByRole("menuitem", { name: "Fork" }))).toEqual(["Ctrl", "Alt", "F"]);
+  });
+
+  it("opens the fork dialog from Session → Fork Session", () => {
+    const onFork = vi.fn();
+    renderMenu({ onFork });
+    act(() => sendCommand({ command: "fork-session", browserViewId: null }));
+    expect(onFork).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("automations started from this session", () => {
+  const AGENT_SESSION: Conversation = { ...CONVERSATION, agent_id: "ag_1", git_branch: null };
+
+  function renderWithInfo(info: Partial<ServerInfo>, conversation = AGENT_SESSION) {
+    return render(
+      <QueryClientProvider client={new QueryClient()}>
+        <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, ...info }}>
+          <MemoryRouter initialEntries={[`/c/${conversation.id}`]}>
+            <HeaderConversationMenu
+              conversation={conversation}
+              currentProject={null}
+              canShare
+              canFork
+              onShare={() => {}}
+              onFork={mocks.fork}
+            />
+          </MemoryRouter>
+        </CapabilitiesProvider>
+      </QueryClientProvider>,
+    );
+  }
+
+  it("offers Create automation below Mark as unread and opens the dialog for the session", () => {
+    renderWithInfo({ automations_enabled: true, scheduled_task_source_sessions: true });
+    openMenu();
+
+    const items = screen.getAllByRole("menuitem");
+    const readState = items.indexOf(screen.getByTestId("header-mark-unread-conversation"));
+    expect(items[readState + 1]).toBe(screen.getByTestId("header-create-automation"));
+    expect(items[readState + 1]).toHaveTextContent(/^Create automation$/);
+
+    fireEvent.click(screen.getByTestId("header-create-automation"));
+    expect(screen.getByTestId("create-automation-dialog")).toHaveAttribute(
+      "data-conversation-id",
+      "conv-1",
+    );
+  });
+
+  it("leaves it out when automations are off", () => {
+    renderWithInfo({ automations_enabled: false, scheduled_task_source_sessions: true });
+    openMenu();
+
+    expect(screen.getByTestId("header-fork-conversation")).toBeInTheDocument();
+    expect(screen.queryByTestId("header-create-automation")).toBeNull();
+  });
+
+  it("deletes the automation that runs from a session before the session", async () => {
+    renderWithInfo({}, { ...AGENT_SESSION, labels: { "omnigent.scheduled_task_source": "st_1" } });
+    openMenu();
+    fireEvent.click(screen.getByRole("menuitem", { name: "Delete" }));
+
+    await waitFor(() =>
+      expect(screen.getByTestId("automation-source-delete-notice")).toHaveTextContent(
+        "Deleting it also deletes the automation “Weekly rubric”.",
+      ),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Delete both" }));
+
+    await waitFor(() =>
+      expect(mocks.deleteConversation).toHaveBeenCalledWith({ id: "conv-1", deleteBranch: false }),
+    );
+    expect(deleteScheduledTask).toHaveBeenCalledWith("st_1");
+    expect(vi.mocked(deleteScheduledTask).mock.invocationCallOrder[0]).toBeLessThan(
+      mocks.deleteConversation.mock.invocationCallOrder[0],
+    );
   });
 });
