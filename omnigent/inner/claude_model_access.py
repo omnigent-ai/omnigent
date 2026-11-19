@@ -33,8 +33,12 @@ from omnigent.util.env_credentials import env_names_with_omnigent_prefix
 
 from .credential_proxy import CredentialRewriteRule
 from .datamodel import CredentialSourceSpec
-from .egress.proxy import EgressProxy, RequestBodyTransform
-from .egress.rules import EgressRule, is_dns_safe_host, parse_rules
+from .egress.proxy import (
+    _CREDENTIAL_INJECTION_FORBIDDEN_METHODS,
+    EgressProxy,
+    RequestBodyTransform,
+)
+from .egress.rules import EgressRule, check_request, is_dns_safe_host, parse_rules
 from .model_auth import (
     ProviderAuthRequired,
     _pin_auth_python_runtime,
@@ -689,12 +693,69 @@ class _ClaudeRelay(_SignerRelay):
             else None
         )
         self._request_body_transform = request_body_transform
+        # Operator rules only: the automatic model routes above serve the
+        # session placeholder and must not widen a shared-host credential.
+        self._operator_rules = list(rules)
         for rule in credential_rewrites or []:
             if rule.host.lower() == access.host:
-                raise ValueError("generic credential rules cannot overlap the Claude model host")
+                # The model host accepts no bare or self-authenticated request,
+                # so a shared-host rule must be selectable by its own placeholder.
+                if rule.synthetic is None or rule.synthetic == access.placeholder:
+                    raise ValueError(
+                        "credential rules on the Claude model host require their own placeholder"
+                    )
+                rule = replace(
+                    rule, inject_on_missing=False, https_only=True, required_tls_port=443
+                )
             self._cred_by_host[rule.host.lower()] = rule
             if rule.synthetic is not None:
                 self._cred_by_synthetic.setdefault(rule.synthetic, {})[rule.host.lower()] = rule
+
+    def _shared_host_headers(self, method: str, path: str, headers_raw: bytes) -> bytes | None:
+        """Return upstream headers when a model-host request selects an operator credential.
+
+        The presented placeholder selects the credential and its policy. The
+        session placeholder reaches only the reconstructed inference routes; a
+        ``credential_proxy`` placeholder reaches only operator egress rules.
+        Bare and self-authenticated requests match neither.
+
+        :returns: ``None`` when the request does not present an operator placeholder.
+        :raises SigningRejected: If the request presents one but must be refused.
+        """
+        if not any(
+            name.lower() == "content-length" for name, _ in _parse_strict_header_lines(headers_raw)
+        ):
+            headers_raw = headers_raw[:-2] + b"Content-Length: 0\r\n\r\n"
+        headers, _ = self._request_headers(headers_raw)
+        by_name = {name.lower(): value for name, value in headers}
+        synthetic = self._extract_synthetic(by_name.get("authorization", ""))
+        if synthetic is None or self._access.host not in self._cred_by_synthetic.get(
+            synthetic, {}
+        ):
+            return None
+        task = asyncio.current_task()
+        sni_host = self._tls_sni_by_task.get(task) if task is not None else None
+        if (
+            method in _CREDENTIAL_INJECTION_FORBIDDEN_METHODS
+            or (sni_host or "").lower() != self._access.host
+            or by_name.get("host", "").lower() != self._access.host
+            # Claude sends an apiKeyHelper value in both credential headers.
+            or by_name.get("x-api-key", synthetic) != synthetic
+            or any(
+                self._access.placeholder in value
+                or (name.lower() not in ("authorization", "x-api-key") and synthetic in value)
+                for name, value in headers
+            )
+            or not check_request(self._operator_rules, method, self._access.host, path)
+        ):
+            raise SigningRejected("request is outside the shared-host credential policy")
+        # Rebuild from the strictly parsed lines; the upstream never sees a placeholder.
+        return (
+            "".join(
+                f"{name}: {value}\r\n" for name, value in headers if name.lower() != "x-api-key"
+            ).encode("ascii")
+            + b"\r\n"
+        )
 
     def _allows_http2_passthrough(self, host: str) -> bool:
         return host.lower() != self._access.host and super()._allows_http2_passthrough(host)
@@ -830,10 +891,16 @@ class _ClaudeRelay(_SignerRelay):
                 self, client_writer, host, port, method, path, request_line, headers_raw, body
             )
         try:
-            self._request_headers(headers_raw)
+            shared_headers = self._shared_host_headers(method, path, headers_raw)
+            if shared_headers is None:
+                self._request_headers(headers_raw)
         except SigningRejected:
             await self._send_forbidden(client_writer, "")
             return False
+        if shared_headers is not None:
+            return await EgressProxy._forward_https(
+                self, client_writer, host, port, method, path, request_line, shared_headers, body
+            )
         return await forward(
             client_writer, host, port, method, path, request_line, headers_raw, body
         )

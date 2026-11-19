@@ -692,6 +692,57 @@ def test_prepared_cli_authenticates_shared_loopback_credential_relay(
     assert not settings_path.exists()
 
 
+@pytest.mark.parametrize("inject_env", [["LLM_API_KEY"], []], ids=["placeholder", "bare"])
+def test_gateway_credential_can_share_the_model_host_only_with_a_placeholder(
+    real_worker_spec: OSEnvSpec,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    inject_env: list[str],
+) -> None:
+    """One gateway hostname may serve Claude and, by placeholder, other harnesses."""
+    prepare_isolated_egress_ca(tmp_path / "ca", monkeypatch)
+    assert real_worker_spec.sandbox is not None
+    real_worker_spec.sandbox.egress_rules = ["* gateway.test/ai-gateway/codex/v1/**"]
+    real_worker_spec.sandbox.credential_proxy = CredentialProxySpec(
+        entries=[
+            CredentialProxyEntry(
+                host="gateway.test",
+                scheme="bearer",
+                source=CredentialSourceSpec(kind="env", env="CLAUDE_TEST_PARENT_SECRET"),
+                inject_env=inject_env,
+            )
+        ]
+    )
+    monkeypatch.setenv("CLAUDE_TEST_PARENT_SECRET", "gateway-parent-credential")
+    monkeypatch.setattr(
+        claude, "create_exec_launcher", Mock(return_value=str(tmp_path / "unused-launcher"))
+    )
+    access = ClaudeModelAccess(
+        "https://gateway.test/ai-gateway/anthropic",
+        "authorization",
+        lambda: "model-parent-credential",
+    )
+    environment = {"PATH": os.environ["PATH"]}
+
+    def prepare() -> claude._PreparedClaudeCli:
+        return claude.prepare_claude_cli_path(
+            sys.executable, real_worker_spec, worker_env=environment, model_access=access
+        )
+
+    if not inject_env:
+        with pytest.raises(ValueError, match="require their own placeholder"):
+            prepare()
+        return
+    prepared = prepare()
+    try:
+        assert environment["ANTHROPIC_AUTH_TOKEN"] == access.placeholder
+        assert environment["LLM_API_KEY"].startswith("oa_cred_")
+        assert environment["LLM_API_KEY"] != access.placeholder
+        assert "parent-credential" not in json.dumps(environment)
+    finally:
+        prepared.close()
+
+
 def test_model_inference_is_automatic_and_credentials_stay_outside_real_worker(
     real_worker_spec: OSEnvSpec,
     monkeypatch: pytest.MonkeyPatch,

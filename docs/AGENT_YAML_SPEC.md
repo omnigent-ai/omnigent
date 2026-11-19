@@ -560,6 +560,20 @@ headers before attaching the provider credential. Broader `egress_rules` cannot
 expand this signing authority. Redirects, account APIs, and arbitrary model-host
 paths receive no credential. Gateway thinking compatibility is preserved.
 
+A `credential_proxy` entry may bind the model host when one gateway hostname also
+serves other traffic, such as a Codex route. The entry must set `env`, because
+the placeholder a request presents selects both the credential and the policy:
+
+- The session placeholder gets the model credential on the signed inference
+  routes above, and nothing else.
+- The entry's placeholder gets the entry's credential on requests that
+  `egress_rules` allow. The automatic inference routes do not count.
+
+Model-host requests with no placeholder, a self-supplied credential, or both
+placeholders are refused. Shared-host requests also need HTTPS on port 443,
+HTTP/1.1, matching CONNECT, TLS SNI, and Host authorities, and a
+`Content-Length` body. An entry without `env` on the model host stops startup.
+
 The CLI, sandboxed session terminals, and `sys_os_*` shell environments get this
 model relay automatically, including when `allow_network: false`. They can make
 inference requests using the placeholder; skills therefore have the session's inference

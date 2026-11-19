@@ -11,7 +11,7 @@ import sys
 import sysconfig
 import time
 import venv
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -30,6 +30,7 @@ from omnigent.inner.claude_model_access import (
     _ClaudeRelay,
     resolve_claude_model_access,
 )
+from omnigent.inner.credential_proxy import CredentialRewriteRule
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.egress.ca import ensure_ca, ensure_ca_bundle
 from omnigent.inner.egress.certs import HostCertCache
@@ -1158,6 +1159,155 @@ async def test_inference_works_without_rules_and_broad_rules_cannot_bypass_signi
         await relay.stop()
         upstream.close()
         await upstream.wait_closed()
+
+
+async def test_shared_model_host_selects_credential_and_policy_by_placeholder(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One gateway host serves Claude and other harnesses on real sockets."""
+    received: list[bytes] = []
+
+    async def provider(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        head = await reader.readuntil(b"\r\n\r\n")
+        length = next(
+            (
+                int(line.split(b":", 1)[1])
+                for line in head.split(b"\r\n")
+                if line.lower().startswith(b"content-length:")
+            ),
+            0,
+        )
+        received.append(head + await reader.readexactly(length))
+        writer.write(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{}")
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    cert, key, bundle, upstream = await _start_model_upstream(tmp_path, monkeypatch, provider)
+    model_credential = Mock(return_value="claude-parent-key")
+    gateway_credential = Mock(return_value="gateway-parent-key")
+    access = ClaudeModelAccess(
+        "https://model.test/gateway/anthropic", "authorization", model_credential
+    )
+    shared = "oa_cred_shared-gateway"
+    rules = ["* model.test/gateway/anthropic/**", "* model.test/gateway/codex/v1/**"]
+    rewrite = CredentialRewriteRule(
+        host="model.test", scheme="bearer", secret_provider=gateway_credential, synthetic=shared
+    )
+    relay = access.create_proxy(
+        parse_rules(rules), cert, key, upstream_ca_bundle=bundle, credential_rewrites=[rewrite]
+    )
+    proxy_port = await relay.start_tcp()
+    session_auth = {"Authorization": "Bearer " + access.placeholder}
+    shared_auth = {"Authorization": "Bearer " + shared}
+    message = {"model": "claude-test", "messages": []}
+    try:
+        async with httpx.AsyncClient(
+            proxy=f"http://127.0.0.1:{proxy_port}",
+            verify=ssl.create_default_context(cafile=str(bundle)),
+            trust_env=False,
+        ) as client:
+            # Claude's own route keeps the reconstructed, session-bound request.
+            response = await client.post(
+                "https://model.test/gateway/anthropic/v1/messages?beta=true",
+                json=message,
+                headers={**session_auth, "X-Dropped": "by-reconstruction"},
+            )
+            assert response.status_code == 200
+            assert b"authorization: Bearer claude-parent-key\r\n" in received[-1]
+            assert b"x-dropped" not in received[-1].lower()
+            gateway_credential.assert_not_called()
+
+            # Other gateway traffic uses the operator credential and egress rules.
+            for method, path, headers, body in (
+                ("POST", "/gateway/codex/v1/responses", {"X-Codex": "kept"}, b'{"input":"hi"}'),
+                ("GET", "/gateway/anthropic/v1/models", {}, b""),
+                # A nested Claude sends its apiKeyHelper value in both headers.
+                ("POST", "/gateway/anthropic/v1/messages", {"x-api-key": shared}, b"{}"),
+            ):
+                response = await client.request(
+                    method,
+                    "https://model.test" + path,
+                    content=body,
+                    headers={**shared_auth, **headers},
+                )
+                assert response.status_code == 200
+                head, _, sent_body = received[-1].partition(b"\r\n\r\n")
+                assert head.startswith(f"{method} {path} HTTP/1.1\r\n".encode())
+                assert b"Authorization: Bearer gateway-parent-key\r\n" in head + b"\r\n"
+                assert sent_body == body
+                assert b"oa_cred_" not in received[-1]
+                assert b"x-api-key" not in head.lower()
+                assert b"claude-parent-key" not in received[-1]
+            assert b"X-Codex: kept\r\n" in received[1]
+            model_credential.assert_called_once_with()
+
+            async def chunked() -> AsyncIterator[bytes]:
+                yield b"{}"
+
+            forwarded = len(received)
+            gateway_credential.reset_mock()
+            codex = "https://model.test/gateway/codex/v1/responses"
+            for method, url, headers, content in (
+                ("POST", codex, {}, b"{}"),
+                ("POST", codex, {"Authorization": "Bearer sandbox-owned-key"}, b"{}"),
+                ("POST", codex, {"x-api-key": "sandbox-owned-key"}, b"{}"),
+                ("POST", codex, {**shared_auth, "x-api-key": "sandbox-owned-key"}, b"{}"),
+                ("POST", codex, {**shared_auth, "x-api-key": access.placeholder}, b"{}"),
+                ("POST", codex, {**shared_auth, "X-Other": access.placeholder}, b"{}"),
+                ("POST", codex, {**shared_auth, "X-Other": shared}, b"{}"),
+                ("POST", codex, {**shared_auth, "Host": "other.test"}, b"{}"),
+                ("POST", codex, shared_auth, chunked()),
+                ("POST", codex, session_auth, b"{}"),
+                ("TRACE", codex, shared_auth, b""),
+                ("OPTIONS", codex, shared_auth, b""),
+                ("POST", "https://model.test/gateway/other", shared_auth, b"{}"),
+                ("POST", "https://model.test/gateway/codex/v2/x", shared_auth, b"{}"),
+                ("POST", "http://model.test/gateway/codex/v1/responses", shared_auth, b"{}"),
+            ):
+                denied = await client.request(method, url, headers=headers, content=content)
+                assert denied.status_code == 403, (method, url, headers)
+            assert len(received) == forwarded
+            gateway_credential.assert_not_called()
+
+            # The automatic model routes never widen the operator credential.
+            relay._operator_rules = parse_rules(rules[1:])
+            denied = await client.post(
+                "https://model.test/gateway/anthropic/v1/messages",
+                json=message,
+                headers=shared_auth,
+            )
+            assert denied.status_code == 403
+            allowed = await client.post(
+                "https://model.test/gateway/anthropic/v1/messages",
+                json=message,
+                headers=session_auth,
+            )
+            assert allowed.status_code == 200
+            assert b"authorization: Bearer claude-parent-key\r\n" in received[-1]
+            assert len(received) == forwarded + 1
+            gateway_credential.assert_not_called()
+    finally:
+        await relay.stop()
+        upstream.close()
+        await upstream.wait_closed()
+
+
+@pytest.mark.parametrize("synthetic", [None, "session"])
+def test_shared_model_host_rule_requires_its_own_placeholder(
+    tmp_path: Path, synthetic: str | None
+) -> None:
+    cert, key = ensure_ca(cache_dir=tmp_path)
+    bundle = ensure_ca_bundle(cert, cache_dir=tmp_path)
+    access = ClaudeModelAccess("https://model.test/gateway", "authorization", lambda: "key")
+    rule = CredentialRewriteRule(
+        host="Model.Test",
+        scheme="bearer",
+        real_secret="gateway-key",
+        synthetic=access.placeholder if synthetic else None,
+    )
+    with pytest.raises(ValueError, match="require their own placeholder"):
+        access.create_proxy([], cert, key, upstream_ca_bundle=bundle, credential_rewrites=[rule])
 
 
 async def test_explicit_invalidation_refreshes_cached_credential(
