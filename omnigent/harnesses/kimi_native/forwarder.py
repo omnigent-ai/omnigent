@@ -363,7 +363,6 @@ def _read_state(bridge_dir: Path) -> _ForwardState | None:
     wire_ino = data.get("wire_ino")
     last_observed_size = data.get("last_observed_size")
     last_prompt_id = data.get("last_prompt_id")
-    replay_floor_line = data.get("replay_floor_line")
     if isinstance(wire_path, str) and isinstance(last_line, int) and isinstance(offset, int):
         return _ForwardState(
             wire_path=wire_path,
@@ -400,8 +399,9 @@ def _read_state(bridge_dir: Path) -> _ForwardState | None:
                 else 0
             ),
             replay_floor_line=(
-                replay_floor_line
-                if isinstance(replay_floor_line, int) and not isinstance(replay_floor_line, bool)
+                data["replay_floor_line"]
+                if isinstance(data.get("replay_floor_line"), int)
+                and not isinstance(data.get("replay_floor_line"), bool)
                 else 0
             ),
         )
