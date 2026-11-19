@@ -388,14 +388,19 @@ def _transcript_write_blocker(transcript_path: Path) -> str:
         ``"/home/u/.claude/projects/-work/abc.jsonl"``.
     :returns: One-line description naming the directory and errno.
     """
+    hidden_by: str | None = None
     for ancestor in transcript_path.parents:
         try:
             ancestor.stat()
         except FileNotFoundError:
             continue
         except OSError as exc:
-            code = errno.errorcode.get(exc.errno or 0, type(exc).__name__)
-            return f"{ancestor} is not accessible ({code})"
+            # The refused lookup means a directory above it lacks search permission,
+            # so keep walking to name that directory rather than the one just tried.
+            hidden_by = errno.errorcode.get(exc.errno or 0, type(exc).__name__)
+            continue
+        if hidden_by is not None:
+            return f"{ancestor} is not searchable ({hidden_by})"
         if not ancestor.is_dir():
             return f"{ancestor} is not a directory (ENOTDIR)"
         if not os.access(ancestor, os.W_OK | os.X_OK):
@@ -6144,7 +6149,8 @@ def _validated_transcript_state(
         return state
     current_fingerprint = _jsonl_cursor_fingerprint(state.transcript_path, state.byte_offset)
     if current_fingerprint is None:
-        if not state.transcript_path.exists():
+        # An unreadable file is reported at Stop, not as a stale cursor on every poll.
+        if not state.transcript_path.exists() or not os.access(state.transcript_path, os.R_OK):
             return state
         _logger.warning(
             "Claude transcript cursor invalid; skipping to end of transcript; "
@@ -8555,7 +8561,7 @@ def _complete_jsonl_end_offset(path: Path) -> int:
                 if newline_index >= 0:
                     return block_start + newline_index + 1
                 block_end = block_start
-    except FileNotFoundError:
+    except (FileNotFoundError, PermissionError):
         return 0
     return 0
 
@@ -8584,6 +8590,9 @@ def _jsonl_cursor_fingerprint(
             sample_start = max(0, byte_offset - _CURSOR_FINGERPRINT_BYTES)
             handle.seek(sample_start)
             sample = handle.read(byte_offset - sample_start)
+    except PermissionError:
+        # Unreadable is not a stale cursor; the Stop-time diagnostic reports the file.
+        return None
     except FileNotFoundError:
         if not missing_ok:
             raise

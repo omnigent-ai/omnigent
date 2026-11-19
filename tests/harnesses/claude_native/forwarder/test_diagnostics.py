@@ -648,7 +648,7 @@ def test_missing_transcript_blocker_treats_an_unsearchable_directory_as_unreadab
     finally:
         locked.chmod(0o755)
     assert probe == forwarder._UnreadTranscript(
-        transcript_path, f"{transcript_path.parent} is not accessible (EACCES)", exists=False
+        transcript_path, f"{locked} is not searchable (EACCES)", exists=False
     )
 
 
@@ -932,50 +932,106 @@ async def test_readable_transcript_keeps_an_empty_stop_reply_as_authoritative(
 
 
 @pytest.mark.asyncio
-async def test_missing_transcript_keeps_the_stop_reply_and_still_reports_the_loss(
+@pytest.mark.parametrize(
+    ("reply", "expected_output"),
+    [
+        pytest.param("Final answer", "Final answer", id="nonempty-reply-kept"),
+        pytest.param("", "notice", id="empty-reply-replaced"),
+        pytest.param(None, "notice", id="no-reply-replaced"),
+    ],
+)
+async def test_missing_transcript_reply_matrix(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
+    reply: str | None,
+    expected_output: str,
 ) -> None:
-    """The parent gets the hook's reply; the chat still names the lost transcript."""
+    """The parent gets the real reply, or the notice without one; the chat names the loss."""
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
     transcript_path = tmp_path / "never-written.jsonl"
-    _record_turn(bridge_dir, transcript_path, last_assistant_message="Final answer")
+    _record_turn(bridge_dir, transcript_path, last_assistant_message=reply)
     caplog.set_level(logging.WARNING, logger=forwarder.__name__)
     requests: list[dict[str, Any]] = []
     async with httpx.AsyncClient(
         transport=_recording_transport(requests), base_url="http://test"
     ) as client:
-        await _forward_stop_edge(client, bridge_dir, "conv_reply_kept")
+        await _forward_stop_edge(client, bridge_dir, "conv_reply_matrix")
 
-    notices = [r["data"] for r in requests if r["type"] == "external_conversation_item"]
+    assert [request["type"] for request in requests] == [
+        "external_conversation_item",
+        "external_session_status",
+    ]
+    [notice] = [r["data"] for r in requests if r["type"] == "external_conversation_item"]
     [status] = [r["data"] for r in requests if r["type"] == "external_session_status"]
-    assert len(notices) == 1
-    assert notices[0]["item_data"]["code"] == "claude_transcript_missing"
-    assert requests.index(
-        next(r for r in requests if r["type"] == "external_conversation_item")
-    ) < requests.index(next(r for r in requests if r["type"] == "external_session_status"))
-    assert status["output"] == "Final answer"
-    assert [r.levelno for r in caplog.records if r.levelno >= logging.WARNING] == [logging.WARNING]
+    assert notice["item_data"]["code"] == "claude_transcript_missing"
+    assert str(transcript_path) in notice["item_data"]["message"]
+    if expected_output == "notice":
+        assert status["output"].startswith("Omnigent could not read this turn's output")
+        assert str(transcript_path) in status["output"]
+    else:
+        assert status["output"] == expected_output
+    assert status["turn_completed"] is True
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    assert str(transcript_path) in warnings[0].getMessage()
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reply", [None, ""], ids=["no-reply", "empty-reply"])
-async def test_missing_transcript_replaces_an_absent_or_empty_stop_reply_with_the_notice(
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads unreadable files")
+async def test_unreadable_transcript_is_surfaced_through_the_forwarder_loop(
     tmp_path: Path,
-    reply: str | None,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Without a reply to show, the parent learns the output was unreadable, not "no output"."""
+    """A real chmod-000 transcript reaches the diagnostic from the production loop."""
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
-    transcript_path = tmp_path / "never-written.jsonl"
-    _record_turn(bridge_dir, transcript_path, last_assistant_message=reply)
-    requests: list[dict[str, Any]] = []
-    async with httpx.AsyncClient(
-        transport=_recording_transport(requests), base_url="http://test"
-    ) as client:
-        await _forward_stop_edge(client, bridge_dir, "conv_no_reply")
+    (bridge_dir / "claude-settings.json").write_text("{}", encoding="utf-8")
+    transcript_path = tmp_path / "claude-session.jsonl"
+    transcript_path.write_text(
+        json.dumps({"type": "user", "uuid": "u1", "message": {"role": "user", "content": "hi"}})
+        + "\n",
+        encoding="utf-8",
+    )
+    transcript_path.chmod(0o000)
+    _record_turn(bridge_dir, transcript_path)
+    caplog.set_level(logging.INFO, logger=forwarder.__name__)
 
-    [status] = [r["data"] for r in requests if r["type"] == "external_session_status"]
-    assert status["output"].startswith("Omnigent could not read this turn's output")
-    assert str(transcript_path) in status["output"]
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forwarder.forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_unreadable_loop",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    posts: list[dict[str, Any]] = []
+    try:
+        while not _idle_edges(posts):
+            posts.append(await _get_recorded_request(server, timeout_s=10.0))
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5.0)
+        transcript_path.chmod(0o644)
+    while True:
+        try:
+            posts.append(server.requests.get_nowait())
+        except queue.Empty:
+            break
+
+    [edge] = _idle_edges(posts)
+    assert edge["turn_completed"] is True
+    assert f"{transcript_path} exists but could not be read" in edge["output"]
+    [item] = [p["body"]["data"] for p in posts if _is_error_item_post(p)]
+    assert item["item_data"]["title"] == "Claude Code's transcript could not be read"
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1
+    assert "exists but could not be read" in warnings[0].getMessage()

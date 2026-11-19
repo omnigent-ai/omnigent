@@ -4839,7 +4839,8 @@ def _read_complete_jsonl_records(
                         text=text,
                     )
                 )
-    except FileNotFoundError:
+    except (FileNotFoundError, PermissionError):
+        # An unreadable transcript yields nothing this poll; the Stop-time diagnostic reports it.
         return _JsonlReadResult(
             line_cursor=start_line,
             byte_offset=byte_offset,
