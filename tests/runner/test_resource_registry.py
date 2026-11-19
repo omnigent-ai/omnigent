@@ -640,6 +640,8 @@ async def test_terminal_resource_role_is_private_and_cleared_on_close(
         conversation_id: str,
         terminal_name: str,
         session_key: str,
+        *,
+        expected: object = None,
     ) -> bool:
         """
         Remove the fake terminal from the registry.
@@ -647,8 +649,10 @@ async def test_terminal_resource_role_is_private_and_cleared_on_close(
         :param conversation_id: Owning session id, e.g. ``"conv_codex"``.
         :param terminal_name: Terminal name, e.g. ``"codex"``.
         :param session_key: Terminal session key, e.g. ``"main"``.
+        :param expected: Unused; the fake has one terminal per key.
         :returns: ``True`` when the fake terminal existed.
         """
+        del expected
         slot = terminal_registry._by_conversation.get(conversation_id, {})
         return slot.pop((terminal_name, session_key), None) is not None
 

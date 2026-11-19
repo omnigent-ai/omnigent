@@ -52,6 +52,7 @@ from omnigent.scheduled_context import SCHEDULED_RUN_HEADER
 from omnigent.spec.types import AgentSpec, ExecutorSpec, MCPServerConfig, ToolsConfig
 from omnigent.terminals import TerminalListEntry, TerminalRegistry
 from omnigent.terminals.pane_reaper import PaneRef
+from tests._helpers.polling import poll_until_async
 from tests.debug_log_helpers import capture_debug_rows
 from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient, _sse
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
@@ -732,17 +733,22 @@ class _ReapableStubResourceRegistry(_StubResourceRegistry):
         super().__init__(tmp_path)
         self.terminal_registry = TerminalRegistry()  # type: ignore[assignment]
 
-    async def close_terminal(self, session_id: str, terminal_id: str) -> bool:
+    async def close_terminal(self, session_id: str, terminal_id: str, **_kwargs: object) -> bool:
         """The stub launched no pane, so there is nothing to close."""
         del session_id, terminal_id
         return True
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", [False, True], ids=["reaped", "cancelled-while-draining"])
 async def test_idle_pane_reap_closes_comment_relay(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cancelled: bool
 ) -> None:
-    """Reaping an idle pane closes its relay; the next launch starts a fresh one."""
+    """Reaping an idle pane closes its relay; the next launch starts a fresh one.
+
+    A reap cancelled while it waits for the pane's transcript forwarder to stop still
+    finishes, so the relaunched pane advertises a relay of its own.
+    """
     started_relays: list[bridge.ClaudeNativeToolRelay] = []
     start_tool_relay = bridge.start_tool_relay
 
@@ -772,7 +778,29 @@ async def test_idle_pane_reap_closes_comment_relay(
             assert resp.status_code == 200, resp.text
             relay_socket = started_relays[0]._httpd.socket
 
-            await reaper._reap(pane)
+            if cancelled:
+                draining, drained = asyncio.Event(), asyncio.Event()
+
+                async def _slow_to_stop_forwarder() -> None:
+                    try:
+                        await asyncio.Event().wait()
+                    except asyncio.CancelledError:
+                        draining.set()
+                        await drained.wait()
+                        raise
+
+                native_runtime._AUTO_FORWARDER_TASKS[session_id] = asyncio.create_task(
+                    _slow_to_stop_forwarder()
+                )
+                reap = asyncio.create_task(reaper._reap(pane))
+                await asyncio.wait_for(draining.wait(), timeout=5)
+                reap.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await reap
+                drained.set()
+                await poll_until_async(lambda: not relay_file.exists(), timeout_s=5)
+            else:
+                await reaper._reap(pane)
             # A surviving relay keeps a listening socket per reaped session
             # until the session is deleted, exhausting the runner's descriptors.
             assert not relay_file.exists(), "tool_relay.json survived the idle reap"

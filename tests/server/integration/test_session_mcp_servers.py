@@ -443,6 +443,7 @@ async def test_live_mcp_status_maps_each_runner_answer(
     }
     answers[:] = [
         httpx.Response(200, json=live),
+        httpx.Response(200, json={**live, "servers": live["servers"][1:2], "partial": True}),
         None,
         httpx.Response(200, json={"running": False, "servers": []}),
         httpx.Response(404, json={"error": "unsupported"}),
@@ -467,9 +468,15 @@ async def test_live_mcp_status_maps_each_runner_answer(
             {"name": "plugin:tools:search", "status": "needs-auth", "error": None, "scope": None},
             {"name": "docs", "status": "failed", "error": "connection refused", "scope": "user"},
         ],
+        "partial": False,
         "reconnect_error": None,
     }
-    assert [(result["live"], result["reason"], result["detail"]) for result in results[1:]] == [
+    # A claude-native runner lists only the servers its Claude Code started without.
+    assert (results[1]["partial"], [server["name"] for server in results[1]["servers"]]) == (
+        True,
+        ["docs"],
+    )
+    assert [(result["live"], result["reason"], result["detail"]) for result in results[2:]] == [
         (False, "not_running", None),
         (False, "not_running", None),
         (False, "unsupported", None),

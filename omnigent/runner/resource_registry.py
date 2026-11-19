@@ -2588,11 +2588,15 @@ class SessionResourceRegistry:
         self,
         session_id: str,
         terminal_id: str,
+        *,
+        expected: TerminalInstance | None = None,
     ) -> bool:
         """Close a terminal resource by id.
 
         :param session_id: Session/conversation identifier.
         :param terminal_id: Opaque terminal resource id.
+        :param expected: When given, close only this exact pane: one moved to
+            another session or replaced meanwhile is left alone.
         :returns: ``True`` if a terminal was closed.
         """
         if self._terminal_registry is None:
@@ -2631,12 +2635,21 @@ class SessionResourceRegistry:
                     session_id,
                     entry.terminal_name,
                     entry.session_key,
+                    expected=expected,
                 )
                 if closed:
+                    # A replacement launched during the close keeps its own role,
+                    # lifecycle and poller.
+                    replaced = (
+                        self._terminal_registry.get(
+                            session_id, entry.terminal_name, entry.session_key
+                        )
+                        is not None
+                    )
                     with self._lock:
-                        self._terminal_roles.pop((session_id, terminal_id), None)
-                        self._terminal_lifecycles.pop((session_id, terminal_id), None)
-                        # A replacement launched during the close keeps its own poller.
+                        if not replaced:
+                            self._terminal_roles.pop((session_id, terminal_id), None)
+                            self._terminal_lifecycles.pop((session_id, terminal_id), None)
                         if poller is not None and self._status_pollers.get(session_id) is poller:
                             del self._status_pollers[session_id]
                     _retire_closed_terminal_poller(poller)

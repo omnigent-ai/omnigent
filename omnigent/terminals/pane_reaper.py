@@ -178,7 +178,7 @@ class NativePaneReaper:
         *,
         list_native_panes: Callable[[], list[PaneRef]],
         is_busy: Callable[[PaneRef], Awaitable[bool]],
-        reap: Callable[[PaneRef], Awaitable[None]],
+        reap: Callable[[PaneRef], Awaitable[object]],
         idle_timeout_s: float | None = None,
         reaper_interval_s: float = _DEFAULT_REAPER_INTERVAL_S,
     ) -> None:

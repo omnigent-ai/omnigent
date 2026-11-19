@@ -7,6 +7,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import httpx
 import pytest
@@ -506,8 +507,8 @@ async def test_runner_reap_releases_sidecars_before_a_recreate_takes_over(
     closing, finish_close = asyncio.Event(), asyncio.Event()
     close_terminal = resource_registry.close_terminal
 
-    async def slow_close(session_id: str, terminal_id: str) -> bool:
-        closed = await close_terminal(session_id, terminal_id)
+    async def slow_close(session_id: str, terminal_id: str, **kwargs: Any) -> bool:
+        closed = await close_terminal(session_id, terminal_id, **kwargs)
         closing.set()
         await finish_close.wait()
         return closed
@@ -568,7 +569,7 @@ async def test_runner_reap_releases_sidecars_when_the_pane_close_fails(
     assert reaper is not None
     forwarder, server = _start_sidecars(conv, "opencode")
 
-    async def failing_close(*_args: object) -> bool:
+    async def failing_close(*_args: object, **_kwargs: object) -> bool:
         raise RuntimeError("pane close failed")
 
     monkeypatch.setattr(resource_registry, "close_terminal", failing_close)
