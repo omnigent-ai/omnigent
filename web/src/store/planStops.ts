@@ -32,6 +32,12 @@ export interface PendingSend {
   content: MessageContentBlock[];
   posted?: boolean;
   replayed?: boolean;
+  /** The server's pending input for this page's native send. */
+  pendingId?: string;
+}
+
+function isAcceptedSend(send: PendingSend): boolean {
+  return send.posted === true || send.replayed === true;
 }
 
 interface PlanStopsState {
@@ -96,7 +102,7 @@ export function latestStopRequest(
   blocks: readonly AnyBlock[],
   pending: readonly PendingSend[],
 ): string[] | null | undefined {
-  const latestPending = pending.findLast((send) => send.posted === true || send.replayed === true);
+  const latestPending = pending.findLast(isAcceptedSend);
   if (latestPending) {
     return isStopPlanMessage(messageText(latestPending.content)) ? [latestPending.tempId] : null;
   }
@@ -129,14 +135,23 @@ export function hasRequestAfter(blocks: readonly AnyBlock[], itemId: string): bo
 }
 
 /**
- * The identities of the stop message the streamed transcript holds as its
- * latest request, if any; with *pending*, of an accepted send too.
+ * The stop message a streamed transcript holds as its latest request: the
+ * identities it goes by, and for a pending send, the server's pending input,
+ * whose receipt names the item it becomes.
  */
-function transcriptStopIdentities(sessionId: string, withPending: boolean): string[] {
+interface TranscriptStop {
+  identities: string[];
+  pendingId?: string;
+}
+
+function transcriptStop(sessionId: string): TranscriptStop | null {
   const state = conversationRegistry.peek(sessionId)?.getState();
-  if (!state) return [];
-  const identities = latestStopRequest(state.blocks, withPending ? state.pendingUserMessages : []);
-  return Array.isArray(identities) ? identities : [];
+  if (!state) return null;
+  const identities = latestStopRequest(state.blocks, state.pendingUserMessages);
+  if (!Array.isArray(identities)) return null;
+  const send = state.pendingUserMessages.findLast(isAcceptedSend);
+  const pendingId = send && (send.pendingId ?? (send.replayed ? send.tempId : undefined));
+  return pendingId ? { identities, pendingId } : { identities };
 }
 
 /** Replace *sessionId*'s request, unless a later Stop already took the place of *current*. */
@@ -187,6 +202,13 @@ function retireStopMessage(sessionId: string, identities: readonly string[]): vo
       },
     };
   });
+}
+
+/** Retire a transcript's stop message, and the item a pending one becomes once its receipt names it. */
+function retireTranscriptStop(sessionId: string, stop: TranscriptStop | null): void {
+  if (!stop) return;
+  retireStopMessage(sessionId, stop.identities);
+  if (stop.pendingId) retireOwnStopMessage(sessionId, { pendingId: stop.pendingId });
 }
 
 /** Retire a Stop's own message, now or once a native receipt names it. */
@@ -281,9 +303,9 @@ export function endPlanStop(sessionId: string, request: PlanStopRequest): void {
 export function supersedePlanStop(sessionId: string | null): () => void {
   if (sessionId === null) return () => undefined;
   const superseded = currentRequest(sessionId);
-  const stopMessage = transcriptStopIdentities(sessionId, false);
+  const stopMessage = transcriptStop(sessionId);
   return () => {
-    retireStopMessage(sessionId, stopMessage);
+    retireTranscriptStop(sessionId, stopMessage);
     const request = currentRequest(sessionId);
     if (superseded === undefined || request?.id !== superseded.id) return;
     if (request.sent) retireOwnStopMessage(sessionId, request);
@@ -309,7 +331,7 @@ function settleIfStopped(sessionId: string): void {
     retireOwnStopMessage(sessionId, request);
     endPlanStop(sessionId, request);
   }
-  retireStopMessage(sessionId, transcriptStopIdentities(sessionId, true));
+  retireTranscriptStop(sessionId, transcriptStop(sessionId));
 }
 
 /** A new surface's ID for {@link watchPlanStop} and {@link reportPlanStopActivity}. */

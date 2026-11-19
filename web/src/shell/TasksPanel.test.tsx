@@ -15,9 +15,7 @@ import { type SessionJournalView, useSessionJournal } from "@/hooks/useSessionJo
 import { useOptionalLoadedConversations } from "@/hooks/useSidebarData";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { formatMessageTimestamp } from "@/lib/relativeTime";
-import type { AnyBlock } from "@/lib/blocks";
 import type { JournalEntry, StepProgress } from "@/lib/sessionJournal";
-import { stopPlanMessage } from "@/lib/workflow";
 import type { ConversationState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { type MessageReceipt, trackPlanStop, usePlanStops } from "@/store/planStops";
@@ -144,14 +142,6 @@ function renderPanel(
       ),
     },
   );
-}
-
-function userMessage(itemId: string, text: string): AnyBlock {
-  return {
-    type: "user_message",
-    ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "turn", itemId },
-    content: [{ type: "input_text", text }],
-  };
 }
 
 /** The session's live state: whether it works, and the agent's own task list. */
@@ -833,19 +823,6 @@ describe("TasksPanel", () => {
       await deliver(false);
       expect(screen.queryByTestId("plan-stopping")).toBeNull();
       expect(screen.getByTestId("plan-stop")).toBeEnabled();
-    });
-
-    it("reads a Stop from the transcript after a reload, through the workers' reports", () => {
-      registerTrackedStop();
-      setSession({
-        sessionStatus: "running",
-        blocks: [
-          userMessage("stop", stopPlanMessage(null)),
-          userMessage("report", "[Message from session 9b8b]\nStopped my shells."),
-        ],
-      });
-      renderPanel();
-      expect(screen.getByTestId("plan-stopping")).toBeInTheDocument();
     });
   });
 

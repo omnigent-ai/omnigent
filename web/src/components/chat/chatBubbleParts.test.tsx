@@ -658,26 +658,10 @@ describe("AssistantBubble error retry", () => {
     expect(useChatStore.getState().failedSendDraft).toBe(draft);
   });
 
-  it("ends a run's Stop once the session accepts the continuation, not when it refuses it", async () => {
-    await trackPlanStop("conv_retry", async () => ({}));
-    fetchMock.mockResolvedValueOnce(jsonResponse({ queued: false, denied: true }));
-    const { unmount } = render(
-      <BubbleView bubble={errorBubble("transient_upstream_error")} isLastAssistant />,
-    );
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
-    await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
-    await act(async () => {});
-    expect(usePlanStops.getState().requests.conv_retry).toMatchObject({ sent: true });
-    unmount();
-
-    fetchMock.mockResolvedValueOnce(jsonResponse({ queued: true, pending_id: "pending_retry" }));
-    render(<BubbleView bubble={errorBubble("transient_upstream_error")} isLastAssistant />);
-    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
-    await waitFor(() => expect(usePlanStops.getState().requests.conv_retry).toBeUndefined());
-  });
-
   it("continues a transient upstream failure in place instead of resuming the runner", async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({ queued: true, pending_id: "pending_retry" }));
+    // The session accepting the continuation also ends a run's Stop.
+    await trackPlanStop("conv_retry", async () => ({}));
     render(<BubbleView bubble={errorBubble("transient_upstream_error")} isLastAssistant />);
 
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
@@ -689,6 +673,7 @@ describe("AssistantBubble error retry", () => {
       type: "message",
       data: { role: "user", content: [{ type: "input_text", text: continuation }] },
     });
+    await waitFor(() => expect(usePlanStops.getState().requests.conv_retry).toBeUndefined());
   });
 
   it.each<[string, ElicitationBlock[]]>([
@@ -762,6 +747,7 @@ describe("AssistantBubble error retry", () => {
     fetchMock.mockResolvedValueOnce(testCase.response());
     const draft = { conversationId: "conv_retry", text: "Keep this draft", files: [] };
     useChatStore.setState({ failedSendDraft: draft });
+    await trackPlanStop("conv_retry", async () => ({}));
     render(<BubbleView bubble={errorBubble()} isLastAssistant />);
 
     fireEvent.click(screen.getByRole("button", { name: "Retry" }));
@@ -771,6 +757,8 @@ describe("AssistantBubble error retry", () => {
     );
     expect(screen.getByRole("button", { name: "Retry" })).toBeEnabled();
     expect(useChatStore.getState().failedSendDraft).toBe(draft);
+    // A run's Stop stays, since the session didn't take the continuation.
+    expect(usePlanStops.getState().requests.conv_retry).toMatchObject({ sent: true });
   });
 
   it.each<Partial<ChatState>>([

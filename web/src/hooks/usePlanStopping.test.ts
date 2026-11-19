@@ -377,7 +377,7 @@ describe("usePlanStopping", () => {
     expect(result.current).toBe(true);
   });
 
-  it("reads a Stop the server replays as pending after a reload", () => {
+  it("reads a Stop the server replays as pending after a reload, until a later request is accepted", async () => {
     const entry = transcript();
     entry.setState({
       blocks: [CONTINUE],
@@ -385,7 +385,18 @@ describe("usePlanStopping", () => {
         { ...pendingSend("pending_srv", stopPlanMessage(null)), replayed: true },
       ],
     });
-    expect(renderStopping(true).result.current).toBe(true);
+    const { result } = renderStopping(true);
+    expect(result.current).toBe(true);
+
+    // A run row's Retry is accepted before either message reaches the transcript.
+    await sendFollowUp()();
+    expect(result.current).toBe(false);
+    // The Stop's receipt arrives, and it commits under its own item.
+    act(() => {
+      notePlanStopReceipt(SESSION, "pending_srv", "stop_srv");
+      entry.setState({ blocks: [CONTINUE, stopMessage("stop_srv")], pendingUserMessages: [] });
+    });
+    expect(result.current).toBe(false);
   });
 
   it("ends a transcript's Stop once the session accepts a follow-up sent outside the chat", async () => {
