@@ -16,6 +16,7 @@ import os
 import signal
 import socket
 import stat
+import subprocess
 import time
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
@@ -38,6 +39,7 @@ from omnigent.api.workspace.v1alpha1.workspace_connect import (
 from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     CONTENT_ENCODING_UTF8,
     ENTRY_TYPE_DIRECTORY,
+    FILE_SEARCH_MODE_SUBSTRING,
     GetCapabilitiesRequest,
     ListDirectoryRequest,
     ReadFileRequest,
@@ -448,12 +450,74 @@ async def test_reader_for_refusal_reaches_the_client(
     assert excinfo.value.code == Code.PERMISSION_DENIED
 
 
+@pytest.mark.parametrize(
+    ("query", "fields"),
+    [
+        ("main", {}),
+        ("src", {}),
+        ("o", {"include": ["*.{py,md}"]}),
+        ("x", {"exclude": ["big.*"]}),
+    ],
+)
+async def test_search_files_matches_the_rest_file_search(
+    tmp_path: Path, client_for: ClientFor, query: str, fields: dict[str, Any]
+) -> None:
+    """With ignored files included, a tree within the walk budget answers as REST does."""
+    root = _workspace(tmp_path)
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    subprocess.run(["git", "-C", str(root), "add", "notes.md", "src"], check=True)
+    (root / ".gitignore").write_text("big.txt\n")
+    reader = WorkspaceReader(root)
+    client = client_for(root)
+
+    response = await client.search_files(
+        SearchFilesRequest(
+            query=query, mode=FILE_SEARCH_MODE_SUBSTRING, include_git_ignored=True, **fields
+        )
+    )
+
+    rest = reader.search(
+        query,
+        include=",".join(fields.get("include", [])) or None,
+        exclude=",".join(fields.get("exclude", [])) or None,
+    )
+    assert [
+        (
+            r.entry.path,
+            "directory" if r.entry.type == ENTRY_TYPE_DIRECTORY else "file",
+            r.entry.size if r.entry.HasField("size") else None,
+        )
+        for r in response.results
+    ] == [(e["path"], e["type"], e["bytes"]) for e in cast("list[dict[str, Any]]", rest["data"])]
+    assert response.truncated is bool(rest["has_more"])
+
+
 async def test_capabilities_list_the_served_methods(tmp_path: Path, client_for: ClientFor) -> None:
     client = client_for(tmp_path)
 
     response = await client.get_capabilities(GetCapabilitiesRequest())
 
-    assert set(response.capabilities) == {"ListDirectory", "ReadFile", "StatPath", "ReadLinkText"}
+    assert set(response.capabilities) == {
+        "ListDirectory",
+        "ReadFile",
+        "StatPath",
+        "ReadLinkText",
+        "SearchFiles",
+        "search_files.substring",
+    }
+
+
+async def test_capabilities_leave_out_methods_whose_tool_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("omnigent.host.workspace_service.shutil.which", lambda _name: None)
+    app = WorkspaceServiceASGIApplication(WorkspaceService(lambda _ctx: WorkspaceReader(tmp_path)))
+    client = _connect(app, "http://workspace.test", ProtocolType.CONNECT)
+
+    response = await client.get_capabilities(GetCapabilitiesRequest())
+
+    assert "SearchFiles" not in response.capabilities
+    assert "search_files.substring" not in response.capabilities
 
 
 async def test_methods_not_served_yet_answer_unimplemented(

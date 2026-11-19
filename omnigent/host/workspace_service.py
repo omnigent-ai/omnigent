@@ -55,11 +55,14 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     ReadFileResponse,
     ReadLinkTextRequest,
     ReadLinkTextResponse,
+    SearchFilesRequest,
+    SearchFilesResponse,
     StatPathRequest,
     StatPathResponse,
 )
 from omnigent.host.frames import HostWorkspaceCallFrame, HostWorkspaceReplyFrame
 from omnigent.host.workspace_methods import WORKSPACE_METHODS
+from omnigent.host.workspace_search import search_files
 from omnigent.host.workspace_tokens import new_token_key, verify_token
 from omnigent.inner.async_utils import run_sync_on_thread
 from omnigent.util.uvicorn_server import NoSignalServer
@@ -99,6 +102,7 @@ _SERVED: dict[str, _Served] = {
     "ReadFile": _Served(),
     "StatPath": _Served(),
     "ReadLinkText": _Served(),
+    "SearchFiles": _Served(features=("search_files.substring",), tool="git"),
 }
 
 
@@ -194,6 +198,14 @@ class WorkspaceService(WorkspaceServiceMethods):
         reader = await _read(self._reader_for, ctx)
         item, is_symlink = await _read(reader.stat_entry, request.path)
         return StatPathResponse(entry=_entry(item, is_symlink=is_symlink))
+
+    async def search_files(
+        self,
+        request: SearchFilesRequest,
+        ctx: RequestContext[SearchFilesRequest, SearchFilesResponse] | None,
+    ) -> SearchFilesResponse:
+        reader = await _read(self._reader_for, ctx)
+        return await search_files(reader.root, request)
 
     async def read_link_text(
         self,
