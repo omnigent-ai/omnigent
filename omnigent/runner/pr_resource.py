@@ -185,7 +185,7 @@ def _add_workspace_repo(root: str, info: dict[str, Any]) -> None:
 
     ``repo`` names a tracked PR's repo, which can differ from the checkout's. In a
     fork checkout ``origin`` is the fork, so gh's resolved base, then a remote of the
-    tracked repo, take precedence over it.
+    tracked repo on origin's host, take precedence over it.
     """
     if "workspace_repo" in info:
         return
@@ -210,9 +210,19 @@ def _add_workspace_repo(root: str, info: dict[str, Any]) -> None:
         return parsed.repository.lower() == tracked_name and tracked_host in ("", parsed.host)
 
     # remote_urls lists origin first, so the last fallback is origin when it parses.
+    # A tracked remote on another host must not move the workspace off origin's host,
+    # e.g. a github.com mirror of an Enterprise checkout.
+    fallback = remotes[0]
     _, parsed = next(
         (remote for remote in remotes if resolved.get(remote[0]) == "base"),
-        next((remote for remote in remotes if is_tracked(remote[1])), remotes[0]),
+        next(
+            (
+                remote
+                for remote in remotes
+                if remote[1].host == fallback[1].host and is_tracked(remote[1])
+            ),
+            fallback,
+        ),
     )
     info["workspace_repo"] = {"name_with_owner": parsed.repository, "host": parsed.host}
 

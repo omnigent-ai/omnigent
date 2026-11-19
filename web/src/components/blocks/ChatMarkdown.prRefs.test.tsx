@@ -3,7 +3,7 @@
 // message has rendered, so these tests also pin that a late answer still links.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
@@ -188,9 +188,9 @@ describe("pull request references in chat markdown", () => {
     );
     const calls = githubInfoRequests().length;
     renderMarkdown("And #4243");
-    await new Promise((resolve) => {
-      setTimeout(resolve, 50);
-    });
+    // A mount-time refetch starts in the mount effect and fetches after a microtask.
+    await act(async () => {});
+    expect(client.getQueryState(["github-info", CONVERSATION_ID])?.fetchStatus).toBe("idle");
     expect(githubInfoRequests()).toHaveLength(calls);
   });
 

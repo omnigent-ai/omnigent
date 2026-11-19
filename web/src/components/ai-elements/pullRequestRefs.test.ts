@@ -29,7 +29,7 @@ function refHrefs(text: string): string[] {
 
 describe("splitPullRequestRefs", () => {
   it("parks bare and explicit references, keeping the surrounding text", () => {
-    expect(splitPullRequestRefs("Fixed in #4242, see acme/app#12.")).toEqual([
+    expect(splitPullRequestRefs("Fixed in #4242, see acme/app#12 (#1234).")).toEqual([
       { type: "text", value: "Fixed in " },
       {
         type: "link",
@@ -44,7 +44,15 @@ describe("splitPullRequestRefs", () => {
         title: null,
         children: [{ type: "text", value: "acme/app#12" }],
       },
-      { type: "text", value: "." },
+      // The boundary character before a reference stays in the text.
+      { type: "text", value: " (" },
+      {
+        type: "link",
+        url: "#omnigent-pr-1234",
+        title: null,
+        children: [{ type: "text", value: "#1234" }],
+      },
+      { type: "text", value: ")." },
     ]);
   });
 
@@ -102,19 +110,6 @@ describe("splitPullRequestRefs", () => {
 
   it("keeps the boundary check free of lookbehind, which Safari < 16.4 can't parse", () => {
     expect(PULL_REQUEST_REF.source).not.toMatch(/\(\?<[=!]/);
-  });
-
-  it("splits a reference preceded by its boundary character", () => {
-    expect(splitPullRequestRefs("x (#1234)")).toEqual([
-      { type: "text", value: "x (" },
-      {
-        type: "link",
-        url: "#omnigent-pr-1234",
-        title: null,
-        children: [{ type: "text", value: "#1234" }],
-      },
-      { type: "text", value: ")" },
-    ]);
   });
 });
 

@@ -238,26 +238,36 @@ def test_tracked_pr_info_names_the_workspace_repo(
     assert info.get("workspace_repo") == workspace_repo
 
 
+GITHUB_FORK = "https://github.com/me/app.git"
+ENTERPRISE_ORIGIN = "https://ghe.example.com/owner/app.git"
+
+
 @pytest.mark.parametrize(
-    ("gh_resolved", "tracked_repo", "workspace_repo"),
+    ("origin", "gh_resolved", "tracked_repo", "workspace_repo"),
     [
         # A fork checkout: gh resolves bare refs against upstream, not the fork.
-        ("upstream", "owner/app", "owner/app"),
-        ("upstream", "owner/other", "owner/app"),
+        (GITHUB_FORK, "upstream", "owner/app", ("owner/app", "github.com")),
+        (GITHUB_FORK, "upstream", "owner/other", ("owner/app", "github.com")),
         # gh's resolved base wins over a remote of the tracked repo.
-        ("origin", "owner/app", "me/app"),
-        (None, "owner/app", "owner/app"),
-        (None, "owner/other", "me/app"),
+        (GITHUB_FORK, "origin", "owner/app", ("me/app", "github.com")),
+        (GITHUB_FORK, None, "owner/app", ("owner/app", "github.com")),
+        (GITHUB_FORK, None, "owner/other", ("me/app", "github.com")),
+        # A public mirror of the tracked repo must not move bare refs off Enterprise.
+        (ENTERPRISE_ORIGIN, None, "owner/app", ("owner/app", "ghe.example.com")),
+        # gh's own choice still wins on any host.
+        (ENTERPRISE_ORIGIN, "upstream", "owner/app", ("owner/app", "github.com")),
     ],
 )
 def test_tracked_pr_info_picks_the_workspace_remote_like_gh(
     repo: Path,
     monkeypatch: pytest.MonkeyPatch,
+    origin: str,
     gh_resolved: str | None,
     tracked_repo: str,
-    workspace_repo: str,
+    workspace_repo: tuple[str, str],
 ) -> None:
-    _git(repo, "remote", "add", "origin", "https://github.com/me/app.git")
+    monkeypatch.setenv("GH_HOST", "ghe.example.com")
+    _git(repo, "remote", "add", "origin", origin)
     _git(repo, "remote", "add", "upstream", "https://github.com/owner/app.git")
     if gh_resolved is not None:
         _git(repo, "config", f"remote.{gh_resolved}.gh-resolved", "base")
@@ -270,7 +280,8 @@ def test_tracked_pr_info_picks_the_workspace_remote_like_gh(
     info = pr_resource.pr_info(str(repo), session_id="session")
 
     assert info["repo"] == {"name_with_owner": tracked_repo, "host": "github.com"}
-    assert info["workspace_repo"] == {"name_with_owner": workspace_repo, "host": "github.com"}
+    name_with_owner, host = workspace_repo
+    assert info["workspace_repo"] == {"name_with_owner": name_with_owner, "host": host}
 
 
 def test_a_directory_outside_git_reports_not_a_git_repo_from_github(tmp_path: Path) -> None:
