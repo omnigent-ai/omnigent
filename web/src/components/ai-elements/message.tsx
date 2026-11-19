@@ -811,8 +811,7 @@ export const MessageResponse = memo(
           <LocalReviewCommentRendererContext.Provider value={renderLocalReviewComment}>
             <StreamingTextContext.Provider value={isStreaming}>
               <MessageMarkdownContext.Provider value={messageMarkdown}>
-                {/* Streamdown is memoized and its comparator ignores the mermaid prop,
-              so remount on theme change to recolor already-rendered diagrams. */}
+                {/* Remount on theme change: Streamdown's memo ignores the mermaid prop. */}
                 <Streamdown
                   key={themeMode}
                   // wrap-anywhere is inherited, giving every prose descendant (including inline code) a break opportunity.

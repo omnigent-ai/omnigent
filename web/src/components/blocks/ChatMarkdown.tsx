@@ -59,7 +59,7 @@ import {
   SESSION_ID_REFERENCE_HREF,
   parseSessionIdReferenceTitle,
   remarkSessionIdReferences,
-  mentionsCompleteSessionId,
+  sessionIdMayStillGrow,
   type SessionIdReferenceTarget,
 } from "@/lib/sessionIdReferences";
 import { useSessionLabel } from "@/hooks/useSessionLabel";
@@ -653,7 +653,7 @@ function SessionIdReference({
   // An id that ends a block may be the start of a longer token that is still streaming in.
   const markdown = useMessageMarkdown();
   const streaming = useIsStreamingText();
-  const pending = trailing && !mentionsCompleteSessionId(markdown, id, streaming);
+  const pending = trailing && sessionIdMayStillGrow(markdown, id, streaming);
   const label = useSessionLabel(pending ? null : id, useFileViewerConversationId() ?? null);
   if (!label) return children;
   return (

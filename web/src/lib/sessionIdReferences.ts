@@ -10,19 +10,19 @@ export const SESSION_ID_REFERENCE_HREF = "#session-id";
 const CLOSING_PUNCTUATION = `)\\]}"'”’*_~.,;:!?`;
 const SESSION_ID_WORD_RE = new RegExp(`^([([{"'“‘*_~]*)([0-9a-f]{32})([${CLOSING_PUNCTUATION}]*)$`);
 const EXACT_SESSION_ID_RE = /^[0-9a-f]{32}$/;
+const TRAILING_CLOSING_PUNCTUATION_RE = new RegExp(`[${CLOSING_PUNCTUATION}]+$`);
 
 // Marks the id that ends a parsed block, which may still be growing while text streams in.
 const TRAILING_SUFFIX = ":end";
 
-/** Whether `markdown` names `id` as a whole word, apart from a last word still streaming in. */
-export function mentionsCompleteSessionId(
-  markdown: string,
-  id: string,
-  streaming: boolean,
-): boolean {
-  const words = markdown.split(/\s+/);
-  if (streaming && !/\s$/.test(markdown)) words.pop();
-  return words.some((word) => SESSION_ID_WORD_RE.exec(word.replace(/`/g, ""))?.[2] === id);
+/** Whether a reference to `id` that ends a block may be the start of a longer token. */
+export function sessionIdMayStillGrow(markdown: string, id: string, streaming: boolean): boolean {
+  if (streaming && markdown.replace(TRAILING_CLOSING_PUNCTUATION_RE, "").endsWith(id)) return true;
+  // A block rendered from older text is stale when every mention of the id now runs on.
+  for (let at = markdown.indexOf(id); at !== -1; at = markdown.indexOf(id, at + 1)) {
+    if (!/[0-9A-Za-z]/.test(markdown.charAt(at + id.length))) return false;
+  }
+  return true;
 }
 
 interface MarkdownNode {
@@ -74,6 +74,7 @@ const OPAQUE_INLINE_TYPES = new Set([
 const OPAQUE_CHARACTER = "\u0000";
 const OPENING_ANCHOR_RE = /^<a[\s>]/i;
 const CLOSING_ANCHOR_RE = /^<\/a\s*>/i;
+const SELF_CONTAINED_ANCHOR_RE = /<\/a\s*>|\/>\s*$/i;
 
 interface InlineLeaf {
   node: MarkdownNode;
@@ -96,9 +97,12 @@ function inlineRuns(tree: MarkdownNode): InlineRun[] {
   const flush = () => {
     if (run.leaves.length) runs.push(run);
     run = { text: "", leaves: [] };
+    anchorDepth = 0;
   };
   const visit = (parent: MarkdownNode) => {
     for (const child of parent.children ?? []) {
+      // An authored link cannot pose as a reference by copying the marker title.
+      if (parseSessionIdReferenceTitle(child.title)) child.title = null;
       if (child.type === "text" || child.type === "inlineCode") {
         const value = child.value ?? "";
         const start = run.text.length;
@@ -116,10 +120,9 @@ function inlineRuns(tree: MarkdownNode): InlineRun[] {
         visit(child);
       } else if (OPAQUE_INLINE_TYPES.has(child.type)) {
         // Raw HTML anchors are separate open and close nodes around their text.
-        if (child.type === "html" && OPENING_ANCHOR_RE.test(child.value ?? "")) anchorDepth += 1;
-        else if (child.type === "html" && CLOSING_ANCHOR_RE.test(child.value ?? "")) {
-          anchorDepth = Math.max(0, anchorDepth - 1);
-        }
+        const html = child.type === "html" ? (child.value ?? "") : "";
+        if (OPENING_ANCHOR_RE.test(html) && !SELF_CONTAINED_ANCHOR_RE.test(html)) anchorDepth += 1;
+        else if (CLOSING_ANCHOR_RE.test(html)) anchorDepth = Math.max(0, anchorDepth - 1);
         run.text += OPAQUE_CHARACTER;
       } else {
         flush();

@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   parseSessionIdReferenceTitle,
   remarkSessionIdReferences,
-  mentionsCompleteSessionId,
+  sessionIdMayStillGrow,
 } from "./sessionIdReferences";
 
 const ID = "e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9";
@@ -97,17 +97,23 @@ describe("remarkSessionIdReferences", () => {
   });
 
   it.each([
-    [`Open ${ID}`, false, true],
-    [`Open \`${ID}\``, false, true],
-    [`Open **${ID}**.`, false, true],
-    [`Open ${ID}ab`, false, false],
-    [`Open ${ID}`, true, false],
-    [`Open **${ID}**.`, true, false],
-    [`Open ${ID} `, true, true],
-    [`Open ${ID}\n\nThen`, true, true],
-  ])("finds a complete id in %j (streaming: %s)", (markdown, streaming, complete) => {
-    expect(mentionsCompleteSessionId(markdown, ID, streaming)).toBe(complete);
-  });
+    [`Open ${ID}`, false, false],
+    [`| a |${ID}|`, false, false],
+    [`Open ${ID}\\.`, false, false],
+    [`Open ${ID}ab`, false, true],
+    [`Open ${ID}`, true, true],
+    [`Open **${ID}**.`, true, true],
+    [`${ID} and then ${ID}`, true, true],
+    [`Open ${ID}ab`, true, true],
+    [`Open \`${ID}\``, true, false],
+    [`Open ${ID} `, true, false],
+    [`Open ${ID}\n\nThen`, true, false],
+  ])(
+    "knows whether the id ending %j may still grow (streaming: %s)",
+    (markdown, streaming, grows) => {
+      expect(sessionIdMayStillGrow(markdown, ID, streaming)).toBe(grows);
+    },
+  );
 
   it("leaves link text, partial inline code and fenced code alone", () => {
     const link = {

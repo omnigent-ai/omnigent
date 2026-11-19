@@ -158,12 +158,22 @@ describe("bare session ids in chat", () => {
     ]);
   });
 
-  it("finds an id that formatting wraps", async () => {
-    renderMarkdown(`Open **${WORKER}**. Or _(${WORKER})_`, cachedWorker());
-    expect((await screen.findAllByTestId("mention-pill")).map((pill) => pill.textContent)).toEqual([
-      "@Build worker",
-      "@Build worker",
-    ]);
+  it("finds an id that formatting wraps, follows an anchor or ends a table", async () => {
+    renderMarkdown(
+      [
+        `Open **${WORKER}**. Or _(${WORKER})_`,
+        "",
+        `<a name="top"/> and <a href="https://example.com/raw">raw</a> then ${WORKER}`,
+        "",
+        "| Worker |",
+        "| --- |",
+        `|${WORKER}|`,
+      ].join("\n"),
+      cachedWorker(),
+    );
+    expect((await screen.findAllByTestId("mention-pill")).map((pill) => pill.textContent)).toEqual(
+      Array(4).fill("@Build worker"),
+    );
   });
 
   it("waits for a streamed id at the end of the text to finish before looking it up", async () => {
@@ -188,9 +198,12 @@ describe("bare session ids in chat", () => {
     expect((await screen.findByTestId("mention-pill")).textContent).toBe("@Build worker");
   });
 
-  it("keeps an authored link that only borrows the reference title", () => {
+  it("keeps an authored link that copies the reference marker", () => {
     renderMarkdown(
-      `[docs](https://example.com/run "omnigent-session-id:${WORKER}")`,
+      [
+        `[docs](https://example.com/run "omnigent-session-id:${WORKER}")`,
+        `[Click me](#session-id "omnigent-session-id:${WORKER}")`,
+      ].join(" and "),
       cachedWorker(),
     );
     expect(screen.queryByTestId("mention-pill")).not.toBeInTheDocument();
@@ -198,5 +211,6 @@ describe("bare session ids in chat", () => {
       "href",
       "https://example.com/run",
     );
+    expect(screen.getByRole("link", { name: "Click me" })).toHaveAttribute("href", "#session-id");
   });
 });
