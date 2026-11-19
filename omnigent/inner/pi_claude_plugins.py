@@ -55,6 +55,9 @@ def _resolve(value: str | Path, *, user_entry: bool = False) -> Path | None:
     must be absolute, since a relative entry is Pi's to resolve. Failures are warned
     about and skipped, so they never abort a launch.
     """
+    if "\0" in str(value):
+        _logger.warning("Ignoring Pi resource path %r: contains a NUL byte", str(value)[:200])
+        return None
     try:
         path = Path(value).expanduser() if user_entry else Path(value)
         if user_entry and not path.is_absolute():
@@ -209,6 +212,9 @@ def add_claude_plugin_resources(settings: _Settings, managed_dir: Path) -> _Sett
     which also governs its skills. Other plugins contribute each skill directory.
     Commands are regenerated under *managed_dir* on every call, so disabled or removed
     plugins leave nothing behind.
+
+    The feature flag is read from this process's environment, which is the runner or
+    host that launches Pi; a server-only setting does not reach it.
 
     :param settings: The managed settings after user relocation, before overlays.
     :param managed_dir: The managed agent dir the settings are written into.

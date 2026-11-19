@@ -39,8 +39,9 @@ implements them separately, so a fix for one harness does not reach the others.
 - `pi-host-mcp`: managed Pi sessions (pi-native with an Omnigent provider, and the
   Pi gateway executor) also get the MCP servers configured for Claude Code, Codex
   and Cursor; the user's own `~/.pi/agent/mcp.json` entries win and it is not written.
-- `pi-claude-plugins`: with `OMNIGENT_FEATURES=pi_claude_plugins`, managed Pi sessions
-  (pi-native and the Pi gateway executor) load the skills, `/<plugin>:<command>`
+- `pi-claude-plugins`: with `OMNIGENT_FEATURES=pi_claude_plugins` in the environment of
+  the host or runner process that launches Pi, managed Pi sessions (pi-native and the
+  Pi gateway executor) load the skills, `/<plugin>:<command>`
   prompts and Pi packages of the Claude Code plugins enabled for the user. Disabled
   plugins stay out, and a resource the user's Pi settings already list by the same
   path is not added again. Excluding one resource of a plugin is not supported yet:
@@ -1257,7 +1258,8 @@ Cross-harness journeys:
   that variable, for example through `OMNIGENT_RUNNER_ENV_PASSTHROUGH=VAR`.
 - **`pi-claude-plugins`:** run `tests/inner/test_pi_claude_plugins.py` and
   `tests/e2e/omnigent/test_pi_claude_plugins_e2e.py` (real Pi, mock model). Manually,
-  start the instance with `OMNIGENT_FEATURES=pi_claude_plugins`, enable a marketplace
+  set `OMNIGENT_FEATURES=pi_claude_plugins` in the environment of the host or runner that
+  launches Pi (a server-only setting does not reach it), enable a marketplace
   plugin with a skill and a command in Claude Code, then start `omnigent pi` with an
   Omnigent provider. Run `/<plugin>:<command> focus`: the body expands with the
   arguments. The skill is listed for the model and `/skill:<name>` works. Disable the

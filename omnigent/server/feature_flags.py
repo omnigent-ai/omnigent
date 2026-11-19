@@ -304,7 +304,7 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
     FeatureDefinition(
         feature=Feature.PI_CLAUDE_PLUGINS,
         description="Expose enabled Claude Code plugins to managed Pi sessions",
-        owner="server",
+        owner="runner",
         review_by_release="0.24.0",
         frontend_visible=False,
     ),

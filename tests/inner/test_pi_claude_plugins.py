@@ -276,10 +276,10 @@ def test_overlong_generated_command_name_is_skipped(claude_dir: Path, tmp_path: 
     assert [p.name for p in _prompts(managed).iterdir()] == ["demo:ok.md"]
 
 
-def test_unresolvable_user_entries_never_abort_and_are_warned(
-    claude_dir: Path, tmp_path: Path, caplog: pytest.LogCaptureFixture
+def test_unresolvable_user_entries_do_not_abort_preparation(
+    claude_dir: Path, tmp_path: Path
 ) -> None:
-    """Symlink loops, NUL bytes and unknown ``~user`` prefixes are skipped with a warning."""
+    """Symlink loops, NUL bytes and unknown ``~user`` entries leave the other entries working."""
     root = _install(claude_dir, "dp@market", files=_skill("review"))
     loop_a, loop_b = tmp_path / "loop-a", tmp_path / "loop-b"
     loop_a.symlink_to(loop_b)
@@ -293,26 +293,21 @@ def test_unresolvable_user_entries_never_abort_and_are_warned(
 
     assert result["skills"] == [*settings["skills"], str(root / "skills" / "review")]
     assert result["packages"] == settings["packages"]
-    assert "Ignoring Pi resource path" in caplog.text
 
 
-@pytest.mark.parametrize(
-    "settings",
-    [
-        {"skills": ["~nonexistent_user_zz/skills"], "prompts": ["bad\0prompt"]},
-        {"packages": ["/does/not/matter", "~nonexistent_user_zz/pkg"]},
-    ],
-    ids=["skills-and-prompts", "packages"],
-)
-def test_no_plugins_leaves_settings_unchanged(
-    claude_dir: Path, tmp_path: Path, settings: dict
-) -> None:
+def test_no_plugins_leaves_settings_unchanged(claude_dir: Path, tmp_path: Path) -> None:
     """With no plugins enabled, unusable user entries come back exactly as written."""
+    settings = {
+        "skills": ["~nonexistent_user_zz/skills"],
+        "prompts": ["bad\0prompt"],
+        "packages": ["/does/not/matter", "~nonexistent_user_zz/pkg"],
+    }
     assert add_claude_plugin_resources(settings, tmp_path / "managed") == settings
 
 
 _KINDS = ("absolute", "tilde", "relative", "prefixed", "tilde_unknown_user", "symlink_loop", "nul")
 _LISTED = {"absolute", "tilde"}
+_UNRESOLVABLE = {"tilde_unknown_user", "symlink_loop", "nul"}
 _CONSUMERS = {"skills": "skills", "packages": "packages", "commands": "prompts"}
 
 
@@ -323,6 +318,7 @@ def test_user_entry_table(
     claude_dir: Path,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A user entry claims a plugin resource only when it lists that resource by path."""
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -361,6 +357,8 @@ def test_user_entry_table(
     else:
         bridged = str(root) in added
     assert bridged == (kind not in _LISTED), f"{kind} for {consumer}"
+    if kind in _UNRESOLVABLE:
+        assert "Ignoring Pi resource path" in caplog.text
 
 
 def _loop(tmp_path: Path) -> str:
@@ -391,10 +389,10 @@ def test_native_provider_launch_writes_plugin_entries(claude_dir: Path, tmp_path
     assert written["skills"] == [str(root / "skills" / "review")]
 
 
-def test_walk_budgets_bound_files_directories_depth_and_entries(
+def test_entries_read_per_directory_are_bounded_before_sorting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Each budget stops the walk: entries read per directory, files, directories, depth."""
+    """Entries read from one directory are capped before sorting, however many exist."""
     crowded = tmp_path / "crowded"
     crowded.mkdir()
     for index in range(module._MAX_ENTRIES_PER_DIR + 200):
@@ -411,23 +409,45 @@ def test_walk_budgets_bound_files_directories_depth_and_entries(
     monkeypatch.setattr(pathlib.Path, "iterdir", counting)
     assert module._walk(crowded, lambda n: n.endswith(".md"), MAX_PLUGIN_FILES) == []
     assert read <= module._MAX_ENTRIES_PER_DIR
-    monkeypatch.undo()
 
+
+def test_file_budget_caps_the_matches(tmp_path: Path) -> None:
+    """A walk returns at most the file limit."""
     many = tmp_path / "many"
     many.mkdir()
     for index in range(MAX_PLUGIN_FILES + 40):
         (many / f"c{index:04d}.md").write_text("x", encoding="utf-8")
-    assert (
-        len(module._walk(many, lambda n: n.endswith(".md"), MAX_PLUGIN_FILES)) == MAX_PLUGIN_FILES
-    )
 
+    found = module._walk(many, lambda n: n.endswith(".md"), MAX_PLUGIN_FILES)
+
+    assert len(found) == MAX_PLUGIN_FILES
+
+
+def test_directory_budget_stops_descending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With a directory budget of three, only the root and two child directories are read."""
+    monkeypatch.setattr(module, "_MAX_WALK_DIRS", 3)
     tree = tmp_path / "tree"
-    deep = tree.joinpath(*[f"l{level}" for level in range(module._MAX_WALK_DEPTH + 2)])
-    deep.mkdir(parents=True)
-    (deep / "deep.md").write_text("x", encoding="utf-8")
-    for index in range(module._MAX_WALK_DIRS + 40):
-        (tree / f"d{index:03d}").mkdir()
-        (tree / f"d{index:03d}" / "leaf.md").write_text("x", encoding="utf-8")
+    for index in range(5):
+        (tree / f"d{index}").mkdir(parents=True)
+        (tree / f"d{index}" / "leaf.md").write_text("x", encoding="utf-8")
+
     found = module._walk(tree, lambda n: n.endswith(".md"), MAX_PLUGIN_FILES)
-    assert all(len(relative) < module._MAX_WALK_DEPTH for relative, _ in found)
-    assert len(found) < module._MAX_WALK_DIRS + 40
+
+    assert len(found) == 2
+
+
+def test_depth_budget_stops_descending(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """With a depth limit of two, a file two levels down is read; one three levels down is not."""
+    monkeypatch.setattr(module, "_MAX_WALK_DEPTH", 2)
+    tree = tmp_path / "tree"
+    (tree / "a" / "b" / "c").mkdir(parents=True)
+    (tree / "a" / "b" / "inside.md").write_text("x", encoding="utf-8")
+    (tree / "a" / "b" / "c" / "outside.md").write_text("x", encoding="utf-8")
+
+    names = {
+        file.name for _, file in module._walk(tree, lambda n: n.endswith(".md"), MAX_PLUGIN_FILES)
+    }
+
+    assert names == {"inside.md"}
