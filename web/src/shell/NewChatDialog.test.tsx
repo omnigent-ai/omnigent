@@ -14513,11 +14513,25 @@ describe("New Chat composer engine", () => {
     expect(editor).not.toHaveAttribute("data-slash-command");
   });
 
-  it("tints a claude-native `!` in CodeMirror, even with its command right after it", async () => {
+  it("tints a claude-native `!` in CodeMirror, even with its command right after it, and sends it unchanged", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
     const editor = await typeInEditor("claude-native", "!pwd");
     expect(commandMarks()).toEqual([["!", COMMAND_TOKEN_CLASS]]);
     expect(editor).toHaveAttribute("data-shell-command", "true");
     expect(editor).toHaveAccessibleDescription("Shell command");
+
+    const submit = screen.getByTestId("new-chat-landing-submit");
+    await waitFor(() => expect(submit).toBeEnabled());
+    fireEvent.click(submit);
+    await waitFor(() =>
+      expect(setPendingInitialPromptMock).toHaveBeenCalledWith(
+        "conv_new",
+        expect.objectContaining({ text: "!pwd" }),
+      ),
+    );
   });
 
   it("keeps the textarea when the flag is off", () => {

@@ -875,8 +875,8 @@ describe("UserBubble command tint", () => {
     vi.unstubAllGlobals();
   });
 
-  function renderScoped(bubble: Bubble, publish: ReactNode) {
-    return render(
+  function scopedTree(bubble: Bubble, publish: ReactNode) {
+    return (
       <QueryClientProvider client={queryClient}>
         <ConversationScopeContext.Provider value="conv_cmd">
           {publish}
@@ -884,8 +884,11 @@ describe("UserBubble command tint", () => {
             <BubbleView bubble={bubble} />
           </FileViewerContext.Provider>
         </ConversationScopeContext.Provider>
-      </QueryClientProvider>,
+      </QueryClientProvider>
     );
+  }
+  function renderScoped(bubble: Bubble, publish: ReactNode) {
+    return render(scopedTree(bubble, publish));
   }
 
   it("tints a known command the composer published, keeping the args in its paragraph", () => {
@@ -902,17 +905,7 @@ describe("UserBubble command tint", () => {
     const text = () => screen.getByTestId("user-message-content").textContent;
     expect(tinted()).not.toBeNull();
 
-    const rerender = (publish: ReactNode) =>
-      view.rerender(
-        <QueryClientProvider client={queryClient}>
-          <ConversationScopeContext.Provider value="conv_cmd">
-            {publish}
-            <FileViewerContext.Provider value={SCOPED_FILE_VIEWER}>
-              <BubbleView bubble={bubble} />
-            </FileViewerContext.Provider>
-          </ConversationScopeContext.Provider>
-        </QueryClientProvider>,
-      );
+    const rerender = (publish: ReactNode) => view.rerender(scopedTree(bubble, publish));
     rerender(<PublishCommands commands={["/help"]} />);
     expect(tinted()).toBeNull();
     expect(text()).toBe("/team fix it");

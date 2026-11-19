@@ -10041,17 +10041,19 @@ describe("Composer with the CodeMirror release flag on", () => {
     expect(editor).not.toHaveAttribute("data-slash-command");
   });
 
-  it("tints a codex-native owner's `!` in the editor and marks it as a shell command", async () => {
+  it("tints a codex-native owner's `!` in the editor and sends the shell command unchanged", async () => {
     const { sessionHarness } = useChatStore.getState();
     onTestFinished(() => useChatStore.setState({ sessionHarness }));
     setComposerState({ conversationId: "conv_codemirror_shell", skills: [], blocks: [] });
     useChatStore.setState({ sessionHarness: "codex-native" });
-    const editor = await renderEditor(
-      composerProps({ isNativeWrapper: true, permissionLevel: null }),
-    );
+    const props = composerProps({ isNativeWrapper: true, permissionLevel: null });
+    const editor = await renderEditor(props);
     act(() => insertComposerText(composerTargetOf(editor)!, "!git status"));
     expect(commandMarks()).toEqual([["!", COMMAND_TOKEN_CLASS]]);
     expect(editor).toHaveAttribute("data-shell-command", "true");
     expect(editor).toHaveAccessibleDescription("Shell command");
+
+    fireEvent.keyDown(editor, { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledExactlyOnceWith("!git status", undefined);
   });
 });

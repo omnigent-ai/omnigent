@@ -3395,13 +3395,18 @@ describe("side-chat composer engine", () => {
     expect(commandMarks()).toEqual([]);
   });
 
-  it("tints a codex-native owner's `!` in CodeMirror and marks the editor as a shell command", async () => {
+  it("tints a codex-native owner's `!` in CodeMirror and sends the shell command unchanged", async () => {
     conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
     renderPane(withFlag(true));
     const editor = await typeInEditor("!git status");
     expect(commandMarks()).toEqual([["!", COMMAND_TOKEN_CLASS]]);
     expect(editor).toHaveAttribute("data-shell-command", "true");
     expect(editor).toHaveAccessibleDescription("Shell command");
+
+    fireEvent.keyDown(editor, { key: "Enter" });
+    expect(send).toHaveBeenCalledExactlyOnceWith("!git status", "agent_side", undefined, {
+      pinnedConversationId: childId,
+    });
   });
 
   it("keeps the textarea when the flag is off", () => {
