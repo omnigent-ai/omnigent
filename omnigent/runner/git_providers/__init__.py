@@ -60,7 +60,9 @@ Additive fields:
 - ``repo.host``: the host of the repository's forge instance, e.g. ``"github.com"``;
   omitted when the provider doesn't know it.
 - ``workspace_repo``: ``{name_with_owner, host}`` of the workspace checkout's own
-  repository, whichever PR ``repo`` describes; omitted when no remote names one.
+  repository, whichever PR ``repo`` describes. Omitted on explicit PR reads and when
+  the preferred remote (gh's resolved base, else origin) isn't recognized on that
+  host; with no remotes, the provider's answer (e.g. from ``GH_REPO``) stands.
 - PR associations in ``prs`` carry ``provider``.
 - The dispatcher adds descriptor ``provider_display`` to info and associations.
 - ``checks`` may also count ``cancelled`` and ``skipped`` jobs, with matching ``runs``

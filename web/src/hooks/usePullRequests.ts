@@ -304,8 +304,8 @@ export interface PullRequestInfo {
   branch?: string;
   /** The selected PR's repo when one is tracked, else the workspace's. */
   repo?: PullRequestRepo | null;
-  /** The workspace checkout's own repo, whatever PR is selected; absent from older hosts
-   *  and when no remote names one. */
+  /** The workspace checkout's own repo, whatever PR is selected; absent from older hosts,
+   *  explicit PR reads, and checkouts whose preferred remote isn't recognized. */
   workspace_repo?: PullRequestRepo;
   /** The PR's base branch; null when there's no PR (the tab is a PR view). */
   base_ref?: string | null;

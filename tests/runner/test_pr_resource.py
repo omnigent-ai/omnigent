@@ -238,6 +238,18 @@ def test_tracked_pr_info_names_the_workspace_repo(
     assert info.get("workspace_repo") == workspace_repo
 
 
+def test_without_remotes_the_provider_names_the_workspace_repo(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No remote can vet gh's answer, which then comes from the user's ``GH_REPO``."""
+    view = {"nameWithOwner": "owner/app", "url": "https://github.com/owner/app"}
+    _stub_gh(monkeypatch, {("repo", "view"): (0, json.dumps(view), "")})
+
+    info = pr_resource.pr_info(str(repo), session_id="session")
+
+    assert info["workspace_repo"] == {"name_with_owner": "owner/app", "host": "github.com"}
+
+
 def test_an_explicit_pr_read_names_no_workspace_repo(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
