@@ -13,7 +13,10 @@ export interface WorkflowDetail extends SavedWorkflow {
   planning_session_id?: string | null;
   /** Epoch seconds of its last write. */
   updated_at?: number;
-  /** The planning chat's proposal the description was saved from, until written otherwise. */
+  /**
+   * The planning chat's proposal the description was saved from or kept over, until written
+   * otherwise.
+   */
   description_source?: string | null;
 }
 

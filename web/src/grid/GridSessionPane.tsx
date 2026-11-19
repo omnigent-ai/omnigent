@@ -15,9 +15,10 @@ import { isFeatureEnabled } from "@/lib/capabilities";
 import { cn } from "@/lib/utils";
 import { Maximize2Icon, XIcon } from "lucide-react";
 import { SideChatPane } from "@/components/chat/SideChatPane";
-import { COMPOSER_COLLAPSED_LABEL_CLASS } from "@/components/composer/ChatComposer";
+import { SessionHarnessPicker } from "@/components/composer/SessionHarnessPicker";
+import { useSessionPickerInputs } from "@/components/composer/sessionPickerInputs";
+import { useSessionHarnessPickerProps } from "@/components/composer/useSessionHarnessPickerProps";
 import { ComposerPermissionPicker } from "@/components/composer/ComposerControls";
-import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
 import { HostBadge } from "@/components/HostBadge";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { Button } from "@/components/ui/button";
@@ -37,14 +38,11 @@ import {
 import { terminalTabKey, useDeleteTerminal } from "@/hooks/useTerminals";
 import { useWorkspaceResources } from "@/shell/useWorkspaceResources";
 import { supportsBrowser } from "@/lib/nativeBridge";
-import {
-  isNativeWrapper,
-  nativeCodingAgentForHarness,
-  nativeCodingAgentForSubagentWrapper,
-} from "@/lib/nativeCodingAgents";
+import { isNativeWrapper, nativeCodingAgentForSubagentWrapper } from "@/lib/nativeCodingAgents";
 import { isOwnerLevel } from "@/lib/permissionsApi";
 import type { Session } from "@/lib/types";
 import { retrySession } from "@/lib/sessionsApi";
+import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
 import { readTranscriptViewDefault } from "@/lib/transcriptViewPreferences";
 import { MainTerminalView } from "@/shell/MainTerminalView";
 import { TerminalFirstContextProvider, type TerminalFirstView } from "@/shell/TerminalFirstContext";
@@ -467,7 +465,15 @@ export function GridSessionPane({
                         <GridPermissionPicker permission={permission} />
                       </>
                     ),
-                    trailing: session && <GridHarnessStatus session={session} />,
+                    trailing: session && (
+                      <GridSessionHarnessPicker
+                        sessionId={sessionId}
+                        session={session}
+                        canEdit={canEdit}
+                        unreachable={unreachable}
+                        runnerOnline={runnerOnline}
+                      />
+                    ),
                     cyclePermissionMode: permission.cycle,
                   }}
                 />
@@ -624,26 +630,52 @@ function GridPermissionPicker({ permission }: { permission: GridPermissionContro
   );
 }
 
-/** The cell session's harness, read-only; the model is shown and switched full screen. */
-function GridHarnessStatus({ session }: { session: Session }) {
-  const agent = nativeCodingAgentForHarness(session.harness);
-  const label = agent?.displayName ?? session.agentName ?? "Session";
+/**
+ * The cell session's model, effort and Smart Routing picker, from the same props
+ * hook as the full-screen composer. It reads and writes this session only; the
+ * busy state is this cell's.
+ */
+function GridSessionHarnessPicker({
+  sessionId,
+  session,
+  canEdit,
+  unreachable,
+  runnerOnline,
+}: {
+  sessionId: string;
+  session: Session;
+  canEdit: boolean;
+  unreachable: boolean;
+  runnerOnline: boolean | undefined;
+}) {
+  const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
+  // A launching sandbox lists no models until its host is bound; ChatPage previews them.
+  const inputs = useSessionPickerInputs(sessionId, session);
+  const wrapper = session.labels?.["omnigent.wrapper"] ?? null;
+  const picker = useSessionHarnessPickerProps({
+    sessionId,
+    hostId: session.hostId,
+    inputs,
+    agentName: session.agentName,
+    wrapperLabel: wrapper,
+    isNativeWrapper: isNativeWrapper(wrapper),
+    runnerOnline,
+    gates: {
+      // A cell the viewer can't edit is read-only, as the full-screen composer treats it.
+      permissionLevel: canEdit ? (session.permissionLevel ?? null) : 1,
+      readOnlyReason: readOnlyReasonForSessionLabels(session, null),
+      sendDisabledReason: null,
+      unreachable,
+    },
+  });
   return (
-    <span
-      title={label}
-      aria-label={label}
-      data-testid="grid-harness-status"
-      className="flex h-8 min-w-0 items-center gap-1 px-2 text-muted-foreground md:h-7"
-    >
-      <ComposerAgentIcon
-        agent={{
-          name: agent?.agentName ?? session.agentName ?? "",
-          harness: agent?.harness ?? session.harness ?? null,
-        }}
-      />
-      <span className={cn("min-w-0 truncate text-ui", COMPOSER_COLLAPSED_LABEL_CLASS)}>
-        {label}
-      </span>
-    </span>
+    <SessionHarnessPicker
+      appearance="composer"
+      busy={busy}
+      busyRef={busyRef}
+      setBusy={setBusy}
+      {...picker}
+    />
   );
 }

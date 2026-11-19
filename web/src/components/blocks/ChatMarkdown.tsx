@@ -869,3 +869,26 @@ export function FilePathAwareMessageResponse({
     </MessageResponse>
   );
 }
+
+// Keeps headings at the surrounding text's size; `!` beats the unlayered rules in index.css.
+const PROSE_MARKDOWN_CLASS =
+  "[&_:is(h1,h2,h3,h4,h5,h6)]:mt-3! [&_:is(h1,h2,h3,h4,h5,h6)]:mb-1! [&_[data-streamdown^=heading]]:text-sm!";
+
+/**
+ * Finished Markdown written for people outside a chat bubble, such as a tool's
+ * prose or a workflow step's description. Its headings keep the surrounding
+ * size, its line breaks stay, and raw HTML, such as a `<date>` placeholder,
+ * shows as written.
+ */
+export function ProseMarkdown({ children, className }: { children: string; className?: string }) {
+  return (
+    <FilePathAwareMessageResponse
+      mode="static"
+      breaks
+      literalHtml
+      className={cn(PROSE_MARKDOWN_CLASS, className)}
+    >
+      {children}
+    </FilePathAwareMessageResponse>
+  );
+}

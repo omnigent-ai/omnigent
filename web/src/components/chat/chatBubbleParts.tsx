@@ -88,6 +88,7 @@ import { QueryClientContext } from "@tanstack/react-query";
 import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
 import { useChatStore, withoutFailedInputs, type PendingUserMessage } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
+import { supersedePlanStop } from "@/store/planStops";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import {
   ConversationScopeContext,
@@ -1433,7 +1434,9 @@ function AssistantBubble({
         ) {
           throw new Error("Wait for the current turn to finish before retrying");
         }
+        const endPlanStop = supersedePlanStop(conversationId);
         await continueFailedTurn(conversationId);
+        endPlanStop();
         return;
       }
       try {
