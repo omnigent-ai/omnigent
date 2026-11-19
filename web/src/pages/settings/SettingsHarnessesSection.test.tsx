@@ -562,8 +562,9 @@ describe("Harnesses grid catalog rows", () => {
       "data-settings-control",
       "harness-claude-native:open",
     );
-    // The link is named by its harness, as the card's open part.
+    // The link is named by its harness, as the card's open part, and nothing overrides that name.
     expect(card("claude-native")).toHaveAttribute("aria-label", "Claude Code");
+    expect(card("claude-native")).toHaveAccessibleName("Claude Code");
     // Its status and description stay available to screen readers as its description.
     expect(card("claude-native")).toHaveAccessibleDescription(
       expect.stringContaining("Configured"),
