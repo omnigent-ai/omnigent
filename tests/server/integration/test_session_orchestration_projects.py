@@ -658,7 +658,8 @@ async def test_the_tool_archives_sub_agents_in_any_of_the_owners_trees(
         agent_id=source["agent_id"], parent_conversation_id=source["id"], title="Worker"
     )
     runner_id = store.get_conversation(source["id"]).runner_id
-    assert runner_id and store.set_runner_id(own_child.id, runner_id)
+    assert runner_id
+    assert store.set_runner_id(own_child.id, runner_id) is True
     stopped: list[str] = []
 
     async def record_stop(session_id: str, _runner_router) -> bool:
@@ -699,10 +700,27 @@ async def test_the_tool_archives_sub_agents_in_any_of_the_owners_trees(
             title=title,
         )
 
-    renamed = await _project_tool(
-        auth_client, source, "sys_session_update", session_id=own_child.id, title="Renamed"
+    # A grandchild cannot archive its sub-agent parent: the server's lineage guard refuses.
+    lead = store.create_conversation(
+        agent_id=source["agent_id"], parent_conversation_id=source["id"], title="Lead"
     )
-    assert "archived: true is the only change" in renamed["error"], renamed
+    grandchild = store.create_conversation(
+        agent_id=source["agent_id"], parent_conversation_id=lead.id, title="Helper"
+    )
+    for session_id in (lead.id, grandchild.id):
+        assert store.set_runner_id(session_id, runner_id) is True
+    refused = json.loads(
+        await execute_tool(
+            tool_name="sys_session_update",
+            arguments=json.dumps({"session_id": lead.id, "archived": True}),
+            server_client=auth_client,
+            conversation_id=grandchild.id,
+        )
+    )
+    assert "cannot archive a session it runs under" in refused["error"], refused
+    unchanged = store.get_conversation(lead.id)
+    assert unchanged.archived is not True and unchanged.title == "Lead"
+    assert "omnigent.closed" not in unchanged.labels
     # A sub-agent still cannot archive the session it runs under.
     refused = json.loads(
         await execute_tool(

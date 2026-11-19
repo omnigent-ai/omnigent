@@ -458,8 +458,8 @@ async def _require_archive_teardown_replica(
     :param request: The PATCH request, for this replica's host registry/store.
     :param session_id: Session being archived, e.g. ``"conv_abc123"``.
     :param conversation_store: Store to read the session's host binding from.
-    :raises OmnigentError: ``WRONG_REPLICA`` when the session's host is live
-        on another replica of a sharded deployment.
+    :raises WrongReplicaError: When the session's routing host is live on
+        another replica of a sharded deployment.
     """
     if not _deployment_is_sharded():
         return
@@ -468,16 +468,17 @@ async def _require_archive_teardown_replica(
     if host_registry is None or host_store is None:
         return
     conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-    if conv is None or conv.host_id is None or conv.runner_id is None:
+    if conv is None or conv.runner_id is None:
         return
-    if host_registry.get(conv.host_id) is not None:
+    # A sub-agent or side chat runs on its ancestor's runner, so its host is inherited.
+    host_id = await asyncio.to_thread(routing_host_id, conv, conversation_store)
+    if host_id is None or host_registry.get(host_id) is not None:
         return
-    host = await asyncio.to_thread(host_store.get_host, conv.host_id)
+    host = await asyncio.to_thread(host_store.get_host, host_id)
     # An offline host has no runner to stop; archiving it here loses nothing.
     if host is not None and host_is_live(host):
-        raise OmnigentError(
-            "host is on another replica; retry with the host's slice key",
-            code=ErrorCode.WRONG_REPLICA,
+        raise WrongReplicaError(
+            "host is on another replica; retry with the host's slice key", host_id=host_id
         )
 
 

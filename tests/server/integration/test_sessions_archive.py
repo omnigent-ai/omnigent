@@ -359,6 +359,7 @@ async def test_archive_tears_down_host_spawned_runner(
 _SHARDED_HOST_ID = "c1b2c3d4e5f61234567890abcdef0123"
 
 
+@pytest.mark.parametrize("target", ["host_bound", "inherited_host"])
 @pytest.mark.parametrize(
     ("host_state", "status"),
     [("on_other_replica", 400), ("on_this_replica", 200), ("offline", 200)],
@@ -370,6 +371,7 @@ async def test_sharded_archive_requires_the_host_replica(
     monkeypatch: pytest.MonkeyPatch,
     host_state: str,
     status: int,
+    target: str,
 ) -> None:
     """
     A sharded archive commits only on the replica that can stop the runner.
@@ -377,14 +379,30 @@ async def test_sharded_archive_requires_the_host_replica(
     The teardown reaches the host-launched runner over the host's tunnel. On a
     replica without it, committing ``archived`` would hide a session whose
     runner keeps running, so a live host elsewhere gets ``wrong_replica``
-    (the client re-addresses with the slice key) and the session is untouched.
+    naming the host's slice key, and the session is untouched. A sub-agent
+    with no host of its own runs on its parent's, so it is routed the same way.
     An offline host has no runner to stop, so its archive still succeeds.
     """
-    session = await create_test_session(client, name=f"archive-sharded-{host_state}")
-    session_id = session["id"]
+    session = await create_test_session(client, name=f"archive-sharded-{host_state}-{target}")
+    parent_id = session["id"]
+    runner_id = "d1b2c3d4e5f61234567890abcdef0123"
     conv_store = SqlAlchemyConversationStore(db_uri)
-    conv_store.set_host_id(session_id, _SHARDED_HOST_ID, workspace="/tmp/archive-ws")
-    conv_store.set_runner_id(session_id, "d1b2c3d4e5f61234567890abcdef0123")
+    conv_store.set_host_id(parent_id, _SHARDED_HOST_ID, workspace="/tmp/archive-ws")
+    conv_store.set_runner_id(parent_id, runner_id)
+    session_id = parent_id
+    if target == "inherited_host":
+        parent = conv_store.get_conversation(parent_id)
+        assert parent is not None
+        child = conv_store.create_conversation(
+            kind="sub_agent",
+            title="worker",
+            parent_conversation_id=parent_id,
+            agent_id=parent.agent_id,
+            runner_id=runner_id,
+            sub_agent_name="worker",
+        )
+        assert child.host_id is None
+        session_id = child.id
     host_store = HostStore(db_uri)
     host_store.upsert_on_connect(_SHARDED_HOST_ID, "archive-host", "local")
     if host_state == "offline":
@@ -412,11 +430,17 @@ async def test_sharded_archive_requires_the_host_replica(
         assert resp.status_code == status, resp.text
         archived = (await client.get(f"/v1/sessions/{session_id}")).json()["archived"]
         if status == 400:
-            assert resp.json()["error"]["code"] == "wrong_replica"
+            error = resp.json()["error"]
+            assert error["code"] == "wrong_replica"
+            assert error["slice_key"] == _SHARDED_HOST_ID
             assert archived is False
             mock_teardown.assert_not_awaited()
         else:
             assert archived is True
+        if target == "inherited_host":
+            # Archiving the sub-agent leaves its parent and the parent's runner alone.
+            assert (await client.get(f"/v1/sessions/{parent_id}")).json()["archived"] is False
+            mock_teardown.assert_not_awaited()
     finally:
         _sessions_common._session_status_cache.pop(session_id, None)
         _sessions_common._intentional_stop_sessions.pop(session_id, None)
