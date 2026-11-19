@@ -13,11 +13,8 @@ const rect = (top: number, height: number, width: number) => ({
   y: top,
 });
 
-/**
- * Give the element `isScroller` matches a viewport and every `<li>` a fixed height at its
- * own `top`, scrolled with its scroller; everything else stays zero-sized. Returns a
- * function that restores the original prototype properties.
- */
+// Sizes the `isScroller` element and each `<li>` at its own scrolled `top`; other elements stay
+// zero-sized. Returns a function that restores the stubbed prototype properties.
 export function stubVirtualListLayout({
   isScroller,
   viewportHeight,
