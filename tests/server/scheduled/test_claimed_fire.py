@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import logging
 import threading
 import time
@@ -21,6 +22,7 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 
+from omnigent.db.account_authority import account_checks_scope
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.server.auth import (
     LEVEL_EDIT,
@@ -112,7 +114,12 @@ class _Claimed:
 
 
 def _claim(
-    store: SqlAlchemyScheduledTaskStore, *, one_time: bool = False, **kwargs: Any
+    store: SqlAlchemyScheduledTaskStore,
+    *,
+    agent_id: str = _AGENT_ID,
+    user_id: str | None = None,
+    one_time: bool = False,
+    **kwargs: Any,
 ) -> _Claimed:
     """Create a due task and claim its first occurrence, as the scheduler's poll would.
 
@@ -126,8 +133,8 @@ def _claim(
         "nightly",
         "do the thing",
         "FREQ=HOURLY;COUNT=1" if one_time else "FREQ=HOURLY",
-        None,
-        _AGENT_ID,
+        user_id,
+        agent_id,
         "UTC",
         **kwargs,
     )
@@ -168,8 +175,16 @@ def _runs(store: SqlAlchemyScheduledTaskStore, task: ScheduledTask) -> list[Sche
 # ── Starting a claimed run ───────────────────────────────────────────────────
 
 
-async def test_connected_fire_runs_on_the_claimed_run(store, debug_log_rows) -> None:
-    claimed = _claim(store)
+@pytest.mark.parametrize("external_auth", [False, True])
+async def test_connected_fire_runs_on_the_claimed_run(
+    store, debug_log_rows, monkeypatch, external_auth
+) -> None:
+    with account_checks_scope(not external_auth):
+        claimed = _claim(store, user_id="alice" if external_auth else None)
+    permissions = FakePermissionStore()
+    if external_auth:
+        owner = replace(permissions.get_user("alice"), account_generation="current")
+        monkeypatch.setattr(permissions, "get_user", lambda _user_id: owner)
     conversations = _ConversationStore()
     seen: list[ScheduledTaskRun] = []
 
@@ -178,9 +193,11 @@ async def test_connected_fire_runs_on_the_claimed_run(store, debug_log_rows) -> 
         await asyncio.to_thread(fire_mod._logger.info, "dispatch correlation probe")
 
     executor = ClaimedRunExecutor(
-        _deps(store, conversation_store=conversations), launch_dispatch=dispatch
+        _deps(store, conversation_store=conversations, permission_store=permissions),
+        launch_dispatch=dispatch,
     )
-    await executor.fire(claimed.task, claimed.lease)
+    with account_checks_scope(not external_auth):
+        await executor.fire(claimed.task, claimed.lease)
 
     [session_id] = conversations.ids
     # The session is on the run before its prompt is sent, so recovery can find it.
@@ -891,6 +908,59 @@ async def test_unsupported_target_skips_the_claimed_run(store) -> None:
     [run] = _runs(store, claimed.task)
     assert (run.status, run.error_code) == ("skipped", "unsupported_target")
     dispatch.assert_not_awaited()
+
+
+async def test_proactive_gate_is_checked_as_the_task_owner(store) -> None:
+    from omnigent.server.proactive_agent import PROACTIVE_AGENT_ID
+
+    owner: contextvars.ContextVar[str | None] = contextvars.ContextVar("owner", default=None)
+    seen: list[tuple[str | None, str]] = []
+
+    @contextlib.asynccontextmanager
+    async def identity(task: ScheduledTask) -> AsyncIterator[None]:
+        token = owner.set("task-owner")
+        try:
+            yield
+        finally:
+            owner.reset(token)
+
+    def enabled_for(user_id: str) -> bool:
+        seen.append((owner.get(), user_id))
+        return False
+
+    claimed = _claim(store, agent_id=PROACTIVE_AGENT_ID)
+    deps = _deps(store)
+    # The agent is shipped, so only the gate can skip the run.
+    deps.agent_store = FakeAgentStore({PROACTIVE_AGENT_ID: _FakeAgent(PROACTIVE_AGENT_ID)})
+    deps.app_state = SimpleNamespace(proactive_agent_enabled_for=enabled_for)
+    dispatch = AsyncMock()
+
+    await ClaimedRunExecutor(deps, fire_identity=identity, launch_dispatch=dispatch).fire(
+        claimed.task, claimed.lease
+    )
+
+    [run] = _runs(store, claimed.task)
+    assert (run.status, run.error_code) == ("skipped", "proactive_agent_off")
+    # Checked for the task's owner, inside the owner's identity scope.
+    assert seen == [("task-owner", claimed.task.user_id or "local")]
+    dispatch.assert_not_awaited()
+    assert store.get(claimed.task.id).state == "active"
+
+
+async def test_proactive_task_skips_when_its_agent_is_not_shipped(store) -> None:
+    from omnigent.server.proactive_agent import PROACTIVE_AGENT_ID
+
+    claimed = _claim(store, agent_id=PROACTIVE_AGENT_ID)
+    deps = _deps(store)
+    deps.app_state = SimpleNamespace(proactive_agent_enabled_for=lambda _user: True)
+    dispatch = AsyncMock()
+
+    await ClaimedRunExecutor(deps, launch_dispatch=dispatch).fire(claimed.task, claimed.lease)
+
+    [run] = _runs(store, claimed.task)
+    assert (run.status, run.error_code) == ("skipped", "proactive_agent_off")
+    dispatch.assert_not_awaited()
+    assert store.get(claimed.task.id).state == "active"
 
 
 async def test_lost_lease_stops_before_the_prompt_is_sent(store) -> None:

@@ -75,8 +75,8 @@ import { type SubagentPanelOpener, SubagentPanelOpenerContext } from "./subagent
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { useChatStore } from "@/store/chatStore";
 import { useCanStartSideChat } from "@/hooks/usePermissions";
-import { SIDE_CHAT_COMMAND_PREFIX, supportsSideChat, usesNativeSideChatFork } from "@/lib/sideChat";
-import { createSideChat, stopSession } from "@/lib/sessionsApi";
+import { supportsSideChat } from "@/lib/sideChat";
+import { startSideChat, stopSideChat } from "./sideChatLifecycle";
 import { subagentSessionIdFromTab } from "@/lib/subagentTabs";
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
@@ -91,10 +91,12 @@ import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { readPreferredShell, resolveDefaultShell, writePreferredShell } from "./preferredShell";
 import { scrollTabIntoView, WorkspaceTabsScroller } from "./WorkspaceTabsScroller";
 import { FilesPanel } from "./FilesPanel";
+import { resolveWorkspaceActiveView } from "./workspaceActiveView";
 import { ContentSearchPanel } from "./ContentSearchPanel";
 import { FileViewer } from "./FileViewer";
 import { ResponsiveViewerSlot } from "./ResponsiveViewerSlot";
 import { TasksPanel } from "./TasksPanel";
+import { SessionDescendantRuns } from "@/components/workflows/WorkflowRunRow";
 import { PullRequestPanel } from "./PullRequestPanel";
 import type { ChangedSort } from "./FlatFileList";
 import { SubagentsPanel } from "./SubagentsPanel";
@@ -938,12 +940,34 @@ function WorkspacePanelImpl({
   onHasSideChatTabsChange,
   subagentPanelOpener,
 }: WorkspacePanelProps) {
-  const terminalShown = selectedTerminalKey !== null && openTerminals.includes(selectedTerminalKey);
   const contentSearchInputRef = useRef<HTMLInputElement>(null);
   const [contentSearchFocusSession, setContentSearchFocusSession] = useState<string | null>(null);
   const railRef = useRef<HTMLElement | null>(null);
   const railContentRef = useRef<HTMLDivElement | null>(null);
   const browsers = useBrowserTabs(conversationId);
+  const sideChats = useSideChats(conversationId);
+  const mobileViewport = useIsMobileViewport();
+  const isMobile = mobileViewport && !contained;
+  const activeView = resolveWorkspaceActiveView(
+    {
+      rightRailTab,
+      selectedFilePath,
+      selectedTerminalKey,
+      selectedBrowserId: browsers.selected,
+      selectedSideChatId: sideChats.selected,
+    },
+    {
+      terminalPresent: (key) => openTerminals.includes(key),
+      showBrowserTab,
+      showGithubTab,
+      showTasksTab: showTasksTab && Boolean(conversationId),
+      showContentSearch,
+      hasAgentTree: Boolean(rootSessionId),
+      mobile: isMobile,
+    },
+  );
+  const { browserSelected, sideChatSelected } = activeView;
+  const terminalShown = activeView.terminalKey !== null;
   const returnPointRef = useRef<ReturnPoint | null>(null);
   // The latest returnFrom, so a close that finishes later uses the tabs open by then.
   const returnFromRef = useRef<(point: ReturnPoint) => void>(() => {});
@@ -995,11 +1019,6 @@ function WorkspacePanelImpl({
   useEffect(() => {
     scrollTabIntoView(activeBrowserRef.current);
   }, [browsers.selected, rightRailTab]);
-  const browserSelected =
-    rightRailTab === "browser" &&
-    browsers.selected !== null &&
-    selectedFilePath === null &&
-    selectedTerminalKey === null;
   const guardFileNavigation = useContext(FileViewerContext)?.guardFileNavigation;
   // The browser page that took keyboard focus from this page, if any. Clicking into
   // a page leaves this page's focus where it was, so only the shell can tell.
@@ -1099,7 +1118,6 @@ function WorkspacePanelImpl({
   );
 
   // ── Side chats: rail tabs backed by forked child conversations. ──────────
-  const sideChats = useSideChats(conversationId);
   // Open tabs stay reachable even where this viewer can't start a side chat.
   const hasSideChatTabs = sideChats.tabs.length > 0;
   useEffect(() => {
@@ -1152,11 +1170,6 @@ function WorkspacePanelImpl({
     onRightRailTabChange("sidechat");
     clearSideChatToOpen();
   }, [sideChatToOpen, conversationId, sideChats, onRightRailTabChange, clearSideChatToOpen]);
-  const sideChatSelected =
-    rightRailTab === "sidechat" &&
-    selectedFilePath === null &&
-    selectedTerminalKey === null &&
-    sideChats.selected !== null;
   // "New side chat" opens an EMPTY tab; the fork isn't created until the first
   // message is sent in it (startPendingSideChat below). Offered on every harness
   // that supports side chat.
@@ -1191,66 +1204,19 @@ function WorkspacePanelImpl({
     : undefined;
   // First message sent in a pending side-chat tab: create the fork now. The
   // pending tab stays put and is rekeyed to the real child once it arrives (via
-  // the sideChatToOpen effect above), so there's no disappear/reappear. Codex
-  // forks in-process (its runner intercepts the `/side` message on the parent,
-  // kept prompt-cache-warm); every other harness forks server-side and reuses
-  // the parent's live runner. Rejects so the composer re-enables and keeps
-  // the typed text for a retry.
-  const startPendingSideChat = (pendingId: string, text: string): Promise<void> => {
-    if (usesNativeSideChatFork(sideChatHarness)) {
-      if (parentAgentId === null) return Promise.reject(new Error("no agent"));
-      // The child arrives asynchronously via session_created with no id to pair
-      // on, so queue this tab to be rekeyed FIFO. The question goes to the
-      // PARENT as `/side`; the native fork seeds the child's first turn. `send`
-      // resolves after its internal catch, so a failure (e.g. the host is too
-      // old to fork — the server refuses) has set `sendFailed` by the time the
-      // await returns; reject then so the pending pane resets and drop the
-      // queued tab so it never waits for a child that isn't coming.
-      awaitingPendingIdsRef.current.push(pendingId);
-      let sendFailed = false;
-      return useChatStore
-        .getState()
-        .send(SIDE_CHAT_COMMAND_PREFIX + text, parentAgentId, undefined, {
-          pinnedConversationId: conversationId,
-          onError: (message) => {
-            sendFailed = true;
-            awaitingPendingIdsRef.current = awaitingPendingIdsRef.current.filter(
-              (id) => id !== pendingId,
-            );
-            toast.error(message);
-          },
-        })
-        .then(() => {
-          if (sendFailed) throw new Error("side chat send failed");
-        });
-    }
-    return createSideChat(
+  // the sideChatToOpen effect above), so there's no disappear/reappear.
+  const startPendingSideChat = (pendingId: string, text: string): Promise<void> =>
+    startSideChat({
       conversationId,
-      useChatStore.getState().sideChatComposers[pendingId]?.settings,
-    ).then(
-      ({ childSessionId }) => {
-        // We have the child id here, so rekey THIS pending tab directly — no
-        // shared queue, so overlapping launches can't cross-assign. Seeding the
-        // draft fires sideChatToOpen, which then just re-selects + reveals.
-        sideChats.rekey(pendingId, childSessionId);
-        // The pending id is gone; drop its composer entry (and its File refs)
-        // now that the text has moved to the real child. Only on success — a
-        // failed create keeps it so the user can retry.
-        useChatStore.getState().clearSideChatComposer(pendingId);
-        useChatStore.getState().openSideChatWithDraft(childSessionId, text, conversationId);
-      },
-      (err) => {
-        // The rail path had no failure feedback (unlike the composer entry
-        // points); surface it. The pending tab + typed text stay for a retry.
-        toast.error("Couldn't start a side chat for this session.");
-        throw err;
-      },
-    );
-  };
+      harness: sideChatHarness,
+      parentAgentId,
+      draftKey: pendingId,
+      text,
+      awaitingDrafts: awaitingPendingIdsRef,
+      onCreated: (childId) => sideChats.rekey(pendingId, childId),
+    });
   // The selected side chat's pane, shown in the rail or the mobile drawer. A
   // `pending:` tab has no child yet; its first send creates the fork.
-  const mobileViewport = useIsMobileViewport();
-  const isMobile = mobileViewport && !contained;
   useEffect(() => {
     if (!showContentSearch || !showFilesPanel || pending || isMobile) return;
     const handleKeyDown = (event: globalThis.KeyboardEvent) => {
@@ -1338,30 +1304,7 @@ function WorkspacePanelImpl({
     );
   };
   const selectedSideChatPane = renderSelectedSideChatPane();
-  const closeSideChat = async (childId: string) => {
-    // Closing a sub-agent tab only hides it; the sub-agent keeps running.
-    if (subagentSessionIdFromTab(childId) !== null) {
-      sideChats.close(childId);
-      return;
-    }
-    // Take the queue first so the stop's idle status can't send it to the closing chat.
-    const queued = useChatStore.getState().clearQueuedMessages(childId);
-    if (!childId.startsWith("pending:")) {
-      try {
-        await stopSession(childId);
-      } catch {
-        useChatStore.getState().restoreQueuedMessages(queued);
-        toast.error("Couldn't close side chat. Try again.");
-        return;
-      }
-    }
-    // The tab is gone, so its unsent text/attachments, follow-ups queued during the
-    // stop, and any seeded question that never got to send have nowhere to return to.
-    useChatStore.getState().clearQueuedMessages(childId);
-    useChatStore.getState().clearSideChatComposer(childId);
-    useChatStore.getState().clearSideChatDraft(childId);
-    sideChats.close(childId);
-  };
+  const closeSideChat = (childId: string) => stopSideChat(childId, () => sideChats.close(childId));
 
   // Closing the file on screen asks its viewer first, which confirms before
   // dropping edits it hasn't saved. Other file tabs have no mounted editor.
@@ -1585,22 +1528,9 @@ function WorkspacePanelImpl({
     );
   };
   // The selected tab's view, beneath any open file or shell tab.
-  const scopeView =
-    sideChatSelected && !isMobile
-      ? "sidechat"
-      : browserSelected && showBrowserTab
-        ? "browser"
-        : rightRailTab === "github" && showGithubTab
-          ? "github"
-          : rightRailTab === "tasks" && showTasksTab && conversationId
-            ? "tasks"
-            : rightRailTab === "subagents" && rootSessionId
-              ? "subagents"
-              : rightRailTab === null
-                ? "empty"
-                : rightRailTab === "content-search" && showContentSearch
-                  ? "content-search"
-                  : "files";
+  const scopeView = activeView.scope;
+  const frontTerminalKey = activeView.terminalKey;
+  const frontFilePath = activeView.filePath;
   // Stays mounted behind a file or shell to keep tree expansion, listing and scroll.
   const filesPanelMounted = showFilesPanel && !pending && scopeView === "files";
   const filesPanelActive = filesPanelMounted && !terminalShown && selectedFilePath === null;
@@ -2127,118 +2057,146 @@ function WorkspacePanelImpl({
           tabIndex={-1}
           className="relative flex min-h-0 flex-1 flex-col overflow-hidden focus:outline-none"
         >
-          {/* Phones use AppShell's drawer instead; one mounted panel keeps the input state single-owner. */}
-          {showContentSearch && showFilesPanel && !pending && !isMobile && (
-            <div
-              className={cn(
-                "min-h-0 flex-1 flex-col",
-                rightRailTab === "content-search" && selectedFilePath === null && !terminalShown
-                  ? "flex"
-                  : "hidden",
-              )}
-            >
-              <ContentSearchPanel
-                inputRef={contentSearchInputRef}
-                key={conversationId}
+          <RenderErrorBoundary
+            name="this workspace pane"
+            resetKey={JSON.stringify([
+              conversationId,
+              rightRailTab,
+              frontFilePath,
+              frontTerminalKey,
+              sideChats.selected,
+              browsers.viewId,
+            ])}
+          >
+            {/* Phones use AppShell's drawer instead; one mounted panel keeps the input state single-owner. */}
+            {showContentSearch && showFilesPanel && !pending && !isMobile && (
+              <div
+                className={cn(
+                  "min-h-0 flex-1 flex-col",
+                  rightRailTab === "content-search" && selectedFilePath === null && !terminalShown
+                    ? "flex"
+                    : "hidden",
+                )}
+              >
+                <RenderErrorBoundary
+                  name="this workspace pane"
+                  resetKey={JSON.stringify([conversationId, rightRailTab === "content-search"])}
+                >
+                  <ContentSearchPanel
+                    inputRef={contentSearchInputRef}
+                    key={conversationId}
+                    conversationId={conversationId}
+                    onFileSelect={openFileViewer}
+                  />
+                </RenderErrorBoundary>
+              </div>
+            )}
+            {filesPanelMounted && (
+              <div
+                className={cn(
+                  "flex min-h-0 flex-1 flex-col",
+                  // Not display:none: hidden rows would measure 0px and collapse
+                  // the virtualized tree's height, losing its scroll position.
+                  !filesPanelActive && "invisible absolute inset-0",
+                )}
+              >
+                <RenderErrorBoundary
+                  name="this workspace pane"
+                  resetKey={JSON.stringify([conversationId, activeView.flat])}
+                >
+                  <FilesPanel
+                    conversationId={contained ? conversationId : undefined}
+                    frameless
+                    onFileSelect={openFileViewer}
+                    flatView={activeView.flat}
+                    showHidden={filesPanelShowHidden}
+                    onShowHiddenChange={onShowHiddenChange}
+                    sort={filesPanelSort}
+                    onSortChange={onSortChange}
+                  />
+                </RenderErrorBoundary>
+              </div>
+            )}
+            {pending ? (
+              <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
+                <Spinner />
+                <span className="text-ui">Starting workspace…</span>
+              </div>
+            ) : frontTerminalKey !== null ? (
+              // Show the selected shell's xterm only while its terminal is actually
+              // present. The selection is sticky (AppShell never prunes it off the
+              // list), so during a transient terminals-list churn this falls back to
+              // the default view and the xterm reappears when the terminal returns.
+              <RailTerminalView
                 conversationId={conversationId}
-                onFileSelect={openFileViewer}
+                terminalKey={frontTerminalKey}
+                readOnly={!isOwnerLevel(permissionLevel)}
+                autoFocus={autoFocusSelectedTerminal}
               />
-            </div>
-          )}
-          {filesPanelMounted && (
-            <div
-              className={cn(
-                "flex min-h-0 flex-1 flex-col",
-                // Not display:none: hidden rows would measure 0px and collapse
-                // the virtualized tree's height, losing its scroll position.
-                !filesPanelActive && "invisible absolute inset-0",
-              )}
-            >
-              <FilesPanel
-                conversationId={contained ? conversationId : undefined}
-                frameless
-                onFileSelect={openFileViewer}
-                flatView={rightRailTab === "changes"}
-                showHidden={filesPanelShowHidden}
-                onShowHiddenChange={onShowHiddenChange}
-                sort={filesPanelSort}
-                onSortChange={onSortChange}
+            ) : frontFilePath !== null ? (
+              <ResponsiveViewerSlot mobile={isMobile} mobileTarget={mobileFileTarget}>
+                <FileViewer
+                  syncUrl={!contained}
+                  agentId={agentId}
+                  mobileOverlay={isMobile}
+                  frameless
+                  open
+                  mediaActive={isMobile ? mobileFileTarget != null : open}
+                  conversationId={conversationId}
+                  path={frontFilePath}
+                  position={filePosition}
+                  onClose={isMobile && onMobileFileClose ? onMobileFileClose : onShowScopeView}
+                  onCloseTab={isMobile && onMobileFileClose ? onMobileFileClose : handleCloseTab}
+                  onNavigateTo={openFileViewer}
+                  permissionLevel={permissionLevel}
+                  onCommentsOpenChange={onCommentsOpenChange}
+                  onShare={onShareFile}
+                  shareDisabledReason={shareDisabledReason}
+                  sort={filesPanelSort}
+                />
+              </ResponsiveViewerSlot>
+            ) : scopeView === "sidechat" ? (
+              // A side chat: a forked child conversation streamed here in its own
+              // scoped surface, beside the still-active main chat. Phones show it
+              // in the side-chats drawer instead, so it never mounts twice.
+              selectedSideChatPane
+            ) : scopeView === "browser" ? (
+              // Browser soft tab — BrowserPane self-gates and measures this rail
+              // slot to position the native view over it.
+              <BrowserPane
+                key={browsers.viewId}
+                conversationId={browsers.viewId!}
+                agentBrowser={browsers.agentBrowser}
+                active={open}
+                focus={browserFocus?.viewId === browsers.viewId ? browserFocus.target : null}
+                onFocused={clearBrowserFocus}
+                className="min-h-0 flex-1"
               />
-            </div>
-          )}
-          {pending ? (
-            <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
-              <Spinner />
-              <span className="text-ui">Starting workspace…</span>
-            </div>
-          ) : terminalShown ? (
-            // Show the selected shell's xterm only while its terminal is actually
-            // present. The selection is sticky (AppShell never prunes it off the
-            // list), so during a transient terminals-list churn this falls back to
-            // the default view and the xterm reappears when the terminal returns.
-            <RailTerminalView
-              conversationId={conversationId}
-              terminalKey={selectedTerminalKey}
-              readOnly={!isOwnerLevel(permissionLevel)}
-              autoFocus={autoFocusSelectedTerminal}
-            />
-          ) : selectedFilePath !== null ? (
-            <ResponsiveViewerSlot mobile={isMobile} mobileTarget={mobileFileTarget}>
-              <FileViewer
-                syncUrl={!contained}
-                agentId={agentId}
-                mobileOverlay={isMobile}
-                frameless
-                open
-                mediaActive={isMobile ? mobileFileTarget != null : open}
-                conversationId={conversationId}
-                path={selectedFilePath}
-                position={filePosition}
-                onClose={isMobile && onMobileFileClose ? onMobileFileClose : onShowScopeView}
-                onCloseTab={isMobile && onMobileFileClose ? onMobileFileClose : handleCloseTab}
-                onNavigateTo={openFileViewer}
-                permissionLevel={permissionLevel}
-                onCommentsOpenChange={onCommentsOpenChange}
-                onShare={onShareFile}
-                shareDisabledReason={shareDisabledReason}
-                sort={filesPanelSort}
-              />
-            </ResponsiveViewerSlot>
-          ) : scopeView === "sidechat" ? (
-            // A side chat: a forked child conversation streamed here in its own
-            // scoped surface, beside the still-active main chat. Phones show it
-            // in the side-chats drawer instead, so it never mounts twice.
-            selectedSideChatPane
-          ) : scopeView === "browser" ? (
-            // Browser soft tab — BrowserPane self-gates and measures this rail
-            // slot to position the native view over it.
-            <BrowserPane
-              key={browsers.viewId}
-              conversationId={browsers.viewId!}
-              agentBrowser={browsers.agentBrowser}
-              active={open}
-              focus={browserFocus?.viewId === browsers.viewId ? browserFocus.target : null}
-              onFocused={clearBrowserFocus}
-              className="min-h-0 flex-1"
-            />
-          ) : scopeView === "github" ? (
-            <RenderErrorBoundary name="pull requests" resetKey={conversationId}>
-              <PullRequestPanel conversationId={conversationId} active={open && !inert} />
-            </RenderErrorBoundary>
-          ) : scopeView === "tasks" && conversationId ? (
-            <RenderErrorBoundary name="tasks" resetKey={conversationId}>
-              <TasksPanel conversationId={conversationId} active={open && !inert} />
-            </RenderErrorBoundary>
-          ) : scopeView === "subagents" && rootSessionId ? (
-            <SubagentPanelOpenerContext.Provider value={subagentPanelOpener ?? null}>
-              <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
-            </SubagentPanelOpenerContext.Provider>
-          ) : scopeView === "empty" ? (
-            <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center text-muted-foreground">
-              <PlusIcon className="size-6" />
-              <p className="text-sm">Open a Workspace tab from the + menu.</p>
-            </div>
-          ) : null}
+            ) : scopeView === "github" ? (
+              <RenderErrorBoundary name="pull requests" resetKey={conversationId}>
+                <PullRequestPanel conversationId={conversationId} active={open && !inert} />
+              </RenderErrorBoundary>
+            ) : scopeView === "tasks" && conversationId ? (
+              <RenderErrorBoundary name="tasks" resetKey={conversationId}>
+                <TasksPanel
+                  conversationId={conversationId}
+                  active={open && !inert}
+                  renderWorkflowRuns={(workflowId) => (
+                    <SessionDescendantRuns sessionId={conversationId} workflowId={workflowId} />
+                  )}
+                />
+              </RenderErrorBoundary>
+            ) : scopeView === "subagents" && rootSessionId ? (
+              <SubagentPanelOpenerContext.Provider value={subagentPanelOpener ?? null}>
+                <SubagentsPanel conversationId={conversationId} rootSessionId={rootSessionId} />
+              </SubagentPanelOpenerContext.Provider>
+            ) : scopeView === "empty" ? (
+              <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center text-muted-foreground">
+                <PlusIcon className="size-6" />
+                <p className="text-sm">Open a Workspace tab from the + menu.</p>
+              </div>
+            ) : null}
+          </RenderErrorBoundary>
         </div>
       </div>
     </aside>

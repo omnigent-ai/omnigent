@@ -15,6 +15,11 @@ import { isFeatureEnabled } from "@/lib/capabilities";
 import { cn } from "@/lib/utils";
 import { Maximize2Icon, XIcon } from "lucide-react";
 import { SideChatPane } from "@/components/chat/SideChatPane";
+import { SessionHarnessPicker } from "@/components/composer/SessionHarnessPicker";
+import { useSessionPickerInputs } from "@/components/composer/sessionPickerInputs";
+import { useSessionHarnessPickerProps } from "@/components/composer/useSessionHarnessPickerProps";
+import { ComposerPermissionPicker } from "@/components/composer/ComposerControls";
+import { HostBadge } from "@/components/HostBadge";
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { Button } from "@/components/ui/button";
 import { useBrowserAgentRelay } from "@/hooks/useBrowserAgentRelay";
@@ -35,7 +40,9 @@ import { useWorkspaceResources } from "@/shell/useWorkspaceResources";
 import { supportsBrowser } from "@/lib/nativeBridge";
 import { isNativeWrapper, nativeCodingAgentForSubagentWrapper } from "@/lib/nativeCodingAgents";
 import { isOwnerLevel } from "@/lib/permissionsApi";
+import type { Session } from "@/lib/types";
 import { retrySession } from "@/lib/sessionsApi";
+import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
 import { readTranscriptViewDefault } from "@/lib/transcriptViewPreferences";
 import { MainTerminalView } from "@/shell/MainTerminalView";
 import { TerminalFirstContextProvider, type TerminalFirstView } from "@/shell/TerminalFirstContext";
@@ -65,6 +72,8 @@ import { revealFolderInFilesPanel } from "@/shell/FilesPanel";
 import { selectPullRequestInPanel } from "@/shell/PullRequestPanel";
 import { citedFilePosition } from "@/shell/filePositionState";
 import { useGridSessions } from "./GridSessionsContext";
+import { useGridPermissionControl, type GridPermissionControl } from "./useGridPermissionControl";
+import { useSharedSessionDraft } from "./sharedSessionDraft";
 
 export type GridWorkspacePanelProps = Pick<
   ComponentProps<typeof WorkspacePanel>,
@@ -98,6 +107,7 @@ export function GridSessionPane({
   const serverInfo = useServerInfo();
   const permissionLevel = session?.permissionLevel ?? (canEdit ? null : 1);
   const grids = useGridSessions()!;
+  useSharedSessionDraft(sessionId);
   const title = session?.title || "Session";
   const {
     attributes,
@@ -129,6 +139,8 @@ export function GridSessionPane({
     turnActive: state.status === "streaming",
     launchedAt: state.runnerLaunchedAt,
   });
+  const unreachable = liveness.kind === "host_offline" || liveness.kind === "local_stranded";
+  const permission = useGridPermissionControl(session, permissionLevel, unreachable);
   const wrapper = session?.labels?.["omnigent.wrapper"];
   const terminalFirst = session?.labels?.["omnigent.ui"] === "terminal";
   const rootSessionId = useRootSessionId(sessionId, session?.parentSessionId);
@@ -437,7 +449,34 @@ export function GridSessionPane({
           <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
             <div ref={setChatRef} className={cn("h-full", showTerminal && "hidden")}>
               <RenderErrorBoundary name="chat" resetKey={sessionId}>
-                <SideChatPane childId={sessionId} fullSession readOnly={!canEdit} />
+                <SideChatPane
+                  childId={sessionId}
+                  fullSession
+                  readOnly={!canEdit}
+                  gridComposer={{
+                    leading: session && (
+                      <>
+                        <HostBadge
+                          sessionId={sessionId}
+                          appearance="composer"
+                          readOnly={!canEdit}
+                          launch={state.sandboxStatus}
+                        />
+                        <GridPermissionPicker permission={permission} />
+                      </>
+                    ),
+                    trailing: session && (
+                      <GridSessionHarnessPicker
+                        sessionId={sessionId}
+                        session={session}
+                        canEdit={canEdit}
+                        unreachable={unreachable}
+                        runnerOnline={runnerOnline}
+                      />
+                    ),
+                    cyclePermissionMode: permission.cycle,
+                  }}
+                />
               </RenderErrorBoundary>
             </div>
             {terminalFirst && (agentTerminal !== null || showTerminal || terminalOpened) && (
@@ -568,5 +607,75 @@ export function GridSessionPane({
           )}
       </FileViewerContext.Provider>
     </TerminalFirstContextProvider>
+  );
+}
+
+/** The cell session's permission mode; its owner can switch it as in the main composer. */
+function GridPermissionPicker({ permission }: { permission: GridPermissionControl }) {
+  const { chip } = permission;
+  if (chip === null) return null;
+  return (
+    <ComposerPermissionPicker
+      label="Permission mode"
+      value={chip.label || "Permission mode"}
+      harness={permission.harness}
+      selectedValue={chip.value}
+      options={chip.options}
+      disabled={!permission.owner || permission.unreachable || permission.busy}
+      disabledReason={
+        permission.owner ? undefined : "Only the session owner can change the permission mode"
+      }
+      onSelect={permission.select}
+    />
+  );
+}
+
+/**
+ * The cell session's model, effort and Smart Routing picker, from the same props
+ * hook as the full-screen composer. It reads and writes this session only; the
+ * busy state is this cell's.
+ */
+function GridSessionHarnessPicker({
+  sessionId,
+  session,
+  canEdit,
+  unreachable,
+  runnerOnline,
+}: {
+  sessionId: string;
+  session: Session;
+  canEdit: boolean;
+  unreachable: boolean;
+  runnerOnline: boolean | undefined;
+}) {
+  const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
+  // A launching sandbox lists no models until its host is bound; ChatPage previews them.
+  const inputs = useSessionPickerInputs(sessionId, session);
+  const wrapper = session.labels?.["omnigent.wrapper"] ?? null;
+  const picker = useSessionHarnessPickerProps({
+    sessionId,
+    hostId: session.hostId,
+    inputs,
+    agentName: session.agentName,
+    wrapperLabel: wrapper,
+    isNativeWrapper: isNativeWrapper(wrapper),
+    runnerOnline,
+    gates: {
+      // A cell the viewer can't edit is read-only, as the full-screen composer treats it.
+      permissionLevel: canEdit ? (session.permissionLevel ?? null) : 1,
+      readOnlyReason: readOnlyReasonForSessionLabels(session, null),
+      sendDisabledReason: null,
+      unreachable,
+    },
+  });
+  return (
+    <SessionHarnessPicker
+      appearance="composer"
+      busy={busy}
+      busyRef={busyRef}
+      setBusy={setBusy}
+      {...picker}
+    />
   );
 }

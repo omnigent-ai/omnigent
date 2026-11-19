@@ -230,6 +230,7 @@ from omnigent.stores.host_store import Host, HostStore, host_is_live
 
 if TYPE_CHECKING:
     from omnigent.onboarding.sandboxes import SandboxHostLauncher
+    from omnigent.server.session_mcp_selection import SessionMcpSelection
     from omnigent.stores.agent_store import AgentStore
     from omnigent.stores.conversation_store import Conversation, ConversationStore
 
@@ -809,6 +810,11 @@ class ManagedSandboxConfig:
         provider's launcher makes the final call through
         :meth:`~omnigent.onboarding.sandboxes.base.SandboxLifecycle.stop_when_archived`
         (see :func:`stop_archived_session_sandbox`).
+    :param mcp_selection: How sessions the server creates in this provider's
+        sandboxes record their owner's MCP services, for a provider that
+        configures MCP servers inside the sandbox rather than through the
+        server's registry. ``None`` uses the registry, as on a connected host.
+        See :mod:`omnigent.server.session_mcp_selection`.
     """
 
     server_url: str
@@ -829,6 +835,7 @@ class ManagedSandboxConfig:
     manages_profiles: bool = False
     default_profile_id: str | None = None
     stop_on_archive: bool = False
+    mcp_selection: SessionMcpSelection | None = None
 
 
 class NoReachableModels(Exception):

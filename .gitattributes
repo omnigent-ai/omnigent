@@ -9,3 +9,4 @@ patches/*.patch -whitespace
 omnigent/api/**/*_pb2.py linguist-generated=true
 omnigent/api/**/*_pb2.pyi linguist-generated=true
 omnigent/api/**/*_connect.py linguist-generated=true
+web/src/gen/**/*_pb.* linguist-generated=true

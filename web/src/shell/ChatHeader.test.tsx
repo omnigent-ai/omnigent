@@ -374,12 +374,18 @@ describe("ChatHeader — open-sidebar toggle visibility", () => {
     );
   });
 
-  it("uses a back arrow and faded header surface for the mobile settings menu", () => {
+  it("uses the menu icon and faded header surface for the mobile settings menu", () => {
     const { container } = renderHeader({ sidebarOpen: false, settingsMode: true });
 
-    const button = screen.getByRole("button", { name: "Back to settings menu" });
-    expect(button.querySelector("svg")).toHaveClass("lucide-arrow-left");
+    const button = screen.getByRole("button", { name: "Open settings menu" });
+    expect(button.querySelector("svg")).toHaveClass("lucide-menu");
     expect(container.querySelector("header")).toHaveClass("settings-mobile-header");
+  });
+
+  it("drops the settings header fade while the sidebar is open", () => {
+    const { container } = renderHeader({ sidebarOpen: true, settingsMode: true });
+
+    expect(container.querySelector("header")).not.toHaveClass("settings-mobile-header");
   });
 
   it("cancels the pending peek as soon as the toggle is pressed", () => {

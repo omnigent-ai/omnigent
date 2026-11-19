@@ -25,13 +25,14 @@ export interface WorkflowRowProps {
   onCreateAutomation?: (workflow: SavedWorkflow) => void;
   onClone: (workflow: SavedWorkflow) => void;
   cloning?: boolean;
-  onDelete: (workflow: SavedWorkflow) => void;
+  /** Absent for a workflow shared with the user, which only its owner deletes. */
+  onDelete?: (workflow: SavedWorkflow) => void;
 }
 
 /**
  * One saved workflow: its name and description, opening its page, with Run,
  * Create automation, Clone and Delete in a ⋯ menu and on right-click, like an
- * automation's row.
+ * automation's row. A workflow shared with the user names its owner.
  */
 export function WorkflowRow({
   workflow,
@@ -63,6 +64,14 @@ export function WorkflowRow({
             {workflow.is_draft && (
               <span className="text-xs font-medium text-muted-foreground">
                 Draft · No saved plan
+              </span>
+            )}
+            {workflow.viewer_role === "viewer" && (
+              <span
+                className="text-xs font-medium text-muted-foreground"
+                data-testid="workflow-row-owner"
+              >
+                Shared by {workflow.owner_display_name ?? "someone else"}
               </span>
             )}
             <span className="line-clamp-2 text-ui text-muted-foreground/80">
@@ -159,17 +168,19 @@ function WorkflowMenuItems({
         <CopyIcon className="size-4" />
         Clone
       </Item>
-      <Item
-        variant="destructive"
-        onSelect={() => {
-          trackClick("workflows.row.delete", "button");
-          onDelete(workflow);
-        }}
-        data-testid="workflow-delete"
-      >
-        <Trash2Icon className="size-4" />
-        Delete
-      </Item>
+      {onDelete && (
+        <Item
+          variant="destructive"
+          onSelect={() => {
+            trackClick("workflows.row.delete", "button");
+            onDelete(workflow);
+          }}
+          data-testid="workflow-delete"
+        >
+          <Trash2Icon className="size-4" />
+          Delete
+        </Item>
+      )}
     </>
   );
 }

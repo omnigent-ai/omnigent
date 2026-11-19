@@ -4544,7 +4544,7 @@ class ClaudeSDKExecutor(Executor):
             # never reaches the server, so drop the compacted client and replay history next turn.
             if compaction_occurred:
                 self._evict_client_on_cancel(session_key)
-            yield TurnCancelled()
+            yield TurnCancelled(usage=turn_usage)
             return
 
         if terminal_error:

@@ -1,14 +1,18 @@
 import { useConversationEntryValue } from "@/hooks/useConversationEntryState";
 import { useOptionalLoadedConversations } from "@/hooks/useSidebarData";
 
-/** Activity for task progress, including the sidebar's child/background rollup. */
+/**
+ * Activity for task progress, including the sidebar's child/background rollup and,
+ * for a session streamed here, a sandbox launch it waits on.
+ */
 export function useSessionWorking(sessionId: string | null, fallbackWorking = false): boolean {
   const liveWorking = useConversationEntryValue(
     sessionId,
     (state) =>
       state.sessionStatus === "running" ||
       state.sessionStatus === "waiting" ||
-      (state.backgroundTaskCount ?? 0) > 0,
+      (state.backgroundTaskCount ?? 0) > 0 ||
+      (state.sandboxStatus !== null && state.sandboxStatus.stage !== "failed"),
   );
   const loaded = useOptionalLoadedConversations();
   const row = loaded?.pages

@@ -65,6 +65,8 @@ const mocks = vi.hoisted(() => {
     projects: [] as string[],
     projectIcons: {} as Record<string, string | null | undefined>,
     moveToProject: { mutate: vi.fn() },
+    moveToNest: { mutate: vi.fn(), isPending: false },
+    searchRows: [] as Conversation[],
     leave: { mutate: vi.fn(), isPending: false },
     // The signed-in viewer. Rows with no `owner` read as owned by them; a row
     // owned by someone else is the shared case Leave applies to.
@@ -77,7 +79,8 @@ const mocks = vi.hoisted(() => {
 // Mock the mobile-viewport hook — jsdom doesn't evaluate media queries, so
 // drive it explicitly. Defaults to desktop (false); the mobile flyout test
 // flips `mocks.isMobile` for the duration of that case.
-vi.mock("@/hooks/useIsMobileViewport", () => ({
+vi.mock(import("@/hooks/useIsMobileViewport"), async (importOriginal) => ({
+  ...(await importOriginal()),
   useIsMobileViewport: () => mocks.isMobile,
 }));
 
@@ -124,6 +127,19 @@ vi.mock("@/hooks/useConversations", async () => {
       isFetchingNextPage: false,
     }),
     useMoveToProject: () => mocks.moveToProject,
+    useMoveToNest: () => mocks.moveToNest,
+    useSessionSearch: (query: string) => ({
+      data: {
+        pages: [
+          {
+            data: mocks.searchRows.filter((row) =>
+              row.title?.toLowerCase().includes(query.toLowerCase()),
+            ),
+          },
+        ],
+      },
+      isFetching: false,
+    }),
   };
 });
 
@@ -295,6 +311,8 @@ beforeEach(() => {
   mocks.rename.isSuccess = false;
   mocks.rename.isError = false;
   mocks.moveToProject.mutate.mockReset();
+  mocks.moveToNest.mutate.mockReset();
+  mocks.searchRows = [];
   mocks.leave.mutate.mockReset();
   mocks.projects = [];
   mocks.projectIcons = {};
@@ -390,30 +408,23 @@ describe("quick pin/unpin hover button", () => {
     expect(iconSelector.querySelector("svg")).toHaveClass("text-primary");
   });
 
-  it("keeps the Projects group-header actions visible without hover, hover-revealed on desktop", () => {
+  it("keeps the Projects group-header actions visible on mobile, hover-revealed on desktop", () => {
     // The "New project" (+) button is the only way to create a project, so its
-    // group-header wrapper must stay visible wherever hover is unavailable —
-    // phones AND touch tablets at `md`+ widths — rather than fade out like the
-    // desktop-only session-header controls. jsdom doesn't evaluate media
-    // queries, so assert the responsive classes: base `flex` (shown at every
-    // breakpoint) with the fade + hover/focus reveals gated on hover
-    // capability, not just the `md` width.
+    // group-header wrapper must stay visible in the mobile layout. jsdom doesn't
+    // evaluate media queries, so assert the responsive classes: base `flex`
+    // (shown at every breakpoint) with the fade + hover/focus reveals from `md`.
     mocks.projects = ["Sprint 42"];
     renderSidebar();
 
     const wrapper = screen.getByTestId("new-project").closest(".transition-opacity");
     expect(wrapper).not.toBeNull();
-    // Visible without hover: base display is `flex`, never `hidden`, and the
-    // fade is not applied by viewport width alone.
     expect(wrapper).toHaveClass("flex");
     expect(wrapper).not.toHaveClass("hidden");
-    expect(wrapper).not.toHaveClass("md:opacity-0");
-    // Hover-capable desktop: fades out until the header is hovered / focused /
-    // a menu opens.
+    // Desktop: fades out until the header is hovered / focused / a menu opens.
     expect(wrapper).toHaveClass(
-      "[@media((hover:hover)_and_(pointer:fine))]:md:opacity-0",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:group-hover/header:opacity-100",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:has-[:focus-visible]:opacity-100",
+      "md:opacity-0",
+      "md:group-hover/header:opacity-100",
+      "md:has-[:focus-visible]:opacity-100",
     );
   });
 
@@ -1108,6 +1119,84 @@ describe("pinned row project flyout", () => {
     // Focusing the row opens nothing — the flyout never mounts on mobile.
     fireEvent.focus(row);
     expect(screen.queryByTestId("pinned-project-flyout")).toBeNull();
+  });
+});
+
+describe("two-step move menu", () => {
+  it.each([false, true])("offers searchable Projects and Nests (mobile=%s)", async (mobile) => {
+    mocks.isMobile = mobile;
+    mocks.projects = ["Sprint 42"];
+    const destination = {
+      ...CONV,
+      id: "destination",
+      title: "Destination nest",
+      family: {
+        id: "other",
+        pinned: false,
+        representative_id: "destination",
+        representative_title: "Destination nest",
+      },
+    };
+    mockConversations([
+      { ...CONV, family: { id: "current", representative_id: CONV.id, pinned: false } },
+      destination,
+    ]);
+    const view = renderSidebar(
+      undefined,
+      serverInfo({ sibling_sessions: true, session_nest_moves: true }),
+    );
+    const open = async (item: HTMLElement) => {
+      if (mobile) fireEvent.click(item);
+      else {
+        item.focus();
+        fireEvent.keyDown(item, { key: "ArrowRight" });
+      }
+    };
+    fireEvent.pointerDown(
+      within(
+        document.querySelector('li[data-sidebar-session-id="conv_1"]') as HTMLElement,
+      ).getByTestId("conversation-actions"),
+      { button: 0 },
+    );
+    expect(screen.queryByRole("menuitem", { name: "Remove from nest" })).toBeNull();
+    await open(screen.getByTestId("move-to-project"));
+    expect(await screen.findByRole("menuitem", { name: "Projects" })).toBeInTheDocument();
+    await open(screen.getByRole("menuitem", { name: "Projects" }));
+    expect(await screen.findByPlaceholderText("Search or create project")).toBeInTheDocument();
+    if (mobile) fireEvent.click(screen.getByTestId("project-picker-back"));
+    await open(screen.getByRole("menuitem", { name: "Nests" }));
+    const search = await screen.findByPlaceholderText("Search nests");
+    fireEvent.change(search, { target: { value: "missing" } });
+    expect(screen.queryByRole("menuitem", { name: "Destination nest" })).toBeNull();
+    fireEvent.change(search, { target: { value: "Destination" } });
+    expect(screen.getByRole("menuitem", { name: "Destination nest" })).toBeInTheDocument();
+    const remote = {
+      ...destination,
+      id: "remote",
+      title: "Member session",
+      family: {
+        ...destination.family,
+        id: "remote",
+        representative_id: "remote",
+        representative_title: "Remote nest",
+      },
+    };
+    mocks.searchRows = [remote];
+    fireEvent.change(search, { target: { value: "Member" } });
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Remote nest" }));
+    expect(mocks.moveToNest.mutate).toHaveBeenCalledWith({ id: CONV.id, destination: remote });
+    view.unmount();
+    renderSidebar(undefined, serverInfo({ sibling_sessions: true, session_nest_moves: true }));
+    fireEvent.pointerDown(
+      within(
+        document.querySelector('li[data-sidebar-session-id="conv_1"]') as HTMLElement,
+      ).getByTestId("conversation-actions"),
+      { button: 0 },
+    );
+    await open(screen.getByTestId("move-to-project"));
+    await open(await screen.findByRole("menuitem", { name: "Nests" }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: "Remove from nest" }));
+    expect(mocks.moveToNest.mutate).toHaveBeenLastCalledWith({ id: CONV.id, destination: null });
   });
 });
 
