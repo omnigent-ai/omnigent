@@ -361,9 +361,6 @@ const HOST_MCP_SIGN_IN_POLL_MS = 5_000;
 /** Only an http(s) page is ever opened from a host's sign-in report. */
 const HOST_SIGN_IN_URL_RE = /^https?:\/\//i;
 
-// Iterate code points (not UTF-16 units) so emoji aren't cut mid-surrogate;
-// prefer the last word boundary within 10 chars of the limit so we don't
-// chop a word in half; trimEnd before the ellipsis so we never emit "foo  …".
 /** The draft's text as sent: a command is trimmed, anything else keeps its leading space. */
 function authoredOutgoingText(fullText: string, trimmed: string): string {
   return isSlashCommandText(trimmed) ? trimmed : fullText.trimEnd();
@@ -417,6 +414,9 @@ function mergeRecalledDraft(
   return { text: serializeReplyDraft(replyDraft), replyDraft, mentions };
 }
 
+// Iterate code points (not UTF-16 units) so emoji aren't cut mid-surrogate;
+// prefer the last word boundary within 10 chars of the limit so we don't
+// chop a word in half; trimEnd before the ellipsis so we never emit "foo  …".
 function truncateTitle(raw: string, max = 60): string {
   const points = Array.from(raw);
   if (points.length <= max) return raw;
