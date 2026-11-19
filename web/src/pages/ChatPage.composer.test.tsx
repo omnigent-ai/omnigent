@@ -934,6 +934,66 @@ describe("Composer send shortcut", () => {
     }
   });
 
+  it("ends the voice take when a dictated message is sent from the mobile layout", () => {
+    const restoreViewport = forceMobileViewport();
+    const handlers: Record<string, (event?: unknown) => void> = {};
+    const startRecognition = vi.fn();
+    const stopRecognition = vi.fn();
+    const abortRecognition = vi.fn();
+    vi.stubGlobal(
+      "SpeechRecognition",
+      class {
+        lang = "en-US";
+        continuous = false;
+        interimResults = false;
+        start = startRecognition;
+        stop = stopRecognition;
+        abort = abortRecognition;
+        addEventListener(type: string, handler: (event?: unknown) => void) {
+          handlers[type] = handler;
+        }
+        removeEventListener() {}
+      },
+    );
+    onTestFinished(() => {
+      vi.unstubAllGlobals();
+      restoreViewport();
+    });
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ onSend })} />);
+    const mic = screen.getByRole("button", { name: "Voice dictation" });
+    fireEvent.click(mic);
+    act(() => handlers.start?.());
+    act(() =>
+      handlers.result?.({
+        resultIndex: 0,
+        results: {
+          length: 1,
+          0: { length: 1, isFinal: true, 0: { transcript: "voice dictated message" } },
+        },
+      }),
+    );
+    expect(mic).toHaveAttribute("aria-pressed", "true");
+
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    expect(onSend).toHaveBeenCalledWith("voice dictated message", undefined);
+    expect(textarea()).toBeEnabled();
+    expect(stopRecognition.mock.calls.length + abortRecognition.mock.calls.length).toBe(1);
+    act(() =>
+      handlers.result?.({
+        resultIndex: 0,
+        results: {
+          length: 1,
+          0: { length: 1, isFinal: true, 0: { transcript: "after the send" } },
+        },
+      }),
+    );
+    expect(textarea()).toHaveValue("");
+    act(() => handlers.end?.());
+    expect(startRecognition).toHaveBeenCalledTimes(1);
+    expect(mic).toHaveAttribute("aria-pressed", "false");
+  });
+
   it("keeps plain Enter completion while Mod+Enter bypasses an open slash menu", () => {
     localStorage.setItem(COMPOSER_SEND_SHORTCUT_STORAGE_KEY, "true");
     const onSend = vi.fn();

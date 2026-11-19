@@ -261,7 +261,7 @@ import {
 import { FileMentionMenu } from "@/components/FileMentionMenu";
 import { FileDropOverlay } from "@/components/FileDropOverlay";
 import { FilePathAwareMessageResponse } from "@/components/blocks/ChatMarkdown";
-import { ComposerMicButton } from "@/components/ComposerMicButton";
+import { ComposerMicButton, type ComposerMicButtonHandle } from "@/components/ComposerMicButton";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { ComposerLocalReviewChips } from "@/components/composer/ComposerLocalReviewChips";
 import { isSubagentRoutingSession } from "@/components/CostRoutingControl";
@@ -2822,6 +2822,7 @@ function ComposerImpl(
   const dirtyRef = useRef(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
+  const micRef = useRef<ComposerMicButtonHandle>(null);
   // While dictation listens, Esc cancels the take instead of interrupting the turn.
   const [dictating, setDictating] = useState(false);
   // On mobile, programmatic focus immediately summons the software keyboard.
@@ -3972,6 +3973,9 @@ function ComposerImpl(
     // reach here via the form submit) and Enter-key sends. Placed after the
     // guard so guarded no-ops don't emit, matching the disabled Send button.
     trackClick("chat.composer.send", "button");
+    // A send ends any voice take, so later speech can't land in the next draft.
+    dictation.commitPending();
+    micRef.current?.endTake();
 
     // A generic (non-Codex) side chat forks the conversation and runs it on the
     // SAME host/sandbox as the source (no new sandbox), then opens it as a rail
@@ -4809,6 +4813,7 @@ function ComposerImpl(
                 </div>
               </MobileHeaderControlPortal>
               <ComposerMicButton
+                ref={micRef}
                 className="size-8 md:size-7"
                 enableHotkey
                 disabled={disabled || isReadOnly || hasPendingElicitation || composerLockedByBtw}

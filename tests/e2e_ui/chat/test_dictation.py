@@ -32,6 +32,7 @@ import pytest
 from playwright.sync_api import Browser, BrowserContext, Page, expect
 
 from omnigent.server.dictation import FAKE_SCRIPT as _FAKE_SCRIPT
+from tests.e2e_ui.conftest import configure_mock_llm
 
 # The capability probe caches per page load; the worklet chunks audio at
 # 100 ms; CI machines are slow — a generous ceiling keeps this deflaked.
@@ -218,6 +219,60 @@ def test_enter_while_listening_commits_text(
         page.keyboard.press("Enter")
         expect(mic).to_have_attribute("aria-pressed", "false")
         expect(composer).to_have_value(re.compile(re.escape(_FAKE_SCRIPT)))
+    finally:
+        context.close()
+
+
+def test_send_button_ends_the_take(
+    browser: Browser,
+    browser_context_args: dict[str, Any],
+    seeded_session: tuple[str, str],
+    mock_llm_server_url: str,
+) -> None:
+    """Tapping Send, the only send gesture on a phone, also ends the take."""
+    base_url, session_id = seeded_session
+    configure_mock_llm(mock_llm_server_url, [{"text": "dictated reply"}], match=_FAKE_SCRIPT)
+    context, page = _open_server_dictation_page(
+        browser, browser_context_args, base_url, session_id
+    )
+    try:
+        composer = page.get_by_placeholder("Send a message…")
+        expect(composer).to_be_visible()
+        composer.fill("")
+        # Keep each mic track so the test can check Send releases the microphone.
+        page.evaluate(
+            """() => {
+              const devices = navigator.mediaDevices;
+              const getUserMedia = devices.getUserMedia.bind(devices);
+              window.micTracks = [];
+              devices.getUserMedia = async (constraints) => {
+                const stream = await getUserMedia(constraints);
+                window.micTracks.push(...stream.getTracks());
+                return stream;
+              };
+            }"""
+        )
+
+        mic = page.get_by_role("button", name="Voice dictation")
+        mic.click()
+        expect(mic).to_have_attribute("aria-pressed", "true")
+        expect(composer).to_have_value(_FAKE_SCRIPT, timeout=_TRANSCRIPT_TIMEOUT_MS)
+        assert page.evaluate("window.micTracks.some((track) => track.readyState === 'live')")
+
+        page.get_by_role("button", name="Send", exact=True).click()
+        expect(
+            page.locator('[data-testid="message-bubble"][data-role="user"]').filter(
+                has_text=_FAKE_SCRIPT
+            )
+        ).to_be_visible(timeout=_TRANSCRIPT_TIMEOUT_MS)
+        expect(composer).to_have_value("")
+        # An enabled mic rules out the auto-stop for a disabled composer.
+        expect(mic).to_be_enabled()
+        expect(mic).to_have_attribute("aria-pressed", "false")
+        page.wait_for_function(
+            "window.micTracks.every((track) => track.readyState === 'ended')",
+            timeout=_TRANSCRIPT_TIMEOUT_MS,
+        )
     finally:
         context.close()
 

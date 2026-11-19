@@ -46,7 +46,7 @@ import {
 } from "@/components/composer/ChatComposer";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import { isComposerInput } from "@/components/composer/engine/composerInput";
-import { ComposerMicButton } from "@/components/ComposerMicButton";
+import { ComposerMicButton, type ComposerMicButtonHandle } from "@/components/ComposerMicButton";
 import { FileMentionMenu } from "@/components/FileMentionMenu";
 import {
   BUILTIN_SLASH_COMMANDS,
@@ -917,6 +917,12 @@ function SideChatComposer({
     [activeTextId, composerKey, editText, reconcileVoiceEdits],
   );
   const dictation = useDictationInsert(activeText, setActiveText, textareaRef);
+  const micRef = useRef<ComposerMicButtonHandle>(null);
+  // A send ends any voice take, so later speech can't land in the next draft.
+  const endVoiceTake = () => {
+    dictation.commitPending();
+    micRef.current?.endTake();
+  };
 
   // This tab's seeded text: on a pending tab the "Ask in side chat" selection
   // to QUOTE, on a live tab the `/side` question to SEND.
@@ -1202,6 +1208,7 @@ function SideChatComposer({
     const trimmed = isSlashCommandText(text) ? text.trim() : text.trimEnd();
     if (pending) {
       if (!canSend || starting || !onStart) return;
+      endVoiceTake();
       // Keep the text so a failed fork can be retried without re-typing.
       void onStart(serializeReplyDraft({ quotes, text: trimmed }));
       return;
@@ -1216,6 +1223,7 @@ function SideChatComposer({
     // A lone command token with skill discovery in flight has nothing to run
     // yet; only hold when the submission would route locally.
     if (routeLocally && slashCompletion.pendingCompletion) return;
+    endVoiceTake();
     const builtin = routeLocally
       ? matchSlashCommandInvocation(trimmed, Object.keys(sideChatBuiltins))
       : null;
@@ -1526,6 +1534,7 @@ function SideChatComposer({
               )}
               {gridComposer?.trailing}
               <ComposerMicButton
+                ref={micRef}
                 className="size-8 md:size-7"
                 disabled={!ready}
                 onVoiceStart={() => voiceEditsRef.current.clear()}

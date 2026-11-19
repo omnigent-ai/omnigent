@@ -104,6 +104,8 @@ export function useDictationInsert(
   noteFocus: () => void;
   /** A streaming partial is in the draft, so the composer must not swap its input now. */
   hasInterim: boolean;
+  /** Pin a pending interim region as text the next take must not revise. */
+  commitPending: () => void;
 } {
   // The draft as last seen. Refreshed on every render so external changes
   // win, and written on insert so a second transcript in the same batch
@@ -216,5 +218,10 @@ export function useDictationInsert(
     }, []),
     // A draft the hook didn't write releases its region during render, before state catches up.
     hasInterim: interimPending && (producedRef.current?.region ?? null) !== null,
+    commitPending: useCallback(() => {
+      const mine = producedRef.current;
+      if (mine?.region) producedRef.current = { ...mine, region: null };
+      setInterimPending(false);
+    }, []),
   };
 }
