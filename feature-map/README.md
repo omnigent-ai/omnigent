@@ -128,7 +128,8 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
   walkthrough, capability-dependent content, and browser-local dismissal.
 
 - [Pull request conversations](./pull-request-conversations.md) covers inline
-  GitHub threads and replies through Workspace, composer, mobile and Canvas.
+  GitHub threads and replies through Workspace, composer, mobile and Canvas, and
+  PR reference links in chat messages.
 
 - [Pull request review navigation](./pull-request-review-navigation.md) covers the
   Changes tab's path filter, find in the fetched patch, copy and open actions, and
