@@ -23,6 +23,7 @@ from alembic import command
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import DBAPIError, IntegrityError
 
+from omnigent.db.cockroachdb import _crdb_server_version, _prepare_crdb_schema_transaction
 from omnigent.db.db_models import SqlScheduledTask, SqlScheduledTaskRun, SqlScheduledTaskShare
 from omnigent.db.utils import (
     _build_alembic_config,
@@ -42,6 +43,8 @@ _COMMENT_ANCHOR_REVISION = "f9b3e6c2a401"
 _MCP_SERVICES_MERGE_REVISION = "a7d4c2e9f610"
 _KIND_PREVIOUS = "b4e2d7a91c35"
 _KIND_REVISION = "27d16059fab9"
+_TIMER_KIND_PREVIOUS = "f7c2d8a4b901"
+_TIMER_KIND_REVISION = "128fa36ead42"
 _SHARES_PREVIOUS = "a7d4c2e9f610"
 _SHARES_REVISION = "a8be64286ffc"
 _SCHEMA_PATHS = [
@@ -291,6 +294,13 @@ def test_expected_indexes(db_engine: Engine) -> None:
         "workspace_id",
         "id",
     ]
+    assert scheduled_tasks_idx_cols["ix_scheduled_tasks_kind_session"] == [
+        "kind",
+        "state",
+        "workspace_id",
+        "session_id",
+        "id",
+    ]
     assert "ix_scheduled_tasks_agent_id" not in scheduled_tasks_idx
     # The separate created_at + user_id listing indexes were folded into the
     # single user-scope index above: with the user_id filter pushed into SQL the
@@ -422,7 +432,7 @@ def test_session_mode_check_rejects_bad_code(db_engine: Engine) -> None:
 
 @pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
 def test_kind_check_rejects_bad_code(db_engine: Engine) -> None:
-    """Migrated and model-built ``kind`` CHECKs both reject codes outside 1-2."""
+    """Migrated and model-built ``kind`` CHECKs both reject codes outside 1-3."""
     tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=db_engine)
     # MySQL reports CHECK violations as OperationalError (3819).
     with pytest.raises((IntegrityError, sa.exc.OperationalError)), db_engine.begin() as conn:
@@ -434,7 +444,7 @@ def test_kind_check_rejects_bad_code(db_engine: Engine) -> None:
                 rrule="FREQ=DAILY;BYHOUR=9",
                 agent_id=b"g" * 16,
                 timezone="UTC",
-                kind=3,
+                kind=4,
                 created_at=1,
             )
         )
@@ -1160,6 +1170,136 @@ def test_kind_migration_makes_existing_tasks_automations_and_round_trips(
         command.upgrade(config, _KIND_REVISION)
     with engine.begin() as conn:
         assert conn.execute(sa.select(tasks.c.kind)).scalars().all() == [1, 1]
+
+
+def test_timer_kind_migration_round_trips(dispatch_migration_engine: Engine) -> None:
+    engine = dispatch_migration_engine
+    config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
+    command.upgrade(config, _TIMER_KIND_PREVIOUS)
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    values = {
+        "name": "check-in",
+        "prompt": b"p",
+        "rrule": "FREQ=MINUTELY;INTERVAL=10",
+        "agent_id": b"g" * 16,
+        "timezone": "UTC",
+        "created_at": 1,
+    }
+
+    def migrate(*, down: bool = False) -> None:
+        # The migration commits on CockroachDB, so it runs on a plain connection, as at startup.
+        with engine.connect() as conn:
+            if engine.dialect.name == "cockroachdb":
+                _prepare_crdb_schema_transaction(conn, _crdb_server_version(engine))
+            config.attributes["connection"] = conn
+            if down:
+                command.downgrade(config, _TIMER_KIND_PREVIOUS)
+            else:
+                command.upgrade(config, _TIMER_KIND_REVISION)
+            conn.commit()
+
+    # MySQL reports CHECK violations as OperationalError (3819).
+    with pytest.raises((IntegrityError, sa.exc.OperationalError)), engine.begin() as conn:
+        conn.execute(tasks.insert().values(id=b"t" * 16, kind=3, **values))
+    migrate()
+    with engine.begin() as conn:
+        conn.execute(tasks.insert().values(id=b"t" * 16, kind=3, **values))
+        # Cancelled timers waiting for cleanup, more than one cleanup batch of them,
+        # and a one-shot timer that fired.
+        conn.execute(
+            tasks.insert(),
+            [{"id": uuid4().bytes, "kind": 3, "state": 3, **values} for _ in range(201)],
+        )
+        conn.execute(tasks.insert().values(id=b"f" * 16, kind=3, state=4, **values))
+        conn.execute(tasks.insert().values(id=b"a" * 16, kind=1, **values))
+    # An active or a paused timer holds the downgrade back.
+    for state in (1, 2):
+        with engine.begin() as conn:
+            conn.execute(tasks.update().where(tasks.c.id == b"t" * 16).values(state=state))
+        with pytest.raises(RuntimeError, match="Delete active or paused timer"):
+            migrate(down=True)
+    with engine.begin() as conn:
+        conn.execute(tasks.update().where(tasks.c.id == b"t" * 16).values(state=3))
+    updates: list[str] = []
+    pages: list[str] = []
+    plans: list[str] = []
+    interrupt_at = [201]
+
+    def inspect_cleanup(conn, cursor, statement, parameters, _context, _executemany) -> None:
+        if statement.startswith("UPDATE scheduled_tasks"):
+            updates.append(statement)
+            if engine.dialect.name != "cockroachdb":
+                assert conn.get_execution_options().get("isolation_level") == "AUTOCOMMIT"
+            if engine.dialect.name == "sqlite" and not plans:
+                steps = cursor.connection.execute(f"EXPLAIN QUERY PLAN {statement}", parameters)
+                plans.append(" ".join(str(step) for step in steps.fetchall()))
+            if len(updates) in interrupt_at:
+                raise RuntimeError("interrupted")
+        elif statement.startswith("SELECT scheduled_tasks.workspace_id, scheduled_tasks.id"):
+            pages.append(statement)
+            assert "LIMIT" in statement
+
+    sa.event.listen(engine, "before_cursor_execute", inspect_cleanup)
+    try:
+        # Stopped at the second batch's first row, the first batch stays converted.
+        with pytest.raises(RuntimeError, match="interrupted"):
+            migrate(down=True)
+        with engine.connect() as conn:
+            version = conn.execute(sa.text("SELECT version_num FROM alembic_version"))
+            assert version.scalar_one() == _TIMER_KIND_REVISION
+            timers = sa.select(sa.func.count()).select_from(tasks).where(tasks.c.kind == 3)
+            assert conn.execute(timers).scalar_one() == 3
+        interrupt_at.clear()
+        updates.clear()
+        pages.clear()
+        migrate(down=True)
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", inspect_cleanup)
+    # The retry converts the rest in one page, then finds none left.
+    assert (len(updates), len(pages)) == (3, 2)
+    if engine.dialect.name == "sqlite":
+        # Each update finds its row by primary key instead of scanning the remaining timers.
+        assert "id=?" in plans[0]
+        assert "ix_scheduled_tasks_kind_session" not in plans[0]
+    assert "ix_scheduled_tasks_kind_session" not in {
+        index["name"] for index in sa.inspect(engine).get_indexes("scheduled_tasks")
+    }
+    with pytest.raises((IntegrityError, sa.exc.OperationalError)), engine.begin() as conn:
+        conn.execute(tasks.insert().values(id=b"x" * 16, kind=3, **values))
+    with engine.begin() as conn:
+        rows = conn.execute(sa.select(tasks.c.kind, tasks.c.state)).tuples().all()
+    # Finished and deleted timers are left as deleted automations for cleanup to purge.
+    assert sorted(rows) == [(1, 1)] + [(1, 3)] * 203
+    migrate()
+
+
+def test_timer_kind_downgrade_requires_live_connection() -> None:
+    config = _build_alembic_config("postgresql://")
+    config.output_buffer = StringIO()
+    with pytest.raises(RuntimeError, match="Downgrade requires a live connection"):
+        command.downgrade(config, f"{_TIMER_KIND_REVISION}:{_TIMER_KIND_PREVIOUS}", sql=True)
+    assert "ALTER TABLE" not in config.output_buffer.getvalue()
+
+
+def test_standalone_timer_kind_migrations_record_their_revision(
+    dispatch_migration_engine: Engine,
+) -> None:
+    """``alembic`` run on its own opens its own connection; on CockroachDB the migration
+    also commits part way, and the revision it reaches must still persist."""
+    engine = dispatch_migration_engine
+    config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
+
+    def revision() -> str:
+        with engine.connect() as conn:
+            return conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
+
+    command.upgrade(config, _TIMER_KIND_REVISION)
+    assert revision() == _TIMER_KIND_REVISION
+    command.downgrade(config, _TIMER_KIND_PREVIOUS)
+    assert revision() == _TIMER_KIND_PREVIOUS
+    assert "ix_scheduled_tasks_kind_session" not in {
+        index["name"] for index in sa.inspect(engine).get_indexes("scheduled_tasks")
+    }
 
 
 @pytest.mark.parametrize(

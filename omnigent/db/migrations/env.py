@@ -79,6 +79,9 @@ def run_migrations_online() -> None:
         )
         with connectable.connect() as conn:
             _run_with_connection(conn)
+            # A migration that commits part way, as CockroachDB DDL needs, leaves the rest of
+            # the run, revision stamp included, in a transaction Alembic no longer tracks.
+            conn.commit()
 
 
 def _run_with_connection(connection: Connection) -> None:
