@@ -551,7 +551,7 @@ export function searchFilesViaWorkspaceApi(
           include: splitGlobList(include),
           exclude: splitGlobList(exclude),
           // The REST search walks ignored files too, so they stay findable.
-          includeIgnored: true,
+          includeGitIgnored: true,
         },
         { signal },
       );

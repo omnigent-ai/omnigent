@@ -544,7 +544,7 @@ describe("searchFilesViaWorkspaceApi", () => {
         path: "src",
         include: ["*.{ts,tsx}", "lib/**"],
         exclude: [],
-        includeIgnored: true,
+        includeGitIgnored: true,
       }),
     ]);
     // Paths are relative to the searched directory, as REST reports them.
