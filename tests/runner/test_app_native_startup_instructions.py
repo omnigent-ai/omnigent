@@ -91,11 +91,15 @@ async def test_startup_instructions_join_stable_text_notes_and_memory_in_order(
     from omnigent.runner.native.orchestration import _native_startup_instructions
 
     spec = _spec("Be a concise assistant.")
-    client = object()
+    import httpx
 
-    text = await _native_startup_instructions(
-        spec, client, "sess", "ROUTING NOTE", None, workspace="/work/omnigent"
-    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json={})),
+        base_url="http://server.test",
+    ) as client:
+        text = await _native_startup_instructions(
+            spec, client, "sess", "ROUTING NOTE", None, workspace="/work/omnigent"
+        )
 
     assert text == (
         f"Be a concise assistant.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"

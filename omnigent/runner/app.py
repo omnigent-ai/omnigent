@@ -162,6 +162,7 @@ from omnigent.runner.native import orchestration as _native_runtime
 from omnigent.runner.native.interrupt import NativeInterruptRunner
 from omnigent.runner.native_controls import build_native_controls
 from omnigent.runner.policy_proxy import _evaluate_policy_via_omnigent
+from omnigent.runner.project_orchestrator import append_project_orchestrator_instructions
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
@@ -6340,6 +6341,9 @@ def create_runner_app(
                             extra={"session_id": conv},
                         )
 
+        instructions = await append_project_orchestrator_instructions(
+            instructions, server_client, conv, cached_spec
+        )
         ctx = TurnDispatch(
             agent_id=_dispatched_agent_id,
             harness=harness_name,
@@ -7005,6 +7009,7 @@ def create_runner_app(
             # background path pre-composes).
             _instr_body = body
             if dispatch is None:
+                _instr_spec_ds: AgentSpec | None = None
                 with contextlib.suppress(OmnigentError, httpx.HTTPError, RuntimeError, ValueError):
                     _instr_entry_ds = await _resolve_session_spec_entry(conv_id)
                     _instr_spec_ds = _unwrap_resolved_spec(_instr_entry_ds)
@@ -7057,6 +7062,14 @@ def create_runner_app(
                                         _ds_delivery.value,
                                         extra={"session_id": conv_id},
                                     )
+                _role_instructions = await append_project_orchestrator_instructions(
+                    cast(str | None, _instr_body.get("instructions")),
+                    server_client,
+                    conv_id,
+                    _instr_spec_ds,
+                )
+                if _role_instructions is not None:
+                    _instr_body = {**_instr_body, "instructions": _role_instructions}
             # Re-warn on every turn when session-create established a miss.
             _ds_sa = _session_sub_agent_names.get(conv_id)
             if _ds_sa and _session_sub_agent_resolved.get(conv_id) is False:

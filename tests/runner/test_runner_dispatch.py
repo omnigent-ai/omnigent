@@ -13567,19 +13567,25 @@ def _contract_root_spec(*, with_child: bool) -> AgentSpec:
 class _ContractSnapshotClient(NullServerClient):
     """Session snapshot naming the requested sub-agent."""
 
-    def __init__(self, conv: str) -> None:
+    def __init__(self, conv: str, *, project_orchestrator: bool = False) -> None:
         super().__init__()
         self._conv = conv
+        self._project_orchestrator = project_orchestrator
 
     async def get(self, url: str, **kwargs: object) -> NullServerClient._Response:
         del kwargs
         _conv = self._conv
+        project_orchestrator = self._project_orchestrator
 
         class _Resp(NullServerClient._Response):
             status_code = 200
 
             def json(self) -> dict[str, object]:
-                return {"agent_id": "ag_contract_root", "sub_agent_name": "worker"}
+                return {
+                    "agent_id": "ag_contract_root",
+                    "sub_agent_name": "worker",
+                    "project_orchestrator": project_orchestrator,
+                }
 
         if url.endswith(f"/v1/sessions/{_conv}"):
             return _Resp()
@@ -13674,6 +13680,24 @@ _CONTRACT_ADAPTERS = {
     "known_harness": _contract_run_known_harness,
     "background": _contract_run_background,
 }
+
+
+@pytest.mark.parametrize("path", ["no_harness", "known_harness", "background"])
+@pytest.mark.parametrize("orchestrator", [True, False])
+async def test_project_role_is_session_scoped_across_dispatch_paths(path, orchestrator):
+    from omnigent.runner.project_orchestrator import PROJECT_ORCHESTRATOR_INSTRUCTION
+
+    conv = f"conv_project_{path}_{orchestrator}"
+    recording = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)
+    app = create_runner_app(
+        process_manager=cast(HarnessProcessManager, _FakeProcessManager(recording)),
+        spec_resolver=_contract_resolver_for("child_present", []),
+        server_client=_ContractSnapshotClient(conv, project_orchestrator=orchestrator),
+    )
+    async with _runner_test_client(app) as http:
+        result = await _CONTRACT_ADAPTERS[path](http, conv, recording)
+    assert "Worker instructions." in result["instructions"]
+    assert (PROJECT_ORCHESTRATOR_INSTRUCTION in result["instructions"]) is orchestrator
 
 
 def _contract_resolver_for(scenario: str, calls: list[str]) -> Any:

@@ -149,6 +149,10 @@ class ProjectStore(ABC):
         """Attach the project's first ordinary orchestrator session; retain an existing one."""
         raise NotImplementedError
 
+    def clear_orchestrator(self, project_id: str, session_id: str, *, user_id: str | None) -> None:
+        """Roll back a failed launch only if this session is still the orchestrator."""
+        raise NotImplementedError
+
     @abstractmethod
     def get_order(self, *, user_id: str | None) -> builtins.list[str] | None:
         """Read saved IDs; None means alphabetical order."""

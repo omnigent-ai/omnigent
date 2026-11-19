@@ -18,7 +18,10 @@ from omnigent.server.routes._workspace_validation import WorkspaceValidationErro
 from omnigent.stores import AgentStore
 from omnigent.stores.project_store import ProjectStore
 
-ProjectSessionCreator = Callable[[Request, str | None, dict[str, Any]], Awaitable[Any]]
+ProjectSessionBinder = Callable[[str], Awaitable[None]]
+ProjectSessionCreator = Callable[
+    [Request, str | None, dict[str, Any], ProjectSessionBinder], Awaitable[Any]
+]
 ProjectSessionDeleter = Callable[[Request, str], Awaitable[Any]]
 
 
@@ -115,16 +118,26 @@ async def ensure_project_orchestrator(
     for source, target in (("model", "model_override"), ("effort", "reasoning_effort")):
         if project.config.get(source):
             payload[target] = project.config[source]
-    created = await create_session(request, project.user_id, payload)
-    session_id = created.id
+    session_id: str | None = None
+    result: Project | None = None
+
+    async def bind_before_launch(created_id: str) -> None:
+        nonlocal session_id, result
+        session_id = created_id
+        result = await asyncio.to_thread(
+            projects.set_orchestrator, project.id, created_id, user_id=project.user_id
+        )
 
     try:
-        result = await asyncio.to_thread(
-            projects.set_orchestrator, project.id, session_id, user_id=project.user_id
-        )
+        await create_session(request, project.user_id, payload, bind_before_launch)
     except Exception:
-        await delete_session(request, session_id)
+        if session_id is not None:
+            await asyncio.to_thread(
+                projects.clear_orchestrator, project.id, session_id, user_id=project.user_id
+            )
+            await delete_session(request, session_id)
         raise
+    assert result is not None and session_id is not None
     if result.orchestrator_session_id != session_id:
         # Normal teardown also stops any runner launched by this unused session.
         await delete_session(request, session_id)
@@ -135,14 +148,8 @@ def ticket_update_message(project_id: str, event: dict[str, Any]) -> str:
     import json
 
     return (
-        f"You are the orchestrator for project {project_id}. This is an automatic ticket update.\n"
-        "Use sys_ticket_list and sys_ticket_get to inspect current board state. "
-        "Clarify 'Done when' criteria, start and "
-        "monitor workers with the normal session tools, and record progress and PR outputs "
-        "on tickets. All project agents can read and update the board. Do not delete tickets. "
-        "Use open, in_progress, or done; Done requires a completion summary. If a person "
-        "must act, add the needs-human tag and explain the question in a comment. "
-        "Your own board updates do not wake you. Do not send redundant acknowledgements.\n\n"
+        f"Automatic ticket update for project {project_id}. "
+        "Use the orchestrator skill to handle it.\n\n"
         f"Ticket {event['ticket_id']} · {event['kind']}\n"
         + json.dumps(event["payload"], ensure_ascii=False)
     )

@@ -1473,6 +1473,7 @@ def register_core_routes(
         request: Request,
         user_id: str | None,
         payload_override: dict[str, Any] | None = None,
+        before_launch: Callable[[str], Awaitable[None]] | None = None,
     ) -> SessionResponse | CreatedSessionResponse:
         """Create a session for *user_id*; see :func:`create_session`."""
         content_type = (
@@ -1717,6 +1718,20 @@ def register_core_routes(
                 launching_task.id if launching_task is not None else None
             ),
         )
+        # Ownership and the project role must exist before runner initialization.
+        if permission_store is not None and user_id is not None:
+            with creation_stage("create_identity_ms"):
+                await asyncio.to_thread(permission_store.ensure_user, user_id)
+            with creation_stage("create_acl_ms"):
+                grant = await asyncio.to_thread(
+                    permission_store.grant,
+                    user_id,
+                    resp.id,
+                    LEVEL_OWNER,
+                )
+            resp.permission_level = grant.level
+        if before_launch is not None:
+            await before_launch(resp.id)
         # Notify the runner about the new session so it can resolve
         # the spec and cache sub_agent_name before the first turn.
         # Without this, the runner doesn't know this session exists
@@ -1789,21 +1804,6 @@ def register_core_routes(
                     resp.id,
                     exc_info=True,
                 )
-        # Grant the creator ownership BEFORE any host launch so the
-        # launch's session-ownership check (shared with
-        # POST /v1/hosts/{host_id}/runners via resolve_host_launch)
-        # sees the grant.
-        if permission_store is not None and user_id is not None:
-            with creation_stage("create_identity_ms"):
-                await asyncio.to_thread(permission_store.ensure_user, user_id)
-            with creation_stage("create_acl_ms"):
-                grant = await asyncio.to_thread(
-                    permission_store.grant,
-                    user_id,
-                    resp.id,
-                    LEVEL_OWNER,
-                )
-            resp.permission_level = grant.level
         if launching_task is not None and conv is not None and source is not None:
             from omnigent.server.scheduled.run_sharing import share_launched_session
 
@@ -2504,6 +2504,11 @@ def register_core_routes(
             request=request,
         )
         snapshot.side_chat_allowed = side_chat_ok
+        if conv.project_id is not None and project_store is not None:
+            project = await asyncio.to_thread(project_store.get, conv.project_id, user_id=user_id)
+            snapshot.project_orchestrator = (
+                project is not None and project.orchestrator_session_id == session_id
+            )
         return snapshot
 
     @router.get(

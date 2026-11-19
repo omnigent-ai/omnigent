@@ -74,7 +74,7 @@ class _SpecStub:
         self.skills = skills
         self.skills_filter = skills_filter
         self.executor = _ExecutorStub(harness)
-        self.tool_groups = ToolGroupsConfig(journal=False)
+        self.tool_groups = ToolGroupsConfig(journal=False, projects=False)
 
 
 class _ServerClient:
@@ -151,7 +151,7 @@ def _make_app(
     :returns: The configured FastAPI app.
     """
     spec = _SpecStub(bundled, skills_filter, harness=harness)
-    spec.tool_groups = ToolGroupsConfig(journal=journal_enabled)
+    spec.tool_groups = ToolGroupsConfig(journal=journal_enabled, projects=False)
     entry = ResolvedSpec(spec=spec, workdir=bundle_dir)
 
     async def _spec_resolver(agent_id: str, session_id: str | None) -> Any:

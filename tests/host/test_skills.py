@@ -40,7 +40,7 @@ def _bundle(files: dict[str, str], **config: object) -> bytes:
         "name": "test-agent",
         "llm": {"model": "test", "connection": {"api_key": "test-key"}},
         "executor": {"config": {"harness": "claude-sdk"}},
-        "tool_groups": {"journal": False},
+        "tool_groups": {"journal": False, "projects": False},
         **config,
     }
     output = io.BytesIO()
@@ -116,13 +116,17 @@ def test_session_catalog_ends_with_the_framework_workflow_skills(tmp_path: Path)
     for enabled in (False, True, False):
         current = replace(frame, workflows_enabled=enabled)
         catalog = discovery.discover(current, tmp_path)
-        expected = ["bundled", "save-workflow", "workflow"] if enabled else ["bundled"]
+        expected = (
+            ["bundled", "orchestrator", "save-workflow", "workflow"]
+            if enabled
+            else ["bundled", "orchestrator"]
+        )
         assert [skill["name"] for skill in catalog] == expected
         if enabled:
-            assert catalog[1]["description"].startswith(
+            assert catalog[2]["description"].startswith(
                 "Design, revise, or save a reusable workflow"
             )
-            assert catalog[2]["description"].startswith("Run a multi-step workflow")
+            assert catalog[3]["description"].startswith("Run a multi-step workflow")
         resolved = resolve_session_skills(
             spec,
             (tmp_path,),
@@ -189,7 +193,7 @@ def test_nested_subagent_uses_directory_name_and_own_filter(tmp_path: Path) -> N
             "llm": {"model": "test", "connection": {"api_key": "test"}},
             "skills": "none",
             "executor": {"config": {"harness": "claude-sdk"}},
-            "tool_groups": {"journal": False},
+            "tool_groups": {"journal": False, "projects": False},
         }
     )
     bundle = _bundle(

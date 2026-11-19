@@ -280,7 +280,11 @@ def resolve_harness_skills(ctx: SkillSourceContext, harness: str | None) -> list
 
 # Skills Omnigent ships, each for agents that have the tool group it drives.
 FRAMEWORK_SKILLS_DIR = Path(__file__).resolve().parent.parent / "resources" / "skills"
-_FRAMEWORK_SKILL_GROUPS = {"workflow": "journal", "save-workflow": "journal"}
+_FRAMEWORK_SKILL_GROUPS = {
+    "workflow": "journal",
+    "save-workflow": "journal",
+    "orchestrator": "projects",
+}
 
 
 def framework_skill_names(spec: AgentSpec | None = None) -> list[str]:
@@ -296,13 +300,15 @@ def framework_skill_names(spec: AgentSpec | None = None) -> list[str]:
     ]
 
 
-def framework_skills(spec: AgentSpec) -> list[SkillSpec]:
+def framework_skills(spec: AgentSpec, *, workflows_enabled: bool = True) -> list[SkillSpec]:
     """The skills Omnigent ships for the agent's tool groups, e.g. ``workflow``.
 
     Like bundled skills, they ignore ``skills_filter``; an agent drops one by
     turning its tool group off, e.g. ``tool_groups.journal: false``.
     """
     names = set(framework_skill_names(spec))
+    if not workflows_enabled:
+        names.difference_update({"workflow", "save-workflow"})
     if not names or not FRAMEWORK_SKILLS_DIR.is_dir():
         return []
     return [
@@ -351,8 +357,11 @@ def resolve_session_skills(
             seen_dirs.add(resolved_dir)
         merged.append(skill)
     # Last, so an agent's or user's own skill of the same name wins.
-    if workflows_enabled:
-        merged.extend(skill for skill in framework_skills(spec) if skill.name not in seen)
+    merged.extend(
+        skill
+        for skill in framework_skills(spec, workflows_enabled=workflows_enabled)
+        if skill.name not in seen
+    )
     return merged
 
 

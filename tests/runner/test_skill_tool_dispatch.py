@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -77,6 +76,30 @@ async def test_framework_skills_load_only_when_server_and_tool_group_enable_them
                 assert heading in result
             else:
                 assert "not found" in result
+
+
+@pytest.mark.parametrize("projects", [True, False])
+def test_orchestrator_skill_loads_without_workflows(tmp_path, isolated_home, projects):
+    spec = AgentSpec(
+        spec_version=1, skills_filter="none", tool_groups=ToolGroupsConfig(projects=projects)
+    )
+    loaded = _execute_skill_tool(
+        "load_skill",
+        {"name": "orchestrator"},
+        agent_spec=spec,
+        runner_workspace=tmp_path,
+    )
+    if projects:
+        assert "# Orchestrate the project" in loaded
+        read = _execute_skill_tool(
+            "read_skill_file",
+            {"skill_name": "orchestrator", "path": "SKILL.md"},
+            agent_spec=spec,
+            runner_workspace=tmp_path,
+        )
+        assert "# Orchestrate the project" in read
+    else:
+        assert "not found" in loaded
 
 
 @pytest.mark.parametrize("name", ["example", "workflow"])
@@ -162,7 +185,7 @@ def test_skill_tools_agree_when_filter_suppresses_host_skills(
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     _write_host_skill(workspace)
-    spec = SimpleNamespace(skills=[], skills_filter="none")
+    spec = AgentSpec(spec_version=1, skills_filter="none")
 
     loaded = _execute_skill_tool(
         "load_skill",
@@ -194,7 +217,7 @@ def test_load_then_read_auxiliary_file_reported_sequence(
     )
     (skill_dir / "DEEPENING.md").write_text("Deepening content.\n")
     (skill_dir / "DESIGN-IT-TWICE.md").write_text("Design it twice content.\n")
-    spec = SimpleNamespace(skills=[], skills_filter="all")
+    spec = AgentSpec(spec_version=1, skills_filter="all")
 
     loaded = _execute_skill_tool(
         "load_skill",

@@ -10705,7 +10705,9 @@ def _execute_skill_tool(
         agent_root=runner_workspace,
         skills_filter=skills_filter,
         fallback_skills=(
-            framework_skills(agent_spec) if workflows_enabled and agent_spec is not None else []
+            framework_skills(agent_spec, workflows_enabled=workflows_enabled)
+            if agent_spec is not None
+            else []
         ),
     )
     tool: Tool = load_tool if tool_name == "load_skill" else ReadSkillFileTool(load_tool.skills)

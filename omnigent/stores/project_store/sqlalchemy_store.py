@@ -381,6 +381,22 @@ class SqlAlchemyProjectStore(ProjectStore):
 
         return run_write_transaction(self._session_immediate, "set_project_orchestrator", write)
 
+    def clear_orchestrator(self, project_id: str, session_id: str, *, user_id: str | None) -> None:
+        def write(session: Session) -> None:
+            require_active_account(session, user_id)
+            session.execute(
+                update(SqlProject)
+                .where(
+                    SqlProject.workspace_id == current_workspace_id(),
+                    SqlProject.id == project_id,
+                    SqlProject.user_id == user_id,
+                    SqlProject.orchestrator_session_id == session_id,
+                )
+                .values(orchestrator_session_id=None)
+            )
+
+        run_write_transaction(self._session_immediate, "clear_project_orchestrator", write)
+
     def get_order(self, *, user_id: str | None) -> builtins.list[str] | None:
         """Return the active order used by project-list endpoints."""
         preference = self.get_order_preference(user_id=user_id)

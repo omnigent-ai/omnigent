@@ -90,6 +90,7 @@ from omnigent.pi_prompt import pi_prompt_args
 from omnigent.process_logging import process_log_reference
 from omnigent.runner.identity import runner_mcp_disabled_servers_active_harnesses
 from omnigent.runner.memory_guidance import memory_startup_guidance
+from omnigent.runner.project_orchestrator import append_project_orchestrator_instructions
 from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
     CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -2012,7 +2013,13 @@ async def _auto_create_opencode_terminal(
 
     # opencode 2.0 ignores config ``instructions``; the per-session global AGENTS.md is read.
     instructions_path = write_opencode_instructions(
-        xdg_config_home, _opencode_session_instructions_from_spec(agent_spec)
+        xdg_config_home,
+        await append_project_orchestrator_instructions(
+            _opencode_session_instructions_from_spec(agent_spec),
+            server_client,
+            session_id,
+            opencode_spec,
+        ),
     )
     config = build_opencode_config(
         model=model_override,
@@ -4312,7 +4319,14 @@ async def _auto_create_devin_terminal(
     authored = raw_author_instructions(spec) if spec is not None else None
     rule_is_live = write_devin_agent_rule(workspace_path, authored, session_id=session_id)
     write_agent_instructions_preamble(
-        bridge_dir, build_native_startup_instructions(None if rule_is_live else spec)
+        bridge_dir,
+        await append_project_orchestrator_instructions(
+            build_native_startup_instructions(None if rule_is_live else spec),
+            server_client,
+            session_id,
+            spec,
+        )
+        or "",
     )
     if rule_is_live:
         # Record the workspace so the SessionEnd hook can remove this rule when
@@ -7891,7 +7905,13 @@ async def _native_startup_instructions(
         *launch_notes,
         await memory_startup_guidance(server_client, session_id, agent_spec, workspace=workspace),
     ]
-    return "\n\n".join(part for part in parts if part)
+    spec = agent_spec.spec if isinstance(agent_spec, ResolvedSpec) else agent_spec
+    return (
+        await append_project_orchestrator_instructions(
+            "\n\n".join(part for part in parts if part), server_client, session_id, spec
+        )
+        or ""
+    )
 
 
 # Claude Code's own setting for its machine-local auto memory.

@@ -84,9 +84,9 @@ def test_native_workflow_skills_require_server_flag_and_journal_tools(
     assert (with_journal / "skills" / "workflow" / "SKILL.md").is_file() is workflows_enabled
     assert (with_journal / "skills" / "save-workflow" / "SKILL.md").is_file() is workflows_enabled
     assert sorted(p.name for p in (with_journal / "skills").iterdir()) == sorted(
-        [SKILL_NAME, *(["save-workflow", "workflow"] if workflows_enabled else [])]
+        [SKILL_NAME, "orchestrator", *(["save-workflow", "workflow"] if workflows_enabled else [])]
     )
-    assert [p.name for p in (without / "skills").iterdir()] == [SKILL_NAME]
+    assert {p.name for p in (without / "skills").iterdir()} == {SKILL_NAME, "orchestrator"}
 
     disabled_spec = (
         None
@@ -98,7 +98,8 @@ def test_native_workflow_skills_require_server_flag_and_journal_tools(
     _ensure_orchestrator_skills_in_bundle(
         with_journal, disabled_spec, workflows_enabled=disabled_by != "server"
     )
-    assert [p.name for p in (with_journal / "skills").iterdir()] == [SKILL_NAME]
+    expected = {SKILL_NAME} if disabled_spec is None else {SKILL_NAME, "orchestrator"}
+    assert {p.name for p in (with_journal / "skills").iterdir()} == expected
     user_skill = with_journal / "skills" / "workflow" / "SKILL.md"
     user_skill.parent.mkdir()
     user_skill.write_text("User-authored workflow instructions")
@@ -106,3 +107,18 @@ def test_native_workflow_skills_require_server_flag_and_journal_tools(
         with_journal, disabled_spec, workflows_enabled=disabled_by != "server"
     )
     assert user_skill.read_text() == "User-authored workflow instructions"
+
+
+def test_orchestrator_skill_is_available_without_workflows_and_respects_project_tools(tmp_path):
+    from omnigent.spec.types import AgentSpec, ToolGroupsConfig
+
+    _ensure_orchestrator_skills_in_bundle(tmp_path, AgentSpec(spec_version=1))
+    assert (tmp_path / "skills" / "orchestrator" / "SKILL.md").is_file()
+    assert not (tmp_path / "skills" / "workflow").exists()
+    sources = codex_skill_sources(tmp_path, tmp_path / "fake-home").linked
+    assert "orchestrator" in select_codex_skill_dirs("all", sources)
+
+    _ensure_orchestrator_skills_in_bundle(
+        tmp_path, AgentSpec(spec_version=1, tool_groups=ToolGroupsConfig(projects=False))
+    )
+    assert not (tmp_path / "skills" / "orchestrator").exists()

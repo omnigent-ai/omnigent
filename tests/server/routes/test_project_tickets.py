@@ -4,6 +4,7 @@ from uuid import uuid4
 
 import pytest
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     HostHelloFrame,
     HostLaunchRunnerFrame,
@@ -37,12 +38,27 @@ async def test_project_creation_has_one_normal_orchestrator(project_client, db_u
     session = (await project_client.get(f"/v1/sessions/{session_id}")).json()
     assert session["title"] == "Orchestrator"
     assert session["project_id"] == project["id"]
+    assert session["project_orchestrator"] is True
     assert SqlAlchemyConversationStore(db_uri).get_conversation(session_id).kind == "default"
     again = await project_client.post(f"/v1/projects/{project['id']}/orchestrator")
     assert again.json()["orchestrator_session_id"] == session_id
     info = (await project_client.get("/v1/info")).json()
     assert info["project_tickets"] is True
     assert info["durable_initial_input"] is False
+
+    worker = (
+        await project_client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": PROJECT_AGENT_ID,
+                "project_id": project["id"],
+                "title": "Orchestrator",
+            },
+        )
+    ).json()
+    worker = (await project_client.get(f"/v1/sessions/{worker['id']}")).json()
+    assert worker["project_id"] == project["id"]
+    assert worker["project_orchestrator"] is False
 
 
 async def test_orchestrator_inherits_defaults_but_not_public_sharing(
@@ -92,6 +108,26 @@ async def test_existing_project_can_initialize_its_orchestrator(project_client, 
     assert len(SqlAlchemyConversationStore(db_uri).list_conversations().data) == 1
 
 
+async def test_failed_launch_can_retry_without_a_dangling_project_role(
+    project_client, db_uri, monkeypatch
+):
+    projects = SqlAlchemyProjectStore(db_uri)
+    project = projects.create(uuid4().hex, "Retry", None)
+    with monkeypatch.context() as launch_failure:
+        launch_failure.setattr(
+            "omnigent.server.routes.sessions.routes_core._get_runner_client",
+            AsyncMock(side_effect=OmnigentError("Launch failed", code=ErrorCode.INVALID_INPUT)),
+        )
+        response = await project_client.post(f"/v1/projects/{project.id}/orchestrator")
+    assert response.status_code == 400
+    assert projects.get(project.id, user_id=None).orchestrator_session_id is None
+    assert SqlAlchemyConversationStore(db_uri).list_conversations().data == []
+
+    retry = await project_client.post(f"/v1/projects/{project.id}/orchestrator")
+    assert retry.status_code == 200
+    assert retry.json()["orchestrator_session_id"] is not None
+
+
 async def test_concurrent_initializer_uses_normal_session_teardown(
     project_client, db_uri, monkeypatch
 ):
@@ -135,6 +171,9 @@ async def test_name_only_project_uses_owned_host_home_and_normal_launch(
                 }
             )
         elif isinstance(frame, HostLaunchRunnerFrame):
+            conversation = SqlAlchemyConversationStore(db_uri).get_conversation(frame.session_id)
+            project = SqlAlchemyProjectStore(db_uri).get(conversation.project_id, user_id=ALICE)
+            assert project.orchestrator_session_id == frame.session_id
             launches.append(frame)
             connection.pending_launches[frame.request_id].set_result({"status": "launched"})
         else:

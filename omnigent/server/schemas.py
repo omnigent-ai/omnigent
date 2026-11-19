@@ -2676,6 +2676,8 @@ class SessionResponse(BaseModel):
     # Whether the viewer may start side chats here: only the owner of the
     # session's root can. ``None`` where the response doesn't compute it.
     side_chat_allowed: bool | None = None
+    # Computed from the project's designated session, not inherited by workers.
+    project_orchestrator: bool = False
 
 
 class UpdateSessionRequest(BaseModel):
