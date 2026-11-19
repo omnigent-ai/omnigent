@@ -1230,13 +1230,25 @@ async def test_workspace_direct_access_is_owner_only(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(("session", "passes"), [("conv_share", False), ("conv_open", True)])
 @pytest.mark.parametrize(
-    "method", ["ReadFile", "StatPath", "ReadLinkText", "SearchFiles", "SearchText"]
+    "method",
+    [
+        "ReadFile",
+        "StatPath",
+        "ReadLinkText",
+        "SearchFiles",
+        "SearchText",
+        "ResolveWorkingCopyBase",
+        "ListWorkingCopyChanges",
+        "ReadBaseFile",
+        "ListRepositoryRefs",
+        "ListBranchCommits",
+    ],
 )
 async def test_workspace_api_follows_the_file_read_gate(
     client: httpx.AsyncClient, session: str, passes: bool, method: str
 ) -> None:
     """A view-only collaborator reads the workspace API only where files are shared."""
-    streaming = method in ("ReadFile", "SearchText")
+    streaming = method in ("ReadFile", "SearchText", "ReadBaseFile")
     resp = await client.post(
         f"/v1/sessions/{session}/workspace"
         f"/omnigent.api.workspace.v1alpha1.WorkspaceService/{method}",

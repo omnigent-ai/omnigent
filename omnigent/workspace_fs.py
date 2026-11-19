@@ -158,9 +158,18 @@ class FileBytes:
     content_type: str | None
 
 
+def guess_content_type(rel: str) -> str | None:
+    """The MIME type a file read reports for ``rel``, from its name alone.
+
+    Uses this machine's MIME table, e.g. ``"text/markdown"`` for ``"notes.md"``.
+    """
+    content_type, _ = mimetypes.guess_type(rel)
+    return content_type
+
+
 def _cap_file_bytes(rel: str, raw: bytes) -> FileBytes:
     """Cap ``raw`` at the read limit and decide whether it is UTF-8 text."""
-    content_type, _ = mimetypes.guess_type(rel)
+    content_type = guess_content_type(rel)
     truncated = len(raw) > _MAX_READ_BYTES
     capped = raw[:_MAX_READ_BYTES] if truncated else raw
     try:

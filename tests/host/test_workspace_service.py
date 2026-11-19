@@ -38,14 +38,18 @@ from omnigent.api.workspace.v1alpha1.workspace_connect import (
     WorkspaceServiceClient,
 )
 from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
+    CHANGE_STATUS_MODIFIED,
     CONTENT_ENCODING_UTF8,
     ENTRY_TYPE_DIRECTORY,
     FILE_SEARCH_MODE_SUBSTRING,
     GetCapabilitiesRequest,
     ListDirectoryRequest,
+    ListRepositoryRefsRequest,
+    ListWorkingCopyChangesRequest,
     ReadBaseFileRequest,
     ReadFileRequest,
     ReadLinkTextRequest,
+    ResolveRepositoryContextRequest,
     SearchFilesRequest,
     SearchTextRequest,
     SearchTextResponse,
@@ -559,6 +563,53 @@ async def test_search_text_matches_the_rest_content_search(
     assert (responses[-1].warning or None) == rest["warning"]
 
 
+async def test_base_reads_match_file_reads_and_changes_list_on_every_route(
+    tmp_path: Path, client_for: ClientFor
+) -> None:
+    """An unchanged file reads the same at HEAD as from the disk; a change lists with its blob."""
+    root = _workspace(tmp_path)
+    env = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "Dev",
+        "GIT_AUTHOR_EMAIL": "dev@example.com",
+        "GIT_COMMITTER_NAME": "Dev",
+        "GIT_COMMITTER_EMAIL": "dev@example.com",
+    }
+    for argv in (["init", "-q"], ["add", "notes.md", "big.txt", "src"], ["commit", "-qm", "c"]):
+        subprocess.run(["git", "-C", str(root), *argv], check=True, env=env)
+    (root / "src" / "main.py").write_text("print('changed')\n")
+    client = client_for(root)
+
+    changes = await client.list_working_copy_changes(ListWorkingCopyChangesRequest())
+    modified = next(f for f in changes.files if f.path == "src/main.py")
+    listed = await client.list_repository_refs(ListRepositoryRefsRequest())
+    head = changes.base.head
+    tree = subprocess.run(
+        ["git", "-C", str(root), "ls-tree", "--object-only", head, "big.txt"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    base = [
+        m
+        async for m in client.read_base_file(
+            ReadBaseFileRequest(commit=head, path="big.txt", object=tree)
+        )
+    ]
+    disk = [m async for m in client.read_file(ReadFileRequest(path="big.txt"))]
+
+    # Untracked files are listed as added; the committed ones that didn't change aren't.
+    assert {"src/main.py", "café.txt"} <= {f.path for f in changes.files}
+    assert not {"notes.md", "big.txt"} & {f.path for f in changes.files}
+    assert modified.status == CHANGE_STATUS_MODIFIED
+    assert modified.base_object and modified.HasField("working")
+    assert listed.refs and not listed.truncated
+    assert b"".join(m.data for m in base) == b"".join(m.data for m in disk)
+    assert base[0].metadata.size == disk[0].metadata.size
+    assert base[0].metadata.encoding == disk[0].metadata.encoding
+    assert base[0].metadata.content_type == disk[0].metadata.content_type
+
+
 async def test_capabilities_list_the_served_methods(tmp_path: Path, client_for: ClientFor) -> None:
     client = client_for(tmp_path)
 
@@ -573,6 +624,13 @@ async def test_capabilities_list_the_served_methods(tmp_path: Path, client_for: 
         "SearchFiles",
         "search_files.substring",
         "SearchText",
+        "ResolveWorkingCopyBase",
+        "revision_comparison",
+        "ListWorkingCopyChanges",
+        "ReadBaseFile",
+        "ListRepositoryRefs",
+        "ListBranchCommits",
+        "branch_commits",
     }
 
 
@@ -594,12 +652,12 @@ async def test_methods_not_served_yet_answer_unimplemented(
     """A client that skips GetCapabilities still gets a code it can fall back on."""
     client = client_for(tmp_path)
 
-    with pytest.raises(ConnectError) as unary:
+    with pytest.raises(ConnectError) as fuzzy:
         await client.search_files(SearchFilesRequest(query="main"))  # fuzzy, the default
-    with pytest.raises(ConnectError) as streamed:
-        [m async for m in client.read_base_file(ReadBaseFileRequest(path="main"))]
+    with pytest.raises(ConnectError) as context:
+        await client.resolve_repository_context(ResolveRepositoryContextRequest())
 
-    assert unary.value.code == streamed.value.code == Code.UNIMPLEMENTED
+    assert fuzzy.value.code == context.value.code == Code.UNIMPLEMENTED
 
 
 @PROTOCOLS

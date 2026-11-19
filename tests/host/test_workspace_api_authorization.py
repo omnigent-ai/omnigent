@@ -35,8 +35,13 @@ _CALLS: dict[str, dict[str, object]] = {
     "ReadLinkText": {"path": "link"},
     "SearchFiles": {"query": "a", "mode": "FILE_SEARCH_MODE_SUBSTRING"},
     "SearchText": {"query": "needle"},
+    "ResolveWorkingCopyBase": {},
+    "ListWorkingCopyChanges": {},
+    "ReadBaseFile": {"commit": "a" * 40, "path": "a.txt", "object": "b" * 40},
+    "ListRepositoryRefs": {},
+    "ListBranchCommits": {},
 }
-_STREAMING = {"SearchText"}
+_STREAMING = {"SearchText", "ReadBaseFile"}
 
 
 def _workspace(root: Path, marker: str) -> Path:

@@ -49,12 +49,22 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     FileMetadata,
     GetCapabilitiesRequest,
     GetCapabilitiesResponse,
+    ListBranchCommitsRequest,
+    ListBranchCommitsResponse,
     ListDirectoryRequest,
     ListDirectoryResponse,
+    ListRepositoryRefsRequest,
+    ListRepositoryRefsResponse,
+    ListWorkingCopyChangesRequest,
+    ListWorkingCopyChangesResponse,
+    ReadBaseFileRequest,
+    ReadBaseFileResponse,
     ReadFileRequest,
     ReadFileResponse,
     ReadLinkTextRequest,
     ReadLinkTextResponse,
+    ResolveWorkingCopyBaseRequest,
+    ResolveWorkingCopyBaseResponse,
     SearchFilesRequest,
     SearchFilesResponse,
     SearchTextRequest,
@@ -63,6 +73,7 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     StatPathResponse,
 )
 from omnigent.host.frames import HostWorkspaceCallFrame, HostWorkspaceReplyFrame
+from omnigent.host.workspace_git import comparison, working_copy
 from omnigent.host.workspace_methods import WORKSPACE_METHODS
 from omnigent.host.workspace_search import search_files, search_text
 from omnigent.host.workspace_tokens import new_token_key, verify_token
@@ -106,6 +117,11 @@ _SERVED: dict[str, _Served] = {
     "ReadLinkText": _Served(),
     "SearchFiles": _Served(features=("search_files.substring",), tool="git"),
     "SearchText": _Served(tool="rg"),
+    "ResolveWorkingCopyBase": _Served(features=("revision_comparison",), tool="git"),
+    "ListWorkingCopyChanges": _Served(tool="git"),
+    "ReadBaseFile": _Served(tool="git"),
+    "ListRepositoryRefs": _Served(tool="git"),
+    "ListBranchCommits": _Served(features=("branch_commits",), tool="git"),
 }
 
 
@@ -201,6 +217,48 @@ class WorkspaceService(WorkspaceServiceMethods):
         reader = await _read(self._reader_for, ctx)
         item, is_symlink = await _read(reader.stat_entry, request.path)
         return StatPathResponse(entry=_entry(item, is_symlink=is_symlink))
+
+    async def resolve_working_copy_base(
+        self,
+        request: ResolveWorkingCopyBaseRequest,
+        ctx: RequestContext[ResolveWorkingCopyBaseRequest, ResolveWorkingCopyBaseResponse] | None,
+    ) -> ResolveWorkingCopyBaseResponse:
+        reader = await _read(self._reader_for, ctx)
+        return await working_copy.resolve_working_copy_base(reader.root, request)
+
+    async def list_working_copy_changes(
+        self,
+        request: ListWorkingCopyChangesRequest,
+        ctx: RequestContext[ListWorkingCopyChangesRequest, ListWorkingCopyChangesResponse] | None,
+    ) -> ListWorkingCopyChangesResponse:
+        reader = await _read(self._reader_for, ctx)
+        return await working_copy.list_working_copy_changes(reader.root, request)
+
+    async def read_base_file(
+        self,
+        request: ReadBaseFileRequest,
+        ctx: RequestContext[ReadBaseFileRequest, ReadBaseFileResponse] | None,
+    ) -> AsyncIterator[ReadBaseFileResponse]:
+        reader = await _read(self._reader_for, ctx)
+        async with aclosing(working_copy.read_base_file(reader.root, request)) as responses:
+            async for response in responses:
+                yield response
+
+    async def list_repository_refs(
+        self,
+        request: ListRepositoryRefsRequest,
+        ctx: RequestContext[ListRepositoryRefsRequest, ListRepositoryRefsResponse] | None,
+    ) -> ListRepositoryRefsResponse:
+        reader = await _read(self._reader_for, ctx)
+        return await comparison.list_repository_refs(reader.root, request)
+
+    async def list_branch_commits(
+        self,
+        request: ListBranchCommitsRequest,
+        ctx: RequestContext[ListBranchCommitsRequest, ListBranchCommitsResponse] | None,
+    ) -> ListBranchCommitsResponse:
+        reader = await _read(self._reader_for, ctx)
+        return await comparison.list_branch_commits(reader.root, request)
 
     async def search_files(
         self,
