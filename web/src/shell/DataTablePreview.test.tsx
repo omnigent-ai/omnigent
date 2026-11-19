@@ -101,6 +101,33 @@ describe("DataTablePreview", () => {
     expect(screen.getByText("1 matching")).toBeInTheDocument();
   });
 
+  it.each([",", "\t"])("edits a later column's filter before earlier columns (%j)", (delimiter) => {
+    renderTable(
+      [
+        ["region", "units", "product"],
+        ["West", "10", "Nimbus Pro"],
+        ["East", "2", "Nimbus Mini"],
+        ["North", "3", "Atlas Desk"],
+      ]
+        .map((row) => row.join(delimiter))
+        .join("\n"),
+      { path: delimiter === "\t" ? "sales.tsv" : "sales.csv" },
+    );
+    const filter = screen.getByRole("textbox", { name: "Filter product" });
+    for (const value of ["N", "Nimbus", "Nimbus ", "Nimbus Pro", " Nimbus Pro "]) {
+      fireEvent.change(filter, { target: { value } });
+      expect(columnValues(0)).toEqual(value.trim() === "Nimbus Pro" ? ["West"] : ["West", "East"]);
+    }
+    fireEvent.change(screen.getByRole("textbox", { name: "Filter region" }), {
+      target: { value: "East" },
+    });
+    expect(screen.getByText("0 matching")).toBeInTheDocument();
+    for (const value of [" ", ""]) {
+      fireEvent.change(filter, { target: { value } });
+      expect(columnValues(0)).toEqual(["East"]);
+    }
+  });
+
   it("copies the selected cell or its row", async () => {
     const writeText = vi.fn().mockResolvedValue(undefined);
     stubClipboard(writeText);

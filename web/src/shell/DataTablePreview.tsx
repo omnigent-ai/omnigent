@@ -125,7 +125,7 @@ function DataTableView({
   onRowsChange?: () => void;
 }) {
   const [sort, setSort] = useState<{ column: number; direction: SortDirection } | null>(null);
-  const [filters, setFilters] = useState<string[]>([]);
+  const [filters, setFilters] = useState<string[]>(() => table.header.map(() => ""));
   const [widths, setWidths] = useState<Record<number, number>>({});
   // Rendered widths of auto-sized columns, read when their resize handle takes focus.
   const [fittedWidths, setFittedWidths] = useState<Record<number, number>>({});
