@@ -1,4 +1,5 @@
 import type { AnyBlock, BlockContext } from "./blocks";
+import type { SessionStatus } from "./types";
 
 export type LatestSessionError = "error" | "disconnected" | "recovered_disconnect";
 
@@ -17,6 +18,7 @@ function sameCausalBoundary(first: BlockContext, next: BlockContext): boolean {
 export function latestActivityErrorWindow(
   blocks: readonly AnyBlock[],
   hostOnline?: boolean | null,
+  sessionStatus?: SessionStatus,
 ): LatestActivityErrorWindow {
   let boundary: BlockContext | null = null;
   let failedLifecycle = false;
@@ -27,6 +29,11 @@ export function latestActivityErrorWindow(
     const block = blocks[i];
     switch (block.type) {
       case "error": {
+        // A resumed session leaves `failed` without adding an item, so its
+        // status-only card no longer describes the latest activity.
+        if (block.fromSessionStatus && sessionStatus !== undefined && sessionStatus !== "failed") {
+          break;
+        }
         if (boundary && !sameCausalBoundary(boundary, block.ctx)) {
           return { state: resolvedFailure(), boundaryResolved: true };
         }
@@ -93,12 +100,32 @@ export function latestActivityErrorWindow(
 export function latestActivityErrorState(
   blocks: readonly AnyBlock[],
   hostOnline?: boolean | null,
+  sessionStatus?: SessionStatus,
 ): LatestSessionError | null | undefined {
-  return latestActivityErrorWindow(blocks, hostOnline).state;
+  return latestActivityErrorWindow(blocks, hostOnline, sessionStatus).state;
 }
 
 /** The latest visible activity, ignoring transcript bookkeeping. */
 export function latestActivityIsError(blocks: readonly AnyBlock[]): boolean | undefined {
   const state = latestActivityErrorState(blocks);
   return state === undefined ? undefined : state === "error" || state === "disconnected";
+}
+
+/** Server-maintained latest-activity error: "error", "disconnected" or "" (absent means none). */
+export const LATEST_ACTIVITY_ERROR_LABEL_KEY = "omnigent.latest_activity_error";
+
+/**
+ * Map the server's latest-activity label to the sidebar badge. A disconnect stops
+ * being a badge once its host is back online.
+ */
+export function latestErrorFromLabels(
+  labels: Readonly<Record<string, string>> | undefined,
+  hostOnline: boolean | null | undefined,
+): LatestSessionError | null {
+  const value = labels?.[LATEST_ACTIVITY_ERROR_LABEL_KEY];
+  if (value === "error") return "error";
+  if (value === "disconnected") {
+    return hostOnline === true ? "recovered_disconnect" : "disconnected";
+  }
+  return null;
 }

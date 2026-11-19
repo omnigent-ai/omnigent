@@ -653,7 +653,7 @@ async def resolve_turn_route(
 
     try:
         model, verdict = await route_turn(req.harness, req.prompt[:_PROMPT_CAP])
-    except Exception as exc:  # noqa: BLE001 — a router outage must never block a turn
+    except Exception as exc:  # a router outage must never block a turn
         _logger.warning(
             "route-turn: router call failed for session=%s; allowing unrouted",
             session_id,
@@ -846,7 +846,7 @@ def _handler_factory(
                     _awaited(resolver(session_id, req)), loop
                 )
                 decision = future.result(timeout=request_timeout_s)
-            except Exception:  # noqa: BLE001 — never wedge a user's prompt
+            except Exception:  # never wedge a user's prompt
                 _logger.warning(
                     "route-turn: resolver failed for session=%s", session_id, exc_info=True
                 )
@@ -921,7 +921,7 @@ def make_server_relay_resolver(
             )
             resp.raise_for_status()
             payload = resp.json()
-        except Exception:  # noqa: BLE001 — server hop failures are expected
+        except Exception:  # server hop failures are expected
             _logger.warning(
                 "route-turn: server relay failed for session=%s", session_id, exc_info=True
             )
@@ -1373,7 +1373,7 @@ async def _prompt_already_ran(session_id: str, prompt: str, server_client: Any) 
         )
         resp.raise_for_status()
         payload = resp.json()
-    except Exception:  # noqa: BLE001 — an unreadable session is "unknown"
+    except Exception:  # an unreadable session is "unknown"
         _logger.debug("route-turn: item scan failed for session=%s", session_id, exc_info=True)
         return None
     if not isinstance(payload, dict):

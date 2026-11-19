@@ -1503,7 +1503,8 @@ def test_delete_of_a_root_inherited_key_does_not_resurrect_from_the_snapshot(
     assert engine.session_state[SESSION_COST_ASK_APPROVED_STATE_KEY] == 0.05
 
     engine.apply_state_updates(
-        [StateUpdate(key=SESSION_COST_ASK_APPROVED_STATE_KEY, action=StateUpdateAction.DELETE)]
+        [StateUpdate(key=SESSION_COST_ASK_APPROVED_STATE_KEY, action=StateUpdateAction.DELETE)],
+        approved=True,
     )
 
     assert SESSION_COST_ASK_APPROVED_STATE_KEY not in engine.session_state, engine.session_state
@@ -1546,12 +1547,14 @@ def test_delete_of_the_same_key_name_on_a_top_level_session_removes_it(
                 action=StateUpdateAction.SET,
                 value=0.05,
             )
-        ]
+        ],
+        approved=True,
     )
     assert engine.session_state[SESSION_COST_ASK_APPROVED_STATE_KEY] == 0.05
 
     engine.apply_state_updates(
-        [StateUpdate(key=SESSION_COST_ASK_APPROVED_STATE_KEY, action=StateUpdateAction.DELETE)]
+        [StateUpdate(key=SESSION_COST_ASK_APPROVED_STATE_KEY, action=StateUpdateAction.DELETE)],
+        approved=True,
     )
 
     assert SESSION_COST_ASK_APPROVED_STATE_KEY not in engine.session_state, engine.session_state

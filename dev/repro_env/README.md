@@ -82,15 +82,18 @@ process/database state produces an explicit error. The three connection
 variables must be supplied together; use the wrapper rather than setting only
 one of them.
 
-Standalone native mock fixtures save an existing provider config to an
-owner-only `.e2e-backup` file next to its resolved target before replacing it
-and restore it on exit. A config symlink remains intact.
-If the test process is killed, recover that backup before retrying; subsequent
-runs refuse to overwrite it.
+Standalone UI runs give each pytest process a private `OMNIGENT_CONFIG_HOME`
+seeded with copies of the user `config.yaml` and file-backed `secrets.json`, so
+native mock fixtures never edit the real files. When the caller sets
+`OMNIGENT_CONFIG_HOME`, the fixtures instead save its existing provider config
+to an owner-only `.e2e-backup` file next to the resolved target before replacing
+it and restore it on exit. A config symlink remains intact. If the test process
+is killed, recover that backup before retrying; subsequent runs refuse to
+overwrite it.
 
 Arbitrary Python/Playwright commands also work with the wrapper. They receive
-`OMNIGENT_REPRO_SERVER_URL`, `OMNIGENT_REPRO_MODEL_URL`, and
-`OMNIGENT_REPRO_RUNNER_ID`. These URLs are valid only inside that invocation;
+`OMNIGENT_REPRO_SERVER_URL`, `OMNIGENT_REPRO_MODEL_URL`, `OMNIGENT_REPRO_RUNNER_ID`,
+and the prepared runner's `CLAUDE_CONFIG_DIR`. The URLs are valid only inside that invocation;
 reuse session IDs across invocations, not the temporary URLs. HTTP, SSE and
 terminal WebSockets all use the same product endpoints. Put shared files in the
 worktree, since `/tmp` is private to each sandbox.

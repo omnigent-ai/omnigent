@@ -1,5 +1,11 @@
 import "@testing-library/jest-dom/vitest";
+import { configure } from "@testing-library/react";
+import type * as ReactVirtualModule from "@tanstack/react-virtual";
 import { vi } from "vitest";
+
+// Tooltip surfaces intentionally wait 1s; leave enough margin for async queries
+// to observe them without racing Testing Library's matching default timeout.
+configure({ asyncUtilTimeout: 2000 });
 
 // The @lobehub icon packages have broken nested-module resolution
 // under vitest; stub presentational glyphs so component modules that
@@ -89,42 +95,39 @@ if (typeof globalThis.ResizeObserver === "undefined") {
 // and exposing the offset/range/scroll handles the transcript's
 // VirtualBubbleList touches, so its real path doesn't throw under jsdom.
 const ROW = 200;
-vi.mock("@tanstack/react-virtual", () => ({
-  useVirtualizer: ({
-    count,
-    getItemKey,
-  }: {
-    count: number;
-    getItemKey?: (i: number) => unknown;
-  }) => {
-    const items = Array.from({ length: count }, (_, index) => ({
-      index,
-      key: getItemKey ? getItemKey(index) : index,
-      start: index * ROW,
-      size: ROW,
-      end: (index + 1) * ROW,
-      lane: 0,
-    }));
-    return {
-      getVirtualItems: () => items,
-      getTotalSize: () => count * ROW,
-      measureElement: () => {},
-      scrollToIndex: () => {},
-      getVirtualItemForOffset: (offset: number) =>
-        items[Math.max(0, Math.min(Math.floor(offset / ROW), count - 1))],
-      getOffsetForIndex: (index: number) => [index * ROW, "start"] as const,
-      takeSnapshot: () => items,
-      scrollOffset: 0,
-      scrollAdjustments: 0,
-      scrollDirection: null,
-      range: count > 0 ? { startIndex: 0, endIndex: count - 1 } : null,
-      // The transcript's prepend hold measures fresh rows itself and reads the
-      // raw measurements back; sizes never change under jsdom.
-      measurementsCache: items,
-      itemSizeCache: new Map(),
-      resizeItem: () => {},
-    };
-  },
+vi.mock("@tanstack/react-virtual", async (importOriginal) => ({
+  measureElement: (await importOriginal<typeof ReactVirtualModule>()).measureElement,
+  useVirtualizer: vi.fn(
+    ({ count, getItemKey }: { count: number; getItemKey?: (i: number) => unknown }) => {
+      const items = Array.from({ length: count }, (_, index) => ({
+        index,
+        key: getItemKey ? getItemKey(index) : index,
+        start: index * ROW,
+        size: ROW,
+        end: (index + 1) * ROW,
+        lane: 0,
+      }));
+      return {
+        getVirtualItems: () => items,
+        getTotalSize: () => count * ROW,
+        measureElement: () => {},
+        scrollToIndex: () => {},
+        getVirtualItemForOffset: (offset: number) =>
+          items[Math.max(0, Math.min(Math.floor(offset / ROW), count - 1))],
+        getOffsetForIndex: (index: number) => [index * ROW, "start"] as const,
+        takeSnapshot: () => items,
+        scrollOffset: 0,
+        scrollAdjustments: 0,
+        scrollDirection: null,
+        range: count > 0 ? { startIndex: 0, endIndex: count - 1 } : null,
+        // The transcript's prepend hold measures fresh rows itself and reads the
+        // raw measurements back; sizes never change under jsdom.
+        measurementsCache: items,
+        itemSizeCache: new Map(),
+        resizeItem: () => {},
+      };
+    },
+  ),
 }));
 
 Object.defineProperty(window, "matchMedia", {

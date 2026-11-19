@@ -501,3 +501,10 @@ def test_malformed_dismissed_detections_treated_as_empty() -> None:
     assert dismissed_detection_names({"dismissed_detections": [3, "codex-databricks"]}) == (
         frozenset({"codex-databricks"})
     )
+
+
+def test_detected_gemini_key_preserves_companion_gateway(monkeypatch) -> None:
+    monkeypatch.setenv("GOOGLE_GEMINI_BASE_URL", "https://gateway.example/gemini")
+    entries = synthesize_detected_entries([_gemini_key()])
+    assert entries["gemini"]["gemini"]["base_url"] == "https://gateway.example/gemini"
+    assert entries["gemini"]["gemini"]["api_key_ref"] == "env:GEMINI_API_KEY"

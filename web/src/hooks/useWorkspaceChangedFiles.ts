@@ -17,18 +17,25 @@
 import { useCallback, useEffect, useRef } from "react";
 import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
+import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useSession } from "@/hooks/useSession";
 import { livenessRowFromSession, useSessionLiveness } from "@/hooks/useSessionLiveness";
 import { authenticatedFetch } from "@/lib/identity";
+import { listDirectoryViaWorkspaceApi } from "@/lib/workspaceApi";
 import { isTempConvId } from "@/lib/tempConversationId";
 import { useChatStore } from "@/store/chatStore";
 
-/** True when `id` is the focused conversation and its agent loop is live. */
+/** True while this session’s agent loop is live, including visible grid panes. */
 export function useSessionActive(conversationId: string | undefined): boolean {
   const focusedId = useChatStore((s) => s.conversationId);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
-  if (!conversationId || conversationId !== focusedId) return false;
-  return sessionStatus === "running" || sessionStatus === "waiting";
+  const gridEnabled = isFeatureEnabled(useServerInfo(), "grid_sessions_display_ui");
+  const scoped = useConversationEntryState(gridEnabled ? (conversationId ?? null) : null);
+  const status =
+    conversationId === focusedId ? sessionStatus : gridEnabled ? scoped.sessionStatus : null;
+  return !!conversationId && (status === "running" || status === "waiting");
 }
 
 /**
@@ -99,6 +106,7 @@ interface WorkspaceQueryOptions {
 export interface WorkspaceChangedFile {
   path: string;
   name: string;
+  repository_root?: string;
   /** Change status: "created", "modified", or "deleted". */
   status: "created" | "modified" | "deleted";
   bytes: number | null;
@@ -107,6 +115,8 @@ export interface WorkspaceChangedFile {
   lines_added: number | null;
   /** Lines removed, or null when unknown. */
   lines_removed: number | null;
+  /** An untracked file's own lines; absent from runners that don't count them. */
+  untracked_lines?: number | null;
 }
 
 export interface WorkspaceChangedFilesResult {
@@ -233,11 +243,13 @@ interface ChangedFilesResponse {
   data: {
     path: string;
     name: string;
+    repository_root?: string;
     status: "created" | "modified" | "deleted";
     bytes: number | null;
     modified_at: number | null;
     lines_added: number | null;
     lines_removed: number | null;
+    untracked_lines?: number | null;
   }[];
   has_more: boolean;
 }
@@ -277,11 +289,13 @@ async function fetchWorkspaceChangedFiles(
   const data: WorkspaceChangedFile[] = json.data.map((e) => ({
     path: e.path,
     name: e.name,
+    repository_root: e.repository_root,
     status: e.status,
     bytes: e.bytes,
     modified_at: e.modified_at,
     lines_added: e.lines_added ?? null,
     lines_removed: e.lines_removed ?? null,
+    untracked_lines: e.untracked_lines ?? null,
   }));
   return { available: true, data };
 }
@@ -388,10 +402,24 @@ function mapFilesystemEntries(
   });
 }
 
+/** A workspace directory listed through the workspace API, or null to list through REST. */
+async function listViaWorkspaceApi(
+  conversationId: string,
+  location: string,
+  maxEntries: number,
+): Promise<FilesystemListResponse | null> {
+  // The workspace API only lists inside the workspace.
+  if (browseLocationBase(location)) return null;
+  const listed = await listDirectoryViaWorkspaceApi(conversationId, location, maxEntries);
+  return listed && { object: "list", data: listed.data, has_more: listed.hasMore };
+}
+
 async function fetchWorkspaceAllFiles(
   conversationId: string,
   location = "",
 ): Promise<WorkspaceAllFilesResult> {
+  const viaApi = await listViaWorkspaceApi(conversationId, location, 1000);
+  if (viaApi) return { available: true, data: mapFilesystemEntries(viaApi, location) };
   const segment = browseLocationSegment(location);
   const params = new URLSearchParams({ limit: "1000", order: "asc" });
   const base = browseLocationBase(location);
@@ -557,6 +585,13 @@ export interface WorkspaceFileSearchResult {
    * definitive "no match".
    */
   truncated: boolean;
+  /** True when the server returned its full result limit, so more matches may exist. */
+  hasMore: boolean;
+  /**
+   * True when the workspace couldn't be searched (no OS environment, or the runner
+   * is unavailable). `files` is then empty, which doesn't mean nothing matched.
+   */
+  unavailable: boolean;
 }
 
 async function fetchWorkspaceFileSearch(
@@ -565,6 +600,7 @@ async function fetchWorkspaceFileSearch(
   include: string,
   exclude: string,
   location: string,
+  signal?: AbortSignal,
 ): Promise<WorkspaceFileSearchResult> {
   const params = new URLSearchParams({ limit: "500" });
   if (query) params.set("q", query);
@@ -575,15 +611,22 @@ async function fetchWorkspaceFileSearch(
   if (base) params.set("base", base);
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/search${segment ? `/${segment}` : ""}?${params}`,
+    { signal },
   );
   // 404 means the runner has no OS environment for this session (cloud-only
   // agent).  Mirror the behaviour of useWorkspaceAllFiles: return empty
   // results rather than surfacing an error.
-  if (res.status === 404) return { files: [], truncated: false };
-  if (await isRunnerUnavailable503(res)) return { files: [], truncated: false };
+  const unavailable = { files: [], truncated: false, hasMore: false, unavailable: true };
+  if (res.status === 404) return unavailable;
+  if (await isRunnerUnavailable503(res)) return unavailable;
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   const json = (await res.json()) as FilesystemListResponse;
-  return { files: mapFilesystemEntries(json, location), truncated: !!json.truncated };
+  return {
+    files: mapFilesystemEntries(json, location),
+    truncated: !!json.truncated,
+    hasMore: !!json.has_more,
+    unavailable: false,
+  };
 }
 
 /**
@@ -623,8 +666,16 @@ export function useWorkspaceFileSearch(
       trimmedExclude,
       location,
     ],
-    queryFn: () =>
-      fetchWorkspaceFileSearch(conversationId!, trimmed, trimmedInclude, trimmedExclude, location),
+    // React Query aborts the signal when a newer query replaces this one.
+    queryFn: ({ signal }) =>
+      fetchWorkspaceFileSearch(
+        conversationId!,
+        trimmed,
+        trimmedInclude,
+        trimmedExclude,
+        location,
+        signal,
+      ),
     enabled:
       (options.enabled ?? true) && !!conversationId && trimmed.length > 0 && serveable !== false,
     staleTime: 5_000,
@@ -640,6 +691,9 @@ async function fetchWorkspaceDirectory(
   location = "",
 ): Promise<WorkspaceFile[]> {
   const target = joinBrowseLocation(location, dirPath);
+  const viaApi = await listViaWorkspaceApi(conversationId, target, 1000);
+  // The tree addresses children relative to the location it is rooted at.
+  if (viaApi) return mapFilesystemEntries(viaApi, target, dirPath);
   const encodedPath = browseLocationSegment(target);
   const params = new URLSearchParams({ limit: "1000", order: "asc" });
   const base = browseLocationBase(target);
@@ -751,6 +805,8 @@ export function resolveChatFilePath(
   // any stripping so a "trusted" absolute path doesn't carry these markers
   // past the existence-check heuristic and trigger a fetch that can't match.
   if (text.includes("://") || text.includes("?") || text.includes("#")) return null;
+  // Windows paths (`C:\x`, `\\host\x`) would otherwise pass as one relative segment.
+  if (/^[A-Za-z]:/.test(text) || text.includes("\\")) return null;
   let p = text;
   if (home && (p === "~" || p.startsWith("~/"))) {
     // Strip a trailing slash off home so "/" home (root user) doesn't
@@ -811,6 +867,8 @@ async function fetchDirEntriesTolerant(
   // ``base=host`` (see ``browseLocationSegment``). Entries of an absolute
   // listing echo back base-relative names, so the listed dir is re-attached
   // below and callers compare full paths uniformly.
+  const viaApi = await listViaWorkspaceApi(conversationId, dirPath, FILE_EXISTENCE_SCAN_LIMIT);
+  if (viaApi) return { files: mapFilesystemEntries(viaApi), truncated: viaApi.has_more };
   const base = `/v1/sessions/${encodeURIComponent(conversationId)}/resources/environments/${DEFAULT_ENVIRONMENT_ID}/filesystem`;
   const params = new URLSearchParams({ order: "asc" });
   const hostBase = browseLocationBase(dirPath);
@@ -858,6 +916,8 @@ async function fetchDirEntriesTolerant(
 export interface WorkspaceFileExistence {
   /** True when the parent listing confirms `path` names an existing file. */
   exists: boolean;
+  /** True when the parent listing shows `path` names a directory instead. */
+  isDirectory: boolean;
   /**
    * True only when a parent listing actually completed successfully for the
    * current inputs and fully answered the question, so `exists: false` means
@@ -872,7 +932,8 @@ export interface WorkspaceFileExistence {
 }
 
 /**
- * Check whether `path` names an existing *file* the session can open.
+ * Check whether `path` names an existing *file* the session can open, or a
+ * directory (reported separately so a folder never reads as missing).
  *
  * Backed by a bounded listing of the path's PARENT directory, shared across
  * sibling files via the React Query cache. A directory beyond the scan limit
@@ -923,14 +984,18 @@ export function useWorkspaceFileExists(
   });
   // No candidate = the check was SKIPPED (not path-shaped and untrusted),
   // not run-and-found-nothing — it must never read as "verified absent".
-  if (!candidate) return { exists: false, settled: false };
+  if (!candidate) return { exists: false, isDirectory: false, settled: false };
   const listing = query.data ?? null;
-  const exists = !!listing?.files.some((e) => e.type === "file" && e.path === candidate);
+  const entry = listing?.files.find((e) => e.path === candidate);
   // Only a listing that genuinely completed proves absence: errors and
   // unavailable-runner responses (data === null) leave the answer open. A
   // hit settles even a truncated page, but a miss on a truncated page
   // doesn't — the file may simply live past the page limit.
-  return { exists, settled: query.isSuccess && listing !== null && (exists || !listing.truncated) };
+  return {
+    exists: entry?.type === "file",
+    isDirectory: entry?.type === "directory",
+    settled: query.isSuccess && listing !== null && (!!entry || !listing.truncated),
+  };
 }
 
 // ── Default environment (working folder root) ─────────────────────────────────

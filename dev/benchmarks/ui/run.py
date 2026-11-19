@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import contextlib
 import datetime
 import json
+import logging
 import math
 import signal
 import statistics
@@ -32,6 +34,9 @@ from playwright.async_api import (
     Response,
     async_playwright,
     expect,
+)
+from playwright.async_api import (
+    Error as PlaywrightError,
 )
 
 from dev.benchmarks.omnigent.compare import (
@@ -237,8 +242,39 @@ async def measure_scenario(
         await page.screenshot(path=str(evidence.with_suffix(".png")))
         return sample
     except Exception:
-        with contextlib.suppress(Exception):
-            await page.screenshot(path=str(evidence.with_suffix(".failed.png")))
+        try:
+            # Failed assets can leave font readiness pending; capture the rendered frame.
+            capture = await (await context.new_cdp_session(page)).send("Page.captureScreenshot")
+            evidence.with_suffix(".failed.png").write_bytes(base64.b64decode(capture["data"]))
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "Failure screenshot could not be saved at %s",
+                evidence.with_suffix(".failed.png"),
+                exc_info=True,
+            )
+            page_state: dict[str, Any] = {"page_closed": page.is_closed()}
+            try:
+                if not page_state["page_closed"]:
+                    async with asyncio.timeout(30):
+                        page_state["document"] = await page.evaluate("""() => ({
+                            readyState: document.readyState,
+                            visibility: document.visibilityState,
+                            viewport: {width: innerWidth, height: innerHeight},
+                            documentElement: document.documentElement ? {
+                                width: document.documentElement.clientWidth,
+                                height: document.documentElement.clientHeight
+                            } : null,
+                            paints: performance.getEntriesByType('paint').map(
+                                ({name, startTime}) => ({name, startTime})),
+                            observedAt: performance.now()
+                        })""")
+            except (PlaywrightError, TimeoutError) as state_error:
+                page_state["state_error"] = repr(state_error)
+            logging.getLogger(__name__).warning(
+                "Document state after failed screenshot capture at %s: %s",
+                evidence.with_suffix(".failed.png"),
+                page_state,
+            )
         raise
     finally:
         await context.close()
@@ -274,7 +310,7 @@ def make_report(
             }
     report = build_report(
         journeys,
-        generated_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        generated_at=datetime.datetime.now(datetime.UTC).isoformat(),
         config={
             "iterations": args.iterations,
             "runs": args.runs,

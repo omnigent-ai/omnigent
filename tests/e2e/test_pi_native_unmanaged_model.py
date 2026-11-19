@@ -464,6 +464,7 @@ def test_facet1_prelaunch_model_options_offer_the_hosts_pi_models(
         "shows only 'Default'. pi_native_model_options() early-returns [] when "
         f"resolve_pi_native_provider() is None. Got: {resp.text}"
     )
+    assert all(isinstance(model, dict) for model in models), models
     offered = {model.get("id") for model in models}
     assert {_PINNED_SPEC_MODEL, _CUSTOM_PICKER_MODEL} <= offered, (
         "pi-native pre-launch model-options must offer the logged-in catalog AND the "

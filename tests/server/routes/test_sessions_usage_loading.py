@@ -16,7 +16,10 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from omnigent.errors import OmnigentError
-from omnigent.runner.native.orchestration import _codex_native_launch_config
+from omnigent.runner.native.orchestration import (
+    _codex_native_launch_config,
+    _pi_native_launch_config,
+)
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, UnifiedAuthProvider
 from omnigent.server.routes._sessions import orchestration
 from omnigent.server.routes.sessions import create_sessions_router
@@ -161,6 +164,94 @@ async def test_snapshot_can_skip_usage_without_exposing_parent_only_cost(
         assert body["external_session_id"] == "thread-resumed"
         stored = usage_app.conversations.get_conversation(usage_app.parent_id)
         assert stored is not None and stored.external_session_id == "thread-resumed"
+    load_usage.assert_not_called()
+
+
+@pytest.mark.parametrize("complete", [True, False, None])
+async def test_pi_launch_restores_only_own_usage_without_loading_display_usage(
+    usage_app: _UsageApp,
+    usage_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    complete: bool | None,
+) -> None:
+    """Real HTTP snapshot and runner decoding exclude the parent's children."""
+    monkeypatch.setattr(orchestration, "_resolve_harness", lambda *_args, **_kwargs: "pi-native")
+    monkeypatch.setattr(
+        orchestration,
+        "load_session_usage",
+        Mock(side_effect=AssertionError("native launch must not aggregate the tree")),
+    )
+    usage_app.conversations.set_session_usage(
+        usage_app.parent_id,
+        {
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "cache_read_input_tokens": 30,
+            "total_cost_usd": 0.25,
+            "native_cost_complete": complete,
+        },
+    )
+    usage_app.conversations.set_session_usage(
+        usage_app.child_id,
+        {
+            "input_tokens": 9000,
+            "output_tokens": 8000,
+            "cache_read_input_tokens": 7000,
+            "total_cost_usd": 99.5,
+        },
+    )
+    launch = await _pi_native_launch_config(
+        session_id=usage_app.parent_id, server_client=usage_client
+    )
+    expected = {
+        "cumulative_input_tokens": 130,
+        "cumulative_output_tokens": 20,
+        "cumulative_cache_read_input_tokens": 30,
+    }
+
+    if complete is True:
+        expected["cumulative_cost_usd"] = 0.25
+    assert launch.native_usage_baseline == expected
+
+
+@pytest.mark.parametrize("side_chat", [True, False], ids=["side-chat", "worker"])
+async def test_codex_side_chat_restores_own_usage_without_loading_display_usage(
+    usage_app: _UsageApp,
+    usage_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    side_chat: bool,
+) -> None:
+    load_usage = Mock(side_effect=AssertionError("side-chat recovery must not aggregate usage"))
+    monkeypatch.setattr(orchestration, "load_session_usage", load_usage)
+    usage_app.conversations.set_labels(
+        usage_app.child_id,
+        {
+            "omnigent.wrapper": "codex-native-ui-subagent",
+            "omnigent.codex_native.agent_nickname": "Side chat" if side_chat else "Worker",
+        },
+    )
+    usage_app.conversations.set_session_usage(
+        usage_app.child_id,
+        {"input_tokens": 100, "output_tokens": 20, "cache_read_input_tokens": 30},
+    )
+    response = await usage_client.get(
+        f"/v1/sessions/{usage_app.child_id}",
+        params={**_USAGE_SNAPSHOT_PARAMS, "include_usage": "false"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    resume_label = "omnigent.codex_native.side_chat_resume"
+    assert body["labels"].get(resume_label) == ("false" if side_chat else None)
+    assert resume_label not in usage_app.conversations.get_conversation(usage_app.child_id).labels
+    if side_chat:
+        baseline = body["native_usage_baseline"]
+        assert baseline["cumulative_input_tokens"] == 130
+        assert baseline["cumulative_output_tokens"] == 20
+        assert baseline["cumulative_cache_read_input_tokens"] == 30
+    else:
+        assert body["native_usage_baseline"] is None
+    assert body["usage_included"] is False
+    assert body["usage_by_model"] is None
     load_usage.assert_not_called()
 
 

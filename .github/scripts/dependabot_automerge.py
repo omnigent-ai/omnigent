@@ -13,6 +13,7 @@ import re
 import subprocess
 import zipfile
 import zlib
+from datetime import UTC, datetime, timedelta
 from functools import cache
 from pathlib import Path
 from urllib.parse import urlencode
@@ -22,6 +23,7 @@ from dependabot_policy import (
     action_changes,
     evaluate_changes,
     require,
+    require_refresh_permissions,
 )
 from maintainer_approval import gh_json, latest_decisive_reviews, paginated
 
@@ -31,6 +33,10 @@ REPORT_CHECKS = (
     "Trivy CVE Scan (repository)",
     "Trivy CVE Scan (dev-tools)",
 )
+
+
+class StaleBase(NeedsReview):
+    """Completed CI used a different base from current main."""
 
 
 @cache
@@ -56,6 +62,30 @@ def read_file(repository: str, sha: str, path: str) -> str:
     return base64.b64decode(blob["content"]).decode()
 
 
+def main_head(repository: str) -> str:
+    # A PR's base.sha can lag the live target branch.
+    return gh_json(["api", f"repos/{repository}/git/ref/heads/main"])["object"]["sha"]
+
+
+@cache
+def refresh_workflows(repository: str, sha: str) -> dict[str, str]:
+    tree_sha = sha
+    for part in (".github", "workflows"):
+        tree = git_object(repository, "trees", tree_sha)
+        require(not tree.get("truncated"), "Workflow inventory is incomplete")
+        entries = [entry for entry in tree["tree"] if entry["path"] == part]
+        require(len(entries) == 1 and entries[0]["mode"] == "040000", "Missing workflow inventory")
+        tree_sha = entries[0]["sha"]
+    tree = git_object(repository, "trees", tree_sha)
+    require(not tree.get("truncated"), "Workflow inventory is incomplete")
+    paths = [entry["path"] for entry in tree["tree"] if entry["path"].endswith((".yml", ".yaml"))]
+    require(bool(paths), "Missing workflow inventory")
+    return {
+        f".github/workflows/{path}": read_file(repository, sha, f".github/workflows/{path}")
+        for path in paths
+    }
+
+
 def evaluate(
     repository: str, number: int, expected_head: str | None = None, *, for_scan: bool = False
 ) -> dict:
@@ -67,7 +97,7 @@ def evaluate(
     )
     require(pull["head"]["repo"]["full_name"] == repository, "Fork PR requires review")
     require(pull["base"]["ref"] == "main", "Only main is covered by auto-merge")
-    head, base = pull["head"]["sha"], pull["base"]["sha"]
+    head, base = pull["head"]["sha"], main_head(repository)
     require(expected_head is None or head == expected_head, "PR head changed during evaluation")
     labels = {label["name"] for label in pull["labels"]}
     require(
@@ -104,7 +134,7 @@ def evaluate(
         if for_scan
         else evaluate_changes(read, paths, policy)
     )
-    return dict(decision, head=head, base=base)
+    return dict(decision, number=number, head=head, base=base)
 
 
 def require_advisory_policy(
@@ -137,13 +167,12 @@ def latest_check(repository: str, head: str, name: str) -> dict:
     return max(runs, key=lambda run: run["id"])
 
 
-def require_approval(repository: str, candidate: dict, mode: str) -> None:
-    if mode != "merge":
-        return
+def approval_refresh_run(repository: str, candidate: dict) -> str | None:
+    """Identify a recoverable approval failure without dispatching or consuming retries."""
     check = latest_check(repository, candidate["head"], "Maintainer Approval")
     require(check["status"] == "completed", "Waiting for Maintainer Approval")
     if check["conclusion"] == "success":
-        return
+        return None
     require(check["conclusion"] == "failure", "Maintainer Approval needs human intervention")
     match = re.fullmatch(
         rf"https://github.com/{re.escape(repository)}/actions/runs/(\d+)/job/\d+",
@@ -160,6 +189,15 @@ def require_approval(repository: str, candidate: dict, mode: str) -> None:
         "Approval workflow cannot be refreshed",
     )
     require(run["run_attempt"] < 3, "Approval refresh retry limit reached; inspect the run")
+    return run_id
+
+
+def require_approval(repository: str, candidate: dict, mode: str) -> None:
+    if mode != "merge":
+        return
+    run_id = approval_refresh_run(repository, candidate)
+    if run_id is None:
+        return
     # Cooldown expiry and mode changes do not generate a new PR event.
     subprocess.run(
         [
@@ -175,15 +213,68 @@ def require_approval(repository: str, candidate: dict, mode: str) -> None:
     raise NeedsReview("Refreshed Maintainer Approval; waiting for the next sweep")
 
 
-def require_reports(repository: str, candidate: dict) -> None:
+def required_workflows(candidate: dict) -> set[str]:
+    workflows = set(candidate["workflows"]) | {"ci.yml", "lint.yml", "trivy.yml"}
+    if candidate["ecosystem"] in {"python", "github-actions"}:
+        workflows.add("windows.yml")
+    return workflows
+
+
+def require_merge_ready(repository: str, candidate: dict, mode: str) -> None:
     head = candidate["head"]
     # Merge Ready is a commit status, unlike the workflow job check runs.
     statuses = paginated(f"repos/{repository}/commits/{head}/statuses")
     merge_ready = [status for status in statuses if status["context"] == "Merge Ready"]
+    if merge_ready and max(merge_ready, key=lambda status: status["id"])["state"] == "success":
+        return
+    if mode == "merge":
+        require_current_candidate(repository, candidate["number"], candidate)
+        query = urlencode(
+            {
+                "event": "workflow_dispatch",
+                "created": ">=" + (datetime.now(UTC) - timedelta(days=1)).isoformat(),
+                "per_page": 100,
+            }
+        )
+        runs = gh_json(
+            ["api", f"repos/{repository}/actions/workflows/merge-ready.yml/runs?{query}"]
+        )
+        require(runs["total_count"] <= 100, "Readiness refresh history is incomplete")
+        title = f"Merge Ready #{candidate['number']} ({head})"
+        attempts = [run for run in runs["workflow_runs"] if run["display_title"] == title]
+        require(
+            all(run["status"] == "completed" for run in attempts),
+            "Merge Ready refresh is already running",
+        )
+        require(len(attempts) < 3, "Merge Ready refresh limit reached for this head in 24 hours")
+        # Cooldown expiry and registry recovery do not emit workflow events.
+        subprocess.run(
+            [
+                "gh",
+                "workflow",
+                "run",
+                "merge-ready.yml",
+                "--repo",
+                repository,
+                "--ref",
+                "main",
+                "-f",
+                f"pr={candidate['number']}",
+                "-f",
+                f"sha={head}",
+            ],
+            check=True,
+            env=dict(os.environ, GH_TOKEN=os.environ["DEPENDABOT_MERGE_TOKEN"]),
+        )
+    raise NeedsReview("Waiting for successful Merge Ready status")
+
+
+def require_reports(repository: str, candidate: dict) -> None:
+    head = candidate["head"]
+    workflows = required_workflows(candidate)
     require(
-        bool(merge_ready)
-        and max(merge_ready, key=lambda status: status["id"])["state"] == "success",
-        "Waiting for successful Merge Ready status",
+        all(step["workflow"] in workflows for step in candidate.get("consumer_steps", [])),
+        "Consumer coverage references a workflow outside the required set",
     )
     for name in (*REPORT_CHECKS, *candidate["checks"]):
         latest = latest_check(repository, head, name)
@@ -195,7 +286,7 @@ def require_reports(repository: str, candidate: dict) -> None:
     # path-filtered check as skippable while its workflow is being created.
     completed_runs = {}
     policy = json.loads(POLICY.read_text())
-    for workflow in sorted(set(candidate["workflows"]) | {"ci.yml", "lint.yml", "trivy.yml"}):
+    for workflow in sorted(workflows):
         latest, jobs = latest_workflow(repository, head, workflow)
         require(
             latest["head_sha"] == head
@@ -203,19 +294,74 @@ def require_reports(repository: str, candidate: dict) -> None:
             and latest["conclusion"] == "success",
             f"Latest {workflow} run did not succeed",
         )
-        required_jobs = (
+        if not any(
+            pull.get("number") == candidate["number"]
+            and pull.get("head", {}).get("sha") == head
+            and pull.get("base", {}).get("sha") == candidate["base"]
+            for pull in latest.get("pull_requests", [])
+        ):
+            raise StaleBase(
+                f"{workflow}: CI did not test the current PR head and base; rebase the PR"
+            )
+        target_jobs = (
+            policy.get("cargo", {})
+            .get("targets", {})
+            .get(candidate["target"], {})
+            .get("workflow_test_jobs", {})
+            if candidate["ecosystem"] == "cargo"
+            else {}
+        )
+        required_jobs = target_jobs.get(workflow) or (
             policy["dependency_workflow_test_jobs"]
             .get(candidate["ecosystem"], {})
             .get(workflow, policy["workflow_test_jobs"][workflow])
         )
-        # Older heads ran the full Python matrix before scope selection existed.
-        if required_jobs == ["CI scope"] and not any(job["name"] == "CI scope" for job in jobs):
-            required_jobs = policy["workflow_test_jobs"][workflow]
+        # Require coverage markers so incomplete runs cannot satisfy the gate.
+        coverage_marker = {
+            "ci.yml": "CI coverage scope",
+            "e2e.yml": "E2E coverage scope",
+            "e2e-ui.yml": "UI coverage scope",
+            "web-tests.yml": "Web coverage scope",
+        }.get(workflow)
+        if coverage_marker and candidate["ecosystem"] in {
+            "python",
+            "npm",
+            "cargo",
+            "github-actions",
+        }:
+            require(
+                any(
+                    job["name"] == coverage_marker and job["conclusion"] == "success"
+                    for job in jobs
+                ),
+                f"{workflow}: waiting for successful {coverage_marker}",
+            )
         for pattern in required_jobs:
             matching = [job for job in jobs if fnmatch.fnmatchcase(job["name"], pattern)]
+            # The CI aggregate checks every selected matrix leg; unrelated
+            # Rust/parity jobs may intentionally skip on a Python update.
+            aggregate_matrix = workflow == "ci.yml" and pattern == "Pytest (*)"
+            allowed = {"success", "skipped"} if aggregate_matrix else {"success"}
             require(
-                bool(matching) and all(job["conclusion"] == "success" for job in matching),
+                bool(matching)
+                and any(job["conclusion"] == "success" for job in matching)
+                and all(job["conclusion"] in allowed for job in matching),
                 f"{workflow}: waiting for successful {pattern} jobs",
+            )
+        for consumer in candidate.get("consumer_steps", []):
+            if consumer["workflow"] != workflow:
+                continue
+            require(
+                any(
+                    job["name"] == consumer["job"]
+                    and job["conclusion"] == "success"
+                    and any(
+                        step["name"] == consumer["step"] and step["conclusion"] == "success"
+                        for step in job.get("steps", [])
+                    )
+                    for job in jobs
+                ),
+                f"{workflow}: waiting for executed consumer step {consumer['step']}",
             )
         completed_runs[workflow] = latest
     if not candidate["target"]:
@@ -239,12 +385,15 @@ def require_reports(repository: str, candidate: dict) -> None:
         ["api", f"repos/{repository}/actions/runs/{trivy_run['id']}/artifacts?per_page=100"]
     )
     require(artifacts["total_count"] <= 100, "Trivy artifact listing is incomplete")
+    target = candidate["target"]
+    scope = "dev-tools" if target.startswith("dev/") else "repository"
+    report_target = target.removeprefix("dev/") if scope == "dev-tools" else target
     reports = [
         a
         for a in artifacts["artifacts"]
-        if a["name"] == "trivy-cve-report-repository" and not a["expired"]
+        if a["name"] == f"trivy-cve-report-{scope}" and not a["expired"]
     ]
-    require(len(reports) == 1, "Missing or ambiguous Trivy repository report")
+    require(len(reports) == 1, f"Missing or ambiguous Trivy {scope} report")
     data = subprocess.run(
         ["gh", "api", f"repos/{repository}/actions/artifacts/{reports[0]['id']}/zip"],
         check=True,
@@ -255,11 +404,11 @@ def require_reports(repository: str, candidate: dict) -> None:
             require_advisory_policy(
                 json.loads(archive.read("trivy-results.json")),
                 candidate["packages"],
-                candidate["target"],
+                report_target,
                 candidate["scanner"],
             )
     except (zipfile.BadZipFile, zlib.error) as exc:
-        raise NeedsReview(f"Trivy repository report is unreadable: {exc}") from exc
+        raise NeedsReview(f"Trivy {scope} report is unreadable: {exc}") from exc
 
 
 def latest_workflow(repository: str, head: str, workflow: str) -> tuple[dict, list[dict]]:
@@ -292,7 +441,7 @@ def refresh_failed_gates(repository: str, candidate: dict, mode: str) -> None:
         "Waiting for successful Security Scan",
     )
     refreshed = []
-    for workflow in sorted(set(candidate["workflows"]) | {"ci.yml", "lint.yml", "trivy.yml"}):
+    for workflow in sorted(required_workflows(candidate)):
         run, jobs = latest_workflow(repository, candidate["head"], workflow)
         if run["status"] != "completed" or run["conclusion"] != "failure":
             continue
@@ -317,6 +466,106 @@ def refresh_failed_gates(repository: str, candidate: dict, mode: str) -> None:
         )
         refreshed.append(workflow)
     require(not refreshed, f"Refreshed blocked CI: {', '.join(refreshed)}; waiting for next sweep")
+
+
+def require_current_candidate(repository: str, number: int, candidate: dict) -> None:
+    current = gh_json(["api", f"repos/{repository}/pulls/{number}"])
+    require(
+        current["head"]["sha"] == candidate["head"]
+        and current["base"]["ref"] == "main"
+        and main_head(repository) == candidate["base"],
+        "PR or main changed during evaluation",
+    )
+    require(
+        not current["draft"] and current["state"] == "open",
+        "PR is now closed or draft",
+    )
+    require(
+        not {label["name"] for label in current["labels"]}
+        & {"hold-automerge", "skip-security-scan"},
+        "PR was put on hold",
+    )
+    reviews = paginated(f"repos/{repository}/pulls/{number}/reviews")
+    require(
+        all(r["state"] != "CHANGES_REQUESTED" for r in latest_decisive_reviews(reviews).values()),
+        "A reviewer has requested changes",
+    )
+
+
+def require_base_refresh_budget(commits: list[dict]) -> None:
+    maximum = json.loads(POLICY.read_text()).get("max_base_refreshes")
+    require(
+        type(maximum) is int and maximum >= 0,
+        "max_base_refreshes must be a non-negative integer",
+    )
+    used = sum(len(commit["parents"]) > 1 for commit in commits)
+    require(
+        used < maximum,
+        f"Base refresh limit reached ({used}/{maximum}); maintainer review required",
+    )
+
+
+def refresh_stale_base(repository: str, candidate: dict, mode: str) -> None:
+    if mode != "merge":
+        return
+    bases = set()
+    for workflow in required_workflows(candidate):
+        run, _jobs = latest_workflow(repository, candidate["head"], workflow)
+        for pull in run.get("pull_requests", []):
+            if (
+                pull.get("number") == candidate["number"]
+                and pull.get("head", {}).get("sha") == candidate["head"]
+            ):
+                bases.add(pull.get("base", {}).get("sha"))
+    require(len(bases) == 1 and None not in bases, "Waiting for CI on one identifiable base")
+    previous_base = bases.pop()
+    require(previous_base != candidate["base"], "CI metadata needs human inspection")
+    # Refresh only an otherwise green candidate, never to hide a failed test.
+    require_reports(repository, dict(candidate, base=previous_base))
+    approval_refresh_run(repository, candidate)
+    commits = paginated(f"repos/{repository}/pulls/{candidate['number']}/commits")
+    pull = gh_json(["api", f"repos/{repository}/pulls/{candidate['number']}"])
+    require(
+        bool(commits)
+        and commits[-1]["sha"] == candidate["head"]
+        and pull.get("commits") == len(commits),
+        "Incomplete commit inventory",
+    )
+    require_base_refresh_budget(commits)
+    files = paginated(f"repos/{repository}/pulls/{candidate['number']}/files")
+    require(
+        len(files) == pull["changed_files"] and bool(files), "Incomplete changed-file inventory"
+    )
+    paths = {file["filename"] for file in files}
+    for sha in (candidate["head"], candidate["base"]):
+        require_refresh_permissions(
+            refresh_workflows(repository, sha), paths, pull["head"].get("ref")
+        )
+    require_current_candidate(repository, candidate["number"], candidate)
+    try:
+        subprocess.run(
+            [
+                "gh",
+                "api",
+                "--method",
+                "PUT",
+                f"repos/{repository}/pulls/{candidate['number']}/update-branch",
+                "-f",
+                f"expected_head_sha={candidate['head']}",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=dict(os.environ, GH_TOKEN=os.environ["DEPENDABOT_MERGE_TOKEN"]),
+        )
+    except subprocess.CalledProcessError as exc:
+        status = re.search(r"HTTP (\d{3})", exc.stderr or "")
+        detail = f" (HTTP {status[1]})" if status else ""
+        raise NeedsReview(
+            f"GitHub rejected branch refresh{detail}; "
+            "inspect conflicts, permissions and current head"
+        ) from exc
+    raise NeedsReview("Updated branch against main; waiting for fresh policy, scans and CI")
 
 
 def sweep(repository: str, mode: str) -> None:
@@ -349,33 +598,19 @@ def sweep(repository: str, mode: str) -> None:
             decision = evaluate(repository, number)
             packages = ", ".join(decision["packages"])
             rows.append(f"- #{number}: eligible ({packages})")
-            require_approval(repository, decision, mode)
             refresh_failed_gates(repository, decision, mode)
-            require_reports(repository, decision)
+            try:
+                require_reports(repository, decision)
+            except StaleBase as stale:
+                try:
+                    refresh_stale_base(repository, decision, mode)
+                except NeedsReview as recovery:
+                    raise NeedsReview(f"{stale}; {recovery}") from recovery
+                raise
+            require_approval(repository, decision, mode)
+            require_merge_ready(repository, decision, mode)
             if mode == "merge":
-                current = gh_json(["api", f"repos/{repository}/pulls/{number}"])
-                require(
-                    current["head"]["sha"] == decision["head"]
-                    and current["base"]["sha"] == decision["base"],
-                    "PR changed during evaluation",
-                )
-                require(
-                    not current["draft"] and current["state"] == "open",
-                    "PR is now closed or draft",
-                )
-                require(
-                    not {label["name"] for label in current["labels"]}
-                    & {"hold-automerge", "skip-security-scan"},
-                    "PR was put on hold",
-                )
-                reviews = paginated(f"repos/{repository}/pulls/{number}/reviews")
-                require(
-                    all(
-                        r["state"] != "CHANGES_REQUESTED"
-                        for r in latest_decisive_reviews(reviews).values()
-                    ),
-                    "A reviewer has requested changes",
-                )
+                require_current_candidate(repository, number, decision)
                 # No --admin or queued --auto: GitHub enforces required checks
                 # now, against precisely the head whose policy/report we read.
                 subprocess.run(

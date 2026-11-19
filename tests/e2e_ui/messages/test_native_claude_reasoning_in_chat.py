@@ -23,7 +23,7 @@ Journey (all real product surfaces; the mock LLM scripts the model turn):
 3. the TUI runs the thinking turn and Claude Code writes the thought to its
    transcript JSONL — the "terminal side has it" half
 4. switch to Chat view: the assistant turn must offer an expandable
-   "Thought for …" section revealing that thought — the half that is broken
+   "Thinking: …" section revealing that thought — the half that is broken
 
 Requires the mock LLM lane (``LLM_API_KEY`` unset): the turn scripts a
 thinking block deterministically, which a real backend cannot guarantee.
@@ -200,13 +200,17 @@ def test_native_claude_thinking_surfaces_as_reasoning_in_chat(
     user_marker = f"usr{nonce}"
     assistant_token = f"ast{nonce}"
     thinking_marker = f"thought{nonce}"
+    # Only in the second paragraph, so it is hidden until the section expands
+    # (the collapsed header previews the first line).
+    thinking_body_marker = f"thoughtbody{nonce}"
     # Pad with prose so the thought streams over several deltas; repeat the
     # marker so it stays findable wherever the surface wraps or truncates.
     thinking_text = (
         f"{thinking_marker} I am weighing how to answer this turn. "
         f"The user asked for one exact token and nothing else, so I will "
         f"reply with it verbatim. {thinking_marker} confirming the token "
-        f"one more time before answering. {thinking_marker}"
+        f"one more time before answering. {thinking_marker}\n\n"
+        f"{thinking_body_marker} final check before answering."
     )
 
     reset_mock_llm(mock_llm_server_url)
@@ -286,9 +290,11 @@ def test_native_claude_thinking_surfaces_as_reasoning_in_chat(
     # The assistant turn offers an expandable reasoning section. When no
     # reasoning item is mirrored at all, there is no dropdown to open —
     # this is where the unfixed mirror fails.
-    reasoning_trigger = bubble.get_by_role("button", name=re.compile(r"Thought for "))
+    reasoning_trigger = bubble.get_by_role(
+        "button", name=re.compile(rf"^Thinking: {re.escape(thinking_marker)} ")
+    )
     expect(reasoning_trigger.first).to_be_visible(timeout=10_000)
 
     # Expanding it reveals the reasoning context the terminal side holds.
     reasoning_trigger.first.click()
-    expect(bubble.get_by_text(thinking_marker).first).to_be_visible(timeout=10_000)
+    expect(bubble.get_by_text(thinking_body_marker).first).to_be_visible(timeout=10_000)

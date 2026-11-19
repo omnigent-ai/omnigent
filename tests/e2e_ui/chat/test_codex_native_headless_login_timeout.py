@@ -37,7 +37,6 @@ import os
 import secrets
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import time
@@ -48,6 +47,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
+from tests._helpers.live_server import find_free_port
 from tests.e2e_ui.conftest import _create_native_codex_session
 from tests.e2e_ui.messages.test_message_render_parity import _ensure_chat_view, _send
 
@@ -63,12 +63,6 @@ _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 
 # The timeout-path marker in the executor error (the observed live failure).
 _STARTUP_TIMEOUT_MARKER = "startup timed out"
-
-
-def _free_port() -> int:
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 # Proxy-blind client: CI forces an egress proxy via HTTP(S)_PROXY env vars
@@ -119,7 +113,7 @@ def headless_codex_session(
     for path in (config_home, codex_home, home_dir, state_dir, artifacts):
         path.mkdir(parents=True, exist_ok=True)
 
-    port = _free_port()
+    port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     binding_token = secrets.token_urlsafe(32)
 

@@ -5,6 +5,7 @@
 
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ALT_KEY, ARROW_DOWN_KEY, ARROW_UP_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { UserMessageNav } from "./UserMessageNav";
 
@@ -38,6 +39,18 @@ describe("UserMessageNav", () => {
     renderNav({});
     expect(screen.getByLabelText("Previous user message")).toBeEnabled();
     expect(screen.getByLabelText("Next user message")).toBeEnabled();
+  });
+
+  it.each([
+    ["Previous user message", "Previous message", ARROW_UP_KEY],
+    ["Next user message", "Next message", ARROW_DOWN_KEY],
+  ])("shows the platform chord on %s", async (ariaLabel, label, arrow) => {
+    renderNav({});
+    fireEvent.pointerMove(screen.getByLabelText(ariaLabel), { pointerType: "mouse" });
+    const tooltip = await screen.findByRole("tooltip");
+    expect(tooltip).toHaveTextContent(label);
+    const keys = Array.from(tooltip.querySelectorAll<HTMLElement>('[data-slot="kbd"]'));
+    expect(keys.map((key) => key.textContent)).toEqual([MOD_KEY, ALT_KEY, arrow]);
   });
 
   it("disables Previous when canPrev=false", () => {

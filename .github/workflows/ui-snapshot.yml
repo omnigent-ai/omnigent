@@ -71,6 +71,9 @@ env:
 jobs:
   gate:
     uses: ./.github/workflows/security-gate.yml
+    permissions:
+      contents: read
+      pull-requests: read
 
   # Cheap pre-flight (no container/build): does this PR touch anything that can
   # change the render? The heavy job below is `if`-gated on it, so non-UI PRs
@@ -83,7 +86,7 @@ jobs:
   detect:
     name: Detect render-affecting changes
     needs: gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       ui: ${{ steps.changes.outputs.ui }}
     steps:
@@ -101,7 +104,8 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
-          if [ "$DEPENDENCY" = true ] && [ "$UI_SCOPE" != dependency ]; then
+          # Dependency-only PRs skip only when the scope rules out the web UI.
+          if [ "$DEPENDENCY" = true ] && { [ "$UI_SCOPE" = none ] || [ "$UI_SCOPE" = sidecar ]; }; then
             echo "ui=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -160,7 +164,7 @@ jobs:
           standalone: true
 
       - name: Install uv
-        uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
+        uses: omnigent-ai/omnigent/.github/actions/setup-uv@c144e4b1a1c2f9ed45aa6596b90c3672b3faf1c8 # self-contained setup
         with:
           enable-cache: true
 

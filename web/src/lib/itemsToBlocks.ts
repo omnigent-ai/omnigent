@@ -48,6 +48,7 @@ import {
   type RoutingDecisionItem,
   type SlashCommandItem,
   type TerminalCommandItem,
+  assistantMessagePhase,
   isCompactionItem,
   isErrorItem,
   isFunctionCallItem,
@@ -63,6 +64,7 @@ import { nativePolicyNameForAgentName } from "./nativeCodingAgents";
 import { routingExtrasFromWire } from "./routingDecision";
 import { isClaudeAgentMessageContent, taskNotificationMarkerContent } from "./systemMessage";
 import { readSubagentActivity } from "./subagentActivity";
+import { readTaskActivity } from "./taskActivity";
 
 // Claude built-ins whose call is a question TO the user rather than work
 // the agent did on its own. The elicitation that carried the card is
@@ -241,7 +243,8 @@ function answersFromToolResult(
 
 function itemToBlock(item: ConversationItem, agentName?: string | null): AnyBlock | null {
   const data = item as unknown as Record<string, unknown>;
-  if (readSubagentActivity(data)) {
+  // Task markers place and fold like sub-agent markers, so they share the notice kind.
+  if (readSubagentActivity(data) || readTaskActivity(data)) {
     return {
       type: "native_tool",
       ctx: ctxFor(item),
@@ -350,6 +353,7 @@ function userMessageToBlock(item: MessageItem): UserMessageBlock {
 }
 
 function assistantMessageToBlock(item: MessageItem): TextDone {
+  const phase = assistantMessagePhase(item.phase);
   const text = item.content
     .filter((b): b is { type: "output_text"; text: string } => b.type === "output_text")
     .map((b) => b.text)
@@ -360,6 +364,7 @@ function assistantMessageToBlock(item: MessageItem): TextDone {
     fullText: text,
     hasCodeBlocks: text.includes("```"),
     ...(item.interrupted === true ? { interrupted: true } : {}),
+    ...(phase !== undefined ? { phase } : {}),
   };
 }
 
