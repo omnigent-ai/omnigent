@@ -783,16 +783,19 @@ def create_workflows_router(
             if stores_workflow_grants(permission_store):
                 assert permission_store is not None
                 principals = permission_store.caller_principals(user_id)
-                shared = _store().get_many(others)
+                # Grants first: get_many reads whoever owns a workflow.
+                granted = [
+                    workflow_id
+                    for workflow_id in others
+                    if permission_store.resolve_workflow_access(principals, workflow_id)
+                    is not None
+                ]
+                shared = _store().get_many(granted) if granted else {}
                 deleted = permission_store.deleted_accounts(
                     [workflow.user_id for workflow in shared.values()]
                 )
                 for workflow_id, workflow in shared.items():
-                    if (
-                        workflow.user_id not in deleted
-                        and permission_store.resolve_workflow_access(principals, workflow_id)
-                        is not None
-                    ):
+                    if workflow.user_id not in deleted:
                         names[workflow_id] = workflow.name
         for run in every:
             run.workflow_name = names.get(run.workflow_id)
