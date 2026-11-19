@@ -111,6 +111,9 @@ export function splitPullRequestRefs(
   if (!text.includes("#")) return [{ type: "text", value: text }];
   const nodes: MarkdownNode[] = [];
   let last = 0;
+  // `#`s before `scanned`; matches only move forward, so counting stays one pass.
+  let hashesBefore = 0;
+  let scanned = 0;
   for (const match of text.matchAll(PULL_REQUEST_REF)) {
     const [whole, prefix, owner, repo, number] = match;
     const token = whole.slice(prefix.length);
@@ -122,8 +125,19 @@ export function splitPullRequestRefs(
         !FILE_EXTENSION.test(repo) &&
         !NON_OWNER.test(owner)
       : BARE_NUMBER.test(number);
-    const hash = start + token.indexOf("#");
-    if (!valid || escaped?.[text.slice(0, hash).split("#").length - 1]) continue;
+    if (!valid) continue;
+    if (escaped) {
+      const hash = start + token.indexOf("#");
+      for (
+        let at = text.indexOf("#", scanned);
+        at !== -1 && at < hash;
+        at = text.indexOf("#", at + 1)
+      ) {
+        hashesBefore += 1;
+      }
+      scanned = hash;
+      if (escaped[hashesBefore]) continue;
+    }
     if (start > last) nodes.push({ type: "text", value: text.slice(last, start) });
     nodes.push({
       type: "link",

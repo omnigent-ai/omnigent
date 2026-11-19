@@ -232,6 +232,24 @@ describe("remarkPullRequestRefs", () => {
     expect(urls).toEqual(linked.map((number) => `${PULL_REQUEST_REF_HREF_PREFIX}${number}`));
   });
 
+  it("maps escaped hashes across a long node", () => {
+    const numbers = Array.from({ length: 5000 }, (_, index) => String(1000 + index));
+    const source = numbers
+      .map((number, index) => (index % 2 ? `#${number}` : `\\#${number}`))
+      .join(" ");
+    const value = numbers.map((number) => `#${number}`).join(" ");
+    const position = { start: { offset: 0 }, end: { offset: source.length } };
+    const tree = {
+      type: "root",
+      children: [{ type: "paragraph", children: [{ type: "text", value, position }] }],
+    };
+    remarkPullRequestRefs()(tree, { value: source });
+    const urls = tree.children[0].children.flatMap((node) => ("url" in node ? [node.url] : []));
+    expect(urls).toEqual(
+      numbers.filter((_, index) => index % 2).map((n) => `${PULL_REQUEST_REF_HREF_PREFIX}${n}`),
+    );
+  });
+
   it("keeps linking after a stray raw closing tag", () => {
     const tree = {
       type: "root",
