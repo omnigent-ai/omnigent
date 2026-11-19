@@ -17,7 +17,12 @@ from tests._helpers.native_session import create_native_session
 from tests._helpers.polling import poll_until
 from tests._helpers.server_runner import server_runner
 from tests._helpers.session import bundle_files, post_session_bundle
-from tests.e2e.conftest import configure_mock_llm, get_mock_requests, set_fallback_mock_llm
+from tests.e2e.conftest import (
+    configure_mock_llm,
+    get_mock_requests,
+    set_fallback_mock_llm,
+    wait_for_native_tools,
+)
 
 _REPO = Path(__file__).resolve().parents[2]
 
@@ -173,6 +178,10 @@ def test_private_manager_launch_send_read_and_sharing(
                         created = response.json()
                     sessions.append(created["session_id"])
                 manager, worker = sessions
+                if harness == "codex-native":
+                    # Scripted replies require the MCP tools, which Codex may not advertise yet.
+                    for session in sessions:
+                        wait_for_native_tools(client, session, mock, "mcp__omnigent")
                 if not orchestration_enabled:
                     configure("BEFORE_SWITCH_TASK", [{"text": "BEFORE_SWITCH_RESULT"}])
                     configure(

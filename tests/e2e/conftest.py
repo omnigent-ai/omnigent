@@ -27,7 +27,9 @@ These tests are excluded from the default ``pytest`` run via
 from __future__ import annotations
 
 import io
+import json
 import os
+import secrets
 import signal
 import subprocess
 import sys
@@ -56,6 +58,7 @@ from tests._helpers.compat import (
 )
 from tests._helpers.live_server import find_free_port
 from tests._helpers.operator_agents import operator_agent_store, post_operator_session
+from tests._helpers.polling import poll_until
 from tests._helpers.session import post_session_bundle
 from tests._model_pools import current_attempt, resolve_model
 from tests.e2e._harness_probes import skip_if_harness_cli_missing
@@ -542,6 +545,71 @@ def get_mock_message_requests(mock_llm_server_url: str, *, key: str | None = Non
     resp = httpx.get(f"{mock_llm_server_url}/mock/message_requests", params=params, timeout=5.0)
     resp.raise_for_status()
     return resp.json()["requests"]
+
+
+def wait_for_native_tools(
+    client: httpx.Client,
+    session_id: str,
+    mock_llm_server_url: str,
+    tool_name: str,
+    *,
+    timeout_s: float = 90,
+) -> None:
+    """
+    Probe a native CLI session until its mock LLM requests advertise *tool_name*.
+
+    Native CLIs may accept input before their MCP connection finishes discovery,
+    so a scripted response guarded by ``required_tools`` can miss its turn. The
+    probe is re-sent after each finished turn that still lacks the tool. Only
+    requests carrying this call's probe marker count as readiness evidence.
+
+    :param client: HTTP client pointed at the live server.
+    :param session_id: Native session to probe, e.g. ``"conv_abc"``.
+    :param mock_llm_server_url: Mock LLM server URL.
+    :param tool_name: Advertised tool or namespace name, e.g. ``"mcp__omnigent"``.
+    :param timeout_s: Seconds to wait for the tool to appear.
+    :raises AssertionError: If the session records a task error or the tool
+        does not appear within *timeout_s*.
+    """
+    # A per-call marker keeps another session's tool-bearing requests from counting.
+    probe = f"NATIVE_TOOL_READY_PROBE {session_id} {secrets.token_hex(4)}: acknowledge readiness."
+
+    def send_probe() -> None:
+        response = client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": probe}]},
+            },
+        )
+        assert response.status_code == 202, response.text
+
+    send_probe()
+    seen_requests = 0
+
+    def ready() -> bool:
+        nonlocal seen_requests
+        response = client.get(f"/v1/sessions/{session_id}")
+        response.raise_for_status()
+        snapshot = response.json()
+        assert not snapshot.get("last_task_error"), snapshot["last_task_error"]
+        if snapshot["status"] != "idle" or snapshot.get("pending_inputs"):
+            return False
+        requests = [r for r in get_mock_requests(mock_llm_server_url) if probe in json.dumps(r)]
+        if any(t.get("name") == tool_name for r in requests for t in r.get("tools", [])):
+            return True
+        if len(requests) > seen_requests:
+            seen_requests = len(requests)
+            send_probe()
+        return False
+
+    try:
+        poll_until(ready, timeout_s=timeout_s, interval_s=0.2)
+    except AssertionError as exc:
+        raise AssertionError(
+            f"session {session_id} never advertised {tool_name!r} "
+            f"after {seen_requests} probe requests: {exc}"
+        ) from exc
 
 
 @pytest.fixture(scope="session")

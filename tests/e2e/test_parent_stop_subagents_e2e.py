@@ -35,7 +35,7 @@ from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.server.routes.sessions import RUNNER_DISCONNECT_GRACE_S
 from tests._helpers.server_runner import server_runner
 from tests._helpers.session import bundle_files, post_session_bundle
-from tests.e2e.conftest import get_mock_requests, set_fallback_mock_llm
+from tests.e2e.conftest import get_mock_requests, set_fallback_mock_llm, wait_for_native_tools
 
 _REPO = Path(__file__).resolve().parents[2]
 _MODELS = {"claude": "claude-sonnet-4-20250514", "codex": "gpt-4o"}
@@ -67,31 +67,6 @@ def _send_message(client: httpx.Client, session_id: str, text: str) -> None:
         },
     )
     assert response.status_code == 202, response.text
-
-
-def _wait_for_native_tools(
-    client: httpx.Client, session_id: str, mock_url: str, tool_name: str
-) -> None:
-    # Native CLIs may accept input before their MCP connection finishes discovery.
-    probe = "NATIVE_TOOL_READY_PROBE: acknowledge readiness."
-    _send_message(client, session_id, probe)
-    seen_requests = 0
-
-    def ready():
-        nonlocal seen_requests
-        snapshot = _get(client, f"/v1/sessions/{session_id}")
-        assert not snapshot.get("last_task_error"), snapshot["last_task_error"]
-        if snapshot["status"] != "idle" or snapshot.get("pending_inputs"):
-            return False
-        requests = [r for r in get_mock_requests(mock_url) if probe in json.dumps(r)]
-        if any(t.get("name") == tool_name for r in requests for t in r.get("tools", [])):
-            return True
-        if len(requests) > seen_requests:
-            seen_requests = len(requests)
-            _send_message(client, session_id, probe)
-        return False
-
-    _wait(ready, "native CLI to advertise its real MCP tools")
 
 
 class _Stream:
@@ -315,7 +290,7 @@ def test_native_parent_teardown_preserves_child_outcome(
         )
         response.raise_for_status()
         parent_id = response.json()["session_id"]
-        _wait_for_native_tools(client, parent_id, mock_url, dispatch_guard)
+        wait_for_native_tools(client, parent_id, mock_url, dispatch_guard)
         # Install after readiness; Codex approval reviews quote the child prompt.
         httpx.post(
             f"{mock_url}/mock/configure",
