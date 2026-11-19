@@ -55,6 +55,25 @@ it("resets on view entry and runtime page-size changes", () => {
   expect(result.current.rows).toHaveLength(10);
 });
 
+it("grows by whole pages to list the reveal row and keeps that window", () => {
+  const fetch = vi.fn();
+  const { result, rerender } = renderHook(
+    ({ scope, reveal }) => useSidebarDisplayPagination(rows, scope, 5, false, fetch, reveal),
+    { initialProps: { scope: "project", reveal: 3 } },
+  );
+  expect(result.current.rows).toHaveLength(5);
+  rerender({ scope: "project", reveal: 12 });
+  expect(result.current.rows).toHaveLength(15);
+  // The window holds once the reveal row moves back up or goes away.
+  rerender({ scope: "project", reveal: -1 });
+  expect(result.current.rows).toHaveLength(15);
+  act(() => result.current.loadMore());
+  expect(result.current.rows).toHaveLength(20);
+  // A new scope starts from one page plus whatever its reveal row needs.
+  rerender({ scope: "other", reveal: 7 });
+  expect(result.current.rows).toHaveLength(10);
+});
+
 it.each([undefined, false, 0, -1, 1.5, Infinity] as const)(
   "preserves existing pagination for %s",
   (size) => {

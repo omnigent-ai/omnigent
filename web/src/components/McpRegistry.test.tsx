@@ -23,6 +23,16 @@ beforeEach(() => {
 });
 
 describe("MCP account connections", () => {
+  it("renders each service's rows from the Settings catalog", async () => {
+    vi.mocked(registryRequest).mockResolvedValue({ data: [service] });
+    render(<McpRegistryConnections />);
+    fireEvent.click(await screen.findByRole("button", { name: "Connect" }));
+    expect(document.querySelector('[data-settings-region="mcp-services:services"]')).not.toBeNull();
+    expect(document.querySelector('[data-settings-row-action="connect"]')).not.toBeNull();
+    expect(document.querySelector('[data-settings-row-field="token"]')).not.toBeNull();
+    expect(document.querySelector('[data-settings-row-action="saveToken"]')).not.toBeNull();
+  });
+
   it.each(["github", "databricks"])(
     "links shared %s accounts to their provider controls",
     async (auth) => {
@@ -99,6 +109,52 @@ describe("MCP service selection", () => {
       "href",
       "/settings/mcp",
     );
+  });
+
+  it("reports a sign-in starting and finishing to its owner", async () => {
+    const oauth = { ...service, auth: "oauth" };
+    vi.mocked(registryRequest).mockResolvedValueOnce({ data: [oauth] });
+    let complete!: () => void;
+    vi.mocked(authorizeRegistryService).mockReturnValue(
+      new Promise<void>((resolve) => {
+        complete = resolve;
+      }),
+    );
+    const onAuthorizingChange = vi.fn();
+    render(
+      <McpRegistryPicker
+        attached={[]}
+        onToggle={vi.fn()}
+        busy={false}
+        onAuthorizingChange={onAuthorizingChange}
+      />,
+    );
+    fireEvent.click(await screen.findByRole("switch", { name: "Work tracker" }));
+    await waitFor(() => expect(onAuthorizingChange).toHaveBeenLastCalledWith(true));
+
+    vi.mocked(registryRequest).mockResolvedValue({ data: [{ ...oauth, connected: true }] });
+    complete();
+    await waitFor(() => expect(onAuthorizingChange).toHaveBeenLastCalledWith(false));
+  });
+
+  it("reports the sign-in as over when its owner unmounts mid-popup", async () => {
+    const oauth = { ...service, auth: "oauth" };
+    vi.mocked(registryRequest).mockResolvedValue({ data: [oauth] });
+    vi.mocked(authorizeRegistryService).mockReturnValue(new Promise<void>(() => {}));
+    const onAuthorizingChange = vi.fn();
+    const { unmount } = render(
+      <McpRegistryPicker
+        attached={[]}
+        onToggle={vi.fn()}
+        busy={false}
+        onAuthorizingChange={onAuthorizingChange}
+      />,
+    );
+    fireEvent.click(await screen.findByRole("switch", { name: "Work tracker" }));
+    await waitFor(() => expect(onAuthorizingChange).toHaveBeenLastCalledWith(true));
+
+    unmount();
+    expect(onAuthorizingChange).toHaveBeenLastCalledWith(false);
   });
 
   it("finishes sign-in before enabling a service", async () => {

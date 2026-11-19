@@ -1,0 +1,1015 @@
+"""Runner-side handlers for the ``sys_journal_*`` tools and ``sys_workflow_request_input``.
+
+The runner has no journal store, so these tools call the server's
+``/v1/sessions/{id}/journal`` routes. A write carries an idempotency key that
+its retries reuse, and once the server accepts it the runner publishes
+``session.journal.appended`` on the session stream, the way it reports
+child-session updates. Reads come back as compact lines the model can scan.
+``sys_workflow_request_input`` has the server mark a task waiting and raise its
+questions, then waits a few minutes for the answer like any other elicitation;
+an answer that comes later reaches the session as a message.
+``sys_workflow_save``, ``sys_workflow_load`` and ``sys_workflow_list`` call
+``/v1/workflows`` as the session's owner, naming the session so the server can
+refuse a shared one's save.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import binascii
+import contextlib
+import difflib
+import hashlib
+import itertools
+import json
+import logging
+import random
+import re
+import uuid
+from collections.abc import Callable
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Any
+from weakref import WeakKeyDictionary
+
+import httpx
+
+from omnigent.entities.session_journal import (
+    IDEMPOTENCY_KEY_MAX_CHARS,
+    JOURNAL_KINDS,
+    InvalidJournalEntryError,
+    JournalEntryTooLargeError,
+    normalize_note,
+    normalize_plan,
+    normalize_status,
+    normalize_step_id,
+)
+from omnigent.entities.workflow import InvalidWorkflowError, normalize_workflow
+from omnigent.entities.workflow_questions import (
+    answers_from_content,
+    normalize_questions,
+    workflow_elicitation_id,
+)
+from omnigent.runner import pending_approvals
+from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+from omnigent.runner.subagent_work import _deliver_subagent_wake_post
+from omnigent.tools.builtins.journal import (
+    JOURNAL_READ_PAGE_MAX,
+    JOURNAL_TOOLS,
+    WORKFLOW_LIST_PAGE_MAX,
+)
+
+JOURNAL_TOOL_NAMES: frozenset[str] = frozenset(tool.name() for tool in JOURNAL_TOOLS)
+_logger = logging.getLogger(__name__)
+
+
+@dataclass
+class _ServerWorkflowFlag:
+    enabled: bool
+    stale: bool = False
+
+
+_server_workflow_flags: WeakKeyDictionary[httpx.AsyncClient, _ServerWorkflowFlag] = (
+    WeakKeyDictionary()
+)
+
+
+def invalidate_server_workflow_flag(server_client: httpx.AsyncClient | None) -> None:
+    """Refresh lazily after reconnect, retaining the last success if the probe fails."""
+    if server_client is not None and (cached := _server_workflow_flags.get(server_client)):
+        cached.stale = True
+
+
+async def server_workflows_enabled(server_client: httpx.AsyncClient | None) -> bool:
+    """Cache the server's startup flag until reconnect without discarding known state."""
+    if server_client is None:
+        return False
+    cached = _server_workflow_flags.get(server_client)
+    if cached is not None and not cached.stale:
+        return cached.enabled
+    try:
+        # Capability discovery must not inherit a streaming client's unlimited read timeout.
+        response = await server_client.get("/v1/info", timeout=5.0)
+        if response.status_code != 200:
+            return cached.enabled if cached is not None else False
+        info = response.json()
+    except (httpx.HTTPError, ValueError):
+        return cached.enabled if cached is not None else False
+    features = info.get("features") if isinstance(info, dict) else None
+    enabled = isinstance(features, dict) and features.get("workflows") is True
+    _server_workflow_flags[server_client] = _ServerWorkflowFlag(enabled)
+    return enabled
+
+
+# A read returns the newest entries whose lines fit this budget.
+_READ_OUTPUT_MAX_BYTES = 32 * 1024
+# Retries while the runner's tunnel reconnects; the idempotency key makes them safe.
+_WRITE_ATTEMPTS = 3
+_RETRYABLE_STATUSES = frozenset({502, 503, 504})
+_STATUS_GLYPHS = {
+    "started": "▶",
+    "done": "✅",
+    "needs_input": "✋",
+    "failed": "❌",
+}
+# What a server answers for a path it has no route for, unlike a route's own
+# 404: FastAPI's default body, or the web UI catch-all's generic error.
+_UNROUTED_NOT_FOUND_BODIES = (
+    {"detail": "Not Found"},
+    {"error": {"code": "not_found", "message": "Not found"}},
+)
+_UNSUPPORTED = "this Omnigent server has no session journal"
+
+_Publisher = Callable[[str, dict[str, Any]], None]
+
+
+def _journal_url(session_id: str) -> str:
+    """The session's journal route; the ID must stay one URL segment."""
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", session_id):
+        raise ValueError("conversation_id must be a session ID")
+    return f"/v1/sessions/{session_id}/journal"
+
+
+def _error(message: str, **fields: object) -> str:
+    return json.dumps({"error": message, **fields}, ensure_ascii=False)
+
+
+def _is_unrouted(response: httpx.Response) -> bool:
+    """Whether *response* says the server has no such route, so it predates the journal."""
+    if response.status_code == 405:
+        return True
+    if response.status_code != 404:
+        return False
+    try:
+        return response.json() in _UNROUTED_NOT_FOUND_BODIES
+    except ValueError:
+        return False
+
+
+def _server_message(response: httpx.Response) -> str:
+    """The server's error message, e.g. ``"invalid_entry: text is required…"``."""
+    try:
+        body = response.json()
+    except ValueError:
+        return response.text[:500]
+    error = body.get("error") if isinstance(body, dict) else None
+    if isinstance(error, dict) and isinstance(error.get("message"), str):
+        return error["message"]
+    detail = body.get("detail") if isinstance(body, dict) else None
+    if response.status_code == 422 and detail is not None:
+        return f"invalid_entry: {json.dumps(detail, ensure_ascii=False)[:500]}"
+    return response.text[:500]
+
+
+# How servers from before plan descriptions refuse any plan field but name and steps.
+_PLAN_FIELDS_REFUSAL = "invalid_entry: a plan's content has exactly two fields, name and steps"
+
+
+def _refuses_plan_description(response: httpx.Response | str, body: dict[str, Any]) -> bool:
+    """Whether an older server refused this plan only because it carries a description."""
+    return (
+        isinstance(response, httpx.Response)
+        and response.status_code == 400
+        and "description" in body["content"]
+        and _server_message(response) == _PLAN_FIELDS_REFUSAL
+    )
+
+
+def _journal_error(response: httpx.Response, conversation_id: str) -> str:
+    """Distinguish a missing session from other route errors, including disabled workflows."""
+    message = _server_message(response)
+    if response.status_code == 404 and message in {"Session not found", "Conversation not found"}:
+        return _error("session_not_found", conversation_id=conversation_id)
+    return _error(message)
+
+
+def _idempotency_key(call_id: str | None) -> str:
+    """``tool:<call ID>``, or a fresh ID when the caller has none, e.g. over MCP."""
+    key = f"tool:{call_id}" if call_id else f"tool:{uuid.uuid4().hex}"
+    if len(key) > IDEMPOTENCY_KEY_MAX_CHARS or not key.isascii():
+        key = f"tool:sha256:{hashlib.sha256(key.encode()).hexdigest()}"
+    return key
+
+
+def _write_request(tool_name: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Build the POST body, checking fields locally so errors come back at once.
+
+    :raises InvalidJournalEntryError: If a field is invalid.
+    """
+    step = args.get("step")
+    if step is not None:
+        step = normalize_step_id(step)
+    if tool_name == "sys_journal_write_note":
+        return {"kind": "note", "content": normalize_note(args.get("body")), "step": step}
+    if tool_name == "sys_journal_write_status":
+        content = normalize_status(args.get("status"), text=args.get("text"))
+        return {"kind": "status", "content": content, "step": step}
+    plan = normalize_plan(
+        args.get("steps"), name=args.get("name"), description=args.get("description")
+    )
+    content = {"name": plan["name"], "steps": plan["steps"]}
+    if "description" in plan:
+        content["description"] = plan["description"]
+    body: dict[str, Any] = {"kind": "plan", "content": content, "step": None}
+    workflow_id = args.get("workflow_id")
+    if workflow_id is not None:
+        if not (isinstance(workflow_id, str) and _WORKFLOW_ID.fullmatch(workflow_id)):
+            raise InvalidJournalEntryError("workflow_id must be a saved workflow's ID")
+        body["workflow_id"] = workflow_id
+    return body
+
+
+async def _post_with_retries(
+    server_client: httpx.AsyncClient, url: str, body: dict[str, Any], conversation_id: str
+) -> httpx.Response | str:
+    """POST the write, retrying transport errors and gateway failures with the same key."""
+    for attempt in range(_WRITE_ATTEMPTS):
+        last = attempt + 1 == _WRITE_ATTEMPTS
+        try:
+            response = await server_client.post(
+                url,
+                json=body,
+                headers={ORCHESTRATION_SOURCE_HEADER: conversation_id},
+                timeout=30.0,
+            )
+        except httpx.TransportError as exc:
+            if last:
+                return f"could not reach the server: {exc}"
+        else:
+            if response.status_code not in _RETRYABLE_STATUSES or last:
+                return response
+        await _sleep(0.5 * (attempt + 1) + random.uniform(0.0, 0.25))
+    raise AssertionError("unreachable")
+
+
+async def _sleep(seconds: float) -> None:
+    """Wait before a retry; tests replace this, never ``asyncio.sleep`` itself."""
+    await asyncio.sleep(seconds)
+
+
+def _publish(
+    publish_event: _Publisher | None, conversation_id: str, entry: dict[str, Any]
+) -> None:
+    event = {
+        "type": "session.journal.appended",
+        "conversation_id": conversation_id,
+        "entry": entry,
+    }
+    if publish_event is not None:
+        publish_event(conversation_id, event)
+        return
+    from omnigent.runtime import session_stream
+
+    session_stream.publish(conversation_id, event)
+
+
+async def _write(
+    tool_name: str,
+    args: dict[str, Any],
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    call_id: str | None,
+    publish_event: _Publisher | None,
+    start_run: bool = True,
+) -> str:
+    try:
+        body = _write_request(tool_name, args)
+    except JournalEntryTooLargeError as exc:
+        return _error(f"entry_too_large: {exc}")
+    except InvalidJournalEntryError as exc:
+        return _error(f"invalid_entry: {exc}")
+    body["idempotency_key"] = _idempotency_key(call_id)
+    if not start_run:
+        body["start_run"] = False
+    url = _journal_url(conversation_id)
+    response = await _post_with_retries(server_client, url, body, conversation_id)
+    if _refuses_plan_description(response, body):
+        del body["content"]["description"]
+        response = await _post_with_retries(server_client, url, body, conversation_id)
+    if isinstance(response, str):
+        return _error(f"{tool_name} failed: {response}")
+    if _is_unrouted(response):
+        return _error(f"{tool_name}: {_UNSUPPORTED}")
+    if response.status_code >= 400:
+        return _journal_error(response, conversation_id)
+    entry = response.json()
+    _publish(publish_event, conversation_id, entry)
+    result: dict[str, Any] = {"id": entry["id"], "position": entry["position"]}
+    if entry.get("kind") == "plan":
+        result["version"] = entry["content"]["version"]
+    return json.dumps(result)
+
+
+# ── Asking the user ───────────────────────────────────
+
+# How long a question holds its tool call. Stays under the native tool relay's
+# 300s budget and a hosted front door's 300s request cap.
+_ANSWER_WAIT_IN_TURN_S = 240.0
+_STILL_OPEN_DETAIL = (
+    "No answer yet. The question stays in the user's Inbox. Finish work that doesn't depend "
+    "on it, then end your turn; their answer will arrive as a new message."
+)
+# Once a late answer's message fails every attempt, the next tries wait for the
+# server's reconnect or these delays, whichever comes first.
+_ANSWER_REDELIVERY_DELAYS_S = (30.0, 60.0, 120.0, 300.0, 600.0, 1800.0, 3600.0)
+
+
+@dataclass(frozen=True)
+class _OpenQuestion:
+    """A question whose tool call returned unanswered."""
+
+    session_id: str
+    answer: asyncio.Task[pending_approvals.Verdict]
+    # Sends the answer, or the dismissal, to the session as a message.
+    delivery: asyncio.Task[None]
+
+
+# By elicitation ID.
+_answers_by_message: dict[str, _OpenQuestion] = {}
+
+
+def answer_arrives_as_message(elicitation_id: str) -> bool:
+    """Whether a workflow question outlived its tool call, so its answer becomes a message."""
+    return elicitation_id in _answers_by_message
+
+
+async def cancel_session_questions(session_id: str) -> None:
+    """Withdraw a deleted session's open questions and any answer on its way to the session."""
+    owned = [key for key, item in _answers_by_message.items() if item.session_id == session_id]
+    tasks: list[asyncio.Task[Any]] = []
+    for elicitation_id in owned:
+        question = _answers_by_message.pop(elicitation_id)
+        tasks += [question.answer, question.delivery]
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+class _InputRequestFailed(Exception):
+    def __init__(self, result: str) -> None:
+        super().__init__(result)
+        self.result = result
+
+
+def _stream_publisher(publish_event: _Publisher | None) -> _Publisher:
+    if publish_event is not None:
+        return publish_event
+    from omnigent.runtime import session_stream
+
+    def publish(conversation_id: str, event: dict[str, Any]) -> None:
+        session_stream.publish(conversation_id, event)
+
+    return publish
+
+
+async def _request_input(
+    args: dict[str, Any],
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    call_id: str | None,
+    publish_event: _Publisher | None,
+) -> str:
+    """Mark a task waiting, raise its questions, and wait a while for the user's answers.
+
+    A question still open when the wait ends stays in the Inbox, and its answer
+    reaches the session later as a message.
+    """
+    tool_name = "sys_workflow_request_input"
+    try:
+        step = normalize_step_id(args.get("step"))
+        questions = normalize_questions(args.get("questions"))
+    except InvalidJournalEntryError as exc:
+        return _error(f"invalid_input: {exc}")
+    body = {"step": step, "questions": questions, "idempotency_key": _idempotency_key(call_id)}
+    url = f"{_journal_url(conversation_id)}/input-requests"
+    elicitation_id = workflow_elicitation_id(conversation_id, body["idempotency_key"])
+    asked = asyncio.Event()
+
+    async def publish_question() -> None:
+        response = await _post_with_retries(server_client, url, body, conversation_id)
+        if isinstance(response, str):
+            raise _InputRequestFailed(_error(f"{tool_name} failed: {response}"))
+        if _is_unrouted(response):
+            raise _InputRequestFailed(
+                _error(f"{tool_name}: this Omnigent server can't ask questions for workflows")
+            )
+        if response.status_code >= 400:
+            raise _InputRequestFailed(_journal_error(response, conversation_id))
+        requested = response.json()
+        if requested["elicitation_id"] != elicitation_id:
+            raise _InputRequestFailed(_error(f"{tool_name}: unexpected question ID from server"))
+        _publish(publish_event, conversation_id, requested["entry"])
+        asked.set()
+
+    async def wait_for_answer() -> pending_approvals.Verdict:
+        while True:
+            try:
+                return await pending_approvals.wait_for_user_verdict(
+                    elicitation_id=elicitation_id,
+                    conversation_id=conversation_id,
+                    publish_event=_stream_publisher(publish_event),
+                    retry_on_server_reconnect=True,
+                    keep_pending_on_reconnect=True,
+                    on_registered=publish_question,
+                )
+            except pending_approvals.ServerReconnected:
+                # The server may have lost the question; the same key raises it again.
+                continue
+
+    answer = asyncio.create_task(wait_for_answer(), name=f"workflow-question:{elicitation_id}")
+
+    def stop_waiting() -> bool:
+        """Leave an asked question open for a later answer; withdraw one never asked."""
+        if not asked.is_set():
+            answer.cancel()
+            return False
+        _deliver_answer_as_message(
+            answer,
+            server_client=server_client,
+            conversation_id=conversation_id,
+            step=step,
+            questions=questions,
+            elicitation_id=elicitation_id,
+        )
+        # No turn waits on it now, so the session's messages flow as usual.
+        pending_approvals.detach(elicitation_id, conversation_id)
+        return True
+
+    try:
+        done, _ = await asyncio.wait({answer}, timeout=_ANSWER_WAIT_IN_TURN_S)
+    except asyncio.CancelledError:
+        # A stopped turn keeps an asked question open; answering it resumes the session.
+        stop_waiting()
+        raise
+    if not done:
+        if stop_waiting():
+            return json.dumps(
+                {"answered": False, "still_open": True, "detail": _STILL_OPEN_DETAIL}
+            )
+        await asyncio.gather(answer, return_exceptions=True)
+        return _error(f"{tool_name} failed: the server didn't take the question in time")
+    try:
+        verdict = answer.result()
+    except _InputRequestFailed as exc:
+        return exc.result
+    if not verdict.approved:
+        return json.dumps(
+            {
+                "answered": False,
+                "detail": (
+                    "No answer: the user dismissed the question. The task stays waiting "
+                    "for them; don't ask again this turn."
+                ),
+            }
+        )
+    return json.dumps(
+        {"answered": True, "answers": answers_from_content(questions, verdict.content)},
+        ensure_ascii=False,
+    )
+
+
+def _deliver_answer_as_message(
+    answer: asyncio.Task[pending_approvals.Verdict],
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    step: str,
+    questions: list[dict[str, Any]],
+    elicitation_id: str,
+) -> None:
+    """Once a still-open question is answered or dismissed, tell its session in a message."""
+
+    async def deliver() -> None:
+        try:
+            try:
+                verdict = await answer
+            except Exception:
+                _logger.warning(
+                    "workflow question %s closed without an answer",
+                    elicitation_id,
+                    exc_info=True,
+                    extra={"session_id": conversation_id},
+                )
+                return
+            if verdict.timed_out:
+                return
+            notice = _answer_notice(step, questions, verdict)
+            for delay_s in _ANSWER_REDELIVERY_DELAYS_S:
+                generation = pending_approvals.current_server_generation()
+                if await _deliver_subagent_wake_post(server_client, conversation_id, notice):
+                    return
+                with contextlib.suppress(TimeoutError):
+                    await pending_approvals.wait_for_server_reconnect(
+                        generation, timeout_seconds=delay_s
+                    )
+            if not await _deliver_subagent_wake_post(server_client, conversation_id, notice):
+                _logger.warning(
+                    "could not deliver the answer to workflow question %s",
+                    elicitation_id,
+                    extra={"session_id": conversation_id},
+                )
+        finally:
+            # Registered until delivered, so deleting the session can still cancel it.
+            entry = _answers_by_message.get(elicitation_id)
+            if entry is not None and entry.delivery is asyncio.current_task():
+                del _answers_by_message[elicitation_id]
+
+    delivery = asyncio.create_task(deliver(), name=f"workflow-answer:{elicitation_id}")
+    _answers_by_message[elicitation_id] = _OpenQuestion(conversation_id, answer, delivery)
+
+
+def _answer_notice(
+    step: str, questions: list[dict[str, Any]], verdict: pending_approvals.Verdict
+) -> str:
+    """The message that brings a question's late answer, or its dismissal, to the agent."""
+    if not verdict.approved:
+        return (
+            f'[System: the user dismissed your question on task "{step}"]\n'
+            "The task stays waiting for them; don't ask again unless they bring it up."
+        )
+    lines = [f'[System: the user answered your question on task "{step}"]']
+    for item in answers_from_content(questions, verdict.content):
+        lines += [f"Q: {item['question']}", f"A: {item['answer'] or '(no answer)'}"]
+    lines.append(
+        "Write the task's next status: started to resume it, done for an approval given, "
+        "failed for one refused. Then go on with the plan."
+    )
+    return "\n".join(lines)
+
+
+# ── Reads ─────────────────────────────────────────────
+
+
+def _encode_cursor(state: dict[str, Any]) -> str:
+    raw = json.dumps(state, separators=(",", ":")).encode()
+    return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+
+def _decode_cursor(cursor: str) -> dict[str, Any]:
+    try:
+        raw = base64.urlsafe_b64decode(cursor + "=" * (-len(cursor) % 4))
+        state = json.loads(raw)
+    except (binascii.Error, ValueError) as exc:
+        raise ValueError("cursor is not a sys_journal_read cursor") from exc
+    if not isinstance(state, dict) or not isinstance(state.get("after"), str):
+        raise ValueError("cursor is not a sys_journal_read cursor")
+    return state
+
+
+def _when(created_at: object) -> str:
+    if not isinstance(created_at, int):
+        return "?"
+    return datetime.fromtimestamp(created_at, UTC).strftime("%m-%d %H:%MZ")
+
+
+def _plan_change(plan: dict[str, Any], previous: dict[str, Any] | None) -> str:
+    """One line on what a plan changed, e.g. ``"added opt-n1, opt-pool"``."""
+    steps = plan.get("content", {}).get("steps", [])
+    if previous is None:
+        return f"{len(steps)} step{'' if len(steps) == 1 else 's'}: " + ", ".join(
+            step["id"] for step in steps
+        )
+    before = {step["id"]: step for step in previous.get("content", {}).get("steps", [])}
+    after = {step["id"]: step for step in steps}
+    added = [step_id for step_id in after if step_id not in before]
+    removed = [step_id for step_id in before if step_id not in after]
+    changed = [
+        step_id for step_id in after if step_id in before and after[step_id] != before[step_id]
+    ]
+    parts = [
+        f"{label} {', '.join(ids)}"
+        for label, ids in (("added", added), ("removed", removed), ("changed", changed))
+        if ids
+    ]
+    return "; ".join(parts) or "no change"
+
+
+def _line(entry: dict[str, Any], previous_plans: dict[str, dict[str, Any] | None]) -> str:
+    """Render one entry as a compact line; a note's later lines follow, indented."""
+    head = f"#{entry['position']} {_when(entry.get('created_at'))}"
+    run_id = entry.get("scheduled_task_run_id")
+    if run_id:
+        head += f" run {run_id[:8]}"
+    kind, content = entry.get("kind"), entry.get("content") or {}
+    step = f" [{entry['step']}]" if entry.get("step") else ""
+    if kind == "status":
+        status = str(content.get("status"))
+        text = f": {content['text']}" if content.get("text") else ""
+        return f"{head} · status{step} {_STATUS_GLYPHS.get(status, '')} {status}{text}"
+    if kind == "note":
+        first, _, rest = str(content.get("body", "")).partition("\n")
+        line = f"{head} · note{step}: {first}"
+        return line + "".join(f"\n    {more}" for more in rest.splitlines())
+    if kind == "plan":
+        author = (entry.get("author") or {}).get("type", "agent")
+        change = _plan_change(entry, previous_plans.get(entry["id"]))
+        name = f" {json.dumps(content['name'], ensure_ascii=False)}" if content.get("name") else ""
+        return f"{head} · plan v{content.get('version')}{name} ({author}): {change}"
+    return f"{head} · {kind}{step}: {json.dumps(content, ensure_ascii=False)}"
+
+
+async def _get(
+    server_client: httpx.AsyncClient, target: str, params: dict[str, Any]
+) -> dict[str, Any] | str:
+    try:
+        response = await server_client.get(_journal_url(target), params=params, timeout=30.0)
+    except ValueError as exc:
+        return _error(f"invalid_entry: {exc}")
+    except httpx.HTTPError as exc:
+        return _error(f"sys_journal_read failed: {exc}")
+    if _is_unrouted(response):
+        return _error(f"sys_journal_read: {_UNSUPPORTED}")
+    if response.status_code in (401, 403):
+        return _error("session_out_of_tree", conversation_id=target)
+    if response.status_code >= 400:
+        return _journal_error(response, target)
+    body = response.json()
+    return body if isinstance(body, dict) else _error("sys_journal_read: malformed response")
+
+
+async def _previous_plans(
+    server_client: httpx.AsyncClient, target: str, entries: list[dict[str, Any]]
+) -> dict[str, dict[str, Any] | None]:
+    """Each plan entry's predecessor, for its change line; one extra read at most."""
+    plans = [entry for entry in entries if entry.get("kind") == "plan"]  # newest first
+    previous: dict[str, dict[str, Any] | None] = {}
+    for newer, older in itertools.pairwise(plans):
+        previous[newer["id"]] = older
+    if plans:
+        oldest = plans[-1]
+        page = await _get(
+            server_client,
+            target,
+            {"kind": "plan", "order": "desc", "after": oldest["id"], "limit": 1},
+        )
+        previous[oldest["id"]] = (
+            page["data"][0] if isinstance(page, dict) and page["data"] else None
+        )
+    return previous
+
+
+async def _read(
+    args: dict[str, Any], *, server_client: httpx.AsyncClient, conversation_id: str
+) -> str:
+    target = args.get("conversation_id") or conversation_id
+    kind, step, limit = args.get("kind"), args.get("step"), args.get("limit")
+    if not isinstance(target, str):
+        return _error("invalid_entry: conversation_id must be a session ID")
+    if kind is not None and kind not in JOURNAL_KINDS:
+        return _error(f"invalid_entry: kind must be one of {', '.join(JOURNAL_KINDS)}")
+    if limit is None:
+        limit = JOURNAL_READ_PAGE_MAX
+    if not isinstance(limit, int) or not 1 <= limit <= JOURNAL_READ_PAGE_MAX:
+        return _error(f"invalid_entry: limit must be between 1 and {JOURNAL_READ_PAGE_MAX}")
+    try:
+        if step is not None:
+            step = normalize_step_id(step)
+        after = None
+        if args.get("cursor") is not None:
+            state = _decode_cursor(str(args["cursor"]))
+            if (state.get("conversation_id"), state.get("kind"), state.get("step")) != (
+                target,
+                kind,
+                step,
+            ):
+                raise ValueError("cursor belongs to a read with other arguments; repeat them")
+            after = state["after"]
+    except (InvalidJournalEntryError, ValueError) as exc:
+        return _error(f"invalid_entry: {exc}")
+    params: dict[str, Any] = {"order": "desc", "limit": limit}
+    for name, value in (("kind", kind), ("step", step), ("after", after)):
+        if value is not None:
+            params[name] = value
+    page = await _get(server_client, target, params)
+    if isinstance(page, str):
+        return page
+    entries: list[dict[str, Any]] = page.get("data", [])
+    if kind == "plan":
+        rendered: list[Any] = [
+            {
+                "position": entry["position"],
+                "version": entry["content"].get("version"),
+                "name": entry["content"].get("name"),
+                "created_at": entry["created_at"],
+                "author": (entry.get("author") or {}).get("type"),
+                "steps": entry["content"].get("steps", []),
+            }
+            for entry in entries
+        ]
+    else:
+        previous = await _previous_plans(server_client, target, entries)
+        rendered = [_line(entry, previous) for entry in entries]
+    # Keep the newest entries that fit; the cursor continues from the oldest kept.
+    kept, size = [], 0
+    for entry, item in zip(entries, rendered, strict=True):
+        cost = len(json.dumps(item, ensure_ascii=False).encode()) + 2
+        if kept and size + cost > _READ_OUTPUT_MAX_BYTES:
+            break
+        kept.append((entry, item))
+        size += cost
+    has_more = bool(page.get("has_more")) or len(kept) < len(entries)
+    next_cursor = (
+        _encode_cursor(
+            {"conversation_id": target, "kind": kind, "step": step, "after": kept[-1][0]["id"]}
+        )
+        if has_more and kept
+        else None
+    )
+    return json.dumps(
+        {
+            "entries": [item for _, item in reversed(kept)],
+            "page": {"has_more": has_more, "next_cursor": next_cursor},
+        },
+        ensure_ascii=False,
+    )
+
+
+# ── Saved workflows ───────────────────────────────────
+
+_WORKFLOWS_URL = "/v1/workflows"
+_NO_WORKFLOWS = "this Omnigent server has no saved workflows"
+# Workflow IDs are bare hex UUIDs, like session IDs.
+_WORKFLOW_ID = re.compile(r"[0-9a-f]{32}")
+# A name with no exact match is compared with this many of the user's workflows.
+_SIMILAR_SCAN = 100
+_SIMILAR_MAX = 5
+# A list page's default size, and how much of each description it shows.
+_LIST_PAGE_DEFAULT = 20
+_DESCRIPTION_PREVIEW_CHARS = 200
+
+
+async def _save_workflow(
+    args: dict[str, Any],
+    *,
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    call_id: str | None,
+    publish_event: _Publisher | None,
+) -> str:
+    """Save a workflow for the session's owner with ``POST /v1/workflows``.
+
+    A matching agent plan is written again naming the saved workflow.
+    """
+    try:
+        name, description, steps = normalize_workflow(
+            name=args.get("name"), description=args.get("description"), steps=args.get("steps")
+        )
+    except InvalidWorkflowError as exc:
+        return _error(f"invalid_workflow: {exc}")
+    try:
+        response = await server_client.post(
+            _WORKFLOWS_URL,
+            json={"name": name, "description": description, "steps": steps},
+            headers={ORCHESTRATION_SOURCE_HEADER: conversation_id},
+            timeout=30.0,
+        )
+    except httpx.HTTPError as exc:
+        # Not retried: a save that did reach the server would come back name_taken.
+        return _error(
+            f"sys_workflow_save failed: {exc}. Check with sys_workflow_load before saving again."
+        )
+    if _is_unrouted(response):
+        return _error(f"sys_workflow_save: {_NO_WORKFLOWS}")
+    if response.status_code == 409:
+        return _error("name_taken", name=name)
+    if response.status_code >= 400:
+        return _error(_server_message(response))
+    workflow = response.json()
+    try:
+        await _name_plan_workflow(
+            workflow["id"],
+            steps=steps,
+            server_client=server_client,
+            conversation_id=conversation_id,
+            call_id=call_id,
+            publish_event=publish_event,
+        )
+    except Exception:
+        _logger.warning("Workflow saved but its journal plan could not be linked", exc_info=True)
+    return json.dumps({"id": workflow["id"], "name": workflow["name"]}, ensure_ascii=False)
+
+
+async def _name_plan_workflow(
+    workflow_id: str,
+    *,
+    steps: list[dict[str, Any]],
+    server_client: httpx.AsyncClient,
+    conversation_id: str,
+    call_id: str | None,
+    publish_event: _Publisher | None,
+) -> None:
+    """Name the saved workflow on a matching agent plan.
+
+    The journal adds no chat line for a plan whose steps don't change, and the
+    Tasks tab keeps each step's progress. An unrelated or drawn plan stays as
+    it is; a failure leaves the saved workflow as it is.
+    """
+    page = await _get(
+        server_client, conversation_id, {"order": "desc", "limit": 1, "kind": "plan"}
+    )
+    if isinstance(page, str) or not page.get("data"):
+        return
+    plan = page["data"][0]
+    if plan.get("workflow_id") == workflow_id or plan["content"].get("source") != "agent":
+        return
+    plan_dependencies = {
+        step["id"]: set(step.get("depends_on") or []) for step in plan["content"]["steps"]
+    }
+    saved_dependencies = {step["id"]: set(step.get("depends_on") or []) for step in steps}
+    if plan_dependencies != saved_dependencies:
+        return
+    await _write(
+        "sys_journal_write_plan",
+        {
+            "name": plan["content"]["name"],
+            "steps": plan["content"]["steps"],
+            "workflow_id": workflow_id,
+        },
+        server_client=server_client,
+        conversation_id=conversation_id,
+        call_id=f"{call_id}:plan" if call_id else None,
+        publish_event=publish_event,
+        start_run=False,
+    )
+
+
+async def _get_workflows(
+    server_client: httpx.AsyncClient, path: str, conversation_id: str, **params: Any
+) -> httpx.Response:
+    return await server_client.get(
+        f"{_WORKFLOWS_URL}{path}",
+        params=params or None,
+        headers={ORCHESTRATION_SOURCE_HEADER: conversation_id},
+        timeout=30.0,
+    )
+
+
+async def _load_workflow(
+    args: dict[str, Any], *, server_client: httpx.AsyncClient, conversation_id: str
+) -> str:
+    """Load one of the session owner's workflows by ID or name, with its steps."""
+    wanted = args.get("workflow")
+    if not isinstance(wanted, str) or not wanted.strip():
+        return _error("invalid_input: workflow must be a saved workflow's ID or name")
+    wanted = " ".join(wanted.split())
+    try:
+        if _WORKFLOW_ID.fullmatch(wanted):
+            response = await _get_workflows(server_client, f"/{wanted}", conversation_id)
+            if response.status_code == 200:
+                return _workflow_result(response.json())
+            if _is_unrouted(response):
+                return _error(f"sys_workflow_load: {_NO_WORKFLOWS}")
+        response = await _get_workflows(
+            server_client, "", conversation_id, name=wanted, limit=_SIMILAR_SCAN
+        )
+        if _is_unrouted(response):
+            return _error(f"sys_workflow_load: {_NO_WORKFLOWS}")
+        if response.status_code >= 400:
+            return _error(_server_message(response))
+        found = response.json().get("data") or []
+        if not found:
+            # No exact name: a case-only difference still counts; otherwise suggest names.
+            response = await _get_workflows(
+                server_client, "", conversation_id, limit=_SIMILAR_SCAN
+            )
+            if response.status_code >= 400:
+                return _error(_server_message(response))
+            names = {item["name"]: item["id"] for item in response.json().get("data") or []}
+            same = [name for name in names if name.casefold() == wanted.casefold()]
+            if not same:
+                folded = {name.casefold(): name for name in names}
+                matches = difflib.get_close_matches(
+                    wanted.casefold(), list(folded), n=_SIMILAR_MAX
+                )
+                similar = [folded[match] for match in matches]
+                return _error("workflow_not_found", workflow=wanted, similar=similar)
+            found = [{"id": names[same[0]]}]
+        response = await _get_workflows(server_client, f"/{found[0]['id']}", conversation_id)
+    except httpx.HTTPError as exc:
+        return _error(f"sys_workflow_load failed: {exc}")
+    if response.status_code >= 400:
+        return _error(_server_message(response))
+    return _workflow_result(response.json())
+
+
+def _description_preview(description: object) -> str:
+    """The start of *description* on one line, cut to fit a list entry."""
+    text = " ".join(str(description or "").split())
+    if len(text) <= _DESCRIPTION_PREVIEW_CHARS:
+        return text
+    return text[: _DESCRIPTION_PREVIEW_CHARS - 1].rstrip() + "…"
+
+
+async def _list_workflows(
+    args: dict[str, Any], *, server_client: httpx.AsyncClient, conversation_id: str
+) -> str:
+    """List one page of the session owner's workflows by name, without their steps."""
+    limit = args.get("limit", _LIST_PAGE_DEFAULT)
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        return _error(f"invalid_input: limit must be 1 to {WORKFLOW_LIST_PAGE_MAX}")
+    if not 1 <= limit <= WORKFLOW_LIST_PAGE_MAX:
+        return _error(f"invalid_input: limit must be 1 to {WORKFLOW_LIST_PAGE_MAX}")
+    cursor = args.get("cursor")
+    if cursor is not None and not (
+        isinstance(cursor, str) and re.fullmatch(r"[A-Za-z0-9_:=-]{1,4096}", cursor)
+    ):
+        return _error("invalid_input: cursor must be a next_cursor from sys_workflow_list")
+    params: dict[str, Any] = {"limit": limit}
+    if cursor is not None:
+        params["after"] = cursor
+    try:
+        response = await _get_workflows(server_client, "", conversation_id, **params)
+    except httpx.HTTPError as exc:
+        return _error(f"sys_workflow_list failed: {exc}")
+    if _is_unrouted(response):
+        return _error(f"sys_workflow_list: {_NO_WORKFLOWS}")
+    if response.status_code >= 400:
+        return _error(_server_message(response))
+    body = response.json()
+    workflows = [
+        {
+            "id": item["id"],
+            "name": item["name"],
+            "description": _description_preview(item.get("description")),
+        }
+        for item in body.get("data") or []
+    ]
+    next_cursor = (
+        (body.get("next_cursor") or body.get("last_id")) if body.get("has_more") else None
+    )
+    return json.dumps({"workflows": workflows, "next_cursor": next_cursor}, ensure_ascii=False)
+
+
+def _workflow_result(workflow: dict[str, Any]) -> str:
+    return json.dumps(
+        {key: workflow.get(key) for key in ("id", "name", "description", "steps")},
+        ensure_ascii=False,
+    )
+
+
+async def execute_journal_tool(
+    tool_name: str,
+    arguments: str,
+    *,
+    server_client: httpx.AsyncClient | None,
+    conversation_id: str | None,
+    call_id: str | None = None,
+    publish_event: _Publisher | None = None,
+) -> str:
+    """Run one journal tool call (``sys_journal_*`` or ``sys_workflow_*``).
+
+    :param tool_name: One of :data:`JOURNAL_TOOL_NAMES`.
+    :param arguments: The call's JSON arguments.
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :param conversation_id: The calling session; writes go to its journal only.
+    :param call_id: The harness's tool call ID, for the write's idempotency key;
+        ``None`` when the call came without one.
+    :param publish_event: Publishes on a session's stream; ``None`` uses the
+        runtime's session stream.
+    :returns: The tool output, a JSON object; ``{"error": …}`` on failure.
+    """
+    if server_client is None or not conversation_id:
+        return _error(f"{tool_name} requires server access")
+    try:
+        args = json.loads(arguments) if arguments.strip() else {}
+    except json.JSONDecodeError:
+        return _error(f"{tool_name}: malformed JSON arguments")
+    if not isinstance(args, dict):
+        return _error(f"{tool_name}: arguments must be an object")
+    if tool_name == "sys_journal_read":
+        return await _read(args, server_client=server_client, conversation_id=conversation_id)
+    if tool_name == "sys_workflow_save":
+        return await _save_workflow(
+            args,
+            server_client=server_client,
+            conversation_id=conversation_id,
+            call_id=call_id,
+            publish_event=publish_event,
+        )
+    if tool_name == "sys_workflow_load":
+        return await _load_workflow(
+            args, server_client=server_client, conversation_id=conversation_id
+        )
+    if tool_name == "sys_workflow_list":
+        return await _list_workflows(
+            args, server_client=server_client, conversation_id=conversation_id
+        )
+    if tool_name == "sys_workflow_request_input":
+        return await _request_input(
+            args,
+            server_client=server_client,
+            conversation_id=conversation_id,
+            call_id=call_id,
+            publish_event=publish_event,
+        )
+    return await _write(
+        tool_name,
+        args,
+        server_client=server_client,
+        conversation_id=conversation_id,
+        call_id=call_id,
+        publish_event=publish_event,
+    )

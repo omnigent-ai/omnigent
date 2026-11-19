@@ -15,15 +15,20 @@ from omnigent.runtime.prompt import (
     EMBEDDED_BROWSER_PRIORITY_INSTRUCTION,
     SUBAGENT_WAKE_NOTICE_INSTRUCTION,
     SUBAGENT_WAKE_NOTICE_SHAPE,
+    WORKSPACE_IMAGE_INSTRUCTION,
     append_framework_instructions,
     build_instructions,
     build_instructions_nullable,
+    build_native_startup_instructions,
     history_to_input_items,
     raw_author_instructions,
 )
 from omnigent.spec import AgentSpec
 from tests._image_fixtures import _TINY_PNG_BASE64
 
+_DEFAULT_FRAMEWORK_INSTRUCTIONS = (
+    f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+)
 _SAMPLE_FRAMEWORK_INSTRUCTION = "Framework instruction for testing build_instructions_nullable."
 
 
@@ -33,6 +38,7 @@ def _spec(
     agents: tuple[str, ...] = (),
     spawn: bool = False,
     builtins: tuple[str, ...] = (),
+    browser: bool = True,
 ) -> AgentSpec:
     """
     Stub only the AgentSpec fields the instruction builders read.
@@ -47,6 +53,7 @@ def _spec(
                 builtins=[SimpleNamespace(name=name) for name in builtins],
             ),
             spawn=spawn,
+            tool_groups=SimpleNamespace(browser=browser),
         ),
     )
 
@@ -258,8 +265,7 @@ def test_framework_instructions_append_after_custom_prompts() -> None:
     )
 
     assert result == (
-        "Agent prompt\n\nRequest prompt\n\n"
-        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\nFramework prompt"
+        f"Agent prompt\n\nRequest prompt\n\n{_DEFAULT_FRAMEWORK_INSTRUCTIONS}\n\nFramework prompt"
     )
 
 
@@ -267,7 +273,7 @@ def test_empty_framework_instructions_do_not_change_default() -> None:
     spec = _spec(None)
 
     assert build_instructions(spec, None, [], framework_instructions=("", "   ")) == (
-        f"You are a helpful assistant.\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}"
+        f"You are a helpful assistant.\n\n{_DEFAULT_FRAMEWORK_INSTRUCTIONS}"
     )
 
 
@@ -277,11 +283,11 @@ def test_framework_only_instructions_use_shared_composer() -> None:
 
 def test_build_instructions_nullable_unauthored_never_fabricates_fallback() -> None:
     """No author text → the always-on framework guidance alone, never the
-    fabricated fallback (and never ``None``, since the embedded-browser
+    fabricated fallback (and never ``None``, since workspace-image
     guidance applies to every agent)."""
     spec = _spec(None)
     result = build_instructions_nullable(spec, None, [])
-    assert result == EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+    assert result == _DEFAULT_FRAMEWORK_INSTRUCTIONS
     assert "You are a helpful assistant." not in result
 
 
@@ -290,13 +296,11 @@ def test_build_instructions_nullable_whitespace_only_treated_as_absent() -> None
     raw_author_instructions' non-empty/non-whitespace gate, so authored_present
     and composed agree on what counts as "authored"."""
     spec = _spec("   \n  ")
-    assert build_instructions_nullable(spec, None, []) == EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
+    assert build_instructions_nullable(spec, None, []) == _DEFAULT_FRAMEWORK_INSTRUCTIONS
     result = build_instructions_nullable(
         spec, None, [], framework_instructions=(_SAMPLE_FRAMEWORK_INSTRUCTION,)
     )
-    assert result == (
-        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}"
-    )
+    assert result == (f"{_DEFAULT_FRAMEWORK_INSTRUCTIONS}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}")
 
 
 def test_build_instructions_nullable_whitespace_only_per_request_treated_as_absent() -> None:
@@ -304,15 +308,11 @@ def test_build_instructions_nullable_whitespace_only_per_request_treated_as_abse
     the same non-empty/non-whitespace gate applies to both instruction
     sources, not just spec.instructions."""
     spec = _spec(None)
-    assert (
-        build_instructions_nullable(spec, "   \n  ", []) == EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
-    )
+    assert build_instructions_nullable(spec, "   \n  ", []) == _DEFAULT_FRAMEWORK_INSTRUCTIONS
     result = build_instructions_nullable(
         spec, "   \n  ", [], framework_instructions=(_SAMPLE_FRAMEWORK_INSTRUCTION,)
     )
-    assert result == (
-        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}"
-    )
+    assert result == (f"{_DEFAULT_FRAMEWORK_INSTRUCTIONS}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}")
 
 
 def test_build_instructions_nullable_authored_present() -> None:
@@ -322,8 +322,7 @@ def test_build_instructions_nullable_authored_present() -> None:
         spec, "Request prompt", [], framework_instructions=("Framework prompt",)
     )
     assert result == (
-        "Agent prompt\n\nRequest prompt\n\n"
-        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\nFramework prompt"
+        f"Agent prompt\n\nRequest prompt\n\n{_DEFAULT_FRAMEWORK_INSTRUCTIONS}\n\nFramework prompt"
     )
 
 
@@ -341,9 +340,7 @@ def test_build_instructions_nullable_framework_only_omits_fallback() -> None:
     result = build_instructions_nullable(
         spec, None, [], framework_instructions=(_SAMPLE_FRAMEWORK_INSTRUCTION,)
     )
-    assert result == (
-        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}"
-    )
+    assert result == (f"{_DEFAULT_FRAMEWORK_INSTRUCTIONS}\n\n{_SAMPLE_FRAMEWORK_INSTRUCTION}")
     assert "You are a helpful assistant." not in (result or "")
 
     # The comparison this helper replaces would have misclassified the
@@ -376,12 +373,12 @@ def test_subagent_wake_instruction_added_for_dispatching_agents(
     result = build_instructions(dispatching, None, [], framework_instructions=("Turn note",))
     assert result == (
         f"Agent prompt\n\n{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n"
-        f"{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}\n\nTurn note"
+        f"{_DEFAULT_FRAMEWORK_INSTRUCTIONS}\n\nTurn note"
     )
 
     unauthored = _spec(None, agents=agents, spawn=spawn, builtins=builtins)
     assert build_instructions_nullable(unauthored, None, []) == (
-        f"{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}"
+        f"{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n{_DEFAULT_FRAMEWORK_INSTRUCTIONS}"
     )
 
 
@@ -396,7 +393,7 @@ def test_embedded_browser_guidance_included_for_every_agent() -> None:
     """
     authored = _spec("Agent prompt")
     assert build_instructions(authored, None, []) == (
-        f"Agent prompt\n\n{EMBEDDED_BROWSER_PRIORITY_INSTRUCTION}"
+        f"Agent prompt\n\n{_DEFAULT_FRAMEWORK_INSTRUCTIONS}"
     )
 
 
@@ -435,3 +432,40 @@ def test_raw_author_instructions_verbatim_and_none() -> None:
 
     whitespace_only = cast(AgentSpec, SimpleNamespace(instructions="   \n  "))
     assert raw_author_instructions(whitespace_only) is None
+
+
+# ─── ``tool_groups.browser: false`` drops the browser guidance ────
+
+
+def test_browser_guidance_omitted_when_browser_group_disabled() -> None:
+    """
+    With the ``browser_*`` tools unregistered, the prompt must not steer
+    the model toward them; workspace-image guidance still applies.
+    """
+    spec = _spec("You are a helpful assistant.", browser=False)
+    assert build_instructions_nullable(spec, None, []) == (
+        f"You are a helpful assistant.\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+    )
+    assert (
+        build_instructions_nullable(_spec(None, browser=False), None, [])
+        == WORKSPACE_IMAGE_INSTRUCTION
+    )
+
+
+def test_browser_group_disabled_keeps_wake_notice_for_spawning_agent() -> None:
+    """Only the browser guidance follows the browser gate; the sub-agent
+    wake notice still rides its own dispatch gate."""
+    spec = _spec(None, spawn=True, browser=False)
+    result = build_instructions_nullable(spec, None, [])
+    assert result == f"{SUBAGENT_WAKE_NOTICE_INSTRUCTION}\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+    assert EMBEDDED_BROWSER_PRIORITY_INSTRUCTION not in result
+
+
+def test_native_startup_instructions_keep_only_stable_image_guidance() -> None:
+    """Native startup preserves author text without unrelated tool/turn guidance."""
+    spec = _spec("  Follow the user's directions.  ", spawn=True)
+    result = build_native_startup_instructions(spec)
+    assert result == f"{spec.instructions}\n\n{WORKSPACE_IMAGE_INSTRUCTION}"
+    assert EMBEDDED_BROWSER_PRIORITY_INSTRUCTION not in result
+    assert SUBAGENT_WAKE_NOTICE_INSTRUCTION not in result
+    assert build_native_startup_instructions(None) == WORKSPACE_IMAGE_INSTRUCTION

@@ -16,6 +16,7 @@
  */
 
 import { stripBasePath, withBasePath } from "./basePath";
+import { isAdminViewEnabled } from "./adminView";
 import { getCachedServerInfo } from "./capabilities";
 import {
   getOmnigentHostConfig,
@@ -23,12 +24,13 @@ import {
   isDatabricksWorkspace,
   isHostRoutingEnabled,
 } from "./host";
+import { clientRoutingKey, SLICE_KEY_HEADER } from "./routingKey";
 import {
   clearHostKeyless,
   getSessionHost,
   isHostKeyless,
   markHostKeyless,
-  modalHostId,
+  updatesRoutingKey,
 } from "@/lib/sessionHost";
 
 // Single-user sentinel from `GET /v1/me` (server's RESERVED_USER_LOCAL);
@@ -37,15 +39,9 @@ const RESERVED_USER_LOCAL = "local";
 
 let currentUserId: string | null = null;
 
-// Replica-routing header, used when the server shards replicas by host. A
-// host's control tunnel and its runners' tunnels register on the same replica,
-// keyed by host_id, so a request scoped to a host (or a session running on one)
-// must carry that host_id to reach the replica holding the tunnel.
-const SLICE_KEY_HEADER = "X-Databricks-Omnigent-Slice-Key";
-
 // The request is valid but reached a replica without its host tunnel.
 // Unlike runner_unavailable, wrong_replica can recover by re-addressing.
-const WRONG_REPLICA_CODE = "wrong_replica";
+export const WRONG_REPLICA_CODE = "wrong_replica";
 
 /**
  * Classify a request URL for slice-key routing. A host-scoped request must key
@@ -56,12 +52,13 @@ const WRONG_REPLICA_CODE = "wrong_replica";
  * - ``/v1/hosts/{host_id}/...`` → ``{scoped: true, hostId}`` from the path.
  * - ``/v1/sessions/{session_id}/...`` → ``{scoped: true, hostId}`` from
  *   {@link getSessionHost}; ``hostId`` is ``null`` when the session hasn't been
- *   loaded yet → send NO key (the modal host would be a wrong guess for a
- *   specific session; a keyless miss re-addresses instead).
+ *   loaded yet → send the client's own key, not the modal host (a wrong guess
+ *   for a specific session); a wrong_replica miss resolves the host and
+ *   re-addresses.
  * - ``/v1/skills`` → the query's ``host_id`` or the host for ``session_id``.
- * - everything else (session lists, ``/v1/sessions/updates``, ``/health``) is a
- *   cross-host / DB-backed read → ``{scoped: false}``, where the modal host is a
- *   legitimate cache-affinity hint.
+ * - everything else (session lists, ``/v1/sessions/projects``,
+ *   ``/v1/sessions/updates``, ``/health``) is a cross-host / DB-backed read →
+ *   ``{scoped: false}``, which any replica can serve.
  *
  * The host-scoped families are an ALLOWLIST of what exists today (verified:
  * ``/v1/sessions/{id}/agent`` is under the sessions prefix, and
@@ -70,6 +67,10 @@ const WRONG_REPLICA_CODE = "wrong_replica";
  * families so a matcher change is a conscious edit.
  */
 type UrlHostScope = { scoped: true; hostId: string | null } | { scoped: false };
+
+// Routes under /v1/sessions/ whose next segment is not a session id. Read as a
+// session id, they would look up a host that can't exist.
+const SESSION_COLLECTION_ROUTES = new Set(["orchestrated", "projects", "updates"]);
 
 function skillsParamsForUrl(url: string): URLSearchParams | null {
   const match = url.match(/\/v1\/skills(?:\?([^#]*))?(?:#.*)?$/);
@@ -88,8 +89,11 @@ function hostScopeForUrl(url: string): UrlHostScope {
   const hostMatch = url.match(/\/v1\/hosts\/([^/?#]+)/);
   if (hostMatch) return { scoped: true, hostId: decodeURIComponent(hostMatch[1]) };
   const sessionMatch = url.match(/\/v1\/sessions\/([^/?#]+)/);
-  if (sessionMatch)
-    return { scoped: true, hostId: getSessionHost(decodeURIComponent(sessionMatch[1])) };
+  if (sessionMatch) {
+    const sessionId = decodeURIComponent(sessionMatch[1]);
+    if (!SESSION_COLLECTION_ROUTES.has(sessionId))
+      return { scoped: true, hostId: getSessionHost(sessionId) };
+  }
   return { scoped: false };
 }
 
@@ -156,6 +160,23 @@ const _hostResolveAttempted = new Set<string>();
 // itself. The list (/v1/sessions?query) and create (POST /v1/sessions) have no
 // /{id} and also don't match.
 const SESSION_SUBPATH_RE = /\/v1\/sessions\/([^/?#]+)\/[^?#]/;
+const SESSION_ROOT_RE = /\/v1\/sessions\/([^/?#]+)(?:[?#]|$)/;
+
+/**
+ * The session whose host a wrong_replica miss should refresh: a sub-path's, or a
+ * root mutation's (e.g. an archive PATCH). A root GET is the host lookup itself,
+ * so it never triggers another lookup.
+ */
+function sessionIdForRecovery(url: string, method: string | undefined): string | null {
+  const subpathSessionId = sessionIdForHostResolve(url);
+  if (subpathSessionId !== null) return subpathSessionId;
+  const verb = (method ?? "GET").toUpperCase();
+  if (verb === "GET" || verb === "HEAD") return null;
+  const match = url.match(SESSION_ROOT_RE);
+  if (match === null) return null;
+  const sessionId = decodeURIComponent(match[1]);
+  return SESSION_COLLECTION_ROUTES.has(sessionId) ? null : sessionId;
+}
 
 /**
  * Bootstrap the session→host map for one session id so its host-scoped traffic
@@ -228,8 +249,8 @@ function sessionIdForHostResolve(url: string): string | null {
  * caller only awaits a non-null result, so the common no-op path adds NO
  * microtask hop (a fetch still dispatches synchronously, as before the gate).
  */
-function beginSessionHostResolve(url: string): Promise<void> | null {
-  const sessionId = sessionIdForHostResolve(url);
+function beginSessionHostResolve(url: string, method: string | undefined): Promise<void> | null {
+  const sessionId = sessionIdForRecovery(url, method);
   return sessionId === null ? null : resolveSessionHost(sessionId);
 }
 
@@ -237,12 +258,16 @@ function beginSessionHostResolve(url: string): Promise<void> | null {
 // {@link hostScopeForUrl} can't see it: the session create (POST /v1/sessions)
 // and the host-mediated local import (POST /v1/imports/local[/stream]).
 const BODY_HOST_KEYED_RE = /\/v1\/(?:sessions(?:\?|$)|imports\/local(?:[/?]|$))/;
-// A managed fork keys like a managed create: its launch must run where its own
-// new host connects, never on the source session's replica.
+// A managed fork, or a move onto a new sandbox, keys like a managed create: its
+// launch must run where its own new host connects, never on the source
+// session's replica.
 const FORK_RE = /\/v1\/sessions\/[^/?#]+\/fork(?:\?|$)/;
+const MANAGED_HOST_MOVE_RE = /\/v1\/sessions\/[^/?#]+\/managed-host(?:\?|$)/;
 
-function isManagedForkRequest(url: string, body: BodyInit | null | undefined): boolean {
-  if (typeof body !== "string" || !FORK_RE.test(url)) return false;
+function isManagedLaunchRequest(url: string, body: BodyInit | null | undefined): boolean {
+  if (typeof body !== "string") return false;
+  if (MANAGED_HOST_MOVE_RE.test(url)) return true;
+  if (!FORK_RE.test(url)) return false;
   try {
     return (JSON.parse(body) as { host_type?: unknown }).host_type === "managed";
   } catch {
@@ -252,8 +277,8 @@ function isManagedForkRequest(url: string, body: BodyInit | null | undefined): b
 
 /**
  * Recover the target host_id from a JSON request body for a body-host-keyed
- * request ({@link isBodyHostKeyedRequest}) or a managed fork, or null when the
- * body names none.
+ * request ({@link isBodyHostKeyedRequest}), a managed fork, or a move onto a
+ * new sandbox, or null when the body names none.
  *
  * These requests carry the host in the body, not the URL, so left unkeyed they
  * round-robin and can miss the replica holding that host's runner tunnel. A
@@ -263,16 +288,18 @@ function isManagedForkRequest(url: string, body: BodyInit | null | undefined): b
  * body host_id pins both to the right replica like every other host-scoped
  * request. A managed-sandbox create's ``host_id`` is the id it chose for its
  * new sandbox host, so the launch runs where that host's tunnel will land.
- * A managed fork's ``host_id`` is the same choice. Bundled (multipart) creates
- * are hostless here (non-string body), as is a managed create or fork without
- * one; all yield null → unkeyed (see
- * {@link isBodyHostKeyedRequest}).
+ * A managed fork's or move's ``host_id`` is the same choice. Multipart creates
+ * carry the same routing fields in their metadata part. Creates, forks and moves
+ * without a host ID carry the client's own key.
  */
 function hostIdFromBody(url: string, body: BodyInit | null | undefined): string | null {
-  if (typeof body !== "string") return null;
-  if (!BODY_HOST_KEYED_RE.test(url) && !FORK_RE.test(url)) return null;
+  const metadata = body instanceof FormData ? body.get("metadata") : body;
+  if (typeof metadata !== "string") return null;
+  if (!BODY_HOST_KEYED_RE.test(url) && !FORK_RE.test(url) && !MANAGED_HOST_MOVE_RE.test(url)) {
+    return null;
+  }
   try {
-    const hostId = (JSON.parse(body) as { host_id?: unknown }).host_id;
+    const hostId = (JSON.parse(metadata) as { host_id?: unknown }).host_id;
     return typeof hostId === "string" && hostId ? hostId : null;
   } catch {
     return null;
@@ -286,20 +313,35 @@ function hostIdFromBody(url: string, body: BodyInit | null | undefined): string 
  * side effect pinned to a replica and must key by their OWN target host:
  *
  * - A managed create keys by the host_id it chose for its sandbox host. One
- *   without a host_id stays unkeyed: if the new host connects elsewhere, its
- *   first message must resolve the assigned host and re-address after
- *   wrong_replica. A create that names a host keeps that key.
+ *   without a host_id carries the client's own key: if the new host connects
+ *   elsewhere, its first message must resolve the assigned host and re-address
+ *   after wrong_replica. A create that names a host keeps that key.
  * - A local import reads the chosen host's transcripts over its tunnel, which is
  *   registered on the replica keyed by that host_id — never the importing user's
  *   modal host (null / a different host for a fresh user), which is why an
  *   unkeyed import lands off-replica and 409s "host is not connected".
  *
- * A bundled (multipart) create has a non-string body and is not matched: it only
- * writes rows and binds the runner via a separate ``POST /v1/hosts/{id}/runners``
- * (keyed from the URL), so it spawns no replica-pinned work and may ride the modal.
+ * Multipart creates can launch on a host during creation, so they use the same
+ * routing rule as JSON creates.
  */
 function isBodyHostKeyedRequest(url: string, body: BodyInit | null | undefined): boolean {
-  return typeof body === "string" && BODY_HOST_KEYED_RE.test(url);
+  return (typeof body === "string" || body instanceof FormData) && BODY_HOST_KEYED_RE.test(url);
+}
+
+const SCHEDULED_TASK_WRITE_RE = /\/v1\/scheduled-tasks(?:\/[^/?#]+)?(?:[?#]|$)/;
+
+// A scheduled-task create or edit naming a connected host is validated against
+// that host's workspace over its tunnel, so it routes to the host's replica.
+function scheduledTaskHostId(url: string, init: RequestInit | undefined): string | null {
+  const verb = (init?.method ?? "GET").toUpperCase();
+  if ((verb !== "POST" && verb !== "PATCH") || typeof init?.body !== "string") return null;
+  if (!SCHEDULED_TASK_WRITE_RE.test(url)) return null;
+  try {
+    const hostId = (JSON.parse(init.body) as { host_id?: unknown }).host_id;
+    return typeof hostId === "string" && hostId ? hostId : null;
+  } catch {
+    return null;
+  }
 }
 
 // Admin flag from the same `/v1/me` probe. Mode-agnostic (the shared
@@ -397,7 +439,7 @@ function isTransientIdentityStatus(status: number): boolean {
  */
 async function probeIdentity(): Promise<boolean> {
   try {
-    const res = await hostFetch("/v1/me");
+    const res = await hostFetch("/v1/me", undefined, { hostless: true });
     if (res.status === 401) {
       // OIDC / accounts mode: server requires authentication.
       // Redirect to the login URL provided in the response body —
@@ -506,11 +548,16 @@ export function getCurrentUserId(): string | null {
 }
 
 /**
- * Whether the current user is an admin, per the `/v1/me` probe.
+ * Whether the current user has admin access enabled in this browser.
  * Mode-agnostic — usable to gate admin chrome under header, accounts,
  * AND OIDC. Returns false before `resolveIdentity` completes.
  */
 export function getCurrentIsAdmin(): boolean {
+  return currentIsAdmin && (getCachedServerInfo()?.admin_view === false || isAdminViewEnabled());
+}
+
+/** The account's role, used to keep the admin-view switch available while off. */
+export function getCurrentAdminEligibility(): boolean {
   return currentIsAdmin;
 }
 
@@ -571,34 +618,32 @@ export async function authenticatedFetch(
   // Null (the common case: warm map, non-session route, or standalone) means no
   // bootstrap is needed — we skip the await so the fetch still dispatches in the
   // same tick, exactly as before the gate.
-  const hostResolve = beginSessionHostResolve(url);
+  const hostResolve = beginSessionHostResolve(url, init?.method);
   if (hostResolve !== null) await hostResolve;
-  // Whether WE (not the caller) stamped the slice key on this request; only then
-  // is a keyless re-address meaningful on a wrong-replica (wrong_replica) response.
+  // Whether WE (not the caller) stamped a host's slice key on this request; only
+  // then is a keyless re-address meaningful on a wrong-replica (wrong_replica) response.
   let stampedSliceKey = false;
   // The host this request is FOR, even when we deliberately send it keyless
   // (demoted). Lets the retry logic below demote/un-demote the right host.
   let derivedHostId: string | null = null;
-  if (!headers.has(SLICE_KEY_HEADER) && isHostRoutingEnabled()) {
-    // Key by the request's OWN host when it's host-scoped; otherwise (a
-    // cross-host / DB-backed read) fall back to the modal host as a
-    // cache-affinity hint. The distinction matters: a host-scoped request whose
-    // host isn't known yet must send NO key rather than the modal — the modal
-    // is the wrong guess for a SPECIFIC session, so it would route to a replica
-    // that doesn't hold the tunnel; a keyless miss re-addresses instead. Only
-    // an unscoped route (list / updates) may ride the modal — a JSON request
-    // whose target host is in the body may not (see {@link isBodyHostKeyedRequest}):
-    // it is keyable ONLY by that body host_id (a managed create with none stays
-    // unkeyed).
+  // Sent without a key because its host's tunnels connected without one.
+  let unkeyed = false;
+  // Names no host (lists, probes, discovery writes). It is keyed by the modal
+  // host, and a wrong_replica reply to it is returned as-is.
+  let hostless = false;
+  const callerKeyed = headers.has(SLICE_KEY_HEADER);
+  if (!callerKeyed && isHostRoutingEnabled()) {
     const scope = hostScopeForUrl(url);
-    if (isManagedForkRequest(url, init?.body)) {
+    if (isManagedLaunchRequest(url, init?.body)) {
       derivedHostId = hostIdFromBody(url, init?.body);
     } else if (scope.scoped) {
       derivedHostId = scope.hostId;
     } else if (isBodyHostKeyedRequest(url, init?.body)) {
       derivedHostId = hostIdFromBody(url, init?.body);
+    } else if (scheduledTaskHostId(url, init) !== null) {
+      derivedHostId = scheduledTaskHostId(url, init);
     } else {
-      derivedHostId = modalHostId();
+      hostless = true;
     }
     // Skip keying a host we've already PROVEN routes keyless (its tunnels dialed
     // in without a key → they live on the default replica). This spares the long
@@ -609,6 +654,12 @@ export async function authenticatedFetch(
     if (derivedHostId && (!isDatabricksWorkspace() || !isHostKeyless(derivedHostId))) {
       headers.set(SLICE_KEY_HEADER, derivedHostId);
       stampedSliceKey = true;
+    } else if (derivedHostId) {
+      unkeyed = true;
+    } else if (hostless) {
+      headers.set(SLICE_KEY_HEADER, updatesRoutingKey());
+    } else if (!headers.has(SLICE_KEY_HEADER)) {
+      headers.set(SLICE_KEY_HEADER, clientRoutingKey());
     }
   }
   // Bypass the browser HTTP cache for all API calls. Session
@@ -617,11 +668,15 @@ export async function authenticatedFetch(
   // URL change. Without no-store the browser may serve a stale
   // cached response — e.g. one captured before an elicitation was
   // published — causing the ApprovalCard to vanish on navigate-back.
-  let res = await hostFetch(url, {
-    ...init,
-    headers,
-    cache: "no-store",
-  });
+  let res = await hostFetch(
+    url,
+    {
+      ...init,
+      headers,
+      cache: "no-store",
+    },
+    { unkeyed },
+  );
 
   // Wrong-replica fallback: a keyed request that reached the wrong replica comes
   // back 400 wrong_replica. Re-address ONCE with the key removed so it routes by
@@ -635,11 +690,15 @@ export async function authenticatedFetch(
     // (callers/tests hold it by reference).
     const retryHeaders = new Headers(headers);
     retryHeaders.delete(SLICE_KEY_HEADER);
-    res = await hostFetch(url, {
-      ...init,
-      headers: retryHeaders,
-      cache: "no-store",
-    });
+    res = await hostFetch(
+      url,
+      {
+        ...init,
+        headers: retryHeaders,
+        cache: "no-store",
+      },
+      { unkeyed: true },
+    );
     // Only a successful keyless retry proves this host uses the default replica.
     // Failed retries must preserve the host key for subsequent requests.
     if (derivedHostId && res.ok) {
@@ -647,33 +706,52 @@ export async function authenticatedFetch(
     }
   } else if (
     derivedHostId === null &&
-    !headers.has(SLICE_KEY_HEADER) &&
+    !hostless &&
+    !callerKeyed &&
     isDatabricksWorkspace() &&
     (await _isWrongReplica(res))
   ) {
-    // The first managed message can outlive provisioning and acquire a host.
-    // Refresh its original hostless lookup, then retry once on that host.
-    const sessionId = sessionIdForHostResolve(url);
+    // A session request whose host was unknown missed. Refresh its host (the first
+    // managed message can outlive provisioning) and try that host's key; then try
+    // the unkeyed default replica, which holds hosts whose tunnels connected
+    // without a key.
+    const sessionId = sessionIdForRecovery(url, init?.method);
+    let hostId: string | null = null;
+    let demoted = false;
     if (sessionId !== null) {
       init?.signal?.throwIfAborted();
       await resolveSessionHost(sessionId, { force: true });
       init?.signal?.throwIfAborted();
-      const hostId = getSessionHost(sessionId);
-      if (hostId !== null) {
-        clearHostKeyless(hostId);
+      hostId = getSessionHost(sessionId);
+      demoted = hostId !== null && isHostKeyless(hostId);
+      if (hostId !== null && !demoted) {
         const retryHeaders = new Headers(headers);
         retryHeaders.set(SLICE_KEY_HEADER, hostId);
-        res = await hostFetch(url, {
-          ...init,
-          headers: retryHeaders,
-          cache: "no-store",
-        });
+        res = await hostFetch(url, { ...init, headers: retryHeaders, cache: "no-store" });
+      }
+    }
+    if (await _isWrongReplica(res)) {
+      const retryHeaders = new Headers(headers);
+      retryHeaders.delete(SLICE_KEY_HEADER);
+      res = await hostFetch(
+        url,
+        { ...init, headers: retryHeaders, cache: "no-store" },
+        { unkeyed: true },
+      );
+      if (hostId !== null && res.ok) {
+        markHostKeyless(hostId);
+      } else if (hostId !== null && demoted && (await _isWrongReplica(res))) {
+        // The default replica missed too, so the demotion is stale: try the host's key.
+        clearHostKeyless(hostId);
+        const keyedHeaders = new Headers(headers);
+        keyedHeaders.set(SLICE_KEY_HEADER, hostId);
+        res = await hostFetch(url, { ...init, headers: keyedHeaders, cache: "no-store" });
       }
     }
   } else if (
     isDatabricksWorkspace() &&
     derivedHostId &&
-    !stampedSliceKey &&
+    unkeyed &&
     isHostKeyless(derivedHostId) &&
     (await _isWrongReplica(res))
   ) {
@@ -713,4 +791,28 @@ export async function authenticatedFetch(
     if (loginUrl) redirectToLogin(loginUrl);
   }
   return res;
+}
+
+// A light authenticated read the SPA already makes at boot. It reaches the same
+// auth edge as the stream and the sends, so its answer speaks for them.
+const SIGN_IN_PROBE_PATH = "/v1/me";
+
+/**
+ * Whether the sign-in has expired, judged from one request that does not follow
+ * redirects. A redirect to a login page or a 401/403 means a retry cannot renew the
+ * sign-in. The edge answers an invalid session with a redirect, never an HTML 200,
+ * so a 200 (such as a maintenance page) reads as not expired. A failed probe also
+ * reads as not expired, and the caller keeps retrying.
+ */
+export async function isSignInExpired(signal?: AbortSignal): Promise<boolean> {
+  try {
+    const res = await hostFetch(
+      SIGN_IN_PROBE_PATH,
+      { redirect: "manual", cache: "no-store", signal },
+      { hostless: true },
+    );
+    return res.type === "opaqueredirect" || res.status === 401 || res.status === 403;
+  } catch {
+    return false;
+  }
 }

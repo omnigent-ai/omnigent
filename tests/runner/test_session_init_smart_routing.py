@@ -6,6 +6,8 @@ whether to advertise ``sys_advise_models``.
 
 from __future__ import annotations
 
+from unittest.mock import Mock
+
 import pytest
 
 from omnigent.entities import Conversation
@@ -14,6 +16,9 @@ from omnigent.runner.session_init_protocol import (
     build_runner_session_init_payload,
     parse_runner_session_init_envelope,
 )
+from omnigent.runtime import _globals
+from omnigent.runtime.caps import RuntimeCaps
+from omnigent.server.routing_backend import RoutingBackends
 
 SESSION_ID = "conv_smart_routing"
 AGENT_ID = "ag_smart_routing"
@@ -41,6 +46,19 @@ def test_payload_carries_the_servers_routing_answer(available: bool) -> None:
     envelope = parse_runner_session_init_envelope(payload)
     assert envelope is not None
     assert envelope.smart_routing_available is available
+
+
+@pytest.mark.parametrize("routes", [True, False])
+def test_builder_stamps_the_servers_own_answer_by_default(
+    monkeypatch: pytest.MonkeyPatch, routes: bool
+) -> None:
+    """Every server call site inherits the answer, so none can forget to state it."""
+    caps = RuntimeCaps(routing_backends=RoutingBackends(local=Mock())) if routes else RuntimeCaps()
+    monkeypatch.setattr(_globals, "_caps", caps)
+    payload = build_runner_session_init_payload(_conversation(), server_version="0.0.0-test")
+    envelope = parse_runner_session_init_envelope(payload)
+    assert envelope is not None
+    assert envelope.smart_routing_available is routes
 
 
 def test_envelope_from_an_older_server_defaults_to_unavailable() -> None:

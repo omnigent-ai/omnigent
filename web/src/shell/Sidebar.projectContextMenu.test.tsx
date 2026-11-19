@@ -1,3 +1,4 @@
+import { EXPANDED_PROJECT_SECTIONS_STORAGE_KEY } from "@/shell/sidebarNav";
 import { conversationPage } from "@/test/sidebarMockHelpers";
 import { renderSidebar } from "@/test/sidebarTestHelpers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -201,6 +202,24 @@ describe("project folder header context menu", () => {
     );
   });
 
+  it("keeps an expanded folder expanded under its new name", async () => {
+    localStorage.setItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY, JSON.stringify([PROJECT_NAME]));
+    renderSidebar();
+
+    fireEvent.contextMenu(folderHeader());
+    fireEvent.click(screen.getByTestId("rename-project"));
+    fireEvent.change(screen.getByDisplayValue(PROJECT_NAME), {
+      target: { value: "Sprint 43" },
+    });
+    fireEvent.click(screen.getByTestId("rename-project-confirm"));
+
+    await waitFor(() =>
+      expect(JSON.parse(localStorage.getItem(EXPANDED_PROJECT_SECTIONS_STORAGE_KEY)!)).toEqual([
+        "Sprint 43",
+      ]),
+    );
+  });
+
   it("drives Project settings from the context menu", () => {
     renderSidebar();
 
@@ -223,6 +242,74 @@ describe("project folder header context menu", () => {
     );
   });
 
+  it("asks again before Delete stops sessions whose agents are working", () => {
+    interface DeleteCallbacks {
+      onSuccess?: (result: unknown) => void;
+    }
+    mocks.deleteProject.mutate.mockImplementationOnce((_vars: unknown, opts: DeleteCallbacks) =>
+      opts.onSuccess?.({ status: "needs_running_confirmation", runningCount: 2 }),
+    );
+    renderSidebar();
+
+    fireEvent.contextMenu(folderHeader());
+    fireEvent.click(screen.getByTestId("delete-project"));
+    fireEvent.click(screen.getByRole("button", { name: "Delete project" }));
+
+    expect(screen.getByTestId("delete-project-running-warning")).toHaveTextContent(
+      `2 sessions in ${PROJECT_NAME} have agents still working.`,
+    );
+    expect(mocks.deleteProject.mutate).toHaveBeenLastCalledWith(
+      { id: PROJECT_ID, name: PROJECT_NAME },
+      expect.anything(),
+    );
+
+    mocks.deleteProject.mutate.mockImplementationOnce((_vars: unknown, opts: DeleteCallbacks) =>
+      opts.onSuccess?.({ status: "deleted", succeeded: [], failed: [] }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Delete anyway" }));
+
+    expect(mocks.deleteProject.mutate).toHaveBeenLastCalledWith(
+      { id: PROJECT_ID, name: PROJECT_NAME, stopRunning: true },
+      expect.anything(),
+    );
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    // Reopening starts from the plain confirmation, not the earlier warning.
+    fireEvent.contextMenu(folderHeader());
+    fireEvent.click(screen.getByTestId("delete-project"));
+    expect(screen.queryByTestId("delete-project-running-warning")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Delete project" })).toBeInTheDocument();
+  });
+
+  it("drops the working-agent warning when Delete is cancelled and reopened", () => {
+    mocks.deleteProject.mutate.mockImplementationOnce(
+      (_vars: unknown, opts: { onSuccess?: (result: unknown) => void }) =>
+        opts.onSuccess?.({ status: "needs_running_confirmation", runningCount: 1 }),
+    );
+    renderSidebar();
+
+    fireEvent.contextMenu(folderHeader());
+    fireEvent.click(screen.getByTestId("delete-project"));
+    fireEvent.click(screen.getByRole("button", { name: "Delete project" }));
+    expect(screen.getByTestId("delete-project-running-warning")).toHaveTextContent(
+      `1 session in ${PROJECT_NAME} has an agent still working.`,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    fireEvent.contextMenu(folderHeader());
+    fireEvent.click(screen.getByTestId("delete-project"));
+    expect(screen.queryByTestId("delete-project-running-warning")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Delete project" }));
+
+    expect(mocks.deleteProject.mutate).toHaveBeenCalledTimes(2);
+    expect(mocks.deleteProject.mutate).toHaveBeenLastCalledWith(
+      { id: PROJECT_ID, name: PROJECT_NAME },
+      expect.anything(),
+    );
+  });
+
   it("keeps New session reachable when a touch opens the menu on hover-capable hardware", () => {
     renderSidebar();
 
@@ -230,11 +317,7 @@ describe("project folder header context menu", () => {
     const item = screen.getByTestId("project-new-session-menu");
 
     expect(item).toHaveAttribute("href", `/?project=${encodeURIComponent(PROJECT_NAME)}`);
-    for (const hiddenClass of [
-      "hidden",
-      "md:hidden",
-      "[@media((hover:hover)_and_(pointer:fine))]:md:hidden",
-    ]) {
+    for (const hiddenClass of ["hidden", "md:hidden", "md:hidden"]) {
       expect(item).not.toHaveClass(hiddenClass);
     }
   });

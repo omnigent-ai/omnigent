@@ -166,10 +166,11 @@ def test_set_remote_routing_available_before_first_caps_read(
     """A runner records the server's routing answer before anything has read its caps."""
     assert _globals._caps is None
 
-    runtime.set_remote_routing_available(True)
-
+    assert runtime.set_remote_routing_available(True) is True
     assert runtime.get_caps().remote_routing_available is True
-    runtime.set_remote_routing_available(False)
+    # Repeating an answer reports no change, so the runner keeps its caches.
+    assert runtime.set_remote_routing_available(True) is False
+    assert runtime.set_remote_routing_available(False) is True
     assert runtime.get_caps().remote_routing_available is False
 
 

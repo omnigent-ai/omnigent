@@ -188,13 +188,27 @@ def validate_omnigent_executor(
     if "context_files" in spec.executor.config:
         if not isinstance(spec.executor.config["context_files"], bool):
             result.add("executor.config.context_files", "must be a boolean")
-        if harness != "pi":
-            result.add("executor.config.context_files", "only supported with harness 'pi'")
+        if harness not in ("pi", "pi-native"):
+            result.add(
+                "executor.config.context_files", "only supported with harness 'pi' or 'pi-native'"
+            )
     if "system_prompt_mode" in spec.executor.config:
         if spec.executor.config["system_prompt_mode"] not in ("append", "replace"):
             result.add("executor.config.system_prompt_mode", "must be 'append' or 'replace'")
-        if harness != "pi":
-            result.add("executor.config.system_prompt_mode", "only supported with harness 'pi'")
+        if harness not in ("pi", "pi-native"):
+            result.add(
+                "executor.config.system_prompt_mode",
+                "only supported with harness 'pi' or 'pi-native'",
+            )
+        elif (
+            harness == "pi-native"
+            and spec.executor.config["system_prompt_mode"] == "replace"
+            and not (spec.instructions or "").strip()
+        ):
+            result.add(
+                "instructions",
+                "pi-native system_prompt_mode='replace' requires non-empty authored instructions",
+            )
     if not harness:
         result.add(
             "executor.config.harness",
@@ -318,6 +332,7 @@ def diagnose_yaml_rejection(path: Path) -> str:
 def load_omnigent_yaml(
     path: Path,
     *,
+    expand_env: bool = True,
     enforce_handler_allowlist: bool = False,
     prune_invalid_sub_agents: bool = False,
 ) -> AgentSpec:
@@ -333,6 +348,8 @@ def load_omnigent_yaml(
 
     :param path: Path to an omnigent YAML file. Caller has
         already verified via :func:`is_omnigent_yaml`.
+    :param expand_env: Whether to expand executor auth environment
+        references. Must be ``False`` for tenant-supplied bundles.
     :param enforce_handler_allowlist: Forwarded to
         :func:`omnigent.inner.loader.load_agent_def` — when ``True``,
         unregistered ``type: function`` policy handlers are rejected
@@ -375,7 +392,11 @@ def load_omnigent_yaml(
     from omnigent.spec.omnigent import agent_def_to_agent_spec
     from omnigent.spec.validator import validate
 
-    agent_def = load_agent_def(path, enforce_handler_allowlist=enforce_handler_allowlist)
+    agent_def = load_agent_def(
+        path,
+        expand_env=expand_env,
+        enforce_handler_allowlist=enforce_handler_allowlist,
+    )
     # Read the raw YAML alongside so the translator can preserve
     # policy-level YAML fields that the omnigent loader drops
     # (label policies in particular compile to synthetic

@@ -300,6 +300,36 @@ def validate_effort(effort: object, provider: str, supported: Iterable[str]) -> 
     return effort_str
 
 
+def validate_effort_for_harness(effort: str, harness: str | None) -> str:
+    """
+    Validate an explicitly requested *effort* against the harness's declared family.
+
+    A harness whose family is ``NONE`` has no effort plumbing, and an
+    unrecognized one cannot be checked at all — the caller asked for this
+    explicitly, so reject rather than accept-and-drop. (Delivery of a
+    persisted effort takes the opposite tack and filters quietly; see the
+    reasoning guard in :mod:`omnigent.runner.app`.)
+
+    :param effort: Requested effort, e.g. ``"high"``.
+    :param harness: Resolved harness, e.g. ``"claude-native"``.
+    :returns: The canonical effort that harness accepts.
+    :raises ValueError: If the harness supports no effort override, or
+        the value falls outside its vocabulary.
+    """
+    from omnigent.harness_aliases import canonicalize_harness
+
+    canonical = canonicalize_harness(harness) if harness is not None else None
+    supported = efforts_for_harness(harness)
+    if not supported:
+        raise ValueError(
+            f"harness {canonical or harness or 'unknown'!r} does not support "
+            "a reasoning-effort override"
+        )
+    validated = validate_effort(effort, canonical or harness or "unknown", supported)
+    assert validated is not None
+    return validated
+
+
 def validate_effort_or_llm_error(
     effort: object,
     provider: str,

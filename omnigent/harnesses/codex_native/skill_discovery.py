@@ -20,7 +20,9 @@ from omnigent.harnesses.codex_native.app_server import (
 from omnigent.util.json_types import JsonObject
 
 
-async def _loaded_skills(codex_path: str, codex_home: Path, cwd: Path) -> list[JsonObject]:
+async def _loaded_skills(
+    codex_path: str, codex_home: Path, cwd: Path, errors: list[str] | None
+) -> list[JsonObject]:
     port = _allocate_loopback_port()
     listen_url = f"ws://127.0.0.1:{port}"
     discovery = await _start_codex_model_discovery_process(
@@ -41,6 +43,14 @@ async def _loaded_skills(codex_path: str, codex_home: Path, cwd: Path) -> list[J
         data = result.get("data") if isinstance(result, dict) else None
         if not isinstance(data, list):
             raise ValueError("Codex skills/list data must be a list")
+        if errors is not None:
+            errors.extend(
+                f"{error.get('path')}: {error.get('message')}"
+                for entry in data
+                if isinstance(entry, dict) and isinstance(entry.get("errors"), list)
+                for error in entry["errors"]
+                if isinstance(error, dict)
+            )
         return [
             skill
             for entry in data
@@ -56,9 +66,15 @@ async def _loaded_skills(codex_path: str, codex_home: Path, cwd: Path) -> list[J
         await _stop_codex_model_discovery_process(discovery)
 
 
-def loaded_codex_skills(codex_path: str, codex_home: Path, cwd: Path) -> list[JsonObject]:
-    """Run the bounded query from synchronous callers, including async applications."""
+def loaded_codex_skills(
+    codex_path: str, codex_home: Path, cwd: Path, *, errors: list[str] | None = None
+) -> list[JsonObject]:
+    """Run the bounded query from synchronous callers, including async applications.
+
+    Codex answers a config or skill-file failure with the skills it could still
+    load; when ``errors`` is given, those failures are appended to it.
+    """
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="codex-skill-discovery") as pool:
         return pool.submit(
-            lambda: asyncio.run(_loaded_skills(codex_path, codex_home, cwd))
+            lambda: asyncio.run(_loaded_skills(codex_path, codex_home, cwd, errors))
         ).result()

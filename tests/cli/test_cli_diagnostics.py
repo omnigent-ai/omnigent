@@ -14,7 +14,7 @@ import pytest
 
 from omnigent import chat as chat_module
 from omnigent import cli as cli_module
-from omnigent import cli_diagnostics
+from omnigent import cli_diagnostics, configuration_commands
 
 
 @dataclass(frozen=True)
@@ -573,6 +573,54 @@ def test_main_reports_discovery_failure_without_runner_recovery_hint(
     assert expected_hint in output
     assert "stale host processes" not in output
     assert "runner tunnel rejection" not in output
+    assert "Traceback" not in output
+
+
+@pytest.mark.parametrize("configured_server", [False, True])
+def test_main_reports_cloud_failure_without_runner_recovery_hint(
+    configured_server: bool,
+    isolated_cli_diagnostics: None,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Cloud configuration errors retain their cause without unrelated host advice."""
+    del isolated_cli_diagnostics
+    requests: list[str] = []
+
+    def fail_connection(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        raise httpx.ConnectError("All connection attempts failed", request=request)
+
+    def open_client(server: str, **_kwargs: object) -> httpx.AsyncClient:
+        return httpx.AsyncClient(base_url=server, transport=httpx.MockTransport(fail_connection))
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_WRAPPER_BYPASS", "1")
+    monkeypatch.delenv("OMNIGENT_SERVER", raising=False)
+    monkeypatch.setattr(configuration_commands, "open_server_client", open_client)
+    argv = ["omnigent", "config", "cloud"]
+    if configured_server:
+        argv.extend(["--server", "http://127.0.0.1:1"])
+    monkeypatch.setattr(sys, "argv", [*argv, "show"])
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli_module.main()
+
+    assert excinfo.value.code == 1
+    assert requests == (
+        ["http://127.0.0.1:1/v1/preferences/configuration"] if configured_server else []
+    )
+    expected_error = (
+        "All connection attempts failed"
+        if configured_server
+        else "Set --server or configure a server first"
+    )
+    output = capsys.readouterr().err
+    assert f"Error: {expected_error}" in output
+    assert "stale host processes" not in output
+    assert "runner tunnel rejection" not in output
+    assert "omnigent stop" not in output
     assert "Traceback" not in output
 
 

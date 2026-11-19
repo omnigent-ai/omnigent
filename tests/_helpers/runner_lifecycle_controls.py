@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -18,10 +19,14 @@ router = APIRouter()
 async def state(request: Request, runner_id: str, host_id: str = "") -> dict[str, Any]:
     """Inspect ownership without changing runner/session lifecycle state."""
     registry = request.app.state.tunnel_registry
+    session = registry.get(runner_id)
     return {
         "pid": os.getpid(),
         "source_file": str(Path(omnigent.__file__).resolve()),
-        "runner_local": registry.get(runner_id) is not None,
+        "runner_local": session is not None,
+        "connection_id": session.hello.connection_id if session is not None else None,
+        "tunnel_diagnostics": session.diagnostics.snapshot() if session is not None else None,
+        "monotonic_time": time.monotonic(),
         "last_liveness_stamp": session_live_state.last_liveness_stamp(runner_id),
         "host_local": bool(host_id and request.app.state.host_registry.get(host_id)),
     }

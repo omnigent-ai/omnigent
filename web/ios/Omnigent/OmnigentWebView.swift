@@ -34,13 +34,20 @@ struct OmnigentWebView: UIViewRepresentable {
   static func connectionErrorMessage(
     for error: Error, databricksInternalFeaturesEnabled: Bool
   ) -> String {
-    let nsError = error as NSError
-    if databricksInternalFeaturesEnabled, nsError.domain == NSURLErrorDomain,
-      [NSURLErrorCannotFindHost, NSURLErrorDNSLookupFailed].contains(nsError.code)
+    let failure = transportFailure(of: error)
+    if databricksInternalFeaturesEnabled, failure.domain == NSURLErrorDomain,
+      [NSURLErrorCannotFindHost, NSURLErrorDNSLookupFailed].contains(failure.code)
     {
       return "Couldn’t reach the server. Check your device’s compliance status in Jamf."
     }
     return error.localizedDescription
+  }
+
+  /// Workspace sign-in wraps the transport error, so look through it for the original code.
+  private static func transportFailure(of error: Error) -> DatabricksTransportFailure {
+    if case .networkUnavailable(let failure)? = error as? DatabricksSessionError { return failure }
+    if case .networkUnavailable(let failure)? = error as? DatabricksOAuthError { return failure }
+    return DatabricksTransportFailure(error)
   }
 
   func makeCoordinator() -> Coordinator {
@@ -72,9 +79,10 @@ struct OmnigentWebView: UIViewRepresentable {
     webView.allowsBackForwardNavigationGestures = false
     webView.isFindInteractionEnabled = true
     webView.isOpaque = false
-    webView.backgroundColor = .clear
-    webView.underPageBackgroundColor = .clear
-    webView.scrollView.backgroundColor = .clear
+    // The rounded keyboard exposes WebKit's backing surfaces below the page.
+    webView.backgroundColor = DesignTokens.nativeBackground
+    webView.underPageBackgroundColor = DesignTokens.nativeBackground
+    webView.scrollView.backgroundColor = DesignTokens.nativeBackground
     webView.scrollView.contentInsetAdjustmentBehavior = .never
 
     // Allow Safari Web Inspector to attach to the web content. Since iOS 16.4 a
@@ -450,6 +458,7 @@ struct OmnigentWebView: UIViewRepresentable {
     private let contextResult: Result<DatabricksWebContext?, Error>
     fileprivate let webStore: DatabricksWebStore?
     private let workspaceBootstrap: DatabricksWorkspaceBootstrap
+    private let workspaceSessionClient = DatabricksSessionClient()
     private var workspaceSession: DatabricksWebSession?
     private var authenticationTask: Task<Void, Never>?
     private var navigationID = UUID()
@@ -769,12 +778,25 @@ struct OmnigentWebView: UIViewRepresentable {
         let cookies = await webStore.cookies()
         guard let self, !Task.isCancelled, navigationID == id, let view = webView, isCurrent(view)
         else { return }
-        activationTask = nil
-        if !cookies.contains(where: {
-          $0.name == "DBAUTH" && !$0.value.isEmpty && $0.isSecure && $0.isHTTPOnly
-            && DatabricksSessionClient.cookie($0, appliesTo: pageURL)
-        }) {
+        defer { if navigationID == id { activationTask = nil } }
+        guard
+          let cookie = cookies.first(where: {
+            $0.name == "DBAUTH" && !$0.value.isEmpty && $0.isSecure && $0.isHTTPOnly
+              && DatabricksSessionClient.cookie($0, appliesTo: pageURL)
+          })
+        else {
           requestWorkspaceRecovery()
+          return
+        }
+        // A cookie outlives its server session (idle timeout, revocation), so ask the workspace.
+        let verdict = await workspaceSessionClient.verify(pageURL: pageURL, cookie: cookie)
+        guard !Task.isCancelled, navigationID == id, authenticationTask == nil,
+          let view = webView, isCurrent(view)
+        else { return }
+        switch verdict {
+        case .expired: requestWorkspaceRecovery()
+        case .forbidden: showWorkspaceFailure(DatabricksSessionError.rejected(403))
+        case .accepted, .unknown: break
         }
       }
     }
@@ -1720,7 +1742,9 @@ struct OmnigentWebView: UIViewRepresentable {
       let nsError = error as NSError
       guard nsError.code != NSURLErrorCancelled else { return }
       if webStore != nil {
-        showWorkspaceFailure(DatabricksSessionError.networkUnavailable)
+        let failure = DatabricksTransportFailure(error)
+        NSLog("[omnigent] workspace page load failed: \(failure)")
+        showWorkspaceFailure(DatabricksSessionError.networkUnavailable(failure))
         return
       }
       parent.model.isLoading = false
