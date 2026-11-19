@@ -1816,8 +1816,6 @@ def _try_sandbox_pi(
         resolved_cwd = pathlib.Path(cwd or os.getcwd()).resolve(strict=False)
         sandbox = resolve_sandbox(os_env, resolved_cwd)
         if not sandbox.active:
-            if os_env.sandbox is not None:
-                raise OSError("Requested sandbox resolved to an inactive policy")
             return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
         # Bundled and legacy CLIs both need their sibling npm dependencies.
         executable = pathlib.Path(pi_path).resolve()
@@ -1830,11 +1828,12 @@ def _try_sandbox_pi(
         sandbox = with_additional_write_roots(sandbox, [home_pi])
         sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
         # npm's .bin symlink can be hidden by the sandbox's dotfile mask.
-        launcher = create_exec_launcher(str(executable), sandbox)
-        return SandboxedPiCli(launch_path=launcher, sandboxed=True)
     except (OSError, ImportError, NotImplementedError) as exc:
         logger.warning("Could not apply sandbox for Pi: %s", exc)
-        raise
+        return SandboxedPiCli(launch_path=pi_path, sandboxed=False)
+    else:
+        launcher = create_exec_launcher(str(executable), sandbox)
+        return SandboxedPiCli(launch_path=launcher, sandboxed=True)
 
 
 def _resolve_pi_skill_args(

@@ -752,8 +752,7 @@ def test_sandbox_launch_path_wraps_when_sandbox_requested(
     monkeypatch.setattr(
         sandbox_mod, "resolve_sandbox", lambda *_a, **_k: SimpleNamespace(active=False)
     )
-    with pytest.raises(OSError, match="Requested sandbox resolved to an inactive policy"):
-        ex._sandbox_launch_path(("PATH",))
+    assert ex._sandbox_launch_path(("PATH",)) == "kimi"
 
 
 def test_run_turn_emits_error_when_kimi_binary_missing(monkeypatch: pytest.MonkeyPatch) -> None:

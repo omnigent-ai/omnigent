@@ -3167,12 +3167,9 @@ class ClaudeSDKExecutor(Executor):
                 "expected once the connecting turn has finished, e.g. idle reap / shutdown)",
                 session_key,
             )
+        finally:
+            # The SDK's disconnect() leaves its transport open, including on failure.
             await self._force_close_client(state.client)
-            return
-        # SDK's disconnect() doesn't close the asyncio transport;
-        # call _force_close_client to flip transport._closed before
-        # the loop tears down.
-        await self._force_close_client(state.client)
 
     def _provider_auth_hint(self) -> str:
         """Say where to fix a credential Claude Code could not authenticate with.
@@ -3232,15 +3229,40 @@ class ClaudeSDKExecutor(Executor):
         await self._close_live_client(session_key)
 
     async def close(self) -> None:
-        session_keys = list(self._clients)
-        for session_key in session_keys:
-            await self.close_session(session_key)
-        if self._gateway_shim is not None:
-            await self._gateway_shim.aclose()
-            self._gateway_shim = None
-        if self._prepared_cli is not None:
-            await run_sync_on_thread(self._prepared_cli.close)
-            self._prepared_cli = None
+        async def release_owned_resources() -> None:
+            first_error: BaseException | None = None
+            for session_key in list(self._clients):
+                try:
+                    await self.close_session(session_key)
+                except BaseException as exc:  # noqa: BLE001 - finish releasing other clients
+                    if first_error is None:
+                        first_error = exc
+            shim, self._gateway_shim = self._gateway_shim, None
+            if shim is not None:
+                try:
+                    await shim.aclose()
+                except BaseException as exc:  # noqa: BLE001 - relay cleanup still follows
+                    if first_error is None:
+                        first_error = exc
+            prepared, self._prepared_cli = self._prepared_cli, None
+            if prepared is not None:
+                try:
+                    await run_sync_on_thread(prepared.close)
+                except BaseException as exc:  # noqa: BLE001 - preserve the first failure
+                    if first_error is None:
+                        first_error = exc
+            if first_error is not None:
+                raise first_error
+
+        cleanup_task = asyncio.create_task(release_owned_resources())
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            try:
+                await await_cleanup_task(cleanup_task)
+            except BaseException:  # noqa: BLE001 - preserve the original cancellation
+                logger.warning("Claude SDK cleanup failed after cancellation")
+            raise
 
     async def interrupt_session(self, session_key: str) -> bool:
         state = self._clients.get(session_key)

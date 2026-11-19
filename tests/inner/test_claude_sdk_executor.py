@@ -3620,6 +3620,66 @@ class TestStreamEventStreaming(unittest.TestCase):
             with self.subTest(cleanup_failure=cleanup_failure):
                 _run(_t(cleanup_failure))
 
+    def test_close_releases_relay_after_disconnect_failure_or_cancellation(self):
+        from omnigent.inner.claude_sdk_executor import (
+            ClaudeSDKExecutor,
+            PreparedClaudeCli,
+            _ClaudeClientState,
+        )
+
+        async def scenario(cancel: bool) -> None:
+            root = Path(tempfile.mkdtemp(prefix="claude-close-test-"))
+            runtime = root / "runtime"
+            runtime.mkdir()
+            (runtime / "cli-settings.json").write_text("synthetic relay settings")
+            relay = SimpleNamespace(stop=Mock())
+            shim = SimpleNamespace(aclose=AsyncMock())
+            entered = asyncio.Event()
+            release = asyncio.Event()
+
+            async def disconnect_first() -> None:
+                if cancel:
+                    entered.set()
+                    await release.wait()
+                else:
+                    raise RuntimeError("disconnect failed")
+
+            first = SimpleNamespace(disconnect=AsyncMock(side_effect=disconnect_first))
+            second = SimpleNamespace(disconnect=AsyncMock())
+            executor = ClaudeSDKExecutor()
+            executor._gateway_shim = shim
+            executor._prepared_cli = PreparedClaudeCli(
+                cli_path=None,
+                enable_native_tools=False,
+                _egress_handle=relay,
+                _runtime_tmpdir=runtime,
+            )
+            executor._clients["first"] = _ClaudeClientState(client=first, model=None)
+            executor._clients["second"] = _ClaudeClientState(client=second, model=None)
+            try:
+                with patch.object(executor, "_force_close_client", new_callable=AsyncMock):
+                    if cancel:
+                        shutdown = asyncio.create_task(executor.close())
+                        await entered.wait()
+                        shutdown.cancel()
+                        release.set()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await shutdown
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "disconnect failed"):
+                            await executor.close()
+                second.disconnect.assert_awaited_once_with()
+                shim.aclose.assert_awaited_once_with()
+                relay.stop.assert_called_once_with()
+                self.assertFalse(runtime.exists())
+                self.assertEqual(executor._clients, {})
+            finally:
+                shutil.rmtree(root, ignore_errors=True)
+
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel):
+                _run(scenario(cancel))
+
     def test_close_session_force_closes_on_loop_mismatch(self):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor, _ClaudeClientState
 

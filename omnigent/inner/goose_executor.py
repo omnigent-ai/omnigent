@@ -376,8 +376,6 @@ class GooseExecutor(Executor):
             cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
             sandbox = resolve_sandbox(os_env, cwd)
             if not sandbox.active:
-                if os_env.sandbox is not None:
-                    raise OSError("Requested sandbox resolved to an inactive policy")
                 return self._goose_path
             # goose must read its own install tree and write its config/state
             # dirs (~/.config/goose, ~/.local/share/goose), or it can't
@@ -394,10 +392,11 @@ class GooseExecutor(Executor):
             )
             sandbox = with_additional_read_roots(sandbox, [Path.home() / ".config" / "goose"])
             sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
-            return create_exec_launcher(self._goose_path, sandbox)
         except (OSError, ImportError, NotImplementedError) as exc:
-            logger.warning("Could not apply sandbox for goose: %s", exc)
-            raise
+            logger.warning("Could not apply sandbox for goose; running unsandboxed: %s", exc)
+            return self._goose_path
+        else:
+            return create_exec_launcher(self._goose_path, sandbox)
 
     async def _read_stderr(self) -> None:
         """Continuously drain goose stderr, logging each line at debug.

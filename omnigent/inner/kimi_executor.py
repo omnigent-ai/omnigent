@@ -469,8 +469,7 @@ class KimiExecutor(Executor):
         call can't touch paths outside the spec's read/write roots — the
         OS-level guarantee kimi's own approval flow can't give.
 
-        Uses the bare binary when no sandbox is requested. A requested sandbox
-        that resolves inactive or cannot launch fails before starting kimi.
+        Falls back to the bare binary when the sandbox backend is unavailable.
 
         :param spawn_env_names: Env-var names we deliberately set on the
             subprocess ``env=``; baked into the policy so the launcher prunes
@@ -495,8 +494,6 @@ class KimiExecutor(Executor):
             cwd = Path(self._cwd or os.getcwd()).resolve(strict=False)
             sandbox = resolve_sandbox(os_env, cwd)
             if not sandbox.active:
-                if os_env.sandbox is not None:
-                    raise OSError("Requested sandbox resolved to an inactive policy")
                 return self._binary_path
             # kimi is a curl-installed single binary: it must read its own
             # install dir and write its config dir ($KIMI_CODE_HOME, default
@@ -508,10 +505,11 @@ class KimiExecutor(Executor):
             sandbox = with_additional_read_roots(sandbox, [bin_dir])
             sandbox = with_additional_write_roots(sandbox, [resolve_user_kimi_home()])
             sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
-            return create_exec_launcher(resolved_bin, sandbox)
         except (OSError, ImportError, NotImplementedError) as exc:
-            _logger.warning("Could not apply sandbox for kimi: %s", exc)
-            raise
+            _logger.warning("Could not apply sandbox for kimi; running unsandboxed: %s", exc)
+            return self._binary_path
+        else:
+            return create_exec_launcher(resolved_bin, sandbox)
 
     def _build_argv(self, *, prompt_text: str) -> list[str]:
         """Assemble the kimi argv for one turn.

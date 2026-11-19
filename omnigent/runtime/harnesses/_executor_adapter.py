@@ -1521,13 +1521,40 @@ class ExecutorAdapter(HarnessApp):
 
     async def on_shutdown(self) -> None:
         """Drain background interrupt tasks, then close the executor session and executor."""
-        if self._bg_tasks:
-            await asyncio.gather(*list(self._bg_tasks), return_exceptions=True)
-            self._bg_tasks.clear()
-        if self._executor is not None:
-            await self._executor.close_session(self._session_key)
-            await self._executor.close()
-            self._executor = None
+
+        async def release_owned_resources() -> None:
+            first_error: BaseException | None = None
+            if self._bg_tasks:
+                try:
+                    await asyncio.gather(*list(self._bg_tasks), return_exceptions=True)
+                except BaseException as exc:
+                    first_error = exc
+                finally:
+                    self._bg_tasks.clear()
+            executor, self._executor = self._executor, None
+            if executor is not None:
+                try:
+                    await executor.close_session(self._session_key)
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+                try:
+                    await executor.close()
+                except BaseException as exc:
+                    if first_error is None:
+                        first_error = exc
+            if first_error is not None:
+                raise first_error
+
+        cleanup_task = asyncio.create_task(release_owned_resources())
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError:
+            try:
+                await await_cleanup_task(cleanup_task)
+            except BaseException:
+                _logger.warning("Executor adapter cleanup failed after cancellation")
+            raise
 
 
 def _classify_openai_exception(exception: BaseException) -> str | None:
