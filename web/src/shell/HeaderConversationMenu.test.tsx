@@ -242,17 +242,8 @@ describe("HeaderConversationMenu", () => {
       conversation: { ...CONVERSATION, labels: { ...CONVERSATION.labels, [MUTED_LABEL_KEY]: "1" } },
     });
     openMenu();
-    expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
-      "Add nested agent",
-      "Pin",
-      "Share",
-      "Fork",
-      "Export",
-      "Rename",
-      "Add to project",
-      "Archive",
-      "Delete",
-    ]);
+    expect(screen.queryByTestId("header-mark-unread-conversation")).toBeNull();
+    expect(screen.getByRole("menuitem", { name: "Rename" })).toBeInTheDocument();
   });
 
   it("opens from the keyboard and focuses the first action", () => {

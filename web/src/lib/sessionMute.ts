@@ -35,6 +35,12 @@ export function muteReadMarker(): number {
   return marker;
 }
 
+/**
+ * Read marker for data with no known read time, such as a pushed frame. Such
+ * data never replaces a recorded preference.
+ */
+export const UNORDERED_READ = Number.NEGATIVE_INFINITY;
+
 /** Whether the viewer muted this session. */
 export function isConversationMuted(row: LabeledRow): boolean {
   return entries.get(row.id)?.muted ?? !!row.labels?.[MUTED_LABEL_KEY];
@@ -65,6 +71,17 @@ export function beginMuteSave(id: string, muted: boolean): boolean {
 export function settleMuteSave(id: string, muted: boolean): void {
   marker += 1;
   entries.set(id, { muted, saving: false, settledAt: marker });
+}
+
+/** Whether `row` disagrees with a saved preference, so only a fresh read can settle it. */
+export function contradictsSavedMute(row: LabeledRow): boolean {
+  const entry = entries.get(row.id);
+  return (
+    entry !== undefined &&
+    !entry.saving &&
+    !!row.labels &&
+    !!row.labels[MUTED_LABEL_KEY] !== entry.muted
+  );
 }
 
 /** Whether any session has a recorded preference, so fetched rows need reconciling. */

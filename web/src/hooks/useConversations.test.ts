@@ -4792,9 +4792,13 @@ describe("mute writes", () => {
     },
   );
 
-  it.each(["move", "archive"] as const)(
-    "keeps a saved mute when a failed %s restores an older snapshot",
-    async (write) => {
+  it.each(
+    (["move", "archive", "delete"] as const).flatMap((write) =>
+      [true, false].map((muted) => ({ write, muted })),
+    ),
+  )(
+    "keeps a saved mute=$muted when a failed $write restores an older snapshot",
+    async ({ write, muted }) => {
       let failWrite!: (response: Response) => void;
       fetchMock.mockImplementation((url: string, init?: RequestInit) => {
         if (url === "/v1/projects") {
@@ -4803,9 +4807,12 @@ describe("mute writes", () => {
           );
         }
         if (url === "/v1/sessions/conv_mute") {
-          return Promise.resolve(mockResponse({ labels: { [MUTED_LABEL_KEY]: "1" } }));
+          return Promise.resolve(mockResponse({ labels: muted ? { [MUTED_LABEL_KEY]: "1" } : {} }));
         }
-        expect(init?.method).toBe("PATCH");
+        if (url === "/v1/sessions/conv_write/events") {
+          return Promise.resolve(mockResponse({ queued: false }));
+        }
+        expect(init?.method).toBe(write === "delete" ? "DELETE" : "PATCH");
         return new Promise<Response>((resolve) => {
           failWrite = resolve;
         });
@@ -4814,7 +4821,10 @@ describe("mute writes", () => {
       queryClient.setQueryData(["projects"], [{ id: "p_target", name: "Target" }]);
       queryClient.setQueryData(
         listKey,
-        infinitePage([conversation({ id: "conv_mute" }), conversation({ id: "conv_write" })]),
+        infinitePage([
+          conversation({ id: "conv_mute", labels: muted ? {} : { [MUTED_LABEL_KEY]: "1" } }),
+          conversation({ id: "conv_write" }),
+        ]),
       );
       const wrapper = ({ children }: { children: ReactNode }) =>
         createElement(QueryClientProvider, { client: queryClient }, children);
@@ -4822,6 +4832,7 @@ describe("mute writes", () => {
         () => ({
           move: useMoveToProject(),
           archive: useArchiveConversation(),
+          delete: useStopAndDeleteConversation(),
           mute: useSetConversationMuted(),
         }),
         { wrapper },
@@ -4829,19 +4840,21 @@ describe("mute writes", () => {
 
       act(() => {
         if (write === "move") result.current.move.mutate({ id: "conv_write", project: "Target" });
-        else result.current.archive.mutate({ id: "conv_write", archived: true });
+        else if (write === "archive")
+          result.current.archive.mutate({ id: "conv_write", archived: true });
+        else result.current.delete.mutate({ id: "conv_write" });
       });
       await waitFor(() => expect(failWrite).toBeDefined());
       await act(async () => {
-        await result.current.mute.mutateAsync({ id: "conv_mute", muted: true });
+        await result.current.mute.mutateAsync({ id: "conv_mute", muted });
       });
       await act(async () => {
         failWrite(mockResponse({ error: "boom" }, { ok: false, status: 500 }));
       });
       await waitFor(() => expect(result.current[write].isError).toBe(true));
 
-      // The rollback may restore the pre-mute label; the saved preference still wins.
-      expect(isConversationMuted(cachedRow(queryClient, "conv_mute"))).toBe(true);
+      // The rollback may restore the pre-save label; the saved preference still wins.
+      expect(isConversationMuted(cachedRow(queryClient, "conv_mute"))).toBe(muted);
       unmount();
       queryClient.clear();
     },

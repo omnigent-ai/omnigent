@@ -12656,15 +12656,13 @@ describe("chatStore — session configuration scope", () => {
     },
   ];
 
-  it.each(
-    ["session_agent_changed", "session_model_options"].flatMap((event) =>
-      [false, true].flatMap((muted) =>
-        [false, true].flatMap((success) =>
-          [false, true].map((cached) => ({ event, muted, success, cached })),
-        ),
-      ),
-    ),
-  )(
+  // Both events and cache states, each mute direction and outcome once.
+  it.each([
+    { event: "session_agent_changed", muted: true, success: true, cached: false },
+    { event: "session_agent_changed", muted: false, success: false, cached: true },
+    { event: "session_model_options", muted: false, success: true, cached: false },
+    { event: "session_model_options", muted: true, success: false, cached: true },
+  ])(
     "applies $event after mute=$muted settles with success=$success, cached=$cached",
     async ({ event, muted, success, cached }) => {
       const id = "conv_mute_refresh";

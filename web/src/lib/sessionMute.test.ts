@@ -3,12 +3,14 @@ import {
   beginMuteSave,
   canFlagUnread,
   clearSessionMuteState,
+  contradictsSavedMute,
   isConversationMuted,
   muteReadMarker,
   MUTED_LABEL_KEY,
   reconcileMuteLabel,
   settleMuteSave,
   showsUnreadFor,
+  UNORDERED_READ,
 } from "./sessionMute";
 
 afterEach(clearSessionMuteState);
@@ -59,6 +61,17 @@ describe("session mute store", () => {
     beginMuteSave("session", true);
     expect(reconcileMuteLabel(row(false), muteReadMarker()).labels[MUTED_LABEL_KEY]).toBe("1");
     expect(isConversationMuted(row(false))).toBe(true);
+  });
+
+  it("keeps a saved preference over data without a read time, flagging disagreement", () => {
+    beginMuteSave("session", true);
+    expect(contradictsSavedMute(row(false))).toBe(false);
+    settleMuteSave("session", true);
+    expect(reconcileMuteLabel(row(false), UNORDERED_READ).labels[MUTED_LABEL_KEY]).toBe("1");
+    expect(isConversationMuted(row(false))).toBe(true);
+    expect(contradictsSavedMute(row(false))).toBe(true);
+    expect(contradictsSavedMute(row(true))).toBe(false);
+    expect(contradictsSavedMute({ id: "other", labels: {} })).toBe(false);
   });
 
   it("refuses an overlapping save for the same session but not another", () => {

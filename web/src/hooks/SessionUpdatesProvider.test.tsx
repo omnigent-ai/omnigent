@@ -883,7 +883,7 @@ describe("SessionUpdatesProvider mute in flight", () => {
     { muted: true, success: false },
     { muted: false, success: false },
   ])(
-    "preserves mute=$muted through a stale frame, then settles success=$success",
+    "keeps mute=$muted through stale frames before and after it settles with success=$success",
     async ({ muted, success }) => {
       let resolvePatch!: (value: unknown) => void;
       vi.stubGlobal(
@@ -930,14 +930,19 @@ describe("SessionUpdatesProvider mute in flight", () => {
         json: async () => ({ labels: muted ? { [MUTED_LABEL_KEY]: "1" } : {} }),
       });
       await waitFor(() => expect(client.isMutating()).toBe(0));
-      expect(row().labels).toEqual({
-        other: "new",
-        ...((success ? muted : !muted) ? { [MUTED_LABEL_KEY]: "1" } : {}),
-      });
-      // Once settled, another device's preference can replace the local value.
+      const saved = success ? muted : !muted;
+      expect(row().labels).toEqual({ other: "new", ...(saved ? { [MUTED_LABEL_KEY]: "1" } : {}) });
+      // A frame read before the save can still arrive after it settles. It can't
+      // undo the saved preference; one that disagrees re-reads the list instead.
+      const invalidate = vi.spyOn(client, "invalidateQueries");
       act(() => handler({ type: "changed", items: [original] }));
-      expect(row().labels).toEqual(original.labels);
-      expect(isConversationMuted(row())).toBe(!muted);
+      expect(row().labels).toEqual(saved ? { [MUTED_LABEL_KEY]: "1" } : {});
+      expect(isConversationMuted(row())).toBe(saved);
+      if (success) {
+        await waitFor(() =>
+          expect(invalidatedKeys(client, invalidate)).toEqual([JSON.stringify(key)]),
+        );
+      }
     },
   );
 });
