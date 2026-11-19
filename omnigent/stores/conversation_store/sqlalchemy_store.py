@@ -1334,9 +1334,14 @@ class SqlAlchemyConversationStore(ConversationStore):
                         )
                 creation_labels = dict(prepared_labels)
                 # Workers retain the automated work that launched them even if
-                # their parent later returns to an interactive turn.
+                # their parent later returns to an interactive turn. The creator
+                # label holds the id callers see, so look its labels up by the stored id.
+                creator_id = prepared_labels.get(CREATED_BY_SESSION_LABEL_KEY)
                 for source_id in dict.fromkeys(
-                    (prepared_labels.get(CREATED_BY_SESSION_LABEL_KEY), parent_conversation_id)
+                    (
+                        self._conversation_storage_id(creator_id) if creator_id else None,
+                        parent_conversation_id,
+                    )
                 ):
                     if source_id is None:
                         continue
@@ -2022,6 +2027,20 @@ class SqlAlchemyConversationStore(ConversationStore):
             raise OmnigentError("Session family is too large", code=ErrorCode.CONFLICT)
         return ids
 
+    def _conversation_storage_id(self, conversation_id: str) -> str:
+        """
+        Return the stored id of a session that callers or labels name.
+
+        Rows are keyed by stored ids. The default returns *conversation_id*
+        unchanged; a store whose readers return sessions under other ids
+        overrides this to map them back before an id is used as a row key.
+
+        :param conversation_id: A session id as callers see it, e.g. a
+            ``CREATED_BY_SESSION_LABEL_KEY`` value.
+        :returns: The id rows are stored under.
+        """
+        return conversation_id
+
     def get_session_family(self, session_id: str) -> list[Conversation]:
         source = self.get_conversation(session_id)
         if source is None:
@@ -2062,7 +2081,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         source = self.get_conversation(source_id)
         if source is None:
             raise ConversationNotFoundError(source_id)
-        family_id = source.family_id or source.id
+        family_id = source.family_id or self._conversation_storage_id(source.id)
         target = self.get_conversation(session_id) if move_existing else None
         if source.family_id is None:
             with self._session("prepare_sibling_membership") as session:
