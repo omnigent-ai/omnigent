@@ -34,6 +34,7 @@ import {
   markRecentlyCreated,
   withMoveTombstone,
 } from "@/hooks/useConversations";
+import { muteReadMarker, reconcileMuteLabel } from "@/lib/sessionMute";
 import {
   type ConversationsInfiniteData,
   type MembershipChange,
@@ -97,12 +98,17 @@ function applyItemsToCache(
   // cleared field overlays the cache in the same shape GET /v1/sessions
   // produces (absent), without tripping the permission_level === null sentinel.
   const itemsById = new Map<string, SessionListWireItem>();
+  // A pushed frame is as fresh as the moment it arrives.
+  const readMarker = muteReadMarker();
   for (const item of items) {
     if (isSessionDeleting(item.id)) continue;
     itemsById.set(
       item.id,
       nullsToUndefined(
-        withMoveTombstone(isSessionArchiving(item.id) ? { ...item, archived: true } : item),
+        reconcileMuteLabel(
+          withMoveTombstone(isSessionArchiving(item.id) ? { ...item, archived: true } : item),
+          readMarker,
+        ),
       ),
     );
   }

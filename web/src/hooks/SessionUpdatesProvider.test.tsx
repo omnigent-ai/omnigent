@@ -16,10 +16,12 @@ import {
   useArchiveConversation,
   useConversations,
   useMoveToProject,
+  useSetConversationMuted,
   type Conversation,
   type ConversationsPage,
 } from "@/hooks/useConversations";
 import { clearRecentlyCreated, type ConversationsInfiniteData } from "@/lib/sessionListCache";
+import { isConversationMuted, MUTED_LABEL_KEY } from "@/lib/sessionMute";
 import { childSessionsQueryKey } from "@/hooks/useChildSessions";
 
 // Mock the socket transport so setWatched is observable and start/stop are
@@ -872,6 +874,72 @@ describe("SessionUpdatesProvider move-to-project in flight", () => {
     });
     await waitFor(() => expect(move.result.current.isSuccess).toBe(true));
   });
+});
+
+describe("SessionUpdatesProvider mute in flight", () => {
+  it.each([
+    { muted: true, success: true },
+    { muted: false, success: true },
+    { muted: true, success: false },
+    { muted: false, success: false },
+  ])(
+    "preserves mute=$muted through a stale frame, then settles success=$success",
+    async ({ muted, success }) => {
+      let resolvePatch!: (value: unknown) => void;
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(
+          () =>
+            new Promise((resolve) => {
+              resolvePatch = resolve;
+            }),
+        ),
+      );
+      const client = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+      const original: Conversation = {
+        ...conv("conv_a"),
+        labels: muted ? {} : { [MUTED_LABEL_KEY]: "1" },
+      };
+      const key = ["conversations", "", false];
+      client.setQueryData<ConversationsInfiniteData>(key, {
+        pages: [{ data: [original], first_id: original.id, last_id: original.id, has_more: false }],
+        pageParams: [undefined],
+      });
+      renderProvider(client, ["/"]);
+      const handler = frameHandler();
+      const wrapper = ({ children }: { children: ReactNode }) => (
+        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+      );
+      const mute = renderHook(() => useSetConversationMuted(), { wrapper });
+      const row = () => client.getQueryData<ConversationsInfiniteData>(key)!.pages[0].data[0];
+      act(() => mute.result.current.mutate({ id: original.id, muted }));
+      await waitFor(() => expect(resolvePatch).toBeDefined());
+      act(() =>
+        handler({
+          type: "changed",
+          items: [
+            { ...original, labels: { ...original.labels, other: "new" }, title: "Late edit" },
+          ],
+        }),
+      );
+      expect(row().labels[MUTED_LABEL_KEY]).toBe(muted ? "1" : undefined);
+      expect(row().title).toBe("Late edit");
+      resolvePatch({
+        ok: success,
+        status: success ? 200 : 500,
+        json: async () => ({ labels: muted ? { [MUTED_LABEL_KEY]: "1" } : {} }),
+      });
+      await waitFor(() => expect(client.isMutating()).toBe(0));
+      expect(row().labels).toEqual({
+        other: "new",
+        ...((success ? muted : !muted) ? { [MUTED_LABEL_KEY]: "1" } : {}),
+      });
+      // Once settled, another device's preference can replace the local value.
+      act(() => handler({ type: "changed", items: [original] }));
+      expect(row().labels).toEqual(original.labels);
+      expect(isConversationMuted(row())).toBe(!muted);
+    },
+  );
 });
 
 describe("SessionUpdatesProvider open-session row", () => {

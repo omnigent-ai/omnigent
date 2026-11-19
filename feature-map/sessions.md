@@ -378,6 +378,24 @@ drop a nested session into the session list above or below a nest to remove it.
 Other rows retain pin/custom ordering. Removal targets appear over the sidebar
 footer, keeping session rows in place and available as drop targets.
 
+**Mute a session:** in the sidebar row menu (three-dot or right-click) or the
+project Kanban card menu, choose Mute. In the sidebar, the title dims;
+an idle row shows a muted bell in its trailing status slot, while active status
+indicators and unsent drafts take priority. A muted
+session sends no browser or desktop notifications, shows no unread dot in the
+sidebar, Kanban board, or Canvas, counts toward no app badge, and stays out of
+the Unread status group, the Kanban Unread lane, and the Inbox's Unread list.
+It can still be marked read, but not unread: the menus hide Mark as unread,
+bulk Mark as unread skips it, the unread shortcut declines, and its Kanban card
+can't be dragged into Unread. Its approvals
+and questions still appear under Awaiting response. The mute is yours alone:
+collaborators on a shared session are unaffected, and a fork starts unmuted.
+Choose Unmute to undo. The item appears only on servers that advertise
+`session_mute` in `/v1/info`.
+Failed output from a muted automation session is also hidden from Unread;
+its failure remains visible on the automation card and in run history.
+Automation failures that never created a session keep their separate Inbox cards.
+
 **Project folder:** right-click its header or open its three-dot menu, then
 choose Rename project. Start typing as soon as the dialog opens. Delete project
 archives every session in the folder; when any of them has an agent working,

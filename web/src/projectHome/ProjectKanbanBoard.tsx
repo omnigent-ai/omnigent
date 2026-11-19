@@ -78,6 +78,7 @@ import {
   type StatusBucket,
 } from "@/shell/sidebarNav";
 import { useSessionActions } from "@/shell/useSessionActions";
+import { showsUnreadFor } from "@/lib/sessionMute";
 import {
   SessionEnvironmentLabel,
   SessionHarnessIcon,
@@ -159,7 +160,7 @@ function markCardUnread(card: KanbanCard) {
 }
 
 function columnOf(row: Conversation): StatusBucket {
-  return statusBucket(row, isUnseen(row), hasSessionDraft(row.id));
+  return statusBucket(row, showsUnreadFor(row, isUnseen(row)), hasSessionDraft(row.id));
 }
 
 export function ProjectKanbanBoard({
@@ -672,7 +673,8 @@ function KanbanCardBody({
 }) {
   const { conversation, members } = card;
   const state =
-    getSessionState(conversation) ?? (isUnseen(conversation) ? { kind: "unseen" as const } : null);
+    getSessionState(conversation) ??
+    (showsUnreadFor(conversation, isUnseen(conversation)) ? { kind: "unseen" as const } : null);
   const working = state?.kind === "running";
   const nestedCount = members.length - 1;
   const responsePreview = useLastResponsePreview(conversation);
