@@ -15,7 +15,15 @@ OpenCode **2.0.18 or a later 2.0.x patch** (`>=2.0.18,<2.1.0`), published on npm
 as `@opencode/cli`. Newer minors are refused until they are validated. OpenCode
 1.x (`opencode-ai`) is no longer supported. A host running an unsupported version
 reports the harness as *outdated* until it is upgraded.
-`OMNIGENT_OPENCODE_SKIP_VERSION_CHECK=1` bypasses the gate at your own risk.
+
+To run an OpenCode you can't change, such as a newer release your organization
+manages, set `OMNIGENT_OPENCODE_SKIP_VERSION_CHECK=1` (any non-empty value) in
+the environment of the host and runner. The host then reports any installed
+OpenCode as ready, setup doesn't offer to reinstall the pinned release, and
+`opencode serve` launches without the version check. A warning names the
+installed version and the supported range. This is at your own risk: releases
+outside the range, including 3.x, haven't been validated. A missing CLI is still
+reported as missing.
 
 ## Install and sign in
 
