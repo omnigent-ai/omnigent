@@ -94,13 +94,13 @@ describe("parseDataTable", () => {
     ["a row that fills the budget", "x".repeat(DATA_TABLE_MAX_CHARS), "wide.csv", ","],
     [
       "one cell bigger than the whole budget",
-      "x".repeat(DATA_TABLE_MAX_CHARS * 2),
+      "x".repeat(DATA_TABLE_MAX_CHARS + 1),
       "wide.csv",
       ",",
     ],
     [
       "one tab-separated cell bigger than the budget",
-      "x".repeat(DATA_TABLE_MAX_CHARS * 2),
+      "x".repeat(DATA_TABLE_MAX_CHARS + 1),
       "wide.tsv",
       "\t",
     ],
