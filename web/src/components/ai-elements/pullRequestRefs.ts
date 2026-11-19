@@ -29,7 +29,7 @@ const GITHUB_REPO = /^[A-Za-z0-9._-]{1,100}$/;
 // `docs/setup.md#3` and `assets/logo.png#3` are file paths; an extensionless `src/foo#12`
 // still links. This also leaves dotted repos like `vercel/next.js#1` as text; a wrong link
 // is worse than none.
-const FILE_EXTENSION = /\.[A-Za-z0-9]{1,6}$/;
+const FILE_EXTENSION = /[^.]\.[A-Za-z0-9]{1,6}$/;
 // Prose (`and/or#1`, `24/7#1`) and git refs (`origin/main#1`) that read as `owner/repo`.
 const NON_OWNER = /^(\d+|origin|upstream|and|or)$/i;
 

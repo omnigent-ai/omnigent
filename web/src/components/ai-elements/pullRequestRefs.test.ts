@@ -54,6 +54,7 @@ describe("splitPullRequestRefs", () => {
     ["PR #1234: done", ["#omnigent-pr-1234"]],
     ["omnigent-ai/omnigent#9882", ["#omnigent-pr-omnigent-ai/omnigent/9882"]],
     ["octocat/hello-world#5", ["#omnigent-pr-octocat/hello-world/5"]],
+    ["octo-org/.github#12", ["#omnigent-pr-octo-org/.github/12"]],
     // Accepted: an all-digit hex color reads the same as a PR number.
     ["#123456", ["#omnigent-pr-123456"]],
   ])("links %j", (text, hrefs) => {
