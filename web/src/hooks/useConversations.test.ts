@@ -4764,12 +4764,15 @@ describe("mute writes", () => {
       let list = readStarts === "before" ? startList() : undefined;
       act(() => result.current.mutate({ id: "conv_m", muted }));
       await waitFor(() => expect(resolvePatch).toBeDefined());
+      expect(cachedRow(queryClient, "conv_m").updated_at).toBe(100);
       list ??= startList();
       await waitFor(() => expect(resolveList).toBeDefined());
       await act(async () => {
         resolvePatch(mockResponse({ labels: muted ? { [MUTED_LABEL_KEY]: "1" } : {} }));
       });
       await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      expect(cachedRow(queryClient, "conv_m").updated_at).toBe(100);
+      expect(isExplicitlyUnread("conv_m")).toBe(true);
       // The read predates the save, so its labels are stale when it lands.
       await act(async () => {
         resolveList(mockResponse(stale.pages[0]));
@@ -4784,8 +4787,6 @@ describe("mute writes", () => {
         ...(muted ? { [MUTED_LABEL_KEY]: "1" } : {}),
       });
       expect(isConversationMuted(cachedRow(queryClient, "conv_m"))).toBe(muted);
-      expect(isExplicitlyUnread("conv_m")).toBe(true);
-      expect(cachedRow(queryClient, "conv_m").updated_at).toBe(100);
 
       // Right after the save, a lagging index still reports the old label.
       fetchMock.mockResolvedValueOnce(mockResponse(stale.pages[0]));
@@ -4795,9 +4796,9 @@ describe("mute writes", () => {
       expect(isConversationMuted(cachedRow(queryClient, "conv_m"))).toBe(muted);
 
       // Once the reindex window passes, a read reports another device's later change.
-      const later = Date.now() + MUTE_REINDEX_GRACE_MS;
-      vi.spyOn(Date, "now").mockReturnValue(later);
-      onTestFinished(() => vi.mocked(Date.now).mockRestore());
+      const later = performance.now() + MUTE_REINDEX_GRACE_MS;
+      const clock = vi.spyOn(performance, "now").mockReturnValue(later);
+      onTestFinished(() => clock.mockRestore());
       fetchMock.mockResolvedValueOnce(
         mockResponse(
           infinitePage([

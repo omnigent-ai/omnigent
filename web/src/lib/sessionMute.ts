@@ -19,7 +19,7 @@ interface MuteEntry {
   muted: boolean;
   /** A save is in flight; a newer save for this session must wait. */
   saving: boolean;
-  /** Reads started before this time (ms) may not reflect the latest save. */
+  /** Reads started before this `performance.now()` may not reflect the latest save. */
   trustedFrom: number;
 }
 
@@ -29,10 +29,43 @@ interface LabeledRow {
 }
 
 const entries = new Map<string, MuteEntry>();
+const recheckListeners = new Set<(id: string) => void>();
+const recheckTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
 /** Capture before a server read starts; pass the result to {@link reconcileMuteLabel}. */
 export function muteReadMarker(): number {
-  return Date.now();
+  return performance.now();
+}
+
+/**
+ * Subscribe to sessions whose saved preference overrode disagreeing server data
+ * inside the grace window. Each is reported once the window ends, so a re-read
+ * can pick up a change made elsewhere meanwhile.
+ *
+ * @returns Unsubscribes the listener.
+ */
+export function onMuteRecheck(listener: (id: string) => void): () => void {
+  recheckListeners.add(listener);
+  return () => {
+    recheckListeners.delete(listener);
+  };
+}
+
+function cancelRecheck(id: string): void {
+  clearTimeout(recheckTimers.get(id));
+  recheckTimers.delete(id);
+}
+
+function scheduleRecheck(id: string, at: number): void {
+  if (recheckTimers.has(id)) return;
+  const timer = setTimeout(
+    () => {
+      recheckTimers.delete(id);
+      for (const listener of recheckListeners) listener(id);
+    },
+    Math.max(0, at - performance.now()),
+  );
+  recheckTimers.set(id, timer);
 }
 
 /** Whether the viewer muted this session. */
@@ -57,13 +90,19 @@ export function canFlagUnread(row: LabeledRow): boolean {
 export function beginMuteSave(id: string, muted: boolean): boolean {
   const entry = entries.get(id);
   if (entry?.saving) return false;
+  // This save supersedes whatever another device changed before it.
+  cancelRecheck(id);
   entries.set(id, { muted, saving: true, trustedFrom: Number.POSITIVE_INFINITY });
   return true;
 }
 
 /** Record the saved (or, after a failure, restored) preference. */
 export function settleMuteSave(id: string, muted: boolean): void {
-  entries.set(id, { muted, saving: false, trustedFrom: Date.now() + MUTE_REINDEX_GRACE_MS });
+  entries.set(id, {
+    muted,
+    saving: false,
+    trustedFrom: performance.now() + MUTE_REINDEX_GRACE_MS,
+  });
 }
 
 /** Whether any session has a recorded preference, so fetched rows need reconciling. */
@@ -75,7 +114,8 @@ export function hasMuteEntries(): boolean {
  * Reconcile a server row's mute label with the recorded preference. Data
  * requested {@link MUTE_REINDEX_GRACE_MS} or more after the latest save replaces
  * the entry; earlier data, or data arriving while a save is in flight, takes the
- * recorded value instead.
+ * recorded value instead. A settled preference that overrides disagreeing data
+ * is reported to {@link onMuteRecheck} listeners when its window ends.
  *
  * @param readMarker - {@link muteReadMarker} captured when the read started.
  * @returns `row` itself when it already agrees, else a copy with the label fixed.
@@ -89,6 +129,8 @@ export function reconcileMuteLabel<T extends LabeledRow>(row: T, readMarker: num
     return row;
   }
   if (!!row.labels[MUTED_LABEL_KEY] === entry.muted) return row;
+  // While saving, disagreeing data predates this write; afterwards it may be news.
+  if (!entry.saving) scheduleRecheck(row.id, entry.trustedFrom);
   const labels = Object.fromEntries(
     Object.entries(row.labels).filter(([key]) => key !== MUTED_LABEL_KEY),
   );
@@ -98,5 +140,6 @@ export function reconcileMuteLabel<T extends LabeledRow>(row: T, readMarker: num
 
 /** Forget recorded preferences between tests; switching viewer or server reloads the page. */
 export function clearSessionMuteState(): void {
+  for (const id of [...recheckTimers.keys()]) cancelRecheck(id);
   entries.clear();
 }

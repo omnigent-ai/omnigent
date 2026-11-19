@@ -7,6 +7,7 @@ import {
   MUTE_REINDEX_GRACE_MS,
   muteReadMarker,
   MUTED_LABEL_KEY,
+  onMuteRecheck,
   reconcileMuteLabel,
   settleMuteSave,
   showsUnreadFor,
@@ -69,6 +70,46 @@ describe("session mute store", () => {
     beginMuteSave("session", true);
     expect(reconcileMuteLabel(row(false), muteReadMarker()).labels[MUTED_LABEL_KEY]).toBe("1");
     expect(isConversationMuted(row(false))).toBe(true);
+  });
+
+  it("rechecks a session when its window ends, only if data disagreed after the save", () => {
+    const rechecked: string[] = [];
+    const unsubscribe = onMuteRecheck((id) => rechecked.push(id));
+    beginMuteSave("session", true);
+    // Data read during the save predates it, so disagreement there isn't news.
+    reconcileMuteLabel(row(false), muteReadMarker());
+    settleMuteSave("session", true);
+    reconcileMuteLabel(row(true), muteReadMarker());
+    vi.advanceTimersByTime(MUTE_REINDEX_GRACE_MS);
+    expect(rechecked).toEqual([]);
+
+    beginMuteSave("session", false);
+    settleMuteSave("session", false);
+    reconcileMuteLabel(row(true), muteReadMarker());
+    reconcileMuteLabel(row(true), muteReadMarker());
+    vi.advanceTimersByTime(MUTE_REINDEX_GRACE_MS - 1);
+    expect(rechecked).toEqual([]);
+    vi.advanceTimersByTime(1);
+    expect(rechecked).toEqual(["session"]);
+
+    unsubscribe();
+    beginMuteSave("session", true);
+    settleMuteSave("session", true);
+    reconcileMuteLabel(row(false), muteReadMarker());
+    vi.advanceTimersByTime(MUTE_REINDEX_GRACE_MS);
+    expect(rechecked).toEqual(["session"]);
+  });
+
+  it("drops a pending recheck when a newer save starts", () => {
+    const rechecked: string[] = [];
+    const unsubscribe = onMuteRecheck((id) => rechecked.push(id));
+    beginMuteSave("session", true);
+    settleMuteSave("session", true);
+    reconcileMuteLabel(row(false), muteReadMarker());
+    beginMuteSave("session", false);
+    vi.advanceTimersByTime(MUTE_REINDEX_GRACE_MS);
+    expect(rechecked).toEqual([]);
+    unsubscribe();
   });
 
   it("refuses an overlapping save for the same session but not another", () => {

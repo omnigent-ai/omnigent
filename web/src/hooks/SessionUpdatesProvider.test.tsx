@@ -21,7 +21,13 @@ import {
   type ConversationsPage,
 } from "@/hooks/useConversations";
 import { clearRecentlyCreated, type ConversationsInfiniteData } from "@/lib/sessionListCache";
-import { isConversationMuted, MUTE_REINDEX_GRACE_MS, MUTED_LABEL_KEY } from "@/lib/sessionMute";
+import {
+  beginMuteSave,
+  isConversationMuted,
+  MUTE_REINDEX_GRACE_MS,
+  MUTED_LABEL_KEY,
+  settleMuteSave,
+} from "@/lib/sessionMute";
 import { childSessionsQueryKey } from "@/hooks/useChildSessions";
 
 // Mock the socket transport so setWatched is observable and start/stop are
@@ -938,9 +944,9 @@ describe("SessionUpdatesProvider mute in flight", () => {
       expect(row().labels).toEqual(saved ? { [MUTED_LABEL_KEY]: "1" } : {});
       expect(isConversationMuted(row())).toBe(saved);
       // Once the reindex window passes, a frame reports another device's change.
-      const later = Date.now() + MUTE_REINDEX_GRACE_MS;
-      vi.spyOn(Date, "now").mockReturnValue(later);
-      onTestFinished(() => vi.mocked(Date.now).mockRestore());
+      const later = performance.now() + MUTE_REINDEX_GRACE_MS;
+      const clock = vi.spyOn(performance, "now").mockReturnValue(later);
+      onTestFinished(() => clock.mockRestore());
       const remote = !saved;
       act(() =>
         handler({
@@ -951,6 +957,42 @@ describe("SessionUpdatesProvider mute in flight", () => {
       expect(isConversationMuted(row())).toBe(remote);
     },
   );
+});
+
+describe("SessionUpdatesProvider mute recheck", () => {
+  it("re-reads only the lists holding a session once a frame it masked has aged out", () => {
+    vi.useFakeTimers();
+    try {
+      const client = new QueryClient();
+      const key = ["conversations", "", false];
+      seedConversations(client, ["conv_a", "conv_b"]);
+      seedProjectFolder(client, "Alpha", ["conv_x"]);
+      beginMuteSave("conv_a", true);
+      settleMuteSave("conv_a", true);
+      client.setQueryData<ConversationsInfiniteData>(key, (old) => ({
+        ...old!,
+        pages: old!.pages.map((page) => ({
+          ...page,
+          data: page.data.map((row) =>
+            row.id === "conv_a" ? { ...row, labels: { [MUTED_LABEL_KEY]: "1" } } : row,
+          ),
+        })),
+      }));
+      renderProvider(client, ["/"]);
+      const invalidate = vi.spyOn(client, "invalidateQueries");
+
+      // Another device unmutes it before this tab's save could have reindexed.
+      act(() => frameHandler()({ type: "changed", items: [conv("conv_a")] }));
+      expect(isConversationMuted({ id: "conv_a" })).toBe(true);
+      act(() => vi.advanceTimersByTime(MUTE_REINDEX_GRACE_MS - 1));
+      expect(invalidatedKeys(client, invalidate)).toEqual([]);
+
+      act(() => vi.advanceTimersByTime(1 + 300)); // the window, then the reconcile debounce
+      expect(invalidatedKeys(client, invalidate)).toEqual([JSON.stringify(key)]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
 
 describe("SessionUpdatesProvider open-session row", () => {
