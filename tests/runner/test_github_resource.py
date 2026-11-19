@@ -165,8 +165,7 @@ def test_github_info_no_pr(repo: Path, monkeypatch: pytest.MonkeyPatch, host: st
     """A branch with no PR yields ``pr``/``base_ref`` null (bare ``gh pr view`` empty).
 
     gh's "no pull requests" failure names no refused field, so it is not retried. The
-    reachable repo names its host, as the provider also serves Enterprise, and is the
-    workspace's own.
+    reachable repo is the workspace's and names its host.
     """
     calls: list[tuple[str, ...]] = []
 

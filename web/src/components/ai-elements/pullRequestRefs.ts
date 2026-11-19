@@ -47,9 +47,8 @@ interface MarkdownNode {
 
 // Their text is already a link. Code and raw HTML carry a `value`, not text children.
 const LINK_NODE_TYPES = new Set(["link", "linkReference"]);
-// Inline raw HTML parses as separate tag and text siblings: `<a href>`, `#1234`, `</a>`.
-// Text inside a raw anchor is already a link; inside raw code it is literal. As in
-// a browser, `<a/>` still opens its element, and a closer only ends its own tag.
+// Track raw anchor and code-like tags; their text parses as sibling nodes. As in a
+// browser, `<a/>` still opens its element.
 const HTML_OPAQUE_TAG = /^<(\/?)(a|code|pre|kbd|samp)(?=[\s/>])/i;
 
 // Tokens of a text node's source, in order. Each `#` of the value is a literal `#`
@@ -178,7 +177,7 @@ function isGitHubRepo(nameWithOwner: string): boolean {
   );
 }
 
-/** The github.com repo whose numbers `nameWithOwner`'s references use; currently the repo itself. */
+/** The github.com repo whose numbers `nameWithOwner`'s references use. */
 function canonicalRepo(nameWithOwner: string): string | null {
   return nameWithOwner;
 }

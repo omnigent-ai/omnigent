@@ -535,11 +535,7 @@ function WorkspaceFileLink({
   );
 }
 
-/**
- * A `#1234` / `owner/repo#12` reference parked by `remarkPullRequestRefs`.
- * Renders as plain text until the session repo loads, and when the reference
- * can't be resolved safely.
- */
+/** Resolve a parked PR reference once session repo data arrives; text until then. */
 function PullRequestRefLink({
   pullRequestRef,
   children,
@@ -547,9 +543,7 @@ function PullRequestRefLink({
   title,
   ...props
 }: React.ComponentPropsWithoutRef<"a"> & { pullRequestRef: PullRequestRef }) {
-  // A side chat inherits its parent's file viewer but may sit in another repo,
-  // so the repo comes from its own session while links open in the parent's
-  // browser, the one AppShell reveals.
+  // Side chats resolve against their own session but open links in the parent viewer.
   const scopedConversationId = useContext(ConversationScopeContext);
   const fileViewerConversationId = useFileViewerConversationId();
   const { data } = usePullRequestInfoSnapshot(scopedConversationId ?? fileViewerConversationId);
