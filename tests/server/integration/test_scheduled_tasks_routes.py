@@ -4168,6 +4168,25 @@ async def test_a_schedule_runs_only_a_workflow_its_owner_can_run(
     assert renamed.status_code == 200, renamed.text
 
 
+async def test_a_clone_runs_only_a_workflow_its_owner_can_still_run(
+    workflows_client: httpx.AsyncClient, workflow_prompt: str
+) -> None:
+    created = await workflows_client.post(
+        "/v1/scheduled-tasks", json=_create_body(prompt=workflow_prompt), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    clone_url = f"/v1/scheduled-tasks/{created.json()['id']}/clone"
+    cloned = await workflows_client.post(clone_url, headers=_headers())
+    assert cloned.status_code == 200, cloned.text
+    assert cloned.json()["prompt"] == workflow_prompt
+    workflow_id = workflow_prompt.split("(ID ")[1][:32]
+    deleted = await workflows_client.delete(f"/v1/workflows/{workflow_id}", headers=_headers())
+    assert deleted.status_code == 200, deleted.text
+    refused = await workflows_client.post(clone_url, headers=_headers())
+    assert refused.status_code == 400, refused.text
+    assert refused.json()["error"]["message"].startswith("workflow_not_found")
+
+
 async def test_a_schedule_cant_run_a_workflow_on_a_server_without_workflows(
     auth_client: httpx.AsyncClient,
 ) -> None:

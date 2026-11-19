@@ -1127,7 +1127,8 @@ async def _start_workflow_run(
 ) -> None:
     """Write *workflow*'s steps as the new session's plan, as a manual launch does.
 
-    :raises _CannotLaunchScheduledFire: With ``workflow_plan_failed``.
+    :raises _CannotLaunchScheduledFire: With ``workflow_plan_failed``, whose message
+        leaves out the storage error, which can carry SQL; the server log keeps it.
     """
     try:
         await initialize_workflow_plan(
@@ -1135,8 +1136,11 @@ async def _start_workflow_run(
         )
     # Any storage failure, not only the journal's own errors; cancellation still propagates.
     except Exception as exc:
+        _logger.exception(
+            "scheduled fire: task %s could not write workflow %s's plan", task.id, workflow.id
+        )
         raise _CannotLaunchScheduledFire(
-            f"could not start the run of the saved workflow: {exc}",
+            "could not start the run of the saved workflow",
             error_code="workflow_plan_failed",
         ) from exc
 

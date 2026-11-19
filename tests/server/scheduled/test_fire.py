@@ -82,6 +82,7 @@ from omnigent.stores.conversation_store import (
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests.server.helpers import build_agent_bundle
 
 # The trigger form's saved state; see encodeTriggerPrompt in web/.../triggerTemplates.ts.
@@ -5269,10 +5270,73 @@ async def test_a_workflow_automation_that_cannot_start_its_workflow_fails_its_ru
 
     (run,) = store.runs
     assert (run["status"], run.get("error_code")) == ("failed", error_code)
+    # The run's failure shows the owner no storage internals.
+    assert "database is locked" not in run["error"]
     assert launched == []
     # No session is left behind: none started, or the one whose plan failed is gone.
     assert conversations.list_conversations(limit=10).data == []
     assert ({"id": "task_1", "state": "paused"} in store.updates) is paused
+
+
+@pytest.mark.asyncio
+async def test_a_workflow_automation_stops_once_its_shared_workflow_is_unshared(
+    db_uri: str,
+) -> None:
+    conversations = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    for user_id in ("alice@example.com", "bob@example.com"):
+        permissions.ensure_user(user_id)
+    workflows = open_workflow_store(conversations)
+    assert workflows is not None
+    workflow = workflows.create(
+        user_id="alice@example.com",
+        name="Triage",
+        description="Triage the queue",
+        steps=_WORKFLOW_STEPS,
+    )
+    permissions.grant_for_workflow("bob@example.com", workflow.id, LEVEL_READ)
+    journal = open_journal_store(conversations)
+    assert journal is not None
+    agents = _sql_agent()
+    store = FakeScheduledTaskStore(
+        rows={
+            "task_1": _task(
+                prompt=_workflow_prompt(workflow.id),
+                user_id="bob@example.com",
+                agent_id=next(iter(agents.agents)),
+                host_id=_SQL_HOST_ID,
+            )
+        }
+    )
+    plans_at_launch: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        plans_at_launch.append(journal.current_workflow_run(conv.id))
+
+    deps = _deps(
+        store,
+        agent_store=agents,
+        conversation_store=conversations,
+        host_registry=FakeHostRegistry({_SQL_HOST_ID}),
+        permission_store=permissions,
+        app_state=_workflows_on(),
+    )
+    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+    assert permissions.revoke_for_workflow("bob@example.com", workflow.id)
+    await build_run_now(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+
+    # Bob ran Alice's shared workflow until she stopped sharing it.
+    shared_run, unshared_run = store.runs
+    assert shared_run["status"] == "running"
+    (plan,) = plans_at_launch
+    assert plan.workflow_id == workflow.id
+    assert (unshared_run["status"], unshared_run.get("error_code")) == (
+        "failed",
+        "workflow_missing",
+    )
+    assert {"id": "task_1", "state": "paused"} in store.updates
 
 
 @pytest.mark.asyncio
