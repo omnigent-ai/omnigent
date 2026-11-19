@@ -4833,6 +4833,12 @@ function ConversationSection({
   /** The rows list, for a project folder's Show more slide. */
   listRef?: RefObject<HTMLUListElement | null>;
 }) {
+  const location = useLocation();
+  const rebasePath = useRebasePath();
+  const activeDraftSourceId =
+    location.pathname === rebasePath("/")
+      ? new URLSearchParams(location.search).get("sibling")
+      : null;
   // An untitled section is always open — there's no header to collapse it.
   const isCollapsed = title != null && collapsed;
   const rows = isCollapsed ? (heldConversations ?? []) : conversations;
@@ -4985,7 +4991,7 @@ function ConversationSection({
                   onToggleFamily={() => onToggleFamily(conv.family!.id)}
                   isActive={
                     conv.id === activeConversationId ||
-                    !!conv.nested_draft_source_id ||
+                    conv.nested_draft_source_id === activeDraftSourceId ||
                     conv.project_draft_name !== undefined
                   }
                   inActiveGrid={gridMembers.has(conv.id)}

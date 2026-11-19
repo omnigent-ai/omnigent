@@ -30,8 +30,14 @@ export function useNestedSessionDrafts(): readonly NestedSessionDraft[] {
 }
 
 export function addNestedSessionDraft(client: QueryClient, id: string, source: Session): void {
+  if (
+    client
+      .getQueryData<readonly NestedSessionDraft[]>(DRAFTS_KEY)
+      ?.some((draft) => draft.key === id)
+  )
+    return;
   client.setQueryData<readonly NestedSessionDraft[]>(DRAFTS_KEY, (drafts = []) => [
-    ...drafts.filter((draft) => draft.key !== id),
+    ...drafts,
     {
       id,
       key: id,

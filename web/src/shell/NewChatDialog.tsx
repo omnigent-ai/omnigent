@@ -101,6 +101,7 @@ import {
   ShuffleIcon,
   WandSparklesIcon,
   TriangleAlertIcon,
+  Trash2Icon,
   XIcon,
 } from "lucide-react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
@@ -2173,6 +2174,7 @@ const LANDING_IMPORT_DISMISSED_STORAGE_KEY = "omnigent:landing-import-dismissed"
 interface LandingDraftState {
   draft: LandingDraft | null;
   revision: number;
+  nestedProvisional?: ReturnType<typeof newTempConversation>;
 }
 const landingDrafts = new Map<string | null, LandingDraftState>();
 
@@ -2389,7 +2391,7 @@ function NewChatLandingContent({
   projectHomeName?: string;
   onSessionStarted?: () => void;
 }) {
-  const [draftState] = useState(() => {
+  const [draftState] = useState<LandingDraftState>(() => {
     const state = landingDrafts.get(siblingSourceId) ?? { draft: null, revision: 0 };
     landingDrafts.set(siblingSourceId, state);
     return state;
@@ -3144,10 +3146,12 @@ function NewChatLandingContent({
 
   // Mirror the current draft fields into a ref every render so the unmount
   // cleanup below can snapshot the latest values without re-subscribing.
-  // `submittedRef` is flipped once the draft is sent to a create, so the
+  // `submittedRef` is flipped once the draft is submitted or deleted, so the
   // snapshot is dropped instead of resurrected.
   const submittedRef = useRef(false);
-  const [nestedProvisional, setNestedProvisional] = useState(newTempConversation);
+  const [nestedProvisional, setNestedProvisional] = useState(
+    () => (draftState.nestedProvisional ??= newTempConversation()),
+  );
   const siblingSourceRef = useRef(siblingSource);
   siblingSourceRef.current = siblingSource;
   const siblingSourceKey = siblingSource?.id;
@@ -3155,9 +3159,6 @@ function NewChatLandingContent({
     const source = siblingSourceRef.current;
     if (!source || submittedRef.current) return;
     addNestedSessionDraft(queryClient, nestedProvisional.id, source);
-    return () => {
-      if (!submittedRef.current) removeNestedSessionDraft(queryClient, nestedProvisional.id);
-    };
   }, [queryClient, nestedProvisional, siblingSourceKey]);
   const submittedDraftRevisionRef = useRef<number | null>(null);
   // Whether this composer is still on screen. The create POST can outlive
@@ -6206,8 +6207,10 @@ function NewChatLandingContent({
     }
     submittedDraftRevisionRef.current = null;
     removeNestedSessionDraft(queryClient, nestedProvisional.id);
-    if (siblingSource && onScreenRef.current) {
-      setNestedProvisional(newTempConversation());
+    if (siblingSource) {
+      const provisional = (draftState.nestedProvisional ??= newTempConversation());
+      addNestedSessionDraft(queryClient, provisional.id, siblingSource);
+      if (onScreenRef.current) setNestedProvisional(provisional);
     }
     const originalDraft =
       temporaryConversationId && !hasPendingLocalMessage(temporaryConversationId)
@@ -6329,6 +6332,7 @@ function NewChatLandingContent({
       if (draftState.draft !== null) writeLandingDraft(draftState, null);
       submittedDraftRevisionRef.current = draftState.revision;
       submittedRef.current = true;
+      draftState.nestedProvisional = undefined;
       submittedLinkedPromptRef.current = submittedLinkedPrompt;
       if (submittedLinkedPrompt !== null) submittedKeptPromptIds.add(submittedLinkedPrompt.id);
       if (siblingSource) updateNestedSessionDraft(queryClient, nestedProvisional.id);
@@ -7590,15 +7594,35 @@ function NewChatLandingContent({
               </h1>
             ) : null}
             {siblingSourceId && (
-              <p
-                className="max-w-full break-words text-center text-sm text-muted-foreground line-clamp-2"
-                data-testid="sibling-composer-context"
-              >
-                A new conversation alongside{" "}
-                <span className="font-medium text-foreground">
-                  {siblingSource?.title?.trim() || "Untitled"}
-                </span>
-              </p>
+              <div className="flex max-w-full flex-wrap items-center justify-center gap-x-3 gap-y-1">
+                <p
+                  className="max-w-full break-words text-center text-sm text-muted-foreground line-clamp-2"
+                  data-testid="sibling-composer-context"
+                >
+                  A new conversation alongside{" "}
+                  <span className="font-medium text-foreground">
+                    {siblingSource?.title?.trim() || "Untitled"}
+                  </span>
+                </p>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="text-muted-foreground"
+                  type="button"
+                  disabled={creating}
+                  onClick={() => {
+                    submittedRef.current = true;
+                    writeLandingDraft(draftState, null);
+                    draftState.nestedProvisional = undefined;
+                    forgetKeptLinkedPrompt(siblingSourceId, null);
+                    removeNestedSessionDraft(queryClient, nestedProvisional.id);
+                    navigate(`/c/${siblingSourceId}`);
+                  }}
+                >
+                  <Trash2Icon className="size-3.5" />
+                  Delete draft
+                </Button>
+              </div>
             )}
             {isMobileViewport && workspaceControls}
           </div>
