@@ -389,7 +389,7 @@ async def test_a_retry_that_waits_returns_the_finished_retry_ack(
 async def test_an_answer_whose_question_changes_during_the_runner_check_is_not_sent(
     question: _Question, monkeypatch: pytest.MonkeyPatch, change: str
 ) -> None:
-    """A question resolved or asked again during the runner check goes to the old path."""
+    """A question resolved or asked again during the runner check is not sent as a message."""
     reached, release = await _gate_runner_check(monkeypatch)
     post_event, _reached, _release = _gated_post_event(question, [])
     answer = question.answer(post_event)

@@ -5981,7 +5981,7 @@ async def test_answer_with_a_live_runner_reaches_the_hook_and_sends_no_message(
         await asyncio.gather(hook_task, return_exceptions=True)
         await fake_runner.aclose()
 
-    # On admission_error the old path's later approval forward still errors, as before.
+    # With admission_error the approval forward uses resource routing and fails: check the hook.
     if lookup == "live":
         assert response.status_code == 202, response.text
         assert response.json() == {"queued": False}

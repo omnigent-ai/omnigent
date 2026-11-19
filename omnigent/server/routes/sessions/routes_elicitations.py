@@ -128,9 +128,9 @@ def register_elicitations_routes(
         :param body: The MCP-shaped verdict — ``action``
             (``"accept"`` / ``"decline"`` / ``"cancel"``) plus
             optional form ``content``.
-        :returns: ``{"queued": False}`` — resolution is synchronous
-            and persists no conversation item. An answer sent as a message
-            (stopped session) returns that send's acknowledgement.
+        :returns: ``{"queued": False}`` — resolution is synchronous and persists no
+            conversation item, except an answer sent as a message on a stopped session,
+            which returns that send's acknowledgement.
         :raises OmnigentError: 404 if no session exists; for an answer sent as a message, the
             message path's error, or 403 when a policy denies it.
         """

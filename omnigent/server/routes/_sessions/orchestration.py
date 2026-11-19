@@ -2991,7 +2991,7 @@ async def _deliver_answer_to_stopped_session(
     Send an AskUserQuestion answer as a user message when the session's runner stays gone.
 
     The message path relaunches the runner; the card closes only after it accepts the message.
-    :returns: The acknowledgement (also for a later answer), or ``None``: resolve as before.
+    :returns: The acknowledgement (also for a later answer), or ``None``: the caller resolves it.
     :raises OmnigentError: 403 on a policy denial, or the message path's error; waiters get it too.
     """
     elicitation_id = data.get("elicitation_id")
@@ -3058,7 +3058,7 @@ async def _deliver_answer_to_stopped_session(
             )
         after = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
         if after is None or after[1].get("params") != params or runner_back:
-            # Resolved elsewhere, asked again, or the runner is back: resolve as before.
+            # Resolved elsewhere, asked again, or the runner is back: the caller resolves it.
             _stopped_session_answers.pop(key, None)
             return None
     if record is None:
@@ -3148,7 +3148,8 @@ async def _session_offline_host_id(
     """
     Return the session's user-run routing host when it has no live tunnel, else ``None``.
 
-    A disconnected host cannot start or reconnect a runner. Side chats inherit an ancestor's host.
+    A disconnected host cannot start or reconnect a runner. Side chats and sub-agents may inherit
+    an ancestor's host.
     Managed sandboxes and a host whose row reads live (connected elsewhere) count as not offline.
     """
     host_id = conv.host_id
