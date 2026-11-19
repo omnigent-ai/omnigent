@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import replace
 
 import click
@@ -386,11 +387,26 @@ async def test_an_undo_during_the_new_grace_keeps_the_sandbox(db_uri, monkeypatc
     fake = _registering_launcher(host_store)
     conv = conversations.create_conversation()
     conversations.update_conversation(conv.id, archived=True)
-    monkeypatch.setattr(sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 0.2)
+    # Hold the teardown inside its grace until the Undo is persisted.
+    grace = 12.5
+    monkeypatch.setattr(sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", grace)
+    in_grace, release = asyncio.Event(), asyncio.Event()
+    real_sleep = asyncio.sleep
+
+    async def gated_sleep(delay, *args, **kwargs):
+        if delay == grace:
+            in_grace.set()
+            await release.wait()
+            return None
+        return await real_sleep(delay, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "sleep", gated_sleep)
 
     await _launch_for(conversations, host_store, fake, conv.id)
+    await asyncio.wait_for(in_grace.wait(), timeout=5)
     # Undo on another replica: only the persisted flag changes.
     conversations.update_conversation(conv.id, archived=False)
+    release.set()
     await orchestration._pending_archive_stops[conv.id]
 
     assert fake.stopped == []
@@ -410,6 +426,24 @@ async def test_a_relaunch_of_an_archived_session_does_not_schedule_a_teardown(
     # A message to the archived session kicks this relaunch and waits on it.
     await _launch_for(conversations, host_store, fake, conv.id, relaunch_host=host)
 
+    assert conv.id not in orchestration._pending_archive_stops
+    assert fake.stopped == []
+
+
+async def test_moving_an_archived_session_to_a_sandbox_does_not_schedule_a_teardown(
+    db_uri, no_undo_grace
+):
+    host_store = HostStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    fake = _registering_launcher(host_store)
+    held_runner_id = "runner_" + "b" * 32
+    # The move holds this claim on the session's runner while the sandbox provisions.
+    conv = conversations.create_conversation(runner_id=held_runner_id)
+    conversations.update_conversation(conv.id, archived=True)
+
+    await _launch_for(conversations, host_store, fake, conv.id, held_runner_id=held_runner_id)
+
+    assert conversations.get_conversation(conv.id).host_id is not None
     assert conv.id not in orchestration._pending_archive_stops
     assert fake.stopped == []
 

@@ -5411,17 +5411,10 @@ async def _stop_if_archived_while_provisioning(
     sandbox_config: ManagedSandboxDeployment,
 ) -> None:
     """
-    Tear down a session that was archived before its managed launch bound a host.
+    Schedule the deferred archive teardown once a create's launch binds an archived session.
 
-    A managed create returns before its sandbox exists, so an archive whose
-    Undo grace ends during provisioning finds no host on the row and stops
-    nothing; the launch then binds and starts the host for an archived session.
-    Rescheduling the normal deferred teardown once the host is bound gives that
-    archive the same outcome as one made afterwards: it waits out a fresh Undo
-    grace, re-reads the archived flag, and keeps the owner, provider and
-    shared-sandbox guards of :func:`stop_archived_session_sandbox`.
-
-    Best-effort: a failed read leaves the sandbox to its idle stop.
+    The archive's own teardown ran before the bind and found no host to stop. A failed
+    read leaves cleanup to the idle stop.
 
     :param session_id: Session the launch just bound, e.g. ``"conv_abc123"``.
     :param conversation_store: Store holding the session row.
@@ -5640,9 +5633,9 @@ async def _bind_and_launch_managed_runner(
                 return
         tracker.finish(session_id)
         _publish_sandbox_status(session_id, "ready")
-        # A relaunch is kicked by a message to the session, so it must not stop the
-        # sandbox that message is waiting on.
-        if relaunch_host is None:
+        # A relaunch or a move starts from a message or a move of the session, and that
+        # work runs on this sandbox, so only a create's launch can have raced an archive.
+        if relaunch_host is None and held_runner_id is None:
             await _stop_if_archived_while_provisioning(
                 session_id,
                 conversation_store=conversation_store,
