@@ -182,6 +182,7 @@ export function shortcutPageGroups(
           { label: "Reload the browser tab", keys: [mod, "R"] },
           { label: "Focus the browser address bar", keys: [mod, "L"] },
         ]),
+        { label: "Exit full screen from a file", keys: ["Esc"] },
       ],
     },
     {

@@ -123,6 +123,40 @@ def test_fullscreen_file_link_survives_reload_and_can_be_exited(
     expect(file_viewer.get_by_text(_FILE_BODY).first).to_be_visible(timeout=20_000)
 
 
+def test_escape_exits_fullscreen_file_and_keeps_its_tab(
+    request: pytest.FixtureRequest,
+    seeded_shareable_session: tuple[str, str],
+) -> None:
+    """Escape leaves a fullscreen file for the chat; a second Escape closes the tab."""
+    base_url, session_id = seeded_shareable_session
+    # Request the page after session setup so a recording starts at the journey.
+    page: Page = request.getfixturevalue("page")
+    page.goto(f"{base_url}/c/{session_id}?{urlencode({'file': _FILE_PATH})}")
+
+    file_viewer = page.locator('[data-testid="file-viewer"]:visible')
+    file_body = file_viewer.get_by_text(_FILE_BODY).first
+    close_tab = page.get_by_role("button", name=f"Close {_FILE_PATH}", exact=True)
+    composer = page.get_by_role("textbox", name="Message the agent", exact=True)
+    expect(file_body).to_be_visible(timeout=20_000)
+
+    page.get_by_role("button", name="Full screen", exact=True).click()
+    exit_fullscreen = page.get_by_role("button", name="Exit full screen", exact=True)
+    expect(exit_fullscreen).to_have_attribute("aria-pressed", "true")
+
+    page.keyboard.press("Escape")
+    expect(page.get_by_role("button", name="Full screen", exact=True)).to_be_visible()
+    expect(composer).to_be_visible()
+    expect(close_tab.first).to_be_visible()
+    expect(file_body).to_be_visible()
+    params = parse_qs(urlsplit(page.url).query)
+    assert params.get("file") == [_FILE_PATH]
+    assert "fullscreen" not in params
+
+    page.keyboard.press("Escape")
+    expect(close_tab).to_have_count(0)
+    expect(composer).to_be_visible()
+
+
 def test_share_file_grants_read_access_and_opens_fullscreen(
     browser: Browser,
     seeded_shareable_session: tuple[str, str],
