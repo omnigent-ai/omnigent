@@ -114,4 +114,26 @@ describe("FloatingComposerPage", () => {
     expect(screen.getByTestId("floating-launch-error")).toHaveTextContent("Couldn't send it.");
     expect(prompt().value).toBe("Fix the build");
   });
+
+  it("ignores an older launch that settles after a newer one", async () => {
+    let settleFirst: (outcome: { error: string | null; freshComposer: boolean }) => void = () => {};
+    vi.mocked(launchFromPanel)
+      .mockReturnValueOnce(
+        new Promise((resolve) => {
+          settleFirst = resolve;
+        }),
+      )
+      .mockResolvedValueOnce({ error: "Couldn't send it.", freshComposer: false });
+    render(<FloatingComposerPage />);
+    fireEvent.change(prompt(), { target: { value: "Fix the build" } });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("button", { name: "Launch" }));
+      fireEvent.click(screen.getByRole("button", { name: "Launch" }));
+    });
+
+    await act(async () => settleFirst({ error: null, freshComposer: true }));
+
+    expect(screen.getByTestId("floating-launch-error")).toHaveTextContent("Couldn't send it.");
+    expect(prompt().value).toBe("Fix the build");
+  });
 });

@@ -1,6 +1,6 @@
 // The floating New Agent panel: the new-chat screen alone, in the desktop shell's
 // panel window. Escape and the X hide it, keeping what was typed.
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { Toaster } from "@/components/ui/sonner";
@@ -35,12 +35,16 @@ export function FloatingComposerPage() {
   // A delivered launch starts a fresh composer; a failed one keeps the prompt where it was.
   const [generation, setGeneration] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  // Only the latest launch's outcome counts, so an older one can't clear a newer prompt.
+  const latestLaunch = useRef(0);
   const presentation = useMemo<ComposerPresentation>(
     () => ({
       kind: "floating",
       launch: (request) => {
+        const launchNumber = ++latestLaunch.current;
         setError(null);
         void launchFromPanel(request).then((outcome) => {
+          if (launchNumber !== latestLaunch.current) return;
           if (outcome.freshComposer) setGeneration((current) => current + 1);
           setError(outcome.error);
         });

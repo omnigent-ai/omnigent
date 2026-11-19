@@ -16,9 +16,9 @@ export interface LaunchOutcome {
 type Delivery = "delivered" | "failed" | "unknown";
 
 export const SEND_FAILED_ERROR =
-  "Couldn't send your message to the new agent. Your prompt is still here, so you can try again.";
+  "The new agent didn't get your message. Its session is open in a window; your prompt is still here.";
 export const SEND_UNKNOWN_ERROR =
-  "Couldn't confirm your message reached the new agent. Open the session before sending it again.";
+  "Couldn't confirm the new agent got your message. Check its session before sending it again.";
 export const OPEN_FAILED_ERROR =
   "Your agent started, but Omnigent couldn't show it. Find it in the sidebar.";
 
@@ -40,44 +40,51 @@ async function deliverFirstMessage({
   files,
 }: FloatingLaunchRequest): Promise<Delivery> {
   const stableId = randomUUID().replace(/-/g, "");
+  let fileBlocks;
   try {
-    // A bundled skill goes as a slash command, as the chat composer sends one.
-    const response = skill
-      ? await postEvent(sessionId, {
-          type: "slash_command",
-          data: { kind: "skill", name: skill.name, arguments: skill.args, stable_id: stableId },
-        })
-      : await postEvent(
-          sessionId,
-          {
+    fileBlocks = skill ? [] : await uploadFileBlocks(sessionId, files ?? []);
+  } catch {
+    return "failed"; // Nothing was posted.
+  }
+  try {
+    // No `holdWhenHostOffline`: the panel can't resend later, so an offline host's failure
+    // is recorded in the session, where its window shows it.
+    const response = await postEvent(
+      sessionId,
+      skill
+        ? {
+            type: "slash_command",
+            data: { kind: "skill", name: skill.name, arguments: skill.args, stable_id: stableId },
+          }
+        : {
             type: "message",
             data: {
               role: "user",
               content: [
-                ...(await uploadFileBlocks(sessionId, files ?? [])),
+                ...fileBlocks,
                 ...(text.trim() ? [{ type: "input_text" as const, text }] : []),
               ],
               stable_id: stableId,
             },
           },
-          { holdWhenHostOffline: true },
-        );
+    );
     return response.denied ? "failed" : "delivered";
   } catch (error) {
-    // A coded answer refused it; only a lost or uncoded answer leaves delivery unknown.
+    // As the chat composer judges a send: a coded answer refused it; anything else may have run.
     if (error instanceof ApiError && error.code !== null) return "failed";
-    if (skill) return "unknown";
     return deliveryFromServer(sessionId, stableId);
   }
 }
 
-/** What became of a message whose post got no clear answer, from the session itself. */
+/**
+ * What became of a message whose post got no clear answer. Only a recorded refusal proves it
+ * failed, and only a stored message the runner didn't refuse proves it arrived; a native
+ * runner takes a message before its transcript stores it, so a missing one proves nothing.
+ */
 async function deliveryFromServer(sessionId: string, stableId: string): Promise<Delivery> {
-  const page = await fetchSessionItemsPage(sessionId).catch(() => null);
-  if (page === null) return "unknown";
-  // The server stores a message before it answers, so a missing one was never sent.
-  if (!page.items.some((item) => item.id === stableId)) return "failed";
   const verdict = await sendVerdictFromServer(sessionId, stableId);
+  if (verdict === "refused") return "failed";
   if (verdict === null) return "unknown";
-  return verdict === "refused" ? "failed" : "delivered";
+  const page = await fetchSessionItemsPage(sessionId).catch(() => null);
+  return page?.items.some((item) => item.id === stableId) ? "delivered" : "unknown";
 }
