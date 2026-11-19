@@ -47,8 +47,9 @@ interface MarkdownNode {
 // Their text is already a link. Code and raw HTML carry a `value`, not text children.
 const LINK_NODE_TYPES = new Set(["link", "linkReference"]);
 // Inline raw HTML parses as separate tag and text siblings: `<a href>`, `#1234`, `</a>`.
-const HTML_ANCHOR_OPEN = /^<a[\s/>]/i;
-const HTML_ANCHOR_CLOSE = /^<\/a\s*>/i;
+// Text inside a raw anchor is already a link; inside raw code it is literal.
+const HTML_OPAQUE_OPEN = /^<(?:a|code|pre|kbd|samp)[\s/>]/i;
+const HTML_OPAQUE_CLOSE = /^<\/(?:a|code|pre|kbd|samp)\s*>/i;
 
 /** Remark plugin parking every pull request reference in a text node on a fragment link. */
 export function remarkPullRequestRefs() {
@@ -57,14 +58,16 @@ export function remarkPullRequestRefs() {
 
 function linkifyChildren(node: MarkdownNode): void {
   if (!node.children || LINK_NODE_TYPES.has(node.type)) return;
-  let openAnchors = 0;
+  let openOpaqueTags = 0;
   node.children = node.children.flatMap((child) => {
     if (child.type === "html" && typeof child.value === "string") {
-      if (HTML_ANCHOR_OPEN.test(child.value)) openAnchors += 1;
-      else if (HTML_ANCHOR_CLOSE.test(child.value)) openAnchors = Math.max(0, openAnchors - 1);
+      if (HTML_OPAQUE_OPEN.test(child.value)) openOpaqueTags += 1;
+      else if (HTML_OPAQUE_CLOSE.test(child.value)) {
+        openOpaqueTags = Math.max(0, openOpaqueTags - 1);
+      }
       return [child];
     }
-    if (openAnchors > 0) return [child];
+    if (openOpaqueTags > 0) return [child];
     if (child.type === "text" && typeof child.value === "string") {
       return splitPullRequestRefs(child.value);
     }

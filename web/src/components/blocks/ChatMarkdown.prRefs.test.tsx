@@ -145,7 +145,7 @@ describe("pull request references in chat markdown", () => {
       [
         "Inline `#1234` and [#5678](https://example.com/x) and https://example.com/page#4321.",
         "",
-        'Raw <a href="https://example.com/raw">#2468</a> HTML.',
+        'Raw <a href="https://example.com/raw">#2468</a> HTML and <code>#1357</code> code.',
         "",
         "a#1234 file.md#L1234 #123 #0123 #fff #123abc",
         "",
@@ -163,6 +163,7 @@ describe("pull request references in chat markdown", () => {
       "href",
       "https://example.com/raw",
     );
+    expect(screen.getByText("#1357").closest("code")).not.toBeNull();
   });
 
   it("keeps references as text when the session isn't on GitHub", () => {

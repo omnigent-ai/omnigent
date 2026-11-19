@@ -121,6 +121,9 @@ describe("remarkPullRequestRefs", () => {
       { type: "inlineCode", value: "#1234" },
       { type: "code", value: "#1234" },
       { type: "html", value: "<b>#1234</b>" },
+      { type: "html", value: "<code>" },
+      { type: "text", value: "#1234" },
+      { type: "html", value: "</code>" },
       { type: "link", url: "https://x.test", children: [{ type: "text", value: "#1234" }] },
       { type: "linkReference", children: [{ type: "text", value: "#1234" }] },
     ];
@@ -162,22 +165,44 @@ describe("remarkPullRequestRefs", () => {
     ]);
   });
 
-  it.each(["<a>", "<a/>", '<a\nhref="https://example.com/raw">'])(
-    "skips text after a raw %j anchor tag",
-    (tag) => {
-      const anchored = [
-        { type: "html", value: tag },
-        { type: "text", value: "#2468" },
-        { type: "html", value: "</a>" },
-      ];
-      const tree = {
-        type: "root",
-        children: [{ type: "paragraph", children: structuredClone(anchored) }],
-      };
-      remarkPullRequestRefs()(tree);
-      expect(tree.children[0].children).toEqual(anchored);
-    },
-  );
+  it.each([
+    ["<a>", "</a>"],
+    ["<a/>", "</a>"],
+    ['<a\nhref="https://example.com/raw">', "</a>"],
+    ["<code>", "</code>"],
+    ["<PRE>", "</pre>"],
+    ["<kbd>", "</kbd>"],
+    ['<samp class="x"/>', "</SAMP >"],
+  ])("skips text between raw %j and %j tags", (open, close) => {
+    const anchored = [
+      { type: "html", value: open },
+      { type: "text", value: "#2468" },
+      { type: "html", value: close },
+    ];
+    const tree = {
+      type: "root",
+      children: [{ type: "paragraph", children: structuredClone(anchored) }],
+    };
+    remarkPullRequestRefs()(tree);
+    expect(tree.children[0].children).toEqual(anchored);
+  });
+
+  it("keeps linking after a stray raw closing tag", () => {
+    const tree = {
+      type: "root",
+      children: [
+        {
+          type: "paragraph",
+          children: [
+            { type: "html", value: "</code>" },
+            { type: "text", value: "#2468" },
+          ],
+        },
+      ],
+    };
+    remarkPullRequestRefs()(tree);
+    expect(tree.children[0].children[1]).toMatchObject({ type: "link", url: "#omnigent-pr-2468" });
+  });
 
   it("links text nested in emphasis and headings", () => {
     const tree = {
