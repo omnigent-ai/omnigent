@@ -546,7 +546,12 @@ class TestState:
 
     @pytest.mark.parametrize(
         "malformed",
-        [{}, {"dropped_edge_status": ["failed"]}, {"dropped_edge_status": {"x": 1}}],
+        [
+            {},
+            {"dropped_edge_status": ["failed"]},
+            {"dropped_edge_status": {"x": 1}},
+            {"dropped_edge_failure_detail": ["boom"]},
+        ],
     )
     def test_lifecycle_fields_default_when_absent_or_malformed(
         self, tmp_path: Path, malformed: dict[str, object]
@@ -561,6 +566,7 @@ class TestState:
         assert loaded.tools_in_flight == 0
         assert loaded.last_edge_id is None
         assert loaded.dropped_edge_status is None
+        assert loaded.dropped_edge_failure_detail is None
         assert loaded.last_assistant_text == ""
 
     def test_last_assistant_text_round_trips(self, tmp_path: Path) -> None:
@@ -2784,46 +2790,61 @@ class TestForwardLoopPostFailures:
         )
         forwarder_health.clear()
 
+    @pytest.mark.parametrize(
+        ("rows", "status"),
+        [
+            ([_prompt_row(), _turn_ended_row("failed", error_message="boom")], "failed"),
+            (
+                [_prompt_row(), _assistant_row("u1", "partial"), _turn_ended_row("cancelled")],
+                "idle",
+            ),
+        ],
+        ids=["failed-coded-error", "cancelled"],
+    )
     async def test_poison_dropped_failed_edge_routes_failed_via_fallback(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        rows: list[dict[str, object]],
+        status: str,
     ) -> None:
-        """A permanently rejected turn_failed edge is what the pane-death fallback reports."""
-        posted: list[tuple[str, str, object, object]] = []
-        rejected_details: list[object] = []
-        edge_attempts = 0
+        """A permanently rejected turn edge, recovered by pane death after a
+        restart, posts exactly the body the direct post carried."""
+        home = tmp_path / "home"
+        bridge = tmp_path / "bridge"
+        bridge.mkdir()
+        _loop_wire(home, rows)
+        rejecting = _FakeAsyncClient(reject={"external_session_status": [404] * 3})
 
-        async def _fake_item(_client: object, **kwargs: object) -> None:
-            return None
+        def _dropped() -> bool:
+            state = _read_state(bridge)
+            return state is not None and state.dropped_edge_status is not None
 
-        async def _fake_status(_client: object, **kwargs: object) -> None:
-            nonlocal edge_attempts
-            edge_attempts += 1
-            if edge_attempts <= 3:
-                rejected_details.append(kwargs.get("failure_detail"))
-                request = httpx.Request("POST", "http://test")
-                raise httpx.HTTPStatusError(
-                    "404", request=request, response=httpx.Response(404, request=request)
-                )
-            posted.append(
-                (
-                    str(kwargs["status"]),
-                    str(kwargs["output"]),
-                    kwargs.get("turn_outcome"),
-                    kwargs.get("failure_detail"),
-                )
-            )
+        await _drive_loop(
+            monkeypatch,
+            bridge_dir=bridge,
+            home=home,
+            client=rejecting,
+            launch_epoch_ms=0,
+            pane_alive=lambda: True,
+            post_backoff_initial_s=0.01,
+            until=_dropped,
+        )
+        direct = rejecting.rejected_posts
+        assert len(direct) == 3 and direct[0]["data"]["status"] == status
+        assert all(body == direct[0] for body in direct)
 
-        monkeypatch.setattr(fwd, "_post_conversation_item", _fake_item)
-        monkeypatch.setattr(fwd, "_post_external_session_status", _fake_status)
-
-        rows = [_prompt_row(), _turn_ended_row("failed", error_message="boom")]
-        await _drive_loop_until(tmp_path, rows, lambda: bool(posted), pane_alive=lambda: False)
-        assert edge_attempts == 4
-        # The recovered edge keeps the coded detail the rejected direct post carried.
-        assert rejected_details == ["provider.auth_error: boom"] * 3
-        assert posted == [
-            ("failed", "provider.auth_error: boom", "failed", "provider.auth_error: boom")
-        ]
+        recovering = _FakeAsyncClient()
+        await _drive_loop(
+            monkeypatch,
+            bridge_dir=bridge,
+            home=home,
+            client=recovering,
+            launch_epoch_ms=0,
+            pane_alive=lambda: False,
+            until=lambda: bool(_status_bodies(recovering)),
+        )
+        assert _status_bodies(recovering) == [direct[0]]
 
     async def test_redelivered_prompt_keeps_one_fallback_sequence(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -3064,9 +3085,9 @@ class _FakeAsyncClient:
 
     Records accepted POST bodies; ``fail_usage_posts`` makes that many
     ``external_session_usage`` posts raise before succeeding, to exercise the
-    per-poll retry path. ``reject`` maps an item ``source_id`` to the HTTP
-    statuses its next attempts get back (one per attempt), all recorded in
-    ``rejected``.
+    per-poll retry path. ``reject`` maps an item ``source_id`` (or, for events
+    without one, the event ``type``) to the HTTP statuses its next attempts get
+    back (one per attempt), all recorded in ``rejected`` / ``rejected_posts``.
     """
 
     def __init__(
@@ -3074,6 +3095,7 @@ class _FakeAsyncClient:
     ) -> None:
         self.posts: list[dict] = []
         self.rejected: list[tuple[str, int]] = []
+        self.rejected_posts: list[dict] = []
         self.fail_usage_posts = fail_usage_posts
         self.reject = reject or {}
 
@@ -3089,10 +3111,11 @@ class _FakeAsyncClient:
             self.fail_usage_posts -= 1
             raise httpx.ConnectError("boom")
         request = httpx.Request("POST", url)
-        source_id = json.get("data", {}).get("source_id")
+        source_id = json.get("data", {}).get("source_id") or json.get("type")
         if self.reject.get(source_id):
             status_code = self.reject[source_id].pop(0)
             self.rejected.append((source_id, status_code))
+            self.rejected_posts.append(json)
             return httpx.Response(status_code, request=request)
         self.posts.append(json)
         return httpx.Response(200, request=request)
@@ -3330,20 +3353,23 @@ class TestForwardLoopPostBodies:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         """A permanently rejected call cannot wedge the tail: its oversized
-        result is capped before upload and the turn's outcome still posts."""
+        error result is capped only in its POST body (parsing, as the offline
+        importer does, leaves it whole) and the turn's outcome still posts."""
         home = tmp_path / "home"
         bridge = tmp_path / "bridge"
         bridge.mkdir()
         big = "y" * (MAX_TOOL_OUTPUT_BYTES + 100)
-        _loop_wire(
+        wire = _loop_wire(
             home,
             [
                 _prompt_row(),
                 _tool_call_row("t1", call_id="c1", args={}),
-                _tool_result_row("t1", call_id="c1", result={"output": big}),
+                _tool_result_row("t1", call_id="c1", result={"output": big, "isError": True}),
                 _turn_ended_row("completed"),
             ],
         )
+        parsed = [i for i in read_kimi_wire_items(wire, 0) if i.kind == "tool_result"]
+        assert [i.text for i in parsed] == [f"Error: {big}"]
         client = _FakeAsyncClient(reject={"kimi:t1:call": [400] * 5})
         await _drive_loop(
             monkeypatch,
@@ -3361,7 +3387,7 @@ class TestForwardLoopPostBodies:
             "function_call_output",
             None,
         ]
-        assert transcript[1]["data"]["item_data"]["output"] == cap_tool_output(big)
+        assert transcript[1]["data"]["item_data"]["output"] == cap_tool_output(f"Error: {big}")
         assert transcript[2]["data"]["turn_outcome"] == "completed"
 
     async def test_retail_reposts_identical_tool_source_ids(

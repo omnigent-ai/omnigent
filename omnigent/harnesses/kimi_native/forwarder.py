@@ -151,6 +151,8 @@ class _ForwardState:
     # Wire outcome (completed/cancelled/failed) of a poison-dropped turn edge.
     dropped_edge_status: str | None = None
     dropped_edge_output: str = ""
+    # The dropped edge's failure detail, so the fallback body matches the direct one.
+    dropped_edge_failure_detail: str | None = None
     # The in-flight turn's latest assistant text, persisted so a restart
     # landing between the assistant message and its turn edge still forwards
     # the real result on the edge instead of an empty output.
@@ -224,7 +226,7 @@ class KimiWireItem:
     # idle with that turn_outcome), "turn_failed" (turn.ended failed or an
     # unknown reason → status: failed), "tool_call"/"tool_result" (a
     # function_call / function_call_output history item; ``text`` holds the
-    # arguments JSON / capped output), "usage" (a per-call token record →
+    # arguments JSON / output, capped when posted), "usage" (a per-call token record →
     # coalesced external_session_usage), or "model" (an llm.request's
     # effective model → deduped external_model_change).
     kind: str = "message"
@@ -284,6 +286,7 @@ def _read_state(bridge_dir: Path) -> _ForwardState | None:
     tools_in_flight = data.get("tools_in_flight")
     dropped_edge_status = data.get("dropped_edge_status")
     dropped_edge_output = data.get("dropped_edge_output")
+    dropped_edge_failure_detail = data.get("dropped_edge_failure_detail")
     last_activity_ts = data.get("last_activity_ts")
     last_seen_offset = data.get("last_seen_offset")
     wire_dev = data.get("wire_dev")
@@ -308,6 +311,11 @@ def _read_state(bridge_dir: Path) -> _ForwardState | None:
             ),
             dropped_edge_output=(
                 dropped_edge_output if isinstance(dropped_edge_output, str) else ""
+            ),
+            dropped_edge_failure_detail=(
+                dropped_edge_failure_detail
+                if isinstance(dropped_edge_failure_detail, str)
+                else None
             ),
             last_assistant_text=(
                 data["last_assistant_text"]
@@ -344,6 +352,7 @@ def _write_state(bridge_dir: Path, state: _ForwardState) -> None:
         "last_edge_id": state.last_edge_id,
         "dropped_edge_status": state.dropped_edge_status,
         "dropped_edge_output": state.dropped_edge_output,
+        "dropped_edge_failure_detail": state.dropped_edge_failure_detail,
         "last_assistant_text": state.last_assistant_text,
         "last_activity_ts": state.last_activity_ts,
         "last_seen_offset": state.last_seen_offset,
@@ -889,7 +898,6 @@ def _tool_item(line_no: int, event: dict[str, object]) -> KimiWireItem:
             text = json.dumps(output, ensure_ascii=False)
         if isinstance(result, dict) and result.get("isError") is True:
             text = f"Error: {text}"
-        text = cap_tool_output(text)
     return KimiWireItem(
         line_no=line_no,
         role="assistant",
@@ -1042,7 +1050,8 @@ async def _post_conversation_item(
     elif item.kind == "tool_result":
         data = {
             "item_type": "function_call_output",
-            "item_data": {"call_id": item.call_id, "output": item.text},
+            # Capped here, not at parse, so retries and offline import skip it.
+            "item_data": {"call_id": item.call_id, "output": cap_tool_output(item.text)},
             "response_id": item.response_id,
             "source_id": f"{item.response_id}:output",
         }
@@ -1621,6 +1630,7 @@ async def forward_kimi_wire_to_session(
     # the fallback close posts THIS outcome instead of its own.
     dropped_edge_status = state.dropped_edge_status if state is not None else None
     dropped_edge_output = state.dropped_edge_output if state is not None else ""
+    dropped_edge_failure_detail = state.dropped_edge_failure_detail if state is not None else None
     # Per-turn discriminator for fallback edge ids (see _ForwardState).
     turn_seq = state.turn_seq if state is not None else 0
     last_prompt_id = state.last_prompt_id if state is not None else None
@@ -1675,6 +1685,7 @@ async def forward_kimi_wire_to_session(
                     last_edge_id=last_edge_id,
                     dropped_edge_status=dropped_edge_status,
                     dropped_edge_output=dropped_edge_output,
+                    dropped_edge_failure_detail=dropped_edge_failure_detail,
                     last_assistant_text=last_assistant_text,
                     last_activity_ts=last_wire_activity_wall,
                     last_seen_offset=last_seen_offset,
@@ -1713,7 +1724,7 @@ async def forward_kimi_wire_to_session(
             # A wire edge the server permanently rejected already told us how
             # this turn ended; the fallback reports that instead of its own.
             outcome = dropped_edge_status or "failed"
-            detail = (dropped_edge_output or None) if dropped_edge_status else failure_detail
+            detail = dropped_edge_failure_detail if dropped_edge_status else failure_detail
             # Turn+line anchored id: a restart retrying this fallback dedupes
             # against the already-posted edge (turn_seq and last_line persist
             # together), while a later turn gets a fresh id EVEN when failed
@@ -2081,8 +2092,8 @@ async def forward_kimi_wire_to_session(
                                     # The turn's true outcome is known; hand it
                                     # to the fallback close.
                                     dropped_edge_status = item.outcome or "failed"
-                                    # A failed edge keeps its full detail for the fallback body.
-                                    dropped_edge_output = item.failure_detail or item.text
+                                    dropped_edge_output = item.text
+                                    dropped_edge_failure_detail = item.failure_detail
                                     tools_in_flight = 0
                                     usage_sync.note_turn_boundary()
                                 _note_tool_consumed(item)
