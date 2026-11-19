@@ -129,10 +129,10 @@ def register_elicitations_routes(
             (``"accept"`` / ``"decline"`` / ``"cancel"``) plus
             optional form ``content``.
         :returns: ``{"queued": False}`` — resolution is synchronous
-            and persists no conversation item. An answer to a question on
-            a session whose runner is gone returns the message path's
-            acknowledgement; an accept during a delivery gets that delivery's result.
-        :raises OmnigentError: 404 if no session exists; 403 when a policy denies such an answer.
+            and persists no conversation item. An answer sent as a message
+            (stopped session) returns that send's acknowledgement.
+        :raises OmnigentError: 404 if no session exists; for an answer sent as a message, the
+            message path's error, or 403 when a policy denies it.
         """
         user_id = _get_user_id(request, auth_provider)
         access = await _require_access_and_level(

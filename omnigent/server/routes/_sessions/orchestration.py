@@ -2933,7 +2933,7 @@ class _StoppedSessionAnswer:
     """
     One question's recovery on this replica: a running delivery, then its acknowledgement.
 
-    ``runner_id`` is the session's runner at the first answer; a retry re-checks it if it matches.
+    ``runner_id``: the session's runner at the first answer; a retry waits only for that runner.
     """
 
     started_at: float
@@ -2991,7 +2991,7 @@ async def _deliver_answer_to_stopped_session(
     Send an AskUserQuestion answer as a user message when the session's runner stays gone.
 
     The message path relaunches the runner; the card closes only after it accepts the message.
-    :returns: The acknowledgement (also for a later answer), or ``None`` for the old path.
+    :returns: The acknowledgement (also for a later answer), or ``None``: resolve as before.
     :raises OmnigentError: 403 on a policy denial, or the message path's error; waiters get it too.
     """
     elicitation_id = data.get("elicitation_id")
@@ -3058,7 +3058,7 @@ async def _deliver_answer_to_stopped_session(
             )
         after = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
         if after is None or after[1].get("params") != params or runner_back:
-            # Resolved elsewhere, asked again, or the runner is back: the old path handles it.
+            # Resolved elsewhere, asked again, or the runner is back: resolve as before.
             _stopped_session_answers.pop(key, None)
             return None
     if record is None:
@@ -3148,8 +3148,8 @@ async def _session_offline_host_id(
     """
     Return the session's user-run routing host when it has no live tunnel, else ``None``.
 
-    Before a relaunch or a runner wait: a disconnected host cannot start a runner. Managed
-    sandboxes and a host whose row reads live (connected elsewhere) count as not offline.
+    A disconnected host cannot start or reconnect a runner. Side chats inherit an ancestor's host.
+    Managed sandboxes and a host whose row reads live (connected elsewhere) count as not offline.
     """
     host_id = conv.host_id
     if host_id is None:
@@ -3180,7 +3180,7 @@ async def _session_runner_reachable(
     Return whether the session's runner is reachable, after the message path's connect grace.
 
     Same gates as the message path's runner wait in routes_events.py: no wait for a hostless
-    session or an offline host; the host's dead report or an exit report ends the wait early.
+    session or an offline host; the host reporting the runner dead, or an exit report, ends it.
     """
     if await _get_runner_client(session_id, runner_router, conversation=conv, for_control=True):
         return True

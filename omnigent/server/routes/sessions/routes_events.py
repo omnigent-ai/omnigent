@@ -2425,12 +2425,7 @@ def register_events_routes(
                 pass
             return {"queued": False}
         if body.type == _APPROVAL_TYPE:
-            # Deliver the verdict through the shared resolver: it
-            # sets any server-side harness Future (owner-checked),
-            # clears the sidebar badge, and forwards
-            # to the runner for runner-side (policy) elicitations.
-            # The dedicated URL endpoint (``.../elicitations/{eid}/
-            # resolve``) routes through the same helper.
+            # An answer whose runner stays gone goes as a message; the resolver handles the rest.
             delivered = await _deliver_answer_to_stopped_session(
                 request,
                 session_id,
@@ -2443,6 +2438,12 @@ def register_events_routes(
             )
             if delivered is not None:
                 return delivered
+            # Deliver the verdict through the shared resolver: it
+            # sets any server-side harness Future (owner-checked),
+            # clears the sidebar badge, and forwards
+            # to the runner for runner-side (policy) elicitations.
+            # The dedicated URL endpoint (``.../elicitations/{eid}/
+            # resolve``) routes through the same helper.
             await _resolve_elicitation(session_id, body.data, runner_router, conversation_store)
             # Apply any policy writes deferred by the relay tool-call ASK gate
             # (e.g. a cost-budget checkpoint) now that the verdict is in.
