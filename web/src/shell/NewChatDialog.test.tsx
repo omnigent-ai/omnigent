@@ -14267,17 +14267,9 @@ describe("NewChatLandingScreen picker curation", () => {
 });
 
 describe("New Chat composer engine", () => {
-  beforeEach(() => {
-    setupLandingMocks();
-    // CodeMirror measures its text through Range.getClientRects, which jsdom lacks.
-    Object.defineProperty(Range.prototype, "getClientRects", {
-      configurable: true,
-      value: () => [],
-    });
-  });
+  beforeEach(() => setupLandingMocks());
   afterEach(() => {
     cleanup();
-    Reflect.deleteProperty(Range.prototype, "getClientRects");
     resetCodeMirrorComposerLoadForTests();
     vi.restoreAllMocks();
   });
@@ -14303,10 +14295,46 @@ describe("New Chat composer engine", () => {
     expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
     fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
     await readCreateBody();
-    expect(setPendingInitialPromptMock).toHaveBeenCalledWith(
-      "conv_new",
-      expect.objectContaining({ text: "ship it" }),
+    await waitFor(() =>
+      expect(setPendingInitialPromptMock).toHaveBeenCalledWith(
+        "conv_new",
+        expect.objectContaining({ text: "ship it" }),
+      ),
     );
+  });
+
+  it("keeps the textarea-only mirror class off the editor once a session is tagged", async () => {
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    mockAgents([
+      testAgent("sdk1", "my-sdk-agent", { display_name: "SDK Agent", harness: "claude-sdk" }),
+    ]);
+    useConversationsMock.mockReturnValue({
+      data: {
+        pages: [
+          {
+            data: [{ id: "s_alpha", object: "conversation", title: "Alpha planning", labels: {} }],
+          },
+        ],
+      },
+    });
+    renderLanding({
+      features: {
+        harness_install: false,
+        codex_plan_at_launch: true,
+        chat_composer_codemirror: true,
+      },
+    });
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    const editor = screen.getByTestId("new-chat-landing-input");
+
+    act(() => insertComposerText(composerTargetOf(editor)!, "@"));
+    fireEvent.click(screen.getByTestId("session-mention-category-sessions"));
+    fireEvent.click(screen.getByTitle("Tag session Alpha planning"));
+
+    expect(composerTargetOf(editor)?.value).toBe("@Alpha planning ");
+    expect(editor).not.toHaveClass("text-transparent");
   });
 
   it("keeps the textarea when the flag is off", () => {
