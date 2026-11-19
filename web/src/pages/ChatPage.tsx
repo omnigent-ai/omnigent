@@ -3134,7 +3134,7 @@ function ComposerImpl(
   };
   // Sessions: this session's subagents, then sidebar-loaded rows, then search hits.
   const { children: childSessions } = useChildSessions(conversationId);
-  // The "@" menu's file/folder rows (a drill-down browser) and session rows.
+  // The "@" menu's rows come from useMentionListings, shared with the grid cell composer.
   const { mentionDir, mentionFilter, mentionEntries, sessionEntries, mentionListingPending } =
     useMentionListings({
       conversationId,
@@ -3144,7 +3144,7 @@ function ComposerImpl(
     });
 
   // Shared selection/chip/keyboard glue (see useMentionBrowser). The token
-  // state and the data source above stay here; everything stateful is shared
+  // state stays here; everything stateful is shared
   // so this composer and the launcher can't drift. ``setText`` also flags the
   // draft dirty so attach/drill participate in draft persistence.
   const {
