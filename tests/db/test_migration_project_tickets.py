@@ -236,3 +236,31 @@ def test_lifecycle_migration_preserves_existing_ticket_statuses_and_history(tmp_
     finally:
         engine.dispose()
         clear_engine_cache()
+
+
+def test_involvement_migration_preserves_existing_session_links(tmp_path):
+    uri = f"sqlite:///{tmp_path / 'involvement.db'}"
+    engine = get_or_create_engine(uri)
+    config = _build_alembic_config(uri)
+    link = {
+        "workspace_id": 0,
+        "project_id": b"a" * 16,
+        "ticket_id": b"b" * 16,
+        "session_id": b"c" * 16,
+        "created_at": 1,
+    }
+    try:
+        with engine.begin() as connection:
+            config.attributes["connection"] = connection
+            command.downgrade(config, "f9a0b1c2d3e4")
+            table = sa.Table("project_ticket_sessions", sa.MetaData(), autoload_with=connection)
+            connection.execute(table.insert().values(**link))
+            command.upgrade(config, "0a1b2c3d4e5f")
+            upgraded = sa.Table("project_ticket_sessions", sa.MetaData(), autoload_with=connection)
+            assert dict(connection.execute(upgraded.select()).mappings().one()) == {
+                **link,
+                "involvement": None,
+            }
+    finally:
+        engine.dispose()
+        clear_engine_cache()

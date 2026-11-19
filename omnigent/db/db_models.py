@@ -1034,6 +1034,7 @@ class SqlProjectTicketSession(OmnigentBase):
     ticket_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
     session_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    involvement: Mapped[str | None] = mapped_column(EnvelopedText(2048), nullable=True)
 
 
 class SqlProjectTicketLink(OmnigentBase):
