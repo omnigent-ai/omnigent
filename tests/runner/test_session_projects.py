@@ -921,8 +921,13 @@ async def test_update_archives_and_closes_a_sub_agent_on_the_callers_runner(titl
 async def test_update_refuses_a_sub_agent_on_the_callers_runner_without_the_server_check():
     requests: list[httpx.Request] = []
     # An older server cannot tell whether the sub-agent owns the shared runner.
-    info = {key: value for key, value in ORGANIZE_INFO.items() if key != "session_archive_runner_checks"}
-    snapshot = {"id": SUB_AGENT, "parent_session_id": PARENT, "runner_id": "runner-1", "labels": {}}
+    info = {**ORGANIZE_INFO, "session_archive_runner_checks": False}
+    snapshot = {
+        "id": SUB_AGENT,
+        "parent_session_id": PARENT,
+        "runner_id": "runner-1",
+        "labels": {},
+    }
     async with _client(_organize_server(requests, snapshot, info)) as client:
         result = json.loads(
             await execute_session_update(
