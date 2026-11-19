@@ -486,3 +486,119 @@ def test_frontmatter_name_renames_a_plugin_command(claude_dir: Path, tmp_path: P
     add_claude_plugin_resources({}, managed)
 
     assert [p.name for p in _prompts(managed).iterdir()] == ["dp:new.md"]
+
+
+def _make_unusable(path: Path, kind: str, limit: int, outside: Path) -> None:
+    """Replace *path* with a special, symlinked, oversized, or directory entry; never read it."""
+    if path.is_dir() and not path.is_symlink():
+        path.rmdir() if not any(path.iterdir()) else None
+    path.unlink(missing_ok=True)
+    if kind == "fifo":
+        os.mkfifo(path)
+    elif kind == "symlink":
+        path.symlink_to(outside)
+    elif kind == "oversize":
+        path.write_bytes(b" " * (limit + 1))
+    else:
+        path.mkdir()
+
+
+_UNUSABLE_KINDS = ("fifo", "symlink", "oversize", "directory")
+
+
+@pytest.mark.timeout(20)
+@pytest.mark.parametrize("kind", _UNUSABLE_KINDS)
+@pytest.mark.parametrize("consumer", ["package", "installed", "command", "skill"])
+def test_unusable_metadata_is_skipped_without_blocking(
+    consumer: str,
+    kind: str,
+    claude_dir: Path,
+    tmp_path: Path,
+) -> None:
+    """A FIFO, symlink, oversized file, or directory where metadata belongs never blocks or loads.
+
+    The hard timeout turns a regression that blocks on a FIFO into a failure. The tests do
+    not read the special file; only the bridge's bounded reader is allowed to open it.
+    """
+    if kind == "fifo" and not hasattr(os, "mkfifo"):
+        pytest.skip("FIFOs need POSIX")
+    outside = tmp_path / "outside.txt"
+    if consumer == "package":
+        root = _install(claude_dir, "dp@market", files={**_skill("review"), "package.json": "{}"})
+        bad = root / "package.json"
+        limit = module.MAX_MANIFEST_BYTES
+        outside.write_text('{"pi": {}}', encoding="utf-8")
+        _make_unusable(bad, kind, limit, outside)
+        result = add_claude_plugin_resources({}, tmp_path / "managed")
+        # Unusable metadata means a plain plugin: its skill loads, and no package does.
+        assert str(root / "skills" / "review") in result["skills"]
+        assert "packages" not in result
+        return
+    if consumer == "installed":
+        root = _install(claude_dir, "dp@market", files=_skill("review"))
+        bad = claude_dir / "plugins" / "installed_plugins.json"
+        valid = bad.read_bytes()
+        limit = module.MAX_MANIFEST_BYTES
+        outside.write_bytes(valid)
+        _make_unusable(bad, kind, limit, outside)
+        result = add_claude_plugin_resources({}, tmp_path / "managed")
+        # A symlink to the user's own valid config is followed; the others load nothing.
+        loaded = str(root / "skills" / "review") in result.get("skills", [])
+        assert loaded is (kind == "symlink")
+        return
+    if consumer == "command":
+        root = _install(
+            claude_dir, "dp@market", files={"commands/ok.md": "OK\n", "commands/x.md": "X\n"}
+        )
+        bad = root / "commands" / "x.md"
+        outside.write_text("SECRET", encoding="utf-8")
+        _make_unusable(bad, kind, module.MAX_COMMAND_BYTES, outside)
+        managed = tmp_path / "managed"
+        add_claude_plugin_resources({}, managed)
+        names = {p.name for p in _prompts(managed).iterdir()}
+        assert "dp:ok.md" in names
+        assert "dp:x.md" not in names
+        return
+    root = _install(claude_dir, "dp@market", files={**_skill("complete"), **_skill("bad")})
+    bad = root / "skills" / "bad" / "SKILL.md"
+    outside.write_text("---\nname: bad\ndescription: d\n---\n", encoding="utf-8")
+    _make_unusable(bad, kind, module.MAX_SKILL_BYTES, outside)
+    result = add_claude_plugin_resources({}, tmp_path / "managed")
+    assert str(root / "skills" / "complete") in result["skills"]
+    assert str(root / "skills" / "bad") not in result["skills"]
+
+
+@pytest.mark.timeout(20)
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs need POSIX")
+def test_fifo_settings_file_skips_the_whole_bridge(claude_dir: Path, tmp_path: Path) -> None:
+    """A FIFO in the user's own settings would block the shared readers, so nothing is bridged."""
+    _install(claude_dir, "dp@market", files=_skill("review"))
+    settings_path = claude_dir / "settings.json"
+    settings_path.unlink()
+    os.mkfifo(settings_path)
+
+    assert add_claude_plugin_resources({}, tmp_path / "managed") == {}
+
+
+def test_project_scoped_installs_are_not_loaded(claude_dir: Path, tmp_path: Path) -> None:
+    """A user-enabled key does not load another project's install; a user install still loads."""
+    user = _install(claude_dir, "dp@market", files=_skill("user"))
+    other = claude_dir / "plugins" / "cache" / "market" / "dp" / "0.9.0"
+    for relative, content in _skill("other").items():
+        (other / relative).parent.mkdir(parents=True, exist_ok=True)
+        (other / relative).write_text(content, encoding="utf-8")
+    _write_json(
+        claude_dir / "plugins" / "installed_plugins.json",
+        {
+            "plugins": {
+                "dp@market": [
+                    {"scope": "project", "projectPath": "/elsewhere", "installPath": str(other)},
+                    {"scope": "user", "installPath": str(user)},
+                ]
+            }
+        },
+    )
+
+    result = add_claude_plugin_resources({}, tmp_path / "managed")
+
+    assert result["skills"] == [str(user / "skills" / "user")]

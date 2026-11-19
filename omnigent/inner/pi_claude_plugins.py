@@ -5,29 +5,34 @@ to the managed ``settings.json``. Entries are only appended, and a resource the 
 already lists by the same resolved path is not added again. Excluding one resource of a
 plugin is not supported yet; disabling the plugin in Claude Code drops all of its resources.
 
-Command names follow the existing plugin command discovery, which matches Claude Code:
-``<plugin>:<path under commands/>``, where a frontmatter ``name`` replaces the filename.
+Command names follow the existing plugin command discovery: ``<plugin>:<path under
+commands/>``, where a frontmatter ``name`` replaces the filename. Unlike that discovery,
+only lowercase ``.md`` files are bridged, and a ``skill.md`` inside a directory is a plain
+command rather than a skill, and ``user-invocable`` is not honored.
 """
 
 from __future__ import annotations
 
 import itertools
+import json
 import logging
 import os
 import re
 import shutil
+import stat
 from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import replace
 from pathlib import Path
 from typing import TypeAlias
 
+import yaml
+
 from omnigent.server.feature_flags import Feature, resolve_feature_flags
 from omnigent.spec.skill_sources import (
+    _FRONTMATTER_RE,
     _enabled_plugin_keys,
-    _parse_command,
-    _plugin_install_paths,
-    _read_json,
+    _quote_description_with_colon,
     skill_source_context_from_env,
 )
 
@@ -41,6 +46,8 @@ PI_CLAUDE_PLUGIN_RESOURCES_DIR = "claude-plugins"
 _PLUGIN_ROOT_VARIABLE = "${CLAUDE_PLUGIN_ROOT}"
 MAX_PLUGIN_FILES = 512
 MAX_COMMAND_BYTES = 256 * 1024
+MAX_MANIFEST_BYTES = 256 * 1024
+MAX_SKILL_BYTES = 1024 * 1024
 _MAX_WALK_DIRS = 256
 _MAX_WALK_DEPTH = 8
 _MAX_ENTRIES_PER_DIR = 1024
@@ -50,6 +57,70 @@ _MAX_FILENAME_BYTES = 255
 _PLUGIN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 # Symlink loops, NUL bytes, and unknown ``~user`` prefixes raise these.
 _PATH_ERRORS = (OSError, RuntimeError, ValueError)
+# The user's own Claude config is checked for readability before the shared readers open it.
+_USER_CONFIG_FILES = (
+    ("settings.json", False),
+    ("settings.local.json", False),
+    ("managed_plugins.json", True),
+)
+
+
+def _read_bytes(path: Path, limit: int, *, follow_symlinks: bool = False) -> bytes | None:
+    """The bytes of the regular file at *path*, or ``None`` with a warning.
+
+    The single bounded reader for this module. The file is opened without blocking, so
+    a FIFO or device cannot stall the caller, and the opened descriptor is checked to be
+    a regular file of at most *limit* bytes. Symlinks are refused unless
+    *follow_symlinks* is set, which is only for the user's own Claude config.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+    if not follow_symlinks:
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        _logger.warning("Skipping Pi resource file %s: %s", path, exc)
+        return None
+    try:
+        with os.fdopen(fd, "rb") as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                _logger.warning("Skipping %s: not a regular file", path)
+                return None
+            data = handle.read(limit + 1)
+    except OSError as exc:
+        _logger.warning("Skipping Pi resource file %s: %s", path, exc)
+        return None
+    if len(data) > limit:
+        _logger.warning("Skipping %s: larger than %d bytes", path, limit)
+        return None
+    return data
+
+
+def _read_text(path: Path, limit: int, *, follow_symlinks: bool = False) -> str | None:
+    """Like :func:`_read_bytes`, decoded as UTF-8; ``None`` when unreadable or not text."""
+    data = _read_bytes(path, limit, follow_symlinks=follow_symlinks)
+    if data is None:
+        return None
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        _logger.warning("Skipping %s: not UTF-8 text", path)
+        return None
+
+
+def _read_json_object(path: Path, limit: int, *, follow_symlinks: bool = False) -> dict | None:
+    """A JSON object read through :func:`_read_bytes`, or ``None``."""
+    text = _read_text(path, limit, follow_symlinks=follow_symlinks)
+    if text is None:
+        return None
+    try:
+        data = json.loads(text)
+    except ValueError:
+        _logger.warning("Skipping %s: not valid JSON", path)
+        return None
+    return data if isinstance(data, dict) else None
 
 
 def _resolve(value: str | Path, *, user_entry: bool = False) -> Path | None:
@@ -72,30 +143,101 @@ def _resolve(value: str | Path, *, user_entry: bool = False) -> Path | None:
         return None
 
 
+def _entry_source(entry: object) -> str | None:
+    """The source string of a Pi resource entry, which may be an object form."""
+    source = entry.get("source") if isinstance(entry, dict) else entry
+    return source if isinstance(source, str) and source else None
+
+
 def _listed_paths(entries: object) -> set[Path]:
     """Resolved paths of a user's plain entries; ``+``, ``-`` and ``!`` entries are not paths."""
     if not isinstance(entries, list):
         return set()
     listed: set[Path] = set()
     for entry in entries:
-        source = entry.get("source") if isinstance(entry, dict) else entry
-        resolved = _resolve(source, user_entry=True) if isinstance(source, str) else None
+        source = _entry_source(entry)
+        resolved = _resolve(source, user_entry=True) if source is not None else None
         if resolved is not None:
             listed.add(resolved)
     return listed
 
 
-def _enabled_plugins() -> list[tuple[str, Path, bool]]:
-    """Enabled Claude plugins as ``(name, install root, declares Pi)``.
+def _claude_user_dir() -> Path:
+    """Claude Code's user config dir: ``$CLAUDE_CONFIG_DIR``, else ``~/.claude``."""
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(configured).expanduser() if configured else Path.home() / ".claude"
 
-    Installation records are read the way the MCP inventory reads them. Only user-level
-    enablement is read; project-level ``enabledPlugins`` are not.
+
+def _user_config_is_readable(claude: Path) -> bool:
+    """Whether the user's Claude config files that the shared readers open are regular files.
+
+    A special file such as a FIFO there would block those readers, so the whole bridge is
+    skipped with a warning instead.
     """
+    for relative, in_plugins in _USER_CONFIG_FILES:
+        path = (claude / "plugins" if in_plugins else claude) / relative
+        try:
+            if not path.exists():
+                continue
+            mode = os.stat(path).st_mode
+        except OSError as exc:
+            _logger.warning("Not bridging Claude plugins: %s is unreadable: %s", path, exc)
+            return False
+        if not stat.S_ISREG(mode):
+            _logger.warning("Not bridging Claude plugins: %s is not a regular file", path)
+            return False
+    return True
+
+
+def _user_install_path(key: str, entries: list, plugins_root: Path) -> Path | None:
+    """The user-scoped install path of *key*, inside the plugins root, or ``None``.
+
+    Records for another scope or project are skipped, so a user-enabled key cannot load
+    an install that belongs to a different project.
+    """
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("scope", "user") != "user" or entry.get("projectPath"):
+            _logger.warning("Not bridging Claude plugin %s: installation is not user-scoped", key)
+            continue
+        raw = entry.get("installPath")
+        if not isinstance(raw, str) or not raw:
+            continue
+        candidate = Path(raw)
+        resolved = _resolve(candidate if candidate.is_absolute() else plugins_root / candidate)
+        if resolved is not None and resolved.is_relative_to(plugins_root):
+            return resolved
+        _logger.warning("Not bridging Claude plugin %s: install path is outside the plugins", key)
+    return None
+
+
+def _enabled_plugins() -> list[tuple[str, Path, bool]]:
+    """Enabled user-scope Claude plugins as ``(name, install root, declares Pi)``.
+
+    Only the user's own enablement is read; project-level ``enabledPlugins`` are not.
+    """
+    claude = _claude_user_dir()
+    if not _user_config_is_readable(claude):
+        return []
+    plugins_root = (claude / "plugins").resolve()
+    installed = _read_json_object(
+        claude / "plugins" / "installed_plugins.json", MAX_MANIFEST_BYTES, follow_symlinks=True
+    )
+    records = installed.get("plugins") if installed else None
+    if not isinstance(records, dict):
+        return []
     ctx = replace(skill_source_context_from_env(roots=(), harness="claude-native"), is_native=True)
+    enabled = _enabled_plugin_keys(ctx)
     plugins: list[tuple[str, Path, bool]] = []
-    for key, root in _plugin_install_paths(ctx, _enabled_plugin_keys(ctx)).items():
-        manifest = _read_json(root / "package.json") or {}
-        declares_pi = isinstance(manifest.get("pi"), dict)
+    for key, entries in records.items():
+        if key not in enabled or not isinstance(entries, list):
+            continue
+        root = _user_install_path(key, entries, plugins_root)
+        if root is None:
+            continue
+        manifest = _read_json_object(root / "package.json", MAX_MANIFEST_BYTES)
+        declares_pi = bool(manifest) and isinstance(manifest.get("pi"), dict)
         plugins.append((key.split("@", 1)[0], root, declares_pi))
     return plugins
 
@@ -137,33 +279,52 @@ def _skill_dirs(skills_dir: Path, listed: set[Path]) -> list[str]:
     """Skill directories under *skills_dir* the user does not list; a listed root claims all."""
     if skills_dir.is_symlink() or not skills_dir.is_dir() or _resolve(skills_dir) in listed:
         return []
-    directories = [
-        _resolve(skill_md.parent)
-        for _, skill_md in _walk(skills_dir, lambda n: n == "SKILL.md", MAX_PLUGIN_FILES)
-    ]
-    return [str(d) for d in directories if d is not None and d not in listed]
+    directories: list[str] = []
+    for _, skill_md in _walk(skills_dir, lambda n: n == "SKILL.md", MAX_PLUGIN_FILES):
+        if _read_bytes(skill_md, MAX_SKILL_BYTES) is None:
+            continue
+        skill_dir = _resolve(skill_md.parent)
+        if skill_dir is not None and skill_dir not in listed:
+            directories.append(str(skill_dir))
+    return directories
 
 
-def _write_command(name: str, root: Path, suffix: str, source: Path, prompts_dir: Path) -> bool:
+def _command_name(text: str, segments: tuple[str, ...]) -> str:
+    """The command name for *segments*, where a frontmatter ``name`` replaces the last one.
+
+    Matches the existing plugin command discovery in ``omnigent.spec.skill_sources``.
+    """
+    *parents, stem = segments
+    name = stem
+    match = _FRONTMATTER_RE.match(text)
+    if match:
+        try:
+            frontmatter = yaml.safe_load(match.group(1))
+        except yaml.YAMLError:
+            try:
+                frontmatter = yaml.safe_load(_quote_description_with_colon(match.group(1)))
+            except yaml.YAMLError:
+                frontmatter = None
+        raw = frontmatter.get("name") if isinstance(frontmatter, dict) else None
+        if isinstance(raw, str) and raw.strip():
+            name = raw.strip()
+    return ":".join((*parents, name))
+
+
+def _write_command(name: str, root: Path, suffix: str, text: str, prompts_dir: Path) -> bool:
     """Write one command prompt named ``<plugin>:<suffix>``; returns ``False`` if skipped."""
     command = f"{name}:{suffix}"
+    if len(f"{command}.md".encode()) > _MAX_FILENAME_BYTES:
+        _logger.warning("Skipping Claude command %s: generated name is too long", command)
+        return False
+    target = prompts_dir / f"{command}.md"
     try:
-        if len(f"{command}.md".encode()) > _MAX_FILENAME_BYTES:
-            _logger.warning("Skipping Claude command %s: generated name is too long", command)
-            return False
-        if not source.resolve().is_relative_to(root):
-            return False
-        if source.stat().st_size > MAX_COMMAND_BYTES:
-            _logger.warning("Skipping Claude command %s: file is too large", command)
-            return False
-        target = prompts_dir / f"{command}.md"
         if target.exists():
             # Another marketplace's plugin with the same name already claimed this command.
             _logger.info("Skipping Claude command %s: name already provided", command)
             return False
-        body = source.read_text(encoding="utf-8")
         prompts_dir.mkdir(parents=True, exist_ok=True)
-        target.write_text(body.replace(_PLUGIN_ROOT_VARIABLE, str(root)), encoding="utf-8")
+        target.write_text(text.replace(_PLUGIN_ROOT_VARIABLE, str(root)), encoding="utf-8")
     except _PATH_ERRORS as exc:
         _logger.warning("Skipping Claude command %s: %s", command, exc)
         return False
@@ -173,11 +334,9 @@ def _write_command(name: str, root: Path, suffix: str, source: Path, prompts_dir
 def _write_commands(name: str, root: Path, prompts_dir: Path, listed: set[Path]) -> bool:
     """Write the plugin's ``commands/**/*.md`` as ``<plugin>:<command>`` prompt templates.
 
-    The command name matches the existing plugin command discovery: the path under
-    ``commands/`` with ``/`` as ``:``, where a frontmatter ``name`` replaces the last
-    segment. A commands directory, or a command file, that the user's ``prompts``
-    setting lists by resolved path is not written again. Files are read only from
-    inside the plugin root.
+    A commands directory, or a command file, that the user's ``prompts`` setting lists by
+    resolved path is not written again. Files are read only through :func:`_read_text`
+    from inside the plugin root.
 
     :returns: ``True`` when at least one prompt was written.
     """
@@ -187,12 +346,13 @@ def _write_commands(name: str, root: Path, prompts_dir: Path, listed: set[Path])
     written = False
     for relative, source in _walk(commands_dir, lambda n: n.endswith(".md"), MAX_PLUGIN_FILES):
         resolved = _resolve(source)
-        if resolved is None or resolved in listed:
+        if resolved is None or resolved in listed or not resolved.is_relative_to(root):
             continue
-        spec = _parse_command(source, (*relative, source.stem), name_from_frontmatter=True)
-        if spec is None:
+        text = _read_text(source, MAX_COMMAND_BYTES)
+        if text is None:
             continue
-        written |= _write_command(name, root, spec.name, source, prompts_dir)
+        suffix = _command_name(text, (*relative, source.stem))
+        written |= _write_command(name, root, suffix, text, prompts_dir)
     return written
 
 
