@@ -40,7 +40,13 @@ let generation = 0;
 
 function settle(next: CodeMirrorComposerLoad) {
   current = next;
-  for (const listener of listeners) listener();
+  for (const listener of listeners) {
+    try {
+      listener();
+    } catch (error: unknown) {
+      console.error("A CodeMirror composer listener threw.", error);
+    }
+  }
 }
 
 export function codeMirrorComposerLoad(): CodeMirrorComposerLoad {
@@ -61,15 +67,10 @@ export function loadCodeMirrorComposer(): void {
     status: "ready" as const,
     Component: module.createCodeMirrorComposerInput(codeMirrorComposerEnvironment()),
   }));
-  // Subscriber errors are logged here, so they can't flip a loaded editor to failed.
   built.then(
     (next) => {
       if (attempt !== generation) return;
-      try {
-        settle(next);
-      } catch (error: unknown) {
-        console.error("A CodeMirror composer listener threw.", error);
-      }
+      settle(next);
     },
     (error: unknown) => {
       if (attempt !== generation) return;

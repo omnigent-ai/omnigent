@@ -70,21 +70,45 @@ describe("loading the CodeMirror composer", () => {
     expect(warn).toHaveBeenCalledTimes(1);
   });
 
-  it("keeps a loaded editor when a subscriber throws", async () => {
-    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const error = vi.spyOn(console, "error").mockImplementation(() => {});
-    resetCodeMirrorComposerLoadForTests(() => Promise.resolve(CodeMirrorComposerModule));
-    const unsubscribe = subscribeCodeMirrorComposerLoad(() => {
-      if (codeMirrorComposerLoad().status === "ready") throw new Error("listener failed");
-    });
+  it.each(["loading", "ready", "failed"] as const)(
+    "keeps a loaded editor when a subscriber throws on %s",
+    async (throwOn) => {
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+      const logError = vi.spyOn(console, "error").mockImplementation(() => {});
+      const importer = vi
+        .fn()
+        .mockImplementationOnce(() =>
+          throwOn === "failed"
+            ? Promise.reject(new Error("offline"))
+            : Promise.resolve(CodeMirrorComposerModule),
+        )
+        .mockResolvedValue(CodeMirrorComposerModule);
+      resetCodeMirrorComposerLoadForTests(importer);
+      const throwingListener = subscribeCodeMirrorComposerLoad(() => {
+        if (codeMirrorComposerLoad().status === throwOn) throw new Error("listener failed");
+      });
+      const statuses: string[] = [];
+      const healthyListener = subscribeCodeMirrorComposerLoad(() =>
+        statuses.push(codeMirrorComposerLoad().status),
+      );
 
-    loadCodeMirrorComposer();
+      loadCodeMirrorComposer();
+      const settled = throwOn === "failed" ? "failed" : "ready";
+      await vi.waitFor(() => expect(codeMirrorComposerLoad().status).toBe(settled));
+      if (throwOn === "failed") {
+        loadCodeMirrorComposer();
+        await vi.waitFor(() => expect(codeMirrorComposerLoad().status).toBe("ready"));
+      }
 
-    await vi.waitFor(() => expect(error).toHaveBeenCalledTimes(1));
-    expect(codeMirrorComposerLoad().status).toBe("ready");
-    expect(warn).not.toHaveBeenCalled();
-    unsubscribe();
-  });
+      expect(importer).toHaveBeenCalledTimes(throwOn === "failed" ? 2 : 1);
+      expect(logError).toHaveBeenCalledTimes(1);
+      expect(statuses).toEqual(
+        throwOn === "failed" ? ["loading", "failed", "loading", "ready"] : ["loading", "ready"],
+      );
+      throwingListener();
+      healthyListener();
+    },
+  );
 
   it("drops a load that finishes after a reset", async () => {
     let finishImport!: () => void;

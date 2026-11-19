@@ -158,6 +158,8 @@ describe("CodeMirrorComposerInput change events", () => {
   it("takes a controlled value without reporting it or making it undoable", () => {
     const onChange = vi.fn();
     const { content, target, rerender, setTarget } = mount({ value: "a", onChange });
+    act(() => insertComposerText(target(), "b", 1, 1));
+    expect(onChange).toHaveBeenCalledTimes(1);
     rerender(
       <CodeMirrorComposerInput
         aria-label="Message the agent"
@@ -166,11 +168,36 @@ describe("CodeMirrorComposerInput change events", () => {
         ref={setTarget}
       />,
     );
-    expect(target().value).toBe("ab");
-    expect(onChange).not.toHaveBeenCalled();
+    rerender(
+      <CodeMirrorComposerInput
+        aria-label="Message the agent"
+        value=""
+        onChange={onChange}
+        ref={setTarget}
+      />,
+    );
+    expect(target().value).toBe("");
+    expect(onChange).toHaveBeenCalledTimes(1);
 
-    act(() => void undo(EditorView.findFromDOM(content)!));
-    expect(target().value).toBe("ab");
+    const editor = EditorView.findFromDOM(content)!;
+    act(() => void undo(editor));
+    act(() => void redo(editor));
+    expect(target().value).toBe("");
+  });
+
+  it("keeps an edit the parent ignores until the value changes", () => {
+    const { target, rerender, setTarget } = mount({ value: "draft" });
+    act(() => insertComposerText(target(), "x", 5, 5));
+
+    rerender(
+      <CodeMirrorComposerInput aria-label="Message the agent" value="draft" ref={setTarget} />,
+    );
+    expect(target().value).toBe("draftx");
+
+    rerender(
+      <CodeMirrorComposerInput aria-label="Message the agent" value="next" ref={setTarget} />,
+    );
+    expect(target().value).toBe("next");
   });
 
   it("puts the caret at the end of a longer value after a caret move past the old end", () => {

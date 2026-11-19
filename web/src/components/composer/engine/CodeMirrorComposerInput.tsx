@@ -385,7 +385,7 @@ function CodeMirrorComposer({
   useImperativeHandle(forwardedRef, () => surfaceRef.current!, []);
 
   // Reconciles when `value` changes, not on every render: a render that lands before a pending
-  // keystroke would otherwise revert it.
+  // keystroke would otherwise revert it. So an edit the parent rejects without changing `value` stays.
   useLayoutEffect(() => {
     const view = viewRef.current;
     if (view && value !== undefined) syncControlledValue(view, value);
