@@ -3053,11 +3053,49 @@ describe("side-chat composer highlight", () => {
     expect(input).toHaveValue("!git status");
   });
 
-  it("does not offer shell mode on a pending tab, whose text seeds the fork", () => {
-    renderPane(<SideChatPane childId="pending:side" onStart={vi.fn()} />);
+  it("does not offer shell mode on a pending Codex tab, whose text seeds a `/side` fork", () => {
+    renderPane(
+      <SideChatPane childId="pending:side" onStart={vi.fn()} pendingHarness="codex-native" />,
+    );
     fireEvent.change(screen.getByTestId("side-chat-input"), { target: { value: "!ls" } });
     expect(screen.queryByTestId("composer-shell-mode-indicator")).toBeNull();
     expect(screen.queryByTestId("composer-highlight-overlay")).toBeNull();
+  });
+
+  // Elsewhere the text becomes the child's first message, which runs as native input.
+  it("offers shell mode on a pending Claude Code tab, and starts it as typed", () => {
+    const onStart = vi.fn(async () => {});
+    renderPane(
+      <SideChatPane childId="pending:side" onStart={onStart} pendingHarness="claude-native" />,
+    );
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "!ls" } });
+    expect(input).toHaveAttribute("data-shell-command", "true");
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent("Shell command");
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onStart).toHaveBeenCalledExactlyOnceWith("!ls");
+  });
+
+  it("refuses a pending Claude Code tab's quoted `!` start, and keeps it", () => {
+    const onStart = vi.fn(async () => {});
+    useChatStore.setState({
+      sideChatComposers: {
+        "pending:side": {
+          text: "",
+          files: [],
+          quotes: [{ id: "q", before: "!ls", text: "quoted line" }],
+        },
+      },
+    });
+    renderPane(
+      <SideChatPane childId="pending:side" onStart={onStart} pendingHarness="claude-native" />,
+    );
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent(
+      SHELL_QUOTE_REFUSAL,
+    );
+    fireEvent.keyDown(screen.getByTestId("side-chat-input"), { key: "Enter" });
+    expect(onStart).not.toHaveBeenCalled();
+    expect(screen.getByTestId("side-chat-command-notice")).toHaveTextContent(SHELL_QUOTE_REFUSAL);
   });
 });
 

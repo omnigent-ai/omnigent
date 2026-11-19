@@ -20,6 +20,7 @@ import type {
   ComposerTextTarget,
 } from "@/components/composer/engine/composerInput";
 import { cn } from "@/lib/utils";
+import { LEVEL_OWNER } from "@/lib/permissionsApi";
 import {
   type Bubble,
   type BubbleCache,
@@ -307,6 +308,7 @@ export function SideChatPane({
   childId,
   selectionParentId,
   onStart,
+  pendingHarness,
   readOnly: restoredReadOnly = false,
   fullSession = false,
   evenComposerPadding = false,
@@ -316,6 +318,8 @@ export function SideChatPane({
   childId: string;
   selectionParentId?: string;
   onStart?: (text: string) => Promise<void>;
+  /** A pending tab's parent harness, which its fork runs. */
+  pendingHarness?: string | null;
   /** Show the transcript without a composer when the viewer cannot edit. */
   readOnly?: boolean;
   /** Display an existing session with its complete history and scoped composer. */
@@ -702,6 +706,7 @@ export function SideChatPane({
                 fullSession={fullSession}
                 childId={childId}
                 harness={sessionHarness}
+                pendingHarness={pendingHarness}
                 session={session}
                 settingsSession={pending ? draftSource : session}
                 agentId={boundAgentId}
@@ -733,6 +738,7 @@ function SideChatComposer({
   fullSession,
   childId,
   harness,
+  pendingHarness = null,
   session,
   settingsSession,
   agentId,
@@ -748,6 +754,7 @@ function SideChatComposer({
   fullSession: boolean;
   childId: string;
   harness: string | null | undefined;
+  pendingHarness?: string | null;
   session: Session | null | undefined;
   settingsSession: Session | null | undefined;
   agentId: string | null;
@@ -1210,10 +1217,16 @@ function SideChatComposer({
     clearText: () => setText(""),
   });
   const menuCommandNames = useMemo(() => Object.keys(menuCommands), [menuCommands]);
-  // A pending tab's text seeds the fork rather than reaching the harness. A null level means
-  // owner, so wait for the snapshot before offering codex's owner-only `!`.
-  const nativeShell =
-    pending || !session ? null : nativeShellHarness(harness, session.permissionLevel ?? null);
+  // Codex forks from a `/side` message, so its pending text never reaches the shell; other
+  // forks send it as the child's first message. Only the root's owner starts a side chat.
+  // A live tab's null level means owner, so wait for the snapshot before codex's owner-only `!`.
+  const nativeShell = pending
+    ? usesNativeSideChatFork(pendingHarness)
+      ? null
+      : nativeShellHarness(pendingHarness, LEVEL_OWNER)
+    : session
+      ? nativeShellHarness(harness, session.permissionLevel ?? null)
+      : null;
   const outgoingText = isSlashCommandText(text) ? text.trim() : text.trimEnd();
   const highlight = useComposerHighlight({
     value: text,
@@ -1249,18 +1262,19 @@ function SideChatComposer({
   const submit = () => {
     if (settingsSavePending()) return;
     const trimmed = outgoingText;
+    const refused = () => {
+      if (highlight.refusal === null) return false;
+      setCommandNotice(highlight.refusal);
+      return true;
+    };
     if (pending) {
-      if (!canSend || starting || !onStart) return;
+      if (!canSend || starting || !onStart || refused()) return;
       // Keep the text so a failed fork can be retried without re-typing.
       void onStart(serializeReplyDraft({ quotes, text: trimmed }));
       return;
     }
     // A grid cell queues or steers its send while the session works; other full sessions wait.
-    if ((busy && fullSession && !gridCell) || !canSend || agentId === null) return;
-    if (highlight.refusal !== null) {
-      setCommandNotice(highlight.refusal);
-      return;
-    }
+    if ((busy && fullSession && !gridCell) || !canSend || agentId === null || refused()) return;
     // On in-process harnesses /help and skills resolve locally; native TUIs
     // (claude-native, codex-native) read the text themselves, and a quote, attachment,
     // tag or review comment is always an ordinary message.
