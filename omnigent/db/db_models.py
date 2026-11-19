@@ -910,6 +910,7 @@ class SqlProject(OmnigentBase):
     # can always override. Opaque and never SQL-filtered — stored compressed
     # (CompressedText).
     config: Mapped[str | None] = mapped_column(CompressedText, nullable=True)
+    orchestrator_session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
 
     __table_args__ = (
         # "list my projects" — prefix scan on (workspace_id, user_id) with
@@ -938,6 +939,98 @@ class SqlProject(OmnigentBase):
             "id",
         ),
     )
+
+
+class SqlProjectTicket(OmnigentBase):
+    """A project-owned outcome; its sessions and append-only history are separate."""
+
+    __tablename__ = "project_tickets"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    project_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    title: Mapped[str] = mapped_column(EnvelopedText(1024), nullable=False)
+    description: Mapped[str] = mapped_column(EnvelopedText(16383), nullable=False)
+    status: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    tags: Mapped[list[dict[str, str]]] = mapped_column(EnvelopedJSON(4096), nullable=False)
+    completion_summary: Mapped[str | None] = mapped_column(EnvelopedText(8192), nullable=True)
+    latest_update: Mapped[str] = mapped_column(EnvelopedText(2048), nullable=False)
+    comment_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    next_event_position: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    updated_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        Index("ix_project_tickets_created", "workspace_id", "project_id", "created_at", "id"),
+        Index(
+            "ix_project_tickets_status", "workspace_id", "project_id", "status", "created_at", "id"
+        ),
+    )
+
+
+class SqlProjectTicketEvent(OmnigentBase):
+    """Immutable ticket activity; notification_state tracks delivery, not content edits."""
+
+    __tablename__ = "project_ticket_events"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    project_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    ticket_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    kind: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    agent_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(EnvelopedJSON(16383), nullable=False)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    notification_state: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+
+    __table_args__ = (
+        Index(
+            "ix_project_ticket_events_position",
+            "workspace_id",
+            "project_id",
+            "ticket_id",
+            "position",
+            "id",
+        ),
+        Index(
+            "ix_project_ticket_events_kind",
+            "workspace_id",
+            "project_id",
+            "ticket_id",
+            "kind",
+            "position",
+            "id",
+        ),
+        # The cross-workspace delivery worker reads a bounded page of pending events.
+        Index(
+            "ix_project_ticket_events_notification",
+            "notification_state",
+            "workspace_id",
+            "project_id",
+            "ticket_id",
+            "position",
+            "id",
+        ),
+        CheckConstraint(
+            "user_id IS NULL OR length(CAST(user_id AS BLOB)) <= 512",
+            name="ck_project_ticket_events_user_id_bytes",
+        ).ddl_if(callable_=_on_sqlite_family),
+    )
+
+
+class SqlProjectTicketSession(OmnigentBase):
+    """Explicit same-project ticket/session associations, never ownership of history."""
+
+    __tablename__ = "project_ticket_sessions"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    project_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    ticket_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    session_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
 
 class SqlConversation(ConversationBase):
