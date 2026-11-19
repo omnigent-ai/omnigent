@@ -166,6 +166,13 @@ describe("pull request references in chat markdown", () => {
     expect(screen.getByText("#1357").closest("code")).not.toBeNull();
   });
 
+  it("follows the browser's raw HTML nesting", () => {
+    seed(githubInfo());
+    // A stray `</a>` doesn't end the code; `<a/>` opens an anchor holding the rest.
+    renderMarkdown("Code <code>#2468</a> #1357</code> then #4321.\n\nSee <a/> #1234 here.");
+    expect(hrefs()).toEqual(["https://github.com/acme/app/pull/4321"]);
+  });
+
   it.each([true, false])("leaves a hand-written parked fragment alone (opted in: %s)", (optIn) => {
     seed(githubInfo());
     renderMarkdown("[section](#omnigent-pr-4242)", optIn);

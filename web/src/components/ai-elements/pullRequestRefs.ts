@@ -50,9 +50,9 @@ interface MarkdownNode {
 // Their text is already a link. Code and raw HTML carry a `value`, not text children.
 const LINK_NODE_TYPES = new Set(["link", "linkReference"]);
 // Inline raw HTML parses as separate tag and text siblings: `<a href>`, `#1234`, `</a>`.
-// Text inside a raw anchor is already a link; inside raw code it is literal.
-const HTML_OPAQUE_OPEN = /^<(?:a|code|pre|kbd|samp)[\s/>]/i;
-const HTML_OPAQUE_CLOSE = /^<\/(?:a|code|pre|kbd|samp)\s*>/i;
+// Text inside a raw anchor is already a link; inside raw code it is literal. As in
+// a browser, `<a/>` still opens its element, and a closer only ends its own tag.
+const HTML_OPAQUE_TAG = /^<(\/?)(a|code|pre|kbd|samp)(?=[\s/>])/i;
 
 /** Remark plugin parking every pull request reference in a text node on a fragment link. */
 export function remarkPullRequestRefs() {
@@ -61,16 +61,18 @@ export function remarkPullRequestRefs() {
 
 function linkifyChildren(node: MarkdownNode): void {
   if (!node.children || LINK_NODE_TYPES.has(node.type)) return;
-  let openOpaqueTags = 0;
+  const openOpaqueTags = new Map<string, number>();
   node.children = node.children.flatMap((child) => {
     if (child.type === "html" && typeof child.value === "string") {
-      if (HTML_OPAQUE_OPEN.test(child.value)) openOpaqueTags += 1;
-      else if (HTML_OPAQUE_CLOSE.test(child.value)) {
-        openOpaqueTags = Math.max(0, openOpaqueTags - 1);
+      const tag = child.value.match(HTML_OPAQUE_TAG);
+      if (tag) {
+        const name = tag[2].toLowerCase();
+        const open = openOpaqueTags.get(name) ?? 0;
+        openOpaqueTags.set(name, tag[1] ? Math.max(0, open - 1) : open + 1);
       }
       return [child];
     }
-    if (openOpaqueTags > 0) return [child];
+    if ([...openOpaqueTags.values()].some((open) => open > 0)) return [child];
     if (child.type === "text" && typeof child.value === "string") {
       return splitPullRequestRefs(child.value);
     }

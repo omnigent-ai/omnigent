@@ -191,6 +191,31 @@ describe("remarkPullRequestRefs", () => {
     expect(tree.children[0].children).toEqual(anchored);
   });
 
+  it("ignores a raw closing tag that closes nothing open", () => {
+    const opaque = [
+      { type: "html", value: "<code>" },
+      { type: "text", value: "#2468" },
+      { type: "html", value: "</a>" },
+      { type: "text", value: " #1357" },
+      { type: "html", value: "</code>" },
+    ];
+    const tree = {
+      type: "root",
+      children: [
+        {
+          type: "paragraph",
+          children: [...structuredClone(opaque), { type: "text", value: " #4321" }],
+        },
+      ],
+    };
+    remarkPullRequestRefs()(tree);
+    expect(tree.children[0].children.slice(0, opaque.length)).toEqual(opaque);
+    expect(tree.children[0].children.at(-1)).toMatchObject({
+      type: "link",
+      url: `${PULL_REQUEST_REF_HREF_PREFIX}4321`,
+    });
+  });
+
   it("keeps linking after a stray raw closing tag", () => {
     const tree = {
       type: "root",
