@@ -3454,6 +3454,51 @@ async def test_run_now_503_when_scheduler_not_running(
     assert resp.status_code == 503, resp.text
 
 
+@pytest.mark.parametrize("owner_deleted", [False, True], ids=["live-owner", "deleted-owner"])
+async def test_run_now_checks_external_owner_and_updates_timer(
+    auth_client: httpx.AsyncClient, auth_app: FastAPI, db_uri: str, owner_deleted: bool
+) -> None:
+    from sqlalchemy import update
+
+    from omnigent.db.db_models import SqlUser
+    from omnigent.db.utils import get_or_create_engine
+    from tests._helpers.polling import poll_until_async
+
+    engine = get_or_create_engine(db_uri)
+    with engine.begin() as connection:
+        connection.execute(
+            update(SqlUser)
+            .where(SqlUser.id == "alice@example.com")
+            .values(account_generation="owner-generation")
+        )
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    task_id = created.json()["id"]
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    assert store.get(task_id).account_generation is None
+    scheduler = auth_app.state.scheduled_task_scheduler
+    assert scheduler.next_run_at(task_id) is not None
+    if owner_deleted:
+        # Leave the task active to model deletion racing a fire's initial task read.
+        with engine.begin() as connection:
+            connection.execute(
+                update(SqlUser).where(SqlUser.id == "alice@example.com").values(deleted_at=1)
+            )
+
+    response = await auth_client.post(f"/v1/scheduled-tasks/{task_id}/run", headers=_headers())
+    assert response.status_code == 202, response.text
+    await poll_until_async(lambda: store.list_runs(task_id)[0])
+    run = store.list_runs(task_id)[0][0]
+
+    assert run.error_code == ("owner_deleted" if owner_deleted else "host_offline"), run.error
+    assert run.status == "failed"
+    assert run.conversation_id is None
+    assert store.get(task_id).state == ("deleted" if owner_deleted else "active")
+    assert (scheduler.next_run_at(task_id) is None) is owner_deleted
+
+
 @pytest.mark.parametrize("auth_app", [True], indirect=True)
 async def test_database_scheduler_run_now_404_for_nonowned_task(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
