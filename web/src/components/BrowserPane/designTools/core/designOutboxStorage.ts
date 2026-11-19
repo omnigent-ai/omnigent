@@ -29,6 +29,7 @@ export interface SavedRequest {
   error?: string;
   /** Its last attempt was refused (it never reached the agent). */
   refused?: true;
+  /** When it was first saved: later saves keep it, so it expires a day after it was made. */
   savedAt: number;
   /** The browser tab that owns it (see `thisTab`). */
   page: string;
@@ -182,6 +183,8 @@ async function bytesOf(file: File): Promise<ArrayBuffer> {
 
 // A request's text and files never change, so its files are read once (once it works).
 const savedFiles = new Map<string, Promise<SavedFile[]>>();
+// When each request this page saves or adopts was first saved.
+const firstSaved = new Map<string, number>();
 
 function filesOf(request: DesignRequest): Promise<SavedFile[]> {
   const cached = savedFiles.get(request.id);
@@ -217,7 +220,7 @@ export async function saveRequest(request: DesignRequest, userId: string): Promi
     status: request.status,
     ...(request.error ? { error: request.error } : {}),
     ...(request.delivery === "refused" ? { refused: true as const } : {}),
-    savedAt: Date.now(),
+    savedAt: firstSaved.get(request.id) ?? Date.now(),
     page: tab,
     userId,
     server: thisServer(),
@@ -225,12 +228,14 @@ export async function saveRequest(request: DesignRequest, userId: string): Promi
   const objects = await store("readwrite");
   objects.put(record);
   await committed(objects.transaction);
+  if (!firstSaved.has(record.id)) firstSaved.set(record.id, record.savedAt);
   noteSavedDesignRequests(true);
 }
 
 /** Forget a saved request (sent, or removed); resolves once it's committed. */
 export async function deleteRequest(id: string): Promise<void> {
   savedFiles.delete(id);
+  firstSaved.delete(id);
   const objects = await store("readwrite");
   objects.delete(id);
   await committed(objects.transaction);
@@ -272,6 +277,7 @@ export function adoptSavedRequests(
         if (record.userId !== userId || record.server !== server || !free(record.page)) continue;
         if (record.page === tab && held.has(record.id)) continue;
         const mine = { ...record, page: tab };
+        firstSaved.set(mine.id, mine.savedAt);
         objects.put(mine);
         adopted.push(mine);
       }
@@ -293,6 +299,7 @@ export function savedFilesOf(record: SavedRequest): File[] {
 /** Test hook: an empty store. */
 export async function resetDesignOutboxStorage(): Promise<void> {
   savedFiles.clear();
+  firstSaved.clear();
   if (!globalThis.indexedDB) return;
   const objects = await store("readwrite");
   objects.clear();

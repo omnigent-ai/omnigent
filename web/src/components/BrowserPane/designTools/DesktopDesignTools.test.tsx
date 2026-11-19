@@ -602,6 +602,35 @@ describe("DesktopDesignTools: Draw", () => {
     expect(tabTools(VIEW).shapes[0]!.points).toHaveLength(4);
   });
 
+  it("draws at the display's current scale after the window changes displays", async () => {
+    fakeShell();
+    const overlays = fakeOverlays();
+    renderTools();
+    await open("Draw on the page");
+    const canvas = overlays.view().getByTestId("draw-layer") as HTMLCanvasElement;
+    const { win } = overlays.opened[0]!;
+    const methods: Record<PropertyKey, ReturnType<typeof vi.fn>> = {};
+    const context = new Proxy(methods, { get: (target, key) => (target[key] ??= vi.fn()) });
+    canvas.getContext = (() => context) as unknown as HTMLCanvasElement["getContext"];
+    const cssWidth = parseFloat(canvas.style.width);
+    const strokeAt = async (ratio: number) => {
+      Object.defineProperty(win, "devicePixelRatio", { value: ratio, configurable: true });
+      fireEvent.pointerDown(canvas, { clientX: 10, clientY: 10 });
+      await act(async () => {
+        fireEvent.pointerUp(win, { clientX: 60, clientY: 40 });
+      });
+    };
+    await strokeAt(2);
+    expect(canvas.width).toBe(cssWidth * 2);
+    expect(methods.setTransform).toHaveBeenLastCalledWith(2, 0, 0, 2, 0, 0);
+    await strokeAt(1);
+    expect(canvas.width).toBe(cssWidth);
+    expect(methods.setTransform).toHaveBeenLastCalledWith(1, 0, 0, 1, 0, 0);
+    await strokeAt(2);
+    expect(canvas.width).toBe(cssWidth * 2);
+    expect(methods.setTransform).toHaveBeenLastCalledWith(2, 0, 0, 2, 0, 0);
+  });
+
   it("keeps Draw's text and the tool when Escape only cancels an input method's text", async () => {
     // Laid out, so the toolbar (and its Escape) counts as on screen.
     vi.spyOn(HTMLElement.prototype, "getClientRects").mockReturnValue([

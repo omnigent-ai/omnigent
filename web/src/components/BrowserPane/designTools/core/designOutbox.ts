@@ -308,22 +308,24 @@ export function processDesignOutbox(): void {
 
 /**
  * Whether `request`'s owner was just confirmed still signed in, so it may go now (cookies
- * may name another account after a sign-in in another window). If not, asks the server.
+ * may name another account after a sign-in in another window). If not, asks the server;
+ * one queued before anyone was known becomes the signed-in account's before it first goes.
  */
 function ownerSignedIn(request: DesignRequest): boolean {
-  const owner = owners.get(request.id);
-  if (owner === undefined) return true;
   const confirmedAt = ownerConfirmedAt.get(request.id);
   if (confirmedAt !== undefined && Date.now() - confirmedAt < OWNER_CHECK_MS) return true;
   if (confirmingOwner.has(request.id)) return false;
   confirmingOwner.add(request.id);
   void fetchSignedInUserId().then((signedIn) => {
     confirmingOwner.delete(request.id);
-    if (signedIn === owner) {
+    // Read now: a save may have bound it while the server answered.
+    const owner = owners.get(request.id);
+    if (signedIn === undefined) {
+      setTimeout(schedule, OWNER_CHECK_MS);
+    } else if (owner === undefined || signedIn === owner) {
+      if (signedIn !== null) owners.set(request.id, signedIn);
       ownerConfirmedAt.set(request.id, Date.now());
       schedule();
-    } else if (signedIn === undefined) {
-      setTimeout(schedule, OWNER_CHECK_MS);
     } else {
       update(request.id, { status: "failed", error: ACCOUNT_CHANGED, delivery: "refused" });
     }

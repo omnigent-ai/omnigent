@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { browserViewId } from "@/hooks/useBrowserTabs";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import type * as ChatStore from "@/store/chatStore";
+import type * as Identity from "@/lib/identity";
 import { nativePendingId } from "./pendingInputId";
 import { useChatStore, type SendOptions } from "@/store/chatStore";
 
@@ -13,6 +14,11 @@ vi.mock("@/store/chatStore", async (importOriginal) => ({
     chat.delivered.add(listener);
     return () => chat.delivered.delete(listener);
   },
+}));
+// No account is known here; the server says none is signed in (no sign-in on this server).
+vi.mock("@/lib/identity", async (importOriginal) => ({
+  ...(await importOriginal<typeof Identity>()),
+  fetchSignedInUserId: async () => null,
 }));
 const runnerTook = (id: string) => {
   for (const listener of chat.delivered) listener(id);

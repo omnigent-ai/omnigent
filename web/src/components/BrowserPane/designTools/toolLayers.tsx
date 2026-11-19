@@ -232,19 +232,19 @@ export function DrawLayer({ tabId, url, rect, onNotice, popoverContainer }: Laye
   const width = rect?.width ?? 0;
   const height = rect?.height ?? 0;
 
-  // Sized only when the frame is: resizing the backing store on each pointer move would stutter.
   useEffect(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
+    // One scale for the backing store and the marks, read now: the window may have changed displays.
+    // Resized only when that changes the size, as resizing on each pointer move would stutter.
     const ratio = windowOf(canvas).devicePixelRatio || 1;
-    canvas.width = Math.round(width * ratio);
-    canvas.height = Math.round(height * ratio);
-  }, [width, height]);
-  useEffect(() => {
-    const canvas = canvasRef.current;
-    const context = canvas?.getContext("2d");
-    if (!canvas || !context) return;
-    prepareMarksCanvas(context, width, height, windowOf(canvas).devicePixelRatio || 1);
+    const backingWidth = Math.round(width * ratio);
+    const backingHeight = Math.round(height * ratio);
+    if (canvas.width !== backingWidth) canvas.width = backingWidth;
+    if (canvas.height !== backingHeight) canvas.height = backingHeight;
+    const context = canvas.getContext("2d");
+    if (!context) return;
+    prepareMarksCanvas(context, width, height, ratio);
     for (const shape of current ? [...shapes, current] : shapes) drawShape(context, shape);
   }, [shapes, current, width, height]);
 

@@ -580,6 +580,52 @@ describe("design outbox storage", () => {
     expect(status()?.error).toBeUndefined();
   });
 
+  it("makes a request queued before anyone was known the signed-in account's before it goes", async () => {
+    let delivered = () => {};
+    const send = vi.fn(
+      () =>
+        new Promise<void>((resolve) => {
+          delivered = resolve;
+        }),
+    );
+    identity.user = null;
+    identity.signedIn = "bob";
+    const id = queueDesignRequest({ tabId: TAB, label: "Annotate", text: "Bob's" });
+    useChatStore.setState({
+      conversationId: SESSION,
+      boundAgentId: "agent_1",
+      status: "idle",
+      sessionStatus: "idle",
+      startupPending: false,
+      queuedMessages: [],
+      pendingUserMessages: [],
+      pendingModelChange: null,
+      send,
+    });
+    await vi.waitFor(() => expect(send).toHaveBeenCalled());
+    // This page learns of Alice while it sends: its saved copy stays Bob's.
+    identity.user = "alice";
+    for (const listener of identity.listeners) listener();
+    await vi.waitFor(async () => expect(await records()).toMatchObject([{ id, userId: "bob" }]));
+    delivered();
+  });
+
+  it("keeps a request's first save time when it's saved again, so it still expires on time", async () => {
+    const madeAt = Date.now();
+    const id = queueDesignRequest({ tabId: TAB, label: "Annotate", text: "Green" });
+    await designOutboxSaved();
+    vi.spyOn(Date, "now").mockReturnValue(madeAt + SAVED_REQUEST_TTL_MS / 2);
+    useDesignOutbox.setState((state) => ({
+      requests: state.requests.map((request) =>
+        request.id === id ? { ...request, status: "failed", error: "Couldn't send: x" } : request,
+      ),
+    }));
+    await designOutboxSaved();
+    const [saved] = await records();
+    expect(saved).toMatchObject({ id, status: "failed" });
+    expect(saved!.savedAt).toBeLessThanOrEqual(madeAt + 1000);
+  });
+
   it("keeps saving a request as its first owner's after the account changes", async () => {
     const id = queueDesignRequest({ tabId: TAB, label: "Annotate", text: "Alice's" });
     await designOutboxSaved();
