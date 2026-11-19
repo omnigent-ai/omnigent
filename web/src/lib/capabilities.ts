@@ -356,6 +356,12 @@ export interface ServerInfo {
    */
   workflows?: boolean;
   /**
+   * Owners can share saved workflows (``/v1/workflows/{id}/permissions``), and
+   * ``/v1/workflows/shared`` lists those shared with the viewer; absent on older
+   * servers (off).
+   */
+  workflow_sharing?: boolean;
+  /**
    * True when the server stores each user's session title instructions
    * (``/v1/settings/session-title-instructions``); absent on older servers (off).
    */
@@ -760,6 +766,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_pull_requests: data.session_pull_requests === true,
           session_journal: data.session_journal === true,
           workflows: data.workflows === true,
+          workflow_sharing: data.workflow_sharing === true,
           session_title_instructions: data.session_title_instructions === true,
           admin_view: data.admin_view === true,
           comment_anchor_metadata: data.comment_anchor_metadata === true,

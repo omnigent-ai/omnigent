@@ -5436,7 +5436,7 @@ function NewChatLandingContent({
   const [inputFocused, setInputFocused] = useState(false);
   const skillPrefix = skillInvocationPrefix(skillsHarness);
   const canStartWorkflow = offersWorkflow(availableSkills);
-  const savedWorkflows = useSavedWorkflows({ enabled: canStartWorkflow });
+  const savedWorkflows = useSavedWorkflows({ enabled: canStartWorkflow, includeShared: true });
   const [workflowDialogOpen, setWorkflowDialogOpen] = useState(false);
   // Run a workflow starts from the draft, or from text typed in the saved-workflow search.
   const [workflowDialogDescription, setWorkflowDialogDescription] = useState<string | null>(null);

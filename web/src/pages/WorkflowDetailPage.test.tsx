@@ -136,6 +136,11 @@ vi.mock("@/components/scheduled/CreateScheduledTaskDialog", () => ({
   CreateScheduledTaskDialog: (props: { open: boolean; lockedWorkflow?: SavedWorkflow | null }) =>
     props.open ? <div data-testid="new-automation-dialog">{props.lockedWorkflow?.name}</div> : null,
 }));
+// The share dialog has its own tests; here it names the workflow it shares.
+vi.mock("@/components/PermissionsModal", () => ({
+  PermissionsModal: (props: { open: boolean; workflow?: { id: string; name: string } }) =>
+    props.open ? <div data-testid="workflow-share-dialog">{props.workflow?.name}</div> : null,
+}));
 // The automations list has its own tests; here it names the workflow it lists.
 vi.mock("@/components/workflows/WorkflowAutomations", () => ({
   WorkflowAutomations: ({ workflowId }: { workflowId: string }) => (
@@ -2113,6 +2118,126 @@ describe("WorkflowDetailPage", () => {
       expect(showToast).toHaveBeenCalledWith("Couldn’t delete “Triage flaky tests”.");
     },
   );
+
+  describe("sharing", () => {
+    const SHARING_INFO = { ...FALLBACK_SERVER_INFO, workflow_sharing: true };
+    const SHARING_OFF = "Sharing has been disabled for this Omnigent server.";
+    const UNSHAREABLE =
+      "This workflow was saved before sharing was available. Clone it, then share the copy.";
+    const SHARED: WorkflowDetail = {
+      ...WORKFLOW,
+      planning_session_id: "d".repeat(32),
+      viewer_role: "viewer",
+      owner_display_name: "Alice",
+    };
+
+    it("lets its owner share it", () => {
+      vi.mocked(useServerInfo).mockReturnValue(SHARING_INFO);
+      mockWorkflow({});
+      mockRuns([]);
+      renderPage();
+
+      fireEvent.click(screen.getByRole("button", { name: "Share workflow" }));
+      expect(screen.getByTestId("workflow-share-dialog")).toHaveTextContent(WORKFLOW.name);
+    });
+
+    it.each([
+      ["a server that doesn't share workflows", FALLBACK_SERVER_INFO],
+      ["a single-user server", { ...SHARING_INFO, single_user: true }],
+    ])("offers no Share on %s", (_label, info) => {
+      vi.mocked(useServerInfo).mockReturnValue(info);
+      mockWorkflow({});
+      mockRuns([]);
+      renderPage();
+      expect(screen.queryByTestId("workflow-detail-share")).toBeNull();
+      expect(screen.getByTestId("workflow-detail-clone")).toBeEnabled();
+    });
+
+    it.each([
+      ["while sharing is off", "off" as const, true, SHARING_OFF],
+      ["on a workflow saved before sharing", undefined, false, UNSHAREABLE],
+      [
+        "on a workflow saved before sharing while sharing is off",
+        "off" as const,
+        false,
+        SHARING_OFF,
+      ],
+    ])("disables Share with its reason %s", async (_label, sharingMode, shareable, reason) => {
+      vi.mocked(useServerInfo).mockReturnValue({
+        ...SHARING_INFO,
+        ...(sharingMode && { sharing_mode: sharingMode }),
+      });
+      mockWorkflow({ data: { ...WORKFLOW, shareable } });
+      mockRuns([]);
+      renderPage();
+
+      const share = screen.getByRole("button", { name: "Share workflow" });
+      expect(share).toBeDisabled();
+      const wrapper = screen.getByRole("group", { name: "Share workflow" });
+      expect(wrapper).toContainElement(share);
+      fireEvent.focus(wrapper);
+      expect(await screen.findByRole("tooltip")).toHaveTextContent(reason);
+      expect(screen.queryByTestId("workflow-share-dialog")).toBeNull();
+    });
+
+    it.each([
+      ["Edit plan with agent", "Only the workflow's owner can edit it."],
+      ["Delete workflow", "Only the workflow's owner can delete it."],
+      ["Share workflow", "Only the workflow's owner can share it."],
+    ])("disables %s on a workflow shared with the viewer", async (label, reason) => {
+      vi.mocked(useServerInfo).mockReturnValue(SHARING_INFO);
+      mockWorkflow({ data: SHARED });
+      mockRuns([]);
+      renderPage();
+
+      expect(screen.getByRole("button", { name: label })).toBeDisabled();
+      fireEvent.focus(screen.getByRole("group", { name: label }));
+      expect(await screen.findByRole("tooltip")).toHaveTextContent(reason);
+    });
+
+    it("shows a workflow shared with the viewer read-only, with Run and Clone", () => {
+      vi.mocked(useServerInfo).mockReturnValue(SHARING_INFO);
+      mockWorkflow({ data: SHARED });
+      mockRuns([run("a".repeat(32), "My run", { done: 2 })]);
+      vi.mocked(useSession).mockClear();
+      renderPage();
+
+      expect(screen.getByTestId("workflow-detail-owner")).toHaveTextContent("Shared by Alice");
+      expect(screen.getByTestId("workflow-detail-clone")).toBeEnabled();
+      expect(screen.queryByRole("button", { name: "Edit description" })).toBeNull();
+      expect(screen.queryByTestId("workflow-detail-create-automation")).toBeNull();
+      expect(screen.queryByTestId("workflow-automations-section")).toBeNull();
+      // The planning chat is the owner's: it isn't loaded or offered.
+      expect(useSession).not.toHaveBeenCalledWith(SHARED.planning_session_id);
+      expect(screen.queryByTestId("planning-chat")).toBeNull();
+      expect(screen.getByTestId("workflow-runs")).toHaveTextContent("My run");
+
+      fireEvent.click(screen.getByTestId("workflow-detail-run"));
+      expect(screen.getByTestId("workflow-session-dialog")).toHaveTextContent(WORKFLOW.id);
+    });
+
+    it("clones a shared workflow into the viewer's own and opens the copy", async () => {
+      vi.mocked(useServerInfo).mockReturnValue(SHARING_INFO);
+      mockWorkflow({ data: SHARED });
+      mockRuns([]);
+      const copy = { ...WORKFLOW, id: "c".repeat(32), name: `${WORKFLOW.name} (copy)` };
+      vi.mocked(authenticatedFetch).mockReset();
+      vi.mocked(authenticatedFetch).mockImplementation(async (_url, init) =>
+        Response.json(init?.method === "POST" ? copy : SHARED),
+      );
+      renderPage();
+
+      fireEvent.click(screen.getByTestId("workflow-detail-clone"));
+      await waitFor(() => expect(navigate).toHaveBeenCalledWith(`/workflows/${copy.id}`));
+      const [, post] = vi.mocked(authenticatedFetch).mock.calls;
+      expect(post?.[0]).toBe("/v1/workflows");
+      expect(JSON.parse(String(post?.[1]?.body))).toEqual({
+        name: copy.name,
+        description: WORKFLOW.description,
+        steps: WORKFLOW.steps,
+      });
+    });
+  });
 
   it("tells a missing workflow from one that failed to load", () => {
     mockWorkflow({ data: undefined, isError: true, error: new WorkflowNotFoundError() });

@@ -19,9 +19,11 @@ import {
   isOwnerLevel,
   listAutomationPermissions,
   listPermissions,
+  listWorkflowPermissions,
   revokePermission,
   revokeSharePermission,
   sharedAutomationsListed,
+  workflowSharingAvailable,
   workspaceSharingBlocked,
 } from "./permissionsApi";
 
@@ -397,6 +399,70 @@ describe("automation permissions", () => {
       ]);
     },
   );
+});
+
+describe("workflow permissions", () => {
+  const workflow = { kind: "workflow", id: "a".repeat(32) } as const;
+  const path = `/v1/workflows/${"a".repeat(32)}/permissions`;
+
+  it("lists every page of a workflow's grants, then shares and unshares one", async () => {
+    fetchMock
+      .mockResolvedValueOnce(
+        mockResponse({
+          permissions: [
+            {
+              user_id: "alice@example.com",
+              workflow_id: workflow.id,
+              level: 1,
+              display_name: "Alice",
+            },
+          ],
+          next_cursor: "alice@example.com",
+        }),
+      )
+      .mockResolvedValueOnce(mockResponse({ permissions: [], next_cursor: null }))
+      .mockResolvedValueOnce(
+        mockResponse({ user_id: "bob@example.com", workflow_id: workflow.id, level: 1 }),
+      )
+      .mockResolvedValueOnce(mockResponse(null, { status: 204 }));
+
+    const grants = await listWorkflowPermissions(workflow.id);
+    expect(grants.permissions.map((grant) => grant.display_name)).toEqual(["Alice"]);
+    await grantSharePermission(workflow, "bob@example.com", 1);
+    await revokeSharePermission(workflow, "bob@example.com");
+
+    expect(fetchMock.mock.calls.map(([url, init]) => [url, init?.method ?? "GET"])).toEqual([
+      [path, "GET"],
+      [`${path}?after=alice%40example.com`, "GET"],
+      [path, "PUT"],
+      [`${path}/bob%40example.com`, "DELETE"],
+    ]);
+    expect(JSON.parse(fetchMock.mock.calls[2]![1].body as string)).toEqual({
+      user_id: "bob@example.com",
+      level: 1,
+    });
+  });
+
+  it("surfaces the server's refusal of a workflow saved before sharing", async () => {
+    const message =
+      "This workflow was saved before sharing was available. Clone it, then share the copy.";
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({ error: { code: "forbidden", message } }, { ok: false, status: 403 }),
+    );
+    await expect(grantSharePermission(workflow, "bob@example.com", 1)).rejects.toThrow(message);
+  });
+});
+
+describe("workflowSharingAvailable", () => {
+  const sharing = { ...FALLBACK_SERVER_INFO, workflow_sharing: true };
+  it.each([
+    ["a multi-user server that shares workflows", sharing, true],
+    ["a single-user server", { ...sharing, single_user: true }, false],
+    ["a server without workflow sharing", FALLBACK_SERVER_INFO, false],
+    ["a server still loading", "loading" as const, false],
+  ])("answers for %s", (_label, info, expected) => {
+    expect(workflowSharingAvailable(info)).toBe(expected);
+  });
 });
 
 describe("canShareAutomation", () => {
