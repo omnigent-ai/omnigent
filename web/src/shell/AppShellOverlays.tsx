@@ -1,5 +1,4 @@
 import { lazy, Suspense } from "react";
-import { ArcaShutdownToast } from "@/components/ArcaShutdownToast";
 import { KeyboardShortcutsDialog } from "@/components/KeyboardShortcutsDialog";
 import { ImportReviewGate } from "@/components/onboarding/HostImportReview";
 import { Toaster } from "@/components/ui/sonner";
@@ -59,8 +58,6 @@ export function AppShellOverlays({
       <KeyboardShortcutsDialog />
       {/* Opens the import modal once per newly connected host. */}
       {!isEmbedded && <ImportReviewGate />}
-      {/* Keep this after Outlet so a visible chat banner wins before the toast effect runs. */}
-      {isFeatureEnabled(serverInfo, "arca_shutdown_warnings") && <ArcaShutdownToast />}
       {/* Dev-only `?import-preview` for the post-setup import modal. */}
       {ImportContextPreview && (
         <Suspense fallback={null}>
