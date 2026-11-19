@@ -31,6 +31,7 @@ import {
   isTextEntry,
 } from "@/lib/hotkeys";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { isComposerInput } from "@/components/composer/engine/composerInput";
 
 /**
  * Map from question id/text → either a single selected label
@@ -324,7 +325,7 @@ export function AskUserQuestionForm({
     };
     // The chat composer. Side-chat composers are excluded and count as other inputs.
     const composer =
-      !inside && target instanceof HTMLTextAreaElement
+      !inside && isComposerInput(target)
         ? target.closest<HTMLElement>("[data-composer-card]:not([data-side-chat])")
         : null;
     const suggestionsOpen = composer?.dataset.suggestionsOpen === "true";

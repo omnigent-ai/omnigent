@@ -29,6 +29,10 @@ import { clearSessionDrafts, getSessionDraft, setSessionDraft } from "@/lib/sess
 import * as sessionsApi from "@/lib/sessionsApi";
 import type { Session } from "@/lib/types";
 import type * as ChatStoreModule from "@/store/chatStore";
+import type * as AgentLabelsModule from "@/lib/agentLabels";
+import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
+import type * as UseConversationsModule from "@/hooks/useConversations";
+import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
 import { gridCellComposerKey, useChatStore, type ChatState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
@@ -76,6 +80,71 @@ vi.mock("@/hooks/useSkills", () => ({
   useSkills: (options: { target: unknown; enabled?: boolean; starting?: boolean }) => {
     skillsFixture.lastOptions = options;
     return { ...skillsFixture.current, refetch: vi.fn() };
+  },
+}));
+// The "@" picker's listings are fixed here, and record who asked for them: a side
+// chat must never ask for its own.
+const mentionListing = vi.hoisted(() => ({
+  rootEntries: [] as unknown[],
+  rootLoading: false,
+  environmentLoading: false,
+  searchHits: [] as unknown[],
+  declaredHarnesses: new Set<string>(["claude-sdk"]),
+  workspaceQueries: [] as { owner?: string; enabled?: boolean }[],
+  environmentQueries: [] as { owner?: string; enabled?: boolean }[],
+  directoryQueries: [] as { owner?: string; dirPath: string | null }[],
+  searchQueries: [] as { owner?: string; query: string }[],
+  childOwners: [] as unknown[],
+  searchEnabled: [] as boolean[],
+  catalogEnabled: [] as boolean[],
+}));
+vi.mock("@/hooks/useWorkspaceChangedFiles", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseWorkspaceChangedFilesModule>()),
+  useWorkspaceAllFiles: (owner?: string, options?: { enabled?: boolean }) => {
+    mentionListing.workspaceQueries.push({ owner, enabled: options?.enabled });
+    return {
+      data:
+        options?.enabled === false
+          ? undefined
+          : { available: true, data: mentionListing.rootEntries },
+      isLoading: options?.enabled !== false && mentionListing.rootLoading,
+    };
+  },
+  useWorkspaceEnvironment: (owner?: string, options?: { enabled?: boolean }) => {
+    mentionListing.environmentQueries.push({ owner, enabled: options?.enabled });
+    return { isLoading: options?.enabled === true && mentionListing.environmentLoading };
+  },
+  useWorkspaceDirectory: (owner: string | undefined, dirPath: string | null) => {
+    mentionListing.directoryQueries.push({ owner, dirPath });
+    return { data: undefined, isLoading: false };
+  },
+  useWorkspaceFileSearch: (owner: string | undefined, query: string) => {
+    mentionListing.searchQueries.push({ owner, query });
+    return { data: undefined };
+  },
+}));
+vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseChildSessionsModule>()),
+  useChildSessions: (owner: string | null) => {
+    mentionListing.childOwners.push(owner);
+    return { children: [] };
+  },
+}));
+vi.mock("@/hooks/useConversations", async (importOriginal) => ({
+  ...(await importOriginal<typeof UseConversationsModule>()),
+  useSessionSearch: (query: string, _scope: string, options: { enabled?: boolean }) => {
+    mentionListing.searchEnabled.push(options.enabled === true);
+    return {
+      data: options.enabled && query ? { pages: [{ data: mentionListing.searchHits }] } : undefined,
+    };
+  },
+}));
+vi.mock("@/lib/agentLabels", async (importOriginal) => ({
+  ...(await importOriginal<typeof AgentLabelsModule>()),
+  // The declared set lets the in-process harness below run its slash menu beside "@".
+  useFileMentionHarnesses: (enabled = true) => {
+    mentionListing.catalogEnabled.push(enabled);
+    return mentionListing.declaredHarnesses;
   },
 }));
 
@@ -1182,6 +1251,23 @@ describe("side-chat interrupt", () => {
     expect(sessionsApi.interrupt).toHaveBeenCalledExactlyOnceWith(childId, "codex_turn_side");
     expect(send).not.toHaveBeenCalled();
     expect(input).toHaveValue("Keep this draft");
+  });
+
+  it("closes /help output from Escape before interrupting", () => {
+    conversationRegistry.acquire(childId).setState({ sessionHarness: "claude-sdk" });
+    renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "/help" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    const notice = screen.getByTestId("side-chat-command-notice");
+    expect(notice).toHaveTextContent(/Show available slash commands/);
+    expect(notice).toHaveAttribute("data-escape-owner");
+
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(screen.queryByTestId("side-chat-command-notice")).toBeNull();
+    expect(sessionsApi.interrupt).not.toHaveBeenCalled();
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(sessionsApi.interrupt).toHaveBeenCalledTimes(1);
   });
 
   it("steers a follow-up into the running side chat when Always steer is on", () => {
@@ -2820,3 +2906,360 @@ it.each([false, true])(
     }
   },
 );
+
+describe("grid cell @-mention picker", () => {
+  const readme = {
+    path: "readme.md",
+    name: "readme.md",
+    type: "file",
+    bytes: 10,
+    modified_at: null,
+  };
+  const src = { path: "src", name: "src", type: "directory", bytes: null, modified_at: null };
+  const fixSession = {
+    id: "sess_fix",
+    title: "Fix CI",
+    provisional: false,
+    archived: false,
+    parent_session_id: null,
+  };
+  const readmeTag = { path: "readme.md", isDir: false, token: "@readme.md" };
+
+  beforeEach(() => {
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+    mentionListing.rootEntries = [src, readme];
+    mentionListing.rootLoading = false;
+    mentionListing.searchHits = [fixSession];
+    mentionListing.declaredHarnesses = new Set(["claude-sdk"]);
+    mentionListing.workspaceQueries = [];
+    mentionListing.environmentQueries = [];
+    mentionListing.environmentLoading = false;
+    mentionListing.directoryQueries = [];
+    mentionListing.searchQueries = [];
+    mentionListing.childOwners = [];
+    mentionListing.searchEnabled = [];
+    mentionListing.catalogEnabled = [];
+  });
+  afterEach(() => clearSessionDrafts());
+
+  /** A grid cell over its session draft, kept in step by the bridge the grid mounts. */
+  function mountCell(gridComposer: { cyclePermissionMode?: () => boolean } = {}) {
+    renderHook(() => useSharedSessionDraft(childId));
+    return renderPane(<SideChatPane childId={childId} fullSession gridComposer={gridComposer} />);
+  }
+  const input = () => screen.getByTestId("side-chat-input") as HTMLTextAreaElement;
+  /** Focus the composer and type `value` with the caret at its end. */
+  function typeText(value: string) {
+    fireEvent.focus(input());
+    fireEvent.change(input(), { target: { value, selectionStart: value.length } });
+  }
+
+  it("opens on @ with the cell's files, and searches its sessions as the query grows", async () => {
+    mountCell();
+    typeText("@");
+
+    expect(screen.getByTestId("file-mention-menu")).toBeInTheDocument();
+    expect(screen.getByTitle("Open src")).toBeInTheDocument();
+    expect(screen.getByTitle("Attach readme.md")).toBeInTheDocument();
+    expect(mentionListing.workspaceQueries).toContainEqual({ owner: childId, enabled: true });
+
+    typeText("@Fix");
+    // The session search waits out the mention debounce before its rows show.
+    await waitFor(() => expect(screen.getByTitle("Tag session Fix CI")).toBeInTheDocument());
+  });
+
+  it("inserts a picked file's token, keeps the tag in the session draft, and sends its marker", () => {
+    mountCell();
+    typeText("@read");
+    fireEvent.click(screen.getByTitle("Attach readme.md"));
+
+    expect(input()).toHaveValue("@readme.md ");
+    expect(getSessionDraft(childId)?.mentions).toEqual({ files: [readmeTag], sessions: [] });
+
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    expect(send).toHaveBeenCalledExactlyOnceWith(
+      "[Attached file: readme.md]",
+      "agent_side",
+      undefined,
+      { pinnedConversationId: childId },
+    );
+  });
+
+  it("inserts a picked session's token and sends its marker with the tool hint", async () => {
+    mountCell();
+    typeText("@Fix");
+    fireEvent.click(await screen.findByTitle("Tag session Fix CI"));
+
+    expect(input()).toHaveValue("@Fix CI ");
+    expect(getSessionDraft(childId)?.mentions).toEqual({
+      files: [],
+      sessions: [{ id: "sess_fix", title: "Fix CI", isSubagent: false, token: "@Fix CI" }],
+    });
+
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    expect(send).toHaveBeenCalledExactlyOnceWith(
+      `[Session: "Fix CI" id=sess_fix subagent=no]\n\n${SESSION_MENTION_HINT}`,
+      "agent_side",
+      undefined,
+      { pinnedConversationId: childId },
+    );
+  });
+
+  it("Enter picks the highlighted row and does not send", () => {
+    mountCell();
+    typeText("@read");
+    fireEvent.keyDown(input(), { key: "Enter" });
+
+    expect(input()).toHaveValue("@readme.md ");
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it("Enter does not send while the file listing is still loading", () => {
+    mentionListing.rootEntries = [];
+    mentionListing.rootLoading = true;
+    mountCell();
+    typeText("@");
+    expect(screen.getByText("Loading…")).toBeInTheDocument();
+    fireEvent.keyDown(input(), { key: "Enter" });
+
+    expect(input()).toHaveValue("@");
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["open", false],
+    ["loading", true],
+  ])(
+    "Mod+Enter with the picker %s neither sends the draft nor steers the queue",
+    (_state, loading) => {
+      writeAlwaysSteer(false);
+      conversationRegistry.acquire(childId).setState({ sessionStatus: "running" });
+      mountCell();
+      typeText("queued first");
+      fireEvent.keyDown(input(), { key: "Enter" });
+      expect(useChatStore.getState().queuedMessages).toEqual([
+        expect.objectContaining({ text: "queued first", conversationId: childId }),
+      ]);
+
+      mentionListing.rootLoading = loading;
+      typeText("@");
+      expect(screen.getByTestId("file-mention-menu")).toBeInTheDocument();
+      fireEvent.keyDown(input(), { key: "Enter", ctrlKey: true });
+
+      expect(input()).toHaveValue("@");
+      expect(send).not.toHaveBeenCalled();
+      expect(useChatStore.getState().queuedMessages).toHaveLength(1);
+    },
+  );
+
+  it("Enter does not send while the workspace environment is still resolving, then submits once it settles", () => {
+    mentionListing.environmentLoading = true;
+    const view = mountCell();
+    typeText("@nomatch");
+    expect(screen.getByText("Loading…")).toBeInTheDocument();
+    fireEvent.keyDown(input(), { key: "Enter" });
+
+    expect(input()).toHaveValue("@nomatch");
+    expect(send).not.toHaveBeenCalled();
+
+    mentionListing.environmentLoading = false;
+    view.rerender(<SideChatPane childId={childId} fullSession gridComposer={{}} />);
+    fireEvent.keyDown(input(), { key: "Enter" });
+    expect(send).toHaveBeenCalledExactlyOnceWith("@nomatch", "agent_side", undefined, {
+      pinnedConversationId: childId,
+    });
+  });
+
+  it("keeps a tag the session draft holds when the cell mounts under its bridge", () => {
+    setSessionDraft(childId, {
+      text: "@readme.md ",
+      files: [],
+      mentions: { files: [readmeTag], sessions: [] },
+    });
+    // As the grid does, the bridge sits in the parent, so the composer is still empty on its first render.
+    function Cell() {
+      useSharedSessionDraft(childId);
+      return <SideChatPane childId={childId} fullSession gridComposer={{}} />;
+    }
+    renderPane(<Cell />);
+
+    expect(input()).toHaveValue("@readme.md ");
+    expect(getSessionDraft(childId)?.mentions).toEqual({ files: [readmeTag], sessions: [] });
+  });
+
+  it("closes the picker when the shared draft is replaced under it", () => {
+    mountCell();
+    typeText("@read");
+    expect(screen.getByTestId("file-mention-menu")).toBeInTheDocument();
+
+    act(() => setSessionDraft(childId, { text: "hello", files: [] }));
+
+    expect(input()).toHaveValue("hello");
+    expect(screen.queryByTestId("file-mention-menu")).toBeNull();
+    fireEvent.keyDown(input(), { key: "Enter" });
+    expect(send).toHaveBeenCalledExactlyOnceWith("hello", "agent_side", undefined, {
+      pinnedConversationId: childId,
+    });
+  });
+
+  it("deleting a tag's token by hand releases its tag, so the same text typed later stays plain", () => {
+    mountCell();
+    typeText("@read");
+    fireEvent.click(screen.getByTitle("Attach readme.md"));
+    // Keep other text, so the draft survives and only the tag's release can clear it.
+    typeText("note ");
+    expect(getSessionDraft(childId)?.mentions).toBeUndefined();
+
+    typeText("note @readme.md");
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    expect(send).toHaveBeenCalledExactlyOnceWith("note @readme.md", "agent_side", undefined, {
+      pinnedConversationId: childId,
+    });
+  });
+
+  it("Backspace at a tag's token removes the token and its tag", () => {
+    mountCell();
+    typeText("@read");
+    fireEvent.click(screen.getByTitle("Attach readme.md"));
+    input().setSelectionRange(10, 10);
+    fireEvent.keyDown(input(), { key: "Backspace" });
+
+    // The token and its tag go; the space after the token stays.
+    expect(input()).toHaveValue(" ");
+    expect(getSessionDraft(childId)?.mentions).toBeUndefined();
+  });
+
+  it("Shift+Tab with the picker open steps the permission mode and keeps the token", () => {
+    const cyclePermissionMode = vi.fn(() => true);
+    mountCell({ cyclePermissionMode });
+    typeText("@read");
+
+    expect(fireEvent.keyDown(input(), { key: "Tab", shiftKey: true })).toBe(false);
+    expect(cyclePermissionMode).toHaveBeenCalledOnce();
+    expect(input()).toHaveValue("@read");
+    expect(screen.getByTestId("file-mention-menu")).toBeInTheDocument();
+  });
+
+  it("a quote card's text opens no picker, and moving focus there closes the main text's", () => {
+    const replyDraft: StoredReplyDraft = {
+      version: 1,
+      quotes: [{ before: "Intro", text: "Quoted line" }],
+      text: "",
+    };
+    setSessionDraft(childId, { text: serializeReplyDraft(replyDraft), files: [], replyDraft });
+    useChatStore.setState({
+      sideChatComposers: {
+        [gridCellComposerKey(childId)]: {
+          text: "",
+          files: [],
+          quotes: [{ id: "q", before: "Intro", text: "Quoted line" }],
+        },
+      },
+    });
+    mountCell();
+    const preamble = screen.getByLabelText("Reply text before quote 1");
+
+    typeText("@");
+    expect(screen.getByTestId("file-mention-menu")).toBeInTheDocument();
+    fireEvent.blur(input());
+    fireEvent.focus(preamble);
+    expect(screen.queryByTestId("file-mention-menu")).toBeNull();
+
+    fireEvent.change(preamble, { target: { value: "Intro @read", selectionStart: 11 } });
+    expect(screen.queryByTestId("file-mention-menu")).toBeNull();
+    fireEvent.keyDown(preamble, { key: "Tab" });
+    expect(preamble).toHaveValue("Intro @read");
+    expect(getSessionDraft(childId)?.mentions?.files ?? []).toEqual([]);
+  });
+
+  it("a command typed before an @ leaves the arrow and Enter keys to the picker", () => {
+    conversationRegistry.acquire(childId).setState({ sessionHarness: "claude-sdk" });
+    skillsFixture.current = {
+      skills: [{ name: "review", description: "Review" }],
+      skillsStatus: "ready",
+    };
+    mountCell();
+    typeText("/review @");
+
+    expect(screen.queryByTestId("slash-command-menu")).toBeNull();
+    expect(screen.getByTestId("file-mention-menu")).toBeInTheDocument();
+    fireEvent.keyDown(input(), { key: "ArrowDown" });
+    expect(screen.getByTestId("file-mention-item-1")).toHaveAttribute("data-active", "true");
+    fireEvent.keyDown(input(), { key: "Enter" });
+
+    expect(input()).toHaveValue("/review @readme.md ");
+    expect(send).not.toHaveBeenCalled();
+    expect(sendSlashCommand).not.toHaveBeenCalled();
+  });
+
+  it("Tab still completes a slash command in a grid cell", () => {
+    conversationRegistry.acquire(childId).setState({ sessionHarness: "claude-sdk" });
+    skillsFixture.current = {
+      skills: [{ name: "review", description: "Review" }],
+      skillsStatus: "ready",
+    };
+    mountCell();
+    typeText("/rev");
+    expect(screen.getByTestId("slash-command-menu")).toBeInTheDocument();
+    expect(screen.queryByTestId("file-mention-menu")).toBeNull();
+    fireEvent.keyDown(input(), { key: "Tab" });
+
+    expect(input()).toHaveValue("/review ");
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])(
+    "side chats (full session: %s) never open the picker, query its listings, or send an @ as a tag",
+    (fullSession) => {
+      renderPane(<SideChatPane childId={childId} fullSession={fullSession} />);
+      typeText("@read");
+
+      expect(screen.queryByTestId("file-mention-menu")).toBeNull();
+      fireEvent.keyDown(input(), { key: "Enter" });
+      expect(send).toHaveBeenCalledExactlyOnceWith("@read", "agent_side", undefined, {
+        pinnedConversationId: childId,
+      });
+      expect(mentionListing.workspaceQueries.length).toBeGreaterThan(0);
+      expect(
+        mentionListing.workspaceQueries.every(
+          (query) => query.owner === undefined && query.enabled === false,
+        ),
+      ).toBe(true);
+      expect(mentionListing.environmentQueries.length).toBeGreaterThan(0);
+      expect(
+        mentionListing.environmentQueries.every(
+          (query) => query.owner === undefined && query.enabled === false,
+        ),
+      ).toBe(true);
+      expect(mentionListing.directoryQueries.length).toBeGreaterThan(0);
+      expect(
+        mentionListing.directoryQueries.every(
+          (query) => query.owner === undefined && query.dirPath === null,
+        ),
+      ).toBe(true);
+      expect(mentionListing.searchQueries.length).toBeGreaterThan(0);
+      expect(
+        mentionListing.searchQueries.every(
+          (query) => query.owner === undefined && query.query === "",
+        ),
+      ).toBe(true);
+      expect(mentionListing.childOwners).not.toContain(childId);
+      expect(mentionListing.searchEnabled).not.toContain(true);
+      expect(mentionListing.catalogEnabled).not.toContain(true);
+    },
+  );
+
+  it("a harness without file mentions offers sessions only, with its workspace listing disabled", async () => {
+    mentionListing.declaredHarnesses = new Set();
+    conversationRegistry.acquire(childId).setState({ sessionHarness: "plain-sdk" });
+    mountCell();
+    typeText("@Fix");
+
+    fireEvent.click(await screen.findByTitle("Tag session Fix CI"));
+    expect(input()).toHaveValue("@Fix CI ");
+    expect(screen.queryByTitle("Open src")).toBeNull();
+    expect(screen.queryByTitle("Attach readme.md")).toBeNull();
+    expect(mentionListing.workspaceQueries).toContainEqual({ owner: childId, enabled: false });
+    expect(mentionListing.workspaceQueries.some((query) => query.enabled === true)).toBe(false);
+  });
+});

@@ -8,6 +8,7 @@ import { isFeatureEnabled, type ServerInfo } from "@/lib/capabilities";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { updateOverlayToastOffset } from "@/lib/updateOverlayInset";
 import { CommandPalette } from "./CommandPalette";
+import { QuickPickCommandPalette } from "./QuickPickCommandPalette";
 import { RecentSessionsSwitcher } from "./RecentSessionsSwitcher";
 
 // Dev-only preview; lazy so the sample data never ships in production bundles.
@@ -47,6 +48,10 @@ export function AppShellOverlays({
   serverConversationId,
   updateOverlayHeight,
 }: AppShellOverlaysProps) {
+  // Both palettes take the same props; the flag picks one for ⌘K and the session switcher.
+  const Palette = isFeatureEnabled(serverInfo, "quick_pick_palette")
+    ? QuickPickCommandPalette
+    : CommandPalette;
   return (
     <>
       {/* Keyboard-shortcuts reference. Self-contained (owns its open state +
@@ -66,7 +71,7 @@ export function AppShellOverlays({
           and in embedded mode — the sidebar's "Search" button opens it
           there even though the ⌘K hotkey is disabled (it belongs to the
           host page). */}
-      <CommandPalette
+      <Palette
         key={sessionSearch ? "sessions" : "commands"}
         sessionsOnly={sessionSearch}
         open={commandPaletteOpen}

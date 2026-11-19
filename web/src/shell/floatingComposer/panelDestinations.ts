@@ -38,7 +38,7 @@ export function panelDestinations(facts: PanelDestinationFacts): PanelDestinatio
   };
 }
 
-/** Whether the panel may target `hostId`: only this Mac's own host. */
+/** Whether the panel may target `hostId`: only this Mac's own host, and nothing while pending. */
 export function panelAllowsHost(destinations: PanelDestinations, hostId: string | null): boolean {
-  return hostId !== null && destinations.thisMac?.hostId === hostId;
+  return !destinations.pending && hostId !== null && destinations.thisMac?.hostId === hostId;
 }

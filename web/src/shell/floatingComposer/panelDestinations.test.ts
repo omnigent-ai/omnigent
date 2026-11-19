@@ -39,10 +39,14 @@ describe("panelDestinations", () => {
     ] satisfies Partial<PanelDestinationFacts>[]) {
       expect(panelDestinations(facts(over)).pending).toBe(true);
     }
-    // Still reading the shell: no host can be chosen, even this Mac's.
-    expect(
-      panelAllowsHost(panelDestinations(facts({ thisMacHostId: undefined })), "host_mac"),
-    ).toBe(false);
+    // Still waiting on any answer: no host can be chosen, even this Mac's.
+    for (const over of [
+      { thisMacHostId: undefined },
+      { hosts: null },
+      { sandboxesOffered: null },
+    ] satisfies Partial<PanelDestinationFacts>[]) {
+      expect(panelAllowsHost(panelDestinations(facts(over)), "host_mac")).toBe(false);
+    }
   });
 
   it("offers no host when the shell can't say which is this Mac", () => {

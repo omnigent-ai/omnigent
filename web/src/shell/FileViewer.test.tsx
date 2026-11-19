@@ -53,7 +53,7 @@ vi.mock("./CodeViewer", () => ({
     wrapLines?: boolean;
     onDirtyChange?: (dirty: boolean) => void;
   }) => {
-    codeViewerRenders({ path, position });
+    codeViewerRenders({ path, position, viewMode });
     return (
       <div
         data-testid="code-viewer"
@@ -269,6 +269,7 @@ interface RenderProps {
   /** Spy for the close affordance; defaults to a throwaway mock. */
   onClose?: () => void;
   onCloseTab?: () => void;
+  onExitFullScreen?: () => void;
   /** Sort order for the prev/next navigation; defaults to the component default. */
   sort?: ChangedSort;
   /** Enables the prev/next nav header when provided. */
@@ -299,6 +300,7 @@ function viewerTree({
   initialSearch = "",
   onClose = vi.fn(),
   onCloseTab,
+  onExitFullScreen,
   sort,
   onNavigateTo,
   escapeCloses = false,
@@ -323,6 +325,7 @@ function viewerTree({
           path={path}
           onClose={onClose}
           onCloseTab={onCloseTab ?? (escapeCloses ? onClose : undefined)}
+          onExitFullScreen={onExitFullScreen}
           sort={sort}
           onNavigateTo={onNavigateTo}
           onShare={onShare}
@@ -451,6 +454,59 @@ function clearIOSViewport(): void {
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
+
+describe("FileViewer render failures", () => {
+  it.each(["retry", "source", "another file"])(
+    "contains a preview crash and recovers through %s",
+    (recovery) => {
+      const error = new Error("File preview failed");
+      const suppressExpectedError = (event: ErrorEvent) => {
+        if (event.error === error) event.preventDefault();
+      };
+      window.addEventListener("error", suppressExpectedError);
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+      let broken = false;
+      codeViewerRenders.mockImplementation(({ path, viewMode }) => {
+        if (broken && path === "results.csv" && viewMode === "preview") throw error;
+      });
+      const tree = (path = "results.csv") => (
+        <>
+          <textarea aria-label="Chat draft" />
+          {viewerTree({ open: true, path })}
+        </>
+      );
+      try {
+        const view = render(tree());
+        const draft = screen.getByRole("textbox", { name: "Chat draft" });
+        fireEvent.change(draft, { target: { value: "Unsent message" } });
+        broken = true;
+        view.rerender(tree());
+
+        expect(screen.getByRole("alert")).toHaveTextContent("Unable to display this file.");
+        expect(screen.getByRole("textbox", { name: "Chat draft" })).toBe(draft);
+        expect(draft).toHaveValue("Unsent message");
+        expect(screen.getByRole("button", { name: "View source" })).toBeInTheDocument();
+
+        if (recovery === "retry") {
+          broken = false;
+          fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+        } else if (recovery === "source") {
+          fireEvent.click(screen.getByRole("button", { name: "View source" }));
+          expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "source");
+        } else {
+          view.rerender(tree("other.csv"));
+        }
+        expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+        expect(screen.getByTestId("code-viewer")).toBeInTheDocument();
+        expect(draft).toHaveValue("Unsent message");
+      } finally {
+        codeViewerRenders.mockReset();
+        window.removeEventListener("error", suppressExpectedError);
+      }
+    },
+  );
+});
 
 // The mobile viewer is a `fixed inset-0` overlay that the iOS shell-lock (which
 // only resizes flow content inside .app-shell) can't lift above the soft
@@ -1922,12 +1978,67 @@ describe("FileViewer markdown preview/edit/source modes", () => {
     expect(screen.queryByRole("button", { name: /^View mode/ })).toBeNull();
   });
 
-  it("keeps HTML's preview-default and preview ↔ source toggle intact", () => {
-    renderViewer({ open: true, path: "page.html" });
-    expect(viewModeOf()).toBe("preview");
-    // In preview, the single toggle switches to source (existing behavior).
-    fireEvent.click(screen.getByRole("button", { name: "View source" }));
+  it.each(["page.html", "results.csv", "export.tsv"])(
+    "opens %s in preview and guards unsaved source edits when toggling back",
+    (path) => {
+      renderViewer({ open: true, path });
+      expect(viewModeOf()).toBe("preview");
+      // In preview, the single toggle switches to source (existing behavior).
+      fireEvent.click(screen.getByRole("button", { name: "View source" }));
+      expect(viewModeOf()).toBe("source");
+      fireEvent.click(screen.getByRole("button", { name: "make dirty" }));
+      fireEvent.click(screen.getByRole("button", { name: "View preview" }));
+      expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+      expect(viewModeOf()).toBe("source");
+      fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+      expect(viewModeOf()).toBe("source");
+      expect(screen.queryByText("Unsaved changes")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "View preview" }));
+      expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+      expect(viewModeOf()).toBe("preview");
+    },
+  );
+
+  it("opens a ?comment= link to a CSV in source, then lets the toggle reach the table", () => {
+    renderViewer({ open: true, path: "results.csv", initialSearch: "comment=c1" });
     expect(viewModeOf()).toBe("source");
+    fireEvent.click(screen.getByRole("button", { name: "View preview" }));
+    expect(viewModeOf()).toBe("preview");
+  });
+
+  it("switches a CSV opened on its table to source when a comment is picked", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
+    renderViewer({ open: true, path: "results.csv" });
+    expect(viewModeOf()).toBe("preview");
+
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    fireEvent.click(screen.getByRole("button", { name: "comment c1" }));
+    expect(viewModeOf()).toBe("source");
+    // The toggle still returns to the table.
+    fireEvent.click(screen.getByRole("button", { name: "View preview" }));
+    expect(viewModeOf()).toBe("preview");
+  });
+
+  it("ends a picked comment's pull toward source when another file opens", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([makeComment("c1")]));
+    const view = renderViewer({ open: true, path: "results.csv" });
+    fireEvent.click(screen.getByRole("button", { name: "Show comments" }));
+    fireEvent.click(screen.getByRole("button", { name: "comment c1" }));
+    expect(viewModeOf()).toBe("source");
+
+    view.rerender(viewerTree({ open: true, path: "other.csv" }));
+    view.rerender(viewerTree({ open: true, path: "results.csv" }));
+    expect(viewModeOf()).toBe("preview");
+  });
+
+  it("keeps a Markdown comment link's pull toward its editor across a visit elsewhere", () => {
+    // Only a data table's pull ends on leaving; Markdown keeps its deep-link bias.
+    const view = renderViewer({ open: true, path: "notes.md", initialSearch: "comment=c1" });
+    expect(viewModeOf()).toBe("editor");
+    view.rerender(viewerTree({ open: true, path: "other.py", initialSearch: "comment=c1" }));
+    view.rerender(viewerTree({ open: true, path: "notes.md", initialSearch: "comment=c1" }));
+    expect(viewModeOf()).toBe("editor");
   });
 
   it("guards unsaved edits when leaving the markdown editor, switching only after Discard", () => {
@@ -2628,6 +2739,76 @@ describe("FileViewer Escape closes the active tab", () => {
   });
 });
 
+describe("FileViewer Escape exits full screen", () => {
+  it("exits full screen and keeps the tab open", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    const onCloseTab = vi.fn();
+    const onExitFullScreen = vi.fn();
+    render(viewerTree({ open: true, frameless: true, onCloseTab, onExitFullScreen }));
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onExitFullScreen).toHaveBeenCalledTimes(1);
+    expect(onCloseTab).not.toHaveBeenCalled();
+  });
+
+  it("keeps unsaved edits without a prompt, and a later Escape still guards them", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    const onCloseTab = vi.fn();
+    const onExitFullScreen = vi.fn();
+    const props = { open: true, frameless: true, path: "file1.md", onCloseTab };
+    const { rerender } = render(viewerTree({ ...props, onExitFullScreen }));
+    const draft = screen.getByRole("textbox", { name: "Draft text" });
+    fireEvent.change(draft, { target: { value: "Unsaved draft" } });
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(onExitFullScreen).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("Unsaved changes")).toBeNull();
+
+    rerender(viewerTree(props));
+    expect(draft).toHaveValue("Unsaved draft");
+    fireEvent.keyDown(window, { key: "Escape" });
+    expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+    expect(onCloseTab).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+    expect(onCloseTab).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps Escape after a click outside the viewer, since full screen hides the chat", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    const onExitFullScreen = vi.fn();
+    render(
+      <>
+        {viewerTree({
+          open: true,
+          frameless: true,
+          syncUrl: false,
+          onCloseTab: vi.fn(),
+          onExitFullScreen,
+        })}
+        <button type="button">Exit full screen</button>
+      </>,
+    );
+    fireEvent.mouseDown(screen.getByRole("button", { name: "Exit full screen" }));
+    // Page-wide Escape handlers, such as declining an approval, yield to the viewer.
+    expect(screen.getByTestId("file-viewer")).toHaveAttribute("data-escape-owner");
+    fireEvent.keyDown(document.body, { key: "Escape" });
+    expect(onExitFullScreen).toHaveBeenCalledTimes(1);
+  });
+
+  it("ignores Escape while focus is in a text field", () => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+    const onExitFullScreen = vi.fn();
+    render(
+      <>
+        {viewerTree({ open: true, frameless: true, onCloseTab: vi.fn(), onExitFullScreen })}
+        <input aria-label="Notes" />
+      </>,
+    );
+    const input = screen.getByRole("textbox", { name: "Notes" });
+    input.focus();
+    fireEvent.keyDown(input, { key: "Escape" });
+    expect(onExitFullScreen).not.toHaveBeenCalled();
+  });
+});
+
 describe("FileViewer video files", () => {
   it("skips capped content and diff reads and suppresses diff controls", () => {
     useCommentsMock.mockReturnValue(makeCommentsQuery([]));
@@ -2769,7 +2950,7 @@ describe("file position navigation", () => {
     rerender(viewerTree({ open: true, path: "file2.md" }));
     expect(codeViewerRenders).toHaveBeenCalled();
     for (const [props] of codeViewerRenders.mock.calls) {
-      expect(props).toEqual({ path: "file2.md", position: undefined });
+      expect(props).toMatchObject({ path: "file2.md", position: undefined });
     }
   });
 

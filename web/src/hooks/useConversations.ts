@@ -433,6 +433,7 @@ export function isSessionArchiving(id: string): boolean {
 // Preserve optimistic membership across stale fetches and frames until the
 // server confirms the move.
 interface MoveTombstone {
+  family?: Conversation["family"];
   /** Target folder name; `null` unfiles. */
   project: string | null;
   projectId: string | null;
@@ -452,17 +453,32 @@ function unmarkSessionMoving(id: string, entry?: MoveTombstone): void {
 
 /** Give a fetched or streamed row the membership of its in-flight move. */
 export function withMoveTombstone<
-  T extends { id: string; project_id?: string | null; labels?: Record<string, string> },
+  T extends {
+    id: string;
+    project_id?: string | null;
+    labels?: Record<string, string>;
+    family?: Conversation["family"];
+  },
 >(row: T): T {
   const entry = movingSessions.get(row.id);
   if (entry === undefined) return row;
   const label = row.labels?.[PROJECT_LABEL_KEY] || undefined;
-  if ((row.project_id ?? null) === entry.projectId && label === entry.projectLabel) return row;
+  if (
+    (row.project_id ?? null) === entry.projectId &&
+    label === entry.projectLabel &&
+    (entry.family === undefined || row.family === entry.family)
+  )
+    return row;
   const labels = Object.fromEntries(
     Object.entries(row.labels ?? {}).filter(([key]) => key !== PROJECT_LABEL_KEY),
   );
   if (entry.projectLabel !== undefined) labels[PROJECT_LABEL_KEY] = entry.projectLabel;
-  return { ...row, project_id: entry.projectId, labels };
+  return {
+    ...row,
+    project_id: entry.projectId,
+    labels,
+    ...(entry.family !== undefined ? { family: entry.family } : {}),
+  };
 }
 
 /** Wipe module-level tombstones between tests. */
@@ -2489,6 +2505,118 @@ export async function moveConversationToProject(
   });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return (await res.json()) as Conversation;
+}
+
+/** Move one session while shielding its optimistic membership from stale frames. */
+export function useMoveToNest() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: async ({ id, destination }: { id: string; destination: Conversation | null }) => {
+      const response = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ nest_source_id: destination?.id ?? null }),
+      });
+      if (!response.ok) throw await apiErrorFromResponse(response);
+      return (await response.json()) as Conversation;
+    },
+    onMutate: async ({ id, destination }) => {
+      await Promise.all(
+        ["conversations", "project-sessions"].map((key) =>
+          queryClient.cancelQueries({ queryKey: [key] }),
+        ),
+      );
+      const row = findCachedConversationRow(queryClient, id);
+      if (!row) return;
+      const projectId = destination ? (destination.project_id ?? null) : (row.project_id ?? null);
+      const projectLabel = (destination ?? row).labels[PROJECT_LABEL_KEY];
+      const project =
+        queryClient.getQueryData<ProjectSummary[]>(["projects"])?.find((p) => p.id === projectId)
+          ?.name ??
+        projectLabel ??
+        null;
+      const move: MoveTombstone = {
+        project,
+        projectId,
+        projectLabel,
+        family: destination?.family ?? null,
+      };
+      markSessionMoving(id, move);
+      const moved = withMoveTombstone(row);
+      const queries = ["conversations", "project-sessions"].flatMap((key) =>
+        queryClient.getQueriesData<ConversationsInfiniteData>({ queryKey: [key] }),
+      );
+      const backfill = queryClient.getQueryData<Conversation | null>(["conversation-backfill", id]);
+      const pins = queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY);
+      for (const [key, data] of queries) {
+        const inProject = key[0] === "project-sessions";
+        const scope = inProject ? parseProjectSessionsQueryKey(key) : null;
+        const globallyVisible = queries.some(
+          ([windowKey, window]) =>
+            windowKey[0] === "conversations" &&
+            (windowKey[5] ?? "updated_at") === scope?.sortBy &&
+            scope?.archived === (row.archived === true) &&
+            window?.pages.some((page) => page.data.some((item) => item.id === id)),
+        );
+        const targetLoaded = queries.some(
+          ([targetKey, target]) =>
+            targetKey[0] === "project-sessions" &&
+            targetKey[1] === project &&
+            target &&
+            parseProjectSessionsQueryKey(targetKey).sortBy === scope?.sortBy &&
+            parseProjectSessionsQueryKey(targetKey).archived === scope?.archived,
+        );
+        if (inProject && key[1] !== project && !globallyVisible && !targetLoaded) continue;
+        const filters = inProject
+          ? filtersFromProjectQueryKey(key)
+          : filtersFromConversationQueryKey(key);
+        const items = new Map([[id, moved]]);
+        let next = mergeItemsIntoPages(data, items, filters).data;
+        if (inProject && key[1] === project && !globallyVisible)
+          next = insertNewRowsIntoPages(next, items, filters).data;
+        if (next !== data) queryClient.setQueryData(key, next);
+      }
+      queryClient.setQueryData(["conversation-backfill", id], backfill ? moved : backfill);
+      if (pins)
+        queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, {
+          ...pins,
+          conversations: pins.conversations.map((c) => (c.id === id ? moved : c)),
+        });
+      return { queries, backfill, pins, move };
+    },
+    onError: (error, { id }, previous) => {
+      showToast(error.message);
+      if (!previous) return;
+      unmarkSessionMoving(id, previous.move);
+      for (const [key, data] of previous.queries) if (data) queryClient.setQueryData(key, data);
+      restoreOpenSessionRow(queryClient, id, previous.backfill);
+      queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, previous.pins);
+    },
+    onSuccess: (updated, _variables, previous) => {
+      if (!previous) return;
+      previous.move.family = updated.family ?? null;
+      previous.move.projectId = updated.project_id ?? null;
+      previous.move.projectLabel = updated.labels?.[PROJECT_LABEL_KEY] || undefined;
+      previous.move.project =
+        queryClient
+          .getQueryData<ProjectSummary[]>(["projects"])
+          ?.find((project) => project.id === updated.project_id)?.name ??
+        previous.move.projectLabel ??
+        null;
+    },
+    onSettled: async (_data, _error, { id }, previous) => {
+      await Promise.all(
+        [
+          ["conversations"],
+          ["project-sessions"],
+          ["projects"],
+          ["session", id],
+          PINNED_CONVERSATIONS_KEY,
+        ].map((queryKey) => queryClient.invalidateQueries({ queryKey })),
+      );
+      if (previous) unmarkSessionMoving(id, previous.move);
+    },
+  });
 }
 
 /**
