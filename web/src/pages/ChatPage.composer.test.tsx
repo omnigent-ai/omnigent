@@ -979,6 +979,16 @@ describe("Composer send shortcut", () => {
     expect(onSend).toHaveBeenCalledWith("voice dictated message", undefined);
     expect(textarea()).toBeEnabled();
     expect(stopRecognition.mock.calls.length + abortRecognition.mock.calls.length).toBe(1);
+    act(() =>
+      handlers.result?.({
+        resultIndex: 0,
+        results: {
+          length: 1,
+          0: { length: 1, isFinal: true, 0: { transcript: "after the send" } },
+        },
+      }),
+    );
+    expect(textarea()).toHaveValue("");
     act(() => handlers.end?.());
     expect(startRecognition).toHaveBeenCalledTimes(1);
     expect(mic).toHaveAttribute("aria-pressed", "false");

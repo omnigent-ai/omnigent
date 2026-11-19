@@ -119,7 +119,9 @@ describe("useDictationInsert", () => {
     // draft is kept, the next take must add to that text rather than replace it.
     const { result } = renderDictation();
     act(() => result.current.replaceInterim("sent but kept"));
+    expect(result.current.hasInterim).toBe(true);
     act(() => result.current.commitPending());
+    expect(result.current.hasInterim).toBe(false);
     act(() => result.current.replaceInterim("next"));
     expect(result.current.value).toBe("sent but kept next");
   });

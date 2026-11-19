@@ -538,6 +538,25 @@ describe("side-chat voice take", () => {
     expect(pending ? onStart : send).toHaveBeenCalledTimes(1);
     expect(mic.endTake).toHaveBeenCalledTimes(1);
   });
+
+  it("adds the next take to a sent partial that a failed fork restores", async () => {
+    let rejectStart!: (error: Error) => void;
+    const onStart = vi.fn(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectStart = reject;
+        }),
+    );
+    renderPane(<SideChatPane childId="pending:side" onStart={onStart} />);
+    act(() => mic.current!.onInterim!("dictated question"));
+    fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
+    expect(onStart).toHaveBeenCalledExactlyOnceWith("dictated question");
+
+    await act(async () => rejectStart(new Error("Fork creation failed")));
+    act(() => mic.current!.onInterim!("and more"));
+
+    expect(screen.getByTestId("side-chat-input")).toHaveValue("dictated question and more");
+  });
 });
 
 describe("side chat opened from a text selection", () => {
