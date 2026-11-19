@@ -6,17 +6,19 @@ coding, and browser-style navigation is something every new user already knows.
 
 ## Principles
 
-- **Everything is a tab.** Files, Diffs and Pull Requests are pages that open in
-  a tab, and so are the session's terminals, agents and other panels. "+" opens
-  a New tab that lists the pages. The sidebar always has at least one tab.
-- **Pages link to each other.** A file, a diff, a commit and a pull request
-  each have a link, and following one shows that page the way a link does on
-  the web.
+- **Everything is a tab.** Every page opens in a tab: the new Files, Diffs and
+  Pull Requests pages, and the pages the sidebar already has, such as
+  terminals, the browser and side chats. "+" opens a New tab that lists them.
+  The sidebar always has at least one tab.
+- **Everything has a link.** Each place a tab can show has a link that names
+  it exactly, down to a file and line in a pull request's diff. Agents can use
+  these links to open tabs for you, and you can share or reopen them. See
+  [Links](#links).
 - **Navigation stays in the current tab.** Choosing a file in the tree or a
-  pull request in the list replaces what the tab shows. ⌘-click (Ctrl-click
-  off macOS) or **Open in new tab** in a row's context menu opens a new tab
-  instead. A link to something already open in another tab selects that tab
-  rather than opening a duplicate.
+  commit in the Commits list changes what this tab shows.
+  A middle click, an Option-click in the Files tree, or **Open in new tab** in
+  a file's menu opens a new tab instead. A link to something already open in
+  another tab selects that tab rather than opening a duplicate.
 - **One back and forward history per session, across tabs.** Unlike a browser,
   history isn't kept per tab. Back and Forward walk every step in order, both
   within a tab and from one tab to another. When an agent's link opens a file
@@ -28,14 +30,65 @@ coding, and browser-style navigation is something every new user already knows.
 
 ## Pages
 
-- **Files**: the workspace tree, with the file viewer and editor beside it.
-  Below a certain width the tree opens as a popover from the toolbar.
+New in v2:
+
+- **Files**: the workspace tree, with a file editor beside it. Images, PDFs and
+  other binary files open in the existing file viewer. Below a certain width
+  the tree opens as a popover from the toolbar.
 - **Diffs**: the working copy's changes as a review, including rendered
   Markdown diffs. Rendered Markdown is sanitized before it reaches the page, as
   in the existing file viewer. Where the host can compare revisions, a Commits
   list shows the branch's commits, each opening what it changed.
-- **Pull Requests**: the session's pull requests and a page for each one. On a
-  wide enough tab the list stays beside the open pull request.
+- **Pull Requests**: the session's pull requests and a page for each one.
+
+Existing pages, which come along unchanged as tabs: terminals, the browser,
+side chats, agents, tasks and text search. The existing viewer's rich Markdown
+preview is planned for Markdown files in Files; at first they open as text in
+the editor.
+
+## Links
+
+A link is `omnigent://<kind>[/<id>]?<parameters>`, and a plain `https://`
+address opens in a browser tab. Some examples:
+
+| Link | Shows |
+| --- | --- |
+| `omnigent://files?path=src/parser.ts&line=42` | A file at a line. `line=40-48` cites a range, and `column` a column. |
+| `omnigent://changes?path=src/parser.ts&line=42` | That file in the session's diff. |
+| `omnigent://changes?base=main&head=feature` | Another comparison: `base` against `head`, or against the working copy without `head`. |
+| `omnigent://pull?url=<pull request URL>&view=changes&path=src/parser.ts&line=42` | A file and line in a pull request's diff. `view` is `summary`, `comments`, `commits` or `changes`, and `commit` picks one commit. |
+| `omnigent://terminal/<key>`, `omnigent://agent/<id>`, `omnigent://chat/<id>` | A terminal, an agent or a side chat. |
+| `omnigent://search?q=<text>` | Text search. |
+
+Any link can add `session=<id>` to open in another session's sidebar, or
+`tab=<id>` to open in a specific tab. A pull request is named by its URL, and a
+sub-page URL such as `…/pull/12/files` becomes the matching view. Each link has
+one canonical text, so the same place always gets the same link.
+
+Opening a link picks a tab by a few rules:
+
+- A tab already showing the same thing (a file, a comparison, a pull request)
+  is reused and moves to the cited place. Otherwise a new tab opens beside the
+  selected one.
+- When you open the link, the tab is selected and the step joins the session's
+  history, so Back returns you to where you were. A move within the same file,
+  such as to another line, replaces the step instead of adding one.
+- When an agent opens one, it never takes over what you're looking at. A tab
+  you aren't viewing moves quietly, or a new one opens behind yours. If the tab
+  is the one you're viewing, has unsaved edits or is your Files tab, it shows a
+  bar offering to go to the agent's place instead.
+
+What's settled and what's open:
+
+- **In the first tabs change:** places, the link syntax above, parsing and
+  canonical formatting, how an open picks a tab, and the shared history. The
+  history lasts until a reload.
+- **Planned:** agents emitting these links in chat and having them open in the
+  sidebar, and a way for an agent to open a place directly.
+- **Open:** how these links sit beside the existing session links
+  (`omnigent://<host>/c/<id>`), which use the same scheme; whether code-host
+  URLs and absolute paths in chat resolve to places; and whether the syntax
+  becomes a stable, documented contract.
 
 ## Two journeys
 
@@ -46,7 +99,7 @@ Back returns you to the pull request where you left it, and Forward goes to the
 file again.
 
 **Reading around a change.** In a Files tab you pick `README.md` in the tree,
-then `src/parser.ts`; the tab steps from one to the other. You ⌘-click
+then `src/parser.ts`; the tab steps from one to the other. You Option-click
 `src/lexer.ts`, which opens in a new tab and leaves `src/parser.ts` where it
 was. Back walks the same steps in reverse: to `src/parser.ts` in the first tab,
 then to `README.md`.
