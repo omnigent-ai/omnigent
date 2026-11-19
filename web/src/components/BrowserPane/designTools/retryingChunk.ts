@@ -42,7 +42,15 @@ export function retryingChunk<P extends object>(
       missing = false;
       retryMs = CHUNK_RETRY_MS;
       changed();
-    }, retryLater);
+    }, failedAgain);
+  }
+
+  // Said once, so a module that throws as it loads can be told from a dropped connection.
+  let warned = false;
+  function failedAgain(error: unknown): void {
+    if (!warned) console.warn("A part of the app couldn't load; trying again later.", error);
+    warned = true;
+    retryLater();
   }
 
   function retryLater(): void {
@@ -54,10 +62,10 @@ export function retryingChunk<P extends object>(
   let Component: ComponentType<P> = lazy(() =>
     load().then(
       (loaded) => ({ default: loaded }),
-      () => {
+      (error: unknown) => {
         missing = true;
         changed();
-        retryLater();
+        failedAgain(error);
         return { default: Nothing };
       },
     ),

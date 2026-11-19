@@ -255,11 +255,15 @@ export function BrowserPane({
     void bridge.browserHasView?.(conversationId).then((r) => {
       if (!cancelled && !viewChanged && r?.exists) {
         setHasView(true);
-        const url = urlEventsRef.current === urlEvents ? r.url : undefined;
+        // A navigation since it asked brought its own URL and back/forward state.
+        const fresh = urlEventsRef.current === urlEvents;
+        const url = fresh ? r.url : undefined;
         if (url) setPageUrl(url);
         if (!urlEditingRef.current && url) setCurrentUrl(url);
-        setCanGoBack(!!r.canGoBack);
-        setCanGoForward(!!r.canGoForward);
+        if (fresh) {
+          setCanGoBack(!!r.canGoBack);
+          setCanGoForward(!!r.canGoForward);
+        }
       }
     });
 

@@ -101,8 +101,17 @@ describe("BrowserPane's design tools", () => {
 
   it("name a page the view moved to before its first look at the view answered", async () => {
     let urlChanged: (payload: { conversationId: string; url: string }) => void = () => {};
-    let answer: (value: { exists: boolean; url: string }) => void = () => {};
+    let navState: (payload: {
+      conversationId: string;
+      canGoBack: boolean;
+      canGoForward: boolean;
+    }) => void = () => {};
+    let answer: (value: { exists: boolean; url: string; canGoBack: boolean }) => void = () => {};
     installBridge({
+      onBrowserNavState: (callback: typeof navState) => {
+        navState = callback;
+        return () => {};
+      },
       browserHasView: () =>
         new Promise((resolve) => {
           answer = resolve;
@@ -114,9 +123,13 @@ describe("BrowserPane's design tools", () => {
     });
     render(<BrowserPane conversationId="conv_race" />);
     const page = await screen.findByLabelText("Tools' page");
-    act(() => urlChanged({ conversationId: "conv_race", url: "https://new.example/" }));
-    await act(async () => answer({ exists: true, url: "https://old.example/" }));
+    act(() => {
+      urlChanged({ conversationId: "conv_race", url: "https://new.example/" });
+      navState({ conversationId: "conv_race", canGoBack: true, canGoForward: false });
+    });
+    await act(async () => answer({ exists: true, url: "https://old.example/", canGoBack: false }));
     expect(page).toHaveTextContent("https://new.example/");
+    expect(screen.getByRole("button", { name: "Go back" })).toBeEnabled();
     expect(screen.getByRole("textbox", { name: "Address bar" })).toHaveValue(
       "https://new.example/",
     );

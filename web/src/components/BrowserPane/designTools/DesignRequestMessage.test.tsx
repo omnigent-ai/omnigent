@@ -1,7 +1,11 @@
 import { render, screen } from "@testing-library/react";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { DesignRequestBody } from "./DesignRequestMessage";
 import { NO_SCREENSHOT_NOTE } from "./parseDesignRequest";
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
 
 describe("DesignRequestBody", () => {
   it("shows the request, what it was about and a missing screenshot's note", () => {
@@ -41,7 +45,6 @@ describe("DesignRequestBody", () => {
     );
     expect(screen.getByText("Make it red")).toBeInTheDocument();
     expect(screen.getByText("p#blurb")).toBeInTheDocument();
-    vi.restoreAllMocks();
   });
 
   it("says which page a drawing was on", async () => {
