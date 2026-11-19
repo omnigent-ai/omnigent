@@ -8,14 +8,17 @@ import {
   useMemo,
   useRef,
   useState,
-  type ClipboardEvent,
-  type KeyboardEvent,
   type ReactNode,
 } from "react";
 import { MessagesSquareIcon, TriangleAlertIcon } from "lucide-react";
 import { toast } from "sonner";
 import { useIsMutating, useQueryClient } from "@tanstack/react-query";
 import { getCurrentAuthorId } from "@/lib/identity";
+import type {
+  ComposerKeyboardEvent,
+  ComposerPasteEvent,
+  ComposerTextTarget,
+} from "@/components/composer/engine/composerInput";
 import { cn } from "@/lib/utils";
 import {
   type Bubble,
@@ -871,7 +874,7 @@ function SideChatComposer({
   const [interrupting, setInterrupting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const tailTextareaRef = useRef<HTMLTextAreaElement>(null);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const textareaRef = useRef<ComposerTextTarget | null>(null);
   const voiceEditsRef = useRef(
     new Map<string | null, { before: string; after: string; quoteIds: Set<string> }>(),
   );
@@ -1006,7 +1009,7 @@ function SideChatComposer({
     errors.forEach((message) => toast.error(message));
     if (accepted.length) setFiles((current) => [...current, ...accepted]);
   };
-  const onPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
+  const onPaste = (event: ComposerPasteEvent) => {
     const pasted = clipboardFiles(event.clipboardData);
     if (!pasted.length) {
       insertPastedText(event);
@@ -1285,7 +1288,7 @@ function SideChatComposer({
     }).finally(refreshLabels);
   };
 
-  const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>, intent: ComposerKeyIntent) => {
+  const handleKeyDown = (event: ComposerKeyboardEvent, intent: ComposerKeyIntent) => {
     // Mod+Enter submits any draft, then steers the whole queue into the running turn.
     if (queues && intent.shouldSteerAllFromKeyboard) {
       event.preventDefault();
@@ -1324,7 +1327,7 @@ function SideChatComposer({
       submit();
     }
   };
-  const focusText = (id: string | null, input: HTMLTextAreaElement) => {
+  const focusText = (id: string | null, input: ComposerTextTarget) => {
     setActiveTextId(id);
     textareaRef.current = input;
     dictation.noteFocus();
@@ -1458,7 +1461,7 @@ function SideChatComposer({
                 keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
                 disabled={!ready}
                 inputFor={(replyQuote) => ({
-                  onChange: (event) => editText(replyQuote.id, event.target.value),
+                  onChange: (event) => editText(replyQuote.id, event.currentTarget.value),
                   onFocus: (event) => focusText(replyQuote.id, event.currentTarget),
                   onKeyDown: handleKeyDown,
                   onPaste,

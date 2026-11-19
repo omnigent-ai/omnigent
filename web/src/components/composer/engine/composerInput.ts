@@ -46,6 +46,8 @@ export const COMPOSER_INPUT_ATTRIBUTE = "data-composer-input";
 export const COMPOSER_INPUT_SELECTOR = `[${COMPOSER_INPUT_ATTRIBUTE}]`;
 /** Names one input within its composer, stable across engines. */
 export const COMPOSER_INPUT_ID_ATTRIBUTE = "data-composer-input-id";
+/** The id of the composer's own input, the one after any reply quotes. */
+export const COMPOSER_TAIL_INPUT_ID = "tail";
 /** Spread onto an engine's focusable node to mark it. */
 export const COMPOSER_INPUT_MARKER = { [COMPOSER_INPUT_ATTRIBUTE]: "" } as const;
 /** A composer input that takes typing now. */
@@ -122,6 +124,9 @@ export function isHistoryInput(event: ComposerInputEvent): boolean {
  * with it, for an input whose surroundings scroll.
  */
 export type ComposerInputHeightMode = "compact" | "unbounded";
+
+/** Which engine renders the composer's editable surface. */
+export type ComposerInputEngine = "textarea" | "codemirror";
 
 /** What every input engine accepts: the subset of textarea props the composer uses. */
 export interface ComposerInputProps {

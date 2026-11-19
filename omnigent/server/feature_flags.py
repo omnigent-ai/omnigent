@@ -48,6 +48,7 @@ class Feature(StrEnum):
     ONE_TIME_AUTOMATIONS = "one_time_automations"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
     SIDEBAR_WINDOWED_ROWS = "sidebar_windowed_rows"
+    CHAT_COMPOSER_CODEMIRROR = "chat_composer_codemirror"
     WORKFLOWS = "workflows"
     SESSION_OVERVIEW = "session_overview"
     PROJECT_KANBAN = "project_kanban"
@@ -252,6 +253,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Mount only the sidebar session rows near the viewport",
         owner="web",
         review_by_release="0.24.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.CHAT_COMPOSER_CODEMIRROR,
+        description="Write chat messages in a CodeMirror editor instead of the plain text box",
+        owner="web",
+        review_by_release="0.25.0",
     ),
     FeatureDefinition(
         feature=Feature.WORKFLOWS,

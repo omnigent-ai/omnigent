@@ -51,6 +51,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "automations_v2": True,
         "splittable_terminal_view_ui": False,
         "sidebar_windowed_rows": False,
+        "chat_composer_codemirror": False,
         "workflows": False,
         "session_overview": False,
         "project_kanban": True,
@@ -206,6 +207,15 @@ def test_arca_shutdown_warnings_are_frontend_visible() -> None:
 
     assert flags.enabled(Feature.ARCA_SHUTDOWN_WARNINGS)
     assert flags.frontend_dict()["arca_shutdown_warnings"] is True
+
+
+def test_chat_composer_codemirror_is_an_opt_in_frontend_feature() -> None:
+    assert not resolve_feature_flags({}).enabled(Feature.CHAT_COMPOSER_CODEMIRROR)
+
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "chat_composer_codemirror"})
+
+    assert flags.enabled(Feature.CHAT_COMPOSER_CODEMIRROR)
+    assert flags.frontend_dict()["chat_composer_codemirror"] is True
 
 
 def test_sibling_sessions_explicit_enable_preserves_default_features() -> None:
