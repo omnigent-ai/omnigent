@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, type ReactNode, type RefObject } from "react";
+import { useEffect, useId, useRef, useState, type ReactNode, type RefObject } from "react";
 import { TerminalIcon } from "lucide-react";
 import { create } from "zustand";
 import { matchSlashCommandInvocation } from "@/components/SlashCommandMenu";
@@ -248,12 +248,15 @@ export interface PublishedComposerCommands {
 // Sent bubbles render outside the composer's tree, so each composer publishes
 // its known commands for the conversation it sends to.
 const usePublishedCommandsStore = create<Record<string, PublishedComposerCommands>>(() => ({}));
-// Composers sharing a conversation stack up; the newest still mounted wins, so
-// unmounting in either order leaves the survivor's commands published.
-const publishedCommandStacks = new Map<string, PublishedComposerCommands[]>();
+// Composers sharing a conversation stack up in mount order and the newest still
+// mounted wins. A catalog change updates its slot in place, keeping that order.
+interface PublishedCommandsSlot {
+  current: PublishedComposerCommands;
+}
+const publishedCommandStacks = new Map<string, PublishedCommandsSlot[]>();
 
 function syncPublishedCommands(conversationId: string): void {
-  const top = publishedCommandStacks.get(conversationId)?.at(-1);
+  const top = publishedCommandStacks.get(conversationId)?.at(-1)?.current;
   usePublishedCommandsStore.setState((state) => {
     const { [conversationId]: _previous, ...rest } = state;
     return top ? { ...rest, [conversationId]: top } : rest;
@@ -265,21 +268,31 @@ export function usePublishComposerCommands(
   commandNames: readonly string[],
   nativeShell: string | null,
 ): void {
+  const [slot] = useState<PublishedCommandsSlot>(() => ({
+    current: { commandNames, nativeShell },
+  }));
   useEffect(() => {
     if (!conversationId) return;
-    const published = { commandNames, nativeShell };
-    const stack = publishedCommandStacks.get(conversationId) ?? [];
-    publishedCommandStacks.set(conversationId, [...stack, published]);
+    publishedCommandStacks.set(conversationId, [
+      ...(publishedCommandStacks.get(conversationId) ?? []),
+      slot,
+    ]);
     syncPublishedCommands(conversationId);
     return () => {
       const remaining = (publishedCommandStacks.get(conversationId) ?? []).filter(
-        (entry) => entry !== published,
+        (entry) => entry !== slot,
       );
       if (remaining.length > 0) publishedCommandStacks.set(conversationId, remaining);
       else publishedCommandStacks.delete(conversationId);
       syncPublishedCommands(conversationId);
     };
-  }, [conversationId, commandNames, nativeShell]);
+  }, [conversationId, slot]);
+  useEffect(() => {
+    const { current } = slot;
+    if (current.commandNames === commandNames && current.nativeShell === nativeShell) return;
+    slot.current = { commandNames, nativeShell };
+    if (conversationId) syncPublishedCommands(conversationId);
+  }, [conversationId, slot, commandNames, nativeShell]);
 }
 
 export function usePublishedComposerCommands(

@@ -256,6 +256,22 @@ describe("usePublishComposerCommands", () => {
     },
   );
 
+  it("keeps the newer composer on top when the older one changes its catalog", () => {
+    const older = renderHook(
+      ({ names }: { names: string[] }) => usePublishComposerCommands("conv_order", names, null),
+      { initialProps: { names: ["/team"] } },
+    );
+    const newer = renderHook(() => usePublishComposerCommands("conv_order", ["/help"], null));
+    const read = renderHook(() => usePublishedComposerCommands("conv_order"));
+
+    older.rerender({ names: ["/team", "/plan"] });
+    expect(read.result.current?.commandNames).toEqual(["/help"]);
+    newer.unmount();
+    expect(read.result.current?.commandNames).toEqual(["/team", "/plan"]);
+    older.unmount();
+    expect(read.result.current).toBeUndefined();
+  });
+
   it("leaves another conversation's commands alone when one updates or unmounts", () => {
     const a = renderHook(
       ({ names, shell }: { names: string[]; shell: string | null }) =>
