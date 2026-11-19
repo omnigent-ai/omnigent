@@ -47,7 +47,7 @@ const PYTHON_WHITESPACE_ONLY = new RegExp(`^[${PYTHON_WHITESPACE_CLASS}]*$`);
 const CLAUDE_DROPPED_CONTROLS = /[\x00-\x08\x0b\x0c\x0e-\x1f]/g;
 
 /** The text Claude Code's TUI receives for a claude-native send of `value`. */
-export function claudeDeliveredText(value: string): string {
+function claudeDeliveredText(value: string): string {
   return value.replace(CLAUDE_DROPPED_CONTROLS, "");
 }
 

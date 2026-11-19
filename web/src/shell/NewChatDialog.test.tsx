@@ -14324,10 +14324,11 @@ describe("NewChatLandingScreen composer highlight", () => {
   it("decides shell mode on the sanitized text but mirrors the raw draft", () => {
     landingAgent("claude-native");
     renderLanding();
-    type("\x05!echo ok");
+    // Sanitizing drops DEL, which the claude-native check alone would keep.
+    type("\x7f!echo ok");
     expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
     const overlay = screen.getByTestId("composer-highlight-overlay");
-    expect(overlay.textContent).toBe("\x05!echo ok");
+    expect(overlay.textContent).toBe("\x7f!echo ok");
     expect(within(overlay).getByText("!")).toHaveClass("text-brand-accent");
   });
 

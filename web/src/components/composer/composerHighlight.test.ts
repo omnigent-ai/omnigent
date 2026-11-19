@@ -93,6 +93,8 @@ describe("composerHighlightSplit native shell", () => {
     ["claude-native", "a command the encoder drops", "!\x1c"],
     ["claude-native", "a `!` after a kept DEL", "\x7f!x"],
     ["claude-native", "a `!` after a kept line break", "\r!x"],
+    ["claude-native", "a `!` after a kept tab", "\t!x"],
+    ["claude-native", "a `!` after a kept C1 control", "\x85!x"],
   ])("%s keeps %s as model input", (harness, _label, value) => {
     expect(splitNativeShellCommand(value, harness)).toBeNull();
   });
