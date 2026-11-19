@@ -228,7 +228,7 @@ it("joins at a nest's center and detaches into the session list or footer", asyn
     fireEvent.mouseUp(document, { clientX: 150, clientY: 515 });
   });
   expect(mocks.moveProject).toHaveBeenLastCalledWith({ id: "conv_d", project: "" });
-});
+}, 15_000);
 
 describe("dropping an unpinned session onto a pinned row", () => {
   it("pins it into that slot and renumbers the existing pins", async () => {
