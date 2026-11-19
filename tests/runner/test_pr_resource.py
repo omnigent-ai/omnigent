@@ -284,10 +284,22 @@ def test_tracked_pr_info_picks_the_workspace_remote_like_gh(
     assert info["workspace_repo"] == {"name_with_owner": name_with_owner, "host": host}
 
 
-@pytest.mark.parametrize("gh_resolved", [None, "origin"])
+@pytest.mark.parametrize(
+    ("gh_resolved", "workspace_repo"),
+    [
+        (None, None),
+        ("origin", None),
+        # gh's resolved base is a deliberate choice, so a recognized one still wins.
+        ("upstream", {"name_with_owner": "owner/app", "host": "github.com"}),
+    ],
+)
 @pytest.mark.parametrize("tracked", [True, False])
 def test_an_unrecognized_origin_names_no_workspace_repo(
-    repo: Path, monkeypatch: pytest.MonkeyPatch, tracked: bool, gh_resolved: str | None
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    tracked: bool,
+    gh_resolved: str | None,
+    workspace_repo: dict[str, str] | None,
 ) -> None:
     """A recognized public upstream must not stand in for an Enterprise origin's host."""
     _git(repo, "remote", "add", "origin", ENTERPRISE_ORIGIN)
@@ -304,7 +316,42 @@ def test_an_unrecognized_origin_names_no_workspace_repo(
 
     info = pr_resource.pr_info(str(repo), session_id="session")
 
-    assert "workspace_repo" not in info
+    assert info.get("workspace_repo") == workspace_repo
+
+
+@pytest.mark.parametrize(
+    ("origin", "workspace_repo"),
+    [
+        ("https://github.com/owner/app.git", ("owner/app", "github.com")),
+        # A fork checkout: gh resolves the upstream on origin's own host.
+        (GITHUB_FORK, ("owner/app", "github.com")),
+        # ssh config aliases only gh resolves; the path still has to name gh's repo.
+        ("git@gh-work:owner/app.git", ("owner/app", "github.com")),
+        ("git@github.com-work:owner/app.git", ("owner/app", "github.com")),
+        ("git@gh-work:me/app.git", None),
+        (ENTERPRISE_ORIGIN, None),
+        ("https://gitserver/owner/app.git", None),
+    ],
+)
+def test_gh_names_the_workspace_repo_only_for_the_preferred_remote(
+    repo: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    origin: str,
+    workspace_repo: tuple[str, str] | None,
+) -> None:
+    """gh resolves a github.com upstream when it doesn't know origin's host."""
+    _git(repo, "remote", "add", "origin", origin)
+    _git(repo, "remote", "add", "upstream", "https://github.com/owner/app.git")
+    view = {"nameWithOwner": "owner/app", "url": "https://github.com/owner/app"}
+    _stub_gh(monkeypatch, {("repo", "view"): (0, json.dumps(view), "")})
+
+    info = pr_resource.pr_info(str(repo), session_id="session")
+
+    if workspace_repo is None:
+        assert "workspace_repo" not in info
+    else:
+        name_with_owner, host = workspace_repo
+        assert info["workspace_repo"] == {"name_with_owner": name_with_owner, "host": host}
 
 
 def test_a_directory_outside_git_reports_not_a_git_repo_from_github(tmp_path: Path) -> None:
