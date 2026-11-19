@@ -547,6 +547,36 @@ export function getCurrentUserId(): string | null {
   return currentUserId;
 }
 
+/** How long fetchSignedInUserId waits for the server's answer, its body included. */
+export const SIGNED_IN_TIMEOUT_MS = 10_000;
+
+/**
+ * Ask the server who is signed in now, bypassing the cache (another window can sign in
+ * as someone else). Null when signed out; undefined when the server can't say in time.
+ */
+export async function fetchSignedInUserId(): Promise<string | null | undefined> {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timedOut = new Promise<undefined>((resolve) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      resolve(undefined);
+    }, SIGNED_IN_TIMEOUT_MS);
+  });
+  const answer = (async () => {
+    const res = await hostFetch("/v1/me", { signal: controller.signal }, { hostless: true });
+    if (res.status === 401) return null;
+    if (!res.ok) return undefined;
+    const data = (await res.json()) as { user_id?: string | null };
+    return data.user_id ?? null;
+  })().catch(() => undefined);
+  try {
+    return await Promise.race([answer, timedOut]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 /**
  * Whether the current user has admin access enabled in this browser.
  * Mode-agnostic — usable to gate admin chrome under header, accounts,

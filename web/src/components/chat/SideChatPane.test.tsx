@@ -43,6 +43,10 @@ import {
 } from "@/components/composer/engine/codeMirrorComposerLoader";
 import { composerTargetOf } from "@/components/composer/engine/composerInput";
 import { insertComposerText } from "@/lib/composerText";
+import {
+  resetDesignOutbox,
+  useDesignOutbox,
+} from "@/components/BrowserPane/designTools/core/designOutbox";
 import { SideChatPane } from "./SideChatPane";
 
 vi.mock("@/store/chatStore", async (importOriginal) => ({
@@ -248,6 +252,38 @@ describe("undelivered startup messages", () => {
       within(notice).getByRole("button", { name: "Copy message to new session" }),
     ).toBeEnabled();
   });
+});
+
+describe("design tool requests", () => {
+  it.each([false, true])(
+    "lists the chat's unsent design requests once (full session: %s)",
+    async (fullSession) => {
+      await act(async () =>
+        useDesignOutbox.setState({
+          requests: [
+            {
+              id: "design_1",
+              tabId: childId,
+              conversationId: childId,
+              label: "Draw: bigger",
+              text: "Bigger",
+              files: [],
+              status: "failed",
+              error: "Couldn't send",
+            },
+          ],
+        }),
+      );
+      renderPane(
+        <MemoryRouter>
+          <SideChatPane childId={childId} fullSession={fullSession} />
+        </MemoryRouter>,
+      );
+      expect(await screen.findByTestId("design-outbox-strip")).toHaveTextContent("Draw: bigger");
+      expect(screen.getAllByTestId("design-outbox-strip")).toHaveLength(1);
+      act(() => resetDesignOutbox());
+    },
+  );
 });
 
 describe("editing a sent side-chat message", () => {

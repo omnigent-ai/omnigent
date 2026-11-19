@@ -43,7 +43,6 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "usage_page": False,
         "harness_install": False,
         "canvas": False,
-        "arca_shutdown_warnings": False,
         "import_review": False,
         "sidebar_grouping_ui": True,
         "workspace_content_search": True,
@@ -200,13 +199,6 @@ def test_canvas_is_a_frontend_visible_feature() -> None:
         "user_inbox",
         "workspace_content_search",
     )
-
-
-def test_arca_shutdown_warnings_are_frontend_visible() -> None:
-    flags = resolve_feature_flags({FEATURES_ENV_VAR: "arca_shutdown_warnings"})
-
-    assert flags.enabled(Feature.ARCA_SHUTDOWN_WARNINGS)
-    assert flags.frontend_dict()["arca_shutdown_warnings"] is True
 
 
 def test_chat_composer_codemirror_is_an_opt_in_frontend_feature() -> None:
