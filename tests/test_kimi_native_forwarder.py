@@ -543,9 +543,15 @@ class TestState:
         )
         assert _read_state(tmp_path) is None
 
-    def test_lifecycle_fields_default_when_absent(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize(
+        "malformed",
+        [{}, {"dropped_edge_status": ["failed"]}, {"dropped_edge_status": {"x": 1}}],
+    )
+    def test_lifecycle_fields_default_when_absent_or_malformed(
+        self, tmp_path: Path, malformed: dict[str, object]
+    ) -> None:
         (tmp_path / "kimi_forwarder.json").write_text(
-            json.dumps({"wire_path": "/x/wire.jsonl", "last_line": 3, "offset": 10}),
+            json.dumps({"wire_path": "/x/wire.jsonl", "last_line": 3, "offset": 10, **malformed}),
             encoding="utf-8",
         )
         loaded = _read_state(tmp_path)
@@ -553,6 +559,7 @@ class TestState:
         assert loaded.turn_open is False
         assert loaded.tools_in_flight == 0
         assert loaded.last_edge_id is None
+        assert loaded.dropped_edge_status is None
         assert loaded.last_assistant_text == ""
 
     def test_last_assistant_text_round_trips(self, tmp_path: Path) -> None:
