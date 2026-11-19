@@ -30,6 +30,12 @@ const REMOTE_SOCKET_PATH =
 // A unary call the host answers only for a valid token, so a 200 proves the right host.
 const PROBE_PATH = "/omnigent.api.workspace.v1alpha1.WorkspaceService/ListDirectory";
 const PROBE_BODY = Buffer.from('{"pageSize":1}');
+// Main's own answers for calls it doesn't send to an unproven host. After a refused token
+// the page renews it; while another question is open it reads through the server for now.
+const NOT_SENT = {
+  refused: { status: 401, code: "unauthenticated", message: "the host refused the token" },
+  busy: { status: 503, code: "unavailable", message: "another SSH question is open" },
+};
 
 /**
  * Whether `socketPath` is a workspace socket an Omnigent host made for this user.
@@ -71,7 +77,7 @@ function isWorkspaceSocket(socketPath) {
  * @param {{hostId?: string, sshTarget?: string, socketPath: string, path: string, headers: Record<string, string>, body: Uint8Array}} request
  * @param {{
  *   sshDestination?: (hostId: string) => string | null,
- *   verifySshTarget?: (hostId: string, alias: string, proves: () => Promise<boolean>) => Promise<boolean>,
+ *   verifySshTarget?: (hostId: string, alias: string, proves: () => Promise<boolean | "refused">) => Promise<boolean | "refused" | "busy">,
  *   forwards?: ReturnType<typeof import("./workspaceSshForwards").createWorkspaceSshForwards>,
  * }} [routes]
  * @returns {Promise<{status: number, headers: Record<string, string>, body: Uint8Array}>}
@@ -111,30 +117,39 @@ function workspaceSocketRequest(request, routes = {}) {
       "content-length": String(PROBE_BODY.byteLength),
       ...(forwarded.authorization ? { authorization: forwarded.authorization } : {}),
     };
-    let ok = false;
+    let proof = false;
     try {
-      ok = (await send(local, PROBE_PATH, probe, PROBE_BODY)).status === 200;
+      const { status } = await send(local, PROBE_PATH, probe, PROBE_BODY);
+      if (status === 200) proof = true;
+      else if (status === 401) proof = "refused";
     } finally {
       // The connection may serve other hosts; it closes once idle, or now if it is gone.
-      if (!ok) dropForward();
+      if (proof !== true) dropForward();
     }
-    return ok;
+    return proof;
   };
   const forward = recorded
     ? forwards.localSocket(destination, socketPath)
-    : routes.verifySshTarget(hostId, destination, proves).then((ok) => {
-        if (!ok) throw new Error("SSH alias not allowed or not verified for this host");
+    : routes.verifySshTarget(hostId, destination, proves).then((verdict) => {
+        if (Object.hasOwn(NOT_SENT, verdict)) return verdict;
+        if (!verdict) throw new Error("SSH alias not allowed or not verified for this host");
         return forwards.localSocket(destination, socketPath);
       });
-  return forward.then(({ socketPath: local, dropConnection, dropForward }) =>
-    send(local, methodPath, forwarded, body).catch((error) => {
+  return forward.then((reached) => {
+    if (typeof reached === "string") {
+      const { status, code, message } = NOT_SENT[reached];
+      const error = new Uint8Array(Buffer.from(JSON.stringify({ code, message })));
+      return { status, headers: { "content-type": "application/json" }, body: error };
+    }
+    const { socketPath: local, dropConnection, dropForward } = reached;
+    return send(local, methodPath, forwarded, body).catch((error) => {
       // A missing listener means the connection is gone. A reset means the remote socket
       // refused (a restarted host) or the master died; cancelling the forward tells which.
       if (error?.code === "ECONNREFUSED" || error?.code === "ENOENT") dropConnection();
       else if (error?.code === "ECONNRESET") dropForward();
       throw error;
-    }),
-  );
+    });
+  });
 }
 
 function send(socketPath, methodPath, forwarded, body) {

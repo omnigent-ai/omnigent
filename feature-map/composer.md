@@ -188,7 +188,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   same older runner cannot resolve this ambiguity. With older servers, an
   unavailable session can also appear to have no goal. See the
   [Goal API compatibility notes](../omnigent/server/codex-API.md) for version
-  requirements.
+  requirements. In Claude Code native sessions, **+ → Goal** and `/goal`
+  send Claude Code's built-in `/goal <condition>`; the composer shows no goal
+  indicator, and progress appears as ordinary agent work in the conversation.
 - `slash-rewind`: in claude-sdk and Claude Code native sessions, `/rewind` opens
   a searchable list of the session's prompts, newest first. Choosing one
   continues the conversation in a new session holding only the history before
@@ -322,8 +324,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   original message, which the agent already has. The transcript is unchanged.
   Sending is a new message, steered or queued like any mid-turn send, and Edit
   never stops the agent. A non-empty draft asks "Replace your draft?" first.
-  Side chats, grid session panes, and writable sub-agent Workspace tabs edit
-  into their own composer, where "@"-mentions return as attachment markers. Edit
+  Side chats and writable sub-agent Workspace tabs edit into their own composer,
+  where "@"-mentions return as attachment markers. A grid session pane edits its
+  session's shared draft, where "@"-mentions return as tokens. Edit
   is hidden on messages the server hasn't accepted yet, messages with no text,
   other contributors' messages (shared session or not), and read-only composers.
 - `delivered-send-recovery`: a sent message stays out of the composer when its
@@ -364,8 +367,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 
 ## How to get to it (user POV)
 
-- In a Codex native chat or a Polly session with a Goal control, send `/goal`,
-  choose `/goal` from the slash menu, or open **+ → Goal**.
+- In a Codex native chat, a Claude Code native chat, or a Polly session with a
+  Goal control, send `/goal`, choose `/goal` from the slash menu, or open
+  **+ → Goal**.
 
 **In-session composer** (open any session):
 
@@ -464,7 +468,7 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   buttons. The New Chat composer opens with the action's prompt as an editable
   draft, through the same one-time handoff token; nothing is sent until Send.
   Component proof: `web/src/pages/InboxPage.test.tsx` (`takes an agent action
-  and opens the composer with its prompt`).
+and opens the composer with its prompt`).
 
 - In the managed desktop app, choose **Arclet Sandbox** and submit a task with
   missing or expired laptop credentials. Click **Refresh dbcert** in the yellow
@@ -509,6 +513,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   `tests/e2e_ui/start_session/test_sandbox_gateway_models_without_binding.py`,
   `tests/e2e_ui/start_session/test_sandbox_model_selection.py::test_optional_gateway_preview_without_a_host`
   and `tests/e2e_ui/start_session/test_sandbox_model_selection.py::test_sandbox_harness_without_reachable_models_blocks_launch`.
+  With no sandbox catalog for the harness (no model capability, or discovery
+  reports it `unconfigured`), Codex, Devin and Pi offer one "Default" row that
+  launches the harness's own default, while Claude Code lists its built-in
+  models.
 - Open a project's actions menu in the sidebar → **Project settings**, pick
   Claude Code, Codex, or Pi as the agent, then set **Model** and **Effort**.
   Click **New session in project** and check the pill shows both.
@@ -579,9 +587,32 @@ for draft persistence and parent-isolation checks. The microphone beside
 side-chat message loads it into that side chat's composer, not the main one.
 
 **Grid cell** (desktop session grids, see [Sessions](sessions.md)): each cell's
-one-row composer shows the session's host status, permission mode (switchable by
-the owner) and harness. Switch hosts and see or switch the model from the
-full-screen view.
+one-row composer shares its session's draft with the full-screen composer, sends
+its tags and review comments as the full-screen composer does, and shows the
+review comments as chips. Sending while the session works queues the message on
+that session, as the full-screen composer does: it waits in the cell's queue strip
+(edit, steer, remove) and sends when the turn ends. With Always steer on it steers
+into the running turn instead, and Mod+Enter steers the whole queue. Editing a
+queued message brings its tags back as tokens. The queue belongs to the session, so
+the full-screen view shows and flushes the same messages; a reload drops a cell's
+queued messages, where the full-screen composer restores its own. Escape does not
+stop a cell's turn, and Interrupt shows only while the draft is empty, so a draft
+sends. Typing "@" opens the full-screen "@" picker over that session: its sessions,
+and its workspace files when the harness opens them. A picked tag is kept in the
+shared draft, so it carries to the full-screen view, and is sent as its marker.
+Enter picks from the open picker and never sends while it is open, and Mod+Enter
+waits for it too. Tags are picked only in the cell's main text, not in quote cards,
+and show as plain `@name` text, not as pills. It also shows the session's host,
+permission mode (switchable by the owner), and the same model and effort picker as
+the full-screen composer, which changes only that session (Smart Routing too, where
+eligible). Shift+Tab in the cell's composer steps that session's mode too, even with
+the "@" picker open; side chats and subagent tabs keep Shift+Tab for focus.
+Switch the host from the cell's host menu when you can edit the session. The model picker
+is hidden along with the composer for a viewer who can't edit the session. It is
+inert while the session is unreachable or structurally read-only, such as a Claude
+Code sub-agent. A cell whose managed sandbox is still launching lists no models until
+its host is bound, unlike the full-screen composer, which previews the sandbox's
+catalog.
 
 ## Driving it with the repro environment
 
@@ -614,7 +645,7 @@ Other connection providers alone do not enable the managed MCP picker.
   with the action's prompt filled in and editable, the handoff token gone from
   the URL, and no session created until Send. Component coverage:
   `web/src/pages/InboxPage.test.tsx` (`takes an agent action and opens the
-  composer with its prompt`).
+composer with its prompt`).
 
 - **`blocked-start`:** on a fresh new-session page with no working directory,
   enter a prompt or attach a file. Hover disabled Start, click it, then move
@@ -829,7 +860,7 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_tracks_real_focus_and_wrapping_keyboard_navigation`,
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_shows_full_skill_description`,
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_shows_a_long_single_match_from_the_keyboard`,
-  `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_highlight_opens_no_tooltip_on_a_touch_screen`,
+  `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_highlight_opens_no_tooltip_in_the_mobile_layout`,
   `tests/browser_ui/chat/test_slash_menu.py::test_slash_menu_bounds_a_very_long_skill_description`,
   `tests/e2e_ui/chat/test_side_chat_slash_command.py::test_side_chat_slash_menu_and_skill_invocation`;
   incomplete catalog:
@@ -952,7 +983,7 @@ Other connection providers alone do not enable the managed MCP picker.
   `web/electron/e2e/desktop_dictation_availability.e2e.js` (new-session
   composer only), run from `web/electron` after building the SPA
   (`OMNIGENT_PW_NO_SANDBOX=1 OMNIGENT_PYTHON=../../.venv/bin/python xvfb-run -a
-  node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
+node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
   server without dictation (on macOS, the macOS Dictation mic instead), then
   the mic dictating through a fake-engine server. Manually, for the in-session,
   new-session and side-chat composers: connect the desktop app to a default
@@ -999,8 +1030,8 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/chat/test_composer_bulk_steer.py::test_bulk_steer_retries_the_whole_queue`.
   The native mid-turn notice has component coverage in
   `web/src/pages/ChatPage.userBubble.test.tsx`.
-  `tests/browser_ui/chat/test_status_indicators.py::test_touch_screens_reveal_timestamps_and_pending_steering`
-  verifies phone and tablet touch visibility without hover.
+  `tests/browser_ui/chat/test_status_indicators.py::test_mobile_layout_reveals_timestamps_and_pending_steering`
+  verifies their visibility without hover in the mobile layout.
 - **`host-offline-hold`:** no browser-level coverage.
   `tests/server/integration/test_session_host_launch.py::test_offline_host_send_held_by_client_records_nothing`
   (plain `uv run pytest`) checks that a held send is refused with nothing
@@ -1038,9 +1069,11 @@ Other connection providers alone do not enable the managed MCP picker.
   `web/src/pages/ChatPage.composer.test.tsx`, and
   `web/src/components/chat/SideChatPane.test.tsx`. Grid session panes and
   sub-agent Workspace tabs render the same `SideChatPane`, whose Edit logic has
-  component coverage; their own wiring is checked by hand: open
-  a grid pane or a writable Workspace tab, click Edit on a message you sent
-  there, and confirm that pane's composer fills while the main one stays empty.
+  component coverage; their own wiring is checked by hand. Open a writable
+  Workspace tab, click Edit on a message you sent there, and confirm that tab's
+  composer fills while the main one stays empty. In a grid pane, Edit fills that
+  cell's composer, which shares the session's draft: after switching to the
+  full-screen view, the same text, tags and review comments show in its composer.
 - **`delivered-send-recovery`, in-session composer (desktop and mobile):**
   `tests/e2e_ui/mobile/test_composer_after_unacked_send.py::test_composer_stays_empty_after_delivered_but_unacked_send`
   runs with a phone viewport. Run the same lost-ack journey at a desktop viewport

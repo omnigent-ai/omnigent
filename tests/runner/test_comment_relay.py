@@ -460,14 +460,15 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
     # (sys_session_list / sys_session_get_history / sys_session_get_info),
     # read-only agent tools (sys_agent_list / sys_agent_get /
     # sys_agent_download), policy tools (sys_add_policy /
-    # sys_policy_registry), and OS tools (sys_os_*) — claude-native
-    # ignores the harness tool schemas, so this relay is the only
-    # surface that reaches Claude Code. All are routed through the AP
-    # server's /mcp endpoint for policy enforcement. The opt-in spawn
-    # writes (sys_session_send/close/create) are absent here because
-    # this fixture's session has no resolvable spec — the fallback
-    # can't evaluate the (tools.agents | spawn) gate; specs that opt
-    # in get them via the ToolManager-derived branch.
+    # sys_policy_registry) — claude-native ignores the harness tool
+    # schemas, so this relay is the only surface that reaches Claude Code.
+    # All are routed through the AP server's /mcp endpoint for policy
+    # enforcement. The opt-in spawn writes (sys_session_send/close/create)
+    # are absent here because this fixture's session has no resolvable
+    # spec — the fallback can't evaluate the (tools.agents | spawn) gate;
+    # specs that opt in get them via the ToolManager-derived branch. The
+    # OS tools (sys_os_*) are absent too: native harnesses use their own
+    # shell and file tools.
     # No more, no less: a missing entry means the schema loop dropped a class;
     # an extra entry means an unintended tool leaked into the relay.
     assert set(tools_by_name) == {
@@ -488,22 +489,16 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "sys_agent_download",
         "sys_add_policy",
         "sys_policy_registry",
-        "sys_os_read",
-        "sys_os_write",
-        "sys_os_edit",
-        "sys_os_shell",
     }
     # Parameters must be the real schemas from the tool classes — proving
     # get_schema() flowed through rather than an empty placeholder. "status"
     # is a real list_comments filter; "comment_id" is required by update_comment;
-    # "conversation_id" is the sys_session_get_history arg the runner dispatch matches;
-    # "path" is a required param for sys_os_read.
+    # "conversation_id" is the sys_session_get_history arg the runner dispatch matches.
     assert "status" in tools_by_name["list_comments"]["parameters"]["properties"]
     assert "comment_id" in tools_by_name["update_comment"]["parameters"]["properties"]
     assert (
         "conversation_id" in tools_by_name["sys_session_get_history"]["parameters"]["properties"]
     )
-    assert "path" in tools_by_name["sys_os_read"]["parameters"]["properties"]
     assert tools_by_name["sys_session_message"]["parameters"]["required"] == [
         "session_id",
         "message",
@@ -1604,6 +1599,56 @@ async def test_native_relay_discovers_session_mcp_tools_through_gateway(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "harness_name",
+    [
+        "claude-native",
+        "codex-native",
+        "cursor-native",
+        "antigravity-native",
+        "qwen-native",
+        "kiro-native",
+    ],
+)
+async def test_native_relay_offers_no_os_tools(tmp_path: Path, harness_name: str) -> None:
+    """
+    The relay never advertises ``sys_os_*`` to a native harness.
+
+    Every native harness has its own shell and file tools, so relayed copies
+    would only add a second route to the workspace. The relay's ``/tool``
+    endpoint runs only advertised names, so withholding them also stops a
+    same-uid caller holding the relay token from reaching ``sys_os_shell``.
+    """
+    spec = AgentSpec(
+        spec_version=1,
+        executor=ExecutorSpec(type="omnigent", config={"harness": harness_name}),
+    )
+    app = _switch_app(
+        tmp_path,
+        _SwitchableServerClient("agent"),
+        {"agent": ResolvedSpec(spec=spec, workdir=tmp_path)},
+    )
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://runner"
+        ) as client:
+            try:
+                await _launch_bridged(client, session_id)
+                tools = {
+                    t["name"]
+                    for t in json.loads((bridge_dir / _TOOL_RELAY_FILE).read_text())["tools"]
+                }
+                assert "list_comments" in tools
+                assert not {name for name in tools if name.startswith("sys_os_")}
+            finally:
+                await client.delete(f"/v1/sessions/{session_id}")
+    finally:
+        shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("initial_revision", [None, "bundle.zip"])
 @pytest.mark.parametrize("harness_name", ["claude-native", "kiro-native", "pi-native"])
 async def test_native_revision_refreshes_relay_before_turn_without_reset(
@@ -1794,7 +1839,9 @@ async def test_agent_switch_replaces_relay_in_same_bridge_dir(
 
 
 @pytest.mark.asyncio
-async def test_agent_switch_moves_relay_to_new_bridge_dir(tmp_path: Path) -> None:
+async def test_agent_switch_moves_relay_to_new_bridge_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """A switch that changes the bridge id relays into the new directory.
 
     Switching between native harness families reassigns the session's
@@ -1802,6 +1849,15 @@ async def test_agent_switch_moves_relay_to_new_bridge_dir(tmp_path: Path) -> Non
     advertisement (otherwise the new harness sees no relay tools at all),
     and the old directory's advertisement must be withdrawn.
     """
+    started_relays: list[bridge.ClaudeNativeToolRelay] = []
+    start_tool_relay = bridge.start_tool_relay
+
+    def start(**kwargs: Any) -> bridge.ClaudeNativeToolRelay:
+        relay = start_tool_relay(**kwargs)
+        started_relays.append(relay)
+        return relay
+
+    monkeypatch.setattr(bridge, "start_tool_relay", start)
     agent_a, agent_b = "ag_bridge_a", "ag_bridge_b"
     bridge_a = f"bridge_{uuid.uuid4().hex[:10]}"
     bridge_b = f"bridge_{uuid.uuid4().hex[:10]}"
@@ -1824,6 +1880,11 @@ async def test_agent_switch_moves_relay_to_new_bridge_dir(tmp_path: Path) -> Non
             await _launch_bridged(c, session_id)
             assert (dir_a / _TOOL_RELAY_FILE).exists(), "no relay written for the first bridge"
             old_relay = json.loads((dir_a / _TOOL_RELAY_FILE).read_text())
+            assert len(started_relays) == 1
+            original_relay = started_relays[0]
+            original_socket = original_relay._httpd.socket
+            assert not original_relay._closed.is_set()
+            assert original_socket.fileno() != -1
 
             server_client.agent_id = agent_b
             server_client.bridge_id = bridge_b
@@ -1839,14 +1900,44 @@ async def test_agent_switch_moves_relay_to_new_bridge_dir(tmp_path: Path) -> Non
             assert not (dir_a / _TOOL_RELAY_FILE).exists(), (
                 "the previous bridge directory kept a stale relay advertisement"
             )
+            assert len(started_relays) == 2
+            assert original_relay._closed.is_set()
+            assert original_socket.fileno() == -1
+            new_relay = json.loads((dir_b / _TOOL_RELAY_FILE).read_text())
+            assert new_relay["token"] != old_relay["token"]
+            mcp_post = AsyncMock(
+                return_value=httpx.Response(
+                    200,
+                    json={"result": {"content": [{"type": "text", "text": '{"items": []}'}]}},
+                    request=httpx.Request("POST", f"http://server/v1/sessions/{session_id}/mcp"),
+                )
+            )
+            monkeypatch.setattr(server_client, "post", mcp_post)
             async with httpx.AsyncClient(trust_env=False) as relay_client:
-                with pytest.raises(httpx.ConnectError):
-                    await relay_client.post(
-                        f"{old_relay['url']}/tool",
-                        headers={"Authorization": f"Bearer {old_relay['token']}"},
-                        json={"name": "list_comments", "arguments": {}},
-                        timeout=2.0,
-                    )
+                refused = await relay_client.post(
+                    f"{new_relay['url']}/tool",
+                    headers={"Authorization": f"Bearer {old_relay['token']}"},
+                    json={"name": "list_comments", "arguments": {}},
+                    timeout=2.0,
+                )
+                assert refused.status_code == 401
+                mcp_post.assert_not_awaited()
+                response = await relay_client.post(
+                    f"{new_relay['url']}/tool",
+                    headers={"Authorization": f"Bearer {new_relay['token']}"},
+                    json={"name": "list_comments", "arguments": {"status": "pending"}},
+                    timeout=2.0,
+                )
+                assert response.status_code == 200
+                result = response.json()
+                assert not result.get("isError")
+                assert json.loads(result["content"][0]["text"]) == {"items": []}
+                mcp_post.assert_awaited_once()
+                assert mcp_post.call_args.args == (f"/v1/sessions/{session_id}/mcp",)
+                mcp_call = mcp_post.call_args.kwargs["json"]
+                assert mcp_call["method"] == "tools/call"
+                assert mcp_call["params"]["name"] == "list_comments"
+                assert mcp_call["params"]["arguments"] == {"status": "pending"}
     finally:
         with contextlib.suppress(httpx.HTTPError):
             async with httpx.AsyncClient(

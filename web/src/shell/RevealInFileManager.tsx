@@ -12,13 +12,8 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
-import {
-  getHostIdentity,
-  isElectronShell,
-  onHostStatusChanged,
-  revealFile,
-  supportsFileReveal,
-} from "@/lib/nativeBridge";
+import { revealFile, supportsFileReveal } from "@/lib/nativeBridge";
+import { useDesktopHostId } from "@/lib/desktopHostId";
 import { FileViewerContext } from "./FileViewerContext";
 import { getSessionHost, subscribeSessionHostChanges } from "@/lib/sessionHost";
 
@@ -29,40 +24,6 @@ export interface RevealTarget {
   hostId: string;
   /** Absolute path on the session's host. */
   path: string;
-}
-
-// This machine's host id, re-read whenever the host's status changes: a fresh
-// install has none until its first host connection.
-let localHostId: string | null = null;
-let watchingHost = false;
-const hostIdListeners = new Set<() => void>();
-
-function readLocalHostId() {
-  void getHostIdentity().then((identity) => {
-    const next = identity?.hostId ?? null;
-    if (next === localHostId) return;
-    localHostId = next;
-    hostIdListeners.forEach((listener) => listener());
-  });
-}
-
-function watchHostId(shouldWatch: boolean, listener: () => void) {
-  if (!watchingHost && shouldWatch) {
-    watchingHost = true;
-    readLocalHostId();
-    onHostStatusChanged(readLocalHostId);
-  }
-  hostIdListeners.add(listener);
-  return () => {
-    hostIdListeners.delete(listener);
-  };
-}
-
-const subscribeToDesktopHostId = (listener: () => void) => watchHostId(isElectronShell(), listener);
-
-/** This machine's host id from the desktop shell; null in a browser or before its first connect. */
-export function useDesktopHostId(): string | null {
-  return useSyncExternalStore(subscribeToDesktopHostId, () => localHostId);
 }
 
 function joinPath(base: string, path: string): string {

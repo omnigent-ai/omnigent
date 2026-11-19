@@ -31,7 +31,6 @@ vi.mock("@/lib/identity", () => ({ authenticatedFetch: (u: string) => authentica
 vi.mock("@/lib/nativeBridge", () => ({
   isIOSShell: () => isIOSShell(),
   isAndroidShell: () => isAndroidShell(),
-  workspaceSocketBridge: () => null,
 }));
 vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
   browseLocationBase: () => "",

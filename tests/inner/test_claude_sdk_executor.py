@@ -3370,9 +3370,10 @@ class TestStreamEventStreaming(unittest.TestCase):
         query_started = asyncio.Event()
 
         class _ResultMessage:
-            def __init__(self, session_id, result):
+            def __init__(self, session_id, result, usage=None):
                 self.session_id = session_id
                 self.result = result
+                self.usage = usage
 
         class _SystemMessage:
             subtype = "hook_started"
@@ -3398,9 +3399,14 @@ class TestStreamEventStreaming(unittest.TestCase):
                     if compacts and len(queries) == 1:
                         yield _SystemMessage()
                     await self.result_ready.wait()
-                    # The first follow-up ends without assistant text.
+                    # The interrupted query reports the usage of its model calls; the
+                    # first follow-up ends without assistant text.
                     yield _ResultMessage(
-                        "claude-session-a", [None, None, "THANKS"][len(queries) - 1]
+                        "claude-session-a",
+                        [None, None, "THANKS"][len(queries) - 1],
+                        usage={"input_tokens": 2641, "output_tokens": 512}
+                        if len(queries) == 1
+                        else None,
                     )
 
                 async def interrupt(self):
@@ -3438,12 +3444,18 @@ class TestStreamEventStreaming(unittest.TestCase):
         return first_events, follow_up_events, queries, connect_calls, interrupt_calls, disconnect
 
     def test_interrupted_query_keeps_session_for_next_turn(self):
-        """An interrupted query ends as cancelled and the next query resumes the same client."""
+        """An interrupted query ends as cancelled and the next query resumes the same client.
+
+        The cancelled turn keeps the usage that the interrupted query reports, as its model
+        calls were spent.
+        """
         first_events, follow_up_events, queries, connect_calls, interrupt_calls, disconnect = (
             self._interrupt_query_then_follow_up(compacts=False)
         )
 
         self.assertIsInstance(first_events[-1], TurnCancelled)
+        self.assertEqual(first_events[-1].usage["input_tokens"], 2641)
+        self.assertEqual(first_events[-1].usage["output_tokens"], 512)
         self.assertEqual(len(interrupt_calls), 1)
         self.assertEqual(len(connect_calls), 1)
         disconnect.assert_not_awaited()

@@ -32,7 +32,7 @@ from omnigent.entities import (
     ResourceEventData,
 )
 from omnigent.errors import StaleCursorError
-from omnigent.server.auth import RESERVED_USER_LOCAL
+from omnigent.server.auth import LEVEL_READ, RESERVED_USER_LOCAL
 from omnigent.session_import import (
     IMPORT_EXTERNAL_SESSION_ID_LABEL_KEY,
     IMPORT_SOURCE_LABEL_KEY,
@@ -50,6 +50,17 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
     SqlAlchemyConversationStore,
 )
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+_SEARCHER = "searcher@example.com"
+
+
+def _grant_search_access(db_uri: str, *conversation_ids: str) -> None:
+    """Grant ``_SEARCHER`` read access so content search can return these conversations."""
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    for conversation_id in conversation_ids:
+        permissions.grant(_SEARCHER, conversation_id, LEVEL_READ)
+
 
 # ── CRUD ──────────────────────────────────────────────
 
@@ -1206,15 +1217,19 @@ def test_append_encodes_item_data_in_one_batch_call(db_uri: str) -> None:
     assert [item.data.content[0]["text"] for item in read_back] == texts
 
 
+@pytest.mark.parametrize("recovering", [False, True])
 def test_append_retry_reuses_prepared_id_and_encoded_payload(
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    recovering: bool,
 ) -> None:
     """A serialization replay repeats SQL, not ID generation or encoding."""
     from contextlib import contextmanager
     from unittest.mock import MagicMock
 
     from sqlalchemy.exc import DBAPIError
+
+    from omnigent.session_recovery import RECOVERY_PROMPT, SessionRecovery
 
     class SerializationFailure(Exception):
         sqlstate = "40001"
@@ -1258,6 +1273,11 @@ def test_append_retry_reuses_prepared_id_and_encoded_payload(
     )
     store = RecordingStore(db_uri)
     conv = store.create_conversation()
+    recovery = SessionRecovery(
+        "a" * 32, "runner", 100, phase="dispatching", attempts=1, attempt_id="attempt"
+    )
+    if recovering:
+        assert store.replace_session_recovery(conv.id, None, recovery)
     retrying_maker = RetryOnceMaker(store._conv_session_immediate)
     store._conv_session_immediate = retrying_maker
     statements: list[str] = []
@@ -1282,7 +1302,12 @@ def test_append_retry_reuses_prepared_id_and_encoded_payload(
                     response_id="resp_retry",
                     data=MessageData(
                         role="user",
-                        content=[{"type": "input_text", "text": "retry once"}],
+                        content=[
+                            {
+                                "type": "input_text",
+                                "text": RECOVERY_PROMPT if recovering else "retry once",
+                            }
+                        ],
                     ),
                 )
             ],
@@ -1298,6 +1323,8 @@ def test_append_retry_reuses_prepared_id_and_encoded_payload(
     assert id_calls == 1
     assert store.encode_calls == 1
     assert persisted.id == item_id
+    assert persisted.data.is_meta is recovering
+    assert store.get_session_recovery(conv.id) == (recovery if recovering else None)
     assert [item.id for item in store.list_items(conv.id).data] == [item_id]
 
 
@@ -1393,7 +1420,10 @@ def test_append_tool_output_with_nul_bytes(
 
     # The meaningful, NUL-adjacent token is still searchable, proving
     # sanitization dropped only the NUL and left real tokens indexed.
-    results = conversation_store.search("marker_unique_token", conversation_id=conv.id)
+    _grant_search_access(db_uri, conv.id)
+    results = conversation_store.search(
+        "marker_unique_token", conversation_id=conv.id, accessible_by=_SEARCHER
+    )
     assert [r.id for r in results] == [item_id]
 
 
@@ -2040,8 +2070,9 @@ def test_list_items_small_page_stays_single_statement(
 # ── Conversation ID / response ID lookups ────────────
 
 
-def test_search(conversation_store: SqlAlchemyConversationStore) -> None:
+def test_search(conversation_store: SqlAlchemyConversationStore, db_uri: str) -> None:
     conv = conversation_store.create_conversation()
+    _grant_search_access(db_uri, conv.id)
     conversation_store.append(
         conv.id,
         [
@@ -2064,21 +2095,23 @@ def test_search(conversation_store: SqlAlchemyConversationStore) -> None:
             ),
         ],
     )
-    results = conversation_store.search("Paris")
+    results = conversation_store.search("Paris", accessible_by=_SEARCHER)
     assert len(results) == 1
     assert results[0].type == "message"
 
-    results = conversation_store.search("sunny")
+    results = conversation_store.search("sunny", accessible_by=_SEARCHER)
     assert len(results) == 1
 
-    assert conversation_store.search("nonexistent") == []
+    assert conversation_store.search("nonexistent", accessible_by=_SEARCHER) == []
 
 
 def test_search_scoped_to_conversation(
     conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
 ) -> None:
     conv1 = conversation_store.create_conversation()
     conv2 = conversation_store.create_conversation()
+    _grant_search_access(db_uri, conv1.id, conv2.id)
     conversation_store.append(
         conv1.id,
         [
@@ -2106,18 +2139,26 @@ def test_search_scoped_to_conversation(
         ],
     )
     # Unscoped: both match "hello"
-    assert len(conversation_store.search("hello")) == 2
+    assert len(conversation_store.search("hello", accessible_by=_SEARCHER)) == 2
 
     # Scoped: only one per conversation
-    assert len(conversation_store.search("hello", conversation_id=conv1.id)) == 1
-    assert len(conversation_store.search("hello", conversation_id=conv2.id)) == 1
+    assert (
+        len(conversation_store.search("hello", conversation_id=conv1.id, accessible_by=_SEARCHER))
+        == 1
+    )
+    assert (
+        len(conversation_store.search("hello", conversation_id=conv2.id, accessible_by=_SEARCHER))
+        == 1
+    )
 
 
 def test_search_function_call_item(
     conversation_store: SqlAlchemyConversationStore,
+    db_uri: str,
 ) -> None:
     """FTS indexes function_call items by name and arguments."""
     conv = conversation_store.create_conversation()
+    _grant_search_access(db_uri, conv.id)
     conversation_store.append(
         conv.id,
         [
@@ -2133,9 +2174,9 @@ def test_search_function_call_item(
             ),
         ],
     )
-    assert len(conversation_store.search("get_weather")) == 1
-    assert len(conversation_store.search("Tokyo")) == 1
-    assert conversation_store.search("nonexistent") == []
+    assert len(conversation_store.search("get_weather", accessible_by=_SEARCHER)) == 1
+    assert len(conversation_store.search("Tokyo", accessible_by=_SEARCHER)) == 1
+    assert conversation_store.search("nonexistent", accessible_by=_SEARCHER) == []
 
 
 def test_list_conversations_search_query_matches_content(
@@ -5549,8 +5590,24 @@ def test_fork_marks_source_workspace_failures_as_notices(
     }
     assert LATEST_ACTIVITY_ERROR_LABEL_KEY not in fork.labels
     assert LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY not in fork.labels
-    assert len(conversation_store.search("source_workspace_missing", conversation_id=fork.id)) == 2
-    assert conversation_store.search("source_workspace_missing", conversation_id=source.id) == []
+    _grant_search_access(db_uri, fork.id, source.id)
+    assert (
+        len(
+            conversation_store.search(
+                "source_workspace_missing", conversation_id=fork.id, accessible_by=_SEARCHER
+            )
+        )
+        == 2
+    )
+    assert conversation_store.search(
+        "Workspace", conversation_id=source.id, accessible_by=_SEARCHER
+    )
+    assert (
+        conversation_store.search(
+            "source_workspace_missing", conversation_id=source.id, accessible_by=_SEARCHER
+        )
+        == []
+    )
 
     [new_failure] = conversation_store.append(fork.id, [missing])
     assert conversation_store.list_items(fork.id).data[-1] == new_failure
@@ -10371,10 +10428,12 @@ async def test_sibling_family_lifecycle(tmp_path, split_database, user_id, monke
     assert store.get_conversation(replacement.id).project_id is None
     assert all(member.project_id == project_id for member in store.get_session_family(later.id))
     candidate = store.create_conversation()
-    with pytest.raises(OmnigentError, match="another family"):
-        store.add_new_sibling(replacement.id, candidate.id, user_id=user_id)
-    assert store.get_conversation(replacement.id).family_id is None
-    assert store.get_conversation(candidate.id).family_id is None
+    store.add_new_sibling(replacement.id, candidate.id, user_id=user_id)
+    assert (
+        store.get_conversation(candidate.id).family_id
+        == store.get_conversation(replacement.id).family_id
+    )
+    assert store.get_conversation(candidate.id).family_id != source.id
 
     another = store.create_conversation()
     another_sibling = store.create_conversation(labels={"omni_project": "Other project"})
@@ -10508,6 +10567,66 @@ def test_failed_family_membership_preserves_source_pin(
         assert pinned_label_key("alice") not in member.labels
     store.set_family_pin(source.id, "", user_id="alice")
     assert not store.list_conversations(pinned=True, pinned_owner="alice").data
+
+
+@pytest.mark.parametrize("store_name", ["conversation_store", "split_db_conversation_store"])
+def test_move_one_session_between_nests(request, store_name, monkeypatch):
+    from omnigent.errors import OmnigentError
+    from omnigent.stores.conversation_store import family_pinned_label_key, pinned_label_key
+
+    store = request.getfixturevalue(store_name)
+    clock = [100]
+    monkeypatch.setattr(
+        "omnigent.stores.conversation_store.sqlalchemy_store.now_epoch", lambda: clock[0]
+    )
+    moved = store.create_conversation(host_id="b" * 32, runner_id="c" * 32, workspace="/workspace")
+    clock[0] = 200
+    head = store.create_conversation()
+    peer = store.create_conversation()
+    store.add_new_sibling(head.id, peer.id, user_id="owner")
+    store.set_conversation_project(head.id, "a" * 32)
+    store.set_family_pin(head.id, "123", user_id="owner")
+    store.set_session_nest(moved.id, head.id, user_id="owner")
+    saved = store.get_conversation(moved.id)
+    assert saved.family_id == head.id and saved.project_id == "a" * 32
+    assert saved.labels[family_pinned_label_key("owner")] == "123"
+    assert (saved.host_id, saved.runner_id, saved.root_conversation_id) == (
+        moved.host_id,
+        moved.runner_id,
+        moved.root_conversation_id,
+    )
+    assert store.get_session_family(moved.id)[0].id == head.id
+    store.set_family_pin(head.id, "234", user_id="owner")
+    store.set_conversation_project(head.id, "d" * 32)
+    assert store.get_conversation(moved.id).project_id == "d" * 32
+    assert store.get_conversation(moved.id).labels[family_pinned_label_key("owner")] == "234"
+    other = store.create_conversation()
+    store.set_session_nest(moved.id, other.id, user_id="owner")
+    assert {row.id for row in store.get_session_family(head.id)} == {head.id, peer.id}
+    assert family_pinned_label_key("owner") not in store.get_conversation(moved.id).labels
+    store.set_session_nest(other.id, None, user_id="owner")
+    assert store.get_conversation(other.id).family_id is None
+    store.set_labels(other.id, {pinned_label_key("owner"): "345"})
+    fresh = store.create_conversation()
+    store.add_new_sibling(other.id, fresh.id, user_id="owner")
+    assert store.get_conversation(fresh.id).labels[family_pinned_label_key("owner")] == "345"
+    assert store.get_conversation(fresh.id).family_id != store.get_conversation(moved.id).family_id
+    child = store.create_conversation(parent_conversation_id=head.id)
+    with pytest.raises(OmnigentError):
+        store.set_session_nest(child.id, head.id, user_id="owner")
+    assert store.get_conversation(child.id).family_id is None
+
+    # Another creation can commit after this caller reads the standalone source.
+    later = store.create_conversation()
+    get_conversation = store.get_conversation
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            store,
+            "get_conversation",
+            lambda session_id: head if session_id == head.id else get_conversation(session_id),
+        )
+        store.add_new_sibling(head.id, later.id, user_id="owner")
+    assert store.get_conversation(later.id).family_id == head.id
 
 
 @pytest.mark.parametrize("split_database", [False, True])

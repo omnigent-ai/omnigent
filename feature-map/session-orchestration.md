@@ -26,7 +26,9 @@ MCP independent creation.
   another session". `sys_session_list` and `sys_session_get_info` expose
   `created_by_session_id` so managers can identify their workers across restarts;
   `sys_session_list` with `include_archived` also lists archived workers, each
-  marked `archived`.
+  marked `archived`. With `created_by_this_session`, the runner pages the global
+  `sessions` view itself and returns only the caller's workers in one call, up to
+  a scan limit; the `sub_agents` view is then empty.
 - `list-scope`: `sys_session_list`'s global `sessions` view lists only the
   caller's own sessions by default, like the sidebar's My view. Sessions other
   users shared with the caller appear only with `visibility: "shared"` (or
@@ -53,10 +55,6 @@ MCP independent creation.
   of the owner's saved workflows, with that workflow's plan already in its
   journal. With workflows disabled, or on a server that doesn't advertise
   `session_create_workflow_id`, the tool refuses it before creating anything.
-  An optional `session_id_placeholder` names text in `message` that the runner
-  replaces with the new session's ID for `same_host` and `host` placements, where it
-  sends the first message itself; the message is sent unchanged when the argument is
-  absent, for `managed` placement, or when filling it in would exceed the message limit.
   With `sibling_sessions` enabled they share one sidebar family and do not appear
   as child agents; with it disabled they remain standalone.
   Managed creation uses the server's configured default sandbox provider. A

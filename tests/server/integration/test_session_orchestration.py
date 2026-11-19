@@ -1765,6 +1765,7 @@ async def test_managed_worker_starts_with_the_source_mcp_services(
     auth_client, auth_app, peers, db_uri, monkeypatch, source_services, inherited
 ):
     import asyncio
+    from dataclasses import replace
 
     from omnigent.server.managed_hosts import parse_sandbox_config
     from omnigent.server.routes.sessions import routes_core
@@ -1773,9 +1774,12 @@ async def test_managed_worker_starts_with_the_source_mcp_services(
     store = SqlAlchemyConversationStore(db_uri)
     if source_services:
         store.set_labels(source["id"], {"deployment.mcp_services": json.dumps(source_services)})
-    auth_app.state.session_mcp_selection = _ListLabelSelection()
-    auth_app.state.sandbox_config = parse_sandbox_config(
+    # The worker runs in a new sandbox of a provider that records MCP services its own way.
+    deployment = parse_sandbox_config(
         {"server_url": "https://managed-test.example.com", "providers": [{"provider": "modal"}]}
+    )
+    auth_app.state.sandbox_config = replace(
+        deployment, configs=(replace(deployment.default, mcp_selection=_ListLabelSelection()),)
     )
     launched = asyncio.Event()
     release = asyncio.Event()
@@ -3072,3 +3076,38 @@ async def test_explicit_host_endpoint_refuses_without_capability_or_source(
     )
     assert response.status_code == 403, response.text
     assert {session.id for session in store.list_conversations().data} == before
+
+
+async def test_owner_moves_one_session_into_and_out_of_a_nest(auth_client, peers, db_uri):
+    source, moved, _ = peers
+    store = SqlAlchemyConversationStore(db_uri)
+    peer = store.create_conversation(agent_id=source["agent_id"])
+    store.add_new_sibling(source["id"], peer.id, user_id="alice")
+    joined = await auth_client.patch(
+        f"/v1/sessions/{moved['id']}", json={"nest_source_id": source["id"]}
+    )
+    assert joined.status_code == 200, joined.text
+    assert joined.json()["family"]["id"] == source["id"]
+    refused = await auth_client.patch(
+        f"/v1/sessions/{moved['id']}", json={"nest_source_id": None, "title": "Mixed"}
+    )
+    assert refused.status_code == 400
+    foreign = await _create_session_as(auth_client, "", "bob")
+    refused = await auth_client.patch(
+        f"/v1/sessions/{moved['id']}", json={"nest_source_id": foreign["id"]}
+    )
+    assert refused.status_code == 403
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.grant("bob", moved["id"], LEVEL_EDIT)
+    refused = await auth_client.patch(
+        f"/v1/sessions/{moved['id']}",
+        json={"nest_source_id": None},
+        headers={"X-Forwarded-Email": "bob"},
+    )
+    assert refused.status_code == 403
+    detached = await auth_client.patch(
+        f"/v1/sessions/{moved['id']}", json={"nest_source_id": None}
+    )
+    assert detached.status_code == 200, detached.text
+    assert detached.json().get("family") is None
+    assert {row.id for row in store.get_session_family(source["id"])} == {source["id"], peer.id}

@@ -58,8 +58,11 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
 from omnigent.stores.permission_store.sqlalchemy_store import (
     delete_deleted_account_grants,
+    delete_deleted_account_workflow_grants,
     delete_deleted_task_grants,
+    delete_grants_on_workflows,
     holds_scheduled_task_grants,
+    holds_workflow_grants,
 )
 
 _logger = logging.getLogger(__name__)
@@ -269,13 +272,16 @@ class SqlAlchemyAccountStore:
             the first-boot admin bootstrap passes True.
         :returns: The created :class:`Account`.
         :raises ValueError: If a user with this id already exists.
-        :raises OmnigentError: ``CONFLICT`` while a deleted account's automation
-            grants, workflows or Inbox items under this name remain; retrying
-            can succeed.
+        :raises OmnigentError: ``CONFLICT`` while a deleted account's automation or
+            workflow grants, workflows or Inbox items under this name remain;
+            retrying can succeed.
         """
         now = int(time.time())
         # Finish any held-grant cleanup a deletion left, so the name inherits nothing.
         delete_deleted_account_grants(
+            self._session_immediate, user_id, batch_size=self._cleanup_batch_size
+        )
+        delete_deleted_account_workflow_grants(
             self._session_immediate, user_id, batch_size=self._cleanup_batch_size
         )
         self._delete_deleted_workflows(user_id)
@@ -288,6 +294,11 @@ class SqlAlchemyAccountStore:
             if holds_scheduled_task_grants(session, user_id):
                 raise OmnigentError(
                     "A deleted account's automation grants are still being removed. Try again.",
+                    code=ErrorCode.CONFLICT,
+                )
+            if holds_workflow_grants(session, user_id):
+                raise OmnigentError(
+                    "A deleted account's workflow grants are still being removed. Try again.",
                     code=ErrorCode.CONFLICT,
                 )
             if existing is not None and self._owned_workflow_ids(session, user_id, limit=1):
@@ -568,6 +579,13 @@ class SqlAlchemyAccountStore:
         if deleted:
             self._delete_scheduled_task_grants(user_id)
             try:
+                # Held grants first, as a re-registered name must not inherit them.
+                delete_deleted_account_workflow_grants(
+                    self._session_immediate, user_id, batch_size=self._cleanup_batch_size
+                )
+            except Exception:
+                _logger.exception("Workflow grant cleanup deferred for a deleted account")
+            try:
                 self._delete_deleted_workflows(user_id)
             except Exception:
                 _logger.exception("Workflow cleanup deferred for a deleted account")
@@ -577,43 +595,56 @@ class SqlAlchemyAccountStore:
                 _logger.exception("Inbox cleanup deferred for a deleted account")
         return deleted
 
-    def _owned_workflow_ids(self, session: Session, user_id: str, *, limit: int) -> list[str]:
-        """Read a bounded page through the unique owner-and-name index."""
-        return list(
-            session.scalars(
-                select(SqlWorkflow.id)
-                .where(
-                    SqlWorkflow.workspace_id == current_workspace_id(),
-                    SqlWorkflow.user_id == user_id,
-                )
-                .order_by(SqlWorkflow.name)
-                .limit(limit)
-                .with_hint(SqlWorkflow, "FORCE INDEX (uq_workflows_user_id_name)", "mysql")
+    def _owned_workflow_ids(
+        self, session: Session, user_id: str, *, limit: int, lock: bool = False
+    ) -> list[str]:
+        """Read a bounded page through the unique owner-and-name index.
+
+        :param lock: Lock the rows, as a grant does, so no grant lands on one meanwhile.
+        """
+        stmt = (
+            select(SqlWorkflow.id)
+            .where(
+                SqlWorkflow.workspace_id == current_workspace_id(),
+                SqlWorkflow.user_id == user_id,
             )
+            .order_by(SqlWorkflow.name)
+            .limit(limit)
+            .with_hint(SqlWorkflow, "FORCE INDEX (uq_workflows_user_id_name)", "mysql")
         )
+        return list(session.scalars(stmt.with_for_update() if lock else stmt))
 
     def _delete_deleted_workflows(self, user_id: str) -> None:
-        """Finish bounded cleanup before a tombstoned username can be registered again."""
+        """Finish bounded cleanup before a tombstoned username can be registered again.
 
-        def delete_batch(session: Session) -> int:
+        Each transaction deletes one bounded batch: grants on the account's workflows
+        while any remain, so none outlives its workflow, then the workflows.
+        """
+
+        def delete_batch(session: Session) -> bool:
+            """Delete one batch; ``True`` while more may remain."""
             account = lock_account(session, user_id)
             if account is None or account.deleted_at is None:
-                return 0
-            ids = self._owned_workflow_ids(session, user_id, limit=self._cleanup_batch_size)
-            if ids:
-                session.execute(
-                    delete(SqlWorkflow).where(
-                        SqlWorkflow.workspace_id == current_workspace_id(),
-                        SqlWorkflow.id.in_(sorted(ids)),
-                    )
-                )
-            return len(ids)
-
-        while (
-            run_write_transaction(
-                self._session_immediate, "delete_deleted_account_workflow_batch", delete_batch
+                return False
+            # Locked before their grants are read, the order a grant takes, so a grant
+            # already in flight commits first and is deleted here, or finds no workflow.
+            ids = self._owned_workflow_ids(
+                session, user_id, limit=self._cleanup_batch_size, lock=True
             )
-            == self._cleanup_batch_size
+            if not ids:
+                return False
+            if delete_grants_on_workflows(session, ids, batch_size=self._cleanup_batch_size):
+                return True
+            session.execute(
+                delete(SqlWorkflow).where(
+                    SqlWorkflow.workspace_id == current_workspace_id(),
+                    SqlWorkflow.id.in_(sorted(ids)),
+                )
+            )
+            return len(ids) == self._cleanup_batch_size
+
+        while run_write_transaction(
+            self._session_immediate, "delete_deleted_account_workflow_batch", delete_batch
         ):
             pass
 

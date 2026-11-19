@@ -14,6 +14,10 @@ import { Button } from "@/components/ui/button";
 import { OmniGlassSurface } from "@/components/OmniGlassSurface";
 import { cn } from "@/lib/utils";
 import { insertComposerText } from "@/lib/composerText";
+import {
+  COMPOSER_INPUT_MARKER,
+  type ComposerTextTarget,
+} from "@/components/composer/engine/composerInput";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import {
@@ -140,7 +144,7 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
         "relative flex w-full flex-col rounded-2xl md:min-h-[105px]",
         appearance === "glass"
           ? "isolate rounded-[20px] border-0 bg-transparent"
-          : "composer-reference-surface border transition-shadow duration-150 has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]",
+          : "composer-reference-surface border transition-shadow duration-150 hover:shadow-[var(--composer-shadow)] has-[[data-composer-input]:focus]:shadow-[var(--composer-shadow)]",
         className,
       )}
       {...props}
@@ -357,8 +361,8 @@ export function ComposerTextInput({
   );
 }
 
-function composerListStartEdit(textarea: HTMLTextAreaElement) {
-  const { value, selectionStart, selectionEnd } = textarea;
+function composerListStartEdit(target: ComposerTextTarget) {
+  const { value, selectionStart, selectionEnd } = target;
   if (selectionStart !== selectionEnd) return null;
   const lineStart = value.lastIndexOf("\n", selectionStart - 1) + 1;
   const prefix = value.slice(lineStart, selectionStart);
@@ -372,8 +376,8 @@ function composerListStartEdit(textarea: HTMLTextAreaElement) {
   };
 }
 
-function composerListEdit(textarea: HTMLTextAreaElement) {
-  const { value, selectionStart, selectionEnd } = textarea;
+function composerListEdit(target: ComposerTextTarget) {
+  const { value, selectionStart, selectionEnd } = target;
   const lineStart = value.lastIndexOf("\n", selectionStart - 1) + 1;
   const lineEndIndex = value.indexOf("\n", selectionEnd);
   const lineEnd = lineEndIndex < 0 ? value.length : lineEndIndex;
@@ -464,6 +468,7 @@ export const ComposerTextarea = forwardRef<
         className,
       )}
       {...props}
+      {...COMPOSER_INPUT_MARKER}
       onCompositionStart={(event) => {
         isComposingRef.current = true;
         onCompositionStart?.(event);
