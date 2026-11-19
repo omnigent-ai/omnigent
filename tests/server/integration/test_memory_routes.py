@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
+from omnigent.stores.memory_store import MemoryActor, MemoryEntry, MemoryStore
 from omnigent.stores.memory_store.hindsight_store import HindsightMemoryStore
 from omnigent.stores.memory_store.sqlalchemy_store import SqlAlchemyMemoryStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
@@ -45,23 +47,44 @@ def with_permissions() -> bool:
     return True
 
 
+class _EventLoopRecordingMemoryStore(SqlAlchemyMemoryStore):
+    """SQLite store that notes the thread each ``get`` coroutine starts on.
+
+    A route that handed the store call to a worker thread would start ``get``
+    there instead of on the event loop.
+    """
+
+    def __init__(self, db_uri: str) -> None:
+        super().__init__(db_uri)
+        self.get_threads: list[int] = []
+
+    async def get(self, actor: MemoryActor, path: str) -> MemoryEntry | None:
+        self.get_threads.append(threading.get_ident())
+        return await super().get(actor, path)
+
+
+@pytest.fixture
+def memory_store(memory_backend: str, db_uri: str) -> MemoryStore:
+    """The backend selected by ``memory_backend``."""
+    if memory_backend == "hindsight":
+        return HindsightMemoryStore(FakeHindsight())
+    if memory_backend == "event-loop-recording":
+        return _EventLoopRecordingMemoryStore(db_uri)
+    return SqlAlchemyMemoryStore(db_uri)
+
+
 @pytest.fixture
 def auth_app(
     runtime_init: None,
     db_uri: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    memory_backend: str,
+    memory_store: MemoryStore,
     with_permissions: bool,
 ) -> FastAPI:
     """An auth-enabled app with a memory store and memory turned on (it is opt-in)."""
     monkeypatch.setenv("OMNIGENT_ADMIN_CREDENTIALS_PATH", str(tmp_path / "admin-credentials"))
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
-    memory_store = (
-        HindsightMemoryStore(FakeHindsight())
-        if memory_backend == "hindsight"
-        else SqlAlchemyMemoryStore(db_uri)
-    )
     return create_app(
         agent_store=SqlAlchemyAgentStore(db_uri),
         file_store=SqlAlchemyFileStore(db_uri),
@@ -112,6 +135,19 @@ async def test_owner_writes_reads_lists_and_deletes(auth_client: httpx.AsyncClie
         "/v1/memory/entry", params={"path": "/user/preferences/style"}, headers=ALICE
     )
     assert missing.status_code == 404
+
+
+@pytest.mark.parametrize("memory_backend", ["event-loop-recording"])
+async def test_the_route_awaits_an_async_store_on_the_event_loop(
+    auth_client: httpx.AsyncClient, memory_store: _EventLoopRecordingMemoryStore
+):
+    await _write(auth_client, ALICE, "/a", "x")
+
+    got = await auth_client.get("/v1/memory/entry", params={"path": "/a"}, headers=ALICE)
+
+    assert got.json()["content"] == "x"
+    # The ASGI app runs on the test's event loop, so the store's coroutine does too.
+    assert memory_store.get_threads == [threading.get_ident()]
 
 
 async def test_the_longest_user_id_can_use_memory(auth_client: httpx.AsyncClient):

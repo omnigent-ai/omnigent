@@ -183,6 +183,9 @@ class HindsightMemoryStore(MemoryStore):
     has accepted and processed the document, which can take a few seconds.
     Listing follows Hindsight's own order (most recently updated first) and pages
     by offset, so a write or delete while paging can shift entries between pages.
+
+    ``_call`` blocks until Hindsight answers, so each operation runs its
+    ``_*_sync`` helper in a worker thread.
     """
 
     supports_search = True
@@ -261,7 +264,12 @@ class HindsightMemoryStore(MemoryStore):
 
     # ── MemoryStore ───────────────────────────────────────────────
 
-    def write(
+    async def write(
+        self, actor: MemoryActor, path: str, content: str, description: str | None = None
+    ) -> MemoryEntry:
+        return await asyncio.to_thread(self._write_sync, actor, path, content, description)
+
+    def _write_sync(
         self, actor: MemoryActor, path: str, content: str, description: str | None = None
     ) -> MemoryEntry:
         validate_actor(actor)
@@ -287,14 +295,26 @@ class HindsightMemoryStore(MemoryStore):
             return MemoryEntry(actor, path, content, description, now, now)
         return self._entry(actor, path, document, with_content=True)
 
-    def get(self, actor: MemoryActor, path: str) -> MemoryEntry | None:
+    async def get(self, actor: MemoryActor, path: str) -> MemoryEntry | None:
+        return await asyncio.to_thread(self._get_sync, actor, path)
+
+    def _get_sync(self, actor: MemoryActor, path: str) -> MemoryEntry | None:
         validate_actor(actor)
         validate_path(path)
         bank = bank_id_for(current_workspace_id(), actor)
         document = self._call(self._fetch(bank, path), "get")
         return None if document is None else self._entry(actor, path, document, with_content=True)
 
-    def list(
+    async def list(
+        self,
+        actor: MemoryActor,
+        path_prefix: str | None = None,
+        page_token: str | None = None,
+        page_size: int = DEFAULT_PAGE_SIZE,
+    ) -> MemoryPage:
+        return await asyncio.to_thread(self._list_sync, actor, path_prefix, page_token, page_size)
+
+    def _list_sync(
         self,
         actor: MemoryActor,
         path_prefix: str | None = None,
@@ -340,7 +360,16 @@ class HindsightMemoryStore(MemoryStore):
         ]
         return MemoryPage(entries=entries, next_page_token=next_token)
 
-    def search(
+    async def search(
+        self,
+        actor: MemoryActor,
+        query: str,
+        path_prefix: str | None = None,
+        limit: int = DEFAULT_SEARCH_LIMIT,
+    ) -> builtins.list[MemoryHit]:
+        return await asyncio.to_thread(self._search_sync, actor, query, path_prefix, limit)
+
+    def _search_sync(
         self,
         actor: MemoryActor,
         query: str,
@@ -391,7 +420,10 @@ class HindsightMemoryStore(MemoryStore):
             for rank, (path, document) in enumerate(found)
         ]
 
-    def delete(self, actor: MemoryActor, path: str) -> bool:
+    async def delete(self, actor: MemoryActor, path: str) -> bool:
+        return await asyncio.to_thread(self._delete_sync, actor, path)
+
+    def _delete_sync(self, actor: MemoryActor, path: str) -> bool:
         validate_actor(actor)
         validate_path(path)
         bank = bank_id_for(current_workspace_id(), actor)
