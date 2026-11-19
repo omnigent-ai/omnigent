@@ -389,9 +389,15 @@ class _Clock:
         return self.now
 
 
+@pytest.mark.parametrize("failed", [False, True])
+@pytest.mark.parametrize("server_only", [False, True], ids=["registered", "server_only"])
 @pytest.mark.parametrize("seconds_per_read", [1.0, 3.0, 9.0])
 def test_summaries_cut_by_the_budget_read_every_tracked_pr_in_turn(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, seconds_per_read: float
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    seconds_per_read: float,
+    server_only: bool,
+    failed: bool,
 ) -> None:
     # More sessions and PRs than any history shared between sessions would keep.
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
@@ -402,7 +408,8 @@ def test_summaries_cut_by_the_budget_read_every_tracked_pr_in_turn(
         for index in range(150)
     }
     for session_id, urls in sessions.items():
-        references = [PullRequestRef.from_url(url) for url in urls]
+        # A server-only selection is one the server tracks and the runner's registry lacks.
+        references = [PullRequestRef.from_url(url) for url in urls[server_only:]]
         SessionPrRegistry(session_id).record(
             references, relationship="created", source="runner", timestamp=0
         )
@@ -411,9 +418,11 @@ def test_summaries_cut_by_the_budget_read_every_tracked_pr_in_turn(
     read: dict[str, list[str]] = {session_id: [] for session_id in sessions}
     reading = ""
 
-    def reference_state(_: str, reference: PullRequestRef) -> dict[str, Any]:
+    def reference_state(_: str, reference: PullRequestRef) -> dict[str, Any] | None:
         read[reading].append(reference.url)
         clock.now += seconds_per_read
+        if failed:
+            return None
         return {"number": reference.number, "url": reference.url, "title": "T", "state": "OPEN"}
 
     monkeypatch.setattr(github_pr_state, "reference_state", reference_state)

@@ -335,7 +335,13 @@ def _summary_info(
     from omnigent.runner import github_pr_state, github_resource
 
     tracked = {entry.url: entry for entry in entries}
-    tracked.setdefault(reference.url, reference)
+    if reference.url not in tracked:
+        # A server-selected PR the registry does not hold keeps its read time apart.
+        try:
+            checked_at = registry.unlisted_checked_at(reference.url)
+        except (OSError, ValueError, FileLockTimeout):
+            checked_at = 0
+        tracked[reference.url] = reference.model_copy(update={"title_checked_at": checked_at})
     # The longest-unchecked PR goes first, so the budget never skips the same ones. The
     # check times live in the session's registry, so other sessions cannot evict them.
     order = sorted(tracked.values(), key=lambda pr: (pr.title_checked_at, pr.url != reference.url))
@@ -373,7 +379,7 @@ def _summary_info(
     }
 
 
-# Marks a discovery result whose provider failed; ``pr_info`` removes it before answering.
+# Marks a discovery result whose provider failed; ``pr_info`` leaves it out of its answer.
 _DISCOVERY_FAILED = "discovery_failed"
 
 
@@ -689,10 +695,12 @@ def pr_info(
     if reference is None:
         info = next((candidate for candidate in discovered if candidate.get("pr")), info)
     for candidate in discovered:
-        if candidate.pop(_DISCOVERY_FAILED, False):
+        # Overlapping reads share a background discovery's result, so it is only read here.
+        if candidate.get(_DISCOVERY_FAILED) is True:
             discovery_incomplete = True
         if candidate is not info:
             info.setdefault("discovery_warnings", []).extend(candidate.get("warnings", []))
+    info.pop(_DISCOVERY_FAILED, None)
     if discovery_incomplete:
         # The server then retries discovery on its next refresh instead of a summary.
         info["discovery_incomplete"] = True
