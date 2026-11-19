@@ -10,6 +10,7 @@ import { create } from "zustand";
 import {
   SHELL_MENTION_REFUSAL,
   SHELL_OWNER_REFUSAL,
+  SHELL_QUOTE_REFUSAL,
   SHELL_REVIEW_COMMENT_REFUSAL,
 } from "@/components/composer/composerHighlight";
 import { SHIFT_KEY } from "@/components/KeyboardShortcut";
@@ -5795,7 +5796,8 @@ describe("Composer native shell mode", () => {
     },
   );
 
-  it("keeps shell mode when a quote moves the `!` out of the tail", () => {
+  // The quote would follow the `!` into the shell, where `> quoted line` truncates a file.
+  it("refuses a `!` send that a reply quote moved out of the tail, and keeps it", () => {
     useChatStore.setState({ sessionHarness: "codex-native" });
     const ref = createRef<ComponentRef<typeof Composer>>();
     const props = composerProps({ isNativeWrapper: true, permissionLevel: null });
@@ -5805,11 +5807,31 @@ describe("Composer native shell mode", () => {
 
     expect(textarea()).toHaveValue("");
     expect(textarea()).toHaveAttribute("data-shell-command", "true");
-    expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent("Shell command");
-    expect(screen.getByTestId("composer-shell-mode-status")).toHaveTextContent("Shell command");
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent(
+      SHELL_QUOTE_REFUSAL,
+    );
+    expect(screen.getByTestId("composer-shell-mode-status")).toHaveTextContent(SHELL_QUOTE_REFUSAL);
     fireEvent.keyDown(textarea(), { key: "Enter" });
-    expect(props.onSend).toHaveBeenCalledOnce();
-    expect(vi.mocked(props.onSend).mock.calls[0]?.[0]).toBe("!ls\n\n> quoted line");
+    expect(props.onSend).not.toHaveBeenCalled();
+    expect(
+      screen.getByText(SHELL_QUOTE_REFUSAL, { selector: "[data-escape-owner]" }),
+    ).toBeVisible();
+    expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue("!ls");
+  });
+
+  it("leaves shell mode off when a file rides along, as it goes out as its own block", () => {
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    const props = composerProps({ isNativeWrapper: true, permissionLevel: null });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "!ls" } });
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+
+    fireEvent.change(document.querySelector('input[type="file"]') as HTMLInputElement, {
+      target: { files: [new File(["hello"], "notes.txt", { type: "text/plain" })] },
+    });
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    expect(screen.queryByTestId("composer-shell-mode-indicator")).toBeNull();
+    expect(textarea()).not.toHaveAttribute("data-shell-command");
   });
 
   it("refuses a quoted `!` send the session won't run, and keeps it", () => {

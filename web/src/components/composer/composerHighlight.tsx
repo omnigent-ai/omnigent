@@ -95,6 +95,8 @@ export const SHELL_OWNER_REFUSAL =
   "Only the session's owner can run shell commands here; drop the leading `!` to ask the agent.";
 export const SHELL_MENTION_REFUSAL =
   "Shell commands can't include @mentions; remove them or drop the leading `!`.";
+export const SHELL_QUOTE_REFUSAL =
+  "Shell commands can't carry a reply quote; remove it or drop the leading `!`.";
 export const SHELL_REVIEW_COMMENT_REFUSAL =
   "Shell commands can't carry review comments; remove them or drop the leading `!`.";
 
@@ -102,11 +104,14 @@ export const SHELL_REVIEW_COMMENT_REFUSAL =
 export interface ShellSendContext {
   mentions: readonly unknown[];
   reviewComments?: readonly unknown[];
+  /** Reply quotes, which the shell would run as extra lines (`> quoted` truncates a file). */
+  quotes?: readonly unknown[];
 }
 
 /** Why shell input can't carry `context`, or null: its tags and review comments reach the shell. */
 function shellSendRefusal(context: ShellSendContext): string | null {
   if (context.mentions.length > 0) return SHELL_MENTION_REFUSAL;
+  if ((context.quotes?.length ?? 0) > 0) return SHELL_QUOTE_REFUSAL;
   return (context.reviewComments?.length ?? 0) > 0 ? SHELL_REVIEW_COMMENT_REFUSAL : null;
 }
 

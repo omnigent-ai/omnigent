@@ -1232,7 +1232,7 @@ function SideChatComposer({
     mentionTokens: [],
     textareaRef: tailTextareaRef,
     textareaNode: tailTextareaNode,
-    sendContext,
+    sendContext: { ...sendContext, quotes },
   });
   usePublishComposerCommands(childId, menuCommandNames, nativeShell);
   // Like the main composer, a draft turns Interrupt into Send; a grid cell queues its draft.

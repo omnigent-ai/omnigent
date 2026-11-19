@@ -26,6 +26,7 @@ import { SESSION_MENTION_HINT } from "@/lib/composerMentions";
 import {
   SHELL_MENTION_REFUSAL,
   SHELL_OWNER_REFUSAL,
+  SHELL_QUOTE_REFUSAL,
   SHELL_REVIEW_COMMENT_REFUSAL,
 } from "@/components/composer/composerHighlight";
 import type { Comment } from "@/hooks/useComments";
@@ -3000,7 +3001,7 @@ describe("side-chat composer highlight", () => {
     });
   });
 
-  it("keeps shell mode when a quote holds the `!`, and sends the quoted message", () => {
+  it("refuses a `!` send that a reply quote holds, and keeps it", () => {
     conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
     useChatStore.setState({
       sideChatComposers: {
@@ -3014,10 +3015,14 @@ describe("side-chat composer highlight", () => {
     renderPane(<SideChatPane childId={childId} />);
     const input = screen.getByTestId("side-chat-input");
     expect(input).toHaveAttribute("data-shell-command", "true");
-    expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent("Shell command");
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent(
+      SHELL_QUOTE_REFUSAL,
+    );
 
     fireEvent.click(screen.getByTestId("side-chat-send"));
-    expect(send.mock.calls[0]?.[0]).toBe("!ls\n\n> quoted line");
+    expect(send).not.toHaveBeenCalled();
+    expect(screen.getByTestId("side-chat-command-notice")).toHaveTextContent(SHELL_QUOTE_REFUSAL);
+    expect(screen.getByRole("textbox", { name: "Reply text before quote 1" })).toHaveValue("!ls");
   });
 
   it("waits for the session's permission level before offering shell mode", () => {

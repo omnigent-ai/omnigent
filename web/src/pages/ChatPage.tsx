@@ -3222,7 +3222,7 @@ function ComposerImpl(
     mentionTokens: draft.quotes.length === 0 ? mentionTokens : [],
     textareaRef: tailTextareaRef,
     textareaNode: tailTextareaNode,
-    sendContext,
+    sendContext: { ...sendContext, quotes: draft.quotes },
   });
   const hasDraft =
     fullText.trim().length > 0 || files.length > 0 || hasMentions || localReviewComments.length > 0;
