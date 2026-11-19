@@ -1154,6 +1154,280 @@ function createHistoryQueue(config) {
   };
 }
 
+// Per-pid temp name: an exiting Pi process and its relaunched successor can
+// write concurrently, and a shared temp path could persist a torn file.
+function writeJsonAtomic(filePath, value) {
+  const tmp = `${filePath}.${process.pid}.tmp`;
+  try {
+    fs.writeFileSync(tmp, JSON.stringify(value));
+    fs.renameSync(tmp, filePath);
+  } catch (_err) {
+    // Remove temporary state after a failed best-effort checkpoint.
+    try {
+      fs.unlinkSync(tmp);
+    } catch (_cleanupErr) {}
+  }
+}
+
+// Native Pi subagents run as their own Pi sessions. A child file sits beneath
+// the parent's per-session directory (``<dir>/<parent stem>/...``) and names
+// the launching file in its ``parentSession`` header; Pi's /fork and /clone
+// write top-level siblings, so they never match.
+const _CHILD_POLL_MS = 2_000;
+// A child whose last reply ended its turn this long ago is reported idle.
+const _CHILD_QUIET_MS = 20_000;
+const _CHILD_READ_CHUNK_BYTES = 1024 * 1024;
+const _CHILD_HEADER_BYTES = 64 * 1024;
+const _CHILD_SCAN_MAX_DEPTH = 10;
+// pi-subagents names each child session ``subagent-<agent>-<run uuid>-<n>``.
+const _PI_SUBAGENTS_SESSION_NAME = /^subagent-(.+)-[0-9a-f-]{36}-\d+$/;
+
+function readFileRange(file, position, length) {
+  let fd;
+  try {
+    fd = fs.openSync(file, "r");
+    const buffer = Buffer.alloc(length);
+    return buffer.subarray(0, fs.readSync(fd, buffer, 0, length, position));
+  } catch (_err) {
+    return null;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+function parseJsonLine(text) {
+  try {
+    const value = JSON.parse(text);
+    return value && typeof value === "object" ? value : null;
+  } catch (_err) {
+    return null;
+  }
+}
+
+function listSessionFiles(dir, depth, found) {
+  if (depth > _CHILD_SCAN_MAX_DEPTH) return;
+  let entries;
+  try {
+    entries = fs.readdirSync(dir, { withFileTypes: true });
+  } catch (_err) {
+    return;
+  }
+  for (const entry of entries) {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) listSessionFiles(full, depth + 1, found);
+    else if (entry.isFile() && entry.name.endsWith(".jsonl")) found.push(full);
+  }
+}
+
+// Returns null while the header line is incomplete.
+function readChildHeader(file) {
+  const head = readFileRange(file, 0, _CHILD_HEADER_BYTES);
+  const newline = head ? head.indexOf(10) : -1;
+  if (newline < 0) return head && head.length >= _CHILD_HEADER_BYTES ? { ignore: true } : null;
+  const header = parseJsonLine(head.subarray(0, newline).toString("utf8"));
+  if (header?.type !== "session" || typeof header.id !== "string" || !header.id ||
+    typeof header.parentSession !== "string" || !header.parentSession)
+    return { ignore: true };
+  let title = "subagent";
+  // The final split segment is a partial line or empty.
+  for (const line of head.subarray(newline + 1).toString("utf8").split("\n").slice(0, -1)) {
+    const entry = parseJsonLine(line);
+    if (entry?.type !== "session_info" || typeof entry.name !== "string" || !entry.name) continue;
+    // The Agents rail splits a child title at its first colon.
+    title = (_PI_SUBAGENTS_SESSION_NAME.exec(entry.name)?.[1] || entry.name).replace(/:/g, "-");
+    break;
+  }
+  return {
+    key: header.id,
+    parentFile: path.resolve(path.dirname(file), header.parentSession),
+    startedAt: Date.parse(header.timestamp) || 0,
+    title,
+  };
+}
+
+/**
+ * Register native Pi subagent sessions as Omnigent child sessions and report
+ * each child's cumulative usage, priced by the child's own model, so the
+ * server's subtree roll-up includes it.
+ *
+ * Reads only bytes appended since the last poll. Cursors and totals persist
+ * together in the bridge dir, so a relaunch resumes without double counting.
+ * Runs on its own timer and retries failed posts on the next poll.
+ */
+function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
+  const enabled = Boolean(config && config.serverUrl && config.sessionId && config.bridgeDir);
+  const statePath = enabled ? path.join(config.bridgeDir, "pi_subagent_children.json") : null;
+  let roots = [];
+  let children = [];
+  const ignoredFiles = new Set();
+  let timer = null;
+  let polling = null;
+
+  try {
+    const saved = JSON.parse(fs.readFileSync(statePath, "utf8"));
+    roots = saved.roots.filter(root => typeof root === "string");
+    children = saved.children.filter(child => typeof child?.file === "string");
+  } catch (_err) {}
+
+  function persist() {
+    if (!statePath) return;
+    writeJsonAtomic(statePath, {
+      roots,
+      children: children.map(({ seen: _seen, postedKey: _postedKey, postedStatus: _status, ...child }) => child),
+    });
+  }
+
+  function discover() {
+    for (const root of roots) {
+      const files = [];
+      listSessionFiles(path.join(path.dirname(root), path.basename(root, ".jsonl")), 0, files);
+      for (const file of files) {
+        if (ignoredFiles.has(file) || children.some(child => child.file === file)) continue;
+        const header = readChildHeader(file);
+        if (!header) continue;
+        if (header.ignore || children.some(child => child.key === header.key)) {
+          ignoredFiles.add(file);
+          continue;
+        }
+        // Give Pi a moment to write the session name used as the title.
+        if (header.title === "subagent" && now() - (fs.statSync(file, { throwIfNoEntry: false })?.mtimeMs ?? 0) < 5_000)
+          continue;
+        children.push({
+          ...header, file, childId: null, offset: 0, lastStop: null,
+          usage: { input: 0, output: 0, cacheRead: 0, costUsd: 0, completeCost: true, model: null },
+        });
+      }
+    }
+  }
+
+  async function post(sessionId, body) {
+    return postEventChecked(
+      { ...config, sessionId }, body, AbortSignal.timeout(assistantItemPostTimeoutMs(config)),
+    );
+  }
+
+  async function ensureMinted(child) {
+    if (child.childId) return true;
+    // A nested child attaches to the child session that launched it.
+    const parentId = roots.includes(child.parentFile)
+      ? config.sessionId
+      : children.find(other => other.file === child.parentFile)?.childId;
+    if (!parentId) return false;
+    try {
+      const response = await post(parentId, {
+        type: "external_acp_subagent_start",
+        data: { subagent_id: child.key, title: child.title },
+      });
+      const childId = (await response?.json?.())?.child_session_id;
+      if (typeof childId === "string" && childId) child.childId = childId;
+    } catch (_err) {}
+    return Boolean(child.childId);
+  }
+
+  function addUsage(child, message) {
+    const usage = extractPiUsage(message);
+    child.seen ||= new Set();
+    const key = usage && `${message.responseId || ""}:${message.timestamp}`;
+    if (!usage || child.seen.has(key)) return;
+    child.seen.add(key);
+    // Same input accounting as the parent's accumulateUsage.
+    child.usage.input += usage.input + usage.cacheRead + usage.cacheWrite;
+    child.usage.output += usage.output;
+    child.usage.cacheRead += usage.cacheRead;
+    if (usage.cost === null) child.usage.completeCost = false;
+    else child.usage.costUsd += usage.cost;
+    if (usage.model) child.usage.model = usage.model;
+  }
+
+  // Consume only complete lines appended since the last poll.
+  function readNew(child) {
+    let stat;
+    try {
+      stat = fs.statSync(child.file);
+    } catch (_err) {
+      return;
+    }
+    child.mtimeMs = stat.mtimeMs;
+    const remaining = stat.size - child.offset;
+    if (remaining <= 0) return;
+    let buffer = readFileRange(child.file, child.offset, Math.min(remaining, _CHILD_READ_CHUNK_BYTES));
+    if (buffer && buffer.lastIndexOf(10) < 0 && remaining > _CHILD_READ_CHUNK_BYTES)
+      buffer = readFileRange(child.file, child.offset, remaining);
+    const end = buffer ? buffer.lastIndexOf(10) : -1;
+    if (end < 0) return;
+    for (const line of buffer.subarray(0, end).toString("utf8").split("\n")) {
+      const entry = parseJsonLine(line);
+      const message = entry?.type === "message" ? entry.message : null;
+      // A forked child starts with a copy of its parent's history.
+      if (message?.role !== "assistant" || message.timestamp < child.startedAt) continue;
+      addUsage(child, message);
+      child.lastStop = typeof message.stopReason === "string" ? message.stopReason : null;
+    }
+    child.offset += end + 1;
+  }
+
+  async function report(child) {
+    const usage = child.usage;
+    const postKey = JSON.stringify(usage);
+    if ((usage.input || usage.output) && postKey !== child.postedKey) {
+      const data = {
+        cost_complete: usage.completeCost,
+        cumulative_input_tokens: usage.input,
+        cumulative_output_tokens: usage.output,
+        cumulative_cache_read_input_tokens: usage.cacheRead,
+      };
+      if (usage.completeCost) data.cumulative_cost_usd = usage.costUsd;
+      if (usage.model) data.model = usage.model;
+      try {
+        await post(child.childId, { type: "external_session_usage", data });
+        child.postedKey = postKey;
+      } catch (_err) {}
+    }
+    const quiet = now() - child.mtimeMs > _CHILD_QUIET_MS;
+    const status = child.lastStop && child.lastStop !== "toolUse" && quiet ? "idle" : "running";
+    if (status === child.postedStatus) return;
+    // A terminal status edge would deliver a result to the parent's inbox and
+    // wake Pi, which already has it; the idle observation only updates the rail.
+    try {
+      await post(child.childId, status === "idle"
+        ? { type: "subagent.status", data: { idle: true } }
+        : { type: "external_session_status", data: { status: "running" } });
+      child.postedStatus = status;
+    } catch (_err) {}
+  }
+
+  async function runPoll() {
+    const current = sessionFile();
+    if (current && !roots.includes(path.resolve(current))) roots.push(path.resolve(current));
+    discover();
+    const minted = [];
+    for (const child of children) {
+      if (!(await ensureMinted(child))) continue;
+      readNew(child);
+      minted.push(child);
+    }
+    // Persist cursors and totals before reporting them.
+    persist();
+    for (const child of minted) await report(child);
+  }
+
+  return {
+    poll() {
+      if (enabled) polling ||= runPoll().finally(() => { polling = null; });
+      return polling || Promise.resolve();
+    },
+    start() {
+      if (!enabled || timer) return;
+      timer = setInterval(() => this.poll().catch(() => {}), _CHILD_POLL_MS);
+      timer?.unref?.();
+    },
+    stop() {
+      clearInterval(timer);
+      timer = null;
+    },
+  };
+}
+
 function assistantMessageSourceId(message, responseId, text) {
   const response =
     message && typeof message.responseId === "string" && message.responseId
@@ -1675,7 +1949,13 @@ module.exports = function (pi) {
   process.env.OMNIGENT_PI_NATIVE_PID = String(process.pid);
   const config = readConfig();
   const history = createHistoryQueue(config);
-  pi.on("session_shutdown", () => history.close());
+  const childSessions = createChildSessionWatcher(config, {
+    sessionFile: () => latestContext?.sessionManager?.getSessionFile?.() || null,
+  });
+  pi.on("session_shutdown", () => {
+    childSessions.stop();
+    return history.close();
+  });
   pi.on("session_compact", async (_event, ctx) => {
     const manager = ctx?.sessionManager;
     if (typeof manager?.buildSessionProjection !== "function") return;
@@ -2065,28 +2345,14 @@ module.exports = function (pi) {
   function persistCumulativeUsage() {
     const statePath = usageStatePath();
     if (!statePath) return;
-    // Per-pid temp name: an exiting Pi process and its relaunched successor
-    // can flush concurrently, and a shared temp path could persist a torn file.
-    const tmp = `${statePath}.${process.pid}.tmp`;
-    try {
-      fs.writeFileSync(
-        tmp,
-        JSON.stringify({
-          cumulative_input_tokens: cumulativeInputTokens,
-          cumulative_output_tokens: cumulativeOutputTokens,
-          cumulative_cache_read_input_tokens: cumulativeCacheReadTokens,
-          cost_complete: completeCost,
-          ...(completeCost ? { cumulative_cost_usd: cumulativeCostUsd } : {}),
-          model: usageModel,
-        }),
-      );
-      fs.renameSync(tmp, statePath);
-    } catch (_err) {
-      // Remove temporary state after a failed best-effort checkpoint.
-      try {
-        fs.unlinkSync(tmp);
-      } catch (_cleanupErr) {}
-    }
+    writeJsonAtomic(statePath, {
+      cumulative_input_tokens: cumulativeInputTokens,
+      cumulative_output_tokens: cumulativeOutputTokens,
+      cumulative_cache_read_input_tokens: cumulativeCacheReadTokens,
+      cost_complete: completeCost,
+      ...(completeCost ? { cumulative_cost_usd: cumulativeCostUsd } : {}),
+      model: usageModel,
+    });
   }
 
   function raiseUsageTotals(saved) {
@@ -2437,6 +2703,7 @@ module.exports = function (pi) {
       () => compacting,
     );
     markInputReady(config);
+    childSessions.start();
     const nativeSessionId =
       ctx && ctx.sessionManager && ctx.sessionManager.getSessionId
         ? ctx.sessionManager.getSessionId()
@@ -2861,3 +3128,5 @@ module.exports = function (pi) {
     }
   });
 };
+
+module.exports.createChildSessionWatcher = createChildSessionWatcher;

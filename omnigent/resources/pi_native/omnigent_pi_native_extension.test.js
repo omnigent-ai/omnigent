@@ -727,8 +727,137 @@ async function testQueuedPromptDuringStartupStaysRunningUntilAgentEnd() {
   }
 }
 
+// Native subagent children: a parent session file plus child session files
+// beneath its per-session directory, watched through the real extension module.
+function childFixture() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-children-"));
+  harnesses.push({ pi: {}, fixtureRoot: root });
+  const sessions = path.join(root, "sessions");
+  const bridgeDir = path.join(root, "bridge");
+  fs.mkdirSync(sessions);
+  fs.mkdirSync(bridgeDir);
+  const parentFile = path.join(sessions, "2026-01-01T00-00-00-000Z_parent.jsonl");
+  fs.writeFileSync(parentFile, JSON.stringify({ type: "session", id: "parent" }) + "\n");
+  const posts = [];
+  global.fetch = async (url, opts) => {
+    const body = JSON.parse(opts.body);
+    const sessionId = decodeURIComponent(String(url).split("/v1/sessions/")[1].split("/")[0]);
+    posts.push({ sessionId, body });
+    const json = body.type === "external_acp_subagent_start"
+      ? { child_session_id: `conv_${body.data.subagent_id}` }
+      : {};
+    return { ok: true, status: 202, json: async () => json };
+  };
+  const config = { serverUrl: "http://mock", sessionId: "conv_parent", bridgeDir };
+  delete require.cache[EXT_PATH];
+  const { createChildSessionWatcher } = require(EXT_PATH);
+  const watcher = (now = Date.now) =>
+    createChildSessionWatcher(config, { sessionFile: () => parentFile, now });
+  return { sessions, bridgeDir, parentFile, posts, watcher };
+}
+
+function childSessionLines({ id, parentFile, agent, startedAt = 1000 }) {
+  return [
+    { type: "session", id, timestamp: new Date(startedAt).toISOString(), parentSession: parentFile },
+    { type: "session_info", name: `subagent-${agent}-00000000-0000-4000-8000-000000000000-1` },
+  ].map((line) => JSON.stringify(line) + "\n").join("");
+}
+
+function assistantLine(model, timestamp, input, output, stopReason = "toolUse") {
+  return JSON.stringify({
+    type: "message",
+    message: {
+      role: "assistant", model, timestamp, responseId: `r-${timestamp}`, stopReason,
+      usage: { input, output, cacheRead: 10, cacheWrite: 0, totalTokens: input + output + 10, cost: { total: 0 } },
+    },
+  }) + "\n";
+}
+
+function childUsage(posts, sessionId) {
+  return posts.filter((p) => p.sessionId === sessionId && p.body.type === "external_session_usage")
+    .map((p) => p.body.data);
+}
+
+async function testChildSessionsAreRegisteredWithTheirOwnModels() {
+  const f = childFixture();
+  const childDir = path.join(f.sessions, path.basename(f.parentFile, ".jsonl"));
+  const writeChild = (relative, text) => {
+    fs.mkdirSync(path.dirname(path.join(childDir, relative)), { recursive: true });
+    fs.writeFileSync(path.join(childDir, relative), text);
+  };
+  writeChild("run-a/run-0/session.jsonl",
+    childSessionLines({ id: "child-a", parentFile: f.parentFile, agent: "worker" }) +
+    assistantLine("model-a", 2000, 100, 10) +
+    // The same message seen twice is counted once.
+    assistantLine("model-a", 2000, 100, 10));
+  writeChild("run-b/run-0/session.jsonl",
+    childSessionLines({ id: "child-b", parentFile: f.parentFile, agent: "reviewer", startedAt: 5000 }) +
+    // Copied by a fork from the parent before the child started.
+    assistantLine("model-parent", 4000, 999, 999) +
+    assistantLine("model-b", 6000, 50, 5));
+  // Pi's own /fork writes a top-level sibling that names the parent.
+  fs.writeFileSync(path.join(f.sessions, "fork.jsonl"),
+    childSessionLines({ id: "pi-fork", parentFile: f.parentFile, agent: "x" }) +
+    assistantLine("model-fork", 2000, 1, 1));
+
+  await f.watcher().poll();
+
+  const starts = f.posts.filter((p) => p.body.type === "external_acp_subagent_start");
+  assert("each child is registered under the parent once",
+    JSON.stringify(starts.map((p) => [p.sessionId, p.body.data.subagent_id, p.body.data.title]).sort()) ===
+      JSON.stringify([["conv_parent", "child-a", "worker"], ["conv_parent", "child-b", "reviewer"]]),
+    JSON.stringify(starts));
+  const usageA = childUsage(f.posts, "conv_child-a");
+  const usageB = childUsage(f.posts, "conv_child-b");
+  assert("child usage is priced by its own model, deduped, without a zero Pi cost",
+    usageA.length === 1 && usageA[0].model === "model-a" &&
+      usageA[0].cumulative_input_tokens === 110 && usageA[0].cumulative_output_tokens === 10 &&
+      usageA[0].cumulative_cache_read_input_tokens === 10 &&
+      usageA[0].cost_complete === false && !("cumulative_cost_usd" in usageA[0]),
+    JSON.stringify(usageA));
+  assert("forked history is not billed to the child",
+    usageB.length === 1 && usageB[0].model === "model-b" && usageB[0].cumulative_input_tokens === 60,
+    JSON.stringify(usageB));
+  assert("a running child reports running",
+    f.posts.some((p) => p.sessionId === "conv_child-a" && p.body.type === "external_session_status" &&
+      p.body.data.status === "running"));
+}
+
+async function testChildReadsIncrementallyAndSurvivesRestart() {
+  const f = childFixture();
+  const file = path.join(f.sessions, path.basename(f.parentFile, ".jsonl"), "run", "session.jsonl");
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const second = assistantLine("model-a", 3000, 20, 2, "stop");
+  fs.writeFileSync(file,
+    childSessionLines({ id: "child", parentFile: f.parentFile, agent: "worker" }) +
+    assistantLine("model-a", 2000, 100, 10) + second.slice(0, 30));
+
+  await f.watcher().poll();
+  assert("a partial trailing line is not counted",
+    childUsage(f.posts, "conv_child").at(-1)?.cumulative_input_tokens === 110,
+    JSON.stringify(childUsage(f.posts, "conv_child")));
+
+  fs.appendFileSync(file, second.slice(30));
+  // A relaunched extension resumes from the persisted cursor and totals.
+  const later = () => Date.now() + 60_000;
+  await f.watcher(later).poll();
+  const usage = childUsage(f.posts, "conv_child");
+  assert("restart completes the line without double counting",
+    usage.at(-1).cumulative_input_tokens === 140 && usage.at(-1).cumulative_output_tokens === 12,
+    JSON.stringify(usage));
+  assert("restart does not register the child again",
+    f.posts.filter((p) => p.body.type === "external_acp_subagent_start").length === 1);
+  assert("a quiet child that ended its turn reports idle without a terminal edge",
+    f.posts.some((p) => p.sessionId === "conv_child" && p.body.type === "subagent.status") &&
+      !f.posts.some((p) => p.body.type === "external_session_status" && p.body.data.status !== "running"));
+  const state = JSON.parse(fs.readFileSync(path.join(f.bridgeDir, "pi_subagent_children.json"), "utf8"));
+  assert("the cursor covers exactly the consumed bytes", state.children[0].offset === fs.statSync(file).size);
+}
+
 (async () => {
   try {
+    await testChildSessionsAreRegisteredWithTheirOwnModels();
+    await testChildReadsIncrementallyAndSurvivesRestart();
     await testSessionStartupDoesNotCompleteATurn();
     await testSessionStartMarksInputReady();
     await testQueuedPromptDuringStartupStaysRunningUntilAgentEnd();
