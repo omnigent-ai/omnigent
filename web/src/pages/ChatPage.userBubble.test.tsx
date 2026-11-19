@@ -895,6 +895,36 @@ describe("UserBubble command tint", () => {
     expect(token.closest("p")).toHaveTextContent("/team fix the bug");
   });
 
+  it("follows the catalog as it is replaced and removed under an existing bubble", () => {
+    const bubble = userBubble("/team fix it");
+    const view = renderScoped(bubble, <PublishCommands />);
+    const tinted = () => screen.queryByText("/team", { selector: ".text-brand-accent" });
+    const text = () => screen.getByTestId("user-message-content").textContent;
+    expect(tinted()).not.toBeNull();
+
+    const rerender = (publish: ReactNode) =>
+      view.rerender(
+        <QueryClientProvider client={queryClient}>
+          <ConversationScopeContext.Provider value="conv_cmd">
+            {publish}
+            <FileViewerContext.Provider value={SCOPED_FILE_VIEWER}>
+              <BubbleView bubble={bubble} />
+            </FileViewerContext.Provider>
+          </ConversationScopeContext.Provider>
+        </QueryClientProvider>,
+      );
+    rerender(<PublishCommands commands={["/help"]} />);
+    expect(tinted()).toBeNull();
+    expect(text()).toBe("/team fix it");
+
+    rerender(<PublishCommands commands={["/help", "/team"]} />);
+    expect(tinted()).not.toBeNull();
+
+    rerender(null);
+    expect(tinted()).toBeNull();
+    expect(text()).toBe("/team fix it");
+  });
+
   it("adds no trailing space after a command sent without args", () => {
     renderScoped(userBubble("/team"), <PublishCommands />);
     expect(screen.getByText("/team")).toHaveClass("text-brand-accent");
