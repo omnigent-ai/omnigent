@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from omnigent.entities.project_ticket import (
     CommentOnTicket,
     CreateTicket,
+    LinkRelatedTicket,
     TicketEventKind,
     TicketStatus,
     UpdateTicket,
@@ -27,6 +28,7 @@ class GetTicket(BaseModel):
     after: int = Field(default=-1, ge=-1, description="Previous events page's last_position.")
     kind: TicketEventKind | None = None
     sessions_after: str | None = None
+    related_after: str | None = None
     limit: int = Field(default=50, ge=1, le=100)
 
 
@@ -43,6 +45,10 @@ class LinkSessionTicket(BaseModel):
     ticket_id: str
     session_id: str | None = Field(default=None, description="Omit to link this session.")
     action: Literal["attach", "remove"] = "attach"
+
+
+class LinkTickets(LinkRelatedTicket):
+    ticket_id: str
 
 
 class _TicketTool(Tool):
@@ -81,8 +87,8 @@ class SysTicketListTool(_TicketTool):
 class SysTicketGetTool(_TicketTool):
     tool_name = "sys_ticket_get"
     help_text = (
-        "Read a ticket and pages of its attributed activity and linked sessions. "
-        "Use kind=output to read PRs and other links."
+        "Read a ticket, its plan/review brief/lead, and pages of activity, sessions "
+        "and related tickets. Use kind=output to read PRs and other links."
     )
     arguments = GetTicket
 
@@ -99,7 +105,10 @@ class SysTicketCreateTool(_TicketTool):
 class SysTicketUpdateTool(_TicketTool):
     tool_name = "sys_ticket_update"
     help_text = (
-        "Edit a ticket; omit unchanged fields. Done requires completion_summary. "
+        "Edit a ticket; omit unchanged fields. Phases: open, planning, in_progress (Working), "
+        "review, done. Review requires review_summary; Done requires completion_summary. "
+        "Save the approach and acceptance criteria in plan. Set lead_session_id to an already "
+        "linked session (null clears it). Optional comment is appended atomically. "
         "Tags replace the whole list: use needs-human plus a comment when a person must act, "
         "and remove that tag when resolved."
     )
@@ -124,6 +133,15 @@ class SysSessionLinkTicketTool(_TicketTool):
     arguments = LinkSessionTicket
 
 
+class SysTicketLinkTool(_TicketTool):
+    tool_name = "sys_ticket_link"
+    help_text = (
+        "Attach or remove a symmetric related-ticket link within this project. "
+        "Links have no type or automatic workflow effects. Explain the relationship in a comment."
+    )
+    arguments = LinkTickets
+
+
 TICKET_TOOL_CLASSES = (
     SysTicketListTool,
     SysTicketGetTool,
@@ -131,5 +149,6 @@ TICKET_TOOL_CLASSES = (
     SysTicketUpdateTool,
     SysTicketCommentTool,
     SysSessionLinkTicketTool,
+    SysTicketLinkTool,
 )
 TICKET_TOOLS = {tool.name(): tool for tool in TICKET_TOOL_CLASSES}

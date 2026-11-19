@@ -196,3 +196,153 @@ async def test_linked_session_deletion_preserves_ticket_and_history(board, db_ur
         tickets.sessions(project.id, ticket["id"], user_id="alice")["data"][0]["session_id"]
         == session.id
     )
+
+
+def test_plan_review_and_feedback_change_atomically(board, monkeypatch):
+    tickets, _, project = board
+    actor = TicketActor("alice")
+    ticket = tickets.create(project.id, CreateTicket(title="Build"), actor)
+    ticket_id = ticket["id"]
+    planning = tickets.update(
+        project.id,
+        ticket_id,
+        UpdateTicket(
+            status="planning",
+            plan="## Approach\n\n- [ ] Verified outcome",
+            comment="Agreed in chat",
+        ),
+        actor,
+    )
+    assert planning["plan"].startswith("## Approach")
+    assert planning["comment_count"] == 1
+    review = tickets.update(
+        project.id,
+        ticket_id,
+        UpdateTicket(
+            status="review",
+            review_summary="Tests passed; please check the layout",
+            tags=[{"key": "needs-human"}],
+        ),
+        actor,
+    )
+    assert review["review_summary"] and review["status"] == "review"
+    append = tickets._append
+
+    def fail_comment(session, project_row, ticket_row, who, kind, payload):
+        if kind == "comment":
+            raise RuntimeError("feedback unavailable")
+        append(session, project_row, ticket_row, who, kind, payload)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(tickets, "_append", fail_comment)
+        with pytest.raises(RuntimeError, match="feedback unavailable"):
+            tickets.update(
+                project.id,
+                ticket_id,
+                UpdateTicket(
+                    status="in_progress",
+                    comment="Adjust spacing",
+                    tags=[],
+                ),
+                actor,
+            )
+    assert tickets.get(project.id, ticket_id, user_id="alice") == review
+    working = tickets.update(
+        project.id,
+        ticket_id,
+        UpdateTicket(
+            status="in_progress",
+            comment="Adjust spacing",
+            tags=[],
+        ),
+        actor,
+    )
+    assert working["review_summary"] == "" and working["plan"] == planning["plan"]
+    assert working["comment_count"] == 2 and working["tags"] == []
+    events = tickets.events(project.id, ticket_id, user_id="alice")["data"]
+    assert [event["kind"] for event in events[-2:]] == ["updated", "comment"]
+    assert events[-1]["payload"] == {"text": "Adjust spacing"}
+
+
+def test_related_links_are_symmetric_idempotent_and_paginated(board):
+    tickets, _, project = board
+    actor = TicketActor("alice")
+    center, *others = [
+        tickets.create(project.id, CreateTicket(title=str(i)), actor) for i in range(4)
+    ]
+    for other in others:
+        tickets.link_ticket(project.id, center["id"], other["id"], "attach", actor)
+        tickets.link_ticket(project.id, other["id"], center["id"], "attach", actor)
+        assert (
+            tickets.related(project.id, other["id"], user_id="alice")["data"][0]["id"]
+            == center["id"]
+        )
+        assert len(tickets.events(project.id, other["id"], user_id="alice")["data"]) == 2
+    page = tickets.related(project.id, center["id"], user_id="alice", limit=2)
+    rest = tickets.related(
+        project.id, center["id"], user_id="alice", after=page["last_id"], limit=2
+    )
+    assert page["has_more"] and not rest["has_more"]
+    assert {row["id"] for row in page["data"] + rest["data"]} == {row["id"] for row in others}
+    tickets.link_ticket(project.id, others[0]["id"], center["id"], "remove", actor)
+    tickets.link_ticket(project.id, center["id"], others[0]["id"], "remove", actor)
+    assert tickets.related(project.id, others[0]["id"], user_id="alice")["data"] == []
+    assert len(tickets.events(project.id, others[0]["id"], user_id="alice")["data"]) == 3
+    assert tickets.get(project.id, center["id"], user_id="alice")["status"] == "open"
+    assert len(tickets.pending_notifications()) == 12
+
+
+def test_related_link_boundaries_and_failed_activity_roll_back(board, monkeypatch):
+    tickets, projects, project = board
+    actor = TicketActor("alice")
+    first, second = [
+        tickets.create(project.id, CreateTicket(title=str(i)), actor) for i in range(2)
+    ]
+    foreign_project = projects.create(uuid4().hex, "Other", "alice")
+    foreign = tickets.create(foreign_project.id, CreateTicket(title="Outside"), actor)
+    for target, who in ((first, actor), (foreign, actor), (second, TicketActor("bob"))):
+        with pytest.raises(OmnigentError):
+            tickets.link_ticket(project.id, first["id"], target["id"], "attach", who)
+    with workspace_scope(9), pytest.raises(OmnigentError):
+        tickets.link_ticket(project.id, first["id"], second["id"], "attach", actor)
+    append = tickets._append
+
+    def fail_second(session, project_row, ticket_row, who, kind, payload):
+        if ticket_row.id == max(first["id"], second["id"]):
+            raise RuntimeError("second event failed")
+        append(session, project_row, ticket_row, who, kind, payload)
+
+    monkeypatch.setattr(tickets, "_append", fail_second)
+    with pytest.raises(RuntimeError, match="second event"):
+        tickets.link_ticket(project.id, first["id"], second["id"], "attach", actor)
+    for ticket in (first, second):
+        assert tickets.related(project.id, ticket["id"], user_id="alice")["data"] == []
+        assert len(tickets.events(project.id, ticket["id"], user_id="alice")["data"]) == 1
+
+
+def test_lead_handoff_requires_links_and_unlink_clears_only_the_lead(board, db_uri):
+    tickets, _, project = board
+    actor = TicketActor("alice")
+    ticket = tickets.create(project.id, CreateTicket(title="Plan"), actor)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    first, second = [conversations.create_conversation(project_id=project.id) for _ in range(2)]
+    with pytest.raises(OmnigentError, match="Link the session"):
+        tickets.update(project.id, ticket["id"], UpdateTicket(lead_session_id=first.id), actor)
+    for worker in (first, second):
+        tickets.link_session(project.id, ticket["id"], worker.id, "attach", actor)
+        tickets.update(project.id, ticket["id"], UpdateTicket(lead_session_id=worker.id), actor)
+    kept = tickets.update(project.id, ticket["id"], UpdateTicket(title="Work"), actor)
+    assert kept["lead_session_id"] == second.id
+    assert len(tickets.sessions(project.id, ticket["id"], user_id="alice")["data"]) == 2
+    cleared = tickets.update(project.id, ticket["id"], UpdateTicket(lead_session_id=None), actor)
+    assert cleared["lead_session_id"] is None
+    tickets.update(project.id, ticket["id"], UpdateTicket(lead_session_id=second.id), actor)
+    result = tickets.link_session(project.id, ticket["id"], second.id, "remove", actor)
+    assert result["lead_session_id"] is None
+    assert (
+        tickets.sessions(project.id, ticket["id"], user_id="alice")["data"][0]["session_id"]
+        == first.id
+    )
+    assert tickets.events(project.id, ticket["id"], user_id="alice")["data"][-1]["payload"][
+        "changes"
+    ] == {"lead_session_id": None}

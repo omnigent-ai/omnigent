@@ -7,6 +7,7 @@ import {
   ExternalLinkIcon,
   GitPullRequestIcon,
   LinkIcon,
+  MessageSquareIcon,
   PencilIcon,
   PlusIcon,
   TagsIcon,
@@ -35,7 +36,7 @@ import { useSessionBadgeStates } from "@/hooks/useSessionBadgeStates";
 import { useViewerId } from "@/hooks/useViewerId";
 import { parseHttpUrl } from "@/lib/openLinkInApp";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
-import { Link } from "@/lib/routing";
+import { Link, useSearchParams, useReplaceSearchParams } from "@/lib/routing";
 import { findCachedListRow } from "@/lib/sessionListCache";
 import { cn } from "@/lib/utils";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
@@ -52,14 +53,28 @@ import {
   type TicketTag,
 } from "@/lib/projectTicketsApi";
 import { ProjectSessionPanel } from "./ProjectSessionPanel";
-import { projectSessionPanelSearch } from "./projectHomeNavigation";
-import { CompleteTicketDialog, TicketError, TicketStatusIcon, TicketTags } from "./TicketControls";
+import {
+  projectSessionPanelSearch,
+  ticketPanelSearch,
+  ticketSessionSearch,
+} from "./projectHomeNavigation";
+import {
+  CompleteTicketDialog,
+  ReviewTicketDialog,
+  RequestTicketChangesDialog,
+  TicketError,
+  TicketStatusIcon,
+  TicketTags,
+} from "./TicketControls";
+import { TicketRelatedTickets } from "./TicketRelatedTickets";
 import {
   useTicket,
   useTicketActions,
   useTicketEvents,
   useTicketProject,
   useTicketSessions,
+  useTicketLifecycleEnabled,
+  useTicketStatuses,
 } from "./useProjectTickets";
 
 function Panel({
@@ -112,9 +127,11 @@ function Panel({
 export function ProjectOrchestratorPanel({
   projectName,
   onClose,
+  ticket,
 }: {
   projectName: string;
   onClose: () => void;
+  ticket?: { id: string; title: string };
 }) {
   const { projectId, projects, ensure } = useTicketProject(projectName);
   const client = useQueryClient();
@@ -133,10 +150,19 @@ export function ProjectOrchestratorPanel({
   });
   if (project.data?.orchestrator_session_id)
     return (
-      <ProjectSessionPanel sessionId={project.data.orchestrator_session_id} onClose={onClose} />
+      <ProjectSessionPanel
+        sessionId={project.data.orchestrator_session_id}
+        onClose={onClose}
+        ticket={ticket}
+      />
     );
   return (
     <Panel title="Orchestrator" onClose={onClose}>
+      {ticket && (
+        <Button asChild variant="ghost" size="sm">
+          <Link to={ticketPanelSearch(ticket.id)}>Back to ticket</Link>
+        </Button>
+      )}
       {projects.isLoading || (projectId && project.isPending) ? (
         <Spinner aria-label="Loading orchestrator" />
       ) : (
@@ -210,6 +236,7 @@ export function ProjectTicketPanel({
     <TicketDetails
       key={`${projectId}:${ticketId}`}
       projectId={projectId}
+      projectName={projectName}
       ticketId={ticketId}
       onClose={onClose}
     />
@@ -288,10 +315,12 @@ function TicketEditor({
 
 function TicketDetails({
   projectId,
+  projectName,
   ticketId,
   onClose,
 }: {
   projectId: string;
+  projectName: string;
   ticketId: string;
   onClose: () => void;
 }) {
@@ -299,6 +328,16 @@ function TicketDetails({
   const { update, comment } = useTicketActions(projectId);
   const [editing, setEditing] = useState(false);
   const [completing, setCompleting] = useState(false);
+  const [reviewing, setReviewing] = useState(false);
+  const [requestingChanges, setRequestingChanges] = useState(false);
+  const lifecycle = useTicketLifecycleEnabled();
+  const statuses = useTicketStatuses();
+  const [searchParams] = useSearchParams();
+  const replaceSearchParams = useReplaceSearchParams();
+  const chatSessionId = searchParams.get("session");
+  const orchestratorChat = searchParams.has("orchestrator");
+  const chatting = !!chatSessionId || orchestratorChat;
+  const closeChat = () => replaceSearchParams(new URLSearchParams({ ticket: ticketId }));
   const ticket = query.data;
   const humanInput = ticket?.tags.find((tag) => tag.key === "needs-human")?.value;
   if (!ticket)
@@ -314,131 +353,394 @@ function TicketDetails({
       </Panel>
     );
   return (
-    <Panel
-      title={ticket.title}
-      onClose={onClose}
-      footer={<TicketCommentComposer ticketId={ticketId} comment={comment} />}
-    >
-      {editing ? (
-        <TicketEditor
-          ticket={ticket}
-          pending={update.isPending}
-          error={update.error}
-          onCancel={() => setEditing(false)}
-          onSave={(changes) =>
-            update.mutate({ id: ticketId, changes }, { onSuccess: () => setEditing(false) })
-          }
-        />
-      ) : (
-        <div className="space-y-4">
-          <div className="flex items-start gap-2">
-            <h3 className="min-w-0 flex-1 text-xl leading-snug font-semibold text-pretty wrap-anywhere">
-              {ticket.title}
-            </h3>
-            <Tooltip>
-              <TooltipTrigger asChild>
+    <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+      <div
+        hidden={chatting}
+        className={chatting ? "hidden" : "flex min-h-0 min-w-0 flex-1 flex-col"}
+      >
+        <Panel
+          title={ticket.title}
+          onClose={onClose}
+          footer={<TicketCommentComposer ticketId={ticketId} comment={comment} />}
+        >
+          {editing ? (
+            <TicketEditor
+              ticket={ticket}
+              pending={update.isPending}
+              error={update.error}
+              onCancel={() => setEditing(false)}
+              onSave={(changes) =>
+                update.mutate({ id: ticketId, changes }, { onSuccess: () => setEditing(false) })
+              }
+            />
+          ) : (
+            <div className="space-y-4">
+              <div className="flex items-start gap-2">
+                <h3 className="min-w-0 flex-1 text-xl leading-snug font-semibold text-pretty wrap-anywhere">
+                  {ticket.title}
+                </h3>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Button
+                      size="icon-sm"
+                      variant="ghost"
+                      className="text-muted-foreground"
+                      aria-label="Edit ticket"
+                      onClick={() => {
+                        update.reset();
+                        setEditing(true);
+                      }}
+                    >
+                      <PencilIcon aria-hidden />
+                    </Button>
+                  </TooltipTrigger>
+                  <TooltipContent>Edit ticket</TooltipContent>
+                </Tooltip>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <Select
+                  value={ticket.status}
+                  disabled={update.isPending}
+                  onValueChange={(value) => {
+                    update.reset();
+                    if (value === "done") setCompleting(true);
+                    else if (value === "review") setReviewing(true);
+                    else
+                      update.mutate({ id: ticketId, changes: { status: value as TicketStatus } });
+                  }}
+                >
+                  <SelectTrigger
+                    size="sm"
+                    aria-label="Ticket status"
+                    className="shrink-0 border-border/60 bg-muted/30"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {statuses.map((status) => (
+                      <SelectItem key={status} value={status}>
+                        <TicketStatusIcon status={status} />
+                        {TICKET_STATUS_LABELS[status]}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                <TicketTags tags={ticket.tags} />
+                <TagEditor
+                  tags={ticket.tags}
+                  disabled={update.isPending}
+                  error={update.error}
+                  onChange={(tags) => update.mutate({ id: ticketId, changes: { tags } })}
+                />
+              </div>
+              {humanInput && (
+                <p className="text-sm leading-relaxed text-warning wrap-anywhere">{humanInput}</p>
+              )}
+              {lifecycle && (
+                <TicketAgentContact
+                  ticket={ticket}
+                  pending={update.isPending}
+                  onClear={() =>
+                    update.mutate({ id: ticketId, changes: { lead_session_id: null } })
+                  }
+                />
+              )}
+              {ticket.description ? (
+                <ProseMarkdown className="text-ui leading-relaxed">
+                  {ticket.description}
+                </ProseMarkdown>
+              ) : (
                 <Button
-                  size="icon-sm"
                   variant="ghost"
-                  className="text-muted-foreground"
-                  aria-label="Edit ticket"
+                  size="sm"
+                  className="-ml-2 text-muted-foreground"
                   onClick={() => {
                     update.reset();
                     setEditing(true);
                   }}
                 >
-                  <PencilIcon aria-hidden />
+                  <PlusIcon aria-hidden />
+                  Add description
                 </Button>
-              </TooltipTrigger>
-              <TooltipContent>Edit ticket</TooltipContent>
-            </Tooltip>
-          </div>
-          <div className="flex flex-wrap items-center gap-2">
-            <Select
-              value={ticket.status}
-              disabled={update.isPending}
-              onValueChange={(value) => {
-                update.reset();
-                if (value === "done") setCompleting(true);
-                else update.mutate({ id: ticketId, changes: { status: value as TicketStatus } });
-              }}
-            >
-              <SelectTrigger
-                size="sm"
-                aria-label="Ticket status"
-                className="shrink-0 border-border/60 bg-muted/30"
-              >
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {TICKET_STATUSES.map((status) => (
-                  <SelectItem key={status} value={status}>
-                    <TicketStatusIcon status={status} />
-                    {TICKET_STATUS_LABELS[status]}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-            <TicketTags tags={ticket.tags} />
-            <TagEditor
-              tags={ticket.tags}
-              disabled={update.isPending}
-              error={update.error}
-              onChange={(tags) => update.mutate({ id: ticketId, changes: { tags } })}
-            />
-          </div>
-          {humanInput && (
-            <p className="text-sm leading-relaxed text-warning wrap-anywhere">{humanInput}</p>
+              )}
+            </div>
           )}
-          {ticket.description ? (
-            <ProseMarkdown className="text-ui leading-relaxed">{ticket.description}</ProseMarkdown>
-          ) : (
+          {!editing && !completing && !reviewing && !requestingChanges && (
+            <TicketError error={update.error} />
+          )}
+          {lifecycle && <TicketPlan projectId={projectId} ticket={ticket} />}
+          {ticket.status === "review" && (
+            <section
+              aria-label="Human review"
+              className="space-y-3 rounded-lg border border-warning/30 bg-warning/5 p-3.5"
+            >
+              <h3 className="flex items-center gap-2 text-sm font-medium">
+                <TicketStatusIcon status="review" />
+                Ready for your review
+              </h3>
+              <ProseMarkdown className="text-ui leading-relaxed">
+                {ticket.review_summary ?? ""}
+              </ProseMarkdown>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  size="sm"
+                  disabled={update.isPending}
+                  onClick={() => {
+                    update.reset();
+                    setCompleting(true);
+                  }}
+                >
+                  <CheckIcon aria-hidden />
+                  Approve &amp; mark done
+                </Button>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  disabled={update.isPending}
+                  onClick={() => {
+                    update.reset();
+                    setRequestingChanges(true);
+                  }}
+                >
+                  Request changes
+                </Button>
+              </div>
+            </section>
+          )}
+          {ticket.completion_summary && (
+            <section className="space-y-2 rounded-lg bg-success/5 p-3.5">
+              <h3 className="flex items-center gap-2 text-sm font-medium">
+                <CheckIcon aria-hidden className="size-4 text-success" />
+                Completion summary
+              </h3>
+              <ProseMarkdown className="text-ui">{ticket.completion_summary}</ProseMarkdown>
+            </section>
+          )}
+          <TicketOutputs projectId={projectId} ticketId={ticketId} />
+          {lifecycle && <TicketRelatedTickets projectId={projectId} ticketId={ticketId} />}
+          <LinkedSessions
+            projectId={projectId}
+            ticketId={ticketId}
+            leadSessionId={ticket.lead_session_id}
+            pending={update.isPending}
+            onLead={
+              lifecycle
+                ? (sessionId) =>
+                    update.mutate({ id: ticketId, changes: { lead_session_id: sessionId } })
+                : undefined
+            }
+          />
+          <TicketActivity projectId={projectId} ticketId={ticketId} />
+          {completing && (
+            <CompleteTicketDialog
+              title={ticket.title}
+              approving={ticket.status === "review"}
+              pending={update.isPending}
+              error={update.error}
+              onClose={() => {
+                setCompleting(false);
+                update.reset();
+              }}
+              onComplete={(summary) =>
+                update.mutate(
+                  {
+                    id: ticketId,
+                    changes: {
+                      status: "done",
+                      completion_summary: summary,
+                      tags: ticket.tags.filter((tag) => tag.key !== "needs-human"),
+                    },
+                  },
+                  { onSuccess: () => setCompleting(false) },
+                )
+              }
+            />
+          )}
+          {reviewing && (
+            <ReviewTicketDialog
+              title={ticket.title}
+              initialSummary={ticket.review_summary}
+              pending={update.isPending}
+              error={update.error}
+              onClose={() => {
+                setReviewing(false);
+                update.reset();
+              }}
+              onComplete={(summary) =>
+                update.mutate(
+                  {
+                    id: ticketId,
+                    changes: {
+                      status: "review",
+                      review_summary: summary,
+                      tags: ticket.tags.some((tag) => tag.key === "needs-human")
+                        ? ticket.tags
+                        : [...ticket.tags, { key: "needs-human" }],
+                    },
+                  },
+                  { onSuccess: () => setReviewing(false) },
+                )
+              }
+            />
+          )}
+          {requestingChanges && (
+            <RequestTicketChangesDialog
+              title={ticket.title}
+              pending={update.isPending}
+              error={update.error}
+              onClose={() => {
+                setRequestingChanges(false);
+                update.reset();
+              }}
+              onComplete={(feedback) =>
+                update.mutate(
+                  {
+                    id: ticketId,
+                    changes: {
+                      status: "in_progress",
+                      comment: feedback,
+                      tags: ticket.tags.filter((tag) => tag.key !== "needs-human"),
+                    },
+                  },
+                  { onSuccess: () => setRequestingChanges(false) },
+                )
+              }
+            />
+          )}
+        </Panel>
+      </div>
+      {chatSessionId ? (
+        <ProjectSessionPanel sessionId={chatSessionId} onClose={closeChat} ticket={ticket} />
+      ) : (
+        orchestratorChat && (
+          <ProjectOrchestratorPanel projectName={projectName} onClose={closeChat} ticket={ticket} />
+        )
+      )}
+    </div>
+  );
+}
+
+function TicketAgentContact({
+  ticket,
+  pending,
+  onClear,
+}: {
+  ticket: ProjectTicket;
+  pending: boolean;
+  onClear: () => void;
+}) {
+  if (!ticket.lead_session_id)
+    return (
+      <Button asChild variant="outline" size="sm">
+        <Link to={ticketSessionSearch(ticket.id)}>
+          <MessageSquareIcon aria-hidden />
+          Ask orchestrator
+        </Link>
+      </Button>
+    );
+  return (
+    <section
+      aria-label="Responsible agent"
+      className="rounded-lg border border-border/60 bg-muted/20 p-1"
+    >
+      <div className="flex items-center justify-between px-2 pt-1">
+        <h3 className="text-sm font-medium text-muted-foreground">
+          {ticket.status === "planning" ? "Planning agent" : "Lead agent"}
+        </h3>
+        <Button
+          variant="ghost"
+          size="icon-sm"
+          disabled={pending}
+          aria-label="Clear lead agent"
+          onClick={onClear}
+        >
+          <XIcon aria-hidden />
+        </Button>
+      </div>
+      <SessionLink
+        sessionId={ticket.lead_session_id}
+        ticketId={ticket.id}
+        showStatus
+        actionLabel={ticket.status === "planning" ? "Discuss plan" : "Chat with agent"}
+      />
+    </section>
+  );
+}
+
+function TicketPlan({ projectId, ticket }: { projectId: string; ticket: ProjectTicket }) {
+  const [editing, setEditing] = useState(false);
+  const [plan, setPlan] = useState("");
+  const { update } = useTicketActions(projectId);
+  const edit = () => {
+    setPlan(ticket.plan ?? "");
+    update.reset();
+    setEditing(true);
+  };
+  if (!editing && !ticket.plan && ticket.status !== "planning")
+    return (
+      <Button variant="ghost" size="sm" className="-ml-2 text-muted-foreground" onClick={edit}>
+        <PlusIcon aria-hidden />
+        Add plan
+      </Button>
+    );
+  return (
+    <section
+      aria-label="Ticket plan"
+      className="space-y-3 rounded-lg border border-border/60 p-3.5"
+    >
+      <div className="flex items-center justify-between gap-2">
+        <h3 className="text-sm font-medium">Plan</h3>
+        {!editing && (
+          <Button variant="ghost" size="icon-sm" aria-label="Edit plan" onClick={edit}>
+            <PencilIcon aria-hidden />
+          </Button>
+        )}
+      </div>
+      {editing ? (
+        <form
+          className="space-y-3"
+          onSubmit={(event) => {
+            event.preventDefault();
+            update.mutate(
+              { id: ticket.id, changes: { plan: plan.trim() } },
+              { onSuccess: () => setEditing(false) },
+            );
+          }}
+        >
+          <Textarea
+            aria-label="Plan"
+            rows={7}
+            maxLength={3000}
+            value={plan}
+            disabled={update.isPending}
+            onChange={(event) => setPlan(event.target.value)}
+            placeholder="Approach, acceptance criteria, and decisions still needed…"
+          />
+          <TicketError error={update.error} />
+          <div className="flex justify-end gap-2">
             <Button
+              type="button"
               variant="ghost"
               size="sm"
-              className="-ml-2 text-muted-foreground"
-              onClick={() => {
-                update.reset();
-                setEditing(true);
-              }}
+              disabled={update.isPending}
+              onClick={() => setEditing(false)}
             >
-              <PlusIcon aria-hidden />
-              Add description
+              Cancel
             </Button>
-          )}
-        </div>
+            <Button type="submit" size="sm" loading={update.isPending}>
+              Save plan
+            </Button>
+          </div>
+        </form>
+      ) : ticket.plan ? (
+        <ProseMarkdown className="text-ui leading-relaxed">{ticket.plan}</ProseMarkdown>
+      ) : (
+        <p className="text-sm text-muted-foreground">
+          Align on the approach and what counts as done in the agent chat. Save the agreed plan
+          here.
+        </p>
       )}
-      {!editing && !completing && <TicketError error={update.error} />}
-      {ticket.completion_summary && (
-        <section className="space-y-2 rounded-lg bg-success/5 p-3.5">
-          <h3 className="flex items-center gap-2 text-sm font-medium">
-            <CheckIcon aria-hidden className="size-4 text-success" />
-            Completion summary
-          </h3>
-          <ProseMarkdown className="text-ui">{ticket.completion_summary}</ProseMarkdown>
-        </section>
-      )}
-      <TicketOutputs projectId={projectId} ticketId={ticketId} />
-      <LinkedSessions projectId={projectId} ticketId={ticketId} />
-      <TicketActivity projectId={projectId} ticketId={ticketId} />
-      {completing && (
-        <CompleteTicketDialog
-          title={ticket.title}
-          pending={update.isPending}
-          error={update.error}
-          onClose={() => {
-            setCompleting(false);
-            update.reset();
-          }}
-          onComplete={(summary) =>
-            update.mutate(
-              { id: ticketId, changes: { status: "done", completion_summary: summary } },
-              { onSuccess: () => setCompleting(false) },
-            )
-          }
-        />
-      )}
-    </Panel>
+    </section>
   );
 }
 
@@ -741,9 +1043,17 @@ function TicketOutputLink({ output, inline = false }: { output: TicketOutput; in
 function SessionLink({
   sessionId,
   showStatus = false,
+  ticketId,
+  actionLabel,
+  onMakeLead,
+  pending,
 }: {
   sessionId: string;
   showStatus?: boolean;
+  ticketId?: string;
+  actionLabel?: string;
+  onMakeLead?: () => void;
+  pending?: boolean;
 }) {
   const mobile = useIsMobileViewport();
   const client = useQueryClient();
@@ -773,36 +1083,74 @@ function SessionLink({
               ? "Disconnected"
               : "Idle";
   return (
-    <Link
-      className={cn(
-        "rounded-sm text-foreground underline-offset-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-        showStatus
-          ? "flex min-w-0 items-center gap-3 rounded-lg px-3 py-2.5 transition-colors hover:bg-muted/40 focus-visible:ring-inset"
-          : "inline-block max-w-full align-bottom wrap-anywhere hover:underline",
+    <>
+      <Link
+        className={cn(
+          "rounded-sm text-foreground underline-offset-4 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+          showStatus
+            ? "flex min-w-0 flex-1 items-center gap-3 rounded-lg px-3 py-2.5 transition-colors hover:bg-muted/40 focus-visible:ring-inset"
+            : "inline-block max-w-full align-bottom wrap-anywhere hover:underline",
+        )}
+        title={`${title} (${sessionId})`}
+        aria-label={actionLabel ? `${actionLabel}: ${title}` : undefined}
+        to={
+          ticketId
+            ? ticketSessionSearch(ticketId, sessionId)
+            : mobile
+              ? `/c/${encodeURIComponent(sessionId)}`
+              : projectSessionPanelSearch(sessionId)
+        }
+      >
+        {showStatus && <BotIcon aria-hidden className="size-4 shrink-0 text-muted-foreground" />}
+        <span className={showStatus ? "min-w-0 flex-1 truncate text-sm font-medium" : undefined}>
+          {title}
+          {actionLabel && (
+            <span className="mt-0.5 block text-sm font-normal text-muted-foreground">
+              {actionLabel}
+            </span>
+          )}
+        </span>
+        {showStatus && (
+          <>
+            <span className="flex shrink-0 items-center gap-1.5 text-sm text-muted-foreground">
+              {!unavailable && !session?.archived && state && <SessionStateBadge state={state} />}
+              {state?.kind !== "awaiting" || unavailable || session?.archived ? (
+                <span>{status}</span>
+              ) : null}
+            </span>
+            <ChevronRightIcon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
+          </>
+        )}
+      </Link>
+      {onMakeLead && (
+        <Button
+          variant="ghost"
+          size="sm"
+          className="mr-1 shrink-0"
+          disabled={pending || !session || unavailable || session.archived}
+          aria-label={`Make ${title} lead`}
+          onClick={onMakeLead}
+        >
+          Make lead
+        </Button>
       )}
-      title={`${title} (${sessionId})`}
-      to={mobile ? `/c/${encodeURIComponent(sessionId)}` : projectSessionPanelSearch(sessionId)}
-    >
-      {showStatus && <BotIcon aria-hidden className="size-4 shrink-0 text-muted-foreground" />}
-      <span className={showStatus ? "min-w-0 flex-1 truncate text-sm font-medium" : undefined}>
-        {title}
-      </span>
-      {showStatus && (
-        <>
-          <span className="flex shrink-0 items-center gap-1.5 text-sm text-muted-foreground">
-            {!unavailable && !session?.archived && state && <SessionStateBadge state={state} />}
-            {state?.kind !== "awaiting" || unavailable || session?.archived ? (
-              <span>{status}</span>
-            ) : null}
-          </span>
-          <ChevronRightIcon aria-hidden className="size-3.5 shrink-0 text-muted-foreground" />
-        </>
-      )}
-    </Link>
+    </>
   );
 }
 
-function LinkedSessions({ projectId, ticketId }: { projectId: string; ticketId: string }) {
+function LinkedSessions({
+  projectId,
+  ticketId,
+  leadSessionId,
+  pending,
+  onLead,
+}: {
+  projectId: string;
+  ticketId: string;
+  leadSessionId?: string | null;
+  pending: boolean;
+  onLead?: (id: string) => void;
+}) {
   const query = useTicketSessions(projectId, ticketId);
   const sessions = query.data?.pages.flatMap((page) => page.data) ?? [];
   if (sessions.length === 0 && !query.error) return null;
@@ -813,8 +1161,21 @@ function LinkedSessions({ projectId, ticketId }: { projectId: string; ticketId: 
       {sessions.length > 0 && (
         <ul className="divide-y divide-border/60 overflow-hidden rounded-lg border border-border/60">
           {sessions.map((session) => (
-            <li key={session.session_id}>
-              <SessionLink sessionId={session.session_id} showStatus />
+            <li key={session.session_id} className="flex min-w-0 items-center">
+              <SessionLink
+                sessionId={session.session_id}
+                ticketId={ticketId}
+                showStatus
+                pending={pending}
+                onMakeLead={
+                  onLead && session.session_id !== leadSessionId
+                    ? () => onLead(session.session_id)
+                    : undefined
+                }
+              />
+              {session.session_id === leadSessionId && (
+                <span className="mr-3 text-sm text-muted-foreground">Lead</span>
+              )}
             </li>
           ))}
         </ul>
@@ -843,7 +1204,21 @@ function ActivityChange({ event }: { event: TicketEvent }) {
     return (
       <>
         {event.payload.action === "attach" ? "linked" : "unlinked"}{" "}
-        <SessionLink sessionId={event.payload.session_id} />
+        <SessionLink sessionId={event.payload.session_id} ticketId={event.ticket_id} />
+      </>
+    );
+  if (typeof event.payload.related_ticket_id === "string")
+    return (
+      <>
+        {event.payload.action === "attach"
+          ? "linked a related ticket"
+          : "unlinked a related ticket"}{" "}
+        <Link
+          to={ticketPanelSearch(event.payload.related_ticket_id)}
+          className="text-foreground hover:underline"
+        >
+          View ticket
+        </Link>
       </>
     );
   const changes = event.payload.changes as Partial<ProjectTicket> | undefined;
@@ -905,14 +1280,16 @@ function TicketActivityItem({
   const note = event.kind === "comment" || event.kind === "execution";
   const changes = event.payload.changes as Partial<ProjectTicket> | undefined;
   const body =
-    typeof event.payload.text === "string" ? event.payload.text : changes?.completion_summary;
+    typeof event.payload.text === "string"
+      ? event.payload.text
+      : (changes?.completion_summary ?? changes?.review_summary);
   const agent = !!(event.session_id || event.agent_id);
   const author =
     event.user_id && event.user_id === viewerId
       ? "You"
       : (event.user_id ?? (agent ? "Agent" : "System"));
   const actor = event.session_id ? (
-    <SessionLink sessionId={event.session_id} />
+    <SessionLink sessionId={event.session_id} ticketId={event.ticket_id} />
   ) : (
     <span className="text-foreground">{author}</span>
   );

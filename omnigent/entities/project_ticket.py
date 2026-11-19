@@ -9,9 +9,16 @@ from urllib.parse import urlsplit, urlunsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-TicketStatus = Literal["open", "in_progress", "done"]
+TicketStatus = Literal["open", "planning", "in_progress", "review", "done"]
 TicketEventKind = Literal["created", "updated", "comment", "execution", "output"]
-STATUS_CODES = {"open": 0, "in_progress": 1, "done": 2}
+STATUS_CODES = {"open": 0, "in_progress": 1, "done": 2, "planning": 3, "review": 4}
+STATUS_LABELS = {
+    "open": "Open",
+    "planning": "Planning",
+    "in_progress": "Working",
+    "review": "Review",
+    "done": "Done",
+}
 EVENT_CODES = {"created": 0, "updated": 1, "comment": 2, "execution": 3, "output": 4}
 NOTIFICATION_PENDING = 0
 NOTIFICATION_QUEUED = 1
@@ -87,8 +94,14 @@ class UpdateTicket(BaseModel):
     status: TicketStatus | None = None
     tags: list[TicketTag] | None = Field(default=None, max_length=20)
     completion_summary: str | None = Field(default=None, min_length=1, max_length=1500)
+    plan: str | None = Field(default=None, max_length=3000)
+    review_summary: str | None = Field(default=None, max_length=1500)
+    lead_session_id: str | None = Field(
+        default=None, description="An already linked session to contact; null clears the lead."
+    )
+    comment: str | None = Field(default=None, min_length=1, max_length=2000)
 
-    @field_validator("title", "completion_summary")
+    @field_validator("title", "completion_summary", "comment")
     @classmethod
     def trim_nonempty(cls, value: str | None) -> str | None:
         if value is not None and not value.strip():
@@ -104,6 +117,8 @@ class UpdateTicket(BaseModel):
     def require_completion(self) -> UpdateTicket:
         if self.status == "done" and not self.completion_summary:
             raise ValueError("marking Done requires a completion summary")
+        if self.status == "review" and not (self.review_summary or "").strip():
+            raise ValueError("entering Review requires a review summary")
         return self
 
 
@@ -126,6 +141,13 @@ class LinkTicketSession(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     session_id: str
+    action: Literal["attach", "remove"] = "attach"
+
+
+class LinkRelatedTicket(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    related_ticket_id: str
     action: Literal["attach", "remove"] = "attach"
 
 

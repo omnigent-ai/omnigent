@@ -56,6 +56,7 @@ async def test_project_creation_has_one_normal_orchestrator(project_client, db_u
     assert (await project_client.get(f"/v1/sessions/{session_id}")).json()["items"] == [greeting]
     info = (await project_client.get("/v1/info")).json()
     assert info["project_tickets"] is True
+    assert info["project_ticket_lifecycle"] is True
     assert info["durable_initial_input"] is False
 
     worker = (
@@ -322,6 +323,103 @@ async def test_links_require_same_project_and_preserve_history(project_client, d
     await store.delete_conversation(source.id)
     assert (await project_client.get(path)).json()["status"] == "open"
     assert len((await project_client.get(path + "/events")).json()["data"]) == 2
+
+
+async def test_lifecycle_related_links_and_lead_api(project_client, db_uri):
+    project = (await project_client.post("/v1/projects", json={"name": "Lifecycle"})).json()
+    base = f"/v1/projects/{project['id']}/tickets"
+    ticket = (await project_client.post(base, json={"title": "Feature"})).json()
+    related = (await project_client.post(base, json={"title": "Related work"})).json()
+    path, other_path = f"{base}/{ticket['id']}", f"{base}/{related['id']}"
+    planned = await project_client.patch(
+        path, json={"status": "planning", "plan": "## Plan\n\n- Acceptance"}
+    )
+    assert planned.status_code == 200 and planned.json()["plan"].startswith("## Plan")
+    assert (await project_client.patch(path, json={"status": "review"})).status_code == 422
+    review = await project_client.patch(
+        path, json={"status": "review", "review_summary": "Verify the demo"}
+    )
+    assert review.status_code == 200
+    changed = await project_client.patch(
+        path, json={"status": "in_progress", "comment": "Adjust the layout"}
+    )
+    assert changed.json()["review_summary"] == "" and changed.json()["comment_count"] == 1
+    for source, target in ((path, related["id"]), (other_path, ticket["id"])):
+        assert (
+            await project_client.post(source + "/related", json={"related_ticket_id": target})
+        ).status_code == 200
+        assert (await project_client.get(source + "/related")).json()["data"][0]["id"] == target
+    assert (
+        await project_client.post(path + "/related", json={"related_ticket_id": ticket["id"]})
+    ).status_code == 400
+    foreign = (await project_client.post("/v1/projects", json={"name": "Elsewhere"})).json()
+    foreign_ticket = (
+        await project_client.post(f"/v1/projects/{foreign['id']}/tickets", json={"title": "Other"})
+    ).json()
+    assert (
+        await project_client.post(
+            path + "/related", json={"related_ticket_id": foreign_ticket["id"]}
+        )
+    ).status_code == 404
+    session = SqlAlchemyConversationStore(db_uri).create_conversation(project_id=project["id"])
+    assert (
+        await project_client.patch(path, json={"lead_session_id": session.id})
+    ).status_code == 400
+    await project_client.post(path + "/sessions", json={"session_id": session.id})
+    assert (await project_client.patch(path, json={"lead_session_id": session.id})).json()[
+        "lead_session_id"
+    ] == session.id
+    assert (await project_client.patch(path, json={"lead_session_id": None})).json()[
+        "lead_session_id"
+    ] is None
+    SqlAlchemyConversationStore(db_uri).update_conversation(session.id, archived=True)
+    assert (
+        await project_client.patch(path, json={"lead_session_id": session.id})
+    ).status_code == 400
+    assert (
+        await project_client.post(
+            path + "/sessions", json={"session_id": session.id, "action": "remove"}
+        )
+    ).status_code == 200
+    assert (
+        await project_client.post(
+            other_path + "/related", json={"related_ticket_id": ticket["id"], "action": "remove"}
+        )
+    ).status_code == 200
+    assert (await project_client.get(path + "/related")).json()["data"] == []
+    assert len((await project_client.get(other_path + "/events")).json()["data"]) == 3
+
+
+async def test_related_and_lead_changes_respect_user_and_project_permissions(
+    multi_user_client, db_uri
+):
+    client = multi_user_client
+    project = (
+        await client.post("/v1/projects", json={"name": "Private"}, headers=_as_user(ALICE))
+    ).json()
+    base = f"/v1/projects/{project['id']}/tickets"
+    ticket = (await client.post(base, json={"title": "Owned"}, headers=_as_user(ALICE))).json()
+    related = (await client.post(base, json={"title": "Peer"}, headers=_as_user(ALICE))).json()
+    path = f"{base}/{ticket['id']}"
+    assert (
+        await client.post(
+            path + "/related", json={"related_ticket_id": related["id"]}, headers=_as_user(BOB)
+        )
+    ).status_code == 404
+    assert (await client.get(path + "/related", headers=_as_user(BOB))).status_code == 404
+    store = SqlAlchemyConversationStore(db_uri)
+    foreign = store.create_conversation(project_id=project["id"])
+    SqlAlchemyPermissionStore(db_uri).grant(BOB, foreign.id, LEVEL_OWNER)
+    response = await client.patch(
+        path, json={"lead_session_id": foreign.id}, headers=_as_user(ALICE)
+    )
+    assert response.status_code in (403, 404)
+    outside = store.create_conversation()
+    SqlAlchemyPermissionStore(db_uri).grant(ALICE, outside.id, LEVEL_OWNER)
+    assert (
+        await client.patch(path, json={"lead_session_id": outside.id}, headers=_as_user(ALICE))
+    ).status_code == 400
+    assert (await client.get(path, headers=_as_user(ALICE))).json()["lead_session_id"] is None
 
 
 async def test_notification_enqueue_survives_crash_without_duplicate_message(

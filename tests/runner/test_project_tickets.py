@@ -44,6 +44,39 @@ TICKET = "c" * 32
             f"/{TICKET}/sessions",
             {"session_id": SOURCE, "action": "attach"},
         ),
+        (
+            "sys_ticket_link",
+            {"ticket_id": TICKET, "related_ticket_id": SOURCE},
+            "POST",
+            f"/{TICKET}/related",
+            {"related_ticket_id": SOURCE, "action": "attach"},
+        ),
+        (
+            "sys_ticket_update",
+            {"ticket_id": TICKET, "lead_session_id": None},
+            "PATCH",
+            f"/{TICKET}",
+            {"lead_session_id": None},
+        ),
+        (
+            "sys_ticket_update",
+            {
+                "ticket_id": TICKET,
+                "status": "planning",
+                "plan": "Agreed scope",
+                "lead_session_id": SOURCE,
+            },
+            "PATCH",
+            f"/{TICKET}",
+            {"status": "planning", "plan": "Agreed scope", "lead_session_id": SOURCE},
+        ),
+        (
+            "sys_ticket_update",
+            {"ticket_id": TICKET, "status": "review", "review_summary": "Check the demo"},
+            "PATCH",
+            f"/{TICKET}",
+            {"status": "review", "review_summary": "Check the demo"},
+        ),
     ],
 )
 async def test_tools_use_only_the_callers_project(name, args, method, suffix, expected):
@@ -81,6 +114,9 @@ async def test_get_returns_paged_activity_outputs_and_sessions():
             return httpx.Response(200, json={"data": [], "has_more": False, "last_position": 6})
         if request.url.path.endswith("/sessions"):
             return httpx.Response(200, json={"data": []})
+        if request.url.path.endswith("/related"):
+            assert request.url.params["after"] == SOURCE
+            return httpx.Response(200, json={"data": [], "has_more": False})
         return httpx.Response(200, json={"id": TICKET})
 
     async with httpx.AsyncClient(
@@ -89,13 +125,14 @@ async def test_get_returns_paged_activity_outputs_and_sessions():
         result = json.loads(
             await execute_ticket_tool(
                 "sys_ticket_get",
-                {"ticket_id": TICKET, "after": 6, "kind": "output"},
+                {"ticket_id": TICKET, "after": 6, "kind": "output", "related_after": SOURCE},
                 client,
                 SOURCE,
             )
         )
     assert result["ticket"]["id"] == TICKET
     assert result["events"]["last_position"] == 6 and result["sessions"]["data"] == []
+    assert result["related"] == {"data": [], "has_more": False}
 
 
 @pytest.mark.parametrize(
@@ -103,6 +140,9 @@ async def test_get_returns_paged_activity_outputs_and_sessions():
     [
         ("sys_ticket_create", {"title": " ", "project_id": PROJECT}),
         ("sys_ticket_update", {"ticket_id": TICKET, "status": "done"}),
+        ("sys_ticket_update", {"ticket_id": TICKET, "status": "review"}),
+        ("sys_ticket_link", {"ticket_id": TICKET, "related_ticket_id": "../../other"}),
+        ("sys_ticket_get", {"ticket_id": TICKET, "related_after": "../other"}),
         ("sys_ticket_get", {"ticket_id": "../../other"}),
         ("sys_ticket_list", {"limit": 101}),
         ("sys_ticket_comment", {"ticket_id": TICKET, "text": "Hi", "notify_orchestrator": False}),
@@ -133,7 +173,7 @@ async def test_source_errors_are_reported_without_writes(status, project_id):
 
 
 def test_tool_schemas_have_no_project_override_delete_or_notification_switch():
-    assert len(TICKET_TOOLS) == 6
+    assert len(TICKET_TOOLS) == 7
     for tool in TICKET_TOOLS.values():
         properties = tool().get_schema()["function"]["parameters"]["properties"]
         assert not {"project_id", "notify_orchestrator", "version"} & properties.keys()

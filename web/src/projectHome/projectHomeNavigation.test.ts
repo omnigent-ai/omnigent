@@ -4,6 +4,8 @@ import {
   projectHomePath,
   projectNameFromHomePath,
   projectSessionPanelSearch,
+  ticketSessionSearch,
+  ticketPanelSearch,
 } from "./projectHomeNavigation";
 
 describe("project home navigation", () => {
@@ -21,5 +23,15 @@ describe("project home navigation", () => {
     const search = projectSessionPanelSearch("a b/c&d");
     expect(search).toBe("?session=a+b%2Fc%26d");
     expect(new URLSearchParams(search).get(PROJECT_PANEL_SESSION_PARAM)).toBe("a b/c&d");
+  });
+
+  it("retains ticket context in worker and orchestrator chats", () => {
+    const ticket = "a b/c&d";
+    const search = new URLSearchParams(ticketSessionSearch(ticket, "worker/one"));
+    expect(search.get("ticket")).toBe(ticket);
+    expect(search.get("session")).toBe("worker/one");
+    expect(new URLSearchParams(ticketSessionSearch(ticket)).has("orchestrator")).toBe(true);
+    expect(new URLSearchParams(ticketPanelSearch(ticket)).get("ticket")).toBe(ticket);
+    expect(new URLSearchParams(ticketPanelSearch(ticket)).has("session")).toBe(false);
   });
 });

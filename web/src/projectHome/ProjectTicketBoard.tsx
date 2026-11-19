@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   DndContext,
   DragOverlay,
@@ -23,12 +23,27 @@ import {
   type TicketStatus,
 } from "@/lib/projectTicketsApi";
 import { cn } from "@/lib/utils";
-import { CompleteTicketDialog, TicketError, TicketStatusIcon, TicketTags } from "./TicketControls";
-import { useTicketActions, useTicketProject, useTickets } from "./useProjectTickets";
+import {
+  CompleteTicketDialog,
+  ReviewTicketDialog,
+  TicketError,
+  TicketStatusIcon,
+  TicketTags,
+} from "./TicketControls";
+import {
+  useRelatedTickets,
+  useTicketActions,
+  useTicketLifecycleEnabled,
+  useTicketProject,
+  useTickets,
+  useTicketStatuses,
+} from "./useProjectTickets";
 
 const STATUS_CLASS: Record<TicketStatus, string> = {
   open: "bg-muted text-muted-foreground",
+  planning: "bg-session-active/10 text-session-active",
   in_progress: "bg-session-active/15 text-session-active",
+  review: "bg-warning/15 text-warning",
   done: "bg-success/15 text-success",
 };
 
@@ -72,6 +87,19 @@ function TicketBoard({
 }) {
   const [dragged, setDragged] = useState<ProjectTicket | null>(null);
   const [completing, setCompleting] = useState<ProjectTicket | null>(null);
+  const [reviewing, setReviewing] = useState<ProjectTicket | null>(null);
+  const [hoveredId, setHoveredId] = useState<string | null>(null);
+  const [focusedId, setFocusedId] = useState<string | null>(null);
+  const lifecycle = useTicketLifecycleEnabled();
+  const statuses = useTicketStatuses();
+  const related = useRelatedTickets(projectId, lifecycle ? (hoveredId ?? focusedId) : null);
+  const { hasNextPage, isFetching, isError, fetchNextPage } = related;
+  const relatedIds = new Set(
+    related.data?.pages.flatMap((page) => page.data.map((ticket) => ticket.id)),
+  );
+  useEffect(() => {
+    if (hasNextPage && !isFetching && !isError) void fetchNextPage();
+  }, [hasNextPage, isFetching, isError, fetchNextPage]);
   const dragEnded = useRef(0);
   const { update } = useTicketActions(projectId ?? "");
   const sensors = useSensors(
@@ -80,7 +108,7 @@ function TicketBoard({
   );
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-      <TicketError error={completing ? null : update.error} />
+      <TicketError error={completing || reviewing ? null : update.error} />
       <DndContext
         sensors={sensors}
         onDragStart={({ active }) => setDragged(active.data.current?.ticket ?? null)}
@@ -97,6 +125,7 @@ function TicketBoard({
             return;
           update.reset();
           if (status === "done") setCompleting(ticket);
+          else if (status === "review") setReviewing(ticket);
           else update.mutate({ id: ticket.id, changes: { status } });
         }}
       >
@@ -106,7 +135,7 @@ function TicketBoard({
           data-testid="project-ticket-board"
           className="flex min-h-0 flex-1 gap-4 overflow-x-auto px-4 pt-1 pb-4"
         >
-          {TICKET_STATUSES.map((status) => (
+          {statuses.map((status) => (
             <TicketColumn
               key={status}
               status={status}
@@ -116,6 +145,9 @@ function TicketBoard({
               disabled={update.isPending}
               overlayClearance={overlayClearance}
               suppressClick={() => Date.now() - dragEnded.current < 250}
+              relatedIds={relatedIds}
+              onHover={setHoveredId}
+              onFocus={setFocusedId}
             />
           ))}
         </div>
@@ -130,6 +162,7 @@ function TicketBoard({
       {completing && (
         <CompleteTicketDialog
           title={completing.title}
+          approving={completing.status === "review"}
           onClose={() => {
             setCompleting(null);
             update.reset();
@@ -138,8 +171,42 @@ function TicketBoard({
           error={update.error}
           onComplete={(summary) =>
             update.mutate(
-              { id: completing.id, changes: { status: "done", completion_summary: summary } },
+              {
+                id: completing.id,
+                changes: {
+                  status: "done",
+                  completion_summary: summary,
+                  tags: completing.tags.filter((tag) => tag.key !== "needs-human"),
+                },
+              },
               { onSuccess: () => setCompleting(null) },
+            )
+          }
+        />
+      )}
+      {reviewing && (
+        <ReviewTicketDialog
+          title={reviewing.title}
+          initialSummary={reviewing.review_summary}
+          pending={update.isPending}
+          error={update.error}
+          onClose={() => {
+            setReviewing(null);
+            update.reset();
+          }}
+          onComplete={(summary) =>
+            update.mutate(
+              {
+                id: reviewing.id,
+                changes: {
+                  status: "review",
+                  review_summary: summary,
+                  tags: reviewing.tags.some((tag) => tag.key === "needs-human")
+                    ? reviewing.tags
+                    : [...reviewing.tags, { key: "needs-human" }],
+                },
+              },
+              { onSuccess: () => setReviewing(null) },
             )
           }
         />
@@ -156,6 +223,9 @@ function TicketColumn({
   disabled,
   suppressClick,
   overlayClearance,
+  relatedIds,
+  onHover,
+  onFocus,
 }: {
   projectId: string | null;
   status: TicketStatus;
@@ -164,6 +234,9 @@ function TicketColumn({
   disabled: boolean;
   suppressClick: () => boolean;
   overlayClearance?: string;
+  relatedIds: Set<string>;
+  onHover: (id: string | null) => void;
+  onFocus: (id: string | null) => void;
 }) {
   const query = useTickets(projectId, status);
   const tickets = query.data?.pages.flatMap((page) => page.data) ?? [];
@@ -208,6 +281,9 @@ function TicketColumn({
             selected={ticket.id === selectedTicketId}
             disabled={disabled}
             suppressClick={suppressClick}
+            related={relatedIds.has(ticket.id)}
+            onHover={onHover}
+            onFocus={onFocus}
           />
         ))}
         {!query.isError && (!projectId || query.isSuccess) && tickets.length === 0 && (
@@ -240,11 +316,17 @@ function TicketCard({
   selected,
   disabled,
   suppressClick,
+  related,
+  onHover,
+  onFocus,
 }: {
   ticket: ProjectTicket;
   selected: boolean;
   disabled: boolean;
   suppressClick: () => boolean;
+  related: boolean;
+  onHover: (id: string | null) => void;
+  onFocus: (id: string | null) => void;
 }) {
   const { setNodeRef, listeners, attributes, isDragging } = useDraggable({
     id: ticket.id,
@@ -259,12 +341,18 @@ function TicketCard({
       role="link"
       to={`?ticket=${encodeURIComponent(ticket.id)}`}
       aria-label={`Open ticket: ${ticket.title}`}
+      data-related-highlight={related || undefined}
+      onMouseEnter={() => onHover(ticket.id)}
+      onMouseLeave={() => onHover(null)}
+      onFocus={() => onFocus(ticket.id)}
+      onBlur={() => onFocus(null)}
       onClick={(event) => {
         if (suppressClick()) event.preventDefault();
       }}
       className={cn(
         "flex flex-col gap-3 rounded-xl border border-border/60 bg-card p-3.5 text-left shadow-xs outline-none transition-colors hover:border-muted-foreground/50 focus-visible:ring-2 focus-visible:ring-ring",
         selected && "border-primary ring-1 ring-primary/20",
+        related && "border-primary/70 bg-primary/5 ring-2 ring-primary/20",
         isDragging && "opacity-40",
       )}
     >

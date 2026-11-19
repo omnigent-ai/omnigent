@@ -18,7 +18,9 @@ header, new-session composer, session quick view and side chat, and UI primitive
 ## Requirements
 
 - R1: Tickets belong to a project and exist independently of sessions.
-- R3: Open, In progress and Done. Title-only creation and reopening are supported.
+- R3: Open → Planning → Working → Review → Done. Planning and human review may
+  be skipped when justified; phases can move backward. Keep `in_progress` as
+  Working's API value. Title-only creation starts in Open.
 - R6: Append attributed comments, changes, execution summaries and output events.
   PRs are `{type: "pull_request", url}` outputs, deduplicated for display.
 - R7: No ticket, comment or history deletion, including through project deletion.
@@ -31,12 +33,35 @@ header, new-session composer, session quick view and side chat, and UI primitive
   Needs human input. A comment explains the request; removing the tag resolves it.
 - R20: Done requires a completion summary. A finished session does not finish a ticket.
 - R21: Keep New ticket and New session. No search or tag-filter UI.
+- R22: Persist a concise plan containing the approach and acceptance criteria.
+  Agents investigate routine choices; ask humans only for necessary decisions
+  or authority. Explicit approval gates cannot be skipped.
+- R23: Before Review, verify the work and save a review brief: delivered scope,
+  evidence, limitations and exact human checks. Default to human review for
+  subjective results; skipping requires an unambiguous, objectively verified
+  outcome and recorded reason. Silence is not approval.
+- R24: Review offers Approve & mark done and Request changes. Feedback returns
+  work to Working with an attributed comment; scope changes may return to Planning.
+- R25: Persist symmetric, untyped related-ticket links. Link/unlink is idempotent,
+  same-project, and recorded on both tickets; no self-links or implied dependencies.
+- R26: An optional `lead_session_id` identifies the linked same-project session
+  to contact, including while idle. Handoffs preserve prior session links/history.
+- R27: Show the lead near the phase with Discuss plan / Chat with agent; reuse
+  existing chat with Back to ticket and retained drafts. Without a lead, offer
+  Ask orchestrator. Other linked sessions remain available.
+- R28: Workers record chat decisions, plan changes and approvals back on the
+  ticket. The orchestrator follows phases, related work, verification and human
+  review without adding a new runtime or treating every discussion as approval.
+- R29: Hovering or keyboard-focusing a board ticket highlights its directly
+  related visible tickets across lanes, without changing selection or phase.
 
 ## Clarifications
 
 - Q5: Keep projects containing tickets rather than deleting their history.
 - Q6: Reuse today's private-project permissions; project sharing is not added.
 - Q7: Existing projects can create their ordinary orchestrator on first use.
+- Q8: `needs-human` remains independent of phase; comments/briefs explain the ask.
+  Screenshots, demos and reports use existing output links and permitted tooling.
 
 ## Acceptance Criteria
 
@@ -57,6 +82,24 @@ header, new-session composer, session quick view and side chat, and UI primitive
   session is created and accessible through the existing session chat.
 - AC27: GIVEN the board WHEN New session is used THEN the existing composer opens
   and creating a session does not create a ticket.
+- AC28: GIVEN existing tickets WHEN the schema is upgraded THEN their status
+  codes, content and history survive; the board exposes all five phases.
+- AC29: GIVEN a ticket WHEN its plan or review brief is saved THEN it is readable
+  as Markdown on the ticket and the attributed change notifies the orchestrator.
+- AC30: GIVEN a ticket WHEN entering Review THEN a review brief is required;
+  requesting changes saves feedback and phase together; Done still needs a summary.
+- AC31: GIVEN two same-project tickets WHEN linked from either side THEN each
+  lists the other once; unlinking retains both histories and changes neither phase.
+- AC32: GIVEN unrelated ownership, projects or tenants WHEN linking tickets or
+  assigning a lead THEN access is rejected without partial writes.
+- AC33: GIVEN a linked lead WHEN its chat is opened and closed THEN the correct
+  existing conversation and Back to ticket are available and ticket drafts survive.
+- AC34: GIVEN a handoff WHEN another linked session becomes lead THEN prior links
+  survive; clearing/unlinking the lead restores Ask orchestrator without launching work.
+- AC35: GIVEN planning or review WHEN workers follow the skill THEN they respect
+  approval gates, record decisions/evidence and do not equate session exit with Done.
+- AC36: GIVEN related tickets on the board WHEN one is hovered or focused THEN
+  its direct neighbors are highlighted; leaving clears the highlight.
 
 ## Constraints
 
@@ -66,20 +109,23 @@ Keep schema changes separately reviewable from the application changes.
 
 ## Out of Scope
 
-Priorities, extra statuses, filters, custom workflows, issue-tracker sync, PR
-unlinking, project sharing, attachments and specialized agent builders.
+Priorities, additional phases, filters, custom workflows, typed dependencies,
+automatic dependency scheduling/rollups, issue-tracker sync, PR unlinking,
+project sharing, file uploads and specialized agent builders.
 
 ## Plan
 
-Tickets store their title, description, status, tags and timestamps. Append-only
-events hold attribution and typed payloads, including PRs. Session associations
-are separate many-to-many links. A project references its ordinary orchestrator
-session. A small durable notification outbox uses the existing session-input path.
+Extend ticket entities/store/API/tools with two status codes, bounded optional
+`plan` and `review_summary`, nullable `lead_session_id`, and a canonical-pair
+related-ticket table. Preserve existing status codes. Update may append a comment
+atomically. Leads must already be linked; unlinking a lead clears its reference.
 
-Expose project-scoped ticket REST APIs and `sys_ticket_list`, `sys_ticket_get`,
-`sys_ticket_create`, `sys_ticket_update`, `sys_ticket_comment`, and
-`sys_session_link_ticket`. The web board uses existing controls and styling;
-the orchestrator uses `ProjectSessionPanel` / `FullSessionChat` unchanged.
+Add paginated related-ticket reads and `sys_ticket_link` attach/remove; include
+related tickets in `sys_ticket_get`. Reuse existing permissions, output events
+and notification outbox. Update the board, shared phase controls and ticket drawer;
+keep ticket context in chat navigation. Teach the canonical orchestrator skill
+the lifecycle and include the same contract in worker briefs. Verify with focused
+entity/store/migration/route/tool and non-browser component tests.
 
 ## Tasks
 
@@ -87,3 +133,14 @@ the orchestrator uses `ProjectSessionPanel` / `FullSessionChat` unchanged.
 - [x] T20: Auto-create the normal project orchestrator and deliver updates.
 - [x] T12: Build the ticket board and details using existing components.
 - [x] T-val: Verify permissions, transactions, outputs, notifications and core UI flows.
+- [x] T22: Add lifecycle, related links and lead-session contracts/storage/API/tools.
+- [x] T23: Add phase-aware plan/review UI, related tickets and direct chat/return.
+- [x] T24: Update the orchestrator/worker contract for planning and acceptance.
+- [x] T-val2: Verify AC28–AC36 with focused non-browser checks; document manual review.
+  Entity/store/migration/route/runner checks: 65 passed, one external-database
+  check skipped; affected registry/relay and route checks passed. UI: 32 passed.
+  Skill structure validated; AC35's live-agent behavior and browser review were
+  not exercised. No live migration or server/runner restart performed.
+  After coordinated upgrade, link two tickets and check hover/focus highlighting;
+  open the planning agent and return with a draft intact; request changes and
+  approve a reviewed ticket.

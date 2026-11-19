@@ -2,6 +2,7 @@ import pytest
 from pydantic import ValidationError
 
 from omnigent.entities.project_ticket import (
+    STATUS_CODES,
     CommentOnTicket,
     CreateTicket,
     TicketOutput,
@@ -33,6 +34,26 @@ def test_done_requires_summary_and_comments_have_no_notification_option():
     )
     with pytest.raises(ValidationError):
         CommentOnTicket(text="Progress", notify_orchestrator=False)
+
+
+def test_lifecycle_preserves_status_codes_and_requires_review_evidence():
+    assert {name: STATUS_CODES[name] for name in ("open", "in_progress", "done")} == {
+        "open": 0,
+        "in_progress": 1,
+        "done": 2,
+    }
+    assert len(set(STATUS_CODES.values())) == 5
+    assert UpdateTicket(status="planning", plan="Approach and done when").plan
+    for summary in (None, "", "  "):
+        with pytest.raises(ValidationError, match="Review"):
+            UpdateTicket(status="review", review_summary=summary)
+    assert (
+        UpdateTicket(status="review", review_summary="Verify the attached demo").status == "review"
+    )
+    assert "lead_session_id" not in UpdateTicket(title="Keep lead").model_fields_set
+    assert "lead_session_id" in UpdateTicket(lead_session_id=None).model_fields_set
+    with pytest.raises(ValidationError):
+        UpdateTicket(comment=" ")
 
 
 @pytest.mark.parametrize("suffix", ["", "/files", "?view=1#discussion"])

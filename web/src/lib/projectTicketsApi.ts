@@ -1,11 +1,13 @@
 import { authenticatedFetch } from "./identity";
 import { apiErrorFromResponse } from "./sessionsApi";
 
-export const TICKET_STATUSES = ["open", "in_progress", "done"] as const;
+export const TICKET_STATUSES = ["open", "planning", "in_progress", "review", "done"] as const;
 export type TicketStatus = (typeof TICKET_STATUSES)[number];
 export const TICKET_STATUS_LABELS: Record<TicketStatus, string> = {
   open: "Open",
-  in_progress: "In progress",
+  planning: "Planning",
+  in_progress: "Working",
+  review: "Review",
   done: "Done",
 };
 export interface TicketTag {
@@ -24,6 +26,9 @@ export interface ProjectTicket {
   status: TicketStatus;
   tags: TicketTag[];
   completion_summary: string | null;
+  plan?: string;
+  review_summary?: string;
+  lead_session_id?: string | null;
   latest_update: string;
   comment_count: number;
   created_at: number;
@@ -55,8 +60,18 @@ export interface TicketSession {
   created_at: number;
 }
 export type TicketChanges = Partial<
-  Pick<ProjectTicket, "title" | "description" | "status" | "tags" | "completion_summary">
->;
+  Pick<
+    ProjectTicket,
+    | "title"
+    | "description"
+    | "status"
+    | "tags"
+    | "completion_summary"
+    | "plan"
+    | "review_summary"
+    | "lead_session_id"
+  >
+> & { comment?: string };
 export interface TicketComment {
   text: string;
   kind?: "comment" | "execution";
@@ -116,6 +131,24 @@ export function listTicketSessions(projectId: string, ticketId: string, after?: 
   const params = new URLSearchParams({ limit: "50" });
   if (after) params.set("after", after);
   return request<TicketPage<TicketSession>>(`${path(projectId, ticketId)}/sessions?${params}`);
+}
+
+export function listRelatedTickets(projectId: string, ticketId: string, after?: string) {
+  const params = new URLSearchParams({ limit: "50" });
+  if (after) params.set("after", after);
+  return request<TicketPage<ProjectTicket>>(`${path(projectId, ticketId)}/related?${params}`);
+}
+
+export function linkRelatedTicket(
+  projectId: string,
+  ticketId: string,
+  relatedTicketId: string,
+  action: "attach" | "remove",
+) {
+  return request<ProjectTicket>(`${path(projectId, ticketId)}/related`, "POST", {
+    related_ticket_id: relatedTicketId,
+    action,
+  });
 }
 
 /** PRs are output events, not mutable associations; preserve all events in activity. */

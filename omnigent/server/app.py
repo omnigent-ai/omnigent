@@ -290,6 +290,7 @@ class ServerInfoResponse(BaseModel):
     managed_sandboxes_enabled: bool
     durable_initial_input: bool = False
     project_tickets: bool = False
+    project_ticket_lifecycle: bool = False
     sandbox_provider: str | None
     sandbox_providers: list[str]
     # UI-relevant capability flags per launchable provider, e.g.
@@ -4153,6 +4154,7 @@ def create_app(
                 "managed_sandboxes_enabled": managed_sandboxes_enabled,
                 "durable_initial_input": startup_inputs is not None and managed_sandboxes_enabled,
                 "project_tickets": ticket_store is not None,
+                "project_ticket_lifecycle": ticket_store is not None,
                 "sandbox_provider": sandbox_provider,
                 "sandbox_providers": sandbox_providers,
                 "sandbox_provider_capabilities": sandbox_provider_capabilities,

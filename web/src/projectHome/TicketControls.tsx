@@ -1,5 +1,11 @@
 import { useState } from "react";
-import { CircleCheckIcon, CircleDashedIcon, CircleDotIcon } from "lucide-react";
+import {
+  CircleCheckIcon,
+  CircleDashedIcon,
+  CircleDotIcon,
+  ClipboardListIcon,
+  EyeIcon,
+} from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -15,12 +21,13 @@ import type { TicketStatus, TicketTag } from "@/lib/projectTicketsApi";
 import { cn } from "@/lib/utils";
 
 export function TicketStatusIcon({ status }: { status: TicketStatus }) {
-  const Icon =
-    status === "done"
-      ? CircleCheckIcon
-      : status === "in_progress"
-        ? CircleDotIcon
-        : CircleDashedIcon;
+  const Icon = {
+    open: CircleDashedIcon,
+    planning: ClipboardListIcon,
+    in_progress: CircleDotIcon,
+    review: EyeIcon,
+    done: CircleCheckIcon,
+  }[status];
   return (
     <Icon
       aria-hidden
@@ -28,9 +35,11 @@ export function TicketStatusIcon({ status }: { status: TicketStatus }) {
         "size-3.5 shrink-0",
         status === "done"
           ? "text-success"
-          : status === "in_progress"
-            ? "text-session-active"
-            : "text-muted-foreground",
+          : status === "review"
+            ? "text-warning"
+            : status === "in_progress" || status === "planning"
+              ? "text-session-active"
+              : "text-muted-foreground",
       )}
     />
   );
@@ -72,14 +81,79 @@ export function CompleteTicketDialog({
   onComplete,
   pending,
   error,
-}: {
+  approving = false,
+  initialSummary = "",
+}: TicketDialogProps & { approving?: boolean }) {
+  return (
+    <TicketTextDialog
+      title={title}
+      onClose={onClose}
+      onComplete={onComplete}
+      pending={pending}
+      error={error}
+      initialSummary={initialSummary}
+      heading={approving ? "Approve & mark done" : "Mark ticket done"}
+      label="Completion summary"
+      submitLabel={approving ? "Approve & mark done" : "Mark done"}
+      placeholder="What was delivered and verified?"
+    />
+  );
+}
+
+interface TicketDialogProps {
   title: string;
   onClose: () => void;
   onComplete: (summary: string) => void;
   pending: boolean;
   error: Error | null;
+  initialSummary?: string;
+}
+
+export function ReviewTicketDialog(props: TicketDialogProps) {
+  return (
+    <TicketTextDialog
+      {...props}
+      heading="Ready for review"
+      label="Review brief"
+      submitLabel="Send for review"
+      placeholder="What changed? What did you verify? Link evidence and explain exactly what the reviewer should check."
+    />
+  );
+}
+
+export function RequestTicketChangesDialog(props: TicketDialogProps) {
+  return (
+    <TicketTextDialog
+      {...props}
+      heading="Request changes"
+      label="Feedback"
+      submitLabel="Request changes"
+      maxLength={2000}
+      placeholder="What needs to change before this ticket can be accepted?"
+    />
+  );
+}
+
+function TicketTextDialog({
+  title,
+  onClose,
+  onComplete,
+  pending,
+  error,
+  initialSummary = "",
+  heading,
+  label,
+  submitLabel,
+  placeholder,
+  maxLength = 1500,
+}: TicketDialogProps & {
+  heading: string;
+  label: string;
+  submitLabel: string;
+  placeholder: string;
+  maxLength?: number;
 }) {
-  const [summary, setSummary] = useState("");
+  const [summary, setSummary] = useState(initialSummary);
   return (
     <Dialog
       open
@@ -91,23 +165,25 @@ export function CompleteTicketDialog({
         <form
           onSubmit={(event) => {
             event.preventDefault();
+            if (pending || !summary.trim()) return;
             onComplete(summary.trim());
           }}
           className="space-y-4"
         >
           <DialogHeader>
-            <DialogTitle>Mark ticket done</DialogTitle>
+            <DialogTitle>{heading}</DialogTitle>
             <DialogDescription>{title}</DialogDescription>
           </DialogHeader>
           <label className="grid gap-2 text-sm">
-            Completion summary
+            {label}
             <Textarea
               autoFocus
               required
-              maxLength={1500}
+              maxLength={maxLength}
               value={summary}
+              disabled={pending}
               rows={5}
-              placeholder="What was delivered and verified?"
+              placeholder={placeholder}
               onChange={(event) => setSummary(event.target.value)}
             />
           </label>
@@ -117,7 +193,7 @@ export function CompleteTicketDialog({
               Cancel
             </Button>
             <Button type="submit" loading={pending} disabled={!summary.trim()}>
-              Mark done
+              {submitLabel}
             </Button>
           </DialogFooter>
         </form>

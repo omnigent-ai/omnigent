@@ -6,7 +6,7 @@ import builtins
 import uuid
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, union_all
 from sqlalchemy.orm import Session
 
 from omnigent.db.account_authority import require_active_account
@@ -14,6 +14,7 @@ from omnigent.db.db_models import (
     SqlProject,
     SqlProjectTicket,
     SqlProjectTicketEvent,
+    SqlProjectTicketLink,
     SqlProjectTicketSession,
     current_workspace_id,
 )
@@ -30,6 +31,7 @@ from omnigent.entities.project_ticket import (
     NOTIFICATION_QUEUED,
     NOTIFICATION_SKIPPED,
     STATUS_CODES,
+    STATUS_LABELS,
     TICKET_PAGE_MAX,
     CommentOnTicket,
     CreateTicket,
@@ -56,6 +58,9 @@ def _ticket(row: SqlProjectTicket) -> dict[str, Any]:
         "status": next(key for key, value in STATUS_CODES.items() if value == row.status),
         "tags": row.tags,
         "completion_summary": row.completion_summary,
+        "plan": row.plan or "",
+        "review_summary": row.review_summary or "",
+        "lead_session_id": row.lead_session_id,
         "latest_update": row.latest_update,
         "comment_count": row.comment_count,
         "created_at": row.created_at,
@@ -226,26 +231,48 @@ class ProjectTicketStore:
     def update(
         self, project_id: str, ticket_id: str, body: UpdateTicket, actor: TicketActor
     ) -> dict[str, Any]:
-        changes = body.model_dump(exclude_none=True)
+        changes = body.model_dump(exclude_none=True, exclude={"comment"})
+        if "lead_session_id" in body.model_fields_set:
+            changes["lead_session_id"] = (
+                _identifier(body.lead_session_id) if body.lead_session_id is not None else None
+            )
 
         def write(session: Session) -> dict[str, Any]:
             project = self._project(session, project_id, actor.user_id, write=True)
             row = self._row(session, project_id, ticket_id, write=True)
-            if not changes:
-                return _ticket(row)
+            lead = changes.get("lead_session_id")
+            if (
+                lead is not None
+                and session.get(
+                    SqlProjectTicketSession, (project.workspace_id, project.id, row.id, lead)
+                )
+                is None
+            ):
+                raise OmnigentError(
+                    "Link the session to this ticket before making it the lead",
+                    code=ErrorCode.INVALID_INPUT,
+                )
             for key, value in changes.items():
                 setattr(row, key, STATUS_CODES[value] if key == "status" else value)
             if body.status is not None and body.status != "done":
                 row.completion_summary = None
-            row.latest_update = (
-                body.completion_summary
-                or (
-                    f"Moved to {body.status.replace('_', ' ')}"
-                    if body.status
-                    else "Updated the ticket"
-                )
-            )[:300]
-            self._append(session, project, row, actor, "updated", {"changes": changes})
+            if body.status not in (None, "review", "done"):
+                row.review_summary = None
+            if changes:
+                row.latest_update = (
+                    body.completion_summary
+                    or body.review_summary
+                    or (
+                        f"Moved to {STATUS_LABELS[body.status]}"
+                        if body.status
+                        else "Updated the ticket"
+                    )
+                )[:300]
+                self._append(session, project, row, actor, "updated", {"changes": changes})
+            if body.comment:
+                self._append(session, project, row, actor, "comment", {"text": body.comment})
+                row.comment_count += 1
+                row.latest_update = body.comment[:300]
             return _ticket(row)
 
         return run_write_transaction(self._write, "update_ticket", write)
@@ -323,17 +350,112 @@ class ProjectTicketStore:
                 session.delete(link)
             else:
                 return _ticket(ticket)
+            payload: dict[str, Any] = {"session_id": session_id, "action": action}
+            if action == "remove" and ticket.lead_session_id == key[3]:
+                ticket.lead_session_id = None
+                payload["changes"] = {"lead_session_id": None}
             self._append(
                 session,
                 project,
                 ticket,
                 actor,
                 "updated",
-                {"session_id": session_id, "action": action},
+                payload,
             )
             return _ticket(ticket)
 
         return run_write_transaction(self._write, "link_ticket_session", write)
+
+    def link_ticket(
+        self,
+        project_id: str,
+        ticket_id: str,
+        related_ticket_id: str,
+        action: str,
+        actor: TicketActor,
+    ) -> dict[str, Any]:
+        ticket_id, related_ticket_id = _identifier(ticket_id), _identifier(related_ticket_id)
+        if ticket_id == related_ticket_id:
+            raise OmnigentError("A ticket cannot link to itself", code=ErrorCode.INVALID_INPUT)
+
+        def write(session: Session) -> dict[str, Any]:
+            project = self._project(session, project_id, actor.user_id, write=True)
+            first_id, second_id = sorted((ticket_id, related_ticket_id))
+            first = self._row(session, project.id, first_id, write=True)
+            second = self._row(session, project.id, second_id, write=True)
+            key = (project.workspace_id, project.id, first_id, second_id)
+            link = session.get(SqlProjectTicketLink, key)
+            if action == "attach" and link is None:
+                session.add(
+                    SqlProjectTicketLink(
+                        workspace_id=key[0],
+                        project_id=key[1],
+                        ticket_id=key[2],
+                        related_ticket_id=key[3],
+                        created_at=now_epoch(),
+                    )
+                )
+            elif action == "remove" and link is not None:
+                session.delete(link)
+            else:
+                return _ticket(first if first.id == ticket_id else second)
+            for current, other in ((first, second), (second, first)):
+                self._append(
+                    session,
+                    project,
+                    current,
+                    actor,
+                    "updated",
+                    {
+                        "related_ticket_id": other.id,
+                        "action": action,
+                    },
+                )
+                current.latest_update = (
+                    f"{'Related to' if action == 'attach' else 'Unlinked'} {other.title}"
+                )[:300]
+            return _ticket(first if first.id == ticket_id else second)
+
+        return run_write_transaction(self._write, "link_related_tickets", write)
+
+    def related(
+        self,
+        project_id: str,
+        ticket_id: str,
+        *,
+        user_id: str | None,
+        after: str | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        limit = max(1, min(limit, TICKET_PAGE_MAX))
+        with self._session("list_related_tickets") as session:
+            project = self._project(session, project_id, user_id)
+            ticket = self._row(session, project.id, ticket_id)
+            scope = (
+                SqlProjectTicketLink.workspace_id == project.workspace_id,
+                SqlProjectTicketLink.project_id == project.id,
+            )
+            neighbors = union_all(
+                select(SqlProjectTicketLink.related_ticket_id).where(
+                    *scope, SqlProjectTicketLink.ticket_id == ticket.id
+                ),
+                select(SqlProjectTicketLink.ticket_id).where(
+                    *scope, SqlProjectTicketLink.related_ticket_id == ticket.id
+                ),
+            )
+            stmt = select(SqlProjectTicket).where(
+                SqlProjectTicket.workspace_id == project.workspace_id,
+                SqlProjectTicket.project_id == project.id,
+                SqlProjectTicket.id.in_(neighbors),
+            )
+            if after is not None:
+                stmt = stmt.where(SqlProjectTicket.id > _identifier(after))
+            rows = session.scalars(stmt.order_by(SqlProjectTicket.id).limit(limit + 1)).all()
+            return {
+                "data": [_ticket(row) for row in rows[:limit]],
+                "has_more": len(rows) > limit,
+                "last_id": rows[min(limit, len(rows)) - 1].id if rows else None,
+            }
 
     def sessions(
         self,
