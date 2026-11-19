@@ -13,8 +13,8 @@ const rect = (top: number, height: number, width: number) => ({
   y: top,
 });
 
-// Sizes the `isScroller` element and each `<li>` at its own scrolled `top`; other elements stay
-// zero-sized. Returns a function that restores the stubbed prototype properties.
+// Sizes the `isScroller` element and each `<li>` at its own scrolled `top`, stacking sized lists in
+// document order; other elements stay zero-sized. Returns a function restoring the stubs.
 export function stubVirtualListLayout({
   isScroller,
   viewportHeight,
@@ -40,6 +40,17 @@ export function stubVirtualListLayout({
     while (node && !isScroller(node)) node = node.parentElement;
     return node;
   };
+  const sizedLists = (root: HTMLElement) =>
+    [...root.querySelectorAll<HTMLElement>("ul")].filter((list) => list.style.height !== "");
+  const listHeight = (list: HTMLElement) => Number.parseFloat(list.style.height) || 0;
+  const listOffset = (list: HTMLElement, scroller: HTMLElement) =>
+    sizedLists(scroller)
+      .filter(
+        (above) =>
+          !above.contains(list) &&
+          (above.compareDocumentPosition(list) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0,
+      )
+      .reduce((offset, above) => offset + listHeight(above), 0);
 
   stub("clientHeight", {
     get(this: HTMLElement) {
@@ -58,24 +69,21 @@ export function stubVirtualListLayout({
       return isScroller(this) ? SCROLLER_WIDTH : 0;
     },
   });
-  // Every list starts at the content's top, so the tallest sized one spans the content.
   stub("scrollHeight", {
     get(this: HTMLElement) {
-      const heights = [...this.querySelectorAll<HTMLElement>("ul")].map(
-        (list) => Number.parseFloat(list.style.height) || 0,
-      );
-      return Math.max(0, ...heights);
+      return sizedLists(this).reduce((height, list) => height + listHeight(list), 0);
     },
   });
   stub("getBoundingClientRect", {
     value(this: HTMLElement) {
       if (isScroller(this)) return rect(0, viewportHeight, SCROLLER_WIDTH);
       const isRow = this.tagName === "LI";
-      // Content moves up as its scroller scrolls; a row sits at its own offset in the list.
-      const scrolledBy = scrollerOf(this)?.scrollTop ?? 0;
+      const list = isRow ? this.parentElement : this.tagName === "UL" ? this : null;
+      const scroller = scrollerOf(this);
+      // Content moves up as its scroller scrolls; a row sits at its own offset in its list.
+      const listTop = list && scroller ? listOffset(list, scroller) - scroller.scrollTop : 0;
       const rowTop = isRow ? Number.parseFloat(this.style.top || "0") : 0;
-      const top = (this.tagName === "UL" || isRow ? -scrolledBy : 0) + rowTop;
-      return rect(top, isRow ? rowHeight : 0, SCROLLER_WIDTH);
+      return rect(listTop + rowTop, isRow ? rowHeight : 0, SCROLLER_WIDTH);
     },
   });
   const scrollTops = new WeakMap<HTMLElement, number>();

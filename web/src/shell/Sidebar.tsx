@@ -6022,10 +6022,8 @@ function ConversationRowImpl({
   // project flyout's HoverCard and leave it lingering over the chat. Gate the
   // flyout off below the `md` breakpoint (see `projectFlyoutName`).
   const isMobile = useContext(IsMobileContext);
-  // When this row becomes active (e.g. a new session navigated to via `/c/:id`),
-  // center it if it is offscreen. A row already fully visible stays put, so
-  // clicking it does not slide the list. A windowed list reveals its own rows,
-  // so an active row mounting just offscreen doesn't pull the list to it.
+  // Center a newly active row (e.g. after navigating to `/c/:id`) if it is offscreen; a fully
+  // visible row stays put. A windowed list reveals its own rows, so a remount doesn't scroll.
   const rowRef = useRef<HTMLLIElement>(null);
   const windowed = placement !== undefined;
   useEffect(() => {

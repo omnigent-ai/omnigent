@@ -148,7 +148,7 @@ describe("Sidebar windowed session rows", () => {
   });
 
   it("keeps a dragged row mounted while the list scrolls to a far drop target", async () => {
-    renderSidebar({ features: WINDOWED });
+    renderSidebar({ features: { ...WINDOWED, sidebar_grouping_ui: true } });
     const source = row("conv_2")!;
     const start = { clientX: 50, clientY: 2 * ROW_PITCH + ROW_HEIGHT / 2 };
 
@@ -165,9 +165,51 @@ describe("Sidebar windowed session rows", () => {
     expect(row("conv_250")).not.toBeNull();
     expect(row("conv_2")).toBe(source);
     expect(source).toHaveClass("opacity-40");
+    const target = { clientX: start.clientX, clientY: ROW_HEIGHT / 2 };
     await act(async () => {
-      fireEvent.keyDown(window, { code: "Escape" });
+      fireEvent.mouseMove(document, target);
     });
+    await act(async () => {
+      fireEvent.mouseUp(document, target);
+    });
+
+    // A row dragged down lands below its target.
+    const { ids } = JSON.parse(localStorage.getItem("omnigent:sidebar-view")!).custom;
+    expect(ids.indexOf("conv_2")).toBe(ids.indexOf("conv_250") + 1);
+  });
+
+  it("places and reveals rows in a windowed list below another windowed list", async () => {
+    writeProjectFolderCollapse(false);
+    mocks.projects = ["Example project"];
+    mocks.projectRows = Array.from({ length: 60 }, (_, index) =>
+      conversation(`proj_${index}`, {
+        updated_at: 2_000 - index,
+        labels: { omni_project: "Example project" },
+      }),
+    );
+    vi.mocked(useConversations).mockImplementation(() =>
+      conversationPage([...mocks.projectRows, ...sessions(SESSION_COUNT)]),
+    );
+    localStorage.setItem(
+      EXPANDED_PROJECT_SECTIONS_STORAGE_KEY,
+      JSON.stringify(["Example project"]),
+    );
+    renderSidebar({ features: WINDOWED, route: "/c/conv_250", path: "/c/:conversationId" });
+
+    await waitFor(() => {
+      const revealed = row("conv_250")!.getBoundingClientRect();
+      expect(revealed.top).toBeGreaterThanOrEqual(0);
+      expect(revealed.bottom).toBeLessThanOrEqual(VIEWPORT_HEIGHT);
+    });
+    const list = row("conv_250")!.parentElement!;
+    const listOffset = list.getBoundingClientRect().top + scroller().scrollTop;
+    expect(listOffset).toBeGreaterThan(59 * ROW_PITCH);
+    act(() => {
+      scroller().scrollTop = listOffset + 100 * ROW_PITCH;
+      scroller().dispatchEvent(new Event("scroll"));
+    });
+    expect(row("conv_100")!.getBoundingClientRect().top).toBe(0);
+    expect(row("conv_250")).toBeNull();
   });
 
   it("loads the next page from the end of the windowed list and windows its rows", async () => {
