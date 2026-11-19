@@ -3471,7 +3471,11 @@ class ClaudeSDKExecutor(Executor):
         if self._gateway_vocabulary is None:
             access = self._prepared_cli.model_access if self._prepared_cli is not None else None
             if access is not None:
-                token = await run_sync_on_thread(access.credential)
+                try:
+                    token = await run_sync_on_thread(access.credential)
+                except Exception:  # noqa: BLE001 - credential errors may contain secrets.
+                    logger.warning("claude-sdk: gateway model discovery credential unavailable")
+                    return {}
                 self._gateway_vocabulary = await run_sync_on_thread(
                     _gateway_model_vocabulary, base_url, None, api_key=token
                 )

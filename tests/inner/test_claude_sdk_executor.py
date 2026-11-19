@@ -2030,6 +2030,48 @@ class TestResolveGatewayEnv(unittest.TestCase):
 
 
 class TestGatewayModelVocabulary(unittest.TestCase):
+    def test_brokered_credential_failure_does_not_abort_or_cache_discovery(self):
+        from omnigent.inner.claude_sdk_executor import (
+            ClaudeSDKExecutor,
+            _GatewayModelVocabulary,
+        )
+
+        credential = Mock(side_effect=[RuntimeError("secret credential detail"), "fresh-token"])
+        executor = ClaudeSDKExecutor.__new__(ClaudeSDKExecutor)
+        executor._prepared_cli = SimpleNamespace(
+            model_access=SimpleNamespace(credential=credential)
+        )
+        executor._gateway = True
+        executor._gateway_vocabulary = None
+        env = {"ANTHROPIC_BASE_URL": "https://gw.example.com/anthropic"}
+        vocabulary = _GatewayModelVocabulary(
+            alias_pins={"ANTHROPIC_DEFAULT_OPUS_MODEL": "gw-opus"},
+            model_overrides={"claude-opus-4-8": "gw-opus"},
+        )
+
+        with (
+            patch(
+                "omnigent.inner.claude_sdk_executor._gateway_model_vocabulary",
+                return_value=vocabulary,
+            ) as listing,
+            patch("omnigent.inner.claude_sdk_executor.logger.warning") as warning,
+        ):
+            self.assertEqual(_run(executor._apply_gateway_model_vocabulary(env, None)), {})
+            self.assertIsNone(executor._gateway_vocabulary)
+            listing.assert_not_called()
+            self.assertNotIn("secret credential detail", str(warning.call_args_list))
+
+            self.assertEqual(
+                _run(executor._apply_gateway_model_vocabulary(env, None)),
+                {"claude-opus-4-8": "gw-opus"},
+            )
+            self.assertEqual(env["ANTHROPIC_DEFAULT_OPUS_MODEL"], "gw-opus")
+            listing.assert_called_once_with(
+                "https://gw.example.com/anthropic", None, api_key="fresh-token"
+            )
+            self.assertIs(executor._gateway_vocabulary, vocabulary)
+            self.assertEqual(credential.call_count, 2)
+
     def test_pins_map_served_families_to_env_vars(self):
         from omnigent.inner.claude_sdk_executor import _gateway_model_vocabulary
         from omnigent.models.model_catalog import ModelEntry, ModelListing

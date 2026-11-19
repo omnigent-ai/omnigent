@@ -852,13 +852,11 @@ class EgressProxy:
         transformed = self._request_body_transform(method, host, port, path, body)
         if transformed == body:
             return headers, body
-        lines = [
-            line
-            for line in headers.split(b"\r\n")
-            if line and line.split(b":", 1)[0].lower() != b"content-length"
-        ]
-        lines.append(f"Content-Length: {len(transformed)}".encode("ascii"))
-        return b"\r\n".join(lines) + b"\r\n\r\n", transformed
+        message = _parse_http_headers(headers)
+        del message["Content-Length"]
+        del message["Transfer-Encoding"]
+        message["Content-Length"] = str(len(transformed))
+        return message.as_bytes(policy=email.policy.HTTP), transformed
 
     async def _forward_http2(
         self,

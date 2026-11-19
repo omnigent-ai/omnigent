@@ -1494,6 +1494,20 @@ def _mitm_client_selected_alpn(
             raw.close()
 
 
+def test_body_transform_rebuilds_bare_lf_headers_with_one_length() -> None:
+    proxy = EgressProxy.__new__(EgressProxy)
+    proxy._request_body_transform = Mock(return_value=b"replacement")
+    headers = b"Host: gateway.example.com\nContent-Length: 40\nTransfer-Encoding: chunked\n\n"
+
+    forwarded, body = proxy._transform_request_body(
+        "POST", "gateway.example.com", 443, "/allowed", headers, b"{}"
+    )
+
+    assert body == b"replacement"
+    assert forwarded == (b"Host: gateway.example.com\r\nContent-Length: 11\r\n\r\n")
+    assert b"Content-Length: 11\r\n" in proxy._force_connection_close(forwarded)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("tls", [False, True])
 async def test_compatibility_body_patch_preserves_framing_and_policy(
