@@ -18,7 +18,8 @@ coding, and browser-style navigation is something every new user already knows.
   commit in the Commits list or a pull request in the list changes what this
   tab shows.
   A middle click, an Option-click in the Files tree, or **Open in new tab** in
-  a file's menu opens a new tab instead. A link to something already open in
+  a file's menu opens a new tab instead; ⌘-click (Ctrl-click off macOS) is
+  planned to do the same. A link to something already open in
   another tab selects that tab rather than opening a duplicate.
 - **One back and forward history per session, across tabs.** Unlike a browser,
   history isn't kept per tab. Back and Forward walk every step in order, both
@@ -43,9 +44,9 @@ New in v2:
 - **Pull Requests**: the session's pull requests and a page for each one.
 
 Existing pages, which come along unchanged as tabs: terminals, the browser,
-side chats, agents, tasks and text search. The existing viewer's rich Markdown
-preview is planned for Markdown files in Files; at first they open as text in
-the editor.
+side chats, agents, tasks and text search. Markdown files in Files open as
+text in the editor at first; the existing rich Markdown preview and its edit
+modes are planned there.
 
 ## Links
 
