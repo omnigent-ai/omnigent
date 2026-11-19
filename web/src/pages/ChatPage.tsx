@@ -92,6 +92,7 @@ import {
   derivePermissionLevel,
   isEditorLevel,
   isOwnerLevel,
+  isPermissionLevelPending,
   isSessionSharedWithOthers,
 } from "@/lib/permissionsApi";
 import { getCurrentAuthorId } from "@/lib/identity";
@@ -961,9 +962,13 @@ export function ChatPage() {
     urlConvId,
     conversationsData !== undefined,
   );
-  // derivePermissionLevel reports null (owner) while the snapshot loads and the row has no level.
-  const permissionPending =
-    activeSession == null && sessionLoading && activeConv?.permission_level == null;
+  const permissionPending = isPermissionLevelPending(
+    activeSession,
+    sessionLoading,
+    activeConv,
+    urlConvId,
+    conversationsData !== undefined,
+  );
   const reconnectHostId = activeSession?.hostId ?? activeConv?.host_id ?? null;
   const reconnectHostOnline = useSessionHostOnline(urlConvId ?? undefined);
   const {

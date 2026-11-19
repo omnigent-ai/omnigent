@@ -124,6 +124,21 @@ export function derivePermissionLevel(
 }
 
 /**
+ * Whether `derivePermissionLevel`'s null stands for a level not known yet rather than the
+ * permissive owner default, so owner-only affordances should wait.
+ */
+export function isPermissionLevelPending(
+  session: Session | null | undefined,
+  sessionLoading: boolean,
+  activeConv: Conversation | null | undefined,
+  conversationId: string | undefined,
+  conversationsLoaded: boolean,
+): boolean {
+  if (session != null || activeConv?.permission_level != null) return false;
+  return sessionLoading || (Boolean(conversationId) && !conversationsLoaded);
+}
+
+/**
  * Whether a session is visible to anyone other than the viewer: another
  * principal owns it (so it's shared *with* the viewer), or the viewer owns
  * it and granted access to a non-viewer principal (a user or the
