@@ -25,6 +25,7 @@ import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { useIsEmbedded } from "@/lib/embedded";
 import { getEmbedRoot } from "@/lib/host";
 import {
+  ENTER_OWNING_SELECTOR,
   isEscapeOwnerOpen,
   isFocusInDialogOrMenu,
   isKeyOwningOverlayOpen,
@@ -91,9 +92,6 @@ function questionKey(question: ClaudeQuestion): string {
 // Digit keys 1-9 pick the first nine rows: the options, then the custom row.
 const DIGIT_SHORTCUT_COUNT = 9;
 const DIGIT_KEY = /^[1-9]$/;
-// Focused controls that keep Enter for their own activation or typing.
-const ENTER_OWNING_SELECTOR =
-  "a[href], button, input, select, textarea, summary, [contenteditable]:not([contenteditable='false']), [role='button'], [role='link'], [role='checkbox'], [role='radio'], [role='switch'], [role='tab'], [role='menuitem'], [role='option'], [role='combobox'], [role='textbox'], [role='searchbox'], [role='slider']";
 // A live dictation take, which commits on Enter and discards on Escape.
 const DICTATION_ACTIVE = "[data-dictating]";
 // Buttons and links inside the form, which Enter activates natively.

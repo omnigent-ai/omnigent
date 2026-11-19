@@ -52,6 +52,8 @@ describe("shortcut registry", () => {
       "pane.next",
       "terminal.splitRight",
       "terminal.splitDown",
+      "transcript.reply",
+      "transcript.askInSideChat",
     ]);
     for (const binding of SHORTCUT_BINDINGS) expect(shortcutBinding(binding.id)).toBe(binding);
     expect(shortcutBinding("settings.open").label).toBe("Open Settings");
@@ -318,6 +320,30 @@ describe("View bindings", () => {
 });
 
 describe("Chat and Pane bindings", () => {
+  it.each([mac, other])(
+    "keeps transcript reply and side-chat chords distinct (%j)",
+    (environment) => {
+      const reply = press({ key: "Enter", altKey: true });
+      const ask = { ...reply, shiftKey: true };
+      expect(matchesShortcut(reply, "transcript.reply", environment)).toBe(true);
+      expect(matchesShortcut(ask, "transcript.askInSideChat", environment)).toBe(true);
+      expect(matchesShortcut(reply, "transcript.askInSideChat", environment)).toBe(false);
+      expect(matchesShortcut(ask, "transcript.reply", environment)).toBe(false);
+      for (const id of ["transcript.reply", "transcript.askInSideChat"] as const) {
+        const chord = id === "transcript.reply" ? reply : ask;
+        for (const change of [
+          { altKey: false },
+          { ctrlKey: true },
+          { metaKey: true },
+          { altGraph: true },
+          { key: "enter" },
+        ]) {
+          expect(matchesShortcut({ ...chord, ...change }, id, environment)).toBe(false);
+        }
+      }
+    },
+  );
+
   it("keeps the composer chords on literal Control, even on macOS", () => {
     for (const environment of [mac, other]) {
       expect(

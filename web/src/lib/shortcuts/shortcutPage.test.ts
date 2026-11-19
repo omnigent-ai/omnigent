@@ -126,9 +126,30 @@ describe("shortcutPageGroups", () => {
     const touch = labelsIn({ ...BROWSER_TAB, preventsKeyboardSubmit: true }, "In chats");
     expect(touch).not.toContain("Send message");
     expect(touch).not.toContain("Pick a question option by number");
+    expect(touch).not.toContain("Reply to selected chat text");
+    expect(touch).not.toContain("Ask about selected chat text in side chat (when available)");
     expect(touch).toContain("Stop response");
     expect(labelsIn(BROWSER_TAB, "In chats").slice(0, 1)).toEqual(["Send message"]);
   });
+
+  it.each([true, false])(
+    "documents transcript selection shortcuts separately from composer shortcuts (Mac: %s)",
+    (mac) => {
+      const items = shortcutPageGroups(BROWSER_TAB, mac).find(
+        (group) => group.title === "In chats",
+      )!.items;
+      const alt = mac ? "⌥" : "Alt";
+      expect(items).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ label: "Reply to selected chat text", keys: [alt, "↵"] }),
+          expect.objectContaining({
+            label: "Ask about selected chat text in side chat (when available)",
+            keys: [alt, "⇧", "↵"],
+          }),
+        ]),
+      );
+    },
+  );
 
   it("widens the workspace tab digits when content search adds a tab", () => {
     const tabRow = (context: ShortcutPageContext) =>
