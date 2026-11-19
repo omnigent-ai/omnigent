@@ -11,11 +11,12 @@ coding, and browser-style navigation is something every new user already knows.
   terminals, the browser and side chats. "+" opens a New tab that lists them.
   The sidebar always has at least one tab.
 - **Everything has a link.** Each place a tab can show has a link that names
-  it exactly, down to a file and line in a pull request's diff. Agents can use
+  it exactly, such as a file at a line or a pull request's changes. Agents can use
   these links to open tabs for you, and you can share or reopen them. See
   [Links](#links).
-- **Navigation stays in the current tab.** Choosing a file in the tree or a
-  commit in the Commits list changes what this tab shows.
+- **Navigation stays in the current tab.** Choosing a file in the tree, a
+  commit in the Commits list or a pull request in the list changes what this
+  tab shows.
   A middle click, an Option-click in the Files tree, or **Open in new tab** in
   a file's menu opens a new tab instead. A link to something already open in
   another tab selects that tab rather than opening a duplicate.
@@ -56,23 +57,27 @@ address opens in a browser tab. Some examples:
 | `omnigent://files?path=src/parser.ts&line=42` | A file at a line. `line=40-48` cites a range, and `column` a column. |
 | `omnigent://changes?path=src/parser.ts&line=42` | That file in the session's diff. |
 | `omnigent://changes?base=main&head=feature` | Another comparison: `base` against `head`, or against the working copy without `head`. |
-| `omnigent://pull?url=<pull request URL>&view=changes&path=src/parser.ts&line=42` | A file and line in a pull request's diff. `view` is `summary`, `comments`, `commits` or `changes`, and `commit` picks one commit. |
+| `omnigent://pull?url=<pull request URL>&view=changes` | A pull request's changes. `view` is `summary`, `comments`, `commits` or `changes`. The link can also name a `path`, `line` and `commit`, but the page can't show those yet: it shows the whole view with a note saying so. |
 | `omnigent://terminal/<key>`, `omnigent://agent/<id>`, `omnigent://chat/<id>` | A terminal, an agent or a side chat. |
 | `omnigent://search?q=<text>` | Text search. |
 
-Any link can add `session=<id>` to open in another session's sidebar, or
-`tab=<id>` to open in a specific tab. A pull request is named by its URL, and a
+An `omnigent://` link can add `session=<id>` to open in another session's
+sidebar, or `tab=<id>` to open in a specific tab. A web page addressed that way
+is `omnigent://web?url=<encoded URL>&session=<id>`. A pull request is named by its URL, and a
 sub-page URL such as `…/pull/12/files` becomes the matching view. Each link has
 one canonical text, so the same place always gets the same link.
 
 Opening a link picks a tab by a few rules:
 
 - A tab already showing the same thing (a file, a comparison, a pull request)
-  is reused and moves to the cited place. Otherwise a new tab opens beside the
-  selected one.
+  is reused and moves to the cited place. A file link with no such tab shows in
+  the Files tab if that's the tab you're viewing. Otherwise a new tab opens
+  beside the selected one.
 - When you open the link, the tab is selected and the step joins the session's
-  history, so Back returns you to where you were. A move within the same file,
-  such as to another line, replaces the step instead of adding one.
+  history, so Back returns you to where you were. Moving to another line of
+  the file the selected Files or Diffs tab already shows replaces the step
+  instead of adding one. Switching tabs, and moves within a pull request, add a
+  step.
 - When an agent opens one, it never takes over what you're looking at. A tab
   you aren't viewing moves quietly, or a new one opens behind yours. If the tab
   is the one you're viewing, has unsaved edits or is your Files tab, it shows a
@@ -81,10 +86,11 @@ Opening a link picks a tab by a few rules:
 What's settled and what's open:
 
 - **In the first tabs change:** places, the link syntax above, parsing and
-  canonical formatting, how an open picks a tab, and the shared history. The
-  history lasts until a reload.
-- **Planned:** agents emitting these links in chat and having them open in the
-  sidebar, and a way for an agent to open a place directly.
+  canonical formatting, how an open picks a tab, and the shared history, which
+  is saved with the session's tabs and survives a reload.
+- **Planned:** showing a file, line or commit inside a pull request's page;
+  agents emitting these links in chat and having them open in the sidebar; and
+  a way for an agent to open a place directly.
 - **Open:** how these links sit beside the existing session links
   (`omnigent://<host>/c/<id>`), which use the same scheme; whether code-host
   URLs and absolute paths in chat resolve to places; and whether the syntax
