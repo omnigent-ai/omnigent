@@ -402,10 +402,11 @@ class QwenExecutor(Executor):
             sandbox = with_additional_read_roots(sandbox, [qwen_dir])
             sandbox = with_additional_write_roots(sandbox, [Path.home() / ".qwen"])
             sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
-            return create_exec_launcher(self._qwen_path, sandbox)
         except (OSError, ImportError, NotImplementedError) as exc:
             logger.warning("Could not apply sandbox for qwen; running unsandboxed: %s", exc)
             return self._qwen_path
+        else:
+            return create_exec_launcher(self._qwen_path, sandbox)
 
     async def _build_spawn_env(self) -> dict[str, str]:
         """The env handed to the qwen subprocess.

@@ -641,7 +641,6 @@ class AcpExecutor(Executor):
             if resolved_bin.parent != Path(".") and resolved_bin.exists():
                 sandbox = with_additional_read_roots(sandbox, [resolved_bin.resolve().parent])
             sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
-            return create_exec_launcher(binary, sandbox), rest
         except (OSError, ImportError, NotImplementedError) as exc:
             logger.warning(
                 "Could not apply sandbox for ACP agent %s; running unsandboxed: %s",
@@ -649,6 +648,8 @@ class AcpExecutor(Executor):
                 exc,
             )
             return binary, rest
+        else:
+            return create_exec_launcher(binary, sandbox), rest
 
     def _startup_error_message(self, exc: BaseException) -> str:
         """Describe a handshake failure, quoting the agent's own stderr.

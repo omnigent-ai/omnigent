@@ -67,6 +67,7 @@ from omnigent.spec.types import (
     ToolsConfig,
 )
 from omnigent.spec.validator import _SKILL_NAME_MAX_LEN, _SKILL_NAME_PATTERN
+from omnigent.util.env_credentials import _ENV_REF_RE, env_names_with_omnigent_prefix
 
 _log = logging.getLogger(__name__)
 
@@ -904,6 +905,19 @@ def _parse_executor(
     )
 
 
+def _api_key_source_env_names(raw_key: str) -> tuple[str, ...]:
+    """Retain credential references before expanding a legacy API key."""
+    return tuple(
+        sorted(
+            {
+                name
+                for match in _ENV_REF_RE.finditer(raw_key)
+                for name in env_names_with_omnigent_prefix(match.group(1) or match.group(2))
+            }
+        )
+    )
+
+
 def _parse_executor_auth(
     raw: dict[str, object],
     *,
@@ -951,6 +965,20 @@ def _parse_executor_auth(
                 "executor.auth.api_key is required when type is 'api_key'",
                 code=ErrorCode.INVALID_INPUT,
             )
+        source_env_names = set(_api_key_source_env_names(raw_key))
+        serialized_names = raw_auth.get("source_env_names", ())
+        if not isinstance(serialized_names, (list, tuple)):
+            raise OmnigentError(
+                "executor.auth.source_env_names must be a list of environment variable names",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        for name in serialized_names:
+            if not isinstance(name, str) or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
+                raise OmnigentError(
+                    "executor.auth.source_env_names must contain valid environment variable names",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            source_env_names.update(env_names_with_omnigent_prefix(name))
         api_key = expand_env_vars({"api_key": raw_key})["api_key"] if expand_env else raw_key
         raw_base_url = raw_auth.get("base_url")
         base_url: str | None = None
@@ -961,7 +989,9 @@ def _parse_executor_auth(
                 if expand_env
                 else raw_base_url_str
             )
-        return ApiKeyAuth(api_key=api_key, base_url=base_url)
+        return ApiKeyAuth(
+            api_key=api_key, base_url=base_url, source_env_names=tuple(sorted(source_env_names))
+        )
     if auth_type == "databricks":
         profile_val = str(raw_auth.get("profile") or "")
         if not profile_val:
