@@ -12,10 +12,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from omnigent.inner._acp_metadata import _META_INPUT_ITEM_ID
 from omnigent.inner.executor import (
     ExecutorError,
     TextChunk,
@@ -25,6 +27,80 @@ from omnigent.inner.executor import (
     TurnComplete,
 )
 from omnigent.inner.goose_executor import GooseExecutor
+
+
+@pytest.mark.parametrize("context", [None, "invalid", '{"pipeline":"repro-agent","run_id":"123"}'])
+@pytest.mark.parametrize(
+    "base_path", ["ai-gateway/codex/v1/responses", "serving-endpoints/responses"]
+)
+@pytest.mark.parametrize(
+    "base_url", ["https://test.cloud.databricks.com/ai-gateway/codex/v1", "https://[invalid"]
+)
+def test_ci_custom_provider_reaches_goose_spawn(
+    tmp_path, monkeypatch, caplog, context, base_path, base_url
+) -> None:
+    """Custom-provider JSON preserves comma-bearing tag values and the Responses path."""
+    from omnigent.databricks_ai_gateway import REQUEST_TAGS_HEADER
+    from omnigent.harnesses.goose_native.credentials import with_goose_ci_request_tags
+
+    monkeypatch.delenv("OMNIGENT_CI_PIPELINE", raising=False)
+    monkeypatch.delenv("OMNIGENT_CI_CONTEXT", raising=False)
+    if context is not None:
+        monkeypatch.setenv("OMNIGENT_CI_CONTEXT", context)
+    if context in (None, "invalid"):
+        monkeypatch.setattr(
+            "omnigent.harnesses.goose_native.credentials.urlsplit",
+            lambda _: pytest.fail("Disabled telemetry must not parse URLs"),
+        )
+        monkeypatch.setattr(
+            "omnigent.databricks_ai_gateway.urlparse",
+            lambda _: pytest.fail("Disabled telemetry must not parse URLs"),
+        )
+    original = {
+        "name": "custom_ci",
+        "engine": "openai",
+        "display_name": "CI",
+        "api_key_env": "OPENAI_API_KEY",
+        "base_url": base_url,
+        "base_path": base_path,
+        "models": [{"name": "test-model", "context_limit": 200000}],
+        "requires_auth": True,
+        "headers": {"X-Existing": "kept", REQUEST_TAGS_HEADER: '{"team":"ci"}'},
+    }
+    provider_dir = tmp_path / "config" / "custom_providers"
+    provider_dir.mkdir(parents=True)
+    (provider_dir / "custom_ci.json").write_text(json.dumps(with_goose_ci_request_tags(original)))
+    monkeypatch.setenv("GOOSE_PATH_ROOT", str(tmp_path))
+    monkeypatch.setenv("GOOSE_PROVIDER", "custom_ci")
+    monkeypatch.setenv("GOOSE_MODEL", "test-model")
+    env = GooseExecutor()._build_spawn_env()
+    configured = json.loads(
+        (
+            Path(env["GOOSE_PATH_ROOT"])
+            / "config"
+            / "custom_providers"
+            / f"{env['GOOSE_PROVIDER']}.json"
+        ).read_text()
+    )
+    assert env["GOOSE_MODEL"] == "test-model"
+    assert {key: value for key, value in configured.items() if key != "headers"} == {
+        key: value for key, value in original.items() if key != "headers"
+    }
+    assert configured["headers"]["X-Existing"] == "kept"
+    expected = {"team": "ci"}
+    if (
+        context
+        and context != "invalid"
+        and base_path.startswith("ai-gateway/")
+        and base_url != "https://[invalid"
+    ):
+        expected.update(json.loads(context))
+    assert json.loads(configured["headers"][REQUEST_TAGS_HEADER]) == expected
+    assert ("malformed Goose provider URL" in caplog.text) == (
+        context not in (None, "invalid") and base_url == "https://[invalid"
+    )
+    assert original["headers"][REQUEST_TAGS_HEADER] == '{"team":"ci"}'
+
 
 # ---------------------------------------------------------------------------
 # Construction / attribute defaults
@@ -1498,3 +1574,48 @@ def test_create_app_returns_fastapi() -> None:
     from omnigent.inner import goose_harness
 
     assert isinstance(goose_harness.create_app(), FastAPI)
+
+
+@pytest.mark.parametrize("input_item_id", ["msg_current", None])
+@pytest.mark.parametrize("content", ["current", [], [{"type": "input_text", "text": ""}]])
+@pytest.mark.parametrize("fresh_session", [False, True], ids=["warm", "history-replay"])
+@pytest.mark.asyncio
+async def test_prompt_includes_input_item_metadata(input_item_id, content, fresh_session) -> None:
+    """Every ACP prompt names the initiating item or explicitly sends null."""
+    from omnigent.runtime.harnesses._executor_adapter import _translate_input_to_messages
+
+    executor = GooseExecutor()
+    executor._initialized = True
+    executor._session_id = "acp-session"
+    executor._proc = MagicMock(returncode=None)
+    executor._system_prompt_sent = not fresh_session
+    prompts = []
+
+    async def send(message):
+        prompts.append(message)
+        executor._pending[message["id"]].set_result({"result": {"stopReason": "end_turn"}})
+
+    executor._send = send
+    tail = {"type": "message", "role": "user", "content": content}
+    if input_item_id is not None:
+        tail["id"] = input_item_id
+    messages = _translate_input_to_messages(
+        [
+            {"type": "message", "role": "user", "id": "msg_old", "content": "old"},
+            {"type": "message", "role": "assistant", "content": "old reply"},
+            tail,
+        ],
+        preserve_empty_initiating_message=executor.preserves_empty_initiating_message(),
+    )
+    events = [event async for event in executor.run_turn(messages, [], "")]
+
+    assert any(isinstance(event, TurnComplete) for event in events)
+    assert len(prompts) == 1
+    assert prompts[0]["method"] == "session/prompt"
+    assert prompts[0]["params"]["_meta"] == {_META_INPUT_ITEM_ID: input_item_id}
+    if fresh_session:
+        assert "old reply" in prompts[0]["params"]["prompt"][0]["text"]
+    else:
+        assert prompts[0]["params"]["prompt"] == [
+            {"type": "text", "text": content if isinstance(content, str) else ""}
+        ]

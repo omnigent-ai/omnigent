@@ -15,6 +15,7 @@ import { isStaleCursorError } from "@/lib/staleCursor";
 import {
   conversationsQueryKey,
   fetchConversationsPage,
+  retryListFetch,
   timeInitialConversationLoad,
   useConversations,
   type SessionSortBy,
@@ -82,6 +83,7 @@ export function useScopeCache(
       return refreshScopeWindow(client.getQueryData<ScopeCacheData>(queryKey), page, limit, sortBy);
     },
     select: filterData,
+    retry: retryListFetch,
     staleTime: enabled ? 30_000 : "static",
     refetchInterval: enabled ? refreshIntervalMs : false,
     enabled,

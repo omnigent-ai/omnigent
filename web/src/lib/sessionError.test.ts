@@ -4,6 +4,8 @@ import {
   latestActivityErrorState,
   latestActivityErrorWindow,
   latestActivityIsError,
+  latestErrorFromLabels,
+  LATEST_ACTIVITY_ERROR_LABEL_KEY,
 } from "./sessionError";
 
 const ctx: BlockContext = {
@@ -39,6 +41,20 @@ describe("latestActivityIsError", () => {
     expect(latestActivityErrorState([disconnected], false)).toBe("disconnected");
     expect(latestActivityErrorState([disconnected], true)).toBe("recovered_disconnect");
     expect(latestActivityErrorState([error], true)).toBe("error");
+  });
+
+  it("retires a status-only failure card once the session has left failed", () => {
+    const statusCard: ErrorBlock = {
+      ...error,
+      ctx: { ...ctx, itemId: null },
+      code: "required_terminal_exited",
+      fromSessionStatus: true,
+    };
+    expect(latestActivityErrorState([text("Done."), statusCard], null, "failed")).toBe("error");
+    expect(latestActivityErrorState([text("Done."), statusCard], null, "idle")).toBeNull();
+    // A persisted fault behind the card still shows after a fresh load, so it still counts.
+    expect(latestActivityErrorState([error, statusCard], null, "idle")).toBe("error");
+    expect(latestActivityErrorState([statusCard])).toBe("error");
   });
 
   it("preserves a genuine fault in a mixed fault and disconnect cascade", () => {
@@ -178,5 +194,26 @@ describe("latestActivityIsError", () => {
   ] satisfies AnyBlock[])("skips $type bookkeeping without hiding an earlier error", (metadata) => {
     expect(latestActivityIsError([metadata])).toBeUndefined();
     expect(latestActivityIsError([error, metadata])).toBe(true);
+  });
+});
+
+const labels = (value: string) => ({ [LATEST_ACTIVITY_ERROR_LABEL_KEY]: value });
+
+describe("latestErrorFromLabels", () => {
+  it("shows no badge when the label is absent or empty", () => {
+    expect(latestErrorFromLabels(undefined, true)).toBeNull();
+    expect(latestErrorFromLabels({ other: "1" }, false)).toBeNull();
+    expect(latestErrorFromLabels(labels(""), true)).toBeNull();
+  });
+
+  it("maps an error label to the error badge regardless of host liveness", () => {
+    expect(latestErrorFromLabels(labels("error"), true)).toBe("error");
+    expect(latestErrorFromLabels(labels("error"), null)).toBe("error");
+  });
+
+  it("keeps a disconnect until the host is back online", () => {
+    expect(latestErrorFromLabels(labels("disconnected"), false)).toBe("disconnected");
+    expect(latestErrorFromLabels(labels("disconnected"), null)).toBe("disconnected");
+    expect(latestErrorFromLabels(labels("disconnected"), true)).toBe("recovered_disconnect");
   });
 });

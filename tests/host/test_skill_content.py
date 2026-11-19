@@ -55,6 +55,8 @@ def test_plain_plugin_and_private_diagnostics(tmp_path, monkeypatch, caplog):
         ("é" * (MAX_SKILL_CONTENT_BYTES // 2 + 1), True),
         ("€" * MAX_SKILL_CONTENT_BYTES, True),
     ],
+    # The content itself would make each test id hundreds of KB long.
+    ids=["ascii-at-cap", "two-byte-over-cap", "three-byte-over-cap"],
 )
 def test_content_byte_cap(monkeypatch, content, truncated):
     from omnigent.spec.types import SkillSpec

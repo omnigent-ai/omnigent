@@ -63,6 +63,11 @@ class _Associations(BaseModel):
 class _Registry(_Associations):
     excluded: list[str] = Field(default_factory=list)
     observations: list[str] = Field(default_factory=list)
+    # Associations the server has not acknowledged, by the revision that last changed them.
+    # @deprecated server-pr-tracking compat, remove in 0.24.0 (~2026-11-24): ``None`` marks a
+    # file written before reporting existed, whose associations all count as unreported.
+    unreported: dict[str, int] | None = None
+    revision: int = 0
 
 
 class _ProviderRegistry(_Associations):
@@ -73,6 +78,7 @@ class SessionPrRegistry:
     """Atomic per-session files shared by the host and its session runners."""
 
     def __init__(self, session_id: str, *, root: Path | None = None) -> None:
+        self.session_id = session_id
         # Conversation IDs are globally allocated; hashing also confines disk paths.
         key = hashlib.sha256(session_id.encode()).hexdigest()
         self.path = (root or data_dir() / "github" / "session-prs") / f"{key}.json"
@@ -97,6 +103,8 @@ class SessionPrRegistry:
         # Equal timestamps retain insertion order across files and process restarts.
         order = {url: index for index, url in enumerate(providers.order)}
         state.prs = sorted(entries.values(), key=lambda pr: order.get(pr.url, len(order)))
+        if state.unreported is None:
+            state.unreported = {pr.url: 0 for pr in state.prs}
         if needs_migration:
             self._write(state)
         return state
@@ -167,6 +175,7 @@ class SessionPrRegistry:
                 return
             now = time.time() if timestamp is None else timestamp
             entries = {pr.url: pr for pr in state.prs}
+            recorded: list[str] = []
             for reference in references:
                 reference = PullRequestRef.from_url(reference.url)
                 if reference.url in state.excluded:
@@ -188,7 +197,11 @@ class SessionPrRegistry:
                     title_checked_at=previous.title_checked_at if previous else 0,
                     title_lookup_timed_out=previous.title_lookup_timed_out if previous else False,
                 )
+                recorded.append(reference.url)
             state.prs = list(entries.values())
+            if recorded and state.unreported is not None:
+                state.revision += 1
+                state.unreported.update(dict.fromkeys(recorded, state.revision))
             if observation_id:
                 state.observations = [*state.observations[-511:], observation_id]
             self._write(state)
@@ -220,6 +233,39 @@ class SessionPrRegistry:
             if changed:
                 self._write(state)
 
+    def pending_reports(self) -> tuple[int, Sequence[SessionPullRequest]]:
+        """Return the registry revision and the associations the server has not acknowledged.
+
+        :raises ValueError: If the registry is corrupt.
+        :raises filelock.Timeout: If the registry is busy.
+        """
+        if not self.path.parent.exists():
+            return 0, []
+        with FileLock(str(self.path) + ".lock", timeout=1):
+            state = self._read()
+            unreported = state.unreported or {}
+            return state.revision, [pr for pr in state.prs if pr.url in unreported]
+
+    def mark_reported(self, revision: int, urls: Collection[str]) -> None:
+        """Forget reports the server acknowledged, keeping changes made after ``revision``.
+
+        :param revision: The revision :meth:`pending_reports` returned with the sent entries.
+        :param urls: The URLs that were sent.
+        """
+        if not self.path.parent.exists():
+            return
+        with FileLock(str(self.path) + ".lock", timeout=1):
+            state = self._read()
+            unreported = state.unreported or {}
+            kept = {
+                url: changed
+                for url, changed in unreported.items()
+                if url not in urls or changed > revision
+            }
+            if kept != state.unreported:
+                state.unreported = kept
+                self._write(state)
+
     def remove(self, url: str) -> None:
         """Remember removal so subsequent hook replay cannot attach the PR again."""
         reference = PullRequestRef.from_url(url)
@@ -227,6 +273,8 @@ class SessionPrRegistry:
         with FileLock(str(self.path) + ".lock", timeout=1):
             state = self._read()
             state.prs = [pr for pr in state.prs if pr.url != reference.url]
+            if state.unreported is not None:
+                state.unreported.pop(reference.url, None)
             if reference.url not in state.excluded:
                 state.excluded.append(reference.url)
             # Commit the exclusion before deleting its companion association.

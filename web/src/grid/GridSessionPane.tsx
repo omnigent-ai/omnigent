@@ -1,11 +1,29 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ComponentProps } from "react";
+import {
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ComponentProps,
+} from "react";
 import { createPortal } from "react-dom";
+import { useQueryClient } from "@tanstack/react-query";
 import { useDraggable, useDroppable } from "@dnd-kit/core";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { cn } from "@/lib/utils";
 import { Maximize2Icon, XIcon } from "lucide-react";
 import { SideChatPane } from "@/components/chat/SideChatPane";
+import { SessionHarnessPicker } from "@/components/composer/SessionHarnessPicker";
+import { useSessionPickerInputs } from "@/components/composer/sessionPickerInputs";
+import { useSessionHarnessPickerProps } from "@/components/composer/useSessionHarnessPickerProps";
+import { ComposerPermissionPicker } from "@/components/composer/ComposerControls";
+import { HostBadge } from "@/components/HostBadge";
+import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
 import { Button } from "@/components/ui/button";
 import { useBrowserAgentRelay } from "@/hooks/useBrowserAgentRelay";
+import { useInertRef } from "@/hooks/useInertRef";
 import { useUiOpenFile } from "@/hooks/useUiOpenFile";
 import { useChildSessions } from "@/hooks/useChildSessions";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
@@ -22,7 +40,9 @@ import { useWorkspaceResources } from "@/shell/useWorkspaceResources";
 import { supportsBrowser } from "@/lib/nativeBridge";
 import { isNativeWrapper, nativeCodingAgentForSubagentWrapper } from "@/lib/nativeCodingAgents";
 import { isOwnerLevel } from "@/lib/permissionsApi";
+import type { Session } from "@/lib/types";
 import { retrySession } from "@/lib/sessionsApi";
+import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
 import { readTranscriptViewDefault } from "@/lib/transcriptViewPreferences";
 import { MainTerminalView } from "@/shell/MainTerminalView";
 import { TerminalFirstContextProvider, type TerminalFirstView } from "@/shell/TerminalFirstContext";
@@ -48,8 +68,13 @@ import {
 import type { RightRailTab } from "@/shell/railTabs";
 import type { ChangedSort } from "@/shell/FlatFileList";
 import { WorkspacePanel } from "@/shell/WorkspacePanel";
+import { revealFolderInFilesPanel } from "@/shell/FilesPanel";
+import { selectPullRequestInPanel } from "@/shell/PullRequestPanel";
 import { citedFilePosition } from "@/shell/filePositionState";
 import { useGridSessions } from "./GridSessionsContext";
+import { ENABLED_COMPOSER_INPUT_SELECTOR } from "@/components/composer/engine/composerInput";
+import { useGridPermissionControl, type GridPermissionControl } from "./useGridPermissionControl";
+import { useSharedSessionDraft } from "./sharedSessionDraft";
 
 export type GridWorkspacePanelProps = Pick<
   ComponentProps<typeof WorkspacePanel>,
@@ -60,6 +85,7 @@ export function GridSessionPane({
   sessionId,
   area,
   selected,
+  focusRequest = null,
   onActivate,
   workspaceTarget,
   workspacePanel,
@@ -68,16 +94,21 @@ export function GridSessionPane({
   sessionId: string;
   area?: string;
   selected: boolean;
+  /** A new object asks this cell to take keyboard focus. */
+  focusRequest?: object | null;
   onActivate: () => void;
   workspaceTarget: HTMLDivElement | null;
   workspacePanel: GridWorkspacePanelProps;
   onOpenWorkspace: () => void;
 }) {
+  const queryClient = useQueryClient();
   const { session, isLoading: sessionLoading } = useSession(sessionId);
   const state = useConversationEntryState(sessionId);
   const canEdit = useCanEdit(sessionId);
+  const serverInfo = useServerInfo();
   const permissionLevel = session?.permissionLevel ?? (canEdit ? null : 1);
   const grids = useGridSessions()!;
+  useSharedSessionDraft(sessionId);
   const title = session?.title || "Session";
   const {
     attributes,
@@ -91,8 +122,11 @@ export function GridSessionPane({
     active,
     isOver,
   } = useDroppable({ id: sessionId, data: { title } });
+  const paneRef = useRef<HTMLElement | null>(null);
+  const chatRef = useRef<HTMLDivElement>(null);
   const setPaneRef = useCallback(
     (node: HTMLElement | null) => {
+      paneRef.current = node;
       setDragNodeRef(node);
       setDropNodeRef(node);
     },
@@ -106,6 +140,8 @@ export function GridSessionPane({
     turnActive: state.status === "streaming",
     launchedAt: state.runnerLaunchedAt,
   });
+  const unreachable = liveness.kind === "host_offline" || liveness.kind === "local_stranded";
+  const permission = useGridPermissionControl(session, permissionLevel, unreachable);
   const wrapper = session?.labels?.["omnigent.wrapper"];
   const terminalFirst = session?.labels?.["omnigent.ui"] === "terminal";
   const rootSessionId = useRootSessionId(sessionId, session?.parentSessionId);
@@ -150,6 +186,27 @@ export function GridSessionPane({
     [sessionId],
   );
   const showTerminal = terminalFirst && view === "terminal";
+  const [terminalOpened, setTerminalOpened] = useState(showTerminal);
+  useEffect(() => {
+    if (showTerminal) setTerminalOpened(true);
+  }, [showTerminal]);
+  const setChatRef = useInertRef(showTerminal, chatRef);
+  const terminalInertRef = useInertRef<HTMLDivElement>(!showTerminal);
+  // A connected terminal focuses itself as the cell activates; otherwise focus
+  // the chat composer, or the cell itself when there is nothing to type into.
+  const handledFocusRequest = useRef<object | null>(null);
+  useEffect(() => {
+    const pane = paneRef.current;
+    if (!focusRequest || focusRequest === handledFocusRequest.current || !pane) return;
+    handledFocusRequest.current = focusRequest;
+    if (pane.contains(document.activeElement)) return;
+    const composer = showTerminal
+      ? undefined
+      : Array.from(
+          chatRef.current?.querySelectorAll<HTMLElement>(ENABLED_COMPOSER_INPUT_SELECTOR) ?? [],
+        ).at(-1);
+    (composer ?? pane).focus({ preventScroll: true });
+  }, [focusRequest, showTerminal]);
   const hadTerminal = useRef(false);
   useEffect(() => {
     if (agentTerminal) hadTerminal.current = true;
@@ -204,11 +261,21 @@ export function GridSessionPane({
     };
   }, []);
   const navigateWorkspace = useCallback(
-    (path: string, options: OpenFileOptions | undefined, apply: () => void) => {
+    (path: string | null, options: OpenFileOptions | undefined, apply: () => void) => {
       if (navigationGuard.current) navigationGuard.current(path, options, apply);
       else apply();
     },
     [],
+  );
+  // Leaving the grid (the shell's Close) asks this cell's viewer about unsaved edits too.
+  const registerShellNavigationGuard = useContext(FileViewerContext)?.registerNavigationGuard;
+  useEffect(
+    () =>
+      registerShellNavigationGuard?.((path, options, navigate) => {
+        if (path === null) navigateWorkspace(null, options, navigate);
+        else navigate();
+      }),
+    [registerShellNavigationGuard, navigateWorkspace],
   );
   const openFile = useCallback(
     (path: string, options?: OpenFileOptions) => {
@@ -228,22 +295,23 @@ export function GridSessionPane({
     [navigateWorkspace, onOpenWorkspace],
   );
   useUiOpenFile(sessionId, selected && canBrowse, openFile);
+  const showTab = useCallback((rightRailTab: RightRailTab | null) => {
+    setWorkspace((previous) => ({
+      ...previous,
+      rightRailTab,
+      selectedFilePath: null,
+      selectedTerminalKey: null,
+      openPanels:
+        isDefaultWorkspaceTab(rightRailTab) && !readPinnedWorkspaceTabs().includes(rightRailTab)
+          ? [...new Set([...(previous.openPanels ?? []), rightRailTab])]
+          : previous.openPanels,
+    }));
+  }, []);
   const selectTab = useCallback(
     (rightRailTab: RightRailTab | null) => {
-      navigateWorkspace("", undefined, () =>
-        setWorkspace((previous) => ({
-          ...previous,
-          rightRailTab,
-          selectedFilePath: null,
-          selectedTerminalKey: null,
-          openPanels:
-            isDefaultWorkspaceTab(rightRailTab) && !readPinnedWorkspaceTabs().includes(rightRailTab)
-              ? [...new Set([...(previous.openPanels ?? []), rightRailTab])]
-              : previous.openPanels,
-        })),
-      );
+      navigateWorkspace("", undefined, () => showTab(rightRailTab));
     },
-    [navigateWorkspace],
+    [navigateWorkspace, showTab],
   );
   const closeFile = useCallback(
     (path: string) => {
@@ -270,10 +338,22 @@ export function GridSessionPane({
     () => ({
       openFile,
       registerNavigationGuard,
-      openGithubTab: () => {
-        selectTab("github");
-        onOpenWorkspace();
+      guardFileNavigation: navigateWorkspace,
+      openGithubTab: (prUrl?: string) => {
+        navigateWorkspace("", undefined, () => {
+          if (prUrl) selectPullRequestInPanel(queryClient, sessionId, prUrl);
+          showTab("github");
+          onOpenWorkspace();
+        });
       },
+      openFolder: showFiles
+        ? (absolutePath: string) =>
+            navigateWorkspace(absolutePath, undefined, () => {
+              revealFolderInFilesPanel(sessionId, absolutePath);
+              showTab("files");
+              onOpenWorkspace();
+            })
+        : undefined,
       conversationId: sessionId,
       workspaceRoot: environment.data?.root ?? null,
       workspaceHome: environment.data?.home ?? null,
@@ -283,8 +363,11 @@ export function GridSessionPane({
     [
       openFile,
       registerNavigationGuard,
-      selectTab,
+      queryClient,
+      navigateWorkspace,
+      showTab,
       onOpenWorkspace,
+      showFiles,
       sessionId,
       environment.data,
       session?.hostId,
@@ -316,10 +399,11 @@ export function GridSessionPane({
           data-grid-session={sessionId}
           data-active={selected}
           aria-label={`${title}${selected ? " (active)" : ""}`}
+          tabIndex={-1}
           onClickCapture={onActivate}
           onFocusCapture={onActivate}
           className={cn(
-            "relative flex min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border bg-background",
+            "relative flex min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border bg-background outline-none",
             selected && "border-brand-accent/50 shadow-lg",
             isDragging && "opacity-50",
           )}
@@ -364,28 +448,59 @@ export function GridSessionPane({
             </Button>
           </header>
           <div className="relative min-h-0 min-w-0 flex-1 overflow-hidden">
-            <div className={cn("h-full", showTerminal && "hidden")} inert={showTerminal}>
-              <SideChatPane childId={sessionId} fullSession readOnly={!canEdit} />
+            <div ref={setChatRef} className={cn("h-full", showTerminal && "hidden")}>
+              <RenderErrorBoundary name="chat" resetKey={sessionId}>
+                <SideChatPane
+                  childId={sessionId}
+                  fullSession
+                  readOnly={!canEdit}
+                  gridComposer={{
+                    leading: session && (
+                      <>
+                        <HostBadge
+                          sessionId={sessionId}
+                          appearance="composer"
+                          readOnly={!canEdit}
+                          launch={state.sandboxStatus}
+                        />
+                        <GridPermissionPicker permission={permission} />
+                      </>
+                    ),
+                    trailing: session && (
+                      <GridSessionHarnessPicker
+                        sessionId={sessionId}
+                        session={session}
+                        canEdit={canEdit}
+                        unreachable={unreachable}
+                        runnerOnline={runnerOnline}
+                      />
+                    ),
+                    cyclePermissionMode: permission.cycle,
+                  }}
+                />
+              </RenderErrorBoundary>
             </div>
-            {terminalFirst && (agentTerminal !== null || showTerminal) && (
+            {terminalFirst && (agentTerminal !== null || showTerminal || terminalOpened) && (
               <div
                 className={cn(
                   "absolute inset-0 flex flex-col",
                   !showTerminal && "invisible opacity-0",
                 )}
+                ref={terminalInertRef}
                 aria-hidden={!showTerminal}
-                inert={!showTerminal}
               >
-                <MainTerminalView
-                  conversationId={sessionId}
-                  visible={showTerminal}
-                  active={selected && !workspacePanel.maximized}
-                  className="pt-0"
-                  readOnly={!session || !isOwnerLevel(permissionLevel)}
-                  runnerOnline={runnerOnline}
-                  onResume={canEdit ? resume : undefined}
-                  sandboxOffline={liveness.kind === "host_asleep"}
-                />
+                <RenderErrorBoundary name="terminal" resetKey={sessionId}>
+                  <MainTerminalView
+                    conversationId={sessionId}
+                    visible={showTerminal}
+                    active={selected && !workspacePanel.maximized}
+                    className="pt-0"
+                    readOnly={!session || !isOwnerLevel(permissionLevel)}
+                    runnerOnline={runnerOnline}
+                    onResume={canEdit ? resume : undefined}
+                    sandboxOffline={liveness.kind === "host_asleep"}
+                  />
+                </RenderErrorBoundary>
               </div>
             )}
           </div>
@@ -421,6 +536,7 @@ export function GridSessionPane({
             <div className={selected && workspacePanel.open ? "contents" : "hidden"}>
               <WorkspacePanel
                 contained
+                keyboardTarget={selected}
                 conversationId={sessionId}
                 sessionHarness={state.sessionHarness}
                 agentId={state.boundAgentId ?? session?.agentId ?? null}
@@ -447,6 +563,12 @@ export function GridSessionPane({
                 }}
                 showFilesPanel={showFiles}
                 showGithubTab={showFiles}
+                showTasksTab={
+                  (isFeatureEnabled(serverInfo, "workflows") &&
+                    serverInfo !== "loading" &&
+                    serverInfo.session_journal === true) ||
+                  (state.todos?.length ?? 0) > 0
+                }
                 showBrowserTab={supportsBrowser()}
                 onReveal={onOpenWorkspace}
                 changedCount={changedCount}
@@ -486,5 +608,75 @@ export function GridSessionPane({
           )}
       </FileViewerContext.Provider>
     </TerminalFirstContextProvider>
+  );
+}
+
+/** The cell session's permission mode; its owner can switch it as in the main composer. */
+function GridPermissionPicker({ permission }: { permission: GridPermissionControl }) {
+  const { chip } = permission;
+  if (chip === null) return null;
+  return (
+    <ComposerPermissionPicker
+      label="Permission mode"
+      value={chip.label || "Permission mode"}
+      harness={permission.harness}
+      selectedValue={chip.value}
+      options={chip.options}
+      disabled={!permission.owner || permission.unreachable || permission.busy}
+      disabledReason={
+        permission.owner ? undefined : "Only the session owner can change the permission mode"
+      }
+      onSelect={permission.select}
+    />
+  );
+}
+
+/**
+ * The cell session's model, effort and Smart Routing picker, from the same props
+ * hook as the full-screen composer. It reads and writes this session only; the
+ * busy state is this cell's.
+ */
+function GridSessionHarnessPicker({
+  sessionId,
+  session,
+  canEdit,
+  unreachable,
+  runnerOnline,
+}: {
+  sessionId: string;
+  session: Session;
+  canEdit: boolean;
+  unreachable: boolean;
+  runnerOnline: boolean | undefined;
+}) {
+  const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
+  // A launching sandbox lists no models until its host is bound; ChatPage previews them.
+  const inputs = useSessionPickerInputs(sessionId, session);
+  const wrapper = session.labels?.["omnigent.wrapper"] ?? null;
+  const picker = useSessionHarnessPickerProps({
+    sessionId,
+    hostId: session.hostId,
+    inputs,
+    agentName: session.agentName,
+    wrapperLabel: wrapper,
+    isNativeWrapper: isNativeWrapper(wrapper),
+    runnerOnline,
+    gates: {
+      // A cell the viewer can't edit is read-only, as the full-screen composer treats it.
+      permissionLevel: canEdit ? (session.permissionLevel ?? null) : 1,
+      readOnlyReason: readOnlyReasonForSessionLabels(session, null),
+      sendDisabledReason: null,
+      unreachable,
+    },
+  });
+  return (
+    <SessionHarnessPicker
+      appearance="composer"
+      busy={busy}
+      busyRef={busyRef}
+      setBusy={setBusy}
+      {...picker}
+    />
   );
 }

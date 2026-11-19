@@ -25,7 +25,10 @@ import {
   useDisablePullRequestAutoMerge,
   useMergePullRequest,
   usePullRequestMergeOptions,
+  useSetPullRequestPreference,
   type PullRequest,
+  type PullRequestAccount,
+  type PullRequestAuth,
   type PullRequestMergeMethod,
 } from "@/hooks/usePullRequests";
 
@@ -155,6 +158,63 @@ function MergeMethodPicker({
   );
 }
 
+/** The accounts a merge can run as, from the PR's info; omit when the provider can't switch. */
+export type MergeAccounts = Pick<PullRequestAuth, "accounts" | "selected_account">;
+
+/** Offers a merge-specific account choice, because read access doesn't imply merge permission. */
+function MergeAccountPicker({
+  options,
+  selected,
+  setPref,
+  prUrl,
+  disabled,
+  onChange,
+}: {
+  options: PullRequestAccount[];
+  selected: string | undefined;
+  setPref: ReturnType<typeof useSetPullRequestPreference>;
+  prUrl: string;
+  disabled: boolean;
+  onChange: () => void;
+}) {
+  return (
+    <div className="flex flex-col gap-1">
+      <div className="flex items-center gap-2">
+        <span aria-hidden className="shrink-0 text-ui text-muted-foreground">
+          Merge as
+        </span>
+        <Select
+          // Stays controlled while no account is known, so the placeholder comes back
+          // and choosing the same account again still saves it.
+          value={selected ?? ""}
+          onValueChange={(login) => {
+            onChange();
+            setPref.mutate({ account: login, pr_url: prUrl });
+          }}
+          disabled={disabled || setPref.isPending}
+        >
+          <SelectTrigger aria-label="Merge as" className="h-8 min-w-0 flex-1 text-ui">
+            <SelectValue placeholder="Choose an account" />
+          </SelectTrigger>
+          <SelectContent>
+            {options.map((account) => (
+              <SelectItem key={account.login} value={account.login}>
+                {account.login}
+                {account.active ? " (active)" : ""}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+      {setPref.isError && (
+        <p role="alert" className="text-ui text-destructive">
+          Couldn’t switch accounts: {setPref.error.message}
+        </p>
+      )}
+    </div>
+  );
+}
+
 /** Confirms the merge and picks its method; the head is fixed when the dialog opens. */
 function PullRequestMergeDialog({
   conversationId,
@@ -162,6 +222,8 @@ function PullRequestMergeDialog({
   pr,
   headSha,
   warning,
+  accounts,
+  unavailable = false,
   onClose,
   onMerged,
 }: {
@@ -171,11 +233,29 @@ function PullRequestMergeDialog({
   headSha: string;
   /** A caveat GitHub still merges with, e.g. failing optional checks. */
   warning?: string;
+  accounts?: MergeAccounts;
+  unavailable?: boolean;
   onClose: () => void;
   onMerged: () => void;
 }) {
   const options = usePullRequestMergeOptions(conversationId, prUrl, true);
   const merge = useMergePullRequest(conversationId);
+  const setPref = useSetPullRequestPreference(conversationId);
+  const accountOptions = accounts?.accounts ?? [];
+  // Once the dialog has offered a choice, every merge from it is bound to an account,
+  // even if a refetch later lists fewer accounts (an account lookup can fail alone).
+  const [accountBound, setAccountBound] = useState(accountOptions.length > 1);
+  if (!accountBound && accountOptions.length > 1) setAccountBound(true);
+  // The host saved (or is saving) this account; the info refetch catches up after.
+  const requestedAccount =
+    setPref.isPending || setPref.isSuccess ? setPref.variables?.account : undefined;
+  const shownAccount = requestedAccount ?? accounts?.selected_account ?? undefined;
+  // What "Merge as" shows, which the merge runs as. An account the picker no longer
+  // lists can't be shown, so it can't be merged as either.
+  const mergeAccount =
+    accountBound && accountOptions.some((account) => account.login === shownAccount)
+      ? shownAccount
+      : undefined;
   const [chosen, setChosen] = useState<PullRequestMergeMethod | null>(null);
   const methods = options.data?.methods ?? [];
   const method = chosen && methods.includes(chosen) ? chosen : (options.data?.default ?? null);
@@ -185,11 +265,15 @@ function PullRequestMergeDialog({
 
   // `isPending` updates after a render, so a fast second click needs this guard.
   const submitting = useRef(false);
+  // E.g. after a failed switch, until the info refetch says which account is saved.
+  const accountUnknown = accountBound && !mergeAccount;
   const confirm = () => {
-    if (!method || submitting.current) return;
+    if (!method || unavailable || setPref.isPending || accountUnknown || submitting.current) {
+      return;
+    }
     submitting.current = true;
     merge.mutate(
-      { prUrl, mergeMethod: method, expectedHead: headSha },
+      { prUrl, mergeMethod: method, expectedHead: headSha, account: mergeAccount },
       {
         onSuccess: () => {
           onMerged();
@@ -205,8 +289,9 @@ function PullRequestMergeDialog({
   return (
     <Dialog
       open
-      // Keep the dialog up while a merge is in flight so its outcome stays visible.
-      onOpenChange={(next) => !next && !merge.isPending && onClose()}
+      // Keep the dialog up while a merge is in flight so its outcome stays visible,
+      // and while an account switch saves, so a reopened dialog can't race it.
+      onOpenChange={(next) => !next && !merge.isPending && !setPref.isPending && onClose()}
     >
       <DialogContent>
         <DialogHeader>
@@ -228,18 +313,35 @@ function PullRequestMergeDialog({
           disabled={merge.isPending}
           onChange={setChosen}
         />
+        {accountBound && (
+          <MergeAccountPicker
+            options={accountOptions}
+            selected={mergeAccount}
+            setPref={setPref}
+            prUrl={prUrl}
+            disabled={merge.isPending || unavailable}
+            // The refusal was the previous account's.
+            onChange={merge.reset}
+          />
+        )}
         {merge.isError && (
           <p role="alert" className="text-ui text-destructive">
             {merge.error.message}
           </p>
         )}
         <DialogFooter>
-          <Button variant="outline" disabled={merge.isPending} onClick={onClose}>
+          <Button
+            variant="outline"
+            disabled={merge.isPending || setPref.isPending}
+            onClick={onClose}
+          >
             Cancel
           </Button>
           <Button
             className={MERGE_BUTTON_CLASS}
-            disabled={!method || merge.isPending}
+            disabled={
+              !method || unavailable || merge.isPending || setPref.isPending || accountUnknown
+            }
             onClick={confirm}
           >
             {merge.isPending && <Spinner aria-hidden />}
@@ -301,50 +403,77 @@ export function PullRequestMerge({
   conversationId,
   prUrl,
   pr,
+  accounts,
+  compact = false,
+  showTrigger = true,
+  unavailable = false,
 }: {
+  compact?: boolean;
+  showTrigger?: boolean;
+  unavailable?: boolean;
   conversationId: string;
   prUrl: string;
   pr: PullRequest;
+  /** The accounts the dialog offers to merge as; omit when the provider can't switch. */
+  accounts?: MergeAccounts;
 }) {
-  // The repository's default method names the button, so it loads with the button.
-  const options = usePullRequestMergeOptions(conversationId, prUrl, !pr.auto_merge);
+  // The full button uses the default method; compact rows load methods on confirmation.
+  const options = usePullRequestMergeOptions(conversationId, prUrl, !pr.auto_merge && !compact);
   // The head the user confirms, kept while the dialog is open even if a poll moves it.
   const [confirmingHead, setConfirmingHead] = useState<string | null>(null);
   // GitHub accepted a merge of this head; the PR stays open here until the refetch lands.
   const [mergedHead, setMergedHead] = useExpiringValue<string>();
 
-  if (pr.auto_merge) {
+  if (pr.auto_merge && !confirmingHead) {
+    if (!showTrigger) return null;
     return (
       <section className="flex flex-wrap items-center gap-2" aria-label="Merge">
         <PullRequestAutoMerge conversationId={conversationId} prUrl={prUrl} pr={pr} />
       </section>
     );
   }
+  if (!showTrigger && !confirmingHead) return null;
   const state: MergeButtonState =
     mergedHead && mergedHead === pr.head_sha
       ? { kind: "checking", hint: "Merge requested. Refreshing…" }
       : mergeButtonState(pr);
   const defaultMethod = options.data?.default;
-  const label = defaultMethod ? MERGE_BUTTON_LABELS[defaultMethod] : "Merge pull request";
+  const label = compact
+    ? mergedHead === pr.head_sha
+      ? "Merging…"
+      : "Merge"
+    : defaultMethod
+      ? MERGE_BUTTON_LABELS[defaultMethod]
+      : "Merge pull request";
   return (
     <section className="flex flex-wrap items-center gap-2" aria-label="Merge">
-      <Button
-        size="sm"
-        variant={state.kind === "ready" ? "default" : "outline"}
-        className={cn(state.kind === "ready" && MERGE_BUTTON_CLASS)}
-        disabled={state.kind !== "ready"}
-        onClick={() => state.kind === "ready" && setConfirmingHead(state.headSha)}
-      >
-        {state.kind === "checking" ? <Spinner aria-hidden /> : <GitMergeIcon aria-hidden />}
-        {label}
-      </Button>
-      {"hint" in state && <span className="text-ui text-muted-foreground">{state.hint}</span>}
+      {showTrigger && (
+        <Button
+          size="sm"
+          variant={!compact && state.kind === "ready" ? "default" : "outline"}
+          className={cn(
+            compact
+              ? "border-green-600 text-green-700 hover:bg-green-500/10 dark:text-green-400"
+              : state.kind === "ready" && MERGE_BUTTON_CLASS,
+          )}
+          disabled={unavailable || state.kind !== "ready"}
+          onClick={() => !unavailable && state.kind === "ready" && setConfirmingHead(state.headSha)}
+        >
+          {state.kind === "checking" ? <Spinner aria-hidden /> : <GitMergeIcon aria-hidden />}
+          {label}
+        </Button>
+      )}
+      {!compact && "hint" in state && (
+        <span className="text-ui text-muted-foreground">{state.hint}</span>
+      )}
       {confirmingHead && (
         <PullRequestMergeDialog
           conversationId={conversationId}
           prUrl={prUrl}
           pr={pr}
           headSha={confirmingHead}
+          unavailable={unavailable}
+          accounts={accounts}
           warning={state.kind === "ready" ? state.hint : undefined}
           onMerged={() => setMergedHead(confirmingHead)}
           onClose={() => setConfirmingHead(null)}

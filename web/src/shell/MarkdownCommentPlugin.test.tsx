@@ -26,8 +26,11 @@ import type { RefObject } from "react";
 import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
 import { MarkdownCommentPlugin } from "./MarkdownCommentPlugin";
+import { createMarkdownDocumentExtensions } from "./markdownDocumentExtensions";
+import { installMarkdownParserPatch } from "./tiptapMarkdownPatches";
 import {
   createCommentDecorationExtension,
+  commentDecorationKey,
   type CommentDecorationState,
 } from "./TipTapCommentExtension";
 
@@ -35,11 +38,9 @@ const CONTENT = "The quick brown fox jumps over the lazy dog.";
 
 let editor: Editor | null = null;
 let commentStateRef: RefObject<CommentDecorationState | null>;
-let contentRef: RefObject<string>;
 
 beforeEach(() => {
   commentStateRef = { current: null };
-  contentRef = { current: CONTENT };
 });
 
 afterEach(() => {
@@ -91,7 +92,7 @@ function renderPlugin(opts: RenderOpts = {}) {
   const utils = render(
     <MarkdownCommentPlugin
       editor={editor}
-      contentRef={contentRef}
+      content={CONTENT}
       commentStateRef={commentStateRef}
       comments={opts.comments ?? []}
       isDirty={opts.isDirty ?? false}
@@ -129,6 +130,44 @@ describe("MarkdownCommentPlugin render", () => {
 // ---------------------------------------------------------------------------
 
 describe("MarkdownCommentPlugin state sync", () => {
+  it("rebuilds existing highlights against the newly saved content without a click or new comment", () => {
+    installMarkdownParserPatch();
+    const raw = `word **word** word\n\n[Details](https://example.invalid/${"x".repeat(100)})`;
+    editor = new Editor({
+      element: document.createElement("div"),
+      extensions: [
+        ...createMarkdownDocumentExtensions("conv_1", "file.md"),
+        createCommentDecorationExtension(commentStateRef),
+      ],
+      content: raw,
+      contentType: "markdown",
+    });
+    const comments = [makeComment({ start_index: 7, end_index: 11, anchor_content: "word" })];
+    const props = {
+      editor,
+      commentStateRef,
+      comments,
+      activeSelection: null,
+      isDirty: false,
+      onSetActiveSelection: vi.fn(),
+    };
+    const { rerender } = render(<MarkdownCommentPlugin {...props} content={raw} />);
+    act(() => {
+      editor!.commands.insertContentAt(
+        editor!.state.doc.content.size,
+        `<p>${"tail ".repeat(80)}</p>`,
+      );
+    });
+    const saved = editor.getMarkdown();
+    rerender(<MarkdownCommentPlugin {...props} content={saved} />);
+    expect(commentStateRef.current?.rawContent).toBe(saved);
+    expect(
+      commentDecorationKey
+        .getState(editor.state)
+        ?.find()
+        .map(({ from, to }) => ({ from, to })),
+    ).toEqual([{ from: 6, to: 10 }]);
+  });
   // WHY: the sync effect must populate commentStateRef from the props.
   it("populates commentStateRef.current from props", () => {
     editor = makeEditor();
@@ -196,7 +235,7 @@ describe("MarkdownCommentPlugin pending-range cleanup", () => {
     rerender(
       <MarkdownCommentPlugin
         editor={editor}
-        contentRef={contentRef}
+        content={CONTENT}
         commentStateRef={commentStateRef}
         comments={[]}
         isDirty={false}

@@ -420,6 +420,7 @@ async def test_deleted_host_cleanup_retries_without_offline_age() -> None:
     hosts = _FakeHostStore(
         {
             7: [
+                _host("host_offline", provider="modal", sandbox_id="sb-offline", updated_at=0),
                 _host(
                     "host_deleted",
                     provider="modal",
@@ -427,13 +428,14 @@ async def test_deleted_host_cleanup_retries_without_offline_age() -> None:
                     updated_at=now,
                     status="online",
                     deleted_at=now,
-                )
+                ),
             ]
         }
     )
     reaper = ManagedSandboxReaper(
         host_store=hosts,  # type: ignore[arg-type]
         sandbox_config=_deployment([modal]),
+        reap_offline=False,
     )
 
     assert await reaper.sweep_once(now=now) == 0
@@ -443,6 +445,8 @@ async def test_deleted_host_cleanup_retries_without_offline_age() -> None:
     assert await reaper.sweep_once(now=now) == 1
     assert modal.terminated == ["sb-deleted"]
     assert "host_deleted" not in hosts.hosts[7]
+
+    assert "host_offline" in hosts.hosts[7]
 
 
 async def test_provider_identity_failure_does_not_stop_other_sandboxes() -> None:

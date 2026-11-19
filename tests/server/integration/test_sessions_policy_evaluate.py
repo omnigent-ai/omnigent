@@ -274,6 +274,67 @@ async def test_tool_call_allow_when_no_matching_policy(
     # No policies → ALLOW (the default engine result).
     assert body["result"] == "POLICY_ACTION_ALLOW"
     assert "reason" not in body
+    # The allow cache is opt-in: no window unless the operator configures one.
+    assert "allow_cache_seconds" not in body
+
+
+def _patch_allow_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    resolver: Any,
+    default_policies: list[FunctionPolicySpec] | None = None,
+) -> None:
+    """Install *resolver* as the caps' native hook allow-cache window."""
+    patched_caps = RuntimeCaps(
+        execution_timeout=get_caps().execution_timeout,
+        default_policies=default_policies or [],
+        native_hook_allow_cache_seconds=resolver,
+    )
+    monkeypatch.setattr("omnigent.server.routes.sessions.get_caps", lambda: patched_caps)
+
+
+async def test_no_policy_allow_carries_configured_cache_window(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no policies, ALLOW tells the runner how long it may reuse the answer."""
+    _patch_allow_cache(monkeypatch, lambda: 30.0)
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_tool_call_request("Read"),
+    )
+    assert resp.status_code == 200
+    assert resp.json() == {"result": "POLICY_ACTION_ALLOW", "allow_cache_seconds": 30.0}
+
+
+async def test_engine_allow_never_carries_cache_window(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An ALLOW decided by real policies must not let the runner skip later calls.
+
+    Read is allowed by the deny-Bash policy, but a cached ALLOW would let the
+    next Bash call through without evaluation.
+    """
+    deny_bash_policy = FunctionPolicySpec(
+        name="admin__deny_bash",
+        on=None,
+        function=FunctionRef(path=f"{__name__}._deny_bash_tool"),
+    )
+    _patch_allow_cache(monkeypatch, lambda: 30.0, default_policies=[deny_bash_policy])
+    agent = await create_test_agent(client)
+    session_id = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session_id}/policies/evaluate",
+        json=_tool_call_request("Read"),
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["result"] == "POLICY_ACTION_ALLOW"
+    assert "allow_cache_seconds" not in body
 
 
 async def test_tool_call_deny_with_default_policy(
@@ -741,18 +802,29 @@ def _patch_default_policies(monkeypatch: pytest.MonkeyPatch, fn_path: str) -> No
 
 
 @pytest.mark.parametrize("tool_name", ["sys_scheduled_task_create", "sys_scheduled_task_update"])
+@pytest.mark.parametrize("legacy", [False, True], ids=["complete-review", "legacy"])
 async def test_scheduled_changes_require_explicit_approval_without_custom_policies(
     client: httpx.AsyncClient,
     tool_name: str,
+    legacy: bool,
 ) -> None:
     agent = await create_test_agent(client)
     session_id = await _create_session(client, agent["id"])
+    arguments = {"prompt": "Review every issue.", "permission_mode": None}
+    if tool_name == "sys_scheduled_task_update":
+        arguments.update(
+            {"scheduled_task_id": "0123456789abcdef0123456789abcdef", "state": "paused"}
+        )
+        if legacy:
+            arguments.pop("prompt")
+    if legacy:
+        arguments.pop("permission_mode")
     drain = asyncio.create_task(_drain_elicitation_id(session_id))
     await asyncio.sleep(0.05)
     evaluate = asyncio.create_task(
         client.post(
             f"/v1/sessions/{session_id}/policies/evaluate",
-            json=_tool_call_request(tool_name),
+            json=_tool_call_request(tool_name, arguments),
         )
     )
     try:

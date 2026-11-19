@@ -97,7 +97,7 @@ jobs:
       && github.event.action != 'closed'
       && contains(github.event.pull_request.labels.*.name, 'ui-preview')
       && github.event.pull_request.draft == false
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       pull-requests: write
     timeout-minutes: 5
@@ -137,7 +137,7 @@ jobs:
         && contains(github.event.pull_request.labels.*.name, 'ui-preview')
         && github.event.pull_request.draft == false
       )
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     timeout-minutes: 30
@@ -310,9 +310,9 @@ jobs:
       ${{ (github.event.pull_request.head.repo.fork
            && !contains(fromJSON('["OWNER", "MEMBER", "COLLABORATOR"]'), github.event.pull_request.author_association)
            && 'ui-preview-fork') || '' }}
-    # Use ubuntu-latest. If the Databricks workspace IP-allowlists, register a
+    # A GitHub-hosted runner. If the Databricks workspace IP-allowlists, register a
     # static-IP runner and switch `runs-on` to it.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       pull-requests: write
     timeout-minutes: 60
@@ -581,7 +581,7 @@ jobs:
         github.event_name != 'push'
         && github.event.action == 'closed'
       )
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       pull-requests: write
     timeout-minutes: 10
