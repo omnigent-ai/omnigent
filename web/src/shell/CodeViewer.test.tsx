@@ -17,6 +17,23 @@ import { highlightCode } from "@/components/ai-elements/code-block";
 
 vi.mock("@/hooks/usePermissions", () => ({ useCanEdit: vi.fn() }));
 const slugRuns = vi.hoisted(() => ({ count: 0 }));
+const tableEditorProps = vi.hoisted(() => vi.fn());
+vi.mock("./DelimitedTableEditor", async () => {
+  const { DataTablePreview } = await import("./DataTablePreview");
+  return {
+    DelimitedTableEditor: (
+      props: Parameters<typeof DataTablePreview>[0] & {
+        conversationId: string;
+        canEdit: boolean;
+        onDirtyChange?: (dirty: boolean) => void;
+        onSaveStatusChange?: (status: string) => void;
+      },
+    ) => {
+      tableEditorProps(props);
+      return <DataTablePreview {...props} />;
+    },
+  };
+});
 vi.mock("rehype-slug", async (importOriginal) => {
   const actual = await importOriginal<typeof rehypeSlugModule>();
   return {
@@ -1277,6 +1294,13 @@ describe("CodeViewer data-file routing", () => {
     expect(screen.getByRole("table", { name: "sales.csv" })).toBeDefined();
     expect(screen.getByRole("cell", { name: "Oslo" })).toBeDefined();
     expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
+    expect(tableEditorProps).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        conversationId: "conv_1",
+        path: "sales.csv",
+        canEdit: true,
+      }),
+    );
   });
 
   it("keeps the raw text in source mode", async () => {

@@ -8,9 +8,11 @@ import {
   compareCells,
   decodeDataFile,
   detectDelimiter,
+  editableDataTable,
   inferColumnType,
   isDataTablePath,
   parseDataTable,
+  replaceDelimitedCell,
   tableFromRecords,
   type DataTable,
 } from "./dataTable";
@@ -19,6 +21,80 @@ import {
 function base64Of(bytes: number[]): string {
   return btoa(String.fromCharCode(...bytes));
 }
+
+describe("CSV/TSV cell editing", () => {
+  it.each([",", ";", "|", "\t"])(
+    "escapes cell edits using the file's %j delimiter",
+    (delimiter) => {
+      const path = delimiter === "\t" ? "data.tsv" : "data.csv";
+      const source = `name${delimiter}note\r\nLee${delimiter}old\r\nKim${delimiter}untouched\r\n`;
+      const value = `comma, tab\tquote" and${delimiter}line\nbreak`;
+      const changed = replaceDelimitedCell(source, path, 0, 1, value);
+      expect(changed).toBe(
+        `name${delimiter}note\r\nLee${delimiter}"${value.replace(/"/g, '""')}"\r\nKim${delimiter}untouched\r\n`,
+      );
+      expect(parseDataTable(changed, path)?.rows).toEqual([
+        ["Lee", value],
+        ["Kim", "untouched"],
+      ]);
+    },
+  );
+
+  it("preserves the BOM, blank lines, headers, existing quoting and mixed line endings", () => {
+    const source = '\ufeff,name,name\r\n\r\n"Lee",01,"two\nlines"\nKim,2,keep\r\n';
+    const changed = replaceDelimitedCell(source, "data.csv", 0, 1, "007");
+    expect(changed).toBe(source.replace(",01,", ",007,"));
+    expect(replaceDelimitedCell(changed, "data.csv", 1, 2, "updated")).toBe(
+      changed.replace("2,keep", "2,updated"),
+    );
+    expect(replaceDelimitedCell(source, "data.csv", 0, 0, "Lee")).toBe(source);
+  });
+
+  it("preserves a single-column record when its only cell is cleared", () => {
+    const changed = replaceDelimitedCell("name\nLee\nKim", "data.csv", 0, 0, "");
+    expect(changed).toBe('name\n""\nKim');
+    expect(parseDataTable(changed, "data.csv")?.rows).toEqual([[""], ["Kim"]]);
+  });
+
+  it.each([
+    ["data.xlsx", "a\n1\n"],
+    ["data.parquet", "a\n1\n"],
+    ["data.csv", "a,b\n1\n"],
+    ["data.csv", 'a,b\n1,"unclosed'],
+    ["data.csv", 'a,b\n1,"closed"junk\n'],
+    ["data.csv", 'a,b\n1,un"quoted\n'],
+    ["data.csv", "a\n"],
+    ["data.csv", `a\n${"1\n".repeat(DATA_TABLE_MAX_ROWS + 1)}`],
+    [
+      "data.csv",
+      `${Array.from({ length: DATA_TABLE_MAX_COLUMNS + 1 }, () => "h").join(",")}\n${",".repeat(DATA_TABLE_MAX_COLUMNS)}\n`,
+    ],
+    ["data.csv", `h\n${"x".repeat(DATA_TABLE_MAX_CHARS + 1)}\n`],
+    ["data.csv", `${"h".repeat(DATA_TABLE_MAX_NAME_CHARS + 1)}\n1\n`],
+  ])("leaves unsafe tables read-only (case %#)", (path, source) => {
+    expect(editableDataTable(source, path)).toBeNull();
+    expect(() => replaceDelimitedCell(source, path, 0, 0, "changed")).toThrow(/cannot be edited/);
+  });
+
+  it("refuses an edit that would exceed the preview budget or address a missing cell", () => {
+    const source = "a,b\n1,2\n";
+    expect(() =>
+      replaceDelimitedCell(source, "data.csv", 0, 0, "x".repeat(DATA_TABLE_MAX_CHARS)),
+    ).toThrow(/editing limits/);
+    for (const [row, column] of [
+      [-1, 0],
+      [1, 0],
+      [0, 2],
+      [0, 0.5],
+      [NaN, 0],
+    ]) {
+      expect(() => replaceDelimitedCell(source, "data.csv", row, column, "changed")).toThrow(
+        /cannot be edited/,
+      );
+    }
+    expect(editableDataTable(source, "data.csv")?.rows).toEqual([["1", "2"]]);
+  });
+});
 
 describe("isDataTablePath", () => {
   it.each([
@@ -394,6 +470,15 @@ describe("inferColumnType and compareCells", () => {
   });
 
   it("orders numbers too large for a float", () => {
+    expect(compareCells("1e9007199254740993", "1e9007199254740992", "number")).toBeGreaterThan(0);
+    expect(
+      compareCells("1e999999999999999999999", "2e999999999999999999998", "number"),
+    ).toBeGreaterThan(0);
+    expect(compareCells("1e-9007199254740993", "1e-9007199254740992", "number")).toBeLessThan(0);
+    expect(
+      compareCells("-1e999999999999999999999", "-2e999999999999999999998", "number"),
+    ).toBeLessThan(0);
+    expect(compareCells("1e9007199254740993", "10e9007199254740992", "number")).toBe(0);
     expect(compareCells("1e999", "1e999", "number")).toBe(0);
     expect(compareCells("2e999", "1e999", "number")).toBeGreaterThan(0);
     expect(compareCells("1e999", "-1e999", "number")).toBeGreaterThan(0);

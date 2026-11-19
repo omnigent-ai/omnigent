@@ -1997,6 +1997,22 @@ describe("FileViewer markdown preview/edit/source modes", () => {
     },
   );
 
+  it.each(["results.csv", "export.tsv"])(
+    "guards unsaved table edits before opening Source for %s",
+    (path) => {
+      renderViewer({ open: true, path });
+      expect(viewModeOf()).toBe("preview");
+      fireEvent.click(screen.getByRole("button", { name: "make dirty" }));
+      fireEvent.click(screen.getByRole("button", { name: "View source" }));
+      expect(screen.getByText("Unsaved changes")).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+      expect(viewModeOf()).toBe("preview");
+      fireEvent.click(screen.getByRole("button", { name: "View source" }));
+      fireEvent.click(screen.getByRole("button", { name: "Discard changes" }));
+      expect(viewModeOf()).toBe("source");
+    },
+  );
+
   it("opens a ?comment= link to a CSV in source, then lets the toggle reach the table", () => {
     renderViewer({ open: true, path: "results.csv", initialSearch: "comment=c1" });
     expect(viewModeOf()).toBe("source");

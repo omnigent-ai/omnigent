@@ -78,6 +78,7 @@ import {
 } from "./codeViewerHelpers";
 import { NotebookPreview } from "./NotebookPreview";
 import { DataTablePreview } from "./DataTablePreview";
+import { DelimitedTableEditor } from "./DelimitedTableEditor";
 import { isDataTablePath, isSpreadsheetPath } from "./dataTable";
 import { SpreadsheetPreview } from "./SpreadsheetPreview";
 import { useScrollRestore } from "./useScrollRestore";
@@ -356,9 +357,14 @@ function PreviewWithSearch({
   onTocOpenChange,
   commentHint,
   deferOffscreen,
+  tableEditing,
 }: {
   content: string;
   deferOffscreen?: boolean;
+  tableEditing?: Pick<
+    CodeViewerProps,
+    "conversationId" | "onDirtyChange" | "onSaveStatusChange"
+  > & { canEdit: boolean };
   /** Workspace path of the previewed file, for resolving relative links. */
   path: string | null;
   kind: "markdown" | "notebook" | "table" | "spreadsheet";
@@ -425,15 +431,28 @@ function PreviewWithSearch({
         onScrollerChange={setSpreadsheetScroller}
       />
     ) : kind === "table" ? (
-      <DataTablePreview
-        content={content}
-        encoding={encoding}
-        path={path ?? ""}
-        truncated={truncated}
-        rootRef={previewRef}
-        onScroll={handleScroll}
-        onRowsChange={handleTableRowsChange}
-      />
+      tableEditing ? (
+        <DelimitedTableEditor
+          {...tableEditing}
+          content={content}
+          encoding={encoding}
+          path={path ?? ""}
+          truncated={truncated}
+          rootRef={previewRef}
+          onScroll={handleScroll}
+          onRowsChange={handleTableRowsChange}
+        />
+      ) : (
+        <DataTablePreview
+          content={content}
+          encoding={encoding}
+          path={path ?? ""}
+          truncated={truncated}
+          rootRef={previewRef}
+          onScroll={handleScroll}
+          onRowsChange={handleTableRowsChange}
+        />
+      )
     ) : kind === "notebook" ? (
       <NotebookPreview content={content} rootRef={previewRef} onScroll={handleScroll} />
     ) : (
@@ -1056,6 +1075,7 @@ export function CodeViewer({
         content={content}
         path={path}
         kind="table"
+        tableEditing={{ conversationId, canEdit, onDirtyChange, onSaveStatusChange }}
         encoding={fileQuery.data.encoding}
         truncated={truncated}
         searchOpen={searchOpen}

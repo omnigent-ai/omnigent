@@ -34,6 +34,11 @@ export interface DataTable {
   textCut?: boolean;
 }
 
+interface CellRange {
+  start: number;
+  end: number;
+}
+
 function extensionOf(path: string): string | null {
   const name = path.split("/").pop() ?? "";
   const dot = name.lastIndexOf(".");
@@ -108,6 +113,7 @@ export function detectDelimiter(text: string, path: string): string {
     const { fieldCounts } = parseRecords(text, delimiter, {
       keepRecords: 0,
       scanRecords: SNIFF_RECORDS,
+      collectFieldCounts: true,
     });
     const tally = new Map<number, number>();
     for (const fields of fieldCounts) tally.set(fields, (tally.get(fields) ?? 0) + 1);
@@ -149,16 +155,32 @@ function parseRecords(
     keepChars = Number.POSITIVE_INFINITY,
     scanRecords = Number.POSITIVE_INFINITY,
     keepFields = Number.POSITIVE_INFINITY,
-  }: { keepRecords: number; keepChars?: number; scanRecords?: number; keepFields?: number },
+    captureRanges = false,
+    collectFieldCounts = false,
+  }: {
+    keepRecords: number;
+    keepChars?: number;
+    scanRecords?: number;
+    keepFields?: number;
+    captureRanges?: boolean;
+    collectFieldCounts?: boolean;
+  },
 ): {
   records: string[][];
   count: number;
   widest: number;
   fieldCounts: number[];
   textCut: boolean;
+  ranges: CellRange[][];
+  wellFormed: boolean;
 } {
   const records: string[][] = [];
   const fieldCounts: number[] = [];
+  const ranges: CellRange[][] = [];
+  let fieldRanges: CellRange[] = [];
+  let fieldStart = 0;
+  let wellFormed = true;
+  let closedQuote = false;
   let textCut = false;
   let count = 0;
   let widest = 0;
@@ -196,20 +218,22 @@ function parseRecords(
     field += chars;
   };
 
-  const endRecord = () => {
+  const endRecord = (end: number) => {
     // A blank line, or the newline that ends the file, is not a record.
     if (recordHasContent || fieldHasChars) {
       count += 1;
       widest = Math.max(widest, fieldCount + 1);
-      fieldCounts.push(fieldCount + 1);
+      if (collectFieldCounts) fieldCounts.push(fieldCount + 1);
       if (keeping) {
         if (fields.length < keepFields) fields.push(field);
+        if (captureRanges) fieldRanges.push({ start: fieldStart, end });
         // The header and the first data row are kept even cut short, as the
         // other readers keep them; a later record that overflows ends keeping.
         const keptSome = recordChars + field.length > 0;
         if (records.length === 0 || !recordOverflowed || (records.length === 1 && keptSome)) {
           textCut ||= recordOverflowed;
           records.push(fields);
+          if (captureRanges) ranges.push(fieldRanges);
           keptChars += recordChars + field.length;
           keeping = records.length < keepRecords;
         } else {
@@ -218,6 +242,8 @@ function parseRecords(
       }
     }
     fields = [];
+    if (captureRanges) fieldRanges = [];
+    closedQuote = false;
     field = "";
     fieldFull = false;
     fieldCount = 0;
@@ -242,6 +268,7 @@ function parseRecords(
           i += 1;
         } else {
           inQuotes = false;
+          closedQuote = true;
         }
       } else {
         fieldHasChars = true;
@@ -250,29 +277,37 @@ function parseRecords(
       continue;
     }
     if (char === '"' && !fieldHasChars) {
+      if (closedQuote) wellFormed = false;
       inQuotes = true;
       recordHasContent = true;
     } else if (char === delimiter) {
       if (keepingField()) {
         fields.push(field);
+        if (captureRanges) fieldRanges.push({ start: fieldStart, end: i });
         recordChars += field.length;
       }
       fieldCount += 1;
       field = "";
       fieldFull = false;
       fieldHasChars = false;
+      closedQuote = false;
+      fieldStart = i + 1;
       recordHasContent = true;
     } else if (char === "\n" || char === "\r") {
+      const end = i;
       if (char === "\r" && text[i + 1] === "\n") i += 1;
-      endRecord();
+      endRecord(end);
+      fieldStart = i + 1;
       if (count >= scanRecords) break;
     } else {
+      if (closedQuote || char === '"') wellFormed = false;
       fieldHasChars = true;
       append(char);
     }
   }
-  if ((fieldHasChars || recordHasContent) && count < scanRecords) endRecord();
-  return { records, count, widest, fieldCounts, textCut };
+  if (inQuotes) wellFormed = false;
+  if ((fieldHasChars || recordHasContent) && count < scanRecords) endRecord(text.length);
+  return { records, count, widest, fieldCounts, textCut, ranges, wellFormed };
 }
 
 const NUMBER_PATTERN = /^([-+]?)(\d{1,3}(?:,\d{3})+|\d+)?(?:\.(\d+))?(?:[eE]([-+]?\d+))?(%?)$/;
@@ -286,7 +321,7 @@ const DATE_PATTERN = /^\d{4}-\d{2}-\d{2}([T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]
 interface CellNumber {
   negative: boolean;
   digits: string;
-  magnitude: number;
+  magnitude: bigint;
 }
 
 /** The number a cell holds, ``"25%"`` as 0.25, or ``null`` when it holds none. */
@@ -305,10 +340,9 @@ function cellNumber(value: string): CellNumber | null {
     negative: sign === "-",
     digits: significant.slice(0, end),
     magnitude:
-      integer.length -
-      (allDigits.length - significant.length) +
-      Number(exponent) -
-      (percent ? 2 : 0),
+      BigInt(integer.length - (allDigits.length - significant.length)) +
+      BigInt(exponent) -
+      (percent ? 2n : 0n),
   };
 }
 
@@ -383,7 +417,7 @@ export function inferColumnType(values: string[]): DataColumnType {
  * @returns Negative, zero or positive, as for ``Array.prototype.sort``.
  */
 // Ordered by comparison rather than subtraction, which gives NaN for two infinities.
-function compareValues(a: number, b: number): number {
+function compareValues(a: number | bigint, b: number | bigint): number {
   return a === b ? 0 : a < b ? -1 : 1;
 }
 
@@ -524,4 +558,69 @@ export function parseDataTable(text: string, path: string, encoding = "utf-8"): 
   });
   const description = encoding === "utf-8" ? "" : encoding;
   return tableFromRecords(records, count - 1, widest, description, textCut);
+}
+
+/** A complete, rectangular CSV/TSV table whose displayed cells map to original source ranges. */
+export function editableDataTable(content: string, path: string): DataTable | null {
+  if (!isDataTablePath(path)) return null;
+  const text = stripBom(content);
+  const table = parseDataTable(text, path);
+  if (
+    !table ||
+    table.rows.length === 0 ||
+    table.textCut ||
+    table.rows.length !== table.totalRows ||
+    table.header.length !== table.totalColumns
+  )
+    return null;
+  const parsed = parseRecords(text, detectDelimiter(text, path), {
+    keepRecords: DATA_TABLE_MAX_ROWS + 1,
+    keepChars: DATA_TABLE_MAX_CHARS,
+    keepFields: DATA_TABLE_MAX_COLUMNS,
+  });
+  return parsed.wellFormed && parsed.records.every((row) => row.length === table.header.length)
+    ? table
+    : null;
+}
+
+/** Replace one data cell without rewriting other cells, headers, blank lines, BOM or line endings. */
+export function replaceDelimitedCell(
+  content: string,
+  path: string,
+  row: number,
+  column: number,
+  value: string,
+): string {
+  const table = editableDataTable(content, path);
+  if (
+    !table ||
+    !Number.isInteger(row) ||
+    !Number.isInteger(column) ||
+    row < 0 ||
+    column < 0 ||
+    row >= table.rows.length ||
+    column >= table.header.length
+  )
+    throw new Error("This cell cannot be edited in table view. Use Source instead.");
+  if (table.rows[row][column] === value) return content;
+  const offset = content.startsWith("\ufeff") ? 1 : 0;
+  const text = content.slice(offset);
+  const delimiter = detectDelimiter(text, path);
+  const { ranges } = parseRecords(text, delimiter, {
+    keepRecords: DATA_TABLE_MAX_ROWS + 1,
+    keepChars: DATA_TABLE_MAX_CHARS,
+    keepFields: DATA_TABLE_MAX_COLUMNS,
+    captureRanges: true,
+  });
+  const range = ranges[row + 1][column];
+  const start = range.start + offset;
+  const end = range.end + offset;
+  const quoted =
+    content[start] === '"' || value === "" || value.includes(delimiter) || /["\r\n]/.test(value);
+  const replacement = quoted ? `"${value.replace(/"/g, '""')}"` : value;
+  const next = content.slice(0, start) + replacement + content.slice(end);
+  if (!editableDataTable(next, path)) {
+    throw new Error("This value exceeds the table editing limits. Use Source instead.");
+  }
+  return next;
 }
