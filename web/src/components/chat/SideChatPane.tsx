@@ -104,7 +104,6 @@ import { useFileMentionHarnesses } from "@/lib/agentLabels";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import {
   nativeShellHarness,
-  shellSendRefusal,
   useComposerHighlight,
   usePublishComposerCommands,
 } from "@/components/composer/composerHighlight";
@@ -1228,6 +1227,7 @@ function SideChatComposer({
     mentionTokens: [],
     textareaRef: tailTextareaRef,
     textareaNode: tailTextareaNode,
+    sendContext,
   });
   usePublishComposerCommands(childId, menuCommandNames, nativeShell);
   // Like the main composer, a draft turns Interrupt into Send; a grid cell queues its draft.
@@ -1252,9 +1252,8 @@ function SideChatComposer({
     }
     // A grid cell queues or steers its send while the session works; other full sessions wait.
     if ((busy && fullSession && !gridCell) || !canSend || agentId === null) return;
-    const refusal = shellSendRefusal(highlight.kind, sendContext);
-    if (refusal !== null) {
-      setCommandNotice(refusal);
+    if (highlight.refusal !== null) {
+      setCommandNotice(highlight.refusal);
       return;
     }
     // On in-process harnesses /help and skills resolve locally; native TUIs

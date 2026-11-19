@@ -14371,7 +14371,9 @@ describe("NewChatLandingScreen composer highlight", () => {
     fireEvent.change(input(), { target: { value: "!cat @", selectionStart: 6 } });
     fireEvent.click(screen.getByTitle("Attach README.md"));
     expect(input()).toHaveValue("!cat @README.md ");
-    expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent(
+      SHELL_MENTION_REFUSAL,
+    );
 
     const submit = screen.getByTestId("new-chat-landing-submit");
     await waitFor(() => expect(submit).toBeEnabled());

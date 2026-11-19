@@ -1775,7 +1775,9 @@ describe("grid cell composer shares its session's draft", () => {
   it("refuses a `!` send that carries a tag and keeps the draft", () => {
     const text = "!cat @src/app.ts";
     bridgedCell({ text, files: [], mentions: { files: [fileTag], sessions: [] } });
-    expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent(
+      SHELL_MENTION_REFUSAL,
+    );
 
     fireEvent.click(screen.getByTestId("side-chat-send"));
 
@@ -1790,7 +1792,9 @@ describe("grid cell composer shares its session's draft", () => {
     (text) => {
       bridgedCell({ text, files: [], reviewComments: [reviewComment] });
 
-      expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+      expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent(
+        SHELL_REVIEW_COMMENT_REFUSAL,
+      );
       expect(screen.getByTestId("composer-highlight-overlay").textContent).toBe(text);
       fireEvent.click(screen.getByTestId("side-chat-send"));
 

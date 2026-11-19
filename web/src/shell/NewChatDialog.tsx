@@ -75,7 +75,6 @@ import { useRequestedComposerEngine } from "@/components/composer/engine/compose
 import type { ComposerTextTarget } from "@/components/composer/engine/composerInput";
 import {
   SHELL_MENTION_REFUSAL,
-  shellSendRefusal,
   useComposerHighlight,
 } from "@/components/composer/composerHighlight";
 import {
@@ -5668,6 +5667,14 @@ function NewChatLandingContent({
   // The draft snapshot is built above the hook; add the tags it owns.
   draftRef.current.mentions = { files: mentionedItems, sessions: mentionedSessions };
   const skillCommandNames = useMemo(() => Object.keys(skillCommands), [skillCommands]);
+  const taggedMentions = useMemo(
+    () =>
+      presentMentions(
+        composerInlineMentions(mentionedItems, mentionedSessions, selectedAgent?.harness ?? null),
+        [message],
+      ),
+    [mentionedItems, mentionedSessions, selectedAgent?.harness, message],
+  );
   const highlight = useComposerHighlight({
     value: message,
     commandNames: skillCommandNames,
@@ -5677,6 +5684,7 @@ function NewChatLandingContent({
     mentionTokens,
     textareaRef,
     textareaNode,
+    sendContext: { mentions: taggedMentions },
   });
 
   const workspaceTarget = JSON.stringify([projectParam, selectedHostId, sandboxSelected]);
@@ -6251,9 +6259,8 @@ function NewChatLandingContent({
       composerInlineMentions(mentionedItems, mentionedSessions, selectedAgent?.harness ?? null),
       [message],
     );
-    const refusal = shellSendRefusal(highlight.kind, { mentions: liveMentions });
-    if (refusal !== null) {
-      setCreateError(refusal);
+    if (highlight.refusal !== null) {
+      setCreateError(highlight.refusal);
       return;
     }
     if (createAttemptRef.current !== null) return;

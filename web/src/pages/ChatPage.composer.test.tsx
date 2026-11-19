@@ -5898,13 +5898,22 @@ describe("Composer native shell mode", () => {
         }),
       );
       const tagged = textarea().value;
-      expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+      // The hint says why before the send is tried.
+      expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent(
+        SHELL_MENTION_REFUSAL,
+      );
       fireEvent.keyDown(textarea(), { key: "Enter" });
       expect(props.onSend).not.toHaveBeenCalled();
-      expect(screen.getByText(SHELL_MENTION_REFUSAL)).toBeVisible();
+      // The composer's inline feedback row repeats it after the refused send.
+      expect(
+        screen.getByText(SHELL_MENTION_REFUSAL, { selector: "[data-escape-owner]" }),
+      ).toBeVisible();
       expect(textarea()).toHaveValue(tagged);
 
       fireEvent.change(textarea(), { target: { value: untagged } });
+      expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent(
+        "Shell command",
+      );
       fireEvent.keyDown(textarea(), { key: "Enter" });
       expect(props.onSend).toHaveBeenCalledExactlyOnceWith(untagged, undefined);
     },
@@ -5953,12 +5962,16 @@ describe("Composer native shell mode", () => {
       // A refused send keeps the context; drop it so later tests don't render its chips.
       onTestFinished(() => clearLocalReviewContexts("conv_shell"));
       act(() => requestLocalReviewContext(comment));
-      expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+      expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent(
+        SHELL_REVIEW_COMMENT_REFUSAL,
+      );
       expect(screen.getByTestId("composer-highlight-overlay").textContent).toBe(draft);
 
       fireEvent.keyDown(textarea(), { key: "Enter" });
       expect(props.onSend).not.toHaveBeenCalled();
-      expect(screen.getByText(SHELL_REVIEW_COMMENT_REFUSAL)).toBeVisible();
+      expect(
+        screen.getByText(SHELL_REVIEW_COMMENT_REFUSAL, { selector: "[data-escape-owner]" }),
+      ).toBeVisible();
       expect(textarea()).toHaveValue(draft);
     },
   );

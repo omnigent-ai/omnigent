@@ -91,12 +91,17 @@ export const SHELL_MENTION_REFUSAL =
 export const SHELL_REVIEW_COMMENT_REFUSAL =
   "Shell commands can't carry review comments; remove them or drop the leading `!`.";
 
-/** Why a `!` send must not go out, or null: tags and review comments would reach the shell. */
-export function shellSendRefusal(
-  kind: ComposerHighlight["kind"],
-  context: { mentions: readonly unknown[]; reviewComments?: readonly unknown[] },
-): string | null {
-  if (kind !== "shell") return null;
+/** What a send carries besides its text. */
+export interface ShellSendContext {
+  mentions: readonly unknown[];
+  reviewComments?: readonly unknown[];
+}
+
+/**
+ * Why a `!` send carrying `context` can't go out, or null: its tags and review comments would
+ * reach the shell.
+ */
+function shellSendRefusal(context: ShellSendContext): string | null {
   if (context.mentions.length > 0) return SHELL_MENTION_REFUSAL;
   return (context.reviewComments?.length ?? 0) > 0 ? SHELL_REVIEW_COMMENT_REFUSAL : null;
 }
@@ -146,10 +151,14 @@ export interface UseComposerHighlightOptions {
   textareaRef: RefObject<ComposerTextTarget | null>;
   /** The input node, when an engine switch can replace it. */
   textareaNode?: ComposerTextTarget | null;
+  /** What the send carries besides its text, which can make a `!` send impossible. */
+  sendContext?: ShellSendContext;
 }
 
 export interface ComposerHighlight {
   kind: ComposerHighlightSplit["kind"] | null;
+  /** Why this shell send must be refused, also shown as the hint; null when it can go out. */
+  refusal: string | null;
   /** Spread onto the composer textarea (merge `className` with the caller's). */
   input: {
     className: string | undefined;
@@ -176,6 +185,7 @@ export function useComposerHighlight({
   mentionTokens,
   textareaRef,
   textareaNode = null,
+  sendContext,
 }: UseComposerHighlightOptions): ComposerHighlight {
   const mirrorRef = useRef<HTMLDivElement>(null);
   const hintId = useId();
@@ -183,10 +193,13 @@ export function useComposerHighlight({
     ? composerHighlightSplit(value, commandNames, nativeShell, classifyValue)
     : null;
   const shell = split?.kind === "shell";
+  const refusal = shell && sendContext ? shellSendRefusal(sendContext) : null;
+  const shellLabel = refusal ?? "Shell command";
   const mirrorActive = split !== null || findMentionTokens(value, mentionTokens).length > 0;
   useComposerMirrorAlignment(mirrorRef, textareaRef, mirrorActive, textareaNode);
   return {
     kind: split?.kind ?? null,
+    refusal,
     input: {
       className: mirrorActive ? MIRRORED_TEXTAREA_CLASS : undefined,
       // A command keeps the editor's own leading-word check; `!` needs its exact offset.
@@ -209,11 +222,11 @@ export function useComposerHighlight({
     hint: (
       <>
         <span aria-live="polite" data-testid="composer-shell-mode-status" className="sr-only">
-          {shell ? "Shell command" : ""}
+          {shell ? shellLabel : ""}
         </span>
         {shell && (
-          // Hidden from reading order so the live region is its only announcement; the
-          // input still names it as its description.
+          // Out of reading order so browse mode doesn't repeat the live region; aria-describedby
+          // still exposes it as the input's description.
           <div
             id={hintId}
             aria-hidden
@@ -221,7 +234,7 @@ export function useComposerHighlight({
             className="flex items-center gap-1 pt-1 text-xs text-brand-accent"
           >
             <TerminalIcon className="size-3" aria-hidden />
-            Shell command
+            {shellLabel}
           </div>
         )}
       </>

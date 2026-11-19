@@ -45,7 +45,6 @@ import {
 } from "@/components/composer/ChatComposer";
 import {
   nativeShellHarness,
-  shellSendRefusal,
   useComposerHighlight,
   usePublishComposerCommands,
 } from "@/components/composer/composerHighlight";
@@ -3214,6 +3213,7 @@ function ComposerImpl(
     mentionTokens: draft.quotes.length === 0 ? mentionTokens : [],
     textareaRef: tailTextareaRef,
     textareaNode: tailTextareaNode,
+    sendContext,
   });
   const hasDraft =
     fullText.trim().length > 0 || files.length > 0 || hasMentions || localReviewComments.length > 0;
@@ -3958,9 +3958,8 @@ function ComposerImpl(
       hasPendingElicitation
     )
       return;
-    const refusal = shellSendRefusal(highlight.kind, sendContext);
-    if (refusal !== null) {
-      setCommandError(refusal);
+    if (highlight.refusal !== null) {
+      setCommandError(highlight.refusal);
       return;
     }
 

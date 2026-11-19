@@ -3,6 +3,7 @@ import { fireEvent, render, renderHook, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { supportsNativeShellInput } from "@/lib/harnessSetup";
 import {
+  SHELL_MENTION_REFUSAL,
   composerHighlightSplit,
   splitKnownSlashCommand,
   splitNativeShellCommand,
@@ -158,6 +159,37 @@ describe("useComposerHighlight CodeMirror token", () => {
 
   it("hands over nothing for prose", () => {
     expect(tokenFor("fix it")).toBeNull();
+  });
+});
+
+describe("useComposerHighlight refusal", () => {
+  function Hint({ mentions }: { mentions: unknown[] }) {
+    const textareaRef = useRef<HTMLTextAreaElement>(null);
+    const { hint, refusal } = useComposerHighlight({
+      value: "!cat",
+      commandNames: KNOWN,
+      enabled: true,
+      nativeShell: "codex-native",
+      mentionTokens: [],
+      textareaRef,
+      sendContext: { mentions },
+    });
+    return createElement("div", { "data-refusal": refusal ?? "" }, hint);
+  }
+
+  it("shows why a `!` send that carries a tag can't go out", () => {
+    const view = render(createElement(Hint, { mentions: [{}] }));
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent(
+      SHELL_MENTION_REFUSAL,
+    );
+    expect(screen.getByTestId("composer-shell-mode-status")).toHaveTextContent(
+      SHELL_MENTION_REFUSAL,
+    );
+    expect(view.container.firstElementChild).toHaveAttribute("data-refusal", SHELL_MENTION_REFUSAL);
+
+    view.rerender(createElement(Hint, { mentions: [] }));
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent("Shell command");
+    expect(view.container.firstElementChild).toHaveAttribute("data-refusal", "");
   });
 });
 
