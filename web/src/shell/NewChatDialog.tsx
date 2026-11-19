@@ -71,7 +71,11 @@ import {
   ComposerFeedbackRow,
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
-import { shellMentionRefusal, useComposerHighlight } from "@/components/composer/composerHighlight";
+import {
+  SHELL_MENTION_REFUSAL,
+  shellMentionRefusal,
+  useComposerHighlight,
+} from "@/components/composer/composerHighlight";
 import {
   SandboxProfilePicker,
   useSandboxProfileCatalog,
@@ -7543,6 +7547,8 @@ function NewChatLandingContent({
                   // remove and nothing else would ever clear this. Left sticky it
                   // reads as a blocker on a composer the user can actually submit.
                   if (attachmentError !== null) clearError();
+                  // The refusal names the draft as typed, so any edit makes it stale.
+                  if (createError === SHELL_MENTION_REFUSAL) setCreateError(null);
                   // Recompute the active "@"-mention from the caret each keystroke.
                   // Sessions are taggable for every agent; files need ``mentionEnabled``.
                   setMention(

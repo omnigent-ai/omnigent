@@ -257,6 +257,7 @@ describe("landing composer highlight", () => {
     expect(authenticatedFetch).not.toHaveBeenCalledWith("/v1/sessions", expect.anything());
 
     type("!cat README.md");
+    expect(screen.queryByTestId("new-chat-landing-error")).toBeNull();
     fireEvent.click(submit);
     await waitFor(() =>
       expect(setPendingInitialPrompt).toHaveBeenCalledWith(
