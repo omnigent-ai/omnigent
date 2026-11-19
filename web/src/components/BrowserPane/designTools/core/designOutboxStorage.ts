@@ -29,7 +29,7 @@ export interface SavedRequest {
   error?: string;
   /** Its last attempt was refused (it never reached the agent). */
   refused?: true;
-  /** When it was first saved: later saves keep it, so it expires a day after it was made. */
+  /** When it was first saved: later saves keep it, so its age runs from when it was made. */
   savedAt: number;
   /** The browser tab that owns it (see `thisTab`). */
   page: string;
@@ -242,7 +242,10 @@ export async function deleteRequest(id: string): Promise<void> {
   await noteCount();
 }
 
-/** How long an unsent request stays saved: anyone's older ones go, on a shared machine too. */
+/**
+ * How old a saved request may be when a page restores: older ones, anyone's, are deleted then.
+ * It's a restore-time cleanup: a request a window still holds stays until that window lets go.
+ */
 export const SAVED_REQUEST_TTL_MS = 24 * 60 * 60_000;
 
 /**
