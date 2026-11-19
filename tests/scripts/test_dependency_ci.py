@@ -690,7 +690,14 @@ def test_workflows_connect_selection_to_jobs():
     assert "test_sdk_real_cli_bash_policy_runs_before_execution" in cli_test["run"]
     assert "test_each_cli_execution_path_inherits_the_sandbox" in cli_test["run"]
     assert "test_bound_host_proc_does_not_expose_synthetic_parent" in cli_test["run"]
-    assert "len(cases) != 17 or skipped" in cli_test["run"]
+    assert "test_session_terminal_runs_real_cli_with_automatic_model_access" in cli_test["run"]
+    assert (
+        "bubblewrap ripgrep tmux"
+        in next(step for step in claude_job["steps"] if step.get("name") == "Enable Bubblewrap")[
+            "run"
+        ]
+    )
+    assert "len(cases) != 19 or skipped" in cli_test["run"]
     seatbelt_job = jobs["seatbelt-containment"]
     assert seatbelt_job["needs"] == "scope"
     assert seatbelt_job["runs-on"] == "macos-15"

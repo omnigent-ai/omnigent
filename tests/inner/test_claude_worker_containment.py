@@ -282,7 +282,9 @@ def test_cli_internal_shell_inherits_filesystem_network_and_env_restrictions(
     request: pytest.FixtureRequest,
 ) -> None:
     """The child shell runs without an Omnigent or vendor tool permission hook."""
-    private = tmp_path / "private-canary"
+    private_dir = tempfile.TemporaryDirectory(prefix="omnigent-private-canary-", dir=Path.home())
+    request.addfinalizer(private_dir.cleanup)
+    private = Path(private_dir.name) / "private-canary"
     private.write_text("private-canary-value")
     outside = tmp_path / "forbidden-write"
     workspace = Path(real_worker_spec.cwd or "")
