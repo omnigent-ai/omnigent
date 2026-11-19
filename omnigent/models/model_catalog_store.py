@@ -201,8 +201,9 @@ async def ensure_catalog(
 
     A hit serves immediately; a miss runs *resolve* once (concurrent
     callers join it), persists a successful answer even when empty, and
-    returns it. A hit older than :data:`CATALOG_STALE_AFTER_S` still serves
-    immediately but kicks *resolve* in the background so the store converges.
+    returns it, or a fresh catalog published by another process while waiting.
+    A hit older than :data:`CATALOG_STALE_AFTER_S` still serves immediately
+    but kicks *resolve* in the background so the store converges.
     The probe's own budgets bound the background work.
 
     :param harness: Canonical harness name.
@@ -229,8 +230,16 @@ async def ensure_catalog(
             return rows
 
         task = asyncio.create_task(_run(), name=f"model-catalog-{harness}")
+        # All waiters may leave before the probe fails, including on a disk hit.
+        task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
         _inflight[key] = task
-    return await asyncio.shield(task)
+    while True:
+        done, _ = await asyncio.wait({task}, timeout=0.05)
+        if done:
+            return task.result()
+        cached = read_catalog(harness, fingerprint)
+        if cached is not None and not catalog_is_stale(harness, fingerprint):
+            return cached
 
 
 def _refresh_in_background(

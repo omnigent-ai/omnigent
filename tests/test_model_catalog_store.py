@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import gc
+import json
 import os
+import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -203,6 +208,216 @@ async def test_reprobe_catalog_failure_returns_none_and_keeps_serving() -> None:
 
     assert await store.reprobe_catalog("claude-native", "abc123", _probe) is None
     assert store.read_catalog("claude-native", "abc123") == _ROWS
+
+
+@pytest.mark.parametrize("published", [_ROWS, []])
+async def test_cold_miss_accepts_catalog_published_by_another_process(
+    published: list[dict[str, object]],
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    local_rows = [{"id": "local"}]
+
+    async def _probe() -> list[dict[str, object]]:
+        started.set()
+        await release.wait()
+        return local_rows
+
+    request = asyncio.create_task(store.ensure_catalog("claude-native", "abc123", _probe))
+    process = None
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        process = await asyncio.create_subprocess_exec(
+            sys.executable,
+            "-c",
+            "import json, sys; from omnigent.models import model_catalog_store as store; "
+            "store.write_catalog('claude-native', 'abc123', json.loads(sys.argv[1]))",
+            json.dumps(published),
+            cwd=Path(__file__).resolve().parents[1],
+        )
+        assert await asyncio.wait_for(process.wait(), timeout=5) == 0
+        assert await asyncio.wait_for(request, timeout=1) == published
+        # The external answer must not cancel the local probe or its eventual write.
+        release.set()
+        assert await store.reprobe_catalog("claude-native", "abc123", _probe) == local_rows
+        assert store.read_catalog("claude-native", "abc123") == local_rows
+    finally:
+        release.set()
+        await asyncio.gather(request, return_exceptions=True)
+        await store.shutdown_catalog_probes()
+        if process is not None and process.returncode is None:
+            process.kill()
+            await process.wait()
+
+
+@pytest.mark.parametrize("outcome", ["rows", "empty", "none", "error"])
+async def test_fast_local_probe_does_not_wait_for_disk_poll(
+    outcome: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    rows = _ROWS if outcome == "rows" else [] if outcome == "empty" else None
+    calls = 0
+    poll_release = asyncio.Event()
+
+    async def gated_sleep(delay: float) -> None:
+        if delay > 0:
+            await poll_release.wait()
+        else:
+            await asyncio.sleep(0)
+
+    monkeypatch.setattr(
+        store, "asyncio", SimpleNamespace(**(vars(asyncio) | {"sleep": gated_sleep}))
+    )
+
+    async def _probe() -> list[dict[str, object]] | None:
+        nonlocal calls
+        calls += 1
+        if outcome == "error":
+            raise OSError("probe failed")
+        return rows
+
+    try:
+        if outcome == "error":
+            with pytest.raises(OSError, match="probe failed"):
+                await asyncio.wait_for(
+                    store.ensure_catalog("claude-native", "abc123", _probe), timeout=1
+                )
+        else:
+            assert (
+                await asyncio.wait_for(
+                    store.ensure_catalog("claude-native", "abc123", _probe), timeout=1
+                )
+                == rows
+            )
+        assert store.read_catalog("claude-native", "abc123") == rows
+        if outcome in {"none", "error"}:
+
+            async def _retry() -> list[dict[str, object]]:
+                return _ROWS
+
+            assert await store.ensure_catalog("claude-native", "abc123", _retry) == _ROWS
+        else:
+            assert await store.ensure_catalog("claude-native", "abc123", _probe) == rows
+        assert calls == 1
+    finally:
+        poll_release.set()
+        await store.shutdown_catalog_probes()
+
+
+@pytest.mark.parametrize(
+    "publication",
+    ["other-fingerprint", "other-harness", "stale", "invalid-json", "invalid-models"],
+)
+async def test_cold_miss_ignores_unusable_publication(publication: str) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _probe() -> list[dict[str, object]]:
+        started.set()
+        await release.wait()
+        return _ROWS
+
+    request = asyncio.create_task(store.ensure_catalog("claude-native", "abc123", _probe))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        if publication == "other-fingerprint":
+            store.write_catalog("claude-native", "abc124", [{"id": "external"}])
+        elif publication == "other-harness":
+            store.write_catalog("codex-native", "abc123", [{"id": "external"}])
+        elif publication == "stale":
+            store.write_catalog("claude-native", "abc123", [{"id": "external"}])
+            _age_entry("claude-native", "abc123", store.CATALOG_STALE_AFTER_S + 60)
+        else:
+            path = store.catalog_path("claude-native", "abc123")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{not json" if publication == "invalid-json" else '{"models": null}')
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(request), timeout=0.15)
+        release.set()
+        assert await asyncio.wait_for(request, timeout=1) == _ROWS
+        assert store.read_catalog("claude-native", "abc123") == _ROWS
+    finally:
+        release.set()
+        await asyncio.gather(request, return_exceptions=True)
+        await store.shutdown_catalog_probes()
+
+
+async def test_concurrent_cancellation_preserves_probe_and_explicit_reprobe() -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    probes = 0
+
+    async def _probe() -> list[dict[str, object]]:
+        nonlocal probes
+        probes += 1
+        started.set()
+        await release.wait()
+        return _ROWS
+
+    requests = [
+        asyncio.create_task(store.ensure_catalog("claude-native", "abc123", _probe))
+        for _ in range(3)
+    ]
+    reprobe = asyncio.create_task(store.reprobe_catalog("claude-native", "abc123", _probe))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        requests[0].cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await requests[0]
+        store.write_catalog("claude-native", "abc123", [{"id": "external"}])
+        assert await asyncio.wait_for(asyncio.gather(*requests[1:]), timeout=1) == [
+            [{"id": "external"}],
+            [{"id": "external"}],
+        ]
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(asyncio.shield(reprobe), timeout=0.15)
+        release.set()
+        assert await asyncio.wait_for(reprobe, timeout=1) == _ROWS
+        assert probes == 1
+        assert store.read_catalog("claude-native", "abc123") == _ROWS
+    finally:
+        release.set()
+        await asyncio.gather(*requests, reprobe, return_exceptions=True)
+        await store.shutdown_catalog_probes()
+
+
+@pytest.mark.parametrize("external_answer", [True, False])
+async def test_detached_probe_error_is_observed(external_answer: bool) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    errors: list[dict[str, object]] = []
+    old_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: errors.append(context))
+
+    async def _probe() -> list[dict[str, object]]:
+        started.set()
+        await release.wait()
+        loop.call_soon(finished.set)
+        raise OSError("late probe failure")
+
+    request = asyncio.create_task(store.ensure_catalog("claude-native", "abc123", _probe))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        if external_answer:
+            store.write_catalog("claude-native", "abc123", _ROWS)
+            assert await asyncio.wait_for(request, timeout=1) == _ROWS
+        else:
+            request.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await request
+        release.set()
+        await asyncio.wait_for(finished.wait(), timeout=1)
+        gc.collect()
+        assert errors == []
+        assert store.read_catalog("claude-native", "abc123") == (
+            _ROWS if external_answer else None
+        )
+    finally:
+        release.set()
+        await asyncio.gather(request, return_exceptions=True)
+        await store.shutdown_catalog_probes()
+        loop.set_exception_handler(old_handler)
 
 
 # ── binary_identity ──────────────────────────────────────
