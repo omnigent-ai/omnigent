@@ -2447,6 +2447,48 @@ def test_load_runner_sandbox_grants_rejects_invalid_values(
         _load_runner_sandbox_grants_from_config()
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        pytest.param(r"\srv\example\cache", id="no-drive"),
+        pytest.param(r"\cache\..\data", id="no-drive-parent"),
+        pytest.param(r"C:cache", id="drive-relative"),
+    ],
+)
+def test_load_runner_sandbox_grants_rejects_windows_paths_without_drive_root(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, path: str
+) -> None:
+    """On Windows a grant must start at a drive root or UNC share, not just a backslash."""
+    monkeypatch.setattr("omnigent.runner._entry.IS_WINDOWS", True)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        f"runner:\n  sandbox_grants:\n    write_paths: ['{path}']\n", encoding="utf-8"
+    )
+
+    with pytest.raises(RuntimeError, match="write_paths entries must be absolute paths"):
+        _load_runner_sandbox_grants_from_config()
+
+
+def test_load_runner_sandbox_grants_reads_windows_drive_and_unc_paths(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Fully qualified Windows drive and UNC paths are valid host grants."""
+    monkeypatch.setattr("omnigent.runner._entry.IS_WINDOWS", True)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    (tmp_path / "config.yaml").write_text(
+        "runner:\n"
+        "  sandbox_grants:\n"
+        "    read_paths: ['C:\\srv\\example\\repo\\.git']\n"
+        "    write_paths: ['\\\\example-host\\share\\cache']\n",
+        encoding="utf-8",
+    )
+
+    assert _load_runner_sandbox_grants_from_config() == (
+        [r"C:\srv\example\repo\.git"],
+        [r"\\example-host\share\cache"],
+    )
+
+
 @pytest.mark.asyncio
 async def test_inactivity_monitor_requests_shutdown_when_idle() -> None:
     """Expired idle timeout requests graceful runner shutdown.

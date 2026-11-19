@@ -23,7 +23,7 @@ import sys
 import threading
 import time
 from collections.abc import AsyncIterator, Callable, Generator, Iterator
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from tempfile import mkdtemp
 from typing import TYPE_CHECKING, cast
 
@@ -286,7 +286,8 @@ def _load_runner_sandbox_grants_from_config() -> tuple[list[str], list[str]]:
     """Load the host's extra sandbox grants from ``runner.sandbox_grants``.
 
     Uploaded bundles cannot grant host paths, so the trusted host lists them in its
-    own config instead. Every entry must be an absolute path; ``~`` is rejected.
+    own config instead. Every entry must be an absolute path; ``~`` is rejected, and
+    on Windows the path needs a drive or UNC share.
 
     :returns: ``(read_paths, write_paths)``, each deduplicated in config order and
         empty when not configured, e.g. ``(["/srv/example/repo/.git"], [])``.
@@ -315,8 +316,10 @@ def _runner_sandbox_grant_paths(field: str, raw_paths: object) -> list[str]:
         return []
     if not isinstance(raw_paths, list):
         raise RuntimeError(f"runner.sandbox_grants.{field} must be a list of absolute paths")
+    # On Windows, Python 3.12's os.path.isabs also accepts drive-less paths like \data.
+    host_path_type = PureWindowsPath if IS_WINDOWS else PurePosixPath
     for path in raw_paths:
-        if not isinstance(path, str) or not os.path.isabs(path):
+        if not isinstance(path, str) or not host_path_type(path).is_absolute():
             raise RuntimeError(
                 f"runner.sandbox_grants.{field} entries must be absolute paths; got {path!r}"
             )
