@@ -817,11 +817,11 @@ def cli_model_server(
             nested_terminal = not body.get("tools") and "TERMINAL_NESTED_PROBE" in json.dumps(
                 body["messages"]
             )
-            blocks = (
-                replies.pop(0)
-                if replies and not nested_terminal
-                else [{"type": "text", "text": "CLI_E2E_OK"}]
-            )
+            if replies and not nested_terminal:
+                next_reply = replies.pop(0)
+                blocks = next_reply() if callable(next_reply) else next_reply
+            else:
+                blocks = [{"type": "text", "text": "CLI_E2E_OK"}]
             message = {
                 "id": f"msg_cli_{len(requests)}",
                 "type": "message",
@@ -1398,27 +1398,25 @@ def test_omnigent_run_cli_with_contained_claude(
             + shlex.join([str(nested_cli_path), *_cli_args("TERMINAL_NESTED_PROBE")])
             + " > terminal-result.json 2> terminal-stderr; printf '%s' $? > terminal-exit"
         )
-        for tool_id, name, arguments in (
-            ("launch", "sys_terminal_launch", {"terminal": "shell", "session": "probe"}),
-            (
-                "wait",
-                "sys_os_shell",
+        replies.append(
+            [
                 {
-                    "command": "for i in $(seq 1 150); do test -f terminal-exit && break; "
-                    "sleep .1; done; cat terminal-exit; cat terminal-result.json"
-                },
-            ),
-        ):
-            replies.append(
-                [
-                    {
-                        "type": "tool_use",
-                        "id": "toolu_terminal_" + tool_id,
-                        "name": "mcp__omnigent__" + name,
-                        "input": arguments,
-                    }
-                ]
-            )
+                    "type": "tool_use",
+                    "id": "toolu_terminal_launch",
+                    "name": "mcp__omnigent__sys_terminal_launch",
+                    "input": {"terminal": "shell", "session": "probe"},
+                }
+            ]
+        )
+
+        def finish_after_terminal() -> list[dict[str, str]]:
+            try:
+                poll_until(lambda: (workspace / "terminal-exit").is_file(), timeout_s=30)
+            except AssertionError:
+                return [{"type": "text", "text": "TERMINAL_TIMEOUT"}]
+            return [{"type": "text", "text": "CLI_E2E_OK"}]
+
+        replies.append(finish_after_terminal)
     elif cli_tool:
         command = execution_probe[0]
         if cli_tool == "mcp__omnigent__sys_os_shell":
@@ -1530,7 +1528,6 @@ def test_omnigent_run_cli_with_contained_claude(
     assert "parent-only-cli-secret" not in result.stdout + result.stderr
     if cli_tool == "terminal":
         _assert_tool_result(requests, "toolu_terminal_launch", "launched")
-        _assert_tool_result(requests, "toolu_terminal_wait", "CLI_E2E_OK")
         _assert_execution_probe(execution_probe)
         assert (workspace / "terminal-exit").read_text() == "0"
         assert (
