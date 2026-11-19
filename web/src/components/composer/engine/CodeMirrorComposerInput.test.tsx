@@ -1,10 +1,19 @@
-import { redo, undo } from "@codemirror/commands";
+import {
+  cursorCharLeft,
+  cursorCharRight,
+  deleteCharBackward,
+  redo,
+  selectCharRight,
+  undo,
+} from "@codemirror/commands";
 import { EditorView } from "@codemirror/view";
 import { act, fireEvent, render, waitFor } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { COMMAND_TOKEN_CLASS } from "@/components/composer/commandToken";
+import { MENTION_TOKEN_CLASS } from "@/components/composer/MentionTokenOverlay";
 import { insertComposerText } from "@/lib/composerText";
 import { CodeMirrorComposerInput } from "./testing/codeMirrorComposer";
-import { COMPOSER_EDITING_KEYMAP } from "./CodeMirrorComposerInput";
+import { COMPOSER_EDITING_KEYMAP, leadingCommandSpan } from "./CodeMirrorComposerInput";
 import {
   isComposerInput,
   isHistoryInput,
@@ -343,5 +352,157 @@ describe("COMPOSER_EDITING_KEYMAP", () => {
     );
     expect(keys).not.toContain("Enter");
     expect(keys.filter((key) => /Ctrl-/.test(key) && /Alt-/.test(key))).toEqual([]);
+  });
+});
+
+describe("CodeMirrorComposerInput mention tokens", () => {
+  const tokenMarks = (container: HTMLElement) =>
+    Array.from(container.querySelectorAll('[data-testid="composer-mention-token"]')).map(
+      (token) => [token.textContent, token.className],
+    );
+
+  it("paints each tagged token with the mention class, and no other text", () => {
+    const { container } = mount({
+      value: "see @a.ts and @a.ts:2-4 then a@b.ts",
+      mentionTokens: ["@a.ts", "@a.ts:2-4"],
+    });
+    expect(tokenMarks(container)).toEqual([
+      ["@a.ts", MENTION_TOKEN_CLASS],
+      ["@a.ts:2-4", MENTION_TOKEN_CLASS],
+    ]);
+  });
+
+  it("refreshes the marks when the tokens change without a text edit", () => {
+    const view = mount({ value: "see @a.ts", mentionTokens: ["@a.ts"] });
+    expect(tokenMarks(view.container)).toHaveLength(1);
+
+    view.rerender(
+      <CodeMirrorComposerInput
+        aria-label="Message the agent"
+        value="see @a.ts"
+        mentionTokens={[]}
+      />,
+    );
+    expect(tokenMarks(view.container)).toEqual([]);
+  });
+
+  it("marks a token typed after mount, and drops it once the text no longer matches", () => {
+    const { container, target } = mount({ mentionTokens: ["@a.ts"] });
+    expect(tokenMarks(container)).toEqual([]);
+
+    act(() => {
+      insertComposerText(target(), "@a.ts", 0, 0);
+    });
+    expect(tokenMarks(container)).toHaveLength(1);
+
+    act(() => {
+      insertComposerText(target(), "x", "@a.ts".length, "@a.ts".length);
+    });
+    expect(tokenMarks(container)).toEqual([]);
+  });
+});
+
+describe("CodeMirrorComposerInput mention tokens move as one character", () => {
+  // CodeMirror measures text for caret motion; jsdom has no layout.
+  const originalRangeRects = {
+    getClientRects: Range.prototype.getClientRects,
+    getBoundingClientRect: Range.prototype.getBoundingClientRect,
+  };
+  beforeAll(() => {
+    Range.prototype.getClientRects = () => [] as unknown as DOMRectList;
+    Range.prototype.getBoundingClientRect = () => new DOMRect();
+  });
+  afterAll(() => Object.assign(Range.prototype, originalRangeRects));
+
+  const draft = "Read @readme.md now";
+  const tokenStart = "Read ".length;
+  const tokenEnd = "Read @readme.md".length;
+  function mountDraft() {
+    const mounted = mount({ value: draft, mentionTokens: ["@readme.md"] });
+    return { ...mounted, editor: EditorView.findFromDOM(mounted.content)! };
+  }
+  const caretAt = (editor: EditorView, offset: number) =>
+    act(() => editor.dispatch({ selection: { anchor: offset } }));
+
+  it("steps the caret over a token in one move, in both directions", () => {
+    const { editor } = mountDraft();
+    caretAt(editor, tokenEnd);
+    act(() => void cursorCharLeft(editor));
+    expect(editor.state.selection.main.head).toBe(tokenStart);
+    act(() => void cursorCharRight(editor));
+    expect(editor.state.selection.main.head).toBe(tokenEnd);
+  });
+
+  it("extends a selection over the whole token", () => {
+    const { editor } = mountDraft();
+    caretAt(editor, tokenStart);
+    act(() => void selectCharRight(editor));
+    expect(editor.state.selection.main).toMatchObject({ from: tokenStart, to: tokenEnd });
+  });
+
+  it("Backspace after a token removes the whole token", () => {
+    const { editor, target } = mountDraft();
+    caretAt(editor, tokenEnd);
+    act(() => void deleteCharBackward(editor));
+    expect(target().value).toBe("Read  now");
+  });
+
+  it("leaves plain text around a token to move one character at a time", () => {
+    const { editor } = mountDraft();
+    caretAt(editor, tokenEnd + 2);
+    act(() => void cursorCharLeft(editor));
+    expect(editor.state.selection.main.head).toBe(tokenEnd + 1);
+  });
+});
+
+describe("CodeMirrorComposerInput command token", () => {
+  const commandMarks = (container: HTMLElement) =>
+    Array.from(container.querySelectorAll('[data-testid="composer-command-token"]')).map(
+      (token) => [token.textContent, token.className],
+    );
+
+  it("tints the leading command like the textarea's mirror, leaving its arguments plain", () => {
+    const { container } = mount({ value: "  /context review this", commandToken: "/context" });
+    expect(commandMarks(container)).toEqual([["/context", COMMAND_TOKEN_CLASS]]);
+  });
+
+  it("follows the token as it changes, and marks nothing for prose", () => {
+    const view = mount({ value: "/context", commandToken: "/context" });
+    view.rerender(
+      <CodeMirrorComposerInput
+        aria-label="Message the agent"
+        value="/context"
+        commandToken={null}
+      />,
+    );
+    expect(commandMarks(view.container)).toEqual([]);
+    view.rerender(
+      <CodeMirrorComposerInput
+        aria-label="Message the agent"
+        value="/review"
+        commandToken="/review"
+      />,
+    );
+    expect(commandMarks(view.container)).toEqual([["/review", COMMAND_TOKEN_CLASS]]);
+  });
+
+  it("never marks text the token no longer leads, even before the token prop catches up", () => {
+    const { container, target } = mount({ value: "/context", commandToken: "/context" });
+    act(() => {
+      insertComposerText(target(), "s", "/context".length, "/context".length);
+    });
+    expect(commandMarks(container)).toEqual([]);
+  });
+});
+
+describe("leadingCommandSpan", () => {
+  it("finds the token after leading whitespace, and only as a whole leading word", () => {
+    expect(leadingCommandSpan("/context", "/context")).toEqual({ start: 0, end: 8 });
+    expect(leadingCommandSpan("\n  /context now", "/context")).toEqual({ start: 3, end: 11 });
+    // A known command's full name may hold a space.
+    expect(leadingCommandSpan("/review pr now", "/review pr")).toEqual({ start: 0, end: 10 });
+    expect(leadingCommandSpan("/contexts", "/context")).toBeNull();
+    expect(leadingCommandSpan("say /context", "/context")).toBeNull();
+    expect(leadingCommandSpan("/context", null)).toBeNull();
   });
 });

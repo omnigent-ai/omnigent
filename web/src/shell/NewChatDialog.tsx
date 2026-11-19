@@ -7638,6 +7638,7 @@ function NewChatLandingContent({
               input={{
                 ref: bindTextarea,
                 value: message,
+                mentionTokens,
                 className: mentionTokensShown ? MIRRORED_TEXTAREA_CLASS : undefined,
                 onScroll: (e) => {
                   if (mirrorRef.current) mirrorRef.current.scrollTop = e.currentTarget.scrollTop;
