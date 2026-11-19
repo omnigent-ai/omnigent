@@ -62,6 +62,16 @@ export function createThingyGestureGate({
       focusedAt = sequence;
     }
   };
+  // Chrome fires no focusin on the frame element when a click moves focus into the frame; Omnigent's
+  // window only loses focus, with the frame already its active element. Element blur events do not
+  // bubble, so this non-capturing listener hears only the window's own.
+  const view = ownerDocument.defaultView;
+  const onWindowBlur = () => {
+    if (frameFocused()) {
+      sequence += 1;
+      focusedAt = sequence;
+    }
+  };
   // Untrusted events count too: only Omnigent's own scripts can dispatch them in its document,
   // and counting them only makes the gate stricter.
   const onHostGesture = () => {
@@ -70,6 +80,7 @@ export function createThingyGestureGate({
   };
 
   frameHost.addEventListener("focusin", onFocusIn);
+  view?.addEventListener("blur", onWindowBlur);
   for (const type of HOST_GESTURES) {
     ownerDocument.addEventListener(type, onHostGesture, true);
   }
@@ -95,6 +106,7 @@ export function createThingyGestureGate({
     frameFocused,
     dispose: () => {
       frameHost.removeEventListener("focusin", onFocusIn);
+      view?.removeEventListener("blur", onWindowBlur);
       for (const type of HOST_GESTURES) {
         ownerDocument.removeEventListener(type, onHostGesture, true);
       }

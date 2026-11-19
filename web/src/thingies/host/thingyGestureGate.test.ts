@@ -1,10 +1,16 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import { createThingyGestureGate } from "./thingyGestureGate";
 
 // A page with a host control and a frame host holding the thingy's frame element. The browser's
 // activation flag is the one input that jsdom lacks, so the test supplies it; focus and the host
 // page's events are real DOM.
+// Browsers report focus entering a frame differently: some fire focusin on the frame element,
+// while Chrome fires none and only blurs the host window, with the frame already active.
+type FrameFocusReport = "focusin" | "window blur";
+
+let frameFocusReport: FrameFocusReport = "focusin";
+
 function setUp({ active = true }: { active?: boolean } = {}) {
   const hostButton = document.createElement("button");
   hostButton.textContent = "Composer";
@@ -24,7 +30,17 @@ function setUp({ active = true }: { active?: boolean } = {}) {
     clock += ms;
   };
   /** A click or Tab into the thingy, as the host sees it: the frame takes focus. */
-  const gestureInFrame = () => frame.focus();
+  const gestureInFrame = () => {
+    if (frameFocusReport === "focusin") {
+      frame.focus();
+      return;
+    }
+    const hideFocusIn = (event: Event) => event.stopPropagation();
+    window.addEventListener("focusin", hideFocusIn, true);
+    frame.focus();
+    window.removeEventListener("focusin", hideFocusIn, true);
+    window.dispatchEvent(new FocusEvent("blur"));
+  };
   const clickHost = () => {
     hostButton.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true }));
     hostButton.focus();
@@ -36,82 +52,89 @@ afterEach(() => {
   document.body.replaceChildren();
 });
 
-describe("thingy gesture gate", () => {
-  it("allows one call after a click inside the thingy", () => {
-    const { gate, gestureInFrame } = setUp();
+describe.each<FrameFocusReport>(["focusin", "window blur"])(
+  "thingy gesture gate (%s)",
+  (report) => {
+    beforeEach(() => {
+      frameFocusReport = report;
+    });
 
-    gestureInFrame();
+    it("allows one call after a click inside the thingy", () => {
+      const { gate, gestureInFrame } = setUp();
 
-    expect(gate.claim()).toBe(true);
-    gate.dispose();
-  });
+      gestureInFrame();
 
-  it("refuses calls when the activation came from a click elsewhere in Omnigent", () => {
-    const { gate, clickHost } = setUp();
+      expect(gate.claim()).toBe(true);
+      gate.dispose();
+    });
 
-    clickHost();
+    it("refuses calls when the activation came from a click elsewhere in Omnigent", () => {
+      const { gate, clickHost } = setUp();
 
-    expect(gate.claim()).toBe(false);
-    gate.dispose();
-  });
+      clickHost();
 
-  it("refuses a click elsewhere that kept focus in the thingy", () => {
-    const { gate, gestureInFrame, hostButton, frame } = setUp();
-    gestureInFrame();
+      expect(gate.claim()).toBe(false);
+      gate.dispose();
+    });
 
-    // A host control that prevents focus changes on mousedown leaves focus in the frame.
-    hostButton.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    it("refuses a click elsewhere that kept focus in the thingy", () => {
+      const { gate, gestureInFrame, hostButton, frame } = setUp();
+      gestureInFrame();
 
-    expect(document.activeElement).toBe(frame);
-    expect(gate.claim()).toBe(false);
-    gate.dispose();
-  });
+      // A host control that prevents focus changes on mousedown leaves focus in the frame.
+      hostButton.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
 
-  it("refuses calls without transient activation, even with focus in the thingy", () => {
-    const { gate, gestureInFrame } = setUp({ active: false });
+      expect(document.activeElement).toBe(frame);
+      expect(gate.claim()).toBe(false);
+      gate.dispose();
+    });
 
-    gestureInFrame();
+    it("refuses calls without transient activation, even with focus in the thingy", () => {
+      const { gate, gestureInFrame } = setUp({ active: false });
 
-    expect(gate.claim()).toBe(false);
-    gate.dispose();
-  });
+      gestureInFrame();
 
-  it("uses up a gesture: a timer in the thingy cannot make a second call", () => {
-    const { gate, gestureInFrame, frameHost, advance } = setUp();
-    gestureInFrame();
-    expect(gate.claim()).toBe(true);
+      expect(gate.claim()).toBe(false);
+      gate.dispose();
+    });
 
-    // Focus left the frame, so a new gesture there is one the host can see.
-    expect(document.activeElement).toBe(frameHost);
-    advance(5_000);
-    expect(gate.claim()).toBe(false);
+    it("uses up a gesture: a timer in the thingy cannot make a second call", () => {
+      const { gate, gestureInFrame, frameHost, advance } = setUp();
+      gestureInFrame();
+      expect(gate.claim()).toBe(true);
 
-    gestureInFrame();
-    expect(gate.claim()).toBe(true);
-    gate.dispose();
-  });
+      // Focus left the frame, so a new gesture there is one the host can see.
+      expect(document.activeElement).toBe(frameHost);
+      advance(5_000);
+      expect(gate.claim()).toBe(false);
 
-  it("spaces calls apart even when the thingy refocuses itself at once", () => {
-    const { gate, gestureInFrame, advance } = setUp();
-    gestureInFrame();
-    expect(gate.claim()).toBe(true);
+      gestureInFrame();
+      expect(gate.claim()).toBe(true);
+      gate.dispose();
+    });
 
-    gestureInFrame();
-    expect(gate.claim()).toBe(false);
+    it("spaces calls apart even when the thingy refocuses itself at once", () => {
+      const { gate, gestureInFrame, advance } = setUp();
+      gestureInFrame();
+      expect(gate.claim()).toBe(true);
 
-    advance(1_000);
-    gestureInFrame();
-    expect(gate.claim()).toBe(true);
-    gate.dispose();
-  });
+      gestureInFrame();
+      expect(gate.claim()).toBe(false);
 
-  it("reports focus in the frame, where a selection can come from", () => {
-    const { gate, gestureInFrame, clickHost } = setUp();
+      advance(1_000);
+      gestureInFrame();
+      expect(gate.claim()).toBe(true);
+      gate.dispose();
+    });
 
-    gestureInFrame();
-    expect(gate.frameFocused()).toBe(true);
-    clickHost();
-    expect(gate.frameFocused()).toBe(false);
-    gate.dispose();
-  });
-});
+    it("reports focus in the frame, where a selection can come from", () => {
+      const { gate, gestureInFrame, clickHost } = setUp();
+
+      gestureInFrame();
+      expect(gate.frameFocused()).toBe(true);
+      clickHost();
+      expect(gate.frameFocused()).toBe(false);
+      gate.dispose();
+    });
+  },
+);
