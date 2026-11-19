@@ -459,6 +459,7 @@ async def test_a_turn_that_may_be_running_finishes_before_the_teardown(
     monkeypatch.setattr(orchestration, "_SELF_ARCHIVE_TURN_POLL_S", 0.01)
     reads = 0
     polled = asyncio.Event()
+    loop = asyncio.get_running_loop()
     read_activity = conversations.get_session_activity
 
     def counting_read(ids):
@@ -466,7 +467,7 @@ async def test_a_turn_that_may_be_running_finishes_before_the_teardown(
         reads += 1
         # The launch's own check is the first read; the rest are the teardown's turn wait.
         if reads >= 3:
-            polled.set()
+            loop.call_soon_threadsafe(polled.set)
         return read_activity(ids)
 
     monkeypatch.setattr(conversations, "get_session_activity", counting_read)
@@ -479,6 +480,52 @@ async def test_a_turn_that_may_be_running_finishes_before_the_teardown(
     conversations.set_session_live_status(conv.id, "idle")
     await asyncio.wait_for(teardown, timeout=5)
     assert len(fake.stopped) == 1
+
+
+async def test_a_failed_archive_check_keeps_the_launch_and_schedules_nothing(
+    db_uri, no_undo_grace, monkeypatch
+):
+    host_store = HostStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    fake = _registering_launcher(host_store)
+    conv = conversations.create_conversation()
+    conversations.update_conversation(conv.id, archived=True)
+
+    def unavailable(_ids):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(conversations, "get_session_activity", unavailable)
+
+    await _launch_for(conversations, host_store, fake, conv.id)
+
+    assert conversations.get_conversation(conv.id).host_id is not None
+    assert conv.id not in orchestration._pending_archive_stops
+    assert fake.stopped == []
+
+
+async def test_a_failed_item_read_makes_the_teardown_wait_for_the_turn(
+    db_uri, no_undo_grace, monkeypatch
+):
+    host_store = HostStore(db_uri)
+    conversations = SqlAlchemyConversationStore(db_uri)
+    fake = _registering_launcher(host_store)
+    conv = conversations.create_conversation()
+    conversations.update_conversation(conv.id, archived=True)
+    scheduled: list[bool] = []
+
+    def unavailable(*_args, **_kwargs):
+        raise RuntimeError("database unavailable")
+
+    def capture(*_args, after_turn=False, **_kwargs):
+        scheduled.append(after_turn)
+
+    monkeypatch.setattr(conversations, "list_items", unavailable)
+    monkeypatch.setattr(orchestration, "_spawn_archive_stop", capture)
+
+    await _launch_for(conversations, host_store, fake, conv.id)
+
+    # With no status and no way to see whether a turn ran, the teardown waits for one.
+    assert scheduled == [True]
 
 
 async def test_moving_an_archived_session_to_a_sandbox_does_not_schedule_a_teardown(
