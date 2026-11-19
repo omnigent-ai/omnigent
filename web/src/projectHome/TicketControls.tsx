@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { CircleCheckIcon, CircleDashedIcon, CircleDotIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -10,16 +11,43 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Textarea } from "@/components/ui/textarea";
-import type { TicketTag } from "@/lib/projectTicketsApi";
+import type { TicketStatus, TicketTag } from "@/lib/projectTicketsApi";
+import { cn } from "@/lib/utils";
+
+export function TicketStatusIcon({ status }: { status: TicketStatus }) {
+  const Icon =
+    status === "done"
+      ? CircleCheckIcon
+      : status === "in_progress"
+        ? CircleDotIcon
+        : CircleDashedIcon;
+  return (
+    <Icon
+      aria-hidden
+      className={cn(
+        "size-3.5 shrink-0",
+        status === "done"
+          ? "text-success"
+          : status === "in_progress"
+            ? "text-session-active"
+            : "text-muted-foreground",
+      )}
+    />
+  );
+}
 
 export function TicketTags({ tags }: { tags: TicketTag[] }) {
   return (
-    <div className="flex flex-wrap gap-1.5">
+    <div className="flex min-w-0 flex-wrap gap-1.5">
       {tags.map((tag) => (
         <Badge
           key={tag.key}
           variant="secondary"
-          className={tag.key === "needs-human" ? "bg-warning/15 text-warning" : undefined}
+          title={tag.value || undefined}
+          className={cn(
+            "h-auto min-h-5 max-w-full whitespace-normal text-left wrap-anywhere",
+            tag.key === "needs-human" && "bg-warning/15 text-warning",
+          )}
         >
           {tag.key === "needs-human"
             ? "Needs human input"

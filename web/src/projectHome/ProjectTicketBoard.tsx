@@ -13,7 +13,9 @@ import { MessageSquareIcon, PlusIcon } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
+import { useNow } from "@/hooks/useNow";
 import { Link } from "@/lib/routing";
+import { absoluteTime, relativeTime } from "@/lib/relativeTime";
 import {
   TICKET_STATUSES,
   TICKET_STATUS_LABELS,
@@ -21,7 +23,7 @@ import {
   type TicketStatus,
 } from "@/lib/projectTicketsApi";
 import { cn } from "@/lib/utils";
-import { CompleteTicketDialog, TicketError, TicketTags } from "./TicketControls";
+import { CompleteTicketDialog, TicketError, TicketStatusIcon, TicketTags } from "./TicketControls";
 import { useTicketActions, useTicketProject, useTickets } from "./useProjectTickets";
 
 const STATUS_CLASS: Record<TicketStatus, string> = {
@@ -178,6 +180,7 @@ function TicketColumn({
     >
       <h2 className="flex shrink-0 items-center justify-between px-1.5 pt-1.5 pb-3 text-sm font-medium text-muted-foreground">
         <Badge className={cn("border-transparent", STATUS_CLASS[status])}>
+          <TicketStatusIcon status={status} />
           {TICKET_STATUS_LABELS[status]}
         </Badge>
         <span className="tabular-nums">
@@ -260,8 +263,8 @@ function TicketCard({
         if (suppressClick()) event.preventDefault();
       }}
       className={cn(
-        "flex flex-col gap-3 rounded-xl border bg-background p-3 text-left outline-none hover:border-muted-foreground/50 focus-visible:ring-2 focus-visible:ring-ring",
-        selected && "border-primary",
+        "flex flex-col gap-3 rounded-xl border border-border/60 bg-card p-3.5 text-left shadow-xs outline-none transition-colors hover:border-muted-foreground/50 focus-visible:ring-2 focus-visible:ring-ring",
+        selected && "border-primary ring-1 ring-primary/20",
         isDragging && "opacity-40",
       )}
     >
@@ -271,17 +274,31 @@ function TicketCard({
 }
 
 function TicketCardContent({ ticket }: { ticket: ProjectTicket }) {
+  const now = useNow();
   return (
     <>
-      <h3 className="text-sm font-medium wrap-anywhere">{ticket.title}</h3>
+      <h3 className="text-ui leading-snug font-medium wrap-anywhere">{ticket.title}</h3>
       {ticket.tags.length > 0 && <TicketTags tags={ticket.tags} />}
-      <p className="line-clamp-2 text-xs text-muted-foreground wrap-anywhere">
+      <p className="line-clamp-2 text-sm leading-relaxed text-muted-foreground wrap-anywhere">
         {ticket.latest_update}
       </p>
-      <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
-        <MessageSquareIcon className="size-3.5" />
-        {ticket.comment_count}
-      </span>
+      <div className="flex items-center justify-between gap-2 text-sm text-muted-foreground">
+        <time
+          dateTime={new Date(ticket.updated_at * 1000).toISOString()}
+          title={`Updated ${absoluteTime(ticket.updated_at * 1000)}`}
+        >
+          {relativeTime(ticket.updated_at * 1000, now.getTime())}
+        </time>
+        {ticket.comment_count > 0 && (
+          <span
+            className="flex items-center gap-1.5 tabular-nums"
+            aria-label={`${ticket.comment_count} comments`}
+          >
+            <MessageSquareIcon aria-hidden className="size-3.5" />
+            {ticket.comment_count}
+          </span>
+        )}
+      </div>
     </>
   );
 }
