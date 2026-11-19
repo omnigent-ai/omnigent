@@ -1458,6 +1458,11 @@ function awaitingNoun(count: number): string {
   return count === 1 ? "awaiting response" : "awaiting responses";
 }
 
+/** `1 completed session` / `5 completed sessions`. */
+function countOf(count: number, one: string, many: string): string {
+  return `${count} ${count === 1 ? one : many}`;
+}
+
 /** The toast after a bulk decline; failed prompts roll back to their cards. */
 export function describeDeclineResult(declined: number, total: number): string {
   if (declined === total) return `Declined ${total} ${awaitingNoun(total)}`;
@@ -1495,6 +1500,7 @@ function InboxBulkActions({
   allIncludes: string;
   /** The tab lists awaiting responses. */
   showDecline: boolean;
+  /** Prompts bulk decline would answer; one session can have several. */
   declineCount: number;
   /** More items exist than are loaded, so the counts cover only part of the tab. */
   loadedOnly: boolean;
@@ -1529,16 +1535,20 @@ function InboxBulkActions({
         {loadedOnly && <DropdownMenuLabel>Loaded items only</DropdownMenuLabel>}
         {showReadItems && (
           <BulkMenuItem
-            label={doneCount > 0 ? `Mark ${doneCount} Done as read` : "Mark Done as read"}
-            detail={doneCount > 0 ? "Keeps errors and comments" : "No Done sessions loaded"}
+            label="Mark done as read"
+            detail={
+              doneCount > 0
+                ? countOf(doneCount, "completed session", "completed sessions")
+                : "No completed sessions"
+            }
             disabled={doneCount === 0}
             onSelect={select("inbox.bulk.mark_done_read", onMarkDoneRead)}
           />
         )}
         {showReadItems && extraCount > 0 && (
           <BulkMenuItem
-            label={`Mark ${allCount} as read`}
-            detail={`Includes ${allIncludes}`}
+            label="Mark all as read"
+            detail={`${countOf(allCount, "unread item", "unread items")}, including ${allIncludes}`}
             onSelect={select("inbox.bulk.mark_all_read", onMarkAllRead)}
           />
         )}
@@ -1546,8 +1556,8 @@ function InboxBulkActions({
         {showDeclineItem && (
           <BulkMenuItem
             variant="destructive"
-            label={`Decline ${declineCount} ${awaitingNoun(declineCount)}…`}
-            detail="Can’t be undone"
+            label="Decline awaiting responses"
+            detail={countOf(declineCount, "request waiting on you", "requests waiting on you")}
             onSelect={select("inbox.bulk.decline", onDecline)}
           />
         )}

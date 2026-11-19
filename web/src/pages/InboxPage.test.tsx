@@ -1586,8 +1586,8 @@ describe("InboxPage bulk actions", () => {
     expect(unreadKinds()).toEqual(expect.arrayContaining(["done", "error"]));
 
     openBulkMenu();
-    const markDone = await screen.findByRole("menuitem", { name: /Mark 1 Done as read/ });
-    expect(markDone).toHaveTextContent("Keeps errors and comments");
+    const markDone = await screen.findByRole("menuitem", { name: /Mark done as read/ });
+    expect(markDone).toHaveTextContent("1 completed session");
     fireEvent.click(markDone);
 
     expect(unreadKinds()).toEqual(["error"]);
@@ -1598,9 +1598,9 @@ describe("InboxPage bulk actions", () => {
     // The Done item stays first, disabled, so a repeat click can't reach the wider action.
     openBulkMenu();
     const items = await screen.findAllByRole("menuitem");
-    expect(items[0]).toHaveTextContent("Mark Done as readNo Done sessions loaded");
+    expect(items[0]).toHaveTextContent("Mark done as readNo completed sessions");
     expect(items[0]).toHaveAttribute("aria-disabled", "true");
-    expect(items[1]).toHaveTextContent("Mark 3 as read");
+    expect(items[1]).toHaveTextContent("3 unread items, including errors and comments");
     fireEvent.keyDown(items[0]!, { key: "Escape" });
 
     fireEvent.click(await screen.findByRole("button", { name: "Undo" }));
@@ -1612,8 +1612,8 @@ describe("InboxPage bulk actions", () => {
     await screen.findAllByTestId("inbox-item");
 
     openBulkMenu();
-    const markAll = await screen.findByRole("menuitem", { name: /Mark 4 as read/ });
-    expect(markAll).toHaveTextContent("Includes errors and comments");
+    const markAll = await screen.findByRole("menuitem", { name: /Mark all as read/ });
+    expect(markAll).toHaveTextContent("4 unread items, including errors and comments");
     fireEvent.click(markAll);
 
     await waitFor(() => expect(unreadKinds()).toEqual([]));
@@ -1628,7 +1628,7 @@ describe("InboxPage bulk actions", () => {
     selectTab("Unread");
 
     openBulkMenu();
-    expect(await screen.findByRole("menuitem", { name: /Mark 4 as read/ })).toBeInTheDocument();
+    expect(await screen.findByRole("menuitem", { name: /Mark all as read/ })).toBeInTheDocument();
     expect(screen.queryByRole("menuitem", { name: /Decline/ })).toBeNull();
   });
 
@@ -1645,8 +1645,8 @@ describe("InboxPage bulk actions", () => {
     selectTab("Awaiting response");
 
     openBulkMenu();
-    const decline = await screen.findByRole("menuitem", { name: /Decline 2 awaiting responses…/ });
-    expect(decline).toHaveTextContent("Can’t be undone");
+    const decline = await screen.findByRole("menuitem", { name: /Decline awaiting responses/ });
+    expect(decline).toHaveTextContent("2 requests waiting on you");
     expect(screen.queryByRole("menuitem", { name: /as read/ })).toBeNull();
     fireEvent.click(decline);
     const dialog = screen.getByRole("dialog", { name: "Decline 2 awaiting responses?" });
@@ -1673,7 +1673,9 @@ describe("InboxPage bulk actions", () => {
     act(() => saveAskUserQuestionDraft("eli_1", draftSignature, unsentDraft));
 
     openBulkMenu();
-    fireEvent.click(await screen.findByRole("menuitem", { name: /Decline 1 awaiting response…/ }));
+    const decline = await screen.findByRole("menuitem", { name: /Decline awaiting responses/ });
+    expect(decline).toHaveTextContent("1 request waiting on you");
+    fireEvent.click(decline);
     fireEvent.click(screen.getByRole("button", { name: "Decline 1" }));
 
     expect(sessionsApi.approve).toHaveBeenCalledOnce();
@@ -1689,7 +1691,7 @@ describe("InboxPage bulk actions", () => {
 
     openBulkMenu();
     expect(await screen.findByText("Loaded items only")).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("menuitem", { name: /Decline 2 awaiting responses…/ }));
+    fireEvent.click(screen.getByRole("menuitem", { name: /Decline awaiting responses/ }));
     expect(screen.getByRole("dialog")).toHaveTextContent("Only loaded items are included.");
   });
 
@@ -1714,7 +1716,7 @@ describe("InboxPage bulk actions", () => {
     fireEvent.pointerDown(screen.getByRole("button", { name: "Inbox bulk actions" }), {
       button: 0,
     });
-    fireEvent.click(await screen.findByRole("menuitem", { name: /Decline 1 awaiting response…/ }));
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Decline awaiting responses/ }));
     fireEvent.click(screen.getByRole("button", { name: "Decline 1" }));
 
     expect(sessionsApi.approve).toHaveBeenCalledOnce();
