@@ -75,7 +75,7 @@ class FakePanel extends EventEmitter {
 const laptop = { id: 1, workArea: { x: 0, y: 25, width: 1512, height: 920 } };
 const external = { id: 2, workArea: { x: 1512, y: 0, width: 2560, height: 1415 } };
 
-function setup({ present, quitting = () => false } = {}) {
+function setup({ present, quitting = () => false, saveFrames } = {}) {
   const created = [];
   const stale = new Set();
   let frames = {};
@@ -91,9 +91,11 @@ function setup({ present, quitting = () => false } = {}) {
       getDisplayNearestPoint: () => external,
     },
     loadFrames: () => frames,
-    saveFrames: (next) => {
-      frames = next;
-    },
+    saveFrames:
+      saveFrames ??
+      ((next) => {
+        frames = next;
+      }),
     isCurrent: (panel) => !stale.has(panel),
     quitting,
     ...(present ? { present } : {}),
@@ -211,6 +213,52 @@ test("hide keeps the panel for its draft and remembers where it was", () => {
   assert.equal(panel.destroyed, false);
   assert.deepEqual(frames()["https://a.example"], panel.bounds);
   assert.equal(controller.hide({}), false);
+});
+
+test("a frame that can't be saved never keeps the panel up", (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  t.mock.method(console, "warn", () => {});
+  const { controller, created } = setup({
+    saveFrames: () => {
+      throw new Error("disk full");
+    },
+  });
+  controller.show("https://a.example");
+  const [panel] = created;
+  assert.equal(controller.hide(panel), true);
+  assert.equal(panel.visible, false);
+  controller.show("https://a.example");
+  controller.mainWindowFocused();
+  assert.equal(panel.visible, false);
+  controller.show("https://a.example");
+  panel.emit("moved");
+  assert.doesNotThrow(() => t.mock.timers.tick(300));
+  controller.hide(panel, { resetFrame: true });
+  assert.equal(panel.visible, false);
+});
+
+test("a picker its page never reported closed stops keeping the panel up once it hides", () => {
+  const { controller, created } = setup();
+  controller.show("https://a.example");
+  const [panel] = created;
+  controller.filePickerOpened(panel);
+  controller.hide(panel);
+  controller.show("https://a.example");
+  controller.mainWindowFocused();
+  assert.equal(panel.visible, false);
+});
+
+test("closing a panel that was replaced leaves the one that replaced it", () => {
+  const { controller, created, stale } = setup();
+  controller.show("https://a.example");
+  stale.add(created[0]);
+  controller.show("https://a.example");
+  const [old, replacement] = created;
+  controller.close(old);
+  assert.equal(replacement.destroyed, false);
+  assert.equal(controller.isPanel(replacement), true);
+  controller.close(replacement);
+  assert.equal(replacement.destroyed, true);
 });
 
 test("closing the panel hides it, keeping its draft, unless the app is quitting", () => {

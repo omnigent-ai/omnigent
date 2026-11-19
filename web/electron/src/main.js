@@ -1838,11 +1838,13 @@ function floatingComposer() {
       });
       // Leaving its page, by a link, a redirect or its own router, must not turn the floating
       // panel into an app window or a sign-in page; it closes, and the next open rebuilds it.
-      // Deferred, so a panel isn't destroyed inside its own navigation event.
+      // Deferred, so a panel isn't destroyed inside its own navigation event; only this panel
+      // closes, never one that replaced it meanwhile.
       const leaveIfNotCurrent = () =>
         setTimeout(() => {
-          if (floatingComposerPanelIsCurrent(panel, serverUrl)) return;
-          floatingComposerController?.closePanels((candidate) => candidate === serverUrl);
+          if (!floatingComposerPanelIsCurrent(panel, serverUrl)) {
+            floatingComposerController?.close(panel);
+          }
         }, 0);
       panel.webContents.on("did-navigate", leaveIfNotCurrent);
       panel.webContents.on("did-navigate-in-page", (_event, _url, isMainFrame) => {

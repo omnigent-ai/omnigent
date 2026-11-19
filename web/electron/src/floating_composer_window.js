@@ -138,16 +138,25 @@ function createFloatingComposerController(deps) {
     saveTimers.delete(panel);
   }
 
+  /** A remembered frame is a convenience: failing to read or save one never keeps a panel up. */
+  function persistFrames(nextFrames) {
+    try {
+      deps.saveFrames(nextFrames(deps.loadFrames()));
+    } catch (err) {
+      console.warn("[omnigent] could not save the floating panel's frame:", err);
+    }
+  }
+
   function rememberFrame(serverUrl, panel) {
     cancelSave(panel);
     if (panel.isDestroyed()) return;
-    deps.saveFrames({ ...deps.loadFrames(), [serverUrl]: panel.getBounds() });
+    persistFrames((frames) => ({ ...frames, [serverUrl]: panel.getBounds() }));
   }
 
   function forgetFrame(serverUrl, panel) {
     cancelSave(panel);
-    deps.saveFrames(
-      Object.fromEntries(Object.entries(deps.loadFrames()).filter(([key]) => key !== serverUrl)),
+    persistFrames((frames) =>
+      Object.fromEntries(Object.entries(frames).filter(([key]) => key !== serverUrl)),
     );
   }
 
@@ -161,9 +170,11 @@ function createFloatingComposerController(deps) {
   function hide(panel, { resetFrame = false } = {}) {
     for (const [serverUrl, candidate] of panels) {
       if (candidate !== panel || panel.isDestroyed()) continue;
+      // A picker its page never reported closed must not keep it up on a later open.
+      pickerOpen.delete(panel);
+      panel.hide();
       if (resetFrame) forgetFrame(serverUrl, panel);
       else rememberFrame(serverUrl, panel);
-      panel.hide();
       return true;
     }
     return false;
@@ -273,12 +284,19 @@ function createFloatingComposerController(deps) {
       }
     },
 
+    /** Close `panel` if it is still one of this controller's, never a newer one for its server. */
+    close(panel) {
+      for (const [serverUrl, candidate] of [...panels]) {
+        if (candidate === panel) discard(serverUrl, panel);
+      }
+    },
+
     /** One of Omnigent's own windows took focus: visible panels hide, like a click-away. */
     mainWindowFocused() {
       for (const [serverUrl, panel] of panels) {
         if (panel.isDestroyed() || !panel.isVisible() || pickerOpen.has(panel)) continue;
-        rememberFrame(serverUrl, panel);
         panel.hide();
+        rememberFrame(serverUrl, panel);
       }
     },
 

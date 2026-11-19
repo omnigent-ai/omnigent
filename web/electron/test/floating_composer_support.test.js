@@ -20,10 +20,12 @@ test("support belongs to one document of one server", () => {
 
 test("a replaced document loses support until it announces again", () => {
   const support = createFloatingComposerSupport();
-  support.announce(1, "https://built-in.local");
+  support.announce(1, "https://local.example");
   assert.equal(support.revoke(1), true);
-  assert.equal(support.supports(1, "https://built-in.local"), false);
+  assert.equal(support.supports(1, "https://local.example"), false);
   assert.equal(support.revoke(1), false);
+  assert.equal(support.announce(1, "https://local.example"), true);
+  assert.equal(support.supports(1, "https://local.example"), true);
 });
 
 test("knows whether any document can render the panel", () => {
