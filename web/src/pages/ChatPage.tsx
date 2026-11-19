@@ -3212,6 +3212,8 @@ function ComposerImpl(
     value,
     commandNames: slashCommandNames,
     enabled: draft.quotes.length === 0 && files.length === 0,
+    // Files go out as separate blocks, so the message is no longer a lone `!` text.
+    shellEnabled: files.length === 0,
     nativeShell,
     refusedNativeShell: permissionPending
       ? null

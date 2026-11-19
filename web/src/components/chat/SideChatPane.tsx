@@ -1219,13 +1219,15 @@ function SideChatComposer({
     value: text,
     commandNames: menuCommandNames,
     enabled: quotes.length === 0 && files.length === 0,
+    // Files go out as separate blocks, so the message is no longer a lone `!` text.
+    shellEnabled: files.length === 0,
     nativeShell,
     refusedNativeShell:
       pending || !session ? null : ownerOnlyShellHarness(harness, session.permissionLevel ?? null),
     // Classify what is sent: trimmed, and in a grid cell with review comments appended.
     classifyValue: gridCell
       ? buildOutgoingMessage({ quotes, text }, outgoingText, sendContext).text
-      : outgoingText,
+      : serializeReplyDraft({ quotes, text: outgoingText }),
     // Tagged mentions aren't painted as pills here.
     mentionTokens: [],
     textareaRef: tailTextareaRef,

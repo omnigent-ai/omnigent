@@ -5795,6 +5795,39 @@ describe("Composer native shell mode", () => {
     },
   );
 
+  it("keeps shell mode when a quote moves the `!` out of the tail", () => {
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const props = composerProps({ isNativeWrapper: true, permissionLevel: null });
+    render(<Composer {...props} ref={ref} />);
+    fireEvent.change(textarea(), { target: { value: "!ls" } });
+    act(() => ref.current?.appendReplyQuote("quoted line"));
+
+    expect(textarea()).toHaveValue("");
+    expect(textarea()).toHaveAttribute("data-shell-command", "true");
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent("Shell command");
+    expect(screen.getByTestId("composer-shell-mode-status")).toHaveTextContent("Shell command");
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledOnce();
+    expect(vi.mocked(props.onSend).mock.calls[0]?.[0]).toBe("!ls\n\n> quoted line");
+  });
+
+  it("refuses a quoted `!` send the session won't run, and keeps it", () => {
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    const ref = createRef<ComponentRef<typeof Composer>>();
+    const props = composerProps({ isNativeWrapper: true, permissionLevel: 2 });
+    render(<Composer {...props} ref={ref} />);
+    fireEvent.change(textarea(), { target: { value: "!ls" } });
+    act(() => ref.current?.appendReplyQuote("quoted line"));
+
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent(
+      SHELL_OWNER_REFUSAL,
+    );
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).not.toHaveBeenCalled();
+    expect(screen.getByLabelText("Reply text before quote 1")).toHaveValue("!ls");
+  });
+
   it("offers no shell mode until the permission level has loaded", () => {
     useChatStore.setState({ sessionHarness: "codex-native" });
     const props = composerProps({ isNativeWrapper: true, permissionLevel: null });

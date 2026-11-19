@@ -144,8 +144,10 @@ export function renderComposerHighlight(
 export interface UseComposerHighlightOptions {
   value: string;
   commandNames: readonly string[];
-  /** False while quotes or attachments ride along (they change what is sent). */
+  /** False while quotes or attachments ride along, as the token no longer leads `value`. */
   enabled: boolean;
+  /** Whether shell mode can apply, judged on `classifyValue`; `enabled` when unset. */
+  shellEnabled?: boolean;
   nativeShell: string | null;
   /** The harness whose `!` this viewer may not run, shown as a refused shell command. */
   refusedNativeShell?: string | null;
@@ -186,6 +188,7 @@ export function useComposerHighlight({
   value,
   commandNames,
   enabled,
+  shellEnabled = enabled,
   nativeShell,
   refusedNativeShell = null,
   classifyValue,
@@ -196,10 +199,16 @@ export function useComposerHighlight({
 }: UseComposerHighlightOptions): ComposerHighlight {
   const mirrorRef = useRef<HTMLDivElement>(null);
   const hintId = useId();
-  const split = enabled
-    ? composerHighlightSplit(value, commandNames, nativeShell ?? refusedNativeShell, classifyValue)
+  const shellHarness = nativeShell ?? refusedNativeShell;
+  // Shell mode follows what is sent, even when `value` can't show the `!` (a quote holds it).
+  const shell =
+    shellEnabled &&
+    shellHarness !== null &&
+    splitNativeShellCommand(classifyValue ?? value, shellHarness) !== null;
+  const painted = enabled
+    ? composerHighlightSplit(value, commandNames, shell ? shellHarness : null, classifyValue)
     : null;
-  const shell = split?.kind === "shell";
+  const split = shell && painted?.kind !== "shell" ? null : painted;
   const refusal = !shell
     ? null
     : nativeShell === null
@@ -211,12 +220,15 @@ export function useComposerHighlight({
   const mirrorActive = split !== null || findMentionTokens(value, mentionTokens).length > 0;
   useComposerMirrorAlignment(mirrorRef, textareaRef, mirrorActive, textareaNode);
   return {
-    kind: split?.kind ?? null,
+    kind: shell ? "shell" : (split?.kind ?? null),
     refusal,
     input: {
       className: mirrorActive ? MIRRORED_TEXTAREA_CLASS : undefined,
       // A command keeps the editor's own leading-word check; `!` needs its exact offset.
-      commandToken: shell ? { token: "!", start: split.before.length } : (split?.token ?? null),
+      commandToken:
+        split?.kind === "shell"
+          ? { token: "!", start: split.before.length }
+          : (split?.token ?? null),
       onScroll: (event) => {
         if (mirrorRef.current) mirrorRef.current.scrollTop = event.currentTarget.scrollTop;
       },

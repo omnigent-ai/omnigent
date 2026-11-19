@@ -3000,6 +3000,26 @@ describe("side-chat composer highlight", () => {
     });
   });
 
+  it("keeps shell mode when a quote holds the `!`, and sends the quoted message", () => {
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+    useChatStore.setState({
+      sideChatComposers: {
+        [childId]: {
+          text: "",
+          files: [],
+          quotes: [{ id: "q", before: "!ls", text: "quoted line" }],
+        },
+      },
+    });
+    renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId("side-chat-input");
+    expect(input).toHaveAttribute("data-shell-command", "true");
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent("Shell command");
+
+    fireEvent.click(screen.getByTestId("side-chat-send"));
+    expect(send.mock.calls[0]?.[0]).toBe("!ls\n\n> quoted line");
+  });
+
   it("waits for the session's permission level before offering shell mode", () => {
     conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
     unfetchedSession.id = childId;
