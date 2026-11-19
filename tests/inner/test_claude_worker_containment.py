@@ -1317,6 +1317,13 @@ async def test_session_terminal_runs_real_cli_with_automatic_model_access(
         pytest.skip("requires tmux")
     requests, _ = cli_model_server
     real_worker_spec.sandbox.allow_network = True
+    cli_path = Path(real_claude_cli).resolve()
+    if not cli_path.is_relative_to(Path(sys.prefix)):
+        # A system CLI outside the Python environment needs an explicit read grant.
+        roots = [cli_path.parent]
+        if node_path := shutil.which("node"):
+            roots.append(Path(node_path).resolve().parent)
+        real_worker_spec.sandbox.read_paths = [str(root) for root in roots]
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://model.test")
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "parent-config"))
     spec = AgentSpec(
@@ -1341,7 +1348,7 @@ async def test_session_terminal_runs_real_cli_with_automatic_model_access(
             model_access_factory=lambda: claude_terminal_model_access(spec),
         )
         assert terminal.model_access is not None
-        command = shlex.join([real_claude_cli, *_cli_args("Say the terminal marker.")])
+        command = shlex.join([str(cli_path), *_cli_args("Say the terminal marker.")])
         sent = await terminal.send(
             f"OMNIGENT_PROBE_CONTROL_SOCKET={shlex.quote(str(terminal.socket_path))} "
             f"{execution_probe[0]} > terminal-probe-stdout; "
