@@ -42,12 +42,11 @@ _KIMI_TEMPLATE_VARIABLES = (
     "base_prompt",
 )
 _KIMI_VARIABLE_RE = re.compile(r"\$\{(" + "|".join(_KIMI_TEMPLATE_VARIABLES) + r")\}")
-_ZERO_WIDTH_SPACE = "​"
 
 
 def _neutralize_kimi_variables(text: str) -> str:
     """Keep Kimi from expanding its own ``${name}`` variables inside *text*."""
-    return _KIMI_VARIABLE_RE.sub(lambda match: f"${_ZERO_WIDTH_SPACE}{{{match[1]}}}", text)
+    return _KIMI_VARIABLE_RE.sub("$\u200b{\\1}", text)
 
 
 def write_kimi_system_prompt(session_home: Path, instructions: str) -> Path:
