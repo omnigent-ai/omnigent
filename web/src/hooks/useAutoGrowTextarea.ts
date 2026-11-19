@@ -178,15 +178,15 @@ export function useAutoGrowTextarea(
     const isAppend = prev !== "" && value.startsWith(prev);
     const testForHeightReduction = !isAppend;
 
+    // A newly mounted textarea tests for reduction, so it drops the default rows height.
+    const isNewTextarea = ta !== measuredRef.current;
     measuredRef.current = ta;
-    measureTextarea(ta, maxRows, onGrowthRef.current, testForHeightReduction);
+    measureTextarea(ta, maxRows, onGrowthRef.current, testForHeightReduction || isNewTextarea);
   }, [ref, value, maxRows]);
 
-  // Install one observer per element (not per keystroke) so the box recovers once layout
-  // settles after a 0-height mount, and measure a newly mounted textarea at once, as after
-  // a switch back from another input engine. Setting height in measureTextarea converges
-  // (auto → fixed → same fixed), so the observer settles rather than looping. Guarded for
-  // environments (jsdom) without ResizeObserver.
+  // One observer per element, so a 0-height mount recovers once layout settles. Newly
+  // mounted textareas are measured at once; measureTextarea converges, so this settles.
+  // Guarded for environments (jsdom) without ResizeObserver.
   const maxRowsRef = useRef(maxRows);
   useLayoutEffect(() => {
     maxRowsRef.current = maxRows;

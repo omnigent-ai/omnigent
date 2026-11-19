@@ -137,8 +137,10 @@ describe("requesting the engine", () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     let now = Date.now();
     vi.spyOn(Date, "now").mockImplementation(() => now);
+    let online = false;
     const importer = vi.fn(async () => {
-      throw new Error("offline");
+      if (!online) throw new Error("offline");
+      return CodeMirrorModule;
     });
     resetCodeMirrorComposerLoadForTests(importer);
     const { result } = renderHook(() => useRequestedComposerEngine(), {
@@ -157,6 +159,12 @@ describe("requesting the engine", () => {
 
     act(() => window.dispatchEvent(new Event("focus")));
     expect(importer).toHaveBeenCalledTimes(2);
+
+    online = true;
+    now += COMPOSER_LOAD_RETRY_INTERVAL_MS;
+    await act(async () => window.dispatchEvent(new Event("focus")));
+    await waitFor(() => expect(codeMirrorComposerLoad().status).toBe("ready"));
+    expect(result.current).toBe("codemirror");
   });
 });
 
@@ -474,6 +482,18 @@ describe("a switch deferred when the session changes", () => {
     // The requested engine stays the same; only the session changes.
     rerender(<Keyed engine="codemirror" draftKey="session-b" />);
 
+    expect(engineOf(composerInput())).toBe("codemirror");
+  });
+
+  it("runs a deferred switch once a drag selection is released in the same session", async () => {
+    await loadedCodeMirror();
+    const { rerender } = render(<Keyed engine="textarea" draftKey="session-a" />);
+    fireEvent.pointerDown(composerInput());
+
+    rerender(<Keyed engine="codemirror" draftKey="session-a" />);
+    expect(engineOf(composerInput())).toBe("textarea");
+
+    fireEvent.pointerUp(window);
     expect(engineOf(composerInput())).toBe("codemirror");
   });
 });

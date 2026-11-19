@@ -215,6 +215,6 @@ export function useDictationInsert(
       focusedRef.current = true;
     }, []),
     // A draft the hook didn't write releases its region during render, before state catches up.
-    hasInterim: interimPending && producedRef.current?.region != null,
+    hasInterim: interimPending && (producedRef.current?.region ?? null) !== null,
   };
 }

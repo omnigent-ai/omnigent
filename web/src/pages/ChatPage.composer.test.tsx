@@ -9811,5 +9811,6 @@ describe("Composer with the CodeMirror release flag on", () => {
     fireEvent.keyDown(editor, { key: "Enter" });
 
     expect(props.onSend).toHaveBeenCalledExactlyOnceWith("ship the fix", undefined);
+    await waitFor(() => expect(composerTargetOf(editor)?.value).toBe(""));
   });
 });
