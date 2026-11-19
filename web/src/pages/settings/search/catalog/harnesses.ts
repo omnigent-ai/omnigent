@@ -443,6 +443,12 @@ export const MCP_SERVER_LIST_ENTRIES = settingsEntryFamily({
       harness,
       label: `MCP servers for ${name}`,
       regions: { servers: OPENS_BY_NAME, listed: {} },
+      // The list isn't a row of its own, so its page's MCP servers tab stands in for it.
+      revealedBy: {
+        entry: `harness-${harness}-detail`,
+        part: "tab",
+        choice: INVENTORY_KIND_LABELS.mcps,
+      },
     };
     if (harness === "claude-native" || harness === "codex-native") {
       return {
