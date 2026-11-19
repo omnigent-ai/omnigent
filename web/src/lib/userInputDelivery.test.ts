@@ -54,6 +54,13 @@ describe("sendVerdictFromServer", () => {
     expect(getSessionSlimMock).toHaveBeenCalledWith("conv_1");
   });
 
+  it("passes the caller's signal to the snapshot read", async () => {
+    getSessionSlimMock.mockResolvedValue(snapshot("idle", null));
+    const signal = new AbortController().signal;
+    await sendVerdictFromServer("conv_1", "item_1", signal);
+    expect(getSessionSlimMock).toHaveBeenCalledWith("conv_1", { signal });
+  });
+
   it("reports the send delivered when the snapshot records no refusal of it", async () => {
     getSessionSlimMock.mockResolvedValue(snapshot("idle", rejection("item_other")));
     await expect(sendVerdictFromServer("conv_1", "item_1")).resolves.toBe("delivered");
