@@ -1180,16 +1180,19 @@ export function CreateScheduledTaskDialog({
     (!sandboxMode || sandboxWorkspace === savedWorkspace) &&
     baseBranch === (editingTask.baseBranch ?? null) &&
     (hostId === "" || hostId === editingTask.hostId);
-  const scheduleError = scheduleUnsupported
-    ? "Choose a frequency to replace this schedule."
-    : unsupportedByScheduler
-      ? "Choose a frequency this server supports."
-      : validateSchedule(schedule, {
-          allowPastEnd,
-          sessionMode,
-          subhourSupported,
-          executionTarget,
-        });
+  let scheduleError: string | null;
+  if (scheduleUnsupported) {
+    scheduleError = "Choose a frequency to replace this schedule.";
+  } else if (unsupportedByScheduler) {
+    scheduleError = "Choose a frequency this server supports.";
+  } else {
+    scheduleError = validateSchedule(schedule, {
+      allowPastEnd,
+      sessionMode,
+      subhourSupported,
+      executionTarget,
+    });
+  }
   const scheduleInvalid = scheduleError !== null;
   const triggerPromptContext = {
     sessionLink,
@@ -1496,11 +1499,18 @@ export function CreateScheduledTaskDialog({
   const missingInstructions =
     !startsFromSession &&
     (effectivePrompt.trim() === "" || (trigger === null && withWorkflow(prompt).trim() === ""));
+  // The schedule's control sits in the top row, under Advanced, or (for a trigger) is
+  // hidden behind a replace note below the instructions.
+  const scheduleInTopRow = !usesTriggerSchedule && !isEdit && fromSession === null;
+  const scheduleInAdvanced = !usesTriggerSchedule && (isEdit || fromSession !== null);
+  const scheduleReason = hiddenTriggerScheduleNeedsReplacement
+    ? "Use a supported schedule."
+    : scheduleError;
   // Why Save is off, in dialog order; the disabled button explains the first.
   const submitBlockers = [
     curationPending && "Loading…",
     name.trim() === "" && "Enter a name in the field at the top.",
-    scheduleError,
+    scheduleInTopRow && scheduleReason,
     missingInstructions &&
       (trigger === null
         ? "Add instructions."
@@ -1509,6 +1519,7 @@ export function CreateScheduledTaskDialog({
       systemPrompt?.trim() === "" &&
       "The template's system prompt can't be empty.",
     workflowKeepsTaskSession && "Remove the workflow to save.",
+    usesTriggerSchedule && scheduleReason,
     !isEdit &&
       !sandboxMode &&
       hostId === "" &&
@@ -1516,12 +1527,13 @@ export function CreateScheduledTaskDialog({
     !isEdit &&
       effectiveAgentId === null &&
       (agents === undefined ? "Loading agents…" : "Pick an agent."),
-    pollingBlockedReason,
-    workerSettings !== null && workerHarnessSettings.blockedReason,
-    workspaceWithoutHost && "Pick a host before pinning a workspace.",
-    costLimitInvalid && "Enter a cost limit greater than zero, or leave it blank.",
     mcpBlockedReason,
     (mcpAuthorizing || mcpSigningIn !== null) && "Finishing MCP sign-in…",
+    scheduleInAdvanced && scheduleReason,
+    workspaceWithoutHost && "Pick a host before pinning a workspace.",
+    costLimitInvalid && "Enter a cost limit greater than zero, or leave it blank.",
+    pollingBlockedReason,
+    workerSettings !== null && workerHarnessSettings.blockedReason,
   ];
   const submitBlockedReason =
     submitBlockers.find((reason): reason is string => Boolean(reason)) ?? null;

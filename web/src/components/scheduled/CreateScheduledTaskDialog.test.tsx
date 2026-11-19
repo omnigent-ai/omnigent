@@ -1161,6 +1161,30 @@ describe("CreateScheduledTaskDialog validation", () => {
     expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
   });
 
+  it("explains an edit's blockers in the order the dialog shows them", async () => {
+    render(
+      <CapabilitiesProvider
+        info={{ ...SERVER_INFO_OFFLINE_FALLBACK, features: { automations_v2: false } }}
+      >
+        <CreateScheduledTaskDialog
+          open
+          onOpenChange={vi.fn()}
+          editingTask={scheduledTask({ rrule: "FREQ=DAILY;INTERVAL=2;BYHOUR=9;BYMINUTE=0" })}
+        />
+      </CapabilitiesProvider>,
+    );
+    const instructions = screen.getByTestId("task-prompt-input");
+    const savedInstructions = (instructions as HTMLTextAreaElement).value;
+    fireEvent.change(instructions, { target: { value: "" } });
+    await userEvent.hover(screen.getByRole("group", { name: "Save changes" }));
+    // An edit keeps the schedule under Advanced, below the instructions.
+    await waitFor(() => expect(screen.getByRole("tooltip")).toHaveTextContent("Add instructions."));
+    fireEvent.change(instructions, { target: { value: savedInstructions } });
+    expect(screen.getByRole("tooltip")).toHaveTextContent(
+      "Choose a frequency this server supports.",
+    );
+  });
+
   it("pins a workspace on confirmation and waits for reconnection if its host disconnects", () => {
     const onOpenChange = vi.fn();
     const { rerender } = render(<CreateScheduledTaskDialog open onOpenChange={onOpenChange} />, {
