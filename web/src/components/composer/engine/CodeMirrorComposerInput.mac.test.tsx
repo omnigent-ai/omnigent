@@ -4,6 +4,7 @@
 import { act, cleanup, fireEvent, render } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { COMPOSER_EDITING_KEYMAP } from "./CodeMirrorComposerInput";
+import { READLINE_BINDINGS } from "./codeMirrorReadline";
 import { CodeMirrorComposerInput } from "./testing/codeMirrorComposer";
 import { insertComposerText } from "@/lib/composerText";
 import type { ComposerTextTarget } from "./composerInput";
@@ -38,7 +39,7 @@ afterEach(cleanup);
 
 describe("CodeMirror composer keys on macOS", () => {
   it("installs no Control+Option binding, on any platform's key", () => {
-    for (const binding of COMPOSER_EDITING_KEYMAP) {
+    for (const binding of [...READLINE_BINDINGS, ...COMPOSER_EDITING_KEYMAP]) {
       for (const key of [binding.key, binding.mac, binding.win, binding.linux]) {
         if (key) expect(key).not.toMatch(/Ctrl-.*Alt-|Alt-.*Ctrl-/);
       }
