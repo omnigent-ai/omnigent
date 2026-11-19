@@ -67,6 +67,8 @@ from omnigent.runtime.filesystem_registry import (
 
 # Match the runner's caps so a host-served read is truncated identically.
 _MAX_READ_BYTES = 10 * 1024 * 1024  # 10 MiB
+# Longer than any platform's PATH_MAX, so a real link always fits.
+_MAX_LINK_TEXT_BYTES = 4096
 _REPOSITORY_BRANCH_TIMEOUT_S = 3.0
 _MAX_REPOSITORY_BRANCHES = 10
 
@@ -220,6 +222,38 @@ def read_repository_branches(root: Path, repositories: list[dict[str, str]]) -> 
     return {"repositories": branches}
 
 
+def _describe_entry(full: Path, name: str, rel: str) -> ListedEntry | None:
+    """Describe one directory entry as the runner's ``list_dir`` does.
+
+    Classifies it by its target's type (following a symlink) and lists a
+    broken symlink as a file with no size, rather than dropping it.
+
+    :returns: The entry, or ``None`` when even ``lstat`` fails.
+    """
+    try:
+        st = full.stat()  # follows symlinks, like the runner
+        entry_type = "directory" if stat.S_ISDIR(st.st_mode) else "file"
+        size = st.st_size if entry_type == "file" else None
+        mtime = int(st.st_mtime)
+    except OSError:
+        try:
+            ls = full.lstat()
+        except OSError:
+            return None
+        entry_type = "file"
+        size = None
+        mtime = int(ls.st_mtime)
+    return {
+        "id": rel,
+        "object": "session.environment.filesystem.entry",
+        "name": name,
+        "path": rel,
+        "type": entry_type,
+        "bytes": size,
+        "modified_at": mtime,
+    }
+
+
 class WorkspaceReader:
     """Read-only view of a workspace directory, confined to its root.
 
@@ -246,6 +280,11 @@ class WorkspaceReader:
                 self._started_registry = create_filesystem_registry(self._root)
                 self._started_registry.start()
             return self._started_registry
+
+    @property
+    def root(self) -> Path:
+        """The workspace directory, resolved."""
+        return self._root
 
     # ── Path confinement ──────────────────────────────────────────
 
@@ -318,6 +357,73 @@ class WorkspaceReader:
         """
         return _cap_file_bytes(path, self._read_capped(path, self._resolve(path)))
 
+    def stat_entry(self, path: str) -> tuple[ListedEntry, bool]:
+        """Describe one path exactly as listing its parent would.
+
+        The parent must stay inside the workspace; the leaf itself may be a
+        symlink, even one pointing outside, as a listing shows it.
+
+        :param path: Relative path (``""`` for the workspace root).
+        :returns: The entry, and whether the path itself is a symlink.
+        :raises WorkspaceReaderError: 400 on an invalid path or escaping
+            parent, 404 when the path doesn't exist.
+        """
+        leaf, parent = self._leaf_beneath(path)
+        if parent is None:
+            entry = _describe_entry(self._root, self._root.name, "")
+            if entry is None:
+                raise WorkspaceReaderError(404, "not_found", "The workspace is not accessible")
+            return entry, False
+        full = parent / leaf.rsplit("/", 1)[-1]
+        entry = _describe_entry(full, full.name, leaf)
+        if entry is None or not is_utf8_encodable(full.name):
+            raise WorkspaceReaderError(404, "not_found", f"Path {path!r} not found")
+        return entry, full.is_symlink()
+
+    def read_link_text(self, path: str) -> bytes:
+        """Return a symlink's own text, without following it.
+
+        The link may point anywhere, even outside the workspace or nowhere;
+        only its parent must stay inside the workspace.
+
+        :param path: Relative path of the link.
+        :returns: The stored target, at most :data:`_MAX_LINK_TEXT_BYTES`.
+        :raises WorkspaceReaderError: 400 on an invalid path, escaping parent
+            or oversized link, 404 when missing, 412 when not a symlink.
+        """
+        leaf, parent = self._leaf_beneath(path)
+        if parent is None:
+            raise WorkspaceReaderError(412, "not_a_symlink", "The workspace root is not a link")
+        full = parent / leaf.rsplit("/", 1)[-1]
+        try:
+            st = full.lstat()
+        except OSError as exc:
+            raise WorkspaceReaderError(404, "not_found", f"Path {path!r} not found") from exc
+        if not stat.S_ISLNK(st.st_mode):
+            raise WorkspaceReaderError(412, "not_a_symlink", f"Path {path!r} is not a symlink")
+        try:
+            target = os.readlink(os.fsencode(full))
+        except OSError as exc:
+            raise WorkspaceReaderError(404, "not_found", f"Path {path!r} not found") from exc
+        if len(target) > _MAX_LINK_TEXT_BYTES:
+            raise WorkspaceReaderError(400, "link_too_long", f"Link {path!r} is too long")
+        return target
+
+    def _leaf_beneath(self, path: str) -> tuple[str, Path | None]:
+        """Validate *path* and resolve its parent inside the workspace.
+
+        :returns: The validated path, and its resolved parent, or ``None``
+            for the workspace root.
+        """
+        try:
+            leaf = _validate_path(path) if path else ""
+        except InvalidPath as exc:
+            raise WorkspaceReaderError(400, "invalid_path", str(exc)) from exc
+        if not leaf:
+            return "", None
+        parent_rel = leaf.rsplit("/", 1)[0] if "/" in leaf else ""
+        return leaf, self._resolve(parent_rel)
+
     def _list_dir(
         self,
         rel: str,
@@ -364,36 +470,10 @@ class WorkspaceReader:
                 # A non-UTF-8 name comes back surrogate-escaped; no JSON or protobuf
                 # answer can carry it, so skip it rather than fail the listing.
                 continue
-            full = resolved / name
             child_rel = os.path.join(validated, name) if validated else name
-            try:
-                st = full.stat()  # follows symlinks, like the runner
-                is_dir = full.is_dir()
-                entry_type = "directory" if is_dir else "file"
-                size = st.st_size if entry_type == "file" else None
-                mtime = int(st.st_mtime)
-            except OSError:
-                # Broken symlink (target gone): fall back to lstat and list it
-                # as a file with no size, matching the runner's list_dir rather
-                # than dropping the entry.
-                try:
-                    ls = full.lstat()
-                except OSError:
-                    continue
-                entry_type = "file"
-                size = None
-                mtime = int(ls.st_mtime)
-            entries.append(
-                {
-                    "id": child_rel,
-                    "object": "session.environment.filesystem.entry",
-                    "name": name,
-                    "path": child_rel,
-                    "type": entry_type,
-                    "bytes": size,
-                    "modified_at": mtime,
-                }
-            )
+            entry = _describe_entry(resolved / name, name, child_rel)
+            if entry is not None:
+                entries.append(entry)
         return entries
 
     def _read_file(

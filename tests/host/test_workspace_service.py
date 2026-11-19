@@ -41,9 +41,11 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     GetCapabilitiesRequest,
     ListDirectoryRequest,
     ReadFileRequest,
+    ReadLinkTextRequest,
     SearchFilesRequest,
     SearchTextRequest,
     SearchTextResponse,
+    StatPathRequest,
 )
 from omnigent.host.frames import (
     CAP_WORKSPACE_API,
@@ -237,6 +239,7 @@ async def test_list_directory_matches_rest_listing_across_pages(
                 "directory" if e.type == ENTRY_TYPE_DIRECTORY else "file",
                 e.size if e.HasField("size") else None,
                 e.modify_time.seconds,
+                e.is_symlink,
             )
             for e in page.entries
         ]
@@ -246,7 +249,14 @@ async def test_list_directory_matches_rest_listing_across_pages(
 
     rest = reader.list_or_read("", limit=1000, order="asc")["data"]
     assert listed == [
-        (e["name"], e["path"], e["type"], e["bytes"], e["modified_at"])
+        (
+            e["name"],
+            e["path"],
+            e["type"],
+            e["bytes"],
+            e["modified_at"],
+            (tmp_path / str(e["path"])).is_symlink(),
+        )
         for e in cast("list[dict[str, object]]", rest)
     ]
 
@@ -316,6 +326,89 @@ async def test_read_file_flags_a_truncated_stream_like_rest(
     assert b"".join(m.data for m in messages) == str(rest["content"]).encode() == b"h"
 
 
+def _workspace_with_escapes(tmp_path: Path) -> Path:
+    """A workspace with symlinks that lead out of it, and a FIFO."""
+    (tmp_path / "workspace").mkdir()
+    root = _workspace(tmp_path / "workspace")
+    (tmp_path / "outside.txt").write_text("secret")
+    (tmp_path / "outside-link").symlink_to("outside.txt")
+    (root / "escape").symlink_to("../outside.txt")
+    (root / "up").symlink_to("..")
+    os.mkfifo(root / "fifo")
+    return root
+
+
+async def test_stat_path_describes_a_path_as_its_parents_listing_does(
+    tmp_path: Path, client_for: ClientFor
+) -> None:
+    root = _workspace_with_escapes(tmp_path)
+    (root / "src" / "inner").symlink_to("main.py")
+    client = client_for(root)
+
+    for parent in ("", "src"):
+        listed = (await client.list_directory(ListDirectoryRequest(path=parent))).entries
+        assert listed
+        for entry in listed:
+            described = (await client.stat_path(StatPathRequest(path=entry.path))).entry
+            assert described == entry, entry.path
+
+    workspace = (await client.stat_path(StatPathRequest(path=""))).entry
+    assert (workspace.name, workspace.path, workspace.type) == (
+        "workspace",
+        "",
+        ENTRY_TYPE_DIRECTORY,
+    )
+    assert not workspace.is_symlink
+
+
+async def test_read_link_text_returns_a_links_own_text_wherever_it_points(
+    tmp_path: Path, client_for: ClientFor
+) -> None:
+    """Outward and dangling links answer with their text; nothing is followed."""
+    root = _workspace_with_escapes(tmp_path)
+    client = client_for(root)
+
+    texts = {
+        path: (await client.read_link_text(ReadLinkTextRequest(path=path))).target
+        for path in ("link.md", "broken", "escape", "up")
+    }
+
+    assert texts == {
+        "link.md": b"notes.md",
+        "broken": b"gone",
+        "escape": b"../outside.txt",
+        "up": b"..",
+    }
+
+
+@pytest.mark.parametrize(
+    ("call", "path", "code"),
+    [
+        ("stat", "missing.txt", Code.NOT_FOUND),
+        ("stat", "../outside.txt", Code.INVALID_ARGUMENT),
+        ("stat", "up/outside.txt", Code.INVALID_ARGUMENT),
+        ("link", "notes.md", Code.FAILED_PRECONDITION),
+        ("link", "src", Code.FAILED_PRECONDITION),
+        ("link", "missing", Code.NOT_FOUND),
+        ("link", "", Code.INVALID_ARGUMENT),
+        ("link", "../outside.txt", Code.INVALID_ARGUMENT),
+        # The leaf may point outside, but the path to it may not.
+        ("link", "up/outside-link", Code.INVALID_ARGUMENT),
+    ],
+)
+async def test_stat_and_link_refusals_map_to_connect_codes(
+    tmp_path: Path, client_for: ClientFor, call: str, path: str, code: Code
+) -> None:
+    client = client_for(_workspace_with_escapes(tmp_path))
+
+    with pytest.raises(ConnectError) as excinfo:
+        if call == "stat":
+            await client.stat_path(StatPathRequest(path=path))
+        else:
+            await client.read_link_text(ReadLinkTextRequest(path=path))
+    assert excinfo.value.code == code
+
+
 @pytest.mark.parametrize(
     ("call", "path", "code"),
     [
@@ -360,7 +453,7 @@ async def test_capabilities_list_the_served_methods(tmp_path: Path, client_for: 
 
     response = await client.get_capabilities(GetCapabilitiesRequest())
 
-    assert set(response.capabilities) == {"ListDirectory", "ReadFile"}
+    assert set(response.capabilities) == {"ListDirectory", "ReadFile", "StatPath", "ReadLinkText"}
 
 
 async def test_methods_not_served_yet_answer_unimplemented(

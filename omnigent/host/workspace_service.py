@@ -53,13 +53,17 @@ from omnigent.api.workspace.v1alpha1.workspace_pb2 import (
     ListDirectoryResponse,
     ReadFileRequest,
     ReadFileResponse,
+    ReadLinkTextRequest,
+    ReadLinkTextResponse,
+    StatPathRequest,
+    StatPathResponse,
 )
 from omnigent.host.frames import HostWorkspaceCallFrame, HostWorkspaceReplyFrame
 from omnigent.host.workspace_methods import WORKSPACE_METHODS
 from omnigent.host.workspace_tokens import new_token_key, verify_token
 from omnigent.inner.async_utils import run_sync_on_thread
 from omnigent.util.uvicorn_server import NoSignalServer
-from omnigent.workspace_fs import WorkspaceReader, WorkspaceReaderError
+from omnigent.workspace_fs import ListedEntry, WorkspaceReader, WorkspaceReaderError
 
 _logger = logging.getLogger(__name__)
 
@@ -67,7 +71,11 @@ _logger = logging.getLogger(__name__)
 _MAX_PAGE_SIZE = 1000
 # Small enough to keep a stream responsive, large enough to keep framing cheap.
 _READ_CHUNK_BYTES = 64 * 1024
-_ERROR_CODES = {400: Code.INVALID_ARGUMENT, 404: Code.NOT_FOUND}
+_ERROR_CODES = {
+    400: Code.INVALID_ARGUMENT,
+    404: Code.NOT_FOUND,
+    412: Code.FAILED_PRECONDITION,
+}
 # A local socket bind; seconds means something is wrong, and the host goes on without it.
 _SOCKET_STARTUP_TIMEOUT_S = 5.0
 _SOCKET_SHUTDOWN_TIMEOUT_S = 2.0
@@ -89,6 +97,8 @@ class _Served:
 _SERVED: dict[str, _Served] = {
     "ListDirectory": _Served(),
     "ReadFile": _Served(),
+    "StatPath": _Served(),
+    "ReadLinkText": _Served(),
 }
 
 
@@ -149,16 +159,9 @@ class WorkspaceService(WorkspaceServiceMethods):
             limit=min(request.page_size or _MAX_PAGE_SIZE, _MAX_PAGE_SIZE),
             after=request.page_token or None,
         )
-        entries = [
-            Entry(
-                name=item["name"],
-                path=item["path"],
-                type=ENTRY_TYPE_DIRECTORY if item["type"] == "directory" else ENTRY_TYPE_FILE,
-                size=item["bytes"],
-                modify_time=Timestamp(seconds=item["modified_at"]),
-            )
-            for item in page.data
-        ]
+        # The REST listing has no symlink flag, so look at each entry itself.
+        links = await _read(_symlinks, reader.root, [item["path"] for item in page.data])
+        entries = [_entry(item, is_symlink=item["path"] in links) for item in page.data]
         # The cursor is the last entry's id; the proto keeps it opaque.
         next_page_token = page.last_id if page.has_more and page.last_id else ""
         return ListDirectoryResponse(entries=entries, next_page_token=next_page_token)
@@ -182,6 +185,42 @@ class WorkspaceService(WorkspaceServiceMethods):
         )
         for start in range(0, len(file.data), _READ_CHUNK_BYTES):
             yield ReadFileResponse(data=file.data[start : start + _READ_CHUNK_BYTES])
+
+    async def stat_path(
+        self,
+        request: StatPathRequest,
+        ctx: RequestContext[StatPathRequest, StatPathResponse] | None,
+    ) -> StatPathResponse:
+        reader = await _read(self._reader_for, ctx)
+        item, is_symlink = await _read(reader.stat_entry, request.path)
+        return StatPathResponse(entry=_entry(item, is_symlink=is_symlink))
+
+    async def read_link_text(
+        self,
+        request: ReadLinkTextRequest,
+        ctx: RequestContext[ReadLinkTextRequest, ReadLinkTextResponse] | None,
+    ) -> ReadLinkTextResponse:
+        if not request.path:
+            raise ConnectError(Code.INVALID_ARGUMENT, "path is required")
+        reader = await _read(self._reader_for, ctx)
+        # The link may point anywhere; only its parent must be in the workspace.
+        return ReadLinkTextResponse(target=await _read(reader.read_link_text, request.path))
+
+
+def _entry(item: ListedEntry, *, is_symlink: bool) -> Entry:
+    return Entry(
+        name=item["name"],
+        path=item["path"],
+        type=ENTRY_TYPE_DIRECTORY if item["type"] == "directory" else ENTRY_TYPE_FILE,
+        size=item["bytes"],
+        modify_time=Timestamp(seconds=item["modified_at"]),
+        is_symlink=is_symlink,
+    )
+
+
+def _symlinks(root: Path, paths: list[str]) -> set[str]:
+    """The ``paths`` under ``root`` that are symlinks themselves."""
+    return {path for path in paths if (root / path).is_symlink()}
 
 
 def _reader_at(
