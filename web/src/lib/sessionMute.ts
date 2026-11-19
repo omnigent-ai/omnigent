@@ -1,11 +1,5 @@
-// The viewer's per-session mute preference.
-//
-// The server stores the preference as the `omnigent.muted` label, and row
-// labels decide it until this tab mutes or unmutes a session. From then on,
-// the tab's entry here decides: other features restore cached rows wholesale
-// (a failed move's or archive's rollback, for example), so a cached label alone
-// can go stale. An entry changes only through this tab's own saves, or through
-// server data requested after the latest save finished.
+// The viewer's mute preferences. Once this tab saves one, its entry here outranks
+// row labels, which rollbacks and lagging reads can leave stale.
 
 /**
  * The reserved `conversation_labels` key recording that the viewer muted a
@@ -14,12 +8,19 @@
  */
 export const MUTED_LABEL_KEY = "omnigent.muted";
 
+/**
+ * How long after a save its value outranks server data. Lists, and the stream's
+ * re-reads, can come from a search index that catches up after the PATCH; this
+ * is the reindex window the delete tombstones and created keep-alive use too.
+ */
+export const MUTE_REINDEX_GRACE_MS = 60_000;
+
 interface MuteEntry {
   muted: boolean;
-  /** A save is in flight, so server data can't replace the value yet. */
+  /** A save is in flight; a newer save for this session must wait. */
   saving: boolean;
-  /** Server reads started before this marker predate the latest save. */
-  settledAt: number;
+  /** Reads started before this time (ms) may not reflect the latest save. */
+  trustedFrom: number;
 }
 
 interface LabeledRow {
@@ -27,19 +28,12 @@ interface LabeledRow {
   labels?: Record<string, string> | null;
 }
 
-let marker = 0;
 const entries = new Map<string, MuteEntry>();
 
 /** Capture before a server read starts; pass the result to {@link reconcileMuteLabel}. */
 export function muteReadMarker(): number {
-  return marker;
+  return Date.now();
 }
-
-/**
- * Read marker for data with no known read time, such as a pushed frame. Such
- * data never replaces a recorded preference.
- */
-export const UNORDERED_READ = Number.NEGATIVE_INFINITY;
 
 /** Whether the viewer muted this session. */
 export function isConversationMuted(row: LabeledRow): boolean {
@@ -63,25 +57,13 @@ export function canFlagUnread(row: LabeledRow): boolean {
 export function beginMuteSave(id: string, muted: boolean): boolean {
   const entry = entries.get(id);
   if (entry?.saving) return false;
-  entries.set(id, { muted, saving: true, settledAt: entry?.settledAt ?? marker });
+  entries.set(id, { muted, saving: true, trustedFrom: Number.POSITIVE_INFINITY });
   return true;
 }
 
 /** Record the saved (or, after a failure, restored) preference. */
 export function settleMuteSave(id: string, muted: boolean): void {
-  marker += 1;
-  entries.set(id, { muted, saving: false, settledAt: marker });
-}
-
-/** Whether `row` disagrees with a saved preference, so only a fresh read can settle it. */
-export function contradictsSavedMute(row: LabeledRow): boolean {
-  const entry = entries.get(row.id);
-  return (
-    entry !== undefined &&
-    !entry.saving &&
-    !!row.labels &&
-    !!row.labels[MUTED_LABEL_KEY] !== entry.muted
-  );
+  entries.set(id, { muted, saving: false, trustedFrom: Date.now() + MUTE_REINDEX_GRACE_MS });
 }
 
 /** Whether any session has a recorded preference, so fetched rows need reconciling. */
@@ -91,8 +73,9 @@ export function hasMuteEntries(): boolean {
 
 /**
  * Reconcile a server row's mute label with the recorded preference. Data
- * requested after the latest save replaces the entry; older data, or data
- * arriving while a save is in flight, takes the recorded value instead.
+ * requested {@link MUTE_REINDEX_GRACE_MS} or more after the latest save replaces
+ * the entry; earlier data, or data arriving while a save is in flight, takes the
+ * recorded value instead.
  *
  * @param readMarker - {@link muteReadMarker} captured when the read started.
  * @returns `row` itself when it already agrees, else a copy with the label fixed.
@@ -101,7 +84,7 @@ export function reconcileMuteLabel<T extends LabeledRow>(row: T, readMarker: num
   const entry = entries.get(row.id);
   // A partial row without labels has nothing to reconcile.
   if (entry === undefined || !row.labels) return row;
-  if (!entry.saving && readMarker >= entry.settledAt) {
+  if (readMarker >= entry.trustedFrom) {
     entry.muted = !!row.labels[MUTED_LABEL_KEY];
     return row;
   }
@@ -113,7 +96,7 @@ export function reconcileMuteLabel<T extends LabeledRow>(row: T, readMarker: num
   return { ...row, labels };
 }
 
-/** Forget recorded preferences, e.g. when the session caches reset. */
+/** Forget recorded preferences between tests; switching viewer or server reloads the page. */
 export function clearSessionMuteState(): void {
   entries.clear();
 }

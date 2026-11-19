@@ -9,7 +9,7 @@ import { act, cleanup, render, renderHook, waitFor } from "@testing-library/reac
 import { QueryClient, QueryClientProvider, QueryObserver } from "@tanstack/react-query";
 import { MemoryRouter, useNavigate } from "react-router-dom";
 import type { ContextType, ReactNode } from "react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 
 import {
   clearSessionTombstones,
@@ -21,7 +21,7 @@ import {
   type ConversationsPage,
 } from "@/hooks/useConversations";
 import { clearRecentlyCreated, type ConversationsInfiniteData } from "@/lib/sessionListCache";
-import { isConversationMuted, MUTED_LABEL_KEY } from "@/lib/sessionMute";
+import { isConversationMuted, MUTE_REINDEX_GRACE_MS, MUTED_LABEL_KEY } from "@/lib/sessionMute";
 import { childSessionsQueryKey } from "@/hooks/useChildSessions";
 
 // Mock the socket transport so setWatched is observable and start/stop are
@@ -883,7 +883,7 @@ describe("SessionUpdatesProvider mute in flight", () => {
     { muted: true, success: false },
     { muted: false, success: false },
   ])(
-    "keeps mute=$muted through stale frames before and after it settles with success=$success",
+    "keeps mute=$muted through stale frames until the reindex window passes, success=$success",
     async ({ muted, success }) => {
       let resolvePatch!: (value: unknown) => void;
       vi.stubGlobal(
@@ -932,17 +932,23 @@ describe("SessionUpdatesProvider mute in flight", () => {
       await waitFor(() => expect(client.isMutating()).toBe(0));
       const saved = success ? muted : !muted;
       expect(row().labels).toEqual({ other: "new", ...(saved ? { [MUTED_LABEL_KEY]: "1" } : {}) });
-      // A frame read before the save can still arrive after it settles. It can't
-      // undo the saved preference; one that disagrees re-reads the list instead.
-      const invalidate = vi.spyOn(client, "invalidateQueries");
+      // A frame read before the save, or from a lagging index, can still arrive
+      // after it settles; it can't undo the saved preference.
       act(() => handler({ type: "changed", items: [original] }));
       expect(row().labels).toEqual(saved ? { [MUTED_LABEL_KEY]: "1" } : {});
       expect(isConversationMuted(row())).toBe(saved);
-      if (success) {
-        await waitFor(() =>
-          expect(invalidatedKeys(client, invalidate)).toEqual([JSON.stringify(key)]),
-        );
-      }
+      // Once the reindex window passes, a frame reports another device's change.
+      const later = Date.now() + MUTE_REINDEX_GRACE_MS;
+      vi.spyOn(Date, "now").mockReturnValue(later);
+      onTestFinished(() => vi.mocked(Date.now).mockRestore());
+      const remote = !saved;
+      act(() =>
+        handler({
+          type: "changed",
+          items: [{ ...original, labels: remote ? { [MUTED_LABEL_KEY]: "1" } : {} }],
+        }),
+      );
+      expect(isConversationMuted(row())).toBe(remote);
     },
   );
 });

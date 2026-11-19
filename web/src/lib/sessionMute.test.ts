@@ -1,19 +1,24 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   beginMuteSave,
   canFlagUnread,
   clearSessionMuteState,
-  contradictsSavedMute,
   isConversationMuted,
+  MUTE_REINDEX_GRACE_MS,
   muteReadMarker,
   MUTED_LABEL_KEY,
   reconcileMuteLabel,
   settleMuteSave,
   showsUnreadFor,
-  UNORDERED_READ,
 } from "./sessionMute";
 
-afterEach(clearSessionMuteState);
+beforeEach(() => {
+  vi.useFakeTimers();
+});
+afterEach(() => {
+  clearSessionMuteState();
+  vi.useRealTimers();
+});
 
 const row = (muted: boolean, extra: Record<string, string> = {}) => ({
   id: "session",
@@ -33,24 +38,27 @@ describe("session mute store", () => {
 
   it.each(
     [false, true].flatMap((muted) =>
-      (["before", "during", "after"] as const).flatMap((read) =>
+      (["before", "during", "in grace", "after grace"] as const).flatMap((read) =>
         [false, true].map((success) => ({ muted, read, success })),
       ),
     ),
   )(
-    "reconciles a read started $read a save of mute=$muted with success=$success",
+    "reconciles a read started $read for a save of mute=$muted with success=$success",
     ({ muted, read, success }) => {
       const saved = success ? muted : !muted;
       let readMarker = read === "before" ? muteReadMarker() : -1;
       beginMuteSave("session", muted);
       if (read === "during") readMarker = muteReadMarker();
       settleMuteSave("session", saved);
-      if (read === "after") readMarker = muteReadMarker();
-      // Older reads report the pre-save state; a read after the save reports
-      // whatever the server holds by then, here the opposite of the save.
-      const fetched = row(read === "after" ? !saved : !muted, { other: "fresh" });
+      vi.advanceTimersByTime(
+        read === "after grace" ? MUTE_REINDEX_GRACE_MS : MUTE_REINDEX_GRACE_MS - 1,
+      );
+      if (read === "in grace" || read === "after grace") readMarker = muteReadMarker();
+      // Earlier reads, or a lagging index, report the pre-save state; a read after
+      // the grace window reports what the server holds, here the opposite of the save.
+      const fetched = row(read === "after grace" ? !saved : !muted, { other: "fresh" });
       const reconciled = reconcileMuteLabel(fetched, readMarker);
-      const expected = read === "after" ? !saved : saved;
+      const expected = read === "after grace" ? !saved : saved;
       expect(!!reconciled.labels[MUTED_LABEL_KEY]).toBe(expected);
       expect(reconciled.labels.other).toBe("fresh");
       expect(isConversationMuted(row(!expected))).toBe(expected);
@@ -61,17 +69,6 @@ describe("session mute store", () => {
     beginMuteSave("session", true);
     expect(reconcileMuteLabel(row(false), muteReadMarker()).labels[MUTED_LABEL_KEY]).toBe("1");
     expect(isConversationMuted(row(false))).toBe(true);
-  });
-
-  it("keeps a saved preference over data without a read time, flagging disagreement", () => {
-    beginMuteSave("session", true);
-    expect(contradictsSavedMute(row(false))).toBe(false);
-    settleMuteSave("session", true);
-    expect(reconcileMuteLabel(row(false), UNORDERED_READ).labels[MUTED_LABEL_KEY]).toBe("1");
-    expect(isConversationMuted(row(false))).toBe(true);
-    expect(contradictsSavedMute(row(false))).toBe(true);
-    expect(contradictsSavedMute(row(true))).toBe(false);
-    expect(contradictsSavedMute({ id: "other", labels: {} })).toBe(false);
   });
 
   it("refuses an overlapping save for the same session but not another", () => {
