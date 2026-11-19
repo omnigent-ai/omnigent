@@ -39,6 +39,7 @@ from omnigent._terminal_picker_theme import PICKER_ACCENT, PICKER_MUTED
 from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.inner.native_attachments import attachment_cache_dir
 from omnigent.models.databricks_model_discovery import DatabricksClaudeCatalog
+from omnigent.models.model_catalog import resolve_catalog_model
 from omnigent.native import native_terminal
 from omnigent.runner.identity import OMNIGENT_INTERNAL_WS_ORIGIN
 from omnigent.runtime import tool_result_replay as trc
@@ -13026,10 +13027,28 @@ def test_resolve_native_claude_config_connect_broker_fallback(
     native Claude Code through the workspace gateway with a broker-minted apiKeyHelper."""
     _isolate_to_connect_fallback(monkeypatch)
     from omnigent.host import databricks_credential as dc
+    from omnigent.onboarding import providers
 
+    # Same-version tiers in the catalog's legacy ``databricks-`` spelling.
+    catalog_rows = (
+        "databricks-claude-haiku-5-5",
+        "databricks-claude-opus-5-5",
+        "databricks-claude-sonnet-5-5",
+        "databricks-claude-fable-5-2",
+    )
+    catalog = {"models": {name: {"mode": "chat"} for name in catalog_rows}}
+    monkeypatch.setattr(
+        "omnigent.models.model_catalog.resolve_catalog_model", resolve_catalog_model
+    )
+    monkeypatch.setattr(
+        providers,
+        "_fetch_provider_catalog",
+        lambda provider: catalog if provider == "databricks" else {},
+    )
     cfg = tmp_path / ".databrickscfg"
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    monkeypatch.delenv("OMNIGENT_DATABRICKS_GATEWAY_MODEL", raising=False)
     workspace_url = "https://ws.cloud.databricks.com"
     dc._write_profile(cfg, workspace_url)
     dc._write_sidecar(cfg, "https://srv", "hid", "launch-tok", workspace_url)
@@ -13047,8 +13066,8 @@ def test_resolve_native_claude_config_connect_broker_fallback(
     ]
     assert config.api_key_helper is not None
     assert "omnigent.host.databricks_credential token" in config.api_key_helper
-    # Model comes from the catalog default (stubbed by _stub_catalog_default).
-    assert config.model == "catalog-databricks-claude-default"
+    # The top tier in Unity Catalog spelling, not the first tier by name.
+    assert config.model == "system.ai.claude-opus-5-5"
 
 
 @pytest.mark.parametrize("gateway", [False, True])
@@ -13323,6 +13342,33 @@ def test_resolve_native_claude_config_spec_path_reaches_connect_broker(
     dc._write_sidecar(cfg, "https://srv", "hid", "launch-tok", "https://ws.example")
 
     config = claude_native.resolve_native_claude_config(spec=spec, refresh_models=False)
+    assert config is not None
+    assert config.env["ANTHROPIC_BASE_URL"] == "https://ws.example/ai-gateway/anthropic"
+    assert (
+        config.api_key_helper
+        and "omnigent.host.databricks_credential token" in config.api_key_helper
+    )
+
+
+def test_resolve_native_claude_config_databricks_connection_provider_uses_broker(
+    _isolated_provider_config: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A default ``connection: databricks`` provider routes Claude through the owner's broker."""
+    from omnigent.host import databricks_credential as dc
+
+    _seed_config(
+        _isolated_provider_config,
+        {"databricks-obo": {"kind": "databricks", "connection": "databricks", "default": True}},
+    )
+    cfg = _isolated_provider_config / ".databrickscfg"
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg))
+    dc._write_profile(cfg, "https://ws.example")
+    dc._write_sidecar(cfg, "https://srv", "hid", "launch-tok", "https://ws.example")
+
+    config = claude_native.resolve_native_claude_config(
+        spec=_no_auth_claude_spec(), refresh_models=False
+    )
+
     assert config is not None
     assert config.env["ANTHROPIC_BASE_URL"] == "https://ws.example/ai-gateway/anthropic"
     assert (
