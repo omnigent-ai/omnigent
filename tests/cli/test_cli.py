@@ -3272,6 +3272,64 @@ def test_expand_config_unresolved_var_raises(
 # ── _resolve_bundle_env_vars ─────────────────────────
 
 
+def _write_optional_knowledge_mcp(root: Path) -> None:
+    mcp_dir = root / "tools" / "mcp"
+    mcp_dir.mkdir(parents=True)
+    (mcp_dir / "knowledge.yaml").write_text(
+        yaml.dump(
+            {
+                "name": "knowledge",
+                "transport": "http",
+                "optional": True,
+                "url": "${OPT_MCP_URL}",
+                "headers": {"Authorization": "Bearer ${OPT_MCP_TOKEN}"},
+            }
+        )
+    )
+
+
+def _bundle_members(data: bytes) -> dict[str, bytes]:
+    import io
+    import tarfile
+
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
+        return {m.name: tf.extractfile(m).read() for m in tf.getmembers() if m.isfile()}  # type: ignore[union-attr]
+
+
+def test_bundle_leaves_out_optional_mcp_with_unset_variables(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An optional MCP server whose variables are unset is not uploaded, so the
+    server never receives a literal ``${VAR}`` url, and bundling does not fail."""
+    monkeypatch.delenv("OPT_MCP_URL", raising=False)
+    monkeypatch.delenv("OPT_MCP_TOKEN", raising=False)
+    _write_config(tmp_path, {"spec_version": 1, "name": "opt-agent"})
+    _write_optional_knowledge_mcp(tmp_path)
+
+    members = _bundle_members(_bundle(tmp_path))
+
+    assert "config.yaml" in members
+    assert "tools/mcp/knowledge.yaml" not in members
+
+
+def test_bundle_resolves_optional_mcp_when_variables_are_set(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With its variables set, an optional MCP server is uploaded resolved."""
+    monkeypatch.setenv("OPT_MCP_URL", "https://kb.example.com/mcp")
+    monkeypatch.setenv("OPT_MCP_TOKEN", "tok")
+    _write_config(tmp_path, {"spec_version": 1, "name": "opt-agent"})
+    _write_optional_knowledge_mcp(tmp_path)
+
+    members = _bundle_members(_bundle(tmp_path))
+
+    shipped = yaml.safe_load(members["tools/mcp/knowledge.yaml"])
+    assert shipped["url"] == "https://kb.example.com/mcp"
+    assert shipped["headers"] == {"Authorization": "Bearer tok"}
+
+
 def test_resolve_bundle_expands_config_yaml(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
