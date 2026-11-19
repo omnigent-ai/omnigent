@@ -1,4 +1,5 @@
 import os
+from uuid import uuid4
 
 import pytest
 import sqlalchemy as sa
@@ -10,6 +11,7 @@ from omnigent.db.db_models import (
     SqlProject,
     SqlProjectTicket,
     SqlProjectTicketEvent,
+    SqlProjectTicketLink,
     SqlProjectTicketSession,
 )
 from omnigent.db.utils import _build_alembic_config, clear_engine_cache, get_or_create_engine
@@ -18,6 +20,7 @@ TABLES = (
     SqlProjectTicket.__table__,
     SqlProjectTicketEvent.__table__,
     SqlProjectTicketSession.__table__,
+    SqlProjectTicketLink.__table__,
 )
 SCHEMA_PATHS = [
     "metadata",
@@ -138,6 +141,18 @@ def test_ticket_pages_seek_indexes_without_sorting(ticket_engine):
             "session_id",
             "sqlite_autoindex_project_ticket_sessions_1",
         ),
+        (
+            "project_ticket_links",
+            f"{ticket} AND related_ticket_id > :id",
+            "related_ticket_id",
+            "sqlite_autoindex_project_ticket_links_1",
+        ),
+        (
+            "project_ticket_links",
+            f"{project} AND related_ticket_id = :ticket AND ticket_id > :id",
+            "ticket_id",
+            "ix_project_ticket_links_reverse",
+        ),
     ]
     with ticket_engine.connect() as connection:
         for table, where, order, index in queries:
@@ -173,8 +188,51 @@ def test_migration_is_additive_and_reversible_before_ticket_writes(tmp_path):
         }
         with engine.begin() as connection:
             config.attributes["connection"] = connection
-            command.upgrade(config, "e8a9b0c1d2e3")
+            command.upgrade(config, "f9a0b1c2d3e4")
         assert {table.name for table in TABLES} <= set(sa.inspect(engine).get_table_names())
+    finally:
+        engine.dispose()
+        clear_engine_cache()
+
+
+def test_lifecycle_migration_preserves_existing_ticket_statuses_and_history(tmp_path):
+    from omnigent.entities.project_ticket import CreateTicket, TicketActor, UpdateTicket
+    from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+    from omnigent.stores.project_ticket_store import ProjectTicketStore
+
+    uri = f"sqlite:///{tmp_path / 'legacy.db'}"
+    engine = get_or_create_engine(uri)
+    config = _build_alembic_config(uri)
+    actor = TicketActor("owner")
+    project = SqlAlchemyProjectStore(uri).create(uuid4().hex, "Existing", actor.user_id)
+    tickets = ProjectTicketStore(uri)
+    records = []
+    for status in ("open", "in_progress", "done"):
+        ticket = tickets.create(project.id, CreateTicket(title=status), actor)
+        if status != "open":
+            ticket = tickets.update(
+                project.id,
+                ticket["id"],
+                UpdateTicket(
+                    status=status,
+                    completion_summary="Verified" if status == "done" else None,
+                ),
+                actor,
+            )
+        records.append((ticket, tickets.events(project.id, ticket["id"], user_id=actor.user_id)))
+    try:
+        with engine.begin() as connection:
+            config.attributes["connection"] = connection
+            command.downgrade(config, "e8a9b0c1d2e3")
+        assert "lead_session_id" not in {
+            column["name"] for column in sa.inspect(engine).get_columns("project_tickets")
+        }
+        with engine.begin() as connection:
+            config.attributes["connection"] = connection
+            command.upgrade(config, "f9a0b1c2d3e4")
+        for ticket, events in records:
+            assert tickets.get(project.id, ticket["id"], user_id=actor.user_id) == ticket
+            assert tickets.events(project.id, ticket["id"], user_id=actor.user_id) == events
     finally:
         engine.dispose()
         clear_engine_cache()

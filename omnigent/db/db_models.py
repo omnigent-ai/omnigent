@@ -954,6 +954,9 @@ class SqlProjectTicket(OmnigentBase):
     status: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     tags: Mapped[list[dict[str, str]]] = mapped_column(EnvelopedJSON(4096), nullable=False)
     completion_summary: Mapped[str | None] = mapped_column(EnvelopedText(8192), nullable=True)
+    plan: Mapped[str | None] = mapped_column(EnvelopedText(16383), nullable=True)
+    review_summary: Mapped[str | None] = mapped_column(EnvelopedText(8192), nullable=True)
+    lead_session_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
     latest_update: Mapped[str] = mapped_column(EnvelopedText(2048), nullable=False)
     comment_count: Mapped[int] = mapped_column(Integer, nullable=False)
     next_event_position: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -1031,6 +1034,28 @@ class SqlProjectTicketSession(OmnigentBase):
     ticket_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
     session_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
     created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
+class SqlProjectTicketLink(OmnigentBase):
+    """An untyped, undirected link stored once with the smaller ticket ID first."""
+
+    __tablename__ = "project_ticket_links"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    project_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    ticket_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    related_ticket_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+    __table_args__ = (
+        Index(
+            "ix_project_ticket_links_reverse",
+            "workspace_id",
+            "project_id",
+            "related_ticket_id",
+            "ticket_id",
+        ),
+    )
 
 
 class SqlConversation(ConversationBase):
