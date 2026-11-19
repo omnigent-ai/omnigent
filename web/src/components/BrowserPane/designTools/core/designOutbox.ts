@@ -274,18 +274,20 @@ async function postableNow(
   request: DesignRequest,
   holdBack: (why: "wait" | "account") => void,
 ): Promise<string | null> {
+  const owner = owners.get(request.id);
+  const signedIn = owner === undefined ? owner : await fetchSignedInUserId();
+  if (signedIn !== owner) {
+    // Can't tell who's signed in: wait, asking again before the next try.
+    if (signedIn === undefined) ownerConfirmedAt.delete(request.id);
+    holdBack(signedIn === undefined ? "wait" : "account");
+    return ACCOUNT_CHANGED;
+  }
+  // Last, after any wait above, so it's what's true as it posts.
   if (sessionState(request.conversationId)?.sessionStatus === "running") {
     holdBack("wait");
     return "A turn started while it was uploading";
   }
-  const owner = owners.get(request.id);
-  if (owner === undefined) return null;
-  const signedIn = await fetchSignedInUserId();
-  if (signedIn === owner) return null;
-  // Can't tell who's signed in: wait, asking again before the next try.
-  if (signedIn === undefined) ownerConfirmedAt.delete(request.id);
-  holdBack(signedIn === undefined ? "wait" : "account");
-  return ACCOUNT_CHANGED;
+  return null;
 }
 
 /** Why a send failed, for the user: refused (it never reached the agent), or maybe arrived. */

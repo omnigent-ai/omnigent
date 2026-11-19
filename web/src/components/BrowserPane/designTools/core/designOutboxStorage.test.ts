@@ -11,6 +11,8 @@ const identity = vi.hoisted(() => ({
   // The server can't be reached to say; counts the asks.
   unreachable: false,
   asks: 0,
+  // Set to hold the server's answers until it resolves.
+  answerAfter: null as Promise<void> | null,
   listeners: new Set<() => void>(),
 }));
 vi.mock("@/lib/identity", async (importOriginal) => ({
@@ -19,6 +21,7 @@ vi.mock("@/lib/identity", async (importOriginal) => ({
   resolveIdentity: async () => identity.user,
   fetchSignedInUserId: async () => {
     identity.asks += 1;
+    await identity.answerAfter;
     if (identity.unreachable) return undefined;
     return identity.signedIn === undefined ? identity.user : identity.signedIn;
   },
@@ -147,6 +150,7 @@ beforeEach(async () => {
   identity.signedIn = undefined;
   identity.unreachable = false;
   identity.asks = 0;
+  identity.answerAfter = null;
   // No session is ready, so requests stay unsent.
   useChatStore.setState({ conversationId: null, boundAgentId: null });
   await designOutboxSaved();
@@ -614,6 +618,47 @@ describe("design outbox storage", () => {
     // Alice again: a Retry posts it.
     identity.signedIn = "alice";
     retryDesignRequest(id);
+    await vi.waitFor(() => expect(posts).toEqual(["Alice's"]));
+  });
+
+  it("waits for a turn that starts while it asks who's signed in, just before it posts", async () => {
+    const posts: string[] = [];
+    let answer = () => {};
+    // Like the chat store: asks once the upload is done, and posts only if nothing holds it back.
+    const send = vi.fn(
+      async (text: string, _agent: string, _files?: File[], opts?: SendOptions) => {
+        if (posts.length === 0 && send.mock.calls.length === 1) {
+          identity.answerAfter = new Promise((resolve) => {
+            answer = resolve;
+          });
+        }
+        const heldBack = await opts?.beforePost?.();
+        if (heldBack) opts?.onError?.(heldBack, true);
+        else posts.push(text);
+      },
+    );
+    const ready = {
+      conversationId: SESSION,
+      boundAgentId: "agent_1",
+      status: "idle" as const,
+      sessionStatus: "idle" as const,
+      startupPending: false,
+      queuedMessages: [],
+      pendingUserMessages: [],
+      pendingModelChange: null,
+      send,
+    };
+    useChatStore.setState(ready);
+    const id = queueDesignRequest({ tabId: TAB, label: "Annotate", text: "Alice's" });
+    const status = () => useDesignOutbox.getState().requests.find((r) => r.id === id)?.status;
+    await vi.waitFor(() => expect(send).toHaveBeenCalledOnce());
+    // A turn starts while the server is asked; then it says Alice, still.
+    useChatStore.setState({ sessionStatus: "running" });
+    identity.answerAfter = null;
+    answer();
+    await vi.waitFor(() => expect(status()).toBe("waiting"));
+    expect(posts).toEqual([]);
+    useChatStore.setState({ sessionStatus: "idle" });
     await vi.waitFor(() => expect(posts).toEqual(["Alice's"]));
   });
 

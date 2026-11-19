@@ -45,7 +45,7 @@ export function retryingChunk<P extends object>(
     }, failedAgain);
   }
 
-  // Said once, so a module that throws as it loads can be told from a dropped connection.
+  // Said once: each retry that fails again would otherwise flood the log.
   let warned = false;
   function failedAgain(error: unknown): void {
     if (!warned) console.warn("A part of the app couldn't load; trying again later.", error);

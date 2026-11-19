@@ -273,6 +273,40 @@ describe("an external send that stops short", () => {
     expect(posted()).toBe(true);
   });
 
+  it("leaves a turn that started during its upload running when it's held back", async () => {
+    let finishUpload = () => {};
+    answerUpload(
+      () =>
+        new Promise<Response>((resolve) => {
+          finishUpload = () => resolve(jsonResponse({ id: "file_1", filename: "element.png" }));
+        }),
+      () => Promise.resolve(jsonResponse({ queued: true, item_id: "ci_mock" })),
+    );
+    const onError = vi.fn();
+    const sending = useChatStore.getState().send("design request", "agent_xyz", shot(), {
+      external: true,
+      stableId: "7".repeat(32),
+      onError,
+      beforePost: async () => "A turn started while it was uploading",
+    });
+    await vi.waitFor(() =>
+      expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith(FILES))).toBe(true),
+    );
+    // Another client's turn starts while the screenshot uploads (as the stream writes it).
+    const entry = conversationRegistry.peek(SESSION)!;
+    const other = { responseId: "response_other", state: "streaming" as const, error: null };
+    entry.setState({ sessionStatus: "running", activeResponse: other });
+    finishUpload();
+    await sending;
+    expect(onError).toHaveBeenCalledWith("A turn started while it was uploading", true);
+    expect(posted()).toBe(false);
+    const state = entry.getState();
+    expect(state.activeResponse).toEqual(other);
+    expect(state.sessionStatus).toBe("running");
+    expect(state.pendingUserMessages).toEqual([]);
+    expect(state.blocks).toEqual([]);
+  });
+
   it("is refused when its upload fails before the POST", async () => {
     answerUpload(
       () => Promise.reject(new TypeError("Failed to fetch")),

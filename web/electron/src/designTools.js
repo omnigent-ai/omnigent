@@ -663,7 +663,8 @@ function sharedDesignTools() {
 
 /** Whether `entry`'s page holds the keys: the page itself, or its open tool's overlay. */
 function isBrowserViewFocused(entry) {
-  return !!entry?.view.webContents.isFocused() || sharedDesignTools().overlayFocused(entry);
+  // Before any tool opens there's no overlay to hold them, nor need to load Electron.
+  return !!entry?.view.webContents.isFocused() || !!shared?.overlayFocused(entry);
 }
 
 /**

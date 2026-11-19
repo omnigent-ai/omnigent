@@ -3076,7 +3076,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       if (initialDraft && !initialSendPending()) return;
       opts?.signal?.throwIfAborted();
       const heldBack = opts?.beforePost ? await opts.beforePost() : null;
-      if (heldBack !== null) throw new Error(heldBack);
+      if (heldBack !== null) {
+        // Not a failure: nothing posted. Drop only this attempt's bubble and latch; a turn
+        // seen starting meanwhile isn't this send's to end.
+        setterFor(sessionId)((s) => ({
+          pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
+          ...(!alreadyStreaming && s.sessionStatus !== "running" && s.activeResponse === null
+            ? { status: "idle" as const, sendLatchedAt: null, sendLatchSeenRunning: null }
+            : {}),
+        }));
+        opts?.onError?.(heldBack, true);
+        return;
+      }
       opts?.signal?.throwIfAborted();
 
       // Promote "pending:<filename>" to real file_ids. Claude-native's

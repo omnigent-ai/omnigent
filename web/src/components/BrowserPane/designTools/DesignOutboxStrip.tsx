@@ -14,6 +14,7 @@ import { cn } from "@/lib/utils";
 import {
   forget,
   retryDesignRequest,
+  unsettled,
   useDesignOutbox,
   type DesignRequest,
 } from "./core/designOutbox";
@@ -101,7 +102,7 @@ export function DesignOutboxStrip({ conversationId, widthClassName }: DesignOutb
   const requests = useDesignOutbox(
     useShallow((state) =>
       state.requests.filter(
-        (request) => request.conversationId === conversationId && request.status !== "sent",
+        (request) => request.conversationId === conversationId && unsettled(request),
       ),
     ),
   );

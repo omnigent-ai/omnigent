@@ -54,7 +54,9 @@ describe("DesignOutboxStrip", () => {
     fireEvent.click(screen.getByRole("button", { name: "Remove Denied one" }));
     expect(useDesignOutbox.getState().requests.map((item) => item.id)).toEqual(["f"]);
     fireEvent.click(screen.getByRole("button", { name: "Retry Annotate button" }));
-    expect(useDesignOutbox.getState().requests[0]?.status).not.toBe("failed");
+    const retried = useDesignOutbox.getState().requests[0];
+    expect(["waiting", "sending"]).toContain(retried?.status);
+    expect(retried?.error).toBeUndefined();
   });
 
   it("shows a failure's whole text, which says what to check before retrying", () => {
