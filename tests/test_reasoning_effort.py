@@ -257,6 +257,14 @@ def test_efforts_for_harness_distinguishes_unsupported_from_unknown() -> None:
     assert efforts_for_harness(None) is None
 
 
+def test_kimi_native_rejects_an_effort_override() -> None:
+    """The Kimi CLI has no effort flag, so a requested effort is refused."""
+    from omnigent.util.reasoning_effort import validate_effort_for_harness
+
+    with pytest.raises(ValueError, match="'kimi-native' does not support a reasoning-effort"):
+        validate_effort_for_harness("high", "kimi-native")
+
+
 def test_efforts_for_harness_resolves_aliases() -> None:
     """An alias resolves to the same vocabulary as its canonical name."""
     from omnigent.harness_aliases import canonicalize_harness

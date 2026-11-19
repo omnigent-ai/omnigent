@@ -56,6 +56,9 @@ import contextlib
 import json
 import logging
 import math
+import os
+import re
+import stat
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -173,6 +176,9 @@ class _ForwardState:
     # Last user row that opened lifecycle state. Kept after fallback closure so
     # a stalled-cursor redelivery cannot reopen and close the same turn again.
     last_prompt_id: str | None = None
+    # Rows below this line were delivered before a cold resume. Kimi may rewrite
+    # a resumed wire under a new inode, which restarts the tail at line 0.
+    replay_floor_line: int = 0
 
 
 @dataclass
@@ -254,6 +260,85 @@ def clear_kimi_bridge_state(bridge_dir: Path) -> None:
         (bridge_dir / _STATE_FILE).unlink()
 
 
+#: Kimi names a session dir ``session_<uuid4>``; the name is its resume id.
+_KIMI_SESSION_DIR_RE = re.compile(
+    r"session_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+)
+
+
+def _resumable_kimi_session_id(
+    state: _ForwardState, *, kimi_home: Path, workspace: str
+) -> str | None:
+    """The Kimi session id behind *state*'s wire, or ``None`` if it can't be resumed.
+
+    The wire must be a regular file at ``sessions/<wd>/<session_uuid>/agents/main/
+    wire.jsonl`` of THIS home's private store, and the private session index must
+    list its session dir under *workspace*.
+    """
+    wire = Path(state.wire_path)
+    try:
+        if not stat.S_ISREG(wire.lstat().st_mode):
+            return None
+        parts = (
+            Path(os.path.realpath(wire))
+            .relative_to(os.path.realpath(kimi_home / "sessions"))
+            .parts
+        )
+    except (OSError, ValueError):
+        return None
+    if len(parts) != 5 or parts[2:] != ("agents", "main", "wire.jsonl"):
+        return None
+    session_name = parts[1]
+    if _KIMI_SESSION_DIR_RE.fullmatch(session_name) is None:
+        return None
+    session_dir = os.path.realpath(wire.parent.parent.parent)
+    for indexed_dir, work_dir in workdirs_for_kimi_sessions(kimi_home).items():
+        if work_dir == workspace and os.path.realpath(indexed_dir) == session_dir:
+            return session_name
+    return None
+
+
+def _terminated_line_count(wire: Path) -> int:
+    """Count the newline-terminated rows of *wire* (``0`` when unreadable)."""
+    try:
+        return wire.read_bytes().count(b"\n")
+    except OSError:
+        return 0
+
+
+def prepare_kimi_bridge_state(bridge_dir: Path, *, kimi_home: Path, workspace: str) -> str | None:
+    """Keep the prior launch's cursor when its Kimi session can resume, else clear it.
+
+    On a resumable session the delivered cursor and dedupe state survive (so
+    the new forwarder tails the same wire without re-posting history), only the
+    turn lifecycle resets, and a replay floor covers a wire Kimi rewrites on
+    resume. Otherwise behaves exactly like :func:`clear_kimi_bridge_state`.
+
+    :param bridge_dir: The kimi-native bridge dir holding the forwarder state.
+    :param kimi_home: The session's private ``KIMI_CODE_HOME``.
+    :param workspace: The resolved workspace the session runs in.
+    :returns: The Kimi session id to pass as ``-S``, or ``None`` for a fresh launch.
+    """
+    state = _read_state(bridge_dir)
+    session_id = (
+        _resumable_kimi_session_id(state, kimi_home=kimi_home, workspace=workspace)
+        if state is not None
+        else None
+    )
+    if state is None or session_id is None:
+        clear_kimi_bridge_state(bridge_dir)
+        return None
+    state.turn_open = False
+    state.tools_in_flight = 0
+    state.last_assistant_text = ""
+    state.dropped_edge_status = None
+    state.dropped_edge_output = ""
+    state.last_activity_ts = None
+    state.replay_floor_line = min(state.last_line, _terminated_line_count(Path(state.wire_path)))
+    _write_state(bridge_dir, state)
+    return session_id
+
+
 def _read_state(bridge_dir: Path) -> _ForwardState | None:
     try:
         raw = (bridge_dir / _STATE_FILE).read_text(encoding="utf-8")
@@ -278,6 +363,7 @@ def _read_state(bridge_dir: Path) -> _ForwardState | None:
     wire_ino = data.get("wire_ino")
     last_observed_size = data.get("last_observed_size")
     last_prompt_id = data.get("last_prompt_id")
+    replay_floor_line = data.get("replay_floor_line")
     if isinstance(wire_path, str) and isinstance(last_line, int) and isinstance(offset, int):
         return _ForwardState(
             wire_path=wire_path,
@@ -313,6 +399,11 @@ def _read_state(bridge_dir: Path) -> _ForwardState | None:
                 and not isinstance(data.get("turn_seq"), bool)
                 else 0
             ),
+            replay_floor_line=(
+                replay_floor_line
+                if isinstance(replay_floor_line, int) and not isinstance(replay_floor_line, bool)
+                else 0
+            ),
         )
     return None
 
@@ -335,6 +426,7 @@ def _write_state(bridge_dir: Path, state: _ForwardState) -> None:
         "last_observed_size": state.last_observed_size,
         "last_prompt_id": state.last_prompt_id,
         "turn_seq": state.turn_seq,
+        "replay_floor_line": state.replay_floor_line,
     }
     tmp = bridge_dir / (_STATE_FILE + ".tmp")
     with contextlib.suppress(OSError):
@@ -1532,6 +1624,7 @@ async def forward_kimi_wire_to_session(
     # Per-turn discriminator for fallback edge ids (see _ForwardState).
     turn_seq = state.turn_seq if state is not None else 0
     last_prompt_id = state.last_prompt_id if state is not None else None
+    replay_floor_line = state.replay_floor_line if state is not None else 0
     wire_dev = state.wire_dev if state is not None else None
     wire_ino = state.wire_ino if state is not None else None
     last_observed_size = (
@@ -1592,6 +1685,7 @@ async def forward_kimi_wire_to_session(
                     last_observed_size=last_observed_size,
                     last_prompt_id=last_prompt_id,
                     turn_seq=turn_seq,
+                    replay_floor_line=replay_floor_line,
                 ),
             )
 
@@ -1684,6 +1778,7 @@ async def forward_kimi_wire_to_session(
                     last_seen_offset = 0
                     last_observed_size = None
                     last_prompt_id = None
+                    replay_floor_line = 0
                     try:
                         discovered_stat = discovered.stat()
                     except OSError:
@@ -1751,6 +1846,10 @@ async def forward_kimi_wire_to_session(
                     last_line,
                     include_unterminated=stable_dead_tail,
                 )
+                if replay_floor_line:
+                    # History delivered before a cold resume, re-read after Kimi
+                    # rewrote the wire; the trailing consume skips past it.
+                    items = [item for item in items if item.line_no >= replay_floor_line]
                 dead_tail_pending = (
                     pane_is_alive is False
                     and not stable_dead_tail
