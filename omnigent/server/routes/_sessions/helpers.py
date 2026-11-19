@@ -12618,7 +12618,7 @@ def require_filesystem_attachment_runtime(
     :param runner_router: Router used to distinguish a remote host from an offline one.
     :param capability: Capability the files need (see
         :func:`~omnigent.inner.native_attachments.filesystem_attachment_capability`),
-        defaulting to the one for the default extensions.
+        defaulting to the one for the legacy extensions.
     :raises OmnigentError: When the runtime needs an upgrade, connection, or reroute.
     """
     from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS

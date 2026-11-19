@@ -452,10 +452,11 @@ def test_attachment_cache_defaults_to_omnigent_folder(
 
 
 @pytest.mark.parametrize(
-    "filename", ["archive.zip", "report.docx", "sheet.xlsx", "deck.pptx", "app.sqlite3"]
+    "filename",
+    ["archive.zip", "report.docx", "sheet.xlsx", "deck.pptx", "app.sqlite3", "clip.MP4"],
 )
 def test_requires_filesystem_allowed(filename: str) -> None:
-    """Archives, office documents, and databases are filesystem."""
+    """Default binary formats are delivered through filesystem tools."""
     assert requires_filesystem(filename)
 
 
@@ -516,10 +517,11 @@ def test_uses_filesystem_delivery(filename: str, metadata: object, expected: boo
     [
         (["a.zip", "b.docx"], CAP_FILESYSTEM_ATTACHMENTS),
         (["a.zip", "trace.gz"], CAP_FILESYSTEM_ATTACHMENT_DELIVERY),
+        (["clip.MP4"], CAP_FILESYSTEM_ATTACHMENT_DELIVERY),
     ],
 )
 def test_filesystem_attachment_capability(filenames: list[str], capability: str) -> None:
-    """Only types outside the default extensions need the newer runtime capability."""
+    """Formats beyond the original extensions need recorded-delivery support."""
     assert filesystem_attachment_capability(filenames) == capability
 
 

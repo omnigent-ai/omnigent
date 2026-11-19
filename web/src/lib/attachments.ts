@@ -151,7 +151,7 @@ const TEXT_CODE_EXTENSIONS = new Set([
   ".ipynb",
 ]);
 
-// Archives, Office documents, and databases require filesystem tools unless the
+// Archives, Office documents, databases, and MP4 videos require filesystem tools unless the
 // server reports its own policy. Mirrors DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS
 // in omnigent/inner/native_attachments.py.
 const DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS = new Set([
@@ -162,6 +162,7 @@ const DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS = new Set([
   ".db",
   ".sqlite",
   ".sqlite3",
+  ".mp4",
 ]);
 
 // Text/code extensions a browser may not map to a `text/*` type, which then
@@ -193,7 +194,7 @@ function extensionOf(filename: string): string {
 
 /**
  * Classify a file into an attachment category, or `null` if its type is not
- * supported (e.g. audio, video, unrecognised binaries). Files requiring local
+ * supported (e.g. audio, other video, unrecognised binaries). Files requiring local
  * tools are identified by extension; other types also use the browser MIME.
  * `policy` is the server's filesystem attachment policy from `/v1/info`.
  */
@@ -231,7 +232,7 @@ function supportedAttachmentTypes(policy?: FilesystemAttachmentsInfo | null): st
     (extensions.length === DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS.size &&
       extensions.every((ext) => DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS.has(ext)));
   if (isDefault) {
-    return "images, PDF, text/code, archives, office documents, and databases";
+    return "images, PDF, text/code, archives, office documents, databases, and MP4 videos";
   }
   if (extensions.length === 0) return "images, PDF, and text/code files";
   return `images, PDF, text/code, and ${extensions.join(", ")} files`;
