@@ -1,0 +1,13 @@
+{"type": "metadata", "protocol_version": "1.5", "created_at": 1786191500000}
+{"type": "permission.set_mode", "mode": "manual", "time": 1786191500010}
+{"type": "turn.prompt", "input": [{"type": "text", "text": "sanitized user prompt"}], "origin": {"kind": "user"}, "time": 1786191500020}
+{"type": "context.append_message", "message": {"role": "user", "content": [{"type": "text", "text": "sanitized"}]}, "time": 1786191500021}
+{"type": "context.append_loop_event", "event": {"type": "step.begin", "uuid": "0b7d6f3e-1c2a-4e5f-8a9b-0c1d2e3f4a5b", "turnId": "0", "step": 1}, "time": 1786191500023}
+{"type": "llm.request", "kind": "loop", "provider": "openai", "model": "system.ai.kimi-k3", "modelAlias": "kimi-k3-databricks"}
+{"type": "context.append_loop_event", "event": {"type": "content.part", "uuid": "1c8e7a4f-2d3b-4f60-9bac-1d2e3f4a5b6c", "turnId": "0", "step": 1, "stepUuid": "0b7d6f3e-1c2a-4e5f-8a9b-0c1d2e3f4a5b", "part": {"type": "text", "text": "sanitized text part"}}, "time": 1786191501200}
+{"type": "context.append_loop_event", "event": {"type": "tool.call", "uuid": "2d9f8b5a-3e4c-4071-acbd-2e3f4a5b6c7d", "turnId": "0", "step": 1, "stepUuid": "0b7d6f3e-1c2a-4e5f-8a9b-0c1d2e3f4a5b", "toolCallId": "call_shell_1", "name": "Bash", "args": {"command": "sleep 60"}}, "time": 1786191501300}
+{"type": "turn.cancel", "turnId": 0, "target": "active", "reason": "user_cancelled", "time": 1786191505400}
+{"type": "turn.step.interrupted", "turnId": 0, "step": 1, "reason": "aborted", "time": 1786191505401}
+{"type": "agent.turn.ended", "turnId": 0, "outcome": "cancelled", "time": 1786191505402}
+{"type": "turn.ended", "turnId": 0, "reason": "cancelled", "durationMs": 5382, "time": 1786191505403}
+{"type": "prompt.completed", "reason": "cancelled", "time": 1786191505404}
