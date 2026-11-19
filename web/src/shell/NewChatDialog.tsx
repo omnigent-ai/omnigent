@@ -71,6 +71,8 @@ import {
   ComposerFeedbackRow,
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
+import { useRequestedComposerEngine } from "@/components/composer/engine/composerEnginePolicy";
+import type { ComposerTextTarget } from "@/components/composer/engine/composerInput";
 import {
   ComposerMirror,
   MIRRORED_TEXTAREA_CLASS,
@@ -2727,7 +2729,14 @@ function NewChatLandingContent({
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const textareaRef = useRef<ComposerTextTarget | null>(null);
+  // Held as state too, so an engine switch that replaces the input re-binds the mention mirror.
+  const [textareaNode, setTextareaNode] = useState<ComposerTextTarget | null>(null);
+  const bindTextarea = useCallback((element: ComposerTextTarget | null) => {
+    textareaRef.current = element;
+    setTextareaNode(element);
+  }, []);
+  const composerEngine = useRequestedComposerEngine();
   const submitTooltipTriggerRef = useRef<HTMLSpanElement>(null);
   const [submitTooltipState, setSubmitTooltipState] = useState<"closed" | "open" | "pinned">(
     "closed",
@@ -5661,7 +5670,7 @@ function NewChatLandingContent({
   // The draft snapshot is built above the hook; add the tags it owns.
   draftRef.current.mentions = { files: mentionedItems, sessions: mentionedSessions };
   const mentionTokensShown = findMentionTokens(message, mentionTokens).length > 0;
-  useComposerMirrorAlignment(mirrorRef, textareaRef, mentionTokensShown);
+  useComposerMirrorAlignment(mirrorRef, textareaRef, mentionTokensShown, textareaNode);
 
   const workspaceTarget = JSON.stringify([projectParam, selectedHostId, sandboxSelected]);
   const [workspaceReadyTarget, setWorkspaceReadyTarget] = useState<string | null>(null);
@@ -7613,6 +7622,9 @@ function NewChatLandingContent({
             className="relative z-30"
           >
             <ChatComposer
+              engine={composerEngine}
+              dictating={dictation.hasInterim}
+              onActiveInputChange={bindTextarea}
               appearance={isMobileViewport ? "glass" : "default"}
               hasContent={
                 files.length > 0 ||
@@ -7624,7 +7636,7 @@ function NewChatLandingContent({
               className={cn(isDragActive && "ring-2 ring-ring ring-inset")}
               data-testid="new-chat-landing-composer"
               input={{
-                ref: textareaRef,
+                ref: bindTextarea,
                 value: message,
                 className: mentionTokensShown ? MIRRORED_TEXTAREA_CLASS : undefined,
                 onScroll: (e) => {
@@ -7632,8 +7644,8 @@ function NewChatLandingContent({
                 },
                 onSelect: (e) => slashCompletion.onSelectionChange(e.currentTarget),
                 onChange: (e) => {
-                  slashCompletion.onSelectionChange(e.target);
-                  setMessage(e.target.value);
+                  slashCompletion.onSelectionChange(e.currentTarget);
+                  setMessage(e.currentTarget.value);
                   // A rejected attachment is never added, so there's no chip to
                   // remove and nothing else would ever clear this. Left sticky it
                   // reads as a blocker on a composer the user can actually submit.
@@ -7642,8 +7654,8 @@ function NewChatLandingContent({
                   // Sessions are taggable for every agent; files need ``mentionEnabled``.
                   setMention(
                     detectMentionAt(
-                      e.target.value,
-                      e.target.selectionStart ?? e.target.value.length,
+                      e.currentTarget.value,
+                      e.currentTarget.selectionStart ?? e.currentTarget.value.length,
                       sessionEntries.map((session) => session.title),
                     ),
                   );

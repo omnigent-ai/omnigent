@@ -23,7 +23,9 @@ import {
   useLayoutEffect,
   useMemo,
   useRef,
+  useState,
   type Ref,
+  type RefObject,
 } from "react";
 
 import { cn } from "@/lib/utils";
@@ -94,6 +96,37 @@ function theme(heightMode: ComposerInputHeightMode): Extension {
     ".cm-line": { padding: "0" },
     ".cm-placeholder": { color: "var(--muted-foreground)" },
   });
+}
+
+/**
+ * Whether an ancestor fieldset is disabled. A contenteditable ignores a disabled fieldset,
+ * which a textarea honours, so the editor follows it. Tracks each fieldset's `disabled`.
+ */
+function useFieldsetDisabled(hostRef: RefObject<HTMLElement | null>): boolean {
+  const [disabled, setDisabled] = useState(false);
+  useLayoutEffect(() => {
+    const host = hostRef.current;
+    if (!host) return;
+    const fieldsets: HTMLFieldSetElement[] = [];
+    for (let node = host.parentElement; node; node = node.parentElement) {
+      if (node instanceof HTMLFieldSetElement) fieldsets.push(node);
+    }
+    // Like a textarea, a disabled fieldset's first legend keeps its contents enabled.
+    const sync = () =>
+      setDisabled(
+        fieldsets.some(
+          (fieldset) =>
+            fieldset.disabled && !fieldset.querySelector(":scope > legend")?.contains(host),
+        ),
+      );
+    const observer = new MutationObserver(sync);
+    for (const fieldset of fieldsets) {
+      observer.observe(fieldset, { attributes: true, attributeFilter: ["disabled"] });
+    }
+    sync();
+    return () => observer.disconnect();
+  }, [hostRef]);
+  return disabled;
 }
 
 function attributes(
@@ -265,6 +298,8 @@ function CodeMirrorComposer({
   const viewRef = useRef<EditorView | null>(null);
   const surfaceRef = useRef<ComposerEditorSurface | null>(null);
   const latest = useRef(props);
+  const fieldsetDisabled = useFieldsetDisabled(hostRef);
+  const disabled = props.disabled === true || fieldsetDisabled;
   useLayoutEffect(() => {
     latest.current = props;
   });
@@ -402,7 +437,7 @@ function CodeMirrorComposer({
   // One key for every prop that becomes an editor or content attribute.
   const attributeKey = JSON.stringify([
     props.placeholder,
-    props.disabled,
+    disabled,
     props.readOnly,
     props["aria-label"],
     props["aria-keyshortcuts"],
@@ -423,13 +458,15 @@ function CodeMirrorComposer({
     const view = viewRef.current;
     if (!view) return;
     view.dispatch({
-      effects: compartments.attributes.reconfigure(attributes(latest.current, environment)),
+      effects: compartments.attributes.reconfigure(
+        attributes({ ...latest.current, disabled }, environment),
+      ),
     });
     // CodeMirror always marks its content aria-multiline, which a combobox doesn't take. It only
     // rewrites attributes whose value changed, so removing it here holds until the role changes.
     if (latest.current.role === "combobox") view.contentDOM.removeAttribute("aria-multiline");
     else view.contentDOM.setAttribute("aria-multiline", "true");
-  }, [compartments, attributeKey, environment]);
+  }, [compartments, attributeKey, disabled, environment]);
   useEffect(() => {
     viewRef.current?.dispatch({
       effects: compartments.placeholder.reconfigure(placeholderText(placeholder ?? "")),
@@ -449,7 +486,7 @@ function CodeMirrorComposer({
       // A caller's text size replaces the default one, as the floating panel's does.
       className={cn(
         "composer-input-text relative w-full text-ui text-foreground md:min-h-[42px]",
-        props.disabled && "opacity-60",
+        disabled && "opacity-60",
         className,
       )}
     />

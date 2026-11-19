@@ -36,6 +36,13 @@ import type * as UseWorkspaceChangedFilesModule from "@/hooks/useWorkspaceChange
 import { gridCellComposerKey, useChatStore, type ChatState } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
+import * as CodeMirrorModule from "@/components/composer/engine/codeMirrorComposerModule";
+import {
+  codeMirrorComposerLoad,
+  resetCodeMirrorComposerLoadForTests,
+} from "@/components/composer/engine/codeMirrorComposerLoader";
+import { composerTargetOf } from "@/components/composer/engine/composerInput";
+import { insertComposerText } from "@/lib/composerText";
 import { SideChatPane } from "./SideChatPane";
 
 vi.mock("@/store/chatStore", async (importOriginal) => ({
@@ -3261,5 +3268,37 @@ describe("grid cell @-mention picker", () => {
     expect(screen.queryByTitle("Attach readme.md")).toBeNull();
     expect(mentionListing.workspaceQueries).toContainEqual({ owner: childId, enabled: false });
     expect(mentionListing.workspaceQueries.some((query) => query.enabled === true)).toBe(false);
+  });
+});
+
+describe("side-chat composer engine", () => {
+  const withFlag = (enabled: boolean) => (
+    <CapabilitiesProvider
+      info={{ ...FALLBACK_SERVER_INFO, features: { chat_composer_codemirror: enabled } }}
+    >
+      <SideChatPane childId={childId} />
+    </CapabilitiesProvider>
+  );
+  beforeEach(() => resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule));
+  afterEach(() => resetCodeMirrorComposerLoadForTests());
+
+  it("writes in CodeMirror and sends a typed question when the flag is on", async () => {
+    renderPane(withFlag(true));
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    const editor = screen.getByTestId("side-chat-input");
+    act(() => insertComposerText(composerTargetOf(editor)!, "Follow up"));
+    fireEvent.keyDown(editor, { key: "Enter" });
+    expect(send).toHaveBeenCalledExactlyOnceWith("Follow up", "agent_side", undefined, {
+      pinnedConversationId: childId,
+    });
+  });
+
+  it("keeps the textarea when the flag is off", () => {
+    renderPane(withFlag(false));
+    expect(screen.getByTestId("side-chat-input").tagName).toBe("TEXTAREA");
+    expect(document.querySelector('[data-composer-engine="codemirror"]')).toBeNull();
+    expect(codeMirrorComposerLoad().status).toBe("idle");
   });
 });

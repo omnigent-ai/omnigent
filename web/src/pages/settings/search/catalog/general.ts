@@ -76,6 +76,7 @@ export const TERMINAL_CLIPBOARD_ENTRY = settingsEntry({
 
 export const OPEN_LINKS_IN_APP_ENTRY = settingsEntry({
   id: "open-links-in-app",
+  available: (availability) => availability.inAppBrowser,
   section: "general",
   label: "Open links in the in-app browser",
   description: `Open chat links in-app, reusing matching tabs. ${MOD_KEY}+click also opens in-app; Shift+click opens your default browser.`,
@@ -84,6 +85,7 @@ export const OPEN_LINKS_IN_APP_ENTRY = settingsEntry({
 
 export const ADMIN_VIEW_ENTRY = settingsEntry({
   id: "admin-view",
+  available: (availability) => availability.adminView,
   section: "general",
   label: "Admin view",
   description: "Turn off to use your normal session access.",
@@ -118,6 +120,19 @@ export const PROACTIVE_AGENT_ENTRY = settingsEntry({
   presence: { retry: { states: ["could not load"] } },
 });
 
+/** The desktop app's shortcut that brings it forward; a row only desktop builds show. */
+export const GLOBAL_SHORTCUT_ENTRY = settingsEntry({
+  id: "global-shortcut",
+  available: (availability) => availability.globalShortcut,
+  section: "general",
+  label: "Show Omnigent from anywhere",
+  description: "Brings Omnigent to the front from any app.",
+  keywords: ["shortcut", "hotkey", "keyboard", "global", "desktop", "bring to front", "window"],
+  // Named by the chord it holds, or by the prompt while it records one.
+  parts: { recorder: "Shortcut" },
+  nameTemplates: { recorder: { before: "Shortcut: " } },
+});
+
 export const GENERAL_SETTINGS = [
   SUBMIT_WITH_MOD_ENTER_ENTRY,
   ALWAYS_STEER_ENTRY,
@@ -130,4 +145,6 @@ export const GENERAL_SETTINGS = [
   PROJECT_KANBAN_BOARD_ENTRY,
   BROWSER_AGENT_TOOLS_ENTRY,
   PROACTIVE_AGENT_ENTRY,
+
+  GLOBAL_SHORTCUT_ENTRY,
 ] as const;
