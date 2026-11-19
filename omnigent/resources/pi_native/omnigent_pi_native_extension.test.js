@@ -860,16 +860,50 @@ async function testChildWrittenAfterTheLastPollIsReportedAtShutdown() {
   const watcher = f.watcher();
   watcher.start();
   await watcher.poll();
-  const file = path.join(f.sessions, path.basename(f.parentFile, ".jsonl"), "run", "session.jsonl");
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  fs.writeFileSync(file,
+  const childDir = path.join(f.sessions, path.basename(f.parentFile, ".jsonl"));
+  const writeChild = (relative, text) => {
+    fs.mkdirSync(path.dirname(path.join(childDir, relative)), { recursive: true });
+    fs.writeFileSync(path.join(childDir, relative), text);
+    return path.join(childDir, relative);
+  };
+  // A tool result longer than one read chunk precedes the final usage.
+  const bigLine = JSON.stringify({ type: "message", message: { role: "toolResult", content: "x".repeat(1100 * 1024) } }) + "\n";
+  writeChild("run/session.jsonl",
     childSessionLines({ id: "late", parentFile: f.parentFile, agent: "worker" }) +
-    assistantLine("model-a", 2000, 100, 10));
+    bigLine + assistantLine("model-a", 2000, 100, 10));
+  const launcher = writeChild("b-launcher/session.jsonl",
+    childSessionLines({ id: "launcher", parentFile: f.parentFile, agent: "lead" }) +
+    assistantLine("model-a", 2000, 30, 3));
+  writeChild("a-nested/session.jsonl",
+    childSessionLines({ id: "nested01", parentFile: launcher, agent: "scout" }) +
+    assistantLine("model-b", 2000, 40, 4));
+  // No session_info title yet, written moments before shutdown.
+  writeChild("untitled/session.jsonl",
+    JSON.stringify({ type: "session", id: "untitled", timestamp: new Date(1000).toISOString(), parentSession: f.parentFile }) +
+    "\n" + assistantLine("model-a", 2000, 50, 5));
 
-  await watcher.stop();
-  assert("a child written after the last poll is registered and reported at shutdown",
-    f.posts.some((p) => p.body.type === "external_acp_subagent_start" && p.body.data.subagent_id === "worker-late") &&
-      childUsage(f.posts, "conv_worker-late").at(-1)?.cumulative_input_tokens === 110,
+  // Sorted enumeration lists the nested child's directory before its launcher's.
+  const readdirSync = fs.readdirSync;
+  fs.readdirSync = (...args) => readdirSync(...args).sort((a, b) => (a.name < b.name ? -1 : 1));
+  try {
+    await watcher.stop();
+  } finally {
+    fs.readdirSync = readdirSync;
+  }
+  const started = (subagentId, sessionId = "conv_parent") => f.posts.some((p) =>
+    p.sessionId === sessionId && p.body.type === "external_acp_subagent_start" && p.body.data.subagent_id === subagentId);
+  assert("a child written after the last poll is registered and reported past a chunk boundary at shutdown",
+    started("worker-late") && childUsage(f.posts, "conv_worker-late").at(-1)?.cumulative_input_tokens === 110,
+    JSON.stringify(f.posts.filter((p) => p.sessionId.includes("late"))));
+  assert("a nested child enumerated before its launcher attaches to it at shutdown",
+    started("lead-launcher") && started("scout-nested01", "conv_lead-launcher") &&
+      childUsage(f.posts, "conv_lead-launcher").at(-1)?.cumulative_input_tokens === 40 &&
+      childUsage(f.posts, "conv_scout-nested01").at(-1)?.cumulative_input_tokens === 50,
+    JSON.stringify(f.posts));
+  assert("an untitled child written just before shutdown is reported under the fallback title",
+    f.posts.some((p) => p.body.type === "external_acp_subagent_start" &&
+      p.body.data.subagent_id === "subagent-untitled" && p.body.data.title === "subagent") &&
+      childUsage(f.posts, "conv_subagent-untitled").at(-1)?.cumulative_input_tokens === 60,
     JSON.stringify(f.posts));
 }
 

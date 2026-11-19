@@ -1301,7 +1301,7 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
     });
   }
 
-  function discover() {
+  function discover(final) {
     for (const root of roots) {
       const files = [];
       listSessionFiles(path.join(path.dirname(root), path.basename(root, ".jsonl")), 0, files);
@@ -1314,7 +1314,7 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
           continue;
         }
         // Give Pi a moment to write the session name used as the title.
-        if (header.title === "subagent" && now() - (fs.statSync(file, { throwIfNoEntry: false })?.mtimeMs ?? 0) < 5_000)
+        if (!final && header.title === "subagent" && now() - (fs.statSync(file, { throwIfNoEntry: false })?.mtimeMs ?? 0) < 5_000)
           continue;
         children.push({
           ...header, file, childId: null, offset: 0, lastStop: null,
@@ -1365,7 +1365,7 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
     if (usage.model) child.usage.model = usage.model;
   }
 
-  // Consume only complete lines appended since the last poll.
+  // Consume complete lines appended since the last poll, chunk by chunk up to the observed size.
   function readNew(child) {
     let stat;
     try {
@@ -1374,22 +1374,22 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
       return;
     }
     child.mtimeMs = stat.mtimeMs;
-    const remaining = stat.size - child.offset;
-    if (remaining <= 0) return;
-    let buffer = readFileRange(child.file, child.offset, Math.min(remaining, _CHILD_READ_CHUNK_BYTES));
-    if (buffer && buffer.lastIndexOf(10) < 0 && remaining > _CHILD_READ_CHUNK_BYTES)
-      buffer = readFileRange(child.file, child.offset, remaining);
-    const end = buffer ? buffer.lastIndexOf(10) : -1;
-    if (end < 0) return;
-    for (const line of buffer.subarray(0, end).toString("utf8").split("\n")) {
-      const entry = parseJsonLine(line);
-      const message = entry?.type === "message" ? entry.message : null;
-      // A forked child starts with a copy of its parent's history.
-      if (message?.role !== "assistant" || message.timestamp < child.startedAt) continue;
-      addUsage(child, message);
-      child.lastStop = typeof message.stopReason === "string" ? message.stopReason : null;
+    for (let remaining = stat.size - child.offset; remaining > 0; remaining = stat.size - child.offset) {
+      let buffer = readFileRange(child.file, child.offset, Math.min(remaining, _CHILD_READ_CHUNK_BYTES));
+      if (buffer && buffer.lastIndexOf(10) < 0 && remaining > _CHILD_READ_CHUNK_BYTES)
+        buffer = readFileRange(child.file, child.offset, remaining);
+      const end = buffer ? buffer.lastIndexOf(10) : -1;
+      if (end < 0) return;
+      for (const line of buffer.subarray(0, end).toString("utf8").split("\n")) {
+        const entry = parseJsonLine(line);
+        const message = entry?.type === "message" ? entry.message : null;
+        // A forked child starts with a copy of its parent's history.
+        if (message?.role !== "assistant" || message.timestamp < child.startedAt) continue;
+        addUsage(child, message);
+        child.lastStop = typeof message.stopReason === "string" ? message.stopReason : null;
+      }
+      child.offset += end + 1;
     }
-    child.offset += end + 1;
   }
 
   async function report(child) {
@@ -1422,15 +1422,20 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
     } catch (_err) {}
   }
 
-  async function runPoll() {
+  async function runPoll(final) {
     const current = sessionFile();
     if (current && !roots.includes(path.resolve(current))) roots.push(path.resolve(current));
-    discover();
+    discover(final);
     const minted = [];
-    for (const child of children) {
-      if (!(await ensureMinted(child))) continue;
-      readNew(child);
-      minted.push(child);
+    // Repeat while registering a launcher lets its nested children attach.
+    for (let progress = true; progress;) {
+      progress = false;
+      for (const child of children) {
+        if (minted.includes(child) || !(await ensureMinted(child))) continue;
+        readNew(child);
+        minted.push(child);
+        progress = true;
+      }
     }
     // Persist cursors and totals before reporting them.
     persist();
@@ -1438,8 +1443,9 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
   }
 
   return {
-    poll() {
-      if (enabled) polling ||= runPoll().finally(() => { polling = null; });
+    // The final poll skips the title grace period so late children are still reported.
+    poll(final = false) {
+      if (enabled) polling ||= runPoll(final).finally(() => { polling = null; });
       return polling || Promise.resolve();
     },
     start() {
@@ -1451,7 +1457,7 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now }) {
     async stop() {
       clearInterval(timer);
       timer = null;
-      const final = Promise.resolve(polling).catch(() => {}).then(() => this.poll());
+      const final = Promise.resolve(polling).catch(() => {}).then(() => this.poll(true));
       const bound = new AbortController();
       await Promise.race([final.catch(() => {}), sleep(assistantItemPostTimeoutMs(config), bound.signal)]);
       bound.abort();
