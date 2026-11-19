@@ -384,7 +384,11 @@ function loadNavigationHarness({
             focus: () => {
               bar.focused = true;
             },
-            show: () => {},
+            visible: false,
+            isVisible: () => bar.visible,
+            show: () => {
+              bar.visible = true;
+            },
             setBounds: () => {},
             isDestroyed: () => destroyed,
             close() {
@@ -6039,16 +6043,72 @@ describe("find bar selection prefill (src/main.js)", () => {
   });
 
   it("keeps the query when Cmd/Ctrl+F is pressed inside the bar", async (t) => {
-    const { h, order } = harness(t, { current: "migration" });
+    const selection = { current: "migration" };
+    const { h, order } = harness(t, selection);
     h.api.openFindBar(h.win);
     const bar = h.findBars[0];
+    bar.emit("ready-to-show");
+    await settle();
+    // A slow page read from the chat is still pending when the user, now typing in
+    // the bar, presses Cmd/Ctrl+F there.
+    let finishRead;
+    selection.current = new Promise((resolve) => {
+      finishRead = resolve;
+    });
+    h.api.openFindBar(h.win);
     bar.focused = true;
     order.length = 0;
     h.api.openFindBar(h.win);
+    finishRead("rollback");
     await settle();
     assert.deepEqual(order, ["omnigent:find-opened"]);
     assert.ok(bar.webContents.sent.some(({ channel }) => channel === "omnigent:find-activate"));
+    assert.deepEqual(
+      prefills(bar).map(({ data }) => data.text),
+      ["migration"],
+    );
+  });
+
+  it("fills a bar that is still loading with the latest selection", async (t) => {
+    const selection = { current: "migration" };
+    const { h } = harness(t, selection);
+    h.api.openFindBar(h.win);
+    const bar = h.findBars[0];
+    selection.current = "rollback";
+    h.api.openFindBar(h.win);
+    await settle();
     assert.deepEqual(prefills(bar), []);
+    bar.emit("ready-to-show");
+    await settle();
+    assert.deepEqual(
+      prefills(bar).map(({ data }) => data.text),
+      ["rollback"],
+    );
+  });
+
+  it("applies only the latest selection when Cmd/Ctrl+F is pressed twice", async (t) => {
+    const selection = { current: "migration" };
+    const { h } = harness(t, selection);
+    h.api.openFindBar(h.win);
+    const bar = h.findBars[0];
+    bar.emit("ready-to-show");
+    await settle();
+    let finishRead;
+    selection.current = new Promise((resolve) => {
+      finishRead = resolve;
+    });
+    h.api.openFindBar(h.win);
+    // The user clicks back into the chat to select another word.
+    bar.focused = false;
+    selection.current = "snapshot";
+    h.api.openFindBar(h.win);
+    await settle();
+    finishRead("rollback");
+    await settle();
+    assert.deepEqual(
+      prefills(bar).map(({ data }) => data.text),
+      ["migration", "snapshot"],
+    );
   });
 });
 

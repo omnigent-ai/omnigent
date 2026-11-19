@@ -3047,6 +3047,8 @@ function attachContextMenu(win) {
  * @type {Map<BrowserWindow, BrowserWindow>} shell window → its find bar
  */
 const findBars = new Map();
+/** Count of find opens per shell window, so only the latest selection read applies. */
+const findOpenGenerations = new WeakMap();
 
 /**
  * Anchor a find bar to its parent's top-right content corner. Called at
@@ -3077,17 +3079,26 @@ function positionFindBar(target, bar) {
 function openFindBar(target) {
   const existing = findBars.get(target);
   const isOpen = existing !== undefined && !existing.isDestroyed();
+  const generation = (findOpenGenerations.get(target) ?? 0) + 1;
+  findOpenGenerations.set(target, generation);
   // Cmd/Ctrl+F from inside the bar keeps its query; from the page, a selection
   // replaces it. Read before find-opened re-renders the transcript.
   const seed =
     isOpen && existing.isFocused() ? Promise.resolve(null) : readFindSeed(target.webContents);
+  // A later open, even from inside the bar, supersedes a read still in flight.
+  const prefill = (bar) =>
+    seed.then((text) => {
+      if (findOpenGenerations.get(target) === generation) prefillFindBar(bar, text);
+    });
   // The menu item opens the bar without a page keydown; the page must still
   // render every transcript row for find to reach off-screen messages.
   target.webContents.send("omnigent:find-opened");
   if (isOpen) {
     existing.focus();
     existing.webContents.send("omnigent:find-activate");
-    void seed.then((text) => prefillFindBar(existing, text));
+    // A bar still loading can't receive the prefill until it first shows.
+    if (existing.isVisible()) void prefill(existing);
+    else existing.once("ready-to-show", () => void prefill(existing));
     return;
   }
   const bar = new BrowserWindow({
@@ -3131,7 +3142,7 @@ function openFindBar(target) {
   bar.once("ready-to-show", () => {
     reposition();
     bar.show();
-    void seed.then((text) => prefillFindBar(bar, text));
+    void prefill(bar);
   });
   bar.on("closed", () => {
     findBars.delete(target);

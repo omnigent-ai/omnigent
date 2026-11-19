@@ -20,13 +20,15 @@ const SEEDABLE_INPUT_TYPES = ["text", "search", "url", "tel", "email"];
 const FIND_SELECTION_SCRIPT = `(() => {
   const active = document.activeElement;
   let text = "";
+  const isControl = active instanceof HTMLTextAreaElement || active instanceof HTMLInputElement;
   const isField =
     active instanceof HTMLTextAreaElement ||
     (active instanceof HTMLInputElement &&
       ${JSON.stringify(SEEDABLE_INPUT_TYPES)}.includes(active.type));
   if (isField && active.selectionEnd > active.selectionStart) {
     text = active.value.slice(active.selectionStart, active.selectionEnd);
-  } else if (!isField) {
+  } else if (!isControl) {
+    // Chromium reports a focused control's selection here, so skip controls.
     text = String(window.getSelection()?.toString() ?? "");
   }
   return text.length > ${MAX_FIND_SEED_LENGTH * 4} ? null : text;

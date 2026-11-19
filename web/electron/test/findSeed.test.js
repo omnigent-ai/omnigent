@@ -56,11 +56,13 @@ describe("FIND_SELECTION_SCRIPT", () => {
     assert.equal(window.eval(FIND_SELECTION_SCRIPT), "retry");
   });
 
-  it("never reads a password field", (t) => {
+  it("never reads a password field, even through the document selection", (t) => {
     const window = page(t, `<input id="secret" type="password" value="hunter2" />`);
     const secret = window.document.getElementById("secret");
     secret.focus();
     secret.setSelectionRange(0, 7);
+    // Chromium reports a focused control's selected text as the document selection.
+    window.getSelection = () => ({ toString: () => "hunter2" });
     assert.equal(window.eval(FIND_SELECTION_SCRIPT), "");
   });
 

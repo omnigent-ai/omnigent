@@ -70,7 +70,10 @@ async function doubleClickWord(page, word, occurrence = 0) {
       for (let node = walker.nextNode(); node; node = walker.nextNode()) {
         if (!node.data.includes(reply.slice(0, 20))) continue;
         let index = -1;
-        for (let seen = 0; seen <= nth; seen += 1) index = node.data.indexOf(target, index + 1);
+        for (let seen = 0; seen <= nth; seen += 1) {
+          index = node.data.indexOf(target, index + 1);
+          if (index < 0) return null;
+        }
         const range = document.createRange();
         range.setStart(node, index);
         range.setEnd(node, index + target.length);
@@ -187,19 +190,12 @@ it(
             };
           });
         await eventually(
-          () =>
-            bar.evaluate(
-              ({ query, matches }) => {
-                const input = document.getElementById("q");
-                const selected = input.value.slice(input.selectionStart, input.selectionEnd);
-                return (
-                  input.value === query &&
-                  selected === query &&
-                  document.getElementById("count").textContent.endsWith(`/${matches}`)
-                );
-              },
-              { query: text, matches: total },
-            ),
+          async () => {
+            const shown = await state();
+            return (
+              shown.value === text && shown.selected === text && shown.count.endsWith(`/${total}`)
+            );
+          },
           `find bar searching "${text}" with ${total} matches`,
           10_000,
         ).catch(async (error) => {
