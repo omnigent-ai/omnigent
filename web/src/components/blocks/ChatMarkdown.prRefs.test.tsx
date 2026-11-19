@@ -166,6 +166,16 @@ describe("pull request references in chat markdown", () => {
     expect(screen.getByText("#1357").closest("code")).not.toBeNull();
   });
 
+  it("leaves a reference whose # the author escaped as text", () => {
+    seed(githubInfo());
+    renderMarkdown("Not \\#4242, &#35;4243, &#x23;4244 or &num;4245, but \\\\#4246 and #4247.");
+    expect(hrefs()).toEqual([
+      "https://github.com/acme/app/pull/4246",
+      "https://github.com/acme/app/pull/4247",
+    ]);
+    expect(screen.getByText(/#4242, #4243, #4244 or #4245/)).toBeVisible();
+  });
+
   it("follows the browser's raw HTML nesting", () => {
     seed(githubInfo());
     // A stray `</a>` doesn't end the code; `<a/>` opens an anchor holding the rest.

@@ -216,6 +216,22 @@ describe("remarkPullRequestRefs", () => {
     });
   });
 
+  it.each([
+    ["a &#35;1234 \\#2345 #5678", "a #1234 #2345 #5678", ["5678"]],
+    ["a &#1234; #5678", "a \u04d2 #5678", ["5678"]],
+    // A source that doesn't account for every `#` links nothing.
+    ["a b c", "a #1234", []],
+  ])("reads escaped hashes in %j from the source", (source, value, linked) => {
+    const position = { start: { offset: 0 }, end: { offset: source.length } };
+    const tree = {
+      type: "root",
+      children: [{ type: "paragraph", children: [{ type: "text", value, position }] }],
+    };
+    remarkPullRequestRefs()(tree, { value: source });
+    const urls = tree.children[0].children.flatMap((node) => ("url" in node ? [node.url] : []));
+    expect(urls).toEqual(linked.map((number) => `${PULL_REQUEST_REF_HREF_PREFIX}${number}`));
+  });
+
   it("keeps linking after a stray raw closing tag", () => {
     const tree = {
       type: "root",

@@ -45,6 +45,7 @@ interface MarkdownNode {
   url?: string;
   title?: string | null;
   children?: MarkdownNode[];
+  position?: { start: { offset?: number }; end: { offset?: number } };
 }
 
 // Their text is already a link. Code and raw HTML carry a `value`, not text children.
@@ -54,12 +55,36 @@ const LINK_NODE_TYPES = new Set(["link", "linkReference"]);
 // a browser, `<a/>` still opens its element, and a closer only ends its own tag.
 const HTML_OPAQUE_TAG = /^<(\/?)(a|code|pre|kbd|samp)(?=[\s/>])/i;
 
+// Tokens of a text node's source, in order. Each `#` of the value is a literal `#`
+// or an escaped one; other escapes and references (`&#1234;`) hold no `#`.
+const SOURCE_TOKEN =
+  /\\#|&#0{0,5}35;|&#[xX]0{0,4}23;|&num;|\\[!-/:-@[-`{-~]|&#\d{1,7};|&#[xX][\dA-Fa-f]{1,6};|#/g;
+const ESCAPED_HASH = /^(?:\\#|&#0{0,5}35;|&#[xX]0{0,4}23;|&num;)$/;
+
 /** Remark plugin parking every pull request reference in a text node on a fragment link. */
 export function remarkPullRequestRefs() {
-  return linkifyChildren;
+  return (tree: MarkdownNode, file?: { value?: unknown }) =>
+    linkifyChildren(tree, typeof file?.value === "string" ? file.value : undefined);
 }
 
-function linkifyChildren(node: MarkdownNode): void {
+/** Per `#` in a text node's value, whether its author escaped it; null if unknown. */
+function escapedHashes(node: MarkdownNode, source: string | undefined): boolean[] | null {
+  const start = node.position?.start.offset;
+  const end = node.position?.end.offset;
+  if (source === undefined || start === undefined || end === undefined) return null;
+  const raw = source.slice(start, end);
+  if (raw === node.value) return null;
+  const escaped: boolean[] = [];
+  for (const [token] of raw.matchAll(SOURCE_TOKEN)) {
+    if (token === "#") escaped.push(false);
+    else if (ESCAPED_HASH.test(token)) escaped.push(true);
+  }
+  const hashes = node.value?.split("#").length ?? 1;
+  // A source this pass misreads leaves the whole node as text.
+  return escaped.length === hashes - 1 ? escaped : Array.from({ length: hashes - 1 }, () => true);
+}
+
+function linkifyChildren(node: MarkdownNode, source?: string): void {
   if (!node.children || LINK_NODE_TYPES.has(node.type)) return;
   const openOpaqueTags = new Map<string, number>();
   node.children = node.children.flatMap((child) => {
@@ -74,15 +99,21 @@ function linkifyChildren(node: MarkdownNode): void {
     }
     if ([...openOpaqueTags.values()].some((open) => open > 0)) return [child];
     if (child.type === "text" && typeof child.value === "string") {
-      return splitPullRequestRefs(child.value);
+      return splitPullRequestRefs(child.value, escapedHashes(child, source));
     }
-    linkifyChildren(child);
+    linkifyChildren(child, source);
     return [child];
   });
 }
 
-/** Splits `text` into text and parked-link nodes; a single text node when nothing matches. */
-export function splitPullRequestRefs(text: string): MarkdownNode[] {
+/**
+ * Splits `text` into text and parked-link nodes; a single text node when nothing matches.
+ * `escaped` flags each `#` of `text` the author escaped, which starts no reference.
+ */
+export function splitPullRequestRefs(
+  text: string,
+  escaped: readonly boolean[] | null = null,
+): MarkdownNode[] {
   if (!text.includes("#")) return [{ type: "text", value: text }];
   const nodes: MarkdownNode[] = [];
   let last = 0;
@@ -97,7 +128,8 @@ export function splitPullRequestRefs(text: string): MarkdownNode[] {
         !FILE_EXTENSION.test(repo) &&
         !NON_OWNER.test(owner)
       : BARE_NUMBER.test(number);
-    if (!valid) continue;
+    const hash = start + token.indexOf("#");
+    if (!valid || escaped?.[text.slice(0, hash).split("#").length - 1]) continue;
     if (start > last) nodes.push({ type: "text", value: text.slice(last, start) });
     nodes.push({
       type: "link",
