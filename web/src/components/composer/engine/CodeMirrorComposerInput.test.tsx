@@ -2,7 +2,7 @@ import { redo, undo } from "@codemirror/commands";
 import { EditorView } from "@codemirror/view";
 import { act, fireEvent, render, waitFor } from "@testing-library/react";
 import { useState } from "react";
-import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { insertComposerText } from "@/lib/composerText";
 import { CodeMirrorComposerInput } from "./testing/codeMirrorComposer";
 import { COMPOSER_EDITING_KEYMAP } from "./CodeMirrorComposerInput";
@@ -26,19 +26,6 @@ function mount(props: Partial<Parameters<typeof CodeMirrorComposerInput>[0]> = {
   const content = view.container.querySelector<HTMLElement>(".cm-content")!;
   return { ...view, content, setTarget, target: () => box.target! };
 }
-
-// CodeMirror measures its text through Range.getClientRects, which jsdom lacks. Stubbed for the
-// whole file, since a measurement can run after the test that caused it has finished.
-beforeAll(() => {
-  Object.defineProperty(Range.prototype, "getClientRects", {
-    configurable: true,
-    writable: true,
-    value: () => [],
-  });
-});
-afterAll(() => {
-  Reflect.deleteProperty(Range.prototype, "getClientRects");
-});
 
 afterEach(() => {
   document.body.replaceChildren();
@@ -131,6 +118,13 @@ describe("CodeMirrorComposerInput", () => {
     expect(content.getAttribute("aria-disabled")).toBe("true");
     rerender(<CodeMirrorComposerInput value="" readOnly />);
     expect(content.getAttribute("aria-readonly")).toBe("true");
+  });
+
+  it("leaves spelling, autocorrect and capitalization on, as a textarea does", () => {
+    const { content } = mount();
+    expect(content.getAttribute("spellcheck")).toBe("true");
+    expect(content.getAttribute("autocorrect")).toBe("on");
+    expect(content.getAttribute("autocapitalize")).toBe("sentences");
   });
 
   it("takes a caller's text size in place of the composer's own", () => {

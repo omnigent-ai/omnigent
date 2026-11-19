@@ -51,6 +51,12 @@ if (!Element.prototype.scrollIntoView) {
   Element.prototype.scrollIntoView = () => {};
 }
 
+// jsdom has no layout. CodeMirror measures its text through Range.getClientRects, so an
+// empty list lets it measure without a rect. Tests that need a rect stub it themselves.
+if (typeof Range.prototype.getClientRects !== "function") {
+  Range.prototype.getClientRects = () => [] as unknown as DOMRectList;
+}
+
 // jsdom doesn't implement IntersectionObserver (used by the sidebar's
 // infinite-scroll sentinel). A no-op stub is enough — tests that need to drive
 // auto-loading can override the global with their own controllable mock.

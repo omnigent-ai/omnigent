@@ -106,6 +106,10 @@ function attributes(
     EditorState.readOnly.of(locked),
     EditorView.contentAttributes.of({
       [environment.inputAttribute]: "",
+      // CodeMirror turns these off by default; a textarea keeps the browser's behaviour.
+      spellcheck: "true",
+      autocorrect: "on",
+      autocapitalize: "sentences",
       "aria-disabled": props.disabled ? "true" : "false",
       ...(props.readOnly ? { "aria-readonly": "true" } : {}),
       // A textarea is named by its placeholder when it has no label; the editor says so itself.

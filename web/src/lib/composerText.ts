@@ -70,7 +70,8 @@ const MAX_INSERTED_PASTE_LINES = 100;
  * Insert a paste's plain text as typed input and claim the event. Chrome drops
  * a paste whose clipboard changes before it inserts, which happens when a
  * dictation or snippet tool restores the clipboard right after its paste; the
- * event's own data is read before that. Returns false when the paste stays native.
+ * event's own data is read before that. Returns true only when the text was
+ * inserted; false means the paste stays native, or a locked input cancelled it.
  */
 export function insertPastedText(event: ComposerPasteEvent): boolean {
   const text = event.clipboardData.getData("text/plain").replace(/\r\n?/g, "\n");

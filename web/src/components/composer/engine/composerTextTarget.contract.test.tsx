@@ -25,9 +25,14 @@ interface Mounted {
 interface MountOptions {
   /** Mount read-only, as a locked draft is. */
   locked?: boolean;
+  /** Mount disabled, which also refuses edits. */
+  disabled?: boolean;
 }
 
-function mountTextarea(initial: string, { locked = false }: MountOptions = {}): Mounted {
+function mountTextarea(
+  initial: string,
+  { locked = false, disabled = false }: MountOptions = {},
+): Mounted {
   const onChange = vi.fn();
   const box: { set?: (value: string) => void; element?: HTMLTextAreaElement | null } = {};
   function Harness() {
@@ -39,6 +44,7 @@ function mountTextarea(initial: string, { locked = false }: MountOptions = {}): 
           box.element = element;
         }}
         readOnly={locked}
+        disabled={disabled}
         value={value}
         onChange={(event) => {
           onChange(event.currentTarget.value);
@@ -55,7 +61,10 @@ function mountTextarea(initial: string, { locked = false }: MountOptions = {}): 
   };
 }
 
-function mountCodeMirror(initial: string, { locked = false }: MountOptions = {}): Mounted {
+function mountCodeMirror(
+  initial: string,
+  { locked = false, disabled = false }: MountOptions = {},
+): Mounted {
   const onChange = vi.fn();
   const box: { set?: (value: string) => void; target?: ComposerTextTarget | null } = {};
   function Harness() {
@@ -67,6 +76,7 @@ function mountCodeMirror(initial: string, { locked = false }: MountOptions = {})
           box.target = target;
         }}
         readOnly={locked}
+        disabled={disabled}
         value={value}
         onChange={(event) => {
           onChange(event.currentTarget.value);
@@ -84,8 +94,11 @@ function mountCodeMirror(initial: string, { locked = false }: MountOptions = {})
 }
 
 /** A surface has no React change events, so its edits are counted as they land. */
-function mountFake(initial: string, { locked = false }: MountOptions = {}): Mounted {
-  const surface = createFakeComposerSurface(initial, { locked });
+function mountFake(
+  initial: string,
+  { locked = false, disabled = false }: MountOptions = {},
+): Mounted {
+  const surface = createFakeComposerSurface(initial, { locked: locked || disabled });
   return {
     target: () => surface,
     changes: () => surface.inserts.length,
@@ -149,16 +162,22 @@ describe.each([
   ["codemirror", mountCodeMirror],
   ["fake", mountFake],
 ])("ComposerTextTarget locked on the %s engine", (_engine, mount) => {
-  it("refuses an insert and keeps its draft, selection and change count", () => {
-    const { target, changes } = mount("draft", { locked: true });
-    act(() => target().setSelectionRange(1, 3));
+  it.each([
+    ["read-only", { locked: true }],
+    ["disabled", { disabled: true }],
+  ] as const)(
+    "refuses an insert into a %s draft and keeps its draft, selection and change count",
+    (_kind, options) => {
+      const { target, changes } = mount("draft", options);
+      act(() => target().setSelectionRange(1, 3));
 
-    expect(insertComposerText(target(), "x", 0, 0)).toBe(false);
+      expect(insertComposerText(target(), "x", 0, 0)).toBe(false);
 
-    expect(target().value).toBe("draft");
-    expect([target().selectionStart, target().selectionEnd]).toEqual([1, 3]);
-    expect(changes()).toBe(0);
-  });
+      expect(target().value).toBe("draft");
+      expect([target().selectionStart, target().selectionEnd]).toEqual([1, 3]);
+      expect(changes()).toBe(0);
+    },
+  );
 });
 
 // The fake surface has no controlled-value sync, so only the rendered engines take a value.

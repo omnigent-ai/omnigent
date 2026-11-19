@@ -49,8 +49,9 @@ export function createFakeComposerSurface(
     scrollTop: 0,
     scrollLeft: 0,
     setSelectionRange(start, end) {
-      // As a textarea does: a start past the end collapses to the end.
-      selection = [Math.min(start, end), end];
+      // As a textarea does: offsets clamp to the value, and a reversed range collapses.
+      const clampedEnd = Math.min(Math.max(end, 0), surface.value.length);
+      selection = [Math.min(Math.max(start, 0), clampedEnd), clampedEnd];
     },
     focus(options) {
       element.focus(options);

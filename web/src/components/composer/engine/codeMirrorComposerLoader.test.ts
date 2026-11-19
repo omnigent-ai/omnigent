@@ -54,7 +54,7 @@ describe("loading the CodeMirror composer", () => {
     expect(importer).toHaveBeenCalledTimes(2);
   });
 
-  it("settles failed when the editor can't be built", async () => {
+  it("settles failed when the editor factory throws", async () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     resetCodeMirrorComposerLoadForTests(() =>
       Promise.resolve({
@@ -68,6 +68,22 @@ describe("loading the CodeMirror composer", () => {
 
     await vi.waitFor(() => expect(codeMirrorComposerLoad().status).toBe("failed"));
     expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a loaded editor when a subscriber throws", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    resetCodeMirrorComposerLoadForTests(() => Promise.resolve(CodeMirrorComposerModule));
+    const unsubscribe = subscribeCodeMirrorComposerLoad(() => {
+      if (codeMirrorComposerLoad().status === "ready") throw new Error("listener failed");
+    });
+
+    loadCodeMirrorComposer();
+
+    await vi.waitFor(() => expect(error).toHaveBeenCalledTimes(1));
+    expect(codeMirrorComposerLoad().status).toBe("ready");
+    expect(warn).not.toHaveBeenCalled();
+    unsubscribe();
   });
 
   it("drops a load that finishes after a reset", async () => {

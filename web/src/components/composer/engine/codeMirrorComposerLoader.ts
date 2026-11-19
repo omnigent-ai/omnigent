@@ -56,21 +56,27 @@ export function subscribeCodeMirrorComposerLoad(listener: () => void): () => voi
 export function loadCodeMirrorComposer(): void {
   if (current.status === "loading" || current.status === "ready") return;
   const attempt = generation;
-  const settleAttempt = (next: CodeMirrorComposerLoad) => {
-    if (attempt === generation) settle(next);
-  };
   settle({ status: "loading" });
-  importer()
-    .then((module) =>
-      settleAttempt({
-        status: "ready",
-        Component: module.createCodeMirrorComposerInput(codeMirrorComposerEnvironment()),
-      }),
-    )
-    .catch((error: unknown) => {
+  const built = importer().then((module) => ({
+    status: "ready" as const,
+    Component: module.createCodeMirrorComposerInput(codeMirrorComposerEnvironment()),
+  }));
+  // Subscriber errors are logged here, so they can't flip a loaded editor to failed.
+  built.then(
+    (next) => {
+      if (attempt !== generation) return;
+      try {
+        settle(next);
+      } catch (error: unknown) {
+        console.error("A CodeMirror composer listener threw.", error);
+      }
+    },
+    (error: unknown) => {
+      if (attempt !== generation) return;
       console.warn("The CodeMirror composer couldn't load; using the standard input.", error);
-      settleAttempt({ status: "failed", error });
-    });
+      settle({ status: "failed", error });
+    },
+  );
 }
 
 /** Test seam: swap the module import and forget any earlier load. */
