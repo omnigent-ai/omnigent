@@ -912,6 +912,21 @@ def test_claude_managed_gateway_reads_base_url_and_credential(clean_env, monkeyp
     assert has_credential is True
 
 
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(True, True), (False, False), ("true", False), (None, False)],
+)
+def test_claude_sideload_flags_disabled_requires_managed_boolean_true(
+    clean_env, value: object, expected: bool
+) -> None:
+    """Only an explicit managed boolean true disables Omnigent plugin flags."""
+    payload = {} if value is None else {"disableSideloadFlags": value}
+    path = clean_env / "remote-settings.json"
+    path.write_text(json.dumps(payload))
+
+    assert ambient.claude_sideload_flags_disabled((path,)) is expected
+
+
 def test_claude_managed_gateway_detected_as_subscription_not_cli_config(
     clean_env, monkeypatch
 ) -> None:

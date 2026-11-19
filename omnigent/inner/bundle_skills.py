@@ -110,7 +110,13 @@ def claude_native_skill_args(
         e.g. ``["--plugin-dir", "/tmp/bundle", "--setting-sources", ""]``.
     """
     args: list[str] = []
-    if bundle_dir is not None and (bundle_dir / "skills").is_dir():
+    from omnigent.onboarding.ambient import claude_sideload_flags_disabled
+
+    if (
+        bundle_dir is not None
+        and (bundle_dir / "skills").is_dir()
+        and not claude_sideload_flags_disabled()
+    ):
         ensure_bundle_plugin_manifest(bundle_dir, agent_name)
         args.extend(["--plugin-dir", str(bundle_dir)])
     if skills_filter == "none":

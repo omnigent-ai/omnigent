@@ -134,6 +134,21 @@ def test_claude_native_skill_args_bundle_without_skills_dir(tmp_path: Path) -> N
     assert "--plugin-dir" not in claude_native_skill_args(tmp_path / "no_skills")
 
 
+def test_claude_native_skill_args_respects_managed_sideload_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A managed sideload ban suppresses the fatal ``--plugin-dir`` flag."""
+    from omnigent.onboarding import ambient
+
+    bundle = _make_bundle_with_skill(tmp_path)
+    monkeypatch.setattr(ambient, "claude_sideload_flags_disabled", lambda: True)
+
+    args = claude_native_skill_args(bundle, agent_name="researcher")
+
+    assert "--plugin-dir" not in args
+    assert not (bundle / ".claude-plugin" / "plugin.json").exists()
+
+
 def test_claude_agents_skill_args_without_portable_skills_skips_native_reads(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
