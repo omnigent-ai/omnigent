@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
-from contextlib import suppress
+from contextlib import ExitStack, nullcontext, suppress
 
 from omnigent.db.db_models import workspace_scope
 from omnigent.db.utils import now_epoch
@@ -194,7 +194,7 @@ class ManagedSandboxReaper:
         cutoff: int,
         now: int,
     ) -> int:
-        with workspace_scope(workspace_id):
+        with workspace_scope(workspace_id), ExitStack() as shared_identity:
             launcher = _launcher_for_teardown(candidates[0], self._sandbox_config)
             if launcher is None:
                 _logger.warning(
@@ -208,20 +208,22 @@ class ManagedSandboxReaper:
             reaped = 0
             # A launcher bound to its owner (credential or bind_owner) acts as one
             # user; candidates may differ in owner, so rebuild per candidate.
-            bound_hook = getattr(type(launcher), "bind_owner", None)
+            bound_hook = getattr(launcher, "bind_owner", None)
             per_owner = getattr(launcher, "owner_credential_provider", None) is not None or (
-                bound_hook is not None and bound_hook is not SandboxHostLauncher.bind_owner
+                bound_hook is not None
+                and getattr(bound_hook, "__func__", bound_hook)
+                is not SandboxHostLauncher.bind_owner
             )
-            with launcher.reaper_identity(workspace_id):
-                for candidate in candidates:
-                    try:
-                        acting = (
-                            _launcher_for_teardown(candidate, self._sandbox_config)
-                            if per_owner
-                            else launcher
-                        )
+            if not per_owner:
+                shared_identity.enter_context(launcher.reaper_identity(workspace_id))
+            for candidate in candidates:
+                try:
+                    acting = launcher
+                    if per_owner and candidate is not candidates[0]:
+                        acting = _launcher_for_teardown(candidate, self._sandbox_config)
                         if acting is None:
                             continue
+                    with acting.reaper_identity(workspace_id) if per_owner else nullcontext():
                         if candidate.deleted_at is not None:
                             sandbox_id = candidate.terminating_sandbox_id or candidate.sandbox_id
                             if sandbox_id is None:
@@ -258,18 +260,18 @@ class ManagedSandboxReaper:
                             sandbox_id=sandbox_id,
                         ):
                             reaped += 1
-                    except OwnerCredentialMissingError:
-                        # Expected until the owner reconnects; retried next sweep.
-                        _logger.warning(
-                            "Managed sandbox reaper cannot act as the owner of host %s "
-                            "(not connected); retrying later",
-                            candidate.host_id,
-                        )
-                    except Exception:
-                        _logger.exception(
-                            "Managed sandbox reaper failed for host %s; continuing",
-                            candidate.host_id,
-                        )
+                except OwnerCredentialMissingError:
+                    # Expected until the owner reconnects; retried next sweep.
+                    _logger.warning(
+                        "Managed sandbox reaper cannot act as the owner of host %s "
+                        "(not connected); retrying later",
+                        candidate.host_id,
+                    )
+                except Exception:
+                    _logger.exception(
+                        "Managed sandbox reaper failed for host %s; continuing",
+                        candidate.host_id,
+                    )
             return reaped
 
     def _is_reap_candidate(self, host: Host, *, cutoff: int, now: int) -> bool:

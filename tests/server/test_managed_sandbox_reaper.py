@@ -770,31 +770,43 @@ async def test_owner_identity_reaps_each_sandbox_as_its_own_owner() -> None:
     assert current["bob"].terminated == ["bob:sb-b"]
 
 
-async def test_reaper_binds_each_candidates_owner_for_bind_owner_launchers() -> None:
+@pytest.mark.parametrize("instance_hook", [False, True], ids=["class-hook", "instance-hook"])
+async def test_reaper_binds_each_candidates_owner_for_bind_owner_launchers(
+    instance_hook: bool,
+) -> None:
     now = 4_000_000
     terminated: list[str] = []
 
     class _BoundOwnerLauncher:
         provider = "databricks"
+        active_owner: str | None = None
 
-        def __init__(self) -> None:
-            self.owner: str | None = None
-
-        def bind_owner(self, owner: str) -> None:
+        def record_owner(self, owner: str) -> None:
             self.owner = owner
 
         @contextlib.contextmanager
         def reaper_identity(self, workspace_id: int) -> Iterator[None]:
-            yield
+            self.active_owner = self.owner
+            try:
+                yield
+            finally:
+                self.active_owner = None
 
         def terminate(self, sandbox_id: str) -> None:
-            terminated.append(f"{self.owner}:{sandbox_id}")
+            terminated.append(f"{self.active_owner}:{sandbox_id}")
+
+    class _ClassHookLauncher(_BoundOwnerLauncher):
+        bind_owner = _BoundOwnerLauncher.record_owner
+
+    class _InstanceHookLauncher(_BoundOwnerLauncher):
+        def __init__(self) -> None:
+            self.bind_owner = self.record_owner
 
     deployment = ManagedSandboxDeployment(
         configs=(
             ManagedSandboxConfig(
                 server_url="https://s.example.com",
-                launcher_factory=_BoundOwnerLauncher,  # type: ignore[arg-type]
+                launcher_factory=_InstanceHookLauncher if instance_hook else _ClassHookLauncher,  # type: ignore[arg-type]
                 token_ttl_s=3600,
                 provider="databricks",
             ),
