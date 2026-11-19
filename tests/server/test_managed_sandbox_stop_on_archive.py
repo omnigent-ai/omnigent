@@ -9,6 +9,7 @@ import click
 import pytest
 
 from omnigent.db.db_models import current_workspace_id
+from omnigent.entities import MessageData, NewConversationItem
 from omnigent.onboarding.sandboxes.base import SandboxCapabilityError
 from omnigent.server.managed_hosts import (
     ManagedLaunchTracker,
@@ -430,21 +431,49 @@ async def test_a_relaunch_of_an_archived_session_does_not_schedule_a_teardown(
     assert fake.stopped == []
 
 
-async def test_a_turn_running_when_the_host_binds_finishes_before_the_teardown(
-    db_uri, no_undo_grace, monkeypatch
+@pytest.mark.parametrize(
+    "status_at_bind", ["running", None], ids=["running", "unknown-after-a-turn"]
+)
+async def test_a_turn_that_may_be_running_finishes_before_the_teardown(
+    db_uri, no_undo_grace, monkeypatch, status_at_bind
 ):
     host_store = HostStore(db_uri)
     conversations = SqlAlchemyConversationStore(db_uri)
     fake = _registering_launcher(host_store)
     conv = conversations.create_conversation()
-    # The first turn archived its own session and is still running.
+    # The first turn archived its own session. Its status may not have reached this
+    # replica or the store, but its message has.
+    conversations.append(
+        conv.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_first_turn",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
+            )
+        ],
+    )
     conversations.update_conversation(conv.id, archived=True)
-    conversations.set_session_live_status(conv.id, "running")
+    if status_at_bind is not None:
+        conversations.set_session_live_status(conv.id, status_at_bind)
     monkeypatch.setattr(orchestration, "_SELF_ARCHIVE_TURN_POLL_S", 0.01)
+    reads = 0
+    polled = asyncio.Event()
+    read_activity = conversations.get_session_activity
+
+    def counting_read(ids):
+        nonlocal reads
+        reads += 1
+        # The launch's own check is the first read; the rest are the teardown's turn wait.
+        if reads >= 3:
+            polled.set()
+        return read_activity(ids)
+
+    monkeypatch.setattr(conversations, "get_session_activity", counting_read)
 
     await _launch_for(conversations, host_store, fake, conv.id)
     teardown = orchestration._pending_archive_stops[conv.id]
-    await asyncio.sleep(0.2)
+    await asyncio.wait_for(polled.wait(), timeout=5)
     assert not teardown.done() and fake.stopped == []
 
     conversations.set_session_live_status(conv.id, "idle")
