@@ -377,6 +377,17 @@ describe("usePlanStopping", () => {
     expect(result.current).toBe(true);
   });
 
+  it("reads a Stop the server replays as pending after a reload", () => {
+    const entry = transcript();
+    entry.setState({
+      blocks: [CONTINUE],
+      pendingUserMessages: [
+        { ...pendingSend("pending_srv", stopPlanMessage(null)), replayed: true },
+      ],
+    });
+    expect(renderStopping(true).result.current).toBe(true);
+  });
+
   it("ends a transcript's Stop once the session accepts a follow-up sent outside the chat", async () => {
     const entry = transcript();
     entry.setState({ blocks: [STOP] });
@@ -435,6 +446,15 @@ describe("latestStopRequest", () => {
     expect(latestStopRequest([stop], [pendingSend("pend_1", "Keep the logs", true)])).toBeNull();
     // A send the session hasn't accepted doesn't count yet.
     expect(latestStopRequest([stop], [pendingSend("pend_1", "Keep the logs")])).toEqual(["stop"]);
+    // After a reload, the server replays sends it accepted that the agent hasn't taken.
+    const replayed = (tempId: string, text: string) => ({
+      ...pendingSend(tempId, text),
+      replayed: true,
+    });
+    expect(latestStopRequest([CONTINUE], [replayed("pending_srv", stopPlanMessage(null))])).toEqual(
+      ["pending_srv"],
+    );
+    expect(latestStopRequest([stop], [replayed("pending_srv", "Keep the logs")])).toBeNull();
     expect(
       latestStopRequest([CONTINUE], [pendingSend("pend_2", stopPlanMessage(null), true)]),
     ).toEqual(["pend_2"]);

@@ -1656,9 +1656,14 @@ describe("chatStore — switchTo", () => {
 
     const state = useChatStore.getState();
     // Keyed by the server pending id so a later consumed event drops it
-    // by id, and content is replayed verbatim so the bubble renders.
+    // by id, and content is replayed verbatim so the bubble renders. Marked
+    // replayed: the session accepted it, so it counts as the latest request.
     expect(state.pendingUserMessages).toEqual([
-      { tempId: "pending_srv1", content: [{ type: "input_text", text: "queued msg" }] },
+      {
+        tempId: "pending_srv1",
+        content: [{ type: "input_text", text: "queued msg" }],
+        replayed: true,
+      },
     ]);
   });
 
@@ -1710,7 +1715,11 @@ describe("chatStore — switchTo", () => {
     // Only the not-yet-committed entry survives; the one already in
     // history is dropped so the message renders exactly once.
     expect(useChatStore.getState().pendingUserMessages).toEqual([
-      { tempId: "pending_live", content: [{ type: "input_text", text: "a genuinely queued msg" }] },
+      {
+        tempId: "pending_live",
+        content: [{ type: "input_text", text: "a genuinely queued msg" }],
+        replayed: true,
+      },
     ]);
   });
 
@@ -1750,6 +1759,7 @@ describe("chatStore — switchTo", () => {
       {
         tempId: "pending_img",
         content: [{ type: "input_image", file_id: "file_xyz", filename: "a.png" }],
+        replayed: true,
       },
     ]);
   });

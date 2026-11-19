@@ -23,11 +23,15 @@ export interface MessageReceipt {
   pendingId?: string;
 }
 
-/** A send the composer shows before the agent takes it; `posted` once the session accepted it. */
+/**
+ * A send the composer shows before the agent takes it: `posted` once the
+ * session accepted this page's POST, `replayed` when the server replays one it accepted.
+ */
 export interface PendingSend {
   tempId: string;
   content: MessageContentBlock[];
   posted?: boolean;
+  replayed?: boolean;
 }
 
 interface PlanStopsState {
@@ -92,7 +96,7 @@ export function latestStopRequest(
   blocks: readonly AnyBlock[],
   pending: readonly PendingSend[],
 ): string[] | null | undefined {
-  const latestPending = pending.findLast((send) => send.posted === true);
+  const latestPending = pending.findLast((send) => send.posted === true || send.replayed === true);
   if (latestPending) {
     return isStopPlanMessage(messageText(latestPending.content)) ? [latestPending.tempId] : null;
   }
