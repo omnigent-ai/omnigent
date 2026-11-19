@@ -16,6 +16,7 @@ import { MessagesSquareIcon, TriangleAlertIcon } from "lucide-react";
 import { toast } from "sonner";
 import { useIsMutating, useQueryClient } from "@tanstack/react-query";
 import { getCurrentAuthorId } from "@/lib/identity";
+import { cn } from "@/lib/utils";
 import {
   type Bubble,
   type BubbleCache,
@@ -41,7 +42,9 @@ import {
   type ComposerKeyIntent,
 } from "@/components/composer/ChatComposer";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
+import { isComposerInput } from "@/components/composer/engine/composerInput";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
+import { FileMentionMenu } from "@/components/FileMentionMenu";
 import {
   BUILTIN_SLASH_COMMANDS,
   SlashCommandMenu,
@@ -61,6 +64,7 @@ import {
   gridCellComposerKey,
   holdsInitialDraft,
   isCompactControl,
+  type QueuedMessage,
   rejectBusyCompact,
   restoredSendDraftUnchanged,
   takeFailedSendDraft,
@@ -68,6 +72,7 @@ import {
   useChatStore,
 } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
+import { RunnerStartingIndicator, SandboxActionBanner } from "@/pages/ChatIndicators";
 import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import { shouldQueueSend } from "@/lib/messageQueue";
@@ -77,15 +82,25 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
+import { useDismissOnEscape } from "@/hooks/useDismissOnEscape";
 import { useSession } from "@/hooks/useSession";
 import type { Session } from "@/lib/types";
+import { useChildSessions } from "@/hooks/useChildSessions";
+import { useMentionBrowser } from "@/hooks/useMentionBrowser";
+import { useMentionListings } from "@/hooks/useMentionListings";
+import { useWorkspaceEnvironment } from "@/hooks/useWorkspaceChangedFiles";
 import { useSkills } from "@/hooks/useSkills";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useFileMentionHarnesses } from "@/lib/agentLabels";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import { isNativeTerminalSession } from "@/lib/nativeCodingAgents";
 import { isPermissionModeCycleKey } from "@/lib/permissionModeCycle";
-import { sideChatSettingsMutationKey, usesNativeSideChatFork } from "@/lib/sideChat";
+import {
+  isSideChatCommand,
+  sideChatSettingsMutationKey,
+  usesNativeSideChatFork,
+} from "@/lib/sideChat";
 import { parentIdFromLabels } from "@/lib/sessionHost";
 import { readOnlyReasonForSessionLabels } from "@/lib/sessionCapabilities";
 import {
@@ -102,13 +117,18 @@ import {
 } from "@/lib/outgoingComposerMessage";
 import {
   composerInlineMentions,
+  detectMentionAt,
+  harnessSupportsFileMentions,
+  mergeTaggedDrafts,
   presentTaggedMentions,
   recallFileMentions,
   recallSessionMentions,
+  type MentionState,
   type TaggedMentions,
 } from "@/lib/composerMentions";
 import { clearLocalReviewContexts } from "@/lib/localReviewContext";
 import {
+  getSessionDraft,
   setSessionMentions,
   useSessionMentions,
   useSessionReviewComments,
@@ -130,20 +150,32 @@ function isPendingSideChat(id: string): boolean {
 }
 
 /**
- * A grid cell's message text with its session and file tags recalled as tokens, as
- * the full-screen composer does. Used by edit-and-resend, failed-send restore and the
- * delivered-draft check, so the three paths agree.
+ * A grid cell's message text with its session and file tags recalled as tokens, as the
+ * full-screen composer does; `quoteBefores` recalls quote cards' text the same way. Used
+ * by every grid path that restores a sent or queued message.
  */
-function recallGridDraft(text: string): { text: string; mentions: TaggedMentions | undefined } {
-  const sessions = recallSessionMentions(text);
-  const files = recallFileMentions(
-    sessions.main,
-    sessions.sessions.map((session) => session.token!),
-  );
-  const tagged = files.files.length > 0 || sessions.sessions.length > 0;
+function recallGridDraft(
+  text: string,
+  quoteBefores: readonly string[] = [],
+): { text: string; quoteBefores: string[]; mentions: TaggedMentions | undefined } {
+  const sessions = recallSessionMentions(text, quoteBefores);
+  const sessionTokens = sessions.sessions.map((session) => session.token!);
+  // One tag list across the segments, so a file named in two of them keeps one token.
+  let mentions: TaggedMentions = { files: [], sessions: sessions.sessions };
+  const segments = [sessions.main, ...sessions.others].map((segment) => {
+    const files = recallFileMentions(segment, sessionTokens);
+    const merged = mergeTaggedDrafts(mentions, {
+      text: files.text,
+      mentions: { files: files.files, sessions: [] },
+    });
+    mentions = merged.mentions!;
+    return merged.text;
+  });
+  const tagged = mentions.files.length > 0 || mentions.sessions.length > 0;
   return {
-    text: files.text,
-    mentions: tagged ? { files: files.files, sessions: sessions.sessions } : undefined,
+    text: segments[0]!,
+    quoteBefores: segments.slice(1),
+    mentions: tagged ? mentions : undefined,
   };
 }
 
@@ -165,6 +197,28 @@ function loadRecalledGridText(childId: string, text: string): void {
   setSessionMentions(childId, recalled.mentions);
 }
 
+/**
+ * A queued grid message as its composer draft: quote cards kept, tags recalled as tokens.
+ * The caller writes `mentions` with `setSessionMentions` after the draft's text.
+ */
+function recallGridQueuedDraft(message: Pick<QueuedMessage, "text" | "replyDraft">) {
+  const restored = restoreReplyDraft(message.text, message.replyDraft);
+  const recalled = recallGridDraft(
+    restored.text,
+    restored.quotes.map((quote) => quote.before),
+  );
+  return {
+    draft: {
+      text: recalled.text,
+      quotes: restored.quotes.map((quote, index) => ({
+        ...quote,
+        before: recalled.quoteBefores[index]!,
+      })),
+    },
+    mentions: recalled.mentions,
+  };
+}
+
 const TEXT_INPUT_TYPES = new Set(["text", "search", "email", "url", "password", "number", "tel"]);
 
 /** A text field other than `own`: typing there must not be interrupted by a focus request. */
@@ -172,6 +226,7 @@ function isOtherTextInput(target: EventTarget | null, own: HTMLElement | null): 
   if (!(target instanceof HTMLElement) || target === own) return false;
   if (target instanceof HTMLInputElement) return TEXT_INPUT_TYPES.has(target.type);
   return (
+    isComposerInput(target) ||
     target instanceof HTMLTextAreaElement ||
     target.matches('[contenteditable]:not([contenteditable="false"])')
   );
@@ -209,6 +264,8 @@ interface GridComposerSlots {
   cyclePermissionMode?: () => boolean;
 }
 
+const NO_TAGGED_MENTIONS: TaggedMentions = { files: [], sessions: [] };
+
 // Accurate for every harness: a side chat is a fork that stays out of the main
 // thread. It is NOT reliably ephemeral — a non-Codex side chat is a persisted
 // fork (hidden from the sidebar), so the copy doesn't promise it disappears.
@@ -237,6 +294,8 @@ export function SideChatPane({
   onStart,
   readOnly: restoredReadOnly = false,
   fullSession = false,
+  evenComposerPadding = false,
+  transcriptTopInset,
   gridComposer,
 }: {
   childId: string;
@@ -246,6 +305,10 @@ export function SideChatPane({
   readOnly?: boolean;
   /** Display an existing session with its complete history and scoped composer. */
   fullSession?: boolean;
+  /** Space below the composer matches its sides, for a pane that frames it on all edges. */
+  evenComposerPadding?: boolean;
+  /** Extra room above the transcript, as a CSS length, for a header laid over it. */
+  transcriptTopInset?: string;
   /**
    * A grid cell's composer: one row tall, with the cell session's controls. It sends
    * the session's shared draft (tags, review comments) as the full-screen composer does.
@@ -438,6 +501,16 @@ export function SideChatPane({
     (starting || computeIsTurnActive(sessionStatus, state.status === "streaming"));
   // Background shells can outlive the child's turn; the indicator shows them.
   const showsBackgroundTasks = (!readOnly || fullSession) && state.backgroundTaskCount > 0;
+  // A full session shows its sandbox launch as the session page does: the stage, not
+  // Working, shows a send waiting on the sandbox, and a failed launch replaces Working.
+  const launch = fullSession ? state.sandboxStatus : null;
+  const launchInFlight = launch !== null && launch.stage !== "failed";
+  const showsWorkingRow =
+    launch?.stage !== "failed" &&
+    shouldShowWorkingIndicator(
+      (launchInFlight ? computeIsWorking(sessionStatus) : showsWorking) || showsBackgroundTasks,
+      bubbles,
+    );
   // Native interruption needs an observed turn; local streaming can start before one exists.
   const interruptReady =
     !usesNativeSideChatFork(sessionHarness) || activeResponse?.state === "streaming";
@@ -506,6 +579,9 @@ export function SideChatPane({
         <div
           ref={transcriptRef}
           className="flex min-h-0 flex-1 flex-col overflow-y-auto px-3 py-4"
+          style={
+            transcriptTopInset ? { paddingTop: `calc(1rem + ${transcriptTopInset})` } : undefined
+          }
           onScroll={(event) => {
             const node = event.currentTarget;
             followTail.current = node.scrollHeight - node.scrollTop - node.clientHeight < 64;
@@ -547,6 +623,8 @@ export function SideChatPane({
             <p role="status" className="m-auto text-sm text-muted-foreground">
               Loading session…
             </p>
+          ) : isEmpty && launch !== null ? (
+            <RunnerStartingIndicator variant="hero" status={launch} />
           ) : isEmpty ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
               <MessagesSquareIcon className="size-6 text-muted-foreground" />
@@ -572,14 +650,21 @@ export function SideChatPane({
                   />
                 ))}
               </EditSentMessageContext.Provider>
-              <WorkingIndicatorRow
-                key={childId}
-                show={shouldShowWorkingIndicator(showsWorking || showsBackgroundTasks, bubbles)}
-              />
+              <WorkingIndicatorRow key={childId} show={showsWorkingRow} />
+              {!showsWorkingRow && launch !== null && (
+                <RunnerStartingIndicator variant="row" status={launch} />
+              )}
               <div ref={bottomRef} />
             </div>
           )}
         </div>
+        {launch !== null && (
+          // A full session's composer is hidden when read-only, so the banner keeps its own gap.
+          <SandboxActionBanner
+            conversationId={childId}
+            className={cn("mx-3 shrink-0", readOnly && "mb-3")}
+          />
+        )}
         {!readOnly && !starting && (
           <SelectionPopup
             containerRef={transcriptRef}
@@ -592,7 +677,7 @@ export function SideChatPane({
           />
         )}
         {(!fullSession || !readOnly) && (
-          <div className="shrink-0 px-3 pt-3 pb-5">
+          <div className={cn("shrink-0 px-3 pt-3", evenComposerPadding ? "pb-3" : "pb-5")}>
             {readOnly ? (
               <p className="rounded-md border border-border bg-muted/40 px-3 py-2 text-center text-sm text-muted-foreground">
                 This side chat has ended and can’t be continued.
@@ -692,8 +777,8 @@ function SideChatComposer({
     () => allQueuedMessages.filter((message) => message.conversationId === childId),
     [allQueuedMessages, childId],
   );
-  // Grid sessions keep waiting for the turn to end; side chats queue like the main composer.
-  const queues = !pending && !fullSession;
+  // Grid cells queue like the full-screen composer; other full sessions wait for the turn to end.
+  const queues = !pending && (!fullSession || gridCell);
   useEffect(() => {
     if (queues && queuedMessages.length > 0 && !settingsSaving) maybeFlushQueuedHead(childId);
   }, [queues, queuedMessages, busy, agentId, childId, maybeFlushQueuedHead, settingsSaving]);
@@ -940,6 +1025,63 @@ function SideChatComposer({
   const isMobile = useIsMobileViewport();
   const [inputFocused, setInputFocused] = useState(false);
   const [commandNotice, setCommandNotice] = useState<string | null>(null);
+  useDismissOnEscape(commandNotice !== null, () => setCommandNotice(null));
+  // A grid cell's "@" picker: the full-screen composer's menu over the cell's session.
+  // Side chats never open it, so their listing queries stay off.
+  const fileMentionHarnesses = useFileMentionHarnesses(gridCell);
+  const [typedMention, setTypedMention] = useState<MentionState | null>(null);
+  // A send or an edit can change the text under an open "@", which then closes its menu.
+  const mention =
+    typedMention !== null &&
+    text.slice(typedMention.start, typedMention.end) === `@${typedMention.query}`
+      ? typedMention
+      : null;
+  const { children: cellChildren } = useChildSessions(gridCell ? childId : null);
+  const fileMentionsEnabled =
+    gridCell && harnessSupportsFileMentions(harness, fileMentionHarnesses);
+  // A cell's root listing waits on the workspace environment, as the all-files query does.
+  const environment = useWorkspaceEnvironment(gridCell ? childId : undefined, {
+    enabled: fileMentionsEnabled,
+  });
+  const { mentionDir, mentionFilter, mentionEntries, sessionEntries, mentionListingPending } =
+    useMentionListings({
+      conversationId: gridCell ? childId : null,
+      enabled: fileMentionsEnabled,
+      mention,
+      subagents: cellChildren,
+      environmentLoading: environment.isLoading,
+    });
+  const {
+    mentionIndex,
+    mentionOpen,
+    sessionMenu,
+    attachMention,
+    openMentionDir,
+    attachSession,
+    handleKeyDown: handleMentionKeyDown,
+    handleTokenBackspace,
+    dismiss: dismissMention,
+  } = useMentionBrowser({
+    mention,
+    setMention: setTypedMention,
+    mentionEntries,
+    sessionEntries,
+    text,
+    setText,
+    textareaRef,
+    isMobile,
+    tags: gridCell
+      ? {
+          mentions: sessionMentions ?? NO_TAGGED_MENTIONS,
+          updateMentions: (update) =>
+            setSessionMentions(
+              childId,
+              update(getSessionDraft(childId)?.mentions ?? NO_TAGGED_MENTIONS),
+            ),
+        }
+      : undefined,
+  });
+  const mentionMenuOpen = mentionOpen || mentionListingPending;
   const nativeSession = isNativeTerminalSession({ harness, labels: session?.labels });
   // A generic side chat has no host/workspace of its own: it forks the parent and
   // runs in the parent's workspace. Discover skills against the parent (the same
@@ -1035,13 +1177,14 @@ function SideChatComposer({
       inputFocused &&
       !pending &&
       !nativeSession &&
+      !mentionMenuOpen &&
       !carriesMessageContext({ quotes, text }, files, sendContext),
     onSelect: applyMenuSelection,
     onTabComplete: completeMenuSelection,
     clearText: () => setText(""),
   });
-  // Like the main composer, a draft turns Interrupt into Send.
-  const showInterrupt = !pending && busy && (fullSession || !canSend);
+  // Like the main composer, a draft turns Interrupt into Send; a grid cell queues its draft.
+  const showInterrupt = !pending && busy && ((fullSession && !gridCell) || !canSend);
 
   const interruptSideChat = () => {
     if (interrupting || !interruptReady) return;
@@ -1060,7 +1203,8 @@ function SideChatComposer({
       void onStart(serializeReplyDraft({ quotes, text: trimmed }));
       return;
     }
-    if ((busy && fullSession) || !canSend || agentId === null) return;
+    // A grid cell queues or steers its send while the session works; other full sessions wait.
+    if ((busy && fullSession && !gridCell) || !canSend || agentId === null) return;
     // On in-process harnesses /help and skills resolve locally; native TUIs
     // (claude-native, codex-native) read the text themselves, and a quote, attachment,
     // tag or review comment is always an ordinary message.
@@ -1114,13 +1258,20 @@ function SideChatComposer({
         child.sessionStatus,
         useChatStore.getState().queuedMessages,
         readAlwaysSteer(),
-        false,
+        // A codex /side command posts now even mid-turn, as the full-screen composer does.
+        gridCell && usesNativeSideChatFork(harness) && isSideChatCommand(message.trim()),
         holdsInitialDraft(child),
       )
     ) {
       clearComposer(composerKey);
+      if (gridCell) clearLocalReviewContexts(childId);
       onSend();
-      enqueueMessage(message, outgoing, snapshotReplyDraft({ quotes, text: trimmed }), childId);
+      enqueueMessage(
+        message,
+        outgoing,
+        gridCell ? composed.replyDraft : snapshotReplyDraft({ quotes, text: trimmed }),
+        childId,
+      );
       return;
     }
     // A running Codex chat refuses a steered /compact; keep the draft as the main composer does.
@@ -1138,25 +1289,38 @@ function SideChatComposer({
     // Mod+Enter submits any draft, then steers the whole queue into the running turn.
     if (queues && intent.shouldSteerAllFromKeyboard) {
       event.preventDefault();
-      if (settingsSavePending()) return;
+      // An open "@" menu keeps its draft unsent, so the queue waits with it.
+      if (settingsSavePending() || mentionMenuOpen) return;
       submit();
       steerAllQueuedMessages(childId);
       return;
     }
+    // An open "@" menu takes its keys first; Shift+Tab stays with the permission cycle.
+    if (!isPermissionModeCycleKey(event) && handleMentionKeyDown(event)) return;
+    // Only the tail input's text holds tags, so only it removes a whole token.
+    if (event.currentTarget === tailTextareaRef.current && handleTokenBackspace(event)) return;
     if (slashCompletion.handleKey(event, intent)) return;
     // Only a grid cell has a permission chip; a side chat leaves Shift+Tab to the browser.
     if (isPermissionModeCycleKey(event) && gridComposer?.cyclePermissionMode?.()) {
       event.preventDefault();
       return;
     }
+    // Esc closes slash-command output before it can reach the turn.
+    if (event.key === "Escape" && commandNotice !== null) {
+      event.preventDefault();
+      setCommandNotice(null);
+      return;
+    }
     // A grid pane is a whole session, so only side chats let Escape stop the turn.
-    if (event.key === "Escape" && queues && busy) {
+    if (event.key === "Escape" && queues && !fullSession && busy) {
       event.preventDefault();
       interruptSideChat();
       return;
     }
     if (intent.shouldSubmitFromKeyboard) {
       event.preventDefault();
+      // Enter with the "@" menu open picks from it or waits for its listing; it never sends.
+      if (mentionMenuOpen) return;
       submit();
     }
   };
@@ -1184,7 +1348,7 @@ function SideChatComposer({
         />
       )}
       {commandNotice !== null && (
-        <ComposerFeedbackRow data-testid="side-chat-command-notice">
+        <ComposerFeedbackRow data-testid="side-chat-command-notice" data-escape-owner="">
           {commandNotice}
         </ComposerFeedbackRow>
       )}
@@ -1196,8 +1360,17 @@ function SideChatComposer({
             onEdit={(queueId) => {
               const target = queuedMessages.find((message) => message.queueId === queueId);
               if (!target) return;
-              const restored = restoreReplyDraft(target.text, target.replyDraft);
-              updateComposer(composerKey, () => ({ ...restored, files: target.files ?? [] }));
+              if (gridCell) {
+                const recalled = recallGridQueuedDraft(target);
+                updateComposer(composerKey, () => ({
+                  ...recalled.draft,
+                  files: target.files ?? [],
+                }));
+                setSessionMentions(childId, recalled.mentions);
+              } else {
+                const restored = restoreReplyDraft(target.text, target.replyDraft);
+                updateComposer(composerKey, () => ({ ...restored, files: target.files ?? [] }));
+              }
               dequeueMessage(queueId);
               tailTextareaRef.current?.focus();
             }}
@@ -1224,6 +1397,14 @@ function SideChatComposer({
             if (commandNotice !== null) setCommandNotice(null);
             slashCompletion.onSelectionChange(event.target);
             setText(event.target.value);
+            if (gridCell)
+              setTypedMention(
+                detectMentionAt(
+                  event.target.value,
+                  event.target.selectionStart ?? event.target.value.length,
+                  sessionEntries.map((row) => row.title),
+                ),
+              );
           },
           onSelect: (event) => slashCompletion.onSelectionChange(event.currentTarget),
           onFocus: (event) => {
@@ -1231,7 +1412,10 @@ function SideChatComposer({
             focusText(null, event.currentTarget);
           },
           // Menu rows preventDefault on mousedown so selecting one keeps focus.
-          onBlur: () => setInputFocused(false),
+          onBlur: () => {
+            setInputFocused(false);
+            dismissMention();
+          },
           placeholder: fullSession ? "Reply to this session..." : "Ask a side question...",
           rows: gridComposer ? 1 : undefined,
           disabled: !ready,
@@ -1251,6 +1435,19 @@ function SideChatComposer({
               labels={slashCompletion.labels}
               skillsStatus={skillsStatus}
               onRetrySkills={() => void refreshSkills()}
+            />
+          ) : mentionMenuOpen ? (
+            <FileMentionMenu
+              currentDir={mentionDir}
+              query={mention?.query ?? ""}
+              fileQuery={mentionFilter}
+              activeIndex={mentionIndex}
+              entries={mentionEntries}
+              loading={mentionListingPending}
+              onOpenDir={openMentionDir}
+              onAttach={attachMention}
+              sessionMenu={sessionMenu}
+              onAttachSession={attachSession}
             />
           ) : undefined,
           inputPrefix:

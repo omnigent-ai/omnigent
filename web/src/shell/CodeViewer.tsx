@@ -77,6 +77,8 @@ import {
   lineOverlapsSelection,
 } from "./codeViewerHelpers";
 import { NotebookPreview } from "./NotebookPreview";
+import { DataTablePreview } from "./DataTablePreview";
+import { isDataTablePath } from "./dataTable";
 import { useScrollRestore } from "./useScrollRestore";
 import { PreviewSearchBar } from "./PreviewSearchBar";
 import { renderLineTokens } from "./codeViewerRendering";
@@ -334,14 +336,15 @@ function MarkdownPreview({
   );
 }
 
-// Markdown / notebook preview with find-in-file. The preview is React-owned
+// Markdown / notebook / data-table preview with find-in-file. The preview is React-owned
 // DOM, so PreviewSearchBar highlights matches via the CSS Custom Highlight API
 // (no node mutation). `contentVersion` = content string, so the match ranges
 // recompute when the rendered document changes.
 function PreviewWithSearch({
   content,
   path,
-  isNotebook,
+  kind,
+  encoding = "utf-8",
   truncated,
   searchOpen,
   onSearchHandled,
@@ -357,7 +360,9 @@ function PreviewWithSearch({
   deferOffscreen?: boolean;
   /** Workspace path of the previewed file, for resolving relative links. */
   path: string | null;
-  isNotebook: boolean;
+  kind: "markdown" | "notebook" | "table";
+  /** How the server sent *content*; only a data table decodes base64. */
+  encoding?: "utf-8" | "base64";
   truncated: boolean;
   searchOpen: boolean;
   onSearchHandled: () => void;
@@ -379,28 +384,51 @@ function PreviewWithSearch({
   // The preview div (not the FileViewer content area) is the real scroller
   // here, so scroll persistence attaches to it directly.
   const handleScroll = useScrollRestore(previewRef, scrollKey, scrollReady);
+  // A table re-renders its rows on sort and filter without new content, so it
+  // says when find must look again.
+  const [tableRowsVersion, setTableRowsVersion] = useState(0);
+  // New content (even emptied, with no rows left to report) also invalidates find.
+  const tableSearchVersion = useMemo(
+    () => [content, tableRowsVersion],
+    [content, tableRowsVersion],
+  );
+  const handleTableRowsChange = useCallback(
+    () => setTableRowsVersion((version) => version + 1),
+    [],
+  );
   const bar = (
     <PreviewSearchBar
       containerRef={previewRef}
-      contentVersion={content}
+      contentVersion={kind === "table" ? tableSearchVersion : content}
       open={searchOpen}
       onClose={onSearchHandled}
       inputRef={searchInputRef}
     />
   );
-  const preview = isNotebook ? (
-    <NotebookPreview content={content} rootRef={previewRef} onScroll={handleScroll} />
-  ) : (
-    <MarkdownPreview
-      content={content}
-      path={path}
-      rootRef={previewRef}
-      onScroll={handleScroll}
-      tocOpen={tocOpen}
-      onTocOpenChange={onTocOpenChange}
-      deferOffscreen={deferOffscreen}
-    />
-  );
+  const preview =
+    kind === "table" ? (
+      <DataTablePreview
+        content={content}
+        encoding={encoding}
+        path={path ?? ""}
+        truncated={truncated}
+        rootRef={previewRef}
+        onScroll={handleScroll}
+        onRowsChange={handleTableRowsChange}
+      />
+    ) : kind === "notebook" ? (
+      <NotebookPreview content={content} rootRef={previewRef} onScroll={handleScroll} />
+    ) : (
+      <MarkdownPreview
+        content={content}
+        path={path}
+        rootRef={previewRef}
+        onScroll={handleScroll}
+        tocOpen={tocOpen}
+        onTocOpenChange={onTocOpenChange}
+        deferOffscreen={deferOffscreen}
+      />
+    );
   // The find bar sits above the preview; a truncated preview also shows the
   // banner. The bar renders nothing when closed, so layout is unchanged then.
   return (
@@ -519,6 +547,11 @@ export interface CodeViewerProps {
   searchOpen: boolean;
   setSearchOpen: (open: boolean) => void;
   /**
+   * Whether the viewer is the surface the user is working in, so Cmd+F opens
+   * this file's find rather than the chat's. Unset means always.
+   */
+  ownsFindShortcut?: () => boolean;
+  /**
    * Bumped by FileViewer on each Cmd+F. Forwarded to the Monaco editor so a
    * press with the find widget already open refocuses its input.
    */
@@ -565,6 +598,7 @@ export function CodeViewer({
   mediaActive = panelOpen,
   searchOpen,
   setSearchOpen,
+  ownsFindShortcut,
   searchFocusNonce,
   searchInputRef,
   viewMode,
@@ -633,7 +667,8 @@ export function CodeViewer({
   const isHtmlPreview = viewMode === "preview" && lang === "html";
   const isMarkdownOrNotebookPreview =
     viewMode === "preview" && (lang === "markdown" || isNotebookPath(path));
-  const isRenderedPreview = isHtmlPreview || isMarkdownOrNotebookPreview;
+  const isDataTablePreview = viewMode === "preview" && isDataTablePath(path);
+  const isRenderedPreview = isHtmlPreview || isMarkdownOrNotebookPreview || isDataTablePreview;
   // Only the Shiki DOM path needs the per-line split; skip it for Monaco and
   // rendered previews, which never render these lines.
   const rawLines = useMemo(
@@ -733,6 +768,7 @@ export function CodeViewer({
     if (!panelOpen || !isMarkdownEditor) return;
     const handler = (e: KeyboardEvent) => {
       if (hasCommandModifier(e) && e.key === "f") {
+        if (ownsFindShortcut && !ownsFindShortcut()) return;
         e.preventDefault();
         setSearchOpen(true);
         setTimeout(() => searchInputRef.current?.focus(), 0);
@@ -743,7 +779,7 @@ export function CodeViewer({
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [panelOpen, isMarkdownEditor, searchOpen, setSearchOpen, searchInputRef]);
+  }, [panelOpen, isMarkdownEditor, searchOpen, setSearchOpen, searchInputRef, ownsFindShortcut]);
 
   // Open search on Cmd+F / Ctrl+F in the Shiki source view.
   useEffect(() => {
@@ -752,6 +788,8 @@ export function CodeViewer({
     if (!panelOpen || isMarkdownEditor || showMonaco) return;
     const handler = (e: KeyboardEvent) => {
       if (hasCommandModifier(e) && e.key === "f") {
+        // Beside the chat, Cmd+F belongs to whichever surface the user is in.
+        if (ownsFindShortcut && !ownsFindShortcut()) return;
         e.preventDefault();
         setSearchOpen(true);
         setTimeout(() => searchInputRef.current?.focus(), 0);
@@ -777,7 +815,15 @@ export function CodeViewer({
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [panelOpen, isMarkdownEditor, showMonaco, searchOpen, setSearchOpen, searchInputRef]);
+  }, [
+    panelOpen,
+    isMarkdownEditor,
+    showMonaco,
+    searchOpen,
+    setSearchOpen,
+    searchInputRef,
+    ownsFindShortcut,
+  ]);
 
   // In Monaco mode the custom search bar isn't rendered; the editor mirrors its
   // native find widget to `searchOpen` (open when set, close when cleared). This
@@ -960,6 +1006,26 @@ export function CodeViewer({
       </Suspense>
     );
   }
+  // Before the binary notice: a data file in another encoding arrives as base64.
+  if (isDataTablePreview && fileQuery.data) {
+    return (
+      <PreviewWithSearch
+        key={`${conversationId}:${path}`}
+        content={content}
+        path={path}
+        kind="table"
+        encoding={fileQuery.data.encoding}
+        truncated={truncated}
+        searchOpen={searchOpen}
+        onSearchHandled={handleSearchHandled}
+        searchInputRef={searchInputRef}
+        scrollKey={conversationId && path ? `viewer-preview:${conversationId}:${path}` : null}
+        scrollReady
+        tocOpen={false}
+        onTocOpenChange={() => {}}
+      />
+    );
+  }
   if (fileQuery.data?.encoding === "base64" || isBinaryPath(path)) {
     return (
       <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
@@ -1015,7 +1081,7 @@ export function CodeViewer({
       <PreviewWithSearch
         content={content}
         path={path}
-        isNotebook={isNotebook}
+        kind={isNotebook ? "notebook" : "markdown"}
         truncated={truncated}
         searchOpen={searchOpen}
         onSearchHandled={handleSearchHandled}

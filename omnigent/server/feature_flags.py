@@ -50,12 +50,15 @@ class Feature(StrEnum):
     SIDEBAR_WINDOWED_ROWS = "sidebar_windowed_rows"
     WORKFLOWS = "workflows"
     SESSION_OVERVIEW = "session_overview"
+    PROJECT_KANBAN = "project_kanban"
     PROJECT_REPOSITORY_CREATION = "project_repository_creation"
     WORKSPACE_DIRECT_ACCESS = "workspace_direct_access"
     WORKSPACE_API_SERVER_ACCESS = "workspace_api_server_access"
     PROACTIVE_AGENT = "proactive_agent"
     USER_INBOX = "user_inbox"
+    PI_CLAUDE_PLUGINS = "pi_claude_plugins"
     MEMORY = "memory"
+    QUICK_PICK_PALETTE = "quick_pick_palette"
 
 
 @dataclass(frozen=True)
@@ -150,7 +153,9 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         feature=Feature.GRID_SESSIONS_DISPLAY_UI,
         description="Local session grids with up to four live conversations",
         owner="web",
-        review_by_release="0.20.0",
+        # On by default; remove the flag and its off path in 0.25.0.
+        review_by_release="0.25.0",
+        default_enabled=True,
     ),
     FeatureDefinition(
         feature=Feature.SPLITTABLE_TERMINAL_VIEW_UI,
@@ -238,7 +243,9 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         feature=Feature.WORKSPACE_CONTENT_SEARCH,
         description="Search workspace file contents through the session runner",
         owner="web",
-        review_by_release="0.20.0",
+        # On by default; remove the flag and its off path in 0.25.0.
+        review_by_release="0.25.0",
+        default_enabled=True,
     ),
     FeatureDefinition(
         feature=Feature.SIDEBAR_WINDOWED_ROWS,
@@ -257,6 +264,13 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Session cost sidebar beside chat, toggled from a header cost chip",
         owner="web",
         review_by_release="0.25.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.PROJECT_KANBAN,
+        description="Project home page opened from a project row: composer above a sessions board",
+        owner="web",
+        review_by_release="0.27.0",
+        default_enabled=True,
     ),
     FeatureDefinition(
         feature=Feature.PROJECT_REPOSITORY_CREATION,
@@ -299,6 +313,19 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         # Clients probe inbox_items_available in GET /v1/info.
         frontend_visible=False,
         default_enabled=True,
+    ),
+    FeatureDefinition(
+        feature=Feature.PI_CLAUDE_PLUGINS,
+        description="Expose enabled Claude Code plugins to managed Pi sessions",
+        owner="runner",
+        review_by_release="0.24.0",
+        frontend_visible=False,
+    ),
+    FeatureDefinition(
+        feature=Feature.QUICK_PICK_PALETTE,
+        description="Run the ⌘K command palette on the fuzzy-matching QuickPick list",
+        owner="web",
+        review_by_release="0.24.0",
     ),
 )
 

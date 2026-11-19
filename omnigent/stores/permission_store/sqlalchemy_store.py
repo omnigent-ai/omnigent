@@ -25,6 +25,8 @@ from omnigent.db.db_models import (
     SqlScheduledTaskShare,
     SqlSessionPermission,
     SqlUser,
+    SqlWorkflow,
+    SqlWorkflowShare,
     current_workspace_id,
 )
 from omnigent.db.enum_codecs import encode_scheduled_task_state
@@ -34,7 +36,13 @@ from omnigent.db.utils import (
     make_named_managed_session_maker,
     run_write_transaction,
 )
-from omnigent.entities import Account, ResolvedAccess, ScheduledTaskPermission, SessionPermission
+from omnigent.entities import (
+    Account,
+    ResolvedAccess,
+    ScheduledTaskPermission,
+    SessionPermission,
+    WorkflowPermission,
+)
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server import session_sharing
 from omnigent.server.auth import (
@@ -48,6 +56,7 @@ from omnigent.stores.permission_store import (
     MAX_GRANTEE_ID_CHARS,
     MAX_GRANTS_PAGE_SIZE,
     MAX_SHARED_SCHEDULED_TASKS_PAGE_SIZE,
+    MAX_SHARED_WORKFLOWS_PAGE_SIZE,
     PermissionStore,
     require_grantee_id_fits,
 )
@@ -60,9 +69,13 @@ _HIDDEN_LIST_USERS = frozenset({RESERVED_USER_PUBLIC, RESERVED_USER_LOCAL})
 # SQLite does not enforce these widths, so grants check MAX_GRANTEE_ID_CHARS themselves.
 assert all(
     isinstance(column.type, String) and column.type.length == MAX_GRANTEE_ID_CHARS
-    for column in (SqlScheduledTaskShare.__table__.c.user_id, SqlUser.__table__.c.id)
+    for column in (
+        SqlScheduledTaskShare.__table__.c.user_id,
+        SqlWorkflowShare.__table__.c.user_id,
+        SqlUser.__table__.c.id,
+    )
 )
-# Never automation grantees: automations are never public, and ``local`` is the
+# Never automation or workflow grantees: neither is ever public, and ``local`` is the
 # single-user identity rather than someone to share with.
 _RESERVED_GRANTEES = frozenset({RESERVED_USER_PUBLIC, RESERVED_USER_LOCAL})
 
@@ -154,7 +167,7 @@ def _to_entity(row: SqlSessionPermission) -> SessionPermission:
 
 def _upsert_grant(
     dialect: str,
-    model: type[SqlSessionPermission] | type[SqlScheduledTaskShare],
+    model: type[SqlSessionPermission] | type[SqlScheduledTaskShare] | type[SqlWorkflowShare],
     key: dict[str, str],
     level: int,
     *,
@@ -207,24 +220,54 @@ def _upsert_grant(
     )
 
 
-def _reserved_grantee_error(user_id: str) -> OmnigentError:
+def _reserved_grantee_error(user_id: str, resource: str = "An automation") -> OmnigentError:
+    """The refusal of a reserved grantee on *resource*, e.g. ``"A workflow"``."""
     return OmnigentError(
-        f"An automation cannot be shared with {user_id!r}.",
+        f"{resource} cannot be shared with {user_id!r}.",
         code=ErrorCode.INVALID_INPUT,
     )
 
 
-def _require_storable_scheduled_task_grant(user_id: str, level: int) -> None:
-    """Refuse a grant the share table cannot hold or the store must never hold."""
+def _require_storable_grant(
+    user_id: str, level: int, *, levels: frozenset[int], resource: str, kinds: str
+) -> None:
+    """Refuse a grant a share table cannot hold or the store must never hold.
+
+    :param levels: The levels the resource may grant.
+    :param resource: The resource for messages, e.g. ``"A workflow"``.
+    :param kinds: Its plural for messages, e.g. ``"Workflows"``.
+    """
     require_grantee_id_fits(user_id)
     # A fast path; the grant rechecks under the key's collation, which folds accents too.
     if session_sharing.is_reserved_grantee(user_id):
-        raise _reserved_grantee_error(user_id)
-    if level not in session_sharing.SCHEDULED_TASK_GRANT_LEVELS:
+        raise _reserved_grantee_error(user_id, resource)
+    if level not in levels:
         raise OmnigentError(
-            f"Automations cannot grant permission level {level!r}.",
+            f"{kinds} cannot grant permission level {level!r}.",
             code=ErrorCode.INVALID_INPUT,
         )
+
+
+def _require_storable_scheduled_task_grant(user_id: str, level: int) -> None:
+    """Refuse an automation grant the share table cannot hold or the store must never hold."""
+    _require_storable_grant(
+        user_id,
+        level,
+        levels=session_sharing.SCHEDULED_TASK_GRANT_LEVELS,
+        resource="An automation",
+        kinds="Automations",
+    )
+
+
+def _require_storable_workflow_grant(user_id: str, level: int) -> None:
+    """Refuse a workflow grant the share table cannot hold or the store must never hold."""
+    _require_storable_grant(
+        user_id,
+        level,
+        levels=session_sharing.WORKFLOW_GRANT_LEVELS,
+        resource="A workflow",
+        kinds="Workflows",
+    )
 
 
 def _lock_live_scheduled_task(session: Session, scheduled_task_id: str, grantee: str) -> None:
@@ -250,7 +293,28 @@ def _lock_live_scheduled_task(session: Session, scheduled_task_id: str, grantee:
         )
 
 
-_GrantRow = TypeVar("_GrantRow", SqlSessionPermission, SqlScheduledTaskShare)
+def _lock_workflow(session: Session, workflow_id: str, grantee: str) -> None:
+    """Lock a workflow's row before its grant rows, the order account deletion also takes.
+
+    A workflow deleted before the lock refuses the grant, so none outlives it. The owner
+    is compared in SQL, so a variant the column's collation matches is refused too.
+    """
+    row = session.execute(
+        select(SqlWorkflow.user_id == grantee)
+        .where(SqlWorkflow.workspace_id == current_workspace_id(), SqlWorkflow.id == workflow_id)
+        .with_for_update()
+        .with_hint(SqlWorkflow, "FORCE INDEX (PRIMARY)", "mysql")
+    ).one_or_none()
+    if row is None:
+        raise OmnigentError("Workflow not found", code=ErrorCode.NOT_FOUND)
+    if row[0]:
+        raise OmnigentError(
+            "A workflow's owner cannot be granted access to it.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+
+_GrantRow = TypeVar("_GrantRow", SqlSessionPermission, SqlScheduledTaskShare, SqlWorkflowShare)
 _Grant = TypeVar("_Grant")
 
 
@@ -288,9 +352,13 @@ def _grant_page(
     return [to_entity(row) for row in page], next_cursor
 
 
+_ShareModel = type[SqlScheduledTaskShare] | type[SqlWorkflowShare]
+
+
 def _delete_grant_batch(
     session: Session,
     *,
+    model: _ShareModel,
     match: ColumnElement[bool],
     key_column: InstrumentedAttribute[str],
     after: str | None,
@@ -302,7 +370,7 @@ def _delete_grant_batch(
         return None, 0
     stmt = (
         select(key_column)
-        .where(SqlScheduledTaskShare.workspace_id == current_workspace_id(), match)
+        .where(model.workspace_id == current_workspace_id(), match)
         .order_by(key_column)
         .limit(batch_size)
     )
@@ -314,8 +382,8 @@ def _delete_grant_batch(
     result = cast(
         CursorResult[tuple[object]],
         session.execute(
-            delete(SqlScheduledTaskShare).where(
-                SqlScheduledTaskShare.workspace_id == current_workspace_id(),
+            delete(model).where(
+                model.workspace_id == current_workspace_id(),
                 match,
                 key_column.in_(keys),
             )
@@ -328,6 +396,7 @@ def _delete_grants_in_batches(
     session_maker: NamedManagedSessionMaker,
     operation_name: str,
     *,
+    model: _ShareModel,
     match: ColumnElement[bool],
     key_column: InstrumentedAttribute[str],
     batch_size: int,
@@ -344,6 +413,7 @@ def _delete_grants_in_batches(
             operation_name,
             partial(
                 _delete_grant_batch,
+                model=model,
                 match=match,
                 key_column=key_column,
                 after=after,
@@ -363,6 +433,7 @@ def delete_scheduled_task_grants(
     return _delete_grants_in_batches(
         session_maker,
         "delete_scheduled_task_grant_batch",
+        model=SqlScheduledTaskShare,
         match=SqlScheduledTaskShare.scheduled_task_id == scheduled_task_id,
         key_column=SqlScheduledTaskShare.user_id,
         batch_size=batch_size,
@@ -392,6 +463,7 @@ def delete_deleted_task_grants(
     return _delete_grants_in_batches(
         session_maker,
         "delete_deleted_task_grant_batch",
+        model=SqlScheduledTaskShare,
         match=SqlScheduledTaskShare.scheduled_task_id == scheduled_task_id,
         key_column=SqlScheduledTaskShare.user_id,
         batch_size=batch_size,
@@ -399,22 +471,30 @@ def delete_deleted_task_grants(
     )
 
 
-def delete_deleted_account_grants(
-    session_maker: NamedManagedSessionMaker, user_id: str, *, batch_size: int
-) -> int:
-    """Delete the grants a deleted account held, one bounded batch per transaction.
-
-    Walks ``ix_scheduled_task_shares_user_id``. Each batch first locks the account and
-    stops once the name belongs to a live account again, whose grants are its own.
-    """
+def _account_is_deleted(user_id: str) -> Callable[[Session], bool]:
+    """A batch check that locks *user_id*'s account and passes while it is deleted or gone."""
 
     def account_is_deleted(session: Session) -> bool:
         account = lock_account(session, user_id)
         return account is None or account.deleted_at is not None
 
+    return account_is_deleted
+
+
+def delete_deleted_account_grants(
+    session_maker: NamedManagedSessionMaker, user_id: str, *, batch_size: int
+) -> int:
+    """Delete the automation grants a deleted account held, one bounded batch per transaction.
+
+    Walks ``ix_scheduled_task_shares_user_id``. Each batch first locks the account and
+    stops once the name belongs to a live account again, whose grants are its own.
+    """
+    account_is_deleted = _account_is_deleted(user_id)
+
     return _delete_grants_in_batches(
         session_maker,
         "delete_deleted_account_grant_batch",
+        model=SqlScheduledTaskShare,
         match=SqlScheduledTaskShare.user_id == user_id,
         key_column=SqlScheduledTaskShare.scheduled_task_id,
         batch_size=batch_size,
@@ -441,6 +521,132 @@ def _to_scheduled_task_permission(row: SqlScheduledTaskShare) -> ScheduledTaskPe
         scheduled_task_id=row.scheduled_task_id,
         level=row.level,
     )
+
+
+def delete_workflow_grants(
+    session_maker: NamedManagedSessionMaker, workflow_id: str, *, batch_size: int
+) -> int:
+    """Delete a workflow's grants along the primary key, one bounded batch per transaction."""
+    return _delete_grants_in_batches(
+        session_maker,
+        "delete_workflow_grant_batch",
+        model=SqlWorkflowShare,
+        match=SqlWorkflowShare.workflow_id == workflow_id,
+        key_column=SqlWorkflowShare.user_id,
+        batch_size=batch_size,
+    )
+
+
+def delete_deleted_account_workflow_grants(
+    session_maker: NamedManagedSessionMaker, user_id: str, *, batch_size: int
+) -> int:
+    """Delete the workflow grants a deleted account held, one bounded batch per transaction.
+
+    Walks ``ix_workflow_shares_user_id``. Each batch first locks the account and stops
+    once the name belongs to a live account again, whose grants are its own.
+    """
+    return _delete_grants_in_batches(
+        session_maker,
+        "delete_deleted_account_workflow_grant_batch",
+        model=SqlWorkflowShare,
+        match=SqlWorkflowShare.user_id == user_id,
+        key_column=SqlWorkflowShare.workflow_id,
+        batch_size=batch_size,
+        proceed=_account_is_deleted(user_id),
+    )
+
+
+def holds_workflow_grants(session: Session, user_id: str) -> bool:
+    """Whether any workflow grant to *user_id* remains in the workspace, in one indexed probe."""
+    return session.execute(
+        select(
+            exists().where(
+                SqlWorkflowShare.workspace_id == current_workspace_id(),
+                SqlWorkflowShare.user_id == user_id,
+            )
+        )
+    ).scalar_one()
+
+
+def delete_grants_on_workflows(
+    session: Session, workflow_ids: Sequence[str], *, batch_size: int
+) -> int:
+    """Delete up to *batch_size* grants on *workflow_ids* in the caller's transaction.
+
+    For deleting workflows a bounded batch at a time: their grants go first, so none
+    outlives its workflow. Each workflow's grants are read along its primary-key
+    prefix, limited to the room left in the batch, so a batch scans ``O(batch_size)``
+    rows however many other grants the workspace holds.
+
+    :returns: The number of grants deleted; ``0`` once the workflows have none.
+    """
+    deleted = 0
+    for workflow_id in sorted(workflow_ids):
+        room = batch_size - deleted
+        if room <= 0:
+            break
+        user_ids = list(
+            session.execute(
+                select(SqlWorkflowShare.user_id)
+                .where(
+                    SqlWorkflowShare.workspace_id == current_workspace_id(),
+                    SqlWorkflowShare.workflow_id == workflow_id,
+                )
+                .order_by(SqlWorkflowShare.user_id)
+                .limit(room)
+            ).scalars()
+        )
+        if user_ids:
+            session.execute(
+                delete(SqlWorkflowShare).where(
+                    SqlWorkflowShare.workspace_id == current_workspace_id(),
+                    SqlWorkflowShare.workflow_id == workflow_id,
+                    SqlWorkflowShare.user_id.in_(user_ids),
+                )
+            )
+            deleted += len(user_ids)
+    return deleted
+
+
+def _to_workflow_permission(row: SqlWorkflowShare) -> WorkflowPermission:
+    """Convert a :class:`SqlWorkflowShare` ORM row to a domain entity."""
+    return WorkflowPermission(user_id=row.user_id, workflow_id=row.workflow_id, level=row.level)
+
+
+def _shared_resource_ids(
+    session: Session,
+    grantee: InstrumentedAttribute[str],
+    resource: InstrumentedAttribute[str],
+    principals: Sequence[str],
+    *,
+    after: str | None,
+    limit: int,
+) -> tuple[list[str], bool]:
+    """The first *limit* resource IDs past *after* shared with any principal, by ID.
+
+    Each principal walks its share table's user index for at most ``limit + 1`` rows.
+    The first ``limit + 1`` distinct IDs are each within their principal's window.
+
+    :param grantee: The share table's ``user_id`` column.
+    :param resource: Its resource ID column, e.g. ``SqlWorkflowShare.workflow_id``.
+    :returns: ``(ids, has_more)``.
+    """
+    workspace = grantee.class_.workspace_id
+    windows = []
+    for principal in sorted(set(principals)):
+        window = (
+            select(resource)
+            .where(workspace == current_workspace_id(), grantee == principal)
+            .order_by(resource)
+            .limit(limit + 1)
+        )
+        if after is not None:
+            window = window.where(resource > after)
+        windows.append(select(window.subquery().c[resource.key]))
+    if not windows:
+        return [], False
+    candidates = sorted(set(session.execute(union_all(*windows)).scalars()))
+    return candidates[:limit], len(candidates) > limit
 
 
 class SqlAlchemyPermissionStore(PermissionStore):
@@ -830,6 +1036,34 @@ class SqlAlchemyPermissionStore(PermissionStore):
             row = session.get(SqlUser, (current_workspace_id(), user_id))
             return _to_account(row) if row is not None and row.deleted_at is None else None
 
+    def deleted_accounts(self, user_ids: Sequence[str]) -> set[str]:
+        """Return the given IDs a deleted account's key matches. See base class.
+
+        Compared in SQL, one primary-key probe each in a single statement, so a
+        spelling the key's collation equates with a deleted account counts, as it
+        would at login, and comes back as given.
+        """
+        wanted = sorted(set(user_ids))
+        if not wanted:
+            return set()
+        probes = [
+            case(
+                (
+                    exists().where(
+                        SqlUser.workspace_id == current_workspace_id(),
+                        SqlUser.id == user_id,
+                        SqlUser.deleted_at.is_not(None),
+                    ),
+                    literal(True),
+                ),
+                else_=literal(False),
+            )
+            for user_id in wanted
+        ]
+        with self._session("read_deleted_accounts") as session:
+            deleted = session.execute(select(*probes)).one()
+        return {user_id for user_id, gone in zip(wanted, deleted, strict=True) if gone}
+
     def user_exists(self, user_id: str) -> bool:
         """Check for a user row. See base class for contract."""
         with self._session("select_user_exists") as session:
@@ -1178,30 +1412,17 @@ class SqlAlchemyPermissionStore(PermissionStore):
                 f"limit must be between 1 and {MAX_SHARED_SCHEDULED_TASKS_PAGE_SIZE}.",
                 code=ErrorCode.INVALID_INPUT,
             )
-        distinct_principals = sorted(set(principals))
-        if not distinct_principals:
+        if not principals:
             return [], None
-        windows = []
-        for principal in distinct_principals:
-            window = (
-                select(SqlScheduledTaskShare.scheduled_task_id)
-                .where(
-                    SqlScheduledTaskShare.workspace_id == current_workspace_id(),
-                    SqlScheduledTaskShare.user_id == principal,
-                )
-                .order_by(SqlScheduledTaskShare.scheduled_task_id)
-                .limit(limit + 1)
-            )
-            if after_scheduled_task_id is not None:
-                window = window.where(
-                    SqlScheduledTaskShare.scheduled_task_id > after_scheduled_task_id
-                )
-            subquery = window.subquery()
-            windows.append(select(subquery.c.scheduled_task_id))
         with self._session("list_scheduled_tasks_shared_with_caller") as session:
-            # The first limit + 1 distinct IDs are each within their principal's window.
-            candidates = sorted(set(session.execute(union_all(*windows)).scalars()))
-            scanned = candidates[:limit]
+            scanned, has_more = _shared_resource_ids(
+                session,
+                SqlScheduledTaskShare.user_id,
+                SqlScheduledTaskShare.scheduled_task_id,
+                principals,
+                after=after_scheduled_task_id,
+                limit=limit,
+            )
             if not scanned:
                 return [], None
             live = set(
@@ -1213,11 +1434,156 @@ class SqlAlchemyPermissionStore(PermissionStore):
                     )
                 ).scalars()
             )
-        next_cursor = scanned[-1] if len(candidates) > limit else None
+        next_cursor = scanned[-1] if has_more else None
         return [task_id for task_id in scanned if task_id in live], next_cursor
 
     def delete_for_scheduled_task(self, scheduled_task_id: str) -> int:
         """Delete every grant on a scheduled task, one batch per transaction. See base class."""
         return delete_scheduled_task_grants(
             self._session_immediate, scheduled_task_id, batch_size=self._cleanup_batch_size
+        )
+
+    # ── Workflow grants ───────────────────────────────────────────────────
+
+    @property
+    def supports_workflow_grants(self) -> bool:
+        """Grants persist in ``workflow_shares``. See base class."""
+        return True
+
+    def grant_for_workflow(self, user_id: str, workflow_id: str, level: int) -> WorkflowPermission:
+        """Upsert a workflow grant. See base class for contract.
+
+        Locks the accounts, then the workflow, then the grant row.
+
+        :raises OmnigentError: ``INVALID_INPUT`` for an over-wide ID, a reserved
+            grantee, the workflow's owner, or a level outside
+            :data:`~omnigent.server.session_sharing.WORKFLOW_GRANT_LEVELS`;
+            ``NOT_FOUND`` when the workflow is missing; the account errors of
+            :meth:`grant`.
+        """
+        _require_storable_workflow_grant(user_id, level)
+
+        def write(session: Session) -> None:
+            require_active_account(session, user_id)
+            _lock_workflow(session, workflow_id, user_id)
+            session.execute(
+                _upsert_grant(
+                    self._engine.dialect.name,
+                    SqlWorkflowShare,
+                    {"workflow_id": workflow_id, "user_id": user_id},
+                    level,
+                )
+            )
+            # The stored key's collation may match a reserved ID the fast path let through.
+            reserved = session.execute(
+                select(SqlWorkflowShare.user_id).where(
+                    SqlWorkflowShare.workspace_id == current_workspace_id(),
+                    SqlWorkflowShare.workflow_id == workflow_id,
+                    SqlWorkflowShare.user_id == user_id,
+                    SqlWorkflowShare.user_id.in_(sorted(_RESERVED_GRANTEES)),
+                )
+            ).first()
+            if reserved is not None:
+                raise _reserved_grantee_error(user_id, "A workflow")
+
+        run_write_transaction(self._session_immediate, "grant_workflow_permission", write)
+        return WorkflowPermission(user_id=user_id, workflow_id=workflow_id, level=level)
+
+    def revoke_for_workflow(self, user_id: str, workflow_id: str) -> bool:
+        """Remove a workflow grant. See base class for contract."""
+
+        def write(session: Session) -> bool:
+            result = cast(
+                CursorResult[tuple[object]],
+                session.execute(
+                    delete(SqlWorkflowShare).where(
+                        SqlWorkflowShare.workspace_id == current_workspace_id(),
+                        SqlWorkflowShare.workflow_id == workflow_id,
+                        SqlWorkflowShare.user_id == user_id,
+                    )
+                ),
+            )
+            return result.rowcount > 0
+
+        return run_write_transaction(self._session_immediate, "revoke_workflow_permission", write)
+
+    def list_for_workflow(
+        self,
+        workflow_id: str,
+        *,
+        limit: int = 100,
+        after_user_id: str | None = None,
+    ) -> tuple[list[WorkflowPermission], str | None]:
+        """Return a workflow's grants with cursor pagination. See base class."""
+        with self._session("list_workflow_permissions") as session:
+            return _grant_page(
+                session,
+                SqlWorkflowShare,
+                SqlWorkflowShare.workflow_id == workflow_id,
+                _to_workflow_permission,
+                limit=limit,
+                after_user_id=after_user_id,
+            )
+
+    def resolve_workflow_access(self, principals: Sequence[str], workflow_id: str) -> int | None:
+        """Return the highest level any principal holds. See base class for contract."""
+        if not principals:
+            return None
+        with self._session("resolve_workflow_access") as session:
+            return session.execute(
+                select(func.max(SqlWorkflowShare.level)).where(
+                    SqlWorkflowShare.workspace_id == current_workspace_id(),
+                    SqlWorkflowShare.workflow_id == workflow_id,
+                    SqlWorkflowShare.user_id.in_(list(principals)),
+                )
+            ).scalar_one()
+
+    def list_workflows_shared_with(
+        self,
+        principals: Sequence[str],
+        *,
+        limit: int = 50,
+        after_workflow_id: str | None = None,
+    ) -> tuple[list[str], str | None]:
+        """Page the workflows shared with any principal. See base class for contract.
+
+        Each principal walks ``ix_workflow_shares_user_id`` past the cursor for at most
+        ``limit + 1`` rows, so a page reads ``O(len(principals) * limit)`` grants, then
+        that page's workflows by primary key.
+        """
+        if not 1 <= limit <= MAX_SHARED_WORKFLOWS_PAGE_SIZE:
+            raise OmnigentError(
+                f"limit must be between 1 and {MAX_SHARED_WORKFLOWS_PAGE_SIZE}.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if not principals:
+            return [], None
+        with self._session("list_workflows_shared_with_caller") as session:
+            scanned, has_more = _shared_resource_ids(
+                session,
+                SqlWorkflowShare.user_id,
+                SqlWorkflowShare.workflow_id,
+                principals,
+                after=after_workflow_id,
+                limit=limit,
+            )
+            if not scanned:
+                return [], None
+            live = set(
+                session.execute(
+                    select(SqlWorkflow.id)
+                    .where(
+                        SqlWorkflow.workspace_id == current_workspace_id(),
+                        SqlWorkflow.id.in_(scanned),
+                    )
+                    .with_hint(SqlWorkflow, "FORCE INDEX (PRIMARY)", "mysql")
+                ).scalars()
+            )
+        next_cursor = scanned[-1] if has_more else None
+        return [workflow_id for workflow_id in scanned if workflow_id in live], next_cursor
+
+    def delete_for_workflow(self, workflow_id: str) -> int:
+        """Delete every grant on a workflow, one batch per transaction. See base class."""
+        return delete_workflow_grants(
+            self._session_immediate, workflow_id, batch_size=self._cleanup_batch_size
         )

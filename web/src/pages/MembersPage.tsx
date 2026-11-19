@@ -51,6 +51,14 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isBootFallbackInfo } from "@/lib/bootCapabilities";
 import { withBasePath } from "@/lib/basePath";
 import { isSingleUserMode } from "@/lib/capabilities";
+import { MEMBERS_INVITE_ENTRY, MEMBERS_LIST_ENTRY } from "@/pages/settings/search/catalog/members";
+import { SettingsItem } from "@/pages/settings/search/SettingsItem";
+import { settingsControlProps } from "@/pages/settings/search/settingsControl";
+import {
+  SettingsDataRegion,
+  settingsOverlayProps,
+  settingsRowOverlayProps,
+} from "@/pages/settings/search/settingsOwnership";
 
 export function MembersPage() {
   const info = useServerInfo();
@@ -117,7 +125,7 @@ export function MembersPage() {
         contentClassName="px-4 md:px-8"
         extraBottom="2.5rem"
       >
-        <h1 className="settings-page-title mb-2 text-2xl font-medium">Members</h1>
+        <h1 className="mb-2 text-2xl font-medium">Members</h1>
         <p className="text-ui text-muted-foreground">
           Member management is not available in single-user mode.
         </p>
@@ -146,7 +154,7 @@ export function MembersPage() {
         contentClassName="px-4 md:px-8"
         extraBottom="2.5rem"
       >
-        <h1 className="settings-page-title mb-2 text-2xl font-medium">Members</h1>
+        <h1 className="mb-2 text-2xl font-medium">Members</h1>
         <p className="text-ui text-muted-foreground">
           You don't have permission to manage members.
         </p>
@@ -199,103 +207,125 @@ export function MembersPage() {
   return (
     <PageScroll maxWidthClassName="max-w-4xl" contentClassName="px-4 md:px-8" extraBottom="2.5rem">
       <div className="mb-6 flex items-center justify-between">
-        <h1 className="settings-page-title text-2xl font-medium">Members</h1>
+        <h1 className="text-2xl font-medium">Members</h1>
         {/* Invite mints a password-backed account — accounts mode only.
         Under OIDC, accounts are provisioned by the IdP on first login, so
         there's nothing to invite here. */}
         {manageable && (
-          <Button onClick={() => setShowCreateInvite(true)}>
-            <UserPlusIcon /> Invite member
-          </Button>
+          <SettingsItem entry={MEMBERS_INVITE_ENTRY}>
+            <Button
+              {...settingsControlProps(MEMBERS_INVITE_ENTRY, "invite")}
+              onClick={() => setShowCreateInvite(true)}
+            >
+              <UserPlusIcon /> Invite member
+            </Button>
+          </SettingsItem>
         )}
       </div>
 
-      {!manageable && (
-        <p className="mb-4 text-sm text-muted-foreground">
-          Users are added on first sign-in through your identity provider. This list is read-only.
-        </p>
-      )}
+      <SettingsItem entry={MEMBERS_LIST_ENTRY}>
+        {!manageable && (
+          <p className="mb-4 text-sm text-muted-foreground">
+            Users are added on first sign-in through your identity provider. This list is read-only.
+          </p>
+        )}
 
-      {loadError !== null && (
-        <div
-          role="alert"
-          className="mb-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
-        >
-          {loadError}
-        </div>
-      )}
+        {loadError !== null && (
+          <div
+            role="alert"
+            className="mb-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
+          >
+            {loadError}
+          </div>
+        )}
 
-      {users !== null && users.length > 0 && (
-        <div className="overflow-hidden rounded-md border border-border">
-          <table className="w-full text-ui">
-            <thead className="bg-muted/40 text-left text-sm uppercase text-muted-foreground">
-              <tr>
-                <th className="px-3 py-2 font-medium">Username</th>
-                <th className="px-3 py-2 font-medium">Role</th>
-                <th className="px-3 py-2 font-medium">Last login</th>
-                {manageable && <th className="px-3 py-2 text-right font-medium">Actions</th>}
-              </tr>
-            </thead>
-            <tbody>
-              {users.map((u) => (
-                <tr key={u.id} className="border-t border-border">
-                  <td className="px-3 py-2 align-middle">
-                    <span className="font-medium">{u.id}</span>
-                    {u.id === meId && (
-                      <span className="ml-2 text-sm text-muted-foreground">(you)</span>
-                    )}
-                    {!u.has_password && (
-                      <Badge variant="outline" className="ml-2">
-                        External
-                      </Badge>
-                    )}
-                  </td>
-                  <td className="px-3 py-2 align-middle">
-                    {u.is_admin ? <Badge>Admin</Badge> : <Badge variant="secondary">Member</Badge>}
-                  </td>
-                  <td className="px-3 py-2 align-middle text-muted-foreground">
-                    {formatEpoch(u.last_login_at)}
-                  </td>
-                  {manageable && (
-                    <td className="px-3 py-2 text-right">
-                      <div className="flex justify-end gap-1">
-                        <Button
-                          variant="ghost"
-                          size="xs"
-                          title="Reset password"
-                          onClick={() => void onResetPassword(u.id)}
-                          disabled={pendingAction || !u.has_password}
-                        >
-                          <KeyRoundIcon /> Reset
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="xs"
-                          title="Remove user"
-                          onClick={() => setDeleteCandidate(u.id)}
-                          disabled={pendingAction || u.id === meId}
-                        >
-                          <Trash2Icon /> Remove
-                        </Button>
-                      </div>
-                    </td>
-                  )}
+        {users !== null && users.length > 0 && (
+          <SettingsDataRegion
+            entry={MEMBERS_LIST_ENTRY}
+            region="members"
+            className="overflow-hidden rounded-md border border-border"
+          >
+            <table className="w-full text-ui">
+              <thead className="bg-muted/40 text-left text-sm uppercase text-muted-foreground">
+                <tr>
+                  <th className="px-3 py-2 font-medium">Username</th>
+                  <th className="px-3 py-2 font-medium">Role</th>
+                  <th className="px-3 py-2 font-medium">Last login</th>
+                  {manageable && <th className="px-3 py-2 text-right font-medium">Actions</th>}
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {users.map((u) => (
+                  <tr key={u.id} className="border-t border-border">
+                    <td className="px-3 py-2 align-middle">
+                      <span className="font-medium">{u.id}</span>
+                      {u.id === meId && (
+                        <span className="ml-2 text-sm text-muted-foreground">(you)</span>
+                      )}
+                      {!u.has_password && (
+                        <Badge variant="outline" className="ml-2">
+                          External
+                        </Badge>
+                      )}
+                    </td>
+                    <td className="px-3 py-2 align-middle">
+                      {u.is_admin ? (
+                        <Badge>Admin</Badge>
+                      ) : (
+                        <Badge variant="secondary">Member</Badge>
+                      )}
+                    </td>
+                    <td className="px-3 py-2 align-middle text-muted-foreground">
+                      {formatEpoch(u.last_login_at)}
+                    </td>
+                    {manageable && (
+                      <td className="px-3 py-2 text-right">
+                        <div className="flex justify-end gap-1">
+                          <Button
+                            data-settings-row-action="resetPassword"
+                            variant="ghost"
+                            size="xs"
+                            title="Reset password"
+                            onClick={() => void onResetPassword(u.id)}
+                            disabled={pendingAction || !u.has_password}
+                          >
+                            <KeyRoundIcon /> Reset
+                          </Button>
+                          <Button
+                            data-settings-row-action="remove"
+                            variant="ghost"
+                            size="xs"
+                            title="Remove user"
+                            onClick={() => setDeleteCandidate(u.id)}
+                            disabled={pendingAction || u.id === meId}
+                          >
+                            <Trash2Icon /> Remove
+                          </Button>
+                        </div>
+                      </td>
+                    )}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </SettingsDataRegion>
+        )}
+
+        {users !== null && users.length === 0 && (
+          <p className="text-ui text-muted-foreground">No members yet.</p>
+        )}
+
+        <div className="mt-3 flex items-center justify-end">
+          <Button
+            {...settingsControlProps(MEMBERS_LIST_ENTRY, "refresh")}
+            variant="ghost"
+            size="sm"
+            onClick={() => void refresh()}
+          >
+            <RefreshCwIcon /> Refresh
+          </Button>
         </div>
-      )}
-
-      {users !== null && users.length === 0 && (
-        <p className="text-ui text-muted-foreground">No members yet.</p>
-      )}
-
-      <div className="mt-3 flex items-center justify-end">
-        <Button variant="ghost" size="sm" onClick={() => void refresh()}>
-          <RefreshCwIcon /> Refresh
-        </Button>
-      </div>
+      </SettingsItem>
 
       {/* ── Create invite modal ───────────────────────────────────── */}
       <Dialog
@@ -306,7 +336,7 @@ export function MembersPage() {
           if (!open) setActionError(null);
         }}
       >
-        <DialogContent>
+        <DialogContent {...settingsOverlayProps(MEMBERS_INVITE_ENTRY, "invite")}>
           <DialogHeader>
             <DialogTitle>Invite a member</DialogTitle>
             <DialogDescription>
@@ -316,6 +346,7 @@ export function MembersPage() {
           </DialogHeader>
           <label className="flex items-center gap-2 text-ui">
             <input
+              {...settingsControlProps(MEMBERS_INVITE_ENTRY, "grantAdmin")}
               type="checkbox"
               checked={inviteAsAdmin}
               onChange={(e) => setInviteAsAdmin(e.target.checked)}
@@ -339,7 +370,11 @@ export function MembersPage() {
             >
               Cancel
             </Button>
-            <Button onClick={() => void onCreateInvite()} loading={pendingAction}>
+            <Button
+              {...settingsControlProps(MEMBERS_INVITE_ENTRY, "create")}
+              onClick={() => void onCreateInvite()}
+              loading={pendingAction}
+            >
               Create invite
             </Button>
           </DialogFooter>
@@ -353,7 +388,7 @@ export function MembersPage() {
           if (!open) setInviteResult(null);
         }}
       >
-        <DialogContent>
+        <DialogContent {...settingsOverlayProps(MEMBERS_INVITE_ENTRY, "invite")}>
           <DialogHeader>
             <DialogTitle>Invite URL</DialogTitle>
             <DialogDescription>
@@ -362,7 +397,13 @@ export function MembersPage() {
               only once.
             </DialogDescription>
           </DialogHeader>
-          {inviteResult !== null && <CopyableValue value={rebaseUrl(inviteResult.register_url)} />}
+          {inviteResult !== null && (
+            <CopyableValue
+              value={rebaseUrl(inviteResult.register_url)}
+              fieldMarkers={{ ...settingsControlProps(MEMBERS_INVITE_ENTRY, "inviteUrl") }}
+              copyMarkers={{ ...settingsControlProps(MEMBERS_INVITE_ENTRY, "copyInviteUrl") }}
+            />
+          )}
           <DialogFooter>
             <Button onClick={() => setInviteResult(null)}>Done</Button>
           </DialogFooter>
@@ -376,16 +417,27 @@ export function MembersPage() {
           if (!open) setResetResult(null);
         }}
       >
-        <DialogContent>
+        <DialogContent {...settingsRowOverlayProps(MEMBERS_LIST_ENTRY, "members", "resetPassword")}>
           <DialogHeader>
             <DialogTitle>New password for {resetResult?.id}</DialogTitle>
             <DialogDescription>
               Send this password to the user out-of-band (e.g. Slack DM). It is shown only once.
             </DialogDescription>
           </DialogHeader>
-          {resetResult !== null && <CopyableValue value={resetResult.new_password} />}
+          {resetResult !== null && (
+            <CopyableValue
+              value={resetResult.new_password}
+              fieldMarkers={{
+                "data-settings-row-field": "password",
+                "aria-label": `New password for ${resetResult.id}`,
+              }}
+              copyMarkers={{ "data-settings-row-action": "copy" }}
+            />
+          )}
           <DialogFooter>
-            <Button onClick={() => setResetResult(null)}>Done</Button>
+            <Button data-settings-row-action="done" onClick={() => setResetResult(null)}>
+              Done
+            </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
@@ -401,7 +453,7 @@ export function MembersPage() {
           }
         }}
       >
-        <DialogContent>
+        <DialogContent {...settingsRowOverlayProps(MEMBERS_LIST_ENTRY, "members", "remove")}>
           <DialogHeader>
             <DialogTitle>Remove {deleteCandidate}?</DialogTitle>
             <DialogDescription>
@@ -420,6 +472,7 @@ export function MembersPage() {
           )}
           <DialogFooter>
             <Button
+              data-settings-row-action="cancel"
               variant="ghost"
               onClick={() => setDeleteCandidate(null)}
               disabled={pendingAction}
@@ -427,6 +480,7 @@ export function MembersPage() {
               Cancel
             </Button>
             <Button
+              data-settings-row-action="remove"
               variant="destructive"
               onClick={() => void onConfirmDelete()}
               loading={pendingAction}
@@ -440,6 +494,9 @@ export function MembersPage() {
   );
 }
 
+/** Attributes a shared copy field takes from the dialog and row that show it. */
+type FieldMarkers = Record<string, string | undefined>;
+
 /**
  * A read-only field paired with a one-click copy button.
  *
@@ -447,7 +504,15 @@ export function MembersPage() {
  * single-use sensitive values that need a frictionless copy path
  * since the user typically pastes them into Slack within seconds.
  */
-function CopyableValue({ value }: { value: string }) {
+function CopyableValue({
+  value,
+  fieldMarkers,
+  copyMarkers,
+}: {
+  value: string;
+  fieldMarkers?: FieldMarkers;
+  copyMarkers?: FieldMarkers;
+}) {
   const [copied, setCopied] = useState(false);
   const onCopy = async () => {
     try {
@@ -461,12 +526,19 @@ function CopyableValue({ value }: { value: string }) {
   return (
     <div className="flex items-center gap-2">
       <Input
+        {...fieldMarkers}
         value={value}
         readOnly
         className="font-mono text-sm"
         onFocus={(e) => e.currentTarget.select()}
       />
-      <Button variant="outline" size="sm" onClick={() => void onCopy()} aria-label="Copy">
+      <Button
+        {...copyMarkers}
+        variant="outline"
+        size="sm"
+        onClick={() => void onCopy()}
+        aria-label="Copy"
+      >
         <CopyIcon /> {copied ? "Copied" : "Copy"}
       </Button>
     </div>

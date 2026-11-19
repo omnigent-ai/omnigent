@@ -35,7 +35,7 @@ import { ScheduledTaskRow } from "@/components/scheduled/ScheduledTaskRow";
 import { AUTOMATION_TEMPLATES } from "@/components/scheduled/automationTemplates";
 import { SESSION_LINK_ID_PLACEHOLDER } from "@/components/scheduled/triggerTemplates";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled, isSharingOff, SHARING_OFF_REASON } from "@/lib/capabilities";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { useNavigate, useRebasePath, useSearchParams } from "@/lib/routing";
 import { getShareableSessionLink } from "@/lib/shareLink";
 import {
@@ -47,7 +47,11 @@ import {
 } from "@/hooks/useScheduledTasks";
 import { useNow } from "@/hooks/useNow";
 import { useViewerId } from "@/hooks/useViewerId";
-import { canShareAutomation, sharedAutomationsListed } from "@/lib/permissionsApi";
+import {
+  automationShareDisabledReason,
+  canShareAutomation,
+  sharedAutomationsListed,
+} from "@/lib/permissionsApi";
 import { ScheduledTaskApiError, type ScheduledTask } from "@/lib/scheduledTasksApi";
 import { nextRunAtMs } from "@/lib/scheduleText";
 import { cn } from "@/lib/utils";
@@ -328,7 +332,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
       <div className="mb-6 flex items-start justify-between gap-4">
         <div className="flex flex-col gap-1">
           <div className="flex items-center gap-1">
-            <h1 className="settings-page-title text-2xl font-medium">Automations</h1>
+            <h1 className="text-2xl font-medium">Automations</h1>
             <Button
               ref={introButtonRef}
               variant="ghost"
@@ -447,7 +451,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
                   onShare={
                     canShareAutomation(info, viewerId, task.ownerUserId) ? handleShare : undefined
                   }
-                  shareDisabledReason={isSharingOff(info) ? SHARING_OFF_REASON : undefined}
+                  shareDisabledReason={automationShareDisabledReason(info, task)}
                 />
               ))}
             </div>

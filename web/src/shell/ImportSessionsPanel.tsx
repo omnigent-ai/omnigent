@@ -135,7 +135,9 @@ export function ImportSessionsPanel() {
 
       <div className="border-b border-border py-4">
         <SettingsItem entry={IMPORT_MODE_ENTRY} className={ROW_CLASS}>
-          <span className="text-ui font-normal md:font-medium">Import</span>
+          <span className="text-ui font-normal md:font-medium">
+            {IMPORT_MODE_ENTRY.parts?.mode}
+          </span>
           <Select
             value={mode}
             disabled={importing}

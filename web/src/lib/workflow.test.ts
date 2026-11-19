@@ -10,6 +10,7 @@ import {
   continuePlanMessage,
   createWorkflowPrompt,
   editWorkflowPlanPrompt,
+  isStopPlanMessage,
   runSavedWorkflowPrompt,
   offersSaveWorkflow,
   offersWorkflow,
@@ -64,6 +65,14 @@ describe("stopPlanMessage", () => {
       expect(message).toContain("until I explicitly tell you to continue");
     },
   );
+
+  it("is recognized whatever plan it names, and nothing else is", () => {
+    expect(isStopPlanMessage(stopPlanMessage(null))).toBe(true);
+    expect(isStopPlanMessage(`${stopPlanMessage('Fix "the" tests')}\n`)).toBe(true);
+    expect(isStopPlanMessage(continuePlanMessage(null))).toBe(false);
+    expect(isStopPlanMessage(`Please don't. ${stopPlanMessage(null)}`)).toBe(false);
+    expect(isStopPlanMessage("Stop the plan now.")).toBe(false);
+  });
 });
 
 describe("taskActionMessage", () => {
@@ -168,7 +177,8 @@ describe("editWorkflowPlanPrompt", () => {
     expect(prompt).toContain("wait for my answer before proposing or publishing changes");
     expect(prompt).toContain("Preserve steps I haven't asked to change");
     expect(prompt).toContain("Set description on every plan you publish");
-    expect(prompt).toContain("Save plan stores it as the workflow description");
+    expect(prompt).toContain("Keep the current description's wording");
+    expect(prompt).toContain("repeat it unchanged when it still fits");
     expect(prompt).not.toContain("Draft a useful first proposal now");
   });
 
@@ -179,6 +189,18 @@ describe("editWorkflowPlanPrompt", () => {
     expect(prompt).toContain("Draft a useful first proposal now");
     expect(prompt).toContain("I will use Save plan on the workflow page to apply the proposal");
   });
+
+  it.each([workflow, { ...workflow, steps: [] }])(
+    "asks for step goals written for a person first, with the run's details last",
+    (planned) => {
+      const prompt = editWorkflowPlanPrompt(planned);
+      expect(prompt).toContain("Write each step's goal for me first");
+      for (const part of ["**Inputs:**", "**What it does:**", "**Outputs:**", "**Details:**"]) {
+        expect(prompt).toContain(part);
+      }
+      expect(prompt).toContain("A run works from the same goal, so keep those details.");
+    },
+  );
 });
 
 describe("parseSavedWorkflowMessage", () => {

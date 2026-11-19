@@ -783,17 +783,25 @@ describe("row actions", () => {
 describe("sharing from the row menu", () => {
   const SHARING_INFO = { ...TRIGGER_INFO, scheduled_task_sharing: true };
 
-  function openRowMenu(viewerId: string, info: typeof SERVER_INFO_OFFLINE_FALLBACK) {
+  function openRowMenu(
+    viewerId: string,
+    info: typeof SERVER_INFO_OFFLINE_FALLBACK,
+    overrides: Partial<ScheduledTask> = {},
+  ) {
     vi.mocked(useViewerId).mockReturnValue(viewerId);
-    setTasks([task({ id: "st_share", ownerUserId: "alice@example.com" })]);
+    setTasks([task({ id: "st_share", ownerUserId: "alice@example.com", ...overrides })]);
     renderPage("/tasks", "", info);
     // A known viewer gets the first-visit guide; dismiss it.
     fireEvent.click(screen.getByRole("button", { name: "Maybe later" }));
     fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
   }
 
-  it("opens the share dialog for an automation the viewer owns", () => {
-    openRowMenu("alice@example.com", SHARING_INFO);
+  // An older server sends no `shareable`.
+  it.each([
+    ["shareable", { shareable: true }],
+    ["from an older server", {}],
+  ])("opens the share dialog for an automation the viewer owns (%s)", (_label, overrides) => {
+    openRowMenu("alice@example.com", SHARING_INFO, overrides);
     fireEvent.click(screen.getByTestId("task-share"));
     expect(screen.getByTestId("share-dialog-open")).toHaveAttribute(
       "data-automation-id",
@@ -801,10 +809,23 @@ describe("sharing from the row menu", () => {
     );
   });
 
-  it("disables Share while the server turns sharing off", () => {
-    openRowMenu("alice@example.com", { ...SHARING_INFO, sharing_mode: "off" });
+  const SHARING_OFF = "Sharing has been disabled for this Omnigent server.";
+  const LEGACY = "This is a legacy automation. Recreate it to share it.";
+  it.each([
+    ["while the server turns sharing off", "off" as const, true, SHARING_OFF],
+    ["on a legacy automation", undefined, false, LEGACY],
+    // Sharing off wins.
+    ["on a legacy automation while sharing is off", "off" as const, false, SHARING_OFF],
+  ])("disables Share with its reason %s", async (_label, sharingMode, shareable, reason) => {
+    openRowMenu(
+      "alice@example.com",
+      { ...SHARING_INFO, ...(sharingMode && { sharing_mode: sharingMode }) },
+      { shareable },
+    );
     const share = screen.getByTestId("task-share");
     expect(share).toHaveAttribute("aria-disabled", "true");
+    fireEvent.focus(share);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(reason);
     fireEvent.click(share);
     expect(screen.queryByTestId("share-dialog-open")).toBeNull();
   });

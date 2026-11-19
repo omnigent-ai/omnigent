@@ -34,6 +34,8 @@ import {
   useRenameProject,
   useUpdateProjectConfig,
   useMoveToProject,
+  useMoveToNest,
+  withMoveTombstone,
   useRenameConversation,
   useStopAndDeleteConversation,
   useStopSession,
@@ -2997,6 +2999,103 @@ describe("fetchProjectSessionIds", () => {
       include_archived: "true",
     });
   });
+});
+
+describe("useMoveToNest", () => {
+  it.each([false, true])(
+    "keeps membership stable until a move settles (detach=%s)",
+    async (detach) => {
+      const family = { id: "nest", representative_id: "head", pinned: false };
+      const row = conversation({ id: "moved", family: detach ? family : null });
+      const destination = detach
+        ? null
+        : conversation({ id: "head", family, project_id: "project" });
+      const updated = {
+        ...row,
+        family: destination?.family ?? null,
+        project_id: destination?.project_id ?? null,
+      };
+      let resolve!: (value: Response) => void;
+      fetchMock.mockReturnValue(
+        new Promise<Response>((done) => {
+          resolve = done;
+        }),
+      );
+      const queryClient = new QueryClient();
+      const key = ["conversations", "", false];
+      queryClient.setQueryData(key, infinitePage([row]));
+      queryClient.setQueryData(
+        ["projects"],
+        [
+          { id: "project", name: "Initial project" },
+          { id: "confirmed", name: "Confirmed project" },
+        ],
+      );
+      const folderKey = ["project-sessions", "Initial project", "created_at", false];
+      queryClient.setQueryData(folderKey, infinitePage([]));
+      let settle!: () => void;
+      vi.spyOn(queryClient, "invalidateQueries").mockReturnValue(
+        new Promise<void>((done) => {
+          settle = done;
+        }),
+      );
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      const { result } = renderHook(() => useMoveToNest(), { wrapper });
+      result.current.mutate({ id: row.id, destination });
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+      expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
+        nest_source_id: destination?.id ?? null,
+      });
+      expect(
+        queryClient.getQueryData<ConversationsInfiniteData>(key)?.pages[0].data[0],
+      ).toMatchObject(updated);
+      expect(withMoveTombstone(row)).toMatchObject(updated);
+      if (!detach)
+        expect(
+          queryClient.getQueryData<ConversationsInfiniteData>(folderKey)?.pages[0].data[0],
+        ).toMatchObject({ id: row.id, family: updated.family, project_id: updated.project_id });
+      const confirmed = { ...updated, project_id: "confirmed" };
+      resolve(mockResponse(confirmed));
+      await waitFor(() => expect(withMoveTombstone(row)).toMatchObject(confirmed));
+      settle();
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      expect(withMoveTombstone(row)).toEqual(row);
+    },
+  );
+
+  it.each([false, true])(
+    "restores a rejected move without reviving a removed open row (removed=%s)",
+    async (removed) => {
+      const row = conversation({
+        id: "moved",
+        family: { id: "nest", representative_id: "head", pinned: false },
+      });
+      let rejectMove!: (response: Response) => void;
+      fetchMock.mockReturnValue(
+        new Promise<Response>((resolve) => {
+          rejectMove = resolve;
+        }),
+      );
+      const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+      const key = ["conversations", "", false];
+      const original = infinitePage([row]);
+      queryClient.setQueryData(key, original);
+      const backfillKey = ["conversation-backfill", row.id];
+      queryClient.setQueryData(backfillKey, row);
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      const { result } = renderHook(() => useMoveToNest(), { wrapper });
+      result.current.mutate({ id: row.id, destination: null });
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+      if (removed) queryClient.setQueryData(backfillKey, null);
+      rejectMove(mockResponse({ detail: "Move rejected" }, { ok: false, status: 409 }));
+      await waitFor(() => expect(result.current.isError).toBe(true));
+      expect(queryClient.getQueryData(key)).toEqual(original);
+      expect(withMoveTombstone(row)).toEqual(row);
+      expect(queryClient.getQueryData(backfillKey)).toEqual(removed ? null : row);
+    },
+  );
 });
 
 describe("useMoveToProject", () => {

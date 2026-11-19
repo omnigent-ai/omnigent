@@ -22,7 +22,7 @@ import os
 from playwright.sync_api import Browser, Route, expect
 
 # iPhone-12-class portrait viewport -- comfortably below the Tailwind ``md``
-# breakpoint (768px) so every ``md:`` rule resolves to its mobile branch.
+# breakpoint (1181px) so every ``md:`` rule resolves to its mobile branch.
 _MOBILE_VIEWPORT = {"width": 390, "height": 844}
 
 # Minimum mobile tap target (Apple HIG 44pt; WCAG's enhanced target size).
@@ -79,7 +79,7 @@ def test_queued_row_controls_meet_mobile_tap_target(
         composer = page.get_by_label("Message the agent")
         expect(composer).to_be_visible(timeout=30_000)
         # Prove the mobile layout branch is actually in effect.
-        assert page.evaluate("matchMedia('(max-width: 767.98px)').matches")
+        assert page.evaluate("matchMedia('(max-width: 1180.98px)').matches")
 
         send = page.get_by_role("button", name="Send", exact=True)
 
