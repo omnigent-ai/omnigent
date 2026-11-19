@@ -1705,16 +1705,14 @@ async def forward_kimi_wire_to_session(
             elif item.kind == "tool_result":
                 tools_in_flight = max(0, tools_in_flight - 1)
 
-        async def _close_turn(outcome: str, edge: str, failure_detail: str) -> None:
+        async def _close_turn(edge: str, failure_detail: str) -> None:
             """Post the terminal edge for a turn that will write no more wire rows."""
             nonlocal turn_open, last_assistant_text, tools_in_flight, last_edge_id, post_backoff
             nonlocal dropped_edge_status, dropped_edge_output, edge_failing_since, last_edge_alert
             # A wire edge the server permanently rejected already told us how
             # this turn ended; the fallback reports that instead of its own.
-            detail: str | None = failure_detail
-            if dropped_edge_status is not None:
-                outcome = dropped_edge_status
-                detail = dropped_edge_output or None
+            outcome = dropped_edge_status or "failed"
+            detail = (dropped_edge_output or None) if dropped_edge_status else failure_detail
             # Turn+line anchored id: a restart retrying this fallback dedupes
             # against the already-posted edge (turn_seq and last_line persist
             # together), while a later turn gets a fresh id EVEN when failed
@@ -2117,7 +2115,7 @@ async def forward_kimi_wire_to_session(
                 # The pane died mid-turn: no further wire rows are coming, so
                 # post the failed edge instead of stranding the session. Give
                 # a final unterminated row its stable-size acceptance poll first.
-                await _close_turn("failed", "pane-death", _PANE_DEATH_DETAIL)
+                await _close_turn("pane-death", _PANE_DEATH_DETAIL)
             elif (
                 drained
                 and turn_open
@@ -2132,7 +2130,7 @@ async def forward_kimi_wire_to_session(
                     tools_in_flight,
                     tool_quiescence_s,
                 )
-                await _close_turn("failed", "tool-quiescence", _TOOL_HUNG_DETAIL)
+                await _close_turn("tool-quiescence", _TOOL_HUNG_DETAIL)
             if not all_posted:
                 await _backoff_after_post_failure()
             await asyncio.sleep(poll_interval_s)

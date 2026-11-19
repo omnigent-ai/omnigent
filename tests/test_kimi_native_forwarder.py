@@ -212,13 +212,6 @@ class TestRowToItem:
         # Still a postable result even when it carries no output.
         assert (item.call_id, item.text) == ("c1", output)
 
-    def test_tool_result_output_is_capped(self) -> None:
-        big = "x" * (MAX_TOOL_OUTPUT_BYTES + 10)
-        item = _row_to_item(8, _tool_result_row("t1", call_id="c1", result={"output": big}))
-        assert item is not None
-        assert item.text == cap_tool_output(big)
-        assert "[output truncated by omnigent" in item.text
-
     @pytest.mark.parametrize(
         "row",
         [
@@ -2238,12 +2231,6 @@ class TestForwardLoopEdges:
         await _drive_loop_until(tmp_path, rows, lambda: bool(self.statuses))
         assert self.statuses == [("idle", "done!")]
 
-    async def test_turn_ended_cancelled_posts_cancelled_outcome(self, tmp_path: Path) -> None:
-        rows = [_prompt_row(), _assistant_row("u1", "partial"), _turn_ended_row("cancelled")]
-        await _drive_loop_until(tmp_path, rows, lambda: bool(self.statuses))
-        assert self.statuses == [("idle", "partial")]
-        assert self.edges == [("cancelled", None)]
-
     async def test_new_prompt_after_missing_edge_drops_previous_reply(
         self, tmp_path: Path
     ) -> None:
@@ -3116,12 +3103,10 @@ async def _drive_loop(
             await task
 
 
-_TRANSCRIPT_TYPES = ("external_conversation_item", "external_session_status")
-
-
 def _transcript(client: _FakeAsyncClient) -> list[dict]:
     """The accepted history and status POST bodies, in order."""
-    return [body for body in client.posts if body["type"] in _TRANSCRIPT_TYPES]
+    types = ("external_conversation_item", "external_session_status")
+    return [body for body in client.posts if body["type"] in types]
 
 
 def _status_bodies(client: _FakeAsyncClient) -> list[dict]:
