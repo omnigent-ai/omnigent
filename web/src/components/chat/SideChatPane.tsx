@@ -104,6 +104,7 @@ import { useFileMentionHarnesses } from "@/lib/agentLabels";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import {
   nativeShellHarness,
+  ownerOnlyShellHarness,
   useComposerHighlight,
   usePublishComposerCommands,
 } from "@/components/composer/composerHighlight";
@@ -1219,6 +1220,8 @@ function SideChatComposer({
     commandNames: menuCommandNames,
     enabled: quotes.length === 0 && files.length === 0,
     nativeShell,
+    refusedNativeShell:
+      pending || !session ? null : ownerOnlyShellHarness(harness, session.permissionLevel ?? null),
     // Classify what is sent: trimmed, and in a grid cell with review comments appended.
     classifyValue: gridCell
       ? buildOutgoingMessage({ quotes, text }, outgoingText, sendContext).text

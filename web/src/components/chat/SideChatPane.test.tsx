@@ -25,6 +25,7 @@ import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
 import { SESSION_MENTION_HINT } from "@/lib/composerMentions";
 import {
   SHELL_MENTION_REFUSAL,
+  SHELL_OWNER_REFUSAL,
   SHELL_REVIEW_COMMENT_REFUSAL,
 } from "@/components/composer/composerHighlight";
 import type { Comment } from "@/hooks/useComments";
@@ -3011,11 +3012,20 @@ describe("side-chat composer highlight", () => {
     expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
   });
 
-  it("does not offer shell mode to a codex-native non-owner", () => {
+  it("tells a codex-native non-owner their `!` send will be refused, and keeps it", () => {
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
     mockSession.snapshot = { permissionLevel: 2 };
     renderPane(<SideChatPane childId={childId} />);
-    fireEvent.change(screen.getByTestId("side-chat-input"), { target: { value: "!git status" } });
-    expect(screen.queryByTestId("composer-shell-mode-indicator")).toBeNull();
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "!git status" } });
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent(
+      SHELL_OWNER_REFUSAL,
+    );
+
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(send).not.toHaveBeenCalled();
+    expect(screen.getByTestId("side-chat-command-notice")).toHaveTextContent(SHELL_OWNER_REFUSAL);
+    expect(input).toHaveValue("!git status");
   });
 
   it("does not offer shell mode on a pending tab, whose text seeds the fork", () => {

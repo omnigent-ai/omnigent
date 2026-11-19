@@ -86,6 +86,16 @@ export function nativeShellHarness(
   return harness !== "codex-native" || isOwnerLevel(permissionLevel) ? harness : null;
 }
 
+/** The harness whose `!` rule applies but which refuses this viewer's shell input, else null. */
+export function ownerOnlyShellHarness(
+  harness: string | null | undefined,
+  permissionLevel: number | null,
+): string | null {
+  return harness === "codex-native" && !isOwnerLevel(permissionLevel) ? harness : null;
+}
+
+export const SHELL_OWNER_REFUSAL =
+  "Only the session's owner can run shell commands here; drop the leading `!` to ask the agent.";
 export const SHELL_MENTION_REFUSAL =
   "Shell commands can't include @mentions; remove them or drop the leading `!`.";
 export const SHELL_REVIEW_COMMENT_REFUSAL =
@@ -143,6 +153,8 @@ export interface UseComposerHighlightOptions {
   /** False while quotes or attachments ride along (they change what is sent). */
   enabled: boolean;
   nativeShell: string | null;
+  /** The harness whose `!` this viewer may not run, shown as a refused shell command. */
+  refusedNativeShell?: string | null;
   /** The text as sent, when it differs from `value`; decides shell mode. */
   classifyValue?: string;
   /** Inline @mention tokens the mirror paints as pills; empty where none apply. */
@@ -181,6 +193,7 @@ export function useComposerHighlight({
   commandNames,
   enabled,
   nativeShell,
+  refusedNativeShell = null,
   classifyValue,
   mentionTokens,
   textareaRef,
@@ -190,10 +203,16 @@ export function useComposerHighlight({
   const mirrorRef = useRef<HTMLDivElement>(null);
   const hintId = useId();
   const split = enabled
-    ? composerHighlightSplit(value, commandNames, nativeShell, classifyValue)
+    ? composerHighlightSplit(value, commandNames, nativeShell ?? refusedNativeShell, classifyValue)
     : null;
   const shell = split?.kind === "shell";
-  const refusal = shell && sendContext ? shellSendRefusal(sendContext) : null;
+  const refusal = !shell
+    ? null
+    : nativeShell === null
+      ? SHELL_OWNER_REFUSAL
+      : sendContext
+        ? shellSendRefusal(sendContext)
+        : null;
   const shellLabel = refusal ?? "Shell command";
   const mirrorActive = split !== null || findMentionTokens(value, mentionTokens).length > 0;
   useComposerMirrorAlignment(mirrorRef, textareaRef, mirrorActive, textareaNode);

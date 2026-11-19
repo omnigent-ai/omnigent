@@ -9,6 +9,7 @@ import {
 import { create } from "zustand";
 import {
   SHELL_MENTION_REFUSAL,
+  SHELL_OWNER_REFUSAL,
   SHELL_REVIEW_COMMENT_REFUSAL,
 } from "@/components/composer/composerHighlight";
 import { SHIFT_KEY } from "@/components/KeyboardShortcut";
@@ -5805,15 +5806,29 @@ describe("Composer native shell mode", () => {
     expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
   });
 
-  it.each([
-    { label: "an unsupported harness", harness: "pi", permissionLevel: null },
-    { label: "a codex-native non-owner", harness: "codex-native", permissionLevel: 2 },
-  ])("shows no shell mode for $label", ({ harness, permissionLevel }) => {
-    useChatStore.setState({ sessionHarness: harness });
-    render(<Composer {...composerProps({ isNativeWrapper: true, permissionLevel })} />);
+  it("shows no shell mode on a harness without native `!` input", () => {
+    useChatStore.setState({ sessionHarness: "pi" });
+    render(<Composer {...composerProps({ isNativeWrapper: true, permissionLevel: null })} />);
     fireEvent.change(textarea(), { target: { value: "!git status" } });
     expect(screen.queryByTestId("composer-shell-mode-indicator")).toBeNull();
     expect(screen.queryByTestId("composer-highlight-overlay")).toBeNull();
+  });
+
+  it("tells a codex-native non-owner their `!` send will be refused, and keeps it", () => {
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    const props = composerProps({ isNativeWrapper: true, permissionLevel: 2 });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "!git status" } });
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveTextContent(
+      SHELL_OWNER_REFUSAL,
+    );
+
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).not.toHaveBeenCalled();
+    expect(
+      screen.getByText(SHELL_OWNER_REFUSAL, { selector: "[data-escape-owner]" }),
+    ).toBeVisible();
+    expect(textarea()).toHaveValue("!git status");
   });
 
   it.each([

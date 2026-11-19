@@ -45,6 +45,7 @@ import {
 } from "@/components/composer/ChatComposer";
 import {
   nativeShellHarness,
+  ownerOnlyShellHarness,
   useComposerHighlight,
   usePublishComposerCommands,
 } from "@/components/composer/composerHighlight";
@@ -3214,6 +3215,9 @@ function ComposerImpl(
     commandNames: slashCommandNames,
     enabled: draft.quotes.length === 0 && files.length === 0,
     nativeShell,
+    refusedNativeShell: permissionPending
+      ? null
+      : ownerOnlyShellHarness(sessionHarness, permissionLevel),
     classifyValue: outgoingClassifyText,
     mentionTokens: draft.quotes.length === 0 ? mentionTokens : [],
     textareaRef: tailTextareaRef,
