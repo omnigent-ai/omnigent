@@ -1275,7 +1275,9 @@ html[data-electron-mac] {
   /* Centers the narrow layout's 2.75rem header controls on the lights. */
   --mac-header-control-inset: max(0px, calc(var(--mac-titlebar-height) / 2 - 1.375rem));
 }
-html[data-electron-mac][data-electron-full-screen] {
+/* Embedded, the preload's full-screen attribute stays on html above the scope root. */
+html[data-electron-mac][data-electron-full-screen],
+.omnigent-app[data-electron-mac]:is([data-electron-full-screen] *) {
   --mac-traffic-light-width: 12px;
   --mac-header-control-inset: 1rem;
 }

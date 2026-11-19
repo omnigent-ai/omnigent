@@ -68,6 +68,7 @@ afterEach(() => {
   cleanup();
   localStorage.clear();
   document.documentElement.className = "";
+  document.documentElement.removeAttribute("data-electron-full-screen");
   document.documentElement.style.colorScheme = "";
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
@@ -109,6 +110,18 @@ describe("macOS Electron embed", () => {
       expect(scope.querySelector(`.${className}`)!.matches(selector), className).toBe(expected);
     }
 
+    let insetSelector = "";
+    css.walkDecls("padding-top", (declaration) => {
+      if (declaration.value.includes("--mac-header-control-inset")) {
+        insetSelector = (declaration.parent as Rule).selector;
+      }
+    });
+    expect(scope.querySelector(".sidebar-header-row")!.matches(insetSelector)).toBe(expected);
+    const fullScreenSelector = selectorFor("[data-electron-full-screen]");
+    expect(scope.matches(fullScreenSelector)).toBe(false);
+    document.documentElement.toggleAttribute("data-electron-full-screen", true);
+    expect(scope.matches(fullScreenSelector)).toBe(expected);
+
     let smoothingSelector = "";
     css.walkDecls("-webkit-font-smoothing", (declaration) => {
       smoothingSelector = (declaration.parent as Rule).selector;
@@ -116,7 +129,7 @@ describe("macOS Electron embed", () => {
     expect(smoothingSelector).not.toBe("");
     expect(scope.matches(smoothingSelector)).toBe(true);
 
-    const controlsSelector = selectorFor(":is(");
+    const controlsSelector = selectorFor(":is(a,button");
     expect(controlsSelector).not.toContain(":has(");
     expect(getByRole("button", { name: "Header action" }).matches(controlsSelector)).toBe(expected);
     render(createPortal(<div role="menu">Menu</div>, getEmbedRoot()!));
