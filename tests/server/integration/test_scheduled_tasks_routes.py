@@ -6739,7 +6739,14 @@ async def test_clone_copies_an_automations_settings_under_a_new_id(
     project_id = await _make_project(auth_client, "triage")
     created = await auth_client.post(
         "/v1/scheduled-tasks",
-        json=_create_body(max_cost_usd=2.5, permission_mode="acceptEdits", project_id=project_id),
+        json=_create_body(
+            max_cost_usd=2.5,
+            permission_mode="acceptEdits",
+            model_override="databricks-claude-sonnet-4-6",
+            reasoning_effort="high",
+            base_branch="HEAD",
+            project_id=project_id,
+        ),
         headers=_headers(),
     )
     assert created.status_code == 200, created.text
@@ -6768,13 +6775,25 @@ async def test_clone_copies_an_automations_settings_under_a_new_id(
         "host_id",
         "max_cost_usd",
         "permission_mode",
+        "model_override",
+        "reasoning_effort",
+        "base_branch",
         "project_id",
         "mcp_services",
         "session_mode",
         "execution_target",
     )
     assert {key: clone[key] for key in copied} == {key: original[key] for key in copied}
-    assert (original["permission_mode"], original["project_id"]) == ("acceptEdits", project_id)
+    # Non-default values, so a field the copy drops shows up as a difference.
+    seeded = {
+        "max_cost_usd": 2.5,
+        "permission_mode": "acceptEdits",
+        "model_override": "databricks-claude-sonnet-4-6",
+        "reasoning_effort": "high",
+        "base_branch": "HEAD",
+        "project_id": project_id,
+    }
+    assert {key: clone[key] for key in seeded} == seeded
     # A paused original can't start running through its clone.
     assert clone["state"] == state
     assert clone["last_run_at"] is None

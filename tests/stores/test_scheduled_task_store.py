@@ -8,6 +8,7 @@ SQLite database.
 from __future__ import annotations
 
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
@@ -2997,21 +2998,22 @@ def test_inbox_mysql_deep_page_seeks_to_cursor(store):
 
 
 @pytest.mark.parametrize(
-    ("days_later", "expected"), [(2, (True, "active")), (3, (False, "completed"))]
+    ("days_later", "expected"),
+    [
+        (2, (int(datetime(2026, 11, 21, 9, tzinfo=UTC).timestamp()), "active")),
+        (3, (None, "completed")),
+    ],
 )
 def test_a_schedule_anchor_keeps_count_from_the_anchor(
     store: SqlAlchemyScheduledTaskStore,
     monkeypatch: pytest.MonkeyPatch,
     days_later: int,
-    expected: tuple[bool, str],
+    expected: tuple[int | None, str],
 ) -> None:
-    from datetime import UTC, datetime
-
     from omnigent.stores.scheduled_task_store import sqlalchemy_store
 
     store.configure_dispatch(True)
     anchor = int(datetime(2026, 11, 18, 12, tzinfo=UTC).timestamp())
-    last_run = int(datetime(2026, 11, 21, 9, tzinfo=UTC).timestamp())
     # Runs on the 19th, 20th and 21st when anchored on the 18th.
     monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: anchor + days_later * 86400)
     task = store.create(
@@ -3026,4 +3028,4 @@ def test_a_schedule_anchor_keeps_count_from_the_anchor(
     )
     assert task.created_at == anchor
     # Only the occurrences left after now remain; none, once COUNT is used up.
-    assert (task.next_run_at == last_run, task.state) == expected
+    assert (task.next_run_at, task.state) == expected

@@ -444,6 +444,20 @@ describe("cloneScheduledTask", () => {
     expect(clone).toMatchObject({ id: "st_2", name: "Nightly triage (copy)" });
   });
 
+  it("sends the browser tools mode header so the copy's source session keeps it", async () => {
+    const win = window as unknown as { omnigentDesktop?: unknown };
+    const before = win.omnigentDesktop;
+    win.omnigentDesktop = { browserTabs: () => undefined };
+    try {
+      fetchMock.mockResolvedValueOnce(mockResponse({ ...TASK_WIRE, id: "st_2" }));
+      await cloneScheduledTask("st_1");
+      const [, init] = fetchMock.mock.calls[0];
+      expect(new Headers(init.headers).get("X-Omnigent-Browser-Agent-Tools")).toBe("on");
+    } finally {
+      win.omnigentDesktop = before;
+    }
+  });
+
   it("throws the server's reason", async () => {
     fetchMock.mockResolvedValueOnce(
       mockResponse(
