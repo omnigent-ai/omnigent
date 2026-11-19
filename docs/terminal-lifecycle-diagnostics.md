@@ -51,6 +51,19 @@ switch for all terminal text retention or existing logging. See
 [Native harness diagnostics](harness-diagnostics.md) for the capture bounds,
 startup-failure fields, and app-server logging controls.
 
+## Idle-poll backoff
+
+Native-terminal idle watchers slow their tmux polling after a pane stays
+quiet, then return to the base cadence on a pane change, a new turn, or an
+explicit wake. Idle and exit edges can therefore be reported up to one
+backed-off interval late.
+
+Set `OMNIGENT_TERMINAL_IDLE_POLL_BACKOFF=0` (or `false`/`no`/`off`) before
+launching the host to pin the pre-backoff polling rate; any other value or
+leaving it unset keeps backoff enabled. The host forwards it through the
+daemon to spawned runners, where the watcher reads it, so set it once on the
+host.
+
 ## Verification
 
 ```sh

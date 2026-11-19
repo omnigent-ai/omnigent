@@ -1,7 +1,12 @@
 import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ComposerConfigSections, type ComposerConfigSection } from "./ComposerConfigSections";
+import {
+  ComposerConfigSections,
+  type ComposerConfigChoice,
+  type ComposerConfigSection,
+} from "./ComposerConfigSections";
 import { DropdownMenu, DropdownMenuContent } from "@/components/ui/dropdown-menu";
+import { nativeModelLabel } from "@/lib/composerModelLabel";
 
 afterEach(cleanup);
 
@@ -221,5 +226,166 @@ describe("ComposerConfigSections", () => {
     expect(
       within(screen.getByTestId("new-chat-landing-agent-models")).getByLabelText("Search models"),
     ).toBeInTheDocument();
+  });
+});
+
+// A Pi-style mixed catalog: Claude from two hosts, GPT, Gemini, GLM, Kimi, and
+// an alias without creator metadata.
+const MIXED_CATALOG = [
+  { id: "anthropic/claude-opus-5", displayName: "Claude Opus 5" },
+  { id: "anthropic/claude-sonnet-5", displayName: "Claude Sonnet 5" },
+  { id: "amazon-bedrock/us.anthropic.claude-sonnet-5", displayName: "Claude Sonnet 5" },
+  { id: "openai/gpt-5.5", displayName: "GPT-5.5" },
+  { id: "openai/gpt-5.5-mini", displayName: "GPT-5.5 mini" },
+  { id: "openrouter/google/gemini-3-pro", displayName: "Gemini 3 Pro" },
+  { id: "omnigent-openai/system.ai.glm-5-2", displayName: "GLM-5.2" },
+  { id: "omnigent/databricks-kimi-k2-7-code", displayName: "Kimi K2.7 Code" },
+  { id: "groq/llama-3.3-70b-versatile", displayName: "Llama 3.3 70B" },
+  { id: "radius/balanced", displayName: "Balanced" },
+];
+
+function catalogSection(
+  catalog: readonly { id: string; displayName: string }[],
+  selected: string,
+  onSelect = vi.fn(),
+): ComposerConfigSection {
+  const modelChoice = (option: { id: string; displayName: string }): ComposerConfigChoice => ({
+    key: option.id,
+    label: nativeModelLabel(option),
+    checked: option.id === selected,
+    onSelect: () => onSelect(option.id),
+    testId: `models-${option.id}`,
+    modelOption: option,
+  });
+  return {
+    testId: "models",
+    header: "Models",
+    choices: [
+      { key: "__default__", label: "Default", checked: selected === "", onSelect: vi.fn() },
+      ...catalog.map(modelChoice),
+    ],
+  };
+}
+
+const groupToggle = (label: string) => screen.getByRole("menuitem", { name: new RegExp(label) });
+const modelRow = (name: string) => screen.queryByRole("menuitemcheckbox", { name });
+
+describe("model catalog browsing", () => {
+  it("groups a long mixed catalog by creator with the selected group expanded", () => {
+    renderSections({ models: catalogSection(MIXED_CATALOG, "openai/gpt-5.5") });
+
+    expect(
+      screen.getAllByRole("menuitem").map((header) => [header.textContent, header.ariaExpanded]),
+    ).toEqual([
+      ["Anthropic3", "false"],
+      ["OpenAI2", "true"],
+      ["Google1", "false"],
+      ["Moonshot AI1", "false"],
+      ["Z.ai1", "false"],
+      ["Meta1", "false"],
+      ["Other models1", "false"],
+    ]);
+    expect(modelRow("GPT-5.5")).toHaveAttribute("aria-checked", "true");
+    expect(modelRow("Claude Opus 5")).toBeNull();
+    expect(modelRow("Default")).toBeVisible();
+
+    fireEvent.click(groupToggle("Anthropic"));
+    expect(groupToggle("Anthropic")).toHaveAttribute("aria-expanded", "true");
+    // Same-named rows from two hosts show which host serves each.
+    expect(modelRow("Claude Sonnet 5 anthropic")).toBeVisible();
+    expect(modelRow("Claude Sonnet 5 amazon-bedrock")).toBeVisible();
+    fireEvent.click(groupToggle("OpenAI"));
+    expect(modelRow("GPT-5.5")).toBeNull();
+  });
+
+  it("scrolls the selected model into view once when the menu opens", () => {
+    const scrollIntoView = vi.spyOn(Element.prototype, "scrollIntoView");
+    try {
+      const { rerender } = renderSections({
+        models: catalogSection(MIXED_CATALOG, "omnigent/databricks-kimi-k2-7-code"),
+      });
+      expect(scrollIntoView).toHaveBeenCalledTimes(1);
+      expect(scrollIntoView.mock.contexts[0]).toBe(modelRow("Kimi K2.7 Code"));
+      rerender(
+        <DropdownMenu open>
+          <DropdownMenuContent>
+            <ComposerConfigSections models={catalogSection(MIXED_CATALOG, "openai/gpt-5.5")} />
+          </DropdownMenuContent>
+        </DropdownMenu>,
+      );
+      expect(scrollIntoView).toHaveBeenCalledTimes(1);
+    } finally {
+      scrollIntoView.mockRestore();
+    }
+  });
+
+  it("searches names, ids, and creators across collapsed groups", () => {
+    const onSelect = vi.fn();
+    renderSections({ models: catalogSection(MIXED_CATALOG, "openai/gpt-5.5", onSelect) });
+    const search = screen.getByRole("textbox", { name: "Search models" });
+
+    fireEvent.change(search, { target: { value: "moonshot" } });
+    expect(screen.queryAllByRole("menuitem")).toHaveLength(0);
+    expect(screen.getByRole("group", { name: "Moonshot AI" })).toHaveTextContent("Kimi K2.7 Code");
+    expect(modelRow("GPT-5.5")).toBeNull();
+    expect(modelRow("Default")).toBeVisible();
+
+    fireEvent.change(search, { target: { value: "system.ai.glm" } });
+    fireEvent.click(modelRow("GLM-5.2")!);
+    expect(onSelect).toHaveBeenCalledWith("omnigent-openai/system.ai.glm-5-2");
+
+    fireEvent.change(search, { target: { value: "no such model" } });
+    expect(screen.getByRole("status")).toHaveTextContent("No matching models");
+
+    fireEvent.change(search, { target: { value: "" } });
+    expect(groupToggle("OpenAI")).toHaveAttribute("aria-expanded", "true");
+    expect(groupToggle("Moonshot AI")).toHaveAttribute("aria-expanded", "false");
+  });
+
+  it("moves between search and rows with the arrow keys and toggles groups with Enter", () => {
+    renderSections({ models: catalogSection(MIXED_CATALOG, "") });
+    const search = screen.getByRole("textbox", { name: "Search models" });
+
+    fireEvent.keyDown(search, { key: "ArrowDown" });
+    expect(modelRow("Default")).toHaveFocus();
+    fireEvent.keyDown(modelRow("Default")!, { key: "ArrowUp" });
+    expect(search).toHaveFocus();
+
+    fireEvent.keyDown(groupToggle("Google"), { key: "Enter" });
+    expect(modelRow("Gemini 3 Pro")).toBeVisible();
+  });
+
+  it("keeps small or single-creator catalogs simple", () => {
+    const { unmount } = renderSections({
+      models: catalogSection(MIXED_CATALOG.slice(3, 8), "openai/gpt-5.5"),
+    });
+    expect(screen.queryByRole("textbox")).toBeNull();
+    expect(screen.queryAllByRole("menuitem")).toHaveLength(0);
+    expect(screen.getAllByRole("menuitemcheckbox")).toHaveLength(6);
+    unmount();
+
+    const claude = [..."abcdefghij"].map((suffix) => ({
+      id: `anthropic/claude-${suffix}`,
+      displayName: `Claude ${suffix}`,
+    }));
+    renderSections({ models: catalogSection(claude, "anthropic/claude-a") });
+    expect(screen.getByRole("textbox", { name: "Search models" })).toBeVisible();
+    expect(screen.queryAllByRole("menuitem")).toHaveLength(0);
+    expect(screen.getAllByRole("menuitemcheckbox")).toHaveLength(11);
+  });
+
+  it("renders a cycle preview flat", () => {
+    render(
+      <DropdownMenu open>
+        <DropdownMenuContent>
+          <ComposerConfigSections
+            models={catalogSection(MIXED_CATALOG, "openai/gpt-5.5")}
+            browseModels={false}
+          />
+        </DropdownMenuContent>
+      </DropdownMenu>,
+    );
+    expect(screen.queryByRole("textbox")).toBeNull();
+    expect(screen.getAllByRole("menuitemcheckbox")).toHaveLength(MIXED_CATALOG.length + 1);
   });
 });

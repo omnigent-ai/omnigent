@@ -122,7 +122,7 @@ class ForkVisibilityFaults:
 
 
 def sidebar_row(page: Page, session_id: str):
-    return page.locator(f'a[href="/c/{session_id}"]')
+    return page.locator(f'li[data-sidebar-session-id="{session_id}"]')
 
 
 def seed_turn_from_composer(page: Page, base_url: str, source_id: str, marker: str) -> None:
@@ -160,7 +160,7 @@ def test_fork_row_while_list_lags_and_push_misses_fork(
     seeded_session: tuple[str, str],
     mock_llm_server_url: str,
 ) -> None:
-    """The fork row appears without a caught-up list or push, and stays through the lag."""
+    """The fork row appears without a caught-up list or push and stays after leaving the fork."""
     base_url, source_id = seeded_session
     configure_mock_llm(
         mock_llm_server_url, [{"text": "OK"}], key="fork-sidebar-seed", match=_MARKER
@@ -176,6 +176,11 @@ def test_fork_row_while_list_lags_and_push_misses_fork(
     assert fork_id in faults.fork_ids, (fork_id, faults.fork_ids)
     row = sidebar_row(page, fork_id)
     expect(row).to_be_visible(timeout=_ROW_TIMEOUT_MS)
+
+    # The open session always has a row, so watch the fork from its source.
+    sidebar_row(page, source_id).click()
+    expect(page).to_have_url(re.compile(rf"/c/{re.escape(source_id)}(\?.*)?$"), timeout=15_000)
+    assert faults.lagging(), faults.diagnostics()
 
     gaps: list[float | None] = []
     while faults.lagging():

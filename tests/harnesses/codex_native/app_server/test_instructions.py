@@ -21,7 +21,21 @@ from omnigent.inner.codex_executor import (
 )
 
 
-def test_sync_developer_instructions_preserves_and_restores_user_config(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("instructions", "expected"),
+    [
+        ("Rename the session.", "Rename the session."),
+        ("Launch \ud83d\ude80.", "Launch 🚀."),
+        ("Broken \ud83d text.", "Broken \ufffd text."),
+        ("Broken \ude80 text.", "Broken \ufffd text."),
+        ("Broken \ude80\ud83d text.", "Broken \ufffd\ufffd text."),
+        ("Résumé 中文 🚀 e\u0301.", "Résumé 中文 🚀 e\u0301."),
+    ],
+    ids=["ascii", "surrogate-pair", "lone-high", "lone-low", "reversed-pair", "unicode"],
+)
+def test_sync_developer_instructions_preserves_and_restores_user_config(
+    tmp_path: Path, instructions: str, expected: str
+) -> None:
     """Framework instructions append without replacing the user's Codex guidance."""
     codex_home = tmp_path / "codex-home"
     codex_home.mkdir()
@@ -31,12 +45,16 @@ def test_sync_developer_instructions_preserves_and_restores_user_config(tmp_path
         encoding="utf-8",
     )
 
-    _sync_codex_developer_instructions(codex_home, "Rename the session.")
-    _sync_codex_developer_instructions(codex_home, "Rename the session.")
+    _sync_codex_developer_instructions(codex_home, instructions)
+    _sync_codex_developer_instructions(codex_home, instructions)
 
     config = tomllib.loads(config_path.read_text(encoding="utf-8"))
     assert config["model"] == "gpt-5.5"
-    assert config["developer_instructions"] == ("Keep user guidance.\n\nRename the session.")
+    assert config["developer_instructions"] == f"Keep user guidance.\n\n{expected}"
+    state = tomllib.loads(
+        (codex_home / ".omnigent-developer-instructions-state.toml").read_text(encoding="utf-8")
+    )
+    assert state == {"base": "Keep user guidance.", "applied": config["developer_instructions"]}
 
     _sync_codex_developer_instructions(codex_home, None)
 

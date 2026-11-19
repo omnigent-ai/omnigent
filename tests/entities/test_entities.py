@@ -84,6 +84,32 @@ def test_assistant_message_includes_true_interrupted() -> None:
     }
 
 
+def test_message_phase_is_assistant_only_and_omitted_when_unset() -> None:
+    """Codex's commentary/answer label persists on assistant text only."""
+    msg = MessageData(role="assistant", agent="codex-native-ui", content=[], phase="commentary")
+    assert msg.model_dump(exclude_none=True)["phase"] == "commentary"
+    unlabelled = MessageData(role="assistant", agent="codex-native-ui", content=[])
+    assert "phase" not in unlabelled.model_dump()
+    with pytest.raises(ValidationError, match="phase"):
+        MessageData(role="user", content=[], phase="final_answer")
+
+
+@pytest.mark.parametrize(
+    ("phase", "stored"),
+    [("summary", "summary"), ("x" * 64, "x" * 64), ("x" * 65, None), ("", None), (3, None)],
+)
+def test_message_phase_keeps_short_strings_and_drops_malformed(
+    phase: object, stored: str | None
+) -> None:
+    """Values a newer Codex adds are kept; malformed ones read as unlabelled, not rejected."""
+    msg = parse_item_data(
+        "message",
+        {"role": "assistant", "agent": "codex-native-ui", "content": [], "phase": phase},
+    )
+    assert isinstance(msg, MessageData)
+    assert msg.phase == stored
+
+
 def test_assistant_message_includes_agent() -> None:
     msg = MessageData(role="assistant", agent="my-agent", content=[])
     dumped = msg.model_dump(exclude_none=True)

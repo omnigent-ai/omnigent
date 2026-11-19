@@ -42,6 +42,16 @@ const UNCOMPRESSED_IMAGE_LIMIT_MB = 5;
 
 export type AttachmentCategory = keyof typeof ATTACHMENT_SIZE_LIMITS_MB;
 
+export function clipboardFiles(data: DataTransfer | null | undefined): File[] {
+  const files: File[] = [];
+  for (const item of data?.items ?? []) {
+    if (item.kind !== "file") continue;
+    const file = item.getAsFile();
+    if (file !== null) files.push(file);
+  }
+  return files;
+}
+
 /** Keep unnamed clipboard images consistent before and after upload. */
 export function attachmentFilename(file: File): string {
   return file.name || "image.png";

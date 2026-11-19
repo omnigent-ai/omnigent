@@ -6,7 +6,7 @@
 //   3. Link button appears for addressed comments too (after switching the tab).
 //   4. No link button is rendered when onCopyCommentLink is omitted.
 
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Comment } from "@/hooks/useComments";
 import { getCurrentAuthorId } from "@/lib/identity";
@@ -195,6 +195,24 @@ describe("CommentsPanel read-only collaborator gating", () => {
     renderGated({ canEdit: true, activeSelection: FRESH_SELECTION });
     expect(screen.getByPlaceholderText("Add a comment…")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Add Comment" })).toBeInTheDocument();
+  });
+
+  it("does not add the comment on the Enter that confirms an IME candidate", () => {
+    const onAddComment = vi.fn();
+    renderGated({ canEdit: true, activeSelection: FRESH_SELECTION, handlers: { onAddComment } });
+    const box = screen.getByPlaceholderText("Add a comment…");
+    fireEvent.change(box, { target: { value: "漢字" } });
+
+    // Chrome flags the confirming Enter with keyCode 229; Safari sends a plain
+    // Enter before compositionend, so only the tracked composition catches it.
+    fireEvent.keyDown(box, { key: "Enter", keyCode: 229 });
+    fireEvent.compositionStart(box);
+    fireEvent.keyDown(box, { key: "Enter" });
+    fireEvent.compositionEnd(box);
+    expect(onAddComment).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(box, { key: "Enter" });
+    expect(onAddComment).toHaveBeenCalledWith("漢字");
   });
 
   it("hides per-comment Edit and Delete actions when read-only", () => {
@@ -408,30 +426,38 @@ describe("CommentsPanel show more / less", () => {
 //
 // The panel is resizable on desktop via a left-edge drag handle, and stacks
 // full-width (no inline width, no handle) on a narrow/mobile viewport. Desktop
-// vs mobile is decided from window.innerWidth (jsdom defaults to 1024 ≥ md).
+// vs mobile is decided from window.innerWidth (jsdom's default 1024 is below md).
 
 describe("CommentsPanel resize affordance", () => {
-  it("renders a resize handle and applies an inline width on desktop", () => {
-    renderPanel([makeComment("c1")], []);
+  function withInnerWidth(width: number, run: () => void) {
+    const orig = window.innerWidth;
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+    try {
+      run();
+    } finally {
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: orig });
+    }
+  }
 
-    // The separator is the drag handle; its parent is the panel root, which
-    // gets an explicit pixel width (default 240px) so it can be dragged wider.
-    const handle = screen.getByRole("separator", { name: "Resize comments panel" });
-    expect((handle.parentElement as HTMLElement).style.width).toBe("240px");
+  it("renders a resize handle and applies an inline width on desktop", () => {
+    withInnerWidth(1280, () => {
+      renderPanel([makeComment("c1")], []);
+
+      // The separator is the drag handle; its parent is the panel root, which
+      // gets an explicit pixel width (default 240px) so it can be dragged wider.
+      const handle = screen.getByRole("separator", { name: "Resize comments panel" });
+      expect((handle.parentElement as HTMLElement).style.width).toBe("240px");
+    });
   });
 
   it("omits the handle and inline width on a narrow (mobile) viewport", () => {
-    const orig = window.innerWidth;
-    Object.defineProperty(window, "innerWidth", { configurable: true, value: 500 });
-    try {
+    withInnerWidth(500, () => {
       renderPanel([makeComment("c1")], []);
       // No drag handle, and the panel falls back to the w-full class (no inline width).
       expect(screen.queryByRole("separator", { name: "Resize comments panel" })).toBeNull();
       const panel = screen.getByText("Comments").closest("div")?.parentElement as HTMLElement;
       expect(panel.style.width).toBe("");
-    } finally {
-      Object.defineProperty(window, "innerWidth", { configurable: true, value: orig });
-    }
+    });
   });
 });
 
@@ -556,5 +582,68 @@ describe("CommentsPanel active-comment reveal", () => {
     fireEvent.click(screen.getByText("Comment c2"));
 
     expect(onClickComment).toHaveBeenCalledWith(addressed);
+  });
+});
+
+describe("CommentsPanel Address All", () => {
+  function renderAddressPanel(
+    comments: Comment[],
+    addressCount?: number,
+    addressFileCount?: number,
+    onAddressAll = vi.fn(),
+  ) {
+    return render(
+      <CommentsPanel
+        comments={comments}
+        addressedComments={[]}
+        activeSelection={null}
+        onAddComment={vi.fn()}
+        onAddressAll={onAddressAll}
+        onEditComment={vi.fn()}
+        onDeleteComment={vi.fn()}
+        onClickComment={vi.fn()}
+        canAddress
+        addressCount={addressCount}
+        addressFileCount={addressFileCount}
+        addressPending={false}
+      />,
+    );
+  }
+
+  it.each([
+    ["drafts only in other files", [], 2, "Address All (2)", true],
+    ["this file's and other files' drafts", [makeComment("c1")], 3, "Address All (3)", true],
+    ["this file's drafts by default", [makeComment("c1")], undefined, "Address All1", true],
+    ["no drafts anywhere", [], 0, "Address All", false],
+  ])(
+    "enables and labels the button from the session count with %s",
+    (_label, comments, count, label, enabled) => {
+      const onAddressAll = vi.fn();
+      renderAddressPanel(comments, count, undefined, onAddressAll);
+
+      const button = screen.getByRole("button", { name: /^Address All/i });
+      fireEvent.click(button);
+      expect(button).toHaveProperty("disabled", !enabled);
+      expect(onAddressAll).toHaveBeenCalledTimes(enabled ? 1 : 0);
+      expect(button.textContent).toBe(label);
+    },
+  );
+
+  // Focus opens the tooltip without the hover delay.
+  it.each([
+    ["this file and another", [makeComment("c1")], 3, 2, "Sends 3 draft comments from 2 files"],
+    ["one other file", [], 1, 1, "Sends 1 draft comment from 1 file"],
+  ])("explains the send scope with drafts in %s", (_label, comments, count, fileCount, tooltip) => {
+    renderAddressPanel(comments, count, fileCount);
+
+    act(() => screen.getByRole("button", { name: `Address All (${count})` }).focus());
+    expect(screen.getByRole("tooltip")).toHaveTextContent(tooltip);
+  });
+
+  it("shows no scope tooltip when every draft is in the open file", () => {
+    renderAddressPanel([makeComment("c1"), makeComment("c2")], 2, 1);
+
+    act(() => screen.getByRole("button", { name: /^Address All/ }).focus());
+    expect(screen.queryByRole("tooltip")).toBeNull();
   });
 });

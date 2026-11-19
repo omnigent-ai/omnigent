@@ -126,7 +126,7 @@ class _ClipboardBrowser:
         self.reveal()
 
     def reveal(self) -> None:
-        if self.page.viewport_size and self.page.viewport_size["width"] < 768:
+        if self.page.viewport_size and self.page.viewport_size["width"] < 1181:
             self.page.get_by_role("button", name="Conversation actions").click()
             self.page.get_by_role("menuitem", name=re.compile(r"^Shells\b")).click()
             drawer = self.page.get_by_test_id("shells-panel-drawer")
@@ -294,7 +294,8 @@ def clipboard_browser(
     )
     browser_contract.json(
         re.compile(
-            rf"/v1/sessions/({'|'.join(map(re.escape, session_ids))})/child_sessions(?:\?.*)?$"
+            rf"/v1/sessions/({'|'.join(map(re.escape, session_ids))})"
+            rf"/(child_sessions|side_chats)(?:\?.*)?$"
         ),
         empty_list,
     )
@@ -448,7 +449,7 @@ def test_terminal_clipboard_popup_floats_top_center_without_resizing_or_stealing
     # Pinned top-center: floats near the top edge (horizontal stays within the
     # viewport, asserted above).
     assert 0 <= bounds["y"] <= 48
-    if width >= 768:
+    if width >= 1181:
         assert 440 <= bounds["width"] <= 520
     else:
         assert width - 40 <= bounds["width"] <= width
@@ -851,7 +852,7 @@ def test_terminal_clipboard_settings_blocks_selection_copying_after_returning_to
     assert ui.copy_selection("allowed browser selection") == "allowed browser selection"
     _expect_clipboard(ui.page, "allowed browser selection")
 
-    ui.page.get_by_test_id("settings-button").click()
+    ui.page.get_by_test_id("sidebar-profile-settings").click()
     preference = ui.page.get_by_test_id("terminal-clipboard-preference-select")
     expect(preference).to_contain_text("Allow copying" if remember else "Ask before copying")
     preference.click()

@@ -330,6 +330,19 @@ def test_fork_keeps_snapshot_even_when_resetting_model_choice(
         assert fetched.inference_snapshot == snapshot
 
 
+def test_fork_on_another_agent_can_leave_the_snapshot_behind(
+    store: SqlAlchemyConversationStore,
+) -> None:
+    snapshot = _snapshot()
+    source = store.create_conversation(inference_snapshot=snapshot)
+
+    fork = store.fork_conversation(source.id, copy_inference_snapshot=False)
+
+    assert fork.inference_snapshot is None
+    fetched = store.get_conversation(source.id)
+    assert fetched is not None and fetched.inference_snapshot == snapshot
+
+
 def test_model_edits_and_host_replacement_preserve_snapshot(
     store: SqlAlchemyConversationStore,
 ) -> None:
