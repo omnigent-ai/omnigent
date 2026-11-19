@@ -75,7 +75,7 @@ class FakePanel extends EventEmitter {
 const laptop = { id: 1, workArea: { x: 0, y: 25, width: 1512, height: 920 } };
 const external = { id: 2, workArea: { x: 1512, y: 0, width: 2560, height: 1415 } };
 
-function setup({ present, quitting = () => false, saveFrames } = {}) {
+function setup({ present, quitting = () => false, saveFrames, loadFrames } = {}) {
   const created = [];
   const stale = new Set();
   let frames = {};
@@ -90,7 +90,7 @@ function setup({ present, quitting = () => false, saveFrames } = {}) {
       getCursorScreenPoint: () => ({ x: 2000, y: 100 }),
       getDisplayNearestPoint: () => external,
     },
-    loadFrames: () => frames,
+    loadFrames: loadFrames ?? (() => frames),
     saveFrames:
       saveFrames ??
       ((next) => {
@@ -237,6 +237,19 @@ test("a frame that can't be saved never keeps the panel up", (t) => {
   assert.equal(panel.visible, false);
 });
 
+for (const [what, loadFrames] of [
+  ["can't be read", () => JSON.parse("{")],
+  ["isn't an object", () => null],
+]) {
+  test(`remembered frames that ${what} never stop the panel opening or hiding`, () => {
+    const { controller, created } = setup({ loadFrames });
+    assert.equal(controller.show("https://a.example"), "shown");
+    const [panel] = created;
+    assert.equal(controller.hide(panel), true);
+    assert.equal(panel.visible, false);
+  });
+}
+
 test("a picker its page never reported closed stops keeping the panel up once it hides", () => {
   const { controller, created } = setup();
   controller.show("https://a.example");
@@ -304,7 +317,8 @@ test("sign-out closes that server's panels; the next open builds a fresh one", (
   const { controller, created } = setup();
   controller.show("https://a.example/ws");
   controller.show("https://b.example");
-  controller.closePanels((serverUrl) => serverUrl.startsWith("https://a.example"));
+  // By origin, as sign-out matches them.
+  controller.closePanels((serverUrl) => new URL(serverUrl).origin === "https://a.example");
   assert.deepEqual(
     created.map((panel) => panel.destroyed),
     [true, false],

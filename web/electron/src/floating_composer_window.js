@@ -138,10 +138,20 @@ function createFloatingComposerController(deps) {
     saveTimers.delete(panel);
   }
 
+  /** The remembered frames, or none when they can't be read. */
+  function readFrames() {
+    try {
+      const frames = deps.loadFrames();
+      return frames !== null && typeof frames === "object" ? frames : {};
+    } catch {
+      return {};
+    }
+  }
+
   /** A remembered frame is a convenience: failing to read or save one never keeps a panel up. */
   function persistFrames(nextFrames) {
     try {
-      deps.saveFrames(nextFrames(deps.loadFrames()));
+      deps.saveFrames(nextFrames(readFrames()));
     } catch (err) {
       console.warn("[omnigent] could not save the floating panel's frame:", err);
     }
@@ -231,7 +241,7 @@ function createFloatingComposerController(deps) {
     // Opened by the global shortcut, so it follows the pointer to the display the user is on.
     const pointerDisplay = deps.screen.getDisplayNearestPoint(deps.screen.getCursorScreenPoint());
     return placeFloatingComposer({
-      savedFrame: deps.loadFrames()[serverUrl],
+      savedFrame: readFrames()[serverUrl],
       displays: deps.screen.getAllDisplays(),
       pointerDisplay,
     });

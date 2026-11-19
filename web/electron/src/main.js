@@ -1836,10 +1836,8 @@ function floatingComposer() {
         path: FLOATING_COMPOSER_PATH,
         windowOptions: floatingComposerWindowOptions(),
       });
-      // Leaving its page, by a link, a redirect or its own router, must not turn the floating
-      // panel into an app window or a sign-in page; it closes, and the next open rebuilds it.
-      // Deferred, so a panel isn't destroyed inside its own navigation event; only this panel
-      // closes, never one that replaced it meanwhile.
+      // A panel that leaves its page (a link, a redirect, its router) or loses its renderer closes
+      // and is rebuilt on the next open: deferred out of the event, and never a newer panel.
       const leaveIfNotCurrent = () =>
         setTimeout(() => {
           if (!floatingComposerPanelIsCurrent(panel, serverUrl)) {
@@ -1847,6 +1845,7 @@ function floatingComposer() {
           }
         }, 0);
       panel.webContents.on("did-navigate", leaveIfNotCurrent);
+      panel.webContents.on("render-process-gone", leaveIfNotCurrent);
       panel.webContents.on("did-navigate-in-page", (_event, _url, isMainFrame) => {
         if (isMainFrame !== false) leaveIfNotCurrent();
       });
