@@ -264,6 +264,9 @@ class _Registry:
     def update_titles(self, *_: Any, **__: Any) -> None:
         pass
 
+    def unlisted_checked_at(self, _: str) -> float:
+        return 0
+
 
 def _pr_info(monkeypatch: pytest.MonkeyPatch, url: str, **kwargs: Any) -> dict[str, Any]:
     monkeypatch.setattr(pr_resource, "SessionPrRegistry", _Registry)
