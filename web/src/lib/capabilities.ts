@@ -93,6 +93,7 @@ export interface ServerInfo {
   /** The server enforces the browser's Admin view cookie; absent on older servers. */
   admin_view?: boolean;
   sibling_sessions?: boolean;
+  session_nest_moves?: boolean;
   session_bundle_workspaces?: boolean;
   sibling_session_destinations?: SiblingSessionDestinations;
   accounts_enabled: boolean;
@@ -354,6 +355,12 @@ export interface ServerInfo {
    * Run a workflow offers; absent on older servers (off).
    */
   workflows?: boolean;
+  /**
+   * Owners can share saved workflows (``/v1/workflows/{id}/permissions``), and
+   * ``/v1/workflows/shared`` lists those shared with the viewer; absent on older
+   * servers (off).
+   */
+  workflow_sharing?: boolean;
   /**
    * True when the server stores each user's session title instructions
    * (``/v1/settings/session-title-instructions``); absent on older servers (off).
@@ -681,6 +688,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
         const harnessInstallEnabled = data.harness_install_enabled === true;
         cachedServerInfo = {
           sibling_sessions: data.sibling_sessions === true,
+          session_nest_moves: data.session_nest_moves === true,
           sibling_session_destinations: parseSiblingSessionDestinations(
             data.sibling_session_destinations,
           ),
@@ -763,6 +771,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_pull_requests: data.session_pull_requests === true,
           session_journal: data.session_journal === true,
           workflows: data.workflows === true,
+          workflow_sharing: data.workflow_sharing === true,
           session_title_instructions: data.session_title_instructions === true,
           admin_view: data.admin_view === true,
           comment_anchor_metadata: data.comment_anchor_metadata === true,

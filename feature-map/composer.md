@@ -188,7 +188,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   same older runner cannot resolve this ambiguity. With older servers, an
   unavailable session can also appear to have no goal. See the
   [Goal API compatibility notes](../omnigent/server/codex-API.md) for version
-  requirements.
+  requirements. In Claude Code native sessions, **+ → Goal** and `/goal`
+  send Claude Code's built-in `/goal <condition>`; the composer shows no goal
+  indicator, and progress appears as ordinary agent work in the conversation.
 - `slash-rewind`: in claude-sdk and Claude Code native sessions, `/rewind` opens
   a searchable list of the session's prompts, newest first. Choosing one
   continues the conversation in a new session holding only the history before
@@ -365,8 +367,9 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 
 ## How to get to it (user POV)
 
-- In a Codex native chat or a Polly session with a Goal control, send `/goal`,
-  choose `/goal` from the slash menu, or open **+ → Goal**.
+- In a Codex native chat, a Claude Code native chat, or a Polly session with a
+  Goal control, send `/goal`, choose `/goal` from the slash menu, or open
+  **+ → Goal**.
 
 **In-session composer** (open any session):
 

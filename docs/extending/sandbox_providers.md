@@ -365,8 +365,10 @@ delivery is uncertain, it shows “Automatic resume failed. Please send a new
 message to continue.” This is not an exactly-once guarantee for tool side effects.
 
 Custom conversation stores opt in with `supports_session_recovery = True` after
-implementing `get_session_recovery` and atomic `replace_session_recovery`, ordered
-with user input, Stop, archive, and deletion. To recover sessions already marked
+implementing `get_session_recovery`, atomic `replace_session_recovery`, and
+`admit_session_recovery`. Admission must validate the current host/runner binding
+and recovery intent under locks ordered with user input, Stop, archive, and
+deletion; unsupported admission fails closed. To recover sessions already marked
 disconnected, implement `get_session_interruption_time` using the original error
 timestamp; without it, only interruptions observed while active are recorded.
 The SQLAlchemy store implements this contract using private `omnigent.recovery.*`

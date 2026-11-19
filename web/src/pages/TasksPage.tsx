@@ -35,7 +35,7 @@ import { ScheduledTaskRow } from "@/components/scheduled/ScheduledTaskRow";
 import { AUTOMATION_TEMPLATES } from "@/components/scheduled/automationTemplates";
 import { SESSION_LINK_ID_PLACEHOLDER } from "@/components/scheduled/triggerTemplates";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled, isSharingOff, SHARING_OFF_REASON } from "@/lib/capabilities";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { useNavigate, useRebasePath, useSearchParams } from "@/lib/routing";
 import { getShareableSessionLink } from "@/lib/shareLink";
 import {
@@ -48,7 +48,11 @@ import {
 } from "@/hooks/useScheduledTasks";
 import { useNow } from "@/hooks/useNow";
 import { useViewerId } from "@/hooks/useViewerId";
-import { canShareAutomation, sharedAutomationsListed } from "@/lib/permissionsApi";
+import {
+  automationShareDisabledReason,
+  canShareAutomation,
+  sharedAutomationsListed,
+} from "@/lib/permissionsApi";
 import {
   cloneCreatedMessage,
   cloneFailedMessage,
@@ -469,7 +473,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
                   onShare={
                     canShareAutomation(info, viewerId, task.ownerUserId) ? handleShare : undefined
                   }
-                  shareDisabledReason={isSharingOff(info) ? SHARING_OFF_REASON : undefined}
+                  shareDisabledReason={automationShareDisabledReason(info, task)}
                   onClone={
                     info !== "loading" && info.scheduled_task_clone ? handleClone : undefined
                   }

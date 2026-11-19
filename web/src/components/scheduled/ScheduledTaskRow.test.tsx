@@ -149,12 +149,19 @@ describe("⋯ menu actions", () => {
     expect(screen.queryByTestId("task-share")).toBeNull();
   });
 
-  it("shows Share disabled, without dispatching, when given a reason", () => {
+  // The page passes the reason, e.g. for a legacy automation.
+  it.each([
+    ["⋯ menu", () => fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 })],
+    ["right-click menu", () => fireEvent.contextMenu(screen.getByTestId("scheduled-task-row"))],
+  ])("shows Share disabled with its reason in the %s, without dispatching", async (_, open) => {
     const onShare = vi.fn();
-    renderRow(task(), { onShare, shareDisabledReason: "Sharing is off." });
-    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    const reason = "This is a legacy automation. Recreate it to share it.";
+    renderRow(task(), { onShare, shareDisabledReason: reason });
+    open();
     const share = screen.getByRole("menuitem", { name: "Share" });
     expect(share).toHaveAttribute("aria-disabled", "true");
+    fireEvent.focus(share);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(reason);
     fireEvent.click(share);
     expect(onShare).not.toHaveBeenCalled();
   });

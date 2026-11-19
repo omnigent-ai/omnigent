@@ -93,6 +93,7 @@ from omnigent.entities import (
     MessageData,
     NewConversationItem,
     PagedList,
+    SlashCommandData,
     parse_item_data,
 )
 from omnigent.errors import ErrorCode, OmnigentError, StaleCursorError
@@ -126,6 +127,7 @@ from omnigent.stores.conversation_store import (
     SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX,
     SCHEDULED_TASK_RUN_LABEL_KEY,
     SIDE_CHAT_COPY_ID_PREFIX_LEN,
+    SIDE_CHAT_LABEL_KEY,
     ConversationAlreadyExistsError,
     ConversationNotFoundError,
     ConversationStore,
@@ -2050,14 +2052,22 @@ class SqlAlchemyConversationStore(ConversationStore):
         for family_id, family in families.items():
             if len(family) > MAX_SESSION_FAMILY_MEMBERS:
                 raise OmnigentError("Session family is too large", code=ErrorCode.CONFLICT)
-            family.sort(key=lambda member: (member.created_at, member.id != family_id, member.id))
+            family.sort(key=lambda member: (member.id != family_id, member.created_at, member.id))
         return families
 
-    def add_new_sibling(self, source_id: str, session_id: str, *, user_id: str | None) -> None:
+    def add_new_sibling(
+        self, source_id: str, session_id: str, *, user_id: str | None, move_existing: bool = False
+    ) -> None:
         source = self.get_conversation(source_id)
         if source is None:
             raise ConversationNotFoundError(source_id)
         family_id = source.family_id or source.id
+        target = self.get_conversation(session_id) if move_existing else None
+        if source.family_id is None:
+            with self._session("prepare_sibling_membership") as session:
+                members = self._family_member_ids(session, family_id)
+                if members and source_id not in members:
+                    family_id = uuid.uuid4().hex
         pin_key = pinned_label_key(user_id)
         family_pin_key = family_pinned_label_key(user_id)
 
@@ -2069,6 +2079,14 @@ class SqlAlchemyConversationStore(ConversationStore):
             promote_pin: bool,
             project_id: str | None,
         ) -> None:
+            if move_existing:
+                labels_session.execute(
+                    delete(SqlConversationLabel).where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        SqlConversationLabel.conversation_id == session_id,
+                        SqlConversationLabel.key == family_pin_key,
+                    )
+                )
             source_labels = _fetch_labels(
                 labels_session, label_source_id, keys=(PROJECT_LABEL_KEY, pin_key, family_pin_key)
             )
@@ -2099,12 +2117,20 @@ class SqlAlchemyConversationStore(ConversationStore):
                     _upsert_prepared_labels(labels_session, member_id, updates, now_epoch())
 
         def write(session: Session) -> None:
-            family_lock = self._lock_session_family(session, family_id)
+            lock_ids = {family_id}
+            if move_existing:
+                lock_ids.update(
+                    key
+                    for key in (source_id, session_id, target.family_id if target else None)
+                    if key
+                )
+            locks = {key: self._lock_session_family(session, key) for key in sorted(lock_ids)}
+            family_lock = locks[family_id]
             source_meta = session.get(
                 SqlConversationMetadata, (current_workspace_id(), source_id), with_for_update=True
             )
             target_meta = session.get(
-                SqlConversationMetadata, (current_workspace_id(), session_id)
+                SqlConversationMetadata, (current_workspace_id(), session_id), with_for_update=True
             )
             if source_meta is None or target_meta is None:
                 raise ConversationNotFoundError(source_id if source_meta is None else session_id)
@@ -2119,10 +2145,21 @@ class SqlAlchemyConversationStore(ConversationStore):
                     source_row is None
                     or target_row is None
                     or source_row.archived
+                    or target_row.archived
                     or source_row.parent_conversation_id is not None
                     or target_row.parent_conversation_id is not None
-                    or target_meta.family_id is not None
-                    or (source_meta.family_id or source_id) != family_id
+                    or (not move_existing and target_meta.family_id is not None)
+                    or (
+                        move_existing
+                        and target_meta.family_id != (target.family_id if target else None)
+                    )
+                    or source_meta.family_id not in (source.family_id, family_id)
+                    or (
+                        move_existing
+                        and any(
+                            row.labels.get(SIDE_CHAT_LABEL_KEY) for row in (source, target) if row
+                        )
+                    )
                 ):
                     raise OmnigentError(
                         "Sibling source is no longer available", code=ErrorCode.CONFLICT
@@ -2170,7 +2207,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                     copy_labels(
                         labels_session,
                         members if initialize_labels else [session_id],
-                        label_source_id=family_id if initialize_labels else source_id,
+                        label_source_id=family_id
+                        if initialize_labels and family_id in members
+                        else source_id,
                         promote_pin=initialize_labels,
                         project_id=source_meta.project_id,
                     )
@@ -2178,6 +2217,49 @@ class SqlAlchemyConversationStore(ConversationStore):
                 family_lock.value = "{}"
 
             run_write_transaction(self._session_immediate, "copy_sibling_labels", finish_labels)
+
+    def set_session_nest(
+        self, session_id: str, source_id: str | None, *, user_id: str | None
+    ) -> None:
+        if source_id == session_id:
+            return
+        if source_id is not None:
+            self.add_new_sibling(source_id, session_id, user_id=user_id, move_existing=True)
+            return
+        source = self.get_conversation(session_id)
+        if source is None:
+            raise ConversationNotFoundError(session_id)
+        if (
+            source.archived
+            or source.parent_conversation_id
+            or source.labels.get(SIDE_CHAT_LABEL_KEY)
+        ):
+            raise OmnigentError(
+                "Only active independent sessions can leave a nest", code=ErrorCode.INVALID_INPUT
+            )
+
+        def write(session: Session) -> None:
+            self._lock_session_family(session, source.family_id or session_id)
+            meta = session.get(
+                SqlConversationMetadata, (current_workspace_id(), session_id), with_for_update=True
+            )
+            if meta is None or meta.family_id != source.family_id:
+                raise OmnigentError(
+                    "Session family changed; retry the move", code=ErrorCode.CONFLICT
+                )
+            meta.family_id = None
+            with self._profile_label_session(
+                session, operation="move_session_nest"
+            ) as labels_session:
+                labels_session.execute(
+                    delete(SqlConversationLabel).where(
+                        SqlConversationLabel.workspace_id == current_workspace_id(),
+                        SqlConversationLabel.conversation_id == session_id,
+                        SqlConversationLabel.key == family_pinned_label_key(user_id),
+                    )
+                )
+
+        run_write_transaction(self._session_immediate, "move_session_nest", write)
 
     def set_family_pin(self, session_id: str, value: str, *, user_id: str | None) -> None:
         value = _prepare_label_updates({PINNED_LABEL_KEY: value})[PINNED_LABEL_KEY]
@@ -2219,8 +2301,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             .order_by(
                 SqlConversation.archived,
-                SqlConversation.created_at,
                 case((SqlConversation.id == family_id, 0), else_=1),
+                SqlConversation.created_at,
                 SqlConversation.id,
             )
             .limit(1)
@@ -3379,8 +3461,15 @@ class SqlAlchemyConversationStore(ConversationStore):
         # Postgres text column never sees a NUL (tool output can embed one, e.g.
         # reading a binary file), which would abort the whole INSERT.
         recovery_candidates: dict[int, NewConversationItem] = {}
+        input_candidates: set[int] = set()
         interruption_notices: set[int] = set()
         for index, item in enumerate(items):
+            if (
+                isinstance(item.data, MessageData)
+                and item.data.role == "user"
+                and (not item.data.is_meta or item.data.user_authored)
+            ) or (isinstance(item.data, SlashCommandData) and item.data.kind == "skill"):
+                input_candidates.add(index)
             if isinstance(item.data, MessageData) and not item.data.user_authored:
                 from omnigent.inner.executor import is_interruption_marker
 
@@ -3501,11 +3590,8 @@ class SqlAlchemyConversationStore(ConversationStore):
                     ]
 
             has_new_input = any(
-                item.stable_id not in existing_by_id
-                and isinstance(item.data, MessageData)
-                and item.data.role == "user"
-                and not item.data.is_meta
-                for item in items
+                index in input_candidates and item.stable_id not in existing_by_id
+                for index, item in enumerate(items)
             )
             recovery = _read_session_recovery(session, conversation_id) if has_new_input else None
             append_rows = []
@@ -3521,16 +3607,30 @@ class SqlAlchemyConversationStore(ConversationStore):
                         item = recovery_candidates[index]
                         prepared = {**prepared, "data": recovery_encoded[index]}
                     elif (
-                        isinstance(item.data, MessageData)
-                        and item.data.role == "user"
-                        and not item.data.is_meta
-                        and recovery is not None
+                        recovery is not None
+                        and index in input_candidates
                         and index not in interruption_notices
-                        and (item.data.user_authored or item.response_id != recovery.response_id)
+                        and (
+                            not isinstance(item.data, MessageData)
+                            or item.data.user_authored
+                            or item.response_id != recovery.response_id
+                        )
                     ):
                         # A native turn's delayed input echo must retain its lifecycle fence.
-                        _write_session_recovery(session, conversation_id, None)
-                        recovery = None
+                        recovery = (
+                            SessionRecovery(
+                                recovery.host_id,
+                                recovery.runner_id,
+                                recovery.interrupted_at,
+                                phase="active",
+                                response_id=item.response_id,
+                            )
+                            if isinstance(item.data, MessageData)
+                            and not item.data.user_authored
+                            and item.response_id == recovery.next_response_id
+                            else None
+                        )
+                        _write_session_recovery(session, conversation_id, recovery)
                     if item.stable_id is not None:
                         seen_stable_ids.add(item.stable_id)
                 append_rows.append((item, prepared, search))
@@ -5819,13 +5919,15 @@ class SqlAlchemyConversationStore(ConversationStore):
 
     @contextmanager
     def _profile_label_session(
-        self, metadata_session: Session, *, read_only: bool = False
+        self, metadata_session: Session, *, read_only: bool = False, operation: str | None = None
     ) -> Iterator[Session]:
         if self._conv_engine is self._engine:
             yield metadata_session
         else:
             session_maker = self._conv_session if read_only else self._conv_session_immediate
-            operation = "check_profile_host_affinity" if read_only else "accept_sandbox_profile"
+            operation = operation or (
+                "check_profile_host_affinity" if read_only else "accept_sandbox_profile"
+            )
             with session_maker(operation) as session:
                 yield session
 

@@ -1,4 +1,5 @@
-import type { ComponentType, ReactNode } from "react";
+import type { ComponentType, ReactElement, ReactNode } from "react";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -47,6 +48,41 @@ const STEPS: WorkflowStep[] = [
   { id: "explore", name: "Explore the failures", goal: null, depends_on: [] },
   { id: "fix", name: "Fix the test", goal: "The suite passes", depends_on: ["explore"] },
 ];
+
+// A goal written for people first, as the save-workflow skill asks.
+const MARKDOWN_GOAL = [
+  "**Inputs:** the failing test's name, from the run's request.",
+  "",
+  "**What it does:**",
+  "- Reruns the test",
+  "- Fixes its cause",
+  "",
+  "**Details:** rerun it with `pnpm test <name>`.",
+].join("\n");
+const MARKDOWN_STEPS: WorkflowStep[] = [STEPS[0]!, { ...STEPS[1]!, goal: MARKDOWN_GOAL }];
+
+/** Inline code checks whether it names a workspace file, which needs a query client. */
+function renderWithQueries(ui: ReactElement) {
+  return render(
+    <QueryClientProvider
+      client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+    >
+      {ui}
+    </QueryClientProvider>,
+  );
+}
+
+/** The goal's bold labels, list items and code rendered as Markdown, with no syntax left over. */
+function expectMarkdownGoal(card: HTMLElement) {
+  expect(within(card).getByText("Inputs:")).toHaveAttribute("data-streamdown", "strong");
+  expect(
+    within(card)
+      .getAllByRole("listitem")
+      .map((item) => item.textContent),
+  ).toEqual(["Reruns the test", "Fixes its cause"]);
+  expect(within(card).getByText("pnpm test <name>").tagName).toBe("CODE");
+  expect(card.textContent).not.toMatch(/\*\*|`/);
+}
 
 // One unbroken token, as a command or path in a step's goal is.
 const LONG_PATH = "//services/payments/third_party/sync/source:unit_suite_with_a_long_name";
@@ -131,20 +167,32 @@ describe("WorkflowStepsGraph", () => {
 
   it("shows a step's full name and goal on hover, wrapped inside its card, with no menu", async () => {
     const goal = `\`${LONG_PATH}\` passes`;
-    render(
+    renderWithQueries(
       <WorkflowStepsGraph steps={[STEPS[0]!, { ...STEPS[1]!, goal }]} title="Triage flaky tests" />,
     );
     const fix = screen.getAllByTestId("workflow-step-node")[1]!;
     expect(within(fix).queryByTestId("workflow-step-node-menu")).toBeNull();
-    expect(within(fix).getByText(goal).parentElement).toHaveClass("wrap-anywhere");
+    expect(within(fix).getByText(`${LONG_PATH} passes`).parentElement).toHaveClass("wrap-anywhere");
     await userEvent.hover(fix);
     const card = await screen.findByTestId("workflow-step-card");
     expect(card).toHaveTextContent("Step 2 of 2");
     expect(card).toHaveTextContent("Fix the test");
-    expect(card).toHaveTextContent(goal);
+    expect(card).toHaveTextContent(`${LONG_PATH} passes`);
     // The graph zooms by scaling what's inside it; the card opens outside it.
     expect(screen.getByTestId("react-flow")).not.toContainElement(card);
     expectTextWrapsInside(card);
+  });
+
+  it("previews a step's goal as plain text in its box, and shows it as Markdown on hover", async () => {
+    renderWithQueries(<WorkflowStepsGraph steps={MARKDOWN_STEPS} title="Triage flaky tests" />);
+    const fix = screen.getAllByTestId("workflow-step-node")[1]!;
+    expect(fix).toHaveTextContent(
+      "Inputs: the failing test's name, from the run's request. What it does: Reruns the test · " +
+        "Fixes its cause · Details: rerun it with pnpm test <name>.",
+    );
+    expect(fix.textContent).not.toMatch(/\*\*|`/);
+    await userEvent.hover(fix);
+    expectMarkdownGoal(await screen.findByTestId("workflow-step-card"));
   });
 });
 
@@ -193,12 +241,15 @@ describe("WorkflowGraphOverlay", () => {
   });
 
   it("shows all of a run's step on hover: where it stands, its result and its goal", async () => {
-    const run = progress("done", "failed");
+    const run = progress("done", "failed").map((item, index) => ({
+      ...item,
+      step: MARKDOWN_STEPS[index]!,
+    }));
     run[1] = { ...run[1]!, status: statusEntry("fix", "failed", "The upload test still fails") };
-    render(
+    renderWithQueries(
       <WorkflowGraphOverlay
         title="Triage flaky tests"
-        steps={STEPS}
+        steps={MARKDOWN_STEPS}
         progress={run}
         onClose={vi.fn()}
       />,
@@ -209,7 +260,9 @@ describe("WorkflowGraphOverlay", () => {
     expect(card).toHaveTextContent("Fix the test");
     expect(within(card).getByRole("img", { name: "Failed" })).toBeInTheDocument();
     expect(card).toHaveTextContent("The upload test still fails");
-    expect(card).toHaveTextContent("Goal: The suite passes");
+    // The whole goal follows its result, as Markdown.
+    expect(within(card).getByText("Goal")).toBeInTheDocument();
+    expectMarkdownGoal(card);
     expectTextWrapsInside(card);
   });
 

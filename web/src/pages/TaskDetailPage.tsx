@@ -60,7 +60,7 @@ import {
   RunWorkflowButton,
   useRunTaskMenus,
 } from "@/components/workflows/RunTasks";
-import { planRunControl } from "@/shell/PlanRunButton";
+import { planRunButtonState, planRunControl } from "@/shell/PlanRunButton";
 import { WorkflowGraphOverlay } from "@/components/workflows/WorkflowStepsGraph";
 import {
   useCloneScheduledTask,
@@ -81,6 +81,7 @@ import {
 import { useNow } from "@/hooks/useNow";
 import { useSession } from "@/hooks/useSession";
 import { useViewerId } from "@/hooks/useViewerId";
+import { usePlanStopping } from "@/hooks/usePlanStopping";
 import { useSessionWorking } from "@/hooks/useSessionWorking";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHosts } from "@/hooks/useHosts";
@@ -99,13 +100,8 @@ import {
 } from "@/lib/scheduleText";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AUTOMATION_SHARE_PARAM } from "@/lib/automationFromSession";
-import {
-  isFeatureEnabled,
-  isSharingOff,
-  sandboxOptionLabel,
-  SHARING_OFF_REASON,
-} from "@/lib/capabilities";
-import { canShareAutomation } from "@/lib/permissionsApi";
+import { isFeatureEnabled, sandboxOptionLabel } from "@/lib/capabilities";
+import { automationShareDisabledReason, canShareAutomation } from "@/lib/permissionsApi";
 import {
   cloneCreatedMessage,
   cloneFailedMessage,
@@ -379,8 +375,8 @@ function TaskDetail({ taskId }: { taskId: string }) {
   const scheduleSummary = describeSchedule(task.rrule, task.timezone);
   const readOnly = isSharedWithViewer(task);
   const canShare = canShareAutomation(info, viewerId, task.ownerUserId);
-  // As for sessions, sharing off disables Share rather than hiding it.
-  const sharingOff = isSharingOff(info);
+  // As for sessions, a reason such as sharing off disables Share rather than hiding it.
+  const shareDisabledReason = automationShareDisabledReason(info, task);
   const nextRun = formatNextRunAt(task.nextRunAt, now);
   // A single per-task busy flag: the header actions disable while any of this
   // task's mutations are in flight.
@@ -500,14 +496,14 @@ function TaskDetail({ taskId }: { taskId: string }) {
             </DisabledActionTooltip>
           ) : (
             canShare &&
-            (sharingOff ? (
+            (shareDisabledReason ? (
               <Tooltip>
                 <TooltipTrigger asChild>
                   {/* Disabled buttons don't receive pointer events, so the wrapper
                       owns hover/focus for the explanatory tooltip. */}
                   <span
                     tabIndex={0}
-                    aria-label={`Share automation disabled: ${SHARING_OFF_REASON}`}
+                    aria-label={`Share automation disabled: ${shareDisabledReason}`}
                     className="inline-flex"
                   >
                     <Button
@@ -521,7 +517,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
                     </Button>
                   </span>
                 </TooltipTrigger>
-                <TooltipContent>{SHARING_OFF_REASON}</TooltipContent>
+                <TooltipContent>{shareDisabledReason}</TooltipContent>
               </Tooltip>
             ) : (
               <Button
@@ -805,7 +801,7 @@ function TaskDetail({ taskId }: { taskId: string }) {
           sessionLink={sessionLink}
         />
       )}
-      {canShare && !sharingOff && (
+      {canShare && !shareDisabledReason && (
         <PermissionsModal
           automation={task}
           open={shareOpen || shareRequested}
@@ -983,10 +979,14 @@ function RunRow({
     ? (steps?.workflowId ?? null)
     : null;
   // Stop while the run's session works; play once it stopped with tasks left.
-  const control =
-    showTasks && steps?.isCurrent && steps.planId
-      ? planRunControl(progress, steps.statuses, sessionWorking, steps.planGraphRevision)
-      : null;
+  const canAct = showTasks && steps?.isCurrent === true && !!steps.planId;
+  const stopping = usePlanStopping(canAct ? (sessionId ?? null) : null, sessionWorking);
+  const control = canAct
+    ? planRunButtonState(
+        planRunControl(progress, steps.statuses, sessionWorking, steps.planGraphRevision),
+        stopping,
+      )
+    : null;
   // What the run's buttons and task menus refresh once its session takes them.
   const refreshKeys = [
     scheduledTaskRunsKey(run.scheduledTaskId),
@@ -997,10 +997,13 @@ function RunRow({
     steps?.isCurrent ? sessionId : null,
     refreshKeys,
     steps?.planId ?? null,
+    stopping,
   );
-  // Room on the row's link for the buttons over its right end.
-  const buttonPadding = ["", "pr-11", "pr-18", "pr-25"][
-    1 + (workflowId ? 1 : 0) + (control ? 1 : 0)
+  // Room on the row's link for the buttons over its right end, in icon widths;
+  // "Stopping…" takes about four.
+  const controlWidth = control === "stopping" ? 4 : Number(control !== null);
+  const buttonPadding = ["", "pr-11", "pr-18", "pr-25", "pr-32", "pr-39", "pr-46"][
+    1 + (workflowId ? 1 : 0) + controlWidth
   ];
   const duration = formatRunDuration(run.firedAt, run.finishedAt);
   // Unread only applies to a succeeded run that produced a conversation.

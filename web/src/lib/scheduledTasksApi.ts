@@ -109,6 +109,11 @@ export interface ScheduledTask {
   viewerRole?: ScheduledTaskViewerRole;
   /** The owner's display name, sent to a viewer; `null` for the owner. */
   ownerDisplayName?: string | null;
+  /**
+   * `false` when the server can't keep grants for this automation, e.g. a legacy
+   * one. Absent counts as shareable.
+   */
+  shareable?: boolean;
 }
 
 /** One run of a scheduled task, camelCased from `_run_to_response`. */
@@ -281,6 +286,8 @@ interface ScheduledTaskWire {
   // Absent on servers that predate sharing automations.
   viewer_role?: ScheduledTaskViewerRole;
   owner_display_name?: string | null;
+  // Absent on servers that predate it.
+  shareable?: boolean;
 }
 
 /** Wire shape of a run row (snake_case), matching `_run_to_response`. */
@@ -373,6 +380,7 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
     nextRunAt: wire.next_run_at,
     viewerRole: wire.viewer_role ?? "owner",
     ownerDisplayName: wire.owner_display_name ?? null,
+    shareable: wire.shareable ?? true,
   };
 }
 

@@ -66,6 +66,14 @@ def record_turn(
         )
     elif previous.phase in {"dispatching", "submitted"}:
         state = replace(previous, phase="submitted", response_id=response_id)
+    elif (
+        previous.phase == "stopped"
+        and previous.host_id == conv.host_id
+        and previous.runner_id == runner_id
+        and response_id != previous.response_id
+    ):
+        # A new native start needs its matching input before it can authorize recovery.
+        state = replace(previous, next_response_id=response_id, interrupted_at=now_epoch())
     else:
         return
     store.replace_session_recovery(session_id, previous, state, expected_conversation=conv)
@@ -128,12 +136,18 @@ def _stop_recovery(
         return
     previous = store.get_session_recovery(conv.id)
     if (previous is None and only_pending) or (
-        response_id is not None and (previous is None or previous.response_id != response_id)
+        response_id is not None
+        and (
+            previous is None or response_id != (previous.next_response_id or previous.response_id)
+        )
     ):
         return
     while True:
         stopped = replace(
-            previous or SessionRecovery(conv.host_id, conv.runner_id, now_epoch()), phase="stopped"
+            previous or SessionRecovery(conv.host_id, conv.runner_id, now_epoch()),
+            phase="stopped",
+            response_id=(previous.next_response_id or previous.response_id) if previous else None,
+            next_response_id=None,
         )
         # Accepted input clears the episode atomically; output must not defeat its fence.
         if store.replace_session_recovery(
@@ -148,7 +162,9 @@ def _stop_recovery(
             latest = store.get_conversation(conv.id)
             if latest is None or latest.next_position != conv.next_position:
                 return
-        elif current.response_id != previous.response_id or current.host_id != previous.host_id:
+        elif (current.next_response_id or current.response_id) != (
+            previous.next_response_id or previous.response_id
+        ) or current.host_id != previous.host_id:
             return
         previous = current
 
