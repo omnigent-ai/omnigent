@@ -168,6 +168,7 @@ from omnigent.server.routes.sharing import create_sharing_router
 from omnigent.server.routes.terminal_attach import create_terminal_attach_router
 from omnigent.server.routes.usage import create_usage_router
 from omnigent.server.routes.user_settings import create_user_settings_router
+from omnigent.server.routes.workflow_permissions import stores_workflow_grants
 from omnigent.server.runner_session_init import (
     TRANSIENT_REJECTION_STATUSES,
     RunnerSessionInitializer,
@@ -326,6 +327,9 @@ class ServerInfoResponse(BaseModel):
     archive_worktree_cleanup: bool = True
     # GET /v1/sessions accepts ``search_scope``; older servers ignore it.
     session_search_scope: bool = True
+    # PATCH stores the ``omnigent.muted`` label per viewer; older servers would
+    # store it as an ordinary label every collaborator sees.
+    session_mute: bool = True
     # GET /v1/sessions applies ``include_archived`` to ``visibility=mine`` and
     # ``shared``; older servers drop archived rows there.
     session_list_scoped_archives: bool = True
@@ -363,6 +367,7 @@ class ServerInfoResponse(BaseModel):
     scheduled_task_sandbox_workspaces: bool = True
     # Owner-private families and reuse of the source session's sandbox.
     sibling_sessions: bool = False
+    session_nest_moves: bool = False
     # Uploaded-agent sessions accept repository lists and worktree options.
     session_bundle_workspaces: bool = True
     # A managed create or fork accepts ``host_id`` naming its new sandbox host;
@@ -403,6 +408,10 @@ class ServerInfoResponse(BaseModel):
     # /v1/workflows, the caller's saved workflows; absent on older servers, which
     # clients treat as unsupported.
     workflows: bool = False
+    # Workflows can be shared through ``/v1/workflows/{id}/permissions``, and
+    # ``GET /v1/workflows/shared`` lists those shared with the caller: needs
+    # ``workflows`` and a store that keeps workflow grants.
+    workflow_sharing: bool = False
     # GET/PUT /v1/settings/session-title-instructions; absent on older servers,
     # which clients treat as unsupported.
     session_title_instructions: bool = False
@@ -426,6 +435,9 @@ class ServerInfoResponse(BaseModel):
     # ``GET /v1/scheduled-tasks/{id}/run-pull-requests``, the PRs of each run, served
     # beside ``session_pull_requests``. Older servers that store session PRs lack it.
     scheduled_task_run_pull_requests: bool = False
+    # ``POST /v1/scheduled-tasks/{id}/clone`` copies an automation under a new ID, on
+    # the database scheduler (``automations_v2``) only; absent on older servers.
+    scheduled_task_clone: bool = False
     # Session PATCH and project create check the agent tool's calling session;
     # absent on older servers, where moves must not run.
     session_move_source_checks: bool = False
@@ -4125,6 +4137,10 @@ def create_app(
         automation_sharing = automations_enabled and scheduled_task_sharing_supported(
             app.state, permission_store
         )
+        workflows_available = (
+            frontend_features[Feature.WORKFLOWS.value]
+            and workflows.open_store(conversation_store) is not None
+        )
         return ServerInfoResponse.model_validate(
             {
                 "accounts_enabled": accounts_enabled,
@@ -4153,9 +4169,11 @@ def create_app(
                 "scheduled_task_worktrees": True,
                 "archive_worktree_cleanup": True,
                 "session_search_scope": True,
+                "session_mute": True,
                 "session_list_scoped_archives": True,
                 "scripted_sessions": app.state.feature_flags.enabled(Feature.SCRIPTED_SESSIONS),
                 "sibling_sessions": frontend_features[Feature.SIBLING_SESSIONS.value],
+                "session_nest_moves": True,
                 "request_managed_sandbox_host_id": True,
                 "session_fork_workspaces": True,
                 "session_bundle_model_override": True,
@@ -4176,8 +4194,9 @@ def create_app(
                 is not None,
                 "session_journal": frontend_features[Feature.WORKFLOWS.value]
                 and session_journal.open_store(conversation_store) is not None,
-                "workflows": frontend_features[Feature.WORKFLOWS.value]
-                and workflows.open_store(conversation_store) is not None,
+                "workflows": workflows_available,
+                "workflow_sharing": workflows_available
+                and stores_workflow_grants(permission_store),
                 "session_title_instructions": user_settings_store is not None,
                 "admin_view": admin_view_supported,
                 "filesystem_attachments": {
@@ -4190,6 +4209,8 @@ def create_app(
                 and bool(app.state.one_time_automations_enabled),
                 "scheduled_task_sharing": automation_sharing,
                 "scheduled_task_shared_with_me": automation_sharing,
+                "scheduled_task_clone": automations_enabled
+                and bool(app.state.scheduled_task_dispatch_enabled),
                 "session_move_source_checks": True,
                 "session_organize_source_checks": True,
                 "sibling_other_project_standalone": True,

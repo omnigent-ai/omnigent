@@ -10493,7 +10493,7 @@ _CLI_SCAFFOLDING_MARKERS: tuple[str, ...] = (
 #   web message that opens one would never be confirmed delivered.
 # - SURFACED — commands that change the next turn's behavior or the
 #   conversation state (``/effort high``, ``/clear``, ``/compact``,
-#   ``/model``, ``/ultrareview``). A web observer needs to see these,
+#   ``/goal``, ``/model``, ``/ultrareview``). A web observer needs to see these,
 #   otherwise the next assistant turn appears to shift unprompted.
 #
 # Unknown names fall through to the Skill branch — a safer default
@@ -10544,6 +10544,7 @@ _CLAUDE_CLI_SURFACED_COMMANDS: frozenset[str] = frozenset(
         "clear",
         "compact",
         "effort",
+        "goal",
         "model",
         "ultrareview",
     }

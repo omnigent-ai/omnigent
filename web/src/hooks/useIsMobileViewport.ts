@@ -6,7 +6,7 @@
 // the `max-md` side of that line to component logic that can't be expressed in
 // CSS alone (e.g. swapping a hover flyout for an in-place page on touch).
 
-import { useSyncExternalStore } from "react";
+import { createContext, useContext, useSyncExternalStore } from "react";
 
 /** Tailwind's `md` breakpoint: tablets up to an iPad Air in landscape (1180px) get the mobile layout. */
 export const MOBILE_BREAKPOINT_PX = 1181;
@@ -30,11 +30,19 @@ function getSnapshot(): boolean {
 }
 
 /**
+ * Set by a desktop window that is narrower than `md` by design, such as the floating New Agent
+ * panel, so its components keep desktop behavior: inline controls and keyboard submit.
+ */
+export const DesktopWindowContext = createContext(false);
+
+/**
  * True when the viewport is narrower than Tailwind's `md` breakpoint (1181px)
  * — i.e. the "mobile" layout the shell's `max-md:` classes target. Reactive:
  * components re-render when the viewport crosses the breakpoint. SSR-safe
  * (returns `false` on the server, matching `initialSidebarOpen`).
  */
 export function useIsMobileViewport(): boolean {
-  return useSyncExternalStore(subscribe, getSnapshot, () => false);
+  const desktopWindow = useContext(DesktopWindowContext);
+  const narrow = useSyncExternalStore(subscribe, getSnapshot, () => false);
+  return narrow && !desktopWindow;
 }

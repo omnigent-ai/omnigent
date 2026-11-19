@@ -72,6 +72,7 @@ import { revealFolderInFilesPanel } from "@/shell/FilesPanel";
 import { selectPullRequestInPanel } from "@/shell/PullRequestPanel";
 import { citedFilePosition } from "@/shell/filePositionState";
 import { useGridSessions } from "./GridSessionsContext";
+import { ENABLED_COMPOSER_INPUT_SELECTOR } from "@/components/composer/engine/composerInput";
 import { useGridPermissionControl, type GridPermissionControl } from "./useGridPermissionControl";
 import { useSharedSessionDraft } from "./sharedSessionDraft";
 
@@ -202,7 +203,7 @@ export function GridSessionPane({
     const composer = showTerminal
       ? undefined
       : Array.from(
-          chatRef.current?.querySelectorAll<HTMLTextAreaElement>("textarea:not(:disabled)") ?? [],
+          chatRef.current?.querySelectorAll<HTMLElement>(ENABLED_COMPOSER_INPUT_SELECTOR) ?? [],
         ).at(-1);
     (composer ?? pane).focus({ preventScroll: true });
   }, [focusRequest, showTerminal]);

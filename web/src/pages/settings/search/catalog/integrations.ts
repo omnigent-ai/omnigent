@@ -2,6 +2,7 @@ import { settingsEntry } from "./types";
 
 export const GITHUB_CONNECTION_ENTRY = settingsEntry({
   id: "github-connection",
+  available: (availability) => availability.integrationProviders.github,
   section: "integrations",
   label: "GitHub",
   description:
@@ -22,6 +23,7 @@ export const GITHUB_CONNECTION_ENTRY = settingsEntry({
 
 export const DATABRICKS_CONNECTION_ENTRY = settingsEntry({
   id: "databricks-connection",
+  available: (availability) => availability.integrationProviders.databricks,
   section: "integrations",
   label: "Databricks",
   description:

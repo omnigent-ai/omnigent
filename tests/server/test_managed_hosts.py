@@ -59,6 +59,7 @@ from omnigent.server.managed_hosts import (
     ManagedSandboxConfig,
     ManagedSandboxDeployment,
     RepoWorkspace,
+    build_owner_launcher,
     host_resume_supported,
     launch_managed_host,
     managed_repo_labels,
@@ -3739,6 +3740,62 @@ class _ReusedIdFakeLauncher(FakeSandboxLauncher):
     def provision(self, name: str) -> str:
         self.provisioned_names.append(name)
         return name
+
+
+class _OwnerRecordingLauncher(FakeSandboxLauncher):
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.events: list[tuple[str, str | None]] = []
+
+    def bind_owner(self, owner: str) -> None:
+        self.events.append(("bind_owner", owner))
+
+    def provision(self, name: str) -> str:
+        self.events.append(("provision", None))
+        return super().provision(name)
+
+
+async def test_launch_binds_owner_before_provision(db_uri: str) -> None:
+    host_store = HostStore(db_uri)
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id, name=invocation.host_name, user_id=_OWNER
+        )
+
+    fake = _OwnerRecordingLauncher(on_host_start=_register)
+    await launch_managed_host(config=_injected_config(fake), owner=_OWNER, host_store=host_store)
+
+    assert fake.events[:2] == [("bind_owner", _OWNER), ("provision", None)]
+
+
+async def test_relaunch_binds_the_host_owner(db_uri: str) -> None:
+    host_store = HostStore(db_uri)
+    host_owner = "bob@example.com"
+
+    def _register(invocation: HostStartInvocation) -> None:
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id, name=invocation.host_name, user_id=host_owner
+        )
+
+    fake = _OwnerRecordingLauncher(on_host_start=_register)
+    config = _injected_config(fake)
+    first = await launch_managed_host(config=config, owner=host_owner, host_store=host_store)
+    gen1 = host_store.get_host(first.host_id)
+    assert gen1 is not None
+    assert gen1.user_id == host_owner
+
+    fake.events.clear()
+    await relaunch_managed_host(config=config, host=gen1, host_store=host_store)
+
+    assert fake.events[-2:] == [("bind_owner", host_owner), ("provision", None)]
+
+
+def test_build_owner_launcher_tolerates_launcher_without_bind_owner() -> None:
+    duck = SimpleNamespace(provider="duck")
+    entry = SimpleNamespace(launcher_factory=lambda: duck)
+
+    assert build_owner_launcher(entry, None, _OWNER) is duck
 
 
 async def test_relaunch_rejects_pending_reused_id_then_allows_retry(

@@ -43,6 +43,12 @@ import {
 import { Shimmer } from "@/components/ai-elements/shimmer";
 import { renderLocalReviewComment } from "./LocalReviewCommentPreview";
 import { omitIncompleteLocalReviewComment } from "@/lib/localReviewComments";
+import { DesignRequestBody } from "@/components/BrowserPane/designTools/DesignRequestMessage";
+import {
+  clipDesignRequest,
+  parseDesignRequest,
+  type DesignRequest,
+} from "@/components/BrowserPane/designTools/parseDesignRequest";
 import { SessionMentionPill } from "@/components/blocks/ChatMarkdown";
 import {
   BlockRenderer,
@@ -88,6 +94,7 @@ import { QueryClientContext } from "@tanstack/react-query";
 import { ApiError, continueFailedTurn, retrySession } from "@/lib/sessionsApi";
 import { useChatStore, withoutFailedInputs, type PendingUserMessage } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
+import { supersedePlanStop } from "@/store/planStops";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import {
   ConversationScopeContext,
@@ -965,6 +972,29 @@ const USER_MESSAGE_REMARK_REHYPE_OPTIONS: MessageResponseProps["remarkRehypeOpti
   },
 };
 
+/** A user message's text as Markdown, as the bubble renders it. */
+function UserMessageMarkdown({ text }: { text: string }) {
+  return (
+    <FilePathAwareMessageResponse
+      className="text-message"
+      breaks
+      mode="static"
+      linkPullRequestRefs
+      remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
+      renderLocalReviewComment={renderLocalReviewComment}
+    >
+      {text}
+    </FilePathAwareMessageResponse>
+  );
+}
+
+/** A design-tool message's card, its words rendered like any user message's. */
+function DesignRequestCard({ request }: { request: DesignRequest }) {
+  return (
+    <DesignRequestBody request={request} words={<UserMessageMarkdown text={request.request} />} />
+  );
+}
+
 /**
  * Copy a deep link to this message (``?message=<id>`` on the session URL).
  * Same confirmation UX as {@link useCopyMessage}.
@@ -1087,6 +1117,8 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
     const parsed = parseSystemMessage(text);
     if (parsed) return <SystemMessageView message={parsed} />;
   }
+  // Parsed from the rendered text, so its words keep their mention pills.
+  const designRequest = isShellCommand || origin ? null : parseDesignRequest(renderedText);
   if (origin && collapsesOrigin && !originExpanded) {
     return (
       <CollapsedSessionMessage
@@ -1246,17 +1278,16 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
                         <pre className="whitespace-pre-wrap break-words font-mono text-sm">
                           <code>{visibleText}</code>
                         </pre>
+                      ) : designRequest ? (
+                        <DesignRequestCard
+                          request={
+                            isCollapsed
+                              ? clipDesignRequest(designRequest, COLLAPSE_THRESHOLD)
+                              : designRequest
+                          }
+                        />
                       ) : (
-                        <FilePathAwareMessageResponse
-                          className="text-message"
-                          breaks
-                          mode="static"
-                          linkPullRequestRefs
-                          remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
-                          renderLocalReviewComment={renderLocalReviewComment}
-                        >
-                          {visibleText}
-                        </FilePathAwareMessageResponse>
+                        <UserMessageMarkdown text={visibleText} />
                       )}
                       {/* Gradient fade at the bottom of collapsed prompts to signal
                       there is more content below. */}
@@ -1434,7 +1465,9 @@ function AssistantBubble({
         ) {
           throw new Error("Wait for the current turn to finish before retrying");
         }
+        const endPlanStop = supersedePlanStop(conversationId);
         await continueFailedTurn(conversationId);
+        endPlanStop();
         return;
       }
       try {

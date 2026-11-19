@@ -26,6 +26,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import {
   DropdownMenu,
   DropdownMenuCheckboxItem,
@@ -1179,11 +1180,20 @@ export function CreateScheduledTaskDialog({
     (!sandboxMode || sandboxWorkspace === savedWorkspace) &&
     baseBranch === (editingTask.baseBranch ?? null) &&
     (hostId === "" || hostId === editingTask.hostId);
-  const scheduleInvalid =
-    scheduleUnsupported ||
-    unsupportedByScheduler ||
-    validateSchedule(schedule, { allowPastEnd, sessionMode, subhourSupported, executionTarget }) !==
-      null;
+  let scheduleError: string | null;
+  if (scheduleUnsupported) {
+    scheduleError = "Choose a frequency to replace this schedule.";
+  } else if (unsupportedByScheduler) {
+    scheduleError = "Choose a frequency this server supports.";
+  } else {
+    scheduleError = validateSchedule(schedule, {
+      allowPastEnd,
+      sessionMode,
+      subhourSupported,
+      executionTarget,
+    });
+  }
+  const scheduleInvalid = scheduleError !== null;
   const triggerPromptContext = {
     sessionLink,
     pollingIntervalMinutes:
@@ -1486,25 +1496,48 @@ export function CreateScheduledTaskDialog({
         };
   const maxCostUsd = costLimit.trim() === "" ? null : Number(costLimit);
   const costLimitInvalid = maxCostUsd !== null && (!Number.isFinite(maxCostUsd) || maxCostUsd <= 0);
-  const canSubmit =
-    !curationPending &&
-    name.trim() !== "" &&
-    (startsFromSession ||
-      (effectivePrompt.trim() !== "" &&
-        (trigger !== null || withWorkflow(prompt).trim() !== ""))) &&
-    (trigger !== null || systemPrompt === null || systemPrompt.trim() !== "") &&
-    (isEdit || effectiveAgentId !== null) &&
-    (isEdit || sandboxMode || hostId !== "") &&
-    !workspaceWithoutHost &&
-    !scheduleInvalid &&
-    !costLimitInvalid &&
-    !workflowKeepsTaskSession &&
-    !pollingBlockedReason &&
-    !(workerSettings !== null && workerHarnessSettings.blockedReason) &&
-    mcpBlockedReason === null &&
-    !mcpAuthorizing &&
-    mcpSigningIn === null &&
-    !mutationPending;
+  const missingInstructions =
+    !startsFromSession &&
+    (effectivePrompt.trim() === "" || (trigger === null && withWorkflow(prompt).trim() === ""));
+  // The schedule's control sits in the top row, under Advanced, or (for a trigger) is
+  // hidden behind a replace note below the instructions.
+  const scheduleInTopRow = !usesTriggerSchedule && !isEdit && fromSession === null;
+  const scheduleInAdvanced = !usesTriggerSchedule && (isEdit || fromSession !== null);
+  const scheduleReason = hiddenTriggerScheduleNeedsReplacement
+    ? "Use a supported schedule."
+    : scheduleError;
+  // Why Save is off, in dialog order; the disabled button explains the first.
+  const submitBlockers = [
+    curationPending && "Loading…",
+    name.trim() === "" && "Enter a name in the field at the top.",
+    scheduleInTopRow && scheduleReason,
+    missingInstructions &&
+      (trigger === null
+        ? "Add instructions."
+        : "Fill in the trigger's required fields and instructions."),
+    trigger === null &&
+      systemPrompt?.trim() === "" &&
+      "The template's system prompt can't be empty.",
+    workflowKeepsTaskSession && "Remove the workflow to save.",
+    usesTriggerSchedule && scheduleReason,
+    !isEdit &&
+      !sandboxMode &&
+      hostId === "" &&
+      (hostsPending ? "Loading hosts…" : "Pick a host to run on."),
+    !isEdit &&
+      effectiveAgentId === null &&
+      (agents === undefined ? "Loading agents…" : "Pick an agent."),
+    mcpBlockedReason,
+    (mcpAuthorizing || mcpSigningIn !== null) && "Finishing MCP sign-in…",
+    scheduleInAdvanced && scheduleReason,
+    workspaceWithoutHost && "Pick a host before pinning a workspace.",
+    costLimitInvalid && "Enter a cost limit greater than zero, or leave it blank.",
+    pollingBlockedReason,
+    workerSettings !== null && workerHarnessSettings.blockedReason,
+  ];
+  const submitBlockedReason =
+    submitBlockers.find((reason): reason is string => Boolean(reason)) ?? null;
+  const canSubmit = !mutationPending && submitBlockedReason === null;
   // Problems that disable Save but whose explanation or fix lives under Advanced settings.
   const advancedBlocksSubmit =
     !curationPending &&
@@ -1811,7 +1844,8 @@ export function CreateScheduledTaskDialog({
         onPointerDownOutside={guardDialogDismiss}
         onInteractOutside={guardDialogDismiss}
       >
-        <DialogHeader className="shrink-0 px-6 pt-6 pb-0">
+        {/* The right padding keeps the bordered name field clear of the close button. */}
+        <DialogHeader className="shrink-0 pt-5 pr-[4.5rem] pb-0 pl-6">
           <DialogTitle className="sr-only">
             {fromSession
               ? `New automation from “${fromSession.title || "this session"}”`
@@ -1824,8 +1858,9 @@ export function CreateScheduledTaskDialog({
             value={name}
             placeholder="Name your automation"
             aria-label="Automation title"
+            aria-required
             data-testid="task-name-input"
-            className="h-8 border-0 px-0 py-0 pr-10 font-heading text-[1.25em] leading-[32px] font-[600] focus-visible:border-transparent focus-visible:ring-0 md:text-[1.25em]"
+            className="h-9 px-3 font-heading text-[1.25em] font-[600] md:text-[1.25em]"
             onChange={(event) => setName(event.target.value)}
           />
           <DialogDescription className="sr-only">
@@ -2866,15 +2901,22 @@ export function CreateScheduledTaskDialog({
           >
             Cancel
           </Button>
-          <Button
-            onClick={handleSubmit}
-            loading={mutationPending}
-            disabled={!canSubmit}
-            data-testid="create-scheduled-task-submit"
-            componentId="tasks.scheduled.save"
+          <DisabledActionTooltip
+            reason={submitBlockedReason ?? undefined}
+            label={isEdit ? "Save changes" : "Create"}
+            className="flex-col sm:flex-row"
+            delayDuration={0}
           >
-            {isEdit ? "Save changes" : "Create"}
-          </Button>
+            <Button
+              onClick={handleSubmit}
+              loading={mutationPending}
+              disabled={!canSubmit}
+              data-testid="create-scheduled-task-submit"
+              componentId="tasks.scheduled.save"
+            >
+              {isEdit ? "Save changes" : "Create"}
+            </Button>
+          </DisabledActionTooltip>
         </DialogFooter>
       </DialogContent>
     </Dialog>

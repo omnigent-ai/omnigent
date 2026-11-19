@@ -17,6 +17,10 @@ import type * as GoalApiModule from "@/lib/goalApi";
 import type * as UseChildSessionsModule from "@/hooks/useChildSessions";
 import type { ChildSessionInfo } from "@/hooks/useChildSessions";
 import type * as FileViewerContextModule from "@/shell/FileViewerContext";
+import * as CodeMirrorModule from "@/components/composer/engine/CodeMirrorComposerInput";
+import { resetCodeMirrorComposerLoadForTests } from "@/components/composer/engine/codeMirrorComposerLoader";
+import { composerTargetOf } from "@/components/composer/engine/composerInput";
+import { insertComposerText } from "@/lib/composerText";
 
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -28,6 +32,7 @@ import { SideChatPane } from "@/components/chat/SideChatPane";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { handleSessionEvent, useChatStore, type ChatState } from "@/store/chatStore";
+import { usePlanStops } from "@/store/planStops";
 import { useSessionTasksActions } from "@/store/sessionTasksActions";
 import {
   continuePlanMessage,
@@ -7325,6 +7330,7 @@ describe("Composer workflow entry point", () => {
           status: original.status,
           sessionStatus: original.sessionStatus,
         });
+        usePlanStops.setState({ requests: {}, settledStops: {} });
       });
       const onStop = vi.fn();
       const onSend = vi.fn(useChatStore.getState().enqueueMessage);
@@ -7334,11 +7340,16 @@ describe("Composer workflow entry point", () => {
       );
       fireEvent.change(textarea(), { target: { value: "An unsent note" } });
       act(() => useSessionTasksActions.getState().stopWork.conv_test?.());
+      // The run shows as stopping from the click, and still once the session takes the message.
+      expect(usePlanStops.getState().requests.conv_test).toMatchObject({ sent: false });
       await waitFor(() =>
         expect(fetchMessage).toHaveBeenCalledWith(
           "/v1/sessions/conv_test/events",
           expect.objectContaining({ method: "POST" }),
         ),
+      );
+      await waitFor(() =>
+        expect(usePlanStops.getState().requests.conv_test).toMatchObject({ sent: true }),
       );
       expect(JSON.parse(fetchMessage.mock.calls[0]![1]!.body as string)).toMatchObject({
         type: "message",
@@ -7363,6 +7374,45 @@ describe("Composer workflow entry point", () => {
       error.mockRestore();
     },
   );
+
+  it.each([
+    {
+      reply: { error: { message: "The session is offline." } },
+      status: 503,
+      message: "The session is offline.",
+    },
+    {
+      reply: { queued: false, denied: true },
+      status: 200,
+      message: "A policy blocked the message.",
+    },
+  ])("restores Stop when the stop message fails, with the error: $message", async (failure) => {
+    setComposerState({
+      conversationId: "conv_test",
+      sessionHarness: "openai-agents",
+      skills: [],
+      sessionStatus: "running",
+    });
+    const fetchMessage = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(failure.reply), {
+        status: failure.status,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    const error = vi.spyOn(toast, "error");
+    onTestFinished(() => {
+      fetchMessage.mockRestore();
+      error.mockRestore();
+      usePlanStops.setState({ requests: {}, settledStops: {} });
+    });
+    renderWithWorkflows(<Composer {...composerProps()} />);
+
+    act(() => useSessionTasksActions.getState().stopWork.conv_test?.());
+    expect(usePlanStops.getState().requests.conv_test).toMatchObject({ sent: false });
+    await waitFor(() => expect(error).toHaveBeenCalledWith(failure.message));
+    expect(error).toHaveBeenCalledOnce();
+    expect(usePlanStops.getState().requests.conv_test).toBeUndefined();
+  });
 
   it("opens the dialog for the Tasks tab's empty state", async () => {
     setComposerState({
@@ -9738,4 +9788,29 @@ describe("saved sandbox inference policy", () => {
       expect(useChatStore.getState().setModel).not.toHaveBeenCalled();
     },
   );
+});
+
+describe("Composer with the CodeMirror release flag on", () => {
+  const codeMirrorInfo = { ...FALLBACK_SERVER_INFO, features: { chat_composer_codemirror: true } };
+  beforeEach(() => resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule));
+  afterEach(() => resetCodeMirrorComposerLoadForTests());
+
+  it("renders the main composer on CodeMirror and sends a typed message", async () => {
+    const props = composerProps();
+    render(
+      <CapabilitiesProvider info={codeMirrorInfo}>
+        <Composer {...props} />
+      </CapabilitiesProvider>,
+    );
+    await waitFor(() =>
+      expect(screen.getByLabelText("Message the agent")).toHaveClass("cm-content"),
+    );
+    const editor = screen.getByLabelText("Message the agent");
+
+    act(() => insertComposerText(composerTargetOf(editor)!, "ship the fix"));
+    fireEvent.keyDown(editor, { key: "Enter" });
+
+    expect(props.onSend).toHaveBeenCalledExactlyOnceWith("ship the fix", undefined);
+    await waitFor(() => expect(composerTargetOf(editor)?.value).toBe(""));
+  });
 });

@@ -31,7 +31,7 @@ export const GOLDEN_GROUP_FLAGS = {
   General: ["native", "siblingSessions", "desktopCommands"],
   "In chats": ["submitWithModEnter", "preventsKeyboardSubmit"],
   Navigation: ["electron", "native"],
-  View: ["native", "browser", "contentSearch", "desktopCommands"],
+  View: ["native", "browser", "contentSearch", "desktopCommands", "preventsKeyboardSubmit"],
   Panes: ["grids", "splitTerminal"],
   "Slash commands": [],
 } as const;
@@ -101,6 +101,7 @@ export const GOLDEN_ROWS: readonly GoldenRow[] = [
   /* 60 */ row("Reload the browser tab", "⌘ R", "Ctrl R"),
   /* 61 */ row("Focus the browser address bar", "⌘ L", "Ctrl L"),
   /* 62 */ row("Mark current session unread or read", "⌘ ⌥ U", "Ctrl Alt U"),
+  /* 63 */ row("Exit full screen from a file", "Esc", "Esc"),
 ];
 
 /**
@@ -148,37 +149,86 @@ export const GOLDEN_GROUPS: Record<string, GoldenGroup | null> = {
   "Navigation: native": { title: "Navigation", rows: [33] },
   "Navigation: electron": { title: "Navigation", rows: [36, 37, 38, 23] },
   "Navigation: electron+native": { title: "Navigation", rows: [36, 37, 38, 33] },
-  "View: -": { title: "View", rows: [24, 25, 26, 27, 28] },
-  "View: native": { title: "View", rows: [24, 34, 35, 27, 28] },
-  "View: browser": { title: "View", rows: [24, 25, 26, 27, 28] },
-  "View: native+browser": { title: "View", rows: [24, 34, 35, 27, 28] },
-  "View: contentSearch": { title: "View", rows: [24, 25, 26, 42, 43, 28] },
-  "View: native+contentSearch": { title: "View", rows: [24, 34, 35, 42, 43, 28] },
-  "View: browser+contentSearch": { title: "View", rows: [24, 25, 26, 42, 43, 28] },
-  "View: native+browser+contentSearch": { title: "View", rows: [24, 34, 35, 42, 43, 28] },
-  "View: desktopCommands": { title: "View", rows: [24, 25, 26, 27, 28, 56, 57, 58] },
-  "View: native+desktopCommands": { title: "View", rows: [24, 34, 35, 27, 28, 56, 57, 58] },
+  "View: -": { title: "View", rows: [24, 25, 26, 27, 28, 63] },
+  "View: native": { title: "View", rows: [24, 34, 35, 27, 28, 63] },
+  "View: browser": { title: "View", rows: [24, 25, 26, 27, 28, 63] },
+  "View: native+browser": { title: "View", rows: [24, 34, 35, 27, 28, 63] },
+  "View: contentSearch": { title: "View", rows: [24, 25, 26, 42, 43, 28, 63] },
+  "View: native+contentSearch": { title: "View", rows: [24, 34, 35, 42, 43, 28, 63] },
+  "View: browser+contentSearch": { title: "View", rows: [24, 25, 26, 42, 43, 28, 63] },
+  "View: native+browser+contentSearch": { title: "View", rows: [24, 34, 35, 42, 43, 28, 63] },
+  "View: desktopCommands": { title: "View", rows: [24, 25, 26, 27, 28, 56, 57, 58, 63] },
+  "View: native+desktopCommands": { title: "View", rows: [24, 34, 35, 27, 28, 56, 57, 58, 63] },
   "View: browser+desktopCommands": {
     title: "View",
-    rows: [24, 25, 26, 27, 59, 28, 56, 57, 58, 60, 61],
+    rows: [24, 25, 26, 27, 59, 28, 56, 57, 58, 60, 61, 63],
   },
   "View: native+browser+desktopCommands": {
     title: "View",
-    rows: [24, 34, 35, 27, 59, 28, 56, 57, 58, 60, 61],
+    rows: [24, 34, 35, 27, 59, 28, 56, 57, 58, 60, 61, 63],
   },
   "View: contentSearch+desktopCommands": {
     title: "View",
-    rows: [24, 25, 26, 42, 43, 28, 56, 57, 58],
+    rows: [24, 25, 26, 42, 43, 28, 56, 57, 58, 63],
   },
   "View: native+contentSearch+desktopCommands": {
     title: "View",
-    rows: [24, 34, 35, 42, 43, 28, 56, 57, 58],
+    rows: [24, 34, 35, 42, 43, 28, 56, 57, 58, 63],
   },
   "View: browser+contentSearch+desktopCommands": {
     title: "View",
-    rows: [24, 25, 26, 42, 43, 59, 28, 56, 57, 58, 60, 61],
+    rows: [24, 25, 26, 42, 43, 59, 28, 56, 57, 58, 60, 61, 63],
   },
   "View: native+browser+contentSearch+desktopCommands": {
+    title: "View",
+    rows: [24, 34, 35, 42, 43, 59, 28, 56, 57, 58, 60, 61, 63],
+  },
+  "View: preventsKeyboardSubmit": { title: "View", rows: [24, 25, 26, 27, 28] },
+  "View: native+preventsKeyboardSubmit": { title: "View", rows: [24, 34, 35, 27, 28] },
+  "View: browser+preventsKeyboardSubmit": { title: "View", rows: [24, 25, 26, 27, 28] },
+  "View: native+browser+preventsKeyboardSubmit": { title: "View", rows: [24, 34, 35, 27, 28] },
+  "View: contentSearch+preventsKeyboardSubmit": { title: "View", rows: [24, 25, 26, 42, 43, 28] },
+  "View: native+contentSearch+preventsKeyboardSubmit": {
+    title: "View",
+    rows: [24, 34, 35, 42, 43, 28],
+  },
+  "View: browser+contentSearch+preventsKeyboardSubmit": {
+    title: "View",
+    rows: [24, 25, 26, 42, 43, 28],
+  },
+  "View: native+browser+contentSearch+preventsKeyboardSubmit": {
+    title: "View",
+    rows: [24, 34, 35, 42, 43, 28],
+  },
+  "View: desktopCommands+preventsKeyboardSubmit": {
+    title: "View",
+    rows: [24, 25, 26, 27, 28, 56, 57, 58],
+  },
+  "View: native+desktopCommands+preventsKeyboardSubmit": {
+    title: "View",
+    rows: [24, 34, 35, 27, 28, 56, 57, 58],
+  },
+  "View: browser+desktopCommands+preventsKeyboardSubmit": {
+    title: "View",
+    rows: [24, 25, 26, 27, 59, 28, 56, 57, 58, 60, 61],
+  },
+  "View: native+browser+desktopCommands+preventsKeyboardSubmit": {
+    title: "View",
+    rows: [24, 34, 35, 27, 59, 28, 56, 57, 58, 60, 61],
+  },
+  "View: contentSearch+desktopCommands+preventsKeyboardSubmit": {
+    title: "View",
+    rows: [24, 25, 26, 42, 43, 28, 56, 57, 58],
+  },
+  "View: native+contentSearch+desktopCommands+preventsKeyboardSubmit": {
+    title: "View",
+    rows: [24, 34, 35, 42, 43, 28, 56, 57, 58],
+  },
+  "View: browser+contentSearch+desktopCommands+preventsKeyboardSubmit": {
+    title: "View",
+    rows: [24, 25, 26, 42, 43, 59, 28, 56, 57, 58, 60, 61],
+  },
+  "View: native+browser+contentSearch+desktopCommands+preventsKeyboardSubmit": {
     title: "View",
     rows: [24, 34, 35, 42, 43, 59, 28, 56, 57, 58, 60, 61],
   },

@@ -2158,6 +2158,8 @@ describe("Workspace rail maximize", () => {
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
     expect(rail().className).toContain("md:shrink-0");
     expect(rail().className).not.toContain("md:absolute");
+    expect(screen.getByRole("main")).toHaveAttribute("data-flyout-boundary");
+    expect(screen.getByRole("main")).not.toContainElement(rail());
     fireEvent.click(screen.getByRole("button", { name: "files: select README.md" }));
 
     // Maximize → the rail breaks out to cover the content region, and the left

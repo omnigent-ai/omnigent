@@ -515,6 +515,92 @@ os_env:
     allow_network: true
 ```
 
+For `harness: claude-sdk`, an active sandbox contains the entire Claude CLI
+and its descendants, including inline skill shell expansion (``!`command` ``),
+hooks, and plugin subprocesses. Both system-installed and SDK-bundled CLIs use
+the same launcher. A sandbox resolution or launch failure stops startup;
+`OMNIGENT_CLAUDE_SDK_NO_SANDBOX` cannot bypass a requested sandbox. Bash is
+available in the contained CLI so skills can execute their shell commands.
+Native Bash calls pass an Omnigent `PreToolUse` policy gate even when Claude's
+permission mode approves tools automatically; Claude's own permission rules
+remain in force.
+Claude's own Bash sandbox is separate from this outer process boundary.
+Containment requires `linux_bwrap` or `darwin_seatbelt`. Windows
+`windows_jobobject` provides process containment without filesystem or network
+isolation and is rejected for sandboxed Claude SDK launches and callbacks.
+Omitting `os_env` or selecting `sandbox.type: none` does not request this
+boundary; skills, hooks, and local MCP commands can then run uncontained.
+On Linux, the optional default CLI wrapper still checks the installed Python
+runtime for mutable hard-link aliases. An integrity failure can stop startup
+even when `os_env` is omitted. Reinstall a `uv tool` environment with
+`uv tool upgrade --reinstall --link-mode copy omnigent` if this occurs.
+Setting `OMNIGENT_CLAUDE_SDK_NO_SANDBOX` while requesting a sandbox raises a
+startup error; use an explicit `sandbox.type: none` to opt out.
+
+Model access is automatic; no model egress rule is needed:
+
+```yaml
+executor:
+  harness: claude-sdk
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: auto
+    write_paths: ["."]
+    allow_network: false
+```
+
+The trusted parent derives the model host and gateway prefix from the selected
+provider. It signs only HTTPS `POST` requests to that provider's
+`/v1/messages` and `/v1/messages/count_tokens` routes, optionally with exactly
+`?beta=true`. Requests must have matching CONNECT, TLS SNI, and Host authorities,
+a session placeholder, and a bounded JSON body. The relay reconstructs upstream
+headers before attaching the provider credential. Broader `egress_rules` cannot
+expand this signing authority. Redirects, account APIs, and arbitrary model-host
+paths receive no credential. Gateway thinking compatibility is preserved.
+
+The CLI, sandboxed session terminals, and `sys_os_*` shell environments get this
+model relay automatically, including when `allow_network: false`. They can make
+inference requests using the placeholder; skills therefore have the session's inference
+capability. Real model tokens and auth commands stay in the trusted parent. The
+CLI, sandboxed session terminals, and `sys_os_*` shell environments use private
+HOME/config/scratch directories. Home-relative Git, package-manager, and shell
+configuration may therefore be unavailable in all three. Host Claude state and
+credential files are excluded; conflicting filesystem grants stop startup. macOS
+also denies Keychain service access. Bundled skills remain available; host Claude
+state and plugins are not imported into the private home. Only bundled skills
+and their supporting files are copied into a separate plugin directory. Keep
+the original agent bundle, including its credential-bearing `config.yaml` and
+MCP configuration, outside the sandbox workspace and read/write grants;
+conflicting layouts fail before execution. Omnigent's Python runtime and
+framework installation must also remain outside sandbox-writable paths.
+
+Direct networking is disabled for these contained launches, including policies
+that previously enabled it with `allow_network: true`. Additional ordinary
+HTTP(S) access requires `egress_rules`; those requests do not receive the model
+credential. API-key providers, explicit Anthropic bearer/OAuth tokens, and host
+Claude OAuth credentials are supported. Host OAuth credentials are reread from
+the credentials file or macOS Keychain; expired credentials require signing in
+again. Databricks profile credentials refresh in the trusted parent. Arbitrary shell auth helpers, HTTP/nonstandard-port model endpoints,
+and Bedrock/Vertex/Foundry transports fail closed. This automatic integration is
+specific to `claude-sdk`; it does not change `claude-native` launches or other
+harnesses' model-authentication policy.
+
+Profile authentication requires the trusted Python profile-token helper on the parent's `PATH`; a profile
+configured only through the Databricks CLI cannot start a sandboxed Claude worker.
+The helper requires an absolute Python interpreter shebang, and its interpreter
+and installed modules must stay outside sandbox write grants.
+The parent retains any `DATABRICKS_CONFIG_FILE` selection. Managed Claude policy
+remains in force, but managed configuration containing model credentials or
+`apiKeyHelper` is rejected before it becomes readable by the CLI. Store model
+credentials in the parent provider configuration instead. Validation includes
+settings-only directories, settings drop-ins, and macOS device and per-user MDM
+preference plists.
+
+See [Claude sandbox CLI verification](CLAUDE_SANDBOX_TESTING.md) for the real CLI
+test matrix, worker prerequisites, and reproducible commands.
+
 On Linux, the `openai-agents` harness supports disposable copy-on-write mounts:
 
 ```yaml
@@ -971,6 +1057,14 @@ absolute/escaping working directories. This includes terminals and nested
 agents. These restrictions apply on multi-user servers and, starting in 0.19.0,
 on local single-user servers too, including bundles uploaded by `omnigent run`.
 Loopback requests can originate from agents as well as the operator.
+
+Uploaded bundles also cannot declare absolute, `~`, or `..` entries in
+`os_env.sandbox` `read_paths`, `write_paths`, or `write_files`. A host that
+needs to expose paths outside the workspace lists absolute paths under
+`runner.sandbox_grants.read_paths` / `write_paths` in its own `config.yaml`
+(`$OMNIGENT_CONFIG_HOME/config.yaml`, default `~/.omnigent/config.yaml`). The
+runner adds them to every agent, terminal, and nested agent with an
+`os_env.sandbox` block that the host runs.
 
 Invalid uploads return HTTP 400 before tools or policy handlers are imported.
 Existing uploaded agents using these features also fail bundle validation when

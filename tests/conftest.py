@@ -557,6 +557,8 @@ def _isolate_claude_managed_settings(
     would otherwise add a phantom Claude credential to every detection assertion.
     ``claude_native`` resolves this same tuple at call time, so neutralizing it
     here covers its Smart-Routing gateway check and managed model overrides too.
+    MDM plist discovery is isolated as well, so containment tests never inspect
+    the host's real managed credentials.
 
     ``autouse=True`` because the alternative leaves us one missed test away from
     host-dependent failures that reproduce only on configured machines. Tests
@@ -571,6 +573,9 @@ def _isolate_claude_managed_settings(
     if "claude_managed_settings" in request.fixturenames:
         return
     monkeypatch.setattr("omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
+    monkeypatch.setattr(
+        "omnigent.inner.claude_model_access._claude_managed_preferences_paths", lambda: ()
+    )
 
 
 @pytest.fixture()

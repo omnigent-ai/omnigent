@@ -268,6 +268,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         delegation_ref: str | None = None,
         first_run_at: int | None = None,
         kind: str = "automation",
+        schedule_anchor: int | None = None,
     ) -> ScheduledTask:
         """Insert a new scheduled task with a required recurring ``rrule``."""
         encoded_kind = encode_scheduled_task_kind(kind)
@@ -286,7 +287,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             )
         ):
             raise ValueError("a reminder needs a one-time rule that continues a given session")
-        created_at = now_epoch()
+        now = now_epoch()
+        created_at = now if schedule_anchor is None else schedule_anchor
 
         def write(session: Session) -> ScheduledTask:
             generation = require_active_account(session, user_id)
@@ -320,7 +322,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 created_at=created_at,
                 updated_at=None,
             )
-            self._refresh_schedule(row, created_at)
+            self._refresh_schedule(row, now)
             if first_run_at is not None and row.next_run_at != first_run_at:
                 # Checked against the real creation time, so a request that arrives
                 # after the intended run cannot be saved for a later occurrence.

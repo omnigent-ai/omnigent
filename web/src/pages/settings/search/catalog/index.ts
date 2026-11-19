@@ -4,6 +4,7 @@
 import type { SettingsSectionId } from "@/shell/settingsNav";
 
 import { ACCOUNT_SETTINGS } from "./account";
+import { ADMIN_SETTINGS } from "./admin";
 import { APPEARANCE_SETTINGS } from "./appearance";
 import { ARCHIVED_SETTINGS } from "./archived";
 import { CLI_SETTINGS } from "./cli";
@@ -31,7 +32,7 @@ export const SECTION_CATALOGS: Readonly<Record<SettingsSectionId, readonly Setti
   shortcuts: [],
   import: IMPORT_SETTINGS,
   account: ACCOUNT_SETTINGS,
-  admin: [],
+  admin: ADMIN_SETTINGS,
   members: MEMBERS_SETTINGS,
   policies: POLICIES_SETTINGS,
   sharing: SHARING_SETTINGS,

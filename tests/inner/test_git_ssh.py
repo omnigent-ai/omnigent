@@ -441,7 +441,10 @@ def test_git_ssh_binding_survives_sandbox_json_round_trip(tmp_path: Path) -> Non
     assert restored.git_ssh == [binding]
 
 
-def test_git_ssh_socket_survives_launcher_mask_round_trip(tmp_path: Path) -> None:
+@pytest.mark.parametrize("legacy_payload", [False, True], ids=["current", "legacy"])
+def test_git_ssh_socket_survives_launcher_mask_round_trip(
+    tmp_path: Path, legacy_payload: bool
+) -> None:
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     scratch = tmp_path / "scratch"
@@ -458,8 +461,14 @@ def test_git_ssh_socket_survives_launcher_mask_round_trip(tmp_path: Path) -> Non
         git_ssh_socket_path=str(socket_path),
         mask_scan_skip_roots=[scratch],
     )
-    decoded = SandboxPolicy.from_jsonable(policy.to_jsonable())
-    assert str(socket_path) in _dotfile_and_symlink_mask_args(workspace, [], decoded)
+    payload = policy.to_jsonable()
+    if legacy_payload:
+        payload.pop("mask_scan_skip_roots")
+    decoded = SandboxPolicy.from_jsonable(payload)
+    assert decoded.mask_scan_skip_roots == (None if legacy_payload else [scratch])
+    assert (
+        str(socket_path) in _dotfile_and_symlink_mask_args(workspace, [], decoded)
+    ) is legacy_payload
     restored = _restore_broker_socket_roots(decoded)
     assert str(socket_path) not in _dotfile_and_symlink_mask_args(workspace, [], restored)
 

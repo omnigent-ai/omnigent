@@ -29,7 +29,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from omnigent.db.account_authority import account_generation, current_account_user
 from omnigent.entities import Agent, Conversation, ScheduledTask, ScheduledTaskRun
@@ -67,6 +67,7 @@ from omnigent.server.routes.scheduled_task_permissions import (
     register_scheduled_task_permissions_routes,
     request_from_agent,
     require_agent_keeps_shared_target,
+    scheduled_task_shareable,
     scheduled_task_sharing_supported,
     scheduled_task_viewer_role,
     without_legacy_sandbox_workspace,
@@ -276,6 +277,7 @@ def _next_run_at(task: ScheduledTask, request: Request) -> str | None:
 def _to_response(
     task: ScheduledTask,
     *,
+    shareable: bool,
     last_run_status: str | None = None,
     next_run_at: str | None = None,
     viewer_role: ScheduledTaskViewerRole = "owner",
@@ -283,6 +285,8 @@ def _to_response(
 ) -> dict[str, Any]:
     """Serialize a :class:`ScheduledTask` to a JSON-safe dict.
 
+    :param shareable: Whether the automation itself can be shared, from
+        :func:`scheduled_task_shareable`.
     :param last_run_status: The status of the task's most recent run
         (``succeeded`` / ``failed`` / ``skipped`` / ``running`` / ``scheduled``),
         or ``None`` when the task has never run. Surfaced so the Tasks list can
@@ -329,6 +333,7 @@ def _to_response(
         "updated_at": task.updated_at,
         "viewer_role": viewer_role,
         "owner_display_name": owner_display_name,
+        "shareable": shareable,
     }
 
 
@@ -480,6 +485,49 @@ def _inbox_cursor_task_id(task_id: str) -> str:
         return uuid.UUID(task_id).hex
     except ValueError:
         return task_id
+
+
+class CloneScheduledTaskRequest(BaseModel):
+    """Optional body for ``POST /v1/scheduled-tasks/{id}/clone``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    # The automation's own host, which clients send so the request routes to that
+    # host's replica; the copy keeps the original's host either way.
+    host_id: str | None = None
+
+
+# The scheduled_tasks.name column's length.
+_TASK_NAME_MAX_CHARS = 256
+_CLONE_NAME_SUFFIX = " (copy)"
+
+
+def _clone_name(name: str) -> str:
+    """*name* with the copy suffix, shortened to fit the name column."""
+    return name[: _TASK_NAME_MAX_CHARS - len(_CLONE_NAME_SUFFIX)] + _CLONE_NAME_SUFFIX
+
+
+def _clone_request(task: ScheduledTask) -> CreateScheduledTaskRequest:
+    """The create body that copies *task*'s settings, leaving its continued session behind."""
+    return CreateScheduledTaskRequest(
+        name=_clone_name(task.name),
+        prompt=task.prompt,
+        rrule=task.rrule,
+        agent_id=task.agent_id,
+        timezone=task.timezone,
+        model_override=task.model_override,
+        reasoning_effort=task.reasoning_effort,
+        permission_mode=task.permission_mode,
+        mcp_services=list(task.mcp_services),
+        max_cost_usd=task.max_cost_usd,
+        session_mode="continue" if task.session_mode == "continue" else "new",
+        workspace=task.workspace,
+        base_branch=task.base_branch,
+        host_id=task.host_id,
+        execution_target=task.execution_target,
+        project_id=task.project_id,
+        source_session_id=task.source_session_id,
+    )
 
 
 def create_scheduled_tasks_router(
@@ -789,9 +837,13 @@ def create_scheduled_tasks_router(
                 code=ErrorCode.INVALID_INPUT,
             )
 
-    async def _require_source_session(source_id: str, owner: str) -> tuple[Conversation, str]:
+    async def _require_source_session(
+        source_id: str, owner: str, *, cloned_task_id: str | None = None
+    ) -> tuple[Conversation, str]:
         """A session *owner* can start an automation from, hiding one they can't see.
 
+        :param cloned_task_id: The automation being cloned, whose own source copy may
+            be copied again for the clone.
         :returns: The session and its last finished response, which its copy stops at.
         """
         from omnigent.stores.conversation_store import (
@@ -812,7 +864,8 @@ def create_scheduled_tasks_router(
                 "An automation can't start from a sub-agent's session or a side chat",
                 code=ErrorCode.INVALID_INPUT,
             )
-        if conv.labels.get(SCHEDULED_TASK_SOURCE_LABEL_KEY):
+        source_of = conv.labels.get(SCHEDULED_TASK_SOURCE_LABEL_KEY)
+        if source_of and (cloned_task_id is None or source_of != cloned_task_id):
             raise OmnigentError(
                 "An automation already runs from this session", code=ErrorCode.INVALID_INPUT
             )
@@ -1062,6 +1115,57 @@ def create_scheduled_tasks_router(
         body: CreateScheduledTaskRequest,
     ) -> dict[str, Any]:
         """Create a scheduled task and arm it on the live scheduler."""
+        return await _create_task(request, body)
+
+    @router.post("/scheduled-tasks/{scheduled_task_id}/clone")
+    async def clone_scheduled_task(
+        request: Request,
+        scheduled_task_id: str,
+        body: CloneScheduledTaskRequest | None = None,
+    ) -> dict[str, Any]:
+        """Copy an owned automation under a new ID, without its runs or continued session.
+
+        Needs the database scheduler: the legacy timer re-anchors an interval
+        schedule whenever it arms one, so it can't run the clone on the original's days.
+        """
+        if not getattr(request.app.state, "scheduled_task_dispatch_enabled", False):
+            raise OmnigentError(
+                "Cloning an automation needs automations_v2, which this server does not enable",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        owner = _owner(request)
+        task = _require_owned(scheduled_task_id, None if owner == RESERVED_USER_LOCAL else owner)
+        if task.kind != "automation":
+            raise OmnigentError("Only an automation can be cloned", code=ErrorCode.INVALID_INPUT)
+        if body is not None and body.host_id is not None and body.host_id != task.host_id:
+            raise OmnigentError(
+                "host_id must be the automation's own host", code=ErrorCode.INVALID_INPUT
+            )
+        try:
+            create = _clone_request(task)
+        except ValidationError as exc:
+            raise OmnigentError(
+                f"This automation can't be cloned: {exc.errors()[0]['msg']}",
+                code=ErrorCode.INVALID_INPUT,
+            ) from exc
+        if create.project_id is not None and (
+            project_store is None
+            or await asyncio.to_thread(
+                project_store.get, create.project_id, user_id=_project_owner(owner)
+            )
+            is None
+        ):
+            # A run files nothing into a deleted project, so the copy starts unfiled.
+            create = create.model_copy(update={"project_id": None})
+        return await _create_task(request, create, cloned_from=task)
+
+    async def _create_task(
+        request: Request,
+        body: CreateScheduledTaskRequest,
+        *,
+        cloned_from: ScheduledTask | None = None,
+    ) -> dict[str, Any]:
+        """Create a task from *body*; a clone may copy *cloned_from*'s source copy and pause."""
         owner = _owner(request)
         require_agent_origin(
             request,
@@ -1140,7 +1244,9 @@ def create_scheduled_tasks_router(
             else:
                 if body.source_session_id is not None:
                     source, source_up_to = await _require_source_session(
-                        body.source_session_id, owner
+                        body.source_session_id,
+                        owner,
+                        cloned_task_id=cloned_from.id if cloned_from is not None else None,
                     )
                     # Runs rebuild the copied history in the task's agent, so it must carry one,
                     # and open the files it refers to.
@@ -1188,6 +1294,15 @@ def create_scheduled_tasks_router(
                     execution_target=body.execution_target,
                     first_run_at=body.first_run_at,
                     kind=body.kind,
+                    # A clone of a paused automation stays paused, so it can't run unasked.
+                    state=(
+                        "paused"
+                        if cloned_from is not None and cloned_from.state == "paused"
+                        else "active"
+                    ),
+                    # An interval schedule's phase follows the creation time, so a
+                    # clone keeps the original's to run on the same days.
+                    schedule_anchor=cloned_from.created_at if cloned_from is not None else None,
                 )
             except Exception as exc:
                 if source_copy is not None:
@@ -1235,6 +1350,7 @@ def create_scheduled_tasks_router(
         # next_run_at comes from the legacy timer or the persisted schedule.
         return _to_response(
             task,
+            shareable=scheduled_task_shareable(permission_store, task.id),
             next_run_at=_next_run_at(task, request),
         )
 
@@ -1276,6 +1392,7 @@ def create_scheduled_tasks_router(
             "scheduled_tasks": [
                 _to_response(
                     t,
+                    shareable=scheduled_task_shareable(permission_store, t.id),
                     last_run_status=latest_status.get(t.id),
                     next_run_at=_next_run_at(t, request),
                 )
@@ -1382,6 +1499,7 @@ def create_scheduled_tasks_router(
             "scheduled_tasks": [
                 _to_response(
                     task,
+                    shareable=scheduled_task_shareable(permission_store, task.id),
                     last_run_status=latest_status.get(task.id),
                     next_run_at=_next_run_at(task, request),
                     viewer_role="viewer",
@@ -1411,6 +1529,7 @@ def create_scheduled_tasks_router(
             owner_name = (await _owner_display_names([task])).get(task.user_id or "", task.user_id)
         return _to_response(
             task,
+            shareable=scheduled_task_shareable(permission_store, task.id),
             last_run_status=latest_status.get(task.id),
             next_run_at=_next_run_at(task, request),
             viewer_role=role,
@@ -1982,6 +2101,7 @@ def create_scheduled_tasks_router(
         latest_status = store.list_latest_run_status_for_tasks([updated.id])
         return _to_response(
             updated,
+            shareable=scheduled_task_shareable(permission_store, updated.id),
             last_run_status=latest_status.get(updated.id),
             next_run_at=_next_run_at(updated, request),
         )
