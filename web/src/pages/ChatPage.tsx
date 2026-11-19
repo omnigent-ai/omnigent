@@ -365,6 +365,11 @@ const HOST_SIGN_IN_URL_RE = /^https?:\/\//i;
 // Iterate code points (not UTF-16 units) so emoji aren't cut mid-surrogate;
 // prefer the last word boundary within 10 chars of the limit so we don't
 // chop a word in half; trimEnd before the ellipsis so we never emit "foo  …".
+/** The draft's text as sent: a command is trimmed, anything else keeps its leading space. */
+function authoredOutgoingText(fullText: string, trimmed: string): string {
+  return isSlashCommandText(trimmed) ? trimmed : fullText.trimEnd();
+}
+
 /**
  * A sent, queued or failed message as an editable composer draft: generated
  * session markers become tokens again and their tags come back with them.
@@ -3166,14 +3171,25 @@ function ComposerImpl(
 
   // Depends on mentionedItems (from the hook above), so it's computed here.
   // Tagged items whose token is still in the draft; deleting a token untags it.
-  const liveMentions = presentMentions(
-    composerInlineMentions(mentionedItems, mentionedSessions, sessionHarness),
-    [draft.text, ...draft.quotes.map((quote) => quote.before)],
+  const liveMentions = useMemo(
+    () =>
+      presentMentions(composerInlineMentions(mentionedItems, mentionedSessions, sessionHarness), [
+        draft.text,
+        ...draft.quotes.map((quote) => quote.before),
+      ]),
+    [mentionedItems, mentionedSessions, sessionHarness, draft],
   );
   const hasMentions = liveMentions.length > 0;
   const sendContext = { mentions: liveMentions, reviewComments: localReviewComments };
-  const plainOutgoingText = (trimmed: string) =>
-    isSlashCommandText(trimmed) ? trimmed : fullText.trimEnd();
+  // Review comments are appended at send, which can make a bare `!` a command.
+  const outgoingClassifyText = useMemo(
+    () =>
+      buildOutgoingMessage(draft, authoredOutgoingText(fullText, fullText.trim()), {
+        mentions: liveMentions,
+        reviewComments: localReviewComments,
+      }).text,
+    [draft, fullText, liveMentions, localReviewComments],
+  );
   // One mirror paints the command or `!` tint and inline mention pills. Quotes
   // and files are sent ahead of the text, so it no longer starts with the token.
   const highlight = useComposerHighlight({
@@ -3181,9 +3197,7 @@ function ComposerImpl(
     commandNames: slashCommandNames,
     enabled: draft.quotes.length === 0 && files.length === 0,
     nativeShell,
-    // Review comments are appended at send, which can make a bare `!` a command.
-    classifyValue: buildOutgoingMessage(draft, plainOutgoingText(fullText.trim()), sendContext)
-      .text,
+    classifyValue: outgoingClassifyText,
     mentionTokens: draft.quotes.length === 0 ? mentionTokens : [],
     textareaRef: tailTextareaRef,
     textareaNode: tailTextareaNode,
@@ -4079,7 +4093,7 @@ function ComposerImpl(
     // one tool hint at the end.
     const outgoing = buildOutgoingMessage(
       draft,
-      goalMessage ?? plainOutgoingText(trimmed),
+      goalMessage ?? authoredOutgoingText(fullText, trimmed),
       sendContext,
     );
     // Sending while a prior response is streaming is fine — the
