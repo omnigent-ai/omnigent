@@ -319,7 +319,11 @@ _PROBE_BODIES: dict[tuple[str, str], dict[str, Any]] = {
 
 
 # Create is not probed: test_users_cannot_schedule_the_proactive_agent covers it.
-_UNPROBED_ROUTES = {("POST", "/v1/scheduled-tasks")}
+# The default-timezone route reads no task and echoes only the caller's zone.
+_UNPROBED_ROUTES = {
+    ("POST", "/v1/scheduled-tasks"),
+    ("PUT", "/v1/scheduled-tasks/default-timezone"),
+}
 
 _SHARING_USER = "alice@example.com"
 _RECIPIENT = "bob@example.com"
