@@ -5543,6 +5543,19 @@ def test_pi_sandbox_launcher_policy_carries_spawn_env_allowlist(
     # launcher's keep-set either.
     assert "FAKE_HOST_SECRET" not in allowlist
 
+    if layout == "standalone":
+
+        def _reject_launcher(_target: str, _policy: SandboxPolicy) -> str:
+            raise OSError("trusted runtime is writable")
+
+        monkeypatch.setattr(sandbox_mod, "create_exec_launcher", _reject_launcher)
+        with patch("omnigent.inner.pi_executor._find_pi_cli", return_value=str(pi_binary)):
+            with pytest.raises(OSError, match="trusted runtime is writable"):
+                PiExecutor(
+                    cwd=str(tmp_path),
+                    os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+                )
+
 
 def test_pi_bundle_resource_roots_follow_passed_args(tmp_path: Path) -> None:
     """Only the bundle roots that contributed a ``--skill`` / ``--extension`` path are granted,

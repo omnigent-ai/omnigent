@@ -79,6 +79,27 @@ def test_handles_tools_internally_and_streaming() -> None:
     assert ex.supports_streaming() is True
 
 
+def test_sandbox_launcher_validation_failure_stops_acp_spawn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.inner import sandbox as sandbox_module
+    from omnigent.inner.sandbox import SandboxPolicy
+
+    policy = SandboxPolicy("linux_bwrap", True, [], [], [], False)
+    monkeypatch.setattr(sandbox_module, "resolve_sandbox", lambda *_args: policy)
+
+    def _reject_launcher(_target: str, _policy: SandboxPolicy) -> str:
+        raise OSError("trusted runtime is writable")
+
+    monkeypatch.setattr(sandbox_module, "create_exec_launcher", _reject_launcher)
+    executor = AcpExecutor(
+        AcpAgentConfig(command="agent"),
+        os_env=OSEnvSpec(sandbox=OSEnvSandboxSpec(type="linux_bwrap")),
+    )
+    with pytest.raises(OSError, match="trusted runtime is writable"):
+        executor._sandbox_launch(("PATH",))
+
+
 # ---------------------------------------------------------------------------
 # session/new shapes (server- vs client-assigned id, optional model)
 # ---------------------------------------------------------------------------

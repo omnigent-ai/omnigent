@@ -6903,6 +6903,24 @@ def _expand_config_env_vars(  # type: ignore[explicit-any]  # raw is parsed YAML
         and cfg.executor.auth is not None
         and cfg.executor.auth.get("type") == "api_key"
     ):
+        from omnigent.errors import ErrorCode, OmnigentError
+        from omnigent.spec.parser import _api_key_source_env_names
+
+        raw_key = cfg.executor.auth.get("api_key")
+        if isinstance(raw_key, str):
+            source_names = _api_key_source_env_names(raw_key)
+            if source_names:
+                auth = raw["executor"]["auth"]
+                existing_names = auth.get("source_env_names", [])
+                if not isinstance(existing_names, list) or any(
+                    not isinstance(name, str) for name in existing_names
+                ):
+                    raise OmnigentError(
+                        "executor.auth.source_env_names must be a list of "
+                        "environment variable names",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                auth["source_env_names"] = sorted(set(existing_names).union(source_names))
         auth_secrets = {
             k: str(cfg.executor.auth[k])
             for k in ("api_key", "base_url")

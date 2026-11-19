@@ -8,6 +8,7 @@ import {
   ComposerSendButton,
   COMPOSER_LABELS_MIN_GAP_PX,
 } from "./ChatComposer";
+import { composerTargetOf } from "./engine/composerInput";
 
 describe("ChatComposer", () => {
   function renderEditor(initial: string, submitWithModEnter = false) {
@@ -45,6 +46,11 @@ describe("ChatComposer", () => {
     caretToEnd(input);
     fireEvent.keyDown(input, { key: " " });
     expect(input).toHaveValue(expected);
+  });
+
+  it("marks its textarea as a composer input target", () => {
+    const { input } = renderEditor("draft");
+    expect(composerTargetOf(input)).toBe(input);
   });
 
   it("leaves markers after other text alone", () => {

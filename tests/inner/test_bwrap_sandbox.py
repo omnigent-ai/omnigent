@@ -1754,7 +1754,8 @@ def test_nested_grant_masked_in_non_recursive_default(tmp_path: Path) -> None:
     )
 
 
-def test_framework_write_root_dotfiles_not_masked(tmp_path: Path) -> None:
+@pytest.mark.parametrize("serialize", [False, True])
+def test_framework_write_root_dotfiles_not_masked(tmp_path: Path, serialize: bool) -> None:
     """
     Regression: a framework write root added via
     ``with_additional_write_roots`` (the per-helper scratch tmpdir) is
@@ -1784,6 +1785,9 @@ def test_framework_write_root_dotfiles_not_masked(tmp_path: Path) -> None:
     # Mirror the real launch: the parent folds the scratch tmpdir in as a
     # framework write root just before building the argv.
     policy = with_additional_write_roots(policy, [scratch])
+    if serialize:
+        # Exec launchers reconstruct the policy before applying bubblewrap.
+        policy = SandboxPolicy.from_jsonable(policy.to_jsonable())
     argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, cwd)
 
     sock = str(scratch.resolve(strict=False) / ".egress.sock")

@@ -14,6 +14,14 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
 
 ## Sub-features
 
+- `codemirror-input`: behind the `chat_composer_codemirror` release flag (off by
+  default; enable it with `OMNIGENT_FEATURES=chat_composer_codemirror` on the
+  server), the main chat's message box is a CodeMirror editor. It takes plain
+  text, scrolls inside the box when the draft is taller than the cap, and keeps
+  the same send, history, and completion keys. Side chats and New Chat follow
+  the same choice. Mobile widths always use the plain text box. It also stays
+  while the editor loads, and stays if loading fails; a failed load retries on
+  window focus, at most once a minute.
 - `touch-targets`: native iOS/Android apps and browsers with a coarse primary
   pointer and no hover use at least 44 CSS-pixel composer controls and menu rows.
   The layout adapts at phone, tablet, and desktop widths; mouse browsers retain
@@ -468,7 +476,7 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   buttons. The New Chat composer opens with the action's prompt as an editable
   draft, through the same one-time handoff token; nothing is sent until Send.
   Component proof: `web/src/pages/InboxPage.test.tsx` (`takes an agent action
-  and opens the composer with its prompt`).
+and opens the composer with its prompt`).
 
 - In the managed desktop app, choose **Arclet Sandbox** and submit a task with
   missing or expired laptop credentials. Click **Refresh dbcert** in the yellow
@@ -597,11 +605,17 @@ queued message brings its tags back as tokens. The queue belongs to the session,
 the full-screen view shows and flushes the same messages; a reload drops a cell's
 queued messages, where the full-screen composer restores its own. Escape does not
 stop a cell's turn, and Interrupt shows only while the draft is empty, so a draft
-sends. It also shows the session's host, permission mode (switchable by the owner),
-and the same model and effort picker as the full-screen composer, which changes only
-that session (Smart Routing too, where eligible). Shift+Tab in the cell's composer
-steps that session's mode too; side chats and subagent tabs keep Shift+Tab for focus.
-Switch the host from the cell's host menu when you can edit the session. The picker
+sends. Typing "@" opens the full-screen "@" picker over that session: its sessions,
+and its workspace files when the harness opens them. A picked tag is kept in the
+shared draft, so it carries to the full-screen view, and is sent as its marker.
+Enter picks from the open picker and never sends while it is open, and Mod+Enter
+waits for it too. Tags are picked only in the cell's main text, not in quote cards,
+and show as plain `@name` text, not as pills. It also shows the session's host,
+permission mode (switchable by the owner), and the same model and effort picker as
+the full-screen composer, which changes only that session (Smart Routing too, where
+eligible). Shift+Tab in the cell's composer steps that session's mode too, even with
+the "@" picker open; side chats and subagent tabs keep Shift+Tab for focus.
+Switch the host from the cell's host menu when you can edit the session. The model picker
 is hidden along with the composer for a viewer who can't edit the session. It is
 inert while the session is unreachable or structurally read-only, such as a Claude
 Code sub-agent. A cell whose managed sandbox is still launching lists no models until
@@ -639,7 +653,7 @@ Other connection providers alone do not enable the managed MCP picker.
   with the action's prompt filled in and editable, the handoff token gone from
   the URL, and no session created until Send. Component coverage:
   `web/src/pages/InboxPage.test.tsx` (`takes an agent action and opens the
-  composer with its prompt`).
+composer with its prompt`).
 
 - **`blocked-start`:** on a fresh new-session page with no working directory,
   enter a prompt or attach a file. Hover disabled Start, click it, then move
@@ -977,7 +991,7 @@ Other connection providers alone do not enable the managed MCP picker.
   `web/electron/e2e/desktop_dictation_availability.e2e.js` (new-session
   composer only), run from `web/electron` after building the SPA
   (`OMNIGENT_PW_NO_SANDBOX=1 OMNIGENT_PYTHON=../../.venv/bin/python xvfb-run -a
-  node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
+node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
   server without dictation (on macOS, the macOS Dictation mic instead), then
   the mic dictating through a fake-engine server. Manually, for the in-session,
   new-session and side-chat composers: connect the desktop app to a default

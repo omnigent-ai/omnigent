@@ -18,10 +18,19 @@
 import type * as IdentityModule from "@/lib/identity";
 import { sideChatSettingsMutationKey } from "@/lib/sideChat";
 
-import { type InfiniteData, QueryClient, QueryObserver } from "@tanstack/react-query";
+import {
+  type InfiniteData,
+  QueryClient,
+  QueryClientProvider,
+  QueryObserver,
+} from "@tanstack/react-query";
+import { act, renderHook, waitFor } from "@testing-library/react";
+import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { toast } from "sonner";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
+import { useSetConversationMuted } from "@/hooks/useConversations";
+import { clearSessionMuteState, MUTED_LABEL_KEY } from "@/lib/sessionMute";
 import type {
   AnyBlock,
   ElicitationBlock,
@@ -12646,6 +12655,100 @@ describe("chatStore — session configuration scope", () => {
       isDefault: false,
     },
   ];
+
+  // Both events and cache states, each mute direction and outcome once.
+  it.each([
+    { event: "session_agent_changed", muted: true, success: true, cached: false },
+    { event: "session_agent_changed", muted: false, success: false, cached: true },
+    { event: "session_model_options", muted: false, success: true, cached: false },
+    { event: "session_model_options", muted: true, success: false, cached: true },
+  ])(
+    "applies $event after mute=$muted settles with success=$success, cached=$cached",
+    async ({ event, muted, success, cached }) => {
+      const id = "conv_mute_refresh";
+      seedSession(id);
+      sessionLabels.set(id, muted ? {} : { [MUTED_LABEL_KEY]: "1" });
+      await useChatStore.getState().switchTo(id);
+      client.setQueryData(["conversation-backfill", id], {
+        id,
+        object: "conversation",
+        title: "Mute refresh",
+        created_at: 0,
+        updated_at: 0,
+        permission_level: null,
+        labels: sessionLabels.get(id) ?? {},
+      } satisfies Conversation);
+      if (!cached) client.removeQueries({ queryKey: ["session", id], exact: true });
+      expect(useChatStore.getState().codexModelOptions).toEqual([]);
+      expect(useChatStore.getState().isNativeTerminalSession).toBe(false);
+      let resolveSnapshot!: (response: Response) => void;
+      const snapshotRead = vi.fn(
+        () =>
+          new Promise<Response>((resolve) => {
+            resolveSnapshot = resolve;
+          }),
+      );
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (String(input).split("?")[0] === `/v1/sessions/${id}`) {
+          if (init?.method === "PATCH")
+            return mockResponse(
+              { labels: muted ? { [MUTED_LABEL_KEY]: "1" } : {} },
+              { ok: success, status: success ? 200 : 500 },
+            );
+          return snapshotRead();
+        }
+        return defaultFetchHandler(input, init);
+      });
+      handleSessionEvent(
+        event === "session_agent_changed"
+          ? {
+              type: "session_agent_changed",
+              conversationId: id,
+              agentId: "ag_updated",
+              agentName: "Updated agent",
+            }
+          : { type: "session_model_options", conversationId: id },
+      );
+      await vi.waitFor(() => expect(snapshotRead).toHaveBeenCalledOnce());
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client }, children);
+      const { result, unmount } = renderHook(() => useSetConversationMuted(), { wrapper });
+      onTestFinished(() => {
+        unmount();
+        clearSessionMuteState();
+        client.clear();
+      });
+      await act(async () => {
+        await result.current.mutateAsync({ id, muted }).catch(() => {});
+      });
+      await waitFor(() => expect(result.current.status).toBe(success ? "success" : "error"));
+      expect(snapshotRead).toHaveBeenCalledOnce();
+      expect(client.getQueryState(["session", id])?.fetchStatus).toBe("fetching");
+      resolveSnapshot(
+        mockResponse({
+          id,
+          agent_id: "ag_updated",
+          status: "idle",
+          created_at: 0,
+          items: [],
+          labels: { ...sessionLabels.get(id), "omnigent.wrapper": "claude-code-native-ui" },
+          model_options: CLAUDE_MODEL_OPTIONS,
+        }),
+      );
+      await vi.waitFor(() =>
+        expect(useChatStore.getState().codexModelOptions).toEqual(CLAUDE_MODEL_OPTIONS),
+      );
+      if (event === "session_agent_changed") {
+        expect(useChatStore.getState().isNativeTerminalSession).toBe(true);
+        expect(useChatStore.getState().boundAgentId).toBe("ag_updated");
+      }
+      expect(
+        !!client.getQueryData<{ labels: Record<string, string> }>(["session", id])?.labels[
+          MUTED_LABEL_KEY
+        ],
+      ).toBe(success ? muted : !muted);
+    },
+  );
 
   interface SnapshotOverrides {
     labels?: Record<string, string>;

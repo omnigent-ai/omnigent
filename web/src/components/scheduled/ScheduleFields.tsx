@@ -430,7 +430,7 @@ export function ScheduleFields({
                   variant="outline"
                   className={cn(
                     inlineChoiceClass,
-                    "h-8 min-w-0 max-w-[85%] gap-2 px-0 font-normal",
+                    "h-8 min-w-0 max-w-[85%] gap-2 px-2 font-normal",
                     pickerTriggerClass,
                   )}
                   disabled={custom && !anchoredScheduling}
@@ -460,7 +460,7 @@ export function ScheduleFields({
                   aria-label="Days of the month"
                   className={cn(
                     inlineChoiceClass,
-                    "h-8 min-w-0 max-w-[85%] gap-2 px-0 font-normal",
+                    "h-8 min-w-0 max-w-[85%] gap-2 px-2 font-normal",
                     pickerTriggerClass,
                   )}
                 >

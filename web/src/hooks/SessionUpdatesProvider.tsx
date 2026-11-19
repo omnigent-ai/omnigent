@@ -34,6 +34,7 @@ import {
   markRecentlyCreated,
   withMoveTombstone,
 } from "@/hooks/useConversations";
+import { contradictsSavedMute, reconcileMuteLabel, UNORDERED_READ } from "@/lib/sessionMute";
 import {
   type ConversationsInfiniteData,
   type MembershipChange,
@@ -97,12 +98,19 @@ function applyItemsToCache(
   // cleared field overlays the cache in the same shape GET /v1/sessions
   // produces (absent), without tripping the permission_level === null sentinel.
   const itemsById = new Map<string, SessionListWireItem>();
+  // A frame may have been read before a mute save, so it can't replace the saved
+  // preference; one that disagrees re-reads its lists, whose reads can.
+  const muteDisputed: string[] = [];
   for (const item of items) {
     if (isSessionDeleting(item.id)) continue;
+    if (contradictsSavedMute(item)) muteDisputed.push(item.id);
     itemsById.set(
       item.id,
       nullsToUndefined(
-        withMoveTombstone(isSessionArchiving(item.id) ? { ...item, archived: true } : item),
+        reconcileMuteLabel(
+          withMoveTombstone(isSessionArchiving(item.id) ? { ...item, archived: true } : item),
+          UNORDERED_READ,
+        ),
       ),
     );
   }
@@ -285,6 +293,14 @@ function applyItemsToCache(
     if (fields.has("archived") || (fields.has("project") && row.archived === true)) {
       targets.add(ARCHIVED_PROJECT_NAMES_HASH);
     }
+  }
+  const pinned = queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY);
+  for (const id of muteDisputed) {
+    for (const list of lists) if (list.ids.has(id)) targets.add(list.queryHash);
+    if (pinned?.conversations.some((row) => row.id === id)) {
+      targets.add(hashKey(PINNED_CONVERSATIONS_KEY));
+    }
+    targets.add(hashKey(["conversation-backfill", id]));
   }
   return targets;
 }

@@ -328,10 +328,10 @@ function isBodyHostKeyedRequest(url: string, body: BodyInit | null | undefined):
   return (typeof body === "string" || body instanceof FormData) && BODY_HOST_KEYED_RE.test(url);
 }
 
-const SCHEDULED_TASK_WRITE_RE = /\/v1\/scheduled-tasks(?:\/[^/?#]+)?(?:[?#]|$)/;
+const SCHEDULED_TASK_WRITE_RE = /\/v1\/scheduled-tasks(?:\/[^/?#]+(?:\/clone)?)?(?:[?#]|$)/;
 
-// A scheduled-task create or edit naming a connected host is validated against
-// that host's workspace over its tunnel, so it routes to the host's replica.
+// A scheduled-task create, edit or clone naming a connected host is validated
+// against that host's workspace over its tunnel, so it routes to the host's replica.
 function scheduledTaskHostId(url: string, init: RequestInit | undefined): string | null {
   const verb = (init?.method ?? "GET").toUpperCase();
   if ((verb !== "POST" && verb !== "PATCH") || typeof init?.body !== "string") return null;

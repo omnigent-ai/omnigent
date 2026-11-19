@@ -1,3 +1,10 @@
+import * as CodeMirrorModule from "@/components/composer/engine/codeMirrorComposerModule";
+import {
+  codeMirrorComposerLoad,
+  resetCodeMirrorComposerLoadForTests,
+} from "@/components/composer/engine/codeMirrorComposerLoader";
+import { composerTargetOf } from "@/components/composer/engine/composerInput";
+import { insertComposerText } from "@/lib/composerText";
 import { testAgent } from "@/test/agentFixtures";
 import { fetchSandboxProfiles, SANDBOX_PROFILES_QUERY_KEY } from "@/lib/sandboxProfilesApi";
 import type * as SandboxProfilesModule from "@/lib/sandboxProfilesApi";
@@ -4335,11 +4342,11 @@ describe("NewChatLandingScreen", () => {
       "composer-reference-surface",
       "border",
       "hover:shadow-[var(--composer-shadow)]",
-      "has-[textarea:focus]:shadow-[var(--composer-shadow)]",
+      "has-[[data-composer-input]:focus]:shadow-[var(--composer-shadow)]",
     );
     expect(composer).not.toHaveClass("bg-card", "dark:bg-card-solid");
     expect(composer).not.toHaveClass("shadow-[var(--composer-shadow)]");
-    expect(composer.className).not.toContain("has-[textarea:focus]:border-");
+    expect(composer.className).not.toContain("has-[[data-composer-input]:focus]:border-");
   });
 
   it("renders the reference two-layer composer with one in-form control row", () => {
@@ -10272,7 +10279,9 @@ describe("NewChatLandingScreen attachments", () => {
     fireEvent.dragOver(composer, { dataTransfer: fileDrag() });
     expect(screen.getByText("Drop files here")).toBeTruthy();
     expect(composer).toHaveClass("ring-2", "ring-ring", "ring-inset");
-    expect(composer).toHaveClass("has-[textarea:focus]:shadow-[var(--composer-shadow)]");
+    expect(composer).toHaveClass(
+      "has-[[data-composer-input]:focus]:shadow-[var(--composer-shadow)]",
+    );
     // Dropping a file attaches it (chip proves it reached state) and clears
     // the overlay.
     const file = new File(["hello"], "dropped.txt", { type: "text/plain" });
@@ -14254,5 +14263,84 @@ describe("NewChatLandingScreen picker curation", () => {
     expect(row("a1")).toBeNull();
     expect(row("a2")).not.toBeNull();
     expect(screen.queryByText("Harnesses")).toBeNull();
+  });
+});
+
+describe("New Chat composer engine", () => {
+  beforeEach(() => setupLandingMocks());
+  afterEach(() => {
+    cleanup();
+    resetCodeMirrorComposerLoadForTests();
+    vi.restoreAllMocks();
+  });
+
+  it("writes in CodeMirror and starts a chat from a typed prompt when the flag is on", async () => {
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding({
+      features: {
+        harness_install: false,
+        codex_plan_at_launch: true,
+        chat_composer_codemirror: true,
+      },
+    });
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    const editor = screen.getByTestId("new-chat-landing-input");
+    act(() => insertComposerText(composerTargetOf(editor)!, "ship it"));
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await readCreateBody();
+    await waitFor(() =>
+      expect(setPendingInitialPromptMock).toHaveBeenCalledWith(
+        "conv_new",
+        expect.objectContaining({ text: "ship it" }),
+      ),
+    );
+  });
+
+  it("keeps the textarea-only mirror class off the editor once a session is tagged", async () => {
+    resetCodeMirrorComposerLoadForTests(async () => CodeMirrorModule);
+    mockAgents([
+      testAgent("sdk1", "my-sdk-agent", { display_name: "SDK Agent", harness: "claude-sdk" }),
+    ]);
+    useConversationsMock.mockReturnValue({
+      data: {
+        pages: [
+          {
+            data: [{ id: "s_alpha", object: "conversation", title: "Alpha planning", labels: {} }],
+          },
+        ],
+      },
+    });
+    renderLanding({
+      features: {
+        harness_install: false,
+        codex_plan_at_launch: true,
+        chat_composer_codemirror: true,
+      },
+    });
+    await waitFor(() =>
+      expect(document.querySelector('[data-composer-engine="codemirror"]')).not.toBeNull(),
+    );
+    const editor = screen.getByTestId("new-chat-landing-input");
+
+    act(() => insertComposerText(composerTargetOf(editor)!, "@"));
+    fireEvent.click(screen.getByTestId("session-mention-category-sessions"));
+    fireEvent.click(screen.getByTitle("Tag session Alpha planning"));
+
+    expect(composerTargetOf(editor)?.value).toBe("@Alpha planning ");
+    expect(editor).not.toHaveClass("text-transparent");
+  });
+
+  it("keeps the textarea when the flag is off", () => {
+    renderLanding();
+    expect(screen.getByTestId("new-chat-landing-input").tagName).toBe("TEXTAREA");
+    expect(document.querySelector('[data-composer-engine="codemirror"]')).toBeNull();
+    expect(codeMirrorComposerLoad().status).toBe("idle");
   });
 });

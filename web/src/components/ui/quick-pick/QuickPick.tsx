@@ -1,14 +1,17 @@
 import {
   type KeyboardEvent,
+  type MutableRefObject,
   type ReactNode,
+  useCallback,
   useId,
   useLayoutEffect,
   useMemo,
   useRef,
   useState,
 } from "react";
-import { SearchIcon } from "lucide-react";
+import { SearchIcon, XIcon } from "lucide-react";
 
+import { Button } from "@/components/ui/button";
 import { CompactShortcutKeys } from "@/components/ui/kbd";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { cn } from "@/lib/utils";
@@ -58,8 +61,17 @@ export interface QuickPickProps<Value> {
   loop?: boolean;
   /** Grow the results to fill the container, such as a full-screen sheet on phones. */
   fillHeight?: boolean;
+  /**
+   * `sidebar` is a search field in a sidebar: results show only while there is a query, as
+   * two-line rows, with the field in a muted well and a button that clears it.
+   */
+  presentation?: QuickPickPresentation;
+  /** Receives the query field, such as to focus it from outside the picker. */
+  inputRef?: MutableRefObject<HTMLInputElement | null>;
   className?: string;
 }
+
+export type QuickPickPresentation = "default" | "sidebar";
 
 interface RowSection<Value> {
   heading?: { key: string; label: string };
@@ -135,16 +147,34 @@ export function QuickPick<Value>({
   inputTestId,
   loop = false,
   fillHeight = false,
+  presentation = "default",
+  inputRef,
   className,
 }: QuickPickProps<Value>) {
   const baseId = useId();
   const listId = `${baseId}-list`;
   // Keyed by the row, not its position, so an option keeps its ID when results above it change.
   const optionId = (row: QuickPickRow<Value>) => `${baseId}-option-${encodeURIComponent(row.key)}`;
+  const sidebar = presentation === "sidebar";
+  // A sidebar search shows only its field until there is something to search for, so
+  // no row is listed (or can be picked) while collapsed.
+  const collapsed = sidebar && query.trim().length === 0;
 
-  const rows = useMemo(() => buildQuickPickRows({ segments, query }), [segments, query]);
+  const rows = useMemo(
+    () => (collapsed ? [] : buildQuickPickRows({ segments, query })),
+    [collapsed, segments, query],
+  );
   const sections = useMemo(() => sectionsOf(rows), [rows]);
   const resultCount = rows.filter((row) => row.kind === "item").length;
+  const showEmpty = !collapsed && resultCount === 0;
+  const queryFieldRef = useRef<HTMLInputElement | null>(null);
+  const setQueryField = useCallback(
+    (node: HTMLInputElement | null) => {
+      queryFieldRef.current = node;
+      if (inputRef) inputRef.current = node;
+    },
+    [inputRef],
+  );
 
   // Until the user picks a row for this query, the top row stays active as results arrive.
   // Any query change forgets the pick, so returning to an earlier query starts at the top.
@@ -237,45 +267,84 @@ export function QuickPick<Value>({
         onMouseDown={(event) => event.preventDefault()}
         onClick={() => accept(row)}
         className={cn(
-          "flex cursor-pointer items-start gap-2 rounded-lg px-2 py-1.5 text-ui select-none",
-          "data-active:bg-muted data-active:text-foreground",
+          "flex cursor-pointer select-none rounded-lg px-2 text-ui",
+          sidebar
+            ? "items-center gap-2 py-1.5 data-active:bg-[var(--sidebar-active)] data-active:text-[var(--sidebar-active-foreground)]"
+            : "items-start gap-2 py-1.5 data-active:bg-muted data-active:text-foreground",
           disabled && "cursor-default opacity-50",
         )}
       >
-        {item.icon ? (
-          <span className="flex size-4 shrink-0 items-center justify-center self-center text-muted-foreground [&_svg]:size-4">
-            {item.icon}
-          </span>
+        {sidebar ? (
+          <>
+            {item.icon ? (
+              <span className="flex size-4 shrink-0 items-center justify-center text-muted-foreground [&_svg]:size-4">
+                {item.icon}
+              </span>
+            ) : null}
+            <div className="flex min-w-0 flex-1 flex-col">
+              <span data-slot="quick-pick-label" className="truncate">
+                <HighlightedText text={item.label} ranges={row.labelRanges} highlight={highlight} />
+              </span>
+              {/* The second line holds the place and any accessory; the accessory keeps its width. */}
+              {(item.description || item.accessory || item.shortcut) && (
+                <span className="flex min-w-0 items-center gap-2">
+                  {item.description && (
+                    <span className="min-w-0 flex-1 truncate text-sm text-muted-foreground">
+                      <HighlightedText
+                        text={item.description}
+                        ranges={row.descriptionRanges}
+                        highlight={highlight}
+                      />
+                    </span>
+                  )}
+                  {item.accessory ? (
+                    <span className="shrink-0">{item.accessory}</span>
+                  ) : item.shortcut ? (
+                    <CompactShortcutKeys keys={item.shortcut} className="shrink-0" />
+                  ) : null}
+                </span>
+              )}
+            </div>
+          </>
         ) : null}
-        <div className="flex min-w-0 flex-1 flex-col gap-0.5">
-          <span data-slot="quick-pick-label" className="truncate">
-            <HighlightedText text={item.label} ranges={row.labelRanges} highlight={highlight} />
-          </span>
-          {item.context}
-          {item.description && (
-            <span className="truncate text-sm text-muted-foreground">
-              <HighlightedText
-                text={item.description}
-                ranges={row.descriptionRanges}
-                highlight={highlight}
-              />
-            </span>
-          )}
-        </div>
-        {item.disabledReason && (
-          <span
-            data-slot="quick-pick-disabled-reason"
-            title={item.disabledReason}
-            className="min-w-0 shrink truncate self-center text-sm text-muted-foreground"
-          >
-            {item.disabledReason}
-          </span>
-        )}
-        {item.accessory && (
-          <span className="flex shrink-0 items-center gap-2 self-center">{item.accessory}</span>
-        )}
-        {item.shortcut && (
-          <CompactShortcutKeys keys={item.shortcut} className="shrink-0 self-center" />
+        {!sidebar && (
+          <>
+            {item.icon ? (
+              <span className="flex size-4 shrink-0 items-center justify-center self-center text-muted-foreground [&_svg]:size-4">
+                {item.icon}
+              </span>
+            ) : null}
+            <div className="flex min-w-0 flex-1 flex-col gap-0.5">
+              <span data-slot="quick-pick-label" className="truncate">
+                <HighlightedText text={item.label} ranges={row.labelRanges} highlight={highlight} />
+              </span>
+              {item.context}
+              {item.description && (
+                <span className="truncate text-sm text-muted-foreground">
+                  <HighlightedText
+                    text={item.description}
+                    ranges={row.descriptionRanges}
+                    highlight={highlight}
+                  />
+                </span>
+              )}
+            </div>
+            {item.disabledReason && (
+              <span
+                data-slot="quick-pick-disabled-reason"
+                title={item.disabledReason}
+                className="min-w-0 shrink truncate self-center text-sm text-muted-foreground"
+              >
+                {item.disabledReason}
+              </span>
+            )}
+            {item.accessory && (
+              <span className="flex shrink-0 items-center gap-2 self-center">{item.accessory}</span>
+            )}
+            {item.shortcut && (
+              <CompactShortcutKeys keys={item.shortcut} className="shrink-0 self-center" />
+            )}
+          </>
         )}
       </div>
     );
@@ -285,18 +354,25 @@ export function QuickPick<Value>({
     <div
       data-slot="quick-pick"
       className={cn(
-        "flex min-h-0 flex-col bg-popover text-popover-foreground",
+        "flex min-h-0 flex-col",
+        !sidebar && "bg-popover text-popover-foreground",
         fillHeight && "flex-1",
         className,
       )}
     >
-      <div className="flex items-center gap-2 border-b border-border px-3 py-2">
+      <div
+        className={cn(
+          "flex items-center gap-2",
+          sidebar ? "rounded-lg bg-muted px-2" : "border-b border-border px-3 py-2",
+        )}
+      >
         <SearchIcon aria-hidden className="size-4 shrink-0 text-muted-foreground" />
         <input
+          ref={setQueryField}
           role="combobox"
           aria-label={label}
-          aria-expanded
-          aria-controls={listId}
+          aria-expanded={!collapsed}
+          aria-controls={collapsed ? undefined : listId}
           aria-autocomplete="list"
           data-testid={inputTestId}
           aria-activedescendant={activeRow === null ? undefined : optionId(activeRow)}
@@ -310,22 +386,44 @@ export function QuickPick<Value>({
           onKeyDown={handleKeyDown}
           className="h-8 min-w-0 flex-1 bg-transparent text-ui outline-hidden placeholder:text-muted-foreground"
         />
+        {sidebar && query !== "" && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            aria-label="Clear search"
+            data-slot="quick-pick-clear"
+            // Keep focus in the query field, as the rows do.
+            onMouseDown={(event) => event.preventDefault()}
+            onClick={() => {
+              onQueryChange("");
+              queryFieldRef.current?.focus();
+            }}
+            className="-mr-1 text-muted-foreground"
+          >
+            <XIcon />
+          </Button>
+        )}
         {inputEnd}
       </div>
       <div
         ref={scrollRef}
         data-slot="quick-pick-scroll"
-        className={cn("overflow-y-auto p-1", fillHeight ? "min-h-0 flex-1" : "max-h-72")}
+        className={cn(
+          "overflow-y-auto p-1",
+          fillHeight ? "min-h-0 flex-1" : "max-h-72",
+          collapsed && "hidden",
+        )}
       >
         {status && <div data-slot="quick-pick-status">{status}</div>}
         {/* Announces the empty message, shown, or the result count, visually hidden. */}
         <div
           role="status"
           aria-live="polite"
-          data-slot={resultCount === 0 ? "quick-pick-empty" : undefined}
-          className={resultCount === 0 && emptyMessage ? "py-6 text-center text-ui" : "sr-only"}
+          data-slot={showEmpty ? "quick-pick-empty" : undefined}
+          className={showEmpty && emptyMessage ? "py-6 text-center text-ui" : "sr-only"}
         >
-          {resultCount === 0 ? emptyMessage : resultCountText(resultCount)}
+          {collapsed ? null : showEmpty ? emptyMessage : resultCountText(resultCount)}
         </div>
         <div id={listId} role="listbox" aria-label={label}>
           {sections.map((section, sectionIndex) => {

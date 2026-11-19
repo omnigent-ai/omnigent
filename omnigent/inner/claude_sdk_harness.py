@@ -349,5 +349,7 @@ def create_app() -> FastAPI:
         :class:`ClaudeSDKExecutor` is constructed lazily on the
         first turn.
     """
-    adapter = ExecutorAdapter(executor_factory=_build_claude_sdk_executor)
+    adapter = ExecutorAdapter(
+        executor_factory=_build_claude_sdk_executor, executor_factory_on_thread=True
+    )
     return adapter.build()

@@ -143,7 +143,7 @@ import {
   openHtmlArtifactInNewTab,
 } from "./codeViewerHelpers";
 import { CommentsPanel, type ActiveSelection } from "./CommentsPanel";
-import { isDataTablePath } from "./dataTable";
+import { isDataTablePath, isSpreadsheetPath } from "./dataTable";
 import { useScrollRestore } from "./useScrollRestore";
 import { isPdfAnchor } from "./pdfCommentHelpers";
 
@@ -381,6 +381,8 @@ interface FileViewerProps {
   viewport?: "desktop" | "mobile";
   /** Called after confirming unsaved edits when closing the active file tab. */
   onCloseTab?: () => void;
+  /** Set while the viewer fills the workspace full screen; Escape then exits full screen. */
+  onExitFullScreen?: () => void;
   /** Called when the comments panel opens or closes inside the viewer. */
   onCommentsOpenChange?: (open: boolean) => void;
   /**
@@ -422,6 +424,7 @@ function FileViewerBody({
   path,
   onClose,
   onCloseTab,
+  onExitFullScreen,
   onNavigateTo,
   onShare,
   shareDisabledReason,
@@ -804,11 +807,13 @@ function FileViewerBody({
     return () => window.removeEventListener("keydown", handler);
   }, [syncUrl, open, onNavigateTo, currentNavIdx, prevPath, nextPath, guardDirty]);
 
-  // Escape closes the active file tab (when search is not open).
+  // Escape exits full screen, keeping the tab open, or else closes the active
+  // file tab (when search is not open).
   useEffect(() => {
-    if (!open || !onCloseTab) return;
+    if (!open || (!onCloseTab && !onExitFullScreen)) return;
     const handler = (e: KeyboardEvent) => {
-      if (!syncUrl && !viewerIsActiveSurfaceRef.current) return;
+      // Full screen hides the chat, so the viewer keeps Escape wherever the user clicked last.
+      if (!syncUrl && !viewerIsActiveSurfaceRef.current && !onExitFullScreen) return;
       if (e.key !== "Escape" || e.defaultPrevented) return;
       if (searchOpen) return;
       const target = e.target;
@@ -819,11 +824,13 @@ function FileViewerBody({
         return;
       }
       e.preventDefault();
-      guardDirty(onCloseTab);
+      // Leaving full screen keeps the file and its edits, so it needs no confirmation.
+      if (onExitFullScreen) onExitFullScreen();
+      else if (onCloseTab) guardDirty(onCloseTab);
     };
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
-  }, [syncUrl, open, onCloseTab, searchOpen, guardDirty]);
+  }, [syncUrl, open, onCloseTab, onExitFullScreen, searchOpen, guardDirty]);
 
   // View mode toggle — markdown defaults to the rich-text editor, HTML and
   // notebooks to their rendered preview, and everything else to source.
@@ -883,6 +890,8 @@ function FileViewerBody({
   // they have no meaningful source/diff/preview text representation, so diff is
   // suppressed and they always resolve to the (viewer-owning) source surface.
   const isModel = isModelFile(path, fileQuery.data?.content_type);
+  // Excel and Parquet open only on the table: no source, diff or line view.
+  const isSpreadsheet = isSpreadsheetPath(path);
   // Binary/base64 files render CodeViewer's "Preview not available" notice, not
   // Monaco — mirrors CodeViewer's own base64/binary-path check.
   const isBinary = fileQuery.data?.encoding === "base64" || isBinaryPath(path);
@@ -892,6 +901,7 @@ function FileViewerBody({
     !isPdf &&
     !isVideo &&
     !isModel &&
+    !isSpreadsheet &&
     (changedFiles.data?.data.some((f) => f.path === path) ?? false);
   const revealTarget = useRevealTarget(path);
   const openInActions = useOpenInActions(isDeletedFile ? null : path);
@@ -1025,7 +1035,13 @@ function FileViewerBody({
       : undefined;
   // Citations preserve diff mode; previewable files need source to expose line numbers.
   const viewMode: "editor" | "preview" | "source" | "diff" =
-    effectiveDiffActive && isDiffAvailable ? "diff" : filePosition ? "source" : fileViewMode;
+    effectiveDiffActive && isDiffAvailable
+      ? "diff"
+      : isSpreadsheet
+        ? "preview"
+        : filePosition
+          ? "source"
+          : fileViewMode;
   const diffViewActive = viewMode === "diff";
   // A citation opens large Markdown in editable source; keep source for the visit
   // so clearing the citation cannot drop unsaved edits by returning to Preview.
@@ -1694,12 +1710,15 @@ function FileViewerBody({
               the back button would be a redundant "exit viewer" mode. */}
           {(!frameless || mobileOverlay) && (
             <div ref={toolbarBackRef} className="shrink-0">
-              {/* Esc runs onCloseTab unless Find is open; the hint applies only when the
-                  back button runs that same handler. */}
+              {/* Esc runs onCloseTab unless Find is open or it exits full screen; the
+                  hint applies only when the back button runs that same handler. */}
               <KeyboardShortcutTooltip
                 label="Close"
                 keys={
-                  onCloseTab !== undefined && onClose === onCloseTab && !searchOpen
+                  onCloseTab !== undefined &&
+                  onClose === onCloseTab &&
+                  !searchOpen &&
+                  onExitFullScreen === undefined
                     ? [ESC_KEY]
                     : undefined
                 }
@@ -2188,9 +2207,12 @@ function FileViewerBody({
     </>
   );
 
-  // While the viewer is the surface last used, Escape closes its Find bar, or else its
-  // tab (see above), so page-wide Escape shortcuts leave it alone.
-  const ownsEscape = open && viewerIsActiveSurface && (searchOpen || onCloseTab !== undefined);
+  // While the viewer is the surface last used, Escape closes its Find bar, or else exits
+  // full screen or closes its tab (see above), so page-wide Escape shortcuts leave it alone.
+  const ownsEscape =
+    open &&
+    (onExitFullScreen !== undefined ||
+      (viewerIsActiveSurface && (searchOpen || onCloseTab !== undefined)));
 
   if (frameless) {
     return (

@@ -71,6 +71,8 @@ import {
   ComposerFeedbackRow,
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
+import { useRequestedComposerEngine } from "@/components/composer/engine/composerEnginePolicy";
+import type { ComposerTextTarget } from "@/components/composer/engine/composerInput";
 import {
   ComposerMirror,
   MIRRORED_TEXTAREA_CLASS,
@@ -207,7 +209,7 @@ import {
 } from "@/store/chatStore";
 import { markSessionCreated } from "@/store/interactionTelemetry";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
-import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { DesktopWindowContext, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { MODEL_PICKER_KEYS, useModelPickerHotkey } from "@/hooks/useModelPickerHotkey";
 import { CliCommandBlock, renderTextWithInlineCode } from "./CliCommandBlock";
 import { isHostAbsolutePath, isNavigablePath } from "./WorkspacePicker";
@@ -426,6 +428,8 @@ import {
 } from "@/components/KeyboardShortcut";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import { CreateAgentDialog } from "./CreateAgentDialog";
+import { useComposerPresentation, type ComposerAppPage } from "./composerPresentation";
+import { panelAllowsHost, panelDestinations } from "./floatingComposer/panelDestinations";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
 import { installAgentBundle } from "@/lib/agentsApi";
 import { createBundledSession, getSessionSlim, launchRunner } from "@/lib/sessionsApi";
@@ -2319,6 +2323,7 @@ export function NewChatLandingScreen({
   projectName,
   onSessionStarted,
 }: { projectName?: string; onSessionStarted?: () => void } = {}) {
+  const floating = useComposerPresentation().kind === "floating";
   const [params] = useSearchParams();
   const navigate = useNavigate();
   const siblingSourceId = params.get("sibling");
@@ -2356,7 +2361,7 @@ export function NewChatLandingScreen({
         </Button>
       </div>
     );
-  return (
+  const content = (
     <NewChatLandingContent
       key={siblingSourceId ?? "standalone"}
       siblingSourceId={siblingSourceId}
@@ -2364,6 +2369,12 @@ export function NewChatLandingScreen({
       projectHomeName={projectName}
       onSessionStarted={onSessionStarted}
     />
+  );
+  // The panel is a desktop window narrower than the mobile breakpoint by design.
+  return floating ? (
+    <DesktopWindowContext.Provider value>{content}</DesktopWindowContext.Provider>
+  ) : (
+    content
   );
 }
 
@@ -2395,7 +2406,14 @@ function NewChatLandingContent({
   const queryClient = useQueryClient();
   const isMobileViewport = useIsMobileViewport();
   const preventsKeyboardSubmit = isMobileViewport;
-  const [submitWithModEnter] = useState(() => readSubmitWithModEnter());
+  // The floating New Agent panel renders this same screen with its own chrome.
+  const presentation = useComposerPresentation();
+  const floating = presentation.kind === "floating" ? presentation : null;
+  const openAppPage = (page: ComposerAppPage) =>
+    floating ? floating.openAppPage(page) : navigate(page);
+  const [savedSubmitWithModEnter] = useState(() => readSubmitWithModEnter());
+  // A panel prompt is often drafted across lines, so only ⌘↵ sends there.
+  const submitWithModEnter = floating !== null || savedSubmitWithModEnter;
   // Single send-telemetry point (see handleCreate). Emitting there rather than
   // via the Start button's componentId covers Enter-key sends too, which never
   // submit the form and would otherwise bypass the Button entirely.
@@ -2711,7 +2729,14 @@ function NewChatLandingContent({
   const [mcpAuthorizing, setMcpAuthorizing] = useState(false);
   // Composer text captured when voice dictation starts, so Esc can revert to it.
   const voiceSnapshotRef = useRef("");
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const textareaRef = useRef<ComposerTextTarget | null>(null);
+  // Held as state too, so an engine switch that replaces the input re-binds the mention mirror.
+  const [textareaNode, setTextareaNode] = useState<ComposerTextTarget | null>(null);
+  const bindTextarea = useCallback((element: ComposerTextTarget | null) => {
+    textareaRef.current = element;
+    setTextareaNode(element);
+  }, []);
+  const composerEngine = useRequestedComposerEngine();
   const submitTooltipTriggerRef = useRef<HTMLSpanElement>(null);
   const [submitTooltipState, setSubmitTooltipState] = useState<"closed" | "open" | "pinned">(
     "closed",
@@ -2743,6 +2768,14 @@ function NewChatLandingContent({
     initialFiles: handoff?.files ?? restoredDraft?.files ?? [],
   });
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // A cancelled native picker fires `cancel`, which React has no prop for.
+  useEffect(() => {
+    const input = fileInputRef.current;
+    if (!floating || !input) return;
+    const closed = () => floating.onFilePicker("closed");
+    input.addEventListener("cancel", closed);
+    return () => input.removeEventListener("cancel", closed);
+  }, [floating]);
 
   // Drag-and-drop — as in the in-session composer, a file dropped anywhere on
   // the landing surface attaches here. Declared after ``landingSurface``.
@@ -2865,6 +2898,8 @@ function NewChatLandingContent({
   // Desktop-shell host status for THIS machine (null outside Electron), so the
   // picker can tag the current machine and offer to auto-connect it.
   const [desktopHost, setDesktopHost] = useState<HostIdentity | null>(null);
+  // Whether the shell has answered, so the floating panel can wait for that answer.
+  const [desktopHostAnswered, setDesktopHostAnswered] = useState(false);
   // The runner picked during desktop onboarding, preselected once it's online.
   const onboardingHost = useOnboardingRunnerHost(hosts);
   // Applied (or given up) once, after the first prefill; later resets use the usual defaults.
@@ -3193,11 +3228,26 @@ function NewChatLandingContent({
   const thisMachineInList =
     thisMachineHostId != null && allHosts.some((h) => h.host_id === thisMachineHostId);
   const canConnectThisMachine = Boolean(desktopHost?.cliInstalled);
+  // The floating panel starts agents only on this Mac or in a new sandbox. In the desktop shell
+  // only the shell's own answer names this Mac, never the loopback guess, and a missing
+  // identity names no host; outside the shell only the loopback rule applies.
+  const panel = panelDestinations({
+    thisMacHostId: !isElectronShell()
+      ? thisMachineHostId
+      : desktopHostAnswered
+        ? (desktopHost?.hostId ?? null)
+        : undefined,
+    hosts: hostsLoading ? null : allHosts,
+    sandboxesOffered: info === "loading" ? null : managedSandboxesEnabled,
+  });
+  const panelHostId = panel.thisMac?.hostId ?? null;
   const showConnectThisMachine =
     siblingMayUseOtherHosts &&
     canConnectThisMachine &&
-    !thisMachineInList &&
-    onlineHosts.length === 0;
+    (floating
+      ? // The panel trusts only the shell's identity, and can't start on other hosts.
+        !panel.pending && panel.thisMac === null
+      : !thisMachineInList && onlineHosts.length === 0);
 
   // Track this machine's host status from the desktop shell (no-op in a browser).
   useEffect(() => {
@@ -3205,7 +3255,9 @@ function NewChatLandingContent({
     let cancelled = false;
     const refresh = () => {
       void getHostIdentity().then((s) => {
-        if (!cancelled) setDesktopHost(s);
+        if (cancelled) return;
+        setDesktopHost(s);
+        setDesktopHostAnswered(true);
       });
     };
     refresh();
@@ -3316,16 +3368,32 @@ function NewChatLandingContent({
   useEffect(() => {
     if (siblingSourceId && siblingSource?.hostId) return;
     if (!prefillSettled) return;
+    // The panel waits to learn which host is this Mac before it picks any place.
+    if (floating && panel.pending) return;
+    const allowed = (hostId: string) => !floating || hostId === panelHostId;
     if (!onboardingHostSettled.current) {
       if (onboardingHost.pending) return;
       onboardingHostSettled.current = true;
-      if (onboardingHost.hostId && !sandboxSelected && selectedHostId === null) {
+      if (
+        onboardingHost.hostId &&
+        allowed(onboardingHost.hostId) &&
+        !sandboxSelected &&
+        selectedHostId === null
+      ) {
         writeLastHostChoice(onboardingHost.hostId);
         setSelectedHostId(onboardingHost.hostId);
         return;
       }
     }
     if (sandboxSelected) return;
+    if (floating && selectedHostId !== null && !allowed(selectedHostId)) {
+      // A restored draft may name a host the panel can't start on; it takes its default instead.
+      setSelectedHostId(null);
+      setWorkspace("");
+      workspaceFromConfigRef.current = false;
+      seededHostRef.current = null;
+      return;
+    }
     if (selectedHostId !== null) return;
 
     // Read the persisted pick once, as a mount-time seed — deliberately NOT a
@@ -3349,13 +3417,14 @@ function NewChatLandingContent({
       // Wait for the list so a remembered host cannot lose to a default.
       if (hostsLoading) return;
       const stored = (hosts ?? []).find((h) => h.host_id === lastChoice);
-      if (stored) {
+      if (stored && allowed(stored.host_id)) {
         setSelectedHostId(stored.host_id);
         return;
       }
       // A transient host-list gap must not replace the saved VM with the local
       // or sandbox default. Leave the slot empty until it returns or the user picks again.
-      return;
+      // The panel can't start on that host anyway, so it takes its default.
+      if (!floating) return;
     }
 
     if (managedSandboxesEnabled) {
@@ -3363,7 +3432,7 @@ function NewChatLandingContent({
       setSandboxProvider(defaultSandboxProvider());
       return;
     }
-    const firstOnline = (hosts ?? []).find((h) => h.status === "online");
+    const firstOnline = (hosts ?? []).find((h) => h.status === "online" && allowed(h.host_id));
     if (firstOnline) setSelectedHostId(firstOnline.host_id);
   }, [
     hosts,
@@ -3378,6 +3447,9 @@ function NewChatLandingContent({
     onboardingHost.hostId,
     siblingSourceId,
     siblingSource?.hostId,
+    floating,
+    panel.pending,
+    panelHostId,
   ]);
 
   // Fall back to the host's home directory when it has no recorded recents, so
@@ -5598,7 +5670,7 @@ function NewChatLandingContent({
   // The draft snapshot is built above the hook; add the tags it owns.
   draftRef.current.mentions = { files: mentionedItems, sessions: mentionedSessions };
   const mentionTokensShown = findMentionTokens(message, mentionTokens).length > 0;
-  useComposerMirrorAlignment(mirrorRef, textareaRef, mentionTokensShown);
+  useComposerMirrorAlignment(mirrorRef, textareaRef, mentionTokensShown, textareaNode);
 
   const workspaceTarget = JSON.stringify([projectParam, selectedHostId, sandboxSelected]);
   const [workspaceReadyTarget, setWorkspaceReadyTarget] = useState<string | null>(null);
@@ -5738,6 +5810,15 @@ function NewChatLandingContent({
         message: pickerSelectionError ?? sandboxCatalogError ?? sandboxProfileError,
       };
     }
+    if (floating && panel.pending)
+      return { field: "other", message: "Finding where this can run…" };
+    if (floating && !sandboxSelected && !panelAllowsHost(panel, selectedHostId)) {
+      const thisMac = localMachineLabel(navigator.userAgent);
+      return {
+        field: "other",
+        message: panel.sandboxes ? `Choose ${thisMac} or a new sandbox` : `Choose ${thisMac}`,
+      };
+    }
     if (sandboxSelected) {
       if (sandboxRepoOverCap) {
         return {
@@ -5825,6 +5906,7 @@ function NewChatLandingContent({
   const arcaHostId = arcaEnabled ? readArcaHostId() : null;
   const arcaHostOnline = arcaHostId !== null && onlineHosts.some((h) => h.host_id === arcaHostId);
   const showArcaOption =
+    !floating &&
     arcaEnabled &&
     (siblingMayUseOtherHosts || arcaHostId === siblingSource?.hostId) &&
     (!arcaPreviewRecovery || !arcaHostOnline);
@@ -6512,28 +6594,31 @@ function NewChatLandingContent({
         // Normal path: bind to an existing registered agent.
         const provisional = siblingSource ? nestedProvisional : newTempConversation();
         try {
-          localConv = beginLocalConversation(initialPrompt, files, provisional, localProject, {
-            // Seed the temp session with the NORMALIZED create identity so the
-            // optimistic composer shows the model/effort/harness/routing being
-            // created, not state projected from the previously active session.
-            modelOverride: normalizedModelOverride,
-            llmModel: resolvedDefaultModel,
-            reasoningEffort: normalizedReasoningEffort,
-            // The RESOLVED native wrapper harness (e.g. "codex-native"), not the
-            // usually-null pickedHarness for a native agent — so the temp page
-            // adapter can re-derive the native model/effort/permission identity.
-            harness: smartRoutingHarnessSelected
-              ? null
-              : (selectedNativeHarness ?? pickedHarness ?? null),
-            costControlModeOverride: costControlOverride ?? null,
-            boundAgentId: effectiveAgentId,
-            // Name (not just id) so the in-session temp composer can evaluate
-            // routing eligibility (isCostRoutingSession needs a bound agent).
-            boundAgentName: agent?.display_name ?? agent?.name ?? null,
-            // Chosen host so temp routing's per-family gateway guard uses the
-            // real host (null for a sandbox create).
-            hostId: sandboxSelected ? null : selectedHostId,
-          });
+          // The floating panel delivers the first message itself; no window shows a temp chat.
+          localConv = floating
+            ? null
+            : beginLocalConversation(initialPrompt, files, provisional, localProject, {
+                // Seed the temp session with the NORMALIZED create identity so the
+                // optimistic composer shows the model/effort/harness/routing being
+                // created, not state projected from the previously active session.
+                modelOverride: normalizedModelOverride,
+                llmModel: resolvedDefaultModel,
+                reasoningEffort: normalizedReasoningEffort,
+                // The RESOLVED native wrapper harness (e.g. "codex-native"), not the
+                // usually-null pickedHarness for a native agent — so the temp page
+                // adapter can re-derive the native model/effort/permission identity.
+                harness: smartRoutingHarnessSelected
+                  ? null
+                  : (selectedNativeHarness ?? pickedHarness ?? null),
+                costControlModeOverride: costControlOverride ?? null,
+                boundAgentId: effectiveAgentId,
+                // Name (not just id) so the in-session temp composer can evaluate
+                // routing eligibility (isCostRoutingSession needs a bound agent).
+                boundAgentName: agent?.display_name ?? agent?.name ?? null,
+                // Chosen host so temp routing's per-family gateway guard uses the
+                // real host (null for a sandbox create).
+                hostId: sandboxSelected ? null : selectedHostId,
+              });
           if (localConv !== null && !onProjectHome) {
             navigate(sessionLocation(localConv.tempConvId));
           }
@@ -6872,15 +6957,26 @@ function NewChatLandingContent({
         // Keep a browser delivery draft only when the create did not accept the input.
         recordOptimisticTitle(data.id, initialPrompt);
         void queryClient.refetchQueries({ queryKey: ["conversations"] });
-        if (!serverOwnsInitialInput)
-          setPendingInitialPrompt(data.id, { text: initialPrompt, skill, files });
-        // Only the full chat delivers a pending prompt, so the project home hands off to it.
-        if (
-          (!onProjectHome || !serverOwnsInitialInput) &&
-          onScreenRef.current &&
-          window.location.href === createLocation
-        ) {
-          navigate(sessionLocation(data.id));
+        if (floating) {
+          // The panel opens the session in a main window and delivers the first message.
+          floating.launch({
+            sessionId: data.id,
+            text: initialPrompt,
+            skill,
+            files,
+            inputAccepted: serverOwnsInitialInput,
+          });
+        } else {
+          if (!serverOwnsInitialInput)
+            setPendingInitialPrompt(data.id, { text: initialPrompt, skill, files });
+          // Only the full chat delivers a pending prompt, so the project home hands off to it.
+          if (
+            (!onProjectHome || !serverOwnsInitialInput) &&
+            onScreenRef.current &&
+            window.location.href === createLocation
+          ) {
+            navigate(sessionLocation(data.id));
+          }
         }
       }
       if (onProjectHome && onScreenRef.current) onSessionStarted?.();
@@ -6940,18 +7036,20 @@ function NewChatLandingContent({
     !!host.sandbox_provider || host.name.toLowerCase().includes("cloud");
   const isReconnectRow = (host: Host) =>
     host.status === "offline" && host.host_id === thisMachineHostId && canConnectThisMachine;
+  // The panel can launch only on this Mac, so other hosts aren't offered.
+  const pickable = (host: Host) => !floating || panelAllowsHost(panel, host.host_id);
   // Keep the selected host and this machine's reconnect action above the fold.
   const listedHosts = [
     ...onlineHosts,
     ...offlineHosts.filter((host) => host.host_id === selectedHostId || isReconnectRow(host)),
-  ];
+  ].filter(pickable);
   // Preserve /v1/hosts order: most recently updated first.
   const otherOfflineHosts = offlineHosts.filter(
-    (host) => host.host_id !== selectedHostId && !isReconnectRow(host),
+    (host) => host.host_id !== selectedHostId && !isReconnectRow(host) && pickable(host),
   );
   const cloudHosts = listedHosts.filter(isCloudHostEntry);
   const localHosts = listedHosts.filter((host) => !isCloudHostEntry(host));
-  const myMachines = allHosts.filter((host) => !isCloudHostEntry(host));
+  const myMachines = allHosts.filter((host) => !isCloudHostEntry(host) && pickable(host));
   let myMachinesEmptyText: string | null = null;
   if (myMachines.length === 0) {
     myMachinesEmptyText = "No hosts connected yet.";
@@ -7427,9 +7525,13 @@ function NewChatLandingContent({
       ref={setLandingSurface}
       className={cn(
         "relative flex",
-        !onProjectHome && "min-h-0 flex-1 items-stretch justify-center md:items-center md:pb-24",
+        floating
+          ? "min-h-0 flex-1 overflow-y-auto"
+          : !onProjectHome &&
+              "min-h-0 flex-1 items-stretch justify-center md:items-center md:pb-24",
       )}
       data-testid="new-chat-landing"
+      data-presentation={presentation.kind}
     >
       {/* Padding lives inside the 800px cap, so the composer surface reaches
           its shared 48rem column (800 − 32 = 768px) on desktop. px-4 (16px
@@ -7438,11 +7540,14 @@ function NewChatLandingContent({
       <div
         className={cn(
           "flex min-h-0 w-full flex-col md:select-none",
-          !onProjectHome &&
-            "max-w-[800px] items-center px-4 pt-8 pb-[max(16px,env(safe-area-inset-bottom))] md:pb-16",
+          floating
+            ? "flex-1"
+            : !onProjectHome &&
+                "max-w-[800px] items-center px-4 pt-8 pb-[max(16px,env(safe-area-inset-bottom))] md:pb-16",
         )}
       >
-        {onProjectHome ? (
+        {/* The panel has its own header, so it shows no heading. */}
+        {floating ? null : onProjectHome ? (
           isMobileViewport && workspaceControls
         ) : (
           /* On phones the heading yields its height first, so a long draft cannot
@@ -7502,7 +7607,10 @@ function NewChatLandingContent({
         {isDragActive && landingSurface ? <FileDropOverlay container={landingSurface} /> : null}
         <fieldset
           disabled={checkingDbcert}
-          className={cn("relative flex min-w-0 flex-col gap-0", COMPOSER_COLUMN_WIDTH)}
+          className={cn(
+            "relative flex min-w-0 flex-col gap-0",
+            floating ? "min-h-0 w-full flex-1" : COMPOSER_COLUMN_WIDTH,
+          )}
           data-testid="new-chat-landing-composer-surface"
         >
           {!isMobileViewport && workspaceControls}
@@ -7514,6 +7622,9 @@ function NewChatLandingContent({
             className="relative z-30"
           >
             <ChatComposer
+              engine={composerEngine}
+              dictating={dictation.hasInterim}
+              onActiveInputChange={bindTextarea}
               appearance={isMobileViewport ? "glass" : "default"}
               hasContent={
                 files.length > 0 ||
@@ -7525,16 +7636,17 @@ function NewChatLandingContent({
               className={cn(isDragActive && "ring-2 ring-ring ring-inset")}
               data-testid="new-chat-landing-composer"
               input={{
-                ref: textareaRef,
+                ref: bindTextarea,
                 value: message,
+                mentionTokens,
                 className: mentionTokensShown ? MIRRORED_TEXTAREA_CLASS : undefined,
                 onScroll: (e) => {
                   if (mirrorRef.current) mirrorRef.current.scrollTop = e.currentTarget.scrollTop;
                 },
                 onSelect: (e) => slashCompletion.onSelectionChange(e.currentTarget),
                 onChange: (e) => {
-                  slashCompletion.onSelectionChange(e.target);
-                  setMessage(e.target.value);
+                  slashCompletion.onSelectionChange(e.currentTarget);
+                  setMessage(e.currentTarget.value);
                   // A rejected attachment is never added, so there's no chip to
                   // remove and nothing else would ever clear this. Left sticky it
                   // reads as a blocker on a composer the user can actually submit.
@@ -7543,8 +7655,8 @@ function NewChatLandingContent({
                   // Sessions are taggable for every agent; files need ``mentionEnabled``.
                   setMention(
                     detectMentionAt(
-                      e.target.value,
-                      e.target.selectionStart ?? e.target.value.length,
+                      e.currentTarget.value,
+                      e.currentTarget.selectionStart ?? e.currentTarget.value.length,
                       sessionEntries.map((session) => session.title),
                     ),
                   );
@@ -7653,6 +7765,7 @@ function NewChatLandingContent({
                       className="hidden"
                       data-testid="new-chat-landing-file-input"
                       onChange={(e) => {
+                        floating?.onFilePicker("closed");
                         if (e.target.files) {
                           addFiles(Array.from(e.target.files));
                           // Reset so the same file can be re-selected.
@@ -7684,7 +7797,11 @@ function NewChatLandingContent({
                       <ComposerAddMenu
                         testIdPrefix="new-chat-landing"
                         disabled={creating}
-                        onAttach={() => fileInputRef.current?.click()}
+                        onAttach={() => {
+                          // The panel stays up while the native picker is open.
+                          floating?.onFilePicker("open");
+                          fileInputRef.current?.click();
+                        }}
                         onPlan={
                           directModeOptions.some((mode) => mode.value === "plan")
                             ? () => selectDirectMode("plan")
@@ -8330,7 +8447,7 @@ function NewChatLandingContent({
                 <button
                   type="button"
                   className="underline underline-offset-2 hover:no-underline"
-                  onClick={() => navigate("/settings/integrations")}
+                  onClick={() => openAppPage("/settings/integrations")}
                   data-testid="sandbox-catalog-error-integrations-link"
                 >
                   Go to Integrations
@@ -8415,7 +8532,7 @@ function NewChatLandingContent({
             </p>
           )}
         </div>
-        {hasNoSessions && !importPromptDismissed ? (
+        {hasNoSessions && !floating && !importPromptDismissed ? (
           <div className="mt-5 flex items-center justify-center gap-2">
             <Button
               variant="outline"

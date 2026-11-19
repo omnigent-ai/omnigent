@@ -40,6 +40,7 @@ import {
   useStopAndDeleteConversation,
   useStopSession,
   useTogglePinnedConversation,
+  useSetConversationMuted,
   useReorderPinnedConversations,
   fetchPinnedConversations,
   usePinnedConversations,
@@ -51,6 +52,7 @@ import {
   type PinnedConversationsResult,
 } from "./useConversations";
 import { PINNED_LABEL_KEY, PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
+import { isConversationMuted, MUTED_LABEL_KEY } from "@/lib/sessionMute";
 import { SidebarConfigContext, sidebarConfig } from "@/lib/sidebarConfig";
 import { PINNED_CONVERSATION_IDS_STORAGE_KEY } from "@/shell/sidebarNav";
 import { useScopeCache } from "./useScopeCache";
@@ -2172,19 +2174,28 @@ describe("useTogglePinnedConversation failure rollback", () => {
       const row = conversation({ id: "conv_x", updated_at: 150, labels: labels("A") });
       queryClient.setQueryData(["conversations", "", false], infinitePage([row]));
       queryClient.setQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY, {
-        conversations: pinValue === undefined ? [] : [row],
+        conversations: [
+          ...(pinValue === undefined ? [] : [row]),
+          conversation({ id: "pinned_only", labels: { [PINNED_LABEL_KEY]: "2000" } }),
+        ],
         filterHonored: true,
       });
       const wrapper = ({ children }: { children: ReactNode }) =>
         createElement(QueryClientProvider, { client: queryClient }, children);
-      const { result } = renderHook(() => useTogglePinnedConversation(), { wrapper });
+      const { result } = renderHook(
+        () => ({
+          pin: useTogglePinnedConversation(),
+          mute: useSetConversationMuted(),
+        }),
+        { wrapper },
+      );
       const listLabels = () =>
         queryClient
           .getQueryData<ConversationsInfiniteData>(["conversations", "", false])
           ?.pages.flatMap((p) => p.data)
           .find((c) => c.id === "conv_x")?.labels;
 
-      act(() => result.current.mutate({ id: "conv_x", pinned }));
+      act(() => result.current.pin.mutate({ id: "conv_x", pinned }));
       await waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
       // A project move lands while the pin PATCH is pending.
       queryClient.setQueryData<ConversationsInfiniteData>(["conversations", "", false], (old) =>
@@ -2203,8 +2214,12 @@ describe("useTogglePinnedConversation failure rollback", () => {
           : old,
       );
 
+      fetchMock.mockResolvedValueOnce(mockResponse({ labels: { [MUTED_LABEL_KEY]: "1" } }));
+      await act(async () => {
+        await result.current.mute.mutateAsync({ id: "pinned_only", muted: true });
+      });
       rejectPatch(mockResponse({}, { ok: false, status: 500 }));
-      await waitFor(() => expect(result.current.isError).toBe(true));
+      await waitFor(() => expect(result.current.pin.isError).toBe(true));
 
       // The move's label survives; only the pin key is rolled back.
       expect(listLabels()).toEqual(labels("B"));
@@ -2212,7 +2227,14 @@ describe("useTogglePinnedConversation failure rollback", () => {
         queryClient
           .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
           ?.conversations.map((c) => c.id) ?? [];
-      expect(pinnedIds).toEqual(pinValue === undefined ? [] : ["conv_x"]);
+      expect(pinnedIds).toEqual(
+        pinValue === undefined ? ["pinned_only"] : ["conv_x", "pinned_only"],
+      );
+      expect(
+        queryClient
+          .getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY)
+          ?.conversations.find((pin) => pin.id === "pinned_only")?.labels[MUTED_LABEL_KEY],
+      ).toBe("1");
       // The row snapped back, so the user is told the write didn't save.
       expect(toasts).toEqual([message]);
       window.removeEventListener("omnigent:toast", onToast);
@@ -4676,4 +4698,219 @@ it("uses the configured API page size for archived initial loads and pagination"
   expect(calls[1].get("after")).toBe(first.last_id);
   unmount();
   client.clear();
+});
+
+describe("mute writes", () => {
+  const listKey = ["conversations", "", false];
+  const cachedRow = (queryClient: QueryClient, id: string) =>
+    queryClient
+      .getQueryData<ConversationsInfiniteData>(listKey)!
+      .pages.flatMap((page) => page.data)
+      .find((row) => row.id === id)!;
+
+  it.each([
+    { muted: true, readStarts: "before" },
+    { muted: false, readStarts: "before" },
+    { muted: true, readStarts: "during" },
+    { muted: false, readStarts: "during" },
+  ])(
+    "keeps mute=$muted against a list read started $readStarts the save, without cancelling it",
+    async ({ muted, readStarts }) => {
+      const stale = infinitePage([
+        conversation({
+          id: "conv_m",
+          labels: muted ? { keep: "me" } : { keep: "me", [MUTED_LABEL_KEY]: "1" },
+        }),
+      ]);
+      let resolvePatch!: (response: Response) => void;
+      let resolveList!: (response: Response) => void;
+      fetchMock.mockImplementation(
+        (_url: string, init?: RequestInit) =>
+          new Promise<Response>((resolve) => {
+            if (init?.method === "PATCH") resolvePatch = resolve;
+            else resolveList = resolve;
+          }),
+      );
+      const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+      queryClient.setQueryData(listKey, stale);
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      const { result, unmount } = renderHook(() => useSetConversationMuted(), { wrapper });
+      const startList = () =>
+        queryClient.fetchQuery({
+          queryKey: listKey,
+          staleTime: 0,
+          queryFn: async () => ({
+            pages: [
+              await fetchConversationsPage({
+                searchQuery: "",
+                includeArchived: false,
+                queryClient,
+              }),
+            ],
+            pageParams: [undefined],
+          }),
+        });
+      let list = readStarts === "before" ? startList() : undefined;
+      act(() => result.current.mutate({ id: "conv_m", muted }));
+      await waitFor(() => expect(resolvePatch).toBeDefined());
+      list ??= startList();
+      await waitFor(() => expect(resolveList).toBeDefined());
+      await act(async () => {
+        resolvePatch(mockResponse({ labels: muted ? { [MUTED_LABEL_KEY]: "1" } : {} }));
+      });
+      await waitFor(() => expect(result.current.isSuccess).toBe(true));
+      // The read predates the save, so its labels are stale when it lands.
+      await act(async () => {
+        resolveList(mockResponse(stale.pages[0]));
+        await list;
+      });
+      const listReads = fetchMock.mock.calls.filter(([url]) =>
+        String(url).startsWith("/v1/sessions?"),
+      );
+      expect(listReads).toHaveLength(1);
+      expect(cachedRow(queryClient, "conv_m").labels).toEqual({
+        keep: "me",
+        ...(muted ? { [MUTED_LABEL_KEY]: "1" } : {}),
+      });
+      expect(isConversationMuted(cachedRow(queryClient, "conv_m"))).toBe(muted);
+
+      // A read started after the save reports another device's later change.
+      fetchMock.mockResolvedValueOnce(
+        mockResponse(
+          infinitePage([
+            conversation({ id: "conv_m", labels: muted ? {} : { [MUTED_LABEL_KEY]: "1" } }),
+          ]).pages[0],
+        ),
+      );
+      await act(async () => {
+        await startList();
+      });
+      expect(isConversationMuted(cachedRow(queryClient, "conv_m"))).toBe(!muted);
+      unmount();
+      queryClient.clear();
+    },
+  );
+
+  it.each(
+    (["move", "archive", "delete"] as const).flatMap((write) =>
+      [true, false].map((muted) => ({ write, muted })),
+    ),
+  )(
+    "keeps a saved mute=$muted when a failed $write restores an older snapshot",
+    async ({ write, muted }) => {
+      let failWrite!: (response: Response) => void;
+      fetchMock.mockImplementation((url: string, init?: RequestInit) => {
+        if (url === "/v1/projects") {
+          return Promise.resolve(
+            mockResponse({ object: "list", data: [{ id: "p_target", name: "Target" }] }),
+          );
+        }
+        if (url === "/v1/sessions/conv_mute") {
+          return Promise.resolve(mockResponse({ labels: muted ? { [MUTED_LABEL_KEY]: "1" } : {} }));
+        }
+        if (url === "/v1/sessions/conv_write/events") {
+          return Promise.resolve(mockResponse({ queued: false }));
+        }
+        expect(init?.method).toBe(write === "delete" ? "DELETE" : "PATCH");
+        return new Promise<Response>((resolve) => {
+          failWrite = resolve;
+        });
+      });
+      const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+      queryClient.setQueryData(["projects"], [{ id: "p_target", name: "Target" }]);
+      queryClient.setQueryData(
+        listKey,
+        infinitePage([
+          conversation({ id: "conv_mute", labels: muted ? {} : { [MUTED_LABEL_KEY]: "1" } }),
+          conversation({ id: "conv_write" }),
+        ]),
+      );
+      const wrapper = ({ children }: { children: ReactNode }) =>
+        createElement(QueryClientProvider, { client: queryClient }, children);
+      const { result, unmount } = renderHook(
+        () => ({
+          move: useMoveToProject(),
+          archive: useArchiveConversation(),
+          delete: useStopAndDeleteConversation(),
+          mute: useSetConversationMuted(),
+        }),
+        { wrapper },
+      );
+
+      act(() => {
+        if (write === "move") result.current.move.mutate({ id: "conv_write", project: "Target" });
+        else if (write === "archive")
+          result.current.archive.mutate({ id: "conv_write", archived: true });
+        else result.current.delete.mutate({ id: "conv_write" });
+      });
+      await waitFor(() => expect(failWrite).toBeDefined());
+      await act(async () => {
+        await result.current.mute.mutateAsync({ id: "conv_mute", muted });
+      });
+      await act(async () => {
+        failWrite(mockResponse({ error: "boom" }, { ok: false, status: 500 }));
+      });
+      await waitFor(() => expect(result.current[write].isError).toBe(true));
+
+      // The rollback may restore the pre-save label; the saved preference still wins.
+      expect(isConversationMuted(cachedRow(queryClient, "conv_mute"))).toBe(muted);
+      unmount();
+      queryClient.clear();
+    },
+  );
+
+  it("refuses an unmute while a mute is saving, so a failed mute leaves the row unmuted", async () => {
+    const resolvers: ((r: Response) => void)[] = [];
+    fetchMock.mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolvers.push(resolve);
+        }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
+    queryClient.setQueryData(
+      ["conversations", "", false],
+      infinitePage([
+        conversation({ id: "conv_m", labels: {} }),
+        conversation({ id: "conv_other", labels: {} }),
+      ]),
+    );
+    // Cancellation must not roll back another session's pending preference.
+    void queryClient
+      .fetchQuery({
+        queryKey: ["conversations", "", false],
+        queryFn: () => new Promise<ConversationsInfiniteData>(() => {}),
+      })
+      .catch(() => {});
+    onTestFinished(() => queryClient.clear());
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    const { result } = renderHook(() => useSetConversationMuted(), { wrapper });
+    const muted = () =>
+      queryClient
+        .getQueryData<ConversationsInfiniteData>(["conversations", "", false])
+        ?.pages.flatMap((p) => p.data)
+        .find((c) => c.id === "conv_m")?.labels?.[MUTED_LABEL_KEY];
+
+    act(() => result.current.mutate({ id: "conv_m", muted: true }));
+    act(() => result.current.mutate({ id: "conv_m", muted: false }));
+    expect(muted()).toBe("1");
+
+    act(() => result.current.mutate({ id: "conv_other", muted: true }));
+    await waitFor(() => expect(resolvers).toHaveLength(2));
+    resolvers[1](mockResponse({ labels: { [MUTED_LABEL_KEY]: "1" } }));
+    await waitFor(() => expect(queryClient.isMutating()).toBe(1));
+    expect(muted()).toBe("1");
+    resolvers[0](mockResponse({}, { ok: false, status: 500 }));
+    await waitFor(() => expect(queryClient.isMutating()).toBe(0));
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(muted()).toBeUndefined();
+    expect(
+      queryClient
+        .getQueryData<ConversationsInfiniteData>(["conversations", "", false])
+        ?.pages[0].data.find((row) => row.id === "conv_other")?.labels[MUTED_LABEL_KEY],
+    ).toBe("1");
+  });
 });

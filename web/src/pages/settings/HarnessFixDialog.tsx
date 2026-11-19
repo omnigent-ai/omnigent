@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   CheckIcon,
@@ -915,6 +915,7 @@ function DeviceCodeState({
   secondsRemaining: number;
   hostName: string;
 }) {
+  const parts = useSettingsOverlayParts();
   if (!isSecureVerificationUrl(login.verification_url)) {
     return <p role="alert">The host returned an invalid sign-in link.</p>;
   }
@@ -926,7 +927,12 @@ function DeviceCodeState({
           <p className="text-sm">Open the ChatGPT sign-in page and choose the account for Codex.</p>
           <div className="flex flex-wrap gap-2">
             <Button asChild size="sm">
-              <a href={login.verification_url} target="_blank" rel="noreferrer">
+              <a
+                href={login.verification_url}
+                target="_blank"
+                rel="noreferrer"
+                {...parts.control("openSignIn", { ...SETTINGS_NO_TOOLTIP, outside: {} })}
+              >
                 Open sign-in page <ExternalLinkIcon className="size-3.5" />
               </a>
             </Button>
@@ -1120,11 +1126,14 @@ function CredentialCard({
   description: string;
   onClick: () => void;
 }) {
+  const descriptionId = useId();
   return (
     <button
       type="button"
       role="radio"
       aria-checked={selected}
+      aria-label={title}
+      aria-describedby={descriptionId}
       onClick={onClick}
       className={cn(
         "flex items-center gap-3 rounded-xl border px-3.5 py-3 text-left transition-colors",
@@ -1136,7 +1145,9 @@ function CredentialCard({
       </span>
       <span className="flex min-w-0 flex-1 flex-col gap-0.5">
         <span className="text-ui font-medium text-foreground">{title}</span>
-        <span className="text-sm text-muted-foreground">{description}</span>
+        <span id={descriptionId} className="text-sm text-muted-foreground">
+          {description}
+        </span>
       </span>
       <span
         className={cn(
