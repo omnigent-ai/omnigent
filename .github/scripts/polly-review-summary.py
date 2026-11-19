@@ -486,9 +486,14 @@ def _markdown_context(
         if "\n" not in paragraph:
             return
         code_spans = _disclosure_code_spans(paragraph) if "`" in paragraph else []
+        unrecognized_start = paragraph.find("`", code_spans[-1][1] if code_spans else 0)
         emphasis = emphasis_span(paragraph, code_spans)
         if (
             any("\n" in paragraph[start:stop] for start, stop in code_spans)
+            or (
+                unrecognized_start >= 0
+                and "\n" in paragraph[unrecognized_start : paragraph.rfind("`")]
+            )
             or (emphasis is not None and "\n" in paragraph[emphasis[0] : emphasis[1]])
             or re.search(r"(?:\\| {2,})\r?\n", paragraph)
         ):

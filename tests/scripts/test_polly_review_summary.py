@@ -967,11 +967,18 @@ def _assert_fragments(
     ]
     + [
         (form, "prose", short)
-        for form in ("multiline-code", "multiline-double-code", "multiline-emphasis", "hard-break")
+        for form in (
+            "multiline-code",
+            "multiline-double-code",
+            "multiline-ambiguous-code",
+            "multiline-emphasis",
+            "hard-break",
+        )
         for short in (False, True)
     ]
     + [
         ("oversized-multiline-code", "prose", False),
+        ("oversized-multiline-ambiguous-code", "prose", False),
         ("intraword-underscore", "prose", False),
     ],
 )
@@ -999,11 +1006,17 @@ def test_multipart_inline_syntax_preserves_parsed_meaning(
         "ambiguous-code": "`unmatched ``literal &amp;``",
         "multiline-code": "`literal\ncode`",
         "multiline-double-code": "``literal ` tick\ncode``",
+        "multiline-ambiguous-code": "`orphan ``literal\ncode``",
         "multiline-emphasis": "*first\nsecond*",
         "hard-break": "first\\\nsecond",
         "oversized-multiline-code": "`literal\ncode`",
+        "oversized-multiline-ambiguous-code": "`orphan ``literal\ncode``",
         "intraword-underscore": "foo_bar_baz",
     }[form]
+    oversized_paragraph = form in {
+        "oversized-multiline-code",
+        "oversized-multiline-ambiguous-code",
+    }
     parser = MarkdownIt("commonmark").enable(["table", "strikethrough"])
     metadata = {"head_sha": "a" * 40, "run_id": "10-1", "run_url": "https://example.test/run"}
     summary = {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
@@ -1040,8 +1053,12 @@ def test_multipart_inline_syntax_preserves_parsed_meaning(
             + "y" * 70000
         )
         assert body[capacities[0]] == body[sum(capacities[:2]) - 1] == "_"
-    elif "\n" in construct and form != "oversized-multiline-code":
-        paragraph = "lead words " * 3 + construct
+    elif "\n" in construct and not oversized_paragraph:
+        paragraph = (
+            "lead words " + construct
+            if form == "multiline-ambiguous-code"
+            else "lead words " * 3 + construct
+        )
         padding = capacity - len(paragraph.split("\n", 1)[0]) - 3
         body = "x" * padding + "\n\n" + paragraph + "\n\n" + "y" * 70000
     else:
@@ -1084,8 +1101,10 @@ def test_multipart_inline_syntax_preserves_parsed_meaning(
     if form in {"entity", "decimal-entity", "hex-entity"}:
         assert "&" in "".join(content for _, content in expected)
         assert construct not in "".join(content for _, content in expected)
-    if form.startswith("multiline") or form == "oversized-multiline-code":
+    if form.startswith("multiline") or oversized_paragraph:
         assert any(kind in {"code_inline", "em_open"} for kind, _ in expected)
+    if form in {"multiline-ambiguous-code", "oversized-multiline-ambiguous-code"}:
+        assert [content for kind, content in expected if kind == "code_inline"] == ["literal code"]
     if form == "intraword-underscore":
         assert not any(kind in {"em_open", "strong_open"} for kind, _ in expected)
         assert sum(content.count("_") for _, content in expected) == 2
@@ -1098,12 +1117,12 @@ def test_multipart_inline_syntax_preserves_parsed_meaning(
     try:
         comments = _published_comments(review, review_path, receipt)
     except ValueError as error:
-        assert form == "oversized-multiline-code" and not short
+        assert oversized_paragraph and not short
         assert "paragraph" in str(error)
         assert not posts and not receipt.exists()
         assert sorted(path.name for path in tmp_path.iterdir()) == ["review.md"]
         return
-    assert form != "oversized-multiline-code", "An oversized dependent paragraph must refuse"
+    assert not oversized_paragraph, "An oversized dependent paragraph must refuse"
     assert posts == [*comments[1:], comments[0]]
     assert receipt.read_text() == metadata["head_sha"] + "\n"
     assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
