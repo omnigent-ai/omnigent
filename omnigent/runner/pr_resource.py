@@ -338,9 +338,7 @@ def _summary_info(
     tracked.setdefault(reference.url, reference)
     # The longest-unchecked PR goes first, so the budget never skips the same ones. The
     # check times live in the session's registry, so other sessions cannot evict them.
-    order = sorted(
-        tracked.values(), key=lambda pr: (pr.title_checked_at, pr.url != reference.url)
-    )
+    order = sorted(tracked.values(), key=lambda pr: (pr.title_checked_at, pr.url != reference.url))
     now = time.time()
     selected: dict[str, Any] | None = None
     states: list[dict[str, Any]] = []

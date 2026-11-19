@@ -396,7 +396,9 @@ def test_summaries_cut_by_the_budget_read_every_tracked_pr_in_turn(
     # More sessions and PRs than any history shared between sessions would keep.
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
     sessions = {
-        f"{index:032x}": [f"https://github.com/example/repo/pull/{2 * index + n}" for n in (42, 43)]
+        f"{index:032x}": [
+            f"https://github.com/example/repo/pull/{2 * index + offset}" for offset in (42, 43)
+        ]
         for index in range(150)
     }
     for session_id, urls in sessions.items():
