@@ -35,9 +35,11 @@ off by default.
 - Desktop app on macOS, from any app or Space: press ⇧⌘Space while an Omnigent
   window of a server with the flag on is open. The panel opens for the server of
   the most recently focused Omnigent window.
-- There is no menu, Dock or command-palette entry yet, and no Settings row to turn
-  ⇧⌘Space off or change it. A chord already used by **Show Omnigent from
-  anywhere** keeps that shortcut.
+- Settings → General → Desktop app → **Open New Agent from anywhere** turns
+  ⇧⌘Space off or records another chord. The row shows only with the flag on, in a
+  desktop app that can show the panel. A chord **Show Omnigent from anywhere**
+  already uses is refused.
+- There is no menu, Dock or command-palette entry yet.
 
 ## Driving it with the repro environment
 
@@ -54,7 +56,10 @@ Follow the [verification skill](skills/verify-omnigent/SKILL.md) for the server.
    front, and the Omnigent window behind shows the new session, which receives the
    prompt.
 4. Repeat with a new sandbox when the server has a sandbox provider.
-5. Restart the server without the flag and reload the app. ⇧⌘Space reaches other
+5. In Settings → General, turn **Open New Agent from anywhere** off: ⇧⌘Space
+   reaches other apps. Turn it on, record ⌃⌥Space and allow it: ⌃⌥Space opens the
+   panel. Try the **Show Omnigent from anywhere** chord: it's refused.
+6. Restart the server without the flag and reload the app. ⇧⌘Space reaches other
    apps again, and `/compose/floating` shows "Page not found".
 
 Component and unit coverage for each part:
@@ -69,6 +74,11 @@ Component and unit coverage for each part:
 - New Chat inside the panel and its locations:
   `web/src/shell/NewChatDialog.flow.test.tsx` and
   `web/src/shell/floatingComposer/panelDestinations.test.ts`.
+- The Settings row and the shortcut calls by id:
+  `web/src/pages/settings/GlobalShortcutControl.test.tsx`,
+  `web/src/pages/SettingsPage.test.tsx`,
+  `web/electron/test/update-main.test.js` and
+  `web/electron/test/preload_update.test.js`.
 - The desktop panel window, its targeting, frame and shortcut:
   `web/electron/test/floating_composer_window.test.js`,
   `web/electron/test/floating_composer_support.test.js`,

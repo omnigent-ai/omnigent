@@ -8,7 +8,9 @@ import { isMacPlatform } from "@/lib/hotkeys";
 import {
   cancelGlobalShortcutRecording,
   type GlobalShortcutChange,
+  type GlobalShortcutId,
   type GlobalShortcutSetting,
+  getDesktopFeatures,
   getGlobalShortcut,
   recordGlobalShortcut,
   setGlobalShortcut,
@@ -58,11 +60,31 @@ function formatAccelerator(accelerator: string): string {
   return parts.map((part) => (part === "Control" ? "Ctrl" : part)).join("+");
 }
 
+/** Each shortcut's row: what it's called, what it does, and its test and component ids. */
+const SHORTCUT_ROWS: Record<
+  GlobalShortcutId,
+  { label: string; description: string; testIdPrefix: string; componentId: string }
+> = {
+  show: {
+    label: "Show Omnigent from anywhere",
+    description: "Brings Omnigent to the front from any app.",
+    testIdPrefix: "global-shortcut",
+    componentId: "settings.general.global_shortcut",
+  },
+  floatingComposer: {
+    label: "Open New Agent from anywhere",
+    description: "Opens the New Agent panel from any app to start a session.",
+    testIdPrefix: "floating-composer-shortcut",
+    componentId: "settings.general.floating_composer_shortcut",
+  },
+};
+
 /**
- * Opt-in shortcut that brings the desktop app to the front from any app. The
- * shell registers it; this control reads and saves the setting.
+ * A system-wide shortcut: by default the opt-in one that brings the desktop app to the
+ * front from any app. The shell registers it; this control reads and saves the setting.
  */
-export function GlobalShortcutControl() {
+export function GlobalShortcutControl({ shortcutId = "show" }: { shortcutId?: GlobalShortcutId }) {
+  const row = SHORTCUT_ROWS[shortcutId];
   const [setting, setSetting] = useState<GlobalShortcutSetting | null>(null);
   const [recording, setRecording] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -70,25 +92,36 @@ export function GlobalShortcutControl() {
   const descriptionId = useId();
 
   useEffect(() => {
-    void getGlobalShortcut().then((saved) => {
+    void (async () => {
+      // An older shell ignores the id and would read and save "show" instead.
+      if (
+        shortcutId !== "show" &&
+        (await getDesktopFeatures())?.floatingComposerShortcut !== true
+      ) {
+        return;
+      }
+      const saved = await getGlobalShortcut(shortcutId);
       setSetting(saved);
       // On, but the shell couldn't register it at launch.
       if (saved?.error) setError(saved.error);
-    });
-  }, []);
+    })();
+  }, [shortcutId]);
 
-  const save = useCallback(async (next: GlobalShortcutChange) => {
-    const result = await setGlobalShortcut(next);
-    if (result.ok) {
-      // Turning off keeps the shell's saved chord, which another window may have changed.
-      setSetting(
-        (current) => result.setting ?? { accelerator: current?.accelerator ?? "", ...next },
-      );
-      setError(null);
-    } else {
-      setError(result.error ?? "Couldn't save the shortcut.");
-    }
-  }, []);
+  const save = useCallback(
+    async (next: GlobalShortcutChange) => {
+      const result = await setGlobalShortcut(next, shortcutId);
+      if (result.ok) {
+        // Turning off keeps the shell's saved chord, which another window may have changed.
+        setSetting(
+          (current) => result.setting ?? { accelerator: current?.accelerator ?? "", ...next },
+        );
+        setError(null);
+      } else {
+        setError(result.error ?? "Couldn't save the shortcut.");
+      }
+    },
+    [shortcutId],
+  );
 
   // The shell recording in flight, if any. One runs at a time, so a second click can't
   // leave a hidden one; a cancelled or unmounted one's late result is dropped.
@@ -109,7 +142,7 @@ export function GlobalShortcutControl() {
     const id = ++nextRecordingRef.current;
     shellRecordingRef.current = id;
     // The shell takes the chord before the app's own shortcuts (Cmd+K, Ctrl+Tab) and menu run.
-    void recordGlobalShortcut().then((accelerator) => {
+    void recordGlobalShortcut(shortcutId).then((accelerator) => {
       if (shellRecordingRef.current !== id) return;
       shellRecordingRef.current = null;
       setRecording(false);
@@ -143,11 +176,11 @@ export function GlobalShortcutControl() {
     <div className="flex flex-col gap-3">
       <div className="flex items-center justify-between gap-6">
         <SettingsLabel
-          label="Show Omnigent from anywhere"
+          label={row.label}
           labelId={labelId}
           descriptionId={descriptionId}
           className="flex-1"
-          description="Brings Omnigent to the front from any app."
+          description={row.description}
           descriptionClassName="text-ui"
         />
         <div className="flex shrink-0 items-center gap-3">
@@ -155,7 +188,7 @@ export function GlobalShortcutControl() {
             variant="outline"
             size="sm"
             aria-describedby={descriptionId}
-            data-testid="global-shortcut-recorder"
+            data-testid={`${row.testIdPrefix}-recorder`}
             onClick={startRecording}
             onBlur={stopRecording}
           >
@@ -171,8 +204,8 @@ export function GlobalShortcutControl() {
                 enabled ? { enabled, accelerator: setting.accelerator } : { enabled: false },
               )
             }
-            data-testid="global-shortcut-toggle"
-            componentId="settings.general.global_shortcut"
+            data-testid={`${row.testIdPrefix}-toggle`}
+            componentId={row.componentId}
           />
         </div>
       </div>

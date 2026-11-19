@@ -2239,6 +2239,12 @@ function GeneralSection() {
         {supportsGlobalShortcut() && (
           <SettingsGroup title="Desktop app" testId="settings-group-desktop-app">
             <GlobalShortcutControl />
+            {isFeatureEnabled(info, "floating_composer") && (
+              // Empty, and hidden, when the shell can't show the panel.
+              <div className="mt-4 border-t border-border pt-4 empty:hidden">
+                <GlobalShortcutControl shortcutId="floatingComposer" />
+              </div>
+            )}
           </SettingsGroup>
         )}
         <AdminViewControl />
