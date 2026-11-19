@@ -112,13 +112,15 @@ def claude_native_skill_args(
     args: list[str] = []
     from omnigent.onboarding.ambient import claude_sideload_flags_disabled
 
-    if (
-        bundle_dir is not None
-        and (bundle_dir / "skills").is_dir()
-        and not claude_sideload_flags_disabled()
-    ):
-        ensure_bundle_plugin_manifest(bundle_dir, agent_name)
-        args.extend(["--plugin-dir", str(bundle_dir)])
+    if bundle_dir is not None and (bundle_dir / "skills").is_dir():
+        if claude_sideload_flags_disabled():
+            _log.warning(
+                "Claude Code has disableSideloadFlags managed policy; launching "
+                "without bundled skills."
+            )
+        else:
+            ensure_bundle_plugin_manifest(bundle_dir, agent_name)
+            args.extend(["--plugin-dir", str(bundle_dir)])
     if skills_filter == "none":
         # Empty setting sources suppress host-skill discovery. Bundle
         # skills ride --plugin-dir and are unaffected.

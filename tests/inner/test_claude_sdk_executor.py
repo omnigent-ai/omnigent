@@ -2830,11 +2830,14 @@ class TestBundlePluginGating(unittest.TestCase):
             skill_dir = bundle / "skills" / "demo"
             skill_dir.mkdir(parents=True)
             (skill_dir / "SKILL.md").write_text("# demo\n")
-            with patch(
-                "omnigent.onboarding.ambient.claude_sideload_flags_disabled",
-                return_value=True,
-            ):
-                self.assertEqual(self._plugins_for_bundle(bundle), [])
+            from omnigent.onboarding import ambient
+
+            settings = bundle / "managed-settings.json"
+            settings.write_text('{"disableSideloadFlags": true}')
+            with patch.object(ambient, "CLAUDE_CODE_SIDELOAD_POLICY_PATHS", (settings,)):
+                with self.assertLogs("omnigent.inner.claude_sdk_executor", "WARNING") as logs:
+                    self.assertEqual(self._plugins_for_bundle(bundle), [])
+            self.assertTrue(any("without bundled skills" in log for log in logs.output))
             self.assertFalse((bundle / ".claude-plugin" / "plugin.json").exists())
 
 

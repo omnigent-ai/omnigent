@@ -927,6 +927,19 @@ def test_claude_sideload_flags_disabled_requires_managed_boolean_true(
     assert ambient.claude_sideload_flags_disabled((path,)) is expected
 
 
+def test_remote_sideload_policy_does_not_affect_managed_gateway_detection(
+    clean_env, monkeypatch
+) -> None:
+    """Claude's cached remote policy must not be treated as a gateway config."""
+    remote = clean_env / "remote-settings.json"
+    remote.write_text(json.dumps({"disableSideloadFlags": True}))
+    monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
+    monkeypatch.setattr(ambient, "CLAUDE_CODE_SIDELOAD_POLICY_PATHS", (remote,))
+
+    assert ambient.claude_sideload_flags_disabled() is True
+    assert ambient.claude_managed_gateway() == (None, False)
+
+
 def test_claude_managed_gateway_detected_as_subscription_not_cli_config(
     clean_env, monkeypatch
 ) -> None:

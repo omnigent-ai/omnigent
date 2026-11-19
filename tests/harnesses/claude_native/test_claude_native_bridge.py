@@ -4228,21 +4228,25 @@ def test_augment_claude_args_injects_mcp_and_hooks(tmp_path: Path) -> None:
 
 
 def test_augment_claude_args_omits_mcp_under_managed_sideload_policy(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     """Managed sideload policy must not make the native harness fail at startup."""
     from omnigent.onboarding import ambient
 
-    monkeypatch.setattr(ambient, "claude_sideload_flags_disabled", lambda: True)
+    settings = tmp_path / "managed-settings.json"
+    settings.write_text('{"disableSideloadFlags": true}')
+    monkeypatch.setattr(ambient, "CLAUDE_CODE_SIDELOAD_POLICY_PATHS", (settings,))
 
-    args = augment_claude_args(
-        (),
-        bridge_dir=tmp_path,
-        python_executable="/venv/bin/python",
-    )
+    with caplog.at_level(logging.WARNING, logger="omnigent.harnesses.claude_native.bridge"):
+        args = augment_claude_args(
+            (),
+            bridge_dir=tmp_path,
+            python_executable="/venv/bin/python",
+        )
 
     assert "--mcp-config" not in args
     assert "--settings" in args
+    assert any("without Omnigent's MCP tools" in record.getMessage() for record in caplog.records)
 
 
 def test_generated_claude_subprocesses_pin_runner_tmpdir(

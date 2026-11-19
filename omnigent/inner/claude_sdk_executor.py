@@ -3771,12 +3771,14 @@ class ClaudeSDKExecutor(Executor):
         bundle_plugins: list[Any] = []  # type: ignore[explicit-any]  # SdkPluginConfig is a TypedDict — typed Any here to keep the import lazy
         from omnigent.onboarding.ambient import claude_sideload_flags_disabled
 
-        if (
-            self._bundle_dir is not None
-            and (self._bundle_dir / "skills").is_dir()
-            and not claude_sideload_flags_disabled()
-        ):
-            bundle_plugins.append({"type": "local", "path": str(self._bundle_dir)})
+        if self._bundle_dir is not None and (self._bundle_dir / "skills").is_dir():
+            if claude_sideload_flags_disabled():
+                logger.warning(
+                    "Claude Code has disableSideloadFlags managed policy; launching "
+                    "without bundled skills."
+                )
+            else:
+                bundle_plugins.append({"type": "local", "path": str(self._bundle_dir)})
         if resolved.setting_sources == [] and not self._gateway:
             # The CLI then skips the user settings env, which may hold the only provider endpoint.
             env = {**_claude_user_settings_env(self._cwd), **env}
