@@ -15,6 +15,7 @@ import {
   buildPendingBubbles,
   buildSlashCommandMap,
   composerOffersClear,
+  composerOffersRewind,
   buildSlashCommandWithArgsSet,
   collectBubbleMarkdown,
   collectPendingElicitations,
@@ -30,6 +31,7 @@ import {
   isSubagentRoutingEligible,
   isUnboundCodingFork,
   mergePendingBubbles,
+  opensResumePicker,
   reorderCommittedRequestElicitations,
   shouldSendInitialPrompt,
   shouldShowAuthorBadge,
@@ -128,21 +130,22 @@ describe("Composer structural read-only reasons", () => {
     ).toBe("Claude Code sub-agents are read-only");
   });
 
-  it("gives a sealed codex /side child its own reason, not the generic one", () => {
-    // Server seals a dead side chat with omnigent.closed; the "Side chat"
-    // nickname distinguishes it from an ordinary closed codex sub-agent.
-    expect(
-      readOnlyReasonForSessionLabels(
-        {
-          labels: {
-            "omnigent.closed": "true",
-            "omnigent.wrapper": "codex-native-ui-subagent",
-            "omnigent.codex_native.agent_nickname": "Side chat",
-          },
-        },
-        null,
-      ),
-    ).toBe("This side chat has ended and can't receive new messages");
+  it.each(
+    [undefined, "false", "true"].flatMap((support) =>
+      [true, false].map((live) => ({ support, live })),
+    ),
+  )("gates closed codex /side recovery (live: $live, support: $support)", ({ live, support }) => {
+    const session = {
+      labels: {
+        "omnigent.closed": "true",
+        "omnigent.wrapper": "codex-native-ui-subagent",
+        "omnigent.codex_native.agent_nickname": "Side chat",
+        ...(support === undefined ? {} : { "omnigent.codex_native.side_chat_resume": support }),
+      },
+    };
+    expect(readOnlyReasonForSessionLabels(live ? session : null, live ? null : session)).toBe(
+      support === "true" ? null : "This sub-agent session is closed",
+    );
   });
 
   it("keeps the generic closed reason for a non-side-chat codex sub-agent", () => {
@@ -1463,7 +1466,7 @@ describe("collectBubbleMarkdown", () => {
 
 // ── Slash command map (skills + built-ins) ────────────────────────────
 
-describe("composer /clear gating", () => {
+describe("composer /clear and /rewind gating", () => {
   const info = (overrides: Partial<ServerInfo>) => ({ ...FALLBACK_SERVER_INFO, ...overrides });
 
   it.each([
@@ -1488,10 +1491,21 @@ describe("composer /clear gating", () => {
     // An older server lists "clear" for native sessions only.
     expect(composerOffersClear("claude-sdk", info({ session_event_types: ["clear"] }))).toBe(false);
   });
+
+  it.each([
+    ["claude-sdk", true],
+    ["claude-native", true],
+    ["codex-native", false],
+    ["openai-agents", false],
+  ] as const)("offers /rewind for %s when the server has the endpoint", (harness, offered) => {
+    expect(composerOffersRewind(harness, info({ session_rewind: true }))).toBe(offered);
+    expect(composerOffersRewind(harness, info({}))).toBe(false);
+    expect(composerOffersRewind(harness, "loading")).toBe(false);
+  });
 });
 
 describe("buildSlashCommandMap", () => {
-  const gatedOffByDefault = ["/btw", "/side", "/mcp", "/clear", "/permissions"];
+  const gatedOffByDefault = ["/btw", "/side", "/mcp", "/clear", "/permissions", "/rewind", "/goal"];
 
   it("returns the built-ins unchanged when no skills are loaded", () => {
     const map = buildSlashCommandMap([], true, true);
@@ -1528,6 +1542,32 @@ describe("buildSlashCommandMap", () => {
     expect(
       buildSlashCommandMap([], true, true, true, false, false, "/", false, false, true)["/clear"],
     ).toBe(BUILTIN_SLASH_COMMANDS["/clear"]);
+  });
+
+  it("includes /rewind only when showRewind is true", () => {
+    expect(buildSlashCommandMap([], true, true)["/rewind"]).toBeUndefined();
+    expect(
+      buildSlashCommandMap(
+        [],
+        true,
+        true,
+        true,
+        false,
+        false,
+        "/",
+        false,
+        false,
+        false,
+        false,
+        true,
+      )["/rewind"],
+    ).toBe(BUILTIN_SLASH_COMMANDS["/rewind"]);
+    // The /permissions slot right before it doesn't turn on /rewind.
+    expect(
+      buildSlashCommandMap([], true, true, true, false, false, "/", false, false, false, true)[
+        "/rewind"
+      ],
+    ).toBeUndefined();
   });
 
   it("includes /btw only when showBtw is true (claude-native)", () => {
@@ -2007,6 +2047,26 @@ describe("unboundSessionResumableInApp", () => {
     for (const src of ["kimi", "kiro", "qwen"]) {
       expect(unboundSessionResumableInApp({ ...owner, importSource: src })).toBe(false);
     }
+  });
+});
+
+describe("opensResumePicker", () => {
+  it("opens for an unbound fork or a resumable host-less session", () => {
+    const idle = { unboundFork: false, resumableUnbound: false, sandboxLaunching: false };
+    expect(opensResumePicker({ ...idle, unboundFork: true })).toBe(true);
+    expect(opensResumePicker({ ...idle, resumableUnbound: true })).toBe(true);
+    expect(opensResumePicker(idle)).toBe(false);
+  });
+
+  it("stays closed while a managed-sandbox launch places the session", () => {
+    // A sandbox clone remains unbound until its sandbox registers; the server
+    // places it and holds the first send for the launch.
+    expect(
+      opensResumePicker({ unboundFork: true, resumableUnbound: true, sandboxLaunching: true }),
+    ).toBe(false);
+    expect(
+      opensResumePicker({ unboundFork: false, resumableUnbound: true, sandboxLaunching: true }),
+    ).toBe(false);
   });
 });
 

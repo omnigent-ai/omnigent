@@ -26,8 +26,12 @@ from tests._helpers.providers import isolate_provider_resolution
     ("helper", "subscription_auth"),
     [(None, False), ("", False), ("printf test-token", False), (None, True)],
 )
+@pytest.mark.parametrize("stream_input", [True, False])
 def test_model_probe_uses_configured_auth_helper(
-    monkeypatch: pytest.MonkeyPatch, helper: str | None, subscription_auth: bool
+    monkeypatch: pytest.MonkeyPatch,
+    helper: str | None,
+    subscription_auth: bool,
+    stream_input: bool,
 ) -> None:
     for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
         monkeypatch.setenv(name, "ambient-credential")
@@ -42,7 +46,7 @@ def test_model_probe_uses_configured_auth_helper(
         else None
     )
 
-    _, args, env = claude_native._claude_model_probe_invocation(config)
+    _, args, env = claude_native._claude_model_probe_invocation(config, stream_input=stream_input)
 
     for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
         if helper or subscription_auth:
@@ -50,8 +54,12 @@ def test_model_probe_uses_configured_auth_helper(
         else:
             assert env[name] == "ambient-credential"
     assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "ambient-credential"
+    assert args.count("--settings") == 1
+    settings = json.loads(args[args.index("--settings") + 1])
+    expected: dict[str, object] = {"disableAllHooks": True}
     if helper:
-        assert json.loads(args[args.index("--settings") + 1])["apiKeyHelper"] == helper
+        expected["apiKeyHelper"] = helper
+    assert settings == expected
 
 
 @pytest.mark.posix_only

@@ -6,7 +6,9 @@ import {
   useCommandHoldTracking,
 } from "./useCommandHold";
 
-type Modifiers = Partial<Pick<KeyboardEvent, "metaKey" | "ctrlKey" | "altKey" | "shiftKey">>;
+type Modifiers = Partial<
+  Pick<KeyboardEvent, "metaKey" | "ctrlKey" | "altKey" | "shiftKey" | "repeat">
+>;
 
 /** Mounts the tracker and reads `held` through a subscriber, as the sidebar hints do. */
 function renderTracking(isMac: boolean, altJoinsHold = true) {
@@ -233,32 +235,66 @@ describe("useCommandHoldTracking on macOS", () => {
     expect(result.current).toBe(true);
   });
 
-  it("never counts Shift as part of the hold", () => {
-    const { result } = renderTracking(true);
-    key("keydown", "Meta", { metaKey: true, shiftKey: true });
-
-    act(() => {
-      vi.advanceTimersByTime(1000);
-    });
-    expect(result.current).toBe(false);
-  });
-
-  it("hides when Shift is pressed during a hold", () => {
+  it("keeps the reveal deadline when Shift joins during the delay", () => {
     const { result } = renderTracking(true);
     key("keydown", "Meta", MAC_COMMAND);
-    elapseRevealDelay();
-
+    act(() => {
+      vi.advanceTimersByTime(300);
+    });
     key("keydown", "Shift", { metaKey: true, shiftKey: true });
-    expect(result.current).toBe(false);
-  });
-
-  it("ignores Ctrl alongside ⌘, which is a text-editing chord on macOS", () => {
-    const { result } = renderTracking(true);
-    key("keydown", "Meta", { metaKey: true, ctrlKey: true });
 
     act(() => {
-      vi.advanceTimersByTime(1000);
+      vi.advanceTimersByTime(COMMAND_HOLD_REVEAL_DELAY_MS - 301);
     });
+    expect(result.current).toBe(false);
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    expect(result.current).toBe(true);
+  });
+
+  it.each([
+    ["Shift in a browser tab", "Shift", { metaKey: true, shiftKey: true }, true],
+    ["Shift in the desktop app", "Shift", { metaKey: true, shiftKey: true }, false],
+    ["Control", "Control", { metaKey: true, ctrlKey: true }, true],
+  ])(
+    "keeps the hint while %s joins the hold and when it is released",
+    (_case, joining, modifiers, altJoinsHold) => {
+      const { result } = renderTracking(true, altJoinsHold);
+      key("keydown", "Meta", MAC_COMMAND);
+      elapseRevealDelay();
+
+      key("keydown", joining, modifiers);
+      expect(result.current).toBe(true);
+
+      key("keyup", joining, MAC_COMMAND);
+      expect(result.current).toBe(true);
+
+      key("keyup", "Meta");
+      expect(result.current).toBe(false);
+    },
+  );
+
+  it.each([
+    ["Shift", "Shift", { shiftKey: true }],
+    ["Control", "Control", { ctrlKey: true }],
+  ])("reveals when %s was already down before ⌘", (_case, joining, modifiers) => {
+    const { result } = renderTracking(true, false);
+    key("keydown", joining, modifiers);
+    key("keydown", "Meta", { metaKey: true, ...modifiers });
+
+    elapseRevealDelay();
+    expect(result.current).toBe(true);
+  });
+
+  it("hides when a key completes the ⇧⌘ chord", () => {
+    const { result } = renderTracking(true);
+    key("keydown", "Meta", MAC_COMMAND);
+    key("keydown", "Shift", { metaKey: true, shiftKey: true });
+    elapseRevealDelay();
+    expect(result.current).toBe(true);
+
+    key("keydown", "O", { metaKey: true, shiftKey: true });
     expect(result.current).toBe(false);
   });
 
@@ -328,6 +364,35 @@ describe("useCommandHoldTracking off macOS", () => {
     expect(result.current).toBe(false);
   });
 
+  it("keeps the hint while Shift joins Ctrl, as in Ctrl+Shift+O", () => {
+    const { result } = renderTracking(false);
+    key("keydown", "Control", OTHER_COMMAND);
+    elapseRevealDelay();
+
+    key("keydown", "Shift", { ctrlKey: true, shiftKey: true });
+    expect(result.current).toBe(true);
+    key("keyup", "Shift", OTHER_COMMAND);
+    expect(result.current).toBe(true);
+  });
+
+  it("reveals when Shift was already down before Ctrl", () => {
+    const { result } = renderTracking(false);
+    key("keydown", "Shift", { shiftKey: true });
+    key("keydown", "Control", { ctrlKey: true, shiftKey: true });
+
+    elapseRevealDelay();
+    expect(result.current).toBe(true);
+  });
+
+  it("hides when Meta joins Ctrl, since it is not a joining key there", () => {
+    const { result } = renderTracking(false);
+    key("keydown", "Control", OTHER_COMMAND);
+    elapseRevealDelay();
+
+    key("keydown", "Meta", { ctrlKey: true, metaKey: true });
+    expect(result.current).toBe(false);
+  });
+
   it("ignores Ctrl together with Meta", () => {
     const { result } = renderTracking(false);
     key("keydown", "Control", { ctrlKey: true, metaKey: true });
@@ -365,6 +430,18 @@ describe("useCommandHoldTracking off macOS", () => {
       vi.advanceTimersByTime(1000);
     });
     expect(result.current).toBe(false);
+
+    // Once AltGraph lifts, Shift alone cannot revive the hold; a fresh Ctrl press can.
+    setAltGraph(false);
+    key("keyup", "AltGraph", OTHER_COMMAND);
+    key("keydown", "Shift", { ctrlKey: true, shiftKey: true });
+    elapseRevealDelay();
+    expect(result.current).toBe(false);
+
+    key("keyup", "Control");
+    key("keydown", "Control", OTHER_COMMAND);
+    elapseRevealDelay();
+    expect(result.current).toBe(true);
   });
 
   it("hides when AltGraph is pressed during the delay", () => {
@@ -377,6 +454,54 @@ describe("useCommandHoldTracking off macOS", () => {
       vi.advanceTimersByTime(1000);
     });
     expect(result.current).toBe(false);
+  });
+});
+
+describe("useCommandHoldTracking after a canceled hold", () => {
+  it.each([
+    ["a chord key on macOS", true, true, "c", { metaKey: true }],
+    ["a chord key off macOS", false, true, "c", { ctrlKey: true }],
+    ["Alt in the desktop app", false, false, "Alt", { ctrlKey: true, altKey: true }],
+  ] as const)(
+    "keeps a hold canceled by %s hidden when Shift joins, until the command key is pressed again",
+    (_case, isMac, altJoinsHold, cancelKey, cancelModifiers) => {
+      const { result } = renderTracking(isMac, altJoinsHold);
+      const commandKey = isMac ? "Meta" : "Control";
+      const command = isMac ? MAC_COMMAND : OTHER_COMMAND;
+      key("keydown", commandKey, command);
+      elapseRevealDelay();
+      key("keydown", cancelKey, cancelModifiers);
+      key("keyup", cancelKey, command);
+      expect(result.current).toBe(false);
+
+      key("keydown", "Shift", { ...command, shiftKey: true });
+      elapseRevealDelay();
+      expect(result.current).toBe(false);
+
+      key("keyup", "Shift", command);
+      key("keyup", commandKey);
+      key("keydown", commandKey, command);
+      elapseRevealDelay();
+      expect(result.current).toBe(true);
+    },
+  );
+});
+
+describe("useCommandHoldTracking after a missed command keyup", () => {
+  it("stays hidden on a repeated command keydown but recovers on a fresh press", () => {
+    const { result } = renderTracking(false);
+    key("keydown", "Control", OTHER_COMMAND);
+    key("keydown", "c", OTHER_COMMAND);
+    key("keyup", "c", OTHER_COMMAND);
+
+    key("keydown", "Control", { ...OTHER_COMMAND, repeat: true });
+    elapseRevealDelay();
+    expect(result.current).toBe(false);
+
+    // The Ctrl keyup was swallowed, so the next press arrives without one.
+    key("keydown", "Control", OTHER_COMMAND);
+    elapseRevealDelay();
+    expect(result.current).toBe(true);
   });
 });
 

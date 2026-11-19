@@ -18,7 +18,7 @@
 
 import { isHostRoutingEnabled, resolveWebSocketUrl } from "@/lib/host";
 import { isPageHidden, nextReconnectDelay } from "@/lib/reconnectBackoff";
-import { modalHostId } from "@/lib/sessionHost";
+import { updatesRoutingKey } from "@/lib/sessionHost";
 import type { SessionListWireItem } from "@/lib/sessionListCache";
 
 /** A frame pushed by the server over the updates stream. */
@@ -60,31 +60,26 @@ export const HEALTHY_CONNECTION_MS = 5_000;
  * (whether served by the Omnigent server directly or through the Vite dev proxy),
  * and an embedding host rebases it onto its proxied WS surface.
  *
- * When host routing is enabled, append `?omnigent_slice_key=<frozen modal
- * host>`. A browser WebSocket handshake can't set request headers, so the
- * routing key rides the query string (the same seam the terminal-attach WS
- * uses). This WS watches sessions across MANY hosts, so no single key is
- * "correct" — it's a NICE-TO-HAVE load/perf lever: keying by the modal host
- * (the one backing most of the user's sessions) lands the standing rescan on
- * the replica most likely holding their sessions' tunnels, so the per-session
- * status read hits that replica's warm relay cache instead of the cross-replica
- * fallback, and spreads the standing connections finer than per-tenant.
- * Correctness is unaffected (the rescan reads are replica-safe).
+ * When host routing is enabled, append `?omnigent_slice_key=` (a browser
+ * WebSocket handshake can't set request headers). The key is
+ * {@link updatesRoutingKey}: the modal host (the one backing most of the user's
+ * sessions), or the client's stored key when there is none. Discovery events
+ * (`hosts_changed`, `projects_changed`, `session_added`) reach only streams on
+ * the replica that published them, so the user's streams and the writes that publish them
+ * share that replica, which also holds most of their sessions' tunnels.
  *
- * The key comes from {@link modalHostId}, which is resolved once and never
- * changes for the page — so every auto-reconnect rebuilds the identical URL and
- * never re-keys (no connection churn). The provider only calls `start()` once
- * the modal host is resolved (see `isModalHostResolved`), so this reads a
- * settled value. Omitted on an unsharded server and when no host was picked.
+ * The modal host is resolved once and never changes for the page, so every
+ * auto-reconnect rebuilds the identical URL (no connection churn). The provider
+ * only calls `start()` once the modal host is resolved (see
+ * `isModalHostResolved`), so this reads a settled value.
  *
  * @returns The fully-qualified WebSocket URL.
  */
 function buildUpdatesUrl(): string {
   const path = "/v1/sessions/updates";
   if (!isHostRoutingEnabled()) return resolveWebSocketUrl(path);
-  const sliceKey = modalHostId();
   return resolveWebSocketUrl(
-    sliceKey ? `${path}?omnigent_slice_key=${encodeURIComponent(sliceKey)}` : path,
+    `${path}?omnigent_slice_key=${encodeURIComponent(updatesRoutingKey())}`,
   );
 }
 

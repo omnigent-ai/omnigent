@@ -79,6 +79,9 @@ class TestUnwrapUserQuery:
     def test_strips_injected_attachment_markers(self) -> None:
         raw = "<user_query>\n[Attached: /tmp/x/img.png]\ndescribe this\n</user_query>"
         assert fwd._unwrap_user_query(raw) == "describe this"
+        # Workspace-relative markers are inline "@file" mentions and stay put.
+        inline = "<user_query>\ncompare [Attached: a.ts] with [Attached: b.ts]\n</user_query>"
+        assert fwd._unwrap_user_query(inline) == "compare [Attached: a.ts] with [Attached: b.ts]"
 
     def test_strips_fork_history_preamble_block(self) -> None:
         # A fork into cursor prepends the prior conversation, fenced. The mirror

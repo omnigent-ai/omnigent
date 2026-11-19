@@ -1,6 +1,6 @@
 """Narrow-window layout beside the macOS desktop shell's window controls.
 
-Electron lets the window shrink to 720px, below the SPA's 768px phone-layout
+Electron lets the window shrink to 720px, below the SPA's 1181px mobile-layout
 breakpoint. These tests emulate the macOS shell in Chromium, as
 ``tests/e2e_ui/sessions/test_session_search.py`` does.
 """
@@ -177,7 +177,7 @@ def test_narrow_window_settings_back_row_clears_window_controls(
     page = _open_session_in_mac_shell(request, base_url, session_id)
     aside = _shrink_window_and_open_sidebar(page)
 
-    aside.get_by_test_id("sidebar-settings-float").click()
+    aside.get_by_test_id("sidebar-profile-settings").click()
     back = page.get_by_role("link", name="Back", exact=True)
     expect(back).to_be_visible()
     _hold_for_recording(page)
@@ -218,7 +218,8 @@ def test_narrow_window_title_bar_stays_draggable(
     expect(page.locator('aside[aria-label="Conversations"]')).to_have_attribute(
         "data-collapsed", "true"
     )
-    # The drawer slide and scrim fade can end a frame apart; sample once both have settled.
+    # The docked sidebar's width and fade transitions can end a frame apart; sample once
+    # both have settled.
     page.wait_for_function(
         "() => !document.getAnimations().some((animation) => animation instanceof CSSTransition)"
     )

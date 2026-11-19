@@ -67,6 +67,17 @@ it("omits hidden sub-agent wakes from visible row geometry", () => {
   expect(vi.mocked(useVirtualizer).mock.lastCall?.[0].count).toBe(3);
 });
 
+it("drops messages from other sessions only when they are hidden", () => {
+  const peer: Bubble = {
+    kind: "user",
+    itemId: "peer",
+    content: [{ type: "input_text", text: "[Message from session s_src]\nreport" }],
+  };
+  const bubbles = [bubble, peer, assistantBubble];
+  expect(visibleTranscriptBubbles(bubbles)).toBe(bubbles);
+  expect(visibleTranscriptBubbles(bubbles, true)).toEqual([bubble, assistantBubble]);
+});
+
 function list(
   hasTasks: boolean,
   scrollEl: HTMLElement,
@@ -295,11 +306,11 @@ it("keeps every action row hover-only when the final message is from the user", 
 
 it("toggles mobile message actions on tap and shows the latest assistant's actions by default", async () => {
   const user = userEvent.setup();
-  const mediaQuery = window.matchMedia("(max-width: 767.98px)");
+  const mediaQuery = window.matchMedia("(max-width: 1180.98px)");
   const matchMedia = vi.spyOn(window, "matchMedia").mockImplementation((query) => ({
     ...mediaQuery,
     media: query,
-    matches: query === "(max-width: 767.98px)",
+    matches: query === "(max-width: 1180.98px)",
   }));
   try {
     const olderReply = {

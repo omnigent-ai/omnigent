@@ -1,18 +1,17 @@
-// Tracks whether the platform command modifier (⌘ on macOS, Ctrl elsewhere) is
-// held on its own, so shortcut hints can show while it is down. In a browser tab,
-// where the session chord is ⌘⌥digit, Alt may join the hold; in the desktop app
-// Alt ends it like any other key. Shift and AltGraph always end it.
+// Tracks whether the command modifier (⌘ on macOS, Ctrl elsewhere) is held, so shortcut hints
+// can show. Shift, Control beside ⌘ on macOS, and Alt in a browser tab (whose session chord is
+// ⌘⌥digit) may join the hold; any other key, including AltGraph, ends it.
 
 import { useEffect } from "react";
 import { create } from "zustand";
-import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
+import { isMacPlatform } from "@/lib/hotkeys";
 import { isNativeShell } from "@/lib/nativeBridge";
 
 /** Hold time before hints show, so a quick chord such as ⌘C never flashes them. */
 export const COMMAND_HOLD_REVEAL_DELAY_MS = 400;
 
 interface CommandHoldState {
-  /** True once the command modifier has been held alone for the reveal delay. */
+  /** True once the command modifier has been held for the reveal delay. */
   held: boolean;
 }
 
@@ -35,12 +34,19 @@ export function useCommandHoldTracking(
 ): void {
   useEffect(() => {
     const commandKey = isMac ? "Meta" : "Control";
+    // Modifier keys that may be down during a hold. Off macOS, Meta opens OS menus.
+    const joiningKeys = new Set([commandKey, "Shift"]);
+    if (isMac) joiningKeys.add("Control");
+    if (altJoinsHold) joiningKeys.add("Alt");
     let revealTimer: ReturnType<typeof setTimeout> | undefined;
     // Other keys still down, which block the hints: those pressed without the
     // modifier, and those pressed during a chord (macOS may drop their keyup).
     const heldKeys = new Set<string>();
     const chordKeys = new Set<string>();
     const keyId = (e: globalThis.KeyboardEvent): string => e.code || e.key;
+    // A hold canceled by another key stays canceled until the command key is released or
+    // pressed afresh, so a joining modifier pressed afterwards cannot revive it.
+    let holdCanceled = false;
 
     const clearHold = (): void => {
       clearTimeout(revealTimer);
@@ -50,11 +56,13 @@ export function useCommandHoldTracking(
     const reset = (): void => {
       heldKeys.clear();
       chordKeys.clear();
+      holdCanceled = false;
       clearHold();
     };
-    // The command modifier, with Alt only where it joins: no Shift, no AltGraph.
-    const isCommandOnlyHold = (e: globalThis.KeyboardEvent): boolean => {
-      if (e.shiftKey || !hasCommandModifier(e, isMac)) return false;
+    // The command modifier down, with only joining modifiers beside it.
+    const isCommandHold = (e: globalThis.KeyboardEvent): boolean => {
+      const commandDown = isMac ? e.metaKey : e.ctrlKey && !e.metaKey;
+      if (!commandDown) return false;
       if (e.altKey && !altJoinsHold) return false;
       // AltGr reports as Ctrl+Alt on Windows/Linux intl layouts. Feature-detect
       // like useSessionNumberHotkeys so synthetic events without the method work.
@@ -62,19 +70,22 @@ export function useCommandHoldTracking(
       return !altGraph;
     };
     const onKeyDown = (e: globalThis.KeyboardEvent): void => {
-      // Only the command modifier (and Alt, where it joins) may join a hold.
-      const joinsHold = e.key === commandKey || (altJoinsHold && e.key === "Alt");
+      // A non-repeat command keydown starts a new hold, recovering from a missed keyup.
+      if (e.key === commandKey && !e.repeat) holdCanceled = false;
+      const joinsHold = joiningKeys.has(e.key);
+      // The physical modifier, not shortcut eligibility: ⌃⌘K still drops K's keyup.
+      const commandDown = isMac ? e.metaKey : e.ctrlKey;
       if (!joinsHold && !heldKeys.has(keyId(e))) {
-        // The physical modifier, not shortcut eligibility: ⌃⌘K still drops K's keyup.
-        const commandDown = isMac ? e.metaKey : e.ctrlKey;
         (commandDown ? chordKeys : heldKeys).add(keyId(e));
       }
-      if (!joinsHold || !isCommandOnlyHold(e)) {
+      if (!joinsHold || !isCommandHold(e)) {
+        if (commandDown) holdCanceled = true;
         clearHold();
         return;
       }
       const keysDown = heldKeys.size + chordKeys.size;
-      if (keysDown === 0 && revealTimer === undefined && !useCommandHoldStore.getState().held) {
+      const idle = revealTimer === undefined && !useCommandHoldStore.getState().held;
+      if (keysDown === 0 && idle && !holdCanceled) {
         revealTimer = setTimeout(() => {
           revealTimer = undefined;
           setHeld(true);
@@ -88,10 +99,11 @@ export function useCommandHoldTracking(
         // macOS sends no keyup for keys released while ⌘ is down, so its release
         // forgets the chord's keys. Keys held from before ⌘ still block.
         if (isMac) chordKeys.clear();
+        holdCanceled = false;
         clearHold();
       }
-      // Releasing a joining Alt keeps the hold. A keyup never starts one.
-      else if (!isCommandOnlyHold(e)) clearHold();
+      // Releasing a joining modifier keeps the hold. A keyup never starts one.
+      else if (!isCommandHold(e)) clearHold();
     };
     const onVisibilityChange = (): void => {
       if (document.visibilityState === "hidden") reset();

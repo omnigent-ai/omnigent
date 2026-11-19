@@ -69,8 +69,8 @@ def _pill(page: Page, count: int) -> Locator:
 
 
 @pytest.mark.browser_context_args(has_touch=True)
-@pytest.mark.parametrize("width", [320, 390, 1024])
-def test_touch_screens_reveal_timestamps_and_pending_steering(
+@pytest.mark.parametrize("width", [320, 390])
+def test_mobile_layout_reveals_timestamps_and_pending_steering(
     page: Page, chat_session_contract: ChatSessionContract, width: int
 ) -> None:
     chat = chat_session_contract
@@ -373,7 +373,7 @@ def test_action_banner_follows_the_launch(
     banner = page.get_by_role("status").filter(has_text="Refresh your dbcert on your laptop.")
     expect(banner).to_be_visible(timeout=20_000)
 
-    # The dbcert arrives. Like the server, update the snapshot as well as the stream.
+    # The credential arrives. Like the server, update the snapshot as well as the stream.
     chat.update_session(sandbox_status={"stage": "provisioning", "provider": "arclet"})
     chat.emit(
         {
@@ -464,7 +464,7 @@ def test_background_task_popover_stays_interactive_and_within_viewport(
     _background_status(chat, 1, [_MONITOR_TASK])
 
     def activate(control: Locator) -> None:
-        if width < 768:
+        if width < 1181:
             control.tap()
         else:
             control.click()

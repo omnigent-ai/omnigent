@@ -10,11 +10,13 @@ and expired holds still fail as before.
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 import pytest
 
 from omnigent.harnesses.claude_native.bridge import (
+    REQUEST_SESSION_ID_ENV_VAR,
     ClaudeComposerNotCleared,
     ClaudeInputBoxOccupied,
     ClaudeTerminalDialog,
@@ -176,6 +178,35 @@ async def test_repeated_prompts_share_one_hold(pane: _Pane, tmp_path: Path) -> N
     assert events == [TurnComplete(response=None)]
     assert pane.delivered == ["hello from the web"]
     assert pane.deliveries == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refusal", [True, ClaudeComposerNotCleared(_NOT_CLEARED)])
+async def test_clearing_a_held_conversation_does_not_deliver_into_its_replacement(
+    pane: _Pane, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refusal: bool | Exception
+) -> None:
+    """An answered prompt must not replay the old conversation's held message after /clear."""
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    active_session = bridge_dir / "bridge.json"
+    active_session.write_text(json.dumps({"active_session_id": "old-session"}))
+    monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, "old-session")
+    pane.refusals = [refusal]
+
+    def prompt_cleared(*_args: object, **_kwargs: object) -> bool:
+        active_session.write_text(json.dumps({"active_session_id": "new-session"}))
+        return not isinstance(refusal, bool)
+
+    monkeypatch.setattr(claude_native_executor, "has_pending_user_prompt", prompt_cleared)
+    monkeypatch.setattr(claude_native_executor, "input_box_reads_clear", prompt_cleared)
+    events = await _run(tmp_path)
+
+    assert pane.deliveries == 1
+    assert pane.delivered == []
+    assert pane.kills == 0
+    assert len(events) == 1 and isinstance(events[0], ExecutorError)
+    assert events[0].undelivered is True
+    assert "no longer active after /clear" in events[0].message
 
 
 @pytest.mark.asyncio
