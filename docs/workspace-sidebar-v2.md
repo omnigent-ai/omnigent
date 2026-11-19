@@ -39,23 +39,21 @@ verifies it on every call. Other clients go through the server, which
 authorizes the call itself and tunnels it to the host without a token.
 `docs/workspace-fast-track.md` describes these routes and their flags.
 
-Being added:
+Being added, in this order:
 
-- A Rust workspace helper, shipped as the `omnigent-workspace-helper` binary
-  wheel through an omnigent extra. The host starts it on first use and stops
-  it when idle. The host still authorizes each request, then forwards only an
-  allowlist of read-only calls to the helper.
-- Search, and the git calls the Diffs page needs, in the workspace API. Git
-  runs with the programs a repository's config can name turned off (external
-  diff commands, textconv drivers and filesystem-monitor hooks), so a read
-  never runs code the repository chose.
-
-Without the helper, file reads fall back to the host's Python reader, then to
-the REST file routes.
+1. The sidebar's web code, with the Diffs page's git calls stubbed until hosts
+   serve them.
+2. Search and those git calls in the workspace API, written in plain Python on
+   the host. Git runs with the programs a repository's config can name turned
+   off (external diff commands, textconv drivers and filesystem-monitor
+   hooks), so a read never runs code the repository chose.
+3. Later, and optionally, a Rust workspace helper for speed, taking over one
+   method at a time. The host would still authorize each call and forward
+   only read-only methods to it.
 
 Clients ask a host which workspace API methods it serves before calling a new
-one. A host that doesn't list search answers from the REST search routes, and
-its file reads are unaffected.
+one. When a host doesn't list search, the sidebar uses the REST search routes;
+file reads are unaffected.
 
 ## npm dependencies
 
