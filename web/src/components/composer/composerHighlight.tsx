@@ -226,8 +226,11 @@ export function useComposerHighlight({
           {shell ? "Shell command" : ""}
         </span>
         {shell && (
+          // Hidden from reading order so the live region is its only announcement; the
+          // input still names it as its description.
           <div
             id={hintId}
+            aria-hidden
             data-testid="composer-shell-mode-indicator"
             className="flex items-center gap-1 pt-1 text-xs text-brand-accent"
           >

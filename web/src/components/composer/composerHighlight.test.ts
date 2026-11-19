@@ -127,6 +127,11 @@ describe("useComposerHighlight shell hint", () => {
     // Same node, so assistive tech sees a text change rather than a new region.
     expect(screen.getByTestId("composer-shell-mode-status")).toBe(status);
     expect(status).toHaveTextContent("Shell command");
+    // The visible hint stays out of reading order, so the mode is announced once.
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toHaveAttribute(
+      "aria-hidden",
+      "true",
+    );
   });
 });
 
