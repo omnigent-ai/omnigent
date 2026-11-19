@@ -41,6 +41,7 @@ import {
   type StreamdownProps,
 } from "streamdown";
 
+import { rehypeMessageDirection } from "./messageDirection";
 import { MarkdownErrorBoundary } from "./MarkdownErrorBoundary";
 import { mermaidOptionsForTheme } from "./MermaidError";
 import { FullscreenIcon, isMermaidPre, MermaidBlock, MERMAID_NO_FULLSCREEN } from "./MermaidBlock";
@@ -792,6 +793,11 @@ export const MessageResponse = memo(
     else if (allowGitHubAttachmentImages)
       rehypePlugins = GITHUB_ATTACHMENT_STREAMDOWN_REHYPE_PLUGINS;
 
+    const directionalRehypePlugins = useMemo(
+      () => [...rehypePlugins, rehypeMessageDirection],
+      [rehypePlugins],
+    );
+
     return (
       <MarkdownErrorBoundary source={props.children}>
         <ShellCommandContext.Provider value={shellAction}>
@@ -816,7 +822,7 @@ export const MessageResponse = memo(
                 controls={messageControls}
                 mermaid={mermaidOptions}
                 // Block remote image fetches that can exfiltrate data through URLs.
-                rehypePlugins={rehypePlugins}
+                rehypePlugins={directionalRehypePlugins}
               />
             </StreamingTextContext.Provider>
           </LocalReviewCommentRendererContext.Provider>

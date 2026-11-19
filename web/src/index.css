@@ -1825,6 +1825,21 @@ html[data-electron-mac] .breadcrumb-folder {
   }
 }
 
+/* Keep mixed-direction prose readable without reordering code and URL tokens. */
+.message-markdown :is(code, pre) {
+  direction: ltr;
+  unicode-bidi: isolate;
+}
+.message-markdown a {
+  unicode-bidi: isolate;
+}
+.message-markdown :is(ul, ol) {
+  padding-inline: 0;
+}
+.message-markdown li {
+  margin-inline-start: 1.5rem;
+}
+
 /* Geist Mono renders wider than Geist Sans at the same point size, making
  * streamdown's default text-sm inline code and code blocks look larger than
  * the surrounding prose. Scale both down to ~87.5 % of the parent font size

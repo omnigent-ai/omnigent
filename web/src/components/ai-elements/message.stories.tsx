@@ -140,3 +140,36 @@ export const BranchedDisplayMath: Story = {
     </div>
   ),
 };
+
+export const BidirectionalMessages: Story = {
+  render: () => (
+    <div className="w-[760px] max-w-full space-y-6">
+      <Message from="user">
+        <MessageContent>
+          <MessageResponse>תבדוק עכשיו את החיבור ל־GitHub.</MessageResponse>
+        </MessageContent>
+      </Message>
+      <Message from="assistant" className="max-w-full">
+        <MessageContent className="w-full">
+          <MessageResponse>
+            {[
+              "## בדיקת החיבור",
+              "",
+              "החיבור ל־`example/repository` עובד דרך **SSH**, ואפשר לבצע push ל־[GitHub](https://example.com).",
+              "",
+              "English stays left-to-right, including `git status` and https://example.com.",
+              "",
+              "- פריט ראשון בעברית עם `git push`.",
+              "- عنصر بالعربية مع رابط [Example](https://example.com).",
+              "",
+              "```sh",
+              "git status",
+              "git push origin feature/example",
+              "```",
+            ].join("\n")}
+          </MessageResponse>
+        </MessageContent>
+      </Message>
+    </div>
+  ),
+};

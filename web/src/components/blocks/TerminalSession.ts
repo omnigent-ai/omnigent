@@ -312,6 +312,21 @@ interface TerminalCore {
   };
 }
 
+const RTL_TERMINAL_WORD = String.raw`[\p{Script=Hebrew}\p{Script=Arabic}][\p{Script=Hebrew}\p{Script=Arabic}\p{Mark}\u200c\u200d]*`;
+const RTL_TERMINAL_PHRASE = new RegExp(
+  `${RTL_TERMINAL_WORD}(?:(?:\\p{P}|\\p{N}| (?! ))+${RTL_TERMINAL_WORD})*`,
+  "gu",
+);
+
+/** Shape adjacent RTL words together; keep terminal columns and LTR tokens separate. */
+export function rtlCharacterJoinRanges(text: string): [number, number][] {
+  const ranges: [number, number][] = [];
+  for (const match of text.matchAll(RTL_TERMINAL_PHRASE)) {
+    if (match[0].length > 1) ranges.push([match.index, match.index + match[0].length]);
+  }
+  return ranges;
+}
+
 /**
  * Load the WebGL renderer onto *term*, returning the addon or ``null``
  * when WebGL is unavailable and the DOM renderer stays in use.
@@ -751,6 +766,7 @@ export class TerminalSession {
     // renders them as plain text.
     this.term.registerLinkProvider(new TerminalLinkProvider(this.term, activateLink));
     this.term.open(container);
+    this.term.registerCharacterJoiner(rtlCharacterJoinRanges);
     // Load the GPU renderer after open() (it needs the mounted canvas).
     // Falls back to the DOM renderer when WebGL is unavailable.
     this.webgl = loadWebglRenderer(this.term);
