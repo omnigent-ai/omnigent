@@ -77,33 +77,46 @@ const mentionTokensFacet = Facet.define<readonly string[], readonly string[]>({
 });
 
 /**
- * Paints each tagged mention token as a mark, rebuilt when the text or the tokens change. The
- * marks are atomic, so the caret, selection and deletion treat a token as one character.
+ * Paints the spans `findSpans` finds in the editor's text, rebuilt when the text or the facet's
+ * value changes. Atomic spans make the caret, selection and deletion treat each as one character.
  */
+function tokenDecorationField<Value>(
+  facet: Facet<Value, Value>,
+  mark: Decoration,
+  findSpans: (text: string, value: Value) => readonly TokenSpan[],
+  atomic: boolean,
+): Extension {
+  const build = (state: EditorState): DecorationSet =>
+    Decoration.set(
+      findSpans(state.doc.toString(), state.facet(facet)).map((span) =>
+        mark.range(span.start, span.end),
+      ),
+    );
+  return StateField.define<DecorationSet>({
+    create: build,
+    update(decorations, transaction) {
+      const valueChanged = transaction.startState.facet(facet) !== transaction.state.facet(facet);
+      return transaction.docChanged || valueChanged ? build(transaction.state) : decorations;
+    },
+    provide: (decorated) => [
+      EditorView.decorations.from(decorated),
+      ...(atomic ? [EditorView.atomicRanges.of((view) => view.state.field(decorated))] : []),
+    ],
+  });
+}
+
+/** Paints each tagged mention token, atomic so a token acts as one character. */
 function mentionTokenField(environment: CodeMirrorComposerEnvironment): Extension {
   const mark = Decoration.mark({
     class: environment.mentionTokenClass,
     attributes: { "data-testid": "composer-mention-token" },
   });
-  const build = (state: EditorState): DecorationSet => {
-    const tokens = state.facet(mentionTokensFacet);
-    if (tokens.length === 0) return Decoration.none;
-    const spans = environment.findMentionTokens(state.doc.toString(), tokens);
-    return Decoration.set(spans.map((span) => mark.range(span.start, span.end)));
-  };
-  return StateField.define<DecorationSet>({
-    create: build,
-    update(decorations, transaction) {
-      const tokensChanged =
-        transaction.startState.facet(mentionTokensFacet) !==
-        transaction.state.facet(mentionTokensFacet);
-      return transaction.docChanged || tokensChanged ? build(transaction.state) : decorations;
-    },
-    provide: (decorated) => [
-      EditorView.decorations.from(decorated),
-      EditorView.atomicRanges.of((view) => view.state.field(decorated)),
-    ],
-  });
+  return tokenDecorationField(
+    mentionTokensFacet,
+    mark,
+    (text, tokens) => environment.findMentionTokens(text, tokens),
+    true,
+  );
 }
 
 /** The command token the editor paints; reconfigured through a compartment when it changes. */
@@ -128,20 +141,15 @@ function commandTokenField(environment: CodeMirrorComposerEnvironment): Extensio
     class: environment.commandTokenClass,
     attributes: { "data-testid": "composer-command-token" },
   });
-  const build = (state: EditorState): DecorationSet => {
-    const span = leadingCommandSpan(state.doc.toString(), state.facet(commandTokenFacet));
-    return span ? Decoration.set([mark.range(span.start, span.end)]) : Decoration.none;
-  };
-  return StateField.define<DecorationSet>({
-    create: build,
-    update(decorations, transaction) {
-      const tokenChanged =
-        transaction.startState.facet(commandTokenFacet) !==
-        transaction.state.facet(commandTokenFacet);
-      return transaction.docChanged || tokenChanged ? build(transaction.state) : decorations;
+  return tokenDecorationField(
+    commandTokenFacet,
+    mark,
+    (text, token) => {
+      const span = leadingCommandSpan(text, token);
+      return span ? [span] : [];
     },
-    provide: (decorated) => EditorView.decorations.from(decorated),
-  });
+    false,
+  );
 }
 
 /** Whether `binding` claims a chord with both Control and Option, which VoiceOver owns. */

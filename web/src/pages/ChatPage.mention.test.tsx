@@ -1068,6 +1068,11 @@ describe("Composer @-file mentions with the CodeMirror composer", () => {
     fireEvent.click(screen.getByTitle("Attach readme.md"));
 
     expect(editor.closest('[data-composer-engine="codemirror"]')).not.toBeNull();
-    expect(tokens()).toEqual(["@readme.md"]);
+    expect(
+      Array.from(
+        editor.querySelectorAll('[data-testid="composer-mention-token"]'),
+        (token) => token.textContent,
+      ),
+    ).toEqual(["@readme.md"]);
   });
 });

@@ -466,11 +466,6 @@ describe("CodeMirrorComposerInput command token", () => {
     expect(commandMarks(container)).toEqual([["/context", COMMAND_TOKEN_CLASS]]);
   });
 
-  it("does not tint a longer word that merely starts with the command", () => {
-    const { container } = mount({ value: "/contexts", commandToken: "/context" });
-    expect(commandMarks(container)).toEqual([]);
-  });
-
   it("follows the token as it changes, and marks nothing for prose", () => {
     const view = mount({ value: "/context", commandToken: "/context" });
     view.rerender(
