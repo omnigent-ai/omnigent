@@ -1040,7 +1040,15 @@ export function useUpdateSessionPr(conversationId: string) {
       updateSessionPr(conversationId, body),
     onSuccess: async (info, body) => {
       await queryClient.cancelQueries({ queryKey: ["github-info", conversationId] });
-      queryClient.setQueryData(["github-info", conversationId], info);
+      // An attach reply reads only that PR; attaching doesn't change the workspace's repo.
+      const workspaceRepo = queryClient.getQueryData<PullRequestInfo>([
+        "github-info",
+        conversationId,
+      ])?.workspace_repo;
+      queryClient.setQueryData(
+        ["github-info", conversationId],
+        info.workspace_repo || !workspaceRepo ? info : { ...info, workspace_repo: workspaceRepo },
+      );
       if (info.selected_pr_url) {
         queryClient.setQueryData(["github-info", conversationId, info.selected_pr_url], info);
       }
