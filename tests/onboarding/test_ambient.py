@@ -944,7 +944,7 @@ def test_claude_sideload_flags_disabled_requires_managed_boolean_true(
 ) -> None:
     """Only an explicit managed boolean true disables Omnigent plugin flags."""
     payload = {} if value is None else {"disableSideloadFlags": value}
-    path = clean_env / "remote-settings.json"
+    path = clean_env / "managed-settings.json"
     path.write_text(json.dumps(payload))
 
     assert ambient.claude_sideload_flags_disabled((path,)) is expected
@@ -954,10 +954,18 @@ def test_remote_sideload_policy_is_ignored(
     clean_env, monkeypatch
 ) -> None:
     """Claude's cached remote policy does not apply to Omnigent sessions."""
-    remote = clean_env / "remote-settings.json"
+    remote = clean_env / ".claude" / "remote-settings.json"
+    remote.parent.mkdir()
     remote.write_text(json.dumps({"disableSideloadFlags": True}))
-    monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", ())
+    managed = clean_env / "managed-settings.json"
+    managed.write_text("{}")
+    monkeypatch.setattr(
+        ambient,
+        "CLAUDE_CODE_MANAGED_SETTINGS_PATHS",
+        (managed, clean_env / "missing-managed-settings.json"),
+    )
 
+    assert remote not in ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS
     assert ambient.claude_sideload_flags_disabled() is False
     assert ambient.claude_managed_gateway() == (None, False)
 
