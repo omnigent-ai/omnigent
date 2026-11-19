@@ -1220,10 +1220,10 @@ function SideChatComposer({
     commandNames: menuCommandNames,
     enabled: quotes.length === 0 && files.length === 0,
     nativeShell,
-    // A grid cell appends review comments at send, which can make a bare `!` a command.
+    // Classify what is sent: trimmed, and in a grid cell with review comments appended.
     classifyValue: gridCell
       ? buildOutgoingMessage({ quotes, text }, outgoingText, sendContext).text
-      : undefined,
+      : outgoingText,
     // Tagged mentions aren't painted as pills here.
     mentionTokens: [],
     textareaRef: tailTextareaRef,

@@ -2970,6 +2970,20 @@ describe("side-chat composer highlight", () => {
     expect(send.mock.calls[0]?.[0]).toBe("!git status");
   });
 
+  it("classifies a `!` draft by the trimmed text it sends", () => {
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+    renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId("side-chat-input");
+    // JS trimming drops U+FEFF but Python's doesn't, so the raw draft alone reads as a command.
+    fireEvent.change(input, { target: { value: "!\ufeff" } });
+    expect(screen.queryByTestId("composer-shell-mode-indicator")).toBeNull();
+    expect(input).not.toHaveAttribute("data-shell-command");
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(send).toHaveBeenCalledExactlyOnceWith("!", "agent_side", undefined, {
+      pinnedConversationId: childId,
+    });
+  });
+
   it("does not offer shell mode to a codex-native non-owner", () => {
     mockSession.snapshot = { permissionLevel: 2 };
     renderPane(<SideChatPane childId={childId} />);
