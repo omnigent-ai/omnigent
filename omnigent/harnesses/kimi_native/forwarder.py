@@ -26,10 +26,9 @@ narrow it further. Relevant wire events:
   ids; they also keep the in-flight tool count for the hung-tool watchdog.
 - ``{"type": "turn.ended", "reason": "completed" | "failed" | "cancelled", …}``
   → the authoritative terminal record for a turn, posted with an explicit
-  ``turn_outcome`` (any other reason is reported as failed). Failed and
-  cancelled turns emit no ``step.end`` at all (see ``tests/fixtures/kimi_wire``),
-  so ``step.end`` finish reasons are never treated as turn edges. A quiet wire
-  never ends a turn; only pane death or a hung tool closes one without a record.
+  ``turn_outcome`` (any other reason is reported as failed). ``step.end`` may
+  be absent or present and never drives a turn edge. A quiet wire never ends a
+  turn; only pane death or a hung tool closes one without a record.
 - ``{"type": "usage.record", "model": …, "usage": {"inputOther", "output",
   "inputCacheRead", "inputCacheCreation"}, "usageScope": "turn"}`` → token
   usage for one LLM call. Accumulated into per-session cumulative totals and
@@ -762,8 +761,8 @@ def _row_to_item(line_no: int, row: dict[str, object]) -> KimiWireItem | None:
             time_ms=_token_count(row.get("time")),
         )
     if row_type == "turn.ended":
-        # The authoritative terminal record: failed and cancelled turns write no
-        # step.end at all, so step.end finish reasons never drive turn edges.
+        # The authoritative terminal record; step.end may be absent or present
+        # and never drives a turn edge.
         # ``time`` rides along (real 0.34.0 rows carry it) so the forward loop
         # can drop a resumed wire's HISTORICAL edges instead of replaying a
         # dead turn's terminal status over a live one.
@@ -2082,7 +2081,8 @@ async def forward_kimi_wire_to_session(
                                     # The turn's true outcome is known; hand it
                                     # to the fallback close.
                                     dropped_edge_status = item.outcome or "failed"
-                                    dropped_edge_output = item.text
+                                    # A failed edge keeps its full detail for the fallback body.
+                                    dropped_edge_output = item.failure_detail or item.text
                                     tools_in_flight = 0
                                     usage_sync.note_turn_boundary()
                                 _note_tool_consumed(item)
