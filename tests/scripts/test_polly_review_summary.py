@@ -277,6 +277,129 @@ def _resolved_destinations(tokens: list) -> list[tuple[str, str]]:
     ]
 
 
+def _check_inline_code_context(
+    table_variant: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from markdown_it import MarkdownIt
+
+    short = table_variant.startswith("short-")
+    variant = table_variant.removeprefix("short-")
+    parser = MarkdownIt("commonmark").enable("table")
+    metadata = {"head_sha": "a" * 40, "run_id": "10-1", "run_url": "https://example.test/run"}
+    summary = {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+    assessment = _REVIEW.replace("::test_empty", f"::test_empty[{table_variant}]")
+    marker = "``" if variant.endswith("-double") else "`"
+    literal = r"&amp; \* literal" + (" ` tick" if len(marker) == 2 else "")
+    construct = marker + literal + marker
+    if variant == "inline-code-oversized":
+        expected_code = ["x" * 70000 + " " + literal]
+        rationale = marker + expected_code[0] + marker
+    elif short:
+        expected_code = [literal]
+        rationale = construct + "prose"
+    else:
+        calibration = _HELPERS["compose_review"](
+            assessment.replace("Guards the regression.", "x" * 130000), summary
+        )
+        padding = [
+            token.content
+            for comment in _HELPERS["review_comments"](calibration, **metadata)
+            for tokens in [parser.parse(comment)]
+            for index, token in enumerate(tokens)
+            if token.type == "inline" and tokens[index - 1].type == "td_open"
+        ][4]
+        assert padding and set(padding) == {"x"}
+        if variant == "inline-code-repeated":
+            unit = construct + "prose"
+            rationale = "x" * ((len(padding) - len(marker) - 3) % len(unit)) + unit * 3000
+            expected_code = [literal] * 3000
+        else:
+            rationale = "x" * (len(padding) - len(marker) - 3) + construct + "prose" + "y" * 70000
+            expected_code = [literal]
+    review = _HELPERS["compose_review"](
+        assessment.replace("Guards the regression.", rationale), summary
+    )
+    original = parser.parse(review)
+    cells = [
+        token
+        for index, token in enumerate(original)
+        if token.type == "inline" and original[index - 1].type == "td_open"
+    ]
+    assert len(cells) == 5
+    assert [
+        child.content for child in cells[4].children if child.type == "code_inline"
+    ] == expected_code
+    assert (len(review.encode("utf-8")) < 60000) == short
+    review_path, receipt, posts = _prepare_publication(
+        tmp_path, monkeypatch, head_sha=metadata["head_sha"], run_url=metadata["run_url"]
+    )
+    try:
+        comments = _published_comments(review, review_path, receipt)
+    except ValueError as error:
+        assert variant == "inline-code-oversized" and not short
+        assert str(error) == (
+            "Polly review table row cannot continue within comment capacity "
+            "without five parsed fields."
+        )
+        assert not posts and not receipt.exists()
+        assert sorted(path.name for path in tmp_path.iterdir()) == ["review.md"]
+        return
+    assert posts == comments[1:] + comments[:1]
+    assert receipt.read_text() == metadata["head_sha"] + "\n"
+    assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
+    assert sum(comment.count("<!-- polly-reviewed-sha:") for comment in comments) == 1
+    rendered = [parser.parse(comment) for comment in comments]
+    rendered_cells = []
+    for tokens in rendered:
+        footer = [
+            token
+            for token in tokens
+            if token.type == "inline" and "Automated review by Polly" in token.content
+        ]
+        assert len(footer) == 1
+        assert any(
+            child.type == "html_inline" and child.content == "<sub>"
+            for child in footer[0].children
+        )
+        data = [
+            token
+            for index, token in enumerate(tokens)
+            if token.type == "inline" and tokens[index - 1].type == "td_open"
+        ]
+        if not data:
+            continue
+        assert len(data) == 5
+        assert [token.content for token in data[:4]] == [token.content for token in cells[:4]]
+        assert [
+            token.content
+            for index, token in enumerate(tokens)
+            if token.type == "inline" and tokens[index - 1].type == "th_open"
+        ] == [
+            token.content
+            for index, token in enumerate(original)
+            if token.type == "inline" and original[index - 1].type == "th_open"
+        ]
+        rendered_cells.append(data[4])
+    assert [
+        child.content
+        for cell in rendered_cells
+        for child in cell.children
+        if child.type == "code_inline"
+    ] == expected_code, "A cut changed literal inline-code content or backtick pairing"
+    assert "".join(child.content for cell in rendered_cells for child in cell.children) == "".join(
+        child.content for child in cells[4].children
+    ), "A cut changed parsed code/prose meaning"
+    assert variant != "inline-code-oversized", (
+        "An oversized atomic code span must refuse publication"
+    )
+    if short:
+        assert len(comments) == 1
+        assert comments[0].split("Polly AI Review\n\n", 1)[1].rsplit("\n---\n", 1)[0] == review
+    else:
+        assert 1 < len(comments) <= _HELPERS["MAX_REVIEW_PARTS"]
+    return
+
+
 def _check_review_context(
     table_variant: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -286,125 +409,6 @@ def _check_review_context(
 
     short = table_variant.startswith("short-")
     variant = table_variant.removeprefix("short-")
-    if variant.startswith("inline-code-"):
-        parser = MarkdownIt("commonmark").enable("table")
-        metadata = {"head_sha": "a" * 40, "run_id": "10-1", "run_url": "https://example.test/run"}
-        summary = {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
-        assessment = _REVIEW.replace("::test_empty", f"::test_empty[{table_variant}]")
-        marker = "``" if variant.endswith("-double") else "`"
-        literal = r"&amp; \* literal" + (" ` tick" if len(marker) == 2 else "")
-        construct = marker + literal + marker
-        if variant == "inline-code-oversized":
-            expected_code = ["x" * 70000 + " " + literal]
-            rationale = marker + expected_code[0] + marker
-        elif short:
-            expected_code = [literal]
-            rationale = construct + "prose"
-        else:
-            calibration = _HELPERS["compose_review"](
-                assessment.replace("Guards the regression.", "x" * 130000), summary
-            )
-            padding = [
-                token.content
-                for comment in _HELPERS["review_comments"](calibration, **metadata)
-                for tokens in [parser.parse(comment)]
-                for index, token in enumerate(tokens)
-                if token.type == "inline" and tokens[index - 1].type == "td_open"
-            ][4]
-            assert padding and set(padding) == {"x"}
-            if variant == "inline-code-repeated":
-                unit = construct + "prose"
-                rationale = "x" * ((len(padding) - len(marker) - 3) % len(unit)) + unit * 3000
-                expected_code = [literal] * 3000
-            else:
-                rationale = (
-                    "x" * (len(padding) - len(marker) - 3) + construct + "prose" + "y" * 70000
-                )
-                expected_code = [literal]
-        review = _HELPERS["compose_review"](
-            assessment.replace("Guards the regression.", rationale), summary
-        )
-        original = parser.parse(review)
-        cells = [
-            token
-            for index, token in enumerate(original)
-            if token.type == "inline" and original[index - 1].type == "td_open"
-        ]
-        assert len(cells) == 5
-        assert [
-            child.content for child in cells[4].children if child.type == "code_inline"
-        ] == expected_code
-        assert (len(review.encode("utf-8")) < 60000) == short
-        review_path, receipt, posts = _prepare_publication(
-            tmp_path, monkeypatch, head_sha=metadata["head_sha"], run_url=metadata["run_url"]
-        )
-        try:
-            comments = _published_comments(review, review_path, receipt)
-        except ValueError as error:
-            assert variant == "inline-code-oversized" and not short
-            assert str(error) == (
-                "Polly review table row cannot continue within comment capacity "
-                "without five parsed fields."
-            )
-            assert not posts and not receipt.exists()
-            assert sorted(path.name for path in tmp_path.iterdir()) == ["review.md"]
-            return
-        assert posts == comments[1:] + comments[:1]
-        assert receipt.read_text() == metadata["head_sha"] + "\n"
-        assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
-        assert sum(comment.count("<!-- polly-reviewed-sha:") for comment in comments) == 1
-        rendered = [parser.parse(comment) for comment in comments]
-        rendered_cells = []
-        for tokens in rendered:
-            footer = [
-                token
-                for token in tokens
-                if token.type == "inline" and "Automated review by Polly" in token.content
-            ]
-            assert len(footer) == 1
-            assert any(
-                child.type == "html_inline" and child.content == "<sub>"
-                for child in footer[0].children
-            )
-            data = [
-                token
-                for index, token in enumerate(tokens)
-                if token.type == "inline" and tokens[index - 1].type == "td_open"
-            ]
-            if not data:
-                continue
-            assert len(data) == 5
-            assert [token.content for token in data[:4]] == [token.content for token in cells[:4]]
-            assert [
-                token.content
-                for index, token in enumerate(tokens)
-                if token.type == "inline" and tokens[index - 1].type == "th_open"
-            ] == [
-                token.content
-                for index, token in enumerate(original)
-                if token.type == "inline" and original[index - 1].type == "th_open"
-            ]
-            rendered_cells.append(data[4])
-        assert [
-            child.content
-            for cell in rendered_cells
-            for child in cell.children
-            if child.type == "code_inline"
-        ] == expected_code, "A cut changed literal inline-code content or backtick pairing"
-        assert "".join(
-            child.content for cell in rendered_cells for child in cell.children
-        ) == "".join(child.content for child in cells[4].children), (
-            "A cut changed parsed code/prose meaning"
-        )
-        assert variant != "inline-code-oversized", (
-            "An oversized atomic code span must refuse publication"
-        )
-        if short:
-            assert len(comments) == 1
-            assert comments[0].split("Polly AI Review\n\n", 1)[1].rsplit("\n---\n", 1)[0] == review
-        else:
-            assert 1 < len(comments) <= _HELPERS["MAX_REVIEW_PARTS"]
-        return
     table_rows = []
     assessment_review = _REVIEW
     comment_context = None
@@ -815,10 +819,7 @@ def _check_review_context(
         assert expected_literals
         assert [item for tokens in rendered for item in literal_tags(tokens)] == expected_literals
         if not short:
-            fragments = [
-                comment.split("part 1 appears.\n\n", 1)[1].rsplit("\n\n---\n", 1)[0]
-                for comment in comments
-            ]
+            fragments = [_multipart_content(comment) for comment in comments]
             assert "".join(fragments) == review
             if variant in {
                 "code-span-cut-guard",
@@ -854,10 +855,7 @@ def _check_review_context(
             == 4000
         )
     if variant.startswith("boundary-inline-"):
-        fragments = [
-            comment.split("part 1 appears.\n\n", 1)[1].rsplit("\n\n---\n", 1)[0]
-            for comment in comments
-        ]
+        fragments = [_multipart_content(comment) for comment in comments]
         assert "".join(fragments) == review
         assert not any(
             token.type in {"code_block", "fence"} for tokens in rendered for token in tokens
@@ -891,10 +889,7 @@ def _check_review_context(
         assert not remaining_code
         remaining = review
         for number, comment in enumerate(comments):
-            _, marker, fragment = comment.partition("part 1 appears.\n\n")
-            assert marker
-            fragment, separator, footer = fragment.rpartition("\n\n---\n")
-            assert separator and footer.startswith("<sub>Automated review by Polly")
+            fragment = _multipart_content(comment)
             if number and not remaining.startswith(fragment):
                 assert fragment.startswith("```text\n")
                 fragment = fragment.removeprefix("```text\n")
@@ -1111,20 +1106,20 @@ def test_multipart_inline_syntax_preserves_parsed_meaning(
     if form == "escape-underscore":
         assert "_literal" in "".join(content for _, content in expected)
         assert construct not in "".join(content for _, content in expected)
-    review_path, receipt, posts = _prepare_publication(
-        tmp_path, monkeypatch, head_sha=metadata["head_sha"], run_url=metadata["run_url"]
-    )
-    try:
-        comments = _published_comments(review, review_path, receipt)
-    except ValueError as error:
-        assert oversized_paragraph and not short
-        assert "paragraph" in str(error)
-        assert not posts and not receipt.exists()
-        assert sorted(path.name for path in tmp_path.iterdir()) == ["review.md"]
-        return
-    assert not oversized_paragraph, "An oversized dependent paragraph must refuse"
-    assert posts == [*comments[1:], comments[0]]
-    assert receipt.read_text() == metadata["head_sha"] + "\n"
+    if oversized_paragraph:
+        review_path, receipt, posts = _prepare_publication(
+            tmp_path, monkeypatch, head_sha=metadata["head_sha"], run_url=metadata["run_url"]
+        )
+        try:
+            _published_comments(review, review_path, receipt)
+        except ValueError as error:
+            assert oversized_paragraph and not short
+            assert "paragraph" in str(error)
+            assert not posts and not receipt.exists()
+            assert sorted(path.name for path in tmp_path.iterdir()) == ["review.md"]
+            return
+        assert not oversized_paragraph, "An oversized dependent paragraph must refuse"
+    comments = _HELPERS["review_comments"](review, **metadata)
     assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
     groups = []
     for comment in comments:
@@ -1296,24 +1291,25 @@ def test_multipart_inline_destinations_keep_rendered_meaning(
         assert len(expected) == 1
     assert _HELPERS["COMMENT_BYTE_LIMIT"] == 60000
     assert (len(review.encode("utf-8")) < 60000) == short
-    review_path, receipt, posts = _prepare_publication(
-        tmp_path, monkeypatch, head_sha=metadata["head_sha"], run_url=metadata["run_url"]
-    )
     try:
-        comments = _published_comments(review, review_path, receipt)
+        comments = _HELPERS["review_comments"](review, **metadata)
     except ValueError as error:
         assert not short and not separated
         assert "inline destination" in str(error) or str(error) == (
             "Polly review table row cannot continue within comment capacity "
             "without five parsed fields."
         )
+        review_path, receipt, posts = _prepare_publication(
+            tmp_path, monkeypatch, head_sha=metadata["head_sha"], run_url=metadata["run_url"]
+        )
+        with pytest.raises(ValueError) as publication_error:
+            _published_comments(review, review_path, receipt)
+        assert str(publication_error.value) == str(error)
         assert not posts and not receipt.exists()
         assert not list(tmp_path.glob("comment*.md"))
         return
     assert bool(len(comments) == 1) == short
     assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
-    assert posts == [*comments[1:], comments[0]]
-    assert receipt.read_text() == metadata["head_sha"] + "\n"
     actual = [
         item
         for comment in comments
@@ -1622,7 +1618,10 @@ def test_multipart_reference_dependencies_are_refused(
 def test_review_comments_preserve_supported_markdown_context(
     table_variant: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _check_review_context(table_variant, tmp_path, monkeypatch)
+    if table_variant.removeprefix("short-").startswith("inline-code-"):
+        _check_inline_code_context(table_variant, tmp_path, monkeypatch)
+    else:
+        _check_review_context(table_variant, tmp_path, monkeypatch)
 
 
 @pytest.mark.parametrize(
@@ -3651,6 +3650,35 @@ def test_unicode_and_wrapper_bytes_are_included_in_comment_limit() -> None:
     overflow_comments = _HELPERS["review_comments"](overflow_review, **review_metadata)
     assert len(overflow_comments) > 1
     assert all(len(comment.encode("utf-8")) <= 60000 for comment in overflow_comments)
+
+    assert _HELPERS["COMMENT_BYTE_LIMIT"] == 60000
+    empty_comment = _HELPERS["review_comments"]("", **review_metadata)[0]
+    prefix, separator, footer = empty_comment.partition("\n---\n")
+    assert separator
+    for content, refusal in (
+        (
+            "- Outer assessment\n  - Nested assessment",
+            "Polly review nested lists are not supported in multipart comments.",
+        ),
+        (
+            "<div>Assessment details.</div>",
+            "Polly review unsupported raw HTML is not supported in multipart comments.",
+        ),
+    ):
+        assessment = _HELPERS["compose_review"](
+            _REVIEW.replace("Fix the parser.", "Fix the parser.\n\n" + content + "\n"),
+            {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]},
+        )
+        assessment += "x" * (60000 - wrapper_bytes - len(assessment.encode("utf-8")))
+        assert len(assessment.encode("utf-8")) == 60000 - wrapper_bytes
+        exact_comments = _HELPERS["review_comments"](assessment, **review_metadata)
+        assert exact_comments == [prefix + assessment + separator + footer]
+        assert len(exact_comments[0].encode("utf-8")) == 60000
+        overflow_assessment = assessment + "x"
+        assert len(overflow_assessment.encode("utf-8")) + wrapper_bytes == 60001
+        with pytest.raises(ValueError) as error:
+            _HELPERS["review_comments"](overflow_assessment, **review_metadata)
+        assert str(error.value) == refusal
 
 
 @pytest.mark.parametrize(
