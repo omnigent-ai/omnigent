@@ -89,7 +89,7 @@ from omnigent.native.native_dispatch import resolve_hook
 from omnigent.pi_prompt import pi_prompt_args
 from omnigent.process_logging import process_log_reference
 from omnigent.runner.identity import runner_mcp_disabled_servers_active_harnesses
-from omnigent.runner.memory_guidance import memory_startup_guidance
+from omnigent.runner.memory_guidance import claude_memory_import_note, memory_startup_guidance
 from omnigent.runner.resource_registry import (
     ANTIGRAVITY_NATIVE_TERMINAL_ROLE,
     CLAUDE_NATIVE_TERMINAL_ROLE,
@@ -8930,20 +8930,27 @@ def _ensure_orchestrator_skills_in_bundle(
     ``CODEX_HOME/skills/`` (codex) picks the skills up. ``build-omnigent``
     is linked for every agent — every ``omnigent claude`` / ``omnigent
     codex`` user should be able to author new agents — and each framework
-    skill, such as ``workflow``, when its server flag and tool group allow it.
-    Existing user skills are left alone. Best-effort: a failure to link is
-    logged but does not abort the terminal launch.
+    skill, such as ``workflow`` or ``import-memory``, when its tool group is on
+    (workflow skills also need the server flag). Existing user skills are left
+    alone. Best-effort: a failure to link is logged but does not abort the
+    terminal launch.
 
     :param bundle_dir: Materialized agent-bundle root, e.g.
         ``/tmp/omnigent-ap-chat-xyz/bundle``.
     :param agent_spec: The session's AgentSpec; decides the framework skills.
+        The runner has already turned off the memory group when the server has
+        no memory.
     :param workflows_enabled: Whether the server advertises workflow tools.
     """
     # Anchored on the package root, not a ``.parent`` count off this file:
     # moving this module deeper must not silently break the source path.
     onboarding_skills = _OMNIGENT_PACKAGE_DIR / "onboarding" / "agent" / "skills"
     sources = {"build-omnigent": onboarding_skills / "build-omnigent"}
-    from omnigent.spec.skill_sources import FRAMEWORK_SKILLS_DIR, framework_skill_names
+    from omnigent.spec.skill_sources import (
+        FRAMEWORK_SKILLS_DIR,
+        WORKFLOW_FRAMEWORK_SKILLS,
+        framework_skill_names,
+    )
 
     # Include disabled names so a reused bundle loses stale framework links.
     sources.update({name: FRAMEWORK_SKILLS_DIR / name for name in framework_skill_names()})
@@ -8952,7 +8959,7 @@ def _ensure_orchestrator_skills_in_bundle(
     if isinstance(spec, AgentSpec):
         enabled.update(framework_skill_names(spec))
     if not workflows_enabled:
-        enabled.difference_update({"workflow", "save-workflow"})
+        enabled.difference_update(WORKFLOW_FRAMEWORK_SKILLS)
     for name, source in sources.items():
         target_dir = bundle_dir / "skills" / name
         try:
@@ -10002,6 +10009,13 @@ async def _auto_create_claude_terminal(
                 and await server_workflows_enabled(server_client)
             ),
         )
+    claude_auto_memory_env = await _claude_auto_memory_env(agent_spec, server_client)
+    # Decided before the instructions are composed, since the offer goes into them.
+    claude_memory_import = (
+        await claude_memory_import_note(workspace)
+        if _CLAUDE_AUTO_MEMORY_OFF_ENV in claude_auto_memory_env
+        else None
+    )
     claude_args = augment_claude_args(
         base_claude_args,
         active_harnesses=runner_mcp_disabled_servers_active_harnesses(),
@@ -10016,7 +10030,12 @@ async def _auto_create_claude_terminal(
         model_overrides=claude_config.model_overrides if claude_config is not None else None,
         subagent_router_dir=subagent_router_dir,
         append_system_prompt=await _native_startup_instructions(
-            agent_spec, server_client, session_id, routed_spawn_note, workspace=workspace
+            agent_spec,
+            server_client,
+            session_id,
+            routed_spawn_note,
+            claude_memory_import,
+            workspace=workspace,
         ),
         allowed_tools=routed_spawn_tools,
         # The route-turn hook is registered only when this session can
@@ -10053,7 +10072,6 @@ async def _auto_create_claude_terminal(
         validate_claude_hook_interpreter_compatibility(resolved_claude)
 
     claude_terminal_env_unset = _claude_terminal_env_unset(claude_config)
-    claude_auto_memory_env = await _claude_auto_memory_env(agent_spec, server_client)
 
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here

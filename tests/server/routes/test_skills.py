@@ -24,6 +24,7 @@ from omnigent.host.frames import (
 )
 from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
 from omnigent.host.skills import HostSkillDiscovery
+from omnigent.memory_availability import without_memory_tools
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, LEVEL_READ
 from omnigent.server.feature_flags import resolve_feature_flags
@@ -221,6 +222,7 @@ async def test_session_target_cannot_be_overridden(skills_app, overrides: dict[s
 @pytest.mark.parametrize(
     "workflows_enabled,host_supports_workflows", [(False, True), (True, True), (True, False)]
 )
+@pytest.mark.parametrize("memory_on", [False, True])
 async def test_presession_catalog_matches_filtered_invocations(
     presession_app,
     tmp_path: Path,
@@ -228,12 +230,14 @@ async def test_presession_catalog_matches_filtered_invocations(
     skill_filter: str | list[str],
     workflows_enabled: bool,
     host_supports_workflows: bool,
+    memory_on: bool,
 ) -> None:
     app, _, conn, _, agent, _ = presession_app
     conn.hello.capabilities = [CAP_WORKFLOWS] if host_supports_workflows else []
     app.state.feature_flags = resolve_feature_flags(
         {"OMNIGENT_FEATURES": "workflows" if workflows_enabled else ""}
     )
+    app.state.memory_available = lambda: memory_on
     monkeypatch.setattr(Path, "home", lambda: tmp_path / "home")
     for name in ("bundled", "hidden", "allowed", "denied", "save-workflow"):
         directory = tmp_path / ".claude" / "skills" / name
@@ -300,14 +304,20 @@ async def test_presession_catalog_matches_filtered_invocations(
         )
         response = await task
     assert response.status_code == 200
+    # Without memory on the server, the runner's copy of the spec has the memory group off.
     expected = resolve_session_skills(
-        spec, (tmp_path,), None, workflows_enabled=workflows_enabled and host_supports_workflows
+        spec if memory_on else without_memory_tools(spec),
+        (tmp_path,),
+        None,
+        workflows_enabled=workflows_enabled and host_supports_workflows,
     )
     assert response.json()["skills"] == [
         {"name": s.name, "description": s.description, "display_name": s.display_name}
         for s in expected
     ]
-    assert "hidden" not in {s["name"] for s in response.json()["skills"]}
+    names = [s["name"] for s in response.json()["skills"]]
+    assert ("import-memory" in names) is memory_on
+    assert "hidden" not in set(names)
     assert response.json()["warnings"] == []
 
 
