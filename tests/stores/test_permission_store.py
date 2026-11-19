@@ -1721,6 +1721,15 @@ def test_delete_for_scheduled_task_removes_only_that_tasks_grants(
     )
 
 
+def test_every_scheduled_task_is_shareable_by_default(
+    store: SqlAlchemyPermissionStore, db_uri: str
+) -> None:
+    """Only a store that cannot keep some automation's grants reports it unshareable."""
+    task_id = _create_scheduled_task(db_uri)
+    assert store.scheduled_task_shareable(task_id) is True
+    assert PermissionStore.scheduled_task_shareable(store, task_id) is True
+
+
 def test_scheduled_task_grant_refuses_a_missing_or_deleted_task(
     store: SqlAlchemyPermissionStore, db_uri: str
 ) -> None:

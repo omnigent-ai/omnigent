@@ -1,7 +1,11 @@
 import { cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { isExplicitlyUnread, resetReadStateForTests } from "./useUnseenConversations";
+import {
+  isExplicitlyUnread,
+  markConversationUnread,
+  resetReadStateForTests,
+} from "./useUnseenConversations";
 import { useToggleUnreadHotkey } from "./useToggleUnreadHotkey";
 
 const { showToast } = vi.hoisted(() => ({ showToast: vi.fn() }));
@@ -57,6 +61,20 @@ describe("useToggleUnreadHotkey", () => {
     expect(showToast).toHaveBeenLastCalledWith("Marked as unread");
     expect(isExplicitlyUnread("conv-1")).toBe(false);
     expect(isExplicitlyUnread("conv-2")).toBe(true);
+  });
+
+  it("marks a muted session read but never unread", () => {
+    const muted = { ...SESSION, labels: { "omnigent.muted": "1" } };
+    renderHook(() => useToggleUnreadHotkey(muted, false));
+    expect(press().defaultPrevented).toBe(true);
+    expect(isExplicitlyUnread("conv-1")).toBe(false);
+    expect(showToast).toHaveBeenLastCalledWith("Unmute the session to mark it as unread.");
+
+    // Unread state flagged before muting can still be cleared.
+    markConversationUnread("conv-1", SESSION.updated_at);
+    press();
+    expect(isExplicitlyUnread("conv-1")).toBe(false);
+    expect(showToast).toHaveBeenLastCalledWith("Marked as read");
   });
 
   it("leaves the chord alone without an open session", () => {

@@ -35,10 +35,11 @@ import { ScheduledTaskRow } from "@/components/scheduled/ScheduledTaskRow";
 import { AUTOMATION_TEMPLATES } from "@/components/scheduled/automationTemplates";
 import { SESSION_LINK_ID_PLACEHOLDER } from "@/components/scheduled/triggerTemplates";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { isFeatureEnabled, isSharingOff, SHARING_OFF_REASON } from "@/lib/capabilities";
+import { isFeatureEnabled } from "@/lib/capabilities";
 import { useNavigate, useRebasePath, useSearchParams } from "@/lib/routing";
 import { getShareableSessionLink } from "@/lib/shareLink";
 import {
+  useCloneScheduledTask,
   useDeleteScheduledTask,
   useRunScheduledTaskNow,
   useScheduledTasks,
@@ -47,8 +48,17 @@ import {
 } from "@/hooks/useScheduledTasks";
 import { useNow } from "@/hooks/useNow";
 import { useViewerId } from "@/hooks/useViewerId";
-import { canShareAutomation, sharedAutomationsListed } from "@/lib/permissionsApi";
-import { ScheduledTaskApiError, type ScheduledTask } from "@/lib/scheduledTasksApi";
+import {
+  automationShareDisabledReason,
+  canShareAutomation,
+  sharedAutomationsListed,
+} from "@/lib/permissionsApi";
+import {
+  cloneCreatedMessage,
+  cloneFailedMessage,
+  ScheduledTaskApiError,
+  type ScheduledTask,
+} from "@/lib/scheduledTasksApi";
 import { nextRunAtMs } from "@/lib/scheduleText";
 import { cn } from "@/lib/utils";
 
@@ -115,6 +125,7 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
   const updateMutation = useUpdateScheduledTask();
   const deleteMutation = useDeleteScheduledTask();
   const runNowMutation = useRunScheduledTaskNow();
+  const cloneMutation = useCloneScheduledTask();
 
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState<FilterTab>("all");
@@ -243,7 +254,9 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
         ? (deleteMutation.variables as string | undefined)
         : runNowMutation.isPending
           ? (runNowMutation.variables as string | undefined)
-          : undefined;
+          : cloneMutation.isPending
+            ? cloneMutation.variables?.id
+            : undefined;
 
   function handlePauseToggle(task: ScheduledTask) {
     updateMutation.mutate({
@@ -270,6 +283,21 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
           showToast("Couldn't start the run");
         }
       },
+    });
+  }
+
+  const cloneAvailable = info !== "loading" && info.scheduled_task_clone === true;
+
+  function handleClone(task: ScheduledTask) {
+    cloneMutation.mutate(task, {
+      onSuccess: (clone) => {
+        showToast(cloneCreatedMessage(clone));
+        // Without detail pages the copy stays here, on the refreshed list.
+        if (isFeatureEnabled(info, "automations_v2")) {
+          navigate(`/tasks/${encodeURIComponent(clone.id)}`);
+        }
+      },
+      onError: (err) => showToast(cloneFailedMessage(err)),
     });
   }
 
@@ -447,7 +475,8 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
                   onShare={
                     canShareAutomation(info, viewerId, task.ownerUserId) ? handleShare : undefined
                   }
-                  shareDisabledReason={isSharingOff(info) ? SHARING_OFF_REASON : undefined}
+                  shareDisabledReason={automationShareDisabledReason(info, task)}
+                  onClone={cloneAvailable ? handleClone : undefined}
                 />
               ))}
             </div>
@@ -498,6 +527,8 @@ export function TasksPage({ templatesOnly = false }: { templatesOnly?: boolean }
                   onPauseToggle={handlePauseToggle}
                   onRunNow={handleRunNow}
                   onDelete={handleDelete}
+                  // Shown disabled: only the owner can clone it.
+                  onClone={cloneAvailable ? handleClone : undefined}
                 />
               ))}
             </div>

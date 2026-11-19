@@ -2,6 +2,7 @@ import {
   useNestedSessionDrafts,
   withNestedSessionDrafts,
   removeNestedSessionDraft,
+  discardNestedSessionDraft,
   nestedSessionSidebarKey,
 } from "@/lib/nestedSessionDrafts";
 import {
@@ -54,6 +55,8 @@ import {
 import { createPortal } from "react-dom";
 import {
   ArchiveIcon,
+  BellIcon,
+  BellOffIcon,
   ArrowUpDownIcon,
   ArchiveRestoreIcon,
   CheckIcon as CheckMarkIcon,
@@ -131,6 +134,7 @@ import {
 import { useProjectOrder, useSaveProjectOrder } from "@/hooks/useProjectOrder";
 import { useIsMutating, useQueries, useQueryClient } from "@tanstack/react-query";
 import { PIN_WRITE_MUTATION_KEY } from "@/lib/sessionListCache";
+import { canFlagUnread, isConversationMuted, showsUnreadFor } from "@/lib/sessionMute";
 import {
   Link,
   useLocation,
@@ -196,6 +200,7 @@ import {
   PINNED_CONVERSATIONS_KEY,
   useTogglePinnedConversation,
   useReorderPinnedConversations,
+  useSetConversationMuted,
   setConversationPinned,
   useRenameConversation,
   useAutomationsEnabled,
@@ -283,7 +288,8 @@ import { extensionPathParts, resolveExtensionPageFromPath } from "@/extensions/c
 import { NewProjectButton } from "./NewProjectButton";
 import { SessionImportStatus } from "./SessionImportStatus";
 import { useSessionImportStore } from "@/store/sessionImport";
-import { SettingsSidebarBody, useSettingsRoute, useTrackSettingsReturn } from "./settingsNav";
+import { useSettingsRoute, useTrackSettingsReturn } from "./settingsNav";
+import { SettingsSidebar } from "./settingsSearch/SettingsSidebar";
 import {
   type ActiveChatOverride,
   clearLegacyPinnedConversationIds,
@@ -951,6 +957,10 @@ function SidebarImpl({
     if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
     if (isMobileViewport() && !isSideBySideSidebarViewport()) onClose();
   });
+  // A search result that opens its row closes the phone's menu, as a section link does.
+  const onSearchNavigate = useStableCallback(() => {
+    if (isMobileViewport() && !isSideBySideSidebarViewport()) onClose();
+  });
 
   // Which top-level nav button to highlight for the current route.
   const {
@@ -1353,10 +1363,11 @@ function SidebarImpl({
           />
         )}
         {inSettings ? (
-          <SettingsSidebarBody
+          <SettingsSidebar
             onNavClick={onNavClick}
             onCollapse={sideBySide ? onClose : undefined}
             harnessesOffered={curatedOutHarnesses.size < NATIVE_CODING_AGENTS.length}
+            onNavigate={onSearchNavigate}
           />
         ) : (
           <>
@@ -2667,7 +2678,7 @@ function ConversationList({
     const statusOf = (c: Conversation): StatusBucket => {
       const frozen = frozenStatus?.get(c.id);
       if (frozen) return frozen;
-      const unseen = isConversationUnseen(c.id, c.updated_at, c.status);
+      const unseen = showsUnreadFor(c, isConversationUnseen(c.id, c.updated_at, c.status));
       const bucket = statusBucket(c, unseen, hasSessionDraft(c.id));
       const live =
         bucket !== "Needs attention" && (c.id === startingId || workingIds.has(c.id))
@@ -4077,7 +4088,7 @@ function projectMarkerState(
       error = true;
     } else if (state?.kind === "disconnected") {
       disconnected = true;
-    } else if (isConversationUnseen(c.id, c.updated_at, c.status)) {
+    } else if (showsUnreadFor(c, isConversationUnseen(c.id, c.updated_at, c.status))) {
       unseen = true;
     }
   }
@@ -4823,6 +4834,12 @@ function ConversationSection({
   /** The rows list, for a project folder's Show more slide. */
   listRef?: RefObject<HTMLUListElement | null>;
 }) {
+  const location = useLocation();
+  const rebasePath = useRebasePath();
+  const activeDraftSourceId =
+    location.pathname === rebasePath("/")
+      ? new URLSearchParams(location.search).get("sibling")
+      : null;
   // An untitled section is always open — there's no header to collapse it.
   const isCollapsed = title != null && collapsed;
   const rows = isCollapsed ? (heldConversations ?? []) : conversations;
@@ -4975,7 +4992,7 @@ function ConversationSection({
                   onToggleFamily={() => onToggleFamily(conv.family!.id)}
                   isActive={
                     conv.id === activeConversationId ||
-                    !!conv.nested_draft_source_id ||
+                    conv.nested_draft_source_id === activeDraftSourceId ||
                     conv.project_draft_name !== undefined
                   }
                   inActiveGrid={gridMembers.has(conv.id)}
@@ -5139,7 +5156,9 @@ export function ConversationMenuItems({
   /** The neighbours Move up/down swap with in the Custom order. */
   reorder?: { previousId?: string; nextId?: string };
 }) {
-  const info = useContext(ServerInfoContext);
+  const info = useServerInfo();
+  const isMuted = isConversationMuted(conversation);
+  const setMuted = useSetConversationMuted();
   const atPinCap = useContext(PinCapacityContext);
   const pinSaving = useContext(PinSavingContext);
   const nestMoves = useContext(NestMoveContext);
@@ -5364,11 +5383,19 @@ export function ConversationMenuItems({
           </TooltipContent>
         </Tooltip>
       )}
-      {/* Every row offers one read-state action: "Mark as unread" re-lights
-          the pink dot so a session can be flagged to revisit (including the
-          one you're currently viewing); a row already showing the dot offers
-          the reverse, "Mark as read", which clears it. */}
-      {canMarkUnread ? (
+      {/* Older servers would share the mute label with every collaborator. */}
+      {info !== "loading" && info.session_mute === true && (
+        <C.Item
+          className="mobile-touch-target"
+          data-testid="mute-conversation"
+          onSelect={() => setMuted.mutate({ id: conversation.id, muted: !isMuted })}
+        >
+          {isMuted ? <BellIcon className="size-3.5" /> : <BellOffIcon className="size-3.5" />}
+          {isMuted ? "Unmute" : "Mute"}
+        </C.Item>
+      )}
+      {/* Muted sessions can clear unread state, but cannot be flagged unread here. */}
+      {canFlagUnread(conversation) && canMarkUnread && (
         <C.Item
           className="mobile-touch-target"
           data-testid="mark-unread-conversation"
@@ -5380,7 +5407,8 @@ export function ConversationMenuItems({
           <MailIcon className="size-3.5" />
           Mark as unread
         </C.Item>
-      ) : (
+      )}
+      {!canMarkUnread && (
         <C.Item
           className="mobile-touch-target"
           data-testid="mark-read-conversation"
@@ -5951,6 +5979,7 @@ function ConversationRowImpl({
   const sessionShortcuts = isActive ? desktopCommands : NO_DESKTOP_COMMANDS;
   const hostsById = useContext(HostsByIdContext);
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   // A client-only `temp:` row (navigate-first create window): no server session
   // yet, so per-row mutations are disabled until it's rekeyed to the real id —
   // otherwise they'd POST to `/v1/sessions/temp:*`. The row still navigates.
@@ -6099,16 +6128,12 @@ function ConversationRowImpl({
     conversation.updated_at,
     conversation.status,
   );
-  // The dot shows when the conversation is content-unseen AND either the
-  // row isn't the one you're viewing OR you explicitly marked it unread.
-  // `isConversationUnseen` still gates on status, so a *running* turn never
-  // shows the dot — marking a working session unread is recorded but stays
-  // invisible until the turn finishes (then the dot lights like any unseen
-  // row). The explicit override only lifts the active-row suppression, so
-  // flagging the thread you're currently viewing surfaces the dot at once.
-  const hasUnseenMessages = readState.unseen && (!isActive || readState.explicitlyUnread);
-  // "Mark as unread" is offered on any row not already showing the dot.
-  const canMarkUnread = !hasUnseenMessages;
+  // Explicit unread overrides active-row suppression; running turns remain
+  // hidden through readState.unseen. Muting hides the dot without marking read.
+  const isMuted = isConversationMuted(conversation);
+  const unread = readState.unseen && (!isActive || readState.explicitlyUnread);
+  const hasUnseenMessages = showsUnreadFor(conversation, unread);
+  const canMarkUnread = !unread;
   // Approvals and failures outrank the unread dot without clearing read state.
   const badgeConversations = useMemo(() => [conversation], [conversation]);
   const [derivedState] = useSessionBadgeStates(badgeConversations);
@@ -6141,7 +6166,30 @@ function ConversationRowImpl({
         ? "with_you"
         : null;
   const showSharedIndicator = sharing !== null;
-  const hasSessionIndicator = sessionState !== null || showDraftIndicator;
+  function renderSessionIndicator() {
+    if (sessionState !== null) return <SessionStateBadge state={sessionState} inSidebar />;
+    if (isMuted && !showDraftIndicator) {
+      return (
+        <BellOffIcon
+          role="img"
+          aria-label="Muted"
+          data-testid="conversation-muted-icon"
+          className="size-3.5 shrink-0 text-muted-foreground"
+        />
+      );
+    }
+    return (
+      <span
+        role="img"
+        aria-label="Draft"
+        data-testid="conversation-draft-indicator"
+        className="inline-flex h-5 shrink-0 items-center justify-center text-muted-foreground"
+      >
+        <MessageCircleDashedIcon aria-hidden className="size-3.5" />
+      </span>
+    );
+  }
+  const hasSessionIndicator = sessionState !== null || isMuted || showDraftIndicator;
   // The "Show → Updated" timestamp takes the indicator slot only when it's free.
   const show = useContext(SidebarShowContext);
   const showUpdated = show.includes("updated") && !hasSessionIndicator;
@@ -6339,6 +6387,7 @@ function ConversationRowImpl({
             (conversation.nested_draft_source_id ||
               conversation.project_draft_name !== undefined) &&
               "italic",
+            isMuted && "text-muted-foreground",
           )}
         >
           {label}
@@ -6477,11 +6526,9 @@ function ConversationRowImpl({
     </div>
   );
 
-  // Provisional (`temp:`) row: navigable, but no mutating affordances (kebab,
-  // context menu, pin, archive, drag) until the real session exists — those
-  // would POST to `/v1/sessions/temp:*`. Rekey to the real id (`hydrateLocal-
-  // Conversation`) drops `provisional` and the full row renders.
+  // Provisional rows only support local actions until the session exists.
   if (isProvisionalRow) {
+    const draftSourceId = conversation.nested_draft_source_id;
     return (
       <li
         ref={rowRef}
@@ -6490,7 +6537,26 @@ function ConversationRowImpl({
         className={cn("group relative", familyIndented && "ml-6")}
       >
         {familyIndented && <span aria-hidden="true" className={SIDEBAR_FAMILY_LINE} />}
-        {rowLink}
+        {draftSourceId && !selectionMode ? (
+          <ContextMenu>
+            <ContextMenuTrigger asChild>{rowLink}</ContextMenuTrigger>
+            <ContextMenuContent className="min-w-44">
+              <ContextMenuItem
+                variant="destructive"
+                onSelect={() => {
+                  if (discardNestedSessionDraft(queryClient, conversation.id) && isActive) {
+                    navigate(`/c/${draftSourceId}`);
+                  }
+                }}
+              >
+                <Trash2Icon className="size-3.5" />
+                Delete draft
+              </ContextMenuItem>
+            </ContextMenuContent>
+          </ContextMenu>
+        ) : (
+          rowLink
+        )}
         {shortcutSlot !== undefined && (
           <SessionShortcutHint slot={shortcutSlot} overlayTop={overlayTop} />
         )}
@@ -6651,18 +6717,7 @@ function ConversationRowImpl({
             isDotMarker(sessionState) && SESSION_STATE_DOT_SLOT_CLASS,
           )}
         >
-          {sessionState !== null ? (
-            <SessionStateBadge state={sessionState} inSidebar />
-          ) : (
-            <span
-              role="img"
-              aria-label="Draft"
-              data-testid="conversation-draft-indicator"
-              className="inline-flex h-5 shrink-0 items-center justify-center text-muted-foreground"
-            >
-              <MessageCircleDashedIcon aria-hidden className="size-3.5" />
-            </span>
-          )}
+          {renderSessionIndicator()}
         </span>
       ) : showUpdated ? (
         <span
@@ -7778,13 +7833,14 @@ function BulkActionBar({
   // the mirror is written (e.g. a background turn lighting a selected row's
   // dot while the bar is open). Computed per render — the selection is small.
   useUnseenTick();
-  // Mirrors the row dot's condition (active-row suppression included), so the
-  // offered direction always matches the dots the user sees.
+  // Mirrors the row menu's read-state action (active-row suppression included).
+  // Muted rows can be marked read but are never flagged unread.
   const unreadSelected = selectedConversations.filter(
     (c) =>
       isConversationUnseen(c.id, c.updated_at, c.status) &&
       (c.id !== activeId || isExplicitlyUnread(c.id)),
   );
+  const flaggableSelected = selectedConversations.filter(canFlagUnread);
 
   const ownedSelected = useMemo(
     () => selectedConversations.filter((c) => isOwnedByViewer(c, viewerId)),
@@ -7896,7 +7952,7 @@ function BulkActionBar({
   }
 
   function handleMarkUnread() {
-    for (const c of selectedConversations) markConversationUnread(c.id, c.updated_at);
+    for (const c of flaggableSelected) markConversationUnread(c.id, c.updated_at);
     onExit();
   }
 
@@ -8001,7 +8057,7 @@ function BulkActionBar({
                     variant="ghost"
                     size="icon-xs"
                     className="shrink-0"
-                    disabled={isBusy || count === 0}
+                    disabled={isBusy || flaggableSelected.length === 0}
                     onClick={handleMarkUnread}
                     aria-label="Mark selected as unread"
                     data-testid="bulk-mark-unread"

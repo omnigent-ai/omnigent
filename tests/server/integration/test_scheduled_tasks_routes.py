@@ -5590,6 +5590,51 @@ async def test_sharing_is_advertised_and_served_together(
             )
 
 
+@_SHARING
+async def test_an_automation_its_store_cannot_share_is_reported_and_refused(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    legacy_id, current_id = await _create_task(auth_client), await _create_task(auth_client)
+
+    async def listed_shareable() -> dict[str, bool]:
+        listed = await auth_client.get("/v1/scheduled-tasks", headers=_headers())
+        assert listed.status_code == 200, listed.text
+        return {task["id"]: task["shareable"] for task in listed.json()["scheduled_tasks"]}
+
+    assert await listed_shareable() == {legacy_id: True, current_id: True}
+    monkeypatch.setattr(
+        SqlAlchemyPermissionStore,
+        "scheduled_task_shareable",
+        lambda self, task_id: task_id != legacy_id,
+    )
+    assert await listed_shareable() == {legacy_id: False, current_id: True}
+    for task_id, shareable in ((legacy_id, False), (current_id, True)):
+        url = f"/v1/scheduled-tasks/{task_id}"
+        detail = await auth_client.get(url, headers=_headers())
+        renamed = await auth_client.patch(url, json={"name": "renamed"}, headers=_headers())
+        assert [detail.json()["shareable"], renamed.json()["shareable"]] == [shareable] * 2
+
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    users = {user.id for user in permissions.list_users()}
+    refused = await _share(auth_client, legacy_id, "bob@example.com")
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["error"]["code"] == "forbidden"
+    assert refused.json()["error"]["message"] == (
+        "This is a legacy automation. Clone it, then share the copy."
+    )
+    # Refused before any write.
+    assert _task_grantees(db_uri, legacy_id) == []
+    assert {user.id for user in permissions.list_users()} == users
+    assert (await _share(auth_client, current_id, "bob@example.com")).status_code == 200
+    # Sharing off is the reason given, as in the web app.
+    auth_app.state.sharing_mode = lambda: SharingMode.OFF
+    off = await _share(auth_client, legacy_id, "bob@example.com")
+    assert off.json()["error"]["message"] == "Sharing has been disabled for this Omnigent server."
+
+
 async def test_owners_still_remove_grants_after_automations_v2_is_turned_off(
     auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
 ) -> None:
@@ -6770,3 +6815,328 @@ async def test_a_shared_run_session_lists_with_its_run_labels(
     [item] = [row for row in listed.json()["data"] if row["id"] == session_id]
     assert item["owner"] == "alice@example.com"
     assert {key: item["labels"].get(key) for key in labels} == labels
+
+
+# Cloning needs the database scheduler, which keeps the original's schedule anchor.
+_ON_DATABASE_SCHEDULER = pytest.mark.parametrize("auth_app", [True], indirect=True)
+
+
+@_ON_DATABASE_SCHEDULER
+@pytest.mark.parametrize("state", ["active", "paused"])
+async def test_clone_copies_an_automations_settings_under_a_new_id(
+    auth_client: httpx.AsyncClient, db_uri: str, state: str
+) -> None:
+    project_id = await _make_project(auth_client, "triage")
+    created = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(
+            max_cost_usd=2.5,
+            permission_mode="acceptEdits",
+            model_override="databricks-claude-sonnet-4-6",
+            reasoning_effort="high",
+            base_branch="HEAD",
+            project_id=project_id,
+        ),
+        headers=_headers(),
+    )
+    assert created.status_code == 200, created.text
+    original = created.json()
+    _seed_run(db_uri, original["id"], uuid.uuid4().hex, conversation_id=uuid.uuid4().hex)
+    if state == "paused":
+        paused = await auth_client.patch(
+            f"/v1/scheduled-tasks/{original['id']}", json={"state": "paused"}, headers=_headers()
+        )
+        assert paused.status_code == 200, paused.text
+
+    resp = await auth_client.post(
+        f"/v1/scheduled-tasks/{original['id']}/clone", headers=_headers()
+    )
+
+    assert resp.status_code == 200, resp.text
+    clone = resp.json()
+    assert clone["id"] != original["id"]
+    assert clone["name"] == "nightly triage (copy)"
+    copied = (
+        "prompt",
+        "rrule",
+        "agent_id",
+        "timezone",
+        "workspace",
+        "host_id",
+        "max_cost_usd",
+        "permission_mode",
+        "model_override",
+        "reasoning_effort",
+        "base_branch",
+        "project_id",
+        "mcp_services",
+        "session_mode",
+        "execution_target",
+    )
+    assert {key: clone[key] for key in copied} == {key: original[key] for key in copied}
+    # Non-default values, so a field the copy drops shows up as a difference.
+    seeded = {
+        "max_cost_usd": 2.5,
+        "permission_mode": "acceptEdits",
+        "model_override": "databricks-claude-sonnet-4-6",
+        "reasoning_effort": "high",
+        "base_branch": "HEAD",
+        "project_id": project_id,
+    }
+    assert {key: clone[key] for key in seeded} == seeded
+    # A paused original can't start running through its clone.
+    assert clone["state"] == state
+    assert clone["last_run_at"] is None
+    runs = await auth_client.get(f"/v1/scheduled-tasks/{clone['id']}/runs", headers=_headers())
+    assert runs.json()["runs"] == []
+    listed = (await auth_client.get("/v1/scheduled-tasks", headers=_headers())).json()
+    assert {task["id"] for task in listed["scheduled_tasks"]} == {original["id"], clone["id"]}
+
+
+@_ON_DATABASE_SCHEDULER
+async def test_clone_leaves_a_continued_session_with_the_original(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    session_id = _owned_session(db_uri)
+    original = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(session_mode="continue", session_id=session_id),
+            headers=_headers(),
+        )
+    ).json()
+
+    resp = await auth_client.post(
+        f"/v1/scheduled-tasks/{original['id']}/clone", headers=_headers()
+    )
+
+    assert resp.status_code == 200, resp.text
+    # Its first run starts the session later runs continue.
+    assert (resp.json()["session_mode"], resp.json()["session_id"]) == ("continue", None)
+
+
+@_ON_DATABASE_SCHEDULER
+async def test_clone_of_an_automation_from_a_session_gets_its_own_copy(
+    auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    from omnigent.stores.conversation_store import SCHEDULED_TASK_SOURCE_LABEL_KEY
+
+    original = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(source_session_id=_session_with_history(db_uri), prompt=""),
+            headers=_headers(),
+        )
+    ).json()
+
+    resp = await auth_client.post(
+        f"/v1/scheduled-tasks/{original['id']}/clone", headers=_headers()
+    )
+
+    assert resp.status_code == 200, resp.text
+    clone = resp.json()
+    assert clone["source_session_id"] not in (None, original["source_session_id"])
+    clone_copy = SqlAlchemyConversationStore(db_uri).get_conversation(clone["source_session_id"])
+    assert clone_copy is not None
+    assert clone_copy.labels[SCHEDULED_TASK_SOURCE_LABEL_KEY] == clone["id"]
+    assert _item_texts(db_uri, clone["source_session_id"]) == [
+        "summarize the alerts",
+        "three alerts",
+    ]
+    # Another automation's copy is still refused as a source.
+    reused = await auth_client.post(
+        "/v1/scheduled-tasks",
+        json=_create_body(source_session_id=original["source_session_id"]),
+        headers=_headers(),
+    )
+    assert reused.status_code == 400, reused.text
+    # Deleting the original leaves the clone's runs a session to start from.
+    deleted = await auth_client.delete(f"/v1/scheduled-tasks/{original['id']}", headers=_headers())
+    assert deleted.status_code in (200, 204), deleted.text
+    assert (
+        SqlAlchemyConversationStore(db_uri).get_conversation(clone["source_session_id"])
+        is not None
+    )
+
+
+@_ON_DATABASE_SCHEDULER
+@pytest.mark.parametrize("shared", [False, True], ids=["stranger", "recipient"])
+async def test_only_the_owner_can_clone_an_automation(
+    auth_client: httpx.AsyncClient, db_uri: str, shared: bool
+) -> None:
+    original = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    _make_user(db_uri, "bob@example.com")
+    if shared:
+        granted = await _share(auth_client, original["id"], "bob@example.com")
+        assert granted.status_code == 200, granted.text
+
+    resp = await auth_client.post(
+        f"/v1/scheduled-tasks/{original['id']}/clone", headers=_headers("bob@example.com")
+    )
+
+    assert resp.status_code == 404, resp.text
+    listed = (await auth_client.get("/v1/scheduled-tasks", headers=_headers())).json()
+    assert [task["id"] for task in listed["scheduled_tasks"]] == [original["id"]]
+
+
+@pytest.mark.parametrize("auth_app", [False, True], indirect=True, ids=["legacy", "database"])
+async def test_clone_is_served_on_the_database_scheduler_only(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    database = auth_app.state.scheduled_task_dispatch_enabled
+    info = (await auth_client.get("/v1/info", headers=_headers())).json()
+    assert info["scheduled_task_clone"] is database
+    original = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+
+    resp = await auth_client.post(
+        f"/v1/scheduled-tasks/{original['id']}/clone", headers=_headers()
+    )
+
+    # The legacy timer re-anchors an interval schedule at each arm, so it can't keep
+    # a clone on the original's days.
+    assert resp.status_code == (200 if database else 400), resp.text
+    expected = 2 if database else 1
+    assert len(SqlAlchemyScheduledTaskStore(db_uri).list()) == expected
+
+
+@pytest.mark.parametrize("length", [0, 249, 250, 256])
+async def test_a_clone_name_keeps_the_suffix_within_the_name_column(length: int) -> None:
+    from omnigent.db.db_models import SqlScheduledTask
+    from omnigent.server.routes.scheduled_tasks import _clone_name
+
+    name = "n" * length
+    clone_name = _clone_name(name)
+    assert len(clone_name) == min(length + 7, SqlScheduledTask.__table__.c.name.type.length)
+    assert clone_name == name[: len(clone_name) - 7] + " (copy)"
+
+
+@_ON_DATABASE_SCHEDULER
+async def test_a_longest_names_clone_fits_the_name_column(auth_client: httpx.AsyncClient) -> None:
+    from omnigent.db.db_models import SqlScheduledTask
+
+    name = "n" * 256
+    original = (
+        await auth_client.post(
+            "/v1/scheduled-tasks", json=_create_body(name=name), headers=_headers()
+        )
+    ).json()
+
+    resp = await auth_client.post(
+        f"/v1/scheduled-tasks/{original['id']}/clone", headers=_headers()
+    )
+
+    assert resp.status_code == 200, resp.text
+    # SQLite doesn't enforce the column length that other databases do.
+    assert len(resp.json()["name"]) == SqlScheduledTask.__table__.c.name.type.length
+
+
+@_ON_DATABASE_SCHEDULER
+async def test_a_clone_runs_on_the_originals_interval_phase(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import UTC, datetime
+
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
+    created_at = int(datetime(2026, 11, 18, 12, tzinfo=UTC).timestamp())
+    first_run = int(datetime(2026, 11, 20, 9, tzinfo=UTC).timestamp())
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: created_at)
+    original = (
+        await auth_client.post(
+            "/v1/scheduled-tasks",
+            json=_create_body(rrule="FREQ=DAILY;INTERVAL=2;BYHOUR=9;BYMINUTE=0", timezone="UTC"),
+            headers=_headers(),
+        )
+    ).json()
+    assert SqlAlchemyScheduledTaskStore(db_uri).get(original["id"]).next_run_at == first_run
+
+    # A day later, a schedule anchored at the clone's own creation would run on the
+    # 21st, the days the original skips.
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: created_at + 86400)
+    resp = await auth_client.post(
+        f"/v1/scheduled-tasks/{original['id']}/clone", headers=_headers()
+    )
+
+    assert resp.status_code == 200, resp.text
+    clone = SqlAlchemyScheduledTaskStore(db_uri).get(resp.json()["id"])
+    assert clone is not None
+    assert clone.next_run_at == first_run
+
+
+@_ON_DATABASE_SCHEDULER
+async def test_a_reminder_cannot_be_cloned(auth_client: httpx.AsyncClient, db_uri: str) -> None:
+    rule, _ = _one_time_rule_in(hours=2)
+    reminder = SqlAlchemyScheduledTaskStore(db_uri).create(
+        scheduled_task_id=uuid.uuid4().hex,
+        name="Check CI",
+        prompt="Check CI",
+        rrule=rule,
+        user_id="alice@example.com",
+        agent_id=builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME),
+        timezone="UTC",
+        session_mode="continue",
+        session_id=_owned_session(db_uri),
+        kind="reminder",
+    )
+
+    resp = await auth_client.post(f"/v1/scheduled-tasks/{reminder.id}/clone", headers=_headers())
+
+    assert resp.status_code == 400, resp.text
+    assert "Only an automation can be cloned" in resp.text
+
+
+@_ON_DATABASE_SCHEDULER
+async def test_a_clone_of_an_automation_whose_project_is_gone_starts_unfiled(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    project_id = await _make_project(auth_client, "gone")
+    original = (
+        await auth_client.post(
+            "/v1/scheduled-tasks", json=_create_body(project_id=project_id), headers=_headers()
+        )
+    ).json()
+    # Paused, so no run clears the stale project first.
+    paused = await auth_client.patch(
+        f"/v1/scheduled-tasks/{original['id']}", json={"state": "paused"}, headers=_headers()
+    )
+    assert paused.status_code == 200, paused.text
+    deleted = await auth_client.delete(f"/v1/projects/{project_id}", headers=_headers())
+    assert deleted.status_code in (200, 204), deleted.text
+
+    resp = await auth_client.post(
+        f"/v1/scheduled-tasks/{original['id']}/clone", headers=_headers()
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["project_id"] is None
+
+
+@_ON_DATABASE_SCHEDULER
+@pytest.mark.parametrize(
+    ("host_id", "status"), [("4b653f6031f35d168cc0b37caa1306d1", 200), ("other-host", 400)]
+)
+async def test_a_clones_routing_host_must_be_the_originals(
+    auth_client: httpx.AsyncClient, db_uri: str, host_id: str, status: int
+) -> None:
+    original = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+
+    resp = await auth_client.post(
+        f"/v1/scheduled-tasks/{original['id']}/clone",
+        json={"host_id": host_id},
+        headers=_headers(),
+    )
+
+    assert resp.status_code == status, resp.text
+    if status == 200:
+        assert resp.json()["host_id"] == original["host_id"]
+    else:
+        assert len(SqlAlchemyScheduledTaskStore(db_uri).list()) == 1

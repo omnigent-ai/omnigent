@@ -22,6 +22,7 @@ import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitles
 import { browserAgentToolsRequestHeaders } from "@/components/BrowserPane/agentTools/preferences";
 import { timezoneRequestHeaders } from "./timezones";
 import { parseBackgroundTasks } from "./sse";
+import { muteReadMarker, reconcileMuteLabel } from "./sessionMute";
 import type {
   BackgroundTaskInfo,
   ModelUsage,
@@ -1554,8 +1555,12 @@ export async function bindOnlyOnlineRunner(sessionId: string): Promise<Session |
  * with no transient (delta) coverage.
  */
 export async function getSession(sessionId: string): Promise<Session> {
+  const readMarker = muteReadMarker();
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}`);
-  return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
+  return reconcileMuteLabel(
+    sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res)),
+    readMarker,
+  );
 }
 
 export interface SessionRepositoryBranch {
@@ -1613,11 +1618,15 @@ export async function getSessionSlim(
     include_usage: "false",
   });
   if (options.refreshState === true) params.set("refresh_state", "true");
+  const readMarker = muteReadMarker();
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}?${params.toString()}`,
     { signal: options.signal },
   );
-  return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
+  return reconcileMuteLabel(
+    sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res)),
+    readMarker,
+  );
 }
 
 export interface SessionSignInLink {

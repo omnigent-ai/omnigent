@@ -100,6 +100,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "automations_v2": True,
         "splittable_terminal_view_ui": False,
         "sidebar_windowed_rows": False,
+        "chat_composer_codemirror": False,
         "workflows": False,
         "session_overview": False,
         "project_kanban": True,
@@ -123,6 +124,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert data["scheduled_task_worktrees"] is True
     # Gates the palette's grouped session search; older servers omit it.
     assert data["session_search_scope"] is True
+    assert data["session_mute"] is True
     # Lets sys_session_list scope archive-inclusive listings server-side.
     assert data["session_list_scoped_archives"] is True
     # Gates the automation dialog's Session control; older servers reject the fields.

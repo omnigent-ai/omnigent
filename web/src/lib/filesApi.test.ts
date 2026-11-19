@@ -1,10 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("./identity", () => ({ authenticatedFetch: vi.fn() }));
-vi.mock("./sessionsApi", () => ({ apiErrorFromResponse: vi.fn() }));
 
 import { authenticatedFetch } from "./identity";
-import { uploadFile } from "./filesApi";
+import { deleteSessionFile, uploadFile } from "./filesApi";
 
 afterEach(() => vi.resetAllMocks());
 
@@ -43,5 +42,29 @@ describe("uploadFile filenames", () => {
     );
     const uploaded = await uploadFile("session_1", new File([], "", { type: "image/png" }));
     expect(uploaded.filename).toBe("stored.png");
+  });
+});
+
+describe("deleteSessionFile", () => {
+  it("encodes both resource identifiers and accepts an empty response", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValue(new Response(null, { status: 204 }));
+
+    await expect(deleteSessionFile("session/1", "file/1")).resolves.toBeUndefined();
+
+    expect(authenticatedFetch).toHaveBeenCalledWith(
+      "/v1/sessions/session%2F1/resources/files/file%2F1",
+      { method: "DELETE" },
+    );
+  });
+
+  it("preserves the server's deletion error", async () => {
+    vi.mocked(authenticatedFetch).mockResolvedValue(
+      new Response(JSON.stringify({ detail: "Cannot delete this file" }), { status: 403 }),
+    );
+
+    await expect(deleteSessionFile("session_1", "file_1")).rejects.toMatchObject({
+      message: "Cannot delete this file",
+      status: 403,
+    });
   });
 });

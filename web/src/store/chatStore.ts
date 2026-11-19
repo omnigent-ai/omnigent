@@ -173,7 +173,7 @@ import type {
   Session,
   SessionStatus,
 } from "@/lib/types";
-import { downloadSessionFile, uploadFile } from "@/lib/filesApi";
+import { deleteSessionFile, downloadSessionFile, uploadFile } from "@/lib/filesApi";
 import { attachmentKey } from "@/lib/attachments";
 import { sendVerdictFromServer, snapshotRefusesSend } from "@/lib/userInputDelivery";
 import type { ActiveResponse } from "./types";
@@ -1962,27 +1962,22 @@ const backgroundFlushCooldownUntil = new Map<string, number>();
 // by File identity dedupes across attempts. Keyed by session too, since a File
 // could be sent to more than one. WeakMap so entries vanish when the File is
 // dropped from the queue/pending state.
-const uploadedFileBlockCache = new WeakMap<File, Map<string, ContentBlock>>();
+type UploadedFileBlock = Extract<ContentBlock, { file_id: string }>;
+const uploadedFileBlockCache = new WeakMap<File, Map<string, UploadedFileBlock>>();
 
-/**
- * Upload a file to a session and return its content block, reusing a prior
- * successful upload of the same File to the same session. Deduping here means
- * a failed post (or a later file's upload failing) doesn't re-upload files
- * that already landed when the message is retried.
- */
-async function uploadFileBlock(sessionId: string, file: File): Promise<ContentBlock> {
-  const cached = uploadedFileBlockCache.get(file)?.get(sessionId);
+/** Keep new uploads private to their batch until every file succeeds. */
+async function uploadFileBlock(
+  sessionId: string,
+  file: File,
+  newUploads: Map<File, UploadedFileBlock>,
+): Promise<UploadedFileBlock> {
+  const cached = newUploads.get(file) ?? uploadedFileBlockCache.get(file)?.get(sessionId);
   if (cached !== undefined) return cached;
   const uploaded = await uploadFile(sessionId, file);
-  const block: ContentBlock = file.type.startsWith("image/")
+  const block: UploadedFileBlock = file.type.startsWith("image/")
     ? { type: "input_image", file_id: uploaded.id, filename: uploaded.filename }
     : { type: "input_file", file_id: uploaded.id, filename: uploaded.filename };
-  let bySession = uploadedFileBlockCache.get(file);
-  if (bySession === undefined) {
-    bySession = new Map<string, ContentBlock>();
-    uploadedFileBlockCache.set(file, bySession);
-  }
-  bySession.set(sessionId, block);
+  newUploads.set(file, block);
   return block;
 }
 
@@ -2008,7 +2003,7 @@ async function rewindAttachmentFiles(
         if (inline) return fileFromDataUri(inline, attachment.filename);
         if (!attachment.fileId) return null;
         const file = await downloadSessionFile(sessionId, attachment.fileId, attachment.filename);
-        const block: ContentBlock = {
+        const block: UploadedFileBlock = {
           type: attachment.type,
           file_id: attachment.fileId,
           filename: attachment.filename,
@@ -2034,10 +2029,29 @@ async function uploadFileBlocks(
   files: readonly File[],
 ): Promise<ContentBlock[]> {
   const blocks: ContentBlock[] = [];
-  // Stop at the first failure so later uploads cannot outlive a requeued send.
-  for (const file of files) {
-    // oxlint-disable-next-line no-await-in-loop
-    blocks.push(await uploadFileBlock(sessionId, file));
+  const newUploads = new Map<File, UploadedFileBlock>();
+  try {
+    // Stop at the first failure so later uploads cannot outlive a requeued send.
+    for (const file of files) {
+      // oxlint-disable-next-line no-await-in-loop
+      blocks.push(await uploadFileBlock(sessionId, file, newUploads));
+    }
+  } catch (error) {
+    await Promise.all(
+      [...newUploads.values()].map(async (block) => {
+        try {
+          await deleteSessionFile(sessionId, block.file_id);
+        } catch (cleanupError) {
+          console.warn("Couldn't remove an upload from a failed attachment batch", cleanupError);
+        }
+      }),
+    );
+    throw error;
+  }
+  for (const [file, block] of newUploads) {
+    const bySession = uploadedFileBlockCache.get(file) ?? new Map<string, UploadedFileBlock>();
+    bySession.set(sessionId, block);
+    uploadedFileBlockCache.set(file, bySession);
   }
   return blocks;
 }

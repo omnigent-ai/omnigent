@@ -72,6 +72,29 @@ def clean_env(tmp_path, monkeypatch: pytest.MonkeyPatch):
     return tmp_path
 
 
+@pytest.mark.skipif(os.name == "nt", reason="directory symlinks require POSIX test support")
+def test_claude_user_settings_sources_include_alias_and_target(
+    clean_env: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = clean_env / "workspace"
+    workspace.mkdir()
+    config = clean_env / "parent-config"
+    config.mkdir()
+    (config / "settings.json").write_text('{"env":{"ANTHROPIC_AUTH_TOKEN":"parent-only"}}')
+    (workspace / "alias").symlink_to(config, target_is_directory=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", "alias")
+
+    settings, sources = ambient.read_claude_user_settings_with_sources(str(workspace))
+
+    assert settings == {"env": {"ANTHROPIC_AUTH_TOKEN": "parent-only"}}
+    assert set(sources) == {
+        workspace / "alias",
+        workspace / "alias" / "settings.json",
+        config,
+        config / "settings.json",
+    }
+
+
 def test_no_credentials_detected(clean_env) -> None:
     """With nothing present, detection returns an empty list.
 

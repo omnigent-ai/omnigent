@@ -1612,6 +1612,25 @@
         "title": "CloneRepositoryRequest",
         "type": "object"
       },
+      "CloneScheduledTaskRequest": {
+        "additionalProperties": false,
+        "description": "Optional body for `POST /v1/scheduled-tasks/{id}/clone`.",
+        "properties": {
+          "host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Host Id"
+          }
+        },
+        "title": "CloneScheduledTaskRequest",
+        "type": "object"
+      },
       "CodexGoalObject": {
         "description": "Current Codex goal state for a Codex-native session.\n\nMirrors Codex app-server's `ThreadGoal` shape using Omnigent's\nsnake-case API convention. `created_at` and `updated_at` are optional\nbecause older app-server documentation examples omit them even though the\ncurrent protocol includes them.",
         "properties": {
@@ -8167,6 +8186,11 @@
             "title": "Scheduled Task Approval Skipping Modes",
             "type": "boolean"
           },
+          "scheduled_task_clone": {
+            "default": false,
+            "title": "Scheduled Task Clone",
+            "type": "boolean"
+          },
           "scheduled_task_harness_settings": {
             "default": true,
             "title": "Scheduled Task Harness Settings",
@@ -8303,6 +8327,11 @@
           "session_move_source_checks": {
             "default": false,
             "title": "Session Move Source Checks",
+            "type": "boolean"
+          },
+          "session_mute": {
+            "default": true,
+            "title": "Session Mute",
             "type": "boolean"
           },
           "session_nest_moves": {
@@ -21581,6 +21610,68 @@
         ]
       }
     },
+    "/v1/scheduled-tasks/{scheduled_task_id}/clone": {
+      "post": {
+        "description": "Copy an owned automation under a new ID, without its runs or continued session.\n\nNeeds the database scheduler: the legacy timer re-anchors an interval\nschedule whenever it arms one, so it can't run the clone on the original's days.",
+        "operationId": "clone_scheduled_task_v1_scheduled_tasks__scheduled_task_id__clone_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "scheduled_task_id",
+            "required": true,
+            "schema": {
+              "title": "Scheduled Task Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/CloneScheduledTaskRequest"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Clone Scheduled Task V1 Scheduled Tasks  Scheduled Task Id  Clone Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Clone Scheduled Task",
+        "tags": [
+          "scheduled_tasks"
+        ]
+      }
+    },
     "/v1/scheduled-tasks/{scheduled_task_id}/permissions": {
       "get": {
         "description": "List the grants on one of the caller's automations with cursor pagination.\n\nThe owner holds no grant and is not listed.\n\n**Returns:** `{\"permissions\": [...], \"next_cursor\": str|null}`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 when the caller does not own the automation, 403 for an agent or a server that cannot keep automation grants.",
@@ -21656,7 +21747,7 @@
         ]
       },
       "put": {
-        "description": "Share one of the caller's automations with a user or group.\n\nRead is the only level, and an automation is never public. A\ncontinue-session automation's session is shared with them too. Auto-creates\nthe grantee user if they don't exist yet.\n\n**Parameters**\n\n- `body` \u2014 The grant request with `user_id` and `level`.\n\n**Returns:** The resulting grant.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 when the caller does not own the automation, 403 for an agent, a server that cannot share automations or the sharing policy, 400 for an empty or over-long ID, the owner, `__public__` or a level other than read.",
+        "description": "Share one of the caller's automations with a user or group.\n\nRead is the only level, and an automation is never public. A\ncontinue-session automation's session is shared with them too. Auto-creates\nthe grantee user if they don't exist yet.\n\n**Parameters**\n\n- `body` \u2014 The grant request with `user_id` and `level`.\n\n**Returns:** The resulting grant.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 when the caller does not own the automation, 403 for an agent, a server that cannot share automations, the sharing policy or an automation its store cannot keep grants for, 400 for an empty or over-long ID, the owner, `__public__` or a level other than read.",
         "operationId": "grant_scheduled_task_permission_v1_scheduled_tasks__scheduled_task_id__permissions_put",
         "parameters": [
           {
