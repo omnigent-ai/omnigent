@@ -9,6 +9,8 @@ import {
   useComposerMirrorAlignment,
 } from "@/components/composer/MentionTokenOverlay";
 import { findMentionTokens } from "@/lib/composerMentions";
+import { supportsNativeShellInput } from "@/lib/harnessSetup";
+import { isOwnerLevel } from "@/lib/permissionsApi";
 
 export interface ComposerHighlightSplit {
   kind: "command" | "shell";
@@ -63,6 +65,32 @@ export function splitNativeShellCommand(
 }
 
 /**
+ * The harness whose `!` rule applies to this viewer's sends, else null. The
+ * server runs codex `!` input only for the owner.
+ */
+export function nativeShellHarness(
+  harness: string | null | undefined,
+  permissionLevel: number | null,
+): string | null {
+  if (!harness || !supportsNativeShellInput(harness)) return null;
+  return harness !== "codex-native" || isOwnerLevel(permissionLevel) ? harness : null;
+}
+
+export const SHELL_MENTION_REFUSAL =
+  "Shell commands can't include @mentions; remove them or drop the leading `!`.";
+
+/**
+ * Why a send must not go out, or null. A tag expands to an attachment marker,
+ * which a shell command would receive as literal arguments.
+ */
+export function shellMentionRefusal(
+  kind: ComposerHighlight["kind"],
+  mentions: readonly unknown[],
+): string | null {
+  return kind === "shell" && mentions.length > 0 ? SHELL_MENTION_REFUSAL : null;
+}
+
+/**
  * What the composer overlay tints in `value`. `nativeShell` is the harness
  * whose `!` rule applies when a `!command` from this viewer runs as a shell
  * command in the session, else null.
@@ -103,7 +131,7 @@ export interface UseComposerHighlightOptions {
   /** False while quotes or attachments ride along (they change what is sent). */
   enabled: boolean;
   nativeShell: string | null;
-  /** The text as sent, when sending drops characters from `value`; decides shell mode. */
+  /** The text as sent, when it differs from `value`; decides shell mode. */
   classifyValue?: string;
   /** Inline @mention tokens the mirror paints as pills; empty where none apply. */
   mentionTokens: readonly string[];
@@ -129,9 +157,9 @@ export interface ComposerHighlight {
 
 /**
  * Paint a leading known command or native `!` shell token, plus inline
- * @mention pills, in upstream's composer mirror. One mirror serves both, so a
- * draft holding a command and mentions shows each. Display-only: the draft
- * value is never changed.
+ * @mention pills, in the composer mirror. One mirror serves both, so a draft
+ * holding a command and mentions shows each. Display-only: the draft value is
+ * never changed.
  */
 export function useComposerHighlight({
   value,

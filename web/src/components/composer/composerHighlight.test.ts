@@ -1,5 +1,5 @@
 import { createElement, useRef } from "react";
-import { render, renderHook, screen } from "@testing-library/react";
+import { fireEvent, render, renderHook, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import { supportsNativeShellInput } from "@/lib/harnessSetup";
 import {
@@ -172,6 +172,27 @@ describe("useComposerHighlight mirror", () => {
     expect(overlay.querySelector(".text-brand-accent:not([data-testid])")).toBeNull();
     expect(screen.getByTestId("composer-mention-token")).toBeInTheDocument();
     expect(screen.getByRole("textbox")).not.toHaveAttribute("data-slash-command");
+  });
+
+  it("follows the textarea's scroll position", () => {
+    const value = ["/team plan", ...Array.from({ length: 40 }, (_, i) => `line ${i}`)].join("\n");
+    render(createElement(Mirror, { value, mentionTokens: [] }));
+    const textarea = screen.getByRole("textbox");
+    const overlay = screen.getByTestId("composer-highlight-overlay");
+    // jsdom keeps no scroll offset, so back both with plain properties.
+    for (const element of [textarea, overlay]) {
+      let scrollTop = 0;
+      Object.defineProperty(element, "scrollTop", {
+        configurable: true,
+        get: () => scrollTop,
+        set: (next: number) => {
+          scrollTop = next;
+        },
+      });
+    }
+    textarea.scrollTop = 240;
+    fireEvent.scroll(textarea);
+    expect(overlay.scrollTop).toBe(240);
   });
 
   it("mounts no mirror for prose without mentions", () => {

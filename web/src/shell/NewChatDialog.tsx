@@ -71,7 +71,7 @@ import {
   ComposerFeedbackRow,
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
-import { useComposerHighlight } from "@/components/composer/composerHighlight";
+import { shellMentionRefusal, useComposerHighlight } from "@/components/composer/composerHighlight";
 import {
   SandboxProfilePicker,
   useSandboxProfileCatalog,
@@ -6160,6 +6160,15 @@ function NewChatLandingContent({
       handleBlockedSubmit();
       return;
     }
+    const liveMentions = presentMentions(
+      composerInlineMentions(mentionedItems, mentionedSessions, selectedAgent?.harness ?? null),
+      [message],
+    );
+    const refusal = shellMentionRefusal(highlight.kind, liveMentions);
+    if (refusal !== null) {
+      setCreateError(refusal);
+      return;
+    }
     if (createAttemptRef.current !== null) return;
     const createAttempt = Symbol();
     createAttemptRef.current = createAttempt;
@@ -6347,10 +6356,6 @@ function NewChatLandingContent({
       // from the marker; no upload happens. Folders carry a trailing "/".
       // Computed BEFORE the create so `smart_routing_message` classifies the
       // prompt the agent actually receives, not the raw textarea value.
-      const liveMentions = presentMentions(
-        composerInlineMentions(mentionedItems, mentionedSessions, selectedAgent?.harness ?? null),
-        [message],
-      );
       const initialPrompt = withSessionMentionHint(
         expandMentionTokens(sanitizeInitialPrompt(message), liveMentions),
         liveMentions.some((m) => m.marker.startsWith("[Session: ")),

@@ -910,17 +910,12 @@ describe("UserBubble command tint", () => {
     expect(screen.getByTestId("message-bubble")).toHaveTextContent(text.trim());
   });
 
-  it("shows args that alone would be a link definition", () => {
-    renderScoped(userBubble("/team [docs]: https://example.com"), <PublishCommands />);
-    expect(screen.getByText("/team")).toHaveClass("text-brand-accent");
-    expect(screen.getByTestId("message-bubble")).toHaveTextContent(
-      "/team [docs]: https://example.com",
-    );
-  });
+  // Alone, these args would parse as a link definition and render nothing.
+  const linkDefinitionArgs = " [docs]: https://example.com";
 
   // The tint wraps the token without changing how the rest of the text parses.
   it.each([
-    " [docs]: https://example.com",
+    linkDefinitionArgs,
     " # x",
     " - x",
     " - first\n- second",
@@ -938,6 +933,9 @@ describe("UserBubble command tint", () => {
     const tinted = screen.getByTestId("user-message-content").innerHTML;
     expect(tinted).toContain(TINTED_TEAM);
     expect(tinted.replace(TINTED_TEAM, "/team")).toBe(untinted);
+    if (args === linkDefinitionArgs) {
+      expect(screen.getByTestId("message-bubble")).toHaveTextContent(text);
+    }
   });
 
   it.each([

@@ -1,6 +1,7 @@
 import { formatLocalReviewComments } from "@/lib/localReviewComments";
 import { requestLocalReviewContext, updateLocalReviewContext } from "@/lib/localReviewContext";
 import { create } from "zustand";
+import { SHELL_MENTION_REFUSAL } from "@/components/composer/composerHighlight";
 import { SHIFT_KEY } from "@/components/KeyboardShortcut";
 import type { SkillSummary, SkillsStatus } from "@/lib/types";
 
@@ -5835,6 +5836,72 @@ describe("Composer native shell mode", () => {
       }
     },
   );
+
+  it("refuses a `!` send that carries a tag, keeps the draft, then sends once it is gone", () => {
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    const props = composerProps({ isNativeWrapper: true, permissionLevel: null });
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "!cat" } });
+    act(() =>
+      useChatStore.setState({
+        pendingComposerAttachments: [{ path: "src/example.ts", isDir: false }],
+      }),
+    );
+    const tagged = textarea().value;
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).not.toHaveBeenCalled();
+    expect(screen.getByText(SHELL_MENTION_REFUSAL)).toBeVisible();
+    expect(textarea()).toHaveValue(tagged);
+
+    fireEvent.change(textarea(), { target: { value: "!cat src/example.ts" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledExactlyOnceWith("!cat src/example.ts", undefined);
+  });
+
+  it("classifies a bare `!` by the review context it sends with", () => {
+    useChatStore.setState({ sessionHarness: "codex-native" });
+    const props = composerProps({ isNativeWrapper: true, permissionLevel: null });
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <Composer {...props} />
+      </QueryClientProvider>,
+    );
+    fireEvent.change(textarea(), { target: { value: "!" } });
+    expect(screen.queryByTestId("composer-shell-mode-indicator")).toBeNull();
+
+    const comment = {
+      id: "shell-review",
+      conversation_id: "conv_shell",
+      path: "src/example.ts",
+      start_index: 0,
+      end_index: 0,
+      body: "Preserve the public API.",
+      status: "draft" as const,
+      created_at: 1,
+      updated_at: 1,
+      anchor_content: null,
+      created_by: null,
+      anchor_metadata: {
+        pr_url: "https://github.com/acme/repo/pull/1",
+        side: "RIGHT" as const,
+        line: 12,
+        start_line: null,
+        head_sha: "a".repeat(40),
+        base_sha: "b".repeat(40),
+      },
+    };
+    act(() => requestLocalReviewContext(comment));
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+    expect(screen.getByTestId("composer-highlight-overlay").textContent).toBe("!");
+
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledExactlyOnceWith(
+      `!\n\n${formatLocalReviewComments([comment], { includeInstruction: false })}`,
+      undefined,
+    );
+  });
 });
 
 describe("Composer placeholder", () => {

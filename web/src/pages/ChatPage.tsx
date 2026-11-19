@@ -46,6 +46,8 @@ import {
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
 import {
+  nativeShellHarness,
+  shellMentionRefusal,
   useComposerHighlight,
   usePublishComposerCommands,
 } from "@/components/composer/composerHighlight";
@@ -122,7 +124,7 @@ import {
 } from "@/lib/sideChat";
 import { shouldQueueSend } from "@/lib/messageQueue";
 import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
-import { skillInvocationPrefix, supportsNativeShellInput } from "@/lib/harnessSetup";
+import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import {
   composerInlineMentions,
@@ -3098,12 +3100,7 @@ function ComposerImpl(
     [commandSkills, showEffort, showModel, showBtw, showSide, skillPrefix],
   );
 
-  // The server runs codex `!` input only for the owner.
-  const nativeShell =
-    supportsNativeShellInput(sessionHarness) &&
-    (sessionHarness !== "codex-native" || isOwnerLevel(permissionLevel))
-      ? sessionHarness
-      : null;
+  const nativeShell = nativeShellHarness(sessionHarness, permissionLevel);
   usePublishComposerCommands(conversationId, slashCommandNames, nativeShell);
 
   const toggleCodexPlanMode = async () => {
@@ -3223,6 +3220,9 @@ function ComposerImpl(
     [draft.text, ...draft.quotes.map((quote) => quote.before)],
   );
   const hasMentions = liveMentions.length > 0;
+  const sendContext = { mentions: liveMentions, reviewComments: localReviewComments };
+  const plainOutgoingText = (trimmed: string) =>
+    isSlashCommandText(trimmed) ? trimmed : fullText.trimEnd();
   // One mirror paints the command or `!` tint and inline mention pills. Quotes
   // and files are sent ahead of the text, so it no longer starts with the token.
   const highlight = useComposerHighlight({
@@ -3230,6 +3230,9 @@ function ComposerImpl(
     commandNames: slashCommandNames,
     enabled: draft.quotes.length === 0 && files.length === 0,
     nativeShell,
+    // Review comments are appended at send, which can make a bare `!` a command.
+    classifyValue: buildOutgoingMessage(draft, plainOutgoingText(fullText.trim()), sendContext)
+      .text,
     mentionTokens: draft.quotes.length === 0 ? mentionTokens : [],
     textareaRef: tailTextareaRef,
   });
@@ -3976,13 +3979,17 @@ function ComposerImpl(
       hasPendingElicitation
     )
       return;
+    const refusal = shellMentionRefusal(highlight.kind, liveMentions);
+    if (refusal !== null) {
+      setCommandError(refusal);
+      return;
+    }
 
     const skill = onSendSlashCommand
       ? matchSlashCommandInvocation(trimmed, slashCommandNames)
       : null;
     const parts = trimmed.split(/\s+/);
     const cmd = parts[0].toLowerCase();
-    const sendContext = { mentions: liveMentions, reviewComments: localReviewComments };
     const opensGenericSideChat =
       cmd === "/side" &&
       !usesNativeSideChatFork(sessionHarness) &&
@@ -4120,7 +4127,7 @@ function ComposerImpl(
     // one tool hint at the end.
     const outgoing = buildOutgoingMessage(
       draft,
-      goalMessage ?? (isSlashCommandText(trimmed) ? trimmed : fullText.trimEnd()),
+      goalMessage ?? plainOutgoingText(trimmed),
       sendContext,
     );
     // Sending while a prior response is streaming is fine — the

@@ -59,7 +59,26 @@ vi.mock("@/hooks/useAvailableAgents", () => ({
   USER_AGENTS_QUERY_KEY: ["available-agents-user"],
 }));
 vi.mock("@/hooks/useHostFilesystem", () => ({
-  useHostFilesystem: () => ({ data: undefined, isLoading: false, error: null }),
+  // One workspace file, so the "@" menu can tag it.
+  useHostFilesystem: (_hostId: string | null, path: string | null) => ({
+    data:
+      path === "/work/repo"
+        ? {
+            entries: [
+              {
+                name: "README.md",
+                path: "/work/repo/README.md",
+                type: "file",
+                bytes: 10,
+                modified_at: 0,
+              },
+            ],
+            truncated: false,
+          }
+        : undefined,
+    isLoading: false,
+    error: null,
+  }),
   useCreateHostDirectory: () => ({ mutateAsync: vi.fn(), isPending: false }),
 }));
 vi.mock("@/hooks/useHostWorktrees", async (importOriginal) => ({
@@ -94,6 +113,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { SHELL_MENTION_REFUSAL } from "@/components/composer/composerHighlight";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
@@ -214,6 +234,36 @@ describe("landing composer highlight", () => {
     const overlay = screen.getByTestId("composer-highlight-overlay");
     expect(overlay.textContent).toBe("\x05!echo ok");
     expect(within(overlay).getByText("!")).toHaveClass("text-brand-accent");
+  });
+
+  it("refuses a `!` send that carries a tag, keeps the draft, then sends once it is gone", async () => {
+    renderLanding("claude-native");
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    fireEvent.change(input(), { target: { value: "!cat @", selectionStart: 6 } });
+    fireEvent.click(screen.getByTitle("Attach README.md"));
+    expect(input()).toHaveValue("!cat @README.md ");
+    expect(screen.getByTestId("composer-shell-mode-indicator")).toBeVisible();
+
+    const submit = screen.getByTestId("new-chat-landing-submit");
+    await waitFor(() => expect(submit).toBeEnabled());
+    fireEvent.click(submit);
+    expect(await screen.findByTestId("new-chat-landing-error")).toHaveTextContent(
+      SHELL_MENTION_REFUSAL,
+    );
+    expect(input()).toHaveValue("!cat @README.md ");
+    expect(setPendingInitialPrompt).not.toHaveBeenCalled();
+    expect(authenticatedFetch).not.toHaveBeenCalledWith("/v1/sessions", expect.anything());
+
+    type("!cat README.md");
+    fireEvent.click(submit);
+    await waitFor(() =>
+      expect(setPendingInitialPrompt).toHaveBeenCalledWith(
+        "conv_new",
+        expect.objectContaining({ text: "!cat README.md" }),
+      ),
+    );
   });
 
   it("does not offer shell mode on a harness without native `!` input", () => {

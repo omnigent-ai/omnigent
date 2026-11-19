@@ -86,9 +86,10 @@ import type { Session } from "@/lib/types";
 import { useSkills } from "@/hooks/useSkills";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
-import { skillInvocationPrefix, supportsNativeShellInput } from "@/lib/harnessSetup";
-import { isOwnerLevel } from "@/lib/permissionsApi";
+import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import {
+  nativeShellHarness,
+  shellMentionRefusal,
   useComposerHighlight,
   usePublishComposerCommands,
 } from "@/components/composer/composerHighlight";
@@ -1119,17 +1120,19 @@ function SideChatComposer({
   });
   const menuCommandNames = useMemo(() => Object.keys(menuCommands), [menuCommands]);
   // A pending tab's text seeds the fork rather than reaching the harness.
-  const nativeShell =
-    !pending &&
-    supportsNativeShellInput(harness) &&
-    (harness !== "codex-native" || isOwnerLevel(session?.permissionLevel ?? null))
-      ? (harness ?? null)
-      : null;
+  const nativeShell = pending
+    ? null
+    : nativeShellHarness(harness, session?.permissionLevel ?? null);
+  const outgoingText = isSlashCommandText(text) ? text.trim() : text.trimEnd();
   const highlight = useComposerHighlight({
     value: text,
     commandNames: menuCommandNames,
     enabled: quotes.length === 0 && files.length === 0,
     nativeShell,
+    // A grid cell appends review comments at send, which can make a bare `!` a command.
+    classifyValue: gridCell
+      ? buildOutgoingMessage({ quotes, text }, outgoingText, sendContext).text
+      : undefined,
     // The side chat has no @-mention picker.
     mentionTokens: [],
     textareaRef: tailTextareaRef,
@@ -1148,7 +1151,7 @@ function SideChatComposer({
 
   const submit = () => {
     if (settingsSavePending()) return;
-    const trimmed = isSlashCommandText(text) ? text.trim() : text.trimEnd();
+    const trimmed = outgoingText;
     if (pending) {
       if (!canSend || starting || !onStart) return;
       // Keep the text so a failed fork can be retried without re-typing.
@@ -1157,6 +1160,11 @@ function SideChatComposer({
     }
     // A grid cell queues or steers its send while the session works; other full sessions wait.
     if ((busy && fullSession && !gridCell) || !canSend || agentId === null) return;
+    const refusal = shellMentionRefusal(highlight.kind, sendContext.mentions);
+    if (refusal !== null) {
+      setCommandNotice(refusal);
+      return;
+    }
     // On in-process harnesses /help and skills resolve locally; native TUIs
     // (claude-native, codex-native) read the text themselves, and a quote, attachment,
     // tag or review comment is always an ordinary message.
