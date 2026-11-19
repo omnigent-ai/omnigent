@@ -266,6 +266,35 @@ def test_fork_drops_the_automation_run_label(
     assert not any(key.startswith(SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX) for key in fork.labels)
 
 
+def test_worker_finds_its_creator_run_by_the_stored_creator_id(db_uri: str) -> None:
+    """A store that names sessions by other ids still gives a worker its creator's run."""
+    from omnigent.stores.conversation_store import (
+        CREATED_BY_SESSION_LABEL_KEY,
+        SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+    )
+
+    class ExternalIdStore(SqlAlchemyConversationStore):
+        def __init__(self, uri: str) -> None:
+            super().__init__(uri)
+            self.stored_ids: dict[str, str] = {}
+
+        def _conversation_storage_id(self, conversation_id: str) -> str:
+            return self.stored_ids.get(conversation_id, conversation_id)
+
+    store = ExternalIdStore(db_uri)
+    run_id = "0123456789abcdef0123456789abcdef"
+    source = store.create_conversation(
+        labels={SCHEDULED_TASK_ORIGIN_LABEL_KEY: "st_1", SCHEDULED_TASK_RUN_LABEL_KEY: run_id}
+    )
+    store.stored_ids["1001"] = source.id
+
+    worker = store.create_conversation(labels={CREATED_BY_SESSION_LABEL_KEY: "1001"})
+
+    assert worker.labels[CREATED_BY_SESSION_LABEL_KEY] == "1001"
+    assert worker.labels[SCHEDULED_TASK_ORIGIN_LABEL_KEY] == "st_1"
+    assert worker.labels[SCHEDULED_TASK_RUN_LABEL_KEY] == run_id
+
+
 def test_fork_drops_sandbox_repo_label(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
