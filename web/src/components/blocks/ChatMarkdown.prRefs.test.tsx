@@ -107,20 +107,17 @@ function hrefs(): string[] {
 }
 
 describe("pull request references in chat markdown", () => {
-  it("links a bare reference to the session repo's PR", () => {
+  it("links bare references to the session repo and explicit ones to their own repo", () => {
     seed(githubInfo());
-    renderMarkdown("Landed in #4242.");
+    renderMarkdown("Landed in #4242; upstream: omnigent-ai/omnigent#9882.");
 
+    expect(hrefs()).toEqual([
+      "https://github.com/acme/app/pull/4242",
+      "https://github.com/omnigent-ai/omnigent/pull/9882",
+    ]);
     const link = screen.getByRole("link", { name: /#4242/ });
-    expect(link).toHaveAttribute("href", "https://github.com/acme/app/pull/4242");
     expect(link).toHaveAttribute("target", "_blank");
     expect(link).toHaveAttribute("rel", "noopener noreferrer");
-  });
-
-  it("links an explicit owner/repo reference to that repo", () => {
-    seed(githubInfo());
-    renderMarkdown("Upstream: omnigent-ai/omnigent#9882");
-    expect(hrefs()).toEqual(["https://github.com/omnigent-ai/omnigent/pull/9882"]);
   });
 
   it("leaves a bare reference as text when the session's repo is unknown", () => {
@@ -204,21 +201,7 @@ describe("pull request references in chat markdown", () => {
     expect(githubInfoRequests()).toHaveLength(calls);
   });
 
-  it("resolves against a side chat's own session, not the parent's", () => {
-    seed(githubInfo());
-    client.setQueryData(
-      ["github-info", "conv_child"],
-      githubInfo({ workspace_repo: { name_with_owner: "acme/lib", host: "github.com" } }),
-    );
-    renderMarkdown("See #4242", true, (children) => (
-      <ConversationScopeContext.Provider value="conv_child">
-        {children}
-      </ConversationScopeContext.Provider>
-    ));
-    expect(hrefs()).toEqual(["https://github.com/acme/lib/pull/4242"]);
-  });
-
-  it("opens a side chat's link in the parent's in-app browser", async () => {
+  it("resolves a side chat's link against its own repo and opens it in the parent's browser", async () => {
     nativeShell.native = true;
     const openOrNavigate = vi.fn().mockResolvedValue({ ok: true });
     Object.assign(window, {
@@ -236,6 +219,7 @@ describe("pull request references in chat markdown", () => {
       </ConversationScopeContext.Provider>
     ));
 
+    expect(hrefs()).toEqual(["https://github.com/acme/lib/pull/4242"]);
     const link = screen.getByRole("link", { name: /#4242/ });
     const event = new MouseEvent("click", { bubbles: true, cancelable: true, button: 0 });
     link.dispatchEvent(event);
