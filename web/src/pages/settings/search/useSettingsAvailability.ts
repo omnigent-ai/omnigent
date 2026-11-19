@@ -38,6 +38,9 @@ export function useSettingsAvailability(): SettingsAvailability {
   const mcpServices = providers.includes("mcp");
   const github = providers.includes("github");
   const databricks = providers.includes("databricks");
+  const projectKanban = isFeatureEnabled(info, "project_kanban");
+  const sessionTitleInstructions = loaded?.session_title_instructions === true;
+  const proactiveAgent = loaded?.proactive_agent_available === true;
   return useMemo(
     () => ({
       globalShortcut,
@@ -48,6 +51,9 @@ export function useSettingsAvailability(): SettingsAvailability {
       archiveWorktreeCleanup,
       mcpServices,
       integrationProviders: { github, databricks },
+      projectKanban,
+      sessionTitleInstructions,
+      proactiveAgent,
     }),
     [
       globalShortcut,
@@ -59,6 +65,9 @@ export function useSettingsAvailability(): SettingsAvailability {
       mcpServices,
       github,
       databricks,
+      projectKanban,
+      sessionTitleInstructions,
+      proactiveAgent,
     ],
   );
 }

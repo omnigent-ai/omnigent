@@ -184,6 +184,12 @@ export interface SettingsAvailability {
   mcpServices: boolean;
   /** Which sandbox account connections the server lists in `enabled_connections`. */
   integrationProviders: { github: boolean; databricks: boolean };
+  /** The server turns on project kanban boards. */
+  projectKanban: boolean;
+  /** The server lets people write their own session title instructions. */
+  sessionTitleInstructions: boolean;
+  /** The server offers the proactive agent. */
+  proactiveAgent: boolean;
 }
 
 export interface SettingsEntry {
