@@ -244,6 +244,8 @@ def test_tracked_pr_info_names_the_workspace_repo(
         # A fork checkout: gh resolves bare refs against upstream, not the fork.
         ("upstream", "owner/app", "owner/app"),
         ("upstream", "owner/other", "owner/app"),
+        # gh's resolved base wins over a remote of the tracked repo.
+        ("origin", "owner/app", "me/app"),
         (None, "owner/app", "owner/app"),
         (None, "owner/other", "me/app"),
     ],

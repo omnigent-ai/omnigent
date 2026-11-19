@@ -211,7 +211,7 @@ def _add_workspace_repo(root: str, info: dict[str, Any]) -> None:
 
     # remote_urls lists origin first, so the last fallback is origin when it parses.
     _, parsed = next(
-        (remote for remote in remotes if remote[0] in resolved),
+        (remote for remote in remotes if resolved.get(remote[0]) == "base"),
         next((remote for remote in remotes if is_tracked(remote[1])), remotes[0]),
     )
     info["workspace_repo"] = {"name_with_owner": parsed.repository, "host": parsed.host}
