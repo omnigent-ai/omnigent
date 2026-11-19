@@ -1,6 +1,7 @@
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ReactNode } from "react";
 import type { MessageContentBlock } from "@/lib/blocks";
 import type { Bubble } from "@/lib/renderItems";
 import { AUTOMATION_CONTEXT_NOTE } from "@/lib/systemMessage";
@@ -9,7 +10,7 @@ import { SessionSharedContext } from "@/components/chat/chatBubbleParts";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { EditSentMessageContext, type SentMessage } from "@/components/chat/editSentMessage";
 import type * as IdentityModule from "@/lib/identity";
-import { BubbleView, buildPendingBubbles } from "./ChatPage";
+import { BtwSidechatAnswer, BubbleView, buildPendingBubbles } from "./ChatPage";
 
 // Unmocked, the viewer id is null in jsdom; Edit tests pin who is signed in.
 const viewer = vi.hoisted(() => ({ id: null as string | null }));
@@ -163,27 +164,29 @@ describe("UserBubble markdown rendering", () => {
 
 const PR_REF_FILE_VIEWER = { ...FILE_VIEWER_NOOP, conversationId: "conv_pr" };
 
+function renderWithSessionRepo(children: ReactNode) {
+  // GitHub info never arrives over the network; the test seeds the cache.
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(() => new Promise<Response>(() => {})),
+  );
+  const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  queryClient.setQueryData(["github-info", "conv_pr"], {
+    object: "session.github.info",
+    available: true,
+    repo: { name_with_owner: "acme/app", host: "github.com" },
+    workspace_repo: { name_with_owner: "acme/app", host: "github.com" },
+  });
+  render(
+    <QueryClientProvider client={queryClient}>
+      <FileViewerContext.Provider value={PR_REF_FILE_VIEWER}>{children}</FileViewerContext.Provider>
+    </QueryClientProvider>,
+  );
+}
+
 describe("UserBubble pull request references", () => {
   it("links a PR reference to the session repo", () => {
-    // GitHub info never arrives over the network; the test seeds the cache.
-    vi.stubGlobal(
-      "fetch",
-      vi.fn(() => new Promise<Response>(() => {})),
-    );
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    queryClient.setQueryData(["github-info", "conv_pr"], {
-      object: "session.github.info",
-      available: true,
-      repo: { name_with_owner: "acme/app", host: "github.com" },
-      workspace_repo: { name_with_owner: "acme/app", host: "github.com" },
-    });
-    render(
-      <QueryClientProvider client={queryClient}>
-        <FileViewerContext.Provider value={PR_REF_FILE_VIEWER}>
-          <BubbleView bubble={userBubble("See #4242 and acme/lib#7")} />
-        </FileViewerContext.Provider>
-      </QueryClientProvider>,
-    );
+    renderWithSessionRepo(<BubbleView bubble={userBubble("See #4242 and acme/lib#7")} />);
     expect(screen.getByRole("link", { name: /#4242/ })).toHaveAttribute(
       "href",
       "https://github.com/acme/app/pull/4242",
@@ -191,6 +194,16 @@ describe("UserBubble pull request references", () => {
     expect(screen.getByRole("link", { name: /acme\/lib#7/ })).toHaveAttribute(
       "href",
       "https://github.com/acme/lib/pull/7",
+    );
+  });
+});
+
+describe("/btw answer pull request references", () => {
+  it("links a PR reference to the session repo", () => {
+    renderWithSessionRepo(<BtwSidechatAnswer answer="Fixed in #4242." />);
+    expect(screen.getByRole("link", { name: /#4242/ })).toHaveAttribute(
+      "href",
+      "https://github.com/acme/app/pull/4242",
     );
   });
 });
