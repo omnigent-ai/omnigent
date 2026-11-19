@@ -37,6 +37,7 @@ outside the lock.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import threading
 from collections.abc import Callable
@@ -46,9 +47,15 @@ from pathlib import Path
 from urllib.parse import quote
 
 from omnigent.debug_logging import debug_event
+from omnigent.inner._subprocess_lifecycle import await_cleanup_task
 from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.os_env import OSEnvironment
-from omnigent.inner.terminal import TerminalInstance, create_terminal_instance
+from omnigent.inner.terminal import (
+    TerminalCreateResult,
+    TerminalInstance,
+    create_terminal_instance,
+)
+from omnigent.util.dedicated_executor import DedicatedExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +66,9 @@ logger = logging.getLogger(__name__)
 # well-behaved tmux to flush and exit, short enough that cleanup
 # doesn't stall.
 _CLOSE_TIMEOUT_S = 5.0
+
+# Version probes and workspace copies must not occupy terminal-delivery workers.
+_TERMINAL_PREPARATION = DedicatedExecutor(max_workers=4, thread_name_prefix="terminal-prepare")
 
 
 def conversation_link_for_id(
@@ -215,6 +225,7 @@ class TerminalRegistry:
         # Per-conversation maps make ``cleanup_conversation`` cheap
         # (one pop) and ``list_for_conversation`` direct.
         self._by_conversation: dict[str, dict[tuple[str, str], TerminalInstance]] = {}
+        self._launch_generations: dict[str, object] = {}
         # Per-instance locks keyed by the full (conv_id, name, session_key)
         # triple. Created at launch, removed at close /
         # cleanup_conversation. Sender / reader / closer tools acquire
@@ -295,6 +306,7 @@ class TerminalRegistry:
         """
         key = (terminal_name, session_key)
         with self._lock:
+            generation = self._launch_generations.setdefault(conversation_id, object())
             existing = self._by_conversation.get(conversation_id, {}).get(key)
         if existing is not None and existing.running:
             if await existing.is_alive():
@@ -323,18 +335,34 @@ class TerminalRegistry:
         shared_environment_args = (
             {"parent_environment": parent_environment} if parent_environment else {}
         )
-        created = create_terminal_instance(
-            terminal_name,
-            session_key,
-            spec,
-            parent_os_env_spec=parent_os_env,
-            **shared_environment_args,
-            cwd_override=cwd_override,
-            sandbox_override=sandbox_override,
-            conversation_link=self.conversation_link_for_id(conversation_id),
+        creation = asyncio.create_task(
+            _TERMINAL_PREPARATION.run(
+                create_terminal_instance,
+                terminal_name,
+                session_key,
+                spec,
+                parent_os_env_spec=parent_os_env,
+                **shared_environment_args,
+                cwd_override=cwd_override,
+                sandbox_override=sandbox_override,
+                conversation_link=self.conversation_link_for_id(conversation_id),
+            )
         )
-        stage = "terminal_spawn"
+        created: TerminalCreateResult | None = None
+        stage = "terminal_prepare"
         try:
+            try:
+                created = await asyncio.shield(creation)
+            except asyncio.CancelledError:
+                # A cancelled await cannot stop the worker allocating private resources.
+                with contextlib.suppress(Exception, asyncio.CancelledError):
+                    await await_cleanup_task(creation)
+                    created = creation.result()
+                raise
+            with self._lock:
+                if self._launch_generations.get(conversation_id) is not generation:
+                    raise asyncio.CancelledError
+            stage = "terminal_spawn"
             created.instance.program_status_app = program_status_app
             created.instance.lifecycle_trace.transfer_session(conversation_id)
             await created.instance.launch(cwd=created.cwd)
@@ -342,7 +370,24 @@ class TerminalRegistry:
             if not await created.instance.is_alive():
                 created.instance.lifecycle_trace.note_exit()
                 raise TerminalExitedDuringLaunch(created.instance)
+            with self._lock:
+                if self._launch_generations.get(conversation_id) is not generation:
+                    raise asyncio.CancelledError
+                slot = self._by_conversation.setdefault(conversation_id, {})
+                racer = slot.get(key)
+                if racer is not None and racer.running:
+                    instance_to_close: TerminalInstance | None = created.instance
+                    winning_instance = racer
+                else:
+                    slot[key] = created.instance
+                    instance_to_close = None
+                    winning_instance = created.instance
+                    self._instance_locks[(conversation_id, terminal_name, session_key)] = (
+                        threading.Lock()
+                    )
         except (Exception, asyncio.CancelledError) as exc:
+            if created is None:
+                raise
             # Until registration, no shutdown sweep can discover this instance.
             cleanup = await _close_unregistered_instance(created.instance)
             cancelled = isinstance(exc, asyncio.CancelledError)
@@ -371,29 +416,6 @@ class TerminalRegistry:
                 # The caller cancelled us while cleanup ran; cancellation wins.
                 raise asyncio.CancelledError() from exc
             raise
-
-        with self._lock:
-            slot = self._by_conversation.setdefault(conversation_id, {})
-            # Re-check: another concurrent launch for the same key may
-            # have raced ours. Take the second-arrival policy: close
-            # ours and return the racer's. Avoids two live tmux
-            # sessions for the same key.
-            racer = slot.get(key)
-            if racer is not None and racer.running:
-                # Close ours outside the lock; racer wins.
-                instance_to_close: TerminalInstance | None = created.instance
-                winning_instance = racer
-            else:
-                slot[key] = created.instance
-                instance_to_close = None
-                winning_instance = created.instance
-                # Allocate a per-instance lock alongside the
-                # registration. Tools fetch it via
-                # :meth:`get_instance_lock` to serialize concurrent
-                # tmux ops on this instance.
-                self._instance_locks[(conversation_id, terminal_name, session_key)] = (
-                    threading.Lock()
-                )
 
         if instance_to_close is not None:
             try:
@@ -668,6 +690,7 @@ class TerminalRegistry:
         :param conversation_id: The conversation being torn down.
         """
         with self._lock:
+            self._launch_generations.pop(conversation_id, None)
             slot = self._by_conversation.pop(conversation_id, None)
             # Drop every per-instance lock owned by this conversation.
             # Iterate over `slot` (the just-popped per-conv map) for the
@@ -706,6 +729,7 @@ class TerminalRegistry:
         a stuck instance shouldn't block the rest of Omnigent shutdown.
         """
         with self._lock:
+            self._launch_generations.clear()
             slots = list(self._by_conversation.items())
             self._by_conversation.clear()
             # AP-shutdown clears all instance locks too — every
