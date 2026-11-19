@@ -22,6 +22,7 @@ import json
 import re
 import threading
 import time
+import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -5237,7 +5238,8 @@ async def test_a_workflow_automation_that_cannot_start_its_workflow_fails_its_ru
         journal = open_journal_store(conversations)
 
         def refuse_append(*args: Any, **kwargs: Any) -> None:
-            raise fire_mod.OmnigentError("the journal refused the plan")
+            # A storage failure the journal doesn't translate into its own errors.
+            raise RuntimeError("database is locked")
 
         monkeypatch.setattr(journal, "append", refuse_append)
     agents = _sql_agent()
@@ -5271,6 +5273,123 @@ async def test_a_workflow_automation_that_cannot_start_its_workflow_fails_its_ru
     # No session is left behind: none started, or the one whose plan failed is gone.
     assert conversations.list_conversations(limit=10).data == []
     assert ({"id": "task_1", "state": "paused"} in store.updates) is paused
+
+
+@pytest.mark.asyncio
+async def test_an_automation_saved_continuing_a_session_runs_its_workflow_prompt_as_before(
+    db_uri: str,
+) -> None:
+    """Its replacement session starts without the workflow, even one since deleted."""
+    conversations = SqlAlchemyConversationStore(db_uri)
+    workflows = open_workflow_store(conversations)
+    assert workflows is not None
+    workflow = workflows.create(
+        user_id=None, name="Triage", description="Triage the queue", steps=_WORKFLOW_STEPS
+    )
+    assert workflows.delete(workflow.id, user_id=None)
+    agents = _sql_agent()
+    # The session it continued was deleted, so this run replaces it.
+    deleted_session = uuid.uuid4().hex
+    store = FakeScheduledTaskStore(
+        rows={
+            "task_1": _task(
+                prompt=_workflow_prompt(workflow.id),
+                agent_id=next(iter(agents.agents)),
+                host_id=_SQL_HOST_ID,
+                session_mode="continue",
+                session_id=deleted_session,
+            )
+        }
+    )
+    launched: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        launched.append(conv)
+
+    deps = _deps(
+        store,
+        agent_store=agents,
+        conversation_store=conversations,
+        host_registry=FakeHostRegistry({_SQL_HOST_ID}),
+        app_state=_workflows_on(),
+    )
+    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+
+    (run,) = store.runs
+    (session,) = launched
+    assert (run["status"], run.get("error_code")) == ("running", None)
+    assert session.id != deleted_session
+    assert open_journal_store(conversations).current_workflow_run(session.id) is None
+    assert not [update for update in store.updates if update.get("state") == "paused"]
+
+
+@pytest.mark.asyncio
+async def test_a_run_copied_from_its_source_session_starts_as_a_run_of_the_workflow(
+    db_uri: str,
+) -> None:
+    from omnigent.entities import MessageData, NewConversationItem
+
+    conversations = SqlAlchemyConversationStore(db_uri)
+    workflow = open_workflow_store(conversations).create(
+        user_id=None, name="Triage", description="Triage the queue", steps=_WORKFLOW_STEPS
+    )
+    agents = _sql_agent()
+    agent_id = next(iter(agents.agents))
+    source = conversations.create_conversation(
+        agent_id=agent_id, host_id=_SQL_HOST_ID, workspace="/repo"
+    )
+    conversations.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_1",
+                data=MessageData(role=role, content=[{"type": part, "text": text}], agent=agent),
+            )
+            for role, part, text, agent in (
+                ("user", "input_text", "triage the queue", None),
+                ("assistant", "output_text", "two new issues", "claude-sdk"),
+            )
+        ],
+    )
+    store = FakeScheduledTaskStore(
+        rows={
+            "task_1": _task(
+                prompt=_workflow_prompt(workflow.id),
+                agent_id=agent_id,
+                host_id=_SQL_HOST_ID,
+                source_session_id=source.id,
+            )
+        }
+    )
+    journal = open_journal_store(conversations)
+    assert journal is not None
+    plans_at_launch: list[Any] = []
+
+    async def _launch(conv: Any, task: Any) -> None:
+        plans_at_launch.append(journal.current_workflow_run(conv.id))
+
+    deps = _deps(
+        store,
+        agent_store=agents,
+        conversation_store=conversations,
+        host_registry=FakeHostRegistry({_SQL_HOST_ID}),
+        app_state=_workflows_on(),
+    )
+    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
+    await _drain()
+
+    (run,) = store.runs
+    (plan,) = plans_at_launch
+    assert run["status"] == "running"
+    # The run's own copy, not the source, starts as the workflow run.
+    assert plan.conversation_id != source.id
+    copy = conversations.get_conversation(plan.conversation_id)
+    assert copy is not None and copy.labels[FORK_SOURCE_LABEL_KEY] == source.id
+    assert (plan.workflow_id, plan.scheduled_task_run_id) == (workflow.id, run["run_id"])
+    assert plan.content["steps"] == workflow.steps
+    assert journal.current_workflow_run(source.id) is None
 
 
 def test_a_run_on_another_agent_leaves_off_the_copys_mcp_picks() -> None:

@@ -847,7 +847,8 @@ async def _run_fire_for_task(
 
     try:
         start_fire_stage("workflow_validation")
-        workflow = await _task_workflow(deps, task)
+        # An automation saved continuing one session keeps sending its prompt as before.
+        workflow = None if task.session_mode == "continue" else await _task_workflow(deps, task)
     except _CannotLaunchScheduledFire as exc:
         _logger.warning("scheduled fire: task %s cannot start its workflow: %s", task.id, exc)
         await recorder.finish("failed", error=str(exc), error_code=exc.error_code)
@@ -1132,7 +1133,8 @@ async def _start_workflow_run(
         await initialize_workflow_plan(
             deps.conversation_store, conv, workflow, user_id=task.user_id
         )
-    except OmnigentError as exc:
+    # Any storage failure, not only the journal's own errors; cancellation still propagates.
+    except Exception as exc:
         raise _CannotLaunchScheduledFire(
             f"could not start the run of the saved workflow: {exc}",
             error_code="workflow_plan_failed",
