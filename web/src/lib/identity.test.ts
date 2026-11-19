@@ -537,6 +537,42 @@ describe("authenticatedFetch", () => {
       expect(headers.get("X-Databricks-Omnigent-Slice-Key")).toBe("host_abc");
     });
 
+    it("keys a clone by its original's host, not the modal host, and retries keyless", async () => {
+      vi.doMock("./sessionHost", () => ({
+        getSessionHost: vi.fn(() => null),
+        setSessionHost: vi.fn(),
+        isHostKeyless: vi.fn(() => false),
+        markHostKeyless: vi.fn(),
+        clearHostKeyless: vi.fn(),
+        modalHostId: vi.fn(() => "host_modal"),
+        resolveModalHost: vi.fn(),
+        isModalHostResolved: vi.fn(() => true),
+      }));
+      vi.doMock("./host", () => ({
+        getOmnigentHostConfig: vi.fn(() => ({ fetcher: () => fetch })),
+        hostFetch: fetchMock,
+        isDatabricksWorkspace: vi.fn(() => true),
+        isHostRoutingEnabled: vi.fn(() => true),
+      }));
+      fetchMock.mockResolvedValueOnce(
+        Response.json({ error: { code: "wrong_replica" } }, { status: 400 }),
+      );
+      fetchMock.mockResolvedValueOnce(mockJsonResponse({}));
+
+      const { authenticatedFetch } = await import("./identity");
+      const response = await authenticatedFetch("/v1/scheduled-tasks/task_1/clone", {
+        method: "POST",
+        body: JSON.stringify({ host_id: "host_task" }),
+      });
+
+      const keys = fetchMock.mock.calls.map(([, init]) =>
+        new Headers((init as RequestInit).headers).get("X-Databricks-Omnigent-Slice-Key"),
+      );
+      expect(keys).toEqual(["host_task", null]);
+      expect(fetchMock.mock.calls[1][2]).toEqual({ unkeyed: true });
+      expect(response.status).toBe(200);
+    });
+
     it("retries keyless on wrong_replica 400 response", async () => {
       vi.doMock("./sessionHost", () => ({
         getSessionHost: vi.fn(() => "host_789"),

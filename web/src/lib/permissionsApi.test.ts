@@ -11,6 +11,7 @@ import type { Session } from "@/lib/types";
 import { FALLBACK_SERVER_INFO, SHARING_OFF_REASON } from "./capabilities";
 import * as identity from "./identity";
 import {
+  LEGACY_AUTOMATION_RECREATE_REASON,
   LEGACY_AUTOMATION_SHARE_REASON,
   LEVEL_OWNER,
   automationShareDisabledReason,
@@ -484,10 +485,17 @@ describe("canShareAutomation", () => {
 
 describe("automationShareDisabledReason", () => {
   const off = { ...FALLBACK_SERVER_INFO, sharing_mode: "off" as const };
+  const cloning = { ...FALLBACK_SERVER_INFO, scheduled_task_clone: true };
   it.each([
     ["a shareable automation", FALLBACK_SERVER_INFO, true, undefined],
     ["an older server's automation", FALLBACK_SERVER_INFO, undefined, undefined],
-    ["a legacy automation", FALLBACK_SERVER_INFO, false, LEGACY_AUTOMATION_SHARE_REASON],
+    ["a legacy automation", cloning, false, LEGACY_AUTOMATION_SHARE_REASON],
+    [
+      "a legacy automation on a server that can't clone",
+      FALLBACK_SERVER_INFO,
+      false,
+      LEGACY_AUTOMATION_RECREATE_REASON,
+    ],
     ["sharing off", off, true, SHARING_OFF_REASON],
     ["sharing off and a legacy automation", off, false, SHARING_OFF_REASON],
   ])("explains %s", (_label, info, shareable, expected) => {

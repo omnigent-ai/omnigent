@@ -330,6 +330,10 @@ export function canShareAutomation(
 
 /** Why Share is disabled on an automation the server can't keep grants for; the server says the same. */
 export const LEGACY_AUTOMATION_SHARE_REASON =
+  "This is a legacy automation. Clone it, then share the copy.";
+
+/** The same reason on a server that can't clone automations. */
+export const LEGACY_AUTOMATION_RECREATE_REASON =
   "This is a legacy automation. Recreate it to share it.";
 
 /**
@@ -341,7 +345,10 @@ export function automationShareDisabledReason(
   task: Pick<ScheduledTask, "shareable">,
 ): string | undefined {
   if (isSharingOff(info)) return SHARING_OFF_REASON;
-  return task.shareable === false ? LEGACY_AUTOMATION_SHARE_REASON : undefined;
+  if (task.shareable !== false) return undefined;
+  return info !== "loading" && info.scheduled_task_clone === true
+    ? LEGACY_AUTOMATION_SHARE_REASON
+    : LEGACY_AUTOMATION_RECREATE_REASON;
 }
 
 /**
