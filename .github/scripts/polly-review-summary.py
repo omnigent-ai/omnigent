@@ -422,7 +422,8 @@ def _markdown_context(
     Ambiguous inline-code contexts with destinations fail closed.
     Indented disclosure-tag lines outside fenced/raw blocks fail closed in multipart.
     Structural disclosure lines with comment-contained tag lookalikes also fail closed.
-    Inline-code formatting across fragments is not balanced.
+    Paragraphs with multiline inline dependencies remain indivisible; inline escapes,
+    entities, spacing and potential emphasis dependencies stay intact at cuts.
     """
     details = 0
     details_starts: list[int | None] = []
@@ -451,6 +452,47 @@ def _markdown_context(
         if protected_spans is None:
             return
         protected_spans.append((start, end, kind))
+
+    def emphasis_span(value: str, code_spans: list[tuple[int, int]]) -> tuple[int, int] | None:
+        first = last = None
+        code_index = 0
+        for marker in re.finditer(r"[*_~]+", value):
+            while code_index < len(code_spans) and code_spans[code_index][1] <= marker.start():
+                code_index += 1
+            if code_index < len(code_spans) and code_spans[code_index][0] <= marker.start():
+                continue
+            if (
+                not marker[0].strip("_")
+                and marker.start()
+                and marker.end() < len(value)
+                and value[marker.start() - 1].isalnum()
+                and value[marker.end()].isalnum()
+            ):
+                continue
+            slash_start = marker.start()
+            while slash_start and value[slash_start - 1] == "\\":
+                slash_start -= 1
+            if (marker.start() - slash_start) % 2 and len(marker[0]) == 1:
+                continue
+            if first is None:
+                first = marker.start()
+            last = marker.end()
+        return (first, last) if first is not None and last is not None else None
+
+    def protect_paragraph(end: int) -> None:
+        if paragraph_start is None:
+            return
+        paragraph = text[paragraph_start:end].removesuffix("\n")
+        if "\n" not in paragraph:
+            return
+        code_spans = _disclosure_code_spans(paragraph) if "`" in paragraph else []
+        emphasis = emphasis_span(paragraph, code_spans)
+        if (
+            any("\n" in paragraph[start:stop] for start, stop in code_spans)
+            or (emphasis is not None and "\n" in paragraph[emphasis[0] : emphasis[1]])
+            or re.search(r"(?:\\| {2,})\r?\n", paragraph)
+        ):
+            protect_span(paragraph_start, end, "multiline paragraph")
 
     def visible_tags(
         pattern: re.Pattern[str],
@@ -516,6 +558,7 @@ def _markdown_context(
                 re.IGNORECASE,
             )
             if raw:
+                protect_paragraph(line_start)
                 if raw[2] and line[raw.end() : raw.end() + 1] != ">":
                     if protected_spans is not None:
                         raise ValueError(
@@ -607,6 +650,7 @@ def _markdown_context(
             protect_span(line_start, min(offset, len(text)), "fence delimiter")
             table_header = ""
             assessment_table = False
+            protect_paragraph(line_start)
             paragraph_start = indented_start = None
             continue
         if protected_spans is not None:
@@ -667,6 +711,41 @@ def _markdown_context(
                     protect_span(destination_start, line_start + closing + 1, "inline destination")
             for start, end in code_spans:
                 protect_span(line_start + start, line_start + end, "inline code")
+            unmatched = line.find("`", cursor)
+            if unmatched >= 0:
+                protect_span(
+                    line_start + max(0, unmatched - 1),
+                    line_start + min(len(line), line.rfind("`") + 2),
+                    "ambiguous inline code",
+                )
+            for literal in re.finditer(
+                r"\\[^\w\s]|&(?:#[xX][0-9A-Fa-f]+|#[0-9]+|[A-Za-z][A-Za-z0-9]*);",
+                line,
+            ):
+                protect_span(
+                    line_start + literal.start(), line_start + literal.end(), "inline literal"
+                )
+            # Keep whitespace inside a fragment so edge trimming cannot remove it.
+            for space in re.finditer(r"[ \t]+", line):
+                if space.start() and space.end() < len(line):
+                    if line.lstrip().startswith("|") and (
+                        line[space.start() - 1] == "|" or line[space.end()] == "|"
+                    ):
+                        continue
+                    protect_span(
+                        line_start + space.start() - 1,
+                        line_start + space.end() + 1,
+                        "assessment spacing"
+                        if assessment_table and line.lstrip().startswith("|")
+                        else "inline spacing",
+                    )
+            emphasis = emphasis_span(line, code_spans)
+            if emphasis is not None:
+                protect_span(
+                    line_start + max(0, emphasis[0] - 1),
+                    line_start + min(len(line), emphasis[1] + 1),
+                    "inline emphasis",
+                )
             ambiguous_destination = inline_ambiguous and destination_seen
             for word in re.finditer(r"\S+", line):
                 value = word[0]
@@ -829,11 +908,13 @@ def _markdown_context(
                 or re.match(r" {0,3}#{1,6}(?:[ \t]|$)", line)
                 or re.fullmatch(r" {0,3}(?:(?:\*[ \t]*){3,}|(?:_[ \t]*){3,})\r?", line)
             ):
+                protect_paragraph(line_start)
                 paragraph_start = None
             elif not indented and paragraph_start is None:
                 paragraph_start = line_start
         previous = line
         previous_start = line_start
+    protect_paragraph(len(text))
     if container_start is not None:
         protect_span(container_start, len(text), "Markdown container")
     if nested_list:
@@ -849,8 +930,15 @@ def _markdown_context(
             if protected_spans and start < protected_spans[-1][1]:
                 prior_start, prior_end, prior_kind = protected_spans.pop()
                 start = prior_start
+                literal_fence = "literal fence run" in {kind, prior_kind}
                 if prior_end >= end:
                     end, kind = prior_end, prior_kind
+                if literal_fence and kind in {
+                    "inline spacing",
+                    "inline emphasis",
+                    "ambiguous inline code",
+                }:
+                    kind = "literal fence run"
             protected_spans.append((start, end, kind))
     prefix = "<details>\n<summary>Review continued</summary>\n\n" * details
     suffix = "\n\n</details>" * details
@@ -947,6 +1035,10 @@ def review_comments(review: str, *, head_sha: str, run_id: str, run_url: str) ->
                     break
                 if span_start < end < span_end:
                     if span_start <= len(before):
+                        if kind == "assessment spacing":
+                            raise ValueError(
+                                "Polly review assessment fragments need all five populated fields."
+                            )
                         raise ValueError(
                             f"Polly review {kind} cannot fit within comment capacity."
                         )

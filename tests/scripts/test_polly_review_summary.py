@@ -825,7 +825,29 @@ def _check_review_context(
                 "code-span-comparison-cut-guard",
                 "code-span-completed-link-cut-guard",
             }:
-                assert len(fragments[0]) == review.index(literal)
+                assert len(fragments[0]) <= review.index(literal)
+                paragraph = review.split("\n\n", 1)[0]
+                remaining = len(paragraph)
+                pieces = []
+                for fragment in fragments:
+                    pieces.append(fragment[:remaining])
+                    remaining -= len(pieces[-1])
+                assert remaining == 0
+                meanings = []
+                for blocks in (
+                    parser.parse(paragraph),
+                    [block for piece in pieces for block in parser.parse(piece)],
+                ):
+                    meaning = []
+                    for block in blocks:
+                        for child in block.children or []:
+                            item = (child.type, child.content)
+                            if item[0] == "text" and meaning and meaning[-1][0] == "text":
+                                meaning[-1] = ("text", meaning[-1][1] + item[1])
+                            else:
+                                meaning.append(item)
+                    meanings.append(meaning)
+                assert meanings[0] == meanings[1], "A cut lost parsed code/prose meaning"
     if variant == "container-bounded-blockquote":
         assert (
             sum(comment.count("Ordinary finding outside the quote.\n") for comment in comments)
@@ -916,6 +938,174 @@ def _assert_fragments(
     assert (
         "".join(cells[4].removeprefix(" ").removesuffix(" ") for cells in fragments) == rationale
     )
+
+
+@pytest.mark.parametrize(
+    ("form", "site", "short"),
+    [
+        (form, site, False)
+        for form in (
+            "entity",
+            "decimal-entity",
+            "hex-entity",
+            "escaped-entity",
+            "escape",
+            "emphasis",
+            "strong",
+            "underscore",
+            "nested-emphasis",
+            "strike",
+            "ambiguous-code",
+        )
+        for site in ("prose", "rationale")
+    ]
+    + [
+        (form, site, True)
+        for form in ("entity", "escape", "emphasis")
+        for site in ("prose", "rationale")
+    ]
+    + [
+        (form, "prose", short)
+        for form in ("multiline-code", "multiline-double-code", "multiline-emphasis", "hard-break")
+        for short in (False, True)
+    ]
+    + [("oversized-multiline-code", "prose", False)],
+)
+def test_multipart_inline_syntax_preserves_parsed_meaning(
+    form: str,
+    site: str,
+    short: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from markdown_it import MarkdownIt
+
+    construct = {
+        "entity": "&amp;",
+        "decimal-entity": "&#38;",
+        "hex-entity": "&#x26;",
+        "escaped-entity": r"\&amp;",
+        "escape": r"\*",
+        "emphasis": "*highlight*",
+        "strong": "**highlight**",
+        "underscore": "_highlight_",
+        "nested-emphasis": "***highlight***",
+        "strike": "~~highlight~~",
+        "ambiguous-code": "`unmatched ``literal &amp;``",
+        "multiline-code": "`literal\ncode`",
+        "multiline-double-code": "``literal ` tick\ncode``",
+        "multiline-emphasis": "*first\nsecond*",
+        "hard-break": "first\\\nsecond",
+        "oversized-multiline-code": "`literal\ncode`",
+    }[form]
+    parser = MarkdownIt("commonmark").enable(["table", "strikethrough"])
+    metadata = {"head_sha": "a" * 40, "run_id": "10-1", "run_url": "https://example.test/run"}
+    summary = {"markdown": "Computed counts", "test_files": ["tests/test_parser.py"]}
+    base = _HELPERS["compose_review"](_REVIEW, summary)
+    if site == "rationale":
+        calibration = _HELPERS["compose_review"](
+            _REVIEW.replace("Guards the regression.", "x" * 130000), summary
+        )
+        capacity = len(
+            [
+                token.content
+                for comment in _HELPERS["review_comments"](calibration, **metadata)
+                for tokens in [parser.parse(_multipart_content(comment))]
+                for index, token in enumerate(tokens)
+                if token.type == "inline" and tokens[index - 1].type == "td_open"
+            ][4]
+        )
+    else:
+        calibration = "x" * 130000 + "\n\n" + base
+        capacity = len(_multipart_content(_HELPERS["review_comments"](calibration, **metadata)[0]))
+    if short:
+        body = "before " + construct + " after"
+    elif "\n" in construct and form != "oversized-multiline-code":
+        paragraph = "lead words " * 3 + construct
+        padding = capacity - len(paragraph.split("\n", 1)[0]) - 3
+        body = "x" * padding + "\n\n" + paragraph + "\n\n" + "y" * 70000
+    else:
+        inside = (
+            construct.index("&amp;") + 2
+            if form == "ambiguous-code"
+            else 1
+            if form in {"escape", "escaped-entity"}
+            else 3
+        )
+        body = "x" * (capacity - inside - 1) + " " + construct + " " + "y" * 70000
+    review = (
+        _HELPERS["compose_review"](_REVIEW.replace("Guards the regression.", body), summary)
+        if site == "rationale"
+        else body + "\n\n" + base
+    )
+
+    def meaning(groups: list) -> list[tuple[str, str]]:
+        result = []
+        for group in groups:
+            for child in group:
+                item = (child.type, child.content)
+                if item[0] == "text" and result and result[-1][0] == "text":
+                    result[-1] = ("text", result[-1][1] + item[1])
+                else:
+                    result.append(item)
+        return result
+
+    original = parser.parse(review if site == "rationale" else body)
+    original_cells = [
+        token
+        for index, token in enumerate(original)
+        if token.type == "inline" and original[index - 1].type == "td_open"
+    ]
+    expected = meaning(
+        [original_cells[4].children]
+        if site == "rationale"
+        else [token.children for token in original if token.type == "inline"]
+    )
+    if form in {"entity", "decimal-entity", "hex-entity"}:
+        assert "&" in "".join(content for _, content in expected)
+        assert construct not in "".join(content for _, content in expected)
+    if form.startswith("multiline") or form == "oversized-multiline-code":
+        assert any(kind in {"code_inline", "em_open"} for kind, _ in expected)
+    review_path, receipt, posts = _prepare_publication(
+        tmp_path, monkeypatch, head_sha=metadata["head_sha"], run_url=metadata["run_url"]
+    )
+    try:
+        comments = _published_comments(review, review_path, receipt)
+    except ValueError as error:
+        assert form == "oversized-multiline-code" and not short
+        assert "paragraph" in str(error)
+        assert not posts and not receipt.exists()
+        assert sorted(path.name for path in tmp_path.iterdir()) == ["review.md"]
+        return
+    assert form != "oversized-multiline-code", "An oversized dependent paragraph must refuse"
+    assert posts == [*comments[1:], comments[0]]
+    assert receipt.read_text() == metadata["head_sha"] + "\n"
+    assert all(len(comment.encode("utf-8")) <= 60000 for comment in comments)
+    groups = []
+    for comment in comments:
+        content = review if short else _multipart_content(comment)
+        if site == "prose":
+            content = content.partition("## Blocking issues\n")[0]
+        tokens = parser.parse(content)
+        if site == "rationale":
+            cells = [
+                token
+                for index, token in enumerate(tokens)
+                if token.type == "inline" and tokens[index - 1].type == "td_open"
+            ]
+            if cells:
+                assert len(cells) == 5
+                assert [token.content for token in cells[:4]] == [
+                    token.content for token in original_cells[:4]
+                ]
+                groups.append(cells[4].children)
+        else:
+            groups.extend(token.children for token in tokens if token.type == "inline")
+    assert meaning(groups) == expected, "Publication changed independently parsed inline meaning"
+    if short:
+        assert len(comments) == 1 and review in comments[0]
+    else:
+        assert len(comments) > 1
 
 
 @pytest.mark.parametrize(
