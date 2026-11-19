@@ -23,7 +23,7 @@ import {
   useProjectFolderPageSize,
 } from "@/lib/projectFolderPaginationPreferences";
 import { useSessionRowQuickActions } from "@/lib/sessionRowQuickActionsPreferences";
-import { useCuratedOutHarnesses } from "@/hooks/useCuratedOutHarnesses";
+import { offersAnyHarness, useCuratedOutHarnesses } from "@/hooks/useCuratedOutHarnesses";
 import { useInertRef } from "@/hooks/useInertRef";
 import { useDebouncedValue } from "@/hooks/useDebouncedValue";
 import { useMenuGuardedTooltip } from "@/hooks/useMenuGuardedTooltip";
@@ -324,7 +324,7 @@ import {
 import { SidebarServerPicker } from "./SidebarServerPicker";
 import { isRowFullyVisible } from "./sidebarRowVisibility";
 import { useHarnessLabels } from "@/lib/agentLabels";
-import { NATIVE_CODING_AGENTS, nativeCodingAgentForSession } from "@/lib/nativeCodingAgents";
+import { nativeCodingAgentForSession } from "@/lib/nativeCodingAgents";
 import { usePullRequestInfo } from "@/hooks/usePullRequests";
 import {
   getPullRequestStatus,
@@ -1366,7 +1366,7 @@ function SidebarImpl({
           <SettingsSidebar
             onNavClick={onNavClick}
             onCollapse={sideBySide ? onClose : undefined}
-            harnessesOffered={curatedOutHarnesses.size < NATIVE_CODING_AGENTS.length}
+            harnessesOffered={offersAnyHarness(curatedOutHarnesses)}
             onNavigate={onSearchNavigate}
           />
         ) : (

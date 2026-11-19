@@ -149,6 +149,17 @@ export const HARNESS_CARD_ENTRIES = settingsEntryFamily({
   },
 });
 
+/**
+ * The harness a Harnesses row is for: the page it lives on, or for a card, which lives on the
+ * grid and so names no page, the card's own harness.
+ */
+export function harnessOfSettingsEntry(entry: SettingsEntry): string | undefined {
+  if (entry.harness !== undefined) return entry.harness;
+  return HARNESS_CARD_ENTRIES.members.find(
+    (harness) => HARNESS_CARD_ENTRIES.entry(harness).id === entry.id,
+  );
+}
+
 /** The fix a harness page's setup warning offers, by its name's key: "Set up" unless one of these. */
 export type HarnessFixActionName = "install" | "update" | "reconfigure" | "tmux";
 
