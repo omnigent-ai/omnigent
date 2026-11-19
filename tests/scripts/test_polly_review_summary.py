@@ -950,6 +950,7 @@ def _assert_fragments(
             "hex-entity",
             "escaped-entity",
             "escape",
+            "escape-underscore",
             "emphasis",
             "strong",
             "underscore",
@@ -969,7 +970,10 @@ def _assert_fragments(
         for form in ("multiline-code", "multiline-double-code", "multiline-emphasis", "hard-break")
         for short in (False, True)
     ]
-    + [("oversized-multiline-code", "prose", False)],
+    + [
+        ("oversized-multiline-code", "prose", False),
+        ("intraword-underscore", "prose", False),
+    ],
 )
 def test_multipart_inline_syntax_preserves_parsed_meaning(
     form: str,
@@ -986,6 +990,7 @@ def test_multipart_inline_syntax_preserves_parsed_meaning(
         "hex-entity": "&#x26;",
         "escaped-entity": r"\&amp;",
         "escape": r"\*",
+        "escape-underscore": r"\_literal",
         "emphasis": "*highlight*",
         "strong": "**highlight**",
         "underscore": "_highlight_",
@@ -997,6 +1002,7 @@ def test_multipart_inline_syntax_preserves_parsed_meaning(
         "multiline-emphasis": "*first\nsecond*",
         "hard-break": "first\\\nsecond",
         "oversized-multiline-code": "`literal\ncode`",
+        "intraword-underscore": "foo_bar_baz",
     }[form]
     parser = MarkdownIt("commonmark").enable(["table", "strikethrough"])
     metadata = {"head_sha": "a" * 40, "run_id": "10-1", "run_url": "https://example.test/run"}
@@ -1020,6 +1026,20 @@ def test_multipart_inline_syntax_preserves_parsed_meaning(
         capacity = len(_multipart_content(_HELPERS["review_comments"](calibration, **metadata)[0]))
     if short:
         body = "before " + construct + " after"
+    elif form == "intraword-underscore":
+        calibration = "x" * 200000 + "\n\n" + base
+        capacities = [
+            len(_multipart_content(comment))
+            for comment in _HELPERS["review_comments"](calibration, **metadata)
+        ]
+        body = (
+            "x" * (capacities[0] - 3)
+            + "foo_bar"
+            + "x" * (capacities[1] - 5)
+            + "_baz"
+            + "y" * 70000
+        )
+        assert body[capacities[0]] == body[sum(capacities[:2]) - 1] == "_"
     elif "\n" in construct and form != "oversized-multiline-code":
         paragraph = "lead words " * 3 + construct
         padding = capacity - len(paragraph.split("\n", 1)[0]) - 3
@@ -1029,7 +1049,7 @@ def test_multipart_inline_syntax_preserves_parsed_meaning(
             construct.index("&amp;") + 2
             if form == "ambiguous-code"
             else 1
-            if form in {"escape", "escaped-entity"}
+            if form in {"escape", "escape-underscore", "escaped-entity"}
             else 3
         )
         body = "x" * (capacity - inside - 1) + " " + construct + " " + "y" * 70000
@@ -1066,6 +1086,12 @@ def test_multipart_inline_syntax_preserves_parsed_meaning(
         assert construct not in "".join(content for _, content in expected)
     if form.startswith("multiline") or form == "oversized-multiline-code":
         assert any(kind in {"code_inline", "em_open"} for kind, _ in expected)
+    if form == "intraword-underscore":
+        assert not any(kind in {"em_open", "strong_open"} for kind, _ in expected)
+        assert sum(content.count("_") for _, content in expected) == 2
+    if form == "escape-underscore":
+        assert "_literal" in "".join(content for _, content in expected)
+        assert construct not in "".join(content for _, content in expected)
     review_path, receipt, posts = _prepare_publication(
         tmp_path, monkeypatch, head_sha=metadata["head_sha"], run_url=metadata["run_url"]
     )

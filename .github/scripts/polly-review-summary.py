@@ -719,7 +719,7 @@ def _markdown_context(
                     "ambiguous inline code",
                 )
             for literal in re.finditer(
-                r"\\[^\w\s]|&(?:#[xX][0-9A-Fa-f]+|#[0-9]+|[A-Za-z][A-Za-z0-9]*);",
+                r"\\[!-/:-@\[-`{-~]|&(?:#[xX][0-9A-Fa-f]+|#[0-9]+|[A-Za-z][A-Za-z0-9]*);",
                 line,
             ):
                 protect_span(
@@ -738,6 +738,18 @@ def _markdown_context(
                         "assessment spacing"
                         if assessment_table and line.lstrip().startswith("|")
                         else "inline spacing",
+                    )
+            for underscore in re.finditer(r"_+", line):
+                if (
+                    underscore.start()
+                    and underscore.end() < len(line)
+                    and line[underscore.start() - 1].isalnum()
+                    and line[underscore.end()].isalnum()
+                ):
+                    protect_span(
+                        line_start + underscore.start() - 1,
+                        line_start + underscore.end() + 1,
+                        "intraword underscore",
                     )
             emphasis = emphasis_span(line, code_spans)
             if emphasis is not None:
