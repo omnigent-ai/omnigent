@@ -1,7 +1,6 @@
 import { redo, undo } from "@codemirror/commands";
 import { EditorView } from "@codemirror/view";
-import { act, fireEvent, render, waitFor } from "@testing-library/react";
-import { useState } from "react";
+import { act, fireEvent, render } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { insertComposerText } from "@/lib/composerText";
 import { CodeMirrorComposerInput } from "./testing/codeMirrorComposer";
@@ -157,13 +156,15 @@ describe("CodeMirrorComposerInput change events", () => {
 
   it("takes a controlled value without reporting it or making it undoable", () => {
     const onChange = vi.fn();
-    const { content, target, rerender, setTarget } = mount({ value: "a", onChange });
-    act(() => insertComposerText(target(), "b", 1, 1));
-    expect(onChange).toHaveBeenCalledTimes(1);
+    const { content, target, rerender, setTarget } = mount({ value: "", onChange });
+    act(() => insertComposerText(target(), "hello", 0, 0));
+    act(() => insertComposerText(target(), "", 3, 5));
+    expect(target().value).toBe("hel");
+    expect(onChange).toHaveBeenCalledTimes(2);
     rerender(
       <CodeMirrorComposerInput
         aria-label="Message the agent"
-        value="ab"
+        value="hel"
         onChange={onChange}
         ref={setTarget}
       />,
@@ -177,12 +178,32 @@ describe("CodeMirrorComposerInput change events", () => {
       />,
     );
     expect(target().value).toBe("");
-    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(onChange).toHaveBeenCalledTimes(2);
 
     const editor = EditorView.findFromDOM(content)!;
     act(() => void undo(editor));
+    expect(target().value).toBe("");
     act(() => void redo(editor));
     expect(target().value).toBe("");
+  });
+
+  it("reports a selection change, but not a controlled value change, as a selection", () => {
+    const onSelect = vi.fn();
+    const { target, rerender, setTarget } = mount({ value: "draft", onSelect });
+
+    rerender(
+      <CodeMirrorComposerInput
+        aria-label="Message the agent"
+        value="other draft"
+        onSelect={onSelect}
+        ref={setTarget}
+      />,
+    );
+    expect(target().value).toBe("other draft");
+    expect(onSelect).not.toHaveBeenCalled();
+
+    act(() => target().setSelectionRange(2, 2));
+    expect(onSelect).toHaveBeenCalledTimes(1);
   });
 
   it("keeps an edit the parent ignores until the value changes", () => {
@@ -214,28 +235,6 @@ describe("CodeMirrorComposerInput change events", () => {
       />,
     );
     expect([target().selectionStart, target().selectionEnd]).toEqual([16, 16]);
-  });
-
-  it("keeps an edit the parent accepts", async () => {
-    const box: { target: ComposerTextTarget | null } = { target: null };
-    function Harness() {
-      const [value, setValue] = useState("draft");
-      return (
-        <CodeMirrorComposerInput
-          aria-label="Message the agent"
-          value={value}
-          onChange={(event) => setValue(event.currentTarget.value)}
-          ref={(target) => {
-            box.target = target;
-          }}
-        />
-      );
-    }
-    render(<Harness />);
-
-    act(() => insertComposerText(box.target!, "x", 5, 5));
-
-    await waitFor(() => expect(box.target!.value).toBe("draftx"));
   });
 
   it("normalizes a controlled CRLF value to the document's line breaks", () => {

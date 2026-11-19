@@ -31,6 +31,7 @@ describe("loading the CodeMirror composer", () => {
     expect(codeMirrorComposerLoad().status).toBe("loading");
     loadCodeMirrorComposer();
 
+    await vi.waitFor(() => expect(finishImport).toBeDefined());
     finishImport();
     await vi.waitFor(() => expect(codeMirrorComposerLoad().status).toBe("ready"));
     expect(statuses).toEqual(["loading", "ready"]);
@@ -42,6 +43,25 @@ describe("loading the CodeMirror composer", () => {
     const importer = vi
       .fn()
       .mockRejectedValueOnce(new Error("offline"))
+      .mockResolvedValueOnce(CodeMirrorComposerModule);
+    resetCodeMirrorComposerLoadForTests(importer);
+
+    loadCodeMirrorComposer();
+    await vi.waitFor(() => expect(codeMirrorComposerLoad().status).toBe("failed"));
+    expect(warn).toHaveBeenCalledTimes(1);
+
+    loadCodeMirrorComposer();
+    await vi.waitFor(() => expect(codeMirrorComposerLoad().status).toBe("ready"));
+    expect(importer).toHaveBeenCalledTimes(2);
+  });
+
+  it("settles failed when the importer throws synchronously, and retries", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const importer = vi
+      .fn()
+      .mockImplementationOnce(() => {
+        throw new Error("sync failure");
+      })
       .mockResolvedValueOnce(CodeMirrorComposerModule);
     resetCodeMirrorComposerLoadForTests(importer);
 
@@ -120,6 +140,7 @@ describe("loading the CodeMirror composer", () => {
     );
     loadCodeMirrorComposer();
 
+    await vi.waitFor(() => expect(finishImport).toBeDefined());
     resetCodeMirrorComposerLoadForTests();
     finishImport();
     await new Promise((resolve) => {

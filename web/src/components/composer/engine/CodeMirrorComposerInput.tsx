@@ -234,8 +234,11 @@ export function createCodeMirrorComposerInput(environment: CodeMirrorComposerEnv
   );
 }
 
-/** Bring a controlled value in without echoing a change or adding an undo step. */
-function syncControlledValue(view: EditorView, value: string) {
+/**
+ * Bring a controlled value in without echoing a change or adding an undo step. A replaced value
+ * also drops the undo history, as a textarea's value setter does, so undo can't restore old text.
+ */
+function syncControlledValue(view: EditorView, value: string, historyCompartment: Compartment) {
   const next = normalizeLineBreaks(value);
   const current = view.state.doc.toString();
   if (current === next) return;
@@ -244,7 +247,9 @@ function syncControlledValue(view: EditorView, value: string) {
     // As a textarea's value setter does: a new value puts the caret at its end.
     selection: EditorSelection.cursor(next.length),
     annotations: [controlledUpdate.of(true), Transaction.addToHistory.of(false)],
+    effects: historyCompartment.reconfigure([]),
   });
+  view.dispatch({ effects: historyCompartment.reconfigure(history()) });
 }
 
 function CodeMirrorComposer({
@@ -266,6 +271,7 @@ function CodeMirrorComposer({
   const compartments = useMemo(
     () => ({
       attributes: new Compartment(),
+      history: new Compartment(),
       placeholder: new Compartment(),
       theme: new Compartment(),
     }),
@@ -338,7 +344,7 @@ function CodeMirrorComposer({
             }),
           ),
           keymap.of(COMPOSER_EDITING_KEYMAP),
-          history(),
+          compartments.history.of(history()),
           EditorView.lineWrapping,
           compartments.attributes.of(attributes(initial, environment)),
           compartments.placeholder.of(placeholderText(initial.placeholder ?? "")),
@@ -353,7 +359,9 @@ function CodeMirrorComposer({
               );
               latest.current.onChange?.({ ...event(), fromHistory });
             }
-            if (update.docChanged || update.selectionSet) latest.current.onSelect?.(event());
+            if ((update.docChanged || update.selectionSet) && fromUser) {
+              latest.current.onSelect?.(event());
+            }
             if (update.docChanged || update.geometryChanged) markOverflow(update.view);
           }),
         ],
@@ -388,8 +396,8 @@ function CodeMirrorComposer({
   // keystroke would otherwise revert it. So an edit the parent rejects without changing `value` stays.
   useLayoutEffect(() => {
     const view = viewRef.current;
-    if (view && value !== undefined) syncControlledValue(view, value);
-  }, [value]);
+    if (view && value !== undefined) syncControlledValue(view, value, compartments.history);
+  }, [compartments, value]);
 
   // One key for every prop that becomes an editor or content attribute.
   const attributeKey = JSON.stringify([

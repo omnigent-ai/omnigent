@@ -1,5 +1,6 @@
 // Loads the CodeMirror composer on demand. The textarea keeps working while it loads, and
-// stays in use if loading fails, until a retry succeeds.
+// stays in use if loading fails. Some browsers cache a failed module fetch, so a retry may
+// need a page reload before it succeeds.
 
 import type { ComponentType } from "react";
 import type { CodeMirrorComposerEnvironment } from "./CodeMirrorComposerInput";
@@ -62,11 +63,15 @@ export function subscribeCodeMirrorComposerLoad(listener: () => void): () => voi
 export function loadCodeMirrorComposer(): void {
   if (current.status === "loading" || current.status === "ready") return;
   const attempt = generation;
+  const startImport = importer;
   settle({ status: "loading" });
-  const built = importer().then((module) => ({
-    status: "ready" as const,
-    Component: module.createCodeMirrorComposerInput(codeMirrorComposerEnvironment()),
-  }));
+  // A synchronous importer throw becomes a rejection, so the load settles failed.
+  const built = Promise.resolve()
+    .then(() => startImport())
+    .then((module) => ({
+      status: "ready" as const,
+      Component: module.createCodeMirrorComposerInput(codeMirrorComposerEnvironment()),
+    }));
   built.then(
     (next) => {
       if (attempt !== generation) return;

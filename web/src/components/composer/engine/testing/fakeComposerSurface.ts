@@ -30,6 +30,7 @@ export function createFakeComposerSurface(
   let selection: [number, number] = [initial.length, initial.length];
   let reveals = 0;
   const inserts: FakeComposerSurface["inserts"] = [];
+  const clamp = (offset: number) => Math.min(Math.max(offset, 0), surface.value.length);
   const surface: FakeComposerSurface = {
     element,
     value: initial,
@@ -50,8 +51,8 @@ export function createFakeComposerSurface(
     scrollLeft: 0,
     setSelectionRange(start, end) {
       // As a textarea does: offsets clamp to the value, and a reversed range collapses.
-      const clampedEnd = Math.min(Math.max(end, 0), surface.value.length);
-      selection = [Math.min(Math.max(start, 0), clampedEnd), clampedEnd];
+      const clampedEnd = clamp(end);
+      selection = [Math.min(clamp(start), clampedEnd), clampedEnd];
     },
     focus(options) {
       element.focus(options);
@@ -61,9 +62,12 @@ export function createFakeComposerSurface(
     },
     insertText(text, start, end) {
       if (locked) return false;
-      inserts.push({ text, start, end });
-      surface.value = surface.value.slice(0, start) + text + surface.value.slice(end);
-      selection = [start + text.length, start + text.length];
+      // Clamped as the real surface clamps, and recorded clamped.
+      const from = clamp(start);
+      const to = clamp(end);
+      inserts.push({ text, start: from, end: to });
+      surface.value = surface.value.slice(0, from) + text + surface.value.slice(to);
+      selection = [from + text.length, from + text.length];
       return true;
     },
     revealCaret() {
