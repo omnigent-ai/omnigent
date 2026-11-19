@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
 import dataclasses
 import json
 import logging
@@ -58,6 +59,7 @@ from omnigent.harness_aliases import (
     is_native_harness,
     native_terminal_name,
 )
+from omnigent.inner._subprocess_lifecycle import await_cleanup_task
 from omnigent.inner.async_utils import run_sync_cleanup
 from omnigent.inner.executor import ToolCallStatus, classify_tool_result
 from omnigent.models.model_override import (
@@ -8962,11 +8964,41 @@ async def _execute_os_env_tool(
                     if resource_registry is not None and conversation_id is not None
                     else []
                 )
-                os_env = create_os_environment(
-                    effective_spec,
-                    additional_read_roots=additional_read_roots,
-                    model_access=model_access,
+                construction = asyncio.create_task(
+                    asyncio.to_thread(
+                        create_os_environment,
+                        effective_spec,
+                        additional_read_roots=additional_read_roots,
+                        model_access=model_access,
+                    )
                 )
+                try:
+                    os_env = await asyncio.shield(construction)
+                except BaseException:
+                    # A cancelled callback still owns a helper created by its worker.
+                    with contextlib.suppress(BaseException):
+                        await await_cleanup_task(construction)
+                    if (
+                        construction.done()
+                        and not construction.cancelled()
+                        and construction.exception() is None
+                    ):
+                        late_environment = construction.result()
+                        if late_environment is not None:
+                            try:
+                                await run_sync_cleanup(
+                                    late_environment.close,
+                                    component="runner_os_env_tool",
+                                    session_id=conversation_id,
+                                )
+                            except asyncio.CancelledError:
+                                pass
+                            except Exception as cleanup_error:  # noqa: BLE001
+                                _logger.warning(
+                                    "Late runner OSEnvironment cleanup failed",
+                                    extra={"error_type": type(cleanup_error).__name__},
+                                )
+                    raise
         if os_env is None:
             return "Error: unable to create OSEnvironment"
         if model_access is not None and not owns_environment:

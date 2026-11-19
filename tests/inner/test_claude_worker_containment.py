@@ -117,17 +117,6 @@ def worker_policy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SandboxPol
     return policy
 
 
-def test_network_denial_still_contains_the_cli(
-    worker_policy: SandboxPolicy, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """Network denial must still contain the CLI."""
-    launcher = Mock(return_value=str(tmp_path / "launcher"))
-    monkeypatch.setattr(claude, "create_exec_launcher", launcher)
-    prepared = claude.prepare_claude_cli_path("/bin/claude", OSEnvSpec())
-    assert prepared.cli_path == str(tmp_path / "launcher")
-    assert launcher.call_args.args[1].allow_network is False
-
-
 def test_backend_that_does_not_wrap_is_rejected(
     worker_policy: SandboxPolicy, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1298,6 +1287,17 @@ async def test_sdk_real_cli_keeps_working_across_turns(
         await executor.close()
 
 
+def _nested_cli_path_and_read_roots(cli: str) -> tuple[Path, list[str]]:
+    """Declare an external CLI installation used from inside a test sandbox."""
+    cli_path = Path(cli).resolve()
+    if cli_path.is_relative_to(Path(sys.prefix)):
+        return cli_path, []
+    roots = [cli_path.parent]
+    if node_path := shutil.which("node"):
+        roots.append(Path(node_path).resolve().parent)
+    return cli_path, [str(root) for root in roots]
+
+
 async def test_session_terminal_runs_real_cli_with_automatic_model_access(
     real_claude_cli: str,
     real_worker_spec: OSEnvSpec,
@@ -1317,13 +1317,9 @@ async def test_session_terminal_runs_real_cli_with_automatic_model_access(
         pytest.skip("requires tmux")
     requests, _ = cli_model_server
     real_worker_spec.sandbox.allow_network = True
-    cli_path = Path(real_claude_cli).resolve()
-    if not cli_path.is_relative_to(Path(sys.prefix)):
-        # A system CLI outside the Python environment needs an explicit read grant.
-        roots = [cli_path.parent]
-        if node_path := shutil.which("node"):
-            roots.append(Path(node_path).resolve().parent)
-        real_worker_spec.sandbox.read_paths = [str(root) for root in roots]
+    cli_path, read_roots = _nested_cli_path_and_read_roots(real_claude_cli)
+    if read_roots:
+        real_worker_spec.sandbox.read_paths = read_roots
     monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://model.test")
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "parent-config"))
     spec = AgentSpec(
@@ -1394,11 +1390,12 @@ def test_omnigent_run_cli_with_contained_claude(
 
     requests, replies = cli_model_server
     workspace = Path(real_worker_spec.cwd)
+    nested_cli_path, nested_read_roots = _nested_cli_path_and_read_roots(real_claude_cli)
     if cli_tool == "terminal":
         terminal_command = (
             execution_probe[0]
             + "; "
-            + shlex.join([real_claude_cli, *_cli_args("TERMINAL_NESTED_PROBE")])
+            + shlex.join([str(nested_cli_path), *_cli_args("TERMINAL_NESTED_PROBE")])
             + " > terminal-result.json 2> terminal-stderr; printf '%s' $? > terminal-exit"
         )
         for tool_id, name, arguments in (
@@ -1432,7 +1429,7 @@ def test_omnigent_run_cli_with_contained_claude(
         if cli_tool == "mcp__omnigent__sys_os_shell":
             command += (
                 "; "
-                + shlex.join([real_claude_cli, *_cli_args("TERMINAL_NESTED_PROBE")])
+                + shlex.join([str(nested_cli_path), *_cli_args("TERMINAL_NESTED_PROBE")])
                 + " > callback-result.json 2> callback-stderr; "
                 "printf '%s' $? > callback-exit"
             )
@@ -1449,6 +1446,14 @@ def test_omnigent_run_cli_with_contained_claude(
                 }
             ]
         )
+    sandbox_settings = {
+        "type": "auto",
+        "allow_network": False,
+        "write_paths": ["."],
+        "egress_allow_private_destinations": True,
+    }
+    if cli_tool in ("terminal", "mcp__omnigent__sys_os_shell") and nested_read_roots:
+        sandbox_settings["read_paths"] = nested_read_roots
     spec_path = tmp_path / "agent" / "config.yaml"
     spec_path.parent.mkdir()
     spec_path.write_text(
@@ -1472,12 +1477,7 @@ def test_omnigent_run_cli_with_contained_claude(
                 "os_env": {
                     "type": "caller_process",
                     "cwd": str(workspace),
-                    "sandbox": {
-                        "type": "auto",
-                        "allow_network": False,
-                        "write_paths": ["."],
-                        "egress_allow_private_destinations": True,
-                    },
+                    "sandbox": sandbox_settings,
                 },
             }
         )

@@ -210,6 +210,49 @@ async def test_equal_boundary_replacement_fences_an_outstanding_resolution(
             environment.close()
 
 
+async def test_disposable_callback_waits_for_construction_before_cancellation_cleanup(
+    callback_session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.runtime import workflow
+
+    spec, workspace, bundle, _ = callback_session
+    access = ClaudeModelAccess("https://model.test", "x-api-key", lambda: "synthetic-key")
+    monkeypatch.setattr(workflow, "claude_terminal_model_access", lambda *_args, **_kwargs: access)
+    started = threading.Event()
+    release = threading.Event()
+    environment = Mock()
+    environment.shell = AsyncMock(return_value={"output": "unexpected"})
+
+    def held_create(*_args, **_kwargs):
+        started.set()
+        assert release.wait(5), "callback construction was not released"
+        return environment
+
+    monkeypatch.setattr(os_module, "create_os_environment", held_create)
+    pending = asyncio.create_task(
+        _execute_os_env_tool(
+            "sys_os_shell",
+            {"command": "printf unexpected"},
+            agent_spec=spec,
+            runner_workspace=workspace,
+            bundle_dir=bundle,
+        )
+    )
+    try:
+        # The runner remains schedulable while the sandbox validates its runtime.
+        assert await asyncio.to_thread(started.wait, 5)
+        assert not pending.done()
+        pending.cancel()
+        await asyncio.sleep(0)
+        assert not pending.done()
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(pending, 5)
+    environment.close.assert_called_once_with()
+    environment.shell.assert_not_awaited()
+
+
 async def test_callback_spawn_has_private_env_protected_bundle_and_authenticated_relay(
     callback_session, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

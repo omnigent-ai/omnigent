@@ -5356,7 +5356,7 @@ def test_prepare_tight_cli_process_bypasses_wrapper_when_env_set(monkeypatch) ->
     assert (prepared.cli_path, prepared.sandbox) == ("/usr/bin/claude", None)
 
 
-def _wrap_probe_spec():
+def _wrap_probe_spec(*, allow_network: bool = True):
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 
     return OSEnvSpec(
@@ -5366,12 +5366,12 @@ def _wrap_probe_spec():
             type="linux_bwrap",
             read_paths=["."],
             write_paths=["."],
-            allow_network=True,
+            allow_network=allow_network,
         ),
     )
 
 
-def _active_policy():
+def _active_policy(*, allow_network: bool = True):
     from omnigent.inner.sandbox import SandboxPolicy
 
     return SandboxPolicy(
@@ -5380,7 +5380,7 @@ def _active_policy():
         read_roots=[Path("/tmp/work")],
         write_roots=[Path("/tmp/work")],
         write_files=[],
-        allow_network=True,
+        allow_network=allow_network,
     )
 
 
@@ -5546,45 +5546,54 @@ async def test_sandboxed_sdk_exposes_bash_for_skill_expansion(
         await executor.close()
 
 
+@pytest.mark.parametrize("allow_network", [True, False], ids=["network-allowed", "network-denied"])
 def test_prepare_claude_cli_path_probe_passes_target_and_still_wraps(
-    monkeypatch,
+    monkeypatch, allow_network: bool
 ) -> None:
     """
-    The happy path is unchanged by the probe: the wrap still happens,
-    native tools stay ON, and the probe exercises the same lane the
-    launcher will (``target=<real CLI>``), so a probe pass means the
-    run-time wrap can build the same grants.
+    The probe uses the CLI target and policy even when networking is denied.
+    A passing probe must still produce a contained launcher with native tools.
     """
     from omnigent.inner.claude_sdk_executor import prepare_claude_cli_path
 
     monkeypatch.setattr(
         "omnigent.inner.claude_sdk_executor.resolve_sandbox",
-        lambda *a, **k: _active_policy(),
+        lambda *a, **k: _active_policy(allow_network=allow_network),
     )
 
-    seen: dict[str, object] = {}
-
-    class _OkBackend:
-        def wrap_launcher_argv(self, argv, policy, cwd, chdir=None, target=None):
-            seen["target"] = target
-            return ["bwrap", "--", *argv]
+    backend = Mock()
+    backend.wrap_launcher_argv.side_effect = lambda argv, *args, **kwargs: [
+        "bwrap",
+        "--",
+        *argv,
+    ]
 
     monkeypatch.setattr(
         "omnigent.inner.claude_sdk_executor.get_backend",
-        lambda name: _OkBackend(),
+        lambda name: backend,
     )
+    launcher = Mock(return_value="/tmp/launcher")
     monkeypatch.setattr(
         "omnigent.inner.claude_sdk_executor.create_exec_launcher",
-        lambda path, sandbox, **kwargs: "/tmp/launcher",
+        launcher,
     )
 
-    prepared = prepare_claude_cli_path("/usr/bin/claude", _wrap_probe_spec())
+    prepared = prepare_claude_cli_path(
+        "/usr/bin/claude", _wrap_probe_spec(allow_network=allow_network)
+    )
 
     assert prepared.cli_path == "/tmp/launcher"
     assert prepared.enable_native_tools is True
-    assert seen["target"] == "/usr/bin/claude", (
+    backend.wrap_launcher_argv.assert_called_once()
+    assert backend.wrap_launcher_argv.call_args.kwargs["target"] == "/usr/bin/claude", (
         "The probe must exercise the target lane run_launcher will use."
     )
+    assert backend.wrap_launcher_argv.call_args.args[1].allow_network is allow_network
+    launcher.assert_called_once()
+    assert launcher.call_args.args[0] == "/usr/bin/claude"
+    assert launcher.call_args.args[1].allow_network is allow_network
+    assert prepared.sandbox is not None
+    assert prepared.sandbox.allow_network is allow_network
 
 
 # ---------------------------------------------------------------------------
