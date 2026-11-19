@@ -188,6 +188,34 @@ def _codex_with_managed_model(root: Path, model: str) -> Path:
     return launcher
 
 
+def _seed_codex_model_catalog(home: Path, slugs: tuple[str, ...]) -> None:
+    """List *slugs* in Codex's catalog; routing only applies picks the host can run."""
+    bundled = json.loads(
+        subprocess.run(
+            [str(shutil.which("codex")), "debug", "models", "--bundled"],
+            capture_output=True,
+            check=True,
+            env={**os.environ, "CODEX_HOME": str(home)},
+            timeout=15,
+        ).stdout
+    )
+    template = next(model for model in bundled["models"] if model["visibility"] == "list")
+    models = [
+        {
+            **template,
+            "slug": slug,
+            "display_name": slug,
+            "supported_in_api": True,
+            "availability_nux": None,
+            "upgrade": None,
+        }
+        for slug in slugs
+    ]
+    catalog = home / "models.json"
+    catalog.write_text(json.dumps({**bundled, "models": models}))
+    (home / "config.toml").write_text(f"model_catalog_json = {json.dumps(str(catalog))}\n")
+
+
 def _last_user_text(request: dict[str, Any]) -> str:
     texts = [
         block.get("text", "")
@@ -233,6 +261,7 @@ def test_routed_model_runs_the_turn_under_a_managed_codex_model(
     )
     source = tmp_path / "source-home"
     source.mkdir()
+    _seed_codex_model_catalog(source, (routed, managed))
     offered = tmp_path / "offered.json"
     common = {
         "OMNIGENT_CONFIG_HOME": str(config_home),
