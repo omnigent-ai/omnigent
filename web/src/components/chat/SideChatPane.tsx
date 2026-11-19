@@ -43,6 +43,7 @@ import {
 } from "@/components/composer/ChatComposer";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
+import { FileMentionMenu } from "@/components/FileMentionMenu";
 import {
   BUILTIN_SLASH_COMMANDS,
   SlashCommandMenu,
@@ -83,9 +84,14 @@ import { useDictationInsert } from "@/hooks/useDictationInsert";
 import { useDismissOnEscape } from "@/hooks/useDismissOnEscape";
 import { useSession } from "@/hooks/useSession";
 import type { Session } from "@/lib/types";
+import { useChildSessions } from "@/hooks/useChildSessions";
+import { useMentionBrowser } from "@/hooks/useMentionBrowser";
+import { useMentionListings } from "@/hooks/useMentionListings";
+import { useWorkspaceEnvironment } from "@/hooks/useWorkspaceChangedFiles";
 import { useSkills } from "@/hooks/useSkills";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useFileMentionHarnesses } from "@/lib/agentLabels";
 import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import { isNativeTerminalSession } from "@/lib/nativeCodingAgents";
 import { isPermissionModeCycleKey } from "@/lib/permissionModeCycle";
@@ -110,14 +116,18 @@ import {
 } from "@/lib/outgoingComposerMessage";
 import {
   composerInlineMentions,
+  detectMentionAt,
+  harnessSupportsFileMentions,
   mergeTaggedDrafts,
   presentTaggedMentions,
   recallFileMentions,
   recallSessionMentions,
+  type MentionState,
   type TaggedMentions,
 } from "@/lib/composerMentions";
 import { clearLocalReviewContexts } from "@/lib/localReviewContext";
 import {
+  getSessionDraft,
   setSessionMentions,
   useSessionMentions,
   useSessionReviewComments,
@@ -251,6 +261,8 @@ interface GridComposerSlots {
   /** Steps the cell's permission mode; returns whether it took the key. */
   cyclePermissionMode?: () => boolean;
 }
+
+const NO_TAGGED_MENTIONS: TaggedMentions = { files: [], sessions: [] };
 
 // Accurate for every harness: a side chat is a fork that stays out of the main
 // thread. It is NOT reliably ephemeral — a non-Codex side chat is a persisted
@@ -1012,6 +1024,62 @@ function SideChatComposer({
   const [inputFocused, setInputFocused] = useState(false);
   const [commandNotice, setCommandNotice] = useState<string | null>(null);
   useDismissOnEscape(commandNotice !== null, () => setCommandNotice(null));
+  // A grid cell's "@" picker: the full-screen composer's menu over the cell's session.
+  // Side chats never open it, so their listing queries stay off.
+  const fileMentionHarnesses = useFileMentionHarnesses(gridCell);
+  const [typedMention, setTypedMention] = useState<MentionState | null>(null);
+  // A send or an edit can change the text under an open "@", which then closes its menu.
+  const mention =
+    typedMention !== null &&
+    text.slice(typedMention.start, typedMention.end) === `@${typedMention.query}`
+      ? typedMention
+      : null;
+  const { children: cellChildren } = useChildSessions(gridCell ? childId : null);
+  const fileMentionsEnabled =
+    gridCell && harnessSupportsFileMentions(harness, fileMentionHarnesses);
+  // A cell's root listing waits on the workspace environment, as the all-files query does.
+  const environment = useWorkspaceEnvironment(gridCell ? childId : undefined, {
+    enabled: fileMentionsEnabled,
+  });
+  const { mentionDir, mentionFilter, mentionEntries, sessionEntries, mentionListingPending } =
+    useMentionListings({
+      conversationId: gridCell ? childId : null,
+      enabled: fileMentionsEnabled,
+      mention,
+      subagents: cellChildren,
+      environmentLoading: environment.isLoading,
+    });
+  const {
+    mentionIndex,
+    mentionOpen,
+    sessionMenu,
+    attachMention,
+    openMentionDir,
+    attachSession,
+    handleKeyDown: handleMentionKeyDown,
+    handleTokenBackspace,
+    dismiss: dismissMention,
+  } = useMentionBrowser({
+    mention,
+    setMention: setTypedMention,
+    mentionEntries,
+    sessionEntries,
+    text,
+    setText,
+    textareaRef,
+    isMobile,
+    tags: gridCell
+      ? {
+          mentions: sessionMentions ?? NO_TAGGED_MENTIONS,
+          updateMentions: (update) =>
+            setSessionMentions(
+              childId,
+              update(getSessionDraft(childId)?.mentions ?? NO_TAGGED_MENTIONS),
+            ),
+        }
+      : undefined,
+  });
+  const mentionMenuOpen = mentionOpen || mentionListingPending;
   const nativeSession = isNativeTerminalSession({ harness, labels: session?.labels });
   // A generic side chat has no host/workspace of its own: it forks the parent and
   // runs in the parent's workspace. Discover skills against the parent (the same
@@ -1107,6 +1175,7 @@ function SideChatComposer({
       inputFocused &&
       !pending &&
       !nativeSession &&
+      !mentionMenuOpen &&
       !carriesMessageContext({ quotes, text }, files, sendContext),
     onSelect: applyMenuSelection,
     onTabComplete: completeMenuSelection,
@@ -1218,11 +1287,16 @@ function SideChatComposer({
     // Mod+Enter submits any draft, then steers the whole queue into the running turn.
     if (queues && intent.shouldSteerAllFromKeyboard) {
       event.preventDefault();
-      if (settingsSavePending()) return;
+      // An open "@" menu keeps its draft unsent, so the queue waits with it.
+      if (settingsSavePending() || mentionMenuOpen) return;
       submit();
       steerAllQueuedMessages(childId);
       return;
     }
+    // An open "@" menu takes its keys first; Shift+Tab stays with the permission cycle.
+    if (!isPermissionModeCycleKey(event) && handleMentionKeyDown(event)) return;
+    // Only the tail input's text holds tags, so only it removes a whole token.
+    if (event.currentTarget === tailTextareaRef.current && handleTokenBackspace(event)) return;
     if (slashCompletion.handleKey(event, intent)) return;
     // Only a grid cell has a permission chip; a side chat leaves Shift+Tab to the browser.
     if (isPermissionModeCycleKey(event) && gridComposer?.cyclePermissionMode?.()) {
@@ -1243,6 +1317,8 @@ function SideChatComposer({
     }
     if (intent.shouldSubmitFromKeyboard) {
       event.preventDefault();
+      // Enter with the "@" menu open picks from it or waits for its listing; it never sends.
+      if (mentionMenuOpen) return;
       submit();
     }
   };
@@ -1319,6 +1395,14 @@ function SideChatComposer({
             if (commandNotice !== null) setCommandNotice(null);
             slashCompletion.onSelectionChange(event.target);
             setText(event.target.value);
+            if (gridCell)
+              setTypedMention(
+                detectMentionAt(
+                  event.target.value,
+                  event.target.selectionStart ?? event.target.value.length,
+                  sessionEntries.map((row) => row.title),
+                ),
+              );
           },
           onSelect: (event) => slashCompletion.onSelectionChange(event.currentTarget),
           onFocus: (event) => {
@@ -1326,7 +1410,10 @@ function SideChatComposer({
             focusText(null, event.currentTarget);
           },
           // Menu rows preventDefault on mousedown so selecting one keeps focus.
-          onBlur: () => setInputFocused(false),
+          onBlur: () => {
+            setInputFocused(false);
+            dismissMention();
+          },
           placeholder: fullSession ? "Reply to this session..." : "Ask a side question...",
           rows: gridComposer ? 1 : undefined,
           disabled: !ready,
@@ -1346,6 +1433,19 @@ function SideChatComposer({
               labels={slashCompletion.labels}
               skillsStatus={skillsStatus}
               onRetrySkills={() => void refreshSkills()}
+            />
+          ) : mentionMenuOpen ? (
+            <FileMentionMenu
+              currentDir={mentionDir}
+              query={mention?.query ?? ""}
+              fileQuery={mentionFilter}
+              activeIndex={mentionIndex}
+              entries={mentionEntries}
+              loading={mentionListingPending}
+              onOpenDir={openMentionDir}
+              onAttach={attachMention}
+              sessionMenu={sessionMenu}
+              onAttachSession={attachSession}
             />
           ) : undefined,
           inputPrefix:

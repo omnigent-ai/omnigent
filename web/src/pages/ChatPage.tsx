@@ -141,18 +141,11 @@ import {
   harnessSupportsFileMentions,
   type MentionItem,
   mentionMarkerFor,
-  MENTION_MATCH_CAP,
   type MentionState,
-  parseMentionToken,
-  rankMentionEntries,
   recallFileMentions,
 } from "@/lib/composerMentions";
 import { useChildSessions } from "@/hooks/useChildSessions";
-import {
-  MENTION_SEARCH_DEBOUNCE_MS,
-  useSessionMentionEntries,
-} from "@/hooks/useSessionMentionEntries";
-import { useDebouncedValue } from "@/hooks/useDebouncedValue";
+import { useMentionListings } from "@/hooks/useMentionListings";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import { getSessionDraft, promoteSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 import {
@@ -260,12 +253,6 @@ import {
 import { FileMentionMenu } from "@/components/FileMentionMenu";
 import { FileDropOverlay } from "@/components/FileDropOverlay";
 import { FilePathAwareMessageResponse } from "@/components/blocks/ChatMarkdown";
-import {
-  useWorkspaceAllFiles,
-  useWorkspaceDirectory,
-  useWorkspaceFileSearch,
-  type WorkspaceFile,
-} from "@/hooks/useWorkspaceChangedFiles";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { ComposerLocalReviewChips } from "@/components/composer/ComposerLocalReviewChips";
@@ -2808,9 +2795,6 @@ function ComposerImpl(
   // ``mentionMarkerFor``. FileViewer's "Attach to agent" gate uses the same helper.
   const fileMentionHarnesses = useFileMentionHarnesses();
   const mentionEnabled = harnessSupportsFileMentions(sessionHarness, fileMentionHarnesses);
-  const workspaceFilesQuery = useWorkspaceAllFiles(composerSessionId ?? undefined, {
-    enabled: mentionEnabled,
-  });
   const valueRef = useRef(fullText);
   valueRef.current = fullText;
   const replyDraftRef = useRef(storedReplyDraft);
@@ -3151,72 +3135,19 @@ function ComposerImpl(
       setPlanModeBusy(false);
     }
   };
-  // "@"-mention is a drill-down file/folder browser. The token after "@"
-  // doubles as a path: text up to the last "/" is the directory being
-  // browsed; text after it filters that directory's entries. Opening a
-  // folder rewrites the token to "<dir>/" so the menu re-lists it — that
-  // is how nested files are reached (recursion via navigation, mirroring
-  // the terminal's git-tracked walk). At any level the user can attach a
-  // single file or the whole folder.
-  const { dir: mentionDir, filter: mentionFilter } = parseMentionToken(mention?.query ?? "");
-  // Root listing reuses the gate's useWorkspaceAllFiles; a sub-directory
-  // uses the lazy per-dir hook (disabled — null path — at the root). Both
-  // return files AND directories with a ``type`` discriminator.
-  const mentionDirQuery = useWorkspaceDirectory(
-    conversationId ?? undefined,
-    mentionEnabled && mention && mentionDir ? mentionDir : null,
-  );
-  const mentionSourceEntries: WorkspaceFile[] = mentionDir
-    ? (mentionDirQuery.data ?? [])
-    : (workspaceFilesQuery.data?.data ?? []);
-  // Typing after "@" also searches the server, debounced like the palette.
-  const debouncedMentionQuery = useDebouncedValue(mention?.query ?? "", MENTION_SEARCH_DEBOUNCE_MS);
-  // Root-level typing also finds files in unexpanded folders (files only).
-  const mentionFileSearch = useWorkspaceFileSearch(
-    composerSessionId ?? undefined,
-    mentionEnabled && mention && !mentionDir ? debouncedMentionQuery : "",
-  );
-  // Folders first, filtered by the typed segment, capped (see rankMentionEntries),
-  // then deeper search hits the cached listing doesn't already show.
-  const mentionEntries = ((): WorkspaceFile[] => {
-    if (!mentionEnabled || !mention) return [];
-    const listed = rankMentionEntries(mentionSourceEntries, mentionFilter);
-    if (mentionDir || !mentionFilter) return listed;
-    const listedPaths = new Set(listed.map((entry) => entry.path));
-    // The search ran on the debounced text; re-check hits against the live filter.
-    const needle = mentionFilter.toLowerCase();
-    const deeper = rankMentionEntries(
-      (mentionFileSearch.data?.files ?? []).filter(
-        (file) => !listedPaths.has(file.path) && file.path.toLowerCase().includes(needle),
-      ),
-      "",
-    );
-    return [...listed, ...deeper].slice(0, MENTION_MATCH_CAP);
-  })();
-
   // Sessions: this session's subagents, then sidebar-loaded rows, then search hits.
   const { children: childSessions } = useChildSessions(conversationId);
-  const sessionEntries = useSessionMentionEntries({
-    mention,
-    debouncedQuery: debouncedMentionQuery,
-    currentSessionId: conversationId,
-    subagents: childSessions,
-  });
-  // True while a mention token is active but its listing hasn't resolved yet:
-  // the cold-boot root fetch, or a sub-directory's first load after drilling
-  // in. During this window ``mentionEntries`` is transiently empty (so the
-  // menu is closed), and a stray Enter must NOT fall through to ``submit`` and
-  // send the half-typed "@dir/" token as a chat message. A *settled*
-  // zero-match (e.g. "@notafile") is deliberately excluded — sending that
-  // literally is the user's intent.
-  const mentionListingPending =
-    mentionEnabled &&
-    mention != null &&
-    (mentionDir ? mentionDirQuery.isLoading : workspaceFilesQuery.isLoading);
+  // The "@" menu's rows come from useMentionListings, shared with the grid cell composer.
+  const { mentionDir, mentionFilter, mentionEntries, sessionEntries, mentionListingPending } =
+    useMentionListings({
+      conversationId,
+      enabled: mentionEnabled,
+      mention,
+      subagents: childSessions,
+    });
 
-  // Shared selection/chip/keyboard glue (see useMentionBrowser). The token
-  // state and the data source above stay here; everything stateful is shared
-  // so this composer and the launcher can't drift. ``setText`` also flags the
+  // Shared selection/chip/keyboard glue (see useMentionBrowser); the token state stays here.
+  // Sharing keeps this composer and the launcher from drifting. ``setText`` also flags the
   // draft dirty so attach/drill participate in draft persistence.
   const {
     mentionIndex,
