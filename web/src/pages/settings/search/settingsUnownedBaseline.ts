@@ -4,6 +4,22 @@
  * may find no more than the baseline allows.
  */
 export const UNOWNED_CONTROLS: Readonly<Record<string, { count: number; reason: string }>> = {
+  "src/components/FontFamilyCombobox.tsx › FontFamilyCombobox › CommandInput": {
+    count: 1,
+    reason: "Font family combobox and its popover internals, not yet catalog-owned.",
+  },
+  "src/components/FontFamilyCombobox.tsx › FontFamilyCombobox › CommandItem": {
+    count: 4,
+    reason: "Font family combobox and its popover internals, not yet catalog-owned.",
+  },
+  "src/components/FontFamilyCombobox.tsx › FontFamilyCombobox › PopoverContent": {
+    count: 1,
+    reason: "Font family combobox and its popover internals, not yet catalog-owned.",
+  },
+  "src/components/FontFamilyCombobox.tsx › FontFamilyCombobox › button": {
+    count: 1,
+    reason: "Font family combobox and its popover internals, not yet catalog-owned.",
+  },
   "src/components/ModelValueCombobox.tsx › ModelValueCombobox › button": {
     count: 1,
     reason: 'Model field\'s combobox; its accessible name includes "*".',
