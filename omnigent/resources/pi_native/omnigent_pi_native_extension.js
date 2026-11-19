@@ -1450,7 +1450,7 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now, shutdo
     const flush = ready => {
       // Once shutdown aborts this poll, it neither posts nor writes state.
       if (signal.aborted) return;
-      // The final poll reads until the shutdown deadline so no ready child is left unread.
+      // The final poll reads up to its own deadline rather than the regular pass limit.
       const readUntil = final ? readDeadline : Math.min(Date.now() + _CHILD_READ_BUDGET_MS, readDeadline);
       ready.forEach(child => readNew(child, readUntil));
       persist();
@@ -1487,7 +1487,7 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now, shutdo
       timer = setInterval(() => this.poll().catch(() => {}), _CHILD_POLL_MS);
       timer?.unref?.();
     },
-    // A last poll, after any in-flight one, captures the final window within the shutdown budget.
+    // A last best-effort poll: reading gets half the shutdown budget, leaving the rest for posts.
     async stop() {
       clearInterval(timer);
       timer = null;
@@ -1495,7 +1495,7 @@ function createChildSessionWatcher(config, { sessionFile, now = Date.now, shutdo
       if (polling) pollAbort.abort();
       const deadlineAt = Date.now() + shutdownTimeoutMs;
       const final = Promise.resolve(polling).catch(() => {})
-        .then(() => Date.now() < deadlineAt && this.poll(true, deadlineAt));
+        .then(() => Date.now() < deadlineAt && this.poll(true, deadlineAt - shutdownTimeoutMs / 2));
       const bound = new AbortController();
       await Promise.race([final.catch(() => {}), sleep(shutdownTimeoutMs, bound.signal)]);
       bound.abort();
