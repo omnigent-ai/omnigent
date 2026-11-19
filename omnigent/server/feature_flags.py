@@ -57,6 +57,7 @@ class Feature(StrEnum):
     PROACTIVE_AGENT = "proactive_agent"
     USER_INBOX = "user_inbox"
     MEMORY = "memory"
+    FLOATING_COMPOSER = "floating_composer"
 
 
 @dataclass(frozen=True)
@@ -311,6 +312,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         # Clients probe inbox_items_available in GET /v1/info.
         frontend_visible=False,
         default_enabled=True,
+    ),
+    FeatureDefinition(
+        feature=Feature.FLOATING_COMPOSER,
+        description="The desktop app's floating New Agent panel, opened with Shift+Cmd+Space",
+        owner="web",
+        review_by_release="0.27.0",
     ),
 )
 

@@ -1,0 +1,86 @@
+// The floating New Agent panel: the new-chat screen alone, in the desktop shell's
+// panel window. Escape and the X hide it, keeping what was typed.
+import { useEffect, useMemo, useState } from "react";
+
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import { Toaster } from "@/components/ui/sonner";
+import { floatingComposerBridge } from "@/lib/nativeBridge";
+import {
+  ComposerPresentationContext,
+  type ComposerPresentation,
+} from "@/shell/composerPresentation";
+import { NewChatLandingScreen } from "@/shell/NewChatDialog";
+import { FloatingComposerHeader } from "./FloatingComposerHeader";
+import { launchFromPanel } from "./floatingLaunch";
+
+/** Open layers that take Escape themselves; while one is up, Escape doesn't hide the panel. */
+const ESCAPE_OWNERS = [
+  "[data-radix-popper-content-wrapper]",
+  "[role='dialog'][data-state='open']",
+  "[role='menu'][data-state='open']",
+  "[role='listbox'][data-state='open']",
+].join(", ");
+
+function escapeOwnerIsOpen(): boolean {
+  return Array.from(document.querySelectorAll(ESCAPE_OWNERS)).some(
+    (layer) => layer.closest("[hidden], [aria-hidden='true']") === null,
+  );
+}
+
+function dismiss() {
+  floatingComposerBridge()?.dismiss();
+}
+
+export function FloatingComposerPage() {
+  // A delivered launch starts a fresh composer; a failed one keeps the prompt where it was.
+  const [generation, setGeneration] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+  const presentation = useMemo<ComposerPresentation>(
+    () => ({
+      kind: "floating",
+      launch: (request) => {
+        setError(null);
+        void launchFromPanel(request).then((outcome) => {
+          if (outcome.freshComposer) setGeneration((current) => current + 1);
+          setError(outcome.error);
+        });
+      },
+      onFilePicker: (state) => floatingComposerBridge()?.filePicker(state),
+      openAppPage: (page) => void floatingComposerBridge()?.openInMainWindow(page),
+    }),
+    [],
+  );
+
+  // Escape hides the panel, after any open picker or menu has taken its own Escape.
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || event.defaultPrevented || event.isComposing) return;
+      if (escapeOwnerIsOpen()) return;
+      dismiss();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, []);
+
+  return (
+    <div className="flex h-dvh flex-col overflow-hidden bg-background text-foreground">
+      <FloatingComposerHeader onClose={dismiss} />
+      {error === null ? null : (
+        <Alert
+          variant="destructive"
+          className="mx-3 mt-2 w-auto"
+          data-testid="floating-launch-error"
+        >
+          <AlertDescription>{error}</AlertDescription>
+        </Alert>
+      )}
+      <main className="flex min-h-0 flex-1 flex-col">
+        <ComposerPresentationContext.Provider value={presentation}>
+          <NewChatLandingScreen key={generation} />
+        </ComposerPresentationContext.Provider>
+      </main>
+      {/* The app shell's toaster isn't mounted here. */}
+      <Toaster position="top-center" />
+    </div>
+  );
+}
