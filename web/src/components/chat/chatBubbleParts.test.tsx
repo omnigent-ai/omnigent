@@ -148,7 +148,7 @@ describe("Bidirectional response width", () => {
           <BubbleView bubble={bubble} isLastAssistant={false} />
         </QueryClientProvider>,
       );
-      expect(screen.getByTestId("message-bubble")).toHaveClass("max-w-full");
+      expect(screen.getByTestId("message-bubble")).toHaveClass("max-w-full", "rtl-response");
       expect(screen.getByTestId("message-bubble").firstElementChild).toHaveClass("w-full");
     },
   );

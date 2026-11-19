@@ -1490,8 +1490,8 @@ function AssistantBubble({
   // thread-level card, not an assistant reply, so it takes the "error" role; a
   // failed turn that still produced tool or reasoning output keeps the assistant role.
   const errorNotice = hasError && bubble.items.every((it) => it.kind === "error");
-  const spansFullColumn =
-    isWide || hasError || /[\p{Script=Hebrew}\p{Script=Arabic}]/u.test(markdownText);
+  const hasRtlText = /[\p{Script=Hebrew}\p{Script=Arabic}]/u.test(markdownText);
+  const spansFullColumn = isWide || hasError || hasRtlText;
   const hasSubagentNotice = bubble.items.some((it) => it.kind === "subagent_activity");
   // Shrink-wrapped to a short reply, tool rows would cut their titles off mid-column.
   const hasToolRows = bubble.items.some((it) => it.kind === "tool" || it.kind === "native_tool");
@@ -1523,6 +1523,7 @@ function AssistantBubble({
         className={cn(
           "mobile-app:gap-0",
           spansFullColumn ? "max-w-full" : "max-w-[var(--chat-prose-width)]",
+          hasRtlText && "rtl-response",
         )}
       >
         {/* Fold-only rows and notices fill the prose width so their hairlines stay visible. */}

@@ -1825,6 +1825,11 @@ html[data-electron-mac] .breadcrumb-folder {
   }
 }
 
+/* Mixed-direction replies align against the chat column, including their prose blocks. */
+.is-assistant.rtl-response {
+  --chat-prose-width: 100%;
+}
+
 /* Paragraph direction also controls alignment within the full response width. */
 .message-markdown :is(p, h1, h2, h3, h4, h5, h6, li, blockquote) {
   text-align: start;
