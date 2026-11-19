@@ -596,6 +596,33 @@ describe("NewChatLandingScreen in the floating panel", () => {
     },
   );
 
+  it("moves a restored draft off a host the panel can't start on", async () => {
+    setHosts([host(), host({ host_id: "host_2", name: "build-box" })]);
+    renderLanding();
+    await waitForWorkspaceSeed();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-host-host_2"));
+    typeMessage("inspect the repo");
+    // Leaving parks the draft, host_2 included.
+    cleanup();
+
+    inDesktopShell({ cliInstalled: true, hostId: "host_1" });
+    vi.mocked(authenticatedFetch).mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    const panel = floatingPanel();
+    renderLanding([], {}, panel);
+    await waitForWorkspaceSeed();
+    fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+    await waitFor(() => expect(panel.launch).toHaveBeenCalled());
+    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toMatchObject({
+      host_id: "host_1",
+      workspace: SEEDED_WORKSPACE,
+    });
+  });
+
   it("starts nowhere until the desktop shell names this Mac's host", async () => {
     let answer!: (identity: { cliInstalled: boolean; hostId: string }) => void;
     const shell = window as unknown as { omnigentDesktop?: unknown };
@@ -663,7 +690,10 @@ describe("NewChatLandingScreen in the floating panel", () => {
     renderLanding([], {}, panel);
     await waitForWorkspaceSeed();
     typeMessage("inspect the repo");
-    fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "Enter" });
+    // Not prevented, so the textarea inserts its newline.
+    expect(fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), { key: "Enter" })).toBe(
+      true,
+    );
     expect(authenticatedFetch).not.toHaveBeenCalled();
 
     fireEvent.keyDown(screen.getByTestId("new-chat-landing-input"), {

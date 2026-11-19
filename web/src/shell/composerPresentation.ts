@@ -17,7 +17,11 @@ export type ComposerPresentation =
   | { kind: "page" }
   | {
       kind: "floating";
-      /** Opens the created session and delivers its first message unless the create took it. */
+      /**
+       * Opens the created session and delivers its first message unless the create took it.
+       * The session already exists, so this owns every failure from here and must not throw:
+       * New Chat would report a create error, and a retry would make a second session.
+       */
       launch: (request: FloatingLaunchRequest) => void;
       /** The native file picker opened or closed, so the panel stays up while it's open. */
       onFilePicker: (state: "open" | "closed") => void;

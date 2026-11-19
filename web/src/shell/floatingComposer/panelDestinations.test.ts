@@ -42,6 +42,7 @@ describe("panelDestinations", () => {
     // Still waiting on any answer: no host can be chosen, even this Mac's.
     for (const over of [
       { thisMacHostId: undefined },
+      { hosts: null },
       { sandboxesOffered: null },
     ] satisfies Partial<PanelDestinationFacts>[]) {
       expect(panelAllowsHost(panelDestinations(facts(over)), "host_mac")).toBe(false);
