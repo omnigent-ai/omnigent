@@ -60,6 +60,7 @@ class Feature(StrEnum):
     MEMORY = "memory"
     QUICK_PICK_PALETTE = "quick_pick_palette"
     FLOATING_COMPOSER = "floating_composer"
+    WORKSPACE_SIDEBAR_V2 = "workspace_sidebar_v2"
 
 
 @dataclass(frozen=True)
@@ -333,6 +334,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="The desktop app's floating New Agent panel, opened with Shift+Cmd+Space",
         owner="web",
         review_by_release="0.27.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.WORKSPACE_SIDEBAR_V2,
+        description="Show the workspace sidebar as tabs: Files, Changes and pull request pages",
+        owner="web",
+        review_by_release="0.26.0",
     ),
 )
 
