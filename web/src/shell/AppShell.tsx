@@ -155,6 +155,7 @@ import { SubagentPanelOpenerContext } from "./subagentPanelOpener";
 import { isMobileViewport, Sidebar } from "./Sidebar";
 import { SidebarHeaderActions } from "./SidebarHeaderActions";
 import { useSettingsRoute } from "./settingsNav";
+import { useOpenSidebarForSettingsSearch } from "./settingsSearch/settingsSearchFocus";
 import { isCachedAncestor, useRootSessionId, useSession } from "@/hooks/useSession";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
 import {
@@ -456,6 +457,17 @@ function AppShellImpl() {
       sidebarOpenBeforeSettingsRef.current = null;
     }
   }, [inSettings, location.pathname, rebasePath, setSidebarOpen]);
+
+  // ⌘K's "Search settings…" opens the sidebar so its field can be seen. From outside Settings the
+  // sidebar's state is recorded first, so Back restores a collapsed sidebar, as after any other trip.
+  useOpenSidebarForSettingsSearch(() => {
+    setSidebarOpen((wasOpen) => {
+      if (!inSettings && sidebarOpenBeforeSettingsRef.current === null) {
+        sidebarOpenBeforeSettingsRef.current = wasOpen;
+      }
+      return true;
+    });
+  });
 
   // Below md an open sidebar is a full-window drawer, so narrowing closes it
   // (except the settings menu) and remembers the desktop state for widening.

@@ -20,7 +20,9 @@ import {
   IMPORT_HARNESS_ENTRY,
   IMPORT_MACHINE_ENTRY,
   IMPORT_MODE_ENTRY,
+  IMPORT_RECENT_COUNT_ALL_LABEL,
   IMPORT_RECENT_COUNT_ENTRY,
+  IMPORT_RECENT_COUNT_LABEL,
   IMPORT_RECENT_LIMITS,
   IMPORT_RUN_ENTRY,
   IMPORT_SESSION_ID_ENTRY,
@@ -195,7 +197,7 @@ export function ImportSessionsPanel() {
             className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3"
           >
             <SettingsLabel
-              label={`${IMPORT_RECENT_COUNT_ENTRY.label}${source === "all" ? " (across all harnesses)" : ""}`}
+              label={source === "all" ? IMPORT_RECENT_COUNT_ALL_LABEL : IMPORT_RECENT_COUNT_LABEL}
               labelId={settingsLabelId(IMPORT_RECENT_COUNT_ENTRY)}
               descriptionId={settingsDescriptionId(IMPORT_RECENT_COUNT_ENTRY)}
               className="flex-1"

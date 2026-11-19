@@ -86,6 +86,30 @@ export function accessibleName(element: Element): string {
   return computeAccessibleName(element);
 }
 
+const HEADING = "h1, h2, h3, h4, h5, h6, [role=heading]";
+
+/**
+ * Whether a row with no label of its own is named by a heading showing `label`: the one its
+ * aria-labelledby names, or else the nearest heading before it that sits outside every row.
+ */
+function rowNamedByHeading(row: Element, label: string): boolean {
+  const labelledBy = (row.getAttribute("aria-labelledby") ?? "").split(/\s+/).filter(Boolean);
+  if (labelledBy.length > 0) {
+    const heading =
+      labelledBy.length === 1 ? row.ownerDocument.getElementById(labelledBy[0]!) : null;
+    return heading !== null && heading.matches(HEADING) && textOf(heading) === label;
+  }
+  let nearest: Element | null = null;
+  for (const heading of row.ownerDocument.querySelectorAll(HEADING)) {
+    const precedes =
+      (heading.compareDocumentPosition(row) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0;
+    if (precedes && !heading.contains(row) && heading.closest("[data-settings-item]") === null) {
+      nearest = heading;
+    }
+  }
+  return nearest !== null && textOf(nearest) === label;
+}
+
 function describe(element: Element): string {
   const role = element.getAttribute("role");
   return `${element.tagName.toLowerCase()}${role ? `[role=${role}]` : ""} "${accessibleName(element)}"`;
@@ -93,9 +117,11 @@ function describe(element: Element): string {
 
 function parseControlId(value: string): { id: string; part?: string } {
   const separator = value.indexOf(":");
-  return separator === -1
-    ? { id: value }
-    : { id: value.slice(0, separator), part: value.slice(separator + 1) };
+  // A row's main control is `id:`, the same form its hash takes, and names no part.
+  if (separator === -1 || separator === value.length - 1) {
+    return { id: separator === -1 ? value : value.slice(0, separator) };
+  }
+  return { id: value.slice(0, separator), part: value.slice(separator + 1) };
 }
 
 /**
@@ -332,7 +358,7 @@ export function auditSettingsDomFindings({
       problem(`${entry.id}: renders ${rows.length} rows, expected 1`);
     }
     for (const row of rows) {
-      if (!textOf(row).includes(entry.label)) {
+      if (!textOf(row).includes(entry.label) && !rowNamedByHeading(row, entry.label)) {
         problem(`${entry.id}: its row doesn't show "${entry.label}"`);
       }
     }
@@ -853,15 +879,10 @@ function isPartHelp(control: Element, name: string, entryFor: EntryLookup): bool
   if (!rowElement || !row?.entry || !control.matches("button")) return false;
   const entry = row.entry;
   // Each part's name, and the sub-label a part (or the main control) shows when it differs.
-  const labels: [string | undefined, string][] = [
-    ...Object.entries(entry.parts ?? {}).map(([part, partName]): [string, string] => [
-      part,
-      partName,
-    ]),
-    ...Object.entries(entry.partLabels ?? {}).map(([part, label]): [string | undefined, string] => [
-      part === "" ? undefined : part,
-      label,
-    ]),
+  // The main control's sub-label is keyed "", which is also its control id's part.
+  const labels: [string, string][] = [
+    ...Object.entries(entry.parts ?? {}),
+    ...Object.entries(entry.partLabels ?? {}),
   ];
   return labels.some(([part, label]) => {
     if (name !== `About ${label}`) return false;

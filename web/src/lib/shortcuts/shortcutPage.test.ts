@@ -34,6 +34,18 @@ function everyContext(): ShortcutPageContext[] {
 }
 
 /** The recorded groups for `context`, assembled as the page would list them. */
+// The recorded rows predate the registry ids, which Settings search reads from the page.
+function withoutShortcutIds(groups: ShortcutPageGroup[]): ShortcutPageGroup[] {
+  return groups.map((group) => ({
+    ...group,
+    items: group.items.map((row) => {
+      const copy = { ...row };
+      delete copy.shortcutId;
+      return copy;
+    }),
+  }));
+}
+
 function goldenGroupsFor(context: ShortcutPageContext, mac: boolean): ShortcutPageGroup[] {
   const platform = mac ? 0 : 1;
   const caps = (keys: GoldenRow["keys"]) => keys[platform].split(" ");
@@ -71,9 +83,10 @@ describe("shortcutPageGroups against the recorded rows", () => {
     const contexts = everyContext();
     expect(contexts).toHaveLength(1024);
     for (const context of contexts) {
-      expect(shortcutPageGroups(context, mac), JSON.stringify(context)).toStrictEqual(
-        goldenGroupsFor(context, mac),
-      );
+      expect(
+        withoutShortcutIds(shortcutPageGroups(context, mac)),
+        JSON.stringify(context),
+      ).toStrictEqual(goldenGroupsFor(context, mac));
     }
   });
 });
