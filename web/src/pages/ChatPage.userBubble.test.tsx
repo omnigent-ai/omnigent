@@ -927,6 +927,14 @@ describe("UserBubble command tint", () => {
     },
   );
 
+  // A known limit: Markdown makes a four-space indent a code block, so the token never leads a
+  // paragraph and stays plain, while the text renders unchanged.
+  it("leaves an indented command untinted and its text unchanged", () => {
+    renderScoped(userBubble("    /team fix it"), <PublishCommands />);
+    expect(screen.getByTestId("user-message-content")).toHaveTextContent("/team fix it");
+    expect(document.querySelector(".text-brand-accent")).toBeNull();
+  });
+
   it("follows the catalog as it is replaced and removed under an existing bubble", () => {
     const bubble = userBubble("/team fix it");
     const view = renderScoped(bubble, <PublishCommands />);
