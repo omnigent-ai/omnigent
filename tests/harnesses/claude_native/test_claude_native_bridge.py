@@ -4227,24 +4227,6 @@ def test_augment_claude_args_injects_mcp_and_hooks(tmp_path: Path) -> None:
     assert "--disallowedTools" not in args
 
 
-def test_augment_claude_args_omits_mcp_under_managed_sideload_policy(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Managed sideload policy must not make the native harness fail at startup."""
-    from omnigent.onboarding import ambient
-
-    monkeypatch.setattr(ambient, "claude_sideload_flags_disabled", lambda: True)
-
-    args = augment_claude_args(
-        (),
-        bridge_dir=tmp_path,
-        python_executable="/venv/bin/python",
-    )
-
-    assert "--mcp-config" not in args
-    assert "--settings" in args
-
-
 def test_generated_claude_subprocesses_pin_runner_tmpdir(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4967,6 +4949,38 @@ def test_augment_claude_args_injects_plugin_dir_for_bundle_with_skills(
     # The skill args are appended alongside the MCP/hook injection, not in
     # place of it — both must reach the final launch command.
     assert "--mcp-config" in args
+
+
+def test_augment_claude_args_omits_sideload_flags_when_managed_settings_disable_them(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Claude Code exits at startup on ``--plugin-dir`` or inline ``--mcp-config`` here."""
+    managed_settings = tmp_path / "etc-claude-code" / "managed-settings.json"
+    managed_settings.parent.mkdir()
+    managed_settings.write_text('{"disableSideloadFlags": true}', encoding="utf-8")
+    monkeypatch.setattr(
+        "omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,)
+    )
+    bundle = tmp_path / "bundle"
+    (bundle / "skills" / "authoring").mkdir(parents=True)
+    (bundle / "skills" / "authoring" / "SKILL.md").write_text("# authoring\n")
+
+    with caplog.at_level(logging.WARNING):
+        args = augment_claude_args(
+            (),
+            bridge_dir=tmp_path,
+            python_executable="/venv/bin/python",
+            bundle_dir=bundle,
+            agent_name="researcher",
+        )
+
+    assert "--plugin-dir" not in args
+    assert "--mcp-config" not in args
+    assert "SessionStart" in _load_invocation_settings(args)["hooks"]
+    assert not (bundle / ".claude-plugin" / "plugin.json").exists()
+    warnings = [record.getMessage() for record in caplog.records]
+    assert any("bundled skills" in message for message in warnings)
+    assert any("Omnigent's MCP tools" in message for message in warnings)
 
 
 def test_augment_claude_args_omits_permission_hook_without_omnigent_server(

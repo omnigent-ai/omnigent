@@ -72,12 +72,10 @@ _OLLAMA_PROBE_TIMEOUT = 0.25
 # never adopt it into a ``providers:`` shape (see ``claude_managed_gateway``).
 _CLAUDE_CODE_MACOS_MANAGED_DIR = Path("/Library/Application Support/ClaudeCode")
 _CLAUDE_CODE_LINUX_MANAGED_DIR = Path("/etc/claude-code")
-_CLAUDE_CODE_REMOTE_SETTINGS = Path.home() / ".claude" / "remote-settings.json"
 CLAUDE_CODE_MANAGED_SETTINGS_PATHS: tuple[Path, ...] = (
     _CLAUDE_CODE_MACOS_MANAGED_DIR / "managed-settings.json",
     _CLAUDE_CODE_LINUX_MANAGED_DIR / "managed-settings.json",
     Path(os.environ.get("PROGRAMDATA", "C:/ProgramData")) / "ClaudeCode" / "managed-settings.json",
-    _CLAUDE_CODE_REMOTE_SETTINGS,
 )
 
 # Maps each provider whose env key we surface to the served model family.
@@ -577,14 +575,12 @@ def claude_sideload_flags_disabled(
 ) -> bool:
     """Return whether Claude Code's managed policy forbids sideload flags.
 
-    Claude Code rejects ``--plugin-dir`` and ``--plugin-url`` at startup when
-    ``disableSideloadFlags`` is enabled. Omnigent must therefore avoid adding
-    its agent-bundle plugin flag under that policy; otherwise an otherwise
-    usable Claude SDK or native session fails before its first turn.
+    Under ``disableSideloadFlags`` Claude Code exits at startup on
+    ``--plugin-dir`` and on an ``--mcp-config`` naming a non-SDK server, so
+    Omnigent must launch without its bundle plugin and inline MCP server.
 
     :param paths: Managed settings files to read, highest precedence first.
-        Defaults to :data:`CLAUDE_CODE_MANAGED_SETTINGS_PATHS`, including the
-        organization-delivered ``~/.claude/remote-settings.json`` file.
+        Defaults to :data:`CLAUDE_CODE_MANAGED_SETTINGS_PATHS`.
     :returns: ``True`` only when the effective managed settings explicitly set
         ``disableSideloadFlags`` to boolean ``true``.
     """

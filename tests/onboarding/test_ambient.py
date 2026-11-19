@@ -921,7 +921,7 @@ def test_claude_sideload_flags_disabled_requires_managed_boolean_true(
 ) -> None:
     """Only an explicit managed boolean true disables Omnigent plugin flags."""
     payload = {} if value is None else {"disableSideloadFlags": value}
-    path = clean_env / "remote-settings.json"
+    path = clean_env / "managed-settings.json"
     path.write_text(json.dumps(payload))
 
     assert ambient.claude_sideload_flags_disabled((path,)) is expected

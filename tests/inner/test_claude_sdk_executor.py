@@ -2822,20 +2822,24 @@ class TestBundlePluginGating(unittest.TestCase):
             )
             self.assertTrue((bundle / ".claude-plugin" / "plugin.json").exists())
 
-    def test_managed_sideload_policy_suppresses_bundle_plugin(self):
-        # Claude Code exits before the first turn if a managed policy disables
-        # sideload flags and the SDK receives a local plugin.
+    def test_bundle_with_skills_skips_plugin_when_managed_settings_disable_sideload_flags(self):
         with tempfile.TemporaryDirectory() as tmp:
-            bundle = Path(tmp)
+            bundle = Path(tmp) / "bundle"
             skill_dir = bundle / "skills" / "demo"
             skill_dir.mkdir(parents=True)
             (skill_dir / "SKILL.md").write_text("# demo\n")
-            with patch(
-                "omnigent.onboarding.ambient.claude_sideload_flags_disabled",
-                return_value=True,
+            managed_settings = Path(tmp) / "managed-settings.json"
+            managed_settings.write_text('{"disableSideloadFlags": true}')
+            with (
+                patch(
+                    "omnigent.onboarding.ambient.CLAUDE_CODE_MANAGED_SETTINGS_PATHS",
+                    (managed_settings,),
+                ),
+                self.assertLogs("omnigent.inner.claude_sdk_executor", "WARNING") as logs,
             ):
                 self.assertEqual(self._plugins_for_bundle(bundle), [])
             self.assertFalse((bundle / ".claude-plugin" / "plugin.json").exists())
+            self.assertIn("disableSideloadFlags", "\n".join(logs.output))
 
 
 # ---------------------------------------------------------------------------

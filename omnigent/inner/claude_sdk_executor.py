@@ -62,7 +62,10 @@ from omnigent.databricks_ai_gateway import (
     with_gateway_attribution_lines,
 )
 from omnigent.inner import _proc
-from omnigent.inner.bundle_skills import ensure_bundle_plugin_manifest
+from omnigent.inner.bundle_skills import (
+    SIDELOAD_DISABLED_SKILLS_WARNING,
+    ensure_bundle_plugin_manifest,
+)
 from omnigent.inner.hook_scripts import subagent_router
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.llms.adapters._content import parse_data_uri as _parse_replay_data_uri
@@ -3771,12 +3774,11 @@ class ClaudeSDKExecutor(Executor):
         bundle_plugins: list[Any] = []  # type: ignore[explicit-any]  # SdkPluginConfig is a TypedDict — typed Any here to keep the import lazy
         from omnigent.onboarding.ambient import claude_sideload_flags_disabled
 
-        if (
-            self._bundle_dir is not None
-            and (self._bundle_dir / "skills").is_dir()
-            and not claude_sideload_flags_disabled()
-        ):
-            bundle_plugins.append({"type": "local", "path": str(self._bundle_dir)})
+        if self._bundle_dir is not None and (self._bundle_dir / "skills").is_dir():
+            if not claude_sideload_flags_disabled():
+                bundle_plugins.append({"type": "local", "path": str(self._bundle_dir)})
+            elif session_key not in self._clients:
+                logger.warning(SIDELOAD_DISABLED_SKILLS_WARNING, self._bundle_dir)
         if resolved.setting_sources == [] and not self._gateway:
             # The CLI then skips the user settings env, which may hold the only provider endpoint.
             env = {**_claude_user_settings_env(self._cwd), **env}
