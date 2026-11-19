@@ -33,7 +33,6 @@ import type {
   PathStoreVisibleRowContext,
   PathStoreVisibleTreeProjectionData,
 } from "./public-types";
-import { compareSegmentSortKeys, createSegmentSortKey, getSegmentSortKey } from "./sort";
 import { isDirectoryExpanded, setDirectoryExpanded, createPathStoreState } from "./state";
 import type { PathStoreState } from "./state";
 
@@ -284,7 +283,6 @@ export class PathStore {
     const segmentTable = this.#state.snapshot.segmentTable;
     const segmentValues = segmentTable.valueById;
     const nodes = this.#state.snapshot.nodes;
-    const targetSegmentSortKeyCache = new Map<string, ReturnType<typeof createSegmentSortKey>>();
 
     for (const path of expandedPaths) {
       if (previousPath != null && path < previousPath) {
@@ -360,24 +358,13 @@ export class PathStore {
           resolvedDepth === sharedDepth ? (previousChildOffsets[resolvedDepth] ?? 0) : 0;
         let nextChildOffset = searchStartIndex;
         let nextNodeId: number | undefined;
-        const targetSegmentSortKey =
-          targetSegmentSortKeyCache.get(segment) ?? createSegmentSortKey(segment);
-        targetSegmentSortKeyCache.set(segment, targetSegmentSortKey);
+        // Siblings follow the tree's comparator, which may not be name order, so no early stop.
         const searchForSegment = (startIndex: number, stopIndex: number): boolean => {
           for (nextChildOffset = startIndex; nextChildOffset < stopIndex; nextChildOffset += 1) {
             const candidateNodeId = childIds[nextChildOffset];
-            const candidateNode = nodes[candidateNodeId];
-            const candidateSegment = segmentValues[candidateNode.nameId];
-            if (candidateSegment === segment) {
+            if (segmentValues[nodes[candidateNodeId].nameId] === segment) {
               nextNodeId = candidateNodeId;
               return true;
-            }
-            const orderComparison = compareSegmentSortKeys(
-              getSegmentSortKey(segmentTable, candidateNode.nameId),
-              targetSegmentSortKey,
-            );
-            if (orderComparison > 0 || (orderComparison === 0 && candidateSegment > segment)) {
-              return false;
             }
           }
           return false;

@@ -193,6 +193,10 @@ function findNodeIdBySegments(
       return null;
     }
 
+    // A path through a file names nothing, as when a selected file's folder became a file.
+    if (!isDirectoryNode(requireNode(state, currentNodeId))) {
+      return null;
+    }
     const currentIndex = getDirectoryIndex(state, currentNodeId);
     const nextNodeId = ensureChildIdByNameId(state.snapshot.nodes, currentIndex).get(segmentId);
     if (nextNodeId === undefined) {

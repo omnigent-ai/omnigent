@@ -11,8 +11,8 @@ return <FileTree model={model} className="file-tree" aria-label="Changed files" 
 `useFileTree` creates a `FileTreeModel` once; later option changes are ignored.
 Drive the tree through the model instead: `getItem(path)` returns a handle to
 select, expand, or collapse a row, `scrollToPath` reveals a row, `setSearch`
-filters rows, and `addPaths` grows the tree, for example after a lazily listed
-directory loads. Directory paths end with `/`.
+filters rows, and `batch` grows or shrinks the tree, for example after a lazily
+listed directory loads. Directory paths end with `/`.
 
 Hosts theme the tree with the `--trees-*-override` custom properties listed at
 the top of `file-tree.css`.
@@ -36,3 +36,11 @@ at commit `cbc028ca863d6e662706dba87b50df3eeaebbfa7`, licensed under Apache 2.0
 
 The files are formatted and linted with this repository's tools, which only
 change their layout and type syntax, plus one renamed local variable.
+
+## Added here
+
+- `FileTreeModel.batch` and `resetPaths`. Adds grow the store in place; a
+  removal or reset rebuilds it, keeping open folders, selection and focus,
+  instead of restoring upstream's remove mutation.
+- `setGitStatus`, the `sort` option (upstream's path comparator), and
+  `orderTreePaths`, which lists paths in the tree's order.

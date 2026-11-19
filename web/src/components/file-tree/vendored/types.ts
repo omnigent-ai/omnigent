@@ -1,3 +1,5 @@
+import type { PathStorePathComparator } from "./path-store/public-types";
+
 export type GitStatus = "added" | "deleted" | "ignored" | "modified" | "renamed" | "untracked";
 
 export interface GitStatusEntry {
@@ -7,6 +9,16 @@ export interface GitStatusEntry {
 
 type FileTreeInitialExpansion = "closed" | "open" | number;
 
+/** What a sort comparator sees of each sibling it orders. */
+export type { PathStoreCompareEntry as FileTreeCompareEntry } from "./path-store/public-types";
+
+/** Orders siblings; folders and files alike, so a comparator may put folders first. */
+export type FileTreeSortComparator = PathStorePathComparator;
+
+/** One change for `FileTreeModel.batch`; a folder needs `recursive` to remove its contents. */
+export type FileTreeBatchOperation =
+  { type: "add"; path: string } | { type: "remove"; path: string; recursive?: boolean };
+
 interface FileTreeControllerOptions {
   paths: readonly string[];
   flattenEmptyDirectories?: boolean;
@@ -14,6 +26,8 @@ interface FileTreeControllerOptions {
   initialExpandedPaths?: readonly string[];
   initialSearchQuery?: string | null;
   initialSelectedPaths?: readonly string[];
+  /** How siblings are ordered; defaults to folders first, then by name. */
+  sort?: FileTreeSortComparator;
 }
 
 export type FileTreeOptions = FileTreeControllerOptions & {

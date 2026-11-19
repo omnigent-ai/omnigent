@@ -15,6 +15,7 @@ import {
 import { type FileTreeGitStatusState, resolveFileTreeGitStatusState } from "./gitStatus";
 import { normalizeSearchQuery } from "./searchHelpers";
 import type {
+  FileTreeBatchOperation,
   FileTreeOptions,
   FileTreeDirectoryHandle,
   FileTreeFileHandle,
@@ -23,6 +24,7 @@ import type {
   FileTreeScrollRequest,
   FileTreeScrollToPathOptions,
   FileTreeVisibleRow,
+  GitStatusEntry,
 } from "./types";
 
 type ProjectionIndexBuffer = Int32Array<ArrayBufferLike>;
@@ -133,7 +135,7 @@ function createVisibleProjection(
  */
 export class FileTreeModel {
   readonly coloredIcons: boolean;
-  readonly gitStatus: FileTreeGitStatusState | null;
+  #gitStatus: FileTreeGitStatusState | null;
   readonly #listeners = new Set<() => void>();
   readonly #onSelectionChange: FileTreeOptions["onSelectionChange"];
   #emittedSelectionVersion = 0;
@@ -166,7 +168,11 @@ export class FileTreeModel {
   #selectionAnchorPath: string | null = null;
   #selectedPaths = new Set<string>();
   #selectionVersion = 0;
-  readonly #store: PathStore;
+  #store: PathStore;
+  readonly #storeOptions: Pick<
+    FileTreeOptions,
+    "flattenEmptyDirectories" | "initialExpansion" | "sort"
+  >;
   #storeVisibleCount = 0;
   #suppressStoreNotifications = false;
   #visibleCount = 0;
@@ -181,8 +187,13 @@ export class FileTreeModel {
       ...storeOptions
     } = options;
     this.coloredIcons = coloredIcons;
-    this.gitStatus = resolveFileTreeGitStatusState(gitStatus);
+    this.#gitStatus = resolveFileTreeGitStatusState(gitStatus);
     this.#onSelectionChange = onSelectionChange;
+    this.#storeOptions = {
+      flattenEmptyDirectories: storeOptions.flattenEmptyDirectories,
+      initialExpansion: storeOptions.initialExpansion,
+      sort: storeOptions.sort,
+    };
     this.#store = new PathStore(storeOptions);
     const resolvedInitialSelectedPaths =
       initialSelectedPaths
@@ -606,14 +617,92 @@ export class FileTreeModel {
     };
   }
 
-  // The tree is read-only for users; callers only grow it, for example when a
-  // lazily listed directory finishes loading its children.
+  /** The resolved git statuses the rows show, or null when the tree has none. */
+  public get gitStatus(): FileTreeGitStatusState | null {
+    return this.#gitStatus;
+  }
+
+  /** Replaces the git statuses, so rows and folder marks repaint. */
+  public setGitStatus(entries: readonly GitStatusEntry[] | undefined): void {
+    this.#gitStatus = resolveFileTreeGitStatusState(entries);
+    this.#emit();
+  }
+
+  // The tree is read-only for users; callers grow it, for example when a lazily
+  // listed directory finishes loading its children.
   public addPaths(paths: readonly string[]): void {
     if (paths.length === 0) {
       return;
     }
 
     this.#store.addPaths(paths);
+  }
+
+  /**
+   * Applies adds and removes in order. Adds grow the tree in place; any removal
+   * rebuilds it from the remaining paths, keeping expansion, selection and focus
+   * on rows that are still there. A folder left empty by a removal stays.
+   */
+  public batch(operations: readonly FileTreeBatchOperation[]): void {
+    if (operations.length === 0) {
+      return;
+    }
+
+    if (operations.every((operation) => operation.type === "add")) {
+      this.addPaths(operations.map((operation) => operation.path));
+      return;
+    }
+
+    const paths = new Set(this.#getListedPaths());
+    const removedFolders: string[] = [];
+    const emptiedFolders = new Set<string>();
+    for (const operation of operations) {
+      if (operation.type === "add") {
+        paths.add(operation.path);
+        continue;
+      }
+
+      const removed = this.#store.getPathInfo(operation.path)?.path ?? operation.path;
+      const folder = removed.endsWith("/") && operation.recursive === true ? removed : null;
+      for (const path of [...paths]) {
+        if (path === removed || (folder !== null && path.startsWith(folder))) {
+          paths.delete(path);
+        }
+      }
+      if (folder !== null) {
+        removedFolders.push(folder);
+      }
+      const parent = getImmediateParentPath(removed);
+      if (parent != null) {
+        emptiedFolders.add(parent);
+      }
+    }
+
+    for (const folder of emptiedFolders) {
+      const gone = removedFolders.some((removed) => folder.startsWith(removed));
+      const occupied = [...paths].some((path) => path.startsWith(folder));
+      if (!gone && !occupied) {
+        paths.add(folder);
+      }
+    }
+
+    this.#rebuildStore([...paths], new Set(this.#getExpandedDirectoryPaths()));
+  }
+
+  /**
+   * Rebuilds the tree from `paths`, for example to apply a new sort. Folders in
+   * `initialExpandedPaths` open and the rest close; without it, open folders
+   * stay open. Selection and focus stay on rows that are still there.
+   */
+  public resetPaths(
+    paths: readonly string[],
+    options: { initialExpandedPaths?: readonly string[] } = {},
+  ): void {
+    const expanded =
+      options.initialExpandedPaths === undefined
+        ? new Set(this.#getExpandedDirectoryPaths())
+        : new Set(options.initialExpandedPaths);
+    this.#rebuildStore(paths, expanded);
   }
 
   public setSearch(value: string | null): void {
@@ -1215,6 +1304,35 @@ export class FileTreeModel {
         this.#searchCollapsedOverrides.delete(collapsedPath);
       }
     }
+  }
+
+  #rebuildStore(paths: readonly string[], expandedPaths: ReadonlySet<string>): void {
+    const focusedPath = this.#focusedPath;
+    const previousSelection = [...this.#selectedPaths];
+    this.#store = new PathStore({ ...this.#storeOptions, paths });
+    this.#itemHandles.clear();
+    this.#invalidateKnownPathCaches();
+    this.#scrollRequest = null;
+    this.#setExpandedPaths(
+      new Set([...expandedPaths].map((path) => this.#store.getPathInfo(path)?.path ?? path)),
+    );
+
+    const keptSelection = previousSelection.filter((path) => this.#store.getPathInfo(path) != null);
+    if (keptSelection.length !== previousSelection.length) {
+      this.#selectedPaths = new Set(keptSelection);
+      this.#selectionVersion += 1;
+    }
+    if (this.#selectionAnchorPath != null && !this.#selectedPaths.has(this.#selectionAnchorPath)) {
+      this.#selectionAnchorPath = keptSelection.at(-1) ?? null;
+    }
+
+    this.#subscribeToStore();
+    const focusCandidate =
+      this.#searchValue != null && this.#searchValue.length > 0
+        ? this.#refreshActiveSearchState()
+        : focusedPath;
+    this.#rebuildVisibleProjection(focusCandidate, true);
+    this.#emit();
   }
 
   #subscribeToStore(): void {
