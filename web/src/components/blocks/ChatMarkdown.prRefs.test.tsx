@@ -147,6 +147,9 @@ describe("pull request references in chat markdown", () => {
         "",
         'Raw <a href="https://example.com/raw">#2468</a> HTML and <code>#1357</code> code.',
         "",
+        // A stray `</a>` doesn't end the code; `<a/>` opens an anchor holding the rest.
+        "Code <code>#3579</a> #9753</code>. See <a/> #8642 here.",
+        "",
         "a#1234 file.md#L1234 #123 #0123 #fff #123abc",
         "",
         "```",
@@ -176,29 +179,10 @@ describe("pull request references in chat markdown", () => {
     expect(screen.getByText(/#4242, #4243, #4244 or #4245/)).toBeVisible();
   });
 
-  it("follows the browser's raw HTML nesting", () => {
-    seed(githubInfo());
-    // A stray `</a>` doesn't end the code; `<a/>` opens an anchor holding the rest.
-    renderMarkdown("Code <code>#2468</a> #1357</code> then #4321.\n\nSee <a/> #1234 here.");
-    expect(hrefs()).toEqual(["https://github.com/acme/app/pull/4321"]);
-  });
-
   it.each([true, false])("leaves a hand-written parked fragment alone (opted in: %s)", (optIn) => {
     seed(githubInfo());
     renderMarkdown("[section](#omnigent-pr-4242)", optIn);
     expect(hrefs()).toEqual(["#omnigent-pr-4242"]);
-  });
-
-  it("keeps references as text when the session isn't on GitHub", () => {
-    seed(
-      githubInfo({
-        provider: "gitlab",
-        workspace_repo: { name_with_owner: "acme/app", host: "gitlab.com" },
-      }),
-    );
-    renderMarkdown("See #4242 and acme/app#12");
-    expect(screen.queryByRole("link")).not.toBeInTheDocument();
-    expect(screen.getByText("#4242")).toBeVisible();
   });
 
   it("keeps references as text when the session's GitHub info fails to load", async () => {

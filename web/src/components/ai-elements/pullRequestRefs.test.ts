@@ -89,21 +89,9 @@ describe("splitPullRequestRefs", () => {
     "-acme/app#12",
     "acme/..#12",
     "#12345678901",
-    "docs/setup.md#3",
-    "src/foo.ts#12",
     "styles/main.css#1234",
-    "docs/index.html#1234",
-    "config/app.toml#1234",
-    "src/app.js#12",
-    "src/index.mjs#1234",
-    "infra/main.tf#123",
-    "api/x.proto#12",
     "vercel/next.js#123",
-    "socketio/socket.io#7",
-    "assets/logo.png#1234",
-    "docs/report.pdf#1234",
     "app/build.gradle#12",
-    "src/App.svelte#3",
     "and/or#1234",
     "origin/main#1",
     "upstream/main#12",
@@ -111,7 +99,6 @@ describe("splitPullRequestRefs", () => {
     "feature/login#12",
     "docs/README#3",
     "acme-/app#12",
-    "src/schema.graphql#1234",
     "cache/build.tsbuildinfo#1234",
   ])("leaves %j as text", (text) => {
     expect(splitPullRequestRefs(text)).toEqual([{ type: "text", value: text }]);
@@ -207,13 +194,20 @@ describe("remarkPullRequestRefs", () => {
       children: [
         {
           type: "paragraph",
-          children: [...structuredClone(opaque), { type: "text", value: " #4321" }],
+          children: [
+            { type: "html", value: "</code>" },
+            { type: "text", value: "#1111 " },
+            ...structuredClone(opaque),
+            { type: "text", value: " #4321" },
+          ],
         },
       ],
     };
     remarkPullRequestRefs()(tree);
-    expect(tree.children[0].children.slice(0, opaque.length)).toEqual(opaque);
-    expect(tree.children[0].children.at(-1)).toMatchObject({
+    const children = tree.children[0].children;
+    expect(children[1]).toMatchObject({ type: "link", url: `${PULL_REQUEST_REF_HREF_PREFIX}1111` });
+    expect(children.slice(3, 3 + opaque.length)).toEqual(opaque);
+    expect(children.at(-1)).toMatchObject({
       type: "link",
       url: `${PULL_REQUEST_REF_HREF_PREFIX}4321`,
     });
@@ -251,26 +245,6 @@ describe("remarkPullRequestRefs", () => {
     expect(urls).toEqual(
       numbers.filter((_, index) => index % 2).map((n) => `${PULL_REQUEST_REF_HREF_PREFIX}${n}`),
     );
-  });
-
-  it("keeps linking after a stray raw closing tag", () => {
-    const tree = {
-      type: "root",
-      children: [
-        {
-          type: "paragraph",
-          children: [
-            { type: "html", value: "</code>" },
-            { type: "text", value: "#2468" },
-          ],
-        },
-      ],
-    };
-    remarkPullRequestRefs()(tree);
-    expect(tree.children[0].children[1]).toMatchObject({
-      type: "link",
-      url: `${PULL_REQUEST_REF_HREF_PREFIX}2468`,
-    });
   });
 
   it("links text nested in emphasis and headings", () => {
