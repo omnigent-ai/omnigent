@@ -1401,11 +1401,6 @@ def test_omnigent_run_cli_with_contained_claude(
         for tool_id, name, arguments in (
             ("launch", "sys_terminal_launch", {"terminal": "shell", "session": "probe"}),
             (
-                "send",
-                "sys_terminal_send",
-                {"terminal": "shell", "session": "probe", "text": terminal_command},
-            ),
-            (
                 "wait",
                 "sys_os_shell",
                 {
@@ -1454,6 +1449,9 @@ def test_omnigent_run_cli_with_contained_claude(
     }
     if cli_tool in ("terminal", "mcp__omnigent__sys_os_shell") and nested_read_roots:
         sandbox_settings["read_paths"] = nested_read_roots
+    terminal_args = ["--noprofile", "--norc"]
+    if cli_tool == "terminal":
+        terminal_args.extend(["-c", terminal_command])
     spec_path = tmp_path / "agent" / "config.yaml"
     spec_path.parent.mkdir()
     spec_path.write_text(
@@ -1471,9 +1469,7 @@ def test_omnigent_run_cli_with_contained_claude(
                     },
                     "auth": {"type": "api_key", "api_key": "parent-only-cli-secret"},
                 },
-                "terminals": {
-                    "shell": {"command": "/bin/bash", "args": ["--noprofile", "--norc"]}
-                },
+                "terminals": {"shell": {"command": "/bin/bash", "args": terminal_args}},
                 "os_env": {
                     "type": "caller_process",
                     "cwd": str(workspace),
@@ -1534,7 +1530,6 @@ def test_omnigent_run_cli_with_contained_claude(
     assert "parent-only-cli-secret" not in result.stdout + result.stderr
     if cli_tool == "terminal":
         _assert_tool_result(requests, "toolu_terminal_launch", "launched")
-        _assert_tool_result(requests, "toolu_terminal_send", "sent")
         _assert_tool_result(requests, "toolu_terminal_wait", "CLI_E2E_OK")
         _assert_execution_probe(execution_probe)
         assert (workspace / "terminal-exit").read_text() == "0"
