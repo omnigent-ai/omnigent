@@ -72,18 +72,10 @@ _OLLAMA_PROBE_TIMEOUT = 0.25
 # never adopt it into a ``providers:`` shape (see ``claude_managed_gateway``).
 _CLAUDE_CODE_MACOS_MANAGED_DIR = Path("/Library/Application Support/ClaudeCode")
 _CLAUDE_CODE_LINUX_MANAGED_DIR = Path("/etc/claude-code")
-_CLAUDE_CODE_REMOTE_SETTINGS = Path.home() / ".claude" / "remote-settings.json"
 CLAUDE_CODE_MANAGED_SETTINGS_PATHS: tuple[Path, ...] = (
     _CLAUDE_CODE_MACOS_MANAGED_DIR / "managed-settings.json",
     _CLAUDE_CODE_LINUX_MANAGED_DIR / "managed-settings.json",
     Path(os.environ.get("PROGRAMDATA", "C:/ProgramData")) / "ClaudeCode" / "managed-settings.json",
-)
-# Cached remote settings are only applied by Claude Code for eligible first-party
-# sessions. Do not let them affect Omnigent's gateway, managed-MCP, or settings
-# merge detection; the sideload policy is the sole feature that needs this cache.
-CLAUDE_CODE_SIDELOAD_POLICY_PATHS: tuple[Path, ...] = (
-    *CLAUDE_CODE_MANAGED_SETTINGS_PATHS,
-    _CLAUDE_CODE_REMOTE_SETTINGS,
 )
 
 # Maps each provider whose env key we surface to the served model family.
@@ -589,14 +581,11 @@ def claude_sideload_flags_disabled(
     usable Claude SDK or native session fails before its first turn.
 
     :param paths: Managed settings files to read, highest precedence first.
-        Defaults to :data:`CLAUDE_CODE_SIDELOAD_POLICY_PATHS`, including the
-        organization-delivered ``~/.claude/remote-settings.json`` cache.
+        Defaults to :data:`CLAUDE_CODE_MANAGED_SETTINGS_PATHS`.
     :returns: ``True`` only when the effective managed settings explicitly set
         ``disableSideloadFlags`` to boolean ``true``.
     """
-    payload = read_claude_managed_settings(
-        CLAUDE_CODE_SIDELOAD_POLICY_PATHS if paths is None else paths
-    )
+    payload = read_claude_managed_settings(paths)
     return payload is not None and payload.get("disableSideloadFlags") is True
 
 

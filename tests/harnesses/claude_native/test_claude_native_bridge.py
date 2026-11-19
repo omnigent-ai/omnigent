@@ -4235,7 +4235,7 @@ def test_augment_claude_args_omits_mcp_under_managed_sideload_policy(
 
     settings = tmp_path / "managed-settings.json"
     settings.write_text('{"disableSideloadFlags": true}')
-    monkeypatch.setattr(ambient, "CLAUDE_CODE_SIDELOAD_POLICY_PATHS", (settings,))
+    monkeypatch.setattr(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (settings,))
 
     with caplog.at_level(logging.WARNING, logger="omnigent.harnesses.claude_native.bridge"):
         args = augment_claude_args(

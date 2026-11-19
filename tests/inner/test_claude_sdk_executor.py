@@ -2906,7 +2906,7 @@ class TestBundlePluginGating(unittest.TestCase):
 
             settings = bundle / "managed-settings.json"
             settings.write_text('{"disableSideloadFlags": true}')
-            with patch.object(ambient, "CLAUDE_CODE_SIDELOAD_POLICY_PATHS", (settings,)):
+            with patch.object(ambient, "CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (settings,)):
                 with self.assertLogs("omnigent.inner.claude_sdk_executor", "WARNING") as logs:
                     self.assertEqual(self._plugins_for_bundle(bundle), [])
             self.assertTrue(any("without bundled skills" in log for log in logs.output))
