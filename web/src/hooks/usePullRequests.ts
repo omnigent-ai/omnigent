@@ -604,8 +604,9 @@ export function usePullRequestInfo(
 }
 
 /**
- * Read-only view of the session's GitHub info for per-item renderers. Shares the
- * cache entry but leaves refreshing to {@link usePullRequestInfo} subscribers.
+ * Reads the shared GitHub-info entry without refetching on mount or focus. An empty
+ * entry still loads, with the context's retries; a failed one waits for another
+ * reader such as {@link usePullRequestInfo} or an invalidation.
  */
 export function usePullRequestInfoSnapshot(rawConversationId: string | undefined) {
   const context = usePullRequestQueryContext(rawConversationId);
