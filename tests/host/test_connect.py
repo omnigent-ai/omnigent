@@ -8678,7 +8678,8 @@ def test_run_host_process_warns_when_managed_gateway_command_is_missing(
     )
     for name in ("configure_host_git", "configure_host_gh", "start_host_gh_refresh"):
         monkeypatch.setattr(f"omnigent.git_credential_github.{name}", lambda *_args: None)
-    monkeypatch.setattr(HostProcess, "run", AsyncMock())
+    host_run = AsyncMock()
+    monkeypatch.setattr(HostProcess, "run", host_run)
 
     with caplog.at_level(logging.INFO):
         run_host_process(
@@ -8690,9 +8691,12 @@ def test_run_host_process_warns_when_managed_gateway_command_is_missing(
         record.getMessage() for record in caplog.records if record.levelno >= logging.WARNING
     ]
     assert any(
-        "Sandbox configure skipped (profile=omnigent)" in message and "Install uv" in message
+        "Sandbox configure skipped (profile=omnigent)" in message
+        and "uvx is not on PATH" in message
+        and "Install uv" in message
         for message in warnings
     ), caplog.text
+    host_run.assert_awaited_once()
 
 
 async def test_run_host_process_invalid_host_id_exits_actionably(
