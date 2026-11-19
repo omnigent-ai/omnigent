@@ -140,6 +140,7 @@ const {
 const {
   createFloatingComposerSupport,
   floatingComposerTarget,
+  isPageOfServer,
   isServerSignInPage,
   mainWindowsByRecency,
 } = require("./floating_composer_support");
@@ -1903,8 +1904,38 @@ function openFloatingComposerFromShortcut() {
   app.focus({ steal: true });
 }
 
+/**
+ * What a main window shows of its own server now: its `"app"`, its `"sign-in"` page, or null
+ * for anything else, such as the setup page or another site.
+ *
+ * @param {BrowserWindow} win
+ * @returns {"app" | "sign-in" | null}
+ */
+function serverPageShown(win) {
+  const serverUrl = windows.get(win)?.serverUrl;
+  const url = win.isDestroyed() ? "" : win.webContents.getURL();
+  if (!serverUrl || !isPageOfServer(url, serverUrl)) return null;
+  return isServerSignInPage(url, serverUrl) ? "sign-in" : "app";
+}
+
+/**
+ * Signing out of a server, however it started, lands its windows on its sign-in page. The
+ * server's panel holds the signed-out account's draft, so it closes then.
+ *
+ * @param {BrowserWindow} win A main window, watched for as long as it lives.
+ */
+function closePanelsOnSignIn(win) {
+  win.webContents.on("did-navigate", () => {
+    if (serverPageShown(win) !== "sign-in") return;
+    const serverUrl = windows.get(win)?.serverUrl;
+    floatingComposerController?.closePanels((candidate) => candidate === serverUrl);
+  });
+}
+
 /** Re-applies ⇧⌘Space after the pages that support the panel changed. */
 function applyFloatingComposerShortcut() {
+  // Windows going away as the app quits must not register a chord on the way out.
+  if (appQuitting) return;
   globalShortcuts.floatingComposer.apply();
   // A chord it let go of may be the one the other shortcut couldn't take.
   if (globalShowShortcut.current().error) globalShowShortcut.apply();
@@ -3080,6 +3111,7 @@ function createWindow(targetUrl, opts = {}) {
     cascadeIfCovering(win);
     if (savedBounds?.maximized) win.maximize();
     trackWindowBounds(win);
+    closePanelsOnSignIn(win);
   }
   return win;
 }
@@ -5209,22 +5241,15 @@ function registerIpc() {
     const contents = win.webContents;
     const hadSupport = floatingComposerSupport.any();
     if (!floatingComposerSupport.announce(contents.id, serverUrl)) return;
+    // Support ends with this document: when another one commits, or its renderer goes away.
     const revoke = () => {
-      contents.removeListener("did-navigate", onNavigate);
+      contents.removeListener("did-navigate", revoke);
       contents.removeListener("render-process-gone", revoke);
       contents.removeListener("destroyed", revoke);
       floatingComposerSupport.revoke(contents.id);
       if (!floatingComposerSupport.any()) applyFloatingComposerShortcut();
     };
-    // Support ends with this document: when another one commits, or its renderer goes away.
-    const onNavigate = (_event, url) => {
-      revoke();
-      // A sign-out lands on the sign-in page; the panel holds the signed-out account's draft.
-      if (isServerSignInPage(url, serverUrl)) {
-        floatingComposerController?.closePanels((candidate) => candidate === serverUrl);
-      }
-    };
-    contents.on("did-navigate", onNavigate);
+    contents.on("did-navigate", revoke);
     contents.on("render-process-gone", revoke);
     contents.on("destroyed", revoke);
     if (!hadSupport) applyFloatingComposerShortcut();
@@ -5257,15 +5282,16 @@ function registerIpc() {
     if (openPath === null) return { ok: false, error: "bad-path" };
     // Bound by main when it built the panel; never taken from the page.
     const serverUrl = floatingComposerController.serverUrlFor(panel);
-    const target = mainWindowsByRecency(mainWindowFocusOrder, mainWindows()).find(
+    const sameServer = mainWindowsByRecency(mainWindowFocusOrder, mainWindows()).filter(
       (win) => windows.get(win)?.serverUrl === serverUrl,
     );
     // A window still connecting would drop the route when its page loads; the panel stays.
-    if (target && connectionAttempts.get(target)?.pending === true) {
+    if (sameServer[0] && connectionAttempts.get(sameServer[0])?.pending === true) {
       return { ok: false, error: "window-loading" };
     }
     // Only a window showing its server's app hears the route, not one on setup or sign-in.
-    if (target && originOf(target.webContents.getURL()) === originOf(serverUrl)) {
+    const target = sameServer.find((win) => serverPageShown(win) === "app");
+    if (target) {
       sendOpenPath(target, openPath);
       // A linked page comes forward; a launched session waits behind the app the user is in.
       if (sessionPath === null) {

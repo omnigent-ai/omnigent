@@ -392,3 +392,14 @@ test("reopening mid-fade stops the earlier fade, so the opacity never goes backw
   }
   assert.equal(panel.opacities.at(-1), 1);
 });
+
+test("Reduce motion stops a fade still running from an earlier show", () => {
+  const panel = fadingPanel();
+  const clock = manualClock();
+  fadeInFloatingComposer(panel, () => {}, { reduceMotion: false, durationMs: 120, ...clock });
+  clock.advance(10);
+  const before = panel.opacities.length;
+  fadeInFloatingComposer(panel, () => {}, { reduceMotion: true, ...clock });
+  for (let step = 0; step < 20 && clock.pending() > 0; step += 1) clock.advance(10);
+  assert.deepEqual(panel.opacities.slice(before), [1]);
+});

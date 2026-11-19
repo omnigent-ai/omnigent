@@ -17,7 +17,7 @@ const displays = [laptop, external, small];
 
 test("opens centred at the default size without a remembered frame", () => {
   assert.deepEqual(centeredFrame(laptop.workArea), { x: 446, y: 305, width: 620, height: 360 });
-  assert.deepEqual(placeFloatingComposer({ displays, fallbackDisplay: external }), {
+  assert.deepEqual(placeFloatingComposer({ displays, pointerDisplay: external }), {
     x: 2482,
     y: 528,
     width: 620,
@@ -74,16 +74,15 @@ test("the shortcut follows the pointer, carrying the remembered frame across", (
       savedFrame,
       displays,
       pointerDisplay: external,
-      fallbackDisplay: laptop,
     }),
     { x: 1512, y: 0, width: 700, height: 400 },
   );
 });
 
-test("⌘K and the menu keep the remembered frame on its own display", () => {
+test("reopening on the same display keeps the remembered frame", () => {
   const savedFrame = { x: 2000, y: 200, width: 800, height: 500 };
   assert.deepEqual(
-    placeFloatingComposer({ savedFrame, displays, fallbackDisplay: laptop }),
+    placeFloatingComposer({ savedFrame, displays, pointerDisplay: external }),
     savedFrame,
   );
 });
@@ -94,14 +93,13 @@ test("a remembered frame shrinks to fit a smaller display", () => {
     savedFrame,
     displays,
     pointerDisplay: small,
-    fallbackDisplay: laptop,
   });
   assert.deepEqual(placed, { x: -800, y: 0, width: 800, height: 560 });
 });
 
-test("a frame left on an unplugged display reopens inside the fallback display", () => {
+test("a frame left on an unplugged display reopens inside the pointer's display", () => {
   const savedFrame = { x: 9000, y: 9000, width: 620, height: 360 };
-  const placed = placeFloatingComposer({ savedFrame, displays: [laptop], fallbackDisplay: laptop });
+  const placed = placeFloatingComposer({ savedFrame, displays: [laptop], pointerDisplay: laptop });
   assert.equal(displayShowingFrame(placed, [laptop])?.id, laptop.id);
   assert.deepEqual(clampFrame(placed, laptop.workArea), placed);
 });
@@ -109,7 +107,7 @@ test("a frame left on an unplugged display reopens inside the fallback display",
 test("ignores a malformed remembered frame", () => {
   for (const savedFrame of [null, "x", { x: 1 }, { x: 0, y: 0, width: Number.NaN, height: 1 }]) {
     assert.deepEqual(
-      placeFloatingComposer({ savedFrame, displays, fallbackDisplay: laptop }),
+      placeFloatingComposer({ savedFrame, displays, pointerDisplay: laptop }),
       centeredFrame(laptop.workArea),
     );
   }

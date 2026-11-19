@@ -121,6 +121,7 @@ function isServerSignInPage(url, serverUrl) {
 module.exports = {
   createFloatingComposerSupport,
   floatingComposerTarget,
+  isPageOfServer,
   isServerSignInPage,
   mainWindowsByRecency,
 };

@@ -61,6 +61,8 @@ const fades = new WeakMap();
  */
 function fadeInFloatingComposer(panel, show, options) {
   if (options.reduceMotion) {
+    // A fade still running from an earlier show would undo this.
+    fades.delete(panel);
     panel.setOpacity(1);
     show();
     return;
@@ -216,7 +218,6 @@ function createFloatingComposerController(deps) {
       savedFrame: deps.loadFrames()[serverUrl],
       displays: deps.screen.getAllDisplays(),
       pointerDisplay,
-      fallbackDisplay: pointerDisplay,
     });
   }
 

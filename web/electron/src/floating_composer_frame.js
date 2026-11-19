@@ -2,8 +2,7 @@
 
 /**
  * Where the floating New Agent composer opens. Pure geometry over Electron's
- * `Display.workArea` rectangles (top-left origin, DIPs), so it is unit-tested
- * without a screen.
+ * `Display.workArea` rectangles (top-left origin, DIPs).
  *
  * A remembered frame keeps its position as a fraction of the free travel on
  * its display, so moving it to another display of a different size lands in
@@ -142,29 +141,21 @@ function translateFrame(frame, source, target) {
 }
 
 /**
- * The frame to open the composer at.
+ * The frame to open the composer at, on the display under the pointer. A remembered frame on
+ * that display keeps its place; one from another display is carried over proportionally; and
+ * without one the composer opens centred.
  *
- * - `pointerDisplay` is set when the global shortcut opened it: the composer
- *   follows the pointer, carrying a remembered frame over proportionally.
- * - Otherwise (⌘K, menu, Dock) a remembered frame keeps its display, and
- *   without one the composer opens centred on `fallbackDisplay`.
- *
- * @param {{
- *   savedFrame?: unknown,
- *   displays: DisplayLike[],
- *   pointerDisplay?: DisplayLike | null,
- *   fallbackDisplay: DisplayLike,
- * }} options
+ * @param {{ savedFrame?: unknown, displays: DisplayLike[], pointerDisplay: DisplayLike }} options
  * @returns {Rect}
  */
-function placeFloatingComposer({ savedFrame, displays, pointerDisplay = null, fallbackDisplay }) {
+function placeFloatingComposer({ savedFrame, displays, pointerDisplay }) {
+  const target = pointerDisplay.workArea;
   const saved = isFiniteRect(savedFrame) ? savedFrame : null;
-  const savedDisplay = saved === null ? null : displayShowingFrame(saved, displays);
-  const target = pointerDisplay ?? savedDisplay ?? fallbackDisplay;
-  if (saved === null) return centeredFrame(target.workArea);
-  if (savedDisplay === null) return translateFrame(saved, target.workArea, target.workArea);
-  if (savedDisplay.id === target.id) return clampFrame(saved, target.workArea);
-  return translateFrame(saved, savedDisplay.workArea, target.workArea);
+  if (saved === null) return centeredFrame(target);
+  const savedDisplay = displayShowingFrame(saved, displays);
+  if (savedDisplay === null) return translateFrame(saved, target, target);
+  if (savedDisplay.id === pointerDisplay.id) return clampFrame(saved, target);
+  return translateFrame(saved, savedDisplay.workArea, target);
 }
 
 module.exports = {
