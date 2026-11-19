@@ -37,6 +37,7 @@ outside the lock.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import threading
 from collections.abc import Awaitable, Callable
@@ -46,6 +47,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from omnigent.debug_logging import debug_event
+from omnigent.inner._subprocess_lifecycle import await_cleanup_task
 from omnigent.inner.claude_model_access import ClaudeModelAccess
 from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.os_env import OSEnvironment
@@ -344,23 +346,44 @@ class TerminalRegistry:
         ):
             if self.environment_resolver is None:
                 raise RuntimeError("copy_on_write terminals require a session resource registry")
-            parent_environment = self.environment_resolver(
-                conversation_id, parent_os_env or environment_spec
+            environment_task = asyncio.create_task(
+                asyncio.to_thread(
+                    self.environment_resolver,
+                    conversation_id,
+                    parent_os_env or environment_spec,
+                )
             )
+            try:
+                parent_environment = await asyncio.shield(environment_task)
+            except BaseException:
+                with contextlib.suppress(BaseException):
+                    await await_cleanup_task(environment_task)
+                raise
         shared_environment_args = (
             {"parent_environment": parent_environment} if parent_environment else {}
         )
-        created = create_terminal_instance(
-            terminal_name,
-            session_key,
-            spec,
-            parent_os_env_spec=parent_os_env,
-            **shared_environment_args,
-            cwd_override=cwd_override,
-            sandbox_override=sandbox_override,
-            conversation_link=self.conversation_link_for_id(conversation_id),
-            model_access=model_access,
+        build_task = asyncio.create_task(
+            asyncio.to_thread(
+                create_terminal_instance,
+                terminal_name,
+                session_key,
+                spec,
+                parent_os_env_spec=parent_os_env,
+                **shared_environment_args,
+                cwd_override=cwd_override,
+                sandbox_override=sandbox_override,
+                conversation_link=self.conversation_link_for_id(conversation_id),
+                model_access=model_access,
+            )
         )
+        try:
+            created = await asyncio.shield(build_task)
+        except BaseException:
+            with contextlib.suppress(BaseException):
+                await await_cleanup_task(build_task)
+            if build_task.done() and not build_task.cancelled() and build_task.exception() is None:
+                await _close_unregistered_instance(build_task.result().instance)
+            raise
         stage = "terminal_model_access"
         try:
             created.instance.program_status_app = program_status_app
@@ -370,9 +393,17 @@ class TerminalRegistry:
                 created.instance.model_access = model_access
                 if created.instance.model_access is not None:
                     try:
-                        created.instance.sandbox_policy = (
-                            created.instance.model_access.protect_sources(policy, created.cwd)
+                        protection_task = asyncio.create_task(
+                            asyncio.to_thread(
+                                created.instance.model_access.protect_sources, policy, created.cwd
+                            )
                         )
+                        try:
+                            created.instance.sandbox_policy = await asyncio.shield(protection_task)
+                        except BaseException:
+                            with contextlib.suppress(BaseException):
+                                await await_cleanup_task(protection_task)
+                            raise
                     except ValueError as exc:
                         raise RuntimeError(f"terminal model access rejected: {exc}") from exc
             stage = "terminal_spawn"

@@ -530,6 +530,10 @@ Containment requires `linux_bwrap` or `darwin_seatbelt`. Windows
 isolation and is rejected for sandboxed Claude SDK launches and callbacks.
 Omitting `os_env` or selecting `sandbox.type: none` does not request this
 boundary; skills, hooks, and local MCP commands can then run uncontained.
+On Linux, the optional default CLI wrapper still checks the installed Python
+runtime for mutable hard-link aliases. An integrity failure can stop startup
+even when `os_env` is omitted. Reinstall a `uv tool` environment with
+`uv tool upgrade --reinstall --link-mode copy omnigent` if this occurs.
 Setting `OMNIGENT_CLAUDE_SDK_NO_SANDBOX` while requesting a sandbox raises a
 startup error; use an explicit `sandbox.type: none` to opt out.
 

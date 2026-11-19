@@ -223,9 +223,9 @@ local server (pass `--force` to stop them immediately); the next `omni` command
 brings the server back up on the new version. Source checkouts update with
 `git pull` instead. Silence the notice with `OMNIGENT_NO_UPDATE_CHECK=1`.
 
-If a `uv tool` install upgraded by an older Omnigent release fails to start a
-sandbox with a `mutable hard-link alias` error, reinstall its dependencies as
-copies:
+If a `uv tool` install fails to start a sandbox with a `mutable hard-link alias`
+error, reinstall its dependencies as copies. The check depends on the installed
+runtime layout, including installations made by older releases:
 
 ```bash
 uv tool upgrade --reinstall --link-mode copy omnigent

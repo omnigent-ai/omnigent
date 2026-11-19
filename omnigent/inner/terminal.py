@@ -1245,6 +1245,8 @@ class TerminalInstance:
     _git_ssh_tmpdir: Path | None = field(default=None, repr=False)
     _tcp_egress_broker: TcpEgressBroker | None = field(default=None, repr=False)
     _tcp_egress_tmpdir: Path | None = field(default=None, repr=False)
+    _exec_launcher_path: Path | None = field(default=None, init=False, repr=False)
+    _launch_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _resource_cleanup_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
     _clipboard_bridge: TerminalClipboardBridge | None = field(default=None, init=False, repr=False)
     _idle_task: asyncio.Task[None] | None = field(default=None, repr=False)
@@ -1776,17 +1778,68 @@ class TerminalInstance:
 
     async def launch(self, *, cwd: Path | None = None) -> None:
         """Start the tmux session."""
+        if not self._launch_lock.acquire(blocking=False):
+            raise RuntimeError("terminal launch is already in progress")
         try:
-            await self._launch_impl(cwd=cwd)
+            try:
+                await self._launch_impl(cwd=cwd)
+            except BaseException:
+                cleanup_task = asyncio.create_task(asyncio.to_thread(self._stop_network_brokers))
+                try:
+                    with contextlib.suppress(BaseException):
+                        await await_cleanup_task(cleanup_task)
+                finally:
+                    with contextlib.suppress(OSError):
+                        self._release_exec_launcher()
+                raise
+        finally:
+            self._launch_lock.release()
+
+    async def _create_exec_launcher(
+        self, cli_path: str, policy: SandboxPolicy, *, cwd: str | None = None
+    ) -> str:
+        if cwd is None:
+            build_task = asyncio.create_task(
+                asyncio.to_thread(create_exec_launcher, cli_path, policy)
+            )
+        else:
+            build_task = asyncio.create_task(
+                asyncio.to_thread(create_exec_launcher, cli_path, policy, cwd=cwd)
+            )
+        try:
+            launcher_path = await asyncio.shield(build_task)
         except BaseException:
-            await asyncio.to_thread(self._stop_network_brokers)
+            with contextlib.suppress(BaseException):
+                await await_cleanup_task(build_task)
+            if build_task.done() and not build_task.cancelled() and build_task.exception() is None:
+                self._exec_launcher_path = Path(build_task.result())
+                with contextlib.suppress(OSError):
+                    self._release_exec_launcher()
             raise
+        self._exec_launcher_path = Path(launcher_path)
+        return launcher_path
+
+    def _release_exec_launcher(self) -> None:
+        launcher_path = self._exec_launcher_path
+        if launcher_path is not None:
+            launcher_path.unlink(missing_ok=True)
+            self._exec_launcher_path = None
+
+    def _bootstrap_optional_brokers(
+        self, sandbox: SandboxPolicy, env: dict[str, str]
+    ) -> SandboxPolicy:
+        if sandbox.git_ssh:
+            sandbox = self._bootstrap_git_ssh(sandbox, env)
+        if sandbox.tcp_egress:
+            sandbox = self._bootstrap_tcp_egress(sandbox, env)
+        return sandbox
 
     async def _launch_impl(self, *, cwd: Path | None = None) -> None:
         from omnigent.terminals import program_status
 
         if self.running:
             return
+        self._release_exec_launcher()
         self._last_exit_snapshot = None
         self._last_exit_status = None
         self._last_exit_signal = None
@@ -1839,18 +1892,24 @@ class TerminalInstance:
                     with contextlib.suppress(BaseException):
                         await await_cleanup_task(bootstrap_task)
                     raise
-            if sandbox_for_launcher.git_ssh:
-                sandbox_for_launcher = self._bootstrap_git_ssh(sandbox_for_launcher, env)
-            if sandbox_for_launcher.tcp_egress:
-                sandbox_for_launcher = self._bootstrap_tcp_egress(sandbox_for_launcher, env)
+            if sandbox_for_launcher.git_ssh or sandbox_for_launcher.tcp_egress:
+                broker_task = asyncio.create_task(
+                    asyncio.to_thread(self._bootstrap_optional_brokers, sandbox_for_launcher, env)
+                )
+                try:
+                    sandbox_for_launcher = await asyncio.shield(broker_task)
+                except BaseException:
+                    with contextlib.suppress(BaseException):
+                        await await_cleanup_task(broker_task)
+                    raise
             cli_path = shutil.which(self.command) or self.command
             if sandbox_for_launcher.copy_on_write_namespace:
                 host_cwd = "/"
-                launcher_path = create_exec_launcher(
+                launcher_path = await self._create_exec_launcher(
                     cli_path, sandbox_for_launcher, cwd=effective_cwd
                 )
             else:
-                launcher_path = create_exec_launcher(cli_path, sandbox_for_launcher)
+                launcher_path = await self._create_exec_launcher(cli_path, sandbox_for_launcher)
             inner_cmd = [launcher_path, *self.args]
         else:
             inner_cmd = [self.command, *self.args]
@@ -2236,8 +2295,11 @@ class TerminalInstance:
             self._stop_network_brokers()
         finally:
             try:
-                if self.os_env is not None:
-                    self.os_env.close()
+                try:
+                    self._release_exec_launcher()
+                finally:
+                    if self.os_env is not None:
+                        self.os_env.close()
             finally:
                 if self.private_dir.exists():
                     shutil.rmtree(self.private_dir, ignore_errors=True)
@@ -3187,98 +3249,107 @@ def create_terminal_instance(
     # Validate the fork source before allocating or populating its private tree.
     private_dir = Path(tempfile.mkdtemp(prefix=_TERMINAL_DIR_PREFIX))
     socket_path = private_dir / "tmux.sock"
-    # The owner claim lets startup reap a tmux server after an abrupt parent exit.
-    owner_claim.write_owner_claim(private_dir)
 
     os_env: OSEnvironment | None = None
     cwd: Path
 
-    if effective_os_env_spec.fork:
-        # Copy the directory tree for fork isolation.
-        fork_root = private_dir / "root"
-        _copy_tree(source_cwd, fork_root)
-        cwd = fork_root
+    try:
+        # The owner claim lets startup reap a tmux server after an abrupt parent exit.
+        owner_claim.write_owner_claim(private_dir)
+        if effective_os_env_spec.fork:
+            # Copy the directory tree for fork isolation.
+            fork_root = private_dir / "root"
+            _copy_tree(source_cwd, fork_root)
+            cwd = fork_root
 
-        # Create an os_env pointing at the fork for mount support.
-        # Use ``replace`` so any future OSEnvSpec field (e.g.
-        # ``start_in_scratch``) is preserved without a code change here.
-        forked_spec = replace(
-            effective_os_env_spec,
-            cwd=str(fork_root),
-            fork=False,  # already forked
-        )
-        os_env = create_os_environment(forked_spec)
-    else:
-        cwd = source_cwd
-        inherited_policy = None
-        if parent_environment is not None and (spec.os_env is None or spec.os_env == "inherit"):
-            inherited_policy = getattr(parent_environment, "sandbox", None)
-            parent_cwd = getattr(parent_environment, "cwd", None)
-            if inherited_policy is not None and parent_cwd is not None:
-                inherited_policy = with_additional_read_roots(inherited_policy, [parent_cwd])
-        os_env = create_os_environment(
-            effective_os_env_spec,
-            sandbox_policy=inherited_policy,
-            copy_on_write_environment=(
-                parent_environment.copy_on_write_environment if parent_environment else None
-            ),
-        )
-
-    # Resolve sandbox policy for the terminal process.
-    sandbox: SandboxPolicy | None = None
-    egress_rules: list[str] | None = None
-    egress_allow_private: bool = False
-    if effective_os_env_spec.sandbox is not None:
-        sandbox_spec = effective_os_env_spec.sandbox
-        if sandbox_spec.type != "none":
-            sandbox = getattr(os_env, "sandbox", None) or resolve_sandbox(
-                effective_os_env_spec, cwd
+            # Create an os_env pointing at the fork for mount support.
+            # Use ``replace`` so any future OSEnvSpec field (e.g.
+            # ``start_in_scratch``) is preserved without a code change here.
+            forked_spec = replace(
+                effective_os_env_spec,
+                cwd=str(fork_root),
+                fork=False,  # already forked
             )
-            if sandbox.active:
-                if os_env is not None:
-                    os_env.prepare_sandbox(sandbox)
-                # Add the private dir to write roots so a forked working
-                # tree (``private_dir/root``) and the instance dir stay
-                # writable inside the pane.
-                sandbox = with_additional_write_roots(sandbox, [private_dir])
-                # The tmux control socket lives inside that
-                # now-writable ``private_dir``. Deny the sandboxed pane
-                # from reaching it so it cannot ``tmux -S <sock> run-shell``
-                # against the unsandboxed server. bwrap overlays /dev/null
-                # onto the socket path; seatbelt emits a network-outbound
-                # unix-socket deny (its default allow_network=true would
-                # otherwise permit the connect).
-                sandbox = with_denied_unix_sockets(sandbox, [socket_path])
-        # Plumb the egress allow-list from the OSEnvSandboxSpec
-        # onto the instance so :meth:`launch` can start a
-        # parent-side MITM proxy. SandboxPolicy itself only carries
-        # the *resolved* relay handshake fields, not the rule list
-        # — see the policy docstring for the rationale (rules live
-        # on the spec; resolved state on the policy).
-        if sandbox_spec.egress_rules:
-            egress_rules = list(sandbox_spec.egress_rules)
-        egress_allow_private = bool(sandbox_spec.egress_allow_private_destinations)
+            os_env = create_os_environment(forked_spec)
+        else:
+            cwd = source_cwd
+            inherited_policy = None
+            if parent_environment is not None and (
+                spec.os_env is None or spec.os_env == "inherit"
+            ):
+                inherited_policy = getattr(parent_environment, "sandbox", None)
+                parent_cwd = getattr(parent_environment, "cwd", None)
+                if inherited_policy is not None and parent_cwd is not None:
+                    inherited_policy = with_additional_read_roots(inherited_policy, [parent_cwd])
+            os_env = create_os_environment(
+                effective_os_env_spec,
+                sandbox_policy=inherited_policy,
+                copy_on_write_environment=(
+                    parent_environment.copy_on_write_environment if parent_environment else None
+                ),
+            )
 
-    instance = TerminalInstance(
-        name=name,
-        session_key=session_key,
-        socket_path=socket_path,
-        private_dir=private_dir,
-        os_env=os_env,
-        command=spec.command or "bash",
-        args=list(spec.args),
-        env=dict(spec.env),
-        env_unset=list(spec.env_unset),
-        inherit_env=spec.inherit_env,
-        sandbox_policy=sandbox,
-        conversation_link=conversation_link,
-        egress_rules=egress_rules,
-        egress_allow_private_destinations=egress_allow_private,
-        scrollback=spec.scrollback,
-        tmux_allow_passthrough=spec.tmux_allow_passthrough,
-        tmux_start_on_attach=spec.tmux_start_on_attach,
-        keep_alive_after_exit=spec.keep_alive_after_exit,
-    )
-    instance._clipboard_bridge = TerminalClipboardBridge(private_dir, socket_path)
+        # Resolve sandbox policy for the terminal process.
+        sandbox: SandboxPolicy | None = None
+        egress_rules: list[str] | None = None
+        egress_allow_private: bool = False
+        if effective_os_env_spec.sandbox is not None:
+            sandbox_spec = effective_os_env_spec.sandbox
+            if sandbox_spec.type != "none":
+                sandbox = getattr(os_env, "sandbox", None) or resolve_sandbox(
+                    effective_os_env_spec, cwd
+                )
+                if sandbox.active:
+                    if os_env is not None:
+                        os_env.prepare_sandbox(sandbox)
+                    # Add the private dir to write roots so a forked working
+                    # tree (``private_dir/root``) and the instance dir stay
+                    # writable inside the pane.
+                    sandbox = with_additional_write_roots(sandbox, [private_dir])
+                    # The tmux control socket lives inside that
+                    # now-writable ``private_dir``. Deny the sandboxed pane
+                    # from reaching it so it cannot ``tmux -S <sock> run-shell``
+                    # against the unsandboxed server. bwrap overlays /dev/null
+                    # onto the socket path; seatbelt emits a network-outbound
+                    # unix-socket deny (its default allow_network=true would
+                    # otherwise permit the connect).
+                    sandbox = with_denied_unix_sockets(sandbox, [socket_path])
+            # Plumb the egress allow-list from the OSEnvSandboxSpec
+            # onto the instance so :meth:`launch` can start a
+            # parent-side MITM proxy. SandboxPolicy itself only carries
+            # the *resolved* relay handshake fields, not the rule list
+            # — see the policy docstring for the rationale (rules live
+            # on the spec; resolved state on the policy).
+            if sandbox_spec.egress_rules:
+                egress_rules = list(sandbox_spec.egress_rules)
+            egress_allow_private = bool(sandbox_spec.egress_allow_private_destinations)
 
-    return TerminalCreateResult(instance=instance, cwd=cwd)
+        instance = TerminalInstance(
+            name=name,
+            session_key=session_key,
+            socket_path=socket_path,
+            private_dir=private_dir,
+            os_env=os_env,
+            command=spec.command or "bash",
+            args=list(spec.args),
+            env=dict(spec.env),
+            env_unset=list(spec.env_unset),
+            inherit_env=spec.inherit_env,
+            sandbox_policy=sandbox,
+            conversation_link=conversation_link,
+            egress_rules=egress_rules,
+            egress_allow_private_destinations=egress_allow_private,
+            scrollback=spec.scrollback,
+            tmux_allow_passthrough=spec.tmux_allow_passthrough,
+            tmux_start_on_attach=spec.tmux_start_on_attach,
+            keep_alive_after_exit=spec.keep_alive_after_exit,
+        )
+        instance._clipboard_bridge = TerminalClipboardBridge(private_dir, socket_path)
+
+        return TerminalCreateResult(instance=instance, cwd=cwd)
+    except BaseException:
+        with contextlib.suppress(Exception):
+            if os_env is not None:
+                os_env.close()
+        shutil.rmtree(private_dir, ignore_errors=True)
+        raise

@@ -12,7 +12,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import NoReturn
@@ -26,7 +26,13 @@ import omnigent.util.tmux_compat as tmux_compat
 from omnigent.errors import ErrorCategory, ErrorImpact, classify_exception
 from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
 from omnigent.inner.claude_model_access import ClaudeModelAccess
-from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
+from omnigent.inner.datamodel import (
+    GitSshBinding,
+    OSEnvSandboxSpec,
+    OSEnvSpec,
+    TcpEgressRoute,
+    TerminalEnvSpec,
+)
 from omnigent.inner.sandbox import SandboxPolicy
 from omnigent.inner.terminal import (
     TerminalInstance,
@@ -3982,6 +3988,165 @@ async def test_terminal_cancel_waits_for_egress_bootstrap_before_cleanup(
         with pytest.raises(asyncio.CancelledError):
             await launch
         assert events == ["started", "stopped"]
+    finally:
+        release.set()
+
+
+async def test_terminal_cancel_waits_for_launcher_validation_and_removes_script(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A late launcher result belongs to the cancelled terminal, not a future launch."""
+    started = threading.Event()
+    release = threading.Event()
+    launcher_path = tmp_path / "launcher.sh"
+    private_dir = tmp_path / "terminal"
+    private_dir.mkdir()
+    instance = TerminalInstance(
+        "shell",
+        "main",
+        private_dir / "tmux.sock",
+        private_dir,
+        sandbox_policy=SandboxPolicy("linux_bwrap", True, [tmp_path], [tmp_path], [], False),
+    )
+    stopped: list[bool] = []
+
+    def validate_and_create(*_args: object, **_kwargs: object) -> str:
+        started.set()
+        assert release.wait(timeout=5)
+        launcher_path.write_text("#!/bin/sh\n", encoding="utf-8")
+        return str(launcher_path)
+
+    monkeypatch.setattr(terminal_mod, "create_exec_launcher", validate_and_create)
+    monkeypatch.setattr(instance, "_stop_network_brokers", lambda: stopped.append(True))
+    launch = asyncio.create_task(instance.launch(cwd=tmp_path))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        heartbeat = asyncio.Event()
+        asyncio.get_running_loop().call_soon(heartbeat.set)
+        await asyncio.wait_for(heartbeat.wait(), timeout=1)
+        launch.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await launch
+        assert not launcher_path.exists()
+        assert stopped == [True]
+    finally:
+        release.set()
+        if not launch.done():
+            launch.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await launch
+
+
+def test_failed_terminal_fork_removes_partially_created_private_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    private_dir = tmp_path / "private"
+    private_dir.mkdir()
+    monkeypatch.setattr(terminal_mod, "_require_supported_tmux", lambda: None)
+    monkeypatch.setattr(terminal_mod.tempfile, "mkdtemp", lambda **_kwargs: str(private_dir))
+
+    def fail_copy(*_args: object) -> None:
+        raise OSError("copy failed")
+
+    monkeypatch.setattr(terminal_mod, "_copy_tree", fail_copy)
+    spec = TerminalEnvSpec(
+        command="cat",
+        os_env=OSEnvSpec(cwd=str(tmp_path), fork=True),
+    )
+    with pytest.raises(OSError, match="copy failed"):
+        create_terminal_instance("shell", "main", spec)
+    assert not private_dir.exists()
+
+
+@pytest.mark.parametrize("spawn_fails", [False, True])
+async def test_terminal_launcher_is_owned_until_close_or_spawn_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, spawn_fails: bool
+) -> None:
+    private_dir = tmp_path / "terminal"
+    private_dir.mkdir()
+    launcher_path = tmp_path / "launcher.sh"
+    instance = TerminalInstance(
+        "shell",
+        "main",
+        private_dir / "tmux.sock",
+        private_dir,
+        sandbox_policy=SandboxPolicy("linux_bwrap", True, [tmp_path], [tmp_path], [], False),
+    )
+
+    def create_launcher(*_args: object, **_kwargs: object) -> str:
+        launcher_path.write_text("#!/bin/sh\n", encoding="utf-8")
+        return str(launcher_path)
+
+    monkeypatch.setattr(terminal_mod, "create_exec_launcher", create_launcher)
+    monkeypatch.setattr(instance, "_tmux_base_cmd", lambda path_env=None: ["tmux"])
+    monkeypatch.setattr(instance, "_tmux", AsyncMock())
+    if spawn_fails:
+        monkeypatch.setattr(
+            terminal_mod.asyncio,
+            "create_subprocess_exec",
+            AsyncMock(side_effect=FileNotFoundError("tmux")),
+        )
+    else:
+        monkeypatch.setattr(
+            terminal_mod.asyncio,
+            "create_subprocess_exec",
+            AsyncMock(return_value=_SuccessfulProcess()),
+        )
+    try:
+        if spawn_fails:
+            with pytest.raises(FileNotFoundError, match="tmux"):
+                await instance.launch(cwd=tmp_path)
+            assert not launcher_path.exists()
+        else:
+            await instance.launch(cwd=tmp_path)
+            assert launcher_path.exists()
+    finally:
+        await instance.close()
+    assert not launcher_path.exists()
+
+
+@pytest.mark.parametrize("broker_kind", ["git_ssh", "tcp_egress"])
+async def test_terminal_cancel_waits_for_optional_broker_before_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, broker_kind: str
+) -> None:
+    started = threading.Event()
+    release = threading.Event()
+    policy = SandboxPolicy("linux_bwrap", True, [tmp_path], [tmp_path], [], False)
+    if broker_kind == "git_ssh":
+        policy = replace(
+            policy,
+            git_ssh=[
+                GitSshBinding(
+                    "git.test", 22, "git", "repo", frozenset({"read"}), "key", "known_hosts"
+                )
+            ],
+        )
+    else:
+        policy = replace(policy, tcp_egress=[TcpEgressRoute("database", "db.test", 5432)])
+    instance = TerminalInstance(
+        "shell", "main", tmp_path / "tmux.sock", tmp_path, sandbox_policy=policy
+    )
+    stopped: list[bool] = []
+
+    def bootstrap(_policy: SandboxPolicy, _env: dict[str, str]) -> SandboxPolicy:
+        started.set()
+        assert release.wait(timeout=5)
+        return policy
+
+    monkeypatch.setattr(instance, f"_bootstrap_{broker_kind}", bootstrap)
+    monkeypatch.setattr(instance, "_stop_network_brokers", lambda: stopped.append(True))
+    launch = asyncio.create_task(instance.launch(cwd=tmp_path))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        heartbeat = asyncio.Event()
+        asyncio.get_running_loop().call_soon(heartbeat.set)
+        await asyncio.wait_for(heartbeat.wait(), timeout=1)
+        launch.cancel()
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await launch
+        assert stopped == [True]
     finally:
         release.set()
 
