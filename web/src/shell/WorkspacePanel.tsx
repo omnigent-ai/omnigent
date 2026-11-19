@@ -2133,7 +2133,10 @@ function WorkspacePanelImpl({
                 size="icon-xs"
                 className="flex size-6 text-muted-foreground hover:text-foreground"
               >
-                {maximized ? (
+                {thingyFullScreen ? (
+                  // Leaving a full screen thingy shows its session, so the button shows the chat.
+                  <MessagesSquareIcon className="size-4" />
+                ) : maximized ? (
                   <MinimizeIcon className="size-4" />
                 ) : (
                   <MaximizeIcon className="size-4" />

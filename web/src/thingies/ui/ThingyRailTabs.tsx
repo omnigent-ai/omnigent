@@ -6,7 +6,7 @@
 // thingy there covers the session instead.
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { MaximizeIcon, MinimizeIcon, PanelsTopLeftIcon, XIcon } from "lucide-react";
+import { MaximizeIcon, MessagesSquareIcon, PanelsTopLeftIcon, XIcon } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 
 import { RenderErrorBoundary } from "@/components/RenderErrorBoundary";
@@ -900,7 +900,8 @@ export function ThingyNewSessionPanel({
                 onClick={() => setFullScreen(!maximized)}
               >
                 {maximized ? (
-                  <MinimizeIcon className="size-4" />
+                  // Leaving full screen shows New session, so the button shows the chat.
+                  <MessagesSquareIcon className="size-4" />
                 ) : (
                   <MaximizeIcon className="size-4" />
                 )}
