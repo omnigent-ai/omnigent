@@ -2934,6 +2934,7 @@ class _StoppedSessionAnswer:
 
     started_at: float
     fingerprint: str | None
+    runner_id: str | None = None
     delivery: asyncio.Future[Any] | None = None
     acknowledgement: dict[str, Any] | None = None
 
@@ -2978,6 +2979,9 @@ async def _deliver_answer_to_stopped_session(
     data: Mapping[str, Any],
     runner_router: RunnerRouter | None,
     post_event: Callable[..., Awaitable[Any]] | None,
+    *,
+    conversation_store: ConversationStore | None = None,
+    runner_exit_reports: RunnerExitReports | None = None,
 ) -> dict[str, Any] | None:
     """
     Send an AskUserQuestion answer as a user message when the session's runner is gone.
@@ -3027,20 +3031,37 @@ async def _deliver_answer_to_stopped_session(
         or not _is_native_terminal_session(conv)
     ):
         return None
-    if record is None:
-        runner = await _get_runner_client(
-            session_id, runner_router, conversation=conv, for_control=True
+    # A retry under a new runner id skips the check: that runner never parked this question.
+    if record is None or record.runner_id == conv.runner_id:
+        runner_back = await _session_runner_reconnects(
+            request, session_id, conv, runner_router, conversation_store, runner_exit_reports
         )
-        record = _stopped_session_answers.get(key)
-        if record is not None:
-            # Another request started this question's recovery during the lookup.
+        current = _stopped_session_answers.get(key)
+        if current is not record or (
+            current is not None
+            and (current.delivery is not None or current.acknowledgement is not None)
+        ):
+            # Another request started or finished this question's recovery during the wait.
             return await _deliver_answer_to_stopped_session(
-                request, session_id, conv, data, runner_router, post_event
+                request,
+                session_id,
+                conv,
+                data,
+                runner_router,
+                post_event,
+                conversation_store=conversation_store,
+                runner_exit_reports=runner_exit_reports,
             )
-        if runner is not None:
+        if pending_elicitations.lookup(elicitation_id, conversation_id=session_id) is None:
             return None
+        if runner_back:
+            _stopped_session_answers.pop(key, None)
+            return None
+    if record is None:
         record = _StoppedSessionAnswer(
-            started_at=time.time(), fingerprint=_harness_elicitation_fingerprint_or_none(params)
+            started_at=time.time(),
+            fingerprint=_harness_elicitation_fingerprint_or_none(params),
+            runner_id=conv.runner_id,
         )
         _stopped_session_answers[key] = record
     return await _run_stopped_session_delivery(
@@ -3082,8 +3103,15 @@ async def _run_stopped_session_delivery(
         )
         with contextlib.ExitStack() as in_flight:
             acknowledgement = await post_event(request, session_id, message, in_flight=in_flight)
-        record.acknowledgement = acknowledgement
         delivery.set_result(acknowledgement)
+        if isinstance(acknowledgement, dict) and acknowledgement.get("denied") is True:
+            _logger.info(
+                "Policy denied the answer to %s; the question stays open",
+                elicitation_id,
+                extra={"session_id": session_id},
+            )
+            return acknowledgement
+        record.acknowledgement = acknowledgement
         _close_answered_card(session_id, elicitation_id, params)
         return acknowledgement
     except Exception as exc:
@@ -3104,6 +3132,68 @@ async def _run_stopped_session_delivery(
                     code=ErrorCode.RUNNER_UNAVAILABLE,
                 )
             )
+
+
+async def _session_runner_reconnects(
+    request: Request,
+    session_id: str,
+    conv: Conversation,
+    runner_router: RunnerRouter | None,
+    conversation_store: ConversationStore | None,
+    runner_exit_reports: RunnerExitReports | None,
+) -> bool:
+    """
+    Return whether the session's runner is reachable, waiting as the message path does.
+
+    Mirrors the message path's connect grace, so a short tunnel gap reaches the hook.
+    """
+    if await _get_runner_client(session_id, runner_router, conversation=conv, for_control=True):
+        return True
+    from omnigent.server.routes import sessions as _sf
+    from omnigent.server.routes.sessions import routes_events
+
+    runner_id = conv.runner_id
+    if (
+        conv.host_id is None
+        or runner_id is None
+        or conversation_store is None
+        or _sf._HOST_BOUND_RUNNER_CONNECT_GRACE_S <= 0
+    ):
+        return False
+    app_state = request.app.state
+    known_exit = runner_exit_reports.get(runner_id) if runner_exit_reports is not None else None
+    offline = (
+        await routes_events._session_offline_host_id(conv, app_state, conversation_store)
+        if known_exit is None
+        else None
+    )
+    host_registry = getattr(app_state, "host_registry", None)
+    host_conn = host_registry.get(conv.host_id) if host_registry is not None else None
+    if offline is not None and host_conn is None:
+        return False
+    tunnel_registry = getattr(app_state, "tunnel_registry", None)
+    if host_registry is not None and host_conn is not None:
+        client = await _sf._wait_for_host_bound_runner_client(
+            session_id,
+            runner_router,
+            tunnel_registry,
+            runner_id=runner_id,
+            timeout_s=_sf._HOST_BOUND_RUNNER_CONNECT_GRACE_S,
+            runner_exit_reports=runner_exit_reports,
+            host_conn=host_conn,
+            host_registry=host_registry,
+            conversation_store=conversation_store,
+        )
+    else:
+        client = await _sf._wait_for_runner_client(
+            session_id,
+            runner_router,
+            tunnel_registry,
+            runner_id=runner_id,
+            timeout_s=_sf._HOST_BOUND_RUNNER_CONNECT_GRACE_S,
+            runner_exit_reports=runner_exit_reports,
+        )
+    return client is not None
 
 
 def _prune_stopped_session_answers() -> None:

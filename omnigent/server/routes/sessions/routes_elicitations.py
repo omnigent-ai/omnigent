@@ -28,6 +28,7 @@ from omnigent.server.auth import (
     LEVEL_EDIT,
     AuthProvider,
 )
+from omnigent.server.host_registry import RunnerExitReports
 from omnigent.server.routes._auth_helpers import (
     get_user_id as _get_user_id,
 )
@@ -71,11 +72,13 @@ def register_elicitations_routes(
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
     message_dispatch: list[Callable[..., Awaitable[Any]]] | None = None,
+    runner_exit_reports: RunnerExitReports | None = None,
 ) -> None:
     """Register the elicitations routes on router.
 
     :param message_dispatch: Holds the events route's message handler once it is
         registered; an answer on a stopped session is sent through it.
+    :param runner_exit_reports: Runner crash reports; they end the runner wait early.
     """
 
     @router.post(
@@ -148,6 +151,8 @@ def register_elicitations_routes(
             _resolve_data,
             runner_router,
             message_dispatch[0] if message_dispatch else None,
+            conversation_store=conversation_store,
+            runner_exit_reports=runner_exit_reports,
         )
         if delivered is not None:
             return delivered

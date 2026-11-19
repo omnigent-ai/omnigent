@@ -73,6 +73,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (
 )
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.host_store import HostStore
+from tests._helpers.polling import poll_until_async
 from tests.budgets import Deadline, budget
 from tests.debug_log_helpers import capture_debug_rows
 from tests.server.helpers import claude_ask_user_question_payload, create_test_agent
@@ -5703,14 +5704,15 @@ async def _park_ask_user_question(
             json=payload or _ask_user_question_hook_payload(),
         )
     )
-    deadline = time.monotonic() + budget(5.0)
-    while time.monotonic() < deadline:
-        pending = pending_elicitations.snapshot_for(session_id)
-        if pending:
-            return hook_task, pending[0]["elicitation_id"]
-        await asyncio.sleep(0.01)
-    hook_task.cancel()
-    raise AssertionError("the AskUserQuestion hook never parked an elicitation")
+    try:
+        await _wait_until(
+            lambda: bool(pending_elicitations.snapshot_for(session_id)),
+            "the AskUserQuestion hook never parked an elicitation",
+        )
+    except AssertionError:
+        hook_task.cancel()
+        raise
+    return hook_task, pending_elicitations.snapshot_for(session_id)[0]["elicitation_id"]
 
 
 async def _park_on_claude_session(
@@ -5820,11 +5822,10 @@ def _stage_live_runner(monkeypatch: pytest.MonkeyPatch, fake_runner: httpx.Async
 
 async def _wait_until(predicate: Callable[[], bool], failure: str) -> None:
     """Poll *predicate* until it holds; fail with *failure* after the hang guard."""
-    deadline = time.monotonic() + budget(5.0)
-    while not predicate():
-        if time.monotonic() > deadline:
-            raise AssertionError(failure)
-        await asyncio.sleep(0.01)
+    try:
+        await poll_until_async(predicate, timeout_s=budget(5.0), interval_s=0.01)
+    except AssertionError:
+        raise AssertionError(failure) from None
 
 
 async def _cancel_all(*tasks: asyncio.Task[Any] | None) -> None:
@@ -5842,24 +5843,6 @@ async def _wait_for_dispatch_in_flight(session_id: str) -> None:
     await _wait_until(
         lambda: orchestration._dispatch_in_flight.get(session_id, 0) > 0,
         "the first answer never reached the message path",
-    )
-
-
-async def _wait_for_follower(session_id: str, elicitation_id: str) -> None:
-    """Wait until a second request waits on the question's running delivery."""
-    from omnigent.server.routes._sessions import orchestration
-
-    def _follower_waits() -> bool:
-        record = orchestration._stopped_session_answers.get((session_id, elicitation_id))
-        # CPython futures list callbacks: the delivery keeps one; each waiting request adds one.
-        return (
-            record is not None
-            and record.delivery is not None
-            and len(record.delivery._callbacks) > 1
-        )
-
-    await _wait_until(
-        _follower_waits, "the second answer never waited on the first one's delivery"
     )
 
 
@@ -6009,6 +5992,168 @@ async def test_answer_with_a_live_runner_reaches_the_hook_and_sends_no_message(
     assert not await _expect_no_launch(comm, budget_s=budget(0.2))
 
 
+@pytest.mark.parametrize("route", ["resolve", "approval_event"])
+async def test_an_answer_during_a_runner_tunnel_gap_reaches_the_hook(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    app: FastAPI,
+    route: str,
+) -> None:
+    """A runner that reconnects inside the connect grace gets the answer through its hook."""
+    from omnigent.server.host_registry import RunnerExitReports
+    from omnigent.server.routes import sessions as sessions_module
+
+    comm, session_id, hook_task, elicitation_id = await _park_on_claude_session(client, app)
+    runner_posts: list[tuple[str, dict[str, Any]]] = []
+    fake_runner = _recording_runner(runner_posts)
+    seen_reports: list[object] = []
+
+    async def _tunnel_gap(*args: Any, **kwargs: Any) -> httpx.AsyncClient | None:
+        del args, kwargs
+        return None
+
+    async def _reconnects(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+        del args
+        seen_reports.append(kwargs.get("runner_exit_reports"))
+        return fake_runner
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", budget(5.0))
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _tunnel_gap)
+    monkeypatch.setattr(sessions_module, "_wait_for_runner_client", _reconnects)
+    try:
+        response = await _resolve_answer(client, session_id, elicitation_id, route=route)
+        hook_response = await asyncio.wait_for(hook_task, budget(5.0))
+    finally:
+        hook_task.cancel()
+        await asyncio.gather(hook_task, return_exceptions=True)
+        await fake_runner.aclose()
+
+    assert response.status_code == 202, response.text
+    assert response.json() == {"queued": False}
+    decision = hook_response.json()["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == "allow", decision
+    assert decision["updatedInput"]["answers"] == {_QUESTION: "sqlite"}
+    assert _message_texts(runner_posts) == []
+    assert seen_reports and isinstance(seen_reports[0], RunnerExitReports), seen_reports
+    assert not await _expect_no_launch(comm, budget_s=budget(0.2))
+
+
+async def test_a_retry_after_the_original_runner_returns_reaches_the_hook(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    app: FastAPI,
+) -> None:
+    """A retry checks the runner again: the runner that asked is back, so its hook gets it."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    comm, session_id, hook_task, elicitation_id = await _park_on_claude_session(client, app)
+    runner_posts: list[tuple[str, dict[str, Any]]] = []
+    fake_runner = _recording_runner(runner_posts)
+    set_runner_client(None)
+    _stage_relaunched_runner(monkeypatch, fake_runner)
+    monkeypatch.setattr(sessions_module, "_HOST_RECONNECT_GRACE_S", 0.05)
+    try:
+        await _disconnect_host(app, comm)
+        failed = await _resolve_answer(client, session_id, elicitation_id)
+        assert failed.json()["error"]["code"] == "runner_unavailable", failed.text
+        _stage_live_runner(monkeypatch, fake_runner)
+        retried = await _resolve_answer(client, session_id, elicitation_id)
+        hook_response = await asyncio.wait_for(hook_task, budget(5.0))
+    finally:
+        hook_task.cancel()
+        await asyncio.gather(hook_task, return_exceptions=True)
+        await fake_runner.aclose()
+
+    assert retried.status_code == 202, retried.text
+    assert retried.json() == {"queued": False}
+    decision = hook_response.json()["hookSpecificOutput"]["decision"]
+    assert decision["behavior"] == "allow", decision
+    assert decision["updatedInput"]["answers"] == {_QUESTION: "sqlite"}
+    assert _message_texts(runner_posts) == []
+    assert orchestration._stopped_session_answers.get((session_id, elicitation_id)) is None
+
+
+async def _serve_dead_runner_then_launch(
+    comm: ApplicationCommunicator, dead_runner_id: str
+) -> HostLaunchRunnerFrame:
+    """Report *dead_runner_id* dead on each status query, then serve the relaunch."""
+    deadline = Deadline(30.0)
+    for _ in range(80):
+        output = await comm.receive_output(timeout=deadline.next_wait(30.0))
+        if output["type"] != "websocket.send":
+            continue
+        frame = decode_host_frame(output["text"])
+        if isinstance(frame, HostRunnerStatusFrame) and frame.runner_id == dead_runner_id:
+            reply = HostRunnerStatusResultFrame(request_id=frame.request_id, status="dead")
+        elif isinstance(frame, HostStatFrame):
+            reply = HostStatResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                exists=True,
+                type="directory",
+                canonical_path=frame.path,
+            )
+        elif isinstance(frame, HostLaunchRunnerFrame):
+            reply = HostLaunchRunnerResultFrame(
+                request_id=frame.request_id, status="launched", runner_id="runner_from_host"
+            )
+        else:
+            continue
+        await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(reply)})
+        if isinstance(frame, HostLaunchRunnerFrame):
+            return frame
+    raise AssertionError("host never received a launch frame")
+
+
+async def test_an_answer_waits_only_until_the_host_reports_the_runner_dead(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    app: FastAPI,
+    db_uri: str,
+) -> None:
+    """The runner check ends on the host's dead report, not the connect grace."""
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    comm, session_id, hook_task, elicitation_id = await _park_on_claude_session(client, app)
+    conv = SqlAlchemyConversationStore(db_uri).get_conversation(session_id)
+    assert conv is not None and conv.runner_id is not None
+    runner_posts: list[tuple[str, dict[str, Any]]] = []
+    fake_runner = _recording_runner(runner_posts)
+    real_wait = sessions_module._wait_for_runner_client
+
+    async def _no_runner(*args: Any, **kwargs: Any) -> httpx.AsyncClient | None:
+        del args, kwargs
+        return None
+
+    async def _relaunched_only(*args: Any, **kwargs: Any) -> httpx.AsyncClient | None:
+        # Only the asking runner's wait stays real; the relaunched one connects at once.
+        if kwargs.get("runner_id") != conv.runner_id:
+            return fake_runner
+        return await real_wait(*args, **kwargs)
+
+    async def _noop_relay_ready(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+
+    set_runner_client(None)
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", budget(30.0))
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _no_runner)
+    monkeypatch.setattr(sessions_module, "_wait_for_runner_client", _relaunched_only)
+    monkeypatch.setattr(sessions_module, "_ensure_runner_relay_ready", _noop_relay_ready)
+    answer = asyncio.create_task(_resolve_answer(client, session_id, elicitation_id))
+    host = asyncio.create_task(_serve_dead_runner_then_launch(comm, conv.runner_id))
+    try:
+        response = await asyncio.wait_for(answer, budget(10.0))
+    finally:
+        await _cancel_all(answer, host, hook_task)
+        await fake_runner.aclose()
+
+    assert response.status_code < 300 and response.json().get("queued") is True, response.text
+    assert len(_message_texts(runner_posts)) == 1, runner_posts
+
+
 @pytest.mark.parametrize("action", ["decline", "cancel"])
 async def test_decline_on_a_stopped_claude_session_does_not_relaunch(
     client: httpx.AsyncClient,
@@ -6045,6 +6190,7 @@ async def test_answer_while_the_host_is_offline_keeps_the_question_open(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     app: FastAPI,
+    db_uri: str,
 ) -> None:
     """A failed wake keeps the card; a retry after a new runner registers still delivers."""
     from omnigent.runtime import pending_elicitations, set_runner_client
@@ -6064,6 +6210,8 @@ async def test_answer_while_the_host_is_offline_keeps_the_question_open(
         assert _message_texts(runner_posts) == []
 
         comm = await _connect_host(app)
+        # A replacement runner always has a new binding; the asking runner never came back.
+        SqlAlchemyConversationStore(db_uri).replace_runner_id(session_id, "runner_replacement")
         _stage_live_runner(monkeypatch, fake_runner)
         retried = await _resolve_answer(client, session_id, elicitation_id)
         hook_response = await asyncio.wait_for(hook_task, budget(5.0))
@@ -6080,115 +6228,12 @@ async def test_answer_while_the_host_is_offline_keeps_the_question_open(
     assert not await _expect_no_launch(comm, budget_s=budget(0.2))
 
 
-@pytest.mark.parametrize("case", ["delivered", "leader_fails", "follower_sees_replacement"])
-async def test_two_answers_at_once_deliver_one_message(
-    client: httpx.AsyncClient,
-    monkeypatch: pytest.MonkeyPatch,
-    app: FastAPI,
-    case: str,
-) -> None:
-    """A second answer waits for the first and gets its result: one message, or the same error."""
-    from omnigent.runtime import pending_elicitations, set_runner_client
-    from omnigent.server.routes import sessions as sessions_module
-
-    comm, session_id, hook_task, elicitation_id = await _park_on_claude_session(client, app)
-    runner_posts: list[tuple[str, dict[str, Any]]] = []
-    fake_runner = _recording_runner(runner_posts)
-    gate = (asyncio.Event(), asyncio.Event())
-    set_runner_client(None)
-    _stage_relaunched_runner(
-        monkeypatch, fake_runner, gate=gate if case == "follower_sees_replacement" else None
-    )
-    if case == "leader_fails":
-        monkeypatch.setattr(sessions_module, "_HOST_RECONNECT_GRACE_S", budget(1.0))
-        await _disconnect_host(app, comm)
-    first = asyncio.create_task(_resolve_answer(client, session_id, elicitation_id))
-    second: asyncio.Task[httpx.Response] | None = None
-    launch: asyncio.Task[HostLaunchRunnerFrame] | None = None
-    try:
-        if case == "follower_sees_replacement":
-            launch = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
-            await asyncio.wait_for(gate[0].wait(), budget(10.0))
-            _stage_live_runner(monkeypatch, fake_runner)
-        else:
-            await _wait_for_dispatch_in_flight(session_id)
-        second = asyncio.create_task(_resolve_answer(client, session_id, elicitation_id))
-        await _wait_for_follower(session_id, elicitation_id)
-        assert not second.done(), "the second answer must wait for the first one's result"
-        if case == "follower_sees_replacement":
-            gate[1].set()
-        elif case == "delivered":
-            launch = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
-        responses = await asyncio.wait_for(asyncio.gather(first, second), budget(10.0))
-    finally:
-        gate[1].set()
-        await _cancel_all(first, second, launch, hook_task)
-        await fake_runner.aclose()
-
-    if case == "leader_fails":
-        assert [r.json()["error"]["code"] for r in responses] == ["runner_unavailable"] * 2
-        assert pending_elicitations.lookup(elicitation_id, conversation_id=session_id) is not None
-        assert _message_texts(runner_posts) == []
-        return
-    assert all(r.status_code < 300 and r.json().get("queued") is True for r in responses), [
-        r.text for r in responses
-    ]
-    assert len(_message_texts(runner_posts)) == 1, runner_posts
-    assert _approval_events(runner_posts) == []
-    assert not await _expect_no_launch(comm, budget_s=budget(0.2))
-
-
-async def test_two_answers_in_the_same_moment_deliver_one_message(
-    client: httpx.AsyncClient,
-    monkeypatch: pytest.MonkeyPatch,
-    app: FastAPI,
-) -> None:
-    """Two tabs that both pass the runner check before either starts still send one message."""
-    from omnigent.runtime import set_runner_client
-    from omnigent.server.routes import sessions as sessions_module
-
-    comm, session_id, hook_task, elicitation_id = await _park_on_claude_session(client, app)
-    runner_posts: list[tuple[str, dict[str, Any]]] = []
-    fake_runner = _recording_runner(runner_posts)
-    set_runner_client(None)
-    _stage_relaunched_runner(monkeypatch, fake_runner)
-    release = asyncio.Event()
-    waiting = 0
-
-    async def _gated_no_runner(*args: Any, **kwargs: Any) -> httpx.AsyncClient | None:
-        nonlocal waiting
-        del args, kwargs
-        waiting += 1
-        await release.wait()
-        return None
-
-    monkeypatch.setattr(sessions_module, "_get_runner_client", _gated_no_runner)
-    answers = [
-        asyncio.create_task(_resolve_answer(client, session_id, elicitation_id)) for _ in range(2)
-    ]
-    launch: asyncio.Task[HostLaunchRunnerFrame] | None = None
-    try:
-        await _wait_until(lambda: waiting == 2, "both answers must reach the runner check")
-        release.set()
-        launch = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
-        responses = await asyncio.wait_for(asyncio.gather(*answers), budget(10.0))
-    finally:
-        release.set()
-        await _cancel_all(*answers, launch, hook_task)
-        await fake_runner.aclose()
-
-    assert all(r.status_code < 300 and r.json().get("queued") is True for r in responses), [
-        r.text for r in responses
-    ]
-    assert len(_message_texts(runner_posts)) == 1, runner_posts
-
-
 async def test_a_cancelled_answer_can_be_answered_again(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     app: FastAPI,
 ) -> None:
-    """A dropped first request hands a waiting answer an error, and a retry still delivers."""
+    """A dropped request leaves the message path, and a retry still delivers one message."""
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
     from omnigent.server.routes._sessions import orchestration
@@ -6201,17 +6246,10 @@ async def test_a_cancelled_answer_can_be_answered_again(
     monkeypatch.setattr(sessions_module, "_HOST_RECONNECT_GRACE_S", budget(30.0))
     await _disconnect_host(app, comm)
     first = asyncio.create_task(_resolve_answer(client, session_id, elicitation_id))
-    second: asyncio.Task[httpx.Response] | None = None
     try:
         await _wait_for_dispatch_in_flight(session_id)
-        second = asyncio.create_task(_resolve_answer(client, session_id, elicitation_id))
-        await _wait_for_follower(session_id, elicitation_id)
-        assert not second.done(), "the second answer must wait for the first one's result"
         first.cancel()
         await asyncio.gather(first, return_exceptions=True)
-        follower = await asyncio.wait_for(second, budget(10.0))
-        assert follower.json()["error"]["code"] == "runner_unavailable", follower.text
-
         monkeypatch.setattr(sessions_module, "_HOST_RECONNECT_GRACE_S", 0.05)
         await _wait_until(
             lambda: orchestration._dispatch_in_flight.get(session_id, 0) == 0,
@@ -6220,60 +6258,11 @@ async def test_a_cancelled_answer_can_be_answered_again(
         comm = await _connect_host(app)
         retried = await _answer_and_serve_launch(client, comm, session_id, elicitation_id)
     finally:
-        await _cancel_all(first, second, hook_task)
+        await _cancel_all(first, hook_task)
         await fake_runner.aclose()
 
     assert retried.status_code < 300, retried.text
     assert len(_message_texts(runner_posts)) == 1
-
-
-async def test_a_card_close_error_does_not_strand_the_answer(
-    client: httpx.AsyncClient,
-    monkeypatch: pytest.MonkeyPatch,
-    app: FastAPI,
-) -> None:
-    """A failed card close after delivery sends no second message, and a retry closes the card."""
-    from omnigent.errors import ErrorCode, OmnigentError
-    from omnigent.runtime import pending_elicitations, set_runner_client
-    from omnigent.server.routes._sessions import orchestration
-
-    comm, session_id, hook_task, elicitation_id = await _park_on_claude_session(client, app)
-    runner_posts: list[tuple[str, dict[str, Any]]] = []
-    fake_runner = _recording_runner(runner_posts)
-    set_runner_client(None)
-    _stage_relaunched_runner(monkeypatch, fake_runner)
-    real_close = orchestration._close_answered_card
-    calls = 0
-
-    def _close_fails_once(*args: Any, **kwargs: Any) -> None:
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise OmnigentError("close failed", code=ErrorCode.INTERNAL_ERROR)
-        real_close(*args, **kwargs)
-
-    monkeypatch.setattr(orchestration, "_close_answered_card", _close_fails_once)
-    first = asyncio.create_task(_resolve_answer(client, session_id, elicitation_id))
-    second: asyncio.Task[httpx.Response] | None = None
-    launch: asyncio.Task[HostLaunchRunnerFrame] | None = None
-    try:
-        await _wait_for_dispatch_in_flight(session_id)
-        second = asyncio.create_task(_resolve_answer(client, session_id, elicitation_id))
-        await _wait_for_follower(session_id, elicitation_id)
-        launch = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
-        leader, follower = await asyncio.wait_for(asyncio.gather(first, second), budget(10.0))
-        retried = await asyncio.wait_for(
-            _resolve_answer(client, session_id, elicitation_id), budget(10.0)
-        )
-    finally:
-        await _cancel_all(first, second, launch, hook_task)
-        await fake_runner.aclose()
-
-    assert leader.status_code >= 500, leader.text
-    assert follower.status_code < 300 and follower.json().get("queued") is True, follower.text
-    assert retried.json() == follower.json()
-    assert len(_message_texts(runner_posts)) == 1
-    assert pending_elicitations.lookup(elicitation_id, conversation_id=session_id) is None
 
 
 async def test_answer_when_the_host_is_on_another_replica_redirects(

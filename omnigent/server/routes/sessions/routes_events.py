@@ -2479,6 +2479,8 @@ def register_events_routes(
                 body.data,
                 runner_router,
                 _post_event_impl,
+                conversation_store=conversation_store,
+                runner_exit_reports=runner_exit_reports,
             )
             if delivered is not None:
                 return delivered
