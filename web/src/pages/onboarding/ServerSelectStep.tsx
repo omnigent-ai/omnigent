@@ -142,6 +142,9 @@ export function ServerSelectStep({
   onCopy,
   onCheckServer,
   onAddModeChange,
+  initialAddedServers,
+  onAddedServersChange,
+  initialSelected,
 }: {
   initialUrl: string;
   error?: string;
@@ -156,6 +159,12 @@ export function ServerSelectStep({
   /** Reports whether the URL-input ("add") view is showing, so the parent can
    *  swap the panel band (hero icons) for it. */
   onAddModeChange?: (addMode: boolean) => void;
+  /** Servers added earlier this session, restored when the step is shown again. */
+  initialAddedServers?: string[];
+  /** Reports the session-added servers whenever they change, so the parent can keep them. */
+  onAddedServersChange?: (servers: string[]) => void;
+  /** Listed server to select on mount, instead of the first one. */
+  initialSelected?: string;
   onBack: () => void;
   /** Connect to a URL; resolves `{error}` to show, else navigation is underway. */
   onConnect: (url: string) => Promise<ConnectResult>;
@@ -171,18 +180,25 @@ export function ServerSelectStep({
 }) {
   // Servers the user added this session (prepended to the persisted recents;
   // they only become real recents once actually connected to).
-  const [addedServers, setAddedServers] = useState<string[]>([]);
+  const [addedServers, setAddedServers] = useState<string[]>(() =>
+    (initialAddedServers ?? []).filter(
+      (url) => !managedServers.includes(url) && !recentServers.includes(url),
+    ),
+  );
+  useEffect(() => {
+    onAddedServersChange?.(addedServers);
+  }, [addedServers, onAddedServersChange]);
   const listed = [...addedServers, ...managedServers, ...recentServers];
 
   // Exclusive focus: EITHER a listed server is selected (Join connects to it)
   // OR the input is active (Add adds a server; Join is disabled). Focusing the
   // input deselects; selecting a server clears the input.
-  const [selected, setSelected] = useState<string | null>(null);
+  const [selected, setSelected] = useState<string | null>(initialSelected ?? null);
   // Pre-fill the input with the just-failed URL (retry after a bad connect
   // reloads with ?url=), else empty. The default localhost is a listed recent,
   // not something to type.
   const [typedUrl, setTypedUrl] = useState(
-    error && initialUrl && initialUrl !== DEFAULT_LOCAL ? initialUrl : "",
+    !initialSelected && error && initialUrl && initialUrl !== DEFAULT_LOCAL ? initialUrl : "",
   );
   const [invalid, setInvalid] = useState(false);
   // Message from a rejected connect, so a failed Join shows something.
@@ -262,11 +278,17 @@ export function ServerSelectStep({
   };
 
   // Connect to the selected server.
+  const [joining, setJoining] = useState(false);
   const join = async () => {
-    if (selected === null) return;
+    if (selected === null || joining) return;
     setConnectError(null);
-    const result = await onConnect(selected);
-    setConnectError(result.error ?? null);
+    setJoining(true);
+    try {
+      const result = await onConnect(selected);
+      setConnectError(result.error ?? null);
+    } finally {
+      setJoining(false);
+    }
   };
 
   const removeServer = (url: string) => {
@@ -510,7 +532,7 @@ export function ServerSelectStep({
             </Button>
             <Button
               disabled={selected === null}
-              loading={connection !== null}
+              loading={connection !== null || joining}
               onClick={join}
               size="lg"
             >

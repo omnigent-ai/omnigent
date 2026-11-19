@@ -318,7 +318,12 @@ def _format_codex_version(version: tuple[int, int, int] | None) -> str:
 #: Omnigent tools the framework calls on every session's behalf, pre-approved
 #: so codex never raises an interactive prompt for them. The rename keeps a
 #: session's title current, which the framework does unprompted on any session.
-_FRAMEWORK_APPROVED_TOOLS: tuple[str, ...] = ("sys_session_rename",)
+# Automation mutations still require Omnigent's server-side human approval.
+_FRAMEWORK_APPROVED_TOOLS: tuple[str, ...] = (
+    "sys_session_rename",
+    "sys_scheduled_task_create",
+    "sys_scheduled_task_update",
+)
 
 #: Additionally pre-approved for an auto-harness Smart Routing session, whose
 #: spawns the router may move onto the counterpart harness family: these four

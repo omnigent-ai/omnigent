@@ -127,6 +127,7 @@ from omnigent.server.auth import (
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
     effective_admin,
+    env_var_is_truthy,
 )
 from omnigent.server.host_registry import (
     HostConnection,
@@ -356,6 +357,8 @@ if TYPE_CHECKING:
     from concurrent.futures import Future
 
     from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
+    from omnigent.server.host_session_recovery import HostSessionRecoverer
+    from omnigent.session_recovery import SessionRecovery
 
 
 def _codex_plan_mode_enabled(mode: str) -> bool:
@@ -2321,6 +2324,14 @@ def _record_daily_cost(
         conversation_store.add_daily_cost(owner.user_id, _utc_day(now_epoch()), delta_usd)
 
 
+HIDE_COST_ENV_VAR = "OMNIGENT_HIDE_COST"
+
+
+def cost_display_hidden() -> bool:
+    """Whether the operator hides USD cost from session views."""
+    return env_var_is_truthy(HIDE_COST_ENV_VAR)
+
+
 def _priced_cost_for_display(usage: dict[str, Any]) -> float | None:
     """
     Extract ``total_cost_usd`` for client display, or ``None`` when unpriced.
@@ -2329,12 +2340,17 @@ def _priced_cost_for_display(usage: dict[str, Any]) -> float | None:
     the UI) is distinct from a priced ``$0.00``. The cost-budget policy is
     unaffected — it reads the value with a ``0.0`` default.
 
+    Operators whose catalog and harness costs are both non-authoritative set
+    ``OMNIGENT_HIDE_COST=1`` to report sessions as unpriced in the session view
+    (snapshot, ``session.usage`` events, per-model breakdown). Token counts, the
+    stored cost budget policies read, and the ``/v1/usage`` report are kept.
+
     :param usage: A conversation's ``session_usage`` dict, e.g.
         ``{"input_tokens": 1200, "total_cost_usd": 0.42}`` (priced) or
         ``{"input_tokens": 1200}`` (unpriced — no cost key).
     :returns: The cumulative cost in USD when priced, else ``None``.
     """
-    if "total_cost_usd" not in usage:
+    if "total_cost_usd" not in usage or cost_display_hidden():
         return None
     try:
         return float(usage["total_cost_usd"])
@@ -4456,6 +4472,11 @@ def _codex_subagent_labels_from_body(
         value = body.data.get(data_key)
         if isinstance(value, str) and value:
             labels[label_key] = value
+    parent_item_id = body.data.get("parent_item_id")
+    if isinstance(parent_item_id, str):
+        from omnigent.harnesses.codex_native.side_chat import PARENT_REFERENCE_ITEM_LABEL
+
+        labels[PARENT_REFERENCE_ITEM_LABEL] = parent_item_id
     return labels
 
 
@@ -5374,6 +5395,8 @@ def reconcile_orphaned_running_status(
     session_id: str,
     conversation_store: ConversationStore,
     stale_before: int,
+    *,
+    host_session_recoverer: HostSessionRecoverer | None = None,
 ) -> bool:
     """
     Settle a session that reads ``running`` but whose runner is
@@ -5399,8 +5422,24 @@ def reconcile_orphaned_running_status(
     :param stale_before: Runner stamps at or after this epoch are fresh.
     :returns: Whether this call performed the transition.
     """
+    interrupted = (
+        conversation_store.get_conversation(session_id)
+        if host_session_recoverer is not None
+        else None
+    )
     if not conversation_store.settle_orphaned_live_status(session_id, stale_before):
         return False
+    if interrupted is not None and host_session_recoverer is not None:
+        host_session_recoverer.record_interruption(interrupted)
+        if host_session_recoverer.enabled(interrupted.host_id):
+            recovery = conversation_store.get_session_recovery(session_id)
+            if (
+                recovery is not None
+                and recovery.host_id == interrupted.host_id
+                and recovery.runner_id == interrupted.runner_id
+                and recovery.phase in {"pending", "launching", "dispatching", "submitted"}
+            ):
+                return True
     _publish_status(
         session_id,
         "idle",
@@ -5936,6 +5975,26 @@ def _publish_btw_sidechat(
         truncated=truncated,
     )
     session_stream.publish(session_id, event.model_dump())
+
+
+def _codex_side_chat_resume_supported(
+    parent: Conversation | None,
+    runner_router: RunnerRouter | None,
+    host_registry: HostRegistry | None,
+) -> bool:
+    """Prefer the connected parent runner's report over its host's build support."""
+    from omnigent.host.frames import CAP_CODEX_SIDE_CHAT_RESUME
+
+    if parent is None:
+        return False
+    if (
+        parent.runner_id is not None
+        and runner_router is not None
+        and runner_router.runner_is_online(parent.runner_id)
+    ):
+        return runner_router.runner_has_capability(parent.runner_id, CAP_CODEX_SIDE_CHAT_RESUME)
+    host = host_registry.get(parent.host_id) if host_registry and parent.host_id else None
+    return host is not None and CAP_CODEX_SIDE_CHAT_RESUME in host.hello.capabilities
 
 
 async def _runner_supports_side_chat_settings(
@@ -6549,6 +6608,8 @@ async def _launch_runner_on_host_impl(
     host_conn: HostConnection,
     *,
     replace_move_claim: bool = False,
+    recovery: SessionRecovery | None = None,
+    recovery_allowed: Callable[[], bool] | None = None,
 ) -> _HostLaunchAttempt:
     """
     Ask a host to spawn a runner for a session and capture the result.
@@ -6606,10 +6667,23 @@ async def _launch_runner_on_host_impl(
             # waiting on this lock, doesn't take it for its result.
             return _move_in_progress_attempt(fresh.runner_id or "")
         last = _relaunch_last_attempt.get(conv.id)
+        # Recovery can rotate the binding without launching it. Ordinary input
+        # needs its own admission after that recovery is cancelled.
+        retry_cancelled_recovery = (
+            recovery is None
+            and last is not None
+            and last.runner_id == fresh.runner_id
+            and last.error_code == "recovery_cancelled"
+        )
         # A waiter may already have read the active flight's replacement binding.
-        if last is not None and last is not previous_attempt and last.runner_id == fresh.runner_id:
+        if (
+            not retry_cancelled_recovery
+            and last is not None
+            and last is not previous_attempt
+            and last.runner_id == fresh.runner_id
+        ):
             return last
-        if fresh.runner_id and fresh.runner_id != conv.runner_id:
+        if not retry_cancelled_recovery and fresh.runner_id and fresh.runner_id != conv.runner_id:
             if last is not None and last.runner_id == fresh.runner_id:
                 return last
             return _HostLaunchAttempt(runner_id=fresh.runner_id)
@@ -6619,6 +6693,8 @@ async def _launch_runner_on_host_impl(
             host_registry,
             host_conn,
             replace_move_claim=replace_move_claim,
+            recovery=recovery,
+            recovery_allowed=recovery_allowed,
         )
         # Re-insert so the plain dict's insertion order is newest-last, then
         # evict from the front once past the cap.
@@ -6650,8 +6726,12 @@ async def _launch_runner_on_host_locked(
     host_conn: HostConnection,
     *,
     replace_move_claim: bool = False,
+    recovery: SessionRecovery | None = None,
+    recovery_allowed: Callable[[], bool] | None = None,
 ) -> _HostLaunchAttempt:
     """The launch round-trip proper; runs under the conversation's lock."""
+    from dataclasses import replace
+
     from omnigent.host.frames import HostLaunchRunnerFrame, encode_host_frame
     from omnigent.runner.identity import token_bound_runner_id
     from omnigent.scheduled_context import current_scheduled_run
@@ -6661,11 +6741,32 @@ async def _launch_runner_on_host_locked(
         # The session is moving onto a new sandbox; that launch starts its runner.
         return _move_in_progress_attempt(conv.runner_id or "")
     await host_registry.admit_launch(host_conn, conv.id)
+    if recovery is not None and (
+        recovery_allowed is None
+        or not await asyncio.to_thread(recovery_allowed)
+        or await asyncio.to_thread(conversation_store.get_session_recovery, conv.id) != recovery
+    ):
+        return _HostLaunchAttempt(
+            runner_id=conv.runner_id or "",
+            error_code="recovery_cancelled",
+            error="Recovery was superseded before runner launch",
+        )
     superseded_runner_id = conv.runner_id
     reap_superseded = await _owns_host_runner(conv, conversation_store)
     binding_token = secrets.token_urlsafe(32)
     new_runner_id = token_bound_runner_id(binding_token)
 
+    if recovery is not None:
+        launching = replace(recovery, launch_runner_id=new_runner_id)
+        if not await asyncio.to_thread(
+            conversation_store.replace_session_recovery, conv.id, recovery, launching
+        ):
+            return _HostLaunchAttempt(
+                runner_id=conv.runner_id or "",
+                error_code="recovery_cancelled",
+                error="Recovery was superseded before runner launch",
+            )
+        recovery = launching
     try:
         # Only while the runner is still the one this launch read, so a claim a
         # move took meanwhile isn't overwritten. The host may have changed: an
@@ -6682,6 +6783,20 @@ async def _launch_runner_on_host_locked(
             error_code="session_binding_changed",
             error="the session's host or runner changed before the runner could start",
         )
+    if recovery:
+        rebound_recovery = replace(recovery, runner_id=new_runner_id)
+        if not await asyncio.to_thread(
+            conversation_store.replace_session_recovery,
+            conv.id,
+            recovery,
+            rebound_recovery,
+        ):
+            return _HostLaunchAttempt(
+                runner_id=new_runner_id,
+                error_code="recovery_cancelled",
+                error="Recovery was superseded before runner launch",
+            )
+        recovery = rebound_recovery
     if bound_conv.runner_last_seen is not None:
         # The new token has not reached the host, so this stamp can only
         # belong to the previous runner. Clear it before launching.
@@ -6743,8 +6858,20 @@ async def _launch_runner_on_host_locked(
                 # Only the binding we just replaced: an unbound session's old
                 # runner may now serve its /clear or /switch successor.
                 superseded_runner_ids=(superseded_runner_id,) if superseded_runner_id else (),
+                recovery=recovery is not None,
             )
         )
+        if recovery is not None and (
+            recovery_allowed is None
+            or not await asyncio.to_thread(recovery_allowed)
+            or await asyncio.to_thread(conversation_store.get_session_recovery, conv.id)
+            != recovery
+        ):
+            return _HostLaunchAttempt(
+                runner_id=new_runner_id,
+                error_code="recovery_cancelled",
+                error="Recovery was superseded before runner launch",
+            )
         for enqueue_attempt in range(2):
             launch_future: asyncio.Future[HostLaunchResult] = (
                 asyncio.get_running_loop().create_future()
@@ -6756,8 +6883,10 @@ async def _launch_runner_on_host_locked(
                 host_conn.pending_launches.pop(request_id, None)
                 launch_future.cancel()
                 replacement = host_registry.get(host_conn.host_id)
+                # A replacement must request recovery under its own capability and policy.
                 if (
-                    enqueue_attempt == 0
+                    recovery is None
+                    and enqueue_attempt == 0
                     and replacement is not None
                     and replacement is not host_conn
                 ):
@@ -8533,6 +8662,8 @@ async def _dispatch_skill_slash_command_to_runner(
         conversation_store,
     )
 
+    from omnigent.tools.browser_agent_tools import browser_agent_tools_turn_flag
+
     runner_body: dict[str, Any] = {
         "type": "message",
         "role": "user",
@@ -8544,6 +8675,7 @@ async def _dispatch_skill_slash_command_to_runner(
         # Live-renderer hint: the runner drops ``browser_*`` schemas for
         # the turn when no renderer is subscribed to the session stream.
         "browser_renderer_available": session_stream.has_subscribers(session_id),
+        **browser_agent_tools_turn_flag(conv.labels),
         # The forwarded message carries ``meta_content`` — i.e. the
         # META item (persisted_items[1]), not the user-visible item.
         # Hand the runner that id so a cold-cache reload drops the
@@ -11239,7 +11371,9 @@ def _reject_reserved_cost_control_label_seed(labels: dict[str, str]) -> None:
         )
 
 
-def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
+def _reject_server_reserved_label_seed(
+    labels: dict[str, str] | None, *, at_creation: bool = False
+) -> None:
     """
     Reject a client-supplied label map that touches server-internal keys.
 
@@ -11248,6 +11382,9 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     critical metadata (e.g. the policy-evaluation actor identity).
 
     :param labels: The client-supplied label mapping, or ``None``.
+    :param at_creation: Whether a session is being created, when a continuation
+        (a native ``/clear`` replacement) may carry its predecessor's browser-tool
+        label.
     :raises OmnigentError: 400 when any reserved key is present.
     """
     if not labels:
@@ -11258,6 +11395,9 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
         raise OmnigentError(
             "Sandbox profile labels are server-owned", code=ErrorCode.INVALID_INPUT
         )
+    from omnigent.session_recovery import reject_recovery_labels
+
+    reject_recovery_labels(labels)
     from omnigent.mcp_selection import MCP_SELECTION_PREFIX
 
     if any(key.startswith(MCP_SELECTION_PREFIX) for key in labels):
@@ -11271,6 +11411,7 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
         FAMILY_PIN_LABEL_PREFIX,
         SCHEDULED_TASK_ACTIVITY_LABEL_KEY,
         SCHEDULED_TASK_INITIAL_RUN_LABEL_KEY,
+        SCHEDULED_TASK_LAUNCH_LABEL_KEY,
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
         SCHEDULED_TASK_PENDING_RUN_LABEL_PREFIX,
         SCHEDULED_TASK_RUN_LABEL_KEY,
@@ -11293,6 +11434,8 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
         # Deleting a session also deletes the automation this label names.
         SCHEDULED_TASK_SOURCE_LABEL_KEY,
         SCHEDULED_TASK_WORKTREE_SOURCE_LABEL_KEY,
+        # Launches from a session carrying it are shared with that automation's grantees.
+        SCHEDULED_TASK_LAUNCH_LABEL_KEY,
         CREATED_BY_SESSION_LABEL_KEY,
     ):
         if key in labels:
@@ -11316,6 +11459,18 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     if _TURN_ACTOR_LABEL in labels:
         raise OmnigentError(
             f"label {_TURN_ACTOR_LABEL!r} is server-internal and cannot be set by clients",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    # The browser-tool mode is fixed at creation: from the app's header, or the
+    # label a continuation copies from its source.
+    from omnigent.tools.browser_agent_tools import BROWSER_AGENT_TOOLS_CREATION_LABEL_KEYS
+
+    if not at_creation and (
+        reserved := sorted(BROWSER_AGENT_TOOLS_CREATION_LABEL_KEYS & labels.keys())
+    ):
+        raise OmnigentError(
+            f"label {reserved[0]!r} is set only when a session is created"
+            " and cannot be set by clients",
             code=ErrorCode.INVALID_INPUT,
         )
     # The archive timestamp is stamped by the server on the archive transition
@@ -13127,5 +13282,6 @@ __all__ = [
     "_wait_for_runner_client",
     "announce_hosts_changed",
     "cancel_managed_launch_tasks",
+    "cost_display_hidden",
     "prefetch_session_routing_catalogs",
 ]

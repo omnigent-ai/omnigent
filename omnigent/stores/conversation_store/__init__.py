@@ -16,6 +16,7 @@ from omnigent.entities import (
     PagedList,
 )
 from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
+from omnigent.session_recovery import SessionRecovery
 from omnigent.stores.conversation_store.activity_error import (
     LATEST_ACTIVITY_ERROR_LABEL_KEY,
     LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY,
@@ -196,6 +197,9 @@ SCHEDULED_TASK_ACTIVITY_LABEL_KEY = "omnigent.scheduled_task_activity"
 # Server-owned: marks the copy an automation starts each run from (its source
 # session). The value is the task id; runs never inherit it.
 SCHEDULED_TASK_SOURCE_LABEL_KEY = "omnigent.scheduled_task_source"
+# Server-owned: the automation whose run's session tree launched this independent or
+# sibling session, directly or through other launches. Forks drop it.
+SCHEDULED_TASK_LAUNCH_LABEL_KEY = "omnigent.scheduled_task_launch"
 
 # Compare-and-swap rounds swap_label tries before giving up on a contended label.
 _LABEL_SWAP_ATTEMPTS = 5
@@ -269,6 +273,8 @@ _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
     ARCHIVED_AT_LABEL_KEY,
     # A fork of an automation's copy isn't what the automation runs from.
     SCHEDULED_TASK_SOURCE_LABEL_KEY,
+    # Nor is a fork of a session a run launched; the automation doesn't share it.
+    SCHEDULED_TASK_LAUNCH_LABEL_KEY,
     # Closing seals only that child (a stopped side chat, a closed sub-agent);
     # forking it is how the user continues it as a session of its own.
     CLOSED_LABEL_KEY,
@@ -399,6 +405,8 @@ class SessionActivity:
     :param runner_id: Bound runner, or ``None`` for an in-process session.
     :param archived: Whether the session is archived; ``None`` when the store
         doesn't report it.
+    :param current_run_id: The scheduled run the session is attributed to now,
+        e.g. ``"run_abc"``; ``None`` when unset or not reported.
     """
 
     updated_at: int
@@ -407,6 +415,7 @@ class SessionActivity:
     pending_elicitation_count: int | None = None
     runner_id: str | None = None
     archived: bool | None = None
+    current_run_id: str | None = None
 
 
 # Freshness window for ``omnigent_conversation_metadata.runner_last_seen``. The tunnel
@@ -571,6 +580,35 @@ class ConversationStore(ABC):
     ) -> bool:
         """Compare-and-set delivery state; None discards a canceled, unsent input."""
         raise NotImplementedError
+
+    supports_session_recovery = False
+
+    def admit_session_recovery(self, conversation_id: str, expected: SessionRecovery) -> bool:
+        """Order turn admission against new input and the current host/runner binding."""
+        del conversation_id, expected
+        return False
+
+    def get_session_recovery(self, conversation_id: str) -> SessionRecovery | None:
+        """Read private recovery intent; unsupported stores do not opt in."""
+        del conversation_id
+        return None
+
+    def get_session_interruption_time(self, conversation_id: str) -> int | None:
+        """Original disconnect-error timestamp, or None when unavailable."""
+        del conversation_id
+        return None
+
+    def replace_session_recovery(
+        self,
+        conversation_id: str,
+        expected: SessionRecovery | None,
+        recovery: SessionRecovery | None,
+        *,
+        expected_conversation: Conversation | None = None,
+    ) -> bool:
+        """Compare and replace recovery intent under the conversation input lock."""
+        del conversation_id, expected, recovery, expected_conversation
+        return False
 
     def list_host_conversation_ids(
         self,
@@ -777,8 +815,8 @@ class ConversationStore(ABC):
         """
         Return each session's last update time, live status and cost in one batch.
 
-        Reads activity and usage per id and no labels, so the cost is bounded by the
-        id count. Missing ids are omitted from the result.
+        Reads activity, usage and the current scheduled run label per id, so the
+        cost is bounded by the id count. Missing ids are omitted from the result.
 
         :param conversation_ids: Conversation ids, e.g. ``["conv_abc123"]``.
             Duplicates are tolerated; empty input returns ``{}`` without a query.
@@ -1140,6 +1178,8 @@ class ConversationStore(ABC):
         query: str,
         conversation_id: str | None = None,
         limit: int = 20,
+        *,
+        accessible_by: str,
     ) -> list[ConversationItem]:
         """
         Full-text search over conversation items.
@@ -1153,6 +1193,8 @@ class ConversationStore(ABC):
         :param conversation_id: Optional conversation to scope
             the search to, e.g. ``"conv_abc123"``.
         :param limit: Maximum number of results to return.
+        :param accessible_by: Authenticated user whose session permissions
+            restrict matches before the result limit.
         :returns: A list of matching :class:`ConversationItem`
             objects ranked by relevance.
         """
@@ -1571,8 +1613,16 @@ class ConversationStore(ABC):
         """Persist the Plan snapshot and return its update; missing metadata returns None."""
         raise NotImplementedError
 
-    def add_new_sibling(self, source_id: str, session_id: str, *, user_id: str | None) -> None:
+    def add_new_sibling(
+        self, source_id: str, session_id: str, *, user_id: str | None, move_existing: bool = False
+    ) -> None:
         """Assign a freshly created session to its source's family before launch."""
+        raise NotImplementedError
+
+    def set_session_nest(
+        self, session_id: str, source_id: str | None, *, user_id: str | None
+    ) -> None:
+        """Move one independent session into a nest, or detach it with ``None``."""
         raise NotImplementedError
 
     def get_session_family(self, session_id: str) -> list[Conversation]:
@@ -2115,6 +2165,10 @@ class ConversationStore(ABC):
 
     def get_profile_host_binding(self, conversation_id: str) -> ProfileHostBinding:
         """Read host metadata and canonical profile labels by their complete unique keys."""
+        raise NotImplementedError
+
+    def get_profile_labels(self, conversation_ids: list[str]) -> dict[str, dict[str, str]]:
+        """Read many sessions' canonical profile labels in one query; unlabeled ones are absent."""
         raise NotImplementedError
 
     def bind_profiled_host(

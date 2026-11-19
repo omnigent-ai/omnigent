@@ -93,8 +93,12 @@ vi.mock("@/hooks/RunnerHealthProvider", () => ({
 // Stub the switch dialog: it owns its own network/query wiring, so the badge
 // test only cares that it is mounted with the session's current binding.
 vi.mock("@/shell/SwitchHostDialog", () => ({
-  SwitchHostDialog: (props: { currentHostId: string | null }) => (
-    <div data-testid="switch-host-dialog" data-current-host={props.currentHostId ?? ""} />
+  SwitchHostDialog: (props: { sessionId: string; currentHostId: string | null }) => (
+    <div
+      data-testid="switch-host-dialog"
+      data-session-id={props.sessionId}
+      data-current-host={props.currentHostId ?? ""}
+    />
   ),
 }));
 
@@ -374,6 +378,31 @@ describe("HostBadge", () => {
     expect(tooltip).toHaveTextContent("Host: None");
     expect(tooltip).not.toHaveTextContent("Status:");
   });
+
+  it.each(["composer", "header"] as const)(
+    "opens the host picker from the %s menu when the session has no bindings",
+    (appearance) => {
+      useSessionMock.mockReturnValue({
+        session: { hostId: null, runnerId: null, workspace: null },
+        isLoading: false,
+        error: null,
+      });
+      useHostsMock.mockReturnValue({ data: undefined });
+      useSessionHostOnlineMock.mockReturnValue(null);
+      const { rerender } = render(
+        <HostBadge sessionId="conv_1" appearance={appearance} readOnly />,
+      );
+      const trigger = screen.getByTestId("composer-host-select");
+      expect(trigger).toHaveAccessibleName("No host bound");
+      fireEvent.pointerDown(trigger, { button: 0 });
+      expect(screen.queryByRole("menuitem", { name: "Switch host…" })).not.toBeInTheDocument();
+      rerender(<HostBadge sessionId="conv_1" appearance={appearance} />);
+      const item = screen.getByRole("menuitem", { name: "Switch host…" });
+      expect(item).not.toHaveAttribute("aria-disabled", "true");
+      fireEvent.click(item);
+      expect(screen.getByTestId("switch-host-dialog")).toHaveAttribute("data-current-host", "");
+    },
+  );
 
   it("keeps the composer host tooltip closed while the host menu is open", async () => {
     render(<HostBadge sessionId="conv_1" appearance="composer" />);
@@ -781,6 +810,7 @@ describe("HostBadge during a sandbox launch", () => {
     expect(menu).not.toHaveTextContent("No host bound");
     expect(menu).not.toHaveTextContent("no host binding");
     expect(screen.queryByRole("menuitem", { name: "Reconnect host" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Switch host…" })).not.toBeInTheDocument();
   });
 
   it("names the launching provider until the bound sandbox's host record loads", () => {
@@ -892,5 +922,43 @@ describe("HostBadge during a sandbox launch", () => {
     useChatStore.setState({ conversationId: "conv_other" });
     render(<HostBadge sessionId="conv_1" appearance="composer" />);
     expect(screen.getByTestId("composer-host-select")).toHaveAccessibleName("No host bound");
+  });
+});
+
+describe("HostBadge in a grid cell", () => {
+  afterEach(() => useChatStore.setState({ conversationId: null, sandboxStatus: null }));
+
+  it("offers Switch host… and switches that cell's session, not the open one", () => {
+    useChatStore.setState({ conversationId: "conv_open" });
+    render(<HostBadge sessionId="conv_cell" appearance="composer" />);
+    fireEvent.pointerDown(screen.getByTestId("composer-host-select"), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: "Switch host…" }));
+    expect(screen.getByTestId("switch-host-dialog")).toHaveAttribute(
+      "data-session-id",
+      "conv_cell",
+    );
+  });
+
+  it("prefers the launch a cell passes in over the open session's own launch", () => {
+    // The cell is also the open session, so its store launch would show without the prop.
+    useChatStore.setState({
+      conversationId: "conv_cell",
+      sandboxStatus: { stage: "provisioning", error: null },
+    });
+    useSessionMock.mockReturnValue({ session: { hostId: null } });
+    const { rerender } = render(
+      <HostBadge sessionId="conv_cell" appearance="composer" launch={null} />,
+    );
+    expect(screen.getByTestId("composer-host-select")).toHaveAccessibleName("No host bound");
+    rerender(
+      <HostBadge
+        sessionId="conv_cell"
+        appearance="composer"
+        launch={{ stage: "connecting", error: null }}
+      />,
+    );
+    expect(screen.getByTestId("composer-host-select")).toHaveAccessibleName(
+      "Host Sandbox, Starting agent",
+    );
   });
 });

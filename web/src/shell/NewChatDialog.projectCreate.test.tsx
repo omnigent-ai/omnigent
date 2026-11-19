@@ -259,7 +259,10 @@ function setRepoIsGit(): void {
   });
 }
 
-function renderLanding(infoOverrides: Partial<ServerInfo> = {}): {
+function renderLanding(
+  infoOverrides: Partial<ServerInfo> = {},
+  landingProps: Parameters<typeof NewChatLandingScreen>[0] = {},
+): {
   rerender: (ui: ReactNode) => void;
   unmount: () => void;
   client: QueryClient;
@@ -298,7 +301,9 @@ function renderLanding(infoOverrides: Partial<ServerInfo> = {}): {
       </QueryClientProvider>
     );
   }
-  const { rerender, unmount } = render(<NewChatLandingScreen />, { wrapper: Wrapper });
+  const { rerender, unmount } = render(<NewChatLandingScreen {...landingProps} />, {
+    wrapper: Wrapper,
+  });
   return { rerender, unmount, client };
 }
 
@@ -673,6 +678,55 @@ describe("NewChatLandingScreen project-aware create (first-class project_id)", (
     expect("host_id" in metadata).toBe(false);
     expect(setSessionHost).not.toHaveBeenCalled();
   });
+
+  it.each([
+    { target: "a connected host", sandbox: false },
+    { target: "a durable sandbox", sandbox: true },
+  ])(
+    "delivers a pending custom agent's first message from the project home on $target",
+    async ({ sandbox }) => {
+      setProjectConfig({ host_id: "host_1", workspace: REPO });
+      vi.mocked(createBundledSession).mockResolvedValue({ id: "conv_new", agentId: "ag_pending" });
+      searchParams = new URLSearchParams();
+      const onSessionStarted = vi.fn();
+      renderLanding(
+        {
+          session_bundle_workspaces: true,
+          managed_sandboxes_enabled: sandbox,
+          durable_initial_input: sandbox,
+        },
+        { projectName: "Alpha", onSessionStarted },
+      );
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain(
+          "alpha",
+        ),
+      );
+      if (sandbox) {
+        fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+        fireEvent.click(screen.getByTestId("new-chat-landing-sandbox-option"));
+      }
+      fireEvent.click(screen.getByTestId("test-create-pending"));
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "hello" },
+      });
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      await waitFor(() => expect(onSessionStarted).toHaveBeenCalled());
+
+      const { setPendingInitialPrompt } = await import("@/store/chatStore");
+      if (sandbox) {
+        // The server delivers it once, so the board stays in view.
+        expect(setPendingInitialPrompt).not.toHaveBeenCalled();
+        expect(navigateMock).not.toHaveBeenCalled();
+      } else {
+        expect(setPendingInitialPrompt).toHaveBeenCalledWith(
+          "conv_new",
+          expect.objectContaining({ text: "hello" }),
+        );
+        expect(navigateMock).toHaveBeenCalledWith("/c/conv_new");
+      }
+    },
+  );
 });
 
 describe("NewChatLandingScreen nested agent creation", () => {
@@ -776,6 +830,10 @@ describe("NewChatLandingScreen nested agent creation", () => {
   it.each([false, true])(
     "submits the clicked source for JSON and uploaded agents (bundle=%s)",
     async (bundled) => {
+      // jsdom's default user agent names the OS running the tests; pin one the label maps.
+      const userAgent = vi
+        .spyOn(navigator, "userAgent", "get")
+        .mockReturnValue("Mozilla/5.0 (X11; Linux x86_64)");
       vi.mocked(getSessionSlim).mockImplementation(async (id) => ({ ...SOURCE_SESSION, id }));
       searchParams = new URLSearchParams("sibling=other");
       renderLanding({ sibling_sessions: true });
@@ -830,6 +888,7 @@ describe("NewChatLandingScreen nested agent creation", () => {
       );
       expect(screen.getByText("other.txt")).toBeVisible();
       expect(screen.queryByText("submitted.txt")).not.toBeInTheDocument();
+      userAgent.mockRestore();
     },
   );
 });

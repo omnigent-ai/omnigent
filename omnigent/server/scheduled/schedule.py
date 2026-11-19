@@ -19,17 +19,22 @@ from omnigent.server.scheduled.rrule import (
 _logger = logging.getLogger(__name__)
 
 
-def next_scheduled_time(task: ScheduledTask, after: int) -> int | None:
-    """Next occurrence; search-budget errors propagate so callers preserve the cursor."""
-    if task.state != "active":
-        return None
+def task_timezone(task: ScheduledTask) -> ZoneInfo:
+    """The task's IANA timezone, or UTC when it is missing or unknown."""
     try:
-        timezone = ZoneInfo(task.timezone or "UTC")
+        return ZoneInfo(task.timezone or "UTC")
     except (ZoneInfoNotFoundError, ValueError):
         _logger.warning(
             "Unknown timezone %r for task %s; defaulting to UTC", task.timezone, task.id
         )
-        timezone = ZoneInfo("UTC")
+        return ZoneInfo("UTC")
+
+
+def next_scheduled_time(task: ScheduledTask, after: int) -> int | None:
+    """Next occurrence; search-budget errors propagate so callers preserve the cursor."""
+    if task.state != "active":
+        return None
+    timezone = task_timezone(task)
     try:
         occurrence = get_next_fire_time(
             task.rrule,
@@ -55,10 +60,22 @@ def manual_trigger_key() -> str:
     return f"manual:{uuid.uuid4().hex}"
 
 
+# Namespace for task IDs that are not UUIDs, such as ones a deployment allocates.
+_NON_UUID_TASK_ID_NAMESPACE = uuid.UUID("8220eb40-f537-40d8-882a-419033fcd6ad")
+
+
+def _task_id_namespace(task_id: str) -> uuid.UUID:
+    """The UUIDv5 namespace a task's sandbox host IDs derive from: the ID itself if a UUID."""
+    try:
+        return uuid.UUID(task_id)
+    except ValueError:
+        return uuid.uuid5(_NON_UUID_TASK_ID_NAMESPACE, task_id)
+
+
 def sandbox_host_id(task_id: str, workspace_id: int, trigger_key: str) -> str:
     """The fresh sandbox identity for one occurrence, from fields no task edit changes."""
     # UUIDv5 lets every replica derive the same sandbox host ID for this task occurrence.
-    return uuid.uuid5(uuid.UUID(task_id), f"{workspace_id}:{trigger_key}").hex
+    return uuid.uuid5(_task_id_namespace(task_id), f"{workspace_id}:{trigger_key}").hex
 
 
 def continued_sandbox_host_id(task_id: str, workspace_id: int) -> str:
@@ -67,7 +84,7 @@ def continued_sandbox_host_id(task_id: str, workspace_id: int) -> str:
     Derived only from fields no task edit changes, so every run routes to the
     replica holding that sandbox's connection, and a session reset keeps it.
     """
-    return uuid.uuid5(uuid.UUID(task_id), f"{workspace_id}:continue").hex
+    return uuid.uuid5(_task_id_namespace(task_id), f"{workspace_id}:continue").hex
 
 
 def occurrence_host_id(task: ScheduledTask, trigger_key: str) -> str | None:
@@ -84,11 +101,13 @@ def host_ownership_key(workspace_id: int, host_id: str | None) -> str:
     return host_id if host_id is not None else str(workspace_id)
 
 
+# The services trigger templates watch, as their prompts name them.
+TRIGGER_SERVICE_NAMES = ("Jira", "Slack", "GitHub", "Linear", "PagerDuty")
 # A task doesn't record its template, so, like the web form (``isTriggerPrompt`` in
 # web/src/components/scheduled/triggerTemplates.ts), recognize the opening sentence.
 _TRIGGER_PROMPT_OPENINGS = tuple(
     f"This automation watches {source} and starts one Omnigent session"
-    for source in ("Jira", "Slack", "GitHub", "Linear", "PagerDuty")
+    for source in TRIGGER_SERVICE_NAMES
 )
 # The trigger form saves its state as the prompt's first line; the model never sees it.
 # Keep in sync with TRIGGER_HEADER_PATTERN in web/src/components/scheduled/triggerTemplates.ts.
@@ -99,6 +118,11 @@ def strip_trigger_header(prompt: str) -> str:
     """Return ``prompt`` without the trigger form's header line, if it has one."""
     match = _TRIGGER_HEADER.match(prompt)
     return prompt[match.end() :] if match else prompt
+
+
+def is_trigger_prompt(prompt: str) -> bool:
+    """Whether ``prompt`` was rendered from a trigger template, by its opening sentence."""
+    return strip_trigger_header(prompt).startswith(_TRIGGER_PROMPT_OPENINGS)
 
 
 def fits_reminder(task: ScheduledTask) -> bool:
@@ -114,4 +138,4 @@ def is_trigger_automation(task: ScheduledTask) -> bool:
     """Whether a task was set up from a trigger template and polls for new items."""
     if task.session_mode != "continue":
         return False
-    return strip_trigger_header(task.prompt).startswith(_TRIGGER_PROMPT_OPENINGS)
+    return is_trigger_prompt(task.prompt)

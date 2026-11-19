@@ -4327,14 +4327,15 @@ describe("NewChatLandingScreen", () => {
     expect(tooltip).not.toHaveTextContent("Status:");
   });
 
-  it("uses a home-specific focus shadow without a resting shadow or focus border", () => {
+  it("uses one hover and focus shadow without a resting shadow or focus border", () => {
     renderLanding();
 
     const composer = screen.getByTestId("new-chat-landing-composer");
     expect(composer).toHaveClass(
       "composer-reference-surface",
       "border",
-      "has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]",
+      "hover:shadow-[var(--composer-shadow)]",
+      "has-[textarea:focus]:shadow-[var(--composer-shadow)]",
     );
     expect(composer).not.toHaveClass("bg-card", "dark:bg-card-solid");
     expect(composer).not.toHaveClass("shadow-[var(--composer-shadow)]");
@@ -7155,8 +7156,7 @@ describe("NewChatLandingScreen", () => {
 
   it("leaves plain Enter as a newline on a phone viewport", async () => {
     // Touch keyboards own the create action (the on-screen button), so plain
-    // Enter never creates — same rule as the in-session composer on a coarse
-    // pointer.
+    // Enter never creates — same rule as the in-session composer.
     const restoreViewport = forceMobileViewport();
     try {
       renderLanding();
@@ -10272,7 +10272,7 @@ describe("NewChatLandingScreen attachments", () => {
     fireEvent.dragOver(composer, { dataTransfer: fileDrag() });
     expect(screen.getByText("Drop files here")).toBeTruthy();
     expect(composer).toHaveClass("ring-2", "ring-ring", "ring-inset");
-    expect(composer).toHaveClass("has-[textarea:focus]:shadow-[var(--composer-shadow-focus)]");
+    expect(composer).toHaveClass("has-[textarea:focus]:shadow-[var(--composer-shadow)]");
     // Dropping a file attaches it (chip proves it reached state) and clears
     // the overlay.
     const file = new File(["hello"], "dropped.txt", { type: "text/plain" });
@@ -13157,6 +13157,116 @@ describe("managed sandbox inference models", () => {
       expect(body.inference_configuration_revision).toBeUndefined();
     },
   );
+
+  it("offers Codex a model choice on a sandbox without an inference catalog", () => {
+    mockHosts([]);
+    renderLanding({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "agent_sandbox",
+      sandbox_provider_capabilities: { agent_sandbox: { multi_repo: true } },
+    });
+    openAgentModels("a2");
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(/Codex/);
+    const menu = screen
+      .getByTestId("new-chat-landing-agent-models")
+      .closest<HTMLElement>('[role="menu"]')!;
+    expect(within(menu).queryByText("Models unavailable")).toBeNull();
+    expect(within(menu).queryAllByTestId(/^new-chat-landing-agent-model-/)).not.toHaveLength(0);
+  });
+
+  function sandboxModelMenu(): HTMLElement {
+    return screen
+      .getByTestId("new-chat-landing-agent-models")
+      .closest<HTMLElement>('[role="menu"]')!;
+  }
+
+  it.each([
+    ["Codex", "a2"],
+    ["Devin", "a3"],
+    ["Pi", "a4"],
+  ])(
+    "launches %s with the harness default from a sandbox without inference config",
+    async (name, agentId) => {
+      mockHosts([]);
+      mockAgents([
+        ...DEFAULT_LANDING_AGENTS,
+        testAgent("a3", "devin-native-ui", { display_name: "Devin", harness: "devin-native" }),
+        testAgent("a4", "pi-native-ui", { display_name: "Pi", harness: "pi-native" }),
+      ]);
+      authenticatedFetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as Response);
+      renderLanding({
+        managed_sandboxes_enabled: true,
+        sandbox_provider: "agent_sandbox",
+        sandbox_provider_capabilities: { agent_sandbox: { multi_repo: true } },
+      });
+      openAgentModels(agentId);
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        new RegExp(name),
+      );
+      const menu = sandboxModelMenu();
+      expect(within(menu).queryByText("Models unavailable")).toBeNull();
+      const modelRows = within(menu)
+        .queryAllByTestId(/^new-chat-landing-agent-model-/)
+        .filter((row) => row.getAttribute("role") === "menuitemcheckbox");
+      expect(modelRows.map((row) => row.dataset.testid)).toEqual([
+        "new-chat-landing-agent-model-default",
+      ]);
+      expect(modelRows[0]).toHaveAttribute("aria-checked", "true");
+      closeMenu();
+      const { body } = await submitAndReadBody();
+      expect(body.host_type).toBe("managed");
+      expect(body.model_override).toBeUndefined();
+    },
+  );
+
+  it("offers the harness default when inference discovery reports the harness unconfigured", async () => {
+    mockHosts([]);
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as Response);
+    renderConfiguredSandbox({ managed_sandboxes_enabled: true, sandbox_provider: "agent_sandbox" });
+    openAgentModels("a2");
+    expect(useSandboxModelOptions).toHaveBeenLastCalledWith(
+      "agent_sandbox",
+      "codex-native",
+      "a2",
+      null,
+      true,
+    );
+    const menu = sandboxModelMenu();
+    expect(within(menu).queryByText("Models unavailable")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-agent-model-default")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    closeMenu();
+    const { body } = await submitAndReadBody();
+    expect(body.host_type).toBe("managed");
+    expect(body.model_override).toBeUndefined();
+    expect(body.inference_configuration_revision).toBeUndefined();
+  });
+
+  it("offers a sandbox the harness default only once server capabilities resolve", () => {
+    mockHosts([]);
+    const { rerenderWith } = renderLanding("loading");
+    expect(screen.queryByTestId("new-chat-landing-agent-select")).toBeNull();
+    rerenderWith({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "agent_sandbox",
+      sandbox_provider_capabilities: { agent_sandbox: { multi_repo: true } },
+    });
+    openAgentModels("a2");
+    const menu = sandboxModelMenu();
+    expect(within(menu).queryByText("Models unavailable")).toBeNull();
+    expect(within(menu).getByTestId("new-chat-landing-agent-model-default")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+  });
 
   it("does not preview inference for an ordinary host on an opted-in server", () => {
     preview(catalog, new Error("Gateway unavailable"));

@@ -117,8 +117,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
   warnings, Inbox surfacing, session deduplication and browser-local dismissal.
 
 - [Automation sharing](./automation-sharing.md) covers the owner's Share action on
-  the detail page and row menus, the read-only share dialog, and the warning on a
-  session an automation manages.
+  the detail page and row menus, the read-only share dialog, the warning on a
+  session an automation manages, and what the people it is shared with see: the
+  Shared with me tab, the read-only automation page and the sidebar folder.
 
 - [Automation templates](./automation-templates.md) covers the gallery tabs,
   suggestions on Your automations, and direct template setup.
@@ -173,6 +174,8 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
   custom-agent targets, fork access checks, archive, reconnect, and resume.
 - [Video recordings](./video-rendering.md) covers inline chat playback, remote
   recording links, file previews, and download fallbacks.
+- [Data-file table preview](./data-table-preview.md) covers CSV and TSV files
+  opening as a sortable, filterable table, its row bounds, and encodings.
 - [Tool calls in chat](./tool-calls.md) covers tool-call rows and their edit
   counts, the expanded field, error and Raw views, and tool-run folding.
 - [Sandbox profiles](./sandbox-profiles.md) covers provider-owned discovery,

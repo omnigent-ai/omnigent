@@ -19,6 +19,8 @@ import { authenticatedFetch } from "./identity";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
 import { sessionRoutingHostId, setSessionHost, setSessionParent } from "./sessionHost";
 import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitlesPreferences";
+import { browserAgentToolsRequestHeaders } from "@/components/BrowserPane/agentTools/preferences";
+import { timezoneRequestHeaders } from "./timezones";
 import { parseBackgroundTasks } from "./sse";
 import type {
   BackgroundTaskInfo,
@@ -204,6 +206,8 @@ interface SessionResponseWire {
   last_total_tokens?: number | null;
   usage_included?: boolean;
   total_cost_usd?: number | null;
+  /** `true` when the operator hides USD cost; clients clear any cached cost. */
+  cost_hidden?: boolean | null;
   /**
    * Per-model breakdown of the same subtree usage, keyed by the raw harness
    * model id. Each value is a `ModelUsage` (the five token buckets + optional
@@ -400,6 +404,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     lastTotalTokens: wire.last_total_tokens,
     usageIncluded: wire.usage_included ?? true,
     totalCostUsd: wire.total_cost_usd,
+    costHidden: wire.cost_hidden === true,
     usageByModel: usageByModelFromWire(wire.usage_by_model),
     lastTaskError: wire.last_task_error,
     pendingElicitations: wire.pending_elicitations ?? [],
@@ -680,6 +685,7 @@ export async function createSession(
       "Content-Type": "application/json",
       "X-Omnigent-Client": getClientSurface(),
       ...backgroundSessionTitlesRequestHeaders(),
+      ...timezoneRequestHeaders(),
     },
     body: JSON.stringify(body),
   });
@@ -755,7 +761,11 @@ export async function importLocalSessions(
   const body = { host_id: hostId, source, limit, session_id: sessionId };
   const res = await authenticatedFetch("/v1/imports/local/stream", {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
+    headers: {
+      "Content-Type": "application/json",
+      "X-Omnigent-Client": getClientSurface(),
+      ...browserAgentToolsRequestHeaders(),
+    },
     body: JSON.stringify(body),
   });
   // Older server without the streaming endpoint: fall back to the buffered
@@ -862,7 +872,11 @@ async function importLocalSessionsBuffered(
 ): Promise<LocalImportResult> {
   const res = await authenticatedFetch("/v1/imports/local", {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
+    headers: {
+      "Content-Type": "application/json",
+      "X-Omnigent-Client": getClientSurface(),
+      ...browserAgentToolsRequestHeaders(),
+    },
     body: JSON.stringify({ host_id: hostId, source, limit }),
   });
   const wire = await readJsonOrThrow<{
@@ -939,6 +953,7 @@ export async function createBundledSession(
     headers: {
       "X-Omnigent-Client": getClientSurface(),
       ...backgroundSessionTitlesRequestHeaders(),
+      ...timezoneRequestHeaders(),
     },
     body: form,
   });
@@ -1092,7 +1107,11 @@ export async function forkSession(
   }
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sourceId)}/fork`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },
+    headers: {
+      "Content-Type": "application/json",
+      "X-Omnigent-Client": getClientSurface(),
+      ...browserAgentToolsRequestHeaders(), // this app's advanced browser tools switch
+    },
     body: JSON.stringify(body),
   });
   return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
@@ -1627,6 +1646,7 @@ export async function getSessionSignInLink(
 export interface SessionUsageSnapshot {
   id: string;
   totalCostUsd: number | null;
+  costHidden: boolean;
   usageByModel: Record<string, ModelUsage> | null;
 }
 
@@ -1646,12 +1666,13 @@ export async function getSessionUsage(
     { signal: options.signal },
   );
   const wire =
-    await readJsonOrThrow<Pick<SessionResponseWire, "id" | "total_cost_usd" | "usage_by_model">>(
-      res,
-    );
+    await readJsonOrThrow<
+      Pick<SessionResponseWire, "id" | "total_cost_usd" | "cost_hidden" | "usage_by_model">
+    >(res);
   return {
     id: wire.id,
     totalCostUsd: wire.total_cost_usd ?? null,
+    costHidden: wire.cost_hidden === true,
     usageByModel: usageByModelFromWire(wire.usage_by_model),
   };
 }

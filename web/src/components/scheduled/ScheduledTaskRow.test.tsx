@@ -38,6 +38,7 @@ function task(overrides: Partial<ScheduledTask> = {}): ScheduledTask {
     modelOverride: null,
     reasoningEffort: null,
     permissionMode: null,
+    mcpServices: [],
     sessionMode: "new",
     sessionId: null,
     workspace: null,
@@ -148,12 +149,19 @@ describe("⋯ menu actions", () => {
     expect(screen.queryByTestId("task-share")).toBeNull();
   });
 
-  it("shows Share disabled, without dispatching, when given a reason", () => {
+  // The page passes the reason, e.g. for a legacy automation.
+  it.each([
+    ["⋯ menu", () => fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 })],
+    ["right-click menu", () => fireEvent.contextMenu(screen.getByTestId("scheduled-task-row"))],
+  ])("shows Share disabled with its reason in the %s, without dispatching", async (_, open) => {
     const onShare = vi.fn();
-    renderRow(task(), { onShare, shareDisabledReason: "Sharing is off." });
-    fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
+    const reason = "This is a legacy automation. Recreate it to share it.";
+    renderRow(task(), { onShare, shareDisabledReason: reason });
+    open();
     const share = screen.getByRole("menuitem", { name: "Share" });
     expect(share).toHaveAttribute("aria-disabled", "true");
+    fireEvent.focus(share);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(reason);
     fireEvent.click(share);
     expect(onShare).not.toHaveBeenCalled();
   });
@@ -161,6 +169,53 @@ describe("⋯ menu actions", () => {
   it("disables the menu trigger while the row is busy", () => {
     renderRow(task(), { busy: true });
     expect(screen.getByTestId("task-row-menu")).toBeDisabled();
+  });
+});
+
+describe("an automation shared with the viewer", () => {
+  const shared = (overrides: Partial<ScheduledTask> = {}) =>
+    task({
+      ownerUserId: "alice@example.com",
+      viewerRole: "viewer",
+      ownerDisplayName: "Alice",
+      ...overrides,
+    });
+  const ACTIONS = ["task-run-now", "task-edit", "task-share", "task-pause-toggle", "task-delete"];
+
+  it("names the owner before the schedule", () => {
+    renderRow(shared({ ownerDisplayName: null }));
+    expect(screen.getByTestId("task-schedule-line").textContent).toMatch(
+      /^Shared by alice@example\.com · Weekdays/,
+    );
+    cleanup();
+    renderRow(task({ ownerUserId: "alice@example.com" }));
+    expect(screen.queryByTestId("task-owner")).toBeNull();
+  });
+
+  it.each([
+    ["⋯ menu", () => fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 })],
+    ["right-click menu", () => fireEvent.contextMenu(screen.getByTestId("scheduled-task-row"))],
+  ])("shows every action disabled in the %s, saying only the owner can", async (_l, open) => {
+    const handlers = {
+      onEdit: vi.fn(),
+      onPauseToggle: vi.fn(),
+      onRunNow: vi.fn(),
+      onDelete: vi.fn(),
+      onShare: vi.fn(),
+    };
+    renderRow(shared({ state: "paused" }), handlers);
+    open();
+    for (const testId of ACTIONS) {
+      const item = screen.getByTestId(testId);
+      expect(item).toHaveAttribute("aria-disabled", "true");
+      fireEvent.click(item);
+    }
+    expect(screen.getByTestId("task-pause-toggle")).toHaveTextContent("Resume");
+    for (const handler of Object.values(handlers)) expect(handler).not.toHaveBeenCalled();
+    fireEvent.focus(screen.getByTestId("task-delete").parentElement!);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(
+      "Only the automation's owner can delete it.",
+    );
   });
 });
 
@@ -231,19 +286,21 @@ it.each(["continue", "new"] as const)(
     renderRow(
       task({
         prompt: "This automation watches Slack and starts one Omnigent session",
+        rrule: "FREQ=MINUTELY;INTERVAL=10",
         sessionMode,
         nextRunAt: "2026-03-10T14:00:00Z",
       }),
     );
     fireEvent.pointerDown(screen.getByTestId("task-row-menu"), { button: 0 });
     expect(await screen.findByTestId("task-edit")).toBeInTheDocument();
+    const scheduleLine = screen.getByTestId("task-schedule-line");
     if (sessionMode === "continue") {
-      expect(screen.getByTestId("task-schedule-line")).toHaveTextContent(
-        "Runs when new items match",
-      );
+      expect(scheduleLine).toHaveTextContent("Runs when new items match");
+      expect(scheduleLine).not.toHaveTextContent("Every 10 minutes");
       expect(screen.queryByTestId("task-next-run")).not.toBeInTheDocument();
       expect(screen.queryByTestId("task-run-now")).not.toBeInTheDocument();
     } else {
+      expect(scheduleLine).toHaveTextContent("Every 10 minutes");
       expect(screen.getByTestId("task-next-run")).toBeInTheDocument();
       expect(screen.getByTestId("task-run-now")).toBeInTheDocument();
     }

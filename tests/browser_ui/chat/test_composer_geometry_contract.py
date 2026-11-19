@@ -162,7 +162,7 @@ def test_landing_and_live_cards_share_the_geometry_contract(
     for surface in ("landing", "live"):
         _surface(page, chat, surface, viewport)
         card_locator = page.locator("[data-composer-card]")
-        if viewport["width"] < 768:
+        if viewport["width"] < 1181:
             expect(card_locator).to_have_attribute("data-mobile-composer", "collapsed")
         card = box(card_locator)
         container = box(card_locator.locator(".."))
@@ -172,7 +172,8 @@ def test_landing_and_live_cards_share_the_geometry_contract(
         assert_within_viewport(box(_submit(page, surface)), viewport["width"])
         assert document_width(page) <= viewport["width"]
         submit = box(_submit(page, surface))
-        if touch or viewport["width"] < 768:
+        mobile_layout = viewport["width"] < 1181
+        if mobile_layout:
             assert submit["width"] >= 44 and submit["height"] >= 44
         else:
             assert submit["height"] < 44
@@ -185,7 +186,7 @@ def test_landing_and_live_cards_share_the_geometry_contract(
         expect(menu).to_be_visible()
         _settle_menu(menu)
         assert_within_viewport(box(menu), viewport["width"])
-        if touch:
+        if mobile_layout:
             for row in menu.get_by_role("menuitem").all():
                 bounds = box(row)
                 assert bounds["width"] >= 44 and bounds["height"] >= 44
@@ -1198,7 +1199,6 @@ def test_composer_growth_reflows_without_covering_output(
     composer.click()
     touch_baseline = settled_geometry(page)
     assert_clearance(touch_baseline, "native touch baseline")
-    # Keep touch input emulated while measuring: ending it resizes touch-sized targets.
     with native_touch_emulation(page) as touch_session:
         touch = scroll_with_native_touch(page, touch_session)
         assert touch["settledDistance"] > 100, touch
@@ -1346,6 +1346,48 @@ def test_composer_growth_stays_bottom_pinned_every_frame(
     assert grown["distanceFromBottom"] <= TOLERANCE
 
 
+def test_phone_composer_growth_keeps_the_bottom_through_a_scroll_before_remeasure(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    chat = chat_session_contract
+    seed_long_transcript(chat, 20)
+    open_live(page, chat, PHONE)
+    # After a reload, rows measuring shorter than their estimates can clamp the
+    # scroll position, which releases StickToBottom's lock at the bottom; then
+    # only the composer growth pin holds it.
+    page.reload()
+    expect(page.get_by_text("Turn 20 response", exact=False).first).to_be_visible()
+    start = settled_geometry(page)
+    assert start["mobileOverlay"], start
+    assert start["distanceFromBottom"] <= TOLERANCE, start
+    # Until the overlay re-measures, a grown composer shortens the transcript's
+    # viewport. A scroll event read in that window (in practice the growth pin's
+    # own, a frame late) is not the reader leaving the bottom.
+    stale = page.evaluate(
+        """() => {
+          const ta = document.querySelector('textarea[aria-label="Message the agent"]');
+          const form = ta.closest('form');
+          const scroller = form.parentElement.querySelector('[role="log"] > div');
+          const surface = form.closest('[data-chat-surface]');
+          form.style.minHeight = `${form.getBoundingClientRect().height + 40}px`;
+          const stale = {
+            overlayHeight: Math.round(parseFloat(
+              getComputedStyle(surface).getPropertyValue('--session-composer-height')) || 0),
+            distanceFromBottom: Math.round(
+              scroller.scrollHeight - scroller.clientHeight - scroller.scrollTop),
+          };
+          scroller.dispatchEvent(new Event('scroll'));
+          return stale;
+        }"""
+    )
+    assert stale["overlayHeight"] == pytest.approx(start["overlayHeight"], abs=TOLERANCE), stale
+    assert stale["distanceFromBottom"] > TOLERANCE, (start, stale)
+    grown = settled_geometry(page)
+    assert grown["overlayHeight"] == pytest.approx(start["overlayHeight"] + 40, abs=TOLERANCE)
+    assert grown["distanceFromBottom"] <= TOLERANCE, (start, grown)
+
+
 def _single_reply(chat: ChatSessionContract, words: int) -> None:
     seed_items(
         chat,
@@ -1450,7 +1492,8 @@ def test_scrollbar_thumb_drags_by_touch(
 ) -> None:
     chat = chat_session_contract
     seed_long_transcript(chat, 30, paragraphs=6)
-    open_live(page, chat, {"width": 800, "height": 1280})
+    # Desktop layout: the mobile composer overlays the thumb parked at the bottom.
+    open_live(page, chat, {"width": 1200, "height": 1280})
     tag_scroller(page)
     expect(page.get_by_test_id("transcript-scrollbar-thumb")).to_be_visible()
     bottom = park_at_bottom(page)

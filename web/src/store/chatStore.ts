@@ -116,6 +116,7 @@ import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSe
 import { applyJournalEntry } from "@/hooks/useSessionJournal";
 import { isFirstPlan } from "@/lib/sessionJournal";
 import { showTasksTabBesideChat } from "@/store/sessionTasksActions";
+import { notePlanStopReceipt, supersedePlanStop } from "@/store/planStops";
 import { noteSessionStreamClosed, noteSessionStreamOpen } from "@/lib/sessionStreamSignals";
 import { invalidateAgentCosts } from "@/hooks/useAgentCosts";
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
@@ -174,6 +175,7 @@ import type {
 } from "@/lib/types";
 import { downloadSessionFile, uploadFile } from "@/lib/filesApi";
 import { attachmentKey } from "@/lib/attachments";
+import { sendVerdictFromServer, snapshotRefusesSend } from "@/lib/userInputDelivery";
 import type { ActiveResponse } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { fetchHarnessCatalog, type HarnessCatalog } from "@/lib/agentLabels";
@@ -636,6 +638,8 @@ export interface PendingUserMessage {
   posted?: boolean;
   /** The send's POST has gone unanswered for {@link SEND_STILL_SENDING_AFTER_MS}. */
   stillSending?: boolean;
+  /** Replayed from the snapshot's `pending_inputs`: the session accepted it, though this page didn't post it. */
+  replayed?: boolean;
   /**
    * The server's pending-input id from the accepted POST. The bubble keeps
    * `tempId` as its React key, so this is its only link to the entry a
@@ -1200,6 +1204,11 @@ export interface SideChatComposerDraft {
  *  fresh object per render would re-render every subscriber). */
 export const EMPTY_SIDE_CHAT_COMPOSER: SideChatComposerDraft = { text: "", files: [] };
 
+/** The composer entry a grid cell edits; a sub-agent tab of the same session has its own. */
+export function gridCellComposerKey(sessionId: string): string {
+  return `grid:${sessionId}`;
+}
+
 export interface AppChatState {
   /** The conversation currently on screen. `null` on `/`. */
   conversationId: string | null;
@@ -1405,9 +1414,10 @@ export interface ChatActions {
     conversationId?: string,
   ) => Promise<void>;
   /**
-   * Set the active session's effort. ``null`` clears the override.
+   * Set the effort of *sessionId*, or of the active session when omitted.
+   * ``null`` clears the override.
    */
-  setEffort: (effort: string | null) => Promise<void>;
+  setEffort: (effort: string | null, sessionId?: string) => Promise<void>;
   /**
    * Set the active session's model. For claude-native, the server also injects
    * ``/model`` into the tmux pane so the in-binary picker tracks the change.
@@ -1415,15 +1425,20 @@ export interface ChatActions {
    * ``expectConfirmation`` marks the pick pending until the harness's own
    * report (or a not-applied error) settles it — pass it for sessions
    * whose chip renders the reported model (claude-/codex-native).
+   * ``sessionId`` targets that session instead of the active one.
    */
-  setModel: (model: string | null, opts?: { expectConfirmation?: boolean }) => Promise<void>;
+  setModel: (
+    model: string | null,
+    opts?: { expectConfirmation?: boolean; sessionId?: string },
+  ) => Promise<void>;
   /**
    * Set the active session's cost-control switch — optimistic local
    * flip, then PATCH; the server's canonical value (or a rollback on
    * failure) settles the state. ``null`` clears back to the spec
-   * default. No-ops when there is no active conversation.
+   * default. Targets *sessionId* when given; otherwise no-ops when there is
+   * no active conversation.
    */
-  setCostControlMode: (mode: "on" | "off" | null) => Promise<void>;
+  setCostControlMode: (mode: "on" | "off" | null, sessionId?: string) => Promise<void>;
   /**
    * Set the active session's sub-agent routing switch — optimistic local
    * write, then PATCH; the server's canonical value (or a rollback on
@@ -1453,16 +1468,16 @@ export interface ChatActions {
    * Switch a running claude-native session's permission mode (e.g. to
    * ``"auto"``). Rejects when the live TUI could not reach the mode, so
    * callers surface the error rather than assuming the switch landed.
-   * No-ops when there is no active conversation.
+   * Targets *sessionId* when given, else the active conversation (no-op without one).
    */
-  setClaudePermissionMode: (mode: string) => Promise<void>;
+  setClaudePermissionMode: (mode: string, sessionId?: string) => Promise<void>;
   /**
    * Switch a running codex-native session's approval/sandbox mode (e.g. to
    * ``"full-access"``). Rejects when the live Codex thread could not accept the
    * update, so callers surface the error rather than assuming it landed.
-   * No-ops when there is no active conversation.
+   * Targets *sessionId* when given, else the active conversation (no-op without one).
    */
-  setCodexApprovalMode: (mode: string) => Promise<void>;
+  setCodexApprovalMode: (mode: string, sessionId?: string) => Promise<void>;
   /**
    * Fetch the next page of older messages and prepend them to `blocks`.
    *
@@ -1477,8 +1492,8 @@ export interface ChatActions {
   /** Drain the queued composer attachments (called by the composer). */
   clearPendingComposerAttachments: () => void;
   /** Stamp {@link ChatState.runnerLaunchedAt} now — call right after a
-   *  successful `launchRunner` for the open session. */
-  markRunnerLaunched: () => void;
+   *  successful `launchRunner`, for `sessionId` or the open session when omitted. */
+  markRunnerLaunched: (sessionId?: string) => void;
   /**
    * Compact the active session's context. Posts a ``compact`` event to the
    * server, which summarises the conversation history in-place. No-ops when
@@ -2944,6 +2959,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // target afterward would leak the message into the now-active session.
     // An explicit pin (navigate-first background POST) wins over the visible id.
     const submitConversationId = pinnedId ?? get().conversationId;
+    // The run's Stop in progress, which this message ends once the session takes it.
+    const endPlanStop = supersedePlanStop(submitConversationId);
     // Only the composer on screen takes back a send cut off by a reload (see
     // `unsentSendToRestore`); a side chat posts to its child beside the parent.
     const sentOnScreen = pinnedId === null || pinnedId === get().conversationId;
@@ -3075,6 +3092,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           return patch;
         });
       } else {
+        endPlanStop();
         // POST accepted: the server can now account for this message
         // (native: pending_inputs replay until the round-trip commits it;
         // non-native: already persisted). Mark the bubble settled — that is
@@ -3316,6 +3334,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // Pin the destination at submit time — see `send` above for why a late
     // resolve mis-routes to the session the user has since switched to.
     const submitConversationId = pinnedId ?? get().conversationId;
+    const endPlanStop = supersedePlanStop(submitConversationId);
 
     const { waitForPrior, rekey, releaseSend } = enterSendChain(submitConversationId);
 
@@ -3363,6 +3382,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           return patch;
         });
       } else {
+        endPlanStop();
         // POST accepted: the server persisted the visible receipt, so
         // navigation can rely on the snapshot — mark the echo settled
         // and drop any stash copy. Without this, an echo stashed by a
@@ -3688,7 +3708,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         blocks: s.blocks.map((b) =>
           b.type === "elicitation" &&
           b.elicitationId === elicitationId &&
-          (!b.nativeDelivery || (b.status === "pending" && b.response === responseValue))
+          b.response === responseValue
             ? {
                 ...b,
                 status: "pending",
@@ -3739,7 +3759,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
-  markRunnerLaunched: () => setActive({ runnerLaunchedAt: Date.now() }),
+  markRunnerLaunched: (sessionId) =>
+    (sessionId === undefined ? setActive : setterFor(sessionId))({ runnerLaunchedAt: Date.now() }),
 
   compact: async () => {
     const { conversationId } = get();
@@ -3798,9 +3819,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     });
   },
 
-  setEffort: async (effort) => {
-    const { conversationId, sessionReasoningEffort: previous } = get();
-    setActive({ sessionReasoningEffort: effort });
+  setEffort: async (effort, sessionId) => {
+    const target = sessionId === undefined ? get() : setterForState(sessionId);
+    if (target === null) return;
+    const conversationId = sessionId ?? target.conversationId;
+    const previous = target.sessionReasoningEffort;
+    (sessionId === undefined ? setActive : setterFor(sessionId))({
+      sessionReasoningEffort: effort,
+    });
     if (conversationId) {
       if (queryClient === null) {
         throw new Error("chatStore.setEffort: queryClient not initialized");
@@ -3837,8 +3863,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   },
 
   setModel: async (model, opts) => {
-    const { conversationId, sessionModelOverride: previous } = get();
-    setActive({ sessionModelOverride: model });
+    const sessionId = opts?.sessionId;
+    const target = sessionId === undefined ? get() : setterForState(sessionId);
+    if (target === null) return;
+    const conversationId = sessionId ?? target.conversationId;
+    const previous = target.sessionModelOverride;
+    (sessionId === undefined ? setActive : setterFor(sessionId))({ sessionModelOverride: model });
     if (conversationId) {
       const expectConfirmation = opts?.expectConfirmation === true && model !== null;
       if (expectConfirmation) {
@@ -3887,10 +3917,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
-  setCostControlMode: async (mode) => {
-    const { conversationId } = get();
-    if (!conversationId) return;
-    const previous = get().costControlModeOverride;
+  setCostControlMode: async (mode, sessionId) => {
+    const target = sessionId === undefined ? get() : setterForState(sessionId);
+    const conversationId = sessionId ?? target?.conversationId;
+    if (!target || !conversationId) return;
+    const previous = target.costControlModeOverride;
     // Routing and a pinned model are mutually exclusive: the server's routing
     // guard skips whenever model_override is set, so turning routing ON must
     // also clear this session's pinned model (in the SAME PATCH) — otherwise
@@ -3898,7 +3929,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // would never run. Mirrors the new-chat dialog's mutual exclusion. Only
     // clear when a model is actually pinned, so toggling routing on a
     // model-less (e.g. SDK) session doesn't emit a spurious model-cleared change.
-    const previousModel = get().sessionModelOverride;
+    const previousModel = target.sessionModelOverride;
     const clearModel = mode === "on" && previousModel != null;
     // Pin the target: these are this conversation's switches, and the PATCH can
     // outlive a switch away. Resolving the target afterwards would leave a
@@ -3991,10 +4022,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
-  setClaudePermissionMode: async (mode) => {
-    const { conversationId } = get();
+  setClaudePermissionMode: async (mode, sessionId) => {
+    const conversationId = sessionId ?? get().conversationId;
     if (!conversationId) return;
-    const previous = get().claudePermissionMode;
+    const previous = (sessionId ? setterForState(sessionId) : get())?.claudePermissionMode ?? "";
     // Pinned for the same reason as `setCostControlMode` — see there.
     const patchSet = setterFor(conversationId);
     // Optimistic, then reconciled against the mode the server confirms the
@@ -4009,10 +4040,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
-  setCodexApprovalMode: async (mode) => {
-    const { conversationId } = get();
+  setCodexApprovalMode: async (mode, sessionId) => {
+    const conversationId = sessionId ?? get().conversationId;
     if (!conversationId) return;
-    const previous = get().codexApprovalMode;
+    const previous = (sessionId ? setterForState(sessionId) : get())?.codexApprovalMode ?? "";
     // Pinned for the same reason as `setCostControlMode` — see there.
     const patchSet = setterFor(conversationId);
     // Optimistic, then reconciled against the mode the server confirms the
@@ -5478,6 +5509,7 @@ async function bindStream(
       const toPending = (p: PendingInput): PendingUserMessage => ({
         tempId: p.pendingId,
         content: p.content,
+        replayed: true,
         ...(p.createdBy !== undefined ? { author: p.createdBy } : {}),
       });
       let candidatePending: PendingUserMessage[];
@@ -5591,11 +5623,15 @@ async function bindStream(
         sessionCostUsd:
           state.sessionCostUsd !== stateBeforeFetch.sessionCostUsd
             ? state.sessionCostUsd
-            : (session.totalCostUsd ?? state.sessionCostUsd),
+            : session.costHidden
+              ? null
+              : (session.totalCostUsd ?? state.sessionCostUsd),
         sessionUsageByModel:
           state.sessionUsageByModel !== stateBeforeFetch.sessionUsageByModel
             ? state.sessionUsageByModel
-            : (session.usageByModel ?? state.sessionUsageByModel),
+            : session.costHidden
+              ? withoutModelCosts(session.usageByModel ?? state.sessionUsageByModel)
+              : (session.usageByModel ?? state.sessionUsageByModel),
         todos: (session.todos ?? []) as {
           content: string;
           status: "pending" | "in_progress" | "completed";
@@ -5603,6 +5639,7 @@ async function bindStream(
         }[],
       };
     });
+    if (session.costHidden && queryClient !== null) invalidateAgentCosts(queryClient, true);
     if (session.usageIncluded === false) void hydrateSessionUsage(id);
     racedNativeModelOptions.delete(id);
   } catch (err) {
@@ -5612,6 +5649,16 @@ async function bindStream(
       conversationLoadError: err instanceof Error ? err : new Error(String(err)),
     });
   }
+}
+
+/** Drop per-model USD while keeping token counts, once the server hides cost. */
+function withoutModelCosts(
+  usageByModel: Record<string, ModelUsage> | null,
+): Record<string, ModelUsage> | null {
+  if (usageByModel === null) return null;
+  return Object.fromEntries(
+    Object.entries(usageByModel).map(([model, usage]) => [model, { ...usage, totalCostUsd: null }]),
+  );
 }
 
 /** Hydrate display-only subtree totals without delaying session reconciliation. */
@@ -5645,16 +5692,23 @@ async function hydrateSessionUsage(id: string): Promise<void> {
     ) {
       return;
     }
+    if (usage.costHidden && queryClient !== null) invalidateAgentCosts(queryClient, true);
     const revisions = sessionUsageRevisions.get(entry) ?? { cost: 0, models: 0 };
     // A live cost/model update during the read wins independently for each field.
     entrySetter(entry)((state) => ({
       ...(revisions.cost === revisionsBeforeFetch.cost &&
       state.sessionCostUsd === before.sessionCostUsd
-        ? { sessionCostUsd: usage.totalCostUsd ?? state.sessionCostUsd }
+        ? {
+            sessionCostUsd: usage.costHidden ? null : (usage.totalCostUsd ?? state.sessionCostUsd),
+          }
         : {}),
       ...(revisions.models === revisionsBeforeFetch.models &&
       state.sessionUsageByModel === before.sessionUsageByModel
-        ? { sessionUsageByModel: usage.usageByModel ?? state.sessionUsageByModel }
+        ? {
+            sessionUsageByModel: usage.costHidden
+              ? withoutModelCosts(usage.usageByModel ?? state.sessionUsageByModel)
+              : (usage.usageByModel ?? state.sessionUsageByModel),
+          }
         : {}),
     }));
   } catch {
@@ -5848,8 +5902,14 @@ function reconnectStatusPatch(
   patch.backgroundAgents = snapshotBackgroundAgents(session);
   if (session.contextWindow != null) patch.contextWindow = session.contextWindow;
   if (session.lastTotalTokens != null) patch.tokensUsed = session.lastTotalTokens;
-  if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
-  if (session.usageByModel != null) patch.sessionUsageByModel = session.usageByModel;
+  if (session.costHidden) {
+    if (queryClient !== null) invalidateAgentCosts(queryClient, true);
+    patch.sessionCostUsd = null;
+    patch.sessionUsageByModel = withoutModelCosts(session.usageByModel ?? s.sessionUsageByModel);
+  } else {
+    if (session.totalCostUsd != null) patch.sessionCostUsd = session.totalCostUsd;
+    if (session.usageByModel != null) patch.sessionUsageByModel = session.usageByModel;
+  }
   if (!settleTurn) return patch;
   patch.sessionStatus = session.status;
   // `waiting` is a TURN-END snapshot (the turn finished; only background work
@@ -6171,6 +6231,17 @@ function reconcileElicitationBlocks(
       return { ...currentDelivery, ctx: b.ctx };
     }
     if (
+      currentDelivery !== undefined &&
+      !b.nativeDelivery &&
+      preGapCards.get(b.elicitationId) === b &&
+      currentDelivery.codexCommand?.requestFingerprint &&
+      currentDelivery.codexCommand.requestFingerprint !== b.codexCommand?.requestFingerprint
+    ) {
+      // A reused id now carries a different Codex command request.
+      changed = true;
+      return { ...currentDelivery, ctx: b.ctx };
+    }
+    if (
       b.status === "pending" &&
       preGapPendingIds.has(b.elicitationId) &&
       !pendingNow.has(b.elicitationId)
@@ -6393,6 +6464,7 @@ async function rehydrateWindowOnReconnect(
       historyGeneration: s.historyGeneration + 1,
     };
   });
+  if (session.usageIncluded === false) void hydrateSessionUsage(id);
   queueAnsweredElicitationRechecks(id, snapshotPending, get().blocks);
   return "applied";
 }
@@ -6473,7 +6545,6 @@ async function reconcileOnReconnect(
     return "failed";
   }
   if (stale()) return "skipped";
-  if (session.usageIncluded === false) void hydrateSessionUsage(id);
   // A live turn edge or send latch change during these reads owns the turn lifecycle.
   const statusPatchFor = (s: ChatState): Partial<ChatState> =>
     settleStatus
@@ -6610,6 +6681,7 @@ async function reconcileOnReconnect(
     if (nextBlocks !== s.blocks) patch.blocks = nextBlocks;
     return patch;
   });
+  if (session.usageIncluded === false) void hydrateSessionUsage(id);
   queueAnsweredElicitationRechecks(id, snapshotPending, get().blocks);
   return "applied";
 }
@@ -7619,6 +7691,20 @@ function revivePendingElicitationBlock(
       const updated = { ...incoming, ctx: target.ctx };
       return { blocks: [...s.blocks.slice(0, idx), updated, ...s.blocks.slice(idx + 1)] };
     }
+    // A reused id carrying a different Codex command request replaces the card,
+    // including a pending card or one with an in-flight verdict for the old request.
+    const changedCodexRequest =
+      incoming.codexCommand?.requestFingerprint &&
+      incoming.codexCommand.requestFingerprint !== target.codexCommand?.requestFingerprint;
+    if (changedCodexRequest) {
+      const updated: ElicitationBlock = {
+        ...incoming,
+        ctx: target.ctx,
+        status: "pending",
+        response: null,
+      };
+      return { blocks: [...s.blocks.slice(0, idx), updated, ...s.blocks.slice(idx + 1)] };
+    }
     if (!isRevivableElicitation(target)) return {};
     // Rebuilt from the incoming request: a recurring id can carry a different
     // request, and the reopened card must show what an answer would approve.
@@ -7843,16 +7929,15 @@ export async function pumpStreamEvents(
       // not persisted items), so the dedupe above can't see them. The
       // server re-publishes the same id whenever a severed harness wait
       // re-parks (hook retries reuse their id), so an already-rendered
-      // id must not append a second card: a pending card (or one
-      // carrying an in-flight user verdict) stays untouched, and a
-      // responded card is revived to answerable in place.
+      // id must not append a second card. A re-publish replaces a
+      // buffered card; a rendered card is revived or refreshed in place.
       if (block.type === "elicitation") {
         const eid = block.elicitationId;
         const buffered = buffer.findIndex(
           (b) => b.type === "elicitation" && b.elicitationId === eid,
         );
         if (buffered !== -1) {
-          if (block.nativeDelivery) buffer[buffered] = { ...block, ctx: buffer[buffered].ctx };
+          buffer[buffered] = { ...block, ctx: buffer[buffered].ctx };
           continue;
         }
         if (get().blocks.some((b) => b.type === "elicitation" && b.elicitationId === eid)) {
@@ -8203,47 +8288,6 @@ function retractDeliveredSendDraft(
     if (delivered(owner)) patch.pendingRetryStableId = null;
   }
   return patch;
-}
-
-/**
- * Whether a session snapshot records the runner refusing the send `stableId`.
- *
- * An attributed rejection names its item and holds whatever the session is
- * doing now; the unattributed record of a server predating the item id stands
- * for any send, but only while the session is still `failed` by it.
- *
- * @param session - A session snapshot.
- * @param stableId - The send's stable id (its persisted item id).
- * @returns `true` when the snapshot's `runner_rejected_event` applies to it.
- */
-function snapshotRefusesSend(session: Session, stableId: string): boolean {
-  const rejection = session.lastTaskError;
-  if (rejection?.code !== "runner_rejected_event") return false;
-  if (rejection.item_id !== undefined) return rejection.item_id === stableId;
-  return session.status === "failed";
-}
-
-/**
- * Ask the server what became of a send whose POST got no answer.
- *
- * The server records a runner rejection before it answers the POST, so a
- * snapshot fetched after the failure is conclusive where one merged during the
- * send may not be.
- *
- * @param sessionId - The session the send was posted to.
- * @param stableId - The send's stable id.
- * @returns `"refused"` or `"delivered"`, or `null` when the fetch itself fails.
- */
-async function sendVerdictFromServer(
-  sessionId: string,
-  stableId: string,
-): Promise<"refused" | "delivered" | null> {
-  try {
-    const session = await getSessionSlim(sessionId);
-    return snapshotRefusesSend(session, stableId) ? "refused" : "delivered";
-  } catch {
-    return null;
-  }
 }
 
 /**
@@ -8825,7 +8869,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       const patch: {
         tokensUsed?: number;
         contextWindow?: number;
-        sessionCostUsd?: number;
+        sessionCostUsd?: number | null;
         sessionUsageByModel?: Record<string, ModelUsage>;
       } = {};
       if (event.contextTokens !== undefined) {
@@ -8834,13 +8878,17 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       if (event.contextWindow !== undefined) {
         patch.contextWindow = event.contextWindow;
       }
-      if (event.totalCostUsd !== undefined) {
+      if (event.costHidden) {
+        patch.sessionCostUsd = null;
+      } else if (event.totalCostUsd !== undefined) {
         patch.sessionCostUsd = event.totalCostUsd;
       }
       if (event.usageByModel !== undefined) {
         patch.sessionUsageByModel = event.usageByModel;
       }
-      if (event.totalCostUsd !== undefined || event.usageByModel !== undefined) {
+      const costChanged = event.totalCostUsd !== undefined || event.costHidden === true;
+      const modelsChanged = event.usageByModel !== undefined || event.costHidden === true;
+      if (costChanged || modelsChanged) {
         const entry =
           sourceConversationId === null
             ? undefined
@@ -8849,12 +8897,18 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           // A same-value receipt is still newer than an in-flight usage read.
           const revisions = sessionUsageRevisions.get(entry);
           sessionUsageRevisions.set(entry, {
-            cost: (revisions?.cost ?? 0) + (event.totalCostUsd !== undefined ? 1 : 0),
-            models: (revisions?.models ?? 0) + (event.usageByModel !== undefined ? 1 : 0),
+            cost: (revisions?.cost ?? 0) + (costChanged ? 1 : 0),
+            models: (revisions?.models ?? 0) + (modelsChanged ? 1 : 0),
           });
         }
       }
-      if (Object.keys(patch).length > 0) {
+      if (event.costHidden) {
+        if (queryClient !== null) invalidateAgentCosts(queryClient, true);
+        applyToConversation((s) => ({
+          ...patch,
+          sessionUsageByModel: withoutModelCosts(event.usageByModel ?? s.sessionUsageByModel),
+        }));
+      } else if (Object.keys(patch).length > 0) {
         applyToConversation(patch);
       }
       return;
@@ -9229,10 +9283,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
           );
           if (settled !== null) patch.blocks = settled;
         }
-        // A `runner_disconnected` card is an observation ("can't reach the
-        // runner"), not a turn result: any live status edge from the runner
-        // proves it is reachable again, so the stale card goes.
-        if (event.status !== "failed") {
+        // A live runner makes its disconnect card stale. Automatic resume
+        // failure supersedes it too, including its manual resume action.
+        if (event.status !== "failed" || statusError?.code === "session_recovery_failed") {
           const current = patch.blocks ?? s.blocks;
           const reachable = current.filter(
             (b) => !(b.type === "error" && b.code === "runner_disconnected"),
@@ -9297,6 +9350,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
     }
     case "session_input_consumed": {
       applyToConversation({ startupPending: false });
+      // A native Stop's receipt places its message in the transcript.
+      if (sourceConversationId && event.clearedPendingId) {
+        notePlanStopReceipt(sourceConversationId, event.clearedPendingId, event.itemId);
+      }
       // A retry from another client may have delivered an undelivered message: clear
       // it now when the receipt names it (native ones do), and re-read either way,
       // superseding any failure read still in flight from before the delivery.

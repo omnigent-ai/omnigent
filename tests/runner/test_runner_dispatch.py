@@ -43,6 +43,7 @@ import logging
 import os
 import tempfile
 import threading
+import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
@@ -71,6 +72,7 @@ from omnigent.inner.executor import (
 from omnigent.inner.executor import (
     Message as _RecoveryMessage,
 )
+from omnigent.inner.executor import NativeTurnAcceptance
 from omnigent.inner.executor import (
     ToolSpec as _RecoveryToolSpec,
 )
@@ -108,6 +110,9 @@ from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from tests._helpers.polling import poll_until_async
 from tests._helpers.providers import isolate_provider_resolution
 from tests.runner.conftest import (
+    _BlockingHarnessClient as _RecoveryBlockingHarnessClient,
+)
+from tests.runner.conftest import (
     _FakeProcessManager as _RecoveryFakeProcessManager,
 )
 from tests.runner.conftest import (
@@ -116,7 +121,7 @@ from tests.runner.conftest import (
 from tests.runner.conftest import (
     _ScriptedHarnessClient as _RecoveryScriptedHarnessClient,
 )
-from tests.runner.helpers import NullServerClient
+from tests.runner.helpers import NullServerClient, accept_subagent_turn
 
 _TEST_HARNESS_NAME = "runner-test-default"
 _TEST_HARNESS_MODULE = "tests._fixtures.runner_test_harness"
@@ -2752,6 +2757,7 @@ async def test_runner_publishes_terminal_failed_when_harness_stream_fails(
         )
 
     statuses = [event.get("status") for event in events]
+    assert conv not in subagent_work._pending_child_acceptances
     # The turn must reach the parametrized terminal state. Without the fix,
     # the failed-stream cases regress in two distinct ways: codex-native
     # publishes only ["running"] (idle is suppressed, so the drain times out
@@ -2948,10 +2954,11 @@ async def test_runner_os_env_helper_retires_after_returned_error_and_shell(
         assert shell_result["exit_code"] == 0
         cwd, pid = shell_result["stdout"].split()
         assert Path(cwd).resolve() == tmp_path.resolve()
-        assert int(pid) == replacement
-        assert not process_alive(replacement)
+        assert int(pid) != replacement
+        assert not process_alive(int(pid))
+        assert process_alive(replacement)
         after_shell = await _os_env_helper_pid(registry, spec, "conv_retire")
-        assert after_shell != replacement
+        assert after_shell == replacement
     finally:
         await registry.cleanup_session("conv_retire")
     assert not process_alive(after_shell)
@@ -2961,10 +2968,13 @@ async def test_runner_os_env_helper_retires_after_returned_error_and_shell(
 @pytest.mark.posix_only
 async def test_runner_os_env_helper_restarts_replaces_workspace_and_times_out(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A crash, workspace change or timeout replaces the helper and closes the old one."""
+    """Crashes and workspace changes replace file helpers; timed-out shells close their own."""
     import signal
+    from subprocess import Popen
 
+    from omnigent.inner import os_env as os_env_module
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.runner.tool_dispatch import _execute_os_env_tool
 
@@ -2993,6 +3003,15 @@ async def test_runner_os_env_helper_restarts_replaces_workspace_and_times_out(
         assert moved != restarted
         assert not process_alive(restarted)
 
+        processes: list[Popen[str]] = []
+        start_helper = os_env_module._HelperProcessClient._start_locked
+
+        def record_start(helper: os_env_module._HelperProcessClient) -> None:
+            start_helper(helper)
+            assert helper._proc is not None
+            processes.append(helper._proc)
+
+        monkeypatch.setattr(os_env_module._HelperProcessClient, "_start_locked", record_start)
         # A timed-out command's descendants may outlive it, so its helper is retired.
         timed_out = await _execute_os_env_tool(
             "sys_os_shell",
@@ -3002,8 +3021,10 @@ async def test_runner_os_env_helper_restarts_replaces_workspace_and_times_out(
             resource_registry=registry,
         )
         assert json.loads(timed_out)["timed_out"] is True
-        assert not process_alive(moved)
-        moved = await _os_env_helper_pid(registry, agent(tmp_path / "b"), "conv_a")
+        assert len(processes) == 1
+        assert processes[0].poll() is not None
+        assert process_alive(moved)
+        assert await _os_env_helper_pid(registry, agent(tmp_path / "b"), "conv_a") == moved
 
     finally:
         await registry.cleanup_session("conv_a")
@@ -3016,8 +3037,9 @@ async def test_runner_os_env_busy_helper_serves_concurrent_calls_and_cancellatio
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Concurrent calls bypass a busy session helper; a cancelled call's helper is closed."""
+    """A held file helper forces fallback; shell cancellation closes only its own helper."""
     import errno
+    from subprocess import Popen
     from unittest.mock import Mock
 
     import omnigent.inner.os_env as os_env_module
@@ -3031,9 +3053,19 @@ async def test_runner_os_env_busy_helper_serves_concurrent_calls_and_cancellatio
         ),
     )
     registry = SessionResourceRegistry()
+    held_lease = None
     blocked: asyncio.Task[str] | None = None
     gate_fd: int | None = None
     fifo = tmp_path / "gate"
+    processes: list[Popen[str]] = []
+    start_helper = os_env_module._HelperProcessClient._start_locked
+
+    def record_start(helper: os_env_module._HelperProcessClient) -> None:
+        start_helper(helper)
+        assert helper._proc is not None
+        processes.append(helper._proc)
+
+    monkeypatch.setattr(os_env_module._HelperProcessClient, "_start_locked", record_start)
 
     def open_gate() -> bool:
         nonlocal gate_fd
@@ -3047,6 +3079,8 @@ async def test_runner_os_env_busy_helper_serves_concurrent_calls_and_cancellatio
 
     try:
         session_helper = await _os_env_helper_pid(registry, spec, "conv_busy")
+        held_lease = await registry.lease_tool_environment("conv_busy", spec.os_env)
+        assert held_lease is not None
         os.mkfifo(fifo)
         (tmp_path / "note.txt").write_text("hi\n")
         blocked = asyncio.create_task(
@@ -3089,6 +3123,11 @@ async def test_runner_os_env_busy_helper_serves_concurrent_calls_and_cancellatio
         gate_fd = None
         with pytest.raises(asyncio.CancelledError):
             await blocked
+        assert len(processes) == 3
+        assert processes[1].poll() is not None
+        assert process_alive(session_helper)
+        await held_lease.release(reusable=False)
+        held_lease = None
         assert not process_alive(session_helper)
         replacement = await _os_env_helper_pid(registry, spec, "conv_busy")
         assert replacement != session_helper
@@ -3098,8 +3137,11 @@ async def test_runner_os_env_busy_helper_serves_concurrent_calls_and_cancellatio
         if blocked is not None:
             blocked.cancel()
             await asyncio.gather(blocked, return_exceptions=True)
+        if held_lease is not None:
+            await held_lease.release(reusable=False)
         await registry.cleanup_session("conv_busy")
     assert not process_alive(replacement)
+    assert all(process.poll() is not None for process in processes)
 
 
 _REVERT_NATIVE_TEXT = f"one{os.linesep}two{os.linesep}"
@@ -3349,17 +3391,30 @@ async def test_runner_os_env_surrogate_path_is_httpx_transport_safe(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("shared_copy_on_write", [True, False], ids=["shared-cow", "fork"])
+@pytest.mark.parametrize(
+    "shared_copy_on_write,credential_proxy",
+    [
+        pytest.param(True, False, id="shared-cow"),
+        pytest.param(False, False, id="fork"),
+        pytest.param(False, True, id="credential-proxy"),
+    ],
+)
 async def test_runner_os_env_dispatch_preserves_shared_and_fork_ownership(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     shared_copy_on_write: bool,
+    credential_proxy: bool,
 ) -> None:
-    """Shared overlays borrow the primary owner; fork calls own separate environments."""
+    """Overlays borrow their owner; forks and credential proxies use disposable helpers."""
     from unittest.mock import AsyncMock, Mock, call
 
     from omnigent.entities import DEFAULT_ENVIRONMENT_ID
-    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, WritePathSpec
+    from omnigent.inner.datamodel import (
+        CredentialProxySpec,
+        OSEnvSandboxSpec,
+        OSEnvSpec,
+        WritePathSpec,
+    )
     from omnigent.inner.os_env import OSEnvironment
     from omnigent.runner.tool_dispatch import _execute_os_env_tool
 
@@ -3380,10 +3435,11 @@ async def test_runner_os_env_dispatch_preserves_shared_and_fork_ownership(
         os_env=OSEnvSpec(
             type="caller_process",
             cwd=str(tmp_path),
-            fork=not shared_copy_on_write,
+            fork=not (shared_copy_on_write or credential_proxy),
             sandbox=OSEnvSandboxSpec(
                 type="none",
                 write_paths=[WritePathSpec(".", copy_on_write=shared_copy_on_write)],
+                credential_proxy=CredentialProxySpec(entries=[]) if credential_proxy else None,
             ),
         ),
     )
@@ -3510,6 +3566,143 @@ async def test_runner_os_env_error_is_httpx_transport_safe(
     finally:
         await registry.cleanup_session(session_id)
     assert [environment.close_count for environment in environments] == [1, 1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "start_in_scratch,outcome",
+    [
+        pytest.param(False, "success", id="cold-success"),
+        pytest.param(False, "error", id="cold-error"),
+        pytest.param(False, "timeout", id="cold-timeout"),
+        pytest.param(False, "raised", id="cold-raised"),
+        pytest.param(False, "cancelled", id="cold-cancelled"),
+        pytest.param(True, "success", id="scratch-workspace-retired"),
+    ],
+)
+async def test_runner_os_env_cold_shell_preserves_file_helper(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    start_in_scratch: bool,
+    outcome: str,
+) -> None:
+    """Cold shell calls leave file leases intact; scratch calls retain their workspace."""
+    from functools import partial
+    from unittest.mock import AsyncMock, Mock, call
+
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.inner.os_env import OSEnvironment
+    from omnigent.inner.sandbox import SandboxPolicy
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+
+    shell_started = asyncio.Event()
+    shell_blocked = asyncio.Event()
+    shell_result = {
+        "success": {"stdout": "done", "exit_code": 0},
+        "error": {"error": "command failed", "exit_code": 1},
+        "timeout": {"error": "command timed out", "timed_out": True},
+        "raised": {"error": "shell failed"},
+    }
+
+    async def shell(**kwargs: object) -> dict[str, object]:
+        del kwargs
+        shell_started.set()
+        if outcome == "cancelled":
+            await shell_blocked.wait()
+        if outcome == "raised":
+            raise RuntimeError("shell failed")
+        return shell_result[outcome]
+
+    environments: list[Mock] = []
+
+    def create_environment(*args: object, **kwargs: object) -> Mock:
+        del args, kwargs
+        environment = Mock(spec=OSEnvironment)
+        environment.cwd = tmp_path.resolve()
+        environment.read = AsyncMock(return_value={"content": "file"})
+        environment.shell = AsyncMock(side_effect=shell)
+        environments.append(environment)
+        return environment
+
+    create = Mock(side_effect=create_environment)
+    monkeypatch.setattr("omnigent.inner.os_env.create_os_environment", create)
+    monkeypatch.setattr(
+        "omnigent.runner.resource_registry.resolve_sandbox",
+        lambda *_: SandboxPolicy(
+            backend_type="linux_bwrap",
+            active=True,
+            read_roots=None,
+            write_roots=[tmp_path],
+            write_files=[],
+            allow_network=False,
+        ),
+    )
+    spec = AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(
+            type="caller_process",
+            cwd=str(tmp_path),
+            start_in_scratch=start_in_scratch,
+            sandbox=OSEnvSandboxSpec(type="linux_bwrap"),
+        ),
+    )
+    session_id = "conv_cold_shell"
+    registry = SessionResourceRegistry()
+    execute = partial(
+        _execute_os_env_tool,
+        agent_spec=spec,
+        conversation_id=session_id,
+        resource_registry=registry,
+    )
+    task: asyncio.Task[str] | None = None
+    try:
+        assert json.loads(await execute("sys_os_read", {"path": "note.txt"})) == {
+            "content": "file"
+        }
+        file_environment = environments[0]
+        task = asyncio.create_task(
+            execute("sys_os_shell", {"command": "example-command", "timeout": 7})
+        )
+        await asyncio.wait_for(shell_started.wait(), timeout=1.0)
+        if outcome == "cancelled":
+            assert not task.done()
+            assert json.loads(await execute("sys_os_read", {"path": "note.txt"})) == {
+                "content": "file"
+            }
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            assert json.loads(await task) == shell_result[outcome]
+
+        assert len(environments) == (1 if start_in_scratch else 2)
+        shell_environment = environments[0 if start_in_scratch else 1]
+        shell_environment.shell.assert_awaited_once_with(command="example-command", timeout=7)
+        shell_environment.close.assert_called_once_with()
+        if start_in_scratch:
+            assert create.call_count == 1
+        else:
+            file_environment.shell.assert_not_awaited()
+            file_environment.close.assert_not_called()
+            shell_environment.read.assert_not_awaited()
+            assert create.call_args_list[1] == call(
+                spec.os_env, additional_read_roots=[registry.codex_skills_dir(session_id)]
+            )
+        assert json.loads(await execute("sys_os_read", {"path": "note.txt"})) == {
+            "content": "file"
+        }
+        assert create.call_count == 2
+        assert file_environment.read.await_count == (
+            1 if start_in_scratch else 3 if outcome == "cancelled" else 2
+        )
+        environments[1 if start_in_scratch else 0].close.assert_not_called()
+    finally:
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        await registry.cleanup_session(session_id)
+    for environment in environments:
+        environment.close.assert_called_once_with()
 
 
 @pytest.mark.asyncio
@@ -11849,11 +12042,25 @@ async def test_on_proxy_stream_end_spares_superseded_response() -> None:
         "late_created",
     ],
 )
-@pytest.mark.parametrize("successor", ["starting", "running", "finished", "unchanged"])
+@pytest.mark.parametrize(
+    ("successor", "native_receipt"),
+    [
+        pytest.param("starting", False, id="starting"),
+        pytest.param("running", False, id="running"),
+        pytest.param("finished", False, id="finished"),
+        pytest.param("unchanged", False, id="unchanged"),
+        pytest.param("starting", True, id="native-starting"),
+        pytest.param("running", True, id="native-running"),
+    ],
+)
 @pytest.mark.parametrize("delivery", ["stream", "background"])
 @pytest.mark.asyncio
 async def test_superseded_harness_stream_cannot_settle_newer_turn(
-    outcome: str, successor: str, delivery: str, monkeypatch: pytest.MonkeyPatch
+    outcome: str,
+    successor: str,
+    native_receipt: bool,
+    delivery: str,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Late stream outcomes cannot consume a successor's status or exit evidence."""
     conv = "conv_late_stream"
@@ -11866,8 +12073,13 @@ async def test_superseded_harness_stream_cannot_settle_newer_turn(
     newer = asyncio.create_task(asyncio.Event().wait())
     exit_error = {"code": "required_terminal_exited", "message": "successor terminal exited"}
     clears_at_boundary: list[str] = []
+    old_requests: set[subagent_work._ChildAcceptanceRequest] = set()
+    successor_request: subagent_work._ChildAcceptanceRequest | None = None
+    successor_work: subagent_work._SubagentWorkEntry | None = None
+    successor_acceptance = NativeTurnAcceptance(conv, "thread_new", "codex_new")
 
     def replace_turn() -> None:
+        nonlocal successor_request, successor_work
         if successor != "unchanged":
             app.state.begin_turn_slot(conv)
             app.state.active_turns[conv] = newer
@@ -11877,6 +12089,25 @@ async def test_superseded_harness_stream_cannot_settle_newer_turn(
                 pm.mark_in_flight(conv, "resp_new")
             if successor == "finished":
                 app.state.on_proxy_stream_end(conv, owner_response_id="resp_new")
+        if native_receipt:
+            old_requests.update(subagent_work._pending_child_acceptances[conv])
+            assert len(old_requests) == 1
+            successor_work = subagent_work.register_subagent_work(
+                parent_session_id="parent_late_stream",
+                child_session_id=conv,
+                agent="codex-native",
+                title="successor",
+                wrapper_label="codex-native-ui",
+            )
+            subagent_work.mark_subagent_work_started(conv)
+            successor_request = subagent_work.begin_subagent_child_acceptance(conv)
+            subagent_work.arm_subagent_child_start_timeout(
+                conv, acceptance=successor_acceptance, request=successor_request, now=5000.0
+            )
+            assert subagent_work._pending_child_acceptances[conv] == old_requests | {
+                successor_request
+            }
+            assert successor_work.awaiting_child_start_since == 5000.0
         app.state.required_terminal_exit_errors[conv] = exit_error
         clears_at_boundary[:] = pm.cleared_in_flight
         queue = app.state.session_event_queues[conv]
@@ -11894,7 +12125,16 @@ async def test_superseded_harness_stream_cannot_settle_newer_turn(
         elif outcome in {"completed", "late_created"}:
             if outcome == "late_created":
                 yield _SSE_RESPONSE_CREATED
-            yield _SSE_RESPONSE_COMPLETED
+            completed = _SSE_RESPONSE_COMPLETED
+            if native_receipt:
+                event = json.loads(completed.split("data: ", 1)[1])
+                event["native_acceptance"] = {
+                    "session_id": conv,
+                    "thread_id": "thread_old",
+                    "response_id": "codex_old",
+                }
+                completed = f"event: response.completed\ndata: {json.dumps(event)}\n\n"
+            yield completed
 
     @asynccontextmanager
     async def stream(*args: Any, **kwargs: Any) -> AsyncIterator[Any]:
@@ -11910,12 +12150,27 @@ async def test_superseded_harness_stream_cannot_settle_newer_turn(
                 json={
                     "type": "message",
                     "role": "user",
-                    "harness": "openai-agents",
+                    "harness": "codex-native" if native_receipt else "openai-agents",
+                    **({"harness_override": "codex-native"} if native_receipt else {}),
                     "content": [{"type": "input_text", "text": "original work"}],
                 },
             )
             assert response.status_code == (200 if delivery == "stream" else 202)
             await _await_bg_turn_task(conv)
+
+            if native_receipt:
+                assert subagent_work.get_subagent_work(conv) is successor_work
+                assert successor_work is not None
+                assert successor_work.status == "running"
+                assert successor_work.native_acceptance == successor_acceptance
+                assert successor_work.awaiting_child_start_since == 5000.0
+                assert subagent_work._pending_child_acceptances[conv] == {successor_request}
+                assert successor_request is not None
+                assert successor_request.finished is False
+                assert successor_request.started_response_ids == set()
+                assert successor_request.settled_response_ids == set()
+                assert successor_request.unidentified_settlement is False
+                assert all(request.finished for request in old_requests)
 
             if successor == "unchanged":
                 assert conv not in app.state.active_turns
@@ -11946,6 +12201,9 @@ async def test_superseded_harness_stream_cannot_settle_newer_turn(
         with contextlib.suppress(asyncio.CancelledError):
             await newer
         app.state.active_turns.pop(conv, None)
+        if successor_request is not None:
+            subagent_work.finish_subagent_child_acceptance(successor_request)
+        subagent_work.unregister_subagent_work_for_session(conv)
 
 
 @pytest.mark.parametrize("replacement", ["none", "task", "stream", "finished"])
@@ -11999,6 +12257,81 @@ async def test_interrupt_cleanup_is_scoped_to_turn_generation(replacement: str) 
             with contextlib.suppress(asyncio.CancelledError):
                 await task
         app.state.active_turns.pop(conv, None)
+
+
+async def _stop_session_without_a_turn(
+    stop_type: str, setup: str
+) -> tuple[httpx.Response, list[str]]:
+    """POST *stop_type* to a session with no turn after *setup*; return response and statuses."""
+    conv = f"conv_stop_{stop_type}_{setup}"
+    child = f"{conv}_child"
+    pm = _RecoveryFakeProcessManager(_RecoveryScriptedHarnessClient([]))
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    if setup not in {"unknown_session", "cache_only_session"}:
+        await pm.get_client(conv, _TEST_HARNESS_NAME)
+    if setup == "finished_task_slot":
+        finished = asyncio.create_task(asyncio.sleep(0))
+        await finished
+        app.state.active_turns[conv] = finished
+    elif setup == "subagent_running":
+        subagent_work.register_subagent_work(
+            parent_session_id=conv, child_session_id=child, agent="worker", title="task"
+        )
+    elif setup == "in_flight_response":
+        pm.mark_in_flight(conv, "resp_live")
+    elif setup == "buffered_message":
+        app.state.session_message_buffers[conv] = [{"type": "message"}]
+    elif setup == "failed_setup":
+        app.state.native_pane_status[conv] = "failed"
+    try:
+        async with _recovery_runner_client(app) as http:
+            if setup == "cache_only_session":
+                initialized = await http.post(
+                    "/v1/sessions", json={"session_id": conv, "agent_id": "ag_stop"}
+                )
+                assert initialized.status_code == 201, initialized.text
+                assert pm.has_session(conv)
+                await pm.release(conv)
+                assert not pm.has_session(conv)
+                retained = await http.get(f"/v1/sessions/{conv}")
+                assert retained.status_code == 200, retained.text
+                assert retained.json()["created_at"] == initialized.json()["created_at"]
+            response = await http.post(f"/v1/sessions/{conv}/events", json={"type": stop_type})
+            if setup == "cache_only_session":
+                assert not pm.has_session(conv)
+    finally:
+        subagent_work.unregister_subagent_work(child)
+    events = _drain_recovery_status_events(app.state.session_event_queues, conv)
+    return response, [event["status"] for event in events]
+
+
+@pytest.mark.parametrize("stop_type", ["interrupt", "stop_session"])
+@pytest.mark.parametrize(
+    "setup", ["no_turn_slot", "finished_task_slot", "subagent_running", "cache_only_session"]
+)
+@pytest.mark.asyncio
+async def test_stop_without_a_turn_settles_idle(stop_type: str, setup: str) -> None:
+    """Stop with no turn publishes ``idle``, like stopping a live turn does."""
+    response, statuses = await _stop_session_without_a_turn(stop_type, setup)
+    assert response.status_code == 204, response.text
+    assert statuses == ["idle"]
+
+
+@pytest.mark.parametrize("stop_type", ["interrupt", "stop_session"])
+@pytest.mark.parametrize(
+    "setup", ["in_flight_response", "buffered_message", "failed_setup", "unknown_session"]
+)
+@pytest.mark.asyncio
+async def test_stop_without_a_turn_leaves_remaining_work_to_report(
+    stop_type: str, setup: str
+) -> None:
+    """Stop publishes nothing while work remains, after failed setup, or for unknown sessions."""
+    response, statuses = await _stop_session_without_a_turn(stop_type, setup)
+    assert response.status_code == 204, response.text
+    assert statuses == []
 
 
 @pytest.mark.asyncio
@@ -13651,7 +13984,8 @@ def _running_child_server_handler(
     accidental untracked create is caught. ``events_status`` forces the child's
     /events response code (e.g. 500 to exercise a post failure), and any DELETE
     of the child is recorded in ``delete_posts`` so a test can assert a still-live
-    turn is never torn down.
+    turn is never torn down. The child's /events answers with the server's real
+    ``queued`` acknowledgement, which does not say whether the message started a turn.
     """
 
     async def _handler(request: httpx.Request) -> httpx.Response:
@@ -13687,7 +14021,9 @@ def _running_child_server_handler(
             return httpx.Response(204)
         if request.method == "POST" and path == f"/v1/sessions/{child_id}/events":
             event_posts.append(json.loads(request.content))
-            return httpx.Response(events_status, json={"ok": events_status < 400})
+            if events_status >= 400:
+                return httpx.Response(events_status, json={"error": "event post failed"})
+            return httpx.Response(202, json={"queued": True, "item_id": "item_steer"})
         return httpx.Response(404, json={"error": str(request.url)})
 
     return _handler
@@ -13831,18 +14167,25 @@ async def test_named_send_reused_in_flight_post_failure_keeps_tracking(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provisional_failure", "reported_start", "acceptance_before_adoption"),
+    [
+        pytest.param(False, True, True, id="already-running"),
+        pytest.param(True, True, True, id="late-running-after-provisional-failure"),
+        pytest.param(True, False, True, id="silent-after-timeout-accept-before-adoption"),
+        pytest.param(True, False, False, id="silent-after-timeout-accept-after-adoption"),
+    ],
+)
 async def test_named_send_adopts_busy_child_as_running_not_launching(
     monkeypatch: pytest.MonkeyPatch,
+    provisional_failure: bool,
+    reported_start: bool,
+    acceptance_before_adoption: bool,
 ) -> None:
-    """A server-busy child with no local work entry is adopted as a running turn.
+    """A busy child is adopted as running while retaining its native turn evidence.
 
-    After a runner restart the in-flight turn's local bookkeeping is gone, but the
-    server still reports the child busy. Pre-PR this was refused ("is already
-    running"); the fix adopts it -- stamping a dispatch id and registering one
-    entry so its result is delivered (review issue #1) -- and registers that entry
-    directly in ``running`` (not ``launching``), so the launch-timeout reaper
-    cannot fail a long-running steered turn whose buffered nudge is waiting for it
-    to yield (review issue #3).
+    A reported start keeps it exempt. A silent, unresolved turn keeps its original
+    acceptance time after provisional failure and replacement.
     """
     from omnigent.runner import app as runner_app
 
@@ -13862,11 +14205,69 @@ async def test_named_send_adopts_busy_child_as_running_not_launching(
         create_posts=create_posts,
         child_busy=True,
     )
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    subagent_work._session_inboxes_ref[parent_id] = inbox
+    dispatch: subagent_work._SubagentWorkEntry | None = None
     try:
+        if provisional_failure:
+            dispatch = subagent_work.register_subagent_work(
+                parent_session_id=parent_id,
+                child_session_id=child_id,
+                agent="claude",
+                title="merge-task",
+            )
+            dispatch.status = "running"
+            accept_subagent_turn(
+                child_id,
+                thread_id="thread_busy",
+                response_id="codex_busy",
+                now=None if reported_start else 1000.0,
+            )
+            if not reported_start:
+                assert (
+                    subagent_work.reap_stalled_subagent_launches(now=1179.0, timeout_s=180.0) == []
+                )
+            provisional = subagent_work.reap_stalled_subagent_launches(
+                now=time.time() + 7200.0 if reported_start else 1181.0, timeout_s=180.0
+            )
+            assert [entry.child_session_id for entry in provisional] == [child_id]
+            assert dispatch.status == "failed"
+        # The late report outlives any provisional failure and precedes adoption.
+        if reported_start:
+            subagent_work.note_subagent_child_start_reported(child_id, response_id="codex_busy")
+        elif acceptance_before_adoption:
+            accept_subagent_turn(
+                child_id, thread_id="thread_busy", response_id="codex_busy", now=1300.0
+            )
         output = await _run_named_continuation(parent_id, handler)
         work = subagent_work.get_subagent_work(child_id)
+        assert work is not None
+        assert work.status == "running"
+        if reported_start:
+            assert work.child_start_reported is True
+        else:
+            assert work.child_start_reported is False
+        # A real start keeps the bound disarmed; a silent turn retains its acceptance age.
+        accept_subagent_turn(
+            child_id,
+            thread_id="thread_busy",
+            response_id="codex_busy",
+            now=None if reported_start else 1300.0,
+        )
+        if reported_start:
+            reaped = subagent_work.reap_stalled_subagent_launches(
+                now=work.created_at + 7200.0, timeout_s=180.0
+            )
+        else:
+            assert work.awaiting_child_start_since == 1000.0
+            assert subagent_work._children_accepted_turns[child_id].accepted_at == 1000.0
+            reaped = subagent_work.reap_stalled_subagent_launches(now=1301.0, timeout_s=180.0)
+            assert reaped == [work]
+            assert work.status == "failed"
+            assert work.launch_timed_out
+            assert subagent_work.reap_stalled_subagent_launches(now=1302.0, timeout_s=180.0) == []
     finally:
-        subagent_work.unregister_subagent_work(child_id)
+        subagent_work.unregister_subagent_work_for_session(child_id)
         subagent_work._session_inboxes_ref.pop(parent_id, None)
 
     assert "already has a launching or running turn" not in output
@@ -13878,14 +14279,42 @@ async def test_named_send_adopts_busy_child_as_running_not_launching(
     assert len(stamped) == 1, "an untracked server-busy turn must be adopted with one stamp"
     # Adopted directly as running (not launching) so it is safe from the reaper,
     # and the entry carries the freshly stamped id so its completion delivers.
-    assert work is not None and work.work_id == stamped[0]
-    assert work.status == "running"
+    assert work.work_id == stamped[0]
+    if reported_start:
+        assert reaped == []
+        assert work.status == "running"
     assert len(event_posts) == 1
+    if not reported_start:
+        assert dispatch is not None
+        assert inbox.qsize() == 2
+        notices = [inbox.get_nowait(), inbox.get_nowait()]
+        assert [notice["work_id"] for notice in notices] == [dispatch.work_id, work.work_id]
+        assert all(notice["status"] == "failed" for notice in notices)
+        assert all("no turn start" in notice["output"] for notice in notices)
+        assert inbox.empty()
+    elif provisional_failure:
+        assert inbox.qsize() == 1
+        assert inbox.get_nowait()["status"] == "failed"
+    else:
+        assert inbox.empty()
 
 
+@pytest.mark.parametrize(
+    ("drain_during_post", "delayed_failure"),
+    [
+        pytest.param(False, None, id="False"),
+        pytest.param(True, None, id="True"),
+        pytest.param(False, "unidentified", id="retained-unidentified-failure"),
+        pytest.param(True, "unidentified", id="drained-unidentified-failure"),
+        pytest.param(False, "identified", id="retained-identified-failure"),
+        pytest.param(True, "identified", id="drained-identified-failure"),
+    ],
+)
 @pytest.mark.asyncio
 async def test_named_send_registers_fresh_when_tracked_turn_already_ended(
     monkeypatch: pytest.MonkeyPatch,
+    drain_during_post: bool,
+    delayed_failure: str | None,
 ) -> None:
     """The busy→ended race registers a fresh entry, not the drained one.
 
@@ -13904,9 +14333,34 @@ async def test_named_send_registers_fresh_when_tracked_turn_already_ended(
     stamped: list[str] = []
     event_posts: list[dict[str, Any]] = []
     create_posts: list[int] = []
+    parent_wakes: list[str] = []
+    pending_requests: list[subagent_work._ChildAcceptanceRequest] = []
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    delivery_gate = asyncio.Event()
+    acceptance = NativeTurnAcceptance(child_id, "thread_fresh", "codex_fresh")
+    harness = _RecoveryBlockingHarnessClient(
+        [
+            'data: {"type":"response.created","response":{"id":"resp_fresh"}}\n\n',
+            "data: "
+            + json.dumps(
+                {
+                    "type": "response.completed",
+                    "response": {"id": "resp_fresh", "status": "completed"},
+                    "native_acceptance": {
+                        "session_id": acceptance.session_id,
+                        "thread_id": acceptance.thread_id,
+                        "response_id": acceptance.response_id,
+                    },
+                }
+            )
+            + "\n\n",
+        ],
+        delivery_gate,
+    )
 
     monkeypatch.setattr(runner_app, "get_session_agent_id", lambda _sid: "ag_parent")
     monkeypatch.setattr(subagent_work, "register_child_session", lambda *a, **k: None)
+    monkeypatch.setattr(subagent_work.time, "time", lambda: 5000.0)
 
     # A stale entry from the turn that just ended: terminal and already delivered.
     stale = subagent_work.register_subagent_work(
@@ -13915,8 +14369,12 @@ async def test_named_send_registers_fresh_when_tracked_turn_already_ended(
     stale.status = "completed"
     stale.delivered = True
     stale_work_id = stale.work_id
+    if delayed_failure:
+        stale.status = "running"
+        stale.delivered = False
+        subagent_work.note_subagent_child_start_reported(child_id, response_id="codex_previous")
 
-    handler = _running_child_server_handler(
+    base_handler = _running_child_server_handler(
         parent_id,
         child_id,
         stamped=stamped,
@@ -13924,24 +14382,185 @@ async def test_named_send_registers_fresh_when_tracked_turn_already_ended(
         create_posts=create_posts,
         child_busy=True,
     )
-    try:
-        output = await _run_named_continuation(parent_id, handler)
-        work = subagent_work.get_subagent_work(child_id)
-    finally:
-        subagent_work.unregister_subagent_work(child_id)
-        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
-    payload = json.loads(output)
-    assert payload["status"] == "running"
-    # A fresh entry is registered under a NEW dispatch id (not the drained one),
-    # in "running", so the new turn's completion has a live entry to deliver to.
-    assert len(stamped) == 1
-    assert work is not None
-    assert work.work_id == stamped[0]
-    assert work.work_id != stale_work_id
-    assert work.status == "running"
-    assert work.delivered is False
-    assert len(event_posts) == 1
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == f"/v1/sessions/{parent_id}/events":
+            parent_wakes.append(json.loads(request.content)["data"]["content"][0]["text"])
+            return httpx.Response(202, json={"queued": True})
+        if (
+            delayed_failure
+            and request.method == "POST"
+            and request.url.path == f"/v1/sessions/{child_id}/events"
+        ):
+            response = await client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": "ag_child",
+                    "model": "test-agent",
+                    "harness_override": "codex-native",
+                    "content": [{"type": "input_text", "text": "Continue the merge."}],
+                },
+            )
+            assert response.status_code == 202, response.text
+            await asyncio.wait_for(harness.post_seen.wait(), timeout=5.0)
+            pending_requests.extend(subagent_work._pending_child_acceptances[child_id])
+            assert len(pending_requests) == 1
+            failure = {"status": "failed", "output": "Previous goal failed."}
+            if delayed_failure == "identified":
+                failure["response_id"] = "codex_previous"
+            response = await client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={"type": "external_session_status", "data": failure},
+            )
+            assert response.status_code == 204, response.text
+            assert stale.status == "failed"
+            assert stale.delivered
+            await poll_until_async(lambda: len(parent_wakes) == 1, timeout_s=5.0)
+            assert inbox.get_nowait()["output"] == "Previous goal failed."
+        if (
+            drain_during_post
+            and request.method == "POST"
+            and request.url.path == f"/v1/sessions/{child_id}/events"
+        ):
+            # An inbox drain consumes the stale result while the steer's POST is in flight.
+            subagent_work.unregister_subagent_work(
+                child_id, work_id=stale_work_id, remember_drained_delivery=True
+            )
+        return await base_handler(request)
+
+    reaped: list[subagent_work._SubagentWorkEntry] = []
+    # Codex accepts the new turn before the message POST returns to the parent, so the
+    # acceptance lands while the stale entry is still the child's only record.
+    if not delayed_failure:
+        accept_subagent_turn(child_id, thread_id="thread_fresh", response_id="codex_fresh")
+    subagent_work._session_inboxes_ref[parent_id] = inbox
+    try:
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler), base_url="http://server"
+        ) as server_client:
+            app = create_runner_app(
+                process_manager=_RecoveryFakeProcessManager(harness),  # type: ignore[arg-type]
+                server_client=server_client,
+            )
+            async with _runner_test_client(app) as client:
+                output = await _run_named_continuation(parent_id, handler)
+                work = subagent_work.get_subagent_work(child_id)
+                assert work is not None
+                if delayed_failure:
+                    assert work.native_acceptance is None
+                    assert work.awaiting_child_start_since is None
+                    assert not pending_requests[0].finished
+                    delivery_gate.set()
+                    await _await_bg_turn_task(child_id)
+                    assert pending_requests[0].finished
+                    assert not pending_requests[0].settled_response_ids
+                    assert not pending_requests[0].unidentified_settlement
+                    assert not pending_requests[0].unidentified_settlement_work_ids
+                    assert child_id not in subagent_work._pending_child_acceptances
+                # Acceptance may precede registration or finish after the previous
+                # turn's failure and replacement, but still bounds this silent turn.
+                assert work.child_start_reported is False
+                assert work.awaiting_child_start_since is not None
+                assert work.awaiting_child_start_since == 5000.0
+                assert work.native_acceptance is not None
+                assert work.native_acceptance.session_id == child_id
+                assert work.native_acceptance.thread_id == "thread_fresh"
+                assert work.native_acceptance.response_id == "codex_fresh"
+                assert work.delivered is False
+                if delayed_failure:
+                    response = await client.post(
+                        f"/v1/sessions/{parent_id}/events",
+                        json={
+                            "type": "message",
+                            "role": "user",
+                            "agent_id": "ag_parent",
+                            "model": "test-agent",
+                            "harness": "openai-agents",
+                            "content": [{"type": "input_text", "text": "Read the old failure."}],
+                        },
+                    )
+                    assert response.status_code == 202, response.text
+                    await _await_bg_turn_task(parent_id)
+                wakes_before_timeout = len(parent_wakes)
+                assert (
+                    subagent_work.reap_stalled_subagent_launches(now=5179.0, timeout_s=180.0) == []
+                )
+                reaped = subagent_work.reap_stalled_subagent_launches(
+                    now=5181.0,
+                    timeout_s=180.0,
+                    mark_terminal=app.state.mark_subagent_terminal_and_wake,
+                )
+
+                payload = json.loads(output)
+                assert payload["status"] == "running"
+                # The replacement's dispatch id must own its eventual completion.
+                assert len(stamped) == 1
+                assert work.work_id == stamped[0]
+                assert work.work_id != stale_work_id
+                assert len(event_posts) == 1
+                assert [entry.child_session_id for entry in reaped] == [child_id]
+                assert work.status == "failed"
+                notice = inbox.get_nowait()
+                assert notice["status"] == "failed"
+                assert "no turn start" in notice["output"]
+                assert work.launch_timed_out
+                assert inbox.empty()
+                assert (
+                    subagent_work.reap_stalled_subagent_launches(now=9000.0, timeout_s=180.0) == []
+                )
+                await poll_until_async(
+                    lambda: len(parent_wakes) == wakes_before_timeout + 1, timeout_s=5.0
+                )
+                assert "finished (failed)" in parent_wakes[-1]
+                response = await client.post(
+                    f"/v1/sessions/{parent_id}/events",
+                    json={
+                        "type": "message",
+                        "role": "user",
+                        "agent_id": "ag_parent",
+                        "model": "test-agent",
+                        "harness": "openai-agents",
+                        "content": [
+                            {"type": "input_text", "text": "Read the provisional failure."}
+                        ],
+                    },
+                )
+                assert response.status_code == 202, response.text
+                delivery_gate.set()
+                await _await_bg_turn_task(parent_id)
+                response = await client.post(
+                    f"/v1/sessions/{child_id}/events",
+                    json={
+                        "type": "external_session_status",
+                        "data": {
+                            "status": "idle",
+                            "turn_outcome": "completed",
+                            "response_id": acceptance.response_id,
+                            "output": "Fresh merge result.",
+                        },
+                    },
+                )
+                assert response.status_code == 204, response.text
+                assert subagent_work.get_subagent_work(child_id) is work
+                assert work.status == "completed"
+                assert not work.launch_timed_out
+                result = inbox.get_nowait()
+                assert result["status"] == "completed"
+                assert result["output"] == "Fresh merge result."
+                assert inbox.empty()
+                await poll_until_async(
+                    lambda: len(parent_wakes) == wakes_before_timeout + 2, timeout_s=5.0
+                )
+                assert "finished (completed)" in parent_wakes[-1]
+    finally:
+        delivery_gate.set()
+        await _await_bg_turn_task(child_id)
+        await _await_bg_turn_task(parent_id)
+        subagent_work.unregister_subagent_work_for_session(child_id)
+        subagent_work._session_inboxes_ref.pop(child_id, None)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
 
 
 @pytest.mark.asyncio

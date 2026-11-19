@@ -14,7 +14,9 @@ import { FullscreenIcon } from "@/components/ai-elements/MermaidBlock";
 import { GraphZoomControls } from "@/components/GraphZoomControls";
 import { Button } from "@/components/ui/button";
 import { HoverCard, HoverCardContent, HoverCardTrigger } from "@/components/ui/hover-card";
+import { StepDescription } from "@/components/workflows/StepDescription";
 import { getEmbedRoot } from "@/lib/host";
+import { markdownPreviewText } from "@/lib/markdownPreviewText";
 import { failedUpstream, type StepProgress, type StepState } from "@/lib/sessionJournal";
 import { cn } from "@/lib/utils";
 import {
@@ -56,6 +58,9 @@ const NODE_TINT: Record<StepState, string> = {
 // The states a run's legend explains, in the order work moves through them.
 const LEGEND: readonly StepState[] = ["waiting", "running", "needs_input", "done", "failed"];
 
+/** How long a step's hover card waits before it opens. */
+export const HOVER_CARD_OPEN_DELAY_MS = 300;
+
 // A node's ⋯ button; React Flow leaves a press on it alone rather than panning.
 const NODE_MENU_BUTTON =
   "nodrag nopan -my-0.5 -mr-1.5 shrink-0 cursor-pointer rounded-md p-0.5 text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/50";
@@ -86,13 +91,14 @@ function StepNode({ id, data }: NodeProps<Node<StepNodeData>>) {
   const [cardOpen, setCardOpen] = useState(false);
   // The card steps aside while the node's menu is open.
   const [menuOpen, setMenuOpen] = useState(false);
+  const goalPreview = data.goal ? markdownPreviewText(data.goal) : "";
   return (
     <>
       <Handle type="target" position={Position.Top} className={HANDLE_CLASS} />
       <HoverCard
         open={cardOpen && !menuOpen}
         onOpenChange={setCardOpen}
-        openDelay={300}
+        openDelay={HOVER_CARD_OPEN_DELAY_MS}
         closeDelay={100}
       >
         <HoverCardTrigger asChild>
@@ -106,19 +112,17 @@ function StepNode({ id, data }: NodeProps<Node<StepNodeData>>) {
             data-state={data.state}
           >
             <StepGlyph state={data.state ?? "waiting"} number={data.number} />
-            <div className="min-w-0 flex-1">
-              <p className="line-clamp-2 break-words text-sm font-medium leading-[18px]">
-                {data.name}
-              </p>
+            <div className="min-w-0 flex-1 wrap-anywhere">
+              <p className="line-clamp-2 text-sm font-medium leading-[18px]">{data.name}</p>
               {/* A step that can't start says why in place of its goal, which its card shows. */}
               {data.failedNames ? (
                 <p className="mt-0.5 line-clamp-2 text-xs leading-snug text-muted-foreground">
                   <CantStart failedNames={data.failedNames} />
                 </p>
               ) : (
-                data.goal && (
+                goalPreview && (
                   <p className="mt-0.5 line-clamp-2 text-xs leading-snug text-muted-foreground">
-                    {data.goal}
+                    {goalPreview}
                   </p>
                 )
               )}
@@ -138,7 +142,10 @@ function StepNode({ id, data }: NodeProps<Node<StepNodeData>>) {
           side="right"
           align="start"
           sideOffset={8}
-          className="flex w-fit max-w-72 flex-col items-start gap-1 px-3 py-2 text-sm"
+          collisionPadding={8}
+          // break-words would let a long path or command set the text's width past the card.
+          // Zooming in leaves less room beside the step, so the card shrinks to fit the window.
+          className="flex max-h-(--radix-hover-card-content-available-height) w-fit max-w-[min(18rem,var(--radix-hover-card-content-available-width))] flex-col items-start gap-1 overflow-y-auto wrap-anywhere px-3 py-2 text-sm"
           data-testid="workflow-step-card"
         >
           {item ? (
@@ -156,8 +163,8 @@ function StepNode({ id, data }: NodeProps<Node<StepNodeData>>) {
               <span className="text-muted-foreground">
                 Step {data.number} of {graph.total}
               </span>
-              <span className="break-words font-medium">{data.name}</span>
-              {data.goal && <span className="break-words text-muted-foreground">{data.goal}</span>}
+              <span className="font-medium">{data.name}</span>
+              {data.goal && <StepDescription text={data.goal} />}
             </>
           )}
         </HoverCardContent>

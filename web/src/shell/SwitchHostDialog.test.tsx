@@ -376,6 +376,32 @@ describe("SwitchHostDialog", () => {
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session-agent", "conv_1"] });
   });
 
+  it("stamps the runner launch on the session it moved, not the conversation open when it lands", async () => {
+    conversationRegistry.acquire("conv_1");
+    let landLaunch!: (value: Awaited<ReturnType<typeof launchRunner>>) => void;
+    launchRunnerMock.mockReturnValueOnce(
+      new Promise((resolve) => {
+        landLaunch = resolve;
+      }),
+    );
+    renderDialog();
+
+    const button = await screen.findByTestId("switch-host-button");
+    await waitFor(() => expect((button as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(button);
+    await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
+
+    // The user opens another conversation while the runner is launching.
+    conversationRegistry.acquire("conv_open");
+    conversationRegistry.setActive("conv_open");
+    landLaunch({ runnerId: "runner_new" });
+
+    await waitFor(() =>
+      expect(conversationRegistry.peek("conv_1")!.getState().runnerLaunchedAt).not.toBeNull(),
+    );
+    expect(conversationRegistry.peek("conv_open")!.getState().runnerLaunchedAt).toBeNull();
+  });
+
   it("keeps the binding when stopping the old runner fails", async () => {
     stopSessionMock.mockRejectedValue(new Error("Old runner could not be stopped"));
     renderDialog();
@@ -789,7 +815,7 @@ describe("SwitchHostDialog", () => {
       expect(screen.getByTestId("mock-host-select")).toHaveValue("host_new");
     });
 
-    it("lists no sandbox once the session has lost its host", () => {
+    it("reconnects a hostless session on a chosen machine without offering a new sandbox", async () => {
       // The server only moves a session off a host it still has, e.g. not after
       // an earlier switch failed partway and left it unbound.
       vi.mocked(useSession).mockReturnValue({
@@ -806,14 +832,39 @@ describe("SwitchHostDialog", () => {
           subAgentName: null,
           kind: "default",
           hostId: null,
+          runnerId: null,
+          workspace: null,
           labels: {},
         },
         isLoading: false,
         error: null,
       });
-      renderDialog(SANDBOX_SERVER);
+      getSessionSlimMock.mockResolvedValue({
+        hostId: null,
+        runnerId: null,
+        workspace: null,
+      } as Awaited<ReturnType<typeof getSessionSlim>>);
+      renderDialog(SANDBOX_SERVER, { currentHostId: null });
       expect(screen.queryByTestId("switch-host-sandbox-option-modal")).toBeNull();
+      expect(screen.getByTestId("mock-host-select")).toHaveValue("host_old");
+      fireEvent.change(screen.getByTestId("mock-host-select"), {
+        target: { value: "host_new" },
+      });
       expect(screen.getByTestId("mock-host-select")).toHaveValue("host_new");
+      fireEvent.change(screen.getByTestId("mock-workspace-input"), {
+        target: { value: "/Users/alice/recovered-worktree" },
+      });
+      fireEvent.click(screen.getByTestId("switch-host-button"));
+
+      await waitFor(() =>
+        expect(launchRunnerMock).toHaveBeenCalledWith(
+          "host_new",
+          "conv_1",
+          "/Users/alice/recovered-worktree",
+        ),
+      );
+      expect(getSessionSlimMock).toHaveBeenCalledWith("conv_1");
+      expect(launchManagedHostMock).not.toHaveBeenCalled();
     });
 
     it.each([false, true])(

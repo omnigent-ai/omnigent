@@ -1,11 +1,6 @@
-// A read-only "Keyboard shortcuts" overlay listing the shortcuts that already
-// exist in the chat surface. The rows come from `@/lib/shortcutCatalog`, which
-// mirrors the live behavior. Nothing here binds new behavior except the
-// dialog's own opener (⌘/Ctrl + /), which this component registers.
-//
-// Self-contained: it owns its open state and listens for its opener directly
-// (a window keydown for ⌘/Ctrl+/, plus a custom event so a menu entry can open
-// it without prop-drilling). Mount it once near the app shell.
+// Read-only "Keyboard shortcuts" overlay; rows come from the registry-backed shortcutPage.
+// It binds only its own opener (⌘/Ctrl + /) and the menu event that opens it.
+// Mount it once near the app shell.
 
 import { useEffect, useState } from "react";
 
@@ -17,19 +12,18 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { hasCommandModifier } from "@/lib/hotkeys";
 import {
   isElectronShell,
   isNativeShell,
   supportsBrowser,
   supportsDesktopCommands,
 } from "@/lib/nativeBridge";
-import { shortcutGroupsFor } from "@/lib/shortcutCatalog";
+import { matchesShortcut } from "@/lib/shortcuts/registry";
+import { shortcutPageGroups } from "@/lib/shortcuts/shortcutPage";
 
 // Custom event the dialog listens for, so non-adjacent surfaces (e.g. the
 // account menu) can open it without threading state through the tree.
@@ -53,10 +47,9 @@ export function KeyboardShortcutsList({
 }) {
   // Feature-based, stable per session; computed at render so tests can vary it.
   const isMobileViewport = useIsMobileViewport();
-  const isCoarsePointer = useIsCoarsePointer();
-  const preventsKeyboardSubmit = isMobileViewport || isCoarsePointer;
+  const preventsKeyboardSubmit = isMobileViewport;
   const serverInfo = useServerInfo();
-  const groups = shortcutGroupsFor({
+  const groups = shortcutPageGroups({
     native: isNativeShell(),
     electron: isElectronShell(),
     browser: supportsBrowser(),
@@ -126,7 +119,7 @@ export function KeyboardShortcutsDialog() {
       // ⌘/Ctrl + / toggles the panel. Plain `/` is the composer's slash-menu
       // trigger, so require the platform command modifier and no Shift/Alt to
       // avoid clashing (only ⌘/ on macOS, only Ctrl+/ on Win/Linux).
-      if (hasCommandModifier(e) && !e.altKey && !e.shiftKey && e.key === "/") {
+      if (matchesShortcut(e, "shortcuts.show")) {
         e.preventDefault();
         setOpen((prev) => !prev);
       }
