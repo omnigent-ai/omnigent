@@ -271,6 +271,7 @@ def _validate_auth_runtime(executable: _TrustedExecutable, policy: SandboxPolicy
 
     if executable.interpreter is None:
         raise ValueError("profile authentication requires a pinned Python runtime")
+    invalid_runtime = "model auth executable and runtime must stay outside sandbox-writable paths"
     try:
         entries = _launcher_path_variants(executable.path)
         trees: set[Path] = set()
@@ -281,6 +282,9 @@ def _validate_auth_runtime(executable: _TrustedExecutable, policy: SandboxPolicy
             trees.update(interpreter.parent.parent / name for name in ("lib", "lib64"))
         entries = {variant for path in entries for variant in _launcher_path_variants(path)}
         trees = {variant for path in trees for variant in _launcher_path_variants(path)}
+    except (OSError, RuntimeError):
+        raise ValueError(invalid_runtime) from None
+    try:
         _validate_launcher_write_grants(policy, entries, trees)
         # The venv library container can hold unrelated unreadable data.
         _validate_trusted_hardlink_aliases(policy, entries, set())
@@ -310,10 +314,8 @@ def _validate_auth_runtime(executable: _TrustedExecutable, policy: SandboxPolicy
         import_trees = {variant for root in roots for variant in _launcher_path_variants(root)}
         _validate_launcher_write_grants(policy, set(), import_trees)
         _validate_trusted_hardlink_aliases(policy, set(), import_trees)
-    except (OSError, RuntimeError):
-        raise ValueError(
-            "model auth executable and runtime must stay outside sandbox-writable paths"
-        ) from None
+    except OSError as exc:
+        raise ValueError(invalid_runtime) from exc
 
 
 def _profile_token_argv(executable: Path, *, host: str, profile: str) -> list[str]:
