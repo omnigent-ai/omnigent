@@ -86,26 +86,39 @@ export function TemplateNameInput({
     <div className="relative w-full">
       <div
         aria-hidden="true"
-        className="pointer-events-none absolute inset-0 flex items-center overflow-hidden whitespace-pre rounded-lg border border-transparent bg-transparent px-2.5 py-1 text-ui text-foreground dark:bg-input/30"
+        className={cn(
+          // Input's own box and type metrics, then the caller's overrides, so the
+          // visible text lands exactly where the input draws its caret and selection.
+          "rounded-lg border bg-transparent px-2.5 py-1 text-ui text-foreground md:text-ui",
+          className,
+          "pointer-events-none absolute inset-0 flex items-center overflow-hidden whitespace-pre border-transparent",
+        )}
         data-testid="task-name-template-overlay"
       >
-        <span ref={backdropTextRef} className="w-max shrink-0 whitespace-pre">
-          {parts.map((part) => {
-            const key = offset;
-            offset += part.text.length;
-            const displayedText = part.text.replace(/[\r\n]/g, "");
-            return part.kind === "placeholder" ? (
-              <mark
-                key={key}
-                className="rounded-sm bg-accent/50 text-accent-foreground"
-                data-template-placeholder
-              >
-                {displayedText}
-              </mark>
-            ) : (
-              <span key={key}>{displayedText}</span>
-            );
-          })}
+        {/* Clip at the content box, as the input does, so no text shows in its padding. */}
+        <span className="min-w-0 flex-1 overflow-hidden">
+          <span
+            ref={backdropTextRef}
+            className="block w-max whitespace-pre"
+            data-testid="task-name-template-overlay-text"
+          >
+            {parts.map((part) => {
+              const key = offset;
+              offset += part.text.length;
+              const displayedText = part.text.replace(/[\r\n]/g, "");
+              return part.kind === "placeholder" ? (
+                <mark
+                  key={key}
+                  className="rounded-sm bg-accent/50 text-accent-foreground"
+                  data-template-placeholder
+                >
+                  {displayedText}
+                </mark>
+              ) : (
+                <span key={key}>{displayedText}</span>
+              );
+            })}
+          </span>
         </span>
       </div>
       <Input
