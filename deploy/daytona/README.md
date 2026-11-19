@@ -316,6 +316,6 @@ it.
 | `DAYTONA_API_KEY` | CLI machine / server | Daytona API credentials (required) |
 | `DAYTONA_API_URL` | CLI machine / server | Non-default Daytona API endpoint |
 | `DAYTONA_TARGET` | CLI machine / server | Target region for new sandboxes |
-| `DAYTONA_OUTBOUND_PROXY_URL` | CLI machine / server | Proxy URL new sandboxes route HTTP(S) traffic through (may embed credentials) |
+| `DAYTONA_OUTBOUND_PROXY_URL` | CLI machine / server | Proxy URL new sandboxes route HTTP(S) traffic through (may embed credentials; set at sandbox creation only, as resuming keeps the original proxy) |
 | `OMNIGENT_DAYTONA_HOST_IMAGE` | CLI machine / server | Override the host image ref (`sandbox.daytona.image` takes precedence) |
 | `OMNIGENT_DAYTONA_SANDBOX_ENV` | CLI machine / server | Comma-separated launcher-side env var names to inject (`sandbox.daytona.env` takes precedence for managed) |

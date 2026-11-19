@@ -526,6 +526,18 @@ def test_provision_outbound_proxy_url_from_server_env(
     assert create.params.outbound_proxy_url == proxy_url
 
 
+def test_provision_outbound_proxy_url_empty_string_treated_as_unset(
+    fake_daytona: _FakeDaytonaState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty server env proxy URL is treated as unset."""
+    monkeypatch.setenv(OUTBOUND_PROXY_URL_ENV_VAR, "")
+
+    DaytonaSandboxLauncher().provision("a")
+
+    [create] = fake_daytona.create_calls
+    assert create.params.outbound_proxy_url is None
+
+
 def test_provision_env_passthrough_resolves_from_server_env(
     fake_daytona: _FakeDaytonaState, monkeypatch: pytest.MonkeyPatch
 ) -> None:
