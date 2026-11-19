@@ -42,10 +42,32 @@ async def test_registry_discovery_and_fresh_native_manager_use_service_route():
         manager = ProxyMcpManager("session-test", client)
         discovered = await manager.schemas_for(spec())
         assert discovered.tool_names == {"tracker__read_ticket"}
+        assert discovered.unavailable_notice() is None
         assert await manager.call_tool(None, "tracker__read_ticket", {}) == "ticket"
         fresh = ProxyMcpManager("session-test", client)
         assert await fresh.call_tool(spec(), "tracker__read_ticket", {}) == "ticket"
     assert len(calls) == 3
+
+
+async def test_registry_discovery_failure_names_the_unavailable_service():
+    error = {"code": -32000, "message": "MCP service returned HTTP 500.\nCheck the service."}
+
+    def handle(request):
+        body = json.loads(request.content)
+        return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "error": error})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="http://test"
+    ) as client:
+        discovered = await ProxyMcpManager("session-test", client).schemas_for(spec())
+
+    assert discovered.tool_names == set()
+    notice = discovered.unavailable_notice()
+    assert notice is not None
+    assert notice.endswith(
+        "\n- tracker: MCP proxy error -32000: MCP service returned HTTP 500. Check the service."
+    )
+    assert "configured but unavailable" in notice
 
 
 async def test_registry_transport_failure_is_not_replayed():

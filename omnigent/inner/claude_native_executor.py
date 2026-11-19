@@ -40,6 +40,7 @@ from omnigent.harnesses.claude_native.bridge import (
     read_launch_model,
     read_model_env,
     read_model_picker_values,
+    read_relay_unavailable_notice,
     read_transcript_path,
     terminal_dialog_pending,
 )
@@ -353,6 +354,9 @@ class ClaudeNativeExecutor(Executor):
         self._require_active_session()
         context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
         context_path.unlink(missing_ok=True)
+        relay_notice = read_relay_unavailable_notice(self._bridge_dir)
+        if relay_notice:
+            notices = [*notices, relay_notice]
         if notices:
             context_path.write_text("\n\n".join(notices), encoding="utf-8")
         try:

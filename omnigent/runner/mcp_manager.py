@@ -82,6 +82,7 @@ def _build_accept_content(
 
 
 _POOL_SPEC_CAPACITY = 8
+_UNAVAILABLE_ERROR_CHARS = 300
 
 
 @dataclass
@@ -121,6 +122,27 @@ class McpSchemasResult:
     schemas: list[_JsonObject]
     tool_names: set[str]
     failures: dict[str, str]  # server_name → error message
+
+    def unavailable_notice(self) -> str | None:
+        """
+        Tell the agent which configured MCP services failed to load.
+
+        Without it, an agent asked about a configured service whose discovery
+        failed sees no tools for it and reports it as not configured.
+
+        :returns: Agent-facing notice, or ``None`` when every service loaded.
+        """
+        if not self.failures:
+            return None
+        lines = [
+            f"- {name}: {' '.join(error.split())[:_UNAVAILABLE_ERROR_CHARS]}"
+            for name, error in sorted(self.failures.items())
+        ]
+        return (
+            "These MCP services are configured for this session, but Omnigent could not "
+            "load their tools, so they are unavailable. If asked about one, say it is "
+            "configured but unavailable rather than not configured.\n" + "\n".join(lines)
+        )
 
 
 def compute_spec_hash(configs: list[MCPServerConfig], cwd: Path | None = None) -> str:

@@ -5864,10 +5864,12 @@ def create_runner_app(
             server_client=server_client,
             session_labels=session_labels,
         )
+        unavailable_notice: str | None = None
         if relay_spec is not None and relay_spec.mcp_servers:
             # Native terminals consume the persistent relay, not per-turn schemas.
             mcp = await ProxyMcpManager(session_id, server_client).schemas_for(relay_spec)
             relay_schemas.extend(mcp.schemas)
+            unavailable_notice = mcp.unavailable_notice()
             for service, error in mcp.failures.items():
                 _logger.warning(
                     "Native relay MCP %r unavailable: %s",
@@ -5999,7 +6001,9 @@ def create_runner_app(
             if current is not None and current.bridge_dir == bridge_dir:
                 # Native policy hooks can cache the relay URL/token at startup.
                 relay = current.relay
-                relay.update_tools(relay_schemas, _relay_tool_executor)
+                relay.update_tools(
+                    relay_schemas, _relay_tool_executor, unavailable_notice=unavailable_notice
+                )
             else:
                 with scheduled_run_scope(None, session_id=session_id):
                     relay = start_tool_relay(
@@ -6010,6 +6014,7 @@ def create_runner_app(
                         policy_client=server_client,
                         session_id=session_id,
                         file_change_observer=_observe_native_file_changes,
+                        unavailable_notice=unavailable_notice,
                     )
         except (OSError, RuntimeError):
             _logger.warning(
