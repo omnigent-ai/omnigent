@@ -50,6 +50,7 @@ import {
 
 import { useDesktopCommand } from "@/lib/desktopCommands";
 import {
+  CHROME_COOKIE_ALL_SITES_SCOPE,
   getDesktopFeatures,
   navigationHostOptions,
   supportsBrowser,
@@ -109,9 +110,9 @@ interface BrowserPaneBridge {
   browserGoForward?: (conversationId: string) => Promise<NavResult>;
   browserReload?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
   openBrowserDevTools?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
-  /** Local Chrome profiles holding cookies for the current site (metadata only). */
+  /** Local Chrome profiles holding cookies, for the current site and overall (metadata only). */
   browserChromeCookiePreview?: (conversationId: string) => Promise<ChromeCookiePreviewResult>;
-  /** Copy the current site's Chrome cookies into this conversation's session. */
+  /** Copy a Chrome profile's cookies, for one site or every website, into this conversation's session. */
   browserChromeCookieImport?: (
     conversationId: string,
     args: { profileId: string; expectedHost: string; scope?: string },
@@ -146,22 +147,75 @@ function getBridge(): BrowserPaneBridge | null {
   return w.omnigentDesktop ?? null;
 }
 
+/** Whether the shell offers every website's cookies for this Chrome profile. */
+function offersAllSites(preview: ChromeCookiePreviewResult | null, profileId: string): boolean {
+  return (preview?.allSitesProfiles ?? []).some((profile) => profile.id === profileId);
+}
+
 /**
- * Scopes the user may target for one Chrome profile: the page's host first,
- * then only the parent domains that profile actually holds a domain cookie for
- * (main-derived; the shell rejects anything else).
+ * Scopes the user may target for one Chrome profile: every website first, when
+ * the shell offers it, then the page's host and only the parent domains that
+ * profile actually holds a domain cookie for (main-derived; the shell rejects
+ * anything else).
  */
 function cookieScopeOptions(
   preview: ChromeCookiePreviewResult | null,
   profileId: string,
 ): string[] {
-  const profile =
-    preview?.profiles?.find((candidate) => candidate.id === profileId) ?? preview?.profiles?.[0];
+  const allSites = offersAllSites(preview, profileId);
+  const listed = preview?.profiles?.find((candidate) => candidate.id === profileId);
+  // A profile offered only for every website holds nothing for this site.
+  if (allSites && !listed) return [CHROME_COOKIE_ALL_SITES_SCOPE];
+  const profile = listed ?? preview?.profiles?.[0];
+  let siteScopes = preview?.host ? [preview.host] : [];
   if (profile?.scopes && profile.scopes.length > 0) {
-    return profile.scopes.map((entry) => entry.host);
+    siteScopes = profile.scopes.map((entry) => entry.host);
+  } else if (preview?.scopes && preview.scopes.length > 0) {
+    siteScopes = preview.scopes;
   }
-  if (preview?.scopes && preview.scopes.length > 0) return preview.scopes;
-  return preview?.host ? [preview.host] : [];
+  return allSites ? [CHROME_COOKIE_ALL_SITES_SCOPE, ...siteScopes] : siteScopes;
+}
+
+/** Chrome profiles the dialog offers: any with cookies for some website, else for this site. */
+function cookieProfileOptions(
+  preview: ChromeCookiePreviewResult | null,
+): { id: string; name: string }[] {
+  const names = new Map<string, string>();
+  for (const profile of [...(preview?.allSitesProfiles ?? []), ...(preview?.profiles ?? [])]) {
+    if (!names.has(profile.id)) names.set(profile.id, profile.name);
+  }
+  return [...names].map(([id, name]) => ({ id, name }));
+}
+
+/** Cookies one Chrome profile holds for a scope. */
+function cookieCountFor(
+  preview: ChromeCookiePreviewResult | null,
+  profileId: string,
+  scope: string,
+): number {
+  if (scope === CHROME_COOKIE_ALL_SITES_SCOPE) {
+    return preview?.allSitesProfiles?.find((profile) => profile.id === profileId)?.cookieCount ?? 0;
+  }
+  const profile = preview?.profiles?.find((candidate) => candidate.id === profileId);
+  return (
+    profile?.scopes?.find((entry) => entry.host === scope)?.cookieCount ??
+    (scope === preview?.host ? (profile?.cookieCount ?? 0) : 0)
+  );
+}
+
+/** Cookies a profile would import for `scope`, or for its first scope when it lacks that one. */
+function cookieCountInPicker(
+  preview: ChromeCookiePreviewResult | null,
+  profileId: string,
+  scope: string,
+): number {
+  const offered = cookieScopeOptions(preview, profileId);
+  return cookieCountFor(preview, profileId, offered.includes(scope) ? scope : (offered[0] ?? ""));
+}
+
+/** How a scope reads in a sentence. */
+function cookieScopeName(scope: string): string {
+  return scope === CHROME_COOKIE_ALL_SITES_SCOPE ? "all websites" : scope;
 }
 
 export interface BrowserPaneProps {
@@ -238,7 +292,10 @@ export function BrowserPane({
   useEffect(() => {
     if (!cookiePreview) return;
     const offered = cookieScopeOptions(cookiePreview, cookieProfileId);
-    if (offered.length > 0 && !offered.includes(cookieScope)) setCookieScope(offered[0]);
+    if (offered.length === 0 || offered.includes(cookieScope)) return;
+    // A site the user picked narrows to another site when one is offered, never to every website.
+    const siteScope = offered.find((scope) => scope !== CHROME_COOKIE_ALL_SITES_SCOPE);
+    setCookieScope(cookieScope && siteScope ? siteScope : offered[0]);
   }, [cookiePreview, cookieProfileId, cookieScope]);
 
   // Track existence through create/close events and a remount probe.
@@ -428,8 +485,8 @@ export function BrowserPane({
     };
   }, [browserSupported]);
 
-  // Step 1: ask main what Chrome holds for THIS site (metadata only — the
-  // Keychain prompt belongs to the import, not to opening the dialog).
+  // Step 1: ask main what Chrome holds, for this site and overall (metadata only
+  // — the Keychain prompt belongs to the import, not to opening the dialog).
   const handlePreviewChromeCookies = useCallback(async () => {
     const bridge = getBridge();
     if (!bridge?.browserChromeCookiePreview) return;
@@ -441,14 +498,20 @@ export function BrowserPane({
         return;
       }
       const profiles = preview.profiles ?? [];
-      if (!preview.host || profiles.length === 0) {
-        toast.info(`No Chrome cookies found for ${preview.host ?? "this site"}.`);
+      const offered = cookieProfileOptions(preview);
+      if (!preview.host || offered.length === 0) {
+        toast.info(
+          preview.allSitesProfiles
+            ? "No Chrome cookies found."
+            : `No Chrome cookies found for ${preview.host ?? "this site"}.`,
+        );
         return;
       }
       // Prefer a profile that actually holds cookies for this page.
-      const preferred = profiles.find((profile) => (profile.cookieCount ?? 0) > 0) ?? profiles[0];
+      const preferred = profiles.find((profile) => (profile.cookieCount ?? 0) > 0) ?? offered[0];
       setCookieProfileId(preferred.id);
-      setCookieScope(preview.host);
+      // Every website when the shell offers it, else this page's own site.
+      setCookieScope(cookieScopeOptions(preview, preferred.id)[0] ?? preview.host);
       setCookiePreview({ ...preview, profiles });
     } catch {
       toast.error("Couldn't look for Chrome cookies.");
@@ -463,9 +526,8 @@ export function BrowserPane({
     const bridge = getBridge();
     const preview = cookiePreview;
     if (!bridge?.browserChromeCookieImport || !preview?.host || !cookieProfileId) return;
-    const scope = cookieScopeOptions(preview, cookieProfileId).includes(cookieScope)
-      ? cookieScope
-      : preview.host;
+    const offered = cookieScopeOptions(preview, cookieProfileId);
+    const scope = offered.includes(cookieScope) ? cookieScope : (offered[0] ?? preview.host);
     setCookieBusy(true);
     try {
       const result = await bridge.browserChromeCookieImport(conversationId, {
@@ -485,8 +547,8 @@ export function BrowserPane({
         // Keep the dialog open — another Chrome profile may hold the session.
         toast.error(
           (result.failed ?? 0) > 0
-            ? `Chrome's cookies for ${scope} couldn't be saved in this browser session.`
-            : `Chrome had no usable cookies for ${scope}.`,
+            ? `Chrome's cookies for ${cookieScopeName(scope)} couldn't be saved in this browser session.`
+            : `Chrome had no usable cookies for ${cookieScopeName(scope)}.`,
         );
         return;
       }
@@ -667,15 +729,18 @@ export function BrowserPane({
   //     canGoBack/canGoForward (both false with no view); reload + DevTools are
   //     explicitly disabled (nothing to reload / no devtools target yet). The
   //     URL bar stays editable so the user can open the first page.
-  const cookieProfiles = cookiePreview?.profiles ?? [];
+  const cookieProfiles = cookieProfileOptions(cookiePreview);
   const selectedCookieProfile =
     cookieProfiles.find((profile) => profile.id === cookieProfileId) ?? cookieProfiles[0];
-  const cookieScopes = cookieScopeOptions(cookiePreview, cookieProfileId);
+  const cookieScopes = cookieScopeOptions(cookiePreview, selectedCookieProfile?.id ?? "");
   const activeCookieScope = cookieScope || cookieScopes[0] || "";
+  const allSitesCookieScope = activeCookieScope === CHROME_COOKIE_ALL_SITES_SCOPE;
   /** Cookies the selected profile holds for one scope. */
   const countForScope = (scope: string) =>
-    selectedCookieProfile?.scopes?.find((entry) => entry.host === scope)?.cookieCount ??
-    (scope === cookiePreview?.host ? (selectedCookieProfile?.cookieCount ?? 0) : 0);
+    cookieCountFor(cookiePreview, selectedCookieProfile?.id ?? "", scope);
+  /** How a scope reads in the picker. */
+  const cookieScopeLabel = (scope: string) =>
+    scope === CHROME_COOKIE_ALL_SITES_SCOPE ? "All websites" : scope;
   return (
     <div
       className={cn("flex min-h-0 min-w-0 flex-col", className)}
@@ -757,7 +822,7 @@ export function BrowserPane({
             onClick={handlePreviewChromeCookies}
             disabled={!hasView || cookieBusy}
             aria-label="Import cookies from Chrome"
-            title="Import this site's cookies from Chrome so you're signed in here too"
+            title="Import cookies from Chrome so you're signed in here too"
             className="flex size-6 items-center justify-center rounded text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-40"
           >
             <CookieIcon className="size-4" />
@@ -826,9 +891,10 @@ export function BrowserPane({
           <DialogHeader>
             <DialogTitle>Import cookies from Chrome</DialogTitle>
             <DialogDescription>
-              Copies {activeCookieScope}'s cookies into this conversation's browser, so the site
-              reuses the sign-in you already have in Chrome. Nothing is written back to Chrome, and
-              the copy disappears when Omnigent quits.
+              {allSitesCookieScope
+                ? "Copies every website's cookies from this Chrome profile into this conversation's browser, so sites reuse the sign-ins you already have in Chrome."
+                : `Copies ${activeCookieScope}'s cookies into this conversation's browser, so the site reuses the sign-in you already have in Chrome.`}{" "}
+              Nothing is written back to Chrome, and the copy disappears when Omnigent quits.
             </DialogDescription>
           </DialogHeader>
           <div className="flex flex-col gap-3">
@@ -837,18 +903,20 @@ export function BrowserPane({
               {cookieScopes.length > 1 ? (
                 <Select value={activeCookieScope} onValueChange={setCookieScope}>
                   <SelectTrigger aria-label="Site scope" className="w-full">
-                    <SelectValue>{activeCookieScope}</SelectValue>
+                    <SelectValue>{cookieScopeLabel(activeCookieScope)}</SelectValue>
                   </SelectTrigger>
                   <SelectContent>
                     {cookieScopes.map((scope) => (
                       <SelectItem key={scope} value={scope}>
-                        {scope} ({countForScope(scope)})
+                        {cookieScopeLabel(scope)} ({countForScope(scope)})
                       </SelectItem>
                     ))}
                   </SelectContent>
                 </Select>
               ) : (
-                <span className="break-all font-medium text-sm">{cookiePreview?.host}</span>
+                <span className="break-all font-medium text-sm">
+                  {cookieScopeLabel(activeCookieScope)}
+                </span>
               )}
             </div>
             <div className="flex flex-col gap-1">
@@ -862,9 +930,7 @@ export function BrowserPane({
                     {cookieProfiles.map((profile) => (
                       <SelectItem key={profile.id} value={profile.id}>
                         {profile.name} (
-                        {profile.scopes?.find((entry) => entry.host === activeCookieScope)
-                          ?.cookieCount ?? profile.cookieCount}
-                        )
+                        {cookieCountInPicker(cookiePreview, profile.id, activeCookieScope)})
                       </SelectItem>
                     ))}
                   </SelectContent>
@@ -876,10 +942,11 @@ export function BrowserPane({
             <p className="text-muted-foreground text-xs">
               {countForScope(activeCookieScope)}{" "}
               {countForScope(activeCookieScope) === 1 ? "cookie" : "cookies"} for{" "}
-              {activeCookieScope} and its subdomains. Other sites' cookies stay out of Omnigent
-              entirely.
+              {allSitesCookieScope
+                ? "every website in this Chrome profile. Each cookie stays bound to its own site."
+                : `${activeCookieScope} and its subdomains. Other sites' cookies stay out of Omnigent entirely.`}
             </p>
-            {activeCookieScope !== cookiePreview?.host && (
+            {!allSitesCookieScope && activeCookieScope !== cookiePreview?.host && (
               <p className="text-muted-foreground text-xs">
                 Cookies from other subdomains stay bound to their own host, so they only apply once
                 the tab visits them.
@@ -891,9 +958,13 @@ export function BrowserPane({
             </p>
             <p className="text-destructive text-xs">
               {/* Agent and user tabs share one jar per conversation: the agent can
-                  act as you on this site whether or not it drives this tab. */}
+                  act as you on these sites whether or not it drives this tab. */}
               This conversation's tabs share one cookie jar, including any tab the agent controls,
-              so the agent can act as you on this site while these cookies are loaded.
+              so the agent can act as you on{" "}
+              {allSitesCookieScope
+                ? "every site you're signed in to in this Chrome profile"
+                : "this site"}{" "}
+              while these cookies are loaded.
             </p>
           </div>
           <DialogFooter>
