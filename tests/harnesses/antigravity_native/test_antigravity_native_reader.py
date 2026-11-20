@@ -4370,11 +4370,11 @@ async def test_rotate_session_for_cascade_mirrors_claude_sequence(
     PATCH runner_id → POST terminal transfer → PATCH old runner_id="" → the
     ``/clear`` notice to the OLD session — and that bridge state is rewritten with
     the new session id + new cascade id. Crucially,
-    NO ``external_session_id`` PATCH is made: agy is one long-lived process hosting
-    many cascades, so the new cascade is already live (reached via the rewritten
-    bridge state, not a later ``--resume``), exactly as claude's
-    ``_create_clear_replacement_session`` makes no such PATCH. The old code PATCHed
-    it, which 400'd on the auto-cold-started session and looped the rotation.
+    NO ``external_session_id`` PATCH is made inside the sequence, where a rejected
+    PATCH would abort the rotation: the old code PATCHed it, which 400'd on the
+    auto-cold-started session and looped the rotation. The caller records it once
+    the rotation has committed (see
+    ``test_run_reader_with_bridge_rebinds_after_rotation``).
     """
     from omnigent.harnesses.antigravity_native.bridge import (
         ANTIGRAVITY_NATIVE_BRIDGE_ID_LABEL_KEY,
@@ -4540,8 +4540,14 @@ async def test_run_reader_with_bridge_rebinds_after_rotation(
         rotate_calls.append((old_session_id, new_cascade_id))
         return new_session
 
+    recorded_external: list[tuple[str, str]] = []
+
+    async def _fake_record_external(client: object, session_id: str, cascade_id: str) -> None:
+        recorded_external.append((session_id, cascade_id))
+
     monkeypatch.setattr(reader, "supervise_reader", _fake_supervise)
     monkeypatch.setattr(reader, "_rotate_session_for_cascade", _fake_rotate)
+    monkeypatch.setattr(reader, "_record_external_session_id", _fake_record_external)
     # Avoid importing the heavy interaction-bridge module in this unit test.
     monkeypatch.setattr(
         "omnigent.harnesses.antigravity_native.interactions.bridge_interaction",
@@ -4561,6 +4567,9 @@ async def test_run_reader_with_bridge_rebinds_after_rotation(
     # supervise_reader ran twice: first on the original session, then rebound on
     # the new (rotated) session id.
     assert supervise_session_ids == [_SESSION_ID, new_session]
+    # The replacement session records the new cascade, so a cold relaunch resumes
+    # the post-/clear conversation instead of starting an empty one.
+    assert recorded_external == [(new_session, new_cascade)]
 
 
 @pytest.mark.asyncio
@@ -4681,8 +4690,14 @@ async def test_run_reader_with_bridge_keeps_old_binding_when_rotation_fails(
     ) -> str | None:
         return None  # rotation fails
 
+    recorded_external: list[tuple[str, str]] = []
+
+    async def _fake_record_external(client: object, session_id: str, cascade_id: str) -> None:
+        recorded_external.append((session_id, cascade_id))
+
     monkeypatch.setattr(reader, "supervise_reader", _fake_supervise)
     monkeypatch.setattr(reader, "_rotate_session_for_cascade", _fake_rotate_fail)
+    monkeypatch.setattr(reader, "_record_external_session_id", _fake_record_external)
     monkeypatch.setattr(
         "omnigent.harnesses.antigravity_native.interactions.bridge_interaction",
         lambda *a, **k: None,
@@ -4701,6 +4716,8 @@ async def test_run_reader_with_bridge_keeps_old_binding_when_rotation_fails(
     assert len(supervise_calls) == 2
     assert supervise_calls[0] == (_SESSION_ID, frozenset())
     assert supervise_calls[1] == (_SESSION_ID, frozenset({failed_cascade}))
+    # No session took the cascade, so nothing is recorded for a later resume.
+    assert recorded_external == []
 
 
 class _BlockingStream:

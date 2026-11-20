@@ -3118,7 +3118,8 @@ async def _request_agy_elicitation(
 # rotation's external_session_id PATCH then hit that already-set, set-once-immutable
 # field → 400 → rotation aborted, but the cold-start had already rebound the reader
 # to its fresh cascade → the detector re-fired → an infinite session-spawn loop. The
-# fix: drop the external_session_id PATCH entirely (claude never does it) AND gate
+# fix: drop the external_session_id PATCH from the rotation sequence (the caller
+# records it, best-effort, only after the rotation has committed) AND gate
 # the runner's antigravity auto-create on an inbound-transfer check (mirroring
 # claude's ``_terminal_inbound`` guard) so the cold-start is skipped for a rotation
 # target and the existing agy is transferred instead.
@@ -3200,7 +3201,8 @@ async def _record_external_session_id(
 
     So a later ``omnigent antigravity --resume`` / omnigent server restart
     relaunches agy with ``--conversation <cascade_id>`` and continues THIS
-    conversation. Called on first-cascade adoption with the TUI-minted cascade.
+    conversation. Called on first-cascade adoption with the TUI-minted cascade,
+    and after a ``/clear`` rotation with the replacement session's cascade.
 
     The cold-start no longer records its headless ``StartCascade`` phantom (which
     the agy TUI never displays) — that was the data-loss bug: a resume launched
@@ -3267,11 +3269,11 @@ async def _rotate_session_for_cascade(
        owns it), when the old session had one.
     4. POST the terminal ``/transfer`` to move the live agy tmux pane old→new (the
        pane — the SAME agy process — keeps running under the new conversation).
-       NO ``external_session_id`` PATCH is made: unlike a resume launch, the new
-       cascade ``new_cascade_id`` is ALREADY live on the existing agy and reached via
-       the rewritten bridge state below, not via a later ``--resume``. (The old code
-       PATCHed it, which 400'd on the auto-cold-started session's already-set,
-       set-once-immutable field and looped the rotation — see the module header.)
+       NO ``external_session_id`` PATCH is made here: a rejected PATCH would abort
+       the rotation. (The old code PATCHed it, which 400'd on the auto-cold-started
+       session's already-set, set-once-immutable field and looped the rotation —
+       see the module header.) The caller records it, best-effort, once the
+       rotation has committed, so a later cold relaunch resumes the new cascade.
     5. Rewrite agy bridge state in ``bridge_dir`` with the new session id + new
        conversation id (the reader re-reads this on rebind to bind the new cascade).
     6. PATCH the old session's ``runner_id`` to ``""`` to release it (best-effort;
@@ -3554,4 +3556,7 @@ async def run_reader_with_bridge(
                 # on this same cascade (it would just fail again every few seconds).
                 failed_rotations.add(new_cascade_id)
                 continue
+            # A cold relaunch of the replacement session (idle reap, runner restart,
+            # --resume) resumes agy only from external_session_id.
+            await _record_external_session_id(client, new_session_id, new_cascade_id)
             current["session_id"] = new_session_id
