@@ -601,6 +601,8 @@ function AppShellImpl() {
   // Sidebar open-state captured when entering full screen, so exiting can
   // restore whatever the user had (collapsed stays collapsed; open reopens).
   const sidebarOpenBeforeMaximizeRef = useRef(false);
+  // Set while a full screen left the sidebar as it was, so leaving it does too.
+  const maximizeKeptSidebarRef = useRef(false);
   // Scope of the mobile Files drawer: false = full folder tree, true =
   // changed-files-only flat list. On desktop the scope is the selected rail
   // tab (Files vs Changes); on a phone there's no tab strip, so the two FAB
@@ -1583,6 +1585,7 @@ function AppShellImpl() {
         if (!sessionJustRestored || !restoredWorkspace?.exitedMaximized) {
           sidebarOpenBeforeMaximizeRef.current = currentLayout.sidebarOpen;
         }
+        maximizeKeptSidebarRef.current = false;
         setSidebarOpen(false);
       } else if (!maximized && currentLayout.rightPanelMaximized) {
         restoreSidebarAfterMaximize();
@@ -2061,17 +2064,23 @@ function AppShellImpl() {
   // setter stays a plain boolean flip. ``restoreSidebarAfterMaximize`` is
   // shared with the session-switch reset, which also drops out of full screen.
   const restoreSidebarAfterMaximize = useCallback(() => {
+    if (maximizeKeptSidebarRef.current) {
+      maximizeKeptSidebarRef.current = false;
+      return;
+    }
     setSidebarOpen(sidebarOpenBeforeMaximizeRef.current);
   }, [setSidebarOpen]);
-  // A thingy opened from the sidebar fills the screen and leaves the sidebar open. A thingy
-  // tab never has a file selected, so the file URL is left alone.
+  // A thingy opened from inside Omnigent fills the screen and leaves the sidebar as it was, open
+  // or closed, and leaving full screen leaves it as the viewer then has it. A thingy tab never
+  // has a file selected, so the file URL is left alone.
   const maximizeRightPanelKeepingSidebar = useCallback(() => {
     if (rightPanelMaximized) return;
-    sidebarOpenBeforeMaximizeRef.current = sidebarOpen;
+    maximizeKeptSidebarRef.current = true;
     setRightPanelMaximized(true);
-  }, [rightPanelMaximized, sidebarOpen]);
+  }, [rightPanelMaximized]);
   const toggleRightPanelMaximized = useCallback(() => {
     if (!rightPanelMaximized) {
+      maximizeKeptSidebarRef.current = false;
       sidebarOpenBeforeMaximizeRef.current = sidebarOpen;
       setSidebarOpen(false);
     } else {

@@ -48,7 +48,11 @@ import {
   thingyDraftText,
   useHasThingyDraft,
 } from "./thingyDrafts";
-import { useThingyNavigate } from "./thingyNavigation";
+import {
+  thingyOpenKeepsSidebar,
+  useThingyNavigate,
+  type ThingyOpenState,
+} from "./thingyNavigation";
 import {
   invalidateThingies,
   useLinkedThingiesSync,
@@ -442,7 +446,7 @@ export function useThingyRailTabState(
     : null;
   const fullScreenThingyId = fullScreen && selected !== null ? thingyIdFromRailKey(selected) : null;
   const handledUrlRef = useRef<string | null>(null);
-  const keepSidebar = (location.state as { keepSidebar?: boolean } | null)?.keepSidebar === true;
+  const keepSidebar = thingyOpenKeepsSidebar(location);
   useEffect(() => {
     if (urlThingy === null) {
       handledUrlRef.current = null;
@@ -814,8 +818,9 @@ export function ThingyNewSessionPanel({
   }, [fullScreenId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Like the side panel's full screen, this one closes the sidebar and opens it again after,
-  // unless the thingy was opened from the sidebar.
-  const keepSidebar = (location.state as { keepSidebar?: boolean } | null)?.keepSidebar === true;
+  // unless the link that opened the thingy says to leave the sidebar as it was (an open from
+  // inside Omnigent; see thingyOpenKeepsSidebar). The Full screen button closes it.
+  const keepSidebar = (location.state as ThingyOpenState | null)?.keepSidebar === true;
   const sidebarStashRef = useRef<boolean | null>(null);
   const sidebarOpenRef = useRef(sidebarOpen);
   sidebarOpenRef.current = sidebarOpen;

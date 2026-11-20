@@ -1,4 +1,5 @@
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor } from "@testing-library/react";
+import { Link, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { ThingyApiError, getThingy, getThingyShelf } from "@/thingies/api/thingyApi";
@@ -20,6 +21,16 @@ vi.mock("@/thingies/host/thingySession", async (importOriginal) => ({
 
 const BOARD = thingyFixture({ id: "board" });
 
+/** Shows the link state the session's page got. */
+function StateProbe() {
+  const { state } = useLocation();
+  return (
+    <span aria-label="keep sidebar">
+      {String((state as { keepSidebar?: boolean } | null)?.keepSidebar)}
+    </span>
+  );
+}
+
 afterEach(() => vi.clearAllMocks());
 
 describe("a thingy's link", () => {
@@ -37,6 +48,45 @@ describe("a thingy's link", () => {
     expect(openThingyFullScreen).toHaveBeenCalledWith(BOARD, expect.any(Function), {
       keepSidebar: false,
     });
+  });
+
+  it("leaves the sidebar as it was when opened from inside Omnigent", async () => {
+    vi.mocked(getThingy).mockResolvedValue(BOARD);
+    let navigate: ((url: string) => void) | undefined;
+    vi.mocked(openThingyFullScreen).mockImplementation(async (_thingy, go) => {
+      navigate = go;
+    });
+    renderWithThingies(
+      <Routes>
+        <Route path="/" element={<Link to="/thingy/board">Board</Link>} />
+        <Route path="/thingy/:thingyId" element={<ThingyOpenPage />} />
+        <Route path="*" element={<StateProbe />} />
+      </Routes>,
+    );
+
+    fireEvent.click(screen.getByRole("link", { name: "Board" }));
+    await waitFor(() =>
+      expect(openThingyFullScreen).toHaveBeenCalledWith(BOARD, expect.any(Function), {
+        keepSidebar: true,
+      }),
+    );
+    // The session's page is a new entry, so it carries the decision on.
+    act(() => navigate!("/c/conv_7"));
+    expect(screen.getByLabelText("keep sidebar")).toHaveTextContent("true");
+  });
+
+  it("tells the session's page to close the sidebar for a link opened fresh", async () => {
+    vi.mocked(getThingy).mockResolvedValue(BOARD);
+    vi.mocked(openThingyFullScreen).mockImplementation(async (_thingy, go) => go("/c/conv_7"));
+    renderWithThingies(
+      <Routes>
+        <Route path="/thingy/:thingyId" element={<ThingyOpenPage />} />
+        <Route path="*" element={<StateProbe />} />
+      </Routes>,
+      { path: "/thingy/board" },
+    );
+
+    expect(await screen.findByLabelText("keep sidebar")).toHaveTextContent("false");
   });
 
   it("keeps the sidebar open for a pinned row", async () => {

@@ -1,7 +1,8 @@
 /**
  * A thingy's link (`/thingy/:thingyId`): opens the thingy filling the screen in the viewer's
  * thingy session, or beside New session when they have none, so leaving full screen shows the
- * session behind it. A pinned sidebar row opens it here too and keeps the sidebar open.
+ * session behind it. Opened from inside Omnigent (a pinned row, the Thingy page), the sidebar stays
+ * as it was; a link opened fresh closes it.
  *
  * The page replaces itself with where the thingy opens, and that URL names the thingy filling
  * the screen (`?thingy=`), so Back returns to the page before the link and Forward opens the
@@ -15,25 +16,21 @@ import { Link, useLocation, useNavigate, useParams } from "@/lib/routing";
 import { withThingyFullScreen } from "@/lib/thingyRailTabs";
 import { openThingyFullScreen } from "@/thingies/host/thingySession";
 import { ThingyUnavailable } from "./ThingyUnavailable";
-import { appPathFromUrl } from "./thingyNavigation";
+import { appPathFromUrl, thingyOpenKeepsSidebar } from "./thingyNavigation";
 import { useThingy } from "./thingyQueries";
-
-/** Link state a pinned sidebar row passes, so full screen leaves the sidebar open. */
-export interface ThingyOpenState {
-  keepSidebar?: boolean;
-}
 
 export function ThingyOpenPage() {
   const { thingyId = "" } = useParams<{ thingyId: string }>();
   const location = useLocation();
-  const keepSidebar = (location.state as ThingyOpenState | null)?.keepSidebar === true;
+  const keepSidebar = thingyOpenKeepsSidebar(location);
   const thingy = useThingy(thingyId);
   const navigate = useNavigate();
   const go = useCallback(
     (url: string) =>
       navigate(withThingyFullScreen(appPathFromUrl(url), thingyId), {
         replace: true,
-        state: keepSidebar ? { keepSidebar } : undefined,
+        // The session's URL is a new entry, so its state carries the decision made here.
+        state: { keepSidebar },
       }),
     [navigate, thingyId, keepSidebar],
   );

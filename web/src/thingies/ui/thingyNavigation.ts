@@ -8,6 +8,24 @@ import { useNavigate } from "@/lib/routing";
 import { thingyBoardPath } from "@/thingies/host/thingyPages";
 import type { ThingyNavigate } from "@/thingies/host/thingySession";
 
+/** Link state saying whether opening a thingy full screen leaves the sidebar as it is. */
+export interface ThingyOpenState {
+  keepSidebar?: boolean;
+}
+
+/**
+ * Whether a thingy opened full screen leaves the sidebar as it is: yes when the viewer opened it
+ * from inside Omnigent, no for a link opened in a new tab or pasted into the address bar, which
+ * opens it with the sidebar closed. Link state that says so wins.
+ */
+export function thingyOpenKeepsSidebar(location: { key: string; state: unknown }): boolean {
+  const kept = (location.state as ThingyOpenState | null)?.keepSidebar;
+  if (typeof kept === "boolean") return kept;
+  // The router names the entry the browser loaded "default"; each navigation in the app gets
+  // its own key, which the browser keeps across a reload.
+  return location.key !== "default";
+}
+
 /** The app path of a same-origin URL, or the path itself. */
 export function appPathFromUrl(url: string): string {
   if (url.startsWith("/")) return url;

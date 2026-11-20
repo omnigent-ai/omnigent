@@ -12,7 +12,7 @@ import { useThingyRailRequest } from "@/lib/thingyRailTabs";
 import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
 import { SIDEBAR_HOVER_HIGHLIGHT, SIDEBAR_ROW } from "@/shell/sidebarStyles";
 import { thingyBoardPath } from "@/thingies/host/thingyPages";
-import type { ThingyOpenState } from "./ThingyOpenPage";
+import type { ThingyOpenState } from "./thingyNavigation";
 import { useThingyStartId } from "./ThingyRailTabs";
 import { useLinkedThingiesSync, useThingiesEnabled, useThingyShelf } from "./thingyQueries";
 
