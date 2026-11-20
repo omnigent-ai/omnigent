@@ -1725,7 +1725,7 @@ def run_launcher(
                 target_environment = (
                     _launcher_target_environment(target_environment_path)
                     if target_environment_path is not None
-                    else dict(os.environ)
+                    else strip_runner_auth_secrets(os.environ)
                 )
                 target_environment.pop(SHARED_ENVIRONMENT_VAR, None)
                 for secret_name in RUNNER_AUTH_SECRET_ENV_VARS:
