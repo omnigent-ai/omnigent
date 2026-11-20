@@ -144,6 +144,9 @@ describe("MembersPage gating", () => {
     });
 
     expect(await screen.findByRole("button", { name: /Invite member/ })).toBeInTheDocument();
+    act(() => {
+      for (const listener of identityUpdates) listener();
+    });
     expect(accountsApi.listUsers).toHaveBeenCalledOnce();
     view.unmount();
     expect(identityUpdates.size).toBe(0);
