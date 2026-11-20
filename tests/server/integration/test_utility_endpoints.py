@@ -122,6 +122,7 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     # Gates the web's archive worktree prompt; older servers omit it.
     assert data["archive_worktree_cleanup"] is True
     assert data["scheduled_task_worktrees"] is True
+    assert data["scheduled_task_default_timezone"] is True
     # Gates the palette's grouped session search; older servers omit it.
     assert data["session_search_scope"] is True
     assert data["session_mute"] is True
