@@ -1377,6 +1377,8 @@ async def test_run_turn_passes_the_exact_required_model_to_the_shared_picker(
         "older-cli-different-model",
         "undiscovered-current",
         "undiscovered-stale",
+        "context-public-not-applied",
+        "context-private-not-applied",
     ],
 )
 async def test_run_turn_requires_a_matching_model_selection_result(
@@ -1384,13 +1386,20 @@ async def test_run_turn_requires_a_matching_model_selection_result(
 ) -> None:
     monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
     target = "private-model"
-    if receipt_kind.startswith(("older-cli-", "undiscovered-")):
+    if receipt_kind.startswith(("older-cli-", "undiscovered-", "context-")):
         monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", tmp_path)
         monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path)
         monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, "web-session")
         composer = _SessionModelComposer()
         if receipt_kind.startswith("older-cli-"):
             composer.version = "2.1.322"
+        elif receipt_kind.startswith("context-"):
+            target = (
+                "claude-sonnet-5-5[1m]"
+                if receipt_kind == "context-public-not-applied"
+                else "private-model[1m]"
+            )
+            composer.model = target.removesuffix("[1m]")
         else:
             target = "system.ai.claude-sonnet-4-6"
         composer.options[-1] = target
@@ -1409,6 +1418,16 @@ async def test_run_turn_requires_a_matching_model_selection_result(
             if receipt_kind == "undiscovered-stale":
                 composer.model = composer.options[0]
         composer.install(monkeypatch)
+        if receipt_kind.startswith("context-"):
+
+            def close_without_applying(socket_path: str, *args: str) -> None:
+                if composer.overlay == "picker" and args[-1] == "s":
+                    composer.sends.append(args)
+                    composer.overlay = None
+                else:
+                    composer._run_tmux(socket_path, *args)
+
+            monkeypatch.setattr(claude_bridge, "_run_tmux", close_without_applying)
     else:
         bridge_dir = tmp_path / "bridge"
         receipt = (
@@ -1465,6 +1484,10 @@ async def test_run_turn_requires_a_matching_model_selection_result(
         assert composer.status_queries == 1
         assert composer.saved_default == initial_default
         assert [command for command in composer.submitted if command] == ["/status"]
+    elif receipt_kind.startswith("context-"):
+        assert composer.model == target.removesuffix("[1m]")
+        assert composer.submitted == ["/status", "/model", "/status"]
+        assert [args[-1] for args in composer.sends].count("s") == 1
 
 
 @pytest.mark.asyncio
@@ -1668,7 +1691,7 @@ async def test_cancelled_model_switch_cleans_only_observed_owned_controls(
     def capture(socket_path: str, target: str, *, join_wrapped: bool = False) -> str:
         nonlocal observed_status
         pane = composer._capture_pane(socket_path, target, join_wrapped=join_wrapped)
-        if composer.overlay == "status":
+        if composer.overlay == "status" and any(sent[-1] == "s" for sent in composer.sends):
             observed_status += 1
             if phase == "status" and observed_status == 2:
                 pause()
@@ -1722,7 +1745,7 @@ async def test_cancelled_model_switch_cleans_only_observed_owned_controls(
             assert composer.overlay == ("picker" if phase == "picker-enter" else None)
         if phase == "picker-enter":
             assert composer.highlight == 0
-            assert composer.status_queries == 0
+            assert composer.status_queries == 1
         assert composer.busy
         assert killed == []
         assert not executor._inject_lock.locked()
@@ -1828,7 +1851,7 @@ async def test_model_control_hold_preserves_user_changes_until_dismissal(
         return result
 
     def deliver(_bridge: Path, *, content: str, timeout_s: float = 30.0) -> None:
-        assert composer.status_queries == 1 and composer.overlay is None
+        assert composer.status_queries == 2 and composer.overlay is None
         assert composer.model == "private-glm[1m]"
         messages.append(content)
 
@@ -1949,7 +1972,7 @@ async def test_run_turn_holds_model_selection_until_prompt_is_answered(
     def deliver(_bridge: Path, *, content: str, timeout_s: float = 30.0) -> None:
         del timeout_s
         assert _bridge == bridge_dir
-        assert composer.status_queries == 1 and composer.overlay is None
+        assert composer.status_queries == 2 and composer.overlay is None
         assert len(receipts) == 1 and receipts[0].status_model == composer.model
         messages.append(content)
 
@@ -1977,8 +2000,8 @@ async def test_run_turn_holds_model_selection_until_prompt_is_answered(
     result = receipts[0]
     assert result.resolved_model == result.status_model == composer.model == "private-glm[1m]"
     assert result.session_id == composer.session
-    assert composer.submitted == ["/model", "/status"]
-    assert composer.status_queries == 1
+    assert composer.submitted == ["/status", "/model", "/status"]
+    assert composer.status_queries == 2
     assert composer.confirmations == int(cache_cost)
 
 

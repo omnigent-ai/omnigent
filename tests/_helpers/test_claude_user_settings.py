@@ -21,9 +21,23 @@ def test_settings_path_follows_claudes_config_dir(env: dict[str, str], expected:
     assert claude_user_settings_path(Path("/repo"), env) == Path(expected)
 
 
-@pytest.mark.parametrize("version", ["2.1.322", "2.1.323", "2.1.323-preview", None])
+@pytest.mark.parametrize(
+    ("version", "metadata_fault"),
+    [
+        ("2.1.322", None),
+        ("2.1.323", None),
+        ("2.1.323-preview", None),
+        (None, None),
+        ("2.1.323", "missing"),
+        ("2.1.323", "invalid-json"),
+        ("2.1.323", "invalid-shape"),
+    ],
+)
 def test_settings_comparison_uses_the_running_sessions_version(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, version: str | None
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    version: str | None,
+    metadata_fault: str | None,
 ) -> None:
     from omnigent.harnesses.claude_native.bridge import CONTEXT_RAW_FILE
     from tests.e2e.routing import _helpers
@@ -37,6 +51,15 @@ def test_settings_comparison_uses_the_running_sessions_version(
     before = _helpers.claude_settings_snapshot(path)
 
     path.write_text(json.dumps({"model": "changed", "language": "en"}))
+    if metadata_fault:
+        context = bridge_dir / CONTEXT_RAW_FILE
+        if metadata_fault == "missing":
+            context.unlink()
+        else:
+            context.write_text("{" if metadata_fault == "invalid-json" else "[]")
+        with pytest.raises(AssertionError, match="Claude metadata"):
+            _helpers.claude_settings_unchanged(path, before, "session")
+        return
     assert _helpers.claude_settings_unchanged(path, before, "session") is (version != "2.1.323")
     path.write_text(json.dumps({"model": "original", "language": "fr"}))
     assert not _helpers.claude_settings_unchanged(path, before, "session")

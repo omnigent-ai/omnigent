@@ -509,9 +509,10 @@ def claude_settings_unchanged(path: Path, before: str, session_id: str) -> bool:
     after = claude_settings_snapshot(path)
     try:
         context = json.loads((claude_bridge_dir(session_id) / CONTEXT_RAW_FILE).read_text())
-    except (OSError, json.JSONDecodeError):
-        context = None
-    version = context.get("version") if isinstance(context, dict) else None
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AssertionError("Could not read running-session Claude metadata") from exc
+    assert isinstance(context, dict), "Invalid running-session Claude metadata"
+    version = context.get("version")
     if supports_session_only_model_switch(version):
         return before == after
     try:

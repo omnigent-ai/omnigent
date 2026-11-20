@@ -1223,8 +1223,9 @@ async def _replay(
                             ),
                             "remediation": (
                                 "Open Terminal to check the current model and resolve the "
-                                "refusal, then enter and send your message again. "
-                                "The saved message will not retry automatically."
+                                "refusal, then copy and send your saved message below. "
+                                "The saved message will not retry automatically.\n\n"
+                                "Saved message:\n" + prompt
                             ),
                         },
                     },

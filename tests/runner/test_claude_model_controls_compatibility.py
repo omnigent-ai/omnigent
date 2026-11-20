@@ -108,7 +108,7 @@ async def test_model_control_accepts_the_original_two_event_fields(
 
     assert response.status_code == 204
     assert composer.model == event["model"]
-    assert composer.status_queries == int(version == "2.1.323")
+    assert composer.status_queries == 2 * int(version == "2.1.323")
     assert composer.saved_default == (
         composer.options[0] if version == "2.1.323" else event["model"]
     )
@@ -169,7 +169,7 @@ async def test_cancelled_model_control_drains_and_cleans_only_observed_owned_con
     def capture(socket_path: str, target: str, *, join_wrapped: bool = False) -> str:
         nonlocal observed_status
         pane = composer._capture_pane(socket_path, target, join_wrapped=join_wrapped)
-        if composer.overlay == "status":
+        if composer.overlay == "status" and any(sent[-1] == "s" for sent in composer.sends):
             observed_status += 1
             if phase == "status" and observed_status == 2:
                 pause()
@@ -259,7 +259,10 @@ async def test_bound_model_control_keeps_the_literal_through_the_real_actuator(
         assert [command for command in composer.submitted if command] == [f"/model {selected}"]
     else:
         assert composer.saved_default == composer.options[0]
-        assert composer.submitted == ["/model", "/status"]
+        assert composer.submitted == (["/status"] if selected.endswith("[1m]") else []) + [
+            "/model",
+            "/status",
+        ]
 
 
 @pytest.mark.parametrize("result_kind", ["absent", "different-session-only", "different-legacy"])
@@ -340,22 +343,42 @@ async def test_busy_legacy_model_control_handles_a_confirmation_after_the_immedi
     assert [command for command in composer.submitted if command] == ["/model private-glm[1m]"]
 
 
+@pytest.mark.parametrize("budget", [0.0, 2.0], ids=["already-expired", "active-expiry"])
 async def test_legacy_model_dialog_watch_has_a_finite_budget(
     model_control: tuple[native_controls.NativeControls, _SessionModelComposer, Path],
     monkeypatch: pytest.MonkeyPatch,
+    budget: float,
 ) -> None:
     controls, composer, bridge_dir = model_control
     composer.version = "2.1.322"
     _session_model_bridge(bridge_dir.parent, composer)
-    monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_LATE_DIALOG_BUDGET_S", 0)
-    confirm = Mock(side_effect=AssertionError("An expired watcher drove the pane"))
+    clock = bridge.time
+    monkeypatch.setattr(native_controls, "time", SimpleNamespace(monotonic=clock.monotonic))
+    monkeypatch.setattr(native_controls, "_CLAUDE_MODEL_LATE_DIALOG_BUDGET_S", budget)
+    keys_at_expiry = []
+
+    def expire(*_args: Any, **_kwargs: Any) -> bool:
+        assert budget > 0, "An expired watcher drove the pane"
+        keys_at_expiry.extend(composer.sends)
+        clock.sleep(budget + 1)
+        return False
+
+    confirm = Mock(side_effect=expire)
     monkeypatch.setattr(bridge, "confirm_legacy_model_dialog", confirm)
 
     response = await controls.handle_claude_native_model_change("web-session", "private-glm[1m]")
-    await asyncio.sleep(0)
+    watches = [
+        task
+        for task in asyncio.all_tasks()
+        if task.get_name() == "claude-legacy-model-dialog-web-session"
+    ]
+    assert len(watches) == 1
+    await asyncio.wait_for(asyncio.gather(*watches), timeout=2)
 
     assert response.status_code == 204
-    confirm.assert_not_called()
+    assert confirm.call_count == int(budget > 0)
+    if budget > 0:
+        assert keys_at_expiry and composer.sends == keys_at_expiry
 
 
 async def test_an_older_model_control_cannot_restart_its_watch_after_a_newer_request(

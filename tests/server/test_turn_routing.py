@@ -1039,7 +1039,7 @@ async def test_replay_selects_the_claude_model_before_posting_one_message(
         assert json["type"] == "message"
         assert json["model_override"] == model
         assert composer.model == model and composer.text == ""
-        assert composer.status_queries == int(session_only)
+        assert composer.status_queries == 2 * int(session_only)
         assert composer.saved_default == (initial_default if session_only else model)
         return await original_post(url, json=json, timeout=timeout)
 
@@ -1100,13 +1100,14 @@ async def test_replay_keeps_the_prompt_pending_when_the_model_actuator_is_not_tr
     ("refusal", "unsupported"),
     [
         ("No exact picker choice", False),
+        ("post-clear-picker-refusal", False),
         (
             "Session-only model switching requires Claude Code 2.1.323 or newer. "
             "Update Claude Code and relaunch this terminal.",
             True,
         ),
     ],
-    ids=["picker-refusal", "unsupported-cli"],
+    ids=["picker-refusal", "post-clear-picker-refusal", "unsupported-cli"],
 )
 async def test_replay_refused_model_switch_can_be_rescheduled_by_the_caller(
     tmp_path: Path,
@@ -1115,24 +1116,52 @@ async def test_replay_refused_model_switch_can_be_rescheduled_by_the_caller(
     unsupported: bool,
     notification_fails: bool,
 ) -> None:
-    """Internal rescheduling preserves the prompt; no UI Retry action is invoked."""
+    """Refusal exposes the exact unsent text and only explicit rescheduling delivers it."""
     from omnigent.harnesses.claude_native.bridge import (
         ClaudeModelSwitchRefused,
         ClaudeModelSwitchResult,
     )
 
-    _mark(tmp_path)
+    actual_picker = refusal == "post-clear-picker-refusal"
+    prompt = "Recover this exact draft: <literal> `message`  " if actual_picker else "hello"
+    bridge_dir = tmp_path
+    if actual_picker:
+        from omnigent.harnesses.claude_native import bridge
+        from tests.harnesses.claude_native._model_switch_support import (
+            _session_model_bridge,
+            _SessionModelComposer,
+        )
+
+        monkeypatch.setattr(bridge, "_TRUSTED_PARENT", tmp_path)
+        monkeypatch.setattr(bridge, "_BRIDGE_ROOT", tmp_path)
+        composer = _SessionModelComposer(draft=prompt)
+        composer.options[-1] = "private-model"
+        bridge_dir = _session_model_bridge(tmp_path, composer)
+        composer.options[-1] = "different-private-model"
+        composer.install(monkeypatch)
+        monkeypatch.setenv(bridge.REQUEST_SESSION_ID_ENV_VAR, "web-session")
+        actuator = bridge.inject_model_command
+    _mark(bridge_dir)
     turn_routing.write_pending_replay(
-        tmp_path, session_id="conv_1", prompt="hello", blocked_turn_id=None, model="private-model"
+        bridge_dir, session_id="conv_1", prompt=prompt, blocked_turn_id=None, model="private-model"
     )
-    pending_before = (tmp_path / turn_routing.PENDING_FILE).read_bytes()
+    pending_before = (bridge_dir / turn_routing.PENDING_FILE).read_bytes()
     client = _FakeServerClient(fail=notification_fails)
     refusing = True
     attempts = 0
+    expected_refusal = refusal
 
     def select(_bridge: Path, *, model: str, owned_draft: str | None) -> ClaudeModelSwitchResult:
-        nonlocal attempts
+        nonlocal attempts, expected_refusal
         attempts += 1
+        if actual_picker:
+            if not refusing:
+                composer.options[-1] = "private-model"
+            try:
+                return actuator(_bridge, model=model, owned_draft=owned_draft)
+            except ClaudeModelSwitchRefused as exc:
+                expected_refusal = str(exc)
+                raise
         if refusing:
             raise ClaudeModelSwitchRefused(refusal, unsupported=unsupported)
         return ClaudeModelSwitchResult(model, model, model, model, "native-session")
@@ -1142,8 +1171,8 @@ async def test_replay_refused_model_switch_can_be_rescheduled_by_the_caller(
     async def replay() -> None:
         await schedule_replay(
             "conv_1",
-            prompt="hello",
-            bridge_dir=tmp_path,
+            prompt=prompt,
+            bridge_dir=bridge_dir,
             blocked_turn_id=None,
             server_client=client,
             harness="claude-native",
@@ -1154,7 +1183,12 @@ async def test_replay_refused_model_switch_can_be_rescheduled_by_the_caller(
     await replay()
     assert attempts == 1
     assert not client.messages
-    assert (tmp_path / turn_routing.PENDING_FILE).read_bytes() == pending_before
+    assert (bridge_dir / turn_routing.PENDING_FILE).read_bytes() == pending_before
+    if actual_picker:
+        assert composer.text == ""
+        assert composer.submitted == ["/model"]
+        assert composer.model == composer.options[0]
+        assert prompt not in composer.submitted
     assert client.posts == [
         (
             "/v1/sessions/conv_1/events",
@@ -1168,12 +1202,14 @@ async def test_replay_refused_model_switch_can_be_rescheduled_by_the_caller(
                         "level": "info",
                         "title": "Your message is saved and has not been sent",
                         "message": (
-                            "Smart Routing could not confirm the requested model. " + refusal
+                            "Smart Routing could not confirm the requested model. "
+                            + expected_refusal
                         ),
                         "remediation": (
                             "Open Terminal to check the current model and resolve the "
-                            "refusal, then enter and send your message again. "
-                            "The saved message will not retry automatically."
+                            "refusal, then copy and send your saved message below. "
+                            "The saved message will not retry automatically.\n\n"
+                            "Saved message:\n" + prompt
                         ),
                     },
                 },
@@ -1192,13 +1228,13 @@ async def test_replay_refused_model_switch_can_be_rescheduled_by_the_caller(
                 "type": "message",
                 "data": {
                     "role": "user",
-                    "content": [{"type": "input_text", "text": "hello"}],
+                    "content": [{"type": "input_text", "text": prompt}],
                 },
                 "model_override": "private-model",
             },
         )
     ]
-    assert turn_routing.read_pending_replay(tmp_path) is None
+    assert turn_routing.read_pending_replay(bridge_dir) is None
 
 
 @pytest.mark.parametrize("surface", ["permission", "dialog", "occupied-input"])

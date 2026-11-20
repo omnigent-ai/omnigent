@@ -830,9 +830,11 @@ class SessionOnlyModelSwitch:
                     "An unrelated draft occupies Claude's input box. Finish it, then retry."
                 )
             self.clear_owned_draft(self.owned_draft)
-        if hinted_current:
+        before_selection: str | None = None
+        if hinted_current or self.choice.model.endswith("[1m]"):
             current = self.local_status()
-            if self.status_matches(current, exact_context=True):
+            before_selection = current
+            if hinted_current and self.status_matches(current, exact_context=True):
                 return self.result(current, already_selected=True)
         if self.choice.status_only:
             raise self.refuse(
@@ -888,7 +890,15 @@ class SessionOnlyModelSwitch:
             )
         self.finish_commit()
         current = self.local_status()
-        if not self.status_matches(current, exact_context=False):
+        ambiguous_context = (
+            self.choice.model.endswith("[1m]")
+            and not self.status_matches(current, exact_context=True)
+            and (
+                before_selection is None
+                or self.status_matches(before_selection, exact_context=False)
+            )
+        )
+        if ambiguous_context or not self.status_matches(current, exact_context=False):
             raise self.refuse(
                 f"Claude's fresh status reports {current}, so the switch to {self.model} "
                 "is unconfirmed. The dependent prompt was not sent."

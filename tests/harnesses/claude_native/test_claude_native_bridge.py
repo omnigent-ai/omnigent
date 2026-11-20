@@ -13468,10 +13468,13 @@ async def test_model_command_selects_session_only_then_reads_fresh_status(
 
     assert result.resolved_model == result.status_model == composer.model == "private-glm[1m]"
     assert result.session_id == composer.session
-    assert composer.submitted == ["/model", "/status"]
-    assert composer.status_queries == 1
+    assert composer.submitted == ["/status", "/model", "/status"]
+    assert composer.status_queries == 2
     assert composer.confirmations == int(cache_cost)
     assert [args[-1] for args in composer.sends] == [
+        "/status",
+        "Enter",
+        "Escape",
         "/model",
         "Enter",
         "Down",
@@ -13668,7 +13671,7 @@ def test_model_command_clears_only_the_exact_owned_blocked_draft(
     )
 
     assert result.resolved_model == "private-glm[1m]"
-    assert composer.submitted == ["/model", "/status"]
+    assert composer.submitted == ["/status", "/model", "/status"]
     clear_bursts = [args for args in composer.sends if "\x1b[107;5u" in args[-1]]
     assert len(clear_bursts) == 1
     assert not any(args[-1] == "Space" for args in composer.sends)
@@ -13812,7 +13815,7 @@ def test_managed_model_status_check_preserves_exact_context_identity(
     [
         (True, True, True, 1, "picker"),
         (True, False, False, 2, "picker"),
-        (False, True, False, 1, "picker"),
+        (False, True, False, 2, "picker"),
         (True, True, True, 1, "observed-default"),
         (True, True, True, 1, "configured-default"),
         (True, False, None, 1, "observed-default"),
@@ -14046,15 +14049,21 @@ def test_model_command_requires_exact_fresh_status_for_a_descriptorless_current_
     ],
     ids=["bare-private", "wrapped-public"],
 )
+@pytest.mark.parametrize("initial_model", ["marked", "plain", "different"])
+@pytest.mark.parametrize("selection_applied", [False, True])
 def test_model_command_explicitly_selects_context_when_status_omits_the_marker(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     model: str,
     picker_value: str,
     reported: str,
+    initial_model: str,
+    selection_applied: bool,
 ) -> None:
     composer = _SessionModelComposer()
-    composer.options[-1] = composer.model = model
+    composer.options[-1] = model
+    if initial_model != "different":
+        composer.model = model if initial_model == "marked" else model.removesuffix("[1m]")
     bridge_dir = _session_model_bridge(tmp_path, composer)
     claude_native_bridge.record_model_vocabulary(
         bridge_dir,
@@ -14075,17 +14084,33 @@ def test_model_command_explicitly_selects_context_when_status_omits_the_marker(
 
     def capture(socket_path: str, target: str) -> str:
         pane = composer._capture_pane(socket_path, target)
-        if composer.overlay == "status":
-            return pane.replace(f"Model: {model}", f"Model: {reported}")
+        if composer.overlay == "status" and composer.model in {model, model.removesuffix("[1m]")}:
+            return pane.replace(f"Model: {composer.model}", f"Model: {reported}")
         return pane
 
     monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
 
-    result = claude_native_bridge.inject_model_command(bridge_dir, model=model)
+    def close_without_applying(socket_path: str, *args: str) -> None:
+        if composer.overlay == "picker" and args[-1] == "s":
+            composer.sends.append(args)
+            composer.overlay = None
+        else:
+            composer._run_tmux(socket_path, *args)
 
-    assert not result.already_selected
-    assert result.resolved_model == model
-    assert result.status_model == reported
+    if not selection_applied:
+        monkeypatch.setattr(claude_native_bridge, "_run_tmux", close_without_applying)
+
+    if initial_model == "different" and selection_applied:
+        result = claude_native_bridge.inject_model_command(bridge_dir, model=model)
+        assert not result.already_selected
+        assert result.resolved_model == model
+        assert result.status_model == reported
+    else:
+        with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused) as caught:
+            claude_native_bridge.inject_model_command(bridge_dir, model=model)
+        assert caught.value.phase == "status"
+        assert caught.value.model_may_have_changed
+
     assert composer.submitted == ["/status", "/model", "/status"]
     assert [args[-1] for args in composer.sends].count("s") == 1
 
@@ -14347,7 +14372,7 @@ def test_model_command_verifies_the_pinned_alias_context(
     assert result.picker_value == picker_value
     assert result.resolved_model == concrete
     assert result.status_model == reported
-    assert composer.submitted == ["/model", "/status"]
+    assert composer.submitted == ["/status", "/model", "/status"]
     assert composer.model == concrete
 
 
@@ -14633,9 +14658,12 @@ def test_model_command_refuses_queued_or_unrecognized_pickers_without_selecting(
         return
     assert caught.value.phase == "picker" and caught.value.command_submitted
     assert not caught.value.model_may_have_changed
-    assert composer.submitted == ["/model"]
+    assert composer.submitted == ["/status", "/model"]
     assert composer.model == composer.options[0]
-    assert not any(args[-1] in {"Down", "Up", "s", "Escape", "/status"} for args in composer.sends)
+    assert [args[-1] for args in composer.sends[:3]] == ["/status", "Enter", "Escape"]
+    assert not any(
+        args[-1] in {"Down", "Up", "s", "Escape", "/status"} for args in composer.sends[3:]
+    )
     assert composer.text == ""
 
 
@@ -14654,9 +14682,10 @@ def test_model_command_cancels_only_its_recognized_unselectable_picker(
     with pytest.raises(claude_native_bridge.ClaudeModelSwitchRefused):
         claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
 
-    assert composer.submitted == ["/model"]
-    assert [args[-1] for args in composer.sends].count("Escape") == 1
-    assert not any(args[-1] in {"s", "/status"} for args in composer.sends)
+    assert composer.submitted == ["/status", "/model"]
+    assert [args[-1] for args in composer.sends].count("Escape") == 2
+    assert [args[-1] for args in composer.sends[:3]] == ["/status", "Enter", "Escape"]
+    assert not any(args[-1] in {"s", "/status"} for args in composer.sends[3:])
     assert composer.overlay is None
 
 
@@ -14664,6 +14693,9 @@ def test_model_command_cancels_only_its_recognized_unselectable_picker(
 @pytest.mark.parametrize(
     "phase",
     [
+        "before-status-draft",
+        "before-status",
+        "before-observed-status",
         "draft",
         "picker",
         "highlight",
@@ -14698,14 +14730,24 @@ def test_model_command_stops_selection_at_cancellation_or_deadline(
     def send(socket_path: str, *args: str) -> None:
         composer._run_tmux(socket_path, *args)
         key = args[-1]
+        committed = any(sent[-1] == "s" for sent in composer.sends)
         reached = (
             (phase == "draft" and key == "/model")
             or (phase == "picker" and key == "Enter" and composer.overlay == "picker")
             or (phase == "highlight" and key == "Down")
             or (phase == "commit" and key == "s")
             or (phase == "confirmation" and key == "Enter" and composer.confirmations == 1)
-            or (phase == "status-draft" and key == "/status")
-            or (phase == "status" and key == "Enter" and composer.overlay == "status")
+            or (phase == "before-status-draft" and key == "/status" and not committed)
+            or (
+                phase == "before-status"
+                and key == "Enter"
+                and composer.overlay == "status"
+                and not committed
+            )
+            or (phase == "status-draft" and key == "/status" and committed)
+            or (
+                phase == "status" and key == "Enter" and composer.overlay == "status" and committed
+            )
         )
         if reached:
             stop_here()
@@ -14717,9 +14759,13 @@ def test_model_command_stops_selection_at_cancellation_or_deadline(
             picker_reads += 1
             if phase == "observed-picker" and picker_reads == 2:
                 stop_here()
-        if composer.overlay == "status":
+        committed = any(sent[-1] == "s" for sent in composer.sends)
+        if composer.overlay == "status" and (
+            (phase == "before-observed-status" and not committed)
+            or (phase == "observed-status" and committed)
+        ):
             status_reads += 1
-            if phase == "observed-status" and status_reads == 2:
+            if status_reads == 2:
                 stop_here()
         if composer.overlay == "cache-cost":
             confirmation_reads += 1
@@ -14738,9 +14784,9 @@ def test_model_command_stops_selection_at_cancellation_or_deadline(
 
     assert stopped_after and composer.sends[: len(stopped_after)] == stopped_after
     cleanup = [args[-1] for args in composer.sends[len(stopped_after) :]]
-    if phase in {"draft", "status-draft"}:
+    if phase in {"draft", "status-draft", "before-status-draft"}:
         assert cleanup == [_CLEAR_ONE_ROW_COMPOSER]
-    elif phase in {"observed-picker", "observed-status"}:
+    elif phase in {"observed-picker", "observed-status", "before-observed-status"}:
         assert cleanup == ["Escape"]
     else:
         assert cleanup == []
@@ -14760,7 +14806,7 @@ def test_model_command_stops_selection_at_cancellation_or_deadline(
         "picker"
         if phase in {"picker", "highlight"}
         else "status"
-        if phase == "status"
+        if phase in {"status", "before-status"}
         else "cache-cost"
         if phase == "observed-confirmation"
         else None
@@ -14783,8 +14829,10 @@ def test_cancelled_model_switch_cleanup_is_bounded_without_retrying_keys(
         if args[-1] == "/model":
             composer._run_tmux(socket_path, *args)
             cancelled.set()
-        else:
+        elif composer.text == "/model":
             composer.sends.append(args)
+        else:
+            composer._run_tmux(socket_path, *args)
 
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", send)
     with claude_native_bridge.cancellable_injection(cancelled):
@@ -14793,9 +14841,15 @@ def test_cancelled_model_switch_cleanup_is_bounded_without_retrying_keys(
         assert claude_native_bridge._INJECTION_CANCEL_EVENT.get() is cancelled
 
     assert claude_native_bridge.time.monotonic() == pytest.approx(1.0)
-    assert [args[-1] for args in composer.sends] == ["/model", _CLEAR_ONE_ROW_COMPOSER]
+    assert [args[-1] for args in composer.sends] == [
+        "/status",
+        "Enter",
+        "Escape",
+        "/model",
+        _CLEAR_ONE_ROW_COMPOSER,
+    ]
     assert composer.text == "/model"
-    assert composer.submitted == []
+    assert composer.submitted == ["/status"]
 
 
 @pytest.mark.parametrize("replacement", [False, True], ids=["own-draft", "replacement-draft"])
@@ -14821,9 +14875,10 @@ def test_model_command_cleans_only_its_exact_unsubmitted_command(
     assert not caught.value.command_submitted and not caught.value.model_may_have_changed
     assert "private runtime details" not in str(caught.value)
     assert composer.text == ("a person's replacement" if replacement else "")
-    assert composer.submitted == []
-    assert not any(args[-1] in {"Enter", "Escape", "s"} for args in composer.sends)
-    assert len(composer.sends) == (1 if replacement else 2)
+    assert composer.submitted == ["/status"]
+    assert [args[-1] for args in composer.sends[:3]] == ["/status", "Enter", "Escape"]
+    assert not any(args[-1] in {"Enter", "Escape", "s"} for args in composer.sends[3:])
+    assert len(composer.sends) == (4 if replacement else 5)
 
 
 def test_model_command_never_repeats_an_ambiguous_session_only_commit(
@@ -14844,9 +14899,17 @@ def test_model_command_never_repeats_an_ambiguous_session_only_commit(
         claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
 
     assert caught.value.phase == "commit" and caught.value.model_may_have_changed
-    assert composer.submitted == ["/model"]
+    assert composer.submitted == ["/status", "/model"]
     assert composer.model == "private-glm[1m]"
-    assert [args[-1] for args in composer.sends] == ["/model", "Enter", "Down", "s"]
+    assert [args[-1] for args in composer.sends] == [
+        "/status",
+        "Enter",
+        "Escape",
+        "/model",
+        "Enter",
+        "Down",
+        "s",
+    ]
 
 
 @pytest.mark.parametrize("failure", ["persistent", "lost-acknowledgement"])
@@ -14871,9 +14934,18 @@ def test_model_command_confirms_cache_cost_at_most_once(
 
     assert caught.value.phase == "confirmation" and caught.value.model_may_have_changed
     assert composer.confirmations == 1
-    assert composer.submitted == ["/model"]
-    assert composer.status_queries == 0
-    assert [args[-1] for args in composer.sends] == ["/model", "Enter", "Down", "s", "Enter"]
+    assert composer.submitted == ["/status", "/model"]
+    assert composer.status_queries == 1
+    assert [args[-1] for args in composer.sends] == [
+        "/status",
+        "Enter",
+        "Escape",
+        "/model",
+        "Enter",
+        "Down",
+        "s",
+        "Enter",
+    ]
 
 
 @pytest.mark.parametrize(
@@ -15096,9 +15168,17 @@ def test_model_command_does_not_confirm_an_unproven_cache_cost_target(
         claude_native_bridge.inject_model_command(bridge_dir, model=model)
 
     assert caught.value.phase == "commit" and caught.value.model_may_have_changed
-    assert composer.confirmations == composer.status_queries == 0
-    assert composer.submitted == ["/model"]
-    assert [args[-1] for args in composer.sends] == ["/model", "Enter", "Down", "s"]
+    initial_status = ["/status", "Enter", "Escape"] if model == "private-glm[1m]" else []
+    assert composer.confirmations == 0
+    assert composer.status_queries == int(bool(initial_status))
+    assert composer.submitted == (["/status"] if initial_status else []) + ["/model"]
+    assert [args[-1] for args in composer.sends] == [
+        *initial_status,
+        "/model",
+        "Enter",
+        "Down",
+        "s",
+    ]
 
 
 @pytest.mark.parametrize("versioned", [False, True], ids=["literal-label", "versioned-model"])
@@ -15135,9 +15215,17 @@ def test_model_command_rechecks_cache_cost_confirmation_before_enter(
         claude_native_bridge.inject_model_command(bridge_dir, model=model)
 
     assert caught.value.phase == "confirmation" and caught.value.model_may_have_changed
-    assert composer.confirmations == composer.status_queries == 0
-    assert composer.submitted == ["/model"]
-    assert [args[-1] for args in composer.sends] == ["/model", "Enter", "Down", "s"]
+    initial_status = [] if versioned else ["/status", "Enter", "Escape"]
+    assert composer.confirmations == 0
+    assert composer.status_queries == int(not versioned)
+    assert composer.submitted == (["/status"] if not versioned else []) + ["/model"]
+    assert [args[-1] for args in composer.sends] == [
+        *initial_status,
+        "/model",
+        "Enter",
+        "Down",
+        "s",
+    ]
 
 
 @pytest.mark.parametrize("selection", ["cache-cost", "same-model"])
@@ -15155,7 +15243,9 @@ def test_model_command_requires_fresh_matching_status(
 
     def capture(socket_path: str, target: str) -> str:
         pane = composer._capture_pane(socket_path, target)
-        if composer.overlay == "status":
+        if composer.overlay == "status" and (
+            selection == "same-model" or composer.confirmations == 1
+        ):
             original, replacement = {
                 "model": ("Model: private-glm[1m]", "Model: claude-sonnet-5-5"),
                 "private-case": ("Model: private-glm[1m]", "Model: private-GLM[1m]"),
@@ -15174,15 +15264,9 @@ def test_model_command_requires_fresh_matching_status(
     committed = selection == "cache-cost" or changed in {"model", "private-case"}
     assert caught.value.command_submitted is committed
     assert caught.value.model_may_have_changed is committed
-    assert composer.status_queries == (2 if selection == "same-model" and committed else 1)
+    assert composer.status_queries == (2 if committed else 1)
     assert composer.confirmations == int(committed)
-    assert composer.submitted == (
-        ["/model", "/status"]
-        if selection == "cache-cost"
-        else ["/status", "/model", "/status"]
-        if committed
-        else ["/status"]
-    )
+    assert composer.submitted == (["/status", "/model", "/status"] if committed else ["/status"])
     assert [args[-1] for args in composer.sends].count("s") == int(committed)
     if not committed:
         assert composer.model == "private-glm[1m]"
@@ -15233,10 +15317,10 @@ def test_model_command_does_not_dismiss_a_replacement_permission_prompt(
             or (blocked_at == "commit" and "s" in sent)
             or (blocked_at == "confirmation" and confirmation_reads >= 2)
             or (blocked_at == "confirmed" and composer.confirmations == 1)
-            or (blocked_at == "status-draft" and "/status" in sent)
+            or (blocked_at == "status-draft" and sent.count("/status") == 2)
         ):
             return _PERMISSION_PROMPT_PANE
-        if composer.overlay == "status":
+        if composer.overlay == "status" and "s" in sent:
             status_reads += 1
             if status_reads >= 2:
                 return _PERMISSION_PROMPT_PANE
@@ -15268,7 +15352,10 @@ def test_model_command_does_not_dismiss_a_replacement_permission_prompt(
         "status-draft": ["/model", "Enter", "Down", "s", "/status"],
         "status": ["/model", "Enter", "Down", "s", "/status", "Enter"],
     }
-    assert [args[-1] for args in composer.sends] == sends[blocked_at]
+    initial_status = (
+        [] if blocked_at in {"preflight", "owned-clear"} else ["/status", "Enter", "Escape"]
+    )
+    assert [args[-1] for args in composer.sends] == initial_status + sends[blocked_at]
     if blocked_at == "preflight":
         assert caught.value.nothing_typed
     else:
@@ -15276,6 +15363,7 @@ def test_model_command_does_not_dismiss_a_replacement_permission_prompt(
         assert not caught.value.__cause__.nothing_typed
         if blocked_at == "owned-clear":
             assert caught.value.phase == "preflight" and not caught.value.command_submitted
+            assert composer.text == ""
 
 
 def test_model_command_tracks_the_highlight_through_a_scrolling_picker(
@@ -15414,7 +15502,7 @@ def test_model_command_can_use_an_exact_live_canonical_row_on_an_older_bridge(
     receipt = claude_native_bridge.inject_model_command(bridge_dir, model="private-glm[1m]")
 
     assert receipt.resolved_model == "private-glm[1m]"
-    assert composer.submitted == ["/model", "/status"]
+    assert composer.submitted == ["/status", "/model", "/status"]
 
 
 @pytest.mark.parametrize(
@@ -15491,7 +15579,9 @@ def test_model_command_does_not_continue_into_a_replacement_session_or_pane(
         claude_native_bridge.inject_model_command(bridge_dir, model=model)
 
     assert sends_before_rotation and composer.sends == sends_before_rotation
-    assert not any(args[-1] == "Escape" for args in composer.sends)
+    assert [args[-1] for args in composer.sends].count("Escape") == int(
+        not versioned and phase != "status"
+    )
 
 
 @pytest.mark.parametrize("overlay", ["picker", "status"])

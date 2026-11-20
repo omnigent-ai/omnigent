@@ -64,8 +64,8 @@ def test_model_changes_preserve_the_version_appropriate_behavior(
         assert result.status_model == composer.model
         assert result.session_id == composer.session
         assert composer.saved_default == initial_default
-        assert composer.status_queries == 1
-        assert composer.submitted == ["/model", "/status"]
+        assert composer.status_queries == 2
+        assert composer.submitted == ["/status", "/model", "/status"]
         assert [args[-1] for args in composer.sends].count("s") == 1
     else:
         assert type(result).__name__ == "ClaudeLegacyModelSwitchResult"
