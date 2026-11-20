@@ -70,6 +70,12 @@ DATABASE_PREFIXES = (
 DATABASE_FILES = {
     "omnigent/server/accounts_store.py",
     "omnigent/server/device_grant_store.py",
+    # tests/stores calls these writers directly.
+    "omnigent/server/host_session_recovery.py",
+    "omnigent/server/journal_markers.py",
+    "omnigent/server/routes/_sessions/helpers.py",
+    "omnigent/server/session_families.py",
+    "omnigent/server/session_live_state.py",
     # UUID bytes are bound into binary columns; the anchor cap sizes MySQL VARBINARY.
     "omnigent/util/uuid.py",
     "omnigent/entities/comment.py",
