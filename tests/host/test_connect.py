@@ -1704,6 +1704,42 @@ async def test_handle_launch_native_cursor_message_points_at_cursor_installer(
     assert host._runners == {}
 
 
+@pytest.mark.parametrize(
+    ("unusable_reason", "expected"),
+    [
+        ("claude was not found", "on host 'test-laptop' (claude was not found) — "),
+        # Another cause, such as missing credentials, must not blame the CLI.
+        (None, "on host 'test-laptop' — "),
+    ],
+)
+async def test_handle_launch_refusal_says_whether_the_cli_is_missing_or_outdated(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unusable_reason: str | None,
+    expected: str,
+) -> None:
+    host = _make_host_process()
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    monkeypatch.setattr("omnigent.host.connect.harness_is_configured", lambda harness: False)
+    monkeypatch.setattr(
+        "omnigent.host.connect.harness_cli_unusable_reason", lambda harness: unusable_reason
+    )
+
+    result = await host._handle_launch(
+        HostLaunchRunnerFrame(
+            request_id="req_claude_native",
+            binding_token="token_abc",
+            workspace=str(workspace),
+            harness="claude-native",
+        )
+    )
+
+    assert result.status == "failed"
+    assert result.error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE
+    assert expected in (result.error or "")
+
+
 @pytest.mark.parametrize("discovery_pending", [False, True])
 @pytest.mark.parametrize(
     ("harness", "pi_version"),

@@ -743,6 +743,33 @@ def missing_harness_cli(harness: str, timeout: float | None = None) -> HarnessIn
     return spec
 
 
+def harness_cli_unusable_reason(harness: str) -> str | None:
+    """Why the CLI *harness* needs can't be used, for a launch refusal.
+
+    Names the two causes :func:`missing_harness_cli` rejects a CLI for: the binary
+    isn't found, or its version is outside the supported range.
+
+    :param harness: An executor harness identifier, e.g. ``"claude-native"``.
+    :returns: E.g. ``"claude was not found"`` or ``"claude 1.0.3 is outside the
+        supported range >=2.1.0"``; ``None`` when the harness needs no CLI or
+        the CLI is usable, so the refusal has another cause.
+    """
+    spec = required_cli_for_harness(harness)
+    key = _all_harness_name_to_key().get(harness)
+    if spec is None or key is None:
+        return None
+    if harness_cli_binary(key) is None:
+        return f"{spec.binary} was not found"
+    if harness_cli_version_satisfies(key):
+        return None
+    version, supported = harness_cli_version(key)
+    if version is None:
+        return f"{spec.binary} --version printed no version"
+    if supported is not None:
+        return f"{spec.binary} {version} is outside the supported range {supported}"
+    return None
+
+
 def harness_setup_hint(harness: str | None) -> str:
     """Return actionable remediation when *harness* can't launch on a machine.
 

@@ -2140,3 +2140,40 @@ def test_missing_harness_cli_lets_a_slow_kimi_through_sub_agent_dispatch(
     assert probe_timeouts == [hi._DEFAULT_CLI_PROBE_TIMEOUT_S]
     # The probe stays inconclusive for callers that need a verified CLI.
     assert hi.harness_cli_installed(hi.KIMI_KEY) is False
+
+
+@pytest.mark.parametrize(
+    ("version_output", "expected"),
+    [
+        (None, "opencode was not found"),
+        ("1.16.0\n", "opencode 1.16.0 is outside the supported range {supported}"),
+        ("not a version\n", "opencode --version printed no version"),
+        ("{min_version}\n", None),
+    ],
+)
+def test_harness_cli_unusable_reason_names_a_missing_or_outdated_cli(
+    monkeypatch: pytest.MonkeyPatch, version_output: str | None, expected: str | None
+) -> None:
+    """A refusal must say whether the CLI is missing or outdated: they need different fixes."""
+    spec = hi.required_cli_for_harness("opencode-native")
+    assert spec is not None and spec.min_version is not None
+    monkeypatch.setattr(
+        hi.shutil, "which", lambda name: None if version_output is None else f"/usr/bin/{name}"
+    )
+
+    def _run(argv: list[str], **k: object) -> subprocess.CompletedProcess[str]:
+        if argv[1:] == ["--version"] and version_output is not None:
+            out = version_output.format(min_version=spec.min_version)
+            return subprocess.CompletedProcess(args=argv, returncode=0, stdout=out, stderr="")
+        raise AssertionError(f"unexpected subprocess: {argv!r}")
+
+    monkeypatch.setattr(hi, "run_isolated", _run)
+    supported = hi.harness_cli_version(hi.OPENCODE_KEY)[1]
+
+    reason = hi.harness_cli_unusable_reason("opencode-native")
+
+    assert reason == (None if expected is None else expected.format(supported=supported))
+
+
+def test_harness_cli_unusable_reason_is_none_for_a_harness_without_a_cli() -> None:
+    assert hi.harness_cli_unusable_reason("claude-sdk") is None

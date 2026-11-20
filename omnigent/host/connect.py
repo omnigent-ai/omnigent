@@ -174,6 +174,7 @@ from omnigent.onboarding.harness_auth import (
 )
 from omnigent.onboarding.harness_install import (
     harness_cli_installed,
+    harness_cli_unusable_reason,
     harness_cli_version,
     harness_setup_hint,
     invalidate_harness_probe_caches,
@@ -2156,11 +2157,19 @@ class HostProcess:
                     )
         if not harness_ready:
             setup_hint = await asyncio.to_thread(harness_setup_hint, frame.harness)
+            # Missing and outdated CLIs need different fixes; None when the
+            # refusal has another cause, such as missing credentials.
+            unusable_reason = (
+                await asyncio.to_thread(harness_cli_unusable_reason, frame.harness)
+                if frame.harness is not None
+                else None
+            )
+            reason = f" ({unusable_reason})" if unusable_reason else ""
             return self._launch_failed(
                 frame,
                 (
                     f"harness {frame.harness!r} is not configured on host "
-                    f"{self._identity.name!r} — {setup_hint}"
+                    f"{self._identity.name!r}{reason} — {setup_hint}"
                 ),
                 error_code=HARNESS_NOT_CONFIGURED_ERROR_CODE,
             )
