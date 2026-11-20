@@ -22,6 +22,10 @@ import pytest
 from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.debug_logging import record_to_row
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.harnesses.claude_native.settings_validation import (
+    CallerSettingsError,
+    CallerSettingsErrorReason,
+)
 from omnigent.harnesses.codex_native.app_server import CodexModelProviderMissingError
 from omnigent.harnesses.codex_native.launch_args import CodexTransportArgsError
 from omnigent.inference_config import ModelNotAllowedError, inference_config_scope
@@ -100,6 +104,66 @@ def test_other_causes_keep_generic_startup_failure_code(cause: Exception) -> Non
     assert payload["code"] == _NATIVE_TERMINAL_START_FAILED_CODE
     assert payload["code"] == "native_terminal_start_failed"
     assert "agent no longer exists" not in payload["message"]
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "missing-cli",
+        "invalid-settings",
+        "invalid-retention",
+        "validation-unavailable",
+        "unexpected-validator",
+    ],
+)
+def test_native_start_error_payload_guidance_and_redaction(
+    caplog: pytest.LogCaptureFixture, pinned_runner_log: Path, failure: str
+) -> None:
+    """Classify every settings cause before publication or HTTP-envelope wrapping."""
+    private_value = "private-validator-value"
+    private_path = "/private/example/settings.json"
+    guidance = None
+    runtime_name = "Claude"
+    if failure == "missing-cli":
+        runtime_name = "Codex"
+        raised: Exception = ImportError("Native Codex requires the 'codex' CLI on PATH.")
+    elif failure == "unexpected-validator":
+        raised = ValueError(f"{private_value} {private_path}")
+    else:
+        settings_error = CallerSettingsError(
+            {
+                "invalid-settings": CallerSettingsErrorReason.INVALID_SETTINGS,
+                "invalid-retention": CallerSettingsErrorReason.INVALID_RETENTION,
+                "validation-unavailable": CallerSettingsErrorReason.VALIDATION_UNAVAILABLE,
+            }[failure]
+        )
+        guidance = settings_error.client_message
+        settings_error.args = (f"{private_value} {private_path}",)
+        raised = settings_error
+
+    with caplog.at_level(logging.WARNING):
+        payload = _native_terminal_start_error_payload(raised, runtime_name, session_id="conv_1")
+
+    error_id = payload["error_id"]
+    assert re.fullmatch(r"err_[0-9a-f]{32}", error_id)
+    message = (
+        f"{guidance} See the runner log for details: {pinned_runner_log}"
+        if guidance is not None
+        else (
+            f"Native {runtime_name} terminal failed to start ({type(raised).__name__}); "
+            f"see the runner log for details: {pinned_runner_log}"
+        )
+    )
+    assert payload == {
+        "code": "native_terminal_start_failed",
+        "error_id": error_id,
+        "message": f"{message} Error ID: {error_id}.",
+    }
+    assert private_value not in json.dumps(payload)
+    assert private_path not in json.dumps(payload)
+    assert "requires the 'codex' CLI" not in payload["message"]
+    assert str(raised) in caplog.text
+    assert error_id in caplog.text
 
 
 @pytest.mark.parametrize(

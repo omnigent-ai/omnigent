@@ -836,6 +836,7 @@ async def test_auto_create_claude_terminal_recreate_cancels_prior_forwarder(
             spec: Any,
             resource_role: str | None = None,
             parent_os_env: Any = None,
+            prepare_terminal: Any = None,
         ) -> SessionResourceView:
             """Return a terminal resource view without launching tmux."""
             del terminal_name, session_key, spec, resource_role

@@ -37,7 +37,7 @@ from omnigent.entities import (
     StoredFile,
 )
 from omnigent.entities.session_resources import session_resource_view_to_dict
-from omnigent.errors import ErrorCode, OmnigentError, WrongReplicaError
+from omnigent.errors import ErrorCode, OmnigentError, TerminalLaunchError, WrongReplicaError
 from omnigent.host.workspace_tokens import mint_token
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
@@ -1478,6 +1478,10 @@ def register_resources_routes(
         }
 
     @router.get(
+        "/sessions/{session_id}/resources/claude-settings-v2/terminals",
+        response_model=None,
+    )
+    @router.get(
         "/sessions/{session_id}/resources/terminals",
         response_model=None,
     )
@@ -1502,6 +1506,8 @@ def register_resources_routes(
         """
         conv = await _validate_session(session_id, request, LEVEL_READ)
         path = f"/v1/sessions/{session_id}/resources/terminals"
+        if request.url.path.endswith("/resources/claude-settings-v2/terminals"):
+            path = f"/v1/sessions/{session_id}/resources/claude-settings-v2/terminals"
         forwarded = {
             key: value
             for key, value in request.query_params.items()
@@ -1597,6 +1603,11 @@ def register_resources_routes(
             )
 
     @router.post(
+        "/sessions/{session_id}/resources/claude-settings-v2/terminals",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    @router.post(
         "/sessions/{session_id}/resources/terminals",
         response_model=None,
         # CSRF hardening: body is parsed via request.json(); require a JSON
@@ -1690,6 +1701,8 @@ def register_resources_routes(
         )
         timings.mark("ensure_runner")
         path = f"/v1/sessions/{session_id}/resources/terminals"
+        if request.url.path.endswith("/resources/claude-settings-v2/terminals"):
+            path = f"/v1/sessions/{session_id}/resources/claude-settings-v2/terminals"
         router = runner_router or get_server_runner_router()
         if router is not None:
             await asyncio.to_thread(router.require_runtime_support, conv)
@@ -1714,10 +1727,18 @@ def register_resources_routes(
         if status >= 400:
             error = payload.get("error", {})
             # OmnigentError derives http_status from code; pass the runner's code, not a status.
-            raise OmnigentError(
-                error.get("message", f"Terminal launch failed (runner returned HTTP {status})"),
-                code=error.get("code", ErrorCode.INTERNAL_ERROR),
+            message = error.get(
+                "message", f"Terminal launch failed (runner returned HTTP {status})"
             )
+            code = error.get("code", ErrorCode.INTERNAL_ERROR)
+            settings_request_ack = payload.get("claude_settings_request_ack")
+            if isinstance(settings_request_ack, str):
+                raise TerminalLaunchError(
+                    message,
+                    code=code,
+                    claude_settings_request_ack=settings_request_ack,
+                )
+            raise OmnigentError(message, code=code)
         _publish_and_persist_resource_event(
             session_id,
             "session.resource.created",

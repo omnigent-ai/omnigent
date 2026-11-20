@@ -97,8 +97,137 @@ def _install_managed_mcp_config(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
 
 
 def _load_invocation_settings(args: list[str]) -> dict[str, Any]:
-    settings_path = Path(args[args.index("--settings") + 1])
+    settings_index = max(index for index, arg in enumerate(args) if arg == "--settings")
+    settings_path = Path(args[settings_index + 1])
     return json.loads(settings_path.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("existing", [False, True])
+@pytest.mark.parametrize("caller", [False, True])
+async def test_claude_terminal_request_preserves_legacy_bridge_identity(
+    tmp_path, monkeypatch, existing, caller, claude_settings_validator
+) -> None:
+    from omnigent.harnesses.claude_native import bridge
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
+    from omnigent.inner.terminal import create_terminal_instance
+
+    bridge_dir = _test_bridge_dir(tmp_path, monkeypatch)
+    identity = bridge_dir / "claude-settings.json"
+    legacy = '{"disableAllHooks":true,"env":{"LEGACY_ONLY":"stale"}}'
+    if existing:
+        bridge_dir.mkdir(parents=True)
+        identity.write_text(legacy)
+    request = claude_native._claude_terminal_request(
+        ('--settings={"env":{"CALLER":"present"}}',) if caller else (),
+        command="claude",
+        bridge_dir=bridge_dir,
+    )
+    args = request["spec"]["args"]
+    assert identity.read_text() == (legacy if existing else "{}")
+    if not existing and os.name != "nt":
+        assert identity.stat().st_mode & 0o777 == 0o600
+    identity_index = args.index(str(identity))
+    baseline = Path(args[identity_index + 2])
+    baseline_bytes = baseline.read_bytes()
+    assert args[identity_index - 1 : identity_index + 2] == [
+        "--settings",
+        str(identity),
+        "--settings",
+    ]
+    created = create_terminal_instance(
+        "claude",
+        "settings",
+        TerminalEnvSpec(
+            command="claude",
+            args=args,
+            os_env=OSEnvSpec(cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")),
+        ),
+    )
+    try:
+        await bridge.finalize_claude_caller_settings(
+            created.instance,
+            bridge_dir=bridge_dir,
+            generation=request["claude_settings_generation"],
+        )
+        settings = _load_invocation_settings(created.instance.args)
+        assert settings["hooks"]["UserPromptSubmit"]
+        assert "disableAllHooks" not in settings
+        assert "LEGACY_ONLY" not in settings.get("env", {})
+        if caller:
+            assert settings["env"]["CALLER"] == "present"
+        else:
+            assert created.instance.args == args
+        assert str(identity) in created.instance.args
+        assert identity.read_text() == (legacy if existing else "{}")
+        assert baseline.read_bytes() == baseline_bytes
+    finally:
+        await created.instance.close()
+
+
+@pytest.mark.parametrize(
+    "probe",
+    [
+        pytest.param(
+            httpx.Response(404, json={"claude_settings_request_protocol": 1}), id="http-404"
+        ),
+        pytest.param(
+            httpx.Response(503, json={"claude_settings_request_protocol": 1}), id="http-503"
+        ),
+        pytest.param(httpx.ConnectError("inert probe failure"), id="connect-error"),
+        pytest.param(httpx.ReadTimeout("inert probe timeout"), id="timeout"),
+        pytest.param(httpx.Response(200, content=b"{"), id="malformed-json"),
+        pytest.param(httpx.Response(200, json=[]), id="non-object"),
+        pytest.param(httpx.Response(200, json={}), id="missing-version"),
+        *[
+            pytest.param(
+                httpx.Response(200, json={"claude_settings_request_protocol": version}), id=name
+            )
+            for name, version in [
+                ("version-zero", 0),
+                ("version-future", 2),
+                ("version-string", "1"),
+                ("version-float", 1.0),
+                ("version-bool", True),
+            ]
+        ],
+    ],
+)
+async def test_cli_settings_probe_falls_back_without_creating_owned_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    probe: httpx.Response | httpx.HTTPError,
+) -> None:
+    from unittest.mock import Mock
+
+    from omnigent.harnesses.claude_native.settings_generation import ClaudeSettingsRequest
+
+    bridge_dir = _test_bridge_dir(tmp_path, monkeypatch)
+    create_request = Mock(side_effect=AssertionError("unsupported probe created an owned request"))
+    monkeypatch.setattr(ClaudeSettingsRequest, "create", create_request)
+    monkeypatch.setattr(
+        claude_native, "resolve_claude_launch", lambda command, args: (command, args)
+    )
+    requests: list[httpx.Request] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.method == "GET":
+            if isinstance(probe, httpx.HTTPError):
+                raise probe
+            return probe
+        return httpx.Response(200, json={"id": "legacy-terminal"})
+
+    async with httpx.AsyncClient(
+        base_url="http://unused.invalid", transport=httpx.MockTransport(respond)
+    ) as client:
+        terminal_id = await claude_native._launch_claude_terminal(
+            client, "probe-session", (), command="claude", bridge_dir=bridge_dir
+        )
+
+    assert terminal_id == "legacy-terminal"
+    assert [request.method for request in requests] == ["GET", "POST"]
+    assert "claude_settings_request" not in json.loads(requests[1].content)
+    create_request.assert_not_called()
 
 
 def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
@@ -392,6 +521,48 @@ def test_claude_terminal_request_launcher_plugin_wraps(tmp_path, monkeypatch) ->
     # The bridge MCP + hook injection still rides along.
     assert "--mcp-config" in spec["args"]
     assert "--settings" in spec["args"]
+
+
+@pytest.mark.parametrize("with_config", [False, True])
+def test_claude_terminal_request_preserves_opaque_launcher(tmp_path, monkeypatch, with_config):
+    import shlex
+
+    monkeypatch.chdir(tmp_path)
+    captured = []
+
+    def launch(command, args):
+        payload = "exec " + shlex.join([command, *args])
+        captured.append(payload)
+        return "bash", ["-lc", payload]
+
+    monkeypatch.setattr(claude_native, "resolve_claude_launch", launch)
+    bridge_dir = _test_bridge_dir(tmp_path, monkeypatch)
+    caller = tmp_path / "caller.json"
+    caller.write_text('{"env":{"CALLER":"present"}}')
+    body = claude_native._claude_terminal_request(
+        ("--settings", str(caller)),
+        command="claude",
+        bridge_dir=bridge_dir,
+        claude_config=(
+            SimpleNamespace(
+                env={},
+                model=None,
+                api_key_helper=None,
+                model_overrides={},
+                subscription_auth=False,
+            )
+            if with_config
+            else None
+        ),
+    )
+    assert body["spec"]["args"][-2:] == ["-lc", captured[0]]
+    assert body["spec"]["command"] == ("env" if with_config else "bash")
+    assert "claude_settings_generation" not in body
+    assert not list(bridge_dir.glob("*.boundary.json"))
+    serialized = shlex.split(captured[0])
+    assert serialized[:4] == ["exec", "claude", "--settings", str(caller)]
+    assert "--mcp-config" in serialized
+    assert len(list(bridge_dir.glob("claude-settings-*.json"))) == 1
 
 
 def test_claude_terminal_request_injects_claude_config(tmp_path, monkeypatch) -> None:

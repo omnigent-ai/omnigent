@@ -42,8 +42,8 @@ from omnigent.util.tmux_compat import tmux_unavailable_reason
 if TYPE_CHECKING:
     from omnigent.terminals.program_status import ProgramStatusReader
 
-from . import _proc
-from ._subprocess_lifecycle import await_cleanup_task
+from . import _proc, process_lifetime
+from ._subprocess_lifecycle import await_cleanup_task, terminate_direct_subprocess
 from .agent_env import strip_desktop_session_env
 from .claude_gateway_shim import gateway_body_transform
 from .claude_model_access import ClaudeModelAccess
@@ -99,6 +99,8 @@ _TERMINAL_DIR_PREFIX = "omnigent-terminal-"
 # Bound for each ``tmux kill-server`` in the orphan sweep; a wedged
 # tmux must not stall runner startup.
 _REAP_KILL_TIMEOUT_S = 10.0
+_TMUX_LAUNCH_CLIENT_TERMINATE_TIMEOUT_S = 0.25
+_TMUX_LAUNCH_CLIENT_KILL_TIMEOUT_S = 1.0
 # Literal tmux empty option value. Passing this as an argv value clears
 # status segments and window formats; it is not an application sentinel.
 _TMUX_EMPTY_OPTION_VALUE = ""
@@ -1054,7 +1056,10 @@ def reap_orphaned_terminals() -> int:
                         entry,
                     )
                     continue
-        shutil.rmtree(entry, ignore_errors=True)
+        with process_lifetime.finish_process_leases(entry) as unused:
+            if not unused:
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
         # Record what the sweep destroyed. The socket path is the join key
         # against the owning session's "no server running on <socket>" exit,
         # so a killed terminal ties to that session, not a mystery loss. A
@@ -1248,6 +1253,32 @@ class TerminalInstance:
     _exec_launcher_path: Path | None = field(default=None, init=False, repr=False)
     _launch_lock: threading.Lock = field(default_factory=threading.Lock, init=False, repr=False)
     _resource_cleanup_task: asyncio.Task[None] | None = field(default=None, init=False, repr=False)
+    _resource_cleanup_terminal_stopped: bool = field(default=False, init=False, repr=False)
+    _resource_cleanup_stack: contextlib.ExitStack = field(
+        default_factory=contextlib.ExitStack, init=False, repr=False
+    )
+    _has_retained_resources: bool = field(default=False, init=False, repr=False)
+    process_lifetime_leases: list[process_lifetime.ProcessLifetimeLease] = field(
+        default_factory=list, init=False, repr=False
+    )
+    _process_lifetime_handoffs: list[
+        tuple[process_lifetime.ProcessLifetimeLease, Callable[[], object]]
+    ] = field(default_factory=list, init=False, repr=False)
+    _process_lifetime_withdrawals: dict[
+        process_lifetime.ProcessLifetimeLease, Callable[[], object]
+    ] = field(default_factory=dict, init=False, repr=False)
+    _process_lifetime_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
+    _process_lifetime_stop: threading.Event = field(
+        default_factory=threading.Event, init=False, repr=False
+    )
+    _private_cleanup_lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
+    _private_cleanup_thread: threading.Thread | None = field(default=None, init=False, repr=False)
+    _launch_started: bool = field(default=False, init=False, repr=False)
+    _launch_incomplete: bool = field(default=False, init=False, repr=False)
     _clipboard_bridge: TerminalClipboardBridge | None = field(default=None, init=False, repr=False)
     _idle_task: asyncio.Task[None] | None = field(default=None, repr=False)
     # Threaded idle-watcher state. Mirrors :attr:`_idle_task` but for
@@ -1798,7 +1829,14 @@ class TerminalInstance:
     async def _create_exec_launcher(
         self, cli_path: str, policy: SandboxPolicy, *, cwd: str | None = None
     ) -> str:
-        if cwd is None:
+        lifetime = process_lifetime.encode_process_leases(self.process_lifetime_leases)
+        if lifetime is not None:
+            build_task = asyncio.create_task(
+                asyncio.to_thread(
+                    create_exec_launcher, cli_path, policy, cwd=cwd, process_lifetime=lifetime
+                )
+            )
+        elif cwd is None:
             build_task = asyncio.create_task(
                 asyncio.to_thread(create_exec_launcher, cli_path, policy)
             )
@@ -1878,6 +1916,21 @@ class TerminalInstance:
         # spawned beyond the launcher inherits HTTP_PROXY / CA
         # env vars so its outbound traffic is filtered.
         host_cwd = effective_cwd
+        lifetime = process_lifetime.encode_process_leases(self.process_lifetime_leases)
+        if lifetime is not None:
+            manifest = self.private_dir / "process-lifetime.json"
+            if not manifest.exists():
+                manifest_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        process_lifetime.write_process_lease_manifest, self.private_dir, lifetime
+                    )
+                )
+                try:
+                    await asyncio.shield(manifest_task)
+                except BaseException:
+                    with contextlib.suppress(BaseException):
+                        await await_cleanup_task(manifest_task)
+                    raise
         sandbox_for_launcher: SandboxPolicy | None = self.sandbox_policy
         if sandbox_for_launcher is not None and sandbox_for_launcher.active:
             env = strip_desktop_session_env(env)
@@ -1913,6 +1966,16 @@ class TerminalInstance:
             inner_cmd = [launcher_path, *self.args]
         else:
             inner_cmd = [self.command, *self.args]
+            lifetime = process_lifetime.encode_process_leases(self.process_lifetime_leases)
+            if lifetime is not None:
+                inner_cmd = [
+                    sys.executable,
+                    "-I",
+                    str(Path(process_lifetime.__file__)),
+                    lifetime,
+                    "--",
+                    *inner_cmd,
+                ]
         if self.program_status_app is not None:
             status_path = self.private_dir / "program-status.json"
             status_path.unlink(missing_ok=True)
@@ -1992,13 +2055,47 @@ class TerminalInstance:
         try:
             if self._clipboard_bridge is not None:
                 self._clipboard_bridge.start()
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                env=env,
-            )
-            stdout, stderr = await proc.communicate()
+            previous_launch_started = self._launch_started
+            previous_launch_incomplete = self._launch_incomplete
+            self._launch_started = True
+            self._launch_incomplete = True
+            self._start_process_lifetime_handoff()
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    env=env,
+                )
+            except OSError:
+                # This attempt created no consumer; an earlier attempt may still be uncertain.
+                self._launch_started = previous_launch_started
+                self._launch_incomplete = previous_launch_incomplete
+                raise
+            try:
+                stdout, stderr = await proc.communicate()
+            except BaseException:
+                cleanup = asyncio.create_task(
+                    terminate_direct_subprocess(
+                        proc,
+                        terminate_timeout=_TMUX_LAUNCH_CLIENT_TERMINATE_TIMEOUT_S,
+                        kill_timeout=_TMUX_LAUNCH_CLIENT_KILL_TIMEOUT_S,
+                    ),
+                    name="tmux-launch-client-cleanup",
+                )
+                try:
+                    await await_cleanup_task(cleanup)
+                except (Exception, asyncio.CancelledError):
+                    logger.warning("Terminal launch client cleanup failed", exc_info=True)
+                else:
+                    if cleanup.result():
+                        self._launch_incomplete = previous_launch_incomplete
+                    else:
+                        logger.warning(
+                            "Terminal launch client was not reaped; retaining resources"
+                        )
+                raise
+            self._launch_incomplete = previous_launch_incomplete
             if proc.returncode != 0:
                 # tmux can report launch failures on either stream.
                 reason = "; ".join(
@@ -2253,8 +2350,61 @@ class TerminalInstance:
         self._stop_git_ssh()
         self._stop_tcp_egress()
 
+    def add_resource_cleanup(self, callback: Callable[[], object]) -> None:
+        """Retire a resource only after this terminal's termination is confirmed."""
+        self._has_retained_resources = True
+        self._resource_cleanup_stack.callback(callback)
+
+    def add_process_lifetime_lease(
+        self,
+        lease: process_lifetime.ProcessLifetimeLease,
+        release: Callable[[], object],
+        *,
+        withdraw_unstarted: Callable[[], object] | None = None,
+    ) -> None:
+        self.process_lifetime_leases.append(lease)
+        with self._process_lifetime_lock:
+            self._process_lifetime_handoffs.append((lease, release))
+            if withdraw_unstarted is not None:
+                self._process_lifetime_withdrawals[lease] = withdraw_unstarted
+
+    def _release_process_lifetime_handoffs(
+        self, *, ready_only: bool, unstarted: bool = False
+    ) -> bool:
+        with self._process_lifetime_lock:
+            ready = [
+                entry
+                for entry in self._process_lifetime_handoffs
+                if not ready_only or process_lifetime.process_lease_ready(entry[0])
+            ]
+            self._process_lifetime_handoffs = [
+                entry for entry in self._process_lifetime_handoffs if entry not in ready
+            ]
+            callbacks = []
+            for lease, release in ready:
+                withdraw = self._process_lifetime_withdrawals.pop(lease, None)
+                callbacks.append(withdraw if unstarted and withdraw is not None else release)
+            pending = bool(self._process_lifetime_handoffs)
+        for release in callbacks:
+            release()
+        return pending
+
+    def _start_process_lifetime_handoff(self) -> None:
+        if not self._process_lifetime_handoffs:
+            return
+
+        def transfer() -> None:
+            while not self._process_lifetime_stop.is_set():
+                if not self._release_process_lifetime_handoffs(ready_only=True):
+                    return
+                self._process_lifetime_stop.wait(0.05)
+
+        threading.Thread(target=transfer, name="terminal-resource-handoff", daemon=True).start()
+
     async def close(self) -> None:
         """Kill the tmux session and clean up."""
+        terminal_stopped = False
+        terminal_unstarted = False
         try:
             if self.lifecycle_trace.note_cleanup():
                 logger.info(
@@ -2271,6 +2421,17 @@ class TerminalInstance:
         except Exception as exc:  # noqa: BLE001 - diagnostics cannot prevent cleanup.
             logger.debug("Terminal cleanup telemetry failed (%s)", type(exc).__name__)
         try:
+            terminal_stopped = not (
+                self.running
+                or self.socket_path.exists()
+                or (self._has_retained_resources and self._launch_started)
+            )
+            terminal_unstarted = (
+                terminal_stopped
+                and not self._launch_started
+                and not self._launch_incomplete
+                and not self._launch_lock.locked()
+            )
             # Cancel both idle-watcher variants first so they don't race
             # the socket teardown. Order doesn't matter — they're
             # independent.
@@ -2281,23 +2442,69 @@ class TerminalInstance:
             # observe a failure. A private socket can still belong to a live tmux
             # server (or a remain-on-exit pane), so cleanup must not trust that
             # advisory flag before issuing kill-server.
-            if self.running or self.socket_path.exists():
-                with contextlib.suppress(RuntimeError):
+            if not terminal_stopped:
+                # This kill cannot confirm a launch that only settles while it is in flight.
+                launch_was_complete = not self._launch_incomplete
+                try:
                     await self._tmux("kill-server")
+                except _TmuxTargetGoneError:
+                    terminal_stopped = launch_was_complete and not self._launch_incomplete
+                except RuntimeError:
+                    pass
+                else:
+                    terminal_stopped = launch_was_complete and not self._launch_incomplete
             self.running = False
 
             if self._clipboard_bridge is not None:
                 await asyncio.to_thread(self._clipboard_bridge.close)
 
         finally:
-            if self._resource_cleanup_task is None or self._resource_cleanup_task.done():
-                self._resource_cleanup_task = asyncio.create_task(
-                    asyncio.to_thread(self._close_resources)
-                )
-            await asyncio.shield(self._resource_cleanup_task)
+            pending = self._resource_cleanup_task
+            if (
+                pending is None
+                or pending.done()
+                or (terminal_stopped and not self._resource_cleanup_terminal_stopped)
+            ):
+                previous = pending if pending is not None and not pending.done() else None
 
-    def _close_resources(self) -> None:
+                async def close_resources() -> None:
+                    try:
+                        if previous is not None:
+                            await asyncio.shield(previous)
+                    finally:
+                        await asyncio.to_thread(
+                            self._close_resources,
+                            terminal_stopped=terminal_stopped,
+                            terminal_unstarted=terminal_unstarted,
+                        )
+
+                pending = asyncio.create_task(close_resources())
+                self._resource_cleanup_task = pending
+                self._resource_cleanup_terminal_stopped = terminal_stopped
+            await asyncio.shield(pending)
+
+    def _close_resources(
+        self, *, terminal_stopped: bool, terminal_unstarted: bool = False
+    ) -> None:
         """Finish revocation and file cleanup even if the async owner times out."""
+        self._process_lifetime_stop.set()
+        launch_locked = self._launch_lock.acquire(blocking=False)
+        try:
+            self._release_process_lifetime_handoffs(
+                ready_only=False,
+                unstarted=(
+                    launch_locked
+                    and terminal_unstarted
+                    and terminal_stopped
+                    and not self._launch_started
+                    and not self._launch_incomplete
+                    and not self.running
+                    and not self.socket_path.exists()
+                ),
+            )
+        finally:
+            if launch_locked:
+                self._launch_lock.release()
         try:
             self._stop_network_brokers()
         finally:
@@ -2308,8 +2515,39 @@ class TerminalInstance:
                     if self.os_env is not None:
                         self.os_env.close()
             finally:
+                # Interrupted launches or kills can leave consumers of these files alive.
+                if terminal_stopped or not self._has_retained_resources:
+                    if self._finish_private_resources() is False:
+
+                        def finish_when_unused() -> None:
+                            pause = threading.Event()
+                            while self._finish_private_resources() is False:
+                                pause.wait(0.05)
+
+                        if (
+                            self._private_cleanup_thread is None
+                            or not self._private_cleanup_thread.is_alive()
+                        ):
+                            self._private_cleanup_thread = threading.Thread(
+                                target=finish_when_unused,
+                                name="terminal-resource-cleanup",
+                                daemon=True,
+                            )
+                            self._private_cleanup_thread.start()
+
+    def _finish_private_resources(self) -> bool | None:
+        with (
+            self._private_cleanup_lock,
+            process_lifetime.finish_process_leases(self.private_dir) as unused,
+        ):
+            if unused is not True:
+                return unused
+            try:
+                self._resource_cleanup_stack.close()
+            finally:
                 if self.private_dir.exists():
                     shutil.rmtree(self.private_dir, ignore_errors=True)
+            return True
 
     def start_idle_watcher(
         self,

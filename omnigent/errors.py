@@ -546,6 +546,25 @@ class OmnigentError(Exception):
         return self._phase_override or phase_for_code(self.code)
 
 
+class TerminalLaunchError(OmnigentError):
+    """A failed terminal launch with its runner admission acknowledgement.
+
+    :param message: Human-readable terminal launch failure.
+    :param claude_settings_request_ack: Settings generation admitted by the runner.
+    :param code: Machine-readable error code determining the HTTP status.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        claude_settings_request_ack: str,
+        code: str = ErrorCode.INTERNAL_ERROR,
+    ) -> None:
+        super().__init__(message, code=code)
+        self.claude_settings_request_ack = claude_settings_request_ack
+
+
 class StaleCursorError(OmnigentError):
     """A pagination cursor row no longer exists.
 

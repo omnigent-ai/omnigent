@@ -26,7 +26,7 @@ from importlib.machinery import all_suffixes
 from pathlib import Path
 from typing import Protocol, cast
 
-from omnigent.runner.identity import RUNNER_AUTH_SECRET_ENV_VARS
+from omnigent.runner.identity import RUNNER_AUTH_SECRET_ENV_VARS, strip_runner_auth_secrets
 from omnigent.util.json_types import JsonValue
 
 from .agent_env import DESKTOP_SESSION_ENV_VARS
@@ -71,6 +71,7 @@ HOST_SANDBOX_BACKEND_ENV = "OMNIGENT_HOST_SANDBOX_BACKEND"
 # work ``activate_sandbox`` does. ``none`` is a no-op backend so it
 # doesn't need a wrap.
 _SPAWN_WRAP_BACKENDS = frozenset({"linux_bwrap", "darwin_seatbelt"})
+_MAX_LAUNCHER_TARGET_ENV_BYTES = 1024 * 1024
 _IMPORT_SUFFIXES = tuple(all_suffixes())
 
 _EDITABLE_PTH_IMPORT = re.compile(r"import (__editable__[A-Za-z0-9_]+_finder); \1\.install\(\)\Z")
@@ -1469,13 +1470,45 @@ def cleanup_private_tmpdir(tmpdir: Path | None) -> None:
     shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def _launcher_target_environment(path: str) -> dict[str, str]:
+    """Read bounded environment operations for the final target only."""
+    with open(path, "rb") as stream:
+        payload = stream.read(_MAX_LAUNCHER_TARGET_ENV_BYTES + 1)
+    if len(payload) > _MAX_LAUNCHER_TARGET_ENV_BYTES:
+        raise ValueError("Target environment payload is too large")
+    data = json.loads(payload)
+    if not isinstance(data, dict) or set(data) != {"inherit", "unset", "variables", "overrides"}:
+        raise ValueError("Invalid target environment payload")
+    inherit, unset = data["inherit"], data["unset"]
+    variables, overrides = data["variables"], data["overrides"]
+    if not isinstance(inherit, bool) or not isinstance(unset, list):
+        raise ValueError("Invalid target environment operations")
+    if any(not isinstance(name, str) for name in unset) or any(
+        not isinstance(values, dict)
+        or any(
+            not isinstance(name, str) or not isinstance(value, str)
+            for name, value in values.items()
+        )
+        for values in (variables, overrides)
+    ):
+        raise ValueError("Invalid target environment values")
+    environment: dict[str, str] = strip_runner_auth_secrets(os.environ) if inherit else {}
+    for name in unset:
+        environment.pop(name, None)
+    environment.update(variables)
+    environment.update(overrides)
+    return environment
+
+
 def run_launcher(
     encoded_sandbox: str,
     target_path: str,
     argv: list[str],
     *,
     cwd: str | None = None,
+    target_environment_path: str | None = None,
     env_overrides: Mapping[str, str] | None = None,
+    process_lifetime: str | None = None,
 ) -> int:
     """
     Activate the sandbox and exec the wrapped target inside it.
@@ -1487,9 +1520,8 @@ def run_launcher(
     *argv* and returns its exit code.
 
     First strips the runner-auth secret from ``os.environ`` so it reaches
-    neither the bwrap re-exec nor the final ``subprocess.run`` (both
-    inherit ``os.environ``): the runner tunnel binding token must never
-    reach the agent's target.
+    neither the bwrap re-exec nor the final ``subprocess.run``: the runner
+    tunnel binding token must never reach the agent's target.
 
     :param encoded_sandbox: JSON-encoded :class:`SandboxPolicy`, as
         produced by ``_encode_json_arg(sandbox.to_jsonable())``.
@@ -1497,6 +1529,8 @@ def run_launcher(
         inside the sandbox, e.g. ``"/usr/bin/python3"``.
     :param argv: Arguments passed to *target_path* (the launcher's own
         ``sys.argv[1:]``).
+    :param target_environment_path: Optional caller-owned environment payload,
+        read only after sandbox activation and applied only to the final target.
     :param env_overrides: Complete sanitized launch environment applied after
         pruning. Model credential values must be placeholders.
     :returns: The target process's exit code.
@@ -1602,7 +1636,12 @@ def run_launcher(
             # The inline carries the RE-ENCODED policy so the in-wrap
             # pass decodes the same granted scratch root the profile
             # was built from.
-            inline = _launcher_inline_source(target_path, sandbox, cwd=cwd)
+            inline_options = {"cwd": cwd}
+            if target_environment_path is not None:
+                inline_options["target_environment_path"] = target_environment_path
+            if process_lifetime is not None:
+                inline_options["process_lifetime"] = process_lifetime
+            inline = _launcher_inline_source(target_path, sandbox, **inline_options)
             launcher_argv = [sys.executable, "-I", "-c", inline, *argv]
             wrapped = list(
                 backend.wrap_launcher_argv(
@@ -1679,7 +1718,33 @@ def run_launcher(
     try:
         activate_sandbox(sandbox)
         logger.info("[omnigent-sandbox] activated; spawning target=%s", target_path)
-        completed = subprocess.run(target_argv)
+        if process_lifetime is not None:
+            from omnigent.inner.process_lifetime import hold_process_leases
+
+            with hold_process_leases(process_lifetime) as descriptors:
+                target_environment = (
+                    _launcher_target_environment(target_environment_path)
+                    if target_environment_path is not None
+                    else strip_runner_auth_secrets(os.environ)
+                )
+                target_environment.pop(SHARED_ENVIRONMENT_VAR, None)
+                for secret_name in RUNNER_AUTH_SECRET_ENV_VARS:
+                    target_environment.pop(secret_name, None)
+                if sandbox.active:
+                    target_environment.pop(HOST_SANDBOX_BACKEND_ENV, None)
+                completed = subprocess.run(
+                    target_argv, env=target_environment, pass_fds=descriptors
+                )
+        elif target_environment_path is None:
+            completed = subprocess.run(target_argv)
+        else:
+            target_environment = _launcher_target_environment(target_environment_path)
+            target_environment.pop(SHARED_ENVIRONMENT_VAR, None)
+            for secret_name in RUNNER_AUTH_SECRET_ENV_VARS:
+                target_environment.pop(secret_name, None)
+            if sandbox.active:
+                target_environment.pop(HOST_SANDBOX_BACKEND_ENV, None)
+            completed = subprocess.run(target_argv, env=target_environment)
         logger.info("[omnigent-sandbox] target exited rc=%s", completed.returncode)
         return int(completed.returncode)
     finally:
@@ -1715,7 +1780,9 @@ def _launcher_inline_source(
     sandbox: SandboxPolicy,
     *,
     cwd: str | None = None,
+    target_environment_path: str | None = None,
     env_overrides_path: str | None = None,
+    process_lifetime: str | None = None,
 ) -> str:
     """Build the ``python -c`` program the exec launcher runs.
 
@@ -1728,13 +1795,19 @@ def _launcher_inline_source(
         if env_overrides_path is not None
         else "None"
     )
+    target_environment = (
+        f", target_environment_path={target_environment_path!r}"
+        if target_environment_path is not None
+        else ""
+    )
+    lifetime = f", process_lifetime={process_lifetime!r}" if process_lifetime is not None else ""
     return (
         "import logging, sys; "
         f"sys.path.insert(0, {str(_project_root())!r}); "
         "logging.basicConfig(level=logging.INFO, format='%(message)s', stream=sys.stderr); "
         "from omnigent.inner.sandbox import run_launcher, _read_launcher_env_overrides; "
         f"raise SystemExit(run_launcher({encoded!r}, {target_path!r}, sys.argv[1:], "
-        f"cwd={cwd!r}, env_overrides={overrides}))"
+        f"cwd={cwd!r}, env_overrides={overrides}{target_environment}{lifetime}))"
     )
 
 
@@ -2144,7 +2217,9 @@ def create_exec_launcher(
     sandbox: SandboxPolicy,
     *,
     cwd: str | None = None,
+    target_environment_path: str | None = None,
     env_overrides: Mapping[str, str] | None = None,
+    process_lifetime: str | None = None,
 ) -> str:
     """Write an executable launcher that runs ``target_path`` inside ``sandbox``.
 
@@ -2155,6 +2230,10 @@ def create_exec_launcher(
 
     :param target_path: The real binary the launcher ultimately spawns.
     :param sandbox: Policy baked into the launcher and applied before the spawn.
+    :param target_environment_path: Optional absolute path to a caller-owned,
+        sandbox-visible JSON file containing final-target environment operations.
+        Only its path enters launcher argv; the caller owns its permissions,
+        lifetime, and existing policy visibility. No read grants are added.
     :param env_overrides: Complete sanitized launch environment snapshot, retained
         in the owner-only script until caller cleanup. Model credential values
         must be placeholders; ordinary paths, flags, and settings are preserved.
@@ -2165,6 +2244,8 @@ def create_exec_launcher(
     """
     if sandbox.tcp_egress and sandbox.tcp_egress_socket_path is None:
         raise ValueError("tcp_egress requires its parent broker before creating a launcher")
+    if target_environment_path is not None and not Path(target_environment_path).is_absolute():
+        raise ValueError("Target environment payload path must be absolute")
     if sandbox.active and sandbox.backend_type in _SPAWN_WRAP_BACKENDS and env_overrides:
         _reject_startup_hook_overrides(env_overrides)
     launcher_dir = Path(tempfile.gettempdir()).resolve(strict=False)
@@ -2196,11 +2277,14 @@ def create_exec_launcher(
                 _validate_launcher_write_grants(
                     sandbox, _launcher_path_variants(Path(path)), set()
                 )
-            inline = (
-                _launcher_inline_source(target_path, sandbox, cwd=cwd, env_overrides_path=path)
-                if env_overrides is not None
-                else _launcher_inline_source(target_path, sandbox, cwd=cwd)
-            )
+            inline_options = {"cwd": cwd}
+            if env_overrides is not None:
+                inline_options["env_overrides_path"] = path
+            if target_environment_path is not None:
+                inline_options["target_environment_path"] = target_environment_path
+            if process_lifetime is not None:
+                inline_options["process_lifetime"] = process_lifetime
+            inline = _launcher_inline_source(target_path, sandbox, **inline_options)
             if os.name == "nt":
                 # The py launcher selects this interpreter through the shebang.
                 script = f"#!{interpreter} -I\n{inline}\n"

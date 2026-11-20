@@ -233,6 +233,15 @@ def test_stale_bridge_cannot_acknowledge_another_terminal(
     [
         (["--settings", "/tmp/random-bridge/claude-settings.json"], Path("/tmp/random-bridge")),
         (["--settings=/tmp/random-bridge/claude-settings.json"], Path("/tmp/random-bridge")),
+        (
+            ["--settings", f"/tmp/random-bridge/claude-settings-{'a' * 32}.json"],
+            Path("/tmp/random-bridge"),
+        ),
+        (
+            ["--settings", f"/tmp/random-bridge/claude-settings-{'a' * 32}-{'b' * 32}.json"],
+            Path("/tmp/random-bridge"),
+        ),
+        (["--settings", "/tmp/random-bridge/claude-settings-invalid.json"], None),
         (["--settings", "/tmp/user-settings.json"], None),
         (["--settings", "claude-settings.json"], None),
         (["--settings"], None),

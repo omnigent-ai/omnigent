@@ -267,6 +267,7 @@ class TerminalRegistry:
         cwd_override: str | None = None,
         sandbox_override: str | None = None,
         program_status_app: str | None = None,
+        prepare_terminal: Callable[[TerminalInstance], Awaitable[None]] | None = None,
         model_access_factory: Callable[[], ClaudeModelAccess | None] | None = None,
     ) -> TerminalInstance:
         """Launch a terminal session, or return the existing one.
@@ -280,6 +281,8 @@ class TerminalRegistry:
         was created.
 
         :param program_status_app: Opt-in runtime PTY relay application identity.
+        :param prepare_terminal: Framework preparation after filesystem creation,
+            once per new instance, before its process starts.
         :param conversation_id: The owning conversation id, e.g.
             ``"conv_abc123"``.
         :param terminal_name: The terminal's spec name from
@@ -406,6 +409,9 @@ class TerminalRegistry:
                             raise
                     except ValueError as exc:
                         raise RuntimeError(f"terminal model access rejected: {exc}") from exc
+            if prepare_terminal is not None:
+                stage = "terminal_prepare"
+                await prepare_terminal(created.instance)
             stage = "terminal_spawn"
             await created.instance.launch(cwd=created.cwd)
             stage = "terminal_liveness"

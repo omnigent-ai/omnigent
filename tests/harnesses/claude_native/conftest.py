@@ -22,3 +22,15 @@ def _ignore_ambient_claude_config_dir(monkeypatch: pytest.MonkeyPatch) -> None:
     :returns: None.
     """
     monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+
+
+@pytest.fixture
+def claude_settings_validator(monkeypatch: pytest.MonkeyPatch):
+    """Stub vendor startup in scenarios focused on settings composition or transport."""
+    from unittest.mock import AsyncMock
+
+    from omnigent.harnesses.claude_native import settings_validation
+
+    validator = AsyncMock()
+    monkeypatch.setattr(settings_validation, "validate_caller_settings", validator)
+    return validator

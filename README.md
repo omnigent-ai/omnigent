@@ -313,6 +313,84 @@ omnigent copilot                     # GitHub Copilot (SDK harness, via `omnigen
 ```
 
 <details>
+<summary>Claude Code caller settings and launch errors</summary>
+
+Pass Claude Code settings files or inline JSON through `--settings`:
+
+```bash
+omnigent claude --settings ./settings.json
+```
+
+For launches with inspectable arguments, Omnigent merges repeated `--settings`
+options in order and composes them with the required bridge settings. Validation
+uses the selected CLI's public, read-only `--bare doctor` command before launch.
+Support is checked by capability, including whether the command diagnoses invalid
+settings. The protocol has been verified with Claude Code 2.1.322 and 2.1.323;
+the version number alone does not establish compatibility.
+
+The plain Claude CLI and supported, parsed `env` wrappers can validate without a
+sandbox. Other wrappers require an active sandbox for validation. Use the plain
+CLI or a supported `env` wrapper, or configure a sandbox, if this requirement
+blocks your launch.
+
+If settings are rejected, check your `--settings` values with the selected CLI
+and retry. Hooks must be an object whose event values are lists, and
+`disableAllHooks` and `allowManagedHooksOnly` must leave Omnigent's bridge hooks
+enabled. If validation is unavailable, update the CLI and wrapper to versions
+that support the read-only check, or check their startup and sandbox
+configuration. These errors leave the launch arguments and bridge settings
+unchanged. Explicit CLI terminal launch requests and automatic native terminal
+startup return fixed guidance without settings values, private paths, or vendor
+diagnostics. Automatic startup also retains its runner-log reference and error ID
+for further diagnosis.
+
+Launches whose arguments are hidden inside serialized shell commands retain
+their existing behavior; this merge and validation apply to inspectable
+invocations.
+
+New peers negotiate fenced settings ownership through a dedicated v2 terminal
+route. Immutable baselines protect overlapping launches. A receiver acquires
+its own lease before bootstrap or settings reads; sender closure atomically
+fences later admission and withdraws only its dispatch claim. A response
+acknowledges admission, not completion of the receiver or model.
+
+Before the native command starts, a resource guard holds its input leases and
+passes them to the selected command. Sandboxed launchers acquire those leases
+after containment. Arbitrary wrappers can close inherited descriptors or leave
+descendants, so released locks and guard exit do not establish that all consumers
+have finished. Terminal cleanup preserves an independent uncertainty claim and
+its private settings; orphan reaping retains those records without a polling
+thread. Pending deletion fences new requests and attachments. Maintenance still
+retires generations with no terminal claims after their request readers release.
+
+The dedicated route is probed before dispatch, so an older server or runner can
+fall back without consuming a v2 request. A dispatched v2 request is never
+retried through an older launch route. For peers without v2 support, this client uses the
+historical single settings file and argument precedence without allocating
+new untracked generations. Caller-settings composition requires the fenced
+path. Existing bundles and registration continue to work without migration.
+
+Terminal claims in new v2 generations, older v1 records and historical untracked
+generations retain conservative ownership rules. Terminal preparation, shutdown
+or a crash can leave files indefinitely, including after the direct child exits.
+Before reclaiming them, the operator must identify their bridge, session,
+generation and peer versions and establish that every possible consumer has
+finished, including in-flight receivers and detached terminals. Retain completion
+evidence without copying credential-bearing settings. Age, controller PID death,
+guard exit and released file locks alone do not establish reclaimability.
+
+Disk lifecycle schema 2 is unchanged. New per-generation request records carry
+v2 ownership bindings; older readers refuse those bindings, and v2 consumers
+verify their exact bridge, request, lease and terminal claim identities. Unknown
+or replaced resources, future formats and unsafe metadata remain protected.
+Explicit bridge preparation can repair damaged supported lifecycle metadata
+while retaining owned resources and fencing stale admissions. Automatic
+reconciliation of uncertain terminal completion remains unfinished for both
+historical and new records.
+
+</details>
+
+<details>
 <summary>Forward variables from your shell to one session</summary>
 
 Sessions run under the host daemon, which may have started from a different
