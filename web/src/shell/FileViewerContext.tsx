@@ -41,6 +41,8 @@ interface FileViewerContextType {
    * verified against the filesystem API via the session id below.
    */
   isChangedPath: (path: string) => boolean;
+  /** True while the changed-files list behind {@link isChangedPath} is still loading. */
+  changedPathsLoading?: boolean;
   /**
    * The focused session id, so chat consumers can verify whether an
    * arbitrary referenced path exists in the workspace (not just the
@@ -96,6 +98,11 @@ const ALWAYS_FALSE = () => false;
  */
 export function useIsChangedPath(): (path: string) => boolean {
   return useContext(FileViewerContext)?.isChangedPath ?? ALWAYS_FALSE;
+}
+
+/** True while the changed-files list is still loading; false outside AppShell. */
+export function useChangedPathsLoading(): boolean {
+  return useContext(FileViewerContext)?.changedPathsLoading ?? false;
 }
 
 /**

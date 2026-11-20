@@ -11,13 +11,26 @@
 // Both should instead open the FileViewer, exactly as an inline-code path does.
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { mentionPillMarkdown } from "@/lib/mentionPills";
+import type * as RunnerHealth from "@/hooks/RunnerHealthProvider";
 import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
+
+const { liveness } = vi.hoisted(() => ({
+  liveness: {
+    runner: undefined as boolean | undefined,
+    host: undefined as boolean | null | undefined,
+  },
+}));
+vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => ({
+  ...(await importOriginal<typeof RunnerHealth>()),
+  useSessionRunnerOnline: () => liveness.runner,
+  useSessionHostOnline: () => liveness.host,
+}));
 import { showToast } from "@/components/ui/toast";
 
 const { copyTextMock } = vi.hoisted(() => ({
@@ -31,6 +44,8 @@ const toastMock = vi.mocked(showToast);
 const fetchMock = vi.fn();
 
 beforeEach(() => {
+  liveness.runner = undefined;
+  liveness.host = undefined;
   fetchMock.mockReset();
   toastMock.mockReset();
   copyTextMock.mockReset().mockResolvedValue(undefined);
@@ -76,6 +91,20 @@ function dirListing(paths: string[]): Response {
 
 const WORKSPACE = "/home/u/ws";
 
+/** Lets every in-flight fetch reach React Query and re-render, so a negative assertion is final. */
+async function settleQueries(): Promise<void> {
+  for (let tick = 0; tick < 5; tick += 1) {
+    // Each tick must run after the previous one's re-render.
+    // oxlint-disable-next-line no-await-in-loop
+    await act(
+      () =>
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, 0);
+        }),
+    );
+  }
+}
+
 // Module scope so the provider value is a constant (jsx-no-constructed-context-values);
 // `renderMarkdown` swaps the changed-file list and resets the spy per test.
 const openFile = vi.fn();
@@ -96,6 +125,7 @@ const FILE_VIEWER_WITH_SESSION = {
   ...FILE_VIEWER,
   conversationId: "conv_1",
 };
+const SAME_SESSION_VIEWER = { ...FILE_VIEWER_WITH_SESSION };
 
 function renderMarkdown(
   markdown: string,
@@ -744,19 +774,33 @@ describe("links to folders", () => {
     expect(document.querySelectorAll("video")).toHaveLength(0);
   });
 
-  it("keeps an inline-code folder path as plain code", async () => {
+  it.each([
+    ["without a trailing slash", "experimental/data/mobile-touch-targets"],
+    ["with a trailing slash", "experimental/data/mobile-touch-targets/"],
+    ["absolute", `${FOLDER}/`],
+  ])("opens an inline-code folder path %s in the Files tree", async (_label, folder) => {
+    fetchMock.mockResolvedValue(folderListing());
+    renderMarkdown(`\`experimental/data/summary.md\` and \`${folder}\``, [], FOLDER_VIEWER);
+
+    fireEvent.click(await screen.findByRole("button", { name: "experimental/data/summary.md" }));
+    expect(openFile).toHaveBeenCalledWith("experimental/data/summary.md");
+    fireEvent.click(await screen.findByRole("button", { name: folder }));
+    expect(openFolder).toHaveBeenCalledWith(FOLDER);
+    expect(toastMock).not.toHaveBeenCalled();
+  });
+
+  it("keeps a trailing-slash inline-code path that names a file as plain code", async () => {
     fetchMock.mockResolvedValue(folderListing());
     renderMarkdown(
-      "`experimental/data/summary.md` and `experimental/data/mobile-touch-targets`",
+      "`experimental/data/summary.md/` and `experimental/data/summary.md`",
       [],
       FOLDER_VIEWER,
     );
 
-    fireEvent.click(await screen.findByRole("button", { name: "experimental/data/summary.md" }));
-    expect(openFile).toHaveBeenCalledWith("experimental/data/summary.md");
-    expect(screen.getByText("experimental/data/mobile-touch-targets").tagName).toBe("CODE");
-    expect(openFolder).not.toHaveBeenCalled();
-    expect(toastMock).not.toHaveBeenCalled();
+    // The sibling shares the parent listing, so once it links the listing has answered.
+    await screen.findByRole("button", { name: "experimental/data/summary.md" });
+    expect(screen.getByText("experimental/data/summary.md/").tagName).toBe("CODE");
+    expect(screen.getAllByRole("button")).toHaveLength(1);
   });
 });
 
@@ -809,12 +853,15 @@ describe("copying a file link's path", () => {
     expect(copyTextMock).toHaveBeenCalledWith("/no/such/file.txt");
   });
 
-  it("copies an unresolvable path as written", async () => {
-    renderMarkdown(`[trap](${WORKSPACE}/../../etc/hosts)`);
+  it.each([`${WORKSPACE}/../../etc/hosts`, "/", ".."])(
+    "copies an unresolvable path as written: %s",
+    async (href) => {
+      renderMarkdown(`[trap](${href})`);
 
-    await copyFromMenu(screen.getByRole("button", { name: "trap" }));
-    expect(copyTextMock).toHaveBeenCalledWith(`${WORKSPACE}/../../etc/hosts`);
-  });
+      await copyFromMenu(screen.getByText("trap"));
+      expect(copyTextMock).toHaveBeenCalledWith(href);
+    },
+  );
 
   it("reports a failed copy", async () => {
     copyTextMock.mockRejectedValue(new Error("denied"));
@@ -831,5 +878,331 @@ describe("copying a file link's path", () => {
     // fireEvent returns false when a handler called preventDefault.
     expect(fireEvent.contextMenu(screen.getByRole("link", { name: "docs" }))).toBe(true);
     expect(screen.queryByRole("menuitem")).toBeNull();
+  });
+});
+
+// Shapes Claude Code and Codex write that only the shared parser recognizes:
+// bare prose paths, paths relative to a folder other than the working folder,
+// diff prefixes, parenthesized line notes, and angle-bracketed link targets.
+describe("file references beyond backticks and links", () => {
+  function listing(entries: { path: string; type?: "file" | "directory" }[]): Response {
+    return jsonResponse({
+      object: "list",
+      data: entries.map(({ path, type = "file" }) => ({
+        name: path.split("/").pop(),
+        path,
+        type,
+        bytes: type === "file" ? 5 : null,
+      })),
+      has_more: false,
+    });
+  }
+
+  /**
+   * Answers searches with `found` and every directory listing with `listed`;
+   * `searchPages` overrides the answer to a search for one file name.
+   */
+  function routeFetch(
+    listed: string[],
+    found: string[] = [],
+    searchPages: Record<string, Response> = {},
+  ): void {
+    fetchMock.mockImplementation(async (url: string) => {
+      if (!url.includes("/search?")) return listing(listed.map((path) => ({ path })));
+      const name = new URL(url, "http://test").searchParams.get("q") ?? "";
+      return searchPages[name] ?? listing(found.map((path) => ({ path })));
+    });
+  }
+
+  it("links a bare prose path at its cited line, leaving the sentence punctuation", () => {
+    renderMarkdown("I edited docs/notes.md:12.", ["docs/notes.md"]);
+
+    const link = screen.getByRole("button", { name: "docs/notes.md:12" });
+    expect(link.parentElement).toHaveTextContent("I edited docs/notes.md:12.");
+    fireEvent.click(link);
+    expect(openFile).toHaveBeenCalledWith("docs/notes.md", { line: 12 });
+  });
+
+  it("links a home-relative prose path", () => {
+    renderMarkdown("Wrote ~/ws/docs/notes.md, then stopped.", ["docs/notes.md"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "~/ws/docs/notes.md" }));
+    expect(openFile).toHaveBeenCalledWith("docs/notes.md");
+  });
+
+  it("links the longest stretch of a spaced prose path that names a file", async () => {
+    routeFetch(["My Notes/plan final.md"]);
+    renderMarkdown(
+      `Saved ${WORKSPACE}/My Notes/plan final.md for review.`,
+      [],
+      FILE_VIEWER_WITH_SESSION,
+    );
+
+    const link = await screen.findByRole("button", { name: `${WORKSPACE}/My Notes/plan final.md` });
+    expect(link.parentElement).toHaveTextContent(
+      `Saved ${WORKSPACE}/My Notes/plan final.md for review.`,
+    );
+    fireEvent.click(link);
+    expect(openFile).toHaveBeenCalledWith("My Notes/plan final.md");
+  });
+
+  it("checks nothing for slash-words, fractions and routes in prose", () => {
+    renderMarkdown(
+      "Use pub/sub over ALB/NLB, 1/2 the time, then run /merge.",
+      [],
+      FILE_VIEWER_WITH_SESSION,
+    );
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button")).toBeNull();
+  });
+
+  it("leaves a path inside an external link's text to that link", () => {
+    renderMarkdown("[docs/notes.md](https://example.com/notes)", ["docs/notes.md"]);
+
+    expect(screen.getByRole("link", { name: "docs/notes.md" })).toHaveAttribute(
+      "href",
+      "https://example.com/notes",
+    );
+    expect(screen.queryByRole("button")).toBeNull();
+  });
+
+  it("links inline code whose first folder has spaces and an ampersand", async () => {
+    routeFetch(["Architecture & Migration/plan.md"]);
+    renderMarkdown("`Architecture & Migration/plan.md`", [], FILE_VIEWER_WITH_SESSION);
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Architecture & Migration/plan.md" }),
+    );
+    expect(openFile).toHaveBeenCalledWith("Architecture & Migration/plan.md");
+  });
+
+  it("finds a bare file name cited at a range below the working folder", async () => {
+    routeFetch([], ["omnigent/cli_auth.py", "omnigent/other.py"]);
+    renderMarkdown("`cli_auth.py:753-755`", [], FILE_VIEWER_WITH_SESSION);
+
+    fireEvent.click(await screen.findByRole("button", { name: "cli_auth.py:753-755" }));
+    expect(openFile).toHaveBeenCalledWith("omnigent/cli_auth.py", { line: 753, endLine: 755 });
+  });
+
+  it("finds a path written relative to a subfolder", async () => {
+    routeFetch([], ["accounts/Example/Predictive Optimization/notes.md"]);
+    renderMarkdown("`Predictive Optimization/notes.md`", [], FILE_VIEWER_WITH_SESSION);
+
+    fireEvent.click(
+      await screen.findByRole("button", { name: "Predictive Optimization/notes.md" }),
+    );
+    expect(openFile).toHaveBeenCalledWith("accounts/Example/Predictive Optimization/notes.md");
+  });
+
+  it.each([
+    ["several files share it", { has_more: false }, ["a/index.ts", "b/index.ts"]],
+    ["a cut-short search found one", { truncated: true, has_more: false }, ["a/index.ts"]],
+    ["a full page found one", { has_more: true }, ["a/index.ts"]],
+  ])("keeps a file name as plain code when %s", async (_label, page, paths) => {
+    const indexPage = jsonResponse({
+      object: "list",
+      data: paths.map((path) => ({ name: "index.ts", path, type: "file", bytes: 5 })),
+      ...page,
+    });
+    routeFetch([], ["omnigent/cli_auth.py"], { "index.ts": indexPage });
+    renderMarkdown("`index.ts:4` and `cli_auth.py:1`", [], FILE_VIEWER_WITH_SESSION);
+
+    await screen.findByRole("button", { name: "cli_auth.py:1" });
+    await settleQueries();
+    expect(screen.getByText("index.ts:4").tagName).toBe("CODE");
+    expect(screen.getAllByRole("button")).toHaveLength(1);
+  });
+
+  it("explains nothing for a markdown link to a file name several files share", async () => {
+    routeFetch([], ["a/index.ts", "b/index.ts"]);
+    renderMarkdown("[index](index.ts:4)", [], FILE_VIEWER_WITH_SESSION);
+
+    await waitFor(() =>
+      expect(fetchMock.mock.calls.some(([url]) => String(url).includes("/search?"))).toBe(true),
+    );
+    await settleQueries();
+    expect(screen.queryByRole("button", { name: "index" })).toBeNull();
+    expect(toastMock).not.toHaveBeenCalled();
+  });
+
+  it("links a prose file whose spaced extension would end in a folder", async () => {
+    fetchMock.mockImplementation(async () =>
+      listing([{ path: "a.md" }, { path: "docs", type: "directory" }]),
+    );
+    renderMarkdown("See ./a.md and docs/", [], FILE_VIEWER_WITH_SESSION);
+
+    fireEvent.click(await screen.findByRole("button", { name: "./a.md" }));
+    expect(openFile).toHaveBeenCalledWith("a.md");
+  });
+
+  it("opens an extensionless prose file at its cited line", () => {
+    renderMarkdown("See Makefile:12.", ["Makefile"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "Makefile:12" }));
+    expect(openFile).toHaveBeenCalledWith("Makefile", { line: 12 });
+  });
+
+  it("keeps a verified link while the runner is offline", async () => {
+    fetchMock.mockResolvedValue(listing([{ path: "docs/notes.md" }]));
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = (viewer: typeof FILE_VIEWER_WITH_SESSION) => (
+      <QueryClientProvider client={client}>
+        <FileViewerContext.Provider value={viewer}>
+          <FilePathAwareMessageResponse>{"[Notes](docs/notes.md)"}</FilePathAwareMessageResponse>
+        </FileViewerContext.Provider>
+      </QueryClientProvider>
+    );
+    const { rerender } = render(tree(FILE_VIEWER_WITH_SESSION));
+    await screen.findByRole("button", { name: "Notes" });
+
+    liveness.runner = false;
+    liveness.host = false;
+    // A new context value re-renders the link, as a liveness change does in the app.
+    rerender(tree(SAME_SESSION_VIEWER));
+
+    fireEvent.click(screen.getByRole("button", { name: "Notes" }));
+    expect(openFile).toHaveBeenCalledWith("docs/notes.md");
+  });
+
+  it("opens a literal a/ path that exists before its changed diff-prefix fallback", async () => {
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        object: "list",
+        data: [{ name: "notes.md", path: "a/notes.md", type: "file", bytes: 5 }],
+        has_more: false,
+      }),
+    );
+    renderMarkdown("`a/notes.md`", ["notes.md"], FILE_VIEWER_WITH_SESSION);
+
+    fireEvent.click(await screen.findByRole("button", { name: "a/notes.md" }));
+    expect(openFile).toHaveBeenCalledWith("a/notes.md");
+    expect(openFile).not.toHaveBeenCalledWith("notes.md");
+  });
+
+  it.each([
+    ["both exist", ["a.md"]],
+    ["the first is missing", []],
+  ])("links a later prose path when %s", async (_label, rootFiles) => {
+    fetchMock.mockImplementation(async (url: string) => {
+      if (url.includes("/filesystem?")) return listing(rootFiles.map((path) => ({ path })));
+      if (url.includes("/filesystem/docs?")) return listing([{ path: "docs/b.md" }]);
+      return listing([]);
+    });
+    renderMarkdown(`See ${WORKSPACE}/a.md and docs/b.md.`, [], FILE_VIEWER_WITH_SESSION);
+
+    fireEvent.click(await screen.findByRole("button", { name: "docs/b.md" }));
+    expect(openFile).toHaveBeenCalledWith("docs/b.md");
+    await settleQueries();
+    expect(screen.queryAllByRole("button", { name: `${WORKSPACE}/a.md` })).toHaveLength(
+      rootFiles.length,
+    );
+    expect(document.body).toHaveTextContent(`See ${WORKSPACE}/a.md and docs/b.md.`);
+  });
+
+  it("opens inline code at the lines cited in a note right after it", () => {
+    renderMarkdown("`session_import/openui.py` (lines 104–106)", ["session_import/openui.py"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "session_import/openui.py" }));
+    expect(openFile).toHaveBeenCalledWith("session_import/openui.py", { line: 104, endLine: 106 });
+  });
+
+  it("opens a Codex angle-bracketed link to a path with spaces at its line", () => {
+    renderMarkdown(`[My Report.md](<${WORKSPACE}/My Project/My Report.md:3>)`, [
+      "My Project/My Report.md",
+    ]);
+
+    fireEvent.click(screen.getByRole("button", { name: "My Report.md" }));
+    expect(openFile).toHaveBeenCalledWith("My Project/My Report.md", { line: 3 });
+  });
+
+  it("opens a diff-prefixed path at its source-style line", () => {
+    renderMarkdown("`b/server/index.js#L10`", ["server/index.js"]);
+
+    fireEvent.click(screen.getByRole("button", { name: "b/server/index.js#L10" }));
+    expect(openFile).toHaveBeenCalledWith("server/index.js", { line: 10 });
+  });
+
+  it("opens a path relative to the working folder's parent", async () => {
+    fetchMock.mockResolvedValue(dirListing(["/home/u/other/notes.md"]));
+    renderMarkdown("`../other/notes.md`", [], FILE_VIEWER_WITH_SESSION);
+
+    fireEvent.click(await screen.findByRole("button", { name: "../other/notes.md" }));
+    expect(openFile).toHaveBeenCalledWith("/home/u/other/notes.md");
+  });
+});
+
+describe("a file written after an earlier mention", () => {
+  it("re-checks a directory listed before the link rendered", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const tree = (messages: string[]) => (
+      <QueryClientProvider client={client}>
+        <FileViewerContext.Provider value={FILE_VIEWER_WITH_SESSION}>
+          {messages.map((message) => (
+            <FilePathAwareMessageResponse key={message}>{message}</FilePathAwareMessageResponse>
+          ))}
+        </FileViewerContext.Provider>
+      </QueryClientProvider>
+    );
+    // The user's request lists the root before the agent has written the file.
+    fetchMock.mockResolvedValue(dirListing([]));
+    const { rerender } = render(tree(["Create report.md and link it."]));
+    await waitFor(() =>
+      expect(client.getQueryState(["workspace-dir-listing", "conv_1", ""])?.status).toBe("success"),
+    );
+    // The agent's reply renders strictly after that listing was fetched.
+    await act(
+      () =>
+        new Promise<void>((resolve) => {
+          setTimeout(resolve, 5);
+        }),
+    );
+
+    fetchMock.mockResolvedValue(
+      jsonResponse({
+        object: "list",
+        data: [{ name: "report.md", path: "report.md", type: "file", bytes: 5 }],
+        has_more: false,
+      }),
+    );
+    rerender(
+      tree(["Create report.md and link it.", `Done: [report.md](file://${WORKSPACE}/report.md)`]),
+    );
+
+    const done = screen.getByText(/^Done:/);
+    fireEvent.click(await within(done).findByRole("button", { name: "report.md" }));
+    expect(openFile).toHaveBeenCalledWith("report.md");
+    expect(toastMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("a link to a changed file while the changed-files list loads", () => {
+  it("waits for the list instead of searching the workspace", async () => {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const markdown = "[Line 100](src/citation_target.py:100)";
+    const tree = (viewer: typeof FILE_VIEWER_WITH_SESSION & { changedPathsLoading: boolean }) => (
+      <QueryClientProvider client={client}>
+        <FileViewerContext.Provider value={viewer}>
+          <FilePathAwareMessageResponse>{markdown}</FilePathAwareMessageResponse>
+        </FileViewerContext.Provider>
+      </QueryClientProvider>
+    );
+    // The listing of src/ answers first and doesn't contain the file.
+    fetchMock.mockResolvedValue(jsonResponse({ object: "list", data: [], has_more: false }));
+    const { rerender } = render(tree({ ...FILE_VIEWER_WITH_SESSION, changedPathsLoading: true }));
+    await waitFor(() =>
+      expect(client.getQueryState(["workspace-dir-listing", "conv_1", "src"])?.status).toBe(
+        "success",
+      ),
+    );
+    await act(async () => {});
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+
+    changedPaths = ["src/citation_target.py"];
+    rerender(tree({ ...FILE_VIEWER_WITH_SESSION, changedPathsLoading: false }));
+
+    fireEvent.click(await screen.findByRole("button", { name: "Line 100" }));
+    expect(openFile).toHaveBeenCalledWith("src/citation_target.py", { line: 100 });
+    expect(fetchMock.mock.calls.some(([url]) => String(url).includes("/search?"))).toBe(false);
   });
 });

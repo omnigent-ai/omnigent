@@ -806,6 +806,7 @@ function AppShellImpl() {
     showFilesPanel,
     changedCount,
     isChangedPath,
+    changedPathsLoading,
   } = useWorkspaceResources({
     sessionId: serverConversationId,
     permissionLevel: activeSession?.permissionLevel ?? activeConv?.permission_level ?? null,
@@ -2800,6 +2801,7 @@ function AppShellImpl() {
       openGithubTab,
       openFolder: showFilesPanel ? openFolderInFiles : undefined,
       isChangedPath,
+      changedPathsLoading,
       conversationId,
       workspaceRoot,
       workspaceHome,
@@ -2813,6 +2815,7 @@ function AppShellImpl() {
       showFilesPanel,
       openFolderInFiles,
       isChangedPath,
+      changedPathsLoading,
       conversationId,
       workspaceRoot,
       workspaceHome,

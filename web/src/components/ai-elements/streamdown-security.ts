@@ -3,6 +3,13 @@ import { createMathPlugin } from "@streamdown/math";
 import { mermaid } from "./mermaidPlugin";
 import { defaultRehypePlugins, type LinkSafetyConfig, type StreamdownProps } from "streamdown";
 import { lazyCodePlugin } from "./lazyCodePlugin";
+import {
+  type FileCitation,
+  findProseFileReferences,
+  shortFileCitationLabel,
+  splitFileCitation,
+  trailingLineNote,
+} from "@/lib/fileReferences";
 
 type StreamdownRehypePlugins = NonNullable<StreamdownProps["rehypePlugins"]>;
 type StreamdownRehypePlugin = StreamdownRehypePlugins[number];
@@ -61,50 +68,23 @@ const PARKED_GITHUB_VIDEO_TAG = "omnigent-github-video";
 export const WORKSPACE_FILE_LINK_ATTR = "data-omnigent-file";
 export const WORKSPACE_IMAGE_ATTR = "data-omnigent-image";
 const PARKED_WORKSPACE_IMAGE_TAG = "omnigent-workspace-image";
+// A file reference found in prose, rendered by the chat's file-reference component.
+export const PROSE_FILE_REFERENCE_TAG = "omnigent-file-ref";
+// On that element: the lengths of the ways the reference could end, longest first.
+export const PROSE_FILE_REFERENCE_ENDS_ATTR = "data-omnigent-ref-ends";
+// On an inline code span: a `(lines 10–12)` position written right after it.
+export const INLINE_CODE_LINE_NOTE_ATTR = "data-omnigent-line";
 
 // A protocol, protocol-relative or in-page href, never a workspace file. A `:12`
 // position is a file citation; a `:12-18` range only after a file extension
 // (`notes.md:12-18`), so `skype:555-1234` (and `Makefile:12-18`) stays a link.
 const NON_FILE_HREF =
   /^(?:[a-zA-Z][a-zA-Z0-9+-]*:(?!\d+(?::\d+)?$)|[a-zA-Z][a-zA-Z0-9+.-]*:(?!\d+(?::\d+|-\d+)?$)|\/\/|#)/;
-// Column and range are mutually exclusive in the colon form.
-const COLON_POSITION_SUFFIX = /:(\d+)(?::(\d+)|-(\d+))?$/;
-// A range's end column is matched but discarded.
-const HASH_POSITION_SUFFIX = /#L(\d+)(?:C(\d+))?(?:-L?(\d+)(?:C\d+)?)?$/i;
-
-export interface WorkspaceFileCitation {
-  path: string;
-  line: number | null;
-  column?: number;
-  /** Last line of a cited range; only set when it follows `line`. */
-  endLine?: number;
-  hasPosition: boolean;
-}
+export type WorkspaceFileCitation = FileCitation;
 
 /** Splits the line target from a local-file citation, preserving its path. */
-export function splitWorkspaceFileCitation(text: string): WorkspaceFileCitation {
-  const match = text.match(COLON_POSITION_SUFFIX) ?? text.match(HASH_POSITION_SUFFIX);
-  if (!match || match.index === undefined) return { path: text, line: null, hasPosition: false };
-  const rawLine = Number(match[1]);
-  const line = Number.isSafeInteger(rawLine) && rawLine > 0 ? rawLine : null;
-  const column = Number(match[2]);
-  const endLine = Number(match[3]);
-  return {
-    path: text.slice(0, match.index),
-    line,
-    ...(Number.isSafeInteger(column) && column > 0 ? { column } : {}),
-    ...(line !== null && Number.isSafeInteger(endLine) && endLine > line ? { endLine } : {}),
-    hasPosition: true,
-  };
-}
-
-/** File name plus cited position, or null when the text has no directory. */
-export function shortFileCitationLabel(text: string): string | null {
-  const { path } = splitWorkspaceFileCitation(text);
-  const slash = path.lastIndexOf("/");
-  if (slash < 0 || slash === path.length - 1) return null;
-  return text.slice(slash + 1);
-}
+export const splitWorkspaceFileCitation = splitFileCitation;
+export { shortFileCitationLabel };
 
 // An Omnigent session deep link, `omnigent://<host[:port]>/c/<session_id>`, which
 // the desktop app registers. Matched on the raw href, so there are no
@@ -303,6 +283,86 @@ function decodeFilePath(path: string): string {
   return splitWorkspaceFileCitation(decoded).hasPosition ? path : decoded;
 }
 
+// Elements whose text is never scanned for prose file references.
+const NO_PROSE_REFERENCES = new Set([
+  "a",
+  "code",
+  "pre",
+  "kbd",
+  "samp",
+  "script",
+  "style",
+  "svg",
+  "math",
+  PROSE_FILE_REFERENCE_TAG,
+]);
+
+/**
+ * Finds file references in prose text and wraps each in a
+ * {@link PROSE_FILE_REFERENCE_TAG} element, and records a `(lines 10–12)` note
+ * written right after an inline code span on that span. The renderer checks
+ * each reference against the filesystem; one that names nothing stays text.
+ */
+export function markProseFileReferences() {
+  const visit = (node: HastElement) => {
+    if (node.type === "element") {
+      const className = node.properties?.className;
+      const classes = Array.isArray(className) ? className : [className];
+      if (NO_PROSE_REFERENCES.has(node.tagName ?? "") || classes.includes("katex")) return;
+    }
+    const children = node.children;
+    if (!children) return;
+    const next: HastElement[] = [];
+    children.forEach((child, index) => {
+      if (child.type === "element" && child.tagName === "code") {
+        const note = trailingLineNote(children[index + 1]?.value ?? "");
+        if (note && children[index + 1]?.type === "text") {
+          child.properties = {
+            ...child.properties,
+            [INLINE_CODE_LINE_NOTE_ATTR]: note.endLine
+              ? `${note.line}-${note.endLine}`
+              : String(note.line),
+          };
+        }
+      }
+      if (child.type !== "text" || !child.value) {
+        visit(child);
+        next.push(child);
+        return;
+      }
+      next.push(...splitProseText(child.value));
+    });
+    node.children = next;
+  };
+  return (tree: HastElement) => visit(tree);
+}
+
+function splitProseText(text: string): HastElement[] {
+  const references = findProseFileReferences(text);
+  if (!references.length) return [{ type: "text", value: text }];
+  const parts: HastElement[] = [];
+  let cursor = 0;
+  for (const reference of references) {
+    const longest = reference.extents[0].end;
+    if (reference.start > cursor) {
+      parts.push({ type: "text", value: text.slice(cursor, reference.start) });
+    }
+    parts.push({
+      type: "element",
+      tagName: PROSE_FILE_REFERENCE_TAG,
+      properties: {
+        [PROSE_FILE_REFERENCE_ENDS_ATTR]: reference.extents
+          .map((extent) => extent.end - reference.start)
+          .join(","),
+      },
+      children: [{ type: "text", value: text.slice(reference.start, longest) }],
+    });
+    cursor = longest;
+  }
+  if (cursor < text.length) parts.push({ type: "text", value: text.slice(cursor) });
+  return parts;
+}
+
 /**
  * Hides GitHub attachments from harden, which blocks every remote image. A bare
  * attachment URL on a line of its own is the one GitHub plays as a video.
@@ -497,7 +557,7 @@ function createStreamdownRehypePlugins(
     // which drops the marker attribute as unknown. Sanitize has also already
     // stripped any dangerous href, leaving nothing to hand over for such a link.
     if (markFileLinks) {
-      plugins.push(markWorkspaceFileLinks);
+      plugins.push(markWorkspaceFileLinks, markProseFileReferences);
     }
     if (allowGitHubAttachmentImages) plugins.push(parkGitHubAttachments);
     if (allowWorkspaceImages) plugins.push(parkWorkspaceImages);
