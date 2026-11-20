@@ -4,6 +4,12 @@ export {
   type QuickPickPresentation,
   type QuickPickProps,
 } from "./QuickPick";
+export {
+  QuickPickDialog,
+  type QuickPickDialogAcceptResult,
+  type QuickPickDialogProps,
+  type QuickPickHeading,
+} from "./QuickPickDialog";
 export { HighlightedText, type MatchHighlight } from "./HighlightedText";
 export {
   compareItemMatches,
