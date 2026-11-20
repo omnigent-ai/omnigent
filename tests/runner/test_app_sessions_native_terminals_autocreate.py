@@ -2804,12 +2804,76 @@ async def test_auto_create_claude_terminal_points_a_managed_relay_entry_at_its_b
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "provider_env", "expected_launch", "subscription_auth"),
+    [
+        pytest.param(
+            "databricks-claude-opus-4-7",
+            {"ANTHROPIC_BASE_URL": "https://gateway.example.test/anthropic"},
+            "databricks-claude-opus-4-7[1m]",
+            False,
+            id="long-context",
+        ),
+        pytest.param(
+            "databricks-claude-opus-4-7",
+            {"ANTHROPIC_BASE_URL": "https://gateway.example.test/anthropic"},
+            "databricks-claude-opus-4-7",
+            True,
+            id="subscription-auth-default-window",
+        ),
+        pytest.param(
+            "databricks-claude-haiku-4-5",
+            {"ANTHROPIC_BASE_URL": "https://gateway.example.test/anthropic"},
+            "databricks-claude-haiku-4-5",
+            False,
+            id="haiku-default-window",
+        ),
+        pytest.param(
+            "databricks-claude-opus-4-5",
+            {"ANTHROPIC_BASE_URL": "https://gateway.example.test/anthropic"},
+            "databricks-claude-opus-4-5",
+            False,
+            id="older-opus-default-window",
+        ),
+        pytest.param(
+            "claude-opus-4-7", {}, "claude-opus-4-7", False, id="direct-api-default-endpoint"
+        ),
+        pytest.param(
+            "claude-opus-4-7",
+            {"ANTHROPIC_BASE_URL": "https://api.anthropic.com"},
+            "claude-opus-4-7",
+            False,
+            id="direct-api-explicit-endpoint",
+        ),
+        pytest.param(
+            "claude-opus-4-7",
+            {"CLAUDE_CODE_USE_BEDROCK": "1"},
+            "claude-opus-4-7",
+            False,
+            id="bedrock-default-endpoint",
+        ),
+        pytest.param(
+            "claude-opus-4-7",
+            {
+                "CLAUDE_CODE_USE_BEDROCK": "1",
+                "ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock.example.test",
+            },
+            "claude-opus-4-7",
+            False,
+            id="bedrock-custom-endpoint",
+        ),
+    ],
+)
 async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    provider_env: dict[str, str],
+    expected_launch: str,
+    subscription_auth: bool,
 ) -> None:
     """
-    Host-spawned launch injects the ucode Databricks gateway config.
+    Host-spawned launches preserve the provider config and its context policy.
 
     On the daemon / web-UI path the runner — not the CLI — launches
     Claude, so it must reproduce the gateway auth the CLI normally
@@ -2846,18 +2910,18 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
         _no_op_forwarder,
     )
 
-    gateway_env = {"ANTHROPIC_BASE_URL": "https://gw.example/anthropic"}
     ucode = ClaudeNativeUcodeConfig(
-        env=dict(gateway_env),
+        env=dict(provider_env),
         api_key_helper="printf %s sk-sentinel-do-not-use",
-        model="databricks-claude-opus-4-7",
+        model=model,
+        subscription_auth=subscription_auth,
         routable_models=(
-            "databricks-claude-opus-4-7",
+            model,
             "databricks-claude-opus-4-8",
             "databricks-claude-sonnet-5",
         ),
         model_overrides={
-            "claude-opus-4-7": "databricks-claude-opus-4-7",
+            model.removeprefix("databricks-"): model,
             "claude-opus-4-8": "databricks-claude-opus-4-8",
             "claude-sonnet-5": "databricks-claude-sonnet-5",
         },
@@ -2892,25 +2956,29 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
     # ENABLE_TOOL_SEARCH forces Claude Code to defer MCP tool schemas
     # instead of loading all 200+ bridge tools into startup context.
     assert spec.env == {
-        **gateway_env,
+        **provider_env,
         "CLAUDE_AGENT_SDK_CLIENT_APP": "omnigent",
         "ENABLE_TOOL_SEARCH": "true",
         "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
         "CLAUDE_ENV_FILE": claude_tool_env_file(),
         "API_TIMEOUT_MS": "120000",
-        "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK": "1",
+        **(
+            {"CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK": "1"}
+            if provider_env.get("ANTHROPIC_BASE_URL") == "https://gateway.example.test/anthropic"
+            else {}
+        ),
     }
     assert spec.command == "claude"
     # The gateway default model is applied (no per-session override here).
     assert "--model" in spec.args
-    assert spec.args[spec.args.index("--model") + 1] == "databricks-claude-opus-4-7"
+    assert spec.args[spec.args.index("--model") + 1] == expected_launch
     # The apiKeyHelper is registered in private settings, not subprocess argv.
     assert all("sk-sentinel-do-not-use" not in arg for arg in spec.args)
     settings = _load_claude_invocation_settings(spec.args)
     assert settings["apiKeyHelper"] == "printf %s sk-sentinel-do-not-use"
     assert settings["modelOverrides"] == {
-        "claude-opus-4-7": "databricks-claude-opus-4-7",
+        model.removeprefix("databricks-"): model,
         "claude-opus-4-8": "databricks-claude-opus-4-8",
         "claude-sonnet-5": "databricks-claude-sonnet-5",
     }
@@ -6370,6 +6438,7 @@ async def _run_auto_create_claude_terminal_for_routing_class(
     session_id: str,
     routed: bool,
     auto_harness: bool = False,
+    custom_slot: str = "workspace-picker-row",
 ) -> Any:
     """Drive the claude-native launch and return the captured terminal spec.
 
@@ -6403,7 +6472,7 @@ async def _run_auto_create_claude_terminal_for_routing_class(
         env={
             "ANTHROPIC_BASE_URL": "https://gw.example/anthropic",
             "ANTHROPIC_DEFAULT_OPUS_MODEL": "databricks-claude-opus-5",
-            "ANTHROPIC_CUSTOM_MODEL_OPTION": "workspace-picker-row",
+            "ANTHROPIC_CUSTOM_MODEL_OPTION": custom_slot,
             "ANTHROPIC_CUSTOM_MODEL_OPTION_NAME": "Workspace pick",
         },
         api_key_helper="printf %s sk-sentinel-do-not-use",
@@ -6523,19 +6592,29 @@ async def test_a_plain_claude_native_launch_carries_no_spawn_routing(
     assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "workspace-picker-row"
 
 
+@pytest.mark.parametrize("custom_slot", ["workspace-picker-row", "databricks-claude-opus-4-7"])
 async def test_a_routed_claude_native_launch_keeps_the_spawn_gate_and_the_pin(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, custom_slot: str
 ) -> None:
+    from omnigent.models.claude_model_vocabulary import claude_model_command_arg
+
     spec = await _run_auto_create_claude_terminal_for_routing_class(
         tmp_path=tmp_path,
         monkeypatch=monkeypatch,
         session_id="4a1c9b1d1f0e4c5da0a1b2c3d4e5f602",
         routed=True,
+        custom_slot=custom_slot,
     )
 
     assert claude_native_bridge.CLAUDE_SUBAGENT_TOOL_MATCHER in _claude_pretooluse_matchers(spec)
     assert any("claude_router_hook" in command for command in _claude_hook_commands(spec))
-    assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7"
+    # The custom-slot pin tracks the launched 1M-capable Opus, so it carries the
+    # same [1m] window marker the launch model does.
+    assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7[1m]"
+    assert (
+        claude_model_command_arg("databricks-claude-opus-4-7[1m]", spec.env)
+        == "databricks-claude-opus-4-7[1m]"
+    )
     # A pinned session's spawns stay on the claude family, so it gets neither
     # the routed-spawn note nor the pre-approvals the cross-family hop needs.
     assert spec.args[spec.args.index("--append-system-prompt") + 1] == WORKSPACE_IMAGE_INSTRUCTION
@@ -6564,7 +6643,8 @@ async def test_an_auto_harness_launch_without_a_cost_control_stamp_is_still_rout
     # The whole routed apparatus, not just the spawn note.
     assert claude_native_bridge.CLAUDE_SUBAGENT_TOOL_MATCHER in _claude_pretooluse_matchers(spec)
     assert any("claude_router_hook" in command for command in _claude_hook_commands(spec))
-    assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7"
+    # The custom-slot pin tracks the launched 1M-capable Opus and carries [1m].
+    assert spec.env["ANTHROPIC_CUSTOM_MODEL_OPTION"] == "databricks-claude-opus-4-7[1m]"
     # And the auto-harness extras, which only make sense alongside the router.
     assert "--append-system-prompt" in spec.args
     allowed = spec.args[spec.args.index("--allowedTools") + 1]
@@ -6683,7 +6763,8 @@ async def test_auto_create_claude_terminal_launch_gate_folds_a_canonical_overrid
         assert args[args.index("--model") + 1] == selected_model
         assert pick_resets == []
     else:
-        assert args[args.index("--model") + 1] == "system.ai.claude-opus-5"
+        # The folded reset lands on the gateway default Opus, marked [1m].
+        assert args[args.index("--model") + 1] == "system.ai.claude-opus-5[1m]"
         assert pick_resets == [{"model_override": "default"}]
 
     await fake_client.aclose()
@@ -6948,7 +7029,7 @@ async def test_auto_create_claude_terminal_refreshes_a_stale_catalog_before_rese
     ("pin", "custom_option", "expected_launch"),
     [
         ("system.ai.claude-opus-4-8[1m]", None, "claude-opus-4-8[1m]"),
-        ("sonnet_5", "system.ai.claude-sonnet-5", "claude-sonnet-5"),
+        ("sonnet_5", "system.ai.claude-sonnet-5", "claude-sonnet-5[1m]"),
     ],
     ids=["gateway-namespace-pin", "custom-slot-pin"],
 )

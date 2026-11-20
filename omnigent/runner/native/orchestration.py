@@ -9535,6 +9535,7 @@ async def _auto_create_claude_terminal(
     _runner_auth = _RunnerDatabricksAuth(_auth_factory)
 
     from omnigent.harnesses.claude_native.main import (
+        _serves_canonical_anthropic_ids,
         build_native_claude_terminal_env,
         claude_config_with_launch_model_pinned,
         claude_config_with_routed_arms_pinned,
@@ -9959,6 +9960,19 @@ async def _auto_create_claude_terminal(
                         str(catalog_default.get("model") or catalog_default.get("id") or "")
                         or None
                     )
+    # Claude Code sizes the context window client-side from the model id and caps
+    # a bare custom gateway id at 200K; the [1m] marker opts a 1M-capable
+    # Opus/Sonnet launch into its real 1M window.
+    if (
+        claude_config is not None
+        and not claude_config.subscription_auth
+        and not claude_config.env.get("CLAUDE_CODE_USE_BEDROCK")
+        and not _serves_canonical_anthropic_ids(claude_config)
+        and launch_model
+    ):
+        from omnigent.models.claude_model_vocabulary import model_id_with_1m_marker
+
+        launch_model = model_id_with_1m_marker(launch_model)
     # Give an exact launch model (a Smart Routing pick is resolved before the
     # terminal exists) a spelling of its own in the picker, so a later
     # ``/model`` can return to it instead of stepping onto whatever the family
