@@ -313,10 +313,7 @@ export function validateSchedule(
   } = {},
 ): string | null {
   if (model.preset === "custom" && model.customFreq === "rule") {
-    return (
-      validateRuleText(model.rule, { sessionMode, executionTarget, subhourSupported }) ??
-      validateEnd(model, allowPastEnd, now)
-    );
+    return validateRuleText(model.rule) ?? validateEnd(model, allowPastEnd, now);
   }
   const minutely = model.preset === "custom" && model.customFreq === "minutely";
   if (!minutely && (!Number.isInteger(model.minute) || model.minute < 0 || model.minute > 59)) {
@@ -415,6 +412,7 @@ export function normalizeRuleText(rule: string): string {
 }
 
 const RULE_FREQUENCIES = ["SECONDLY", "MINUTELY", "HOURLY", "DAILY", "WEEKLY", "MONTHLY", "YEARLY"];
+// The fields the server's parser accepts; COUNT and UNTIL belong to Ends.
 const RULE_FIELDS = new Set([
   "FREQ",
   "INTERVAL",
@@ -430,48 +428,14 @@ const RULE_FIELDS = new Set([
   "BYSETPOS",
   "BYEASTER",
 ]);
-// The server samples eight years of runs from 2016-01-01 (see validate_rrule). 9988 has
-// the same weekdays and leap years, and rrule.js stops a rule that never matches at 9999.
-const RULE_SAMPLE_START = Date.UTC(9988, 0, 1);
-const RULE_SAMPLE_END = Date.UTC(9996, 0, 1);
-const RULE_GAP_WINDOW_MS = 25 * 60 * 60 * 1000;
-const MAX_RULE_GAP_SAMPLES = 2000;
-const ruleValidationCache = new Map<string, string | null>();
 
-/** Check RRULE text the way the server's `validate_rrule` does. */
-export function validateRuleText(
-  rule: string,
-  {
-    sessionMode = "new",
-    executionTarget,
-    subhourSupported = false,
-  }: {
-    sessionMode?: "new" | "continue";
-    executionTarget?: ScheduledTaskExecutionTarget;
-    subhourSupported?: boolean;
-  } = {},
-): string | null {
-  // The form validates on every render, and sampling runs can take a few milliseconds.
-  const key = JSON.stringify([rule, sessionMode, executionTarget, subhourSupported]);
-  if (!ruleValidationCache.has(key)) {
-    if (ruleValidationCache.size >= 100) ruleValidationCache.clear();
-    ruleValidationCache.set(
-      key,
-      checkRuleText(rule, sessionMode, executionTarget, subhourSupported),
-    );
-  }
-  return ruleValidationCache.get(key)!;
-}
-
-function checkRuleText(
-  rule: string,
-  sessionMode: "new" | "continue",
-  executionTarget: ScheduledTaskExecutionTarget | undefined,
-  subhourSupported: boolean,
-): string | null {
+/**
+ * Check the shape of RRULE editor text. Whether a rule runs, how often, and its value
+ * ranges are left to the server, which checks them on save and explains any problem.
+ */
+export function validateRuleText(rule: string): string | null {
   const text = normalizeRuleText(rule);
   if (text === "") return "Enter a recurrence rule, such as FREQ=DAILY;BYHOUR=9;BYMINUTE=0.";
-  if (text.length > 4096) return "Use a rule of at most 4,096 characters.";
   if (/[\r\n]/.test(text))
     return "Enter one RRULE line. Choose the timezone below instead of DTSTART;TZID.";
   const parts = parseRuleParts(text);
@@ -481,58 +445,8 @@ function checkRuleText(
     return "Set when the schedule ends under Ends instead of with COUNT or UNTIL.";
   const unknown = [...parts.keys()].find((key) => !RULE_FIELDS.has(key));
   if (unknown !== undefined) return `${unknown} isn't a supported rule field.`;
-  const frequency = parts.get("FREQ") ?? "";
-  if (!RULE_FREQUENCIES.includes(frequency))
+  if (!RULE_FREQUENCIES.includes(parts.get("FREQ") ?? ""))
     return "Include a FREQ such as MINUTELY, HOURLY, DAILY, WEEKLY, MONTHLY or YEARLY.";
-  const maxInterval = 366 * ({ SECONDLY: 3600, MINUTELY: 60 }[frequency] ?? 1);
-  if (parseNumberPart(parts.get("INTERVAL") ?? "1", 1, maxInterval) === null)
-    return `INTERVAL must be a whole number from 1 to ${maxInterval}.`;
-  let timesPerDay = 1;
-  for (const [key, value] of parts) {
-    if (!key.startsWith("BY")) continue;
-    const values = new Set(value.split(","));
-    const pattern = key === "BYDAY" ? /^[+-]?\d*(MO|TU|WE|TH|FR|SA|SU)$/ : /^[+-]?\d+$/;
-    if ([...values].some((item) => !pattern.test(item))) return `${key} has an invalid value.`;
-    if (values.size > 24) return `${key} can list at most 24 values.`;
-    if (["BYHOUR", "BYMINUTE", "BYSECOND"].includes(key)) timesPerDay *= values.size;
-  }
-  if (timesPerDay > 24) return "BYHOUR, BYMINUTE and BYSECOND can combine to at most 24 times.";
-
-  let runs = 0;
-  let minimumGap = Infinity;
-  try {
-    let first: number | null = null;
-    let previous: number | null = null;
-    new RRule({
-      ...RRule.parseString(text),
-      dtstart: new Date(RULE_SAMPLE_START),
-      until: new Date(RULE_SAMPLE_END),
-    }).all((date) => {
-      const time = date.getTime();
-      runs += 1;
-      if (previous !== null) minimumGap = Math.min(minimumGap, time - previous);
-      first ??= time;
-      previous = time;
-      return runs < MAX_RULE_GAP_SAMPLES && time < first + RULE_GAP_WINDOW_MS;
-    });
-  } catch (error) {
-    return `This rule isn't valid: ${error instanceof Error ? error.message : String(error)}`;
-  }
-  if (runs === 0) return "This rule never runs.";
-  if (runs === 1) return "This rule runs only once. Change it so it repeats.";
-  const minimum = minimumScheduleInterval(
-    "minutely",
-    sessionMode,
-    subhourSupported,
-    executionTarget,
-  );
-  if (minimumGap < minimum * 60_000) {
-    if (minimumGap >= MIN_SUBHOUR_MINUTE_INTERVAL * 60_000) {
-      if (!subhourSupported) return "This server requires schedules of at least 60 minutes.";
-      return "New sandbox sessions require schedules of at least 60 minutes. Continue in the same session or use a connected host for shorter intervals.";
-    }
-    return `Runs must be at least ${minimum} minutes apart.`;
-  }
   return null;
 }
 

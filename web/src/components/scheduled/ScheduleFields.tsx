@@ -226,7 +226,7 @@ export function ScheduleFields({
       setVisualBeforeRule(model);
       onChange({ ...model, preset: "custom", customFreq: "rule", rule: buildRecurringRule(model) });
     } else {
-      const parsed = parseRRuleToScheduleModel(model.rule);
+      const parsed = parseRRuleToScheduleModel(normalizeRuleText(model.rule));
       const visual =
         parsed !== null && parsed.customFreq !== "rule"
           ? parsed
@@ -345,6 +345,8 @@ export function ScheduleFields({
       </DropdownMenuContent>
     </DropdownMenu>
   );
+  const ruleText = normalizeRuleText(model.rule);
+  const ruleSummary = ruleMode && !error ? describeSchedule(ruleText) : null;
   const timezoneRow = (className: string) => (
     <div className={cn("flex min-w-0 items-center justify-between gap-3", className)}>
       <span className="shrink-0">Timezone</span>
@@ -378,9 +380,10 @@ export function ScheduleFields({
           className="text-sm text-muted-foreground"
           data-testid="schedule-rule-summary"
         >
-          {error
-            ? "RFC 5545 RRULE, run in the timezone below. Set the end under Ends."
-            : describeSchedule(normalizeRuleText(model.rule))}
+          {/* A rule without a plain-language summary describes itself. */}
+          {ruleSummary !== null && ruleSummary !== ruleText
+            ? ruleSummary
+            : "RFC 5545 RRULE, run in the timezone below. Set the end under Ends."}
         </p>
       </div>
       {timezoneRow("py-2")}

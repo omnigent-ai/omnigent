@@ -129,6 +129,14 @@ describe("parseRRuleToScheduleModel", () => {
       rule: "FREQ=YEARLY;BYWEEKNO=1;BYDAY=MO;BYHOUR=9;BYMINUTE=0",
       end: { type: "count", count: 3 },
     });
+    const until = "FREQ=MONTHLY;BYDAY=1MO;BYHOUR=9;BYMINUTE=0;UNTIL=20271231T155959Z";
+    const parsed = parseRRuleToScheduleModel(until);
+    expect(parsed).toMatchObject({
+      customFreq: "rule",
+      rule: "FREQ=MONTHLY;BYDAY=1MO;BYHOUR=9;BYMINUTE=0",
+      end: { type: "until", until: "20271231T155959Z" },
+    });
+    expect(buildRRule(parsed!)).toBe(until);
     expect(
       buildRRule(
         model({ preset: "custom", customFreq: "rule", rule: " rrule:freq=yearly;byeaster=0 " }),
@@ -273,48 +281,36 @@ describe("minute cadence policy", () => {
 describe("validateRuleText", () => {
   it.each([
     ["", "Enter a recurrence rule, such as FREQ=DAILY;BYHOUR=9;BYMINUTE=0."],
-    ["FREQ=DAILY;COUNT=3", "Set when the schedule ends under Ends instead of with COUNT or UNTIL."],
-    ["FREQ=DAILY;DTSTART=20260101T000000Z", "DTSTART isn't a supported rule field."],
     [
       "DTSTART;TZID=Asia/Singapore:19700101T000000\nRRULE:FREQ=WEEKLY;BYDAY=MO",
       "Enter one RRULE line. Choose the timezone below instead of DTSTART;TZID.",
     ],
+    [
+      "FREQ=DAILY;BYHOUR",
+      "Write the rule as NAME=VALUE pairs separated by semicolons, using each name once.",
+    ],
+    [
+      "FREQ=DAILY;BYHOUR=9;BYHOUR=10",
+      "Write the rule as NAME=VALUE pairs separated by semicolons, using each name once.",
+    ],
+    ["FREQ=DAILY;COUNT=3", "Set when the schedule ends under Ends instead of with COUNT or UNTIL."],
+    ["FREQ=DAILY;DTSTART=20260101T000000Z", "DTSTART isn't a supported rule field."],
     ["BYHOUR=9", "Include a FREQ such as MINUTELY, HOURLY, DAILY, WEEKLY, MONTHLY or YEARLY."],
-    ["FREQ=DAILY;INTERVAL=0", "INTERVAL must be a whole number from 1 to 366."],
-    ["FREQ=DAILY;BYHOUR=nine", "BYHOUR has an invalid value."],
-    [
-      "FREQ=DAILY;BYHOUR=0,1,2,3,4,5,6,7,8,9,10,11,12;BYMINUTE=0,30",
-      "BYHOUR, BYMINUTE and BYSECOND can combine to at most 24 times.",
-    ],
-    ["FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=30", "This rule never runs."],
-    ["FREQ=DAILY;BYHOUR=9;BYMINUTE=0;BYMONTH=13", "This rule never runs."],
-    [
-      "FREQ=DAILY;BYHOUR=9;BYMONTH=2;BYMONTHDAY=29;BYDAY=MO",
-      "This rule runs only once. Change it so it repeats.",
-    ],
-    ["FREQ=MINUTELY;INTERVAL=5", "Runs must be at least 60 minutes apart."],
-  ])("rejects %s", (rule, message) => {
-    expect(validateRuleText(rule)).toEqual(message);
+  ])("rejects %j", (rule, message) => {
+    expect(validateRuleText(rule)).toBe(message);
   });
 
-  it("applies the session's minimum gap like the server", () => {
-    const halfHourly = "FREQ=DAILY;BYHOUR=9;BYMINUTE=0,30";
-    expect(validateRuleText(halfHourly, { subhourSupported: true })).toBe(
-      "New sandbox sessions require schedules of at least 60 minutes. Continue in the same session or use a connected host for shorter intervals.",
-    );
-    expect(validateRuleText(halfHourly)).toBe(
-      "This server requires schedules of at least 60 minutes.",
-    );
-    expect(
-      validateRuleText(halfHourly, { sessionMode: "continue", subhourSupported: true }),
-    ).toBeNull();
-  });
-
+  // The server decides whether these run, how often and with which values, then
+  // explains its verdict on save; sampling them here diverged from it or hung the tab.
   it.each([
-    "FREQ=YEARLY;BYWEEKNO=1;BYDAY=MO;BYHOUR=9;BYMINUTE=0",
-    "RRULE:FREQ=YEARLY;BYEASTER=-2;BYHOUR=9;BYMINUTE=0",
-    "freq=monthly;byday=-1fr;byhour=16;byminute=0",
-  ])("accepts %s", (rule) => {
+    "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9,10,11,12,13,14,15,16,17;BYMINUTE=0",
+    "rrule:freq=monthly;byday=-1fr;byhour=16;byminute=0",
+    "FREQ=YEARLY;BYEASTER=0;BYMONTH=4;BYMONTHDAY=1,21;BYHOUR=9;BYMINUTE=0",
+    "FREQ=DAILY;BYHOUR=9,09,009,0009,00009;BYMINUTE=0,00,000,0000,00000",
+    "FREQ=MINUTELY;BYHOUR=99",
+    "FREQ=SECONDLY;BYSECOND=61",
+    "FREQ=YEARLY;BYMONTH=2;BYMONTHDAY=30",
+  ])("leaves %s to the server", (rule) => {
     expect(validateRuleText(rule)).toBeNull();
   });
 });

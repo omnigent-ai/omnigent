@@ -240,7 +240,9 @@ describe("describeSchedule", () => {
   });
 
   it.each([
+    "FREQ=MINUTELY;INTERVAL=10;BYDAY=MO",
     "FREQ=MINUTELY;INTERVAL=10;BYMONTH=3",
+    "FREQ=MINUTELY;INTERVAL=60;BYDAY=MO",
     "FREQ=MINUTELY;INTERVAL=60;BYMONTH=3",
     "FREQ=MINUTELY;INTERVAL=10;BYSECOND=30",
   ])("preserves filters the library omits from minute summaries: %s", (rule) => {
@@ -248,71 +250,21 @@ describe("describeSchedule", () => {
   });
 
   it.each([
-    ["FREQ=MINUTELY;INTERVAL=10;BYDAY=MO", "Every 10 minutes on Monday"],
-    [
-      "FREQ=MINUTELY;INTERVAL=15;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9,10,11,12,13,14,15,16",
-      "Every 15 minutes during 9:00 AM–5:00 PM on weekdays",
-    ],
-    [
-      "FREQ=MINUTELY;INTERVAL=30;BYHOUR=22,23,0,1,8",
-      "Every 30 minutes during 10:00 PM–2:00 AM and 8:00 AM–9:00 AM",
-    ],
-    [
-      "FREQ=HOURLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9,10,11,12,13,14,15,16,17;BYMINUTE=0",
-      "Hourly from 9:00 AM to 5:00 PM on weekdays",
-    ],
-    ["FREQ=HOURLY;BYHOUR=22,23,0,1,2,3,4,5,6;BYMINUTE=30", "Hourly from 10:30 PM to 6:30 AM"],
-    ["FREQ=HOURLY;BYHOUR=8,11,14,17;BYMINUTE=0", "Every 3 hours from 8:00 AM to 5:00 PM"],
-    [
-      "FREQ=HOURLY;BYHOUR=9,12,17;BYMINUTE=0;BYDAY=SA,SU",
-      "At 9:00 AM, 12:00 PM, and 5:00 PM on weekends",
-    ],
-    ["FREQ=HOURLY;BYMINUTE=0,30", "Hourly at :00 and :30"],
-    ["FREQ=DAILY;BYHOUR=9,17;BYMINUTE=0", "Every day at 9:00 AM and 5:00 PM"],
-    [
-      "FREQ=DAILY;INTERVAL=2;BYHOUR=9,13,17;BYMINUTE=0",
-      "Every 2 days at 9:00 AM, 1:00 PM, and 5:00 PM",
-    ],
-    [
-      "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9,10,11,12,13,14,15,16,17;BYMINUTE=0",
-      "Hourly from 9:00 AM to 5:00 PM on weekdays",
-    ],
-    [
-      "FREQ=WEEKLY;BYDAY=MO,TH;BYHOUR=9,17;BYMINUTE=0",
-      "Weekly on Monday and Thursday at 9:00 AM and 5:00 PM",
-    ],
-    ["FREQ=MONTHLY;BYDAY=1MO;BYHOUR=9;BYMINUTE=0", "Monthly on the first Monday at 9:00 AM"],
-    [
-      "FREQ=MONTHLY;BYDAY=1TU,3TU;BYHOUR=9;BYMINUTE=0",
-      "Monthly on the first and third Tuesday at 9:00 AM",
-    ],
-    [
-      "FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1;BYHOUR=16;BYMINUTE=0",
-      "Monthly on the last weekday at 4:00 PM",
-    ],
-    [
-      "FREQ=MONTHLY;BYMONTHDAY=1,-1;BYHOUR=9;BYMINUTE=0",
-      "Monthly on the 1st and last day at 9:00 AM",
-    ],
-    [
-      "FREQ=MONTHLY;BYMONTH=1,4,7,10;BYMONTHDAY=1;BYHOUR=9;BYMINUTE=0",
-      "Monthly in January, April, July, and October on the 1st at 9:00 AM",
-    ],
-    [
-      "FREQ=YEARLY;BYMONTH=11;BYDAY=4TH;BYHOUR=9;BYMINUTE=0",
-      "Yearly in November on the fourth Thursday at 9:00 AM",
-    ],
-  ])("summarizes %s", (rule, summary) => {
-    expect(describeSchedule(rule)).toBe(summary);
-  });
-
-  it.each([
-    // The library reads these as "every month on weekdays" and "every year".
-    "FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1;BYHOUR=9,17;BYMINUTE=0",
+    "FREQ=HOURLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9,10,11,12,13,14,15,16,17;BYMINUTE=0",
+    "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=9,10,11,12,13,14,15,16,17;BYMINUTE=0",
+    "FREQ=DAILY;BYHOUR=9;BYMINUTE=0,30",
+    "FREQ=DAILY;BYDAY=MO;BYHOUR=9;BYMINUTE=0",
+    "FREQ=MONTHLY;BYDAY=1MO;BYHOUR=9;BYMINUTE=0",
+    "FREQ=MONTHLY;BYDAY=MO,TU,WE,TH,FR;BYSETPOS=-1;BYHOUR=9;BYMINUTE=0",
+    "FREQ=MONTHLY;BYMONTHDAY=-1;BYHOUR=9;BYMINUTE=0",
+    "FREQ=MONTHLY;BYMONTH=1,4,7,10;BYMONTHDAY=1;BYHOUR=9;BYMINUTE=0",
+    "FREQ=YEARLY;BYMONTHDAY=1;BYHOUR=9;BYMINUTE=0",
+    "FREQ=YEARLY;BYMONTH=1,13;BYMONTHDAY=1;BYHOUR=9;BYMINUTE=0",
+    "FREQ=YEARLY;BYWEEKNO=1;BYDAY=MO;BYHOUR=9;BYMINUTE=0",
     "FREQ=YEARLY;BYEASTER=0;BYHOUR=9;BYMINUTE=0",
-    "FREQ=HOURLY;INTERVAL=2;BYHOUR=9,10,11;BYMINUTE=0",
-    "FREQ=YEARLY;BYYEARDAY=1,100;BYHOUR=9;BYMINUTE=0",
-  ])("shows a rule no phrase states exactly as written: %s", (rule) => {
+    "FREQ=DAILY;BYHOUR=9;BYMINUTE=0;BYSECOND=30",
+    "FREQ=WEEKLY;INTERVAL=2;WKST=SU;BYDAY=SU,MO;BYHOUR=9;BYMINUTE=0",
+  ])("shows a rule its phrases can't state exactly as written: %s", (rule) => {
     expect(describeSchedule(rule)).toBe(rule);
   });
 
