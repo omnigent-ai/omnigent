@@ -1631,7 +1631,7 @@ def test_inject_user_message_via_tui_short_message_raises_when_not_submitted(
 
 
 def test_build_mcp_config_registers_omnigent_relay(tmp_path: Path) -> None:
-    """build_mcp_config emits the shared serve-mcp relay command + enabledTools."""
+    """build_mcp_config emits the shared serve-mcp relay command without enabledTools."""
     config = build_mcp_config(tmp_path, python_executable="python-test")
     server = config["mcpServers"]["omnigent"]
     assert server["command"] == "python-test"
@@ -1643,15 +1643,9 @@ def test_build_mcp_config_registers_omnigent_relay(tmp_path: Path) -> None:
         "--bridge-dir",
         str(tmp_path),
     ]
-    # agy's auto-approve allowlist is the enabledTools key (not cursor's autoApprove).
-    assert "sys_session_send" in server["enabledTools"]
-    assert "sys_os_shell" in server["enabledTools"]
-    assert "sys_terminal_launch" in server["enabledTools"]
-    assert "sys_list_models" in server["enabledTools"]
-    assert "sys_project_list" in server["enabledTools"]
-    assert "sys_session_update" in server["enabledTools"]
-    assert "sys_project_update" in server["enabledTools"]
-    assert server["enabledTools"] == sorted(server["enabledTools"])
+    # enabledTools is a visibility allowlist in agy and must stay omitted so
+    # dynamically advertised relay tools (browser, memory, automations) stay visible.
+    assert "enabledTools" not in server
     assert server["env"]["TMPDIR"]
     # The relay's HOME and data dir are pinned to the runner's so its bridge-root
     # validation matches where the bridge dir lives, even if a future agy launch
@@ -1951,7 +1945,93 @@ def test_seed_isolated_agy_home_never_clobbers_existing_isolated_settings(
 
     seed_isolated_agy_home(bridge_dir)
 
-    assert json.loads(iso_settings.read_text(encoding="utf-8")) == {"model": "session-pick"}
+    isolated = json.loads(iso_settings.read_text(encoding="utf-8"))
+    assert isolated["model"] == "session-pick"
+    assert "theme" not in isolated
+    assert isolated["permissions"]["allow"] == ["mcp(omnigent/*)"]
+
+
+def test_seed_isolated_agy_home_merges_omnigent_mcp_allow_rule(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """MCP allow-rule merges into permissions.allow idempotently without mutating real home."""
+    fake_home = tmp_path / "real-home"
+    real_settings = fake_home / ".gemini" / "antigravity-cli" / "settings.json"
+    real_settings.parent.mkdir(parents=True)
+    real_payload = {
+        "theme": "dark",
+        "permissions": {
+            "allow": ["mcp(other/*)"],
+            "ask": ["shell(git push *)"],
+            "deny": ["shell(rm -rf *)"],
+        },
+    }
+    real_settings.write_text(json.dumps(real_payload), encoding="utf-8")
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    seed_isolated_agy_home(bridge_dir)
+    seed_isolated_agy_home(bridge_dir)
+
+    iso_settings = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json"
+    isolated = json.loads(iso_settings.read_text(encoding="utf-8"))
+    assert isolated["theme"] == "dark"
+    assert isolated["permissions"] == {
+        "allow": ["mcp(other/*)", "mcp(omnigent/*)"],
+        "ask": ["shell(git push *)"],
+        "deny": ["shell(rm -rf *)"],
+    }
+    assert json.loads(real_settings.read_text(encoding="utf-8")) == real_payload
+
+
+def test_seed_isolated_agy_home_populates_empty_settings_json(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty or whitespace-only settings.json still receives the Omnigent allow-rule."""
+    fake_home = tmp_path / "real-home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    iso_settings = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json"
+    iso_settings.parent.mkdir(parents=True)
+    iso_settings.write_text("  \n", encoding="utf-8")
+
+    seed_isolated_agy_home(bridge_dir)
+
+    isolated = json.loads(iso_settings.read_text(encoding="utf-8"))
+    assert isolated["permissions"] == {"allow": ["mcp(omnigent/*)"]}
+
+
+@pytest.mark.parametrize(
+    "raw_content",
+    [
+        "{not valid json",
+        "[]",
+        json.dumps({"permissions": "not-an-object"}),
+        json.dumps({"permissions": {"allow": "not-a-list"}}),
+    ],
+    ids=["invalid-json", "non-object-root", "non-object-permissions", "non-list-allow"],
+)
+def test_seed_isolated_agy_home_leaves_malformed_settings_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, raw_content: str
+) -> None:
+    """Malformed or unexpected-shape isolated settings.json is left untouched."""
+    fake_home = tmp_path / "real-home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", classmethod(lambda _cls: fake_home))
+
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+    iso_settings = agy_gemini_dir(bridge_dir) / "antigravity-cli" / "settings.json"
+    iso_settings.parent.mkdir(parents=True)
+    iso_settings.write_text(raw_content, encoding="utf-8")
+
+    seed_isolated_agy_home(bridge_dir)
+
+    assert iso_settings.read_text(encoding="utf-8") == raw_content
 
 
 def test_seed_isolated_agy_home_prefers_real_onboarding_marker(
