@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import copy
-import errno
 import hashlib
 import json
 import logging
@@ -16,6 +15,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from stat import S_ISREG
 from typing import NotRequired, TypedDict
 
 import httpx
@@ -376,39 +376,69 @@ _MISSING_TRANSCRIPT_GRACE_S = 2.0
 _MISSING_TRANSCRIPT_GRACE_POLL_S = 0.25
 
 
+# Shapes of a hook-reported transcript path. ``unusable`` covers everything that is
+# neither a readable regular file nor a plain absence, so it never reaches the
+# transcript readers and never yields a loss diagnostic.
+_TRANSCRIPT_FILE = "file"
+_TRANSCRIPT_NOT_YET_PRESENT = "not_yet_present"
+_TRANSCRIPT_UNUSABLE = "unusable"
+
+
+def _transcript_shape(transcript_path: Path) -> str:
+    """
+    Classify a hook-reported transcript path as readable, not yet written, or unusable.
+
+    :param transcript_path: Transcript path reported by a hook, e.g.
+        ``"/home/u/.claude/projects/-work/abc.jsonl"``.
+    :returns: ``"file"`` for a readable regular file; ``"not_yet_present"`` when the
+        file is absent under a searchable directory; ``"unusable"`` for anything
+        else, including unreadable files, directories, a non-directory parent,
+        an unsearchable ancestor, and special files.
+    """
+    try:
+        status = os.stat(transcript_path)
+    except FileNotFoundError:
+        try:
+            parent = transcript_path.parent
+            searchable = parent.is_dir() and os.access(parent, os.X_OK)
+        except OSError:
+            return _TRANSCRIPT_UNUSABLE
+        return _TRANSCRIPT_NOT_YET_PRESENT if searchable else _TRANSCRIPT_UNUSABLE
+    except OSError:
+        return _TRANSCRIPT_UNUSABLE
+    if not S_ISREG(status.st_mode) or not os.access(transcript_path, os.R_OK):
+        return _TRANSCRIPT_UNUSABLE
+    return _TRANSCRIPT_FILE
+
+
+def _transcript_path_present(path: Path) -> bool:
+    """
+    Whether anything exists at ``path``; an error that hides the answer counts as present.
+
+    :param path: Transcript path from this session's cursor or hook history.
+    :returns: ``False`` only when the path is definitely absent.
+    """
+    try:
+        os.stat(path)
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
 def _transcript_write_blocker(transcript_path: Path) -> str:
     """
-    Explain why a hook-reported transcript file could not be created.
+    Name why a not-yet-present transcript's directory has not taken the file.
 
-    Walks up from the file to the nearest existing ancestor and names the
-    errno a writer hits there, e.g. ``"/home/u/.claude is not writable
-    (EACCES)"`` for a root-owned config directory.
-
-    :param transcript_path: Transcript path Claude Code reported, e.g.
-        ``"/home/u/.claude/projects/-work/abc.jsonl"``.
-    :returns: One-line description naming the directory and errno.
+    :param transcript_path: Transcript path whose directory is searchable and
+        whose file is absent, e.g. ``"/home/u/.claude/projects/-work/abc.jsonl"``.
+    :returns: One-line cause, e.g. ``"/home/u/.claude/projects/-work is not writable (EACCES)"``.
     """
-    hidden_by: str | None = None
-    for ancestor in transcript_path.parents:
-        try:
-            ancestor.stat()
-        except FileNotFoundError:
-            continue
-        except OSError as exc:
-            # The refused lookup means a directory above it lacks search permission,
-            # so keep walking to name that directory rather than the one just tried.
-            hidden_by = errno.errorcode.get(exc.errno or 0, type(exc).__name__)
-            continue
-        if hidden_by is not None:
-            return f"{ancestor} is not searchable ({hidden_by})"
-        if not ancestor.is_dir():
-            return f"{ancestor} is not a directory (ENOTDIR)"
-        if not os.access(ancestor, os.W_OK | os.X_OK):
-            return f"{ancestor} is not writable ({_unwritable_directory_errno(ancestor)})"
-        if ancestor != transcript_path.parent:
-            return f"{transcript_path.parent} does not exist (ENOENT); {ancestor} is writable"
-        return f"{ancestor} is writable but the file was never created"
-    return f"no ancestor of {transcript_path} exists (ENOENT)"
+    parent = transcript_path.parent
+    if os.access(parent, os.W_OK | os.X_OK):
+        return f"{parent} is writable but the file was never created"
+    return f"{parent} is not writable ({_unwritable_directory_errno(parent)})"
 
 
 def _mount_is_read_only(directory: Path) -> bool:
@@ -428,83 +458,75 @@ def _unwritable_directory_errno(
 
 
 @dataclass(frozen=True)
-class _UnreadTranscript:
+class _LostTranscript:
     """
-    A hook-reported transcript the forwarder could not read at the turn's ``Stop``.
+    A hook-reported transcript that is definitely absent under a searchable directory.
 
-    :param path: Transcript path Claude Code reported.
-    :param blocker: Why it is unreadable, e.g. ``"/home/u/.claude is not writable (EACCES)"``.
-    :param exists: Whether the file exists but cannot be read, rather than never appeared.
+    :param path: Transcript path Claude Code reported for the turn.
+    :param blocker: Why the directory has not taken the file, e.g.
+        ``"/home/u/.claude/projects/-work is not writable (EACCES)"``.
     """
 
     path: Path
     blocker: str
-    exists: bool
 
 
-def _transcript_unreadable(transcript_path: Path) -> bool:
+def _saved_transcript_path(bridge_dir: Path) -> Path | None:
     """
-    Whether a hook-reported transcript exists but this process cannot read it.
-
-    An unsearchable ancestor counts too, because it hides the file. A missing
-    file is not unreadable; the transcript cursor logic handles that case.
-
-    :param transcript_path: Transcript path carried by the latest hook record.
-    :returns: ``True`` when reads of the file would be refused.
-    """
-    try:
-        return transcript_path.exists() and not os.access(transcript_path, os.R_OK)
-    except OSError:
-        return True
-
-
-def _missing_transcript_blocker(
-    bridge_dir: Path, hook_transcript_path: Path | None
-) -> _UnreadTranscript | None:
-    """
-    Return the hook-reported transcript and why it is unreadable, or ``None`` when it is fine.
+    Return the transcript path the forwarder's saved cursor follows, if any.
 
     :param bridge_dir: Native Claude bridge directory.
-    :param hook_transcript_path: Transcript path carried by the ``Stop`` hook record.
-    :returns: The unread transcript for a missing or unreadable file.
+    :returns: The saved cursor's transcript path, or ``None`` when nothing is saved.
     """
-    transcript_path = hook_transcript_path or read_transcript_path(bridge_dir)
-    if transcript_path is None:
+    state = _read_forward_state(bridge_dir)
+    return state.transcript_path if state is not None else None
+
+
+def _transcript_loss(
+    bridge_dir: Path, stop_path: Path | None, saved_path: Path | None
+) -> _LostTranscript | None:
+    """
+    Return the loss a ``Stop`` proves, or ``None`` when the evidence is not unambiguous.
+
+    Deliberately conservative: a missed warning is acceptable, a false "transcript
+    lost" is not. The loss fires only when the Stop's path is still the path hooks
+    advertise now, the file is absent under a searchable directory, and no other
+    transcript path this session has is present. A relocation, or a later hook that
+    advertised another path, leaves the evidence ambiguous, so the function stays
+    quiet; a readable later path is processed normally by the transcript forwarder.
+
+    :param bridge_dir: Native Claude bridge directory.
+    :param stop_path: Transcript path carried by the ``Stop`` hook record.
+    :param saved_path: Transcript path the forwarder's saved cursor follows.
+    :returns: The lost transcript, or ``None``.
+    """
+    if stop_path is None or read_transcript_path(bridge_dir) != stop_path:
         return None
-    try:
-        if transcript_path.exists():
-            if os.access(transcript_path, os.R_OK):
-                return None
-            return _UnreadTranscript(
-                transcript_path, f"{transcript_path} is not readable (EACCES)", exists=True
-            )
-    except OSError:
-        # An unsearchable ancestor hides the file as surely as a missing one.
-        pass
-    return _UnreadTranscript(
-        transcript_path, _transcript_write_blocker(transcript_path), exists=False
-    )
+    if _transcript_shape(stop_path) != _TRANSCRIPT_NOT_YET_PRESENT:
+        return None
+    if saved_path is not None and saved_path != stop_path:
+        if _transcript_path_present(saved_path):
+            return None
+    return _LostTranscript(stop_path, _transcript_write_blocker(stop_path))
 
 
-async def _unread_transcript_after_grace(
-    bridge_dir: Path, hook_transcript_path: Path | None
-) -> _UnreadTranscript | None:
+async def _lost_transcript_after_grace(
+    bridge_dir: Path, stop_path: Path | None
+) -> _LostTranscript | None:
     """
-    Re-probe a transcript that is unread at ``Stop`` until it appears or the grace window ends.
+    Re-probe an absent transcript until it appears, becomes ambiguous, or the grace ends.
 
     :param bridge_dir: Native Claude bridge directory.
-    :param hook_transcript_path: Transcript path carried by the ``Stop`` hook record.
-    :returns: The unread transcript if it is still unreadable when the window closes,
-        or ``None`` once it reads.
+    :param stop_path: Transcript path carried by the ``Stop`` hook record.
+    :returns: The lost transcript if it is still absent when the window closes.
     """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + _MISSING_TRANSCRIPT_GRACE_S
     while True:
-        unread = await asyncio.to_thread(
-            _missing_transcript_blocker, bridge_dir, hook_transcript_path
-        )
-        if unread is None or loop.time() >= deadline:
-            return unread
+        saved_path = await asyncio.to_thread(_saved_transcript_path, bridge_dir)
+        lost = await asyncio.to_thread(_transcript_loss, bridge_dir, stop_path, saved_path)
+        if lost is None or loop.time() >= deadline:
+            return lost
         await asyncio.sleep(_MISSING_TRANSCRIPT_GRACE_POLL_S)
 
 
@@ -517,50 +539,37 @@ async def _surface_missing_transcript(
     dedupe: _ForwardDedupeState,
 ) -> str | None:
     """
-    Report a finished turn whose hook-reported transcript file still does not exist.
+    Report a finished turn whose transcript is unambiguously absent.
 
-    Report a missing or unreadable Stop transcript to chat and parent, logging once per path.
+    Logs once per path, posts an error item into the session, and returns the text the
+    idle edge carries as ``output`` when the hook carried no reply of its own.
 
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
     :param bridge_dir: Native Claude bridge directory.
     :param record: The ``Stop`` hook record ending the turn.
     :param dedupe: Per-session baseline holding the once-per-path log latch.
-    :returns: Parent-facing notice naming the unread transcript, or ``None``
-        when the transcript exists or no path is known yet.
+    :returns: Parent-facing notice naming the absent transcript, or ``None``
+        when the evidence is not unambiguous.
     """
-    unread = await _unread_transcript_after_grace(bridge_dir, record.transcript_path)
-    if unread is None:
+    lost = await _lost_transcript_after_grace(bridge_dir, record.transcript_path)
+    if lost is None:
         return None
-    if unread.exists:
-        problem = "exists but could not be read"
-        title = "Claude Code's transcript could not be read"
-        message = (
-            f"Claude Code's transcript at {unread.path} exists, but Omnigent cannot read it, "
-            "so this turn's prompt and replies were not mirrored into this session."
-        )
-        remediation = (
-            "Make the transcript file readable by the session user so Omnigent can mirror it."
-        )
-    else:
-        problem = "never appeared"
-        title = "Claude Code's transcript was never written"
-        message = (
-            f"Claude Code reported its transcript at {unread.path}, but the file never "
-            "appeared, so this turn's prompt and replies were not mirrored into this session."
-        )
-        remediation = (
-            "Make that directory writable by the session user so Claude Code can write "
-            "its transcript."
-        )
-    if unread.path not in dedupe.missing_transcript_warned_paths:
-        dedupe.missing_transcript_warned_paths.add(unread.path)
+    title = "Claude Code's transcript was never written"
+    message = (
+        f"Claude Code reported its transcript at {lost.path}, but the file never "
+        "appeared, so this turn's prompt and replies were not mirrored into this session."
+    )
+    remediation = (
+        "Make that directory writable by the session user so Claude Code can write its transcript."
+    )
+    if lost.path not in dedupe.missing_transcript_warned_paths:
+        dedupe.missing_transcript_warned_paths.add(lost.path)
         _logger.warning(
-            "Claude transcript %s reported by hooks %s before the turn's Stop (%s); "
+            "Claude transcript %s reported by hooks never appeared before the turn's Stop (%s); "
             "the turn's prompt and replies were not mirrored; session=%s",
-            unread.path,
-            problem,
-            unread.blocker,
+            lost.path,
+            lost.blocker,
             session_id,
             extra={"session_id": session_id},
         )
@@ -580,7 +589,7 @@ async def _surface_missing_transcript(
                 "code": _MISSING_TRANSCRIPT_ERROR_CODE,
                 "title": title,
                 "message": message,
-                "cause": f"{unread.blocker}.",
+                "cause": f"{lost.blocker}.",
                 "remediation": remediation,
             },
         },
@@ -621,7 +630,7 @@ async def _surface_missing_transcript(
         )
     return (
         "Omnigent could not read this turn's output: Claude Code's transcript "
-        f"{unread.path} {problem} ({unread.blocker})."
+        f"{lost.path} never appeared ({lost.blocker})."
     )
 
 
@@ -1822,7 +1831,10 @@ async def forward_claude_transcript_to_session(
                         transcript_path=transcript_path,
                         diagnostics=transcript_diagnostics,
                     )
-                    if transcript_path is not None and _transcript_unreadable(transcript_path):
+                    if (
+                        transcript_path is not None
+                        and _transcript_shape(transcript_path) == _TRANSCRIPT_UNUSABLE
+                    ):
                         # Reads of an unreadable transcript would raise and restart this
                         # loop, so the poll forwards hook records only. The Stop-time
                         # diagnostic then reports the turn, and the saved transcript
@@ -3869,7 +3881,10 @@ async def _maybe_rotate_session_on_clear(
         )
     await _write_hook_state_async(bridge_dir, durable)
     reset_transcript_forward_state(bridge_dir, reset_hooks=False)
-    if clear_record.transcript_path is not None:
+    if (
+        clear_record.transcript_path is not None
+        and _transcript_shape(clear_record.transcript_path) != _TRANSCRIPT_UNUSABLE
+    ):
         # A cleared native conversation has no copied history to skip.
         await _ensure_state_for_transcript(
             bridge_dir=bridge_dir,
@@ -4066,10 +4081,14 @@ async def _maybe_rotate_session_on_fork(
             extra={"session_id": session_id},
         )
     await _write_hook_state_async(bridge_dir, durable)
-    await _seed_fork_transcript_forward_state(
-        bridge_dir=bridge_dir,
-        transcript_path=fork_record.transcript_path,
-    )
+    if (
+        fork_record.transcript_path is not None
+        and _transcript_shape(fork_record.transcript_path) != _TRANSCRIPT_UNUSABLE
+    ):
+        await _seed_fork_transcript_forward_state(
+            bridge_dir=bridge_dir,
+            transcript_path=fork_record.transcript_path,
+        )
     return new_session_id
 
 
