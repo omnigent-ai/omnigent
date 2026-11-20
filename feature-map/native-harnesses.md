@@ -874,6 +874,9 @@ Cross-harness journeys:
   Every pick still requires success before the next prompt.
   Terminal checks preserve naturally wrapped and explicitly multiline drafts
   during a refused model change, retaining raw and joined pane captures.
+  Each draft is then explicitly submitted and its complete text must match in
+  the native transcript and exactly one conversation request. Screen rows alone
+  do not establish logical newline boundaries or ownership for automated clearing.
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_refusal_preserves_a_newer_same_model_selection`
   pauses its owned CLI to force a real unconfirmed switch; a late 503 preserves
   a newer same-value model write and its effort while the applied model stays

@@ -1394,16 +1394,19 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
             timeout=5,
         )
     )
-    long_draft = "draft-start " + "0123456789 " * (columns // 8 + 1) + "draft-end"
-    split_at = long_draft.index(" ", columns // 2)
-    drafts = {
-        "soft-wrap": long_draft,
-        "hard-newline": long_draft[:split_at] + "\n" + long_draft[split_at:],
-    }
     evidence = Path(os.environ.get("OMNIGENT_E2E_RECORD_DIR", str(tmp_path)))
     evidence.mkdir(parents=True, exist_ok=True)
     with httpx.Client(base_url=base_url, timeout=40) as client:
-        for kind, draft in drafts.items():
+        for kind in ("soft-wrap", "hard-newline"):
+            nonce = uuid.uuid4().hex[:8]
+            marker, reply = f"draft-{kind}-{nonce}", f"preserved-draft-{nonce}"
+            draft = marker + " " + "0123456789 " * (columns // 8 + 1) + "draft-end"
+            if kind == "hard-newline":
+                split_at = draft.index(" ", columns // 2)
+                draft = draft[:split_at] + "\n" + draft[split_at:]
+            model = _PINNED_CLAUDE_MODELS["sonnet"]
+            set_fallback_mock_llm(mock_llm_server_url, "default", reply)
+            set_fallback_mock_llm(mock_llm_server_url, _native_claude_wire_model(model), reply)
             buffer_name = f"owned-renderer-{uuid.uuid4().hex}"
             subprocess.run(
                 [*tmux, "load-buffer", "-b", buffer_name, "-"],
@@ -1432,23 +1435,42 @@ def test_claude_native_picker_repeated_pins_reach_the_real_terminal(
             )
             box = bridge._composer_box(raw)
             assert box is not None and box.framed and len(box.rows) > 1
-            assert model_switch._draft(joined) == draft, (
-                "The actual renderer did not preserve draft newline provenance; "
-                f"inspect {kind}-renderer.json before accepting model-control ownership"
-            )
             refused = client.patch(f"/v1/sessions/{session_id}", json={"model_override": "opus"})
             assert refused.status_code == 503, refused.text
-            assert (
-                model_switch._draft(
-                    bridge._capture_pane(advert["socket_path"], target, join_wrapped=True)
-                )
-                == draft
+            preserved = bridge._composer_box(bridge._capture_pane(advert["socket_path"], target))
+            assert preserved is not None and preserved.framed
+            assert preserved.rows == box.rows
+            assert all(
+                marker not in json.dumps(request)
+                for request in get_mock_message_requests(mock_llm_server_url)
             )
             assert _live_claude_snapshot(base_url, session_id)["llm_model"] == (
-                _native_claude_wire_model(_PINNED_CLAUDE_MODELS["sonnet"])
+                _native_claude_wire_model(model)
             )
             _screenshot(page, f"real-native-{kind}-draft-refused")
-            subprocess.run([*tmux, "send-keys", "-t", target, "C-c"], check=True, timeout=5)
+
+            # Explicit submission exposes logical newlines independently of screen wrapping.
+            subprocess.run([*tmux, "send-keys", "-t", target, "Enter"], check=True, timeout=5)
+            _wait_for_transcript_message(page, base_url, session_id, reply, role="assistant")
+            native_session, user_text = _assert_native_claude_turn(
+                base_url, session_id, marker, reply, model
+            )
+            assert user_text == draft, {"expected": draft, "native_user_text": user_text}
+            _assert_mock_claude_turn(
+                mock_llm_server_url,
+                marker,
+                model,
+                native_session=native_session,
+                user_text=draft,
+            )
+            (evidence / f"{kind}-delivered.json").write_text(
+                json.dumps(
+                    {"native_session": native_session, "user_text": user_text, "reply": reply},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            _screenshot(page, f"real-native-{kind}-draft-delivered")
             poll_until(
                 lambda: (
                     model_switch._draft(bridge._capture_pane(advert["socket_path"], target)) == ""
