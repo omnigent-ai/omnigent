@@ -2109,6 +2109,10 @@ export const SESSION_READ_TIMEOUT_MS = 15_000;
 export const ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS = SESSION_READ_TIMEOUT_MS;
 // A send whose POST is still open after this says so on its bubble.
 export const SEND_STILL_SENDING_AFTER_MS = 10_000;
+// A send still pending after this fails, so its draft comes back for a retry.
+export const SEND_UNANSWERED_AFTER_MS = SEND_CHAIN_MAX_WAIT_MS;
+const SEND_UNANSWERED_MESSAGE =
+  "The server didn't answer, so this may have reached the agent. If it doesn't appear, send it again.";
 // After the stream reconnects, `reconcileActiveSessionStatus` runs once
 // immediately — but a server that just restarted may not have reprocessed the
 // in-flight turn's completion yet, so that read can see a stale "running" and
@@ -4306,7 +4310,10 @@ export function sendableQueuedHead(
   return waitsForHost(queuedMessages, head.conversationId) ? null : head;
 }
 
-/** Await a send's POST, marking its pending bubble once the POST is slow to answer. */
+/**
+ * Await a send's POST, marking its pending bubble once slow; fail it if still pending after
+ * {@link SEND_UNANSWERED_AFTER_MS}, unless the session's row shows a turn running.
+ */
 async function withStillSendingMark<T>(
   sessionId: string,
   tempId: string,
@@ -4319,11 +4326,30 @@ async function withStillSendingMark<T>(
       ),
     }));
   }, SEND_STILL_SENDING_AFTER_MS);
+  let unanswered: ReturnType<typeof setTimeout> | undefined;
   try {
     // Never cancelled: the server may already have accepted the send.
-    return await post();
+    return await Promise.race([
+      post(),
+      new Promise<never>((_resolve, reject) => {
+        const giveUp = (): void => {
+          // A bubble its commit already replaced was delivered: its turn may be running.
+          const pending = setterForState(sessionId)?.pendingUserMessages.some(
+            (p) => p.tempId === tempId && p.posted !== true,
+          );
+          if (!pending) return;
+          if (cachedConversationStatus(sessionId) === "running") {
+            unanswered = setTimeout(giveUp, SEND_STILL_SENDING_AFTER_MS);
+          } else {
+            reject(new Error(SEND_UNANSWERED_MESSAGE));
+          }
+        };
+        unanswered = setTimeout(giveUp, SEND_UNANSWERED_AFTER_MS);
+      }),
+    ]);
   } finally {
     clearTimeout(timer);
+    clearTimeout(unanswered);
   }
 }
 
