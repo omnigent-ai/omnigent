@@ -40,7 +40,13 @@ vi.mock("@/hooks/useWorkspaceChangedFiles", () => ({
 vi.mock("@/store/chatStore", () => ({ useChatStore: () => undefined }));
 
 import { clearHostKeyless, markHostKeyless, setSessionHost } from "@/lib/sessionHost";
-import { downloadWorkspaceFile, fetchFileContent, workspaceFileMediaUrl } from "./useFileContent";
+import {
+  downloadWorkspaceFile,
+  fetchFileContent,
+  fetchFileContentViaRest,
+  fileContentQuery,
+  workspaceFileMediaUrl,
+} from "./useFileContent";
 
 const RAW_URL =
   "/v1/sessions/sess_abc/resources/environments/default/filesystem/src/main.py?download=true";
@@ -109,6 +115,58 @@ describe("fetchFileContent", () => {
 
     expect(await fetchFileContent("sess_abc", "src/main.py", undefined, {})).toBe(content);
     expect(authenticatedFetch).not.toHaveBeenCalled();
+  });
+});
+
+describe("fetchFileContentViaRest", () => {
+  it("reads through REST only, for a caller that already asked the workspace API", async () => {
+    readFileViaWorkspaceApi.mockClear();
+    authenticatedFetch.mockResolvedValue(
+      new Response(JSON.stringify({ path: "src/main.py", content: "x" }), { status: 200 }),
+    );
+
+    expect(await fetchFileContentViaRest("sess_abc", "src/main.py")).toMatchObject({
+      content: "x",
+    });
+    expect(readFileViaWorkspaceApi).not.toHaveBeenCalled();
+    expect(authenticatedFetch).toHaveBeenCalledWith(
+      "/v1/sessions/sess_abc/resources/environments/default/filesystem/src/main.py",
+    );
+  });
+
+  it("fails with the response's status", async () => {
+    authenticatedFetch.mockResolvedValue(
+      new Response("gone", { status: 404, statusText: "Not Found" }),
+    );
+    await expect(fetchFileContentViaRest("sess_abc", "src/main.py")).rejects.toThrow(
+      "404 Not Found",
+    );
+  });
+});
+
+describe("fileContentQuery", () => {
+  it("reads one file under the viewer's key, passing the SSH alias on", async () => {
+    const content = { path: "src/main.py", content: "x" };
+    readFileViaWorkspaceApi.mockResolvedValueOnce(content);
+    const query = fileContentQuery("sess_abc", "src/main.py", "my-box");
+
+    expect(query.queryKey).toEqual(["file-content", "sess_abc", "src/main.py"]);
+    expect(query.staleTime).toBe(5_000);
+    expect(await query.queryFn({ signal: new AbortController().signal })).toBe(content);
+    expect(readFileViaWorkspaceApi).toHaveBeenLastCalledWith(
+      "sess_abc",
+      "src/main.py",
+      expect.anything(),
+      "my-box",
+    );
+  });
+
+  it("sends no read once cancelled", async () => {
+    readFileViaWorkspaceApi.mockClear();
+    const controller = new AbortController();
+    controller.abort();
+    await expect(fileContentQuery("sess_abc", "src/main.py").queryFn(controller)).rejects.toThrow();
+    expect(readFileViaWorkspaceApi).not.toHaveBeenCalled();
   });
 });
 

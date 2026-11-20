@@ -61,13 +61,14 @@ describe("QuickPickCommandPalette", () => {
     expect(actionSlot?.querySelector("svg")).toBeTruthy();
   });
 
-  it("finds actions by their initials and highlights the matched letters", () => {
+  it("finds actions by their initials and underlines the letters they hit", () => {
     const { input } = renderPalette();
     fireEvent.change(input, { target: { value: "gts" } });
     const actions = within(screen.getByRole("group", { name: "Actions" })).getAllByRole("option");
     expect(actions[0].textContent).toContain("Go to Settings");
-    const marked = [...actions[0].querySelectorAll("mark")].map((mark) => mark.textContent);
-    expect(marked.join("").toLowerCase()).toBe("gts");
+    const marks = [...actions[0].querySelectorAll("mark")];
+    expect(marks.map((mark) => mark.textContent)).toEqual(["G", "t", "S"]);
+    expect(marks.every((mark) => mark.dataset.matchHighlight === "underline")).toBe(true);
   });
 
   it("moves between groups with Alt+Arrow and runs the action with Enter", () => {

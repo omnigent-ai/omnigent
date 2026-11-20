@@ -59,6 +59,20 @@ function browserTabsBridge(): BrowserTabsBridge | undefined {
   return (window as unknown as { omnigentDesktop?: BrowserTabsBridge }).omnigentDesktop;
 }
 
+/** Close a session's browser view; true once it's gone, or where there is none to close. */
+export function closeBrowserView(
+  conversationId: string,
+  tabId: string,
+  bridge: BrowserTabsBridge | undefined = browserTabsBridge(),
+): Promise<boolean> {
+  const closing = bridge?.browserClose?.(browserViewId(conversationId, tabId));
+  if (!closing) return Promise.resolve(true);
+  return closing.then(
+    (result) => result.ok,
+    () => false,
+  );
+}
+
 const agentNavigationEpochs = new Map<string, number>();
 // Counts each session's tab selections, across mounts of its rail, so a slow reopen
 // only selects its tab if nothing was selected after it was requested.
@@ -119,6 +133,21 @@ export function openBrowserTab(conversationId: string, tabId: string): BrowserTa
   const next = withTab(readBrowserTabsState(conversationId));
   saveBrowserTabsState(conversationId, next);
   return next;
+}
+
+/** `state` without `tabId`, selecting its left neighbour when it was selected. */
+function withoutBrowserTab(state: BrowserTabsState, tabId: string): BrowserTabsState {
+  const index = state.tabs.indexOf(tabId);
+  if (index === -1) return state;
+  const tabs = state.tabs.filter((id) => id !== tabId);
+  const selected =
+    state.selected === tabId ? (tabs[Math.max(0, index - 1)] ?? null) : state.selected;
+  return { tabs, selected };
+}
+
+/** Forget a browser view whose view a host other than the rail closed, such as a workspace tab. */
+export function forgetBrowserTab(conversationId: string, tabId: string): Promise<void> {
+  return updateBrowserTabs(conversationId, (current) => withoutBrowserTab(current, tabId));
 }
 
 /** The tab agents act on: the reserved agent tab unless an agent picked another one. */
@@ -416,12 +445,7 @@ export function useBrowserTabs(conversationId: string) {
     update((previous) => {
       // An agent navigated this tab while main closed its page: keep it.
       if (railClose.superseded(previous)) return previous;
-      const index = previous.tabs.indexOf(tabId);
-      if (index === -1) return previous;
-      const tabs = previous.tabs.filter((id) => id !== tabId);
-      const selected =
-        previous.selected === tabId ? (tabs[Math.max(0, index - 1)] ?? null) : previous.selected;
-      return { tabs, selected };
+      return withoutBrowserTab(previous, tabId);
     });
     return "closed";
   };

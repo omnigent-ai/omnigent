@@ -6,6 +6,7 @@ import { createConnectTransport } from "@connectrpc/connect-web";
 import { base64Encode } from "@bufbuild/protobuf/wire";
 import type { MessageInitShape } from "@bufbuild/protobuf";
 import {
+  ComparisonKind,
   ContentEncoding,
   EntryType,
   FileSearchMode,
@@ -331,6 +332,8 @@ export interface ListedEntry {
   type: "file" | "directory";
   bytes: number | null;
   modified_at: number | null;
+  /** The deepest directory of a single-child chain, when the host reports it. */
+  leaf_directory_path?: string;
 }
 
 const LIST_PAGE_SIZE = 1000;
@@ -501,6 +504,7 @@ function listedEntry(entry: Entry): ListedEntry {
     type: entry.type === EntryType.DIRECTORY ? "directory" : "file",
     bytes: entry.size === undefined ? null : Number(entry.size),
     modified_at: entry.modifyTime ? Number(entry.modifyTime.seconds) : null,
+    ...(entry.leafDirectoryPath ? { leaf_directory_path: entry.leafDirectoryPath } : {}),
   };
 }
 
@@ -636,6 +640,11 @@ export function searchTextViaWorkspaceApi(
 // request the host rejects throws its ConnectError, whose message says why.
 const GIT_OPTIONS = { throwAnswers: true } as const;
 
+/** The optional features a comparison relies on: a host may serve the method without them. */
+function comparisonFeatures(comparison: ComparisonInit): string[] {
+  return comparison.kind === ComparisonKind.REVISIONS ? ["revision_comparison"] : [];
+}
+
 /** Resolve a comparison's base and head commits. */
 export function resolveWorkingCopyBaseViaWorkspaceApi(
   sessionId: string,
@@ -650,7 +659,7 @@ export function resolveWorkingCopyBaseViaWorkspaceApi(
       if (!response.base) throw new UnusableAnswerError("The workspace API sent no base");
       return response.base;
     },
-    { ...GIT_OPTIONS, signal },
+    { ...GIT_OPTIONS, signal, features: comparisonFeatures(comparison) },
   );
 }
 
@@ -664,7 +673,7 @@ export function listWorkingCopyChangesViaWorkspaceApi(
     sessionId,
     "listWorkingCopyChanges",
     (client) => client.listWorkingCopyChanges({ comparison }, { signal }),
-    { ...GIT_OPTIONS, signal },
+    { ...GIT_OPTIONS, signal, features: comparisonFeatures(comparison) },
   );
 }
 
@@ -729,7 +738,7 @@ export function listBranchCommitsViaWorkspaceApi(
     sessionId,
     "listBranchCommits",
     (client) => client.listBranchCommits({ baseRevision }, { signal }),
-    { ...GIT_OPTIONS, signal },
+    { ...GIT_OPTIONS, signal, features: ["branch_commits"] },
   );
 }
 

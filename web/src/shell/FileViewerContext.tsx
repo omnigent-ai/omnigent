@@ -13,6 +13,16 @@ export interface FilePosition {
   column?: number;
   /** Last line of a cited range (`file.ts:10-20`), greater than `line`. */
   endLine?: number;
+  /** Column just past a cited range's end, on `endLine` (or `line`). */
+  endColumn?: number;
+}
+
+/**
+ * A request to show a file in its diff, as a Changes-list click makes. Object
+ * identity is the request key, as for `FilePosition`.
+ */
+export interface FileDiffRequest {
+  readonly view: "diff";
 }
 
 export type OpenFileOptions = Partial<FilePosition>;

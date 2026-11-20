@@ -194,7 +194,12 @@ import {
   fetchDatabricksStatus,
   type DatabricksConnectionStatus,
 } from "@/lib/databricksIntegration";
-import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
+import {
+  getCurrentIsAdmin,
+  getCurrentUserId,
+  resolveIdentity,
+  subscribeIdentity,
+} from "@/lib/identity";
 import { useAdminViewSwitchShown } from "@/hooks/useAdminViewSwitchShown";
 import { isAdminViewEnabled, setAdminViewEnabled } from "@/lib/adminView";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
@@ -2990,10 +2995,17 @@ function AccountSection() {
 
   useEffect(() => {
     if (capabilitiesLoading) return;
-    void (async () => {
-      const userId = await resolveIdentity();
+    let active = true;
+    const update = (userId: string | null) => {
+      if (!active) return;
       setMe(userId === null ? null : { id: userId, is_admin: getCurrentIsAdmin() });
-    })();
+    };
+    const unsubscribe = subscribeIdentity(() => update(getCurrentUserId()));
+    void resolveIdentity().then(update);
+    return () => {
+      active = false;
+      unsubscribe();
+    };
   }, [capabilitiesLoading]);
 
   const onSignOut = useCallback(() => signOutOfBrowserSession(accountsEnabled), [accountsEnabled]);

@@ -116,6 +116,11 @@ export function parseHttpUrl(href: string): URL | null {
   return url.protocol === "http:" || url.protocol === "https:" ? url : null;
 }
 
+/** Open `href` where links open: the in-app browser when the user opted in, else a new window. */
+export function openLink(conversationId: string | undefined, href: string): void {
+  if (!maybeOpenLinkInApp(conversationId, href)) window.open(href, "_blank", "noopener,noreferrer");
+}
+
 /**
  * Open an http(s) `href` in a matching or new in-app browser tab when the user
  * opted in. Returns true when routed (the caller cancels the default click).
@@ -147,7 +152,11 @@ export function maybeOpenLinkInApp(conversationId: string | undefined, href: str
  * window.open regardless, so it would navigate twice.
  */
 export function followLinkWithPopupFallback(
-  event: MouseEvent,
+  // React's or the DOM's: a menu row passes the native click, so the menu still sees it unhandled.
+  event: Pick<
+    MouseEvent,
+    "defaultPrevented" | "button" | "shiftKey" | "altKey" | "metaKey" | "ctrlKey" | "preventDefault"
+  >,
   href: string,
   conversationId: string | undefined,
 ): void {

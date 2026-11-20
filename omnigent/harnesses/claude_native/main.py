@@ -756,6 +756,8 @@ def claude_config_with_launch_model_pinned(
         env set.
     """
     from omnigent.models.claude_model_vocabulary import (
+        LONG_CONTEXT_MARKER,
+        alias_pins,
         claude_model_command_arg,
         normalized_model_id,
     )
@@ -770,10 +772,27 @@ def claude_config_with_launch_model_pinned(
     model = launch_model.strip()
     if model in _UCODE_CLAUDE_TIER_TO_ENV or model == _UCODE_CLAUDE_CUSTOM_TIER:
         return claude_config
-    if claude_model_command_arg(model, claude_config.env) is not None:
-        # Already speakable: an alias pinned to exactly this id, or the
-        # custom slot already holding it.
+    custom_slot = claude_config.env.get(_ANTHROPIC_CUSTOM_MODEL_OPTION_ENV, "").strip()
+    speakable = claude_model_command_arg(model, claude_config.env)
+    resolved_speakable = (
+        alias_pins(claude_config.env).get(speakable, speakable) if speakable is not None else None
+    )
+    wants_marker = model.lower().endswith(LONG_CONTEXT_MARKER)
+    if (
+        speakable is not None
+        and speakable != custom_slot
+        and resolved_speakable is not None
+        and resolved_speakable.lower().endswith(LONG_CONTEXT_MARKER) == wants_marker
+    ):
+        # A family alias preserves the window only when its configured pin
+        # carries the same marker.
         return claude_config
+    if custom_slot == model:
+        # The slot already holds this id byte-for-byte, marker included.
+        return claude_config
+    # Otherwise (re)write the slot to the launch model. A slot that matches only
+    # once ``[1m]`` is stripped would make ``/model`` re-select the bare id and
+    # fall back to 200K, so the slot must carry the marked spelling verbatim.
     normalized = normalized_model_id(model)
     tier = next(
         (family for family in _UCODE_CLAUDE_TIER_TO_ENV if family in normalized.split("-")),

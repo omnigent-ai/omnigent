@@ -3,6 +3,7 @@
 
 import type { BundledLanguage } from "shiki";
 import type { ResolvedThemeMode } from "@/components/theme/themeMode";
+import { isVideoFile } from "@/lib/video";
 
 // ---------------------------------------------------------------------------
 // Shared selection type
@@ -795,4 +796,15 @@ export function lineOverlapsSelection(
   for (let i = 0; i < lineIdx; i++) lineStart += rawLines[i].length + 1;
   const lineEnd = lineStart + rawLines[lineIdx].length;
   return start <= lineEnd && end > lineStart;
+}
+
+/** Files a diff can't show as text: images, PDFs, video, 3D models, other binaries. */
+export function hasNoTextDiff(path: string): boolean {
+  return (
+    isBinaryPath(path) ||
+    isImageFile(path) ||
+    isPdfFile(path) ||
+    isVideoFile(path) ||
+    isModelFile(path)
+  );
 }

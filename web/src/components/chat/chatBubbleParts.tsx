@@ -985,6 +985,7 @@ function UserMessageMarkdown({ text, leadingCommand }: { text: string; leadingCo
       className="text-message"
       breaks
       mode="static"
+      linkPullRequestRefs
       remarkRehypeOptions={USER_MESSAGE_REMARK_REHYPE_OPTIONS}
       renderLocalReviewComment={renderLocalReviewComment}
       leadingCommand={leadingCommand}
@@ -1359,13 +1360,9 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
           </div>
         )}
         {visibilityToggle}
-        <div
-          id={actionsId}
-          className={cn(
-            "flex max-w-full items-center justify-end gap-3 pt-1 mobile-app:py-0",
-            visibilityClassName,
-          )}
-        >
+        <div className="flex max-w-full items-center justify-end gap-3 pt-1 mobile-app:py-0">
+          {/* Outside the hover-revealed actions: a mid-turn message can wait
+              minutes behind a long tool call and must not look delivered. */}
           {awaitingAgent && (
             <span
               className="min-w-0 truncate text-sm leading-4 text-muted-foreground"
@@ -1375,52 +1372,57 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
               The agent will read this after its current step
             </span>
           )}
-          {ts && (
-            <span
-              className="shrink-0 select-none whitespace-nowrap text-sm leading-4 text-foreground/56"
-              data-testid="message-timestamp"
-            >
-              {ts}
-            </span>
-          )}
-          <MessageActions className="shrink-0">
-            {text && (
+          <div
+            id={actionsId}
+            className={cn("flex shrink-0 items-center gap-3", visibilityClassName)}
+          >
+            {ts && (
+              <span
+                className="shrink-0 select-none whitespace-nowrap text-sm leading-4 text-foreground/56"
+                data-testid="message-timestamp"
+              >
+                {ts}
+              </span>
+            )}
+            <MessageActions className="shrink-0">
+              {text && (
+                <MessageAction
+                  tooltip="Copy"
+                  size="icon-xxs"
+                  className="max-md:size-8"
+                  onClick={handleCopy}
+                  componentId="chat.message.copy_user"
+                >
+                  {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
+                </MessageAction>
+              )}
+              {canEdit && (
+                <MessageAction
+                  tooltip="Edit and resend"
+                  size="icon-xxs"
+                  className="max-md:size-8"
+                  onClick={() =>
+                    editSentMessage({
+                      text: isShellCommand ? text : userMessageBody(bubble.content),
+                    })
+                  }
+                  componentId="chat.message.edit_user"
+                >
+                  <PencilIcon size={14} />
+                </MessageAction>
+              )}
               <MessageAction
-                tooltip="Copy"
+                tooltip={isLinkCopied ? "Copied!" : "Copy link"}
                 size="icon-xxs"
                 className="max-md:size-8"
-                onClick={handleCopy}
-                componentId="chat.message.copy_user"
+                data-testid="copy-message-link"
+                disabled={bubble.pending}
+                onClick={handleCopyLink}
               >
-                {isCopied ? <CheckIcon size={14} /> : <CopyIcon size={14} />}
+                {isLinkCopied ? <CheckIcon size={14} /> : <Link2Icon size={14} />}
               </MessageAction>
-            )}
-            {canEdit && (
-              <MessageAction
-                tooltip="Edit and resend"
-                size="icon-xxs"
-                className="max-md:size-8"
-                onClick={() =>
-                  editSentMessage({
-                    text: isShellCommand ? text : userMessageBody(bubble.content),
-                  })
-                }
-                componentId="chat.message.edit_user"
-              >
-                <PencilIcon size={14} />
-              </MessageAction>
-            )}
-            <MessageAction
-              tooltip={isLinkCopied ? "Copied!" : "Copy link"}
-              size="icon-xxs"
-              className="max-md:size-8"
-              data-testid="copy-message-link"
-              disabled={bubble.pending}
-              onClick={handleCopyLink}
-            >
-              {isLinkCopied ? <CheckIcon size={14} /> : <Link2Icon size={14} />}
-            </MessageAction>
-          </MessageActions>
+            </MessageActions>
+          </div>
         </div>
       </div>
     </Message>

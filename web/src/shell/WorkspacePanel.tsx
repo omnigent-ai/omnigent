@@ -124,7 +124,7 @@ function WorkspaceMenuShortcut({
   return <CompactShortcutKeys keys={keys} className={className} />;
 }
 
-function WorkspaceTabTooltip({
+export function WorkspaceTabTooltip({
   label,
   shortcut,
   className,
@@ -630,7 +630,7 @@ function TerminalTabsStrip({
 // id from its tab key and tracks per-terminal connection/activity status.
 // ---------------------------------------------------------------------------
 
-function RailTerminalView({
+export function RailTerminalView({
   conversationId,
   terminalKey,
   readOnly,

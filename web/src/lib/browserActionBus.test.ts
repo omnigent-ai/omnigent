@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { emitBrowserActionRequest, onBrowserActionRequest } from "./browserActionBus";
+import {
+  emitBrowserActionRequest,
+  emitBrowserActionSettled,
+  onBrowserActionRequest,
+  onBrowserActionSettled,
+} from "./browserActionBus";
 import type { BrowserActionRequestEvent } from "./events";
 
 function event(actionId = "baction_1"): BrowserActionRequestEvent {
@@ -84,5 +89,29 @@ describe("browserActionBus", () => {
 
   it("emitting with no listeners registered is a no-op", () => {
     expect(() => emitBrowserActionRequest(event(), "conv_src")).not.toThrow();
+  });
+
+  it("tells settled listeners how an action ended, until they unsubscribe, past a throwing one", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const boom = vi.fn(() => {
+      throw new Error("listener blew up");
+    });
+    const listener = vi.fn();
+    const unsubBoom = onBrowserActionSettled(boom);
+    const unsub = onBrowserActionSettled(listener);
+    const evt = event();
+
+    emitBrowserActionSettled(evt, "conv_src", { ok: true, data: { tab_id: "t1" } });
+    emitBrowserActionSettled(evt, "conv_src", { ok: false, error: "no browser" });
+
+    expect(listener.mock.calls).toEqual([
+      [evt, "conv_src", { ok: true, data: { tab_id: "t1" } }],
+      [evt, "conv_src", { ok: false, error: "no browser" }],
+    ]);
+    expect(warn).toHaveBeenCalled();
+    unsub();
+    unsubBoom();
+    emitBrowserActionSettled(evt, "conv_src", { ok: false, error: "gone" });
+    expect(listener).toHaveBeenCalledTimes(2);
   });
 });
