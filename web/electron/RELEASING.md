@@ -18,6 +18,8 @@ gh workflow run omnigent-desktop.yml \
 
 Watch the run's Linux/Windows builds, security scans, Blob upload, and site-PR jobs. The workflow publishes under `win/` and `linux/` in the `omnigent-builds` Vercel Blob store, and opens a PR updating `latest.yml`, `latest-linux.yml`, and the Windows/Linux download redirects. A `dry-run` only previews these writes. Re-dispatching the same version in publish mode is not a retry strategy: uploads are create-only and existing paths cause a collision.
 
+The Windows installer must be Authenticode-signed, so the workflow's Windows job has to run `pnpm --dir web/electron run build:win:release` with `WIN_CSC_LINK` / `WIN_CSC_KEY_PASSWORD` available (see [Windows code signing](README.md#windows-code-signing)). That script aborts instead of producing an unsigned installer; `build:win` makes the unsigned **Omnigent Dev** package and is not a release build.
+
 ## 3. Build the signed, notarized macOS release
 
 Use a Mac with the **Databricks, Inc. (8RMX4WU6F8)** Developer ID Application certificate and Apple notarization credentials. See [macOS code signing & notarization](README.md#macos-code-signing--notarization) for the supported `APPLE_API_KEY` / `APPLE_API_KEY_ID` / `APPLE_API_ISSUER` (or Apple ID) variables. Keep credentials in ignored local files or a secret manager; never commit, print, or paste them into the PR.
