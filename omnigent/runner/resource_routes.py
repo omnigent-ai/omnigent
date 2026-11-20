@@ -404,7 +404,10 @@ def register_resource_routes(
         )
 
         if not body.get("bridge_inject_dir"):
-            raise HTTPException(400, "Fenced Claude settings require native bridge injection")
+            raise OmnigentError(
+                "Fenced Claude settings require native bridge injection",
+                code=ErrorCode.INVALID_INPUT,
+            )
         bridge_id = await _claude_native_bridge_id_for_session(
             server_client=server_client, session_id=session_id
         )
@@ -420,8 +423,8 @@ def register_resource_routes(
                 dispose=ClaudeSettingsLease.close,
             )
         except ValueError as exc:
-            raise HTTPException(
-                409, "Claude settings request expired; rebuild the request"
+            raise OmnigentError(
+                "Claude settings request expired; rebuild the request", code=ErrorCode.CONFLICT
             ) from exc
         try:
             yield bridge_id, lease

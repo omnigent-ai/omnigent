@@ -701,10 +701,9 @@ class ClaudeSettingsLease:
         """Retain inputs until confirmed terminal termination, including after transfer."""
         retained = self._retain_for_terminal()
         try:
-            retained._attach_process_lifetime(instance)
-            instance.add_resource_cleanup(retained.close)
+            retained._publish_terminal(instance)
         except BaseException:
-            retained.close()
+            retained._discard_unpublished()
             raise
 
     async def attach_async(
@@ -726,17 +725,20 @@ class ClaudeSettingsLease:
             await _run_claude_settings_step(retained._discard_unpublished)
             raise
         try:
-            retained._attach_process_lifetime(instance)
-            instance.add_resource_cleanup(retained.close)
+            retained._publish_terminal(instance)
         except BaseException:
-            await _run_claude_settings_step(retained.close)
+            await _run_claude_settings_step(retained._discard_unpublished)
             raise
 
-    def _attach_process_lifetime(self, instance: TerminalInstance) -> None:
+    def _publish_terminal(self, instance: TerminalInstance) -> None:
         with self._close_lock:
             if self._fd is None:
                 raise ClaudeSettingsRequestExpired()
+            self._attach_process_lifetime(instance)
+            instance.add_resource_cleanup(self.close)
             self._terminal_published = True
+
+    def _attach_process_lifetime(self, instance: TerminalInstance) -> None:
         if self._fenced_binding is None:
             return
         from omnigent.inner.process_lifetime import ProcessLifetimeLease
@@ -754,6 +756,7 @@ class ClaudeSettingsLease:
                 instance.private_dir / f"{self._terminal_claim.stem}.ready",
             ),
             self.close,
+            withdraw_unstarted=self._withdraw_unstarted,
         )
         if instance.sandbox_policy is not None and instance.sandbox_policy.active:
             instance.sandbox_policy = with_additional_read_roots(
@@ -768,10 +771,16 @@ class ClaudeSettingsLease:
         """Discard preparation that never exposed its claim to a terminal."""
         self._close(discard_unpublished=True)
 
-    def _close(self, *, discard_unpublished: bool) -> None:
+    def _withdraw_unstarted(self) -> None:
+        """Withdraw a registered claim only after its terminal proves no spawn occurred."""
+        self._close(discard_unpublished=False, withdraw_unstarted=True)
+
+    def _close(self, *, discard_unpublished: bool, withdraw_unstarted: bool = False) -> None:
         with self._close_lock:
             fd, self._fd = self._fd, None
-            unpublished = discard_unpublished and not self._terminal_published
+            unpublished = withdraw_unstarted or (
+                discard_unpublished and not self._terminal_published
+            )
         if fd is None:
             return
         try:

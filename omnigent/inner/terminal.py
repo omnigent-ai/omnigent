@@ -1264,6 +1264,9 @@ class TerminalInstance:
     _process_lifetime_handoffs: list[
         tuple[process_lifetime.ProcessLifetimeLease, Callable[[], object]]
     ] = field(default_factory=list, init=False, repr=False)
+    _process_lifetime_withdrawals: dict[
+        process_lifetime.ProcessLifetimeLease, Callable[[], object]
+    ] = field(default_factory=dict, init=False, repr=False)
     _process_lifetime_lock: threading.Lock = field(
         default_factory=threading.Lock, init=False, repr=False
     )
@@ -2353,13 +2356,21 @@ class TerminalInstance:
         self._resource_cleanup_stack.callback(callback)
 
     def add_process_lifetime_lease(
-        self, lease: process_lifetime.ProcessLifetimeLease, release: Callable[[], object]
+        self,
+        lease: process_lifetime.ProcessLifetimeLease,
+        release: Callable[[], object],
+        *,
+        withdraw_unstarted: Callable[[], object] | None = None,
     ) -> None:
         self.process_lifetime_leases.append(lease)
         with self._process_lifetime_lock:
             self._process_lifetime_handoffs.append((lease, release))
+            if withdraw_unstarted is not None:
+                self._process_lifetime_withdrawals[lease] = withdraw_unstarted
 
-    def _release_process_lifetime_handoffs(self, *, ready_only: bool) -> bool:
+    def _release_process_lifetime_handoffs(
+        self, *, ready_only: bool, unstarted: bool = False
+    ) -> bool:
         with self._process_lifetime_lock:
             ready = [
                 entry
@@ -2369,8 +2380,12 @@ class TerminalInstance:
             self._process_lifetime_handoffs = [
                 entry for entry in self._process_lifetime_handoffs if entry not in ready
             ]
+            callbacks = []
+            for lease, release in ready:
+                withdraw = self._process_lifetime_withdrawals.pop(lease, None)
+                callbacks.append(withdraw if unstarted and withdraw is not None else release)
             pending = bool(self._process_lifetime_handoffs)
-        for _lease, release in ready:
+        for release in callbacks:
             release()
         return pending
 
@@ -2389,6 +2404,7 @@ class TerminalInstance:
     async def close(self) -> None:
         """Kill the tmux session and clean up."""
         terminal_stopped = False
+        terminal_unstarted = False
         try:
             if self.lifecycle_trace.note_cleanup():
                 logger.info(
@@ -2409,6 +2425,12 @@ class TerminalInstance:
                 self.running
                 or self.socket_path.exists()
                 or (self._has_retained_resources and self._launch_started)
+            )
+            terminal_unstarted = (
+                terminal_stopped
+                and not self._launch_started
+                and not self._launch_incomplete
+                and not self._launch_lock.locked()
             )
             # Cancel both idle-watcher variants first so they don't race
             # the socket teardown. Order doesn't matter — they're
@@ -2451,7 +2473,9 @@ class TerminalInstance:
                             await asyncio.shield(previous)
                     finally:
                         await asyncio.to_thread(
-                            self._close_resources, terminal_stopped=terminal_stopped
+                            self._close_resources,
+                            terminal_stopped=terminal_stopped,
+                            terminal_unstarted=terminal_unstarted,
                         )
 
                 pending = asyncio.create_task(close_resources())
@@ -2459,10 +2483,28 @@ class TerminalInstance:
                 self._resource_cleanup_terminal_stopped = terminal_stopped
             await asyncio.shield(pending)
 
-    def _close_resources(self, *, terminal_stopped: bool) -> None:
+    def _close_resources(
+        self, *, terminal_stopped: bool, terminal_unstarted: bool = False
+    ) -> None:
         """Finish revocation and file cleanup even if the async owner times out."""
         self._process_lifetime_stop.set()
-        self._release_process_lifetime_handoffs(ready_only=False)
+        launch_locked = self._launch_lock.acquire(blocking=False)
+        try:
+            self._release_process_lifetime_handoffs(
+                ready_only=False,
+                unstarted=(
+                    launch_locked
+                    and terminal_unstarted
+                    and terminal_stopped
+                    and not self._launch_started
+                    and not self._launch_incomplete
+                    and not self.running
+                    and not self.socket_path.exists()
+                ),
+            )
+        finally:
+            if launch_locked:
+                self._launch_lock.release()
         try:
             self._stop_network_brokers()
         finally:

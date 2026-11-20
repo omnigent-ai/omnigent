@@ -2510,9 +2510,10 @@ async def test_cli_settings_request_ownership_survives_admission_and_terminal_li
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("protocol", [1, 2])
 @pytest.mark.parametrize("phase", ["admission", "attachment"])
 async def test_cancelled_settings_route_disposes_late_owner_before_rollback(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, phase: str, protocol: int
 ) -> None:
     from omnigent.harnesses.claude_native import settings_generation
     from omnigent.harnesses.claude_native.main import _claude_terminal_request
@@ -2539,7 +2540,7 @@ async def test_cancelled_settings_route_disposes_late_owner_before_rollback(
         resource_registry=registry,
     )
     bridge_dir = prepare_bridge_dir(session_id, workspace=tmp_path)
-    request = ClaudeSettingsRequest.create(bridge_dir)
+    request = ClaudeSettingsRequest.create(bridge_dir, protocol=protocol)
     body = _claude_terminal_request(
         (), command="claude", bridge_dir=bridge_dir, settings_request=request
     )
@@ -2559,6 +2560,7 @@ async def test_cancelled_settings_route_disposes_late_owner_before_rollback(
     acquire = settings_generation.acquire_claude_settings_request
     retain = ClaudeSettingsLease._retain_for_terminal
     close = ClaudeSettingsLease.close
+    close_impl = ClaudeSettingsLease._close
 
     def late_owner(owner: ClaudeSettingsLease) -> ClaudeSettingsLease:
         late_owners.append(owner)
@@ -2568,23 +2570,23 @@ async def test_cancelled_settings_route_disposes_late_owner_before_rollback(
             raise TimeoutError("settings owner was not released")
         return owner
 
-    def acquire_owner(*args) -> ClaudeSettingsLease:
-        owner = acquire(*args)
+    def acquire_owner(*args, **kwargs) -> ClaudeSettingsLease:
+        owner = acquire(*args, **kwargs)
         return late_owner(owner) if phase == "admission" else owner
 
     def retain_owner(self) -> ClaudeSettingsLease:
         return late_owner(retain(self))
 
-    def close_owner(self) -> None:
+    def close_owner(self, **kwargs) -> None:
         worker_threads.append(threading.get_ident())
         if late_owners and self is late_owners[0]:
             loop.call_soon_threadsafe(disposing.set)
             if threading.get_ident() != loop_thread and not release_disposal.wait(timeout=5):
                 raise TimeoutError("settings disposal was not released")
-            close(self)
+            close_impl(self, **kwargs)
             cleanup_order.append("disposed")
         else:
-            close(self)
+            close_impl(self, **kwargs)
             cleanup_order.append("released")
 
     async def prepare_before_launch(**kwargs):
@@ -2595,13 +2597,14 @@ async def test_cancelled_settings_route_disposes_late_owner_before_rollback(
 
     monkeypatch.setattr(settings_generation, "acquire_claude_settings_request", acquire_owner)
     monkeypatch.setattr(ClaudeSettingsLease, "_retain_for_terminal", retain_owner)
-    monkeypatch.setattr(ClaudeSettingsLease, "close", close_owner)
+    monkeypatch.setattr(ClaudeSettingsLease, "_close", close_owner)
     monkeypatch.setattr(registry, "launch_required_terminal", prepare_before_launch)
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://runner"
     ) as client:
+        terminal_path = "claude-settings-v2/terminals" if protocol == 2 else "terminals"
         task = asyncio.create_task(
-            client.post(f"/v1/sessions/{session_id}/resources/terminals", json=body)
+            client.post(f"/v1/sessions/{session_id}/resources/{terminal_path}", json=body)
         )
         try:
             await asyncio.wait_for(started.wait(), timeout=5)

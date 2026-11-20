@@ -5570,26 +5570,37 @@ async def test_overlapping_caller_settings_finalizers_keep_immutable_baseline(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "registration_fails", [False, True], ids=["adopted", "registration-failed"]
+    ("protocol", "registration_failure"),
+    [(1, None), (1, "cleanup"), (2, None), (2, "process"), (2, "cleanup")],
 )
 async def test_async_settings_attachment_registers_on_loop_and_releases_failed_retention(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, registration_fails: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    protocol: int,
+    registration_failure: str | None,
 ) -> None:
     from omnigent.harnesses.claude_native.settings_generation import (
         ClaudeSettingsLease,
         ClaudeSettingsRequest,
         acquire_claude_settings_request,
     )
+    from omnigent.inner.terminal import TerminalInstance
 
-    request = ClaudeSettingsRequest.create(tmp_path)
+    request = ClaudeSettingsRequest.create(tmp_path, protocol=protocol)
     augment_claude_args((), bridge_dir=tmp_path, settings_request=request)
-    lease = acquire_claude_settings_request(tmp_path, request.generation)
-    terminal = Mock()
+    lease = acquire_claude_settings_request(tmp_path, request.generation, protocol=protocol)
+    private = tmp_path / "terminal"
+    private.mkdir()
+    terminal = TerminalInstance(
+        name="claude", session_key="main", socket_path=private / "socket", private_dir=private
+    )
     callbacks: list[Callable[[], None]] = []
     retained: list[ClaudeSettingsLease] = []
     worker_threads: list[int] = []
     loop_thread = threading.get_ident()
     retain = ClaudeSettingsLease._retain_for_terminal
+    add_cleanup = terminal.add_resource_cleanup
+    add_lifetime = terminal.add_process_lifetime_lease
 
     def retain_in_worker(self) -> ClaudeSettingsLease:
         worker_threads.append(threading.get_ident())
@@ -5599,18 +5610,27 @@ async def test_async_settings_attachment_registers_on_loop_and_releases_failed_r
 
     def register(callback: Callable[[], None]) -> None:
         assert threading.get_ident() == loop_thread
-        if registration_fails:
+        if registration_failure == "cleanup":
             raise RuntimeError("terminal cleanup registration failed")
         callbacks.append(callback)
+        add_cleanup(callback)
+
+    def register_lifetime(*args, **kwargs) -> None:
+        assert threading.get_ident() == loop_thread
+        if registration_failure == "process":
+            raise RuntimeError("terminal process registration failed")
+        add_lifetime(*args, **kwargs)
 
     monkeypatch.setattr(ClaudeSettingsLease, "_retain_for_terminal", retain_in_worker)
-    terminal.add_resource_cleanup.side_effect = register
+    monkeypatch.setattr(terminal, "add_resource_cleanup", register)
+    monkeypatch.setattr(terminal, "add_process_lifetime_lease", register_lifetime)
     try:
-        if registration_fails:
-            with pytest.raises(RuntimeError, match="terminal cleanup registration failed"):
+        if registration_failure:
+            with pytest.raises(RuntimeError, match=r"terminal .* registration failed"):
                 await lease.attach_async(terminal)
             assert retained[0]._fd is retained[0]._bridge_fd is retained[0]._claim_fd is None
             assert not list(tmp_path.glob("*.terminal-*.owner"))
+            assert not list(tmp_path.glob("*.unconfirmed.owner"))
         else:
             await lease.attach_async(terminal)
             assert retained[0]._fd is not None
@@ -5620,8 +5640,7 @@ async def test_async_settings_attachment_registers_on_loop_and_releases_failed_r
     finally:
         lease.close()
         request.close()
-        for callback in callbacks:
-            callback()
+        await terminal.close()
         for owner in retained:
             owner.close()
     assert not list(tmp_path.glob("claude-settings-*"))

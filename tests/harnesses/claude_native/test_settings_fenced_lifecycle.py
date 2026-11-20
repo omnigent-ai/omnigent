@@ -21,8 +21,8 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 from click import ClickException
-from fastapi import HTTPException
 
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.claude_native import bridge, main
 from omnigent.harnesses.claude_native.settings_generation import (
     ClaudeSettingsRequest,
@@ -368,9 +368,11 @@ async def test_route_dependency_admits_before_bootstrap_and_releases_on_every_ex
             await ownership.aclose()
         assert not baseline.exists()
         expired = provider("conv_fenced", incoming)
-        with pytest.raises(HTTPException) as error:
+        with pytest.raises(OmnigentError) as error:
             await anext(expired)
-        assert error.value.status_code == 409
+        assert error.value.http_status == 409
+        assert error.value.code == ErrorCode.CONFLICT
+        assert "rebuild the request" in error.value.message
 
 
 _CONTROLLER = """
@@ -667,7 +669,7 @@ async def test_late_terminal_guard_refuses_retired_operands_before_target_starts
             )
         await instance.close()
         assert private.exists() is not confirmed_close
-    assert baseline.exists()
+    assert baseline.exists() is not confirmed_close
     marker = tmp_path / "target-started"
     result = subprocess.run(
         [

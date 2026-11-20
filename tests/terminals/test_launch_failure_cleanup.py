@@ -173,12 +173,14 @@ async def test_cancelled_shared_environment_resolution_keeps_loop_responsive(
 
 
 @requires_tmux
-@pytest.mark.parametrize("retained_preparation", [False, True])
+@pytest.mark.parametrize(
+    "settings_protocol", [None, 1, 2], ids=["no-settings", "legacy", "fenced"]
+)
 async def test_missing_tmux_during_spawn_releases_private_resources(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
-    retained_preparation: bool,
+    settings_protocol: int | None,
 ) -> None:
     from omnigent.harnesses.claude_native.bridge import augment_claude_args
     from omnigent.harnesses.claude_native.settings_generation import (
@@ -193,11 +195,11 @@ async def test_missing_tmux_during_spawn_releases_private_resources(
     empty_bin.mkdir()
     released = []
     request = None
-    if retained_preparation:
+    if settings_protocol is not None:
         bridge_root = tmp_path / "claude-native"
         monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", bridge_root)
         bridge_dir = bridge_root / "prepared"
-        request = ClaudeSettingsRequest.create(bridge_dir)
+        request = ClaudeSettingsRequest.create(bridge_dir, protocol=settings_protocol)
         augment_claude_args((), bridge_dir=bridge_dir, settings_request=request)
         baseline = settings_generation_path(bridge_dir, request.generation)
         monkeypatch.setattr(
@@ -208,7 +210,10 @@ async def test_missing_tmux_during_spawn_releases_private_resources(
 
     async def prepare(instance: TerminalInstance) -> None:
         assert request is not None
-        with acquire_claude_settings_request(bridge_dir, request.generation) as lease:
+        assert settings_protocol is not None
+        with acquire_claude_settings_request(
+            bridge_dir, request.generation, protocol=settings_protocol
+        ) as lease:
             lease.attach(instance)
         instance.add_resource_cleanup(lambda: released.append(instance))
         (instance.private_dir / "prepared-settings.json").write_text("{}")
@@ -223,7 +228,7 @@ async def test_missing_tmux_during_spawn_releases_private_resources(
                 "shell",
                 "main",
                 _spec(tmp_path, env={"PATH": str(empty_bin)}),
-                prepare_terminal=prepare if retained_preparation else None,
+                prepare_terminal=prepare if settings_protocol is not None else None,
             )
         assert raised.value.filename == "tmux"
         assert len(created) == 1
@@ -244,7 +249,7 @@ async def test_missing_tmux_during_spawn_releases_private_resources(
             await instance.close()
         if request is not None:
             request.close()
-    assert released == (created if retained_preparation else [])
+    assert released == (created if settings_protocol is not None else [])
 
 
 @pytest.mark.parametrize(
