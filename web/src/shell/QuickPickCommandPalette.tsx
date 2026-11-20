@@ -2,7 +2,8 @@
 // with fuzzy-ranked actions and keyboard navigation from the QuickPick list, and the
 // commands features on screen offer through `usePaletteCommands`, under their headings.
 
-import { useEffect, useRef, useState } from "react";
+import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { useStore } from "zustand";
 import { XIcon } from "lucide-react";
 import { useNavigate } from "@/lib/routing";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
@@ -16,7 +17,7 @@ import {
 } from "@/components/ui/quick-pick";
 import { occurrenceRanges } from "@/components/ui/quick-pick/match";
 import { usePaletteCommandsStore } from "@/store/paletteCommands";
-import { type ActionCommand, useAppCommands } from "./appCommands";
+import { useAppCommands } from "./appCommands";
 import type { CommandPaletteProps } from "./CommandPalette";
 import {
   type CommandRegion,
@@ -25,21 +26,44 @@ import {
   useCommandRegion,
   useCommandRegionReader,
 } from "./commandContext";
+import { useCommandOptionsPage } from "./commandOptionsPage";
 import {
-  currentPaletteCommand,
-  type PaletteCommandRow,
-  paletteCommandItems,
-} from "./paletteCommandRows";
+  type PaletteParentPlace,
+  paletteChildPageStore,
+  resetPaletteToRoot,
+} from "./commandPaletteChildPage";
+import { currentPaletteCommand, paletteCommandItems } from "./paletteCommandRows";
 import { PaletteSessionContext } from "./PaletteSessionContext";
+import type { PaletteTarget as PaletteRow } from "./paletteTarget";
+import { useSettingChoicesPage } from "./settingChoicesPage";
 import { type PaletteSession, usePaletteSessionSearch } from "./usePaletteSessionSearch";
 
-type PaletteRow =
-  | { kind: "session"; id: string }
-  | { kind: "action"; action: ActionCommand }
-  | PaletteCommandRow
-  | { kind: "more"; load: () => void; lastRowId: string | undefined };
-
 const COMMAND_HISTORY_KEY = "command-palette:commands";
+
+/** The child pages' copy; their headings name what they act on. */
+const CHILD_PAGE_COPY = {
+  "setting-choices": {
+    label: "Choose a value",
+    placeholder: "Choose a value…",
+    empty: "No matching values.",
+  },
+  "command-options": {
+    label: "Choose one",
+    placeholder: "Choose one…",
+    empty: "Nothing to choose from.",
+  },
+} as const;
+
+/** The footer's line for what a page waits on, or why a choice didn't apply. */
+function pageStatusSummary(text: string): () => ReactNode {
+  return function PageStatus() {
+    return (
+      <span role="status" data-slot="palette-page-status">
+        {text}
+      </span>
+    );
+  };
+}
 
 /** A blank icon slot, so session labels line up with the icon-prefixed actions. */
 const SESSION_ICON = <span aria-hidden className="size-4" />;
@@ -68,27 +92,49 @@ export function QuickPickCommandPalette({
   const region = useCommandRegion(open);
   const readRegion = useCommandRegionReader();
   const targetKey = commandTargetKey(context, region);
+  const commandItems = useMemo(
+    () => paletteCommandItems([], featureGroups, targetKey),
+    [featureGroups, targetKey],
+  );
   const latestContext = useRef(context);
   latestContext.current = context;
-  /** The command `item` runs now, with focus in `inRegion`, or null once it no longer applies. */
-  const currentCommand = (
-    item: QuickPickItem<PaletteRow>,
+  /** The command row `itemId` offers now for `rowTargetKey`, with focus in `inRegion`. */
+  const commandFor = (
+    itemId: string,
+    rowTargetKey: string,
     inRegion: CommandRegion | null = readRegion(),
   ) =>
-    item.value.kind === "command"
-      ? currentPaletteCommand(item.id, item.value.targetKey, {
-          appCommands: [],
-          featureGroups: usePaletteCommandsStore.getState().groups,
-          targetKey: commandTargetKey(latestContext.current, inRegion),
-        })
-      : null;
+    currentPaletteCommand(itemId, rowTargetKey, {
+      appCommands: [],
+      featureGroups: usePaletteCommandsStore.getState().groups,
+      targetKey: commandTargetKey(latestContext.current, inRegion),
+    });
+  /** The command `item` runs now, or null once it no longer applies. */
+  const currentCommand = (item: QuickPickItem<PaletteRow>, inRegion?: CommandRegion | null) =>
+    item.value.kind === "command" ? commandFor(item.id, item.value.targetKey, inRegion) : null;
   // Show more parks the selection on its group's last row, so the next ArrowDown
-  // reaches the rows it loads; the user's next move clears it.
+  // reaches the rows it loads, and Back makes the row that opened a page active again;
+  // the user's next move clears it.
   const [parkedId, setParkedId] = useState<string | null>(null);
-  // Every opening starts from the top row, as the query does.
+  // A child page has its own query; the root's stays as it was for Back.
+  const [pageQuery, setPageQuery] = useState("");
+  // Every opening starts from the top row of a fresh root, and a close drops what a page awaited.
   useEffect(() => {
     if (!open) setParkedId(null);
+    resetPaletteToRoot();
   }, [open]);
+  const childPage = useStore(paletteChildPageStore, (state) => state.page);
+  // Back on the row that opened the page, once a choice applies or its setting goes away.
+  const restoreParent = (parent: PaletteParentPlace | null) => {
+    setPageQuery("");
+    if (parent && parent.query !== query) search.setQuery(parent.query);
+    setParkedId(parent?.activeId ?? null);
+  };
+  const settingPage = useSettingChoicesPage(commandItems, targetKey, restoreParent);
+  const optionsPage = useCommandOptionsPage(
+    (itemId, pageTargetKey) => commandFor(itemId, pageTargetKey),
+    restoreParent,
+  );
 
   const highlightQuery = sessionsOnly ? query : debouncedQuery;
   const sessionItem = (session: PaletteSession, group: string): QuickPickItem<PaletteRow> => ({
@@ -142,7 +188,13 @@ export function QuickPickCommandPalette({
       : [];
 
   const { visibleSessions, contentSessions, searching } = search;
-  const segments: QuickPickSegment<PaletteRow>[] = [
+  const pageItems =
+    childPage?.kind === "setting-choices"
+      ? settingPage.items
+      : childPage?.kind === "command-options"
+        ? optionsPage.items
+        : null;
+  const rootSegments: QuickPickSegment<PaletteRow>[] = [
     {
       sourceId: "sessions",
       ranking: "provider",
@@ -185,12 +237,12 @@ export function QuickPickCommandPalette({
       fuzzyMatching: "words",
       items: sessionsOnly
         ? []
-        : paletteCommandItems([], featureGroups, targetKey)
-            // Rows that open a page of values or options wait until the palette has pages.
-            .filter((item) => !item.opensPage)
-            .map((item) => ({ ...item, matchHighlight: "underline" })),
+        : commandItems.map((item) => ({ ...item, matchHighlight: "underline" })),
     },
   ];
+  const segments: QuickPickSegment<PaletteRow>[] = pageItems
+    ? [{ sourceId: "page", ranking: "client", fuzzyMatching: "words", items: pageItems }]
+    : rootSegments;
 
   const accept = (item: QuickPickItem<PaletteRow>): QuickPickAcceptResult => {
     const row = item.value;
@@ -203,10 +255,29 @@ export function QuickPickCommandPalette({
       row.action.run();
       return undefined;
     }
+    if (row.kind === "setting-choice") return settingPage.acceptChoice(row.value);
+    if (row.kind === "command-option") return optionsPage.acceptOption(row.optionId);
     if (row.kind === "command") {
       const command = currentCommand(item);
       // A row withdrawn or built for another target since stays open, now showing what applies.
       if (!command) return "keepOpen";
+      // A setting's row opens its values, with the one the query named active.
+      if (command.setting) {
+        const activeChoice = settingPage.openChoices(command, item.id, row.targetKey, {
+          query,
+          activeId: item.id,
+        });
+        setPageQuery("");
+        setParkedId(activeChoice);
+        return "keepOpen";
+      }
+      // A command that asks which first opens its options.
+      if (command.options) {
+        optionsPage.openOptions(command, item.id, row.targetKey, { query, activeId: item.id });
+        setPageQuery("");
+        setParkedId(null);
+        return "keepOpen";
+      }
       if (command.keepsPaletteOpen) {
         command.run();
         return "keepOpen";
@@ -274,6 +345,16 @@ export function QuickPickCommandPalette({
     </Button>
   );
 
+  const pageCopy = childPage ? CHILD_PAGE_COPY[childPage.kind] : null;
+  // What a page waits on or why a choice didn't apply; on the root, that a page's setting went away.
+  const pageStatus = settingPage.open
+    ? settingPage.status
+    : optionsPage.open
+      ? optionsPage.status
+      : settingPage.notice;
+  const back = () => restoreParent(settingPage.open ? settingPage.back() : optionsPage.back());
+  const pageHeading = settingPage.heading ?? optionsPage.heading;
+
   return (
     <QuickPickDialog
       open={open}
@@ -284,26 +365,43 @@ export function QuickPickCommandPalette({
           ? "inset-x-0 top-0 flex h-(--omnigent-viewport-height,100dvh) max-h-(--omnigent-viewport-height,100dvh) w-full max-w-full translate-x-0 flex-col rounded-none border-0 pt-(--mac-titlebar-height,var(--omnigent-safe-top,0px)) pb-(--omnigent-safe-bottom,0px) shadow-none sm:max-w-full"
           : "top-1/4 sm:max-w-2xl"
       }
-      label={label}
+      label={pageCopy?.label ?? label}
+      heading={childPage && pageHeading ? { label: pageHeading } : undefined}
+      onBack={childPage ? back : undefined}
+      backLabel="Back"
+      summary={pageStatus !== null ? pageStatusSummary(pageStatus) : undefined}
       // Commands picked lately lead the commands, under Recent; sessions keep their own order.
       historyKey={sessionsOnly ? undefined : COMMAND_HISTORY_KEY}
       // Sessions lead, unless the query names a command from a word's start, such as "settings".
       sourcesFirst
-      placeholder={sessionsOnly ? "Search sessions by name…" : "Search sessions or run a command"}
+      placeholder={
+        pageCopy?.placeholder ??
+        (sessionsOnly ? "Search sessions by name…" : "Search sessions or run a command")
+      }
       segments={segments}
-      query={query}
+      query={childPage ? pageQuery : query}
       onQueryChange={(next) => {
         setParkedId(null);
-        search.setQuery(next);
+        settingPage.clearNotice();
+        if (childPage) setPageQuery(next);
+        else search.setQuery(next);
       }}
       onAccept={accept}
       activeId={parkedId}
       onActiveIdChange={() => setParkedId(null)}
       inputTestId="command-palette-input"
       // As in today's palette, a load error or loading message stands in for the empty one.
-      emptyMessage={loadStatus ? null : search.searchFetching ? "Searching…" : "No results found"}
-      status={status}
-      listEnd={olderSessions}
+      emptyMessage={
+        childPage
+          ? (optionsPage.empty ?? pageCopy?.empty)
+          : loadStatus
+            ? null
+            : search.searchFetching
+              ? "Searching…"
+              : "No results found"
+      }
+      status={childPage ? undefined : status}
+      listEnd={childPage ? undefined : olderSessions}
       inputEnd={
         isMobile && (
           // The full-screen sheet has no ⌘K/Esc affordance, so touch users close it here.
