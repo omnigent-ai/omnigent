@@ -99,4 +99,3 @@ def test_a_mode_that_skips_approval_is_not_inherited(
     harness: str, mode: str, child_harness: str
 ) -> None:
     assert inherited_permission_mode(harness, mode, child_harness) is None
-
