@@ -18,6 +18,7 @@ import pytest
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.harnesses.claude_native import bridge
 from omnigent.harnesses.claude_native import main as claude_native
+from omnigent.harnesses.claude_native.model_switch import supports_session_only_model_switch
 from omnigent.models import model_catalog_store
 from omnigent.runner import create_runner_app
 from omnigent.spec.types import AgentSpec, ExecutorSpec
@@ -218,6 +219,16 @@ async def test_runner_switches_managed_glm_in_a_real_claude_terminal(
     )
     try:
         await _wait_for_model(bridge_dir, _INITIAL_MODEL, socket_path)
+        try:
+            context = json.loads((bridge_dir / bridge.CONTEXT_RAW_FILE).read_text())
+        except (OSError, json.JSONDecodeError):
+            context = None
+        version = context.get("version") if isinstance(context, dict) else None
+        if not supports_session_only_model_switch(version):
+            pytest.skip(
+                "saved-default preservation requires stable Claude Code 2.1.323+; "
+                f"the running session reports {version!r}"
+            )
         native_session_id = bridge.read_claude_session_id(bridge_dir)
         assert native_session_id
         (tmp_path / "before-switch.txt").write_text(_capture_pane(socket_path))

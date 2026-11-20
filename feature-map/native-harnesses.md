@@ -812,8 +812,9 @@ Cross-harness journeys:
   `tests/inner/test_claude_native_executor.py::test_model_control_hold_preserves_user_changes_until_dismissal`.
   A fresh terminal still starts on the saved default.
   Run `OMNIGENT_E2E_CLAUDE_NATIVE=1 uv run --no-sync pytest tests/e2e/test_claude_native_managed_model_switch.py --reruns 0`.
-  This switching journey requires Claude Code 2.1.323 or newer and tmux; use a
-  clean container if machine-managed settings override the fixture's picker.
+  This switching journey requires stable Claude Code 2.1.323 or newer and tmux;
+  older or unverified running versions skip before switching. Use a clean
+  container if machine-managed settings override the fixture's picker.
   It makes no model calls and does not verify browser rendering or live gateway
   servability.
   Older CLIs and CLIs with unavailable or unverified version metadata retain
@@ -827,6 +828,10 @@ Cross-harness journeys:
   submitted and any terminal confirmation is left for the person to answer.
   Missing or mismatched session identity still uses
   legacy submission; the newer fresh-status guarantee does not apply.
+  Legacy web model changes can return HTTP 204 after command submission, before
+  the switch is observed, with confirmation continuing in a delayed watcher.
+  That response acknowledges submission; session-only selection requires a
+  confirmed switch.
   Existing bridge metadata works without re-registration. Upgrading Claude Code
   is optional; default preservation and fresh native receipts apply only when
   the running terminal reports a stable version of 2.1.323 or newer. A failure on
