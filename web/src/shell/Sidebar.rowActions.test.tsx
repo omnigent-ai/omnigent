@@ -241,14 +241,14 @@ function serverInfo(overrides: Partial<ServerInfo> = {}): ServerInfo {
   };
 }
 
-// `activeId` mounts the sidebar at `/c/:conversationId` (via a matching
-// Route so `useParams` populates), making that row the active one — the
-// rest of the suite renders at `/` where no row is active. `info` pins the
-// server sharing policy via CapabilitiesProvider (default "loading" → on).
 function CurrentPath() {
   return <span data-testid="current-path">{useLocation().pathname}</span>;
 }
 
+// `activeId` mounts the sidebar at `/c/:conversationId` (via a matching
+// Route so `useParams` populates), making that row the active one — the
+// rest of the suite renders at `/` where no row is active. `info` pins the
+// server sharing policy via CapabilitiesProvider (default "loading" → on).
 function renderSidebar(
   activeId?: string,
   info?: ServerInfo,
@@ -1444,6 +1444,24 @@ describe("right-click context menu", () => {
 
     expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
     expect(screen.queryByTestId("open-session-window")).toBeNull();
+  });
+
+  it("offers no new window for a pop-out's own session, only for others", () => {
+    mockConversations([CONV, { ...CONV, id: "conv_2", title: "Other Session" }]);
+    document.documentElement.dataset.sessionWindow = "true";
+    try {
+      renderSidebar("conv_1");
+
+      fireEvent.contextMenu(screen.getByRole("link", { name: /My Session/ }));
+      expect(screen.getByTestId("rename-conversation")).toBeInTheDocument();
+      expect(screen.queryByTestId("open-session-window")).toBeNull();
+      fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
+
+      fireEvent.contextMenu(screen.getByRole("link", { name: /Other Session/ }));
+      expect(screen.getByTestId("open-session-window")).toBeInTheDocument();
+    } finally {
+      delete document.documentElement.dataset.sessionWindow;
+    }
   });
 
   it("offers Fork for a managed source", () => {

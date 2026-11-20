@@ -258,6 +258,7 @@ import { cn } from "@/lib/utils";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { isDesktopLayout, useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useOpenSessionWindow } from "@/hooks/useOpenSessionWindow";
+import { isSessionWindow } from "@/lib/sessionWindow";
 import {
   isSideBySideSidebarViewport,
   useIsSideBySideSidebarViewport,
@@ -5242,6 +5243,9 @@ export function ConversationMenuItems({
   // desktop always renders the native side-flyout submenu regardless.
   const isMobile = useIsMobileViewport();
   const openSessionWindow = useOpenSessionWindow();
+  const { conversationId: routeSessionId } = useParams<{ conversationId: string }>();
+  // A pop-out can't pop out the session it's showing.
+  const showsOwnSessionWindow = isSessionWindow() && conversation.id === routeSessionId;
   const { trackClick } = useOmnigentAnalytics();
   const [view, setView] = useState<"main" | "move" | "projects" | "nests">("main");
 
@@ -5356,7 +5360,7 @@ export function ConversationMenuItems({
           </C.SubContent>
         </C.Sub>
       )}
-      {openSessionWindow && !kanbanCard && (
+      {openSessionWindow && !kanbanCard && !showsOwnSessionWindow && (
         <C.Item
           className="mobile-touch-target"
           data-testid="open-session-window"

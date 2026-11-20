@@ -65,6 +65,21 @@ describe("session window", () => {
     expect(popup.location.href).toBe("/c/conv_1?window=session");
   });
 
+  it("sends a popup that left for another site back to the session", () => {
+    const location = {
+      href: "",
+      get pathname(): string {
+        throw new DOMException("Blocked a frame with origin", "SecurityError");
+      },
+    };
+    const popup = { location, focus: vi.fn() };
+    vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window);
+
+    expect(openBrowserSessionWindow("conv_1")).toBe(true);
+    expect(location.href).toBe("/c/conv_1?window=session");
+    expect(popup.focus).toHaveBeenCalled();
+  });
+
   it("reports a blocked popup", () => {
     vi.spyOn(window, "open").mockReturnValue(null);
     expect(openBrowserSessionWindow("conv_1")).toBe(false);
