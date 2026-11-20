@@ -2780,7 +2780,7 @@ async def test_copy_refuses_a_workspace_file_for_a_harness_without_a_workspace(
     )
 
     assert resp.status_code == 415, resp.text
-    assert "Claude Code or Codex" in resp.text
+    assert "local file attachments" in resp.text
     listed = file_store.list(session_id="405bfe154d5c0e795a2b87021bc897bf", limit=10)
     assert listed.data == []
 

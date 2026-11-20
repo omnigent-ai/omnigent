@@ -112,6 +112,19 @@ DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS: frozenset[str] = (
 # Harnesses supporting uploads and history restoration for these file formats.
 FILESYSTEM_ATTACHMENT_HARNESSES: frozenset[str] = frozenset({"claude-native", "codex-native"})
 
+# These adapters already render uploaded attachments as local file paths.
+FILESYSTEM_ATTACHMENT_UPLOAD_HARNESSES: frozenset[str] = FILESYSTEM_ATTACHMENT_HARNESSES | {
+    "pi-native",
+    "cursor-native",
+    "kiro-native",
+    "goose-native",
+    "antigravity-native",
+    "qwen-native",
+    "kimi-native",
+    "hermes-native",
+    "devin-native",
+}
+
 # Advertised by builds that can deliver and restore these attachments.
 CAP_FILESYSTEM_ATTACHMENTS = "filesystem_attachments"
 

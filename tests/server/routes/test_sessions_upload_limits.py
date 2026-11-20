@@ -20,6 +20,7 @@ from omnigent.inner.native_attachments import (
     MAX_FILESYSTEM_ATTACHMENT_UPLOAD_BYTES,
     FilesystemAttachmentPolicy,
 )
+from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 from omnigent.runtime.content_resolver import (
     MAX_TEXT_UPLOAD_BYTES,
 )
@@ -149,6 +150,27 @@ def test_upload_rejects_unsupported_type(upload_client: tuple[TestClient, str]) 
     assert "Unsupported attachment type" in resp.text
 
 
+@pytest.mark.parametrize(
+    "key", ["pi", "cursor", "kiro", "goose", "antigravity", "qwen", "kimi", "hermes", "devin"]
+)
+@pytest.mark.parametrize("filename", ["archive.zip", "clip.mp4"])
+def test_native_harness_uploads_files(
+    upload_client: tuple[TestClient, str], db_uri: str, key: str, filename: str
+) -> None:
+    """Other local-file native adapters admit recorded binary uploads, including MP4."""
+    client, session_id = upload_client
+    native = native_coding_agent_for_harness(f"{key}-native")
+    assert native is not None
+    SqlAlchemyConversationStore(db_uri).set_labels(session_id, native.presentation_labels)
+    response = _upload(
+        client, session_id, filename, b"synthetic binary", "application/octet-stream"
+    )
+    assert response.status_code == 201, response.text
+    stored = SqlAlchemyFileStore(db_uri).get(response.json()["id"])
+    assert stored is not None
+    assert stored.source_metadata["delivery"] == "filesystem"
+
+
 @pytest.fixture
 def all_types_policy(monkeypatch: pytest.MonkeyPatch) -> None:
     """Configure the server to deliver every file that can't be inlined as a file."""
@@ -241,7 +263,7 @@ def test_unsupported_type_message_names_the_configured_extensions(
     client, session_id = upload_client
     response = _upload(client, session_id, "clip.mp4", content_type="video/mp4")
     assert response.status_code == 415, response.text
-    assert "use Claude Code or Codex for .gz, .har files." in response.text
+    assert "use a supported native coding agent for .gz, .har files." in response.text
 
 
 _GZ_BYTES = "data:application/gzip;base64,H4s="
@@ -323,6 +345,7 @@ def test_quota_counts_files_recorded_for_filesystem_delivery(
     ],
     ids=["default-type", "mp4", "all-types"],
 )
+@pytest.mark.parametrize("harness", ["openai-agents", "opencode-native"])
 def test_upload_rejects_filesystem_types_for_an_unsupported_harness(
     upload_client: tuple[TestClient, str],
     db_uri: str,
@@ -330,6 +353,7 @@ def test_upload_rejects_filesystem_types_for_an_unsupported_harness(
     filename: str,
     content_type: str,
     policy: FilesystemAttachmentPolicy | None,
+    harness: str,
 ) -> None:
     """An SDK session refuses formats requiring native filesystem tools."""
     if policy is not None:
@@ -340,9 +364,12 @@ def test_upload_rejects_filesystem_types_for_an_unsupported_harness(
     sdk_session = SqlAlchemyConversationStore(db_uri).create_conversation(
         title="sdk session", agent_id="087b7cb7ac30abf4debfaa578d052ec6"
     )
+    native = native_coding_agent_for_harness(harness)
+    if native is not None:
+        SqlAlchemyConversationStore(db_uri).set_labels(sdk_session.id, native.presentation_labels)
     resp = _upload(client, sdk_session.id, filename, b"PK\x03\x04 fake", content_type)
     assert resp.status_code == 415, resp.text
-    assert "Claude Code or Codex" in resp.text
+    assert "local file attachments" in resp.text
 
 
 @pytest.mark.parametrize(
@@ -383,10 +410,12 @@ def test_message_cannot_inline_a_filesystem_attachment(
 @pytest.mark.parametrize(
     "filename,target_harness,event_type,block_type,status",
     [
-        ("archive.zip", "cursor-native", "message", "input_file", 415),
+        ("archive.zip", "cursor-native", "message", "input_file", 202),
         ("archive.zip", "openai-agents", "message", "input_file", 415),
         ("archive.zip", "openai-agents", "message", "input_image", 415),
-        ("archive.zip", "cursor-native", "slash_command", "input_file", 415),
+        ("archive.zip", "cursor-native", "slash_command", "input_file", 202),
+        ("archive.zip", "pi-native", "message", "input_file", 202),
+        ("archive.zip", "opencode-native", "message", "input_file", 415),
         ("archive.zip", "claude-native", "message", "input_file", 202),
         ("archive.zip", "codex-native", "message", "input_file", 202),
         ("notes.txt", "openai-agents", "message", "input_file", 202),
@@ -438,6 +467,7 @@ def test_send_rechecks_unsent_upload_after_fork_into_another_harness(
         json={
             "type": event_type,
             "data": {
+                "name": "inspect",
                 "role": "user",
                 "content": [
                     {"type": block_type, "file_id": files[0].id, "filename": "renamed.txt"}
@@ -448,7 +478,7 @@ def test_send_rechecks_unsent_upload_after_fork_into_another_harness(
     assert response.status_code == status, response.text
     if status == 415:
         assert filename in response.text
-        assert "Claude Code or Codex" in response.text
+        assert "local file attachments" in response.text
         policy.assert_not_awaited()
     else:
         assert response.json()["denied"] is True

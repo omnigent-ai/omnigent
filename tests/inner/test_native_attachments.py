@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib
 import logging
 import re
 from pathlib import Path
@@ -493,6 +494,36 @@ async def test_re_resolution_takes_the_filename_from_stored_metadata() -> None:
     resolved, _notice = result
     assert resolved["filename"] == "payload.txt"
     assert not requires_filesystem(str(resolved["filename"]))
+
+
+@pytest.mark.parametrize(
+    "key", ["pi", "cursor", "kiro", "goose", "antigravity", "qwen", "kimi", "hermes", "devin"]
+)
+async def test_native_file_delivery(key: str, tmp_path: Path) -> None:
+    """File-path adapters expose uploaded MP4 bytes through the existing renderer."""
+    from omnigent.inner.native_attachments import (
+        FILESYSTEM_ATTACHMENT_UPLOAD_HARNESSES,
+    )
+
+    assert f"{key}-native" in FILESYSTEM_ATTACHMENT_UPLOAD_HARNESSES
+    render = importlib.import_module(f"omnigent.inner.{key}_native_executor")._content_to_text
+    bridge = tmp_path / key
+    body = b"synthetic video bytes"
+    client = _FakeFileClient(
+        {
+            "name": "clip.mp4",
+            "content_type": "video/mp4",
+            "metadata": {"source_metadata": {"delivery": "filesystem"}},
+        },
+        body=body,
+    )
+    block = {"type": "input_file", "file_id": "video-file"}
+    resolved = await resolve_file_id_block(block, session_id="session-example", client=client)
+    assert resolved is not None
+    path = attachment_cache_dir(bridge) / "clip.mp4"
+    assert str(path) in render([resolved[0]], bridge)
+    assert path.read_bytes() == body
+    assert path.stat().st_mode & 0o111 == 0
 
 
 @pytest.mark.parametrize(

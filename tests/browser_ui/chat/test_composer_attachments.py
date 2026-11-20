@@ -37,7 +37,8 @@ _ZIP_NAME = "photos.zip"
 # ``routes_resources.upload_session_file``. Used to drive the failed-send path.
 _SERVER_415_DETAIL = (
     "Unsupported attachment type 'video/webm'. Attach images, PDF, or text/code files, "
-    "or use Claude Code or Codex for archives, Office documents, databases, and MP4 videos."
+    "or use a supported native coding agent for archives, Office documents, "
+    "databases, and MP4 videos."
 )
 
 
