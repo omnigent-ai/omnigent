@@ -63,9 +63,6 @@ it.each([
   if (shown) {
     expect(await screen.findByRole("button", { name: "Open sign-in link" })).toBeInTheDocument();
   } else {
-    await new Promise<void>((resolve) => {
-      setTimeout(resolve, 50);
-    });
     expect(screen.queryByRole("button", { name: "Open sign-in link" })).toBeNull();
     expect(getSessionSignInLink).not.toHaveBeenCalled();
   }
