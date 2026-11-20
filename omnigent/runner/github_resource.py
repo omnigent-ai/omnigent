@@ -984,7 +984,7 @@ def _pr_view_json(root: str, fields: str, *, token: str | None = None) -> dict[s
 
 
 def _repo_payload(name_with_owner: str | None, url: object) -> dict[str, Any]:
-    """Include the forge host so clients can distinguish github.com from Enterprise."""
+    """The repo payload; the forge host (omitted when unknown) tells github.com from Enterprise."""
     repo: dict[str, Any] = {"name_with_owner": name_with_owner}
     host = host_of(url) if isinstance(url, str) else None
     if host:

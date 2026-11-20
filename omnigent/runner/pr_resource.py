@@ -199,8 +199,8 @@ def _add_workspace_repo(root: str, info: dict[str, Any]) -> None:
     """Name the checkout's own repo from local config, or vet the provider's.
 
     Precedence: gh's resolved base, then the remote gh would pick on origin's host.
-    Tracked PRs don't count, so attaching one never retargets bare references. An
-    unrecognized preferred remote names no workspace repo.
+    Tracked PRs don't count toward the local pick. An unrecognized preferred remote
+    names no workspace repo.
     """
 
     def run(argv: list[str]) -> tuple[int | None, str]:
