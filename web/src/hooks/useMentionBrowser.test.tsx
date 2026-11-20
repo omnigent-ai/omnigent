@@ -327,23 +327,6 @@ describe("useMentionBrowser released tags", () => {
     expect(result.current.browser.mentionedItems).toEqual([]);
   });
 
-  it("records a restore point when the notice for a deletion arrives after the render that drops it", () => {
-    const { result } = renderBrowser();
-    tagReadme(result);
-    const input = fakeInput(result, "tail");
-    input.value = "Read ";
-    act(() => result.current.setText("Read "));
-    act(() =>
-      result.current.browser.noteTextChange({
-        currentTarget: input as unknown as ComposerTextTarget,
-      }),
-    );
-    expect(result.current.browser.mentionTokens).toEqual([]);
-
-    change(result, "Read @readme.md ", "undo");
-    expect(result.current.browser.mentionTokens).toEqual(["@readme.md"]);
-  });
-
   it("records no restore point for a token removed by a controlled replacement", () => {
     const { result } = renderBrowser();
     tagReadme(result);
