@@ -30,6 +30,7 @@ afterEach(() => {
   useChatStore.setState({
     sandboxStatus: null,
     backgroundTaskCount: 0,
+    backgroundAgents: [],
     blockedOn: null,
     blocks: [],
     sessionStatus: "idle",
@@ -248,6 +249,46 @@ describe("WorkingIndicator", () => {
     expect(screen.queryByTestId("background-tasks-indicator")).toBeNull();
   });
 
+  it("names a background agent a finished turn left running instead of shimmering", () => {
+    useChatStore.setState({
+      backgroundAgents: [{ id: "a1", type: "subagent", description: "Audit the auth flow" }],
+      blockedOn: null,
+      sessionStatus: "waiting",
+      status: "idle",
+    });
+    const { rerender } = render(<WorkingIndicator />);
+    expect(screen.queryByTestId("working-indicator")).toBeNull();
+    expect(screen.getByTestId("background-agents-indicator")).toHaveTextContent(
+      "Background agent running: Audit the auth flow",
+    );
+    // No composer pill announces agents, so the indicator owns the live region.
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Background agent running: Audit the auth flow",
+    );
+
+    act(() =>
+      useChatStore.setState({
+        backgroundAgents: [{ id: "a1" }, { id: "a2", description: "Lint" }],
+      }),
+    );
+    rerender(<WorkingIndicator />);
+    expect(screen.getByTestId("background-agents-indicator")).toHaveTextContent(
+      "2 background agents running",
+    );
+
+    // A follow-up the user just sent is foreground work again.
+    act(() => useChatStore.setState({ status: "streaming" }));
+    rerender(<WorkingIndicator />);
+    expect(screen.queryByTestId("background-agents-indicator")).toBeNull();
+    expect(screen.getByTestId("working-indicator")).toBeInTheDocument();
+
+    // An SDK orchestrator's `waiting` names no agents and keeps the shimmer.
+    act(() => useChatStore.setState({ status: "idle", backgroundAgents: [] }));
+    rerender(<WorkingIndicator />);
+    expect(screen.queryByTestId("background-agents-indicator")).toBeNull();
+    expect(screen.getByTestId("working-indicator")).toBeInTheDocument();
+  });
+
   describe("parked on a terminal permission prompt", () => {
     const sideChatId = "conv_side_child";
     const terminalFirstSession: TerminalFirstContextValue = {
@@ -315,12 +356,15 @@ describe("WorkingIndicator", () => {
       );
     });
 
-    it("still points at the terminal when the only pending card is a sub-agent's", () => {
+    it.each([
+      ["a sub-agent's", { targetSessionId: "conv_sub_agent" }],
+      ["a question the agent keeps working past", { isBlocking: false as const }],
+    ])("still points at the terminal when the only pending card is %s", (_case, cardFields) => {
       useChatStore.setState({
         conversationId: "conv_root",
         sessionStatus: "running",
         blockedOn: "permission prompt",
-        blocks: [{ ...pendingApproval, targetSessionId: "conv_sub_agent" }],
+        blocks: [{ ...pendingApproval, ...cardFields }],
       });
       renderInTerminalFirstSession();
 

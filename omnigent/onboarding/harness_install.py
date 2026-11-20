@@ -35,7 +35,9 @@ when the credentials file is absent — see ``ambient._claude_login_detected``.)
 
 from __future__ import annotations
 
+import functools
 import json
+import logging
 import os
 import re
 import shutil
@@ -56,9 +58,14 @@ from omnigent.harness_install_spec import HarnessInstallSpec, SetupStep
 from omnigent.harnesses.opencode_native.client import (
     OPENCODE_MAX_VERSION_EXCLUSIVE,
     OPENCODE_MIN_VERSION,
+    OPENCODE_SKIP_VERSION_CHECK_ENV,
+    opencode_version_check_skipped,
 )
 from omnigent.inner import _proc
+from omnigent.inner._proc import run_isolated
 from omnigent.onboarding.provider_config import ANTHROPIC_FAMILY, GEMINI_FAMILY, OPENAI_FAMILY
+
+_logger = logging.getLogger(__name__)
 
 # Pi is not a configure-menu family (the menu is Claude + Codex), but the
 # first-run ``run`` flow falls back to it, so it has install metadata too.
@@ -692,7 +699,7 @@ def required_cli_for_harness(harness: str) -> HarnessInstallSpec | None:
     return _all_harness_install().get(key) if key is not None else None
 
 
-def missing_harness_cli(harness: str) -> HarnessInstallSpec | None:
+def missing_harness_cli(harness: str, timeout: float | None = None) -> HarnessInstallSpec | None:
     """Return a harness's required CLI spec when that CLI can't be used.
 
     Combines :func:`required_cli_for_harness` with the same probe
@@ -703,18 +710,35 @@ def missing_harness_cli(harness: str) -> HarnessInstallSpec | None:
     spawning a worker whose harness can never boot here, instead of letting
     the missing or incompatible binary surface as a lazy, generic turn failure.
 
+    A present binary whose ``--version`` probe times out is let through: the
+    probe is inconclusive, and the harness's own boot reports any real failure.
+
     :param harness: An executor harness identifier, e.g. ``"pi"`` or
         ``"claude-native"``.
+    :param timeout: Seconds to wait for the ``--version`` probe, e.g. ``10.0``
+        on the host launch path; ``None`` uses the default CLI probe budget.
     :returns: The :class:`HarnessInstallSpec` for a CLI-backed harness whose
         ``binary`` is not on ``PATH`` or is outside its supported version range;
-        ``None`` when the harness needs no CLI (SDK-based / unknown) or the
-        required binary is present and version-compatible.
+        ``None`` when the harness needs no CLI (SDK-based / unknown), the
+        required binary is present and version-compatible, or the binary is
+        present but its version probe timed out.
     """
     spec = required_cli_for_harness(harness)
     if spec is None:
         return None
     install_key = _all_harness_name_to_key().get(harness)
-    if install_key is not None and harness_cli_installed(install_key):
+    if install_key is None:
+        return spec
+    try:
+        probe_timeout = _DEFAULT_CLI_PROBE_TIMEOUT_S if timeout is None else timeout
+        if harness_cli_installed(install_key, probe_timeout, raise_on_timeout=True):
+            return None
+    except subprocess.TimeoutExpired:
+        _logger.warning(
+            "%s --version did not respond; letting %r through the CLI preflight unverified",
+            spec.binary,
+            harness,
+        )
         return None
     return spec
 
@@ -879,6 +903,8 @@ def _harness_cli_version_satisfies(
     spec: HarnessInstallSpec,
     binary: str,
     timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_S,
+    *,
+    raise_on_timeout: bool = False,
 ) -> bool:
     """Check *binary*'s ``--version`` against *spec*'s declared range.
 
@@ -889,12 +915,17 @@ def _harness_cli_version_satisfies(
 
     :param timeout: Seconds to wait for the ``--version`` subprocess before
         giving up, e.g. ``10.0`` on the readiness path.
+    :param raise_on_timeout: Re-raise :class:`subprocess.TimeoutExpired` so the
+        caller can tell an unanswered probe from an incompatible version.
     """
     if spec.min_version is None and spec.max_version_exclusive is None:
         return True
-    version = _harness_cli_version_string(spec, binary, timeout)
+    version = _harness_cli_version_string(spec, binary, timeout, raise_on_timeout=raise_on_timeout)
     if version is None:
         return False
+    if spec == _HARNESS_INSTALL[OPENCODE_KEY] and opencode_version_check_skipped():
+        _warn_opencode_version_check_skipped(version, _version_range_str(spec))
+        return True
     try:
         parsed = Version(version)
     except InvalidVersion:
@@ -921,6 +952,17 @@ def _harness_cli_version_satisfies(
         except InvalidVersion:
             return False
     return True
+
+
+@functools.cache
+def _warn_opencode_version_check_skipped(version: str, supported: str | None) -> None:
+    """Warn once per installed version; readiness probes run this repeatedly."""
+    _logger.warning(
+        "%s set; treating OpenCode %s as installed (supported %s)",
+        OPENCODE_SKIP_VERSION_CHECK_ENV,
+        version,
+        supported,
+    )
 
 
 def harness_install_spec(key: str) -> HarnessInstallSpec | None:
@@ -968,7 +1010,12 @@ def harness_cli_version_satisfies(key: str) -> bool:
     return _harness_cli_version_satisfies(spec, binary)
 
 
-def harness_cli_installed(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_S) -> bool:
+def harness_cli_installed(
+    key: str,
+    timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_S,
+    *,
+    raise_on_timeout: bool = False,
+) -> bool:
     """Return whether the harness's CLI is present and meets its version range.
 
     "Installed" now means the CLI binary (:func:`resolve_cli_binary`) is
@@ -983,6 +1030,9 @@ def harness_cli_installed(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     :param timeout: Seconds to wait for the ``--version`` probe subprocess,
         e.g. ``10.0`` on the readiness path where a hung CLI must not stall
         the refresh.
+    :param raise_on_timeout: Raise :class:`subprocess.TimeoutExpired` when the
+        resolved binary's ``--version`` probe does not finish in *timeout*,
+        instead of reporting ``False``.
     :returns: ``True`` when the CLI resolves and is version-compatible;
         ``False`` when it doesn't resolve, the key has no associated CLI,
         or its version falls outside the declared range.
@@ -993,7 +1043,7 @@ def harness_cli_installed(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     binary = harness_cli_binary(key)
     if binary is None:
         return False
-    return _harness_cli_version_satisfies(spec, binary, timeout)
+    return _harness_cli_version_satisfies(spec, binary, timeout, raise_on_timeout=raise_on_timeout)
 
 
 def harness_cli_version(key: str) -> tuple[str | None, str | None]:
@@ -1037,6 +1087,8 @@ def _harness_cli_version_string(
     spec: HarnessInstallSpec,
     binary: str,
     timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_S,
+    *,
+    raise_on_timeout: bool = False,
 ) -> str | None:
     """Return the parsed, normalized version string from *binary* ``--version``.
 
@@ -1046,6 +1098,8 @@ def _harness_cli_version_string(
 
     :param timeout: Seconds to wait for the ``--version`` subprocess, e.g.
         :data:`READINESS_CLI_PROBE_TIMEOUT_S` on the readiness path.
+    :param raise_on_timeout: Re-raise :class:`subprocess.TimeoutExpired`
+        instead of returning ``None``.
     """
     probe_cwd = _cli_probe_cwd()
     if probe_cwd is not None and not os.path.isabs(binary):
@@ -1060,15 +1114,18 @@ def _harness_cli_version_string(
         if cached is not None and time.monotonic() < cached[1]:
             return cached[0]
     try:
-        completed = subprocess.run(
+        completed = run_isolated(
             [binary, "--version"],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
             timeout=timeout,
-            check=False,
             cwd=probe_cwd,
         )
+    except subprocess.TimeoutExpired:
+        if raise_on_timeout:
+            raise
+        return None
     except (OSError, subprocess.SubprocessError):
         return None
     # Failed launchers can print a runtime version, not the CLI's version.
@@ -1400,9 +1457,8 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
         if time.monotonic() < _LOGIN_PROBE_CACHE.get(cache_key, 0.0):
             return True
     try:
-        result = subprocess.run(
+        result = run_isolated(
             [binary, *spec.status_args],
-            check=False,
             timeout=timeout,
             # Concurrent probes must not change or restore a shared terminal's input mode.
             stdin=subprocess.DEVNULL,

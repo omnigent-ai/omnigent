@@ -323,7 +323,7 @@ describe("arca binary resolution", () => {
 });
 
 describe("arca connect command", () => {
-  it("binds remote login and noninteractive startup to the same SPOG workspace", () => {
+  it("binds remote login and noninteractive startup to the same workspace", () => {
     const server = "https://account.databricks.com/omnigent?o=123&test=value";
     const args = buildLoginArgs(server);
     assert.deepEqual(args, [
