@@ -1301,12 +1301,14 @@ async def test_message_sent_while_a_moved_session_provisions_waits_for_the_sandb
     assert again.json()["error"]["code"] == "conflict"
 
     gate.set()
-    tracker = env.app.state.managed_launches
-    for _ in range(150):
-        launch = tracker.get(session_id)
-        if launch is not None and launch.settled.is_set():
-            break
-        await asyncio.sleep(0.1)
+
+    def claim_released() -> bool:
+        current = env.conv_store.get_conversation(session_id)
+        return current is not None and current.runner_id is None
+
+    # The launch settles before the move releases its claim, so wait for the release.
+    await poll_until_async(claim_released)
+    launch = env.app.state.managed_launches.get(session_id)
     assert launch is not None and launch.error is not None
     snapshot = await env.client.get(f"/v1/sessions/{session_id}")
     assert snapshot.status_code == 200, snapshot.text
