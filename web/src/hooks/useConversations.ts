@@ -85,7 +85,7 @@ import {
   updateProjectConfig as apiUpdateProjectConfig,
 } from "@/lib/projectsApi";
 import { releaseConversation, useChatStore } from "@/store/chatStore";
-import type { Session, SessionFamily } from "@/lib/types";
+import type { SandboxStatus, Session, SessionFamily } from "@/lib/types";
 import type { SessionPullRequestSummary } from "@/hooks/useSessionPullRequests";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import { markConversationSeen } from "./useUnseenConversations";
@@ -224,6 +224,11 @@ export interface Conversation {
    * when no web card exists for the prompt.
    */
   blocked_on?: string | null;
+  /**
+   * Managed-sandbox launch progress. Present while the launch is in flight or
+   * has failed; absent for sessions without a managed launch and once ready.
+   */
+  sandbox_status?: SandboxStatus | null;
   status?: "idle" | "running" | "failed";
   /**
    * Whether the session's runner is reachable, matching `GET /health`.

@@ -1473,6 +1473,7 @@ def _build_session_list_item(
         ),
         background_work_running=conv.background_work_running is True,
         blocked_on=_blocked_on_for(conv.id, conv.blocked_on),
+        sandbox_status=_session_sandbox_status_cache.get(conv.id),
         workspace=conv.workspace,
         git_branch=conv.git_branch,
         archived=conv.archived,

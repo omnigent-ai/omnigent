@@ -3833,6 +3833,10 @@ class SessionListItem(BaseModel):
         128 characters. The sidebar shows such a session as needing input even
         when no web card exists for the prompt. ``None`` when it is not parked
         or its runner is offline.
+    :param sandbox_status: Managed-sandbox launch progress while the launch is
+        in flight or has failed. ``None`` for sessions without a managed launch
+        and once the launch succeeds. Lets list surfaces keep provisioning
+        sessions out of their completed groups without fetching each session.
     :param workspace: Absolute path on disk where the runner cd's,
         e.g. ``"/Users/corey/universe/src/foo"``. ``None`` for
         sessions that haven't been bound to a host workspace.
@@ -3907,6 +3911,7 @@ class SessionListItem(BaseModel):
     pending_elicitations_count: int = 0
     background_work_running: bool = False
     blocked_on: str | None = None
+    sandbox_status: SandboxStatus | None = None
     workspace: str | None = None
     git_branch: str | None = None
     archived: bool = False

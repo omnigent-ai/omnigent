@@ -24,7 +24,9 @@ from starlette.testclient import TestClient
 from omnigent.entities import Conversation
 from omnigent.errors import OmnigentError
 from omnigent.server.routes import sessions as sessions_mod
+from omnigent.server.routes._sessions.common import _session_sandbox_status_cache
 from omnigent.server.routes.sessions import create_sessions_router
+from omnigent.server.schemas import SandboxStatus
 
 
 class _ConversationStore:
@@ -139,6 +141,18 @@ def test_list_item_embeds_viewer_read_state() -> None:
     item = _build_item(None, _make_conversation("conv_a"))
     assert item.viewer_last_seen == 4_999  # type: ignore[attr-defined]
     assert item.viewer_unread is True  # type: ignore[attr-defined]
+
+
+def test_list_item_embeds_sandbox_launch_status() -> None:
+    """List rows expose launch progress so list surfaces can file active launches."""
+    conv = _make_conversation("conv_launch")
+    launch_status = SandboxStatus(stage="provisioning")
+    _session_sandbox_status_cache[conv.id] = launch_status
+    try:
+        assert _build_item(None, conv).sandbox_status == launch_status  # type: ignore[attr-defined]
+    finally:
+        _session_sandbox_status_cache.pop(conv.id, None)
+    assert _build_item(None, conv).sandbox_status is None  # type: ignore[attr-defined]
 
 
 def test_list_item_reports_a_booting_session_as_running() -> None:
