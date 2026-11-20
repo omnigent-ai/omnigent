@@ -464,6 +464,7 @@ def build_app(resolved_config: _ResolvedConfig | None = None) -> _BuiltApp:
     mcp_registry = build_mcp_registry_from_env(database_url)
 
     app = create_app(
+        host_session_recovery=True,
         agent_store=agent_store,
         file_store=file_store,
         conversation_store=conversation_store,

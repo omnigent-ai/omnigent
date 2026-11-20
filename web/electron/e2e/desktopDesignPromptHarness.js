@@ -242,7 +242,8 @@ async function startFormFixture() {
   };
 }
 
-async function launchDesignDesktop(tmpDir, recordDir, serverUrl) {
+/** Launch the desktop app on `serverUrl`; `env` adds to its environment. */
+async function launchDesignDesktop(tmpDir, recordDir, serverUrl, env = {}) {
   const { _electron } = require("playwright");
   const userDataDir = path.join(tmpDir, "user-data");
   fs.mkdirSync(userDataDir);
@@ -264,6 +265,7 @@ async function launchDesignDesktop(tmpDir, recordDir, serverUrl) {
     env: {
       ...isolatedEnv(path.join(tmpDir, "config")),
       OMNIGENT_DESKTOP_VERSION_OVERRIDE: "999.0.0",
+      ...env,
     },
     ...(recordDir ? { recordVideo: { dir: recordDir } } : {}),
   });

@@ -163,6 +163,35 @@ export interface SettingsRowOverlay {
   readonly rowFields?: Readonly<Record<string, SettingsNameAffix>>;
 }
 
+/**
+ * What decides whether a row shows on this build, server and account. Each field is a fact the
+ * Settings page already reads for its own rows, so search and the page agree.
+ */
+export interface SettingsAvailability {
+  /** The desktop shell offers ⇧⌘Space for New Agent from anywhere. */
+  globalShortcut: boolean;
+  /** `floating_composer` is on and the shell can change the New Agent panel's shortcut. */
+  floatingComposerShortcut: boolean;
+  /** The shell has an in-app browser for chat links. */
+  inAppBrowser: boolean;
+  /** Settings shows the Admin view switch: to an admin-eligible viewer, where the server offers it. */
+  adminView: boolean;
+  /** The server signs people in with its own accounts, which have a password here. */
+  accountsEnabled: boolean;
+  /** The server offers deleting a session's worktree when it's archived. */
+  archiveWorktreeCleanup: boolean;
+  /** The server lists managed MCP services in `enabled_connections`. */
+  mcpServices: boolean;
+  /** Which sandbox account connections the server lists in `enabled_connections`. */
+  integrationProviders: { github: boolean; databricks: boolean };
+  /** The server turns on project kanban boards. */
+  projectKanban: boolean;
+  /** The server lets people write their own session title instructions. */
+  sessionTitleInstructions: boolean;
+  /** The server offers the proactive agent. */
+  proactiveAgent: boolean;
+}
+
 export interface SettingsEntry {
   /** Stable, and the URL hash that reveals the row: `#<id>`, or `#<id>:<part>` for a part. */
   id: string;
@@ -220,6 +249,8 @@ export interface SettingsEntry {
   harness?: string;
   /** For a keyboard shortcut row, the registry binding it lists. */
   shortcutId?: ShortcutId;
+  /** Whether the row shows on this build, server and account; a row without it always shows. */
+  available?: (availability: SettingsAvailability) => boolean;
 }
 
 type DeclaredPart<Entry> = Entry extends { parts: infer Parts } ? keyof Parts & string : never;

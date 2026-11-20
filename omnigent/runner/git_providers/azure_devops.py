@@ -36,6 +36,7 @@ from omnigent.runner.git_providers import (
     ProviderCapabilities,
     PullRequestAuth,
     PullRequestFacet,
+    PullRequestStatus,
     ReviewerRef,
     ShellPrOp,
     ShellSegment,
@@ -840,6 +841,36 @@ class AzureDevOpsPullRequests:
             return None, failure.timed_out
         title = pr.get("title")
         return (title.strip() or None) if isinstance(title, str) else None, False
+
+    def pr_status(
+        self,
+        root: str,  # noqa: ARG002 - the PR is read from Azure DevOps
+        reference: PullRequestRef,
+        deadline: float,
+    ) -> tuple[PullRequestStatus | None, bool]:
+        """Read one PR's title, state and draft flag; times out as :meth:`pr_title` does."""
+        repo = _reference_repo(reference)
+        if repo is None:
+            return None, False
+        if time.monotonic() >= deadline:
+            return None, True
+        token = _token()
+        if token is None:
+            return None, False
+        try:
+            with self._client(repo.org, token, deadline=deadline) as client:
+                pr = _call(client.get_pull_request, repo.project, repo.repo, reference.number)
+        except _RestFailure as failure:
+            return None, failure.timed_out
+        title = pr.get("title")
+        return (
+            PullRequestStatus(
+                title=(title.strip() or None) if isinstance(title, str) else None,
+                state=_PR_STATES.get(str(pr.get("status") or "").lower()),
+                is_draft=pr.get("isDraft") is True,
+            ),
+            False,
+        )
 
     def verify_accessible(
         self,

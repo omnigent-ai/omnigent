@@ -607,6 +607,7 @@ async def test_runner_shell_retires_helper_and_owned_background_processes(
 
     import psutil
 
+    import omnigent.inner.os_env as os_env_module
     from omnigent.inner.os_env import CallerProcessOSEnvironment
     from omnigent.runner.resource_registry import SessionResourceRegistry
     from omnigent.runner.tool_dispatch import _execute_os_env_tool
@@ -644,6 +645,16 @@ async def test_runner_shell_retires_helper_and_owned_background_processes(
         helper = replacement.environment._helper._proc
         assert helper is not None
         await replacement.release(reusable=True)
+        file_helper = helper
+        processes: list[subprocess.Popen[str]] = []
+        start_helper = os_env_module._HelperProcessClient._start_locked
+
+        def record_start(client: os_env_module._HelperProcessClient) -> None:
+            start_helper(client)
+            assert client._proc is not None
+            processes.append(client._proc)
+
+        monkeypatch.setattr(os_env_module._HelperProcessClient, "_start_locked", record_start)
         task = asyncio.create_task(
             _execute_os_env_tool(
                 "sys_os_shell",
@@ -661,6 +672,10 @@ async def test_runner_shell_retires_helper_and_owned_background_processes(
             )
         )
         await poll_until_async((tmp_path / "started").exists, timeout_s=5)
+        assert len(processes) == 1
+        helper = processes[0]
+        assert helper.pid != file_helper.pid
+        assert file_helper.poll() is None
         descendants = psutil.Process(helper.pid).children(recursive=True)
         sleepers = []
         for process in descendants:
@@ -683,12 +698,22 @@ async def test_runner_shell_retires_helper_and_owned_background_processes(
                 return True
 
         await poll_until_async(lambda: all(stopped(p) for p in descendants), timeout_s=5)
+        reused = await registry.lease_tool_environment(session_id, spec)
+        assert reused is replacement
+        assert (await reused.environment.read("note.txt"))["content"] == "owned test workspace"
+        assert isinstance(reused.environment, CallerProcessOSEnvironment)
+        reused_helper = reused.environment._helper._proc
+        assert reused_helper is not None
+        assert reused_helper.pid == file_helper.pid
+        assert file_helper.poll() is None
+        await reused.release(reusable=True)
     finally:
         (tmp_path / "release").touch()
         if task is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         await registry.cleanup_session(session_id)
+    assert file_helper.poll() is not None
 
 
 def test_sandbox_hides_dotfiles_created_after_helper_start(

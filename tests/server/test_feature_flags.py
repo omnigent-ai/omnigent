@@ -29,11 +29,14 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
             Feature.CODEX_PLAN_AT_LAUNCH,
             Feature.GRID_SESSIONS_DISPLAY_UI,
             Feature.PEER_SESSION_MESSAGING,
+            Feature.PROJECT_KANBAN,
             Feature.PROJECT_REPOSITORY_CREATION,
+            Feature.SCRIPTED_SESSIONS,
             Feature.SESSION_ORCHESTRATION,
             Feature.SIBLING_SESSIONS,
             Feature.SIDEBAR_GROUPING_UI,
             Feature.USER_INBOX,
+            Feature.WORKSPACE_CONTENT_SEARCH,
         }
     )
     assert flags.frontend_dict() == {
@@ -41,22 +44,25 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
         "usage_page": False,
         "harness_install": False,
         "canvas": False,
-        "arca_shutdown_warnings": False,
         "import_review": False,
         "sidebar_grouping_ui": True,
-        "workspace_content_search": False,
+        "workspace_content_search": True,
         "grid_sessions_display_ui": True,
         "automations_v2": True,
         "splittable_terminal_view_ui": False,
         "sidebar_windowed_rows": False,
+        "chat_composer_codemirror": False,
         "workflows": False,
         "session_overview": False,
+        "project_kanban": True,
         "project_repository_creation": True,
+        "quick_pick_palette": False,
         "session_orchestration": True,
         "sibling_sessions": True,
         "codex_plan_at_launch": True,
         "workspace_direct_access": False,
         "workspace_api_server_access": False,
+        "floating_composer": False,
     }
 
 
@@ -73,12 +79,15 @@ def test_resolves_comma_separated_enabled_set() -> None:
         "grid_sessions_display_ui",
         "harness_install",
         "peer_session_messaging",
+        "project_kanban",
         "project_repository_creation",
+        "scripted_sessions",
         "session_orchestration",
         "sibling_sessions",
         "sidebar_grouping_ui",
         "usage_page",
         "user_inbox",
+        "workspace_content_search",
     )
 
 
@@ -98,11 +107,14 @@ def test_resolves_comma_separated_enabled_set() -> None:
         "claude_osc_status",
         "grid_sessions_display_ui",
         "peer_session_messaging",
+        "project_kanban",
         "project_repository_creation",
+        "scripted_sessions",
         "session_orchestration",
         "sibling_sessions",
         "sidebar_grouping_ui",
         "user_inbox",
+        "workspace_content_search",
     ],
 )
 def test_explicit_disable_wins_and_preserves_other_features(override: str, feature: str) -> None:
@@ -116,12 +128,15 @@ def test_explicit_disable_wins_and_preserves_other_features(override: str, featu
         "codex_plan_at_launch",
         "grid_sessions_display_ui",
         "peer_session_messaging",
+        "project_kanban",
         "project_repository_creation",
+        "scripted_sessions",
         "session_orchestration",
         "sibling_sessions",
         "sidebar_grouping_ui",
         "usage_page",
         "user_inbox",
+        "workspace_content_search",
     } - {feature}
 
 
@@ -136,11 +151,14 @@ def test_default_off_features_can_also_be_explicitly_disabled(feature: str) -> N
         "codex_plan_at_launch",
         "grid_sessions_display_ui",
         "peer_session_messaging",
+        "project_kanban",
         "project_repository_creation",
+        "scripted_sessions",
         "session_orchestration",
         "sibling_sessions",
         "sidebar_grouping_ui",
         "user_inbox",
+        "workspace_content_search",
     )
 
 
@@ -179,19 +197,30 @@ def test_canvas_is_a_frontend_visible_feature() -> None:
         "codex_plan_at_launch",
         "grid_sessions_display_ui",
         "peer_session_messaging",
+        "project_kanban",
         "project_repository_creation",
+        "scripted_sessions",
         "session_orchestration",
         "sibling_sessions",
         "sidebar_grouping_ui",
         "user_inbox",
+        "workspace_content_search",
     )
 
 
-def test_arca_shutdown_warnings_are_frontend_visible() -> None:
-    flags = resolve_feature_flags({FEATURES_ENV_VAR: "arca_shutdown_warnings"})
+def test_floating_composer_is_a_frontend_visible_feature() -> None:
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "floating_composer"})
+    assert flags.enabled(Feature.FLOATING_COMPOSER)
+    assert flags.frontend_dict()["floating_composer"] is True
 
-    assert flags.enabled(Feature.ARCA_SHUTDOWN_WARNINGS)
-    assert flags.frontend_dict()["arca_shutdown_warnings"] is True
+
+def test_chat_composer_codemirror_is_an_opt_in_frontend_feature() -> None:
+    assert not resolve_feature_flags({}).enabled(Feature.CHAT_COMPOSER_CODEMIRROR)
+
+    flags = resolve_feature_flags({FEATURES_ENV_VAR: "chat_composer_codemirror"})
+
+    assert flags.enabled(Feature.CHAT_COMPOSER_CODEMIRROR)
+    assert flags.frontend_dict()["chat_composer_codemirror"] is True
 
 
 def test_sibling_sessions_explicit_enable_preserves_default_features() -> None:

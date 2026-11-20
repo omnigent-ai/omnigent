@@ -8425,8 +8425,8 @@ def test_clone_claude_transcript_repairs_stale_image_duplication(
     in both the structured content and the metadata) — or one holding an
     MCP screenshot as a raw string — would overflow the clone's first
     ``--resume`` before any later rebuild could heal it. The copy must
-    repair image-bearing tool-result records on the way through: exactly
-    one structured image copy per payload, redacted metadata, and no
+    repair image- and PDF-bearing tool-result records on the way through:
+    exactly one structured copy per payload, redacted metadata, and no
     string-valued content carrying base64. Records without image
     duplication must pass through unchanged.
     """
@@ -8496,15 +8496,101 @@ def test_clone_claude_transcript_repairs_stale_image_duplication(
         },
         "toolUseResult": json.dumps("file written"),
     }
+    b64_pdf = base64.b64encode(b"%PDF-1.7\n" + b"0" * 3000).decode()
+    pdf_blocks = [
+        {"type": "text", "text": "PDF file read: report.pdf"},
+        {
+            "type": "document",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": b64_pdf},
+        },
+    ]
+    pdf_string = json.dumps(pdf_blocks, separators=(",", ":"))
+    stale_pdf = {
+        "type": "user",
+        "cwd": str(source_workspace.resolve()),
+        "sessionId": source_uuid,
+        "uuid": "u4",
+        "parentUuid": "u3",
+        "message": {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "toolu_4", "content": pdf_string}],
+        },
+        "toolUseResult": claude_native._json_safe_tool_use_result(pdf_string),
+    }
+    b64_native_pdf = base64.b64encode(b"%PDF-1.7\n" + b"1" * 3000).decode()
+    native_pdf_blocks = [
+        {"type": "text", "text": "PDF file read: notes.pdf"},
+        {
+            "type": "document",
+            "source": {"type": "base64", "media_type": "application/pdf", "data": b64_native_pdf},
+        },
+    ]
+    native_pdf = {
+        "type": "user",
+        "cwd": str(source_workspace.resolve()),
+        "sessionId": source_uuid,
+        "uuid": "u5",
+        "parentUuid": "u4",
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_5", "content": native_pdf_blocks}
+            ],
+        },
+        # Older Claude Code kept the payload in its own Read metadata.
+        "toolUseResult": {"type": "pdf", "file": {"base64": b64_native_pdf, "originalSize": 3009}},
+    }
+    stripped_pdf_meta = {"type": "pdf", "file": {"base64": "", "originalSize": 3009}}
+    stripped_native_pdf = {
+        **native_pdf,
+        "uuid": "u6",
+        "parentUuid": "u5",
+        "toolUseResult": stripped_pdf_meta,
+    }
+    b64_native_image = "iVBORw0KGgo" + "L" * 4000 + "="
+    native_image_block = {
+        "type": "image",
+        "source": {"type": "base64", "media_type": "image/png", "data": b64_native_image},
+    }
+    stripped_image_meta = {
+        "type": "image",
+        "file": {"base64": "", "type": "image/png", "originalSize": 3009},
+    }
+    native_image = {
+        **native_pdf,
+        "uuid": "u7",
+        "parentUuid": "u6",
+        "message": {
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": "toolu_7", "content": [native_image_block]}
+            ],
+        },
+        "toolUseResult": {
+            **stripped_image_meta,
+            "file": {**stripped_image_meta["file"], "base64": b64_native_image},
+        },
+    }
     source_path.write_text(
         "".join(
-            json.dumps(record) + "\n" for record in (stale_structured, stale_mixed, plain_result)
+            json.dumps(record) + "\n"
+            for record in (
+                stale_structured,
+                stale_mixed,
+                plain_result,
+                stale_pdf,
+                native_pdf,
+                stripped_native_pdf,
+                native_image,
+            )
         ),
         encoding="utf-8",
     )
     source_text = source_path.read_text(encoding="utf-8")
     assert source_text.count(b64_structured) == 2, "pre-fix wedged state"
     assert source_text.count(b64_mcp) == 2, "pre-fix wedged state"
+    assert source_text.count(b64_native_pdf) == 3
+    assert source_text.count(b64_native_image) == 2
     monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
 
     result = claude_native._clone_claude_transcript(
@@ -8537,6 +8623,18 @@ def test_clone_claude_transcript_repairs_stale_image_duplication(
     # No image duplication: the plain record is preserved untouched.
     assert records[2]["message"]["content"][0]["content"] == "file written"
     assert records[2]["toolUseResult"] == json.dumps("file written")
+    # A PDF replayed as a raw string becomes a document block, kept once.
+    assert records[3]["message"]["content"][0]["content"] == pdf_blocks
+    assert text.count(b64_pdf) == 1
+    # Claude Code's Read metadata keeps its native shape, as current releases store it.
+    assert records[4]["message"]["content"][0]["content"] == native_pdf_blocks
+    assert records[4]["toolUseResult"] == stripped_pdf_meta
+    assert records[5]["message"]["content"][0]["content"] == native_pdf_blocks
+    assert records[5]["toolUseResult"] == stripped_pdf_meta
+    assert text.count(b64_native_pdf) == 2
+    assert records[6]["message"]["content"][0]["content"] == [native_image_block]
+    assert records[6]["toolUseResult"] == stripped_image_meta
+    assert text.count(b64_native_image) == 1
     # The fork must not mutate the source session's transcript.
     assert source_path.read_text(encoding="utf-8") == source_text
 
@@ -10528,6 +10626,31 @@ def test_tool_use_result_redacts_inline_image_base64() -> None:
     assert tool_use_result[1]["width"] == 1280
     # Whole-record invariant: the payload exists exactly once.
     assert json.dumps(record).count(b64) == 1
+
+
+def test_claude_transcript_pdf_read_result_replays_as_one_document_block() -> None:
+    """
+    A PDF Read result resumes as a document block, not base64 prompt text.
+
+    The payload must appear exactly once in the rebuilt record.
+    """
+    pdf_b64 = base64.b64encode(b"%PDF-1.7\n" + b"0" * 30_000).decode()
+    text_block = {"type": "text", "text": "PDF file read: /tmp/test/report.pdf (29.3KB)"}
+    document_block = {
+        "type": "document",
+        "source": {"type": "base64", "media_type": "application/pdf", "data": pdf_b64},
+    }
+    records = _image_output_records(
+        json.dumps([text_block, document_block], separators=(",", ":"))
+    )
+
+    assert len(records) == 1
+    record = records[0]
+    assert record["message"]["content"][0]["content"] == [text_block, document_block]
+    redacted = json.loads(record["toolUseResult"])[1]["source"]["data"]
+    assert pdf_b64 not in redacted
+    assert "application/pdf" in redacted
+    assert json.dumps(record).count(pdf_b64) == 1
 
 
 def test_tool_use_result_redaction_is_tool_name_independent() -> None:

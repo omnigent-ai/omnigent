@@ -1,9 +1,14 @@
 import { describe, expect, it } from "vitest";
 
+import { CUSTOM_AGENT_CREATE_ENTRY } from "./customAgents";
 import { SECTION_CATALOGS, SETTINGS_ENTRIES, settingsEntryById } from "./index";
 import { settingsEntryProblems } from "./types";
 
 describe("Settings catalog", () => {
+  it("indexes the custom agent create page so Settings search can find it", () => {
+    expect(SETTINGS_ENTRIES).toContain(CUSTOM_AGENT_CREATE_ENTRY);
+  });
+
   it("files each entry under the section it names", () => {
     for (const [section, entries] of Object.entries(SECTION_CATALOGS)) {
       for (const entry of entries) expect(entry.section).toBe(section);

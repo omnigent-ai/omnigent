@@ -44,6 +44,11 @@ if (process.platform === "darwin") {
   });
 }
 
+/** A shortcut id for the shell to check; anything else names the default "show". */
+function shortcutId(id) {
+  return typeof id === "string" ? id : undefined;
+}
+
 // Collapse the update states the in-page UpdateBanner renders on
 // (available / downloading / downloaded / error-security) to `idle` so the server page can
 // never show a banner — that UI is shell-owned (the corner overlay). Kept here
@@ -65,6 +70,21 @@ function bannerSafe(status) {
 // Native integrations for the SPA: a dock/taskbar badge and OS notifications.
 // Numbers/strings only so the values survive contextBridge's structured-clone
 // boundary.
+// Annotate and Draw (designTools.js): open and stop a tool's overlay on a view, and its page
+// operations and captures. A test run can leave them out, to stand in for an older shell.
+const designTools =
+  process.env?.OMNIGENT_DESKTOP_LEGACY_DESIGN_MODE === "1"
+    ? {}
+    : {
+        browserDesignTools: (args) => ipcRenderer.invoke("omnigent:browser-design-tools", args),
+        /** Main ended a view's opening (its page went): `{ viewId, type: "ended", session, reason }`. */
+        onBrowserDesignToolsEvent: (callback) => {
+          const listener = (_event, payload) => callback(payload);
+          ipcRenderer.on("browser-design-tools-event", listener);
+          return () => ipcRenderer.removeListener("browser-design-tools-event", listener);
+        },
+      };
+
 contextBridge.exposeInMainWorld("omnigentDesktop", {
   kind: "electron",
   /** Paint the dock/taskbar badge; 0 clears it. Fire-and-forget. */
@@ -173,25 +193,30 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
         startSystemDictation: () => ipcRenderer.invoke("omnigent:start-system-dictation"),
       }
     : {}),
-  /** The "Show Omnigent from anywhere" shortcut (off by default). */
-  getGlobalShortcut: () => ipcRenderer.invoke("omnigent:get-global-shortcut"),
+  /**
+   * A system-wide shortcut by id: "show" (Show Omnigent from anywhere, off by default, and
+   * the default id) or "floatingComposer" (the New Agent panel, macOS).
+   */
+  getGlobalShortcut: (id) => ipcRenderer.invoke("omnigent:get-global-shortcut", shortcutId(id)),
   /**
    * Saves `{ enabled, accelerator }`, or turns the shortcut off for `{ enabled: false }`,
    * keeping the saved chord. Resolves `{ ok, setting?, error? }`; `ok: false` means the
    * saved setting is unchanged.
    */
-  setGlobalShortcut: ({ enabled, accelerator } = {}) =>
+  setGlobalShortcut: ({ enabled, accelerator } = {}, id) =>
     ipcRenderer.invoke(
       "omnigent:set-global-shortcut",
       enabled !== true && accelerator === undefined
         ? { enabled: false }
         : { enabled: enabled === true, accelerator: String(accelerator ?? "") },
+      shortcutId(id),
     ),
   /**
    * Takes the next chord in the shell, before the page's shortcuts and the menu see it.
    * Resolves its accelerator, or null when Escape or the cancel call ends recording.
    */
-  recordGlobalShortcut: () => ipcRenderer.invoke("omnigent:record-global-shortcut"),
+  recordGlobalShortcut: (id) =>
+    ipcRenderer.invoke("omnigent:record-global-shortcut", shortcutId(id)),
   cancelGlobalShortcutRecording: () =>
     ipcRenderer.invoke("omnigent:cancel-global-shortcut-recording"),
   /** The runner picked during onboarding for this server ("local" |
@@ -242,6 +267,30 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * Resolves null off a connected server.
    */
   getDesktopFeatures: () => ipcRenderer.invoke("omnigent:get-desktop-features"),
+  /**
+   * The floating New Agent panel, usable when getDesktopFeatures() reports
+   * `floatingComposer` (macOS). A main window's page announces it can render the panel;
+   * the panel's own page dismisses itself and opens what it launched in a main window.
+   */
+  floatingComposer: {
+    /** From a main window: this document can render the panel (version 1) for its server. */
+    announceSupport: (version) => ipcRenderer.send("omnigent:floating-composer:announce", version),
+    /** From the panel: hide it, keeping its draft. */
+    dismiss: () => ipcRenderer.send("omnigent:floating-composer:dismiss"),
+    /**
+     * From the panel: open `/c/<id>` or a page it links to in a main window of its server,
+     * then hide. Resolves `{ ok: true }` or
+     * `{ ok: false, error: "not-composer" | "bad-path" | "window-loading" }`.
+     */
+    openInMainWindow: (path) =>
+      ipcRenderer.invoke("omnigent:floating-composer:open-in-main-window", path),
+    /** From the panel: its native file picker opened or closed. */
+    filePicker: (state) =>
+      ipcRenderer.send(
+        "omnigent:floating-composer:file-picker",
+        state === "open" ? "open" : "closed",
+      ),
+  },
   /**
    * Connect the user's Arca instance to the window's
    * server as a host, via `arca ssh`. Native consent is asked in the main
@@ -587,6 +636,8 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
     ipcRenderer.on("browser-nav-state", listener);
     return () => ipcRenderer.removeListener("browser-nav-state", listener);
   },
+
+  ...designTools,
 
   // ── Design mode (point-and-prompt) ─────────────────────────────────────
   // Toggle the in-page picker + popup. On Send, the SPA gets the submit via

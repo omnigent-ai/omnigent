@@ -11,7 +11,7 @@ from playwright.sync_api import Page, Route, expect
 from tests.e2e_ui.conftest import fetch_with_retry
 
 
-@pytest.mark.parametrize("width", [390, 1000])
+@pytest.mark.parametrize("width", [390, 1280])
 @pytest.mark.parametrize("dark", [False, True], ids=["light", "dark"])
 def test_subagent_composer_masks_overlap(
     page: Page,
@@ -37,7 +37,7 @@ def test_subagent_composer_masks_overlap(
     tray = page.get_by_test_id("composer-subagent-tray")
     bar = page.get_by_test_id("composer-workspace-controls")
     expect(tray).to_be_visible(timeout=30_000)
-    if width < 768:
+    if width < 1181:
         expect(bar).to_have_count(0)
         card = page.locator("[data-composer-card]")
         expect(card.locator(".omni-glass-surface")).to_be_visible()

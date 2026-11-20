@@ -99,10 +99,14 @@ class SysScheduledTaskCreateTool(Tool):
                             ),
                         },
                         "timezone": {
-                            "type": "string",
+                            "type": ["string", "null"],
                             "description": (
                                 "IANA timezone the rule is evaluated in, e.g. "
-                                "'America/Los_Angeles'. Defaults to 'UTC'."
+                                "'America/Los_Angeles'. Use the zone the user names; "
+                                "otherwise omit it or send JSON null. Current runners "
+                                "request their recorded browser timezone, falling back "
+                                "to UTC when unavailable or unsupported. "
+                                "Do not infer a zone from the host or environment."
                             ),
                         },
                         "model_override": {

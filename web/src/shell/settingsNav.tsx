@@ -6,7 +6,7 @@
 // selection is URL-driven (/settings/<section>) so the nav (in the sidebar)
 // and the content (in the outlet) stay in sync without shared state.
 
-import { useEffect } from "react";
+import { type ReactNode, useEffect } from "react";
 import {
   ArchiveIcon,
   ArrowLeftIcon,
@@ -16,6 +16,7 @@ import {
   GitBranchIcon,
   KeyboardIcon,
   PaletteIcon,
+  PanelRightOpenIcon,
   PlugIcon,
   SettingsIcon,
   Share2Icon,
@@ -82,7 +83,7 @@ export function settingsSectionPath(id: SettingsSectionId): string {
   return `/settings/${id}`;
 }
 
-interface SettingsNavItem {
+export interface SettingsNavItem {
   id: SettingsSectionId;
   label: string;
   icon: typeof PaletteIcon;
@@ -257,14 +258,8 @@ export function useTrackSettingsReturn(): void {
  * Settings nav rendered inside the sidebar card, replacing the conversation
  * list on /settings. Its Back row matches the navigation rows below it.
  */
-export function SettingsSidebarBody({
-  onNavClick,
-  harnessesOffered = true,
-}: {
-  onNavClick: (e: React.MouseEvent<HTMLAnchorElement>) => void;
-  /** False when the deployment curated out every harness, which drops Harnesses. */
-  harnessesOffered?: boolean;
-}) {
+/** The sections Settings shows here: this viewer's, this deploy's and this build's. */
+export function useSettingsNavGroups(harnessesOffered = true): SettingsNavGroup[] {
   const info = useServerInfo();
   // Account section shows whenever there's a login session (accounts OR OIDC).
   const hasAuthSession = info !== "loading" && info.login_url !== null;
@@ -275,8 +270,7 @@ export function SettingsSidebarBody({
   const integrationsEnabled =
     info !== "loading" && (info.enabled_connections ?? []).some((provider) => provider !== "mcp");
   const mcpEnabled = info !== "loading" && (info.enabled_connections ?? []).includes("mcp");
-  const { section } = useSettingsRoute();
-  const groups = settingsNavGroups(
+  return settingsNavGroups(
     hasAuthSession,
     isElectronShell(),
     isAdmin,
@@ -287,6 +281,26 @@ export function SettingsSidebarBody({
     adminGeneralSettingsAvailable(info),
     harnessesOffered,
   );
+}
+
+export function SettingsSidebarBody({
+  onNavClick,
+  onCollapse,
+  harnessesOffered = true,
+  search,
+  searching = false,
+}: {
+  onNavClick: (e: React.MouseEvent<HTMLAnchorElement>) => void;
+  /** Shown while the menu docks beside the page, which leaves no strip to tap away. */
+  onCollapse?: () => void;
+  /** False when the deployment curated out every harness, which drops Harnesses. */
+  harnessesOffered?: boolean;
+  /** The search field, shown under Back; a search's results take the section nav's place. */
+  search?: ReactNode;
+  searching?: boolean;
+}) {
+  const { section } = useSettingsRoute();
+  const groups = useSettingsNavGroups(harnessesOffered);
 
   return (
     <>
@@ -294,7 +308,7 @@ export function SettingsSidebarBody({
       home sidebar's header row gets: with the sidebar now starting at the
       window's top edge on the macOS shell, this Back row would otherwise sit
       underneath the window controls (see index.css). Inert elsewhere. */}
-      <div className="settings-sidebar-header px-3 pt-3">
+      <div className="settings-sidebar-header flex items-center justify-between px-3 pt-3">
         <Button
           asChild
           variant="ghost"
@@ -305,7 +319,7 @@ export function SettingsSidebarBody({
         >
           {/* Returns to wherever the user was before entering settings (the
           conversation they were viewing, or home) — see settingsReturnPath.
-          No onNavClick here: on mobile the sidebar is a full-screen overlay.
+          No onNavClick here: on mobile the sidebar is an overlay.
           Leaving /settings swaps the sidebar back to the conversation list —
           but we keep the overlay OPEN so mobile lands on that list rather than
           closing onto the content behind it. On desktop onNavClick is a no-op
@@ -315,54 +329,69 @@ export function SettingsSidebarBody({
             Back
           </Link>
         </Button>
+        {onCollapse && (
+          <Button
+            type="button"
+            variant="ghost"
+            size="icon-xs"
+            aria-label="Close sidebar"
+            onClick={onCollapse}
+            className="size-6 text-muted-foreground hover:text-foreground"
+          >
+            <PanelRightOpenIcon className="size-4" />
+          </Button>
+        )}
       </div>
-      <nav className="flex flex-1 flex-col gap-4 overflow-y-auto px-3 py-3">
-        {groups.map((group) => (
-          <div key={group.title} className="flex flex-col">
-            <h2 className="flex h-7 items-center px-2 text-sm font-normal text-muted-foreground">
-              {group.title}
-            </h2>
-            <div className="mt-1 flex flex-col gap-px">
-              {group.items.map((item) => {
-                const Icon = item.icon;
-                const selected = section === item.id;
-                return (
-                  <Button
-                    key={item.id}
-                    asChild
-                    variant="ghost"
-                    className={cn(
-                      SIDEBAR_ROW,
-                      "w-full justify-start border-0 font-normal",
-                      selected &&
-                        "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)] dark:hover:bg-[var(--sidebar-active)] dark:hover:text-[var(--sidebar-active-foreground)]",
-                      item.hideOnMobile && "max-md:hidden",
-                    )}
-                  >
-                    <Link
-                      to={settingsSectionPath(item.id)}
-                      onClick={onNavClick}
-                      data-testid={`settings-nav-${item.id}`}
-                      componentId={`settings.nav.${item.id}`}
-                      aria-current={selected ? "page" : undefined}
+      {search}
+      {searching ? null : (
+        <nav className="flex flex-1 flex-col gap-4 overflow-y-auto px-3 py-3">
+          {groups.map((group) => (
+            <div key={group.title} className="flex flex-col">
+              <h2 className="flex h-7 items-center px-2 text-sm font-normal text-muted-foreground">
+                {group.title}
+              </h2>
+              <div className="mt-1 flex flex-col gap-px">
+                {group.items.map((item) => {
+                  const Icon = item.icon;
+                  const selected = section === item.id;
+                  return (
+                    <Button
+                      key={item.id}
+                      asChild
+                      variant="ghost"
+                      className={cn(
+                        SIDEBAR_ROW,
+                        "w-full justify-start border-0 font-normal",
+                        selected &&
+                          "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)] dark:hover:bg-[var(--sidebar-active)] dark:hover:text-[var(--sidebar-active-foreground)]",
+                        item.hideOnMobile && "max-md:hidden",
+                      )}
                     >
-                      <Icon
-                        className={cn(
-                          "ui-icon",
-                          selected
-                            ? "text-[var(--sidebar-active-foreground)]"
-                            : "text-muted-foreground",
-                        )}
-                      />
-                      {item.label}
-                    </Link>
-                  </Button>
-                );
-              })}
+                      <Link
+                        to={settingsSectionPath(item.id)}
+                        onClick={onNavClick}
+                        data-testid={`settings-nav-${item.id}`}
+                        componentId={`settings.nav.${item.id}`}
+                        aria-current={selected ? "page" : undefined}
+                      >
+                        <Icon
+                          className={cn(
+                            "ui-icon",
+                            selected
+                              ? "text-[var(--sidebar-active-foreground)]"
+                              : "text-muted-foreground",
+                          )}
+                        />
+                        {item.label}
+                      </Link>
+                    </Button>
+                  );
+                })}
+              </div>
             </div>
-          </div>
-        ))}
-      </nav>
+          ))}
+        </nav>
+      )}
     </>
   );
 }

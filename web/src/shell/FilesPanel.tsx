@@ -709,6 +709,7 @@ export function FilesPanel({
             sort={changedSort}
             conversationId={conversationId}
             runnerWentOffline={runnerWentOffline}
+            scrollParentRef={scrollRef}
           />
         )}
         {!showAsleepHint && !flatView && (
