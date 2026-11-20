@@ -10,6 +10,7 @@ import tomlkit
 
 from omnigent.errors import ErrorCategory, ErrorImpact, classify_exception
 from omnigent.harnesses.codex_native import app_server, launch_args
+from omnigent.native.permission_modes import PERMISSION_LAUNCH_ARGS
 from omnigent.harnesses.codex_native.launch_args import (
     absolute_codex_path,
     canonical_codex_launch_args,
@@ -87,6 +88,28 @@ def test_remote_resume_option_spellings(args: tuple[str, ...], expected: dict) -
     assert app_server.build_codex_remote_args(
         codex_args=args, thread_id="thread-test", remote_url="ws://127.0.0.1:9876"
     ) == ["resume", "--remote", "ws://127.0.0.1:9876", "thread-test"]
+
+
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (tuple(PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"]), "approve-for-me"),
+        (("-m", "gpt", "--approve-for-me"), "approve-for-me"),
+        (("-s=workspace-write", "-a=on-request"), "ask-for-approval"),
+        # A later reviewer setting replaces an earlier one.
+        (
+            (*PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"], "-c", 'approvals_reviewer="user"'),
+            "ask-for-approval",
+        ),
+        (("--sandbox", "read-only", "--ask-for-approval", "on-request"), "read-only"),
+        (("--dangerously-bypass-approvals-and-sandbox",), "full-access"),
+        (("--approve-for-me", "--sandbox", "read-only"), None),
+        (("--profile", "strict"), None),
+        ((), None),
+    ],
+)
+def test_codex_launch_permission_preset(args: tuple[str, ...], expected: str | None) -> None:
+    assert app_server.codex_launch_permission_preset(args) == expected
 
 
 @pytest.mark.parametrize(

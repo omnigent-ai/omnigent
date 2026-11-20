@@ -45,6 +45,7 @@ if TYPE_CHECKING:
     from omnigent.spec.types import AgentSpec, RetryPolicy
 
 from omnigent.cli_invocation import cli_invocation
+from omnigent.codex_approval_modes import codex_permission_preset_from_thread_settings
 from omnigent.debug_logging import debug_event
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.codex_egress import CertificateFailure, detect_certificate_failure
@@ -5334,6 +5335,31 @@ def _codex_resume_permission_params(terminal_launch_args: Sequence[str] | None) 
     if "permissions" in params:
         params.pop("sandbox", None)
     return params
+
+
+def codex_launch_permission_preset(terminal_launch_args: Sequence[str] | None) -> str | None:
+    """
+    The ``/permissions`` preset Codex starts in with these launch args.
+
+    :param terminal_launch_args: Persisted Codex launch arguments.
+    :returns: A preset, e.g. ``"approve-for-me"``, or ``None`` for Codex's default,
+        a custom profile, or conflicting flags.
+    """
+    try:
+        params = _codex_resume_permission_params(terminal_launch_args)
+    except ValueError:
+        return None
+    if not params:
+        return None
+    settings: dict[str, object] = {
+        "approvalPolicy": params.get("approvalPolicy"),
+        "approvalsReviewer": params.get("approvalsReviewer"),
+    }
+    if isinstance(params.get("sandbox"), str):
+        settings["sandboxPolicy"] = {"type": params["sandbox"]}
+    if isinstance(params.get("permissions"), str):
+        settings["activePermissionProfile"] = {"id": params["permissions"]}
+    return codex_permission_preset_from_thread_settings(settings)
 
 
 _CODEX_RESUME_PERMISSION_CONFIG_FIELDS = {

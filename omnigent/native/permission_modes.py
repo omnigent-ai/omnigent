@@ -162,22 +162,3 @@ def inherited_permission_mode(
     ]
     return matches[0] if len(matches) == 1 else None
 
-
-def launch_args_permission_mode(harness: str, launch_args: list[str] | None) -> str | None:
-    """
-    The permission mode ``launch_args`` select, judged by the last mode flags they carry.
-
-    :param harness: The session's canonical harness, e.g. ``"codex-native"``.
-    :param launch_args: The session's ``terminal_launch_args``, or ``None``.
-    :returns: The mode, e.g. ``"approve-for-me"``, or ``None`` when no mode's flags appear.
-    """
-    args = list(launch_args or [])
-    found: tuple[int, str] | None = None
-    for mode, flags in PERMISSION_LAUNCH_ARGS.get(harness, {}).items():
-        width = len(flags)
-        starts = [
-            i for i in range(len(args) - width + 1) if flags and args[i : i + width] == flags
-        ]
-        if starts and (found is None or starts[-1] > found[0]):
-            found = (starts[-1], mode)
-    return found[1] if found is not None else None
