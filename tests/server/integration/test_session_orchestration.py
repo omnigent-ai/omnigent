@@ -1583,6 +1583,19 @@ def _set_native_parent(db_uri, session_id, parent) -> None:
             ["--permission-mode", "auto"],
             id="parent-launch-args",
         ),
+        # A switch made after launch replaces the launch flags.
+        pytest.param(
+            (
+                "claude-native",
+                {"omnigent.claude_native.permission_mode": "auto"},
+                ["--permission-mode", "plan"],
+            ),
+            "codex-native",
+            {},
+            {},
+            PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
+            id="live-mode-over-launch-args",
+        ),
         pytest.param(
             _CLAUDE_AUTO_PARENT,
             "codex-native",
@@ -1644,6 +1657,34 @@ async def test_sub_agent_starts_in_its_parents_permission_mode(
     child = SqlAlchemyConversationStore(db_uri).get_conversation(result["conversation_id"])
     assert child.parent_conversation_id == source["id"]
     assert child.terminal_launch_args == expected
+
+
+async def test_custom_native_parent_passes_on_its_mode(auth_client, peers, db_uri):
+    from tests._helpers.session import post_session_bundle
+    from tests.server.helpers import build_agent_bundle
+
+    # A custom agent declaring a native harness runs chat-first, without a wrapper label.
+    bundle = build_agent_bundle(
+        "custom-claude-parent", executor={"config": {"harness": "claude-native"}}
+    )
+    uploaded = await post_session_bundle(auth_client.post, "/v1/sessions", bundle)
+    assert uploaded.status_code == 201, uploaded.text
+    parent_id = uploaded.json()["session_id"]
+    store = SqlAlchemyConversationStore(db_uri)
+    assert WRAPPER_LABEL_KEY not in store.get_conversation(parent_id).labels
+    store.set_labels(parent_id, {"omnigent.claude_native.permission_mode": "auto"})
+    worker_agent_id = await _upload_native_worker(auth_client)
+    result = json.loads(
+        await execute_tool(
+            tool_name="sys_session_create",
+            arguments=json.dumps({"agent_id": worker_agent_id}),
+            server_client=auth_client,
+            conversation_id=parent_id,
+        )
+    )
+    assert result.get("conversation_id"), result
+    child = store.get_conversation(result["conversation_id"])
+    assert child.terminal_launch_args == PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"]
 
 
 async def test_added_agent_and_independent_worker_inheritance(

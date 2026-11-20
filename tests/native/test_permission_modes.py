@@ -10,7 +10,6 @@ from omnigent.native.permission_modes import (
     PERMISSION_MODE_CONCEPTS,
     created_session_launch_args,
     inherited_permission_mode,
-    launch_args_permission_mode,
 )
 
 _GATED = [
@@ -101,29 +100,3 @@ def test_a_mode_that_skips_approval_is_not_inherited(
 ) -> None:
     assert inherited_permission_mode(harness, mode, child_harness) is None
 
-
-@pytest.mark.parametrize(
-    ("harness", "launch_args", "expected"),
-    [
-        ("claude-native", ["--model", "opus", "--permission-mode", "auto"], "auto"),
-        # The CLI applies the last flag it reads.
-        ("claude-native", ["--permission-mode", "plan", "--permission-mode", "auto"], "auto"),
-        (
-            "codex-native",
-            PERMISSION_LAUNCH_ARGS["codex-native"]["approve-for-me"],
-            "approve-for-me",
-        ),
-        (
-            "codex-native",
-            ["-m", "gpt", *PERMISSION_LAUNCH_ARGS["codex-native"]["ask-for-approval"]],
-            "ask-for-approval",
-        ),
-        ("codex-native", ["--sandbox", "workspace-write"], None),
-        ("codex-native", None, None),
-        ("claude-sdk", ["--permission-mode", "auto"], None),
-    ],
-)
-def test_launch_args_permission_mode(
-    harness: str, launch_args: list[str] | None, expected: str | None
-) -> None:
-    assert launch_args_permission_mode(harness, launch_args) == expected

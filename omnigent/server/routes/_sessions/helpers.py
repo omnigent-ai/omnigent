@@ -99,7 +99,6 @@ from omnigent.native.permission_modes import (
     PERMISSION_LAUNCH_ARGS,
     created_session_launch_args,
     inherited_permission_mode,
-    launch_args_permission_mode,
 )
 from omnigent.native.session_todos import validate_session_todos
 from omnigent.policies.types import EvaluationContext
@@ -11301,15 +11300,17 @@ def _session_live_permission_mode(conv: Conversation) -> tuple[str, str] | None:
     :returns: ``(harness, mode)``, e.g. ``("claude-native", "auto")``, or ``None``
         when the session isn't a Claude Code or Codex session with a known mode.
     """
-    native_agent = native_coding_agent_for_wrapper_label(
-        conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
-    )
+    from omnigent.harnesses.claude_native.bridge import claude_launch_permission_mode
+    from omnigent.harnesses.codex_native.app_server import codex_launch_permission_preset
+
+    native_agent = _native_coding_agent_for_session(conv)
     if native_agent is None:
         return None
     harness = native_agent.harness
     launch_args = list(conv.terminal_launch_args or [])
     if harness == _CLAUDE_NATIVE_HARNESS:
         mode = conv.labels.get(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+        mode = mode or claude_launch_permission_mode(launch_args)
     elif harness == _CODEX_NATIVE_HARNESS:
         if (
             conv.labels.get(CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY) == "1"
@@ -11317,9 +11318,9 @@ def _session_live_permission_mode(conv: Conversation) -> tuple[str, str] | None:
         ):
             return harness, "bypass"
         mode = conv.labels.get(_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY)
+        mode = mode or codex_launch_permission_preset(launch_args)
     else:
         return None
-    mode = mode or launch_args_permission_mode(harness, launch_args)
     return (harness, mode) if mode else None
 
 
